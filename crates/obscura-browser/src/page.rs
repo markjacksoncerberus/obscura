@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{ObscuraHttpClient, ObscuraNetError, Response};
@@ -8,8 +9,105 @@ use url::Url;
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
 
+fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
+    let rest = uri.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    if meta.split(';').any(|t| t.eq_ignore_ascii_case("base64")) {
+        let cleaned: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+        BASE64.decode(cleaned).ok()
+    } else {
+        Some(percent_decode(payload))
+    }
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = hex_val(b[i + 1]);
+            let lo = hex_val(b[i + 2]);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(feature = "stealth")]
 use obscura_net::StealthHttpClient;
+
+/// Returns true when a JS-initiated navigation would step from a
+/// non-file scheme into a file: URL. We treat that move as an SOP
+/// violation because the existing realm survives the navigation and
+/// can read the new document's body.
+fn cross_scheme_to_file(from: &str, to: &str) -> bool {
+    let to_is_file = Url::parse(to)
+        .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or(false);
+    if !to_is_file {
+        return false;
+    }
+    Url::parse(from)
+        .map(|u| !u.scheme().eq_ignore_ascii_case("file"))
+        .unwrap_or(true)
+}
+
+/// Sub-resource fetch policy. A page may only pull a `<script src>` /
+/// `<link rel=stylesheet href>` / etc. when the URL scheme is safe for
+/// the page's origin. http(s) pages cannot reach into file: or data:
+/// to fabricate scripts, and pages with no origin only get http/https.
+fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
+    let Ok(target) = Url::parse(resource) else { return false };
+    let scheme = target.scheme().to_ascii_lowercase();
+    match scheme.as_str() {
+        "http" | "https" => true,
+        "file" => page_url.map(|u| u.scheme().eq_ignore_ascii_case("file")).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Escape a value for safe inclusion inside a JavaScript template
+/// literal. The previous implementation only escaped `\`, `` ` `` and
+/// `${`; that left U+2028 / U+2029 (the JS-specific line terminators)
+/// and other control characters as breakout vectors. Done at the
+/// callsite means future tweaks come back to one function.
+fn escape_for_js_template_literal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            '$' => out.push_str("\\$"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            '\u{0000}' => out.push_str("\\0"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone)]
 pub struct NetworkEvent {
@@ -46,10 +144,24 @@ pub struct Page {
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
         let http_client = context.http_client.clone();
-        let frame_id = format!("{}.1", id);
+        // Chromium convention: the main frame's frameId == the targetId.
+        // Playwright's frame manager looks up the main frame by targetId
+        // (via target._targetInfo.targetId), so any divergence here makes
+        // Page.getFrameTree return a frame the client cannot match,
+        // triggering a Target.closeTarget and "Frame has been detached".
+        let frame_id = id.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = if context.stealth {
-            Some(Arc::new(StealthHttpClient::new(context.cookie_jar.clone())))
+            // The wreq client backing StealthHttpClient does not speak SOCKS5.
+            // Callers must validate the proxy scheme up front and fail loudly
+            // (see obscura-cli) rather than silently rewriting socks5:// to
+            // http://, which only works when the upstream happens to be a
+            // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
+            // like `ssh -ND` (#160).
+            Some(Arc::new(StealthHttpClient::with_proxy(
+                context.cookie_jar.clone(),
+                context.proxy_url.as_deref(),
+            )))
         } else {
             None
         };
@@ -101,30 +213,25 @@ impl Page {
         self.http_client.fetch(url).await
     }
     fn init_js(&mut self) {
+        // Drop any existing runtime so the JS realm starts clean on
+        // every navigation. The old code reused the V8 isolate and
+        // only re-bound `globalThis.document`, leaving window.onload,
+        // custom window properties and event handlers from the prior
+        // page in place. That made it possible for a page to set
+        // attacker-controlled state, trigger a navigation, and then
+        // run code in the next document's context.
         if self.js.is_some() {
-            let url_str = self.url_string();
-            let title = self.title.clone();
-            let dom = self.dom.take();
-
-            let js = self.js.as_mut().unwrap();
-            js.set_url(&url_str);
-            js.set_title(&title);
-
-            if let Some(d) = dom {
-                js.set_dom(d);
-            }
-
-            let _ = js.execute_script("<reset>",
-                "_cache.clear(); globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; \
-                 _iframeRegistry.length = 0; globalThis.length = 0; \
-                 globalThis._formValues = {}; globalThis._formChecked = {}; \
-                 globalThis._eventRegistry = {}; \
-                 globalThis.document = new Document(+_dom('document_node_id'));");
-
-            return;
+            let _ = self.js.take();
         }
 
-        let mut rt = ObscuraJsRuntime::with_base_url(&self.url_string());
+        // Thread the BrowserContext's proxy through to the ES-module loader
+        // and op_fetch_url so dynamic imports and JS fetch() honour the
+        // configured upstream proxy (#139). When proxy_url is None this is
+        // equivalent to with_base_url() (direct connection).
+        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
+            &self.url_string(),
+            self.context.proxy_url.clone(),
+        );
         rt.set_url(&self.url_string());
         rt.set_title(&self.title);
 
@@ -251,6 +358,19 @@ impl Page {
                     src_url.clone()
                 };
 
+                if !subresource_allowed(self.url.as_ref(), &full_url) {
+                    // Block file://, data:, javascript:, and other
+                    // off-origin schemes from being injected as a
+                    // <script src>. Without this an http page can
+                    // include <script src="file:///etc/passwd"> and
+                    // see the body parsed as JS source.
+                    tracing::warn!(
+                        "blocking cross-scheme <script src>: page={} src={}",
+                        self.url_string(),
+                        full_url,
+                    );
+                    continue;
+                }
                 if self.should_block_url(&full_url) {
                     tracing::info!("Blocked script by interception: {}", full_url);
                     continue;
@@ -282,9 +402,18 @@ impl Page {
         let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp)) = result {
-                let code = String::from_utf8_lossy(&resp.body).to_string();
+                // Script bodies: only the HTTP Content-Type charset matters
+                // (no in-band meta-charset for JS).
+                let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
                 fetched.insert(idx, (url, code, resp));
             }
+        }
+
+        // Spec: readyState is "loading" while parser-discovered scripts execute.
+        // Scripts that check readyState === 'loading' will register DOMContentLoaded
+        // listeners instead of calling their callback immediately.
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script("<ready-state>", "globalThis.__documentReadyState__ = 'loading';");
         }
 
         for (i, script) in all_to_execute.iter().enumerate() {
@@ -340,10 +469,15 @@ impl Page {
         }
 
         if let Some(js) = &mut self.js {
+            // Spec order: readyState -> interactive, fire DOMContentLoaded on both
+            // document and window, then readyState -> complete, fire load.
             let _ = js.execute_script("<load-events>",
-                "if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { document.dispatchEvent(new Event('DOMContentLoaded')); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('load')); } catch(e) {}");
+                "globalThis.__documentReadyState__ = 'interactive';\n\
+                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
+                 globalThis.__documentReadyState__ = 'complete';\n\
+                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}");
         }
 
         if let Some(js) = &mut self.js {
@@ -402,13 +536,35 @@ impl Page {
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
-        for _chain in 0..10 {
+        const REDIRECT_LIMIT: usize = 10;
+        for chain in 0..REDIRECT_LIMIT {
             self.navigate_single(&current_url, wait_until, &current_method, &current_body).await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
+                if cross_scheme_to_file(&current_url, &next_url) {
+                    // SOP gate. A web page must not be able to drive
+                    // a navigation to file:// and then read the loaded
+                    // document. Without this an http(s) page sets
+                    // window.onload, calls location.href = "file:..."
+                    // and harvests document.body from a local file
+                    // once the new document loads.
+                    tracing::warn!(
+                        "blocking JS-initiated cross-scheme navigation to file: {} -> {}",
+                        current_url,
+                        next_url,
+                    );
+                    break;
+                }
                 tracing::info!("JS-triggered navigation chain: {} {} -> {}", current_method, current_url, next_url);
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
+                if chain + 1 == REDIRECT_LIMIT {
+                    // Hit the cap and the page still wants to keep
+                    // chaining. Surface that as an error instead of
+                    // returning Ok(()) so callers can distinguish a
+                    // successful load from a redirect storm.
+                    return Err(PageError::TooManyRedirects(REDIRECT_LIMIT));
+                }
                 continue;
             }
             break;
@@ -457,7 +613,24 @@ impl Page {
             }
         }
 
-        let response = if method == "POST" {
+        if url.scheme() == "about" {
+            self.navigate_blank();
+            self.init_js();
+            return Ok(());
+        }
+
+        let response = if url.scheme() == "data" {
+            let content_type = url_str.strip_prefix("data:")
+                .and_then(|s| s.split(',').next())
+                .unwrap_or("text/html")
+                .split(';').next()
+                .unwrap_or("text/html")
+                .to_string();
+            let body_bytes = decode_data_uri(url_str).unwrap_or_default();
+            let mut headers = std::collections::HashMap::new();
+            headers.insert("content-type".to_string(), content_type);
+            Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
+        } else if method == "POST" {
             self.http_client.post_form(&url, body).await
         } else {
             self.do_fetch(&url).await
@@ -479,7 +652,11 @@ impl Page {
             self.url = Some(response.url.clone());
         }
 
-        let body_text = String::from_utf8_lossy(&response.body).to_string();
+        // Honor the response charset: HTTP Content-Type → <meta charset> sniff
+        // in the first 1KB → UTF-8 fallback. Without this, every non-UTF-8
+        // page (GBK, Big5, Shift-JIS, Windows-125x, EUC-KR, ISO-8859-x)
+        // came through as replacement characters.
+        let body_text = obscura_net::decode_response(&response.body, response.content_type());
         let dom = parse_html(&body_text);
 
         self.title = dom
@@ -512,6 +689,14 @@ impl Page {
             } else {
                 href.clone()
             };
+            if !subresource_allowed(self.url.as_ref(), &full_url) {
+                tracing::warn!(
+                    "blocking cross-scheme <link rel=stylesheet href>: page={} href={}",
+                    self.url_string(),
+                    full_url,
+                );
+                continue;
+            }
             if self.should_block_url(&full_url) {
                 tracing::info!("Blocked stylesheet by interception: {}", full_url);
                 continue;
@@ -539,7 +724,9 @@ impl Page {
         let mut css_sources = Vec::new();
         for result in css_results {
             if let Some((url_str, resp)) = result {
-                let css = String::from_utf8_lossy(&resp.body).to_string();
+                // CSS bodies: honor the Content-Type charset; CSS @charset is
+                // out of scope for the current scrape-focused pipeline.
+                let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
                 self.record_network_event(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, resp.body.len());
                 css_sources.push(css);
             }
@@ -558,10 +745,13 @@ impl Page {
         if !css_sources.is_empty() {
             if let Some(js) = &mut self.js {
                 let combined_css = css_sources.join("\n");
-                let escaped = combined_css
-                    .replace('\\', "\\\\")
-                    .replace('`', "\\`")
-                    .replace("${", "\\${");
+                // Use the thorough template-literal escape that
+                // covers U+2028 / U+2029 and other control chars.
+                // The previous escaper only handled `, \, and ${,
+                // letting attacker-controlled CSS containing a raw
+                // U+2028 break out of the template literal and run
+                // arbitrary JS in the page's V8 realm.
+                let escaped = escape_for_js_template_literal(&combined_css);
                 let code = format!("globalThis.__obscura_css = `{}`;", escaped);
                 let _ = js.execute_script("<css>", &code);
             }
@@ -678,13 +868,14 @@ impl Page {
         }
     }
 
-    pub fn evaluate_for_cdp(
+    pub async fn evaluate_for_cdp(
         &mut self,
         expression: &str,
         return_by_value: bool,
+        await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.evaluate_for_cdp(expression, return_by_value) {
+            match js.evaluate_for_cdp(expression, return_by_value, await_promise).await {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
@@ -832,6 +1023,21 @@ impl Page {
         }
     }
 
+    pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
+        if let Some((url, method, body)) = self.take_pending_navigation() {
+            self.navigate_with_wait_post(
+                &url,
+                crate::lifecycle::WaitUntil::Load,
+                &method,
+                &body,
+            )
+            .await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     pub fn set_intercept_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>) {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
@@ -850,6 +1056,9 @@ pub enum PageError {
 
     #[error("Parse error: {0}")]
     ParseError(String),
+
+    #[error("Too many redirects (limit {0})")]
+    TooManyRedirects(usize),
 }
 
 impl From<ObscuraNetError> for PageError {

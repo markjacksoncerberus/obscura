@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
+use crate::util::url_is_file_scheme;
 
 pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Result<Value, String> {
     match method {
@@ -15,6 +16,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                         "title": "",
                         "url": "",
                         "attached": true,
+                        "canAccessOpener": false,
                         "browserContextId": "",
                     }
                 }),
@@ -29,6 +31,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": false,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         }
                     }),
@@ -47,6 +50,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                         "title": page.title,
                         "url": page.url_string(),
                         "attached": true,
+                        "canAccessOpener": false,
                         "browserContextId": page.context.id,
                     })
                 })
@@ -55,6 +59,17 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
         }
         "createTarget" => {
             let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+
+            // Same gate as Page.navigate (GHSA-q55h-vfv9-qcr5). Without this,
+            // a CDP client can call Target.createTarget {url:"file:///etc/passwd"}
+            // and then Runtime.evaluate the body off the created target,
+            // bypassing the page-domain check entirely.
+            if url_is_file_scheme(url) && !ctx.default_context.allow_file_access {
+                return Err(
+                    "Target.createTarget to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string()
+                );
+            }
+
             let page_id = ctx.create_page();
             let session_id = format!("{}-session", page_id);
 
@@ -78,6 +93,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": false,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         }
                     }),
@@ -95,6 +111,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": true,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         },
                         "waitingForDebugger": false,
@@ -103,6 +120,32 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
             }
 
             Ok(json!({ "targetId": page_id }))
+        }
+        "attachToBrowserTarget" => {
+            // Playwright calls this on connect to obtain a session for the
+            // implicit "browser" target. Returning Unknown method aborts
+            // the connect handshake before any user code runs.
+            let session_id = "browser-session".to_string();
+            ctx.sessions.insert(session_id.clone(), "browser".to_string());
+
+            ctx.pending_events.push(CdpEvent::new(
+                "Target.attachedToTarget",
+                json!({
+                    "sessionId": session_id,
+                    "targetInfo": {
+                        "targetId": "browser",
+                        "type": "browser",
+                        "title": "",
+                        "url": "",
+                        "attached": true,
+                        "canAccessOpener": false,
+                        "browserContextId": "",
+                    },
+                    "waitingForDebugger": false,
+                }),
+            ));
+
+            Ok(json!({ "sessionId": session_id }))
         }
         "attachToTarget" => {
             let target_id = params.get("targetId").and_then(|v| v.as_str())
@@ -121,6 +164,7 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": true,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         },
                         "waitingForDebugger": false,
@@ -174,11 +218,15 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": page.title,
                             "url": page.url_string(),
                             "attached": true,
+                            "canAccessOpener": false,
                             "browserContextId": page.context.id,
                         }
                     }))
                 }
                 None => {
+                    // canAccessOpener is required on every TargetInfo per the
+                    // CDP spec. Strict clients (chromiumoxide) panic if it's
+                    // missing. The browser target itself has no opener.
                     Ok(json!({
                         "targetInfo": {
                             "targetId": "browser",
@@ -186,11 +234,72 @@ pub async fn handle(method: &str, params: &Value, ctx: &mut CdpContext) -> Resul
                             "title": "",
                             "url": "",
                             "attached": true,
+                            "canAccessOpener": false,
                         }
                     }))
                 }
             }
         }
         _ => Err(format!("Unknown Target method: {}", method)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn attach_to_browser_target_returns_session_id() {
+        let mut ctx = CdpContext::new();
+        let result = handle("attachToBrowserTarget", &json!({}), &mut ctx)
+            .await
+            .expect("attachToBrowserTarget should succeed");
+
+        assert_eq!(result["sessionId"], "browser-session");
+        assert_eq!(
+            ctx.sessions.get("browser-session").map(String::as_str),
+            Some("browser")
+        );
+
+        // Playwright/Puppeteer expect a Target.attachedToTarget event before
+        // they finish wiring up the session — without it the connect promise
+        // hangs.
+        let attached_evt = ctx
+            .pending_events
+            .iter()
+            .find(|e| e.method == "Target.attachedToTarget")
+            .expect("attachedToTarget event must be emitted");
+        assert_eq!(attached_evt.params["sessionId"], "browser-session");
+        assert_eq!(attached_evt.params["targetInfo"]["type"], "browser");
+    }
+
+    #[tokio::test]
+    async fn unknown_target_method_still_errors() {
+        let mut ctx = CdpContext::new();
+        let err = handle("notARealMethod", &json!({}), &mut ctx)
+            .await
+            .expect_err("unknown methods must surface as errors");
+        assert!(err.contains("Unknown Target method"));
+    }
+
+    /// Regression for #122 item 5: every TargetInfo payload must carry the
+    /// `canAccessOpener` field. The browser-target branch of getTargetInfo
+    /// (no targetId passed → no page) used to omit it; strict CDP clients
+    /// like chromiumoxide panic when the field is missing.
+    #[tokio::test]
+    async fn get_target_info_browser_target_includes_can_access_opener() {
+        let mut ctx = CdpContext::new();
+        // No targetId → falls through to the browser-target branch.
+        let result = handle("getTargetInfo", &json!({}), &mut ctx)
+            .await
+            .expect("getTargetInfo with no targetId must return browser info");
+
+        let info = &result["targetInfo"];
+        assert_eq!(info["type"], "browser", "must be the browser target");
+        assert!(
+            info.get("canAccessOpener").is_some(),
+            "canAccessOpener must be present on every TargetInfo, got: {result}"
+        );
+        assert_eq!(info["canAccessOpener"], false);
     }
 }

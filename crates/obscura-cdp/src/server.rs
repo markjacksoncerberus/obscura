@@ -3,12 +3,27 @@ use std::net::SocketAddr;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
+
+// PR #36 comment 4341743194: the deferral queue in `process_with_interception`
+// must be bounded so a stalled navigation cannot OOM the process. When the cap
+// is reached we return an explicit error response rather than silently dropping.
+const MAX_DEFERRED_MESSAGES: usize = 256;
+
+// The WS-stream forwarding channel must also be bounded: if the LocalSet
+// (CDP processor + nav tasks) stalls, the accept thread keeps pushing
+// `std::net::TcpStream`s into the queue. An unbounded channel would let
+// that queue grow without limit and OOM the process. With a bounded
+// capacity, when the LocalSet is saturated the accept thread closes the
+// new connection on the spot instead of buffering it — the kernel TCP
+// backlog still absorbs short-term spikes, but a long-term stall now
+// fails loudly at accept time rather than silently piling up FDs.
+const MAX_PENDING_WS_HANDOFFS: usize = 128;
 use crate::types::CdpRequest;
 
 struct CdpMessage {
@@ -24,57 +39,314 @@ enum ServerMessage {
 }
 
 pub async fn start(port: u16) -> anyhow::Result<()> {
-    start_with_options(port, None).await
+    start_with_options(port, None, false).await
 }
 
-pub async fn start_with_options(port: u16, proxy: Option<String>) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(&addr).await?;
+pub async fn start_with_options(
+    port: u16,
+    proxy: Option<String>,
+    stealth: bool,
+) -> anyhow::Result<()> {
+    start_with_full_options(port, proxy, stealth, None, None).await
+}
 
-    info!("Obscura CDP server listening on ws://127.0.0.1:{}", port);
+pub async fn start_with_full_options(
+    port: u16,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    storage_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    start_with_host(port, "127.0.0.1", proxy, stealth, user_agent, storage_dir).await
+}
+
+pub async fn start_with_host(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    storage_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    start_with_host_and_security(port, host, proxy, stealth, user_agent, false, storage_dir).await
+}
+
+pub async fn start_with_host_and_security(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    start_with_host_security_and_storage(port, host, proxy, stealth, user_agent, allow_file_access, storage_dir).await
+}
+
+pub async fn start_with_host_security_and_storage(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let ip: std::net::IpAddr = host
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
+    let addr = SocketAddr::new(ip, port);
+
+    // Issue #62: the HTTP control plane (/json/version, /json) must remain
+    // reachable even while V8 JS evaluation blocks the tokio LocalSet thread.
+    //
+    // We use a dedicated OS thread with a blocking std::net::TcpListener so
+    // the kernel's accept backlog is always drained promptly. HTTP endpoints
+    // are served directly via blocking I/O; WebSocket connections are
+    // forwarded to the existing LocalSet for CDP processing.
+    let std_listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| anyhow::anyhow!("bind {}:{}: {}", host, port, e))?;
+    std_listener
+        .set_nonblocking(false)
+        .map_err(|e| anyhow::anyhow!("set_nonblocking: {}", e))?;
+
+    info!("Obscura CDP server listening on ws://{}:{}", host, port);
     info!(
-        "DevTools endpoint: ws://127.0.0.1:{}/devtools/browser",
-        port
+        "DevTools endpoint: ws://{}:{}/devtools/browser",
+        host, port
     );
+    if allow_file_access {
+        info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
+    }
+
+    let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
+
+    // Dedicated accept thread: drains the kernel backlog immediately and
+    // handles HTTP endpoints (/json/version, /json, /json/protocol) with
+    // blocking I/O so they never contend with the LocalSet's V8 work.
+    //
+    // Lifecycle note: this thread is spawned detached (no `join` handle).
+    // It is intended to run for the entire process lifetime — the same
+    // contract Chromium DevTools / Playwright clients expect from a CDP
+    // server. When `start_with_*` returns (whether by Ok or panic in the
+    // LocalSet), `ws_rx` drops; the next `ws_tx.blocking_send` then
+    // returns `SendError`, which `accept_dispatch` surfaces as
+    // "accept channel closed" and the loop logs+continues. The listener
+    // FD stays bound until the process exits. If we ever need to support
+    // graceful shutdown for embedded/library use, add an
+    // `Arc<AtomicBool>` shutdown flag checked between `accept()`s and
+    // switch to a non-blocking `set_nonblocking(true)` + poll loop.
+    // For the standalone `obscura serve` binary the detached lifetime is
+    // correct.
+    std::thread::Builder::new()
+        .name("obscura-cdp-accept".into())
+        .spawn(move || {
+            for stream in std_listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        if let Err(e) = accept_dispatch(stream, port, &ws_tx) {
+                            if !format!("{}", e).contains("close") {
+                                error!("Accept dispatch error: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => error!("Accept error: {}", e),
+                }
+            }
+        })?;
 
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-            let processor_handle = tokio::task::spawn_local(cdp_processor(msg_rx, proxy));
+            let _processor_handle = tokio::task::spawn_local(cdp_processor(
+                msg_rx, proxy, stealth, user_agent, allow_file_access, storage_dir,
+            ));
 
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer_addr)) => {
-                        info!("New connection from {}", peer_addr);
-                        let tx = msg_tx.clone();
-                        tokio::task::spawn_local(async move {
-                            if let Err(e) = handle_connection(stream, port, tx).await {
-                                if !format!("{}", e).contains("close") {
-                                    error!("Connection error from {}: {}", peer_addr, e);
-                                }
-                            }
-                        });
+            while let Some(stream) = ws_rx.recv().await {
+                // Convert std TcpStream → tokio TcpStream inside the LocalSet
+                // where the tokio runtime is active.
+                stream
+                    .set_nonblocking(true)
+                    .map_err(|e| error!("set_nonblocking on WS stream: {}", e))
+                    .ok();
+                let tokio_stream = match TcpStream::from_std(stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("TcpStream::from_std failed: {}", e);
+                        continue;
                     }
-                    Err(e) => error!("Accept error: {}", e),
-                }
+                };
+                let tx = msg_tx.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = handle_connection_ws(tokio_stream, tx).await {
+                        error!("WebSocket connection error: {}", e);
+                    }
+                });
             }
         })
-        .await
+        .await;
+
+    Ok(())
+}
+
+const HTTP_PEEK_BUF: usize = 4096;
+const WS_PEEK_BUF: usize = 4;
+
+/// Dispatch a freshly-accepted TCP connection on the dedicated accept thread.
+///
+/// Peek at the first bytes to decide HTTP vs WebSocket:
+/// - HTTP (`GET /json/*`): serve synchronously via blocking I/O so the
+///   response is never stalled by the LocalSet.
+/// - WebSocket: set non-blocking, convert to tokio `TcpStream`, and forward
+///   to the LocalSet for CDP processing.
+fn accept_dispatch(
+    stream: std::net::TcpStream,
+    port: u16,
+    ws_tx: &mpsc::Sender<std::net::TcpStream>,
+) -> anyhow::Result<()> {
+    let mut buf = [0u8; WS_PEEK_BUF];
+    let n = stream.peek(&mut buf)?;
+
+    if n >= 4 && &buf == b"GET " {
+        let mut peek_buf = [0u8; HTTP_PEEK_BUF];
+        let n = stream.peek(&mut peek_buf)?;
+        let line = String::from_utf8_lossy(&peek_buf[..n]);
+
+        let endpoint = if line.contains("/json/version") {
+            Some("version")
+        } else if line.contains("/json/list") || line.contains("/json\r\n") || line.contains("/json HTTP") {
+            Some("list")
+        } else if line.contains("/json/protocol") {
+            Some("protocol")
+        } else {
+            None
+        };
+
+        if let Some(ep) = endpoint {
+            return handle_http_json_blocking(stream, port, ep);
+        }
+        // Fall through: GET request that isn't a /json endpoint → treat as
+        // WebSocket upgrade (Chromium DevTools clients issue GET with
+        // Upgrade: websocket).
+    }
+
+    // Try to hand off the WS stream to the LocalSet. If the bounded channel
+    // is full the LocalSet is saturated — drop the connection cleanly
+    // rather than blocking the accept thread (which would freeze the HTTP
+    // control plane that this whole rework exists to keep alive). The
+    // dropped `stream` closes itself; the client will see ECONNRESET and
+    // can retry.
+    ws_tx
+        .try_send(stream)
+        .map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
+                anyhow::anyhow!("ws handoff channel full")
+            }
+            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("accept channel closed"),
+        })
+}
+
+/// Serve an HTTP `/json/*` endpoint with blocking I/O on the accept thread.
+fn handle_http_json_blocking(
+    mut stream: std::net::TcpStream,
+    port: u16,
+    endpoint: &str,
+) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+
+    let mut buf = vec![0u8; 4096];
+    let _ = stream.read(&mut buf)?;
+
+    let body = match endpoint {
+        "version" => serde_json::to_string_pretty(&json!({
+            "Browser": "Obscura/0.1.0",
+            "Protocol-Version": "1.3",
+            "User-Agent": "Obscura/0.1.0 (Headless Browser)",
+            "V8-Version": "N/A",
+            "WebKit-Version": "N/A",
+            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
+        }))?,
+        "list" => serde_json::to_string_pretty(&json!([{
+            "description": "",
+            "devtoolsFrontendUrl": "",
+            "id": "page-1",
+            "title": "",
+            "type": "page",
+            "url": "about:blank",
+            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/page-1", port),
+        }]))?,
+        "protocol" => {
+            serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
+        }
+        _ => "{}".to_string(),
+    };
+
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(), body,
+    );
+    stream.write_all(resp.as_bytes())?;
+    stream.flush()?;
+    Ok(())
 }
 
 async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
 ) {
-    let mut ctx = CdpContext::new_with_proxy(proxy);
+    let mut ctx = if storage_dir.is_some() {
+        // Use storage-aware context creation with security settings
+        CdpContext::new_with_storage(proxy, stealth, user_agent, storage_dir)
+    } else {
+        CdpContext::new_with_security(proxy, stealth, user_agent, allow_file_access)
+    };
     let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
     ctx.intercept_tx = Some(itx);
     let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
     let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
 
-    while let Some(msg) = rx.recv().await {
+    // Issue #19 follow-up: messages deferred from inside
+    // `process_with_interception` because routing them through
+    // `process_cdp_message → dispatch` while a nav was in flight would have
+    // tripped V8's TryGetCurrent invariant. Drained at the top of each
+    // outer iteration so they get processed sequentially with no other nav
+    // in flight.
+    let mut deferred: std::collections::VecDeque<ServerMessage> =
+        std::collections::VecDeque::new();
+
+    // Subscribe to Ctrl-C once. The future is single-shot, so we break out of
+    // the outer loop when it fires and never poll it again. Without this the
+    // accept loop just exits and any cookies set during the session are lost
+    // before `BrowserContext::save_cookies()` runs.
+    let mut shutdown = Box::pin(tokio::signal::ctrl_c());
+
+    loop {
+        // Drain any deferred messages from the previous interception window
+        // before pulling new ones off the wire. Each is processed with no
+        // nav-task spawn_local in flight, so dispatch's v8_lock can claim
+        // the only Isolate cleanly.
+        let msg = if let Some(d) = deferred.pop_front() {
+            d
+        } else {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(m) => m,
+                    None => break,
+                },
+                _ = &mut shutdown => {
+                    tracing::info!("Shutdown signal received");
+                    break;
+                }
+            }
+        };
+
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
                 let _ = reply_tx.send(
@@ -90,6 +362,7 @@ async fn cdp_processor(
                     process_with_interception(
                         &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
                         &mut intercept_rx, &mut intercepted_paused,
+                        &mut deferred,
                     ).await;
                 } else {
                     if cdp_msg.text.contains("Fetch.") {
@@ -101,11 +374,16 @@ async fn cdp_processor(
         }
 
     }
+
+    // Single exit point handles both Ctrl-C shutdown and the channel being
+    // closed by the accept thread. Without this any cookies set during the
+    // session are dropped on the floor.
+    ctx.default_context.save_cookies();
 }
 
 fn handle_fetch_resolution(
     text: &str,
-    ctx: &mut CdpContext,
+    _ctx: &mut CdpContext,
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
 ) {
@@ -154,6 +432,7 @@ async fn process_with_interception(
     rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
+    deferred: &mut std::collections::VecDeque<ServerMessage>,
 ) {
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -187,6 +466,21 @@ async fn process_with_interception(
             return;
         }
     };
+
+    // Issue #19 follow-up: V8 only allows ONE entered Isolate per OS thread.
+    // The regular dispatch path enforces this via `get_session_page_mut`
+    // (which `suspend_js`'es every other page before letting the target
+    // page run JS). The interception path here bypasses that — it removes
+    // the target page and spawns a nav task — so we have to enforce the
+    // same invariant explicitly. Otherwise nav-2's `init_js` constructs
+    // Isolate-2 while page-1's Isolate-1 is still alive in ctx.pages, and
+    // the next V8 scope unwind aborts the process via `Context::Exit`'s
+    // `heap->isolate() == Isolate::TryGetCurrent()` check.
+    for other in ctx.pages.iter_mut() {
+        if other.has_js() {
+            other.suspend_js();
+        }
+    }
 
     let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let wait_until = req.params.get("waitUntil")
@@ -223,18 +517,44 @@ async fn process_with_interception(
     let url_owned = url.to_string();
 
     tokio::task::spawn_local(async move {
+        // Issue #19: serialize V8 work across pages. The interception path
+        // spawns navigation here while the parent task continues to pump
+        // CDP messages via `dispatch` (which also acquires this lock); both
+        // sides must coordinate or V8 aborts the process at concurrency >= 5.
+        let _v8_guard = obscura_js::v8_lock::global().lock().await;
         let result = page.navigate_with_wait(&url_owned, wait_until).await.map_err(|e| e.to_string());
         for source in &preload_scripts {
             if let Err(e) = page.execute_preload_script(source) {
                 tracing::debug!("Preload script error: {}", e);
             }
         }
+        drop(_v8_guard);
         let _ = nav_done_tx.send((page, result)).await;
     });
 
-    let mut navigate_result: Result<(), String> = Ok(());
-    let mut page_back: Option<obscura_browser::Page> = None;
+    let navigate_result: Result<(), String>;
+    let page_back: Option<obscura_browser::Page>;
 
+    // Issue #19 follow-up (PR #36 maintainer's fetch-intercept repro):
+    // While the spawned nav task is executing V8 (potentially parked on
+    // `op_fetch_url`'s `resolve_rx.await` *with Isolate-N still entered*),
+    // we must NOT let the parent's `select!` route foreign Cdp messages
+    // through `process_cdp_message → dispatch → page handlers`, because
+    // those handlers call `get_session_page_mut` which `suspend_js`'es
+    // OTHER pages (drops their `JsRuntime`, which calls
+    // `JsRealmInner::destroy`). That trips V8's
+    // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts
+    // the process via `V8_Fatal`.
+    //
+    // The `obscura_js::v8_lock` mutex doesn't save us here: it's a
+    // `tokio::sync::Mutex` that is released around `.await`s inside V8
+    // ops, so it doesn't actually keep the V8 enter/exit pair contiguous
+    // on the thread.
+    //
+    // Park foreign Cdp messages into the outer deferred queue so the
+    // outer `cdp_processor` loop processes them after this nav fully
+    // completes (and its JsRuntime is no longer in flight on the
+    // LocalSet).
     loop {
         let has_irx = intercept_rx.is_some();
 
@@ -305,22 +625,55 @@ async fn process_with_interception(
                 tracing::info!("INTERCEPTION select: received CDP message during navigation");
                 match msg {
                     ServerMessage::NewConnection { reply_tx: new_tx } => {
+                        // Safe: no V8 enter, just bookkeeping.
                         let pid = ctx.create_page();
                         let sid = format!("{}-session", pid);
                         ctx.sessions.insert(sid.clone(), pid.clone());
                         let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
                     }
                     ServerMessage::Cdp(msg) => {
-                        if msg.text.contains("Fetch.") {
+                        if msg.text.contains("Fetch.continueRequest")
+                            || msg.text.contains("Fetch.fulfillRequest")
+                            || msg.text.contains("Fetch.failRequest")
+                        {
+                            // Safe: only flips a oneshot to resume the parked
+                            // op inside the spawned nav task. No V8 enter on
+                            // this side; the actual V8 work happens back on
+                            // the nav task's thread.
                             handle_fetch_resolution(&msg.text, ctx, &msg.reply_tx, intercepted_paused);
                         } else {
-                            process_cdp_message(&msg.text, ctx, &msg.reply_tx).await;
+                            // UNSAFE during nav: would route through dispatch,
+                            // which can `suspend_js` other pages and trip the
+                            // V8 invariant. Defer until nav completes —
+                            // pushed to the outer `cdp_processor` queue so
+                            // it's processed sequentially with no nav task
+                            // in flight.
+                            if deferred.len() >= MAX_DEFERRED_MESSAGES {
+                                tracing::warn!("INTERCEPTION: deferred queue full ({}), returning error to client", MAX_DEFERRED_MESSAGES);
+                                if let Ok(req) = serde_json::from_str::<CdpRequest>(&msg.text) {
+                                    let resp = crate::types::CdpResponse::error(
+                                        req.id,
+                                        -32000,
+                                        "Server busy: navigation in progress, try again later".to_string(),
+                                        req.session_id,
+                                    );
+                                    if let Ok(json) = serde_json::to_string(&resp) {
+                                        let _ = msg.reply_tx.send(json);
+                                    }
+                                }
+                            } else {
+                                tracing::info!("INTERCEPTION: deferring CDP message until nav completes");
+                                deferred.push_back(ServerMessage::Cdp(msg));
+                            }
                         }
                     }
                 }
             }
         }
     }
+
+    // Deferred messages are handled by the outer `cdp_processor` loop
+    // (it drains `deferred` before pulling the next message off `rx`).
 
     let mut page = page_back.expect("navigation task should return the page");
 
@@ -400,14 +753,20 @@ async fn process_cdp_message(
 
     let response = dispatch::dispatch(&req, ctx).await;
 
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = reply_tx.send(json);
-    }
-
+    // Chromium CDP semantics: events emitted as a side-effect of a command
+    // (e.g. Target.targetCreated + Target.attachedToTarget from
+    // Target.createTarget) MUST arrive BEFORE the command's response.
+    // Playwright awaits the response and immediately reads state wired up
+    // by those events; if the response lands first, accessing
+    // Target._page errors with "Cannot read properties of undefined".
     for event in ctx.pending_events.drain(..) {
         if let Ok(json) = serde_json::to_string(&event) {
             let _ = reply_tx.send(json);
         }
+    }
+
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = reply_tx.send(json);
     }
 
     if let Some((nav_url, nav_method, nav_body)) = check_pending_navigation(ctx, &req.session_id) {
@@ -481,6 +840,15 @@ fn fast_path_response(text: &str) -> Option<String> {
         "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
             Some(json!({}))
         }
+        // Critical: Puppeteer calls this as the *first* CDP command on connect
+        // (`BrowserConnector._connectToCdpBrowser`). If another client or a long
+        // `Page.navigate` / interception holds the single `cdp_processor` task,
+        // queued Target commands starve and Puppeteer hits protocolTimeout on
+        // `Target.getBrowserContexts`. Fast-path bypasses the queue — same payload
+        // as `domains::target::handle` when default context id is `"default"`.
+        "Target.getBrowserContexts" => {
+            Some(json!({ "browserContextIds": ["default"] }))
+        }
         _ => None,
     };
 
@@ -500,28 +868,10 @@ fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Op
     page.take_pending_navigation()
 }
 
-async fn handle_connection(
+async fn handle_connection_ws(
     stream: TcpStream,
-    port: u16,
     msg_tx: mpsc::UnboundedSender<ServerMessage>,
 ) -> anyhow::Result<()> {
-    let mut buf = [0u8; 4];
-    stream.peek(&mut buf).await?;
-
-    if &buf == b"GET " {
-        let mut peek_buf = [0u8; 1024];
-        let n = stream.peek(&mut peek_buf).await?;
-        let line = String::from_utf8_lossy(&peek_buf[..n]);
-
-        if line.contains("/json/version") {
-            return handle_http_json(stream, port, "version").await;
-        } else if line.contains("/json/list") || line.contains("/json\r\n") || line.contains("/json HTTP") {
-            return handle_http_json(stream, port, "list").await;
-        } else if line.contains("/json/protocol") {
-            return handle_http_json(stream, port, "protocol").await;
-        }
-    }
-
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     info!("WebSocket connected");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
@@ -585,45 +935,5 @@ async fn handle_connection(
     }
 
     send_task.abort();
-    Ok(())
-}
-
-async fn handle_http_json(stream: TcpStream, port: u16, endpoint: &str) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = stream;
-    let mut buf = vec![0u8; 4096];
-    let _ = stream.read(&mut buf).await?;
-
-    let body = match endpoint {
-        "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Obscura/0.1.0",
-            "Protocol-Version": "1.3",
-            "User-Agent": "Obscura/0.1.0 (Headless Browser)",
-            "V8-Version": "N/A",
-            "WebKit-Version": "N/A",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
-        }))?,
-        "list" => serde_json::to_string_pretty(&json!([{
-            "description": "",
-            "devtoolsFrontendUrl": "",
-            "id": "page-1",
-            "title": "",
-            "type": "page",
-            "url": "about:blank",
-            "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/page-1", port),
-        }]))?,
-        "protocol" => {
-            serde_json::to_string_pretty(&json!({ "version": { "major": "1", "minor": "3" } }))?
-        }
-        _ => "{}".to_string(),
-    };
-
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(), body,
-    );
-    stream.write_all(resp.as_bytes()).await?;
-    stream.flush().await?;
     Ok(())
 }

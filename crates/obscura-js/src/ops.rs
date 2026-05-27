@@ -1,11 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use deno_core::op2;
 use deno_core::OpState;
 use deno_core::Extension;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{DomTree, NodeData, NodeId};
 use obscura_net::{CookieJar, ObscuraHttpClient};
 use tokio::sync::Mutex;
@@ -119,6 +120,17 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
+        "query_selector_scoped" => {
+            let root_nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.query_selector_from(NodeId::new(root_nid), &arg2).ok().flatten()
+                .map(|id| id.index().to_string()).unwrap_or("-1".into())
+        }
+        "query_selector_all_scoped" => {
+            let root_nid = arg1.parse::<u32>().unwrap_or(0);
+            let ids: Vec<i32> = dom.query_selector_all_from(NodeId::new(root_nid), &arg2).ok()
+                .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
+            serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.get_node(NodeId::new(nid)).map(|n| match &n.data {
@@ -162,6 +174,18 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             let val = dom.get_node(NodeId::new(nid)).and_then(|n| n.get_attribute(&arg2).map(|s| s.to_string()));
             serde_json::to_string(&val).unwrap_or("null".into())
         }
+        "attribute_names" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let names: Vec<String> = dom
+                .get_node(NodeId::new(nid))
+                .map(|n| {
+                    n.attrs()
+                        .map(|a| a.iter().map(|x| x.name.local.as_ref().to_string()).collect())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            serde_json::to_string(&names).unwrap_or("[]".into())
+        }
         "set_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let node_id = NodeId::new(nid);
@@ -192,7 +216,7 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "remove_child" => {
             let child = arg1.parse::<u32>().unwrap_or(0);
-            dom.detach(NodeId::new(child));
+            dom.remove_child(NodeId::new(child));
             "true".into()
         }
         "insert_before" => {
@@ -227,8 +251,10 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.with_node_mut(NodeId::new(nid), |n| {
-                if let NodeData::Text { contents } = &mut n.data {
-                    *contents = arg2.clone();
+                match &mut n.data {
+                    NodeData::Text { contents } => { *contents = arg2.clone(); }
+                    NodeData::Comment { contents } => { *contents = arg2.clone(); }
+                    _ => {}
                 }
             });
             "true".into()
@@ -244,6 +270,9 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "create_text_node" => {
             dom.new_node(NodeData::Text { contents: arg1.clone() }).index().to_string()
+        }
+        "create_comment_node" => {
+            dom.new_node(NodeData::Comment { contents: arg1.clone() }).index().to_string()
         }
         "element_children" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -275,15 +304,34 @@ fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     }
 }
 
-static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-fn get_shared_client() -> &'static reqwest::Client {
-    SHARED_HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .build()
-            .expect("failed to build shared reqwest::Client")
-    })
+// op_fetch_url backs JS-level `fetch()` and XHR. Pre-#139 it used a
+// process-wide `OnceLock<reqwest::Client>` initialised with no proxy, so
+// every JS network call bypassed the configured upstream proxy. We now
+// build a client per request, threading whatever `proxy_url` the page's
+// ObscuraHttpClient was configured with.
+//
+// The per-request build cost is negligible (≪1ms) compared with the actual
+// network round-trip; the simplification is worth not having to invalidate
+// a cache when the proxy is reconfigured between fetches.
+fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
+    // Redirects are followed manually below so each hop can be re-validated
+    // against the same SSRF policy as the initial URL (GHSA-8v6v-g4rh-jmcm).
+    // With reqwest's default auto-follow, an attacker-controlled origin can
+    // 302 to http://127.0.0.1 and read the internal-service body.
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if let Some(proxy) = proxy_url {
+        let p = reqwest::Proxy::all(proxy)
+            .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
+        builder = builder.proxy(p);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("failed to build reqwest::Client: {}", e))
 }
+
+/// Cap on the number of redirect hops op_fetch_url will follow.
+/// Matches reqwest's default policy of 10.
+const FETCH_REDIRECT_LIMIT: usize = 10;
 
 #[op2(async)]
 #[string]
@@ -311,7 +359,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx) = {
+    let (cookie_jar, in_flight, intercept_tx, proxy_url) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -328,6 +376,10 @@ async fn op_fetch_url(
         }
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
+        // #139: thread the configured proxy through to the per-request
+        // reqwest::Client. Without this, op_fetch_url silently bypasses
+        // BrowserContext.proxy_url for every JS fetch() / XHR call.
+        let proxy_url = gs.http_client.as_ref().and_then(|c| c.proxy_url().map(|s| s.to_string()));
         tracing::debug!("op_fetch_url: intercept_enabled={}, has_tx={}", gs.intercept_enabled, gs.intercept_tx.is_some());
         let itx = if gs.intercept_enabled {
             gs.intercept_counter += 1;
@@ -335,7 +387,7 @@ async fn op_fetch_url(
         } else {
             None
         };
-        (jar, in_flight, itx)
+        (jar, in_flight, itx, proxy_url)
     };
 
     if let Some((tx, request_id)) = intercept_tx {
@@ -370,7 +422,7 @@ async fn op_fetch_url(
                         "error": reason,
                     }).to_string());
                 }
-                Ok(InterceptResolution::Continue { url: new_url, method: new_method, headers: new_headers, body: new_body }) => {
+                Ok(InterceptResolution::Continue { url: _new_url, method: _new_method, headers: _new_headers, body: _new_body }) => {
                     tracing::debug!("Interception: continue request {}", url);
                 }
                 Err(_) => {
@@ -379,7 +431,8 @@ async fn op_fetch_url(
         }
     }
 
-    let client = get_shared_client();
+    let client = build_request_client(proxy_url.as_deref())
+        .map_err(deno_error::JsErrorBox::generic)?;
 
     let request_origin = url::Url::parse(&url)
         .ok()
@@ -437,60 +490,126 @@ async fn op_fetch_url(
         }
     }
 
-    let mut req = client.request(req_method, &url);
+    // Follow redirects manually so the SSRF policy applies to every hop.
+    // reqwest's auto-follow would bypass validate_fetch_url on the redirect
+    // target and let an attacker-allowed origin 302 to http://127.0.0.1
+    // (GHSA-8v6v-g4rh-jmcm).
+    let mut current_url = url.clone();
+    let mut current_method = req_method;
+    let mut current_body = body;
+    let mut redirects_followed: usize = 0;
+    let response = loop {
+        let mut req = client.request(current_method.clone(), &current_url);
 
-    if is_cross_origin {
-        req = req.header("Origin", &page_origin);
-    }
+        if is_cross_origin {
+            req = req.header("Origin", &page_origin);
+        }
 
-    if !is_cross_origin {
-        if let Some(ref jar) = cookie_jar {
-            if let Ok(parsed_url) = url::Url::parse(&url) {
-                let cookie_header = jar.get_cookie_header(&parsed_url);
-                if !cookie_header.is_empty() {
-                    req = req.header("Cookie", &cookie_header);
+        if !is_cross_origin {
+            if let Some(ref jar) = cookie_jar {
+                if let Ok(parsed_url) = url::Url::parse(&current_url) {
+                    let cookie_header = jar.get_cookie_header(&parsed_url);
+                    if !cookie_header.is_empty() {
+                        req = req.header("Cookie", &cookie_header);
+                    }
                 }
             }
         }
-    }
 
-    for (k, v) in &custom_headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
+        for (k, v) in &custom_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
 
-    if !body.is_empty() {
-        req = req.body(body);
-    }
+        if !current_body.is_empty() {
+            req = req.body(current_body.clone());
+        }
 
-    if let Some(ref counter) = in_flight {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+        if let Some(ref counter) = in_flight {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| {
+        let resp = req.send().await.map_err(|e| {
             if let Some(ref counter) = in_flight {
                 counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             deno_error::JsErrorBox::generic(e.to_string())
         })?;
 
-    if let Some(ref counter) = in_flight {
-        counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
+        if let Some(ref counter) = in_flight {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
-    let status = response.status().as_u16();
-
-    if let Some(ref jar) = cookie_jar {
-        if let Ok(parsed_url) = url::Url::parse(&url) {
-            for val in response.headers().get_all(reqwest::header::SET_COOKIE) {
-                if let Ok(s) = val.to_str() {
-                    jar.set_cookie(s, &parsed_url);
+        if let Some(ref jar) = cookie_jar {
+            if let Ok(parsed_url) = url::Url::parse(&current_url) {
+                for val in resp.headers().get_all(reqwest::header::SET_COOKIE) {
+                    if let Ok(s) = val.to_str() {
+                        jar.set_cookie(s, &parsed_url);
+                    }
                 }
             }
         }
-    }
+
+        if !resp.status().is_redirection() {
+            break resp;
+        }
+
+        let location_header = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let Some(location) = location_header else {
+            // 3xx without a Location header is not actually a redirect.
+            break resp;
+        };
+
+        let base = match url::Url::parse(&current_url) {
+            Ok(b) => b,
+            Err(_) => break resp,
+        };
+        let next_url = match base.join(&location) {
+            Ok(u) => u,
+            Err(_) => break resp,
+        };
+
+        // Re-validate every redirect target against the SSRF policy.
+        if let Err(reason) = validate_fetch_url(&next_url) {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": next_url.to_string(),
+                "headers": {},
+                "blocked": true,
+                "error": format!("Redirect to forbidden URL blocked: {}", reason),
+            })
+            .to_string());
+        }
+
+        redirects_followed += 1;
+        if redirects_followed > FETCH_REDIRECT_LIMIT {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": next_url.to_string(),
+                "headers": {},
+                "blocked": true,
+                "error": format!("Too many redirects (>{})", FETCH_REDIRECT_LIMIT),
+            })
+            .to_string());
+        }
+
+        // Browser semantics: 301/302/303 downgrade to GET with no body.
+        // 307/308 preserve method and body.
+        let status_code = resp.status().as_u16();
+        if status_code == 301 || status_code == 302 || status_code == 303 {
+            current_method = reqwest::Method::GET;
+            current_body.clear();
+        }
+
+        current_url = next_url.to_string();
+    };
+
+    let status = response.status().as_u16();
 
     let resp_headers: std::collections::HashMap<String, String> = response
         .headers()
@@ -517,16 +636,19 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_body = response
-        .text()
+    let resp_bytes = response
+        .bytes()
         .await
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
+    let resp_body_base64 = BASE64.encode(&resp_bytes);
 
     tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_body.len());
 
     Ok(serde_json::json!({
         "status": status,
         "body": resp_body,
+        "bodyBase64": resp_body_base64,
         "url": url,
         "headers": resp_headers,
     })
@@ -551,11 +673,15 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 
 fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
     let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" {
+    if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(format!(
-            "Forbidden URL scheme '{}' - only http and https are allowed",
+            "Forbidden URL scheme '{}' - only http, https, and file are allowed",
             scheme
         ));
+    }
+
+    if scheme == "file" {
+        return Ok(());
     }
 
     if let Some(host) = url.host() {
@@ -635,7 +761,13 @@ fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
 fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
+    gs.url = url.to_string();
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
+}
+
+#[op2(async)]
+async fn op_sleep(#[number] millis: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
 
 pub fn build_extension() -> Extension {
@@ -648,6 +780,7 @@ pub fn build_extension() -> Extension {
             op_get_cookies(),
             op_set_cookie(),
             op_navigate(),
+            op_sleep(),
         ]),
         ..Default::default()
     }

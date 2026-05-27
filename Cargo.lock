@@ -741,6 +741,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1594,6 +1603,7 @@ name = "obscura-browser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "futures",
  "obscura-dom",
  "obscura-js",
@@ -1635,6 +1645,7 @@ dependencies = [
  "obscura-cdp",
  "obscura-dom",
  "obscura-js",
+ "obscura-mcp",
  "obscura-net",
  "serde",
  "serde_json",
@@ -1663,6 +1674,7 @@ name = "obscura-js"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "deno_core",
  "deno_error",
  "html5ever",
@@ -1678,13 +1690,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "obscura-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "obscura-browser",
+ "obscura-dom",
+ "obscura-net",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "obscura-net"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "encoding_rs",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -2148,7 +2176,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2547,10 +2575,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

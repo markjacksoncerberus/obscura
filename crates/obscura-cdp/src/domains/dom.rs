@@ -1,7 +1,35 @@
+use obscura_browser::Page;
 use obscura_dom::{DomTree, NodeData, NodeId};
 use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
+
+/// Resolve a DOM `nodeId` from CDP params. Honors `nodeId`, `backendNodeId`,
+/// and `objectId` in that order. Playwright commonly passes only `objectId`
+/// (returned by a prior `DOM.resolveNode`); without this fallback those
+/// requests silently default to node 0 and click the wrong element.
+fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
+    if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64()) {
+        return Ok(nid);
+    }
+    if let Some(nid) = params.get("backendNodeId").and_then(|v| v.as_u64()) {
+        return Ok(nid);
+    }
+    if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
+        let code = format!(
+            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects['{}']; \
+             return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
+            oid.replace('\'', "\\'")
+        );
+        let result = page.evaluate(&code);
+        let nid = result.as_f64().map(|n| n as i64).unwrap_or(-1);
+        if nid < 0 {
+            return Err(format!("objectId {oid} could not be resolved to a node"));
+        }
+        return Ok(nid as u64);
+    }
+    Err("nodeId, backendNodeId, or objectId required".to_string())
+}
 
 pub async fn handle(
     method: &str,
@@ -138,15 +166,61 @@ pub async fn handle(
         "setAttributeValue" => Ok(json!({})),
         "removeNode" => Ok(json!({})),
         "getBoxModel" => {
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = resolve_node_id(page, params)?;
+            let code = format!(
+                "(function() {{\
+                    var el = globalThis._wrap && globalThis._wrap({0});\
+                    if (!el || typeof el.getBoundingClientRect !== 'function') return null;\
+                    var r = el.getBoundingClientRect();\
+                    return [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom,\
+                            r.width, r.height];\
+                }})()",
+                node_id
+            );
+            let val = page.evaluate(&code);
+            let (quad, w, h) = if let Some(arr) = val.as_array() {
+                let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                if nums.len() >= 10 {
+                    let q: Vec<Value> = nums[..8].iter().map(|n| json!(n)).collect();
+                    (q, nums[8], nums[9])
+                } else {
+                    (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+                }
+            } else {
+                (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+            };
             Ok(json!({
                 "model": {
-                    "content": [8,8, 108,8, 108,28, 8,28],
-                    "padding": [8,8, 108,8, 108,28, 8,28],
-                    "border": [8,8, 108,8, 108,28, 8,28],
-                    "margin": [0,0, 116,0, 116,36, 0,36],
-                    "width": 100, "height": 20,
+                    "content": quad.clone(),
+                    "padding": quad.clone(),
+                    "border": quad.clone(),
+                    "margin": quad,
+                    "width": w, "height": h,
                 }
             }))
+        }
+        "getContentQuads" => {
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let node_id = resolve_node_id(page, params)?;
+            let code = format!(
+                "(function() {{\
+                    var el = globalThis._wrap && globalThis._wrap({0});\
+                    if (!el || typeof el.getBoundingClientRect !== 'function') return null;\
+                    var r = el.getBoundingClientRect();\
+                    return [r.left, r.top, r.right, r.top, r.right, r.bottom, r.left, r.bottom];\
+                }})()",
+                node_id
+            );
+            let val = page.evaluate(&code);
+            let quad = if let Some(arr) = val.as_array() {
+                let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+                if nums.len() == 8 { nums.iter().map(|n| json!(n)).collect::<Vec<_>>() }
+                else { vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)] }
+            } else {
+                vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)]
+            };
+            Ok(json!({ "quads": [quad] }))
         }
         _ => Err(format!("Unknown DOM method: {}", method)),
     }

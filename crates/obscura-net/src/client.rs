@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,8 +21,17 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn text(&self) -> Result<String, std::string::FromUtf8Error> {
-        String::from_utf8(self.body.clone())
+    /// Decode the body as text, honoring the response charset.
+    ///
+    /// Uses the HTTP `Content-Type` header's `charset=` parameter, then for
+    /// HTML responses falls back to sniffing `<meta charset>` in the first
+    /// 1KB, then UTF-8. Mirrors browser behaviour per the HTML5 spec.
+    pub fn text(&self) -> String {
+        if self.is_html() {
+            crate::encoding::decode_response(&self.body, self.content_type())
+        } else {
+            crate::encoding::decode_non_html(&self.body, self.content_type())
+        }
     }
 
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -65,12 +73,17 @@ pub type RequestCallback = Arc<dyn Fn(&RequestInfo) + Send + Sync>;
 pub type ResponseCallback = Arc<dyn Fn(&RequestInfo, &Response) + Send + Sync>;
 
 fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
+    let allow_private_network = std::env::var_os("OBSCURA_ALLOW_PRIVATE_NETWORK").is_some();
     let scheme = url.scheme();
-    if scheme != "http" && scheme != "https" {
+    if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(ObscuraNetError::Network(format!(
-            "Forbidden URL scheme '{}' - only http and https are allowed",
+            "Forbidden URL scheme '{}' - only http, https, and file are allowed",
             scheme
         )));
+    }
+
+    if scheme == "file" || allow_private_network {
+        return Ok(());
     }
 
     if let Some(host) = url.host() {
@@ -113,6 +126,41 @@ fn validate_url(url: &Url) -> Result<(), ObscuraNetError> {
     }
 
     Ok(())
+}
+
+async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
+    let path = url
+        .to_file_path()
+        .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
+    let body = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ObscuraNetError::Network(format!("Failed to read file: {}", e)))?;
+
+    let mut headers = HashMap::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ct = match ext.to_lowercase().as_str() {
+            "html" | "htm" => "text/html",
+            "css" => "text/css",
+            "js" | "mjs" => "application/javascript",
+            "json" => "application/json",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            "webp" => "image/webp",
+            "ico" => "image/x-icon",
+            _ => "application/octet-stream",
+        };
+        headers.insert("content-type".to_string(), ct.to_string());
+    }
+
+    Ok(Response {
+        url: url.clone(),
+        status: 200,
+        headers,
+        body,
+        redirected_from: Vec::new(),
+    })
 }
 
 pub struct ObscuraHttpClient {
@@ -174,6 +222,14 @@ impl ObscuraHttpClient {
         }).await
     }
 
+    /// Read-only accessor for the proxy URL the client was configured with
+    /// (if any). Exposed so callers outside the `obscura-net` crate — notably
+    /// `op_fetch_url` in `obscura-js` (#139) — can route their own reqwest
+    /// requests through the same upstream proxy.
+    pub fn proxy_url(&self) -> Option<&str> {
+        self.proxy_url.as_deref()
+    }
+
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         self.fetch_with_method(Method::GET, url, None).await
     }
@@ -189,6 +245,10 @@ impl ObscuraHttpClient {
         initial_body: Option<Vec<u8>>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url)?;
+
+        if url.scheme() == "file" {
+            return fetch_file_url(url).await;
+        }
 
         let mut method = initial_method;
         let mut body = initial_body;
@@ -286,9 +346,33 @@ impl ObscuraHttpClient {
             );
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
+            tracing::debug!(
+                "Cookie header for {}: {} cookies ({} bytes)",
+                current_url.host_str().unwrap_or("?"),
+                cookie_header.split("; ").filter(|s| !s.is_empty()).count(),
+                cookie_header.len(),
+            );
             if !cookie_header.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(&cookie_header) {
-                    headers.insert(reqwest::header::COOKIE, val);
+                match HeaderValue::from_str(&cookie_header) {
+                    Ok(val) => {
+                        headers.insert(reqwest::header::COOKIE, val);
+                    }
+                    Err(_) => {
+                        let filtered: String = cookie_header
+                            .split("; ")
+                            .filter(|pair| HeaderValue::from_str(pair).is_ok())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        if !filtered.is_empty() {
+                            if let Ok(val) = HeaderValue::from_str(&filtered) {
+                                headers.insert(reqwest::header::COOKIE, val);
+                            }
+                        }
+                        tracing::debug!(
+                            "Cookie header invalid chars, filtered {} -> {} bytes",
+                            cookie_header.len(), filtered.len(),
+                        );
+                    }
                 }
             }
 

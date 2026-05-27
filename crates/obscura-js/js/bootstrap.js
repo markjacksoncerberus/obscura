@@ -146,27 +146,42 @@ globalThis.console = {
 };
 
 let _tid = 0;
-const _pendingTimers = new Map();
 const _clearedTimers = new Set();
+const _intervals = new Set();
+
+const _scheduleAfter = (delay, fn) => {
+  const d = Math.max(0, Number(delay) || 0);
+  if (d === 0) Promise.resolve().then(fn);
+  else Deno.core.ops.op_sleep(d).then(fn);
+};
 
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   if (typeof fn !== "function") return ++_tid;
   const id = ++_tid;
-  _pendingTimers.set(id, { fn, args, delay });
-  Promise.resolve().then(() => {
-    if (!_clearedTimers.has(id) && _pendingTimers.has(id)) {
-      _pendingTimers.delete(id);
-      try { fn(...args); } catch(e) { console.error("Timer error:", e); }
-    }
+  _scheduleAfter(delay, () => {
+    if (_clearedTimers.has(id)) return;
+    try { fn(...args); } catch(e) { console.error("Timer error:", e); }
   });
   return id;
 };
 
-globalThis.clearTimeout = (id) => { _clearedTimers.add(id); _pendingTimers.delete(id); };
-globalThis.setInterval = (fn, delay, ...args) => {
-  return setTimeout(fn, delay, ...args);
+globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
+
+globalThis.setInterval = (fn, delay = 0, ...args) => {
+  if (typeof fn !== "function") return ++_tid;
+  const id = ++_tid;
+  _intervals.add(id);
+  const tick = () => {
+    if (!_intervals.has(id)) return;
+    try { fn(...args); } catch(e) { console.error("Interval error:", e); }
+    if (!_intervals.has(id)) return;
+    _scheduleAfter(delay, tick);
+  };
+  _scheduleAfter(delay, tick);
+  return id;
 };
-globalThis.clearInterval = globalThis.clearTimeout;
+
+globalThis.clearInterval = (id) => { _intervals.delete(id); _clearedTimers.add(id); };
 globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
 globalThis.cancelAnimationFrame = globalThis.clearTimeout;
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
@@ -292,14 +307,14 @@ class Node {
   }
   replaceChild(newChild, oldChild) {
     if (!oldChild || !newChild) return oldChild;
-    _dom("insert_before", this._nid, newChild._nid, oldChild._nid);
+    _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
     return oldChild;
   }
   insertBefore(n, ref) {
     if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
-    _dom("insert_before", this._nid, n._nid, ref._nid);
+    _dom("insert_before", n._nid, ref._nid);
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -341,9 +356,80 @@ class Node {
   }
   getRootNode() { return globalThis.document; }
   normalize() {} // no-op
-  isEqualNode(other) { return other && this._nid === other._nid; }
+  isEqualNode(other) {
+    if (!other) return false;
+    if (this._nid === other._nid) return true;
+    if (this.nodeType !== other.nodeType) return false;
+    if (this.nodeName !== other.nodeName) return false;
+    if (this.nodeValue !== other.nodeValue) return false;
+    const a = this.attributes ? this.attributes : null;
+    const b = other.attributes ? other.attributes : null;
+    if ((a && a.length) || (b && b.length)) {
+      if (!a || !b || a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (other.getAttribute(a[i].name) !== a[i].value) return false;
+      }
+    }
+    const cA = this.childNodes || [];
+    const cB = other.childNodes || [];
+    if (cA.length !== cB.length) return false;
+    for (let i = 0; i < cA.length; i++) {
+      if (!cA[i].isEqualNode(cB[i])) return false;
+    }
+    return true;
+  }
   isSameNode(other) { return other && this._nid === other._nid; }
   addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
+}
+class CharacterData extends Node {
+  get data() {
+    return _domParse("text_content", this._nid) ?? "";
+  }
+  set data(v) {
+    _dom("set_text_content", this._nid, String(v ?? ""));
+  }
+  get length() { return this.data.length; }
+  substringData(offset, count) {
+    return this.data.substring(offset, offset + count);
+  }
+  appendData(s) { this.data += s; }
+  insertData(offset, s) {
+    const d = this.data;
+    this.data = d.slice(0, offset) + s + d.slice(offset);
+  }
+  deleteData(offset, count) {
+    const d = this.data;
+    this.data = d.slice(0, offset) + d.slice(offset + count);
+  }
+  replaceData(offset, count, s) {
+    const d = this.data;
+    this.data = d.slice(0, offset) + s + d.slice(offset + count);
+  }
+}
+
+class Text extends CharacterData {
+  get nodeName() { return "#text"; }
+  get nodeType() { return 3; }
+  get wholeText() { return this.data; }
+  splitText(offset) {
+    const d = this.data;
+    const tail = d.substring(offset);
+    this.data = d.substring(0, offset);
+    const newNid = +_dom("create_text_node", tail);
+    const parent = this.parentNode;
+    if (parent) {
+      const ref = this.nextSibling;
+      parent.insertBefore(_wrap(newNid), ref);
+    }
+    return _wrap(newNid);
+  }
+  cloneNode() { return document.createTextNode(this.data); }
+}
+
+class Comment extends CharacterData {
+  get nodeName() { return "#comment"; }
+  get nodeType() { return 8; }
+  cloneNode() { return document.createComment(this.data); }
 }
 
 class Element extends Node {
@@ -363,13 +449,24 @@ class Element extends Node {
     return "http://www.w3.org/1999/xhtml";
   }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
-  set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
+  set innerHTML(v) {
+    if (this.localName === 'template') {
+      this.content.innerHTML = v;
+      return;
+    }
+    _dom("set_inner_html", this._nid, String(v ?? ""));
+  }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
   get innerText() { return this.textContent; }
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
     return ids.map(_wrapEl).filter(Boolean);
+  }
+  get content() {
+    if (this.localName !== 'template') return undefined;
+    if (!this._templateContent) this._templateContent = document.createDocumentFragment();
+    return this._templateContent;
   }
   get childElementCount() { return this.children.length; }
   get firstElementChild() { return this.children[0] || null; }
@@ -402,10 +499,35 @@ class Element extends Node {
   removeAttributeNS(ns, n) { this.removeAttribute(n); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
+  get attributes() {
+    const el = this;
+    const names = _domParse("attribute_names", el._nid) || [];
+    const list = names.map((name) => ({
+      name,
+      localName: name,
+      value: el.getAttribute(name) ?? "",
+      namespaceURI: null,
+      prefix: null,
+      specified: true,
+      ownerElement: el,
+      nodeName: name,
+      nodeValue: el.getAttribute(name) ?? "",
+      nodeType: 2,
+    }));
+    list.length = names.length;
+    list.getNamedItem = (n) => names.includes(n) ? list[names.indexOf(n)] : null;
+    list.setNamedItem = (a) => { if (a && a.name) el.setAttribute(a.name, a.value); return a; };
+    list.removeNamedItem = (n) => { const a = list.getNamedItem(n); if (a) el.removeAttribute(n); return a; };
+    list.item = (i) => list[i] || null;
+    for (let i = 0; i < names.length; i++) {
+      Object.defineProperty(list, names[i], { value: list[i], configurable: true, enumerable: false });
+    }
+    return list;
+  }
   getAttributeNS(ns, n) { return this.getAttribute(n); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all", s) || [];
+    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;
     list.forEach = Array.prototype.forEach.bind(list);
@@ -461,12 +583,14 @@ class Element extends Node {
   }
   dispatchEvent(event) {
     if (!event) return true;
-    event.target = this;
+    if (!event.target) event.target = this;
     event.currentTarget = this;
     const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error(e); } }
-    if (event.bubbles && !event.defaultPrevented && this.parentNode) {
-      event.currentTarget = this.parentNode;
+    for (const h of handlers) {
+      try { h.call(this, event); } catch(e) { console.error(e); }
+      if (event._immediatePropagationStopped) break;
+    }
+    if (event.bubbles && !event._propagationStopped && this.parentNode) {
       this.parentNode.dispatchEvent(event);
     }
     return !event.defaultPrevented;
@@ -585,7 +709,10 @@ class Element extends Node {
     }
     return this._iframeWin;
   }
-  get action() { return this.getAttribute("action") || ""; }
+  get action() {
+    const action = this.getAttribute("action") || _domParse("document_url") || "";
+    try { return new URL(action, _domParse("document_url") || "about:blank").href; } catch(e) { return action; }
+  }
   set action(v) { this.setAttribute("action", v); }
   get method() { return this.getAttribute("method") || "get"; }
   set method(v) { this.setAttribute("method", v); }
@@ -677,9 +804,48 @@ class Element extends Node {
   get scrollLeft() { return 0; } set scrollLeft(v) {}
   getBoundingClientRect() {
     globalThis.__obscura_click_target = this;
-    return {x:8,y:8,width:100,height:20,top:8,right:108,bottom:28,left:8,toJSON(){return this;}};
+    // No layout engine, but Playwright's actionability polling needs each
+    // element to occupy a stable, distinct rect so hit-testing can pick the
+    // right one (issue #45). Synthesize a deterministic position from the
+    // node id: every nid maps to a unique cell in a 12-column grid, sized
+    // to fit a 1280x720 viewport. Stable across reads, different per node.
+    const VW = 1280, VH = 720, COLS = 12, CW = 100, CH = 20, GX = 110, GY = 30;
+    const rowsPerScreen = Math.max(1, Math.floor((VH - 10) / GY));
+    const cell = this._nid | 0;
+    const col = ((cell * 7) | 0) % COLS;
+    const row = (((cell * 13) | 0) >> 0) % rowsPerScreen;
+    const x = 10 + col * GX;
+    const y = 10 + row * GY;
+    return {
+      x, y, width: CW, height: CH,
+      top: y, right: x + CW, bottom: y + CH, left: x,
+      toJSON() { return this; },
+    };
   }
   getClientRects() { return [this.getBoundingClientRect()]; }
+  // No layout engine: a stub that always returns true unblocks Playwright's
+  // actionability polling. With a real layout we'd check display, visibility,
+  // opacity and rect dimensions per spec.
+  checkVisibility(opts) { return true; }
+  // ARIA reflection properties. Without an accessibility tree we expose the
+  // raw aria-* attributes so Playwright's getByRole / getByLabel locators can
+  // at least find elements that author them explicitly.
+  get role() { return this.getAttribute('role'); }
+  set role(v) { if (v == null) this.removeAttribute('role'); else this.setAttribute('role', String(v)); }
+  get ariaLabel() { return this.getAttribute('aria-label'); }
+  set ariaLabel(v) { if (v == null) this.removeAttribute('aria-label'); else this.setAttribute('aria-label', String(v)); }
+  get ariaRoleDescription() { return this.getAttribute('aria-roledescription'); }
+  set ariaRoleDescription(v) { if (v == null) this.removeAttribute('aria-roledescription'); else this.setAttribute('aria-roledescription', String(v)); }
+  get ariaChecked() { return this.getAttribute('aria-checked'); }
+  set ariaChecked(v) { if (v == null) this.removeAttribute('aria-checked'); else this.setAttribute('aria-checked', String(v)); }
+  get ariaDisabled() { return this.getAttribute('aria-disabled'); }
+  set ariaDisabled(v) { if (v == null) this.removeAttribute('aria-disabled'); else this.setAttribute('aria-disabled', String(v)); }
+  get ariaExpanded() { return this.getAttribute('aria-expanded'); }
+  set ariaExpanded(v) { if (v == null) this.removeAttribute('aria-expanded'); else this.setAttribute('aria-expanded', String(v)); }
+  get ariaHidden() { return this.getAttribute('aria-hidden'); }
+  set ariaHidden(v) { if (v == null) this.removeAttribute('aria-hidden'); else this.setAttribute('aria-hidden', String(v)); }
+  get ariaSelected() { return this.getAttribute('aria-selected'); }
+  set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView() { globalThis.__obscura_click_target = this; }
   animate(keyframes, options) {
     const duration = typeof options === 'number' ? options : (options?.duration || 0);
@@ -692,10 +858,24 @@ class Element extends Node {
     };
   }
   getAnimations() { return []; }
-  get isConnected() { return true; }
-  after() {} before() {} remove() { if (this.parentNode) this.parentNode.removeChild(this); }
+  get isConnected() {
+    var node = this;
+    while (node) {
+      if (node.nodeType === 9) return true;
+      node = node.parentNode;
+    }
+    return false;
+  }
+  remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   append(...nodes) { for (const n of nodes) { if (typeof n === "string") this.appendChild(document.createTextNode(n)); else this.appendChild(n); } }
-  prepend() {}
+  prepend(...nodes) {
+    const ref = this.firstChild;
+    for (const n of nodes) {
+      const node = (typeof n === "string") ? document.createTextNode(n) : n;
+      if (ref) this.insertBefore(node, ref);
+      else this.appendChild(node);
+    }
+  }
 }
 
 class Document extends Node {
@@ -725,7 +905,7 @@ class Document extends Node {
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
   get contentType() { return "text/html"; }
-  get readyState() { return "complete"; }
+  get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
@@ -739,8 +919,12 @@ class Document extends Node {
   }
   getElementsByTagName(t) { return this.querySelectorAll(t); }
   getElementsByClassName(c) { return this.querySelectorAll("." + c); }
+  getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
   createElement(t) {
     const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
+    if (el && t.toLowerCase() === 'template') {
+      el._templateContent = this.createDocumentFragment();
+    }
     return el;
   }
   createElementNS(ns, t) {
@@ -750,12 +934,8 @@ class Document extends Node {
   }
   createTextNode(t) { return _wrap(+_dom("create_text_node", String(t))); }
   createComment(t) {
-    const nid = +_dom("create_text_node", "");
-    const n = new Node(nid);
-    n._isComment = true;
-    n.nodeType = 8; // Override nodeType
-    Object.defineProperty(n, "nodeType", { value: 8, writable: false });
-    Object.defineProperty(n, "nodeName", { value: "#comment", writable: false });
+    const nid = +_dom("create_comment_node", String(t ?? ""));
+    const n = new Comment(nid);
     _cache.set(nid, n);
     return n;
   }
@@ -765,9 +945,46 @@ class Document extends Node {
     _cache.set(nid, frag);
     return frag;
   }
-  createEvent(type) { return new Event(type); }
+  // Legacy DOM Level 2 event factory. Spec returns an event of the requested
+  // class with an empty type until init*Event() is called. We previously
+  // returned a generic Event for every type, which broke libraries that call
+  // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
+  createEvent(type) {
+    const map = {
+      'customevent': CustomEvent, 'customevents': CustomEvent,
+      'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
+      'keyboardevent': KeyboardEvent, 'keyboardevents': KeyboardEvent,
+      'focusevent': FocusEvent,
+      'inputevent': InputEvent,
+      'uievent': UIEvent, 'uievents': UIEvent,
+      'wheelevent': WheelEvent,
+      'pointerevent': PointerEvent,
+      'errorevent': ErrorEvent,
+      'popstateevent': PopStateEvent,
+      'animationevent': AnimationEvent,
+      'transitionevent': TransitionEvent,
+    };
+    const Cls = map[String(type || '').toLowerCase()] || Event;
+    return new Cls('');
+  }
   createRange() { return { setStart(){}, setEnd(){}, collapse(){}, selectNodeContents(){}, cloneContents(){ return document.createDocumentFragment(); } }; }
-  addEventListener(type, fn, opts) {} removeEventListener() {} dispatchEvent() { return true; }
+  addEventListener(type, fn, opts) {
+    if (typeof fn !== 'function') return;
+    if (!this._listeners) this._listeners = {};
+    if (!this._listeners[type]) this._listeners[type] = [];
+    if (!this._listeners[type].includes(fn)) this._listeners[type].push(fn);
+  }
+  removeEventListener(type, fn) {
+    if (this._listeners?.[type]) {
+      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
+    }
+  }
+  dispatchEvent(event) {
+    if (!event) return true;
+    const handlers = (this._listeners?.[event.type] || []).slice();
+    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error('document event error:', e); } }
+    return !event.defaultPrevented;
+  }
   createTreeWalker(root, whatToShow, filter) {
     whatToShow = whatToShow || 0xFFFFFFFF; // NodeFilter.SHOW_ALL
     const walker = {
@@ -872,9 +1089,9 @@ class Document extends Node {
     };
   }
   get styleSheets() { return []; }
-  get forms() { return []; }
-  get images() { return []; }
-  get links() { return []; }
+  get forms() { return this.querySelectorAll("form"); }
+  get images() { return this.querySelectorAll("img"); }
+  get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
     return Deno.core.ops.op_get_cookies();
@@ -913,11 +1130,27 @@ class Document extends Node {
 class DocumentFragment extends Node {
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
-  querySelector(s) { return null; }
-  querySelectorAll(s) { return []; }
-  get children() { return []; }
-  get firstElementChild() { return null; }
+  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
+  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  querySelectorAll(s) {
+    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const list = ids.map(_wrapEl).filter(Boolean);
+    list.item = (i) => list[i] || null;
+    return list;
+  }
+  get children() {
+    const ids = _domParse("element_children", this._nid) || [];
+    return ids.map(_wrapEl).filter(Boolean);
+  }
+  get firstElementChild() { return this.children[0] || null; }
+  get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
   getElementById(id) { return null; }
+  cloneNode(deep) {
+    const frag = document.createDocumentFragment();
+    if (deep) frag.innerHTML = this.innerHTML;
+    return frag;
+  }
 }
 
 class DocumentType extends Node {
@@ -936,12 +1169,19 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
+function _elementClassFor(nid) {
+  const tag = _domParse("tag_name", nid);
+  if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  return Element;
+}
 function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
   let n;
-  if (t === 1) n = new Element(nid);
+  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
+  else if (t === 3) n = new Text(nid);
+  else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
   else n = new Node(nid);
   _cache.set(nid, n);
@@ -950,10 +1190,14 @@ function _wrap(nid) {
 function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
-  const n = new Element(nid);
+  const C = _elementClassFor(nid);
+  const n = new C(nid);
   _cache.set(nid, n);
   return n;
 }
+
+globalThis._wrap = _wrap;
+globalThis.self = globalThis;
 
 globalThis.document = null;
 function _resolveUrl(url) {
@@ -992,6 +1236,35 @@ globalThis.parent = globalThis;
 globalThis.frames = globalThis;
 globalThis.frameElement = null;
 globalThis.length = 0;
+
+// HTML spec exposes on* event handler IDL attributes on Window. Libraries like
+// jQuery feature-detect bubbling via `("on" + ev) in window` and fall back to
+// a legacy IE path that crashes on missing DOM APIs when the check returns
+// false. Initialising them to null makes the check match real browsers.
+for (const _ev of [
+  "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
+  "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
+  "dragenter","dragleave","dragover","dragstart","drop","durationchange","emptied",
+  "ended","error","focus","focusin","focusout","formdata","gotpointercapture",
+  "hashchange","input","invalid","keydown","keypress","keyup","languagechange",
+  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message",
+  "mousedown","mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup",
+  "offline","online","pagehide","pageshow","paste","pause","play","playing",
+  "pointercancel","pointerdown","pointerenter","pointerleave","pointermove",
+  "pointerout","pointerover","pointerup","popstate","progress","ratechange",
+  "rejectionhandled","reset","resize","scroll","seeked","seeking","select",
+  "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
+  "unload","volumechange","waiting","wheel",
+]) {
+  if (!(("on" + _ev) in globalThis)) globalThis["on" + _ev] = null;
+}
+
+globalThis.Window = globalThis.Window || function Window() {};
+Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
+  value(obj) { return obj === globalThis || (obj && obj.window === obj); },
+  configurable: true,
+});
+
 
 const _iframeRegistry = [];
 function _registerIframe(iframeEl) {
@@ -1113,8 +1386,63 @@ globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 globalThis.__fetchInterceptEnabled = false;
 globalThis.__fetchInterceptCallback = null; // Set by CDP to handle paused requests
 
+function _base64ToUint8Array(b64) {
+  const clean = String(b64 || '').replace(/[\r\n\s]/g, '');
+  if (!clean) return new Uint8Array();
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const padding = clean.endsWith('==') ? 2 : (clean.endsWith('=') ? 1 : 0);
+  const bytes = new Uint8Array((clean.length * 3 >> 2) - padding);
+  let out = 0;
+  for (let i = 0; i < clean.length; i += 4) {
+    const a = alphabet.indexOf(clean[i]);
+    const b = alphabet.indexOf(clean[i + 1]);
+    const c = clean[i + 2] === '=' ? 0 : alphabet.indexOf(clean[i + 2]);
+    const d = clean[i + 3] === '=' ? 0 : alphabet.indexOf(clean[i + 3]);
+    const n = (a << 18) | (b << 12) | (c << 6) | d;
+    if (out < bytes.length) bytes[out++] = (n >> 16) & 0xff;
+    if (out < bytes.length) bytes[out++] = (n >> 8) & 0xff;
+    if (out < bytes.length) bytes[out++] = n & 0xff;
+  }
+  return bytes;
+}
+
+function _bodyToUint8Array(body) {
+  if (body == null) return new Uint8Array();
+  if (body instanceof Uint8Array) return body;
+  if (body instanceof ArrayBuffer) return new Uint8Array(body);
+  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  return new TextEncoder().encode(String(body));
+}
+
+function _arrayBufferFromBytes(bytes) {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+function _installWasmStreamingFallback() {
+  if (typeof WebAssembly === 'undefined') return;
+  if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
+  const nativeInstantiateStreaming = WebAssembly.instantiateStreaming;
+  const fallback = async function instantiateStreaming(source, imports) {
+    const response = await source;
+    if (response && typeof response.arrayBuffer === 'function') {
+      return WebAssembly.instantiate(await response.arrayBuffer(), imports);
+    }
+    if (typeof nativeInstantiateStreaming === 'function') {
+      return nativeInstantiateStreaming.call(WebAssembly, response, imports);
+    }
+    return WebAssembly.instantiate(response, imports);
+  };
+  fallback.__obscuraFallback = true;
+  WebAssembly.instantiateStreaming = fallback;
+}
+_installWasmStreamingFallback();
+
 globalThis.fetch = async (input, init = {}) => {
-  let url = typeof input === "string" ? input : (input instanceof Request ? input.url : input?.url || "");
+  let url = typeof input === "string"
+    ? input
+    : (input instanceof Request
+      ? input.url
+      : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
   if (url && !url.includes('://')) {
     try {
       const base = _domParse("document_url") || "about:blank";
@@ -1138,16 +1466,15 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
   const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
-  return {
-    ok: parsed.status >= 200 && parsed.status < 300, status: parsed.status, statusText: "",
-    type: respType, redirected: false, url: parsed.url || url,
-    headers: new Headers(parsed.headers || {}),
-    async text() { return parsed.body || ""; },
-    async json() { return JSON.parse(parsed.body || "null"); },
-    async arrayBuffer() { return new TextEncoder().encode(parsed.body || "").buffer; },
-    async blob() { return new Blob([parsed.body || ""]); },
-    clone() { return this; },
-  };
+  const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
+  return new Response(responseBody, {
+    status: parsed.status,
+    statusText: "",
+    headers: parsed.headers || {},
+    type: respType,
+    url: parsed.url || url,
+    redirected: false,
+  });
 };
 
 if (typeof Headers === "undefined") {
@@ -1419,7 +1746,8 @@ if (typeof Request === 'undefined') {
     constructor(input, init = {}) {
       if (typeof input === 'string') { this.url = input; }
       else if (input instanceof Request) { this.url = input.url; init = { ...input, ...init }; }
-      else { this.url = String(input); }
+      else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
+      else { this.url = input?.url || input?.href || String(input); }
       this.method = (init.method || 'GET').toUpperCase();
       this.headers = new Headers(init.headers);
       this.body = init.body || null;
@@ -1440,16 +1768,16 @@ if (typeof Request === 'undefined') {
 if (typeof Response === 'undefined') {
   globalThis.Response = class Response {
     constructor(body, init = {}) {
-      this._body = body; this.status = init.status || 200; this.statusText = init.statusText || '';
+      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status || 200; this.statusText = init.statusText || '';
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(init.headers);
-      this.type = 'basic'; this.url = '';
+      this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
     }
-    async text() { return this._body ? String(this._body) : ''; }
+    async text() { return new TextDecoder().decode(this._bodyBytes); }
     async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }
-    async blob() { return new Blob([await this.text()]); }
-    clone() { return new Response(this._body, { status: this.status, headers: this.headers }); }
+    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
+    async blob() { return new Blob([this._bodyBytes]); }
+    clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
     static error() { return new Response(null, { status: 0 }); }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
     static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
@@ -1491,6 +1819,15 @@ if (!Element.prototype.after) {
   };
   _markNative(Element.prototype.after);
 }
+
+// ChildNode mixin: also mix before/after/replaceWith/remove into
+// CharacterData.prototype (covers Text, Comment, ProcessingInstruction).
+// These are the same implementations as Element.prototype — frameworks
+// (Svelte 5, Vue, Lit) anchor on Comment/Text nodes and call these methods.
+if (!CharacterData.prototype.before) CharacterData.prototype.before = Element.prototype.before;
+if (!CharacterData.prototype.after) CharacterData.prototype.after = Element.prototype.after;
+if (!CharacterData.prototype.replaceWith) CharacterData.prototype.replaceWith = Element.prototype.replaceWith;
+if (!CharacterData.prototype.remove) CharacterData.prototype.remove = Element.prototype.remove;
 
 if (!('isConnected' in Node.prototype)) {
   Object.defineProperty(Node.prototype, 'isConnected', {
@@ -1544,7 +1881,9 @@ if (typeof TextDecoder === 'undefined') {
     constructor(label) { this.encoding = label || 'utf-8'; }
     decode(buf) {
       if (!buf) return '';
-      const bytes = new Uint8Array(buf.buffer || buf);
+      const bytes = ArrayBuffer.isView(buf)
+        ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+        : new Uint8Array(buf);
       let str = '', i = 0;
       while (i < bytes.length) {
         let c = bytes[i++];
@@ -1743,12 +2082,23 @@ globalThis.IntersectionObserver = class {
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 
 globalThis.Event = class Event {
-  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now(); }
+  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return true; }
-  preventDefault() { this.defaultPrevented=true; } stopPropagation(){} stopImmediatePropagation(){}
-  initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable; }
+  preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
+  initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
 };
-globalThis.CustomEvent = class extends Event { constructor(t,o={}) { super(t,o);this.detail=o.detail; } };
+globalThis.CustomEvent = class extends Event {
+  constructor(t,o={}) { super(t,o);this.detail=o.detail; }
+  // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
+  // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
+  // instead of new CustomEvent(...). See issue #41.
+  initCustomEvent(type,bubbles,cancelable,detail) {
+    this.type = type;
+    this.bubbles = !!bubbles;
+    this.cancelable = !!cancelable;
+    this.detail = detail;
+  }
+};
 globalThis.MouseEvent = class extends Event { constructor(t,o={}) { super(t,o);this.clientX=o.clientX||0;this.clientY=o.clientY||0; } };
 globalThis.KeyboardEvent = class extends Event { constructor(t,o={}) { super(t,o);this.key=o.key||"";this.code=o.code||""; } };
 globalThis.FocusEvent = class extends Event {};
@@ -1770,7 +2120,25 @@ globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
-if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class { constructor(init=""){this._p=new Map();if(typeof init==="string"){init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this._p.set(decodeURIComponent(k),decodeURIComponent(v.join("=")));});}} get(k){return this._p.get(k)??null;} set(k,v){this._p.set(k,String(v));} has(k){return this._p.has(k);} toString(){return[...this._p].map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");} forEach(cb){this._p.forEach((v,k)=>cb(v,k));} };
+if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class {
+  constructor(init=""){
+    this._p=[];
+    if(typeof init==="string"){
+      init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this.append(decodeURIComponent(k),decodeURIComponent(v.join("=")));});
+    } else if (init && typeof init[Symbol.iterator] === 'function') {
+      for (const pair of init) if (pair && pair.length >= 2) this.append(pair[0], pair[1]);
+    } else if (init && typeof init === 'object') {
+      Object.keys(init).forEach(k => this.append(k, init[k]));
+    }
+  }
+  append(k,v){this._p.push([String(k),String(v)]);}
+  get(k){const p=this._p.find(([key])=>key===String(k)); return p?p[1]:null;}
+  set(k,v){this.delete(k); this.append(k,v);}
+  delete(k){k=String(k); this._p=this._p.filter(([key])=>key!==k);}
+  has(k){k=String(k); return this._p.some(([key])=>key===k);}
+  toString(){return this._p.map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");}
+  forEach(cb){this._p.forEach(([k,v])=>cb(v,k,this));}
+};
 
 globalThis.DOMParser = class { parseFromString(s,t) { return globalThis.document; } };
 globalThis.XMLSerializer = class XMLSerializer {
@@ -1837,7 +2205,15 @@ globalThis.crypto = globalThis.crypto || { getRandomValues(arr) { for(let i=0;i<
 globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
-const _mkStore = () => { const s={}; return { getItem:k=>s[k]??null, setItem:(k,v)=>{s[k]=String(v);}, removeItem:k=>{delete s[k];}, clear:()=>{for(const k in s)delete s[k];}, get length(){return Object.keys(s).length;}, key:i=>Object.keys(s)[i]??null }; };
+globalThis.Storage = function Storage() {};
+Storage.prototype.getItem = function(k) { return (this._data && this._data[k]) ?? null; };
+Storage.prototype.setItem = function(k, v) { if (this._data) this._data[k] = String(v); };
+Storage.prototype.removeItem = function(k) { if (this._data) delete this._data[k]; };
+Storage.prototype.clear = function() { if (this._data) for (var k in this._data) delete this._data[k]; };
+Object.defineProperty(Storage.prototype, 'length', { get: function() { return this._data ? Object.keys(this._data).length : 0; } });
+Storage.prototype.key = function(i) { return this._data ? Object.keys(this._data)[i] ?? null : null; };
+
+const _mkStore = () => { var s = Object.create(Storage.prototype); s._data = {}; return s; };
 globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
@@ -1860,7 +2236,13 @@ globalThis.HTMLAnchorElement = Element;
 globalThis.HTMLImageElement = Element;
 globalThis.HTMLInputElement = Element;
 globalThis.HTMLButtonElement = Element;
-globalThis.HTMLFormElement = Element;
+globalThis.HTMLFormElement = class HTMLFormElement extends Element {
+  get elements() { return this.querySelectorAll("input, select, textarea, button, fieldset, output, object"); }
+  get length() { return this.elements.length; }
+  // Inherit submit() from Element.prototype: it dispatches the cancelable
+  // 'submit' event and (if not prevented) builds form data and navigates.
+  reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
+};
 globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = Element;
 globalThis.HTMLLabelElement = Element;
@@ -1894,8 +2276,9 @@ globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
 globalThis.SVGElement = Element;
 globalThis.SVGSVGElement = Element;
-globalThis.Text = Node;
-globalThis.Comment = Node;
+globalThis.CharacterData = CharacterData;
+globalThis.Text = Text;
+globalThis.Comment = Comment;
 globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
@@ -1922,22 +2305,29 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
   Element.prototype.getElementsByTagName, Element.prototype.getElementsByClassName,
   Element.prototype.matches, Element.prototype.closest,
   Element.prototype.getBoundingClientRect, Element.prototype.getClientRects,
+  Element.prototype.checkVisibility,
   Element.prototype.addEventListener, Element.prototype.removeEventListener,
   Element.prototype.dispatchEvent, Element.prototype.click,
   Element.prototype.focus, Element.prototype.blur,
   Element.prototype.cloneNode, Element.prototype.attachShadow,
   Element.prototype.insertAdjacentHTML, Element.prototype.scrollIntoView,
-  Element.prototype.append, Element.prototype.remove,
+  Element.prototype.append, Element.prototype.prepend, Element.prototype.remove,
+  Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
+  HTMLFormElement.prototype.reset,
   Element.prototype.getContext, Element.prototype.toDataURL, Element.prototype.toBlob,
   Node.prototype.appendChild, Node.prototype.removeChild,
   Node.prototype.replaceChild, Node.prototype.insertBefore,
   Node.prototype.contains, Node.prototype.hasChildNodes, Node.prototype.cloneNode,
+  CharacterData.prototype.before, CharacterData.prototype.after,
+  CharacterData.prototype.replaceWith, CharacterData.prototype.remove,
   Document.prototype.getElementById, Document.prototype.querySelector,
   Document.prototype.querySelectorAll, Document.prototype.getElementsByTagName,
   Document.prototype.createElement, Document.prototype.createElementNS,
   Document.prototype.createTextNode, Document.prototype.createComment,
   Document.prototype.createDocumentFragment, Document.prototype.createEvent,
   Document.prototype.hasFocus,
+  Storage, Storage.prototype.getItem, Storage.prototype.setItem,
+  Storage.prototype.removeItem, Storage.prototype.clear, Storage.prototype.key,
   Notification, Notification.requestPermission,
   window.chrome?.csi, window.chrome?.loadTimes,
   MutationObserver, ResizeObserver, IntersectionObserver, PerformanceObserver,
@@ -2011,7 +2401,7 @@ class _IframeDocument {
   createTextNode(text) { return document.createTextNode(text); }
   createComment(text) { return document.createComment(text); }
   createDocumentFragment() { return document.createDocumentFragment(); }
-  createEvent(type) { return new Event(type); }
+  createEvent(type) { return document.createEvent(type); }
   hasFocus() { return false; }
 
   get cookie() { return ''; }
@@ -2382,17 +2772,33 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     get lastChild() { return children[children.length - 1] || null; },
     get firstElementChild() { return children.find(c => c.nodeType === 1) || null; },
     get children() { return children.filter(c => c.nodeType === 1); },
-    appendChild(c) { if (c) { children.push(c); c.parentNode = shadow; } return c; },
+    appendChild(c) {
+      if (c) {
+        children.push(c);
+        try { c.parentNode = shadow; } catch (_) { /* parentNode is getter-only on Node, ignore */ }
+      }
+      return c;
+    },
     insertBefore(n, ref) {
       if (!n) return n;
       if (!ref) { shadow.appendChild(n); return n; }
       const idx = children.indexOf(ref);
-      if (idx >= 0) { children.splice(idx, 0, n); n.parentNode = shadow; }
+      if (idx >= 0) {
+        children.splice(idx, 0, n);
+        try { n.parentNode = shadow; } catch (_) {}
+      }
       else shadow.appendChild(n);
       return n;
     },
     removeChild(c) { const idx = children.indexOf(c); if (idx >= 0) children.splice(idx, 1); return c; },
-    replaceChild(n, o) { const idx = children.indexOf(o); if (idx >= 0) { children[idx] = n; n.parentNode = shadow; } return o; },
+    replaceChild(n, o) {
+      const idx = children.indexOf(o);
+      if (idx >= 0) {
+        children[idx] = n;
+        try { n.parentNode = shadow; } catch (_) {}
+      }
+      return o;
+    },
     querySelector(s) {
       for (const c of children) {
         if (c.matches && c.matches(s)) return c;
@@ -2889,9 +3295,40 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
 }
 
+// Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:
+// in-viewport coords return <body> (or <html> as fallback), out-of-viewport returns null.
+// Wrong-but-non-throwing beats "undefined", which traps ad/analytics bootstraps in retry loops
+// (see issue #63).
+if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
+  Document.prototype.elementFromPoint = function(x, y) {
+    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
+      return null;
+    }
+    var w = (typeof window !== 'undefined' && window.innerWidth) || 0;
+    var h = (typeof window !== 'undefined' && window.innerHeight) || 0;
+    if (x < 0 || y < 0 || x > w || y > h) {
+      return null;
+    }
+    return this.body || this.documentElement || null;
+  };
+  Document.prototype.elementsFromPoint = function(x, y) {
+    var el = this.elementFromPoint(x, y);
+    return el ? [el] : [];
+  };
+}
+if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {
+  ShadowRoot.prototype.elementFromPoint = function(x, y) {
+    return Document.prototype.elementFromPoint.call(globalThis.document || this, x, y);
+  };
+  ShadowRoot.prototype.elementsFromPoint = function(x, y) {
+    return Document.prototype.elementsFromPoint.call(globalThis.document || this, x, y);
+  };
+}
+
 globalThis.__obscura_init = function() {
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
+  _installWasmStreamingFallback();
 
   globalThis.document = new Document(+_dom("document_node_id"));
 

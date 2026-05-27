@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use url::Url;
 
+const DEFAULT_SAME_SITE: &str = "Lax";
+
 pub struct CookieJar {
     cookies: RwLock<HashMap<String, HashMap<String, CookieEntry>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CookieEntry {
     name: String,
     value: String,
@@ -164,6 +166,8 @@ impl CookieJar {
                     path: entry.path.clone(),
                     secure: entry.secure,
                     http_only: entry.http_only,
+                    same_site: entry.same_site.clone(),
+                    expires: entry.expires.map(|e| e as i64),
                 });
             }
         }
@@ -173,6 +177,12 @@ impl CookieJar {
     pub fn set_cookies_from_cdp(&self, cookies: Vec<CookieInfo>) {
         let mut jar = self.cookies.write().unwrap();
         for cookie in cookies {
+            let same_site = if cookie.same_site.is_empty() {
+                DEFAULT_SAME_SITE.to_string()
+            } else {
+                cookie.same_site
+            };
+            let expires = cookie.expires.and_then(|e| if e > 0 { Some(e as u64) } else { None });
             let entry = CookieEntry {
                 name: cookie.name.clone(),
                 value: cookie.value,
@@ -180,8 +190,8 @@ impl CookieJar {
                 domain: cookie.domain.clone(),
                 secure: cookie.secure,
                 http_only: cookie.http_only,
-                expires: None,
-                same_site: "Lax".to_string(),
+                expires,
+                same_site,
             };
             jar.entry(cookie.domain).or_default().insert(cookie.name, entry);
         }
@@ -335,8 +345,95 @@ impl CookieJar {
         }
     }
 
+    pub fn delete_cookies_filtered(&self, name: &str, domain: &str, path: Option<&str>) {
+        let mut cookies = self.cookies.write().unwrap();
+        let matches_path = |entry_path: &str| match path {
+            Some(p) => entry_path == p,
+            None => true,
+        };
+        if domain.is_empty() {
+            for domain_cookies in cookies.values_mut() {
+                domain_cookies.retain(|n, e| !(n == name && matches_path(&e.path)));
+            }
+        } else {
+            let domains_to_try = [
+                domain.to_string(),
+                format!(".{}", domain.trim_start_matches('.')),
+                domain.trim_start_matches('.').to_string(),
+            ];
+            for d in &domains_to_try {
+                if let Some(domain_cookies) = cookies.get_mut(d.as_str()) {
+                    domain_cookies.retain(|n, e| !(n == name && matches_path(&e.path)));
+                }
+            }
+        }
+    }
+
     pub fn clear(&self) {
         self.cookies.write().unwrap().clear();
+    }
+
+    /// Serialize all non-expired cookies to a JSON file.
+    /// Writes atomically via tempfile then rename.
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), std::io::Error> {
+        use std::io::Write;
+
+        let cookies = self.cookies.read().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut all: Vec<CookieInfo> = Vec::new();
+        for domain_cookies in cookies.values() {
+            for entry in domain_cookies.values() {
+                if let Some(exp) = entry.expires {
+                    if exp < now {
+                        continue;
+                    }
+                }
+                all.push(CookieInfo {
+                    name: entry.name.clone(),
+                    value: entry.value.clone(),
+                    domain: entry.domain.clone(),
+                    path: entry.path.clone(),
+                    secure: entry.secure,
+                    http_only: entry.http_only,
+                    same_site: entry.same_site.clone(),
+                    expires: entry.expires.map(|e| e as i64),
+                });
+            }
+        }
+
+        let json = serde_json::to_string_pretty(&all).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut tmp = tempfile::NamedTempFile::new_in(
+            path.parent().unwrap_or(std::path::Path::new(".")),
+        )?;
+        tmp.write_all(json.as_bytes())?;
+        tmp.persist(path).map_err(|e| e.error)?;
+        Ok(())
+    }
+
+    /// Load cookies from a JSON file into the jar.
+    /// Merges with existing cookies (does not clear).
+    /// Returns the number of cookies loaded.
+    pub fn load_from_file(&self, path: &std::path::Path) -> Result<usize, std::io::Error> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let data = std::fs::read_to_string(path)?;
+        let cookies: Vec<CookieInfo> =
+            serde_json::from_str(&data).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?;
+        let count = cookies.len();
+        self.set_cookies_from_cdp(cookies);
+        Ok(count)
     }
 }
 
@@ -355,6 +452,10 @@ pub struct CookieInfo {
     pub secure: bool,
     #[serde(rename = "httpOnly")]
     pub http_only: bool,
+    #[serde(default, rename = "sameSite")]
+    pub same_site: String,
+    #[serde(default)]
+    pub expires: Option<i64>,
 }
 
 fn parse_http_date(s: &str) -> Result<u64, ()> {
@@ -391,7 +492,7 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
 
 fn domain_matches(host: &str, domain: &str) -> bool {
     let host = host.to_lowercase();
-    let domain = domain.to_lowercase();
+    let domain = domain.trim_start_matches('.').to_lowercase();
     host == domain || host.ends_with(&format!(".{}", domain))
 }
 
@@ -425,6 +526,33 @@ mod tests {
         let other_url = Url::parse("https://other.com/").unwrap();
         let header3 = jar.get_cookie_header(&other_url);
         assert!(header3.is_empty());
+    }
+
+    #[test]
+    fn test_cdp_cookie_with_leading_dot_domain_matches_requests() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "token".to_string(),
+            value: "xyz".to_string(),
+            domain: ".example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }]);
+
+        let apex_url = Url::parse("https://example.com/").unwrap();
+        let apex_header = jar.get_cookie_header(&apex_url);
+        assert!(apex_header.contains("token=xyz"));
+
+        let subdomain_url = Url::parse("https://api.example.com/").unwrap();
+        let subdomain_header = jar.get_cookie_header(&subdomain_url);
+        assert!(subdomain_header.contains("token=xyz"));
+
+        let other_url = Url::parse("https://other.com/").unwrap();
+        let other_header = jar.get_cookie_header(&other_url);
+        assert!(other_header.is_empty());
     }
 
     #[test]
@@ -482,5 +610,177 @@ mod tests {
 
         jar.clear();
         assert!(jar.get_cookie_header(&url).is_empty());
+    }
+
+    #[test]
+    fn test_set_cookies_from_cdp_preserves_same_site_and_expires() {
+        let jar = CookieJar::new();
+        let future_expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600;
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "sid".to_string(),
+            value: "abc".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: true,
+            http_only: true,
+            same_site: "Strict".to_string(),
+            expires: Some(future_expiry),
+        }]);
+
+        let cookies = jar.get_all_cookies();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].same_site, "Strict");
+        assert_eq!(cookies[0].expires, Some(future_expiry));
+    }
+
+    #[test]
+    fn test_set_cookies_from_cdp_session_when_expires_none() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "n".to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }]);
+        let cookies = jar.get_all_cookies();
+        assert_eq!(cookies[0].expires, None);
+        assert_eq!(cookies[0].same_site, DEFAULT_SAME_SITE);
+    }
+
+    #[test]
+    fn test_delete_cookies_filtered_path_mismatch_preserves_cookie() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "sid".to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/admin".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }]);
+        jar.delete_cookies_filtered("sid", "example.com", Some("/other"));
+        assert_eq!(jar.get_all_cookies().len(), 1);
+
+        jar.delete_cookies_filtered("sid", "example.com", Some("/admin"));
+        assert!(jar.get_all_cookies().is_empty());
+    }
+
+    #[test]
+    fn test_delete_cookies_filtered_no_path_deletes_regardless() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "sid".to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/admin".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }]);
+        jar.delete_cookies_filtered("sid", "example.com", None);
+        assert!(jar.get_all_cookies().is_empty());
+    }
+
+    #[test]
+    fn test_set_cookies_from_cdp_expired_does_not_persist() {
+        let jar = CookieJar::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "old".to_string(),
+            value: "v".to_string(),
+            domain: "example.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: false,
+            same_site: String::new(),
+            expires: Some(now - 1),
+        }]);
+        let url = Url::parse("https://example.com/").unwrap();
+        assert!(jar.get_cookie_header(&url).is_empty());
+    }
+    fn test_save_load_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("session=abc123; Domain=example.com; Path=/", &url);
+        jar.set_cookie("token=xyz; Secure; HttpOnly", &url);
+
+        jar.save_to_file(&path).unwrap();
+        assert!(path.exists());
+
+        let jar2 = CookieJar::new();
+        let count = jar2.load_from_file(&path).unwrap();
+        assert_eq!(count, 2);
+
+        let header = jar2.get_cookie_header(&url);
+        assert!(header.contains("session=abc123"));
+        assert!(header.contains("token=xyz"));
+    }
+
+    #[test]
+    fn test_load_nonexistent_file_returns_zero() {
+        let jar = CookieJar::new();
+        let count = jar
+            .load_from_file(std::path::Path::new("/nonexistent/cookies.json"))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_domain_matches_subdomain_without_leading_dot() {
+        let jar = CookieJar::new();
+        jar.set_cookies_from_cdp(vec![CookieInfo {
+            name: "session".to_string(),
+            value: "abc".to_string(),
+            domain: "xiaohongshu.com".to_string(),
+            path: "/".to_string(),
+            secure: false,
+            http_only: true,
+            same_site: String::new(),
+            expires: None,
+        }]);
+        let url = Url::parse("https://www.xiaohongshu.com/explore").unwrap();
+        let header = jar.get_cookie_header(&url);
+        assert!(header.contains("session=abc"), "Cookie header was: '{}'", header);
+    }
+
+    #[test]
+    fn test_cookie_from_file_load_then_send_in_request() {
+        // Simulate what happens: load cookies from file → navigate → cookie should be in request
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cookies.json");
+        
+        // Write cookies like we exported from Chrome
+        let cookies = serde_json::json!([
+            {"name": "a1", "value": "testval", "domain": "xiaohongshu.com", "path": "/", "secure": false, "httpOnly": false},
+            {"name": "web_session", "value": "sess123", "domain": "xiaohongshu.com", "path": "/", "secure": false, "httpOnly": true},
+        ]);
+        std::fs::write(&path, serde_json::to_string(&cookies).unwrap()).unwrap();
+        
+        let jar = CookieJar::new();
+        let count = jar.load_from_file(&path).unwrap();
+        assert_eq!(count, 2, "Should load 2 cookies");
+        
+        let url = Url::parse("https://www.xiaohongshu.com/explore").unwrap();
+        let header = jar.get_cookie_header(&url);
+        assert!(header.contains("a1=testval"), "Missing a1 in: '{}'", header);
+        assert!(header.contains("web_session=sess123"), "Missing web_session in: '{}'", header);
     }
 }
