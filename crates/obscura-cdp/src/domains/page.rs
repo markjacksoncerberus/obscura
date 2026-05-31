@@ -11,7 +11,8 @@ async fn do_navigate(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<Value, String> {
-    let wait_until = params.get("waitUntil")
+    let wait_until = params
+        .get("waitUntil")
         .and_then(|v| {
             if let Some(s) = v.as_str() {
                 Some(WaitUntil::from_str(s))
@@ -46,16 +47,25 @@ async fn do_navigate(
     let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
 
     let (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle) = {
-        let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+        let page = ctx
+            .get_session_page_mut(session_id)
+            .ok_or("No page for session")?;
         let frame_id = page.frame_id.clone();
         let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
 
-        let nav_method = params.get("__method").and_then(|v| v.as_str()).unwrap_or("GET");
+        let nav_method = params
+            .get("__method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
         if nav_method == "POST" && !nav_body.is_empty() {
-            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body).await.map_err(|e| e.to_string())?;
+            page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
+                .await
+                .map_err(|e| e.to_string())?;
         } else {
-            page.navigate_with_wait(url, wait_until).await.map_err(|e| e.to_string())?;
+            page.navigate_with_wait(url, wait_until)
+                .await
+                .map_err(|e| e.to_string())?;
         }
 
         for source in &preload_scripts {
@@ -68,17 +78,40 @@ async fn do_navigate(
         let network_events: Vec<_> = page.network_events.drain(..).collect();
         let page_url = page.url_string();
         let page_id = page.id.clone();
-        (frame_id, loader_id, network_events, page_url, page_id, reached_network_idle)
+        (
+            frame_id,
+            loader_id,
+            network_events,
+            page_url,
+            page_id,
+            reached_network_idle,
+        )
     };
 
     let es = session_id.clone();
     let ts = timestamp();
 
     let mut phase1 = vec![
-        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
-        CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
-        CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
+        CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Runtime.executionContextsCleared".into(),
+            params: json!({}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}),
+            session_id: es.clone(),
+        },
     ];
     let world_names: Vec<String> = if ctx.isolated_worlds.is_empty() {
         vec!["__puppeteer_utility_world__24.40.0".to_string()]
@@ -135,16 +168,36 @@ async fn do_navigate(
     }
 
     let mut phase3 = vec![
-        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
-        CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
+        CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Page.domContentEventFired".into(),
+            params: json!({"timestamp": ts}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Page.lifecycleEvent".into(),
+            params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}),
+            session_id: es.clone(),
+        },
+        CdpEvent {
+            method: "Page.loadEventFired".into(),
+            params: json!({"timestamp": ts}),
+            session_id: es.clone(),
+        },
     ];
     if reached_network_idle || matches!(wait_until, WaitUntil::Load | WaitUntil::DomContentLoaded) {
         let idle_ts = timestamp();
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
-    phase3.push(CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id}), session_id: es });
+    phase3.push(CdpEvent {
+        method: "Page.frameStoppedLoading".into(),
+        params: json!({"frameId": frame_id}),
+        session_id: es,
+    });
     ctx.pending_events.extend(phase3);
 
     Ok(json!({
@@ -162,12 +215,15 @@ pub async fn handle(
     match method {
         "enable" => Ok(json!({})),
         "navigate" => {
-            let url = params.get("url").and_then(|v| v.as_str())
+            let url = params
+                .get("url")
+                .and_then(|v| v.as_str())
                 .ok_or("url required")?;
             do_navigate(url, params, ctx, session_id).await
         }
         "reload" => {
-            let current_url = ctx.get_session_page(session_id)
+            let current_url = ctx
+                .get_session_page(session_id)
                 .map(|p| p.url_string())
                 .unwrap_or_else(|| "about:blank".to_string());
             let reload_params = json!({
@@ -176,7 +232,9 @@ pub async fn handle(
             do_navigate(&current_url, &reload_params, ctx, session_id).await
         }
         "getFrameTree" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+            let page = ctx
+                .get_session_page(session_id)
+                .ok_or("No page for session")?;
             Ok(json!({
                 "frameTree": {
                     "frame": {
@@ -193,11 +251,19 @@ pub async fn handle(
             }))
         }
         "createIsolatedWorld" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
-            let frame_id_param = params.get("frameId").and_then(|v| v.as_str())
-                .unwrap_or(&page.frame_id).to_string();
-            let world_name = params.get("worldName").and_then(|v| v.as_str())
-                .unwrap_or("").to_string();
+            let page = ctx
+                .get_session_page(session_id)
+                .ok_or("No page for session")?;
+            let frame_id_param = params
+                .get("frameId")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&page.frame_id)
+                .to_string();
+            let world_name = params
+                .get("worldName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let page_url = page.url_string();
             let page_id = page.id.clone();
             let context_id: i64 = 100;
@@ -239,12 +305,16 @@ pub async fn handle(
             ctx.preload_counter += 1;
             let identifier = format!("{}", ctx.preload_counter);
             if !source.is_empty() {
-                ctx.preload_scripts.push((identifier.clone(), source.to_string()));
+                ctx.preload_scripts
+                    .push((identifier.clone(), source.to_string()));
             }
             Ok(json!({ "identifier": identifier }))
         }
         "removeScriptToEvaluateOnNewDocument" => {
-            let identifier = params.get("identifier").and_then(|v| v.as_str()).unwrap_or("");
+            let identifier = params
+                .get("identifier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             ctx.preload_scripts.retain(|(id, _)| id != identifier);
             Ok(json!({}))
         }
@@ -259,7 +329,9 @@ pub async fn handle(
             let height = 720.0_f64;
             let content_height = ctx
                 .get_session_page_mut(session_id)
-                .map(|p| p.evaluate("document.documentElement && document.documentElement.scrollHeight"))
+                .map(|p| {
+                    p.evaluate("document.documentElement && document.documentElement.scrollHeight")
+                })
                 .and_then(|v| v.as_f64())
                 .filter(|n| *n > 0.0)
                 .unwrap_or(height);
@@ -287,7 +359,9 @@ pub async fn handle(
             }))
         }
         "getNavigationHistory" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
+            let page = ctx
+                .get_session_page(session_id)
+                .ok_or("No page for session")?;
             Ok(json!({
                 "currentIndex": 0,
                 "entries": [{
@@ -319,7 +393,9 @@ pub async fn handle(
                 .get("quality")
                 .and_then(|v| v.as_u64())
                 .and_then(|n| u8::try_from(n).ok());
-            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            let page = ctx
+                .get_session_page_mut(session_id)
+                .ok_or("No page for session")?;
             let data = page
                 .capture_screenshot_base64(format, quality)
                 .map_err(|e| e.to_string())?;
@@ -335,7 +411,9 @@ pub async fn handle(
                     "Page.captureSnapshot currently supports only format='mhtml' (got '{format}')"
                 ));
             }
-            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            let page = ctx
+                .get_session_page_mut(session_id)
+                .ok_or("No page for session")?;
             Ok(json!({ "data": page.capture_snapshot_mhtml() }))
         }
         "startScreencast" | "stopScreencast" | "screencastFrameAck" => Ok(json!({})),
@@ -419,8 +497,7 @@ mod tests {
         );
         // Direct user to a workaround so the message is actionable.
         assert!(
-            err.to_lowercase().contains("evaluate")
-                || err.to_lowercase().contains("html"),
+            err.to_lowercase().contains("evaluate") || err.to_lowercase().contains("html"),
             "error must point to a workaround: {err}"
         );
     }
