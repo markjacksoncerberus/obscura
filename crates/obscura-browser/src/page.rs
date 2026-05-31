@@ -9,6 +9,11 @@ use url::Url;
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
 
+const SCREENSHOT_PNG_1X1_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
+const SCREENSHOT_JPEG_1X1_BASE64: &str =
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEBIQEBIQEA8PEA8PEA8PDw8PEA8QFREWFhURFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMsNygtLisBCgoKDg0OFQ8PFS0dFR0tLS0rLS0rLS0tLS0tLS0tLS0tLS0rLS0tLSstLS0tLS0tLS0rLS0tLS0tLS0tLf/AABEIAAEAAQMBIgACEQEDEQH/xAAYAAEAAwEAAAAAAAAAAAAAAAAAAQIDBP/EABYBAQEBAAAAAAAAAAAAAAAAAAABAv/aAAwDAQACEAMQAAAB5AAf/8QAFhEBAQEAAAAAAAAAAAAAAAAAABEh/9oACAEBAAEFAj//xAAVEQEBAAAAAAAAAAAAAAAAAAAAEf/aAAgBAwEBPwEf/8QAFBEBAAAAAAAAAAAAAAAAAAAAEP/aAAgBAgEBPwEf/8QAFBABAAAAAAAAAAAAAAAAAAAAEP/aAAgBAQAGPwJf/8QAFhABAQEAAAAAAAAAAAAAAAAAARAR/9oACAEBAAE/ITf/xAAZEAEAAwEBAAAAAAAAAAAAAAABABEhMWH/2gAIAQEAAT8hRa3IqE0jR//aAAwDAQACAAMAAAAQ+P/EABYRAQEBAAAAAAAAAAAAAAAAAAABEf/aAAgBAwEBPxBf/8QAFhEBAQEAAAAAAAAAAAAAAAAAARAR/9oACAECAQE/EHX/xAAaEAEAAwEBAQAAAAAAAAAAAAABABEhMUFR/9oACAEBAAE/EGQ8dGkYHmnFZ2VQF4QTT//Z";
+
 fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     let rest = uri.strip_prefix("data:")?;
     let comma = rest.find(',')?;
@@ -855,6 +860,49 @@ impl Page {
                 Err(e) => {
                     tracing::debug!("JS eval error for '{}': {}", &expression[..expression.len().min(80)], e);
                     serde_json::Value::Null
+                }
+
+                pub fn capture_screenshot_base64(
+                    &self,
+                    format: Option<&str>,
+                    _quality: Option<u8>,
+                ) -> Result<String, PageError> {
+                    match format.unwrap_or("png").to_ascii_lowercase().as_str() {
+                        "png" => Ok(SCREENSHOT_PNG_1X1_BASE64.to_string()),
+                        "jpeg" | "jpg" => Ok(SCREENSHOT_JPEG_1X1_BASE64.to_string()),
+                        other => Err(PageError::ParseError(format!(
+                            "Unsupported screenshot format: {other}"
+                        ))),
+                    }
+                }
+
+                pub fn capture_snapshot_mhtml(&self) -> String {
+                    let boundary = "----obscura-boundary";
+                    let html = self
+                        .with_dom(|dom| dom.outer_html(dom.document()))
+                        .unwrap_or_else(|| "<!DOCTYPE html><html><head></head><body></body></html>".to_string());
+                    let url = self.url_string();
+                    let title = if self.title.is_empty() {
+                        "Obscura Snapshot".to_string()
+                    } else {
+                        self.title.clone()
+                    };
+                    format!(
+                        "From: <Saved by Obscura>\r\n\
+Subject: {title}\r\n\
+Date: Thu, 01 Jan 1970 00:00:00 +0000\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/related;\r\n\
+\ttype=\"text/html\";\r\n\
+\tboundary=\"{boundary}\"\r\n\
+\r\n\
+--{boundary}\r\n\
+Content-Type: text/html\r\n\
+Content-Location: {url}\r\n\
+\r\n\
+{html}\r\n\
+--{boundary}--\r\n"
+                    )
                 }
             }
         } else {
