@@ -9,10 +9,8 @@ use url::Url;
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
 
-const SCREENSHOT_PNG_1X1_BASE64: &str =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
-const SCREENSHOT_JPEG_1X1_BASE64: &str =
-    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEBIQEBIQEA8PEA8PEA8PDw8PEA8QFREWFhURFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMsNygtLisBCgoKDg0OFQ8PFS0dFR0tLS0rLS0rLS0tLS0tLS0tLS0tLS0rLS0tLSstLS0tLS0tLS0rLS0tLS0tLS0tLf/AABEIAAEAAQMBIgACEQEDEQH/xAAYAAEAAwEAAAAAAAAAAAAAAAAAAQIDBP/EABYBAQEBAAAAAAAAAAAAAAAAAAABAv/aAAwDAQACEAMQAAAB5AAf/8QAFhEBAQEAAAAAAAAAAAAAAAAAABEh/9oACAEBAAEFAj//xAAVEQEBAAAAAAAAAAAAAAAAAAAAEf/aAAgBAwEBPwEf/8QAFBEBAAAAAAAAAAAAAAAAAAAAEP/aAAgBAgEBPwEf/8QAFBABAAAAAAAAAAAAAAAAAAAAEP/aAAgBAQAGPwJf/8QAFhABAQEAAAAAAAAAAAAAAAAAARAR/9oACAEBAAE/ITf/xAAZEAEAAwEBAAAAAAAAAAAAAAABABEhMWH/2gAIAQEAAT8hRa3IqE0jR//aAAwDAQACAAMAAAAQ+P/EABYRAQEBAAAAAAAAAAAAAAAAAAABEf/aAAgBAwEBPxBf/8QAFhEBAQEAAAAAAAAAAAAAAAAAARAR/9oACAECAQE/EHX/xAAaEAEAAwEBAQAAAAAAAAAAAAABABEhMUFR/9oACAEBAAE/EGQ8dGkYHmnFZ2VQF4QTT//Z";
+const SCREENSHOT_PNG_1X1_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
+const SCREENSHOT_JPEG_1X1_BASE64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEBIQEBIQEA8PEA8PEA8PDw8PEA8QFREWFhURFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMsNygtLisBCgoKDg0OFQ8PFS0dFR0tLS0rLS0rLS0tLS0tLS0tLS0tLS0rLS0tLSstLS0tLS0tLS0rLS0tLS0tLS0tLf/AABEIAAEAAQMBIgACEQEDEQH/xAAYAAEAAwEAAAAAAAAAAAAAAAAAAQIDBP/EABYBAQEBAAAAAAAAAAAAAAAAAAABAv/aAAwDAQACEAMQAAAB5AAf/8QAFhEBAQEAAAAAAAAAAAAAAAAAABEh/9oACAEBAAEFAj//xAAVEQEBAAAAAAAAAAAAAAAAAAAAEf/aAAgBAwEBPwEf/8QAFBEBAAAAAAAAAAAAAAAAAAAAEP/aAAgBAgEBPwEf/8QAFBABAAAAAAAAAAAAAAAAAAAAEP/aAAgBAQAGPwJf/8QAFhABAQEAAAAAAAAAAAAAAAAAARAR/9oACAEBAAE/ITf/xAAZEAEAAwEBAAAAAAAAAAAAAAABABEhMWH/2gAIAQEAAT8hRa3IqE0jR//aAAwDAQACAAMAAAAQ+P/EABYRAQEBAAAAAAAAAAAAAAAAAAABEf/aAAgBAwEBPxBf/8QAFhEBAQEAAAAAAAAAAAAAAAAAARAR/9oACAECAQE/EHX/xAAaEAEAAwEBAQAAAAAAAAAAAAABABEhMUFR/9oACAEBAAE/EGQ8dGkYHmnFZ2VQF4QTT//Z";
 
 fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     let rest = uri.strip_prefix("data:")?;
@@ -80,15 +78,11 @@ fn cross_scheme_to_file(from: &str, to: &str) -> bool {
 /// the page's origin. http(s) pages cannot reach into file: or data:
 /// to fabricate scripts, and pages with no origin only get http/https.
 fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
-    let Ok(target) = Url::parse(resource) else {
-        return false;
-    };
+    let Ok(target) = Url::parse(resource) else { return false };
     let scheme = target.scheme().to_ascii_lowercase();
     match scheme.as_str() {
         "http" | "https" => true,
-        "file" => page_url
-            .map(|u| u.scheme().eq_ignore_ascii_case("file"))
-            .unwrap_or(false),
+        "file" => page_url.map(|u| u.scheme().eq_ignore_ascii_case("file")).unwrap_or(false),
         _ => false,
     }
 }
@@ -200,21 +194,13 @@ impl Page {
             return false;
         }
         for pattern in &self.intercept_block_patterns {
-            if pattern == "*" {
-                return true;
-            }
+            if pattern == "*" { return true; }
             if pattern.starts_with('*') && pattern.ends_with('*') {
-                if url.contains(&pattern[1..pattern.len() - 1]) {
-                    return true;
-                }
+                if url.contains(&pattern[1..pattern.len()-1]) { return true; }
             } else if pattern.starts_with('*') {
-                if url.ends_with(&pattern[1..]) {
-                    return true;
-                }
+                if url.ends_with(&pattern[1..]) { return true; }
             } else if pattern.ends_with('*') {
-                if url.starts_with(&pattern[..pattern.len() - 1]) {
-                    return true;
-                }
+                if url.starts_with(&pattern[..pattern.len()-1]) { return true; }
             } else if url.contains(pattern) {
                 return true;
             }
@@ -278,10 +264,7 @@ impl Page {
     }
 
     async fn execute_scripts(&mut self) {
-        tracing::info!(
-            "execute_scripts called, js runtime exists: {}",
-            self.js.is_some()
-        );
+        tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
 
         #[derive(Debug)]
         struct ScriptInfo {
@@ -293,8 +276,8 @@ impl Page {
         }
 
         let all_scripts = match &self.js {
-            Some(js) => js
-                .with_dom(|dom| {
+            Some(js) => {
+                js.with_dom(|dom| {
                     let script_ids = dom.query_selector_all("script").unwrap_or_default();
                     let mut scripts = Vec::new();
 
@@ -332,8 +315,8 @@ impl Page {
                         }
                     }
                     scripts
-                })
-                .unwrap_or_default(),
+                }).unwrap_or_default()
+            }
             None => return,
         };
 
@@ -359,14 +342,8 @@ impl Page {
 
         let scripts = regular;
 
-        tracing::info!(
-            "Found {} regular + {} deferred + {} async scripts",
-            scripts.len(),
-            deferred.len(),
-            async_scripts.len()
-        );
-        let all_to_execute: Vec<ScriptInfo> = scripts
-            .into_iter()
+        tracing::info!("Found {} regular + {} deferred + {} async scripts", scripts.len(), deferred.len(), async_scripts.len());
+        let all_to_execute: Vec<ScriptInfo> = scripts.into_iter()
             .chain(deferred.into_iter())
             .chain(async_scripts.into_iter())
             .collect();
@@ -376,13 +353,10 @@ impl Page {
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if let Some(src_url) = &script.src {
-                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://")
-                {
+                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
                     src_url.clone()
                 } else if let Some(base) = &self.url {
-                    base.join(src_url)
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|_| src_url.clone())
+                    base.join(src_url).map(|u| u.to_string()).unwrap_or_else(|_| src_url.clone())
                 } else {
                     src_url.clone()
                 };
@@ -410,30 +384,25 @@ impl Page {
         }
 
         let client = self.http_client.clone();
-        let fetch_futures: Vec<_> = fetch_tasks
-            .iter()
-            .map(|(idx, url)| {
-                let client = client.clone();
-                let url = url.clone();
-                let idx = *idx;
-                async move {
-                    let parsed =
-                        Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                    match client.fetch(&parsed).await {
-                        Ok(resp) => Some((idx, url, resp)),
-                        Err(e) => {
-                            tracing::warn!("Failed to fetch script {}: {}", url, e);
-                            None
-                        }
+        let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
+            let client = client.clone();
+            let url = url.clone();
+            let idx = *idx;
+            async move {
+                let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                match client.fetch(&parsed).await {
+                    Ok(resp) => Some((idx, url, resp)),
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch script {}: {}", url, e);
+                        None
                     }
                 }
-            })
-            .collect();
+            }
+        }).collect();
 
         let fetch_results = futures::future::join_all(fetch_futures).await;
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
-            std::collections::HashMap::new();
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp)) = result {
                 // Script bodies: only the HTTP Content-Type charset matters
@@ -447,24 +416,14 @@ impl Page {
         // Scripts that check readyState === 'loading' will register DOMContentLoaded
         // listeners instead of calling their callback immediately.
         if let Some(js) = &mut self.js {
-            let _ = js.execute_script(
-                "<ready-state>",
-                "globalThis.__documentReadyState__ = 'loading';",
-            );
+            let _ = js.execute_script("<ready-state>", "globalThis.__documentReadyState__ = 'loading';");
         }
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if script.src.is_some() {
                 if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                    self.record_network_event(
-                        &url,
-                        "GET",
-                        "Script",
-                        resp.status,
-                        &resp.headers,
-                        resp.body.len(),
-                    );
+                    self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
                     if let Some(js) = &mut self.js {
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
@@ -485,9 +444,7 @@ impl Page {
                 let full_url = if src.starts_with("http://") || src.starts_with("https://") {
                     src.clone()
                 } else if let Some(base) = &self.url {
-                    base.join(src)
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|_| src.clone())
+                    base.join(src).map(|u| u.to_string()).unwrap_or_else(|_| src.clone())
                 } else {
                     src.clone()
                 };
@@ -497,14 +454,7 @@ impl Page {
                     match js.load_module(&full_url).await {
                         Ok(()) => {
                             tracing::info!("ES module loaded: {}", full_url);
-                            self.record_network_event(
-                                &full_url,
-                                "GET",
-                                "Script",
-                                200,
-                                &std::collections::HashMap::new(),
-                                0,
-                            );
+                            self.record_network_event(&full_url, "GET", "Script", 200, &std::collections::HashMap::new(), 0);
                         }
                         Err(e) => {
                             tracing::warn!("ES module error ({}): {}", full_url, e);
@@ -540,8 +490,7 @@ impl Page {
                 let result = tokio::time::timeout(
                     tokio::time::Duration::from_millis(10),
                     js.run_event_loop(),
-                )
-                .await;
+                ).await;
 
                 match result {
                     Ok(Ok(())) => {
@@ -569,8 +518,7 @@ impl Page {
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
-        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load)
-            .await
+        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load).await
     }
 
     pub async fn navigate_with_wait(
@@ -578,8 +526,7 @@ impl Page {
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
     ) -> Result<(), PageError> {
-        self.navigate_with_wait_post(url_str, wait_until, "GET", "")
-            .await
+        self.navigate_with_wait_post(url_str, wait_until, "GET", "").await
     }
 
     pub async fn navigate_with_wait_post(
@@ -594,8 +541,7 @@ impl Page {
         let mut current_body = body.to_string();
         const REDIRECT_LIMIT: usize = 10;
         for chain in 0..REDIRECT_LIMIT {
-            self.navigate_single(&current_url, wait_until, &current_method, &current_body)
-                .await?;
+            self.navigate_single(&current_url, wait_until, &current_method, &current_body).await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
                 if cross_scheme_to_file(&current_url, &next_url) {
                     // SOP gate. A web page must not be able to drive
@@ -611,12 +557,7 @@ impl Page {
                     );
                     break;
                 }
-                tracing::info!(
-                    "JS-triggered navigation chain: {} {} -> {}",
-                    current_method,
-                    current_url,
-                    next_url
-                );
+                tracing::info!("JS-triggered navigation chain: {} {} -> {}", current_method, current_url, next_url);
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
@@ -682,30 +623,21 @@ impl Page {
         }
 
         let response = if url.scheme() == "data" {
-            let content_type = url_str
-                .strip_prefix("data:")
+            let content_type = url_str.strip_prefix("data:")
                 .and_then(|s| s.split(',').next())
                 .unwrap_or("text/html")
-                .split(';')
-                .next()
+                .split(';').next()
                 .unwrap_or("text/html")
                 .to_string();
             let body_bytes = decode_data_uri(url_str).unwrap_or_default();
             let mut headers = std::collections::HashMap::new();
             headers.insert("content-type".to_string(), content_type);
-            Ok(obscura_net::Response {
-                url: url.clone(),
-                status: 200,
-                headers,
-                body: body_bytes,
-                redirected_from: Vec::new(),
-            })
+            Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
         } else if method == "POST" {
             self.http_client.post_form(&url, body).await
         } else {
             self.do_fetch(&url).await
-        }
-        .map_err(|e| {
+        }.map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
@@ -756,9 +688,7 @@ impl Page {
             let full_url = if href.starts_with("http://") || href.starts_with("https://") {
                 href.clone()
             } else if let Some(base) = &self.url {
-                base.join(href)
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|_| href.clone())
+                base.join(href).map(|u| u.to_string()).unwrap_or_else(|_| href.clone())
             } else {
                 href.clone()
             };
@@ -778,24 +708,20 @@ impl Page {
         }
 
         let client = self.http_client.clone();
-        let css_futures: Vec<_> = css_fetch_urls
-            .iter()
-            .map(|full_url| {
-                let client = client.clone();
-                let url_str = full_url.clone();
-                async move {
-                    let parsed =
-                        Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                    match client.fetch(&parsed).await {
-                        Ok(resp) => Some((url_str, resp)),
-                        Err(e) => {
-                            tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
-                            None
-                        }
+        let css_futures: Vec<_> = css_fetch_urls.iter().map(|full_url| {
+            let client = client.clone();
+            let url_str = full_url.clone();
+            async move {
+                let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                match client.fetch(&parsed).await {
+                    Ok(resp) => Some((url_str, resp)),
+                    Err(e) => {
+                        tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
+                        None
                     }
                 }
-            })
-            .collect();
+            }
+        }).collect();
 
         let css_results = futures::future::join_all(css_futures).await;
         let mut css_sources = Vec::new();
@@ -804,14 +730,7 @@ impl Page {
                 // CSS bodies: honor the Content-Type charset; CSS @charset is
                 // out of scope for the current scrape-focused pipeline.
                 let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                self.record_network_event(
-                    &url_str,
-                    "GET",
-                    "Stylesheet",
-                    resp.status,
-                    &resp.headers,
-                    resp.body.len(),
-                );
+                self.record_network_event(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, resp.body.len());
                 css_sources.push(css);
             }
         }
@@ -878,9 +797,7 @@ impl Page {
                     if idle_since.is_none() {
                         idle_since = Some(now);
                     }
-                    if now.duration_since(idle_since.unwrap())
-                        >= tokio::time::Duration::from_millis(500)
-                    {
+                    if now.duration_since(idle_since.unwrap()) >= tokio::time::Duration::from_millis(500) {
                         break;
                     }
                 } else {
@@ -888,10 +805,7 @@ impl Page {
                 }
 
                 if now >= deadline {
-                    tracing::debug!(
-                        "Network idle timeout reached with {} active requests",
-                        active
-                    );
+                    tracing::debug!("Network idle timeout reached with {} active requests", active);
                     break;
                 }
 
@@ -899,8 +813,7 @@ impl Page {
                     let _ = tokio::time::timeout(
                         tokio::time::Duration::from_millis(50),
                         js.run_event_loop(),
-                    )
-                    .await;
+                    ).await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
@@ -915,9 +828,7 @@ impl Page {
     pub fn navigate_blank(&mut self) {
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
-        self.dom = Some(parse_html(
-            "<!DOCTYPE html><html><head></head><body></body></html>",
-        ));
+        self.dom = Some(parse_html("<!DOCTYPE html><html><head></head><body></body></html>"));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
     }
@@ -945,11 +856,7 @@ impl Page {
             match js.evaluate(expression) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!(
-                        "JS eval error for '{}': {}",
-                        &expression[..expression.len().min(80)],
-                        e
-                    );
+                    tracing::debug!("JS eval error for '{}': {}", &expression[..expression.len().min(80)], e);
                     serde_json::Value::Null
                 }
             }
@@ -982,9 +889,7 @@ impl Page {
         let boundary = "----obscura-boundary";
         let html = self
             .with_dom(|dom| dom.outer_html(dom.document()))
-            .unwrap_or_else(|| {
-                "<!DOCTYPE html><html><head></head><body></body></html>".to_string()
-            });
+            .unwrap_or_else(|| "<!DOCTYPE html><html><head></head><body></body></html>".to_string());
         let url = self.url_string();
         let title = if self.title.is_empty() {
             "Obscura Snapshot".to_string()
@@ -1016,10 +921,7 @@ Content-Location: {url}\r\n\
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js
-                .evaluate_for_cdp(expression, return_by_value, await_promise)
-                .await
-            {
+            match js.evaluate_for_cdp(expression, return_by_value, await_promise).await {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
@@ -1060,16 +962,7 @@ Content-Location: {url}\r\n\
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js
-                .call_function_on_for_cdp(
-                    function_declaration,
-                    object_id,
-                    args,
-                    return_by_value,
-                    await_promise,
-                )
-                .await
-            {
+            match js.call_function_on_for_cdp(function_declaration, object_id, args, return_by_value, await_promise).await {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("callFunctionOn error: {}", e);
@@ -1178,18 +1071,20 @@ Content-Location: {url}\r\n\
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
         if let Some((url, method, body)) = self.take_pending_navigation() {
-            self.navigate_with_wait_post(&url, crate::lifecycle::WaitUntil::Load, &method, &body)
-                .await?;
+            self.navigate_with_wait_post(
+                &url,
+                crate::lifecycle::WaitUntil::Load,
+                &method,
+                &body,
+            )
+            .await?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
 
-    pub fn set_intercept_tx(
-        &mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
-    ) {
+    pub fn set_intercept_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>) {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
