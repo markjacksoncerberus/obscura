@@ -973,7 +973,7 @@ impl Page {
             "png" => Ok(SCREENSHOT_PNG_1X1_BASE64.to_string()),
             "jpeg" | "jpg" => Ok(SCREENSHOT_JPEG_1X1_BASE64.to_string()),
             other => Err(PageError::ParseError(format!(
-                "Unsupported screenshot format: {other}"
+                "Unsupported screenshot format: {other}. Supported formats: png, jpeg, jpg"
             ))),
         }
     }
