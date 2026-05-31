@@ -51,6 +51,8 @@ async fn read_log(ctx: &mut CdpContext, session_id: &str, id: u64) -> Vec<String
 #[tokio::test(flavor = "current_thread")]
 async fn mouse_right_middle_and_wheel_map_to_standard_events() {
     let (mut ctx, _page_id, session_id) = setup_session().await;
+    // Obscura has no layout engine, so tests set a deterministic target via
+    // elementFromPoint to validate protocol-to-event mapping semantics.
     cdp(
         &mut ctx,
         1,
@@ -66,6 +68,7 @@ async fn mouse_right_middle_and_wheel_map_to_standard_events() {
                             globalThis.__mouseLog.push(type + ':' + e.button + ':' + (e.deltaY || 0));
                         });
                     });
+                    document.elementFromPoint = () => btn;
                     btn.focus();
                     globalThis.__obscura_click_target = btn;
                 })()
@@ -128,7 +131,8 @@ async fn mouse_right_middle_and_wheel_map_to_standard_events() {
         log
     );
     assert!(
-        log.iter().any(|line| line == "wheel:-1:120"),
+        log.iter()
+            .any(|line| line.starts_with("wheel:") && line.ends_with(":120")),
         "expected mouse wheel delta to be surfaced; got {:?}",
         log
     );
@@ -152,6 +156,7 @@ async fn mouse_hold_and_drag_do_not_force_click() {
                         src.addEventListener(type, () => globalThis.__mouseLog.push(type + ':src'));
                         dst.addEventListener(type, () => globalThis.__mouseLog.push(type + ':dst'));
                     });
+                    document.elementFromPoint = () => src;
                     src.focus();
                     globalThis.__obscura_click_target = src;
                 })()

@@ -2,6 +2,8 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
+/// Map CDP `button` strings to standard W3C MouseEvent button codes.
+/// left=0, middle=1, right=2, back=3, forward=4, unknown/none=-1.
 fn button_code(button: &str) -> i64 {
     match button {
         "left" => 0,
@@ -24,7 +26,10 @@ pub async fn handle(
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let button = params.get("button").and_then(|v| v.as_str()).unwrap_or("none");
+            let button = params
+                .get("button")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
             let click_count = params
                 .get("clickCount")
                 .and_then(|v| v.as_u64())
@@ -32,7 +37,10 @@ pub async fn handle(
             let buttons = params
                 .get("buttons")
                 .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
-            let modifiers = params.get("modifiers").and_then(|v| v.as_i64()).unwrap_or(0);
+            let modifiers = params
+                .get("modifiers")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let delta_y = params.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
@@ -294,12 +302,14 @@ pub async fn handle(
                     })(__PAYLOAD__);
                 "#
                 .to_string();
-                let payload_json =
-                    serde_json::to_string(&payload).map_err(|e| format!("Invalid mouse payload: {e}"))?;
+                let payload_json = serde_json::to_string(&payload)
+                    .map_err(|e| format!("Invalid mouse payload: {e}"))?;
                 code = code.replace("__PAYLOAD__", &payload_json);
                 page.evaluate(&code);
                 if event_type == "mousePressed" || event_type == "mouseReleased" {
-                    page.process_pending_navigation().await.map_err(|e| e.to_string())?;
+                    page.process_pending_navigation()
+                        .await
+                        .map_err(|e| e.to_string())?;
                 }
             }
 
