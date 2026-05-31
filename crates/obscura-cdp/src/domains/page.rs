@@ -313,17 +313,32 @@ pub async fn handle(
                     .to_string(),
             )
         }
-        "captureScreenshot" | "captureSnapshot" => {
-            // Same story as printToPDF: rasterising a page needs a layout and
-            // paint pipeline that Obscura intentionally does not have. Reply
-            // with a clear error so clients can fail fast instead of waiting
-            // on the generic "Unknown Page method" reply.
-            Err(format!(
-                "Page.{method} is not supported by Obscura: no layout or paint engine. \
-                 For visual snapshots, drive a real headless Chromium for the \
-                 screenshot leg of your pipeline and use Obscura for the scraping leg."
-            ))
+        "captureScreenshot" => {
+            let format = params.get("format").and_then(|v| v.as_str());
+            let quality = params
+                .get("quality")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u8::try_from(n).ok());
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            let data = page
+                .capture_screenshot_base64(format, quality)
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "data": data }))
         }
+        "captureSnapshot" => {
+            let format = params
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("mhtml");
+            if !format.eq_ignore_ascii_case("mhtml") {
+                return Err(format!(
+                    "Page.captureSnapshot currently supports only format='mhtml' (got '{format}')"
+                ));
+            }
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page for session")?;
+            Ok(json!({ "data": page.capture_snapshot_mhtml() }))
+        }
+        "startScreencast" | "stopScreencast" | "screencastFrameAck" => Ok(json!({})),
         _ => Err(format!("Unknown Page method: {}", method)),
     }
 }
@@ -410,31 +425,52 @@ mod tests {
         );
     }
 
-    /// Regression for #45: same idea as printToPDF for captureScreenshot.
-    /// Playwright's `page.screenshot()` calls Page.captureScreenshot via CDP;
-    /// without an explicit arm, clients see "Unknown Page method" and have
-    /// no idea why their screenshot request failed.
     #[tokio::test]
-    async fn capture_screenshot_returns_descriptive_unsupported_error() {
+    async fn capture_screenshot_returns_base64_data() {
         let mut ctx = CdpContext::new();
-        let err = handle("captureScreenshot", &json!({}), &mut ctx, &None)
+        let page_id = ctx.create_page();
+        let session_id = "session-1".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let result = handle("captureScreenshot", &json!({}), &mut ctx, &Some(session_id))
             .await
-            .expect_err("captureScreenshot must error until a real paint exists");
+            .expect("captureScreenshot should succeed");
+        let data = result
+            .get("data")
+            .and_then(|v| v.as_str())
+            .expect("response should include base64 screenshot data");
         assert!(
-            !err.contains("Unknown Page method"),
-            "captureScreenshot must NOT fall through to the catch-all: {err}"
+            data.starts_with("iVBOR"),
+            "default screenshot should be png base64, got: {data}"
         );
-        assert!(
-            err.contains("not supported by Obscura"),
-            "error must clearly state screenshot is unsupported: {err}"
-        );
-        // Same for the MHTML snapshot sibling method.
-        let err2 = handle("captureSnapshot", &json!({}), &mut ctx, &None)
+    }
+
+    #[tokio::test]
+    async fn capture_snapshot_returns_mhtml_data() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = "session-1".to_string();
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let result = handle("captureSnapshot", &json!({}), &mut ctx, &Some(session_id))
             .await
-            .expect_err("captureSnapshot must error until a real renderer exists");
+            .expect("captureSnapshot should succeed");
+        let data = result
+            .get("data")
+            .and_then(|v| v.as_str())
+            .expect("response should include mhtml payload");
         assert!(
-            !err2.contains("Unknown Page method"),
-            "captureSnapshot must NOT fall through: {err2}"
+            data.contains("Content-Type: multipart/related"),
+            "snapshot should be MHTML multipart payload"
         );
+    }
+
+    #[tokio::test]
+    async fn screencast_control_methods_return_empty_response() {
+        let mut ctx = CdpContext::new();
+        for method in ["startScreencast", "stopScreencast", "screencastFrameAck"] {
+            let result = handle(method, &json!({}), &mut ctx, &None)
+                .await
+                .expect("screenshot control method should succeed");
+            assert_eq!(result, json!({}), "{method} should return empty object");
+        }
     }
 }
