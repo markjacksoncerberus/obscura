@@ -2099,7 +2099,23 @@ globalThis.CustomEvent = class extends Event {
     this.detail = detail;
   }
 };
-globalThis.MouseEvent = class extends Event { constructor(t,o={}) { super(t,o);this.clientX=o.clientX||0;this.clientY=o.clientY||0; } };
+globalThis.MouseEvent = class extends Event {
+  constructor(t,o={}) {
+    super(t,o);
+    this.screenX = o.screenX || 0;
+    this.screenY = o.screenY || 0;
+    this.clientX = o.clientX || 0;
+    this.clientY = o.clientY || 0;
+    this.ctrlKey = !!o.ctrlKey;
+    this.shiftKey = !!o.shiftKey;
+    this.altKey = !!o.altKey;
+    this.metaKey = !!o.metaKey;
+    this.button = o.button ?? 0;
+    this.buttons = o.buttons ?? 0;
+    this.relatedTarget = o.relatedTarget || null;
+    this.detail = o.detail || 0;
+  }
+};
 globalThis.KeyboardEvent = class extends Event { constructor(t,o={}) { super(t,o);this.key=o.key||"";this.code=o.code||""; } };
 globalThis.FocusEvent = class extends Event {};
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
@@ -2108,7 +2124,15 @@ globalThis.PointerEvent = class extends Event { constructor(t,o={}) { super(t,o)
 globalThis.AnimationEvent = class extends Event {};
 globalThis.TransitionEvent = class extends Event {};
 globalThis.UIEvent = class extends Event {};
-globalThis.WheelEvent = class extends Event {};
+globalThis.WheelEvent = class extends MouseEvent {
+  constructor(t,o={}) {
+    super(t,o);
+    this.deltaX = o.deltaX || 0;
+    this.deltaY = o.deltaY || 0;
+    this.deltaZ = o.deltaZ || 0;
+    this.deltaMode = o.deltaMode || 0;
+  }
+};
 globalThis.PopStateEvent = class extends Event {};
 globalThis.HashChangeEvent = class extends Event {};
 globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data; } };
