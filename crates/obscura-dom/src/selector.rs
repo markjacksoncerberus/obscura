@@ -379,10 +379,51 @@ impl<'a> Element for DomElement<'a> {
 
     fn match_non_ts_pseudo_class(
         &self,
-        _pc: &PseudoClass,
+        pc: &PseudoClass,
         _context: &mut MatchingContext<'_, Self::Impl>,
     ) -> bool {
-        false
+        // The static DOM tree has no pointer or focus state, so :hover/:active/
+        // :focus can't match here. (Live :focus needs per-node focus state — a
+        // later DOM-liveness phase.)
+        if matches!(
+            pc,
+            PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus
+        ) {
+            return false;
+        }
+        // :disabled/:enabled/:checked derive from the element's tag + attributes.
+        self.tree
+            .with_node(self.node_id, |n| {
+                let name = match n.as_element() {
+                    Some(qn) => qn.local.as_ref(),
+                    None => return false,
+                };
+                let form_disableable = matches!(
+                    name,
+                    "input" | "button" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
+                );
+                match pc {
+                    PseudoClass::Disabled => {
+                        form_disableable && n.get_attribute("disabled").is_some()
+                    }
+                    PseudoClass::Enabled => {
+                        form_disableable && n.get_attribute("disabled").is_none()
+                    }
+                    PseudoClass::Checked => {
+                        (name == "input"
+                            && n.get_attribute("type")
+                                .map(|t| {
+                                    let t = t.to_ascii_lowercase();
+                                    t == "checkbox" || t == "radio"
+                                })
+                                .unwrap_or(false)
+                            && n.get_attribute("checked").is_some())
+                            || (name == "option" && n.get_attribute("selected").is_some())
+                    }
+                    PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus => false,
+                }
+            })
+            .unwrap_or(false)
     }
 
     fn match_pseudo_element(
@@ -580,6 +621,7 @@ impl DomTree {
 
 #[cfg(test)]
 mod tests {
+    use crate::tree::NodeId;
     use crate::tree_sink::parse_html;
 
     #[test]
@@ -598,6 +640,44 @@ mod tests {
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
         assert_eq!(node.get_attribute("class"), Some("foo bar"));
+    }
+
+    #[test]
+    fn phase5_form_pseudo_classes_match_by_attribute() {
+        let tree = parse_html(
+            r#"<form>
+                 <input id="c1" type="checkbox" checked>
+                 <input id="c2" type="checkbox">
+                 <input id="t" type="text" disabled>
+                 <button id="b">ok</button>
+               </form>"#,
+        );
+        let id_of = |nid: NodeId| tree.get_node(nid).unwrap().get_attribute("id").unwrap().to_string();
+
+        // :checked — only the checked checkbox.
+        let checked = tree.query_selector_all(":checked").unwrap();
+        assert_eq!(checked.len(), 1);
+        assert_eq!(id_of(checked[0]), "c1");
+
+        // :disabled — the disabled text input (not the enabled ones).
+        let disabled = tree.query_selector_all(":disabled").unwrap();
+        assert_eq!(disabled.len(), 1);
+        assert_eq!(id_of(disabled[0]), "t");
+
+        // :enabled — the two checkboxes + the button (form elements w/o disabled).
+        let enabled = tree.query_selector_all(":enabled").unwrap();
+        let mut ids: Vec<String> = enabled.iter().map(|&n| id_of(n)).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["b", "c1", "c2"]);
+
+        // input:checked compound still works.
+        let compound = tree.query_selector_all("input:checked").unwrap();
+        assert_eq!(compound.len(), 1);
+        assert_eq!(id_of(compound[0]), "c1");
+
+        // :hover/:focus never match in the static tree.
+        assert!(tree.query_selector_all(":hover").unwrap().is_empty());
+        assert!(tree.query_selector_all(":focus").unwrap().is_empty());
     }
 
     #[test]
