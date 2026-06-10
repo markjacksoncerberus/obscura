@@ -155,7 +155,22 @@ pub struct Page {
 
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
-        let http_client = context.http_client.clone();
+        // Per-page HTTP client: its own in-flight request counter so
+        // network-idle detection isn't cross-contaminated by other pages'
+        // requests. Pages run concurrently on their own OS threads (issue #19),
+        // so a shared client's `active_requests()` would see *every* page's
+        // traffic and a page could wait on unrelated requests. Shares the
+        // context's cookie jar + proxy, and copies its resolved user-agent.
+        let http_client = {
+            let mut client = ObscuraHttpClient::with_options(
+                context.cookie_jar.clone(),
+                context.proxy_url.as_deref(),
+            );
+            if let Ok(mut ua) = client.user_agent.try_write() {
+                *ua = context.user_agent.clone();
+            }
+            Arc::new(client)
+        };
         let viewport = context.default_viewport;
         // Chromium convention: the main frame's frameId == the targetId.
         // Playwright's frame manager looks up the main frame by targetId

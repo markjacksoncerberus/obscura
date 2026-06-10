@@ -134,12 +134,11 @@ const _getFp = function() {
   return _fpCache;
 };
 const _fp = function(key) { return _getFp()[key]; };
-globalThis._eventRegistry = globalThis._eventRegistry || {};
-globalThis._formValues = globalThis._formValues || {};
-globalThis._formChecked = globalThis._formChecked || {};
-const _eventRegistry = globalThis._eventRegistry;
-const _formValues = globalThis._formValues;
-const _formChecked = globalThis._formChecked;
+// Module-local internal state — not exposed on window (the code below uses
+// these bare bindings; a fresh per-navigation runtime starts them empty).
+const _eventRegistry = {};
+const _formValues = {};
+const _formChecked = {};
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 const _consoleFn = (level, args) => {
   try { Deno.core.ops.op_console_msg(level, args.map(a => {
