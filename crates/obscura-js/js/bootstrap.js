@@ -634,24 +634,40 @@ class Element extends Node {
     }
   }
   addEventListener(type, handler, opts) {
+    if (!handler) return;
+    // opts may be a boolean (capture) or { capture, once, passive }.
+    const o = (typeof opts === 'boolean') ? { capture: opts } : (opts || {});
+    const cap = !!o.capture;
     const key = this._nid;
     if (!_eventRegistry[key]) _eventRegistry[key] = {};
     if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
-    _eventRegistry[key][type].push(handler);
+    const list = _eventRegistry[key][type];
+    // Per spec, a duplicate (type, handler, capture) registration is ignored.
+    if (list.some(e => e.handler === handler && e.capture === cap)) return;
+    list.push({ handler, capture: cap, once: !!o.once, passive: !!o.passive });
   }
-  removeEventListener(type, handler) {
+  removeEventListener(type, handler, opts) {
     const key = this._nid;
+    const cap = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
     if (_eventRegistry[key] && _eventRegistry[key][type]) {
-      _eventRegistry[key][type] = _eventRegistry[key][type].filter(h => h !== handler);
+      _eventRegistry[key][type] =
+        _eventRegistry[key][type].filter(e => !(e.handler === handler && e.capture === cap));
     }
   }
   dispatchEvent(event) {
     if (!event) return true;
     if (!event.target) event.target = this;
     event.currentTarget = this;
-    const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
-    for (const h of handlers) {
-      try { h.call(this, event); } catch(e) { console.error(e); }
+    // Snapshot: listeners added during this dispatch must not run for it.
+    const entries = ((_eventRegistry[this._nid] || {})[event.type] || []).slice();
+    for (const e of entries) {
+      const h = e.handler;
+      // `once` listeners are removed before invocation (per spec).
+      if (e.once) this.removeEventListener(event.type, h, { capture: e.capture });
+      try {
+        if (typeof h === 'function') h.call(this, event);
+        else if (h && typeof h.handleEvent === 'function') h.handleEvent(event);
+      } catch(err) { console.error(err); }
       if (event._immediatePropagationStopped) break;
     }
     if (event.bubbles && !event._propagationStopped && this.parentNode) {
@@ -679,8 +695,25 @@ class Element extends Node {
       }
     }
   }
-  focus() { __obscura_focused = this; __obscura_click_target = this; }
-  blur() { if (__obscura_focused === this) __obscura_focused = null; }
+  focus() {
+    const prev = __obscura_focused;
+    if (prev === this) return;
+    if (prev) {
+      try { prev.dispatchEvent(new Event('blur', { bubbles: false })); } catch(e) {}
+      try { prev.dispatchEvent(new Event('focusout', { bubbles: true })); } catch(e) {}
+    }
+    __obscura_focused = this;
+    __obscura_click_target = this;
+    // focus/blur do not bubble; focusin/focusout do.
+    try { this.dispatchEvent(new Event('focus', { bubbles: false })); } catch(e) {}
+    try { this.dispatchEvent(new Event('focusin', { bubbles: true })); } catch(e) {}
+  }
+  blur() {
+    if (__obscura_focused !== this) return;
+    __obscura_focused = null;
+    try { this.dispatchEvent(new Event('blur', { bubbles: false })); } catch(e) {}
+    try { this.dispatchEvent(new Event('focusout', { bubbles: true })); } catch(e) {}
+  }
   get value() {
     if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     const tag = this.localName;
