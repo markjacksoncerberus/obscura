@@ -134,6 +134,29 @@ impl Node {
     }
 }
 
+/// The shape of a DOM mutation, mirroring the parts of a DOM `MutationRecord`
+/// the JS bridge needs. Phase 0c: the Rust tree is the authoritative source of
+/// mutations, so `MutationObserver` fires regardless of whether a mutation came
+/// from a JS wrapper method or directly from a Rust/CDP code path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationKind {
+    ChildList,
+    Attributes,
+    CharacterData,
+}
+
+#[derive(Clone, Debug)]
+pub struct MutationRecord {
+    pub kind: MutationKind,
+    pub target: NodeId,
+    pub added: Vec<NodeId>,
+    pub removed: Vec<NodeId>,
+    pub prev_sibling: Option<NodeId>,
+    pub next_sibling: Option<NodeId>,
+    pub attr_name: Option<String>,
+    pub old_value: Option<String>,
+}
+
 pub struct DomTree {
     inner: RefCell<DomTreeInner>,
 }
@@ -143,6 +166,13 @@ pub(crate) struct DomTreeInner {
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    // Phase 0c: Rust-side mutation queue. Gated by `mutations_enabled` (off by
+    // default) so the queue only grows while a consumer — a registered JS
+    // MutationObserver, via the bridge — is draining it. Avoids both a memory
+    // leak and double-firing alongside the legacy JS-instrumented path until
+    // the bridge switches over to draining this.
+    pub(crate) mutations_enabled: bool,
+    pub(crate) pending_mutations: Vec<MutationRecord>,
 }
 
 impl DomTree {
@@ -162,6 +192,8 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                mutations_enabled: false,
+                pending_mutations: Vec::new(),
             }),
         }
     }
@@ -172,6 +204,25 @@ impl DomTree {
 
     pub(crate) fn borrow_inner(&self) -> std::cell::Ref<'_, DomTreeInner> {
         self.inner.borrow()
+    }
+
+    /// Turn Rust-side mutation recording on/off. Off clears any queued records.
+    /// The JS bridge enables this while at least one MutationObserver is active.
+    pub fn set_mutation_recording(&self, on: bool) {
+        let mut inner = self.inner.borrow_mut();
+        inner.mutations_enabled = on;
+        if !on {
+            inner.pending_mutations.clear();
+        }
+    }
+
+    pub fn is_recording_mutations(&self) -> bool {
+        self.inner.borrow().mutations_enabled
+    }
+
+    /// Take and clear the queued mutation records (delivered to JS observers).
+    pub fn drain_mutations(&self) -> Vec<MutationRecord> {
+        std::mem::take(&mut self.inner.borrow_mut().pending_mutations)
     }
 
     pub fn new_node(&self, data: NodeData) -> NodeId {
@@ -251,6 +302,20 @@ impl DomTree {
             }
             parent.last_child = Some(child_id);
         }
+
+        // Phase 0c: childList addition (appended after the previous last child).
+        if inner.mutations_enabled {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::ChildList,
+                target: parent_id,
+                added: vec![child_id],
+                removed: Vec::new(),
+                prev_sibling: old_last,
+                next_sibling: None,
+                attr_name: None,
+                old_value: None,
+            });
+        }
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
@@ -291,6 +356,20 @@ impl DomTree {
         } else if let Some(Some(parent)) = inner.nodes.get_mut(parent_id.index()) {
             parent.first_child = Some(new_sibling_id);
         }
+
+        // Phase 0c: childList addition, inserted before `existing_id`.
+        if inner.mutations_enabled {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::ChildList,
+                target: parent_id,
+                added: vec![new_sibling_id],
+                removed: Vec::new(),
+                prev_sibling: prev_id,
+                next_sibling: Some(existing_id),
+                attr_name: None,
+                old_value: None,
+            });
+        }
     }
 
     pub fn detach(&self, node_id: NodeId) {
@@ -326,6 +405,24 @@ impl DomTree {
             node.parent = None;
             node.prev_sibling = None;
             node.next_sibling = None;
+        }
+
+        // Phase 0c: a detach from a real parent is a childList removal. Siblings
+        // were captured above, before the unlink. (Detaching an already-orphan
+        // node returned early, so `parent_id` here means it had a parent.)
+        if inner.mutations_enabled {
+            if let Some(parent) = parent_id {
+                inner.pending_mutations.push(MutationRecord {
+                    kind: MutationKind::ChildList,
+                    target: parent,
+                    added: Vec::new(),
+                    removed: vec![node_id],
+                    prev_sibling: prev_id,
+                    next_sibling: next_id,
+                    attr_name: None,
+                    old_value: None,
+                });
+            }
         }
     }
 
@@ -695,6 +792,56 @@ mod tests {
 
         tree.detach(c1);
         assert_eq!(tree.children(doc), vec![c2]);
+    }
+
+    #[test]
+    fn phase0c_rust_mutations_are_recorded_only_when_enabled() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+
+        // Disabled by default: a mutation records nothing (no leak / no double
+        // fire alongside the JS-instrumented path).
+        let pre = tree.new_node(NodeData::Text { contents: "x".into() });
+        tree.append_child(doc, pre);
+        assert!(tree.drain_mutations().is_empty());
+
+        // Enabled: childList add → one record with the right shape.
+        tree.set_mutation_recording(true);
+        let c1 = tree.new_node(NodeData::Text { contents: "a".into() });
+        tree.append_child(doc, c1);
+        let recs = tree.drain_mutations();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].kind, MutationKind::ChildList);
+        assert_eq!(recs[0].target, doc);
+        assert_eq!(recs[0].added, vec![c1]);
+        assert!(recs[0].removed.is_empty());
+        assert_eq!(recs[0].prev_sibling, Some(pre)); // appended after `pre`
+
+        // Drain clears the queue.
+        assert!(tree.drain_mutations().is_empty());
+
+        // Detach of a real child → one childList removal record.
+        tree.detach(c1);
+        let recs = tree.drain_mutations();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].kind, MutationKind::ChildList);
+        assert_eq!(recs[0].target, doc);
+        assert_eq!(recs[0].removed, vec![c1]);
+        assert!(recs[0].added.is_empty());
+
+        // insert_before → addition with the right next-sibling.
+        let c2 = tree.new_node(NodeData::Text { contents: "b".into() });
+        tree.insert_before(pre, c2);
+        let recs = tree.drain_mutations();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].added, vec![c2]);
+        assert_eq!(recs[0].next_sibling, Some(pre));
+
+        // Turning recording off clears any queue and stops recording.
+        tree.set_mutation_recording(false);
+        let c3 = tree.new_node(NodeData::Text { contents: "c".into() });
+        tree.append_child(doc, c3);
+        assert!(tree.drain_mutations().is_empty());
     }
 
     #[test]
