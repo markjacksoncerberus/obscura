@@ -704,6 +704,7 @@ class Element extends Node {
     }
     __obscura_focused = this;
     __obscura_click_target = this;
+    _dom("set_focus", this._nid, ""); // Phase 0b: Rust focus state for :focus
     // focus/blur do not bubble; focusin/focusout do.
     try { this.dispatchEvent(new Event('focus', { bubbles: false })); } catch(e) {}
     try { this.dispatchEvent(new Event('focusin', { bubbles: true })); } catch(e) {}
@@ -711,6 +712,7 @@ class Element extends Node {
   blur() {
     if (__obscura_focused !== this) return;
     __obscura_focused = null;
+    _dom("set_focus", "", ""); // Phase 0b: clear Rust focus state
     try { this.dispatchEvent(new Event('blur', { bubbles: false })); } catch(e) {}
     try { this.dispatchEvent(new Event('focusout', { bubbles: true })); } catch(e) {}
   }
@@ -727,11 +729,10 @@ class Element extends Node {
       this.textContent = String(v);
     }
   }
-  get checked() {
-    if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
-    return this.hasAttribute("checked");
-  }
-  set checked(v) { _formChecked[this._nid] = !!v; }
+  // Phase 0b: checked state lives in the Rust DOM so it's visible to the
+  // selector engine (:checked) and consistent across all access paths.
+  get checked() { return _dom("get_checked", this._nid, "") === "1"; }
+  set checked(v) { _dom("set_checked", this._nid, v ? "1" : "0"); }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");

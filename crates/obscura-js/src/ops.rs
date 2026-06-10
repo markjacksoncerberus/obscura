@@ -304,6 +304,29 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 .collect();
             serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
         }
+        // Phase 0b: live element state (checked / focus) so :checked reflects
+        // JS-set state and :focus / activeElement track the focused element.
+        "set_checked" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.set_checked(NodeId::new(nid), arg2 == "1");
+            "true".into()
+        }
+        "get_checked" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            if dom.checked(NodeId::new(nid)) { "1".into() } else { "0".into() }
+        }
+        "set_focus" => {
+            if arg1.is_empty() {
+                dom.set_focus(None);
+            } else {
+                dom.set_focus(Some(NodeId::new(arg1.parse::<u32>().unwrap_or(0))));
+            }
+            "true".into()
+        }
+        "get_focus" => match dom.focused() {
+            Some(n) => n.raw().to_string(),
+            None => "-1".into(),
+        },
         "create_document_fragment" => {
             dom.new_node(NodeData::Document).index().to_string()
         }

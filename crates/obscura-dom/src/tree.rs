@@ -173,6 +173,12 @@ pub(crate) struct DomTreeInner {
     // the bridge switches over to draining this.
     pub(crate) mutations_enabled: bool,
     pub(crate) pending_mutations: Vec<MutationRecord>,
+    // Phase 0b: dynamic element state that doesn't live in attributes. Kept in
+    // side maps so we never touch the `Node` literal (constructed in many
+    // places). `checked_state` overrides the `checked` attribute default once
+    // JS sets `el.checked`; `focused` is the single focused element.
+    pub(crate) checked_state: HashMap<NodeId, bool>,
+    pub(crate) focused: Option<NodeId>,
 }
 
 impl DomTree {
@@ -194,6 +200,8 @@ impl DomTree {
                 id_index: HashMap::new(),
                 mutations_enabled: false,
                 pending_mutations: Vec::new(),
+                checked_state: HashMap::new(),
+                focused: None,
             }),
         }
     }
@@ -223,6 +231,35 @@ impl DomTree {
     /// Take and clear the queued mutation records (delivered to JS observers).
     pub fn drain_mutations(&self) -> Vec<MutationRecord> {
         std::mem::take(&mut self.inner.borrow_mut().pending_mutations)
+    }
+
+    /// Phase 0b: dynamic checked state. Set when JS assigns `el.checked`.
+    pub fn set_checked(&self, id: NodeId, checked: bool) {
+        self.inner.borrow_mut().checked_state.insert(id, checked);
+    }
+
+    /// Resolve an element's checked state: the JS-set state if present, else the
+    /// `checked` attribute default. Used by `:checked` and the checked getter.
+    pub fn checked(&self, id: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        if let Some(&c) = inner.checked_state.get(&id) {
+            return c;
+        }
+        inner
+            .nodes
+            .get(id.index())
+            .and_then(|n| n.as_ref())
+            .map(|n| n.get_attribute("checked").is_some())
+            .unwrap_or(false)
+    }
+
+    /// Phase 0b: the focused element (drives `:focus` and `document.activeElement`).
+    pub fn set_focus(&self, id: Option<NodeId>) {
+        self.inner.borrow_mut().focused = id;
+    }
+
+    pub fn focused(&self) -> Option<NodeId> {
+        self.inner.borrow().focused
     }
 
     /// Record an attribute mutation. Called from the op layer, which performs

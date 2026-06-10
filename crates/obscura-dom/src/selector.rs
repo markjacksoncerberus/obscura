@@ -382,48 +382,48 @@ impl<'a> Element for DomElement<'a> {
         pc: &PseudoClass,
         _context: &mut MatchingContext<'_, Self::Impl>,
     ) -> bool {
-        // The static DOM tree has no pointer or focus state, so :hover/:active/
-        // :focus can't match here. (Live :focus needs per-node focus state — a
-        // later DOM-liveness phase.)
-        if matches!(
-            pc,
-            PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus
-        ) {
-            return false;
+        match pc {
+            // No pointer state in a headless tree.
+            PseudoClass::Hover | PseudoClass::Active => false,
+            // Phase 0b: live focus state.
+            PseudoClass::Focus => self.tree.focused() == Some(self.node_id),
+            // :disabled/:enabled from tag + attribute; :checked from live state.
+            PseudoClass::Disabled | PseudoClass::Enabled | PseudoClass::Checked => self
+                .tree
+                .with_node(self.node_id, |n| {
+                    let name = match n.as_element() {
+                        Some(qn) => qn.local.as_ref(),
+                        None => return false,
+                    };
+                    let form_disableable = matches!(
+                        name,
+                        "input" | "button" | "select" | "textarea" | "optgroup" | "option"
+                            | "fieldset"
+                    );
+                    match pc {
+                        PseudoClass::Disabled => {
+                            form_disableable && n.get_attribute("disabled").is_some()
+                        }
+                        PseudoClass::Enabled => {
+                            form_disableable && n.get_attribute("disabled").is_none()
+                        }
+                        PseudoClass::Checked => {
+                            let is_check_radio = name == "input"
+                                && n.get_attribute("type")
+                                    .map(|t| {
+                                        let t = t.to_ascii_lowercase();
+                                        t == "checkbox" || t == "radio"
+                                    })
+                                    .unwrap_or(false);
+                            // Phase 0b: live checked state overrides the attr default.
+                            (is_check_radio && self.tree.checked(self.node_id))
+                                || (name == "option" && n.get_attribute("selected").is_some())
+                        }
+                        _ => false,
+                    }
+                })
+                .unwrap_or(false),
         }
-        // :disabled/:enabled/:checked derive from the element's tag + attributes.
-        self.tree
-            .with_node(self.node_id, |n| {
-                let name = match n.as_element() {
-                    Some(qn) => qn.local.as_ref(),
-                    None => return false,
-                };
-                let form_disableable = matches!(
-                    name,
-                    "input" | "button" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
-                );
-                match pc {
-                    PseudoClass::Disabled => {
-                        form_disableable && n.get_attribute("disabled").is_some()
-                    }
-                    PseudoClass::Enabled => {
-                        form_disableable && n.get_attribute("disabled").is_none()
-                    }
-                    PseudoClass::Checked => {
-                        (name == "input"
-                            && n.get_attribute("type")
-                                .map(|t| {
-                                    let t = t.to_ascii_lowercase();
-                                    t == "checkbox" || t == "radio"
-                                })
-                                .unwrap_or(false)
-                            && n.get_attribute("checked").is_some())
-                            || (name == "option" && n.get_attribute("selected").is_some())
-                    }
-                    PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus => false,
-                }
-            })
-            .unwrap_or(false)
     }
 
     fn match_pseudo_element(
@@ -675,8 +675,31 @@ mod tests {
         assert_eq!(compound.len(), 1);
         assert_eq!(id_of(compound[0]), "c1");
 
-        // :hover/:focus never match in the static tree.
+        // :hover never matches in a headless tree.
         assert!(tree.query_selector_all(":hover").unwrap().is_empty());
+    }
+
+    #[test]
+    fn phase0b_dynamic_checked_and_focus() {
+        let tree = parse_html(
+            r#"<input id="a" type="checkbox"><input id="b" type="checkbox"><input id="c" type="text">"#,
+        );
+        let a = tree.query_selector("#a").unwrap().unwrap();
+        let c = tree.query_selector("#c").unwrap().unwrap();
+
+        // No checked attribute and no state → :checked empty.
+        assert!(tree.query_selector_all(":checked").unwrap().is_empty());
+        // Live checked state (no attribute) → :checked matches it.
+        tree.set_checked(a, true);
+        assert_eq!(tree.query_selector_all(":checked").unwrap(), vec![a]);
+        tree.set_checked(a, false);
+        assert!(tree.query_selector_all(":checked").unwrap().is_empty());
+
+        // Live focus → :focus matches the focused element.
+        assert!(tree.query_selector_all(":focus").unwrap().is_empty());
+        tree.set_focus(Some(c));
+        assert_eq!(tree.query_selector_all(":focus").unwrap(), vec![c]);
+        tree.set_focus(None);
         assert!(tree.query_selector_all(":focus").unwrap().is_empty());
     }
 
