@@ -225,6 +225,41 @@ impl DomTree {
         std::mem::take(&mut self.inner.borrow_mut().pending_mutations)
     }
 
+    /// Record an attribute mutation. Called from the op layer, which performs
+    /// attribute writes via `with_node_mut` rather than a child-list method.
+    pub fn record_attribute_mutation(&self, target: NodeId, name: &str, old_value: Option<String>) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.mutations_enabled {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::Attributes,
+                target,
+                added: Vec::new(),
+                removed: Vec::new(),
+                prev_sibling: None,
+                next_sibling: None,
+                attr_name: Some(name.to_string()),
+                old_value,
+            });
+        }
+    }
+
+    /// Record a characterData (text/comment contents) mutation.
+    pub fn record_character_data_mutation(&self, target: NodeId, old_value: Option<String>) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.mutations_enabled {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::CharacterData,
+                target,
+                added: Vec::new(),
+                removed: Vec::new(),
+                prev_sibling: None,
+                next_sibling: None,
+                attr_name: None,
+                old_value,
+            });
+        }
+    }
+
     pub fn new_node(&self, data: NodeData) -> NodeId {
         let mut inner = self.inner.borrow_mut();
         let id = if let Some(slot) = inner.free_list.pop() {

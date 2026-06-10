@@ -2090,12 +2090,18 @@ globalThis.MutationObserver = class MutationObserver {
     this._targets = this._targets.filter(t => t.target._nid !== target._nid);
     this._targets.push({ target, options: opts });
     if (!__mutationObservers.includes(this)) __mutationObservers.push(this);
+    // Phase 0c: turn on the Rust-authoritative mutation queue while observed
+    // (idempotent). The Rust DOM now records every mutation regardless of which
+    // code path made it; we drain it on delivery.
+    _dom("set_mutation_recording", "1");
   }
   disconnect() {
     this._targets = [];
     this._records = [];
     const idx = __mutationObservers.indexOf(this);
     if (idx >= 0) __mutationObservers.splice(idx, 1);
+    // Stop recording (and clear the queue) once nothing is observing.
+    if (__mutationObservers.length === 0) _dom("set_mutation_recording", "0");
   }
   takeRecords() {
     const r = this._records.slice();
@@ -2141,6 +2147,35 @@ globalThis.MutationObserver = class MutationObserver {
 
 // Deliver every observer's queued records on a microtask. Callbacks may mutate
 // the DOM and produce new records, so loop (with a cap) until quiescent.
+// Drain the Rust-authoritative mutation queue and fan each record out to the
+// matching observers' pending queues. The Rust DOM is the single source of
+// truth (Phase 0c), so this fires for mutations from ANY path — JS wrappers,
+// CDP DOM-domain ops, fragment imports — not just JS-instrumented ones.
+const __drainMutations = function() {
+  if (!__mutationObservers.length) return;
+  let raw;
+  try { raw = JSON.parse(_dom("drain_mutations", "", "")); } catch (e) { return; }
+  if (!raw || !raw.length) return;
+  for (const m of raw) {
+    const target = _wrap(m.target);
+    if (!target) continue;
+    const rec = {
+      type: m.type, // 'childList' | 'attributes' | 'characterData'
+      target: target,
+      addedNodes: (m.addedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
+      removedNodes: (m.removedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
+      attributeName: m.attributeName ?? null,
+      oldValue: m.oldValue ?? null,
+      previousSibling: m.previousSibling != null ? _wrap(m.previousSibling) : null,
+      nextSibling: m.nextSibling != null ? _wrap(m.nextSibling) : null,
+    };
+    for (const obs of __mutationObservers) obs._enqueue(rec);
+  }
+};
+
+// Deliver every observer's queued records on a microtask. Drains the Rust queue
+// first; callbacks may mutate the DOM (producing new records), so loop — with a
+// cap — re-draining until quiescent.
 let __mutationDeliveryScheduled = false;
 const __scheduleMutationDelivery = function() {
   if (__mutationDeliveryScheduled) return;
@@ -2151,6 +2186,7 @@ const __scheduleMutationDelivery = function() {
     let delivered;
     do {
       delivered = false;
+      __drainMutations();
       for (const obs of __mutationObservers.slice()) {
         if (obs._records.length === 0) continue;
         const batch = obs._records.splice(0);
@@ -2161,29 +2197,11 @@ const __scheduleMutationDelivery = function() {
   });
 };
 
-// Enqueue a MutationRecord for all interested observers. Targets/nodes are
-// resolved via _wrap so a wrapper is minted on demand (the module
-// cache may not yet hold one for a freshly created nid).
-// TODO(dom-phase-0c): mutations performed purely in Rust via op_dom
-// (set_inner_html / set_text_content done Rust-side) won't emit records until a
-// Rust-side mutation broadcast (drain_mutations op) exists. This first cut
-// covers JS-initiated mutations, which is what frameworks (React/Vue) do.
-const __notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, extra) {
-  if (!__mutationObservers.length) return;
-  const target = _wrap(target_nid);
-  if (!target) return;
-  extra = extra || {};
-  const rec = {
-    type: type, // 'childList' | 'attributes' | 'characterData'
-    target: target,
-    addedNodes: (addedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
-    removedNodes: (removedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
-    attributeName: attributeName || null,
-    oldValue: extra.oldValue ?? null,
-    previousSibling: extra.previousSibling != null ? _wrap(extra.previousSibling) : null,
-    nextSibling: extra.nextSibling != null ? _wrap(extra.nextSibling) : null,
-  };
-  for (const obs of __mutationObservers) obs._enqueue(rec);
+// A JS DOM mutation happened (the Rust tree already recorded it); just schedule
+// a delivery tick, which drains the Rust queue. The (type, ...) args are kept
+// for call-site compatibility but no longer used — Rust is the record source.
+const __notifyMutation = function() {
+  if (__mutationObservers.length) __scheduleMutationDelivery();
 };
 
 globalThis.ShadowRoot = class ShadowRoot {};

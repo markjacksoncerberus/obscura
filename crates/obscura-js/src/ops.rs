@@ -7,7 +7,7 @@ use deno_core::op2;
 use deno_core::OpState;
 use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use obscura_dom::{DomTree, NodeData, NodeId};
+use obscura_dom::{DomTree, MutationKind, NodeData, NodeId};
 use obscura_net::{CookieJar, ObscuraHttpClient};
 use tokio::sync::Mutex;
 
@@ -190,13 +190,18 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let node_id = NodeId::new(nid);
             if let Some((name, value)) = arg2.split_once('\0') {
+                let old = dom
+                    .get_node(node_id)
+                    .and_then(|n| n.get_attribute(name).map(|s| s.to_string()));
                 if name == "id" {
-                    let old_id = dom.get_node(node_id).and_then(|n| n.get_attribute("id").map(|s| s.to_string()));
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
-                    dom.update_id_index(node_id, old_id.as_deref(), Some(value));
+                    dom.update_id_index(node_id, old.as_deref(), Some(value));
                 } else {
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
                 }
+                // Phase 0c: attribute mutation record (the op writes via
+                // with_node_mut, so it can't ride a child-list tree method).
+                dom.record_attribute_mutation(node_id, name, old);
             }
             "true".into()
         }
@@ -227,11 +232,16 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "remove_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.with_node_mut(NodeId::new(nid), |n| {
+            let node_id = NodeId::new(nid);
+            let old = dom
+                .get_node(node_id)
+                .and_then(|n| n.get_attribute(&arg2).map(|s| s.to_string()));
+            dom.with_node_mut(node_id, |n| {
                 if let NodeData::Element { attrs, .. } = &mut n.data {
                     attrs.retain(|a| a.name.local.as_ref() != arg2.as_str());
                 }
             });
+            dom.record_attribute_mutation(node_id, &arg2, old);
             "true".into()
         }
         "set_inner_html" => {
@@ -250,14 +260,49 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "set_text_content" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.with_node_mut(NodeId::new(nid), |n| {
+            let node_id = NodeId::new(nid);
+            let mut old: Option<String> = None;
+            let mut is_char_data = false;
+            dom.with_node_mut(node_id, |n| {
                 match &mut n.data {
-                    NodeData::Text { contents } => { *contents = arg2.clone(); }
-                    NodeData::Comment { contents } => { *contents = arg2.clone(); }
+                    NodeData::Text { contents } => { old = Some(contents.clone()); *contents = arg2.clone(); is_char_data = true; }
+                    NodeData::Comment { contents } => { old = Some(contents.clone()); *contents = arg2.clone(); is_char_data = true; }
                     _ => {}
                 }
             });
+            if is_char_data {
+                dom.record_character_data_mutation(node_id, old);
+            }
             "true".into()
+        }
+        // Phase 0c source switch: JS turns recording on while ≥1 MutationObserver
+        // is active, then drains the Rust-authoritative queue each delivery tick.
+        "set_mutation_recording" => {
+            dom.set_mutation_recording(arg1 == "1");
+            "true".into()
+        }
+        "drain_mutations" => {
+            let recs = dom.drain_mutations();
+            let arr: Vec<serde_json::Value> = recs
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "type": match r.kind {
+                            MutationKind::ChildList => "childList",
+                            MutationKind::Attributes => "attributes",
+                            MutationKind::CharacterData => "characterData",
+                        },
+                        "target": r.target.raw(),
+                        "addedNodes": r.added.iter().map(|n| n.raw()).collect::<Vec<u32>>(),
+                        "removedNodes": r.removed.iter().map(|n| n.raw()).collect::<Vec<u32>>(),
+                        "previousSibling": r.prev_sibling.map(|n| n.raw()),
+                        "nextSibling": r.next_sibling.map(|n| n.raw()),
+                        "attributeName": r.attr_name,
+                        "oldValue": r.old_value,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
         }
         "create_document_fragment" => {
             dom.new_node(NodeData::Document).index().to_string()
