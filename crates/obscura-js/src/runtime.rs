@@ -57,7 +57,7 @@ impl ObscuraJsRuntime {
         runtime
             .execute_script(
                 "<obscura:init>",
-                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; globalThis.__obscura_init();".to_string(),
+                "globalThis.__obscura_init();".to_string(),
             )
             .expect("init should not fail");
 
@@ -107,7 +107,7 @@ impl ObscuraJsRuntime {
         let escaped = ua.replace('\\', "\\\\").replace('\'', "\\'");
         let _ = self.runtime.execute_script(
             "<set-ua>",
-            format!("globalThis.__obscura_ua = '{}';", escaped),
+            format!("__obscura_ua = '{}';", escaped),
         );
     }
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
@@ -145,13 +145,13 @@ impl ObscuraJsRuntime {
                 "(async function() {{\n\
                     try {{\n\
                         var __result = await ({expr});\n\
-                        globalThis.__obscura_objects['{oid}'] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
+                        __obscura_objects['{oid}'] = __result;\n\
+                        __obscura_await_meta = {meta_fn};\n\
+                        __obscura_await_rejected = false;\n\
                     }} catch(e) {{\n\
-                        globalThis.__obscura_objects['{oid}'] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
+                        __obscura_objects['{oid}'] = e;\n\
+                        __obscura_await_meta = {err_meta_fn};\n\
+                        __obscura_await_rejected = true;\n\
                     }}\n\
                 }})()",
                 expr = cleaned_expr,
@@ -164,7 +164,7 @@ impl ObscuraJsRuntime {
                 "(function() {{\n\
                     var __result;\n\
                     try {{ __result = ({expr}); }} catch(e) {{ __result = undefined; }}\n\
-                    globalThis.__obscura_objects['{oid}'] = __result;\n\
+                    __obscura_objects['{oid}'] = __result;\n\
                     return {meta_fn};\n\
                 }})()",
                 expr = cleaned_expr,
@@ -180,14 +180,14 @@ impl ObscuraJsRuntime {
 
         let meta_str = if await_promise {
             self.resolve_promises().await;
-            let rejected = self.runtime.execute_script("<readRejected>", "globalThis.__obscura_await_rejected".to_string())
+            let rejected = self.runtime.execute_script("<readRejected>", "__obscura_await_rejected".to_string())
                 .map_err(|e| format!("JS error: {}", e))?;
             if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                let err = self.runtime.execute_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
+                let err = self.runtime.execute_script("<readError>", format!("String(__obscura_objects['{0}'] && (__obscura_objects['{0}'].message || __obscura_objects['{0}']))", oid))
                     .map_err(|e| format!("JS error: {}", e))?;
                 return Err(format!("Promise rejected: {}", self.v8_to_json(err)?.as_str().unwrap_or("")));
             }
-            self.runtime.execute_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            self.runtime.execute_script("<readMeta>", "__obscura_await_meta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
@@ -200,11 +200,11 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("__obscura_objects['{}']", oid),
         );
 
         if await_promise && return_by_value {
-            let read = self.runtime.execute_script("<readResult>", format!("globalThis.__obscura_objects['{}']", oid))
+            let read = self.runtime.execute_script("<readResult>", format!("__obscura_objects['{}']", oid))
                 .map_err(|e| format!("JS error: {}", e))?;
             let json_val = self.v8_to_json(read)?;
             return Ok(Self::info_from_json(&json_val));
@@ -234,8 +234,8 @@ impl ObscuraJsRuntime {
                     var __fn = ({fn_decl});\n\
                     var __this = ({this_expr});\n\
                     var __result = await __fn.call(__this, {args});\n\
-                    globalThis.__obscura_objects['{oid}'] = __result;\n\
-                    globalThis.__obscura_await_meta = {meta_fn};\n\
+                    __obscura_objects['{oid}'] = __result;\n\
+                    __obscura_await_meta = {meta_fn};\n\
                 }})()",
                 setup = setup,
                 fn_decl = function_declaration,
@@ -254,7 +254,7 @@ impl ObscuraJsRuntime {
             if return_by_value {
                 let read = self.runtime.execute_script(
                     "<readResult>",
-                    format!("globalThis.__obscura_objects['{}']", oid),
+                    format!("__obscura_objects['{}']", oid),
                 ).map_err(|e| format!("JS error: {}", e))?;
                 let json_val = self.v8_to_json(read)?;
                 return Ok(Self::info_from_json(&json_val));
@@ -262,7 +262,7 @@ impl ObscuraJsRuntime {
 
             let meta_result = self.runtime.execute_script(
                 "<readMeta>",
-                "globalThis.__obscura_await_meta".to_string(),
+                "__obscura_await_meta".to_string(),
             ).map_err(|e| format!("JS error: {}", e))?;
             let meta_str = self.v8_to_json(meta_result)?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -272,7 +272,7 @@ impl ObscuraJsRuntime {
             };
             self.object_store.insert(
                 oid.clone(),
-                format!("globalThis.__obscura_objects['{}']", oid),
+                format!("__obscura_objects['{}']", oid),
             );
             return Ok(Self::info_from_meta(&meta_json, Some(oid)));
         }
@@ -303,7 +303,7 @@ impl ObscuraJsRuntime {
                 var __fn = ({fn_decl});\n\
                 var __this = ({this_expr});\n\
                 var __result = __fn.call(__this, {args});\n\
-                globalThis.__obscura_objects['{oid}'] = __result;\n\
+                __obscura_objects['{oid}'] = __result;\n\
                 return {meta_fn};\n\
             }})()",
             setup = setup,
@@ -324,7 +324,7 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("__obscura_objects['{}']", oid),
         );
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
     }
@@ -341,7 +341,7 @@ impl ObscuraJsRuntime {
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let code = format!(
-            "globalThis.__obscura_objects['{}'] = ({});",
+            "__obscura_objects['{}'] = ({});",
             oid, js_expression,
         );
         self.runtime
@@ -349,7 +349,7 @@ impl ObscuraJsRuntime {
             .map_err(|e| format!("Store error: {}", e))?;
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("__obscura_objects['{}']", oid),
         );
         Ok(oid)
     }
@@ -363,7 +363,7 @@ impl ObscuraJsRuntime {
         let code = format!(
             "(function() {{\n\
                 var __result = ({expr});\n\
-                globalThis.__obscura_objects['{oid}'] = __result;\n\
+                __obscura_objects['{oid}'] = __result;\n\
                 return {meta_fn};\n\
             }})()",
             expr = js_expression,
@@ -382,7 +382,7 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("__obscura_objects['{}']", oid),
         );
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
     }
@@ -390,7 +390,7 @@ impl ObscuraJsRuntime {
     pub fn release_object(&mut self, object_id: &str) {
         if self.object_store.remove(object_id).is_some() {
             let code = format!(
-                "delete globalThis.__obscura_objects['{}'];",
+                "delete __obscura_objects['{}'];",
                 object_id,
             );
             let _ = self.runtime.execute_script("<release>", code);
@@ -400,7 +400,7 @@ impl ObscuraJsRuntime {
     pub fn release_object_group(&mut self) {
         let _ = self.runtime.execute_script(
             "<releaseGroup>",
-            "globalThis.__obscura_objects = {};".to_string(),
+            "__obscura_objects = {};".to_string(),
         );
         self.object_store.clear();
     }

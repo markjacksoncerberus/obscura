@@ -38,34 +38,25 @@ Function.prototype.toString = function() {
 const _markNative = function(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; };
 _nativeFns.add(Function.prototype.toString);
 
-// Engine internals must not pollute the page's `window`. Most runtime plumbing
-// (_wrap, _cache, the __mutation* family, __obscura_focused/click_target/errors)
-// is now module-local — declared as closure bindings where used, so it never
-// touches globalThis at all (invisible to Object.keys AND getOwnPropertyNames).
-//
-// What remains below is only the small set the Rust<->JS eval bridge addresses
-// by literal name (it builds `globalThis.__obscura_objects[...] = ...` source).
-// Pre-declaring each as a non-enumerable, writable, configurable property means
-// every later `globalThis.<name> = ...` assignment — including the ones Rust
-// creates — preserves non-enumerability: reachable by name, but off
-// Object.keys(window)/for-in. (Taking these to zero too needs an op-based
-// bridge that doesn't name globals — tracked as a follow-up.)
+// Engine internals must not pollute the page's `window`. ALL runtime plumbing —
+// including the Rust<->JS eval bridge state — is now declared as top-level
+// lexical bindings (let/const). Those live in the global *lexical* environment,
+// which is shared across every script run in this realm, so Rust's separately-
+// executed eval scripts reach them by BARE name (no `globalThis.` prefix), yet
+// they are absent from BOTH Object.keys(window)/for-in AND
+// Object.getOwnPropertyNames(window). Legitimate Web API constructors stay on
+// `window` (real browsers expose those).
 let __obscura_focused = null;
 let __obscura_click_target = null;
 
-for (const _n of [
-  '__obscura_objects', '__obscura_oid',
-  '__obscura_await_meta', '__obscura_await_rejected', '__obscura_ua',
-]) {
-  try {
-    Object.defineProperty(globalThis, _n, {
-      value: globalThis[_n], // preserve anything already assigned (e.g. __obscura_errors)
-      enumerable: false,
-      writable: true,
-      configurable: true,
-    });
-  } catch (_e) { /* already defined non-config: leave it */ }
-}
+// Rust<->JS eval bridge scratchpad / object registry. `__obscura_objects` is a
+// persistent map of CDP objectId -> live JS value (so callFunctionOn can re-
+// reference a handle returned by an earlier evaluate). Rust mutates these by
+// bare name from its eval scripts (e.g. `__obscura_objects['oid'] = v`).
+let __obscura_objects = {};
+let __obscura_await_meta = null;
+let __obscura_await_rejected = false;
+let __obscura_ua = '';
 
 [Error, TypeError, ReferenceError, SyntaxError, RangeError, URIError, EvalError].forEach(E => {
   try {
@@ -1353,7 +1344,7 @@ const _registerIframe = function(iframeEl) {
   });
 };
 globalThis.navigator = {
-  get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
+  get userAgent() { return __obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
   language: "en-US", languages: ["en-US","en"], platform: "Linux x86_64",
   onLine: true, cookieEnabled: true, hardwareConcurrency: 8,
