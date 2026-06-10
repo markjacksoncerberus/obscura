@@ -1,26 +1,26 @@
 "use strict";
 
-globalThis.__obscura_errors = [];
+const __obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
 globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.preventDefault(); };
 
 globalThis.onerror = function(msg, src, line, col, error) {
-  globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
+  __obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
 };
-globalThis.__windowListeners = {};
+const __windowListeners = {};
 globalThis.addEventListener = function(type, fn) {
-  if (!globalThis.__windowListeners[type]) globalThis.__windowListeners[type] = [];
-  globalThis.__windowListeners[type].push(fn);
+  if (!__windowListeners[type]) __windowListeners[type] = [];
+  __windowListeners[type].push(fn);
 };
 globalThis.removeEventListener = function(type, fn) {
-  if (globalThis.__windowListeners[type]) {
-    globalThis.__windowListeners[type] = globalThis.__windowListeners[type].filter(h => h !== fn);
+  if (__windowListeners[type]) {
+    __windowListeners[type] = __windowListeners[type].filter(h => h !== fn);
   }
 };
 globalThis.dispatchEvent = function(event) {
   if (!event) return true;
-  const handlers = globalThis.__windowListeners[event.type] || [];
+  const handlers = __windowListeners[event.type] || [];
   for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
   return !event.defaultPrevented;
 };
@@ -35,24 +35,27 @@ Function.prototype.toString = function() {
   }
   return _origToString.call(this);
 };
-function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
+const _markNative = function(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; };
 _nativeFns.add(Function.prototype.toString);
 
-// Engine internals must not pollute the page's `window`. Real browsers don't
-// expose runtime plumbing as enumerable globals, and a page that did
-// `window._cache = ...` would otherwise clobber ours. Pre-declaring each name
-// as a non-enumerable, writable, configurable property means every later
-// `globalThis.<name> = ...` assignment — including the ones the Rust<->JS eval
-// bridge creates (__obscura_objects, __obscura_oid, __obscura_await_*) — keeps
-// it off Object.keys(window)/for-in while staying reachable by direct name
-// (which the bridge needs). This runs before any of these are assigned.
+// Engine internals must not pollute the page's `window`. Most runtime plumbing
+// (_wrap, _cache, the __mutation* family, __obscura_focused/click_target/errors)
+// is now module-local — declared as closure bindings where used, so it never
+// touches globalThis at all (invisible to Object.keys AND getOwnPropertyNames).
+//
+// What remains below is only the small set the Rust<->JS eval bridge addresses
+// by literal name (it builds `globalThis.__obscura_objects[...] = ...` source).
+// Pre-declaring each as a non-enumerable, writable, configurable property means
+// every later `globalThis.<name> = ...` assignment — including the ones Rust
+// creates — preserves non-enumerability: reachable by name, but off
+// Object.keys(window)/for-in. (Taking these to zero too needs an op-based
+// bridge that doesn't name globals — tracked as a follow-up.)
+let __obscura_focused = null;
+let __obscura_click_target = null;
+
 for (const _n of [
-  '__obscura_errors', '__obscura_objects', '__obscura_oid',
+  '__obscura_objects', '__obscura_oid',
   '__obscura_await_meta', '__obscura_await_rejected', '__obscura_ua',
-  '__obscura_focused', '__obscura_click_target',
-  '_wrap', '_cache',
-  '__mutationObservers', '__mutationDeliveryScheduled',
-  '__scheduleMutationDelivery', '__notifyMutation',
 ]) {
   try {
     Object.defineProperty(globalThis, _n, {
@@ -85,18 +88,18 @@ if (_origStackDesc && _origStackDesc.get) {
 }
 
 let _fpSeed = 0;
-function _fpRand(salt) {
+const _fpRand = function(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
   h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
   h = Math.imul(h ^ (h >>> 13), 0x45d9f3b);
   return ((h ^ (h >>> 16)) >>> 0) / 0xFFFFFFFF;
-}
-function _fpNoise(x, y, channel) {
+};
+const _fpNoise = function(x, y, channel) {
   return (_fpRand(x * 7919 + y * 6271 + channel * 8923) - 0.5) * 4;
-}
+};
 
-var _fpCache = null;
-function _getFp() {
+let _fpCache = null;
+const _getFp = function() {
   if (_fpCache) return _fpCache;
   const gpuPool = [
     'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
@@ -138,8 +141,8 @@ function _getFp() {
     canvasFingerprint: cfp,
   };
   return _fpCache;
-}
-function _fp(key) { return _getFp()[key]; }
+};
+const _fp = function(key) { return _getFp()[key]; };
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
 globalThis._formChecked = globalThis._formChecked || {};
@@ -263,13 +266,13 @@ class Node {
   get ownerDocument() { return globalThis.document; }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
-    const _watching = globalThis.__mutationObservers?.length;
+    const _watching = __mutationObservers?.length;
     const t = this.nodeType;
     if (t === 3 || t === 8) {
       // Character data node: setting textContent replaces its data.
       const _old = _watching ? (_domParse("text_content", this._nid) ?? "") : null;
       _dom("set_text_content", this._nid, String(v ?? ""));
-      if (_watching) globalThis.__notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
+      if (_watching) __notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
       return;
     }
     const children = _domParse("child_nodes", this._nid) || [];
@@ -280,7 +283,7 @@ class Node {
       _dom("append_child", this._nid, tn);
       added = [tn];
     }
-    if (_watching) globalThis.__notifyMutation('childList', this._nid, added, children);
+    if (_watching) __notifyMutation('childList', this._nid, added, children);
   }
   get nodeValue() {
     const t = this.nodeType;
@@ -290,9 +293,9 @@ class Node {
   set nodeValue(v) {
     const t = this.nodeType;
     if (t === 3 || t === 8) {
-      const _old = globalThis.__mutationObservers?.length ? (_domParse("text_content", this._nid) ?? "") : null;
+      const _old = __mutationObservers?.length ? (_domParse("text_content", this._nid) ?? "") : null;
       _dom("set_text_content", this._nid, String(v ?? ""));
-      if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
+      if (__mutationObservers?.length) __notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
     }
   }
   get parentNode() { return _wrap(+_dom("parent_node", this._nid)); }
@@ -309,9 +312,9 @@ class Node {
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
     if (!c) return c;
-    const _prev = globalThis.__mutationObservers?.length ? +_dom("last_child", this._nid) : -1;
+    const _prev = __mutationObservers?.length ? +_dom("last_child", this._nid) : -1;
     _dom("append_child", this._nid, c._nid);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null });
+    if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [c._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null });
     if (c instanceof Element && c.tagName === 'SCRIPT') {
       const scriptType = c.getAttribute('type') || '';
       if (scriptType && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
@@ -345,33 +348,33 @@ class Node {
   removeChild(c) {
     if (!c) return c;
     let _prev = -1, _next = -1;
-    if (globalThis.__mutationObservers?.length) {
+    if (__mutationObservers?.length) {
       _prev = +_dom("prev_sibling", c._nid);
       _next = +_dom("next_sibling", c._nid);
     }
     _dom("remove_child", c._nid);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
+    if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [], [c._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
     return c;
   }
   replaceChild(newChild, oldChild) {
     if (!oldChild || !newChild) return oldChild;
     let _prev = -1, _next = -1;
-    if (globalThis.__mutationObservers?.length) {
+    if (__mutationObservers?.length) {
       _prev = +_dom("prev_sibling", oldChild._nid);
       _next = +_dom("next_sibling", oldChild._nid);
     }
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
+    if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
     return oldChild;
   }
   insertBefore(n, ref) {
     if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
     _dom("insert_before", n._nid, ref._nid);
-    if (globalThis.__mutationObservers?.length) {
+    if (__mutationObservers?.length) {
       const _prev = +_dom("prev_sibling", n._nid);
-      globalThis.__notifyMutation('childList', this._nid, [n._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: ref._nid });
+      __notifyMutation('childList', this._nid, [n._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: ref._nid });
     }
     return n;
   }
@@ -444,9 +447,9 @@ class CharacterData extends Node {
     return _domParse("text_content", this._nid) ?? "";
   }
   set data(v) {
-    const _old = globalThis.__mutationObservers?.length ? (_domParse("text_content", this._nid) ?? "") : null;
+    const _old = __mutationObservers?.length ? (_domParse("text_content", this._nid) ?? "") : null;
     _dom("set_text_content", this._nid, String(v ?? ""));
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
+    if (__mutationObservers?.length) __notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
   }
   get length() { return this.data.length; }
   substringData(offset, count) {
@@ -514,12 +517,12 @@ class Element extends Node {
       this.content.innerHTML = v;
       return;
     }
-    const _watching = globalThis.__mutationObservers?.length;
+    const _watching = __mutationObservers?.length;
     const _old = _watching ? (_domParse("child_nodes", this._nid) || []) : null;
     _dom("set_inner_html", this._nid, String(v ?? ""));
     if (_watching) {
       const _new = _domParse("child_nodes", this._nid) || [];
-      globalThis.__notifyMutation('childList', this._nid, _new, _old);
+      __notifyMutation('childList', this._nid, _new, _old);
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
@@ -557,15 +560,15 @@ class Element extends Node {
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
   getAttribute(n) { return _domParse("get_attribute", this._nid, n); }
   setAttribute(n, v) {
-    const _old = globalThis.__mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
+    const _old = __mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
     _dom("set_attribute", this._nid, n + "\0" + String(v));
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
+    if (__mutationObservers?.length) __notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
   }
   setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
   removeAttribute(n) {
-    const _old = globalThis.__mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
+    const _old = __mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
     _dom("remove_attribute", this._nid, n);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
+    if (__mutationObservers?.length) __notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
   }
   removeAttributeNS(ns, n) { this.removeAttribute(n); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
@@ -686,8 +689,8 @@ class Element extends Node {
       }
     }
   }
-  focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
-  blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
+  focus() { __obscura_focused = this; __obscura_click_target = this; }
+  blur() { if (__obscura_focused === this) __obscura_focused = null; }
   get value() {
     if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     const tag = this.localName;
@@ -874,7 +877,7 @@ class Element extends Node {
   get scrollTop() { return 0; } set scrollTop(v) {}
   get scrollLeft() { return 0; } set scrollLeft(v) {}
   getBoundingClientRect() {
-    globalThis.__obscura_click_target = this;
+    __obscura_click_target = this;
     // No layout engine, but Playwright's actionability polling needs each
     // element to occupy a stable, distinct rect so hit-testing can pick the
     // right one (issue #45). Synthesize a deterministic position from the
@@ -917,7 +920,7 @@ class Element extends Node {
   set ariaHidden(v) { if (v == null) this.removeAttribute('aria-hidden'); else this.setAttribute('aria-hidden', String(v)); }
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
-  scrollIntoView() { globalThis.__obscura_click_target = this; }
+  scrollIntoView() { __obscura_click_target = this; }
   animate(keyframes, options) {
     const duration = typeof options === 'number' ? options : (options?.duration || 0);
     return {
@@ -1151,7 +1154,7 @@ class Document extends Node {
     return this.createTreeWalker(root, whatToShow, filter);
   }
   getSelection() { return globalThis.getSelection(); }
-  get activeElement() { return globalThis.__obscura_focused || this.body; }
+  get activeElement() { return __obscura_focused || this.body; }
   get implementation() {
     return {
       createHTMLDocument(title) { return globalThis.document; },
@@ -1240,12 +1243,12 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
-function _elementClassFor(nid) {
+const _elementClassFor = function(nid) {
   const tag = _domParse("tag_name", nid);
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   return Element;
-}
-function _wrap(nid) {
+};
+const _wrap = function(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
@@ -1257,26 +1260,26 @@ function _wrap(nid) {
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
-}
-function _wrapEl(nid) {
+};
+const _wrapEl = function(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const C = _elementClassFor(nid);
   const n = new C(nid);
   _cache.set(nid, n);
   return n;
-}
+};
 
-globalThis._wrap = _wrap;
-globalThis._cache = _cache;
+// _wrap / _cache are module-local (declared above); no need to expose them on
+// the page's window — page scripts can neither see nor clobber them.
 globalThis.self = globalThis;
 
 globalThis.document = null;
-function _resolveUrl(url) {
+const _resolveUrl = function(url) {
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
   try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
-}
+};
 globalThis.location = {
   get href() { return _domParse("document_url") ?? "about:blank"; },
   set href(url) { Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
@@ -1339,7 +1342,7 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
 
 
 const _iframeRegistry = [];
-function _registerIframe(iframeEl) {
+const _registerIframe = function(iframeEl) {
   const idx = _iframeRegistry.length;
   _iframeRegistry.push(iframeEl);
   globalThis.length = _iframeRegistry.length;
@@ -1348,7 +1351,7 @@ function _registerIframe(iframeEl) {
     configurable: true,
     enumerable: false,
   });
-}
+};
 globalThis.navigator = {
   get userAgent() { return globalThis.__obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
@@ -1462,7 +1465,7 @@ globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 globalThis.__fetchInterceptEnabled = false;
 globalThis.__fetchInterceptCallback = null; // Set by CDP to handle paused requests
 
-function _base64ToUint8Array(b64) {
+const _base64ToUint8Array = function(b64) {
   const clean = String(b64 || '').replace(/[\r\n\s]/g, '');
   if (!clean) return new Uint8Array();
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1480,21 +1483,21 @@ function _base64ToUint8Array(b64) {
     if (out < bytes.length) bytes[out++] = n & 0xff;
   }
   return bytes;
-}
+};
 
-function _bodyToUint8Array(body) {
+const _bodyToUint8Array = function(body) {
   if (body == null) return new Uint8Array();
   if (body instanceof Uint8Array) return body;
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
   return new TextEncoder().encode(String(body));
-}
+};
 
-function _arrayBufferFromBytes(bytes) {
+const _arrayBufferFromBytes = function(bytes) {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-}
+};
 
-function _installWasmStreamingFallback() {
+const _installWasmStreamingFallback = function() {
   if (typeof WebAssembly === 'undefined') return;
   if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
   const nativeInstantiateStreaming = WebAssembly.instantiateStreaming;
@@ -1510,7 +1513,7 @@ function _installWasmStreamingFallback() {
   };
   fallback.__obscuraFallback = true;
   WebAssembly.instantiateStreaming = fallback;
-}
+};
 _installWasmStreamingFallback();
 
 globalThis.fetch = async (input, init = {}) => {
@@ -2080,7 +2083,7 @@ Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
   set(sheets) { this._adoptedStyleSheets = sheets; },
 });
 
-globalThis.__mutationObservers = [];
+const __mutationObservers = [];
 globalThis.MutationObserver = class MutationObserver {
   constructor(callback) {
     this._callback = callback;
@@ -2096,13 +2099,13 @@ globalThis.MutationObserver = class MutationObserver {
     // Replace any existing registration for the same target node.
     this._targets = this._targets.filter(t => t.target._nid !== target._nid);
     this._targets.push({ target, options: opts });
-    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
+    if (!__mutationObservers.includes(this)) __mutationObservers.push(this);
   }
   disconnect() {
     this._targets = [];
     this._records = [];
-    const idx = globalThis.__mutationObservers.indexOf(this);
-    if (idx >= 0) globalThis.__mutationObservers.splice(idx, 1);
+    const idx = __mutationObservers.indexOf(this);
+    if (idx >= 0) __mutationObservers.splice(idx, 1);
   }
   takeRecords() {
     const r = this._records.slice();
@@ -2142,23 +2145,23 @@ globalThis.MutationObserver = class MutationObserver {
     if (rec.type === 'attributes' && o.attributeOldValue) out.oldValue = rec.oldValue ?? null;
     if (rec.type === 'characterData' && o.characterDataOldValue) out.oldValue = rec.oldValue ?? null;
     this._records.push(out);
-    globalThis.__scheduleMutationDelivery();
+    __scheduleMutationDelivery();
   }
 };
 
 // Deliver every observer's queued records on a microtask. Callbacks may mutate
 // the DOM and produce new records, so loop (with a cap) until quiescent.
-globalThis.__mutationDeliveryScheduled = false;
-globalThis.__scheduleMutationDelivery = function() {
-  if (globalThis.__mutationDeliveryScheduled) return;
-  globalThis.__mutationDeliveryScheduled = true;
+let __mutationDeliveryScheduled = false;
+const __scheduleMutationDelivery = function() {
+  if (__mutationDeliveryScheduled) return;
+  __mutationDeliveryScheduled = true;
   Promise.resolve().then(() => {
-    globalThis.__mutationDeliveryScheduled = false;
+    __mutationDeliveryScheduled = false;
     let iterations = 0;
     let delivered;
     do {
       delivered = false;
-      for (const obs of globalThis.__mutationObservers.slice()) {
+      for (const obs of __mutationObservers.slice()) {
         if (obs._records.length === 0) continue;
         const batch = obs._records.splice(0);
         delivered = true;
@@ -2169,28 +2172,28 @@ globalThis.__scheduleMutationDelivery = function() {
 };
 
 // Enqueue a MutationRecord for all interested observers. Targets/nodes are
-// resolved via globalThis._wrap so a wrapper is minted on demand (the module
+// resolved via _wrap so a wrapper is minted on demand (the module
 // cache may not yet hold one for a freshly created nid).
 // TODO(dom-phase-0c): mutations performed purely in Rust via op_dom
 // (set_inner_html / set_text_content done Rust-side) won't emit records until a
 // Rust-side mutation broadcast (drain_mutations op) exists. This first cut
 // covers JS-initiated mutations, which is what frameworks (React/Vue) do.
-globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, extra) {
-  if (!globalThis.__mutationObservers.length) return;
-  const target = globalThis._wrap(target_nid);
+const __notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, extra) {
+  if (!__mutationObservers.length) return;
+  const target = _wrap(target_nid);
   if (!target) return;
   extra = extra || {};
   const rec = {
     type: type, // 'childList' | 'attributes' | 'characterData'
     target: target,
-    addedNodes: (addedNodes || []).map(nid => globalThis._wrap(nid)).filter(Boolean),
-    removedNodes: (removedNodes || []).map(nid => globalThis._wrap(nid)).filter(Boolean),
+    addedNodes: (addedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
+    removedNodes: (removedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
     attributeName: attributeName || null,
     oldValue: extra.oldValue ?? null,
-    previousSibling: extra.previousSibling != null ? globalThis._wrap(extra.previousSibling) : null,
-    nextSibling: extra.nextSibling != null ? globalThis._wrap(extra.nextSibling) : null,
+    previousSibling: extra.previousSibling != null ? _wrap(extra.previousSibling) : null,
+    nextSibling: extra.nextSibling != null ? _wrap(extra.nextSibling) : null,
   };
-  for (const obs of globalThis.__mutationObservers) obs._enqueue(rec);
+  for (const obs of __mutationObservers) obs._enqueue(rec);
 };
 
 globalThis.ShadowRoot = class ShadowRoot {};
@@ -2280,7 +2283,7 @@ globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o)
 globalThis.ClipboardEvent = class extends Event {};
 globalThis.SubmitEvent = class extends Event {};
 
-function _abortError(name, msg) { if (typeof DOMException === 'function') return new DOMException(msg, name); const e = new Error(msg); e.name = name; return e; }
+const _abortError = function(name, msg) { if (typeof DOMException === 'function') return new DOMException(msg, name); const e = new Error(msg); e.name = name; return e; };
 globalThis.AbortSignal = class AbortSignal {
   constructor() { this.aborted = false; this.reason = undefined; this.onabort = null; this._listeners = []; }
   addEventListener(type, fn) { if (type === 'abort' && typeof fn === 'function') this._listeners.push(fn); }
@@ -2685,8 +2688,8 @@ class _IframeWindow {
   blur() {}
 }
 
-globalThis.__ariaQuerySelector = function(root, selector) { return null; };
-globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
+const __ariaQuerySelector = function(root, selector) { return null; };
+const __ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
@@ -3126,7 +3129,7 @@ globalThis.Worker = class Worker {
     const worker = this;
 
     if (typeof url === 'string' && (url.startsWith('blob:') || url.startsWith('http'))) {
-      const blobContent = globalThis.__blobStore?.[url];
+      const blobContent = __blobStore?.[url];
       if (blobContent) {
         this._code = blobContent;
       } else {
@@ -3186,18 +3189,18 @@ globalThis.Worker = class Worker {
   }
 };
 
-globalThis.__blobStore = globalThis.__blobStore || {};
+const __blobStore = {};
 const _origCreateObjectURL = URL.createObjectURL;
 URL.createObjectURL = function(blob) {
   if (blob && typeof blob.text === 'function') {
     const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
-    blob.text().then(text => { globalThis.__blobStore[id] = text; });
+    blob.text().then(text => { __blobStore[id] = text; });
     return id;
   }
   return 'blob:obscura/fallback';
 };
 URL.revokeObjectURL = function(url) {
-  delete globalThis.__blobStore[url];
+  delete __blobStore[url];
 };
 
 globalThis.scrollTo = function(x, y) {};
