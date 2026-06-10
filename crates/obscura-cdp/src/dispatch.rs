@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use obscura_browser::{BrowserContext, Page};
+use obscura_browser::{BrowserContext, Page, RenderSettings};
 use obscura_js::ops::InterceptedRequest;
 use serde_json::json;
 
@@ -66,7 +66,14 @@ impl CdpContext {
         user_agent: Option<String>,
         storage_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        Self::_new_inner(proxy, stealth, user_agent, storage_dir, false)
+        Self::_new_inner(
+            proxy,
+            stealth,
+            user_agent,
+            storage_dir,
+            false,
+            RenderSettings::default(),
+        )
     }
 
     pub fn new_with_security(
@@ -75,7 +82,34 @@ impl CdpContext {
         user_agent: Option<String>,
         allow_file_access: bool,
     ) -> Self {
-        Self::_new_inner(proxy, stealth, user_agent, None, allow_file_access)
+        Self::_new_inner(
+            proxy,
+            stealth,
+            user_agent,
+            None,
+            allow_file_access,
+            RenderSettings::default(),
+        )
+    }
+
+    /// Full constructor including render configuration. Used by the server so
+    /// `--render-mode` / `--window-size` reach every page.
+    pub fn new_with_security_and_render(
+        proxy: Option<String>,
+        stealth: bool,
+        user_agent: Option<String>,
+        allow_file_access: bool,
+        storage_dir: Option<std::path::PathBuf>,
+        render: RenderSettings,
+    ) -> Self {
+        Self::_new_inner(
+            proxy,
+            stealth,
+            user_agent,
+            storage_dir,
+            allow_file_access,
+            render,
+        )
     }
 
     fn _new_inner(
@@ -84,6 +118,7 @@ impl CdpContext {
         user_agent: Option<String>,
         storage_dir: Option<std::path::PathBuf>,
         allow_file_access: bool,
+        render: RenderSettings,
     ) -> Self {
         let mut ctx = if let Some(ref dir) = storage_dir {
             BrowserContext::with_storage_full(
@@ -94,14 +129,11 @@ impl CdpContext {
                 Some(dir.clone()),
             )
         } else {
-            BrowserContext::with_full_options(
-                "default".to_string(),
-                proxy,
-                stealth,
-                user_agent,
-            )
+            BrowserContext::with_full_options("default".to_string(), proxy, stealth, user_agent)
         };
         ctx.allow_file_access = allow_file_access;
+        ctx.render_mode = render.mode;
+        ctx.default_viewport = render.viewport;
         let default_context = Arc::new(ctx);
         // Pre-seed with the default-frame execution context ids that
         // `Runtime.enable` (1) and post-navigation re-emission (2) advertise
@@ -124,6 +156,44 @@ impl CdpContext {
             intercept_tx: None,
             isolated_worlds: Vec::new(),
             valid_context_ids,
+        }
+    }
+
+    /// Build a context that reuses an already-constructed `BrowserContext`
+    /// (shared cookie jar / proxy / robots cache) instead of creating a fresh
+    /// one. Used by a per-page thread (issue #19 Option 2): each thread runs
+    /// its own single-page `CdpContext` so the existing domain handlers work
+    /// unchanged, while cookies and the browser context stay shared across all
+    /// page threads via the `Arc`.
+    pub fn with_shared_context(default_context: Arc<BrowserContext>) -> Self {
+        let mut valid_context_ids = HashSet::new();
+        valid_context_ids.insert(1);
+        valid_context_ids.insert(2);
+        CdpContext {
+            pages: Vec::new(),
+            sessions: HashMap::new(),
+            pending_events: Vec::new(),
+            default_context,
+            page_counter: 0,
+            preload_scripts: Vec::new(),
+            preload_counter: 0,
+            fetch_intercept: FetchInterceptState::new(),
+            intercept_tx: None,
+            isolated_worlds: Vec::new(),
+            valid_context_ids,
+        }
+    }
+
+    /// Register a page that already has an assigned id (e.g. one minted by the
+    /// router on the main thread) and bind a session to it. Used by a page
+    /// thread to materialize its single page with the externally-chosen id so
+    /// session routing lines up. Returns a mutable ref to the new page.
+    pub fn insert_page_with_id(&mut self, page_id: String, session_id: Option<String>) {
+        let mut page = Page::new(page_id.clone(), self.default_context.clone());
+        page.navigate_blank();
+        self.pages.push(page);
+        if let Some(sid) = session_id {
+            self.sessions.insert(sid, page_id);
         }
     }
 
@@ -150,9 +220,7 @@ impl CdpContext {
     }
 
     pub fn get_session_page(&self, session_id: &Option<String>) -> Option<&Page> {
-        let page_id = session_id
-            .as_ref()
-            .and_then(|sid| self.sessions.get(sid))?;
+        let page_id = session_id.as_ref().and_then(|sid| self.sessions.get(sid))?;
         self.get_page(page_id)
     }
 
@@ -180,36 +248,29 @@ impl CdpContext {
     }
 }
 
+/// Single-page dispatch entry retained for unit tests and the
+/// `Target.sendMessageToTarget` unwrap path. The live server no longer calls
+/// this — it routes through [`dispatch_routed`] on per-page threads
+/// (issue #19 "Option 2"), where each `JsRuntime`/Isolate is pinned to its own
+/// OS thread, so the process-wide V8 lock the old single-thread model needed is
+/// gone entirely.
 pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
-    // headless_chrome (and older Puppeteer) wrap every CDP call inside
-    // Target.sendMessageToTarget. Unwrap and recurse BEFORE acquiring the
-    // V8 lock — the recursive dispatch will acquire it for the inner call,
-    // and tokio Mutex is not reentrant.
     if req.method == "Target.sendMessageToTarget" {
         return dispatch_send_message_to_target(req, ctx).await;
     }
+    dispatch_routed(req, ctx).await
+}
 
-    // Issue #19: V8 fatal abort under concurrent CDP work.
-    //
-    // Every CDP handler below may end up calling into a per-Page `JsRuntime`
-    // (each owning its own V8 Isolate). All of them run on a single OS
-    // thread (current_thread tokio + LocalSet). When two pages' V8-touching
-    // futures interleave across an `.await` (which `process_with_interception`
-    // can trigger by handling new CDP messages while a navigation task is in
-    // flight on `spawn_local`), V8 trips the
-    // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts the
-    // process via `V8_Fatal` — no Rust panic, just `abort(3)`.
-    //
-    // Holding the process-wide V8 lock around the entire dispatch keeps each
-    // handler contiguous on the thread: V8 fully exits one Isolate before
-    // the next page is allowed in. This converts the abort into latency.
-    // It overshoots — non-V8 handlers (Browser.*, Storage.*, Emulation.*)
-    // also serialize — but those are cheap and the safety win dominates.
-    //
-    // The properly concurrent fix is to pin each `JsRuntime` to its own OS
-    // thread and message-pass; that's tracked as the larger #19 follow-up.
-    let _v8_guard = obscura_js::v8_lock::global().lock().await;
-
+/// Route a CDP request to its domain handler WITHOUT acquiring the process-wide
+/// V8 lock.
+///
+/// Safe to call directly only when the caller guarantees V8 thread-affinity —
+/// i.e. a per-page thread that exclusively owns its `JsRuntime`/Isolate (issue
+/// #19 "Option 2"). On a dedicated thread no other isolate is ever entered, so
+/// the `heap->isolate() == Isolate::TryGetCurrent()` hazard the global lock
+/// guards against cannot occur. The legacy single-thread `dispatch` above wraps
+/// this in the process-wide lock instead.
+pub async fn dispatch_routed(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     let (domain, method) = match req.method.split_once('.') {
         Some((d, m)) => (d, m),
         None => {
@@ -233,16 +294,15 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
-        "Accessibility" => domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await,
+        "Accessibility" => {
+            domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await
+        }
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
-        "Emulation" | "Log" | "Performance" | "Security" | "CSS"
-        | "ServiceWorker" | "Inspector"
-        | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
-        | "Audits" => {
-            Ok(json!({}))
-        }
+        "Emulation" => domains::emulation::handle(method, &req.params, ctx, &req.session_id).await,
+        "Log" | "Performance" | "Security" | "CSS" | "ServiceWorker" | "Inspector" | "Debugger"
+        | "Profiler" | "HeapProfiler" | "Overlay" | "Audits" => Ok(json!({})),
         _ => Err(format!("Unknown domain: {}", domain)),
     };
 
@@ -330,7 +390,11 @@ mod tests {
     async fn audits_enable_returns_empty_success() {
         let mut ctx = CdpContext::new();
         let resp = dispatch(&req("Audits.enable"), &mut ctx).await;
-        assert!(resp.error.is_none(), "Audits.enable should not error: {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "Audits.enable should not error: {:?}",
+            resp.error
+        );
         assert_eq!(resp.result, Some(json!({})));
     }
 
@@ -362,7 +426,11 @@ mod tests {
         };
 
         let resp = dispatch(&outer, &mut ctx).await;
-        assert!(resp.error.is_none(), "wrapper must succeed: {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "wrapper must succeed: {:?}",
+            resp.error
+        );
         assert_eq!(resp.id, 99);
         assert_eq!(resp.result, Some(json!({})));
 
@@ -378,8 +446,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(inner_msg).unwrap();
         assert_eq!(parsed["id"], 42);
         // Browser.getVersion returns a populated result object, not an error.
-        assert!(parsed.get("result").is_some(), "inner response carries result");
-        assert!(parsed.get("error").is_none(), "inner response is not an error");
+        assert!(
+            parsed.get("result").is_some(),
+            "inner response carries result"
+        );
+        assert!(
+            parsed.get("error").is_none(),
+            "inner response is not an error"
+        );
     }
 
     #[tokio::test]

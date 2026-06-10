@@ -237,12 +237,24 @@ class Node {
   get ownerDocument() { return globalThis.document; }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
+    const _watching = globalThis.__mutationObservers?.length;
+    const t = this.nodeType;
+    if (t === 3 || t === 8) {
+      // Character data node: setting textContent replaces its data.
+      const _old = _watching ? (_domParse("text_content", this._nid) ?? "") : null;
+      _dom("set_text_content", this._nid, String(v ?? ""));
+      if (_watching) globalThis.__notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
+      return;
+    }
     const children = _domParse("child_nodes", this._nid) || [];
     for (const c of children) _dom("remove_child", c);
+    let added = [];
     if (v != null && v !== "") {
       const tn = +_dom("create_text_node", String(v));
       _dom("append_child", this._nid, tn);
+      added = [tn];
     }
+    if (_watching) globalThis.__notifyMutation('childList', this._nid, added, children);
   }
   get nodeValue() {
     const t = this.nodeType;
@@ -251,7 +263,11 @@ class Node {
   }
   set nodeValue(v) {
     const t = this.nodeType;
-    if (t === 3 || t === 8) _dom("set_text_content", this._nid, String(v ?? ""));
+    if (t === 3 || t === 8) {
+      const _old = globalThis.__mutationObservers?.length ? (_domParse("text_content", this._nid) ?? "") : null;
+      _dom("set_text_content", this._nid, String(v ?? ""));
+      if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
+    }
   }
   get parentNode() { return _wrap(+_dom("parent_node", this._nid)); }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
@@ -267,8 +283,9 @@ class Node {
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
     if (!c) return c;
+    const _prev = globalThis.__mutationObservers?.length ? +_dom("last_child", this._nid) : -1;
     _dom("append_child", this._nid, c._nid);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null });
     if (c instanceof Element && c.tagName === 'SCRIPT') {
       const scriptType = c.getAttribute('type') || '';
       if (scriptType && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
@@ -301,20 +318,35 @@ class Node {
   }
   removeChild(c) {
     if (!c) return c;
+    let _prev = -1, _next = -1;
+    if (globalThis.__mutationObservers?.length) {
+      _prev = +_dom("prev_sibling", c._nid);
+      _next = +_dom("next_sibling", c._nid);
+    }
     _dom("remove_child", c._nid);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
     return c;
   }
   replaceChild(newChild, oldChild) {
     if (!oldChild || !newChild) return oldChild;
+    let _prev = -1, _next = -1;
+    if (globalThis.__mutationObservers?.length) {
+      _prev = +_dom("prev_sibling", oldChild._nid);
+      _next = +_dom("next_sibling", oldChild._nid);
+    }
     _dom("insert_before", newChild._nid, oldChild._nid);
     _dom("remove_child", oldChild._nid);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
     return oldChild;
   }
   insertBefore(n, ref) {
     if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
     _dom("insert_before", n._nid, ref._nid);
+    if (globalThis.__mutationObservers?.length) {
+      const _prev = +_dom("prev_sibling", n._nid);
+      globalThis.__notifyMutation('childList', this._nid, [n._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: ref._nid });
+    }
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -386,7 +418,9 @@ class CharacterData extends Node {
     return _domParse("text_content", this._nid) ?? "";
   }
   set data(v) {
+    const _old = globalThis.__mutationObservers?.length ? (_domParse("text_content", this._nid) ?? "") : null;
     _dom("set_text_content", this._nid, String(v ?? ""));
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
   }
   get length() { return this.data.length; }
   substringData(offset, count) {
@@ -454,7 +488,13 @@ class Element extends Node {
       this.content.innerHTML = v;
       return;
     }
+    const _watching = globalThis.__mutationObservers?.length;
+    const _old = _watching ? (_domParse("child_nodes", this._nid) || []) : null;
     _dom("set_inner_html", this._nid, String(v ?? ""));
+    if (_watching) {
+      const _new = _domParse("child_nodes", this._nid) || [];
+      globalThis.__notifyMutation('childList', this._nid, _new, _old);
+    }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
   get innerText() { return this.textContent; }
@@ -491,11 +531,16 @@ class Element extends Node {
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
   getAttribute(n) { return _domParse("get_attribute", this._nid, n); }
   setAttribute(n, v) {
+    const _old = globalThis.__mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
     _dom("set_attribute", this._nid, n + "\0" + String(v));
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
   }
   setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
-  removeAttribute(n) { _dom("remove_attribute", this._nid, n); }
+  removeAttribute(n) {
+    const _old = globalThis.__mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
+    _dom("remove_attribute", this._nid, n);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
+  }
   removeAttributeNS(ns, n) { this.removeAttribute(n); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
@@ -1197,6 +1242,7 @@ function _wrapEl(nid) {
 }
 
 globalThis._wrap = _wrap;
+globalThis._cache = _cache;
 globalThis.self = globalThis;
 
 globalThis.document = null;
@@ -1438,6 +1484,10 @@ function _installWasmStreamingFallback() {
 _installWasmStreamingFallback();
 
 globalThis.fetch = async (input, init = {}) => {
+  const _signal = init.signal || (input instanceof Request ? input.signal : null);
+  if (_signal && _signal.aborted) {
+    return Promise.reject(_signal.reason !== undefined ? _signal.reason : _abortError('AbortError', 'The operation was aborted'));
+  }
   let url = typeof input === "string"
     ? input
     : (input instanceof Request
@@ -1454,7 +1504,10 @@ globalThis.fetch = async (input, init = {}) => {
   const body = init.body ? String(init.body) : "";
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
+  const _fetchPromise = Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
+  const raw = _signal
+    ? await Promise.race([_fetchPromise, new Promise((_, reject) => { _signal.addEventListener('abort', () => { reject(_signal.reason !== undefined ? _signal.reason : _abortError('AbortError', 'The operation was aborted')); }); })])
+    : await _fetchPromise;
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -2001,55 +2054,113 @@ globalThis.__mutationObservers = [];
 globalThis.MutationObserver = class MutationObserver {
   constructor(callback) {
     this._callback = callback;
-    this._targets = [];
-    this._records = [];
+    this._targets = [];   // [{target, options}]
+    this._records = [];   // queued MutationRecords pending delivery
   }
   observe(target, options) {
-    this._targets.push({ target, options: options || {} });
-    globalThis.__mutationObservers.push(this);
+    if (!target) return;
+    const opts = options || {};
+    // Normalise: characterData/attributes implied when *OldValue/attributeFilter set.
+    if (opts.attributeOldValue || opts.attributeFilter) opts.attributes = true;
+    if (opts.characterDataOldValue) opts.characterData = true;
+    // Replace any existing registration for the same target node.
+    this._targets = this._targets.filter(t => t.target._nid !== target._nid);
+    this._targets.push({ target, options: opts });
+    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
   }
   disconnect() {
     this._targets = [];
+    this._records = [];
     const idx = globalThis.__mutationObservers.indexOf(this);
     if (idx >= 0) globalThis.__mutationObservers.splice(idx, 1);
   }
   takeRecords() {
     const r = this._records.slice();
-    this._records = [];
+    this._records.length = 0;
     return r;
   }
-  _notify(records) {
-    this._records.push(...records);
-    Promise.resolve().then(() => {
-      if (this._records.length > 0) {
-        const batch = this._records.splice(0);
-        try { this._callback(batch, this); } catch(e) { /* observer errors shouldn't propagate */ }
-      }
-    });
+  // Does record `rec` apply to any of this observer's registered targets?
+  _matches(rec) {
+    for (const t of this._targets) {
+      const o = t.options;
+      if (rec.type === 'childList' && !o.childList) continue;
+      if (rec.type === 'attributes' && !o.attributes) continue;
+      if (rec.type === 'characterData' && !o.characterData) continue;
+      if (rec.type === 'attributes' && o.attributeFilter &&
+          !o.attributeFilter.includes(rec.attributeName)) continue;
+      if (t.target._nid === rec.target._nid) return t;
+      if (o.subtree && t.target.contains && t.target.contains(rec.target)) return t;
+    }
+    return null;
+  }
+  _enqueue(rec) {
+    const t = this._matches(rec);
+    if (!t) return;
+    const o = t.options;
+    // Tailor record to what this observer asked for (oldValue is opt-in).
+    const out = {
+      type: rec.type,
+      target: rec.target,
+      addedNodes: rec.addedNodes,
+      removedNodes: rec.removedNodes,
+      previousSibling: rec.previousSibling,
+      nextSibling: rec.nextSibling,
+      attributeName: rec.type === 'attributes' ? rec.attributeName : null,
+      attributeNamespace: null,
+      oldValue: null,
+    };
+    if (rec.type === 'attributes' && o.attributeOldValue) out.oldValue = rec.oldValue ?? null;
+    if (rec.type === 'characterData' && o.characterDataOldValue) out.oldValue = rec.oldValue ?? null;
+    this._records.push(out);
+    globalThis.__scheduleMutationDelivery();
   }
 };
-globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName) {
-  if (!globalThis.__mutationObservers.length) return;
-  const target = globalThis._cache?.get(target_nid) || null;
-  if (!target) return;
-  const record = {
-    type: type, // 'childList', 'attributes', 'characterData'
-    target: target,
-    addedNodes: (addedNodes || []).map(nid => globalThis._cache?.get(nid) || null).filter(Boolean),
-    removedNodes: (removedNodes || []).map(nid => globalThis._cache?.get(nid) || null).filter(Boolean),
-    attributeName: attributeName || null,
-    oldValue: null,
-    previousSibling: null,
-    nextSibling: null,
-  };
-  for (const obs of globalThis.__mutationObservers) {
-    for (const t of obs._targets) {
-      if (t.target._nid === target_nid || (t.options.subtree && target.contains && target.closest && true)) {
-        obs._notify([record]);
-        break;
+
+// Deliver every observer's queued records on a microtask. Callbacks may mutate
+// the DOM and produce new records, so loop (with a cap) until quiescent.
+globalThis.__mutationDeliveryScheduled = false;
+globalThis.__scheduleMutationDelivery = function() {
+  if (globalThis.__mutationDeliveryScheduled) return;
+  globalThis.__mutationDeliveryScheduled = true;
+  Promise.resolve().then(() => {
+    globalThis.__mutationDeliveryScheduled = false;
+    let iterations = 0;
+    let delivered;
+    do {
+      delivered = false;
+      for (const obs of globalThis.__mutationObservers.slice()) {
+        if (obs._records.length === 0) continue;
+        const batch = obs._records.splice(0);
+        delivered = true;
+        try { obs._callback(batch, obs); } catch(e) { /* observer errors shouldn't propagate */ }
       }
-    }
-  }
+    } while (delivered && ++iterations < 64);
+  });
+};
+
+// Enqueue a MutationRecord for all interested observers. Targets/nodes are
+// resolved via globalThis._wrap so a wrapper is minted on demand (the module
+// cache may not yet hold one for a freshly created nid).
+// TODO(dom-phase-0c): mutations performed purely in Rust via op_dom
+// (set_inner_html / set_text_content done Rust-side) won't emit records until a
+// Rust-side mutation broadcast (drain_mutations op) exists. This first cut
+// covers JS-initiated mutations, which is what frameworks (React/Vue) do.
+globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNodes, attributeName, extra) {
+  if (!globalThis.__mutationObservers.length) return;
+  const target = globalThis._wrap(target_nid);
+  if (!target) return;
+  extra = extra || {};
+  const rec = {
+    type: type, // 'childList' | 'attributes' | 'characterData'
+    target: target,
+    addedNodes: (addedNodes || []).map(nid => globalThis._wrap(nid)).filter(Boolean),
+    removedNodes: (removedNodes || []).map(nid => globalThis._wrap(nid)).filter(Boolean),
+    attributeName: attributeName || null,
+    oldValue: extra.oldValue ?? null,
+    previousSibling: extra.previousSibling != null ? globalThis._wrap(extra.previousSibling) : null,
+    nextSibling: extra.nextSibling != null ? globalThis._wrap(extra.nextSibling) : null,
+  };
+  for (const obs of globalThis.__mutationObservers) obs._enqueue(rec);
 };
 
 globalThis.ShadowRoot = class ShadowRoot {};
@@ -2139,8 +2250,25 @@ globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o)
 globalThis.ClipboardEvent = class extends Event {};
 globalThis.SubmitEvent = class extends Event {};
 
-globalThis.AbortController = class AbortController { constructor(){this.signal={aborted:false,addEventListener(){},removeEventListener(){},onabort:null};} abort(){this.signal.aborted=true;} };
-globalThis.AbortSignal = { timeout(ms){return {aborted:false,addEventListener(){},removeEventListener(){}}; } };
+function _abortError(name, msg) { if (typeof DOMException === 'function') return new DOMException(msg, name); const e = new Error(msg); e.name = name; return e; }
+globalThis.AbortSignal = class AbortSignal {
+  constructor() { this.aborted = false; this.reason = undefined; this.onabort = null; this._listeners = []; }
+  addEventListener(type, fn) { if (type === 'abort' && typeof fn === 'function') this._listeners.push(fn); }
+  removeEventListener(type, fn) { if (type === 'abort') { const i = this._listeners.indexOf(fn); if (i >= 0) this._listeners.splice(i, 1); } }
+  dispatchEvent(ev) { const type = ev && ev.type; if (type === 'abort') { const list = this._listeners.slice(); for (const fn of list) { try { fn.call(this, ev); } catch (e) {} } if (typeof this.onabort === 'function') { try { this.onabort.call(this, ev); } catch (e) {} } } return true; }
+  throwIfAborted() { if (this.aborted) throw (this.reason !== undefined ? this.reason : _abortError('AbortError', 'The operation was aborted')); }
+  _fireAbort() { const ev = (typeof Event === 'function') ? new Event('abort') : { type: 'abort' }; this.dispatchEvent(ev); }
+  static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = (reason !== undefined ? reason : _abortError('AbortError', 'The operation was aborted')); return s; }
+  static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { if (!s.aborted) { s.aborted = true; s.reason = _abortError('TimeoutError', 'The operation timed out'); s._fireAbort(); } }, ms); return s; }
+  static any(signals) { const s = new AbortSignal(); const arr = Array.from(signals || []); for (const inp of arr) { if (inp && inp.aborted) { s.aborted = true; s.reason = inp.reason; return s; } } const onAbort = function() { if (!s.aborted) { s.aborted = true; s.reason = this.reason; s._fireAbort(); } }; for (const inp of arr) { if (inp && typeof inp.addEventListener === 'function') inp.addEventListener('abort', onAbort); } return s; }
+};
+globalThis.AbortController = class AbortController {
+  constructor() { this.signal = new AbortSignal(); }
+  abort(reason) { if (this.signal.aborted) return; this.signal.aborted = true; this.signal.reason = (reason !== undefined ? reason : _abortError('AbortError', 'The operation was aborted')); this.signal._fireAbort(); }
+};
+_markNative(AbortSignal); _markNative(AbortSignal.abort); _markNative(AbortSignal.timeout); _markNative(AbortSignal.any);
+_markNative(AbortSignal.prototype.addEventListener); _markNative(AbortSignal.prototype.removeEventListener); _markNative(AbortSignal.prototype.dispatchEvent); _markNative(AbortSignal.prototype.throwIfAborted);
+_markNative(AbortController); _markNative(AbortController.prototype.abort);
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };

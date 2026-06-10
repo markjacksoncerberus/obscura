@@ -1,0 +1,28 @@
+[package]
+name = "obscura-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless HTML/CSS rendering for Obscura, backed by the Blitz engine (CPU rasterizer)."
+
+[dependencies]
+# `default-features = false` drops blitz-dom's `system_fonts` feature, which
+# would otherwise pull `parley/system` → fontconfig (a build- and run-time
+# system library). We render with the bundled font only, so we want neither.
+# `svg`/`woff` are pure-Rust and keep SVG images and WOFF/WOFF2 web fonts
+# working. `accessibility`, `custom-widget`, and `file_input` are irrelevant to
+# headless rasterization and stay off.
+blitz-dom = { version = "=0.3.0-alpha.4", default-features = false, features = ["svg", "woff"] }
+blitz-html = "=0.3.0-alpha.4"
+blitz-paint = "=0.3.0-alpha.4"
+blitz-traits = "=0.3.0-alpha.4"
+anyrender = "0.10"
+anyrender_vello_cpu = "0.13"
+# 2D geometry/paint primitives. Pinned to the same versions Blitz/anyrender
+# resolve to so the `PaintScene` brush/shape types unify across crates.
+peniko = "0.6"
+kurbo = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }

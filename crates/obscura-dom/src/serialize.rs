@@ -3,17 +3,33 @@ use crate::tree::{DomTree, NodeData, NodeId};
 impl DomTree {
     pub fn outer_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_node(node_id, true, &mut buf);
+        self.serialize_node(node_id, true, false, &mut buf);
         buf
     }
 
     pub fn inner_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_children(node_id, &mut buf);
+        self.serialize_children(node_id, false, &mut buf);
         buf
     }
 
-    fn serialize_node(&self, node_id: NodeId, include_self: bool, buf: &mut String) {
+    /// Like [`outer_html`](Self::outer_html), but stamps every element with a
+    /// `data-obscura-nid="<NodeId>"` attribute. A downstream renderer (Blitz)
+    /// can then map a painted/laid-out node back to the originating Obscura
+    /// [`NodeId`] for geometry queries (`getBoundingClientRect`, box model, …).
+    pub fn outer_html_with_obscura_ids(&self, node_id: NodeId) -> String {
+        let mut buf = String::new();
+        self.serialize_node(node_id, true, true, &mut buf);
+        buf
+    }
+
+    fn serialize_node(
+        &self,
+        node_id: NodeId,
+        include_self: bool,
+        emit_nids: bool,
+        buf: &mut String,
+    ) {
         let node = match self.get_node(node_id) {
             Some(n) => n,
             None => return,
@@ -21,7 +37,7 @@ impl DomTree {
 
         match &node.data {
             NodeData::Document => {
-                self.serialize_children(node_id, buf);
+                self.serialize_children(node_id, emit_nids, buf);
             }
             NodeData::Doctype { name, .. } => {
                 buf.push_str("<!DOCTYPE ");
@@ -41,11 +57,16 @@ impl DomTree {
                         escape_attr(&attr.value, buf);
                         buf.push('"');
                     }
+                    if emit_nids {
+                        buf.push_str(" data-obscura-nid=\"");
+                        buf.push_str(&node_id.raw().to_string());
+                        buf.push('"');
+                    }
                     buf.push('>');
                 }
 
                 if !is_void_element(tag) {
-                    self.serialize_children(node_id, buf);
+                    self.serialize_children(node_id, emit_nids, buf);
                     if include_self {
                         buf.push_str("</");
                         buf.push_str(tag);
@@ -54,7 +75,8 @@ impl DomTree {
                 }
             }
             NodeData::Text { contents } => {
-                let parent_is_raw = node.parent
+                let parent_is_raw = node
+                    .parent
                     .and_then(|pid| {
                         self.with_node(pid, |p| {
                             p.as_element()
@@ -85,9 +107,9 @@ impl DomTree {
         }
     }
 
-    fn serialize_children(&self, node_id: NodeId, buf: &mut String) {
+    fn serialize_children(&self, node_id: NodeId, emit_nids: bool, buf: &mut String) {
         for child_id in self.children(node_id) {
-            self.serialize_node(child_id, true, buf);
+            self.serialize_node(child_id, true, emit_nids, buf);
         }
     }
 }
@@ -116,8 +138,20 @@ fn escape_attr(s: &str, buf: &mut String) {
 fn is_void_element(tag: &str) -> bool {
     matches!(
         tag,
-        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
-            | "param" | "source" | "track" | "wbr"
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
     )
 }
 

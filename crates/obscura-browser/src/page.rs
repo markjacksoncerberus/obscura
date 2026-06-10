@@ -8,11 +8,9 @@ use url::Url;
 
 use crate::context::BrowserContext;
 use crate::lifecycle::LifecycleState;
+use crate::render_mode::ViewportConfig;
 
-const SCREENSHOT_PNG_1X1_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
-const SCREENSHOT_JPEG_1X1_BASE64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAkGBxAQEBIQEBIQEA8PEA8PEA8PDw8PEA8QFREWFhURFRUYHSggGBolGxUVITEhJSkrLi4uFx8zODMsNygtLisBCgoKDg0OFQ8PFS0dFR0tLS0rLS0rLS0tLS0tLS0tLS0tLS0rLS0tLSstLS0tLS0tLS0rLS0tLS0tLS0tLf/AABEIAAEAAQMBIgACEQEDEQH/xAAYAAEAAwEAAAAAAAAAAAAAAAAAAQIDBP/EABYBAQEBAAAAAAAAAAAAAAAAAAABAv/aAAwDAQACEAMQAAAB5AAf/8QAFhEBAQEAAAAAAAAAAAAAAAAAABEh/9oACAEBAAEFAj//xAAVEQEBAAAAAAAAAAAAAAAAAAAAEf/aAAgBAwEBPwEf/8QAFBEBAAAAAAAAAAAAAAAAAAAAEP/aAAgBAgEBPwEf/8QAFBABAAAAAAAAAAAAAAAAAAAAEP/aAAgBAQAGPwJf/8QAFhABAQEAAAAAAAAAAAAAAAAAARAR/9oACAEBAAE/ITf/xAAZEAEAAwEBAAAAAAAAAAAAAAABABEhMWH/2gAIAQEAAT8hRa3IqE0jR//aAAwDAQACAAMAAAAQ+P/EABYRAQEBAAAAAAAAAAAAAAAAAAABEf/aAAgBAwEBPxBf/8QAFhEBAQEAAAAAAAAAAAAAAAAAARAR/9oACAECAQE/EHX/xAAaEAEAAwEBAQAAAAAAAAAAAAABABEhMUFR/9oACAEBAAE/EGQ8dGkYHmnFZ2VQF4QTT//Z";
-
-fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
     let rest = uri.strip_prefix("data:")?;
     let comma = rest.find(',')?;
     let meta = &rest[..comma];
@@ -78,11 +76,15 @@ fn cross_scheme_to_file(from: &str, to: &str) -> bool {
 /// the page's origin. http(s) pages cannot reach into file: or data:
 /// to fabricate scripts, and pages with no origin only get http/https.
 fn subresource_allowed(page_url: Option<&Url>, resource: &str) -> bool {
-    let Ok(target) = Url::parse(resource) else { return false };
+    let Ok(target) = Url::parse(resource) else {
+        return false;
+    };
     let scheme = target.scheme().to_ascii_lowercase();
     match scheme.as_str() {
         "http" | "https" => true,
-        "file" => page_url.map(|u| u.scheme().eq_ignore_ascii_case("file")).unwrap_or(false),
+        "file" => page_url
+            .map(|u| u.scheme().eq_ignore_ascii_case("file"))
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -140,6 +142,13 @@ pub struct Page {
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
+    /// The viewport this page lays out and paints against. Starts from the
+    /// context's default; `Emulation.setDeviceMetricsOverride` mutates it.
+    pub viewport: ViewportConfig,
+    /// Cached resolved layout/paint, keyed by a hash of the last snapshot.
+    /// `None` until the first render in `on-demand`/`always` mode.
+    #[cfg(feature = "render")]
+    render_cache: Option<crate::render::RenderCache>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
@@ -147,6 +156,7 @@ pub struct Page {
 impl Page {
     pub fn new(id: String, context: Arc<BrowserContext>) -> Self {
         let http_client = context.http_client.clone();
+        let viewport = context.default_viewport;
         // Chromium convention: the main frame's frameId == the targetId.
         // Playwright's frame manager looks up the main frame by targetId
         // (via target._targetInfo.targetId), so any divergence here makes
@@ -184,6 +194,9 @@ impl Page {
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
             intercept_tx: None,
+            viewport,
+            #[cfg(feature = "render")]
+            render_cache: None,
             #[cfg(feature = "stealth")]
             stealth_client,
         }
@@ -194,13 +207,21 @@ impl Page {
             return false;
         }
         for pattern in &self.intercept_block_patterns {
-            if pattern == "*" { return true; }
+            if pattern == "*" {
+                return true;
+            }
             if pattern.starts_with('*') && pattern.ends_with('*') {
-                if url.contains(&pattern[1..pattern.len()-1]) { return true; }
+                if url.contains(&pattern[1..pattern.len() - 1]) {
+                    return true;
+                }
             } else if pattern.starts_with('*') {
-                if url.ends_with(&pattern[1..]) { return true; }
+                if url.ends_with(&pattern[1..]) {
+                    return true;
+                }
             } else if pattern.ends_with('*') {
-                if url.starts_with(&pattern[..pattern.len()-1]) { return true; }
+                if url.starts_with(&pattern[..pattern.len() - 1]) {
+                    return true;
+                }
             } else if url.contains(pattern) {
                 return true;
             }
@@ -264,7 +285,10 @@ impl Page {
     }
 
     async fn execute_scripts(&mut self) {
-        tracing::info!("execute_scripts called, js runtime exists: {}", self.js.is_some());
+        tracing::info!(
+            "execute_scripts called, js runtime exists: {}",
+            self.js.is_some()
+        );
 
         #[derive(Debug)]
         struct ScriptInfo {
@@ -276,8 +300,8 @@ impl Page {
         }
 
         let all_scripts = match &self.js {
-            Some(js) => {
-                js.with_dom(|dom| {
+            Some(js) => js
+                .with_dom(|dom| {
                     let script_ids = dom.query_selector_all("script").unwrap_or_default();
                     let mut scripts = Vec::new();
 
@@ -315,8 +339,8 @@ impl Page {
                         }
                     }
                     scripts
-                }).unwrap_or_default()
-            }
+                })
+                .unwrap_or_default(),
             None => return,
         };
 
@@ -342,8 +366,14 @@ impl Page {
 
         let scripts = regular;
 
-        tracing::info!("Found {} regular + {} deferred + {} async scripts", scripts.len(), deferred.len(), async_scripts.len());
-        let all_to_execute: Vec<ScriptInfo> = scripts.into_iter()
+        tracing::info!(
+            "Found {} regular + {} deferred + {} async scripts",
+            scripts.len(),
+            deferred.len(),
+            async_scripts.len()
+        );
+        let all_to_execute: Vec<ScriptInfo> = scripts
+            .into_iter()
             .chain(deferred.into_iter())
             .chain(async_scripts.into_iter())
             .collect();
@@ -353,10 +383,13 @@ impl Page {
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if let Some(src_url) = &script.src {
-                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://") {
+                let full_url = if src_url.starts_with("http://") || src_url.starts_with("https://")
+                {
                     src_url.clone()
                 } else if let Some(base) = &self.url {
-                    base.join(src_url).map(|u| u.to_string()).unwrap_or_else(|_| src_url.clone())
+                    base.join(src_url)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| src_url.clone())
                 } else {
                     src_url.clone()
                 };
@@ -384,25 +417,30 @@ impl Page {
         }
 
         let client = self.http_client.clone();
-        let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
-            let client = client.clone();
-            let url = url.clone();
-            let idx = *idx;
-            async move {
-                let parsed = Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch(&parsed).await {
-                    Ok(resp) => Some((idx, url, resp)),
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch script {}: {}", url, e);
-                        None
+        let fetch_futures: Vec<_> = fetch_tasks
+            .iter()
+            .map(|(idx, url)| {
+                let client = client.clone();
+                let url = url.clone();
+                let idx = *idx;
+                async move {
+                    let parsed =
+                        Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    match client.fetch(&parsed).await {
+                        Ok(resp) => Some((idx, url, resp)),
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch script {}: {}", url, e);
+                            None
+                        }
                     }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         let fetch_results = futures::future::join_all(fetch_futures).await;
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> = std::collections::HashMap::new();
+        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
+            std::collections::HashMap::new();
         for result in fetch_results {
             if let Some((idx, url, resp)) = result {
                 // Script bodies: only the HTTP Content-Type charset matters
@@ -416,14 +454,24 @@ impl Page {
         // Scripts that check readyState === 'loading' will register DOMContentLoaded
         // listeners instead of calling their callback immediately.
         if let Some(js) = &mut self.js {
-            let _ = js.execute_script("<ready-state>", "globalThis.__documentReadyState__ = 'loading';");
+            let _ = js.execute_script(
+                "<ready-state>",
+                "globalThis.__documentReadyState__ = 'loading';",
+            );
         }
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if script.src.is_some() {
                 if let Some((url, code, resp)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
-                    self.record_network_event(&url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
+                    self.record_network_event(
+                        &url,
+                        "GET",
+                        "Script",
+                        resp.status,
+                        &resp.headers,
+                        resp.body.len(),
+                    );
                     if let Some(js) = &mut self.js {
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
@@ -444,7 +492,9 @@ impl Page {
                 let full_url = if src.starts_with("http://") || src.starts_with("https://") {
                     src.clone()
                 } else if let Some(base) = &self.url {
-                    base.join(src).map(|u| u.to_string()).unwrap_or_else(|_| src.clone())
+                    base.join(src)
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| src.clone())
                 } else {
                     src.clone()
                 };
@@ -454,7 +504,14 @@ impl Page {
                     match js.load_module(&full_url).await {
                         Ok(()) => {
                             tracing::info!("ES module loaded: {}", full_url);
-                            self.record_network_event(&full_url, "GET", "Script", 200, &std::collections::HashMap::new(), 0);
+                            self.record_network_event(
+                                &full_url,
+                                "GET",
+                                "Script",
+                                200,
+                                &std::collections::HashMap::new(),
+                                0,
+                            );
                         }
                         Err(e) => {
                             tracing::warn!("ES module error ({}): {}", full_url, e);
@@ -490,7 +547,8 @@ impl Page {
                 let result = tokio::time::timeout(
                     tokio::time::Duration::from_millis(10),
                     js.run_event_loop(),
-                ).await;
+                )
+                .await;
 
                 match result {
                     Ok(Ok(())) => {
@@ -518,7 +576,8 @@ impl Page {
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
-        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load).await
+        self.navigate_with_wait(url_str, crate::lifecycle::WaitUntil::Load)
+            .await
     }
 
     pub async fn navigate_with_wait(
@@ -526,7 +585,8 @@ impl Page {
         url_str: &str,
         wait_until: crate::lifecycle::WaitUntil,
     ) -> Result<(), PageError> {
-        self.navigate_with_wait_post(url_str, wait_until, "GET", "").await
+        self.navigate_with_wait_post(url_str, wait_until, "GET", "")
+            .await
     }
 
     pub async fn navigate_with_wait_post(
@@ -541,7 +601,8 @@ impl Page {
         let mut current_body = body.to_string();
         const REDIRECT_LIMIT: usize = 10;
         for chain in 0..REDIRECT_LIMIT {
-            self.navigate_single(&current_url, wait_until, &current_method, &current_body).await?;
+            self.navigate_single(&current_url, wait_until, &current_method, &current_body)
+                .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
                 if cross_scheme_to_file(&current_url, &next_url) {
                     // SOP gate. A web page must not be able to drive
@@ -557,7 +618,12 @@ impl Page {
                     );
                     break;
                 }
-                tracing::info!("JS-triggered navigation chain: {} {} -> {}", current_method, current_url, next_url);
+                tracing::info!(
+                    "JS-triggered navigation chain: {} {} -> {}",
+                    current_method,
+                    current_url,
+                    next_url
+                );
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
@@ -572,6 +638,9 @@ impl Page {
             }
             break;
         }
+        // In `always` mode, resolve layout eagerly now so the first screenshot /
+        // geometry query has no build latency. A no-op in other modes / builds.
+        self.prewarm_render();
         Ok(())
     }
 
@@ -623,21 +692,30 @@ impl Page {
         }
 
         let response = if url.scheme() == "data" {
-            let content_type = url_str.strip_prefix("data:")
+            let content_type = url_str
+                .strip_prefix("data:")
                 .and_then(|s| s.split(',').next())
                 .unwrap_or("text/html")
-                .split(';').next()
+                .split(';')
+                .next()
                 .unwrap_or("text/html")
                 .to_string();
             let body_bytes = decode_data_uri(url_str).unwrap_or_default();
             let mut headers = std::collections::HashMap::new();
             headers.insert("content-type".to_string(), content_type);
-            Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
+            Ok(obscura_net::Response {
+                url: url.clone(),
+                status: 200,
+                headers,
+                body: body_bytes,
+                redirected_from: Vec::new(),
+            })
         } else if method == "POST" {
             self.http_client.post_form(&url, body).await
         } else {
             self.do_fetch(&url).await
-        }.map_err(|e| {
+        }
+        .map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
@@ -688,7 +766,9 @@ impl Page {
             let full_url = if href.starts_with("http://") || href.starts_with("https://") {
                 href.clone()
             } else if let Some(base) = &self.url {
-                base.join(href).map(|u| u.to_string()).unwrap_or_else(|_| href.clone())
+                base.join(href)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| href.clone())
             } else {
                 href.clone()
             };
@@ -708,20 +788,24 @@ impl Page {
         }
 
         let client = self.http_client.clone();
-        let css_futures: Vec<_> = css_fetch_urls.iter().map(|full_url| {
-            let client = client.clone();
-            let url_str = full_url.clone();
-            async move {
-                let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch(&parsed).await {
-                    Ok(resp) => Some((url_str, resp)),
-                    Err(e) => {
-                        tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
-                        None
+        let css_futures: Vec<_> = css_fetch_urls
+            .iter()
+            .map(|full_url| {
+                let client = client.clone();
+                let url_str = full_url.clone();
+                async move {
+                    let parsed =
+                        Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    match client.fetch(&parsed).await {
+                        Ok(resp) => Some((url_str, resp)),
+                        Err(e) => {
+                            tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
+                            None
+                        }
                     }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         let css_results = futures::future::join_all(css_futures).await;
         let mut css_sources = Vec::new();
@@ -730,7 +814,14 @@ impl Page {
                 // CSS bodies: honor the Content-Type charset; CSS @charset is
                 // out of scope for the current scrape-focused pipeline.
                 let css = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                self.record_network_event(&url_str, "GET", "Stylesheet", resp.status, &resp.headers, resp.body.len());
+                self.record_network_event(
+                    &url_str,
+                    "GET",
+                    "Stylesheet",
+                    resp.status,
+                    &resp.headers,
+                    resp.body.len(),
+                );
                 css_sources.push(css);
             }
         }
@@ -797,7 +888,9 @@ impl Page {
                     if idle_since.is_none() {
                         idle_since = Some(now);
                     }
-                    if now.duration_since(idle_since.unwrap()) >= tokio::time::Duration::from_millis(500) {
+                    if now.duration_since(idle_since.unwrap())
+                        >= tokio::time::Duration::from_millis(500)
+                    {
                         break;
                     }
                 } else {
@@ -805,7 +898,10 @@ impl Page {
                 }
 
                 if now >= deadline {
-                    tracing::debug!("Network idle timeout reached with {} active requests", active);
+                    tracing::debug!(
+                        "Network idle timeout reached with {} active requests",
+                        active
+                    );
                     break;
                 }
 
@@ -813,7 +909,8 @@ impl Page {
                     let _ = tokio::time::timeout(
                         tokio::time::Duration::from_millis(50),
                         js.run_event_loop(),
-                    ).await;
+                    )
+                    .await;
                 } else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
@@ -828,7 +925,9 @@ impl Page {
     pub fn navigate_blank(&mut self) {
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
-        self.dom = Some(parse_html("<!DOCTYPE html><html><head></head><body></body></html>"));
+        self.dom = Some(parse_html(
+            "<!DOCTYPE html><html><head></head><body></body></html>",
+        ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
     }
@@ -856,7 +955,11 @@ impl Page {
             match js.evaluate(expression) {
                 Ok(val) => val,
                 Err(e) => {
-                    tracing::debug!("JS eval error for '{}': {}", &expression[..expression.len().min(80)], e);
+                    tracing::debug!(
+                        "JS eval error for '{}': {}",
+                        &expression[..expression.len().min(80)],
+                        e
+                    );
                     serde_json::Value::Null
                 }
             }
@@ -871,25 +974,176 @@ impl Page {
         }
     }
 
-    pub fn capture_screenshot_base64(
-        &self,
-        format: Option<&str>,
-        _quality: Option<u8>,
-    ) -> Result<String, PageError> {
-        match format.unwrap_or("png").to_ascii_lowercase().as_str() {
-            "png" => Ok(SCREENSHOT_PNG_1X1_BASE64.to_string()),
-            "jpeg" | "jpg" => Ok(SCREENSHOT_JPEG_1X1_BASE64.to_string()),
-            other => Err(PageError::ParseError(format!(
-                "Unsupported screenshot format: {other}. Supported formats: png, jpeg, jpg"
-            ))),
+    /// Serialize the page's *current* (post-JavaScript) DOM to HTML, stamping
+    /// every element with `data-obscura-nid` so a renderer can map geometry back
+    /// to Obscura node ids. Reads through to the live DOM whether it currently
+    /// lives on the page or inside the JS runtime.
+    pub fn build_render_snapshot(&self) -> Option<String> {
+        self.with_dom(|dom| dom.outer_html_with_obscura_ids(dom.document()))
+    }
+
+    /// Resolve (and cache) the current DOM into a paintable/queryable document.
+    /// Rebuilds only when the snapshot or viewport has changed since the last
+    /// render, so repeated screenshots and geometry reads are cheap. Returns an
+    /// error in `never` mode.
+    #[cfg(feature = "render")]
+    pub fn ensure_render(&mut self) -> Result<&mut obscura_render::ResolvedDoc, PageError> {
+        if !self.context.render_mode.is_enabled() {
+            return Err(PageError::RenderUnavailable(
+                "rendering disabled (render-mode=never); start with \
+                 --render-mode on-demand|always"
+                    .to_string(),
+            ));
         }
+
+        let html = self.build_render_snapshot().unwrap_or_default();
+        let viewport = self.viewport;
+        let key = crate::render::cache_key(&html, &viewport);
+
+        let stale = self.render_cache.as_ref().is_none_or(|c| c.key != key);
+        if stale {
+            let provider = self.make_net_provider();
+            let input = crate::render::build_input(html, self.url_string(), viewport, provider);
+            let doc = crate::render::with_engine(|engine| engine.layout(input));
+            self.render_cache = Some(crate::render::RenderCache { key, doc });
+        }
+
+        Ok(&mut self
+            .render_cache
+            .as_mut()
+            .expect("cache populated above")
+            .doc)
+    }
+
+    /// Pre-warm the render cache. Called after navigation in `always` mode so
+    /// layout is ready before the first screenshot / geometry query.
+    #[cfg(feature = "render")]
+    pub fn prewarm_render(&mut self) {
+        if self.context.render_mode == crate::render_mode::RenderMode::Always {
+            if let Err(e) = self.ensure_render() {
+                tracing::debug!("prewarm_render skipped: {e}");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "render"))]
+    pub fn prewarm_render(&mut self) {}
+
+    /// Absolute layout box (CSS px) for an Obscura node id, via the renderer.
+    /// `None` if rendering is off or the node isn't laid out.
+    #[cfg(feature = "render")]
+    pub fn render_node_rect(&mut self, obscura_nid: u64) -> Option<(f64, f64, f64, f64)> {
+        let doc = self.ensure_render().ok()?;
+        doc.node_rect(obscura_nid)
+            .map(|r| (r.x, r.y, r.width, r.height))
+    }
+
+    /// The full content size (CSS px) from real layout, or `None` if rendering
+    /// is off. Used by `Page.getLayoutMetrics`.
+    #[cfg(feature = "render")]
+    pub fn render_content_size(&mut self) -> Option<(f64, f64)> {
+        let doc = self.ensure_render().ok()?;
+        let s = doc.content_size();
+        Some((s.width, s.height))
+    }
+
+    #[cfg(not(feature = "render"))]
+    pub fn render_content_size(&mut self) -> Option<(f64, f64)> {
+        None
+    }
+
+    #[cfg(not(feature = "render"))]
+    pub fn render_node_rect(&mut self, _obscura_nid: u64) -> Option<(f64, f64, f64, f64)> {
+        None
+    }
+
+    /// Capture a screenshot of the page's current rendering as base64.
+    ///
+    /// `clip` is `(x, y, width, height)` in CSS pixels; `full_page` renders the
+    /// whole content height (CDP `captureBeyondViewport`). Requires the `render`
+    /// feature and a non-`never` render mode.
+    pub fn capture_screenshot_base64(
+        &mut self,
+        format: Option<&str>,
+        quality: Option<u8>,
+        clip: Option<(f64, f64, f64, f64)>,
+        full_page: bool,
+    ) -> Result<String, PageError> {
+        let format_str = format.unwrap_or("png").to_ascii_lowercase();
+        // Validate the format the same way for every build so callers get a
+        // consistent error for a bad format string.
+        let is_png = format_str == "png";
+        let is_jpeg = format_str == "jpeg" || format_str == "jpg";
+        if !is_png && !is_jpeg {
+            return Err(PageError::ParseError(format!(
+                "Unsupported screenshot format: {format_str}. Supported formats: png, jpeg, jpg"
+            )));
+        }
+
+        #[cfg(feature = "render")]
+        {
+            let opts = obscura_render::PaintOptions {
+                format: if is_png {
+                    obscura_render::ImageFormat::Png
+                } else {
+                    obscura_render::ImageFormat::Jpeg
+                },
+                quality: quality.unwrap_or(80),
+                full_page,
+                clip: clip.map(|(x, y, width, height)| obscura_render::Clip {
+                    x,
+                    y,
+                    width,
+                    height,
+                }),
+            };
+            let doc = self.ensure_render()?;
+            let bytes = doc
+                .render_image(&opts)
+                .map_err(|e| PageError::RenderUnavailable(e.to_string()))?;
+            Ok(BASE64.encode(bytes))
+        }
+        #[cfg(not(feature = "render"))]
+        {
+            let _ = (quality, clip, full_page);
+            Err(PageError::RenderUnavailable(
+                "screenshots require the `render` feature (build with --features render)"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Build the resource provider Blitz uses to fetch sub-resources (external
+    /// CSS, images, web fonts). Routes through Obscura's HTTP client so cookies,
+    /// proxy, and request-blocking all apply.
+    #[cfg(feature = "render")]
+    fn make_net_provider(&self) -> std::sync::Arc<dyn obscura_render::ResourceProvider> {
+        let patterns = if self.intercept_enabled {
+            self.intercept_block_patterns.clone()
+        } else {
+            Vec::new()
+        };
+        // Use a *fresh* client, not `self.http_client`. The page's client lazily
+        // initialized its reqwest connection pool on the main `current_thread`
+        // runtime during navigation. Reusing it from the render fetch runtime —
+        // while the main runtime is blocked inside the synchronous render —
+        // makes concurrent sub-resource fetches stall/fail ("error sending
+        // request"). A fresh client (empty pool) initializes on the fetch
+        // runtime instead. The cookie jar and proxy are still shared.
+        let client = std::sync::Arc::new(ObscuraHttpClient::with_options(
+            self.context.cookie_jar.clone(),
+            self.context.proxy_url.as_deref(),
+        ));
+        std::sync::Arc::new(crate::render::ObscuraNetProvider::new(client, patterns))
     }
 
     pub fn capture_snapshot_mhtml(&self) -> String {
         let boundary = "----obscura-boundary";
         let html = self
             .with_dom(|dom| dom.outer_html(dom.document()))
-            .unwrap_or_else(|| "<!DOCTYPE html><html><head></head><body></body></html>".to_string());
+            .unwrap_or_else(|| {
+                "<!DOCTYPE html><html><head></head><body></body></html>".to_string()
+            });
         let url = self.url_string();
         let title = if self.title.is_empty() {
             "Obscura Snapshot".to_string()
@@ -921,7 +1175,10 @@ Content-Location: {url}\r\n\
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.evaluate_for_cdp(expression, return_by_value, await_promise).await {
+            match js
+                .evaluate_for_cdp(expression, return_by_value, await_promise)
+                .await
+            {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("evaluate_for_cdp error: {}", e);
@@ -962,7 +1219,16 @@ Content-Location: {url}\r\n\
         await_promise: bool,
     ) -> obscura_js::runtime::RemoteObjectInfo {
         if let Some(js) = &mut self.js {
-            match js.call_function_on_for_cdp(function_declaration, object_id, args, return_by_value, await_promise).await {
+            match js
+                .call_function_on_for_cdp(
+                    function_declaration,
+                    object_id,
+                    args,
+                    return_by_value,
+                    await_promise,
+                )
+                .await
+            {
                 Ok(info) => info,
                 Err(e) => {
                     tracing::debug!("callFunctionOn error: {}", e);
@@ -1071,20 +1337,18 @@ Content-Location: {url}\r\n\
 
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
         if let Some((url, method, body)) = self.take_pending_navigation() {
-            self.navigate_with_wait_post(
-                &url,
-                crate::lifecycle::WaitUntil::Load,
-                &method,
-                &body,
-            )
-            .await?;
+            self.navigate_with_wait_post(&url, crate::lifecycle::WaitUntil::Load, &method, &body)
+                .await?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
 
-    pub fn set_intercept_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>) {
+    pub fn set_intercept_tx(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>,
+    ) {
         self.intercept_tx = Some(tx.clone());
         if let Some(js) = &self.js {
             js.set_intercept_tx(tx);
@@ -1105,10 +1369,155 @@ pub enum PageError {
 
     #[error("Too many redirects (limit {0})")]
     TooManyRedirects(usize),
+
+    #[error("Rendering unavailable: {0}")]
+    RenderUnavailable(String),
 }
 
 impl From<ObscuraNetError> for PageError {
     fn from(e: ObscuraNetError) -> Self {
         PageError::NetworkError(e.to_string())
+    }
+}
+
+#[cfg(all(test, feature = "render"))]
+mod render_tests {
+    use std::sync::Arc;
+
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use obscura_dom::parse_html;
+
+    use super::{Page, PageError};
+    use crate::context::BrowserContext;
+    use crate::render_mode::{RenderMode, ViewportConfig};
+
+    fn page_with_mode(mode: RenderMode) -> Page {
+        let mut ctx = BrowserContext::new("test".to_string());
+        ctx.render_mode = mode;
+        ctx.default_viewport = ViewportConfig {
+            width: 200,
+            height: 100,
+            device_scale_factor: 1.0,
+            dark: false,
+            print: false,
+        };
+        Page::new("p".to_string(), Arc::new(ctx))
+    }
+
+    #[test]
+    fn screenshot_reflects_current_dom_and_changes_on_mutation() {
+        let mut page = page_with_mode(RenderMode::OnDemand);
+        page.dom = Some(parse_html(
+            r#"<!DOCTYPE html><html><body style="margin:0">
+                 <div style="width:80px;height:40px;background:#ff0000"></div>
+               </body></html>"#,
+        ));
+
+        let shot_a = page
+            .capture_screenshot_base64(Some("png"), None, None, false)
+            .expect("screenshot a");
+        let bytes_a = BASE64.decode(&shot_a).expect("valid base64");
+        assert!(bytes_a.starts_with(&[0x89, b'P', b'N', b'G']), "not a PNG");
+        assert!(bytes_a.len() > 200, "png too small: {}", bytes_a.len());
+
+        // Identical DOM → cache hit → identical output.
+        let shot_a2 = page
+            .capture_screenshot_base64(Some("png"), None, None, false)
+            .unwrap();
+        assert_eq!(shot_a, shot_a2, "unchanged DOM should reuse cached render");
+
+        // Mutate the DOM (as JS-loaded content would). The screenshot must
+        // reflect the new content, not the cached old one.
+        page.dom = Some(parse_html(
+            r#"<!DOCTYPE html><html><body style="margin:0">
+                 <div style="width:160px;height:80px;background:#0000ff"></div>
+               </body></html>"#,
+        ));
+        let shot_b = page
+            .capture_screenshot_base64(Some("png"), None, None, false)
+            .unwrap();
+        assert_ne!(shot_a, shot_b, "changed DOM must produce a new screenshot");
+    }
+
+    #[test]
+    fn never_mode_errors() {
+        let mut page = page_with_mode(RenderMode::Never);
+        page.dom = Some(parse_html("<html><body>hi</body></html>"));
+        let err = page
+            .capture_screenshot_base64(Some("png"), None, None, false)
+            .unwrap_err();
+        assert!(matches!(err, PageError::RenderUnavailable(_)));
+    }
+
+    #[test]
+    fn jpeg_output_and_invalid_format() {
+        let mut page = page_with_mode(RenderMode::OnDemand);
+        page.dom = Some(parse_html(
+            "<html><body style=\"margin:0\"><p>hello</p></body></html>",
+        ));
+        let jpeg = page
+            .capture_screenshot_base64(Some("jpeg"), Some(70), None, false)
+            .unwrap();
+        let jbytes = BASE64.decode(&jpeg).unwrap();
+        assert!(jbytes.starts_with(&[0xFF, 0xD8, 0xFF]), "not a JPEG");
+
+        let bad = page
+            .capture_screenshot_base64(Some("gif"), None, None, false)
+            .unwrap_err();
+        assert!(matches!(bad, PageError::ParseError(_)));
+    }
+
+    /// Minimal blocking HTTP/1.1 server that returns `css` as `text/css` for any
+    /// request. Returns the bound port. Leaks its thread (fine for a test).
+    fn serve_css(css: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = css.as_bytes();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn external_css_is_fetched_and_applied() {
+        // The local test server is on loopback, which Obscura's HTTP client
+        // blocks as SSRF by default — opt in for the test. (That the fetch goes
+        // through that client at all is the point: cookies/proxy/blocking apply.)
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+
+        // The box's size + green background live only in the external sheet, so
+        // a green viewport proves the stylesheet was fetched through Obscura's
+        // network stack and applied by the renderer.
+        let port = serve_css("body{margin:0}.box{width:200px;height:100px;background:#00ff00}");
+        let mut page = page_with_mode(RenderMode::OnDemand);
+        page.dom = Some(parse_html(&format!(
+            r#"<!DOCTYPE html><html><head>
+                 <link rel="stylesheet" href="http://127.0.0.1:{port}/s.css">
+               </head><body><div class="box"></div></body></html>"#
+        )));
+
+        let shot = page
+            .capture_screenshot_base64(Some("png"), None, None, false)
+            .expect("screenshot");
+        let bytes = BASE64.decode(&shot).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        let px = img.get_pixel(100, 50);
+        assert!(
+            px[1] > 200 && px[0] < 80 && px[2] < 80,
+            "expected green from external CSS at center, got {px:?}"
+        );
     }
 }

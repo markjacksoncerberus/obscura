@@ -3,6 +3,12 @@ name = "obscura-cdp"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Propagates the Blitz renderer down to obscura-browser so CDP screenshots
+# (Page.captureScreenshot) and real layout metrics work.
+render = ["obscura-browser/render"]
+
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-browser = { workspace = true }

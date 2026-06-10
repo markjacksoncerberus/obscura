@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
+use obscura_browser::BrowserContext;
 use serde_json::json;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -9,22 +11,31 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
+use crate::page_thread::PageThread;
+use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
-// PR #36 comment 4341743194: the deferral queue in `process_with_interception`
-// must be bounded so a stalled navigation cannot OOM the process. When the cap
-// is reached we return an explicit error response rather than silently dropping.
-const MAX_DEFERRED_MESSAGES: usize = 256;
-
-// The WS-stream forwarding channel must also be bounded: if the LocalSet
-// (CDP processor + nav tasks) stalls, the accept thread keeps pushing
-// `std::net::TcpStream`s into the queue. An unbounded channel would let
-// that queue grow without limit and OOM the process. With a bounded
-// capacity, when the LocalSet is saturated the accept thread closes the
-// new connection on the spot instead of buffering it — the kernel TCP
-// backlog still absorbs short-term spikes, but a long-term stall now
-// fails loudly at accept time rather than silently piling up FDs.
+// The WS-stream forwarding channel must be bounded: if the LocalSet (CDP
+// router) stalls, the accept thread keeps pushing `std::net::TcpStream`s into
+// the queue. An unbounded channel would let that queue grow without limit and
+// OOM the process. With a bounded capacity, when the LocalSet is saturated the
+// accept thread closes the new connection on the spot instead of buffering it —
+// the kernel TCP backlog still absorbs short-term spikes, but a long-term stall
+// now fails loudly at accept time rather than silently piling up FDs.
 const MAX_PENDING_WS_HANDOFFS: usize = 128;
-use crate::types::CdpRequest;
+
+/// Domains whose handlers touch a page's V8 `JsRuntime` and therefore run on
+/// that page's dedicated OS thread (issue #19 "Option 2").
+const PAGE_DOMAINS: &[&str] = &[
+    "Page",
+    "DOM",
+    "Runtime",
+    "Network",
+    "Fetch",
+    "Input",
+    "Accessibility",
+    "Emulation",
+    "LP",
+];
 
 struct CdpMessage {
     text: String,
@@ -80,7 +91,17 @@ pub async fn start_with_host_and_security(
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
-    start_with_host_security_and_storage(port, host, proxy, stealth, user_agent, allow_file_access, storage_dir).await
+    start_with_host_security_storage_and_render(
+        port,
+        host,
+        proxy,
+        stealth,
+        user_agent,
+        allow_file_access,
+        storage_dir,
+        obscura_browser::RenderSettings::default(),
+    )
+    .await
 }
 
 pub async fn start_with_host_security_and_storage(
@@ -91,6 +112,31 @@ pub async fn start_with_host_security_and_storage(
     user_agent: Option<String>,
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    start_with_host_security_storage_and_render(
+        port,
+        host,
+        proxy,
+        stealth,
+        user_agent,
+        allow_file_access,
+        storage_dir,
+        obscura_browser::RenderSettings::default(),
+    )
+    .await
+}
+
+/// Like [`start_with_host_security_and_storage`], but also configures the
+/// render mode and default viewport for every page in this server.
+pub async fn start_with_host_security_storage_and_render(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    render: obscura_browser::RenderSettings,
 ) -> anyhow::Result<()> {
     let ip: std::net::IpAddr = host
         .parse()
@@ -111,10 +157,7 @@ pub async fn start_with_host_security_and_storage(
         .map_err(|e| anyhow::anyhow!("set_nonblocking: {}", e))?;
 
     info!("Obscura CDP server listening on ws://{}:{}", host, port);
-    info!(
-        "DevTools endpoint: ws://{}:{}/devtools/browser",
-        host, port
-    );
+    info!("DevTools endpoint: ws://{}:{}/devtools/browser", host, port);
     if allow_file_access {
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
@@ -161,7 +204,13 @@ pub async fn start_with_host_security_and_storage(
             let (msg_tx, msg_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
             let _processor_handle = tokio::task::spawn_local(cdp_processor(
-                msg_rx, proxy, stealth, user_agent, allow_file_access, storage_dir,
+                msg_rx,
+                proxy,
+                stealth,
+                user_agent,
+                allow_file_access,
+                storage_dir,
+                render,
             ));
 
             while let Some(stream) = ws_rx.recv().await {
@@ -216,7 +265,10 @@ fn accept_dispatch(
 
         let endpoint = if line.contains("/json/version") {
             Some("version")
-        } else if line.contains("/json/list") || line.contains("/json\r\n") || line.contains("/json HTTP") {
+        } else if line.contains("/json/list")
+            || line.contains("/json\r\n")
+            || line.contains("/json HTTP")
+        {
             Some("list")
         } else if line.contains("/json/protocol") {
             Some("protocol")
@@ -238,15 +290,16 @@ fn accept_dispatch(
     // control plane that this whole rework exists to keep alive). The
     // dropped `stream` closes itself; the client will see ECONNRESET and
     // can retry.
-    ws_tx
-        .try_send(stream)
-        .map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => {
-                warn!("WS handoff channel full ({}); dropping new WebSocket connection", MAX_PENDING_WS_HANDOFFS);
-                anyhow::anyhow!("ws handoff channel full")
-            }
-            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("accept channel closed"),
-        })
+    ws_tx.try_send(stream).map_err(|e| match e {
+        mpsc::error::TrySendError::Full(_) => {
+            warn!(
+                "WS handoff channel full ({}); dropping new WebSocket connection",
+                MAX_PENDING_WS_HANDOFFS
+            );
+            anyhow::anyhow!("ws handoff channel full")
+        }
+        mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("accept channel closed"),
+    })
 }
 
 /// Serve an HTTP `/json/*` endpoint with blocking I/O on the accept thread.
@@ -293,6 +346,498 @@ fn handle_http_json_blocking(
     Ok(())
 }
 
+/// A page that lives on its own OS thread, plus the small bit of metadata the
+/// router answers `Target.*` queries with (so they don't round-trip to the
+/// thread).
+struct PageEntry {
+    thread: PageThread,
+    url: String,
+    title: String,
+}
+
+/// The CDP router. Owns NO `Page`/V8 state itself — each page lives on its own
+/// OS thread (issue #19 "Option 2"). The router holds a `CdpContext` purely for
+/// server-local domains (Browser/Storage and the bookkeeping Target methods),
+/// which shares its `BrowserContext` (cookie jar / proxy) with every page
+/// thread via the `Arc`.
+struct Router {
+    ctx: CdpContext,
+    shared: Arc<BrowserContext>,
+    browser_context_id: String,
+    allow_file: bool,
+    pages: HashMap<String, PageEntry>,    // page_id -> entry
+    sessions: HashMap<String, String>,    // session_id -> page_id
+    page_counter: u32,
+}
+
+impl Router {
+    async fn route(&mut self, text: &str, reply_tx: &mpsc::UnboundedSender<String>) {
+        let req: CdpRequest = match serde_json::from_str(text) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Invalid CDP: {}: {}", e, &text[..text.len().min(200)]);
+                return;
+            }
+        };
+        self.route_req(req, reply_tx).await;
+    }
+
+    async fn route_req(&mut self, req: CdpRequest, reply_tx: &mpsc::UnboundedSender<String>) {
+        // headless_chrome / older Puppeteer wrap every call inside
+        // Target.sendMessageToTarget; unwrap and re-route the inner request.
+        if req.method == "Target.sendMessageToTarget" {
+            self.route_send_message_to_target(req, reply_tx).await;
+            return;
+        }
+
+        let (domain, method) = match req.method.split_once('.') {
+            Some(x) => x,
+            None => {
+                let r = CdpResponse::error(
+                    req.id,
+                    -32601,
+                    format!("Invalid method format: {}", req.method),
+                    req.session_id.clone(),
+                );
+                forward(reply_tx, &[], &r);
+                return;
+            }
+        };
+
+        // Page-routed domains → the page's own thread.
+        if PAGE_DOMAINS.contains(&domain) {
+            self.route_to_page(req, reply_tx).await;
+            return;
+        }
+
+        // Target lifecycle the router owns directly (pages live in threads).
+        if domain == "Target" {
+            match method {
+                "createTarget" => {
+                    self.create_target(req, reply_tx).await;
+                    return;
+                }
+                "closeTarget" => {
+                    self.close_target(&req, reply_tx);
+                    return;
+                }
+                "attachToTarget" => {
+                    self.attach_to_target(&req, reply_tx);
+                    return;
+                }
+                "getTargets" => {
+                    self.get_targets(&req, reply_tx);
+                    return;
+                }
+                "setDiscoverTargets" => {
+                    self.set_discover_targets(&req, reply_tx);
+                    return;
+                }
+                "getTargetInfo" => {
+                    self.get_target_info(&req, reply_tx);
+                    return;
+                }
+                // attachToBrowserTarget / setAutoAttach / *BrowserContext are
+                // page-agnostic bookkeeping — handle on the router context.
+                _ => {}
+            }
+        }
+
+        // Everything else is server-local (Browser.*, Storage.*, the remaining
+        // Target.* bookkeeping, no-op domains). No page V8 work, so no lock.
+        let resp = dispatch::dispatch_routed(&req, &mut self.ctx).await;
+        let events = std::mem::take(&mut self.ctx.pending_events);
+        forward(reply_tx, &events, &resp);
+    }
+
+    async fn route_send_message_to_target(
+        &mut self,
+        req: CdpRequest,
+        reply_tx: &mpsc::UnboundedSender<String>,
+    ) {
+        let session_id = req
+            .params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let message = match req.params.get("message").and_then(|v| v.as_str()) {
+            Some(m) => m.to_string(),
+            None => {
+                let r = CdpResponse::error(
+                    req.id,
+                    -32602,
+                    "sendMessageToTarget requires a message string".into(),
+                    req.session_id.clone(),
+                );
+                forward(reply_tx, &[], &r);
+                return;
+            }
+        };
+        let inner: CdpRequest = match serde_json::from_str(&message) {
+            Ok(r) => r,
+            Err(e) => {
+                let r = CdpResponse::error(
+                    req.id,
+                    -32700,
+                    format!("sendMessageToTarget message is not a valid CDP request: {e}"),
+                    req.session_id.clone(),
+                );
+                forward(reply_tx, &[], &r);
+                return;
+            }
+        };
+        let inner_with_session = CdpRequest {
+            id: inner.id,
+            method: inner.method,
+            params: inner.params,
+            session_id: session_id.clone().or(inner.session_id),
+        };
+        // The inner call forwards its own response/events to the client via
+        // reply_tx. Box the recursion to sidestep the async-fn size limit.
+        Box::pin(self.route_req(inner_with_session, reply_tx)).await;
+
+        // Ack the wrapper itself.
+        let r = CdpResponse::success(req.id, json!({}), req.session_id);
+        forward(reply_tx, &[], &r);
+    }
+
+    async fn route_to_page(&mut self, req: CdpRequest, reply_tx: &mpsc::UnboundedSender<String>) {
+        let page_id = req
+            .session_id
+            .as_ref()
+            .and_then(|sid| self.sessions.get(sid))
+            .cloned();
+        let page_id = match page_id {
+            Some(id) => id,
+            None => {
+                let r = CdpResponse::error(
+                    req.id,
+                    -32000,
+                    "No page for session".into(),
+                    req.session_id.clone(),
+                );
+                forward(reply_tx, &[], &r);
+                return;
+            }
+        };
+
+        // Keep the router's cached URL roughly current for Target.* queries.
+        if req.method == "Page.navigate" {
+            if let Some(u) = req.params.get("url").and_then(|v| v.as_str()) {
+                if let Some(e) = self.pages.get_mut(&page_id) {
+                    e.url = u.to_string();
+                }
+            }
+        }
+
+        let id = req.id;
+        let session_id = req.session_id.clone();
+        let out = match self.pages.get(&page_id) {
+            Some(entry) => entry.thread.dispatch(req).await,
+            None => None,
+        };
+        match out {
+            Some(out) => forward(reply_tx, &out.events, &out.response),
+            None => {
+                // The page thread died (closed channel or a panic that dropped
+                // the reply sender). Surface a CDP error instead of aborting —
+                // a strict improvement over the old single-thread model where a
+                // V8 abort took the whole server down.
+                let r = CdpResponse::error(
+                    id,
+                    -32000,
+                    "Page thread is no longer available".into(),
+                    session_id,
+                );
+                forward(reply_tx, &[], &r);
+            }
+        }
+    }
+
+    async fn create_target(&mut self, req: CdpRequest, reply_tx: &mpsc::UnboundedSender<String>) {
+        let url = req
+            .params
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("about:blank")
+            .to_string();
+
+        // Same file:// gate as Page.navigate (GHSA-q55h-vfv9-qcr5).
+        if crate::util::url_is_file_scheme(&url) && !self.allow_file {
+            let r = CdpResponse::error(
+                req.id,
+                -32000,
+                "Target.createTarget to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".into(),
+                req.session_id.clone(),
+            );
+            forward(reply_tx, &[], &r);
+            return;
+        }
+
+        self.page_counter += 1;
+        let page_id = format!("page-{}", self.page_counter);
+        let session_id = format!("{}-session", page_id);
+
+        let thread = match PageThread::spawn(
+            page_id.clone(),
+            session_id.clone(),
+            self.shared.clone(),
+            reply_tx.clone(),
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                let r = CdpResponse::error(
+                    req.id,
+                    -32000,
+                    format!("failed to spawn page thread: {e}"),
+                    req.session_id.clone(),
+                );
+                forward(reply_tx, &[], &r);
+                return;
+            }
+        };
+        self.pages.insert(
+            page_id.clone(),
+            PageEntry {
+                thread,
+                url: if url == "about:blank" || url.is_empty() {
+                    "about:blank".to_string()
+                } else {
+                    url.clone()
+                },
+                title: String::new(),
+            },
+        );
+        self.sessions.insert(session_id.clone(), page_id.clone());
+
+        // If a non-blank URL was given, navigate on the page thread now (the
+        // blank page is already loaded on spawn). Forward the navigation's
+        // lifecycle events to the client.
+        if !(url == "about:blank" || url.is_empty()) {
+            let nav = CdpRequest {
+                id: 0,
+                method: "Page.navigate".to_string(),
+                params: json!({ "url": url }),
+                session_id: Some(session_id.clone()),
+            };
+            if let Some(entry) = self.pages.get(&page_id) {
+                if let Some(out) = entry.thread.dispatch(nav).await {
+                    for e in &out.events {
+                        if let Ok(j) = serde_json::to_string(e) {
+                            let _ = reply_tx.send(j);
+                        }
+                    }
+                }
+            }
+        }
+
+        let cached_url = self
+            .pages
+            .get(&page_id)
+            .map(|e| e.url.clone())
+            .unwrap_or_default();
+
+        let created = CdpEvent::new(
+            "Target.targetCreated",
+            json!({
+                "targetInfo": {
+                    "targetId": page_id,
+                    "type": "page",
+                    "title": "",
+                    "url": cached_url,
+                    "attached": false,
+                    "canAccessOpener": false,
+                    "browserContextId": self.browser_context_id,
+                }
+            }),
+        );
+        let attached = CdpEvent::new(
+            "Target.attachedToTarget",
+            json!({
+                "sessionId": session_id,
+                "targetInfo": {
+                    "targetId": page_id,
+                    "type": "page",
+                    "title": "",
+                    "url": cached_url,
+                    "attached": true,
+                    "canAccessOpener": false,
+                    "browserContextId": self.browser_context_id,
+                },
+                "waitingForDebugger": false,
+            }),
+        );
+        let resp = CdpResponse::success(req.id, json!({ "targetId": page_id }), req.session_id);
+        forward(reply_tx, &[created, attached], &resp);
+    }
+
+    fn close_target(&mut self, req: &CdpRequest, reply_tx: &mpsc::UnboundedSender<String>) {
+        let target_id = match req.params.get("targetId").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => {
+                let r = CdpResponse::error(req.id, -32602, "targetId required".into(), req.session_id.clone());
+                forward(reply_tx, &[], &r);
+                return;
+            }
+        };
+        let session_id = format!("{}-session", target_id);
+        let detached = CdpEvent::new(
+            "Target.detachedFromTarget",
+            json!({ "sessionId": session_id, "targetId": target_id }),
+        );
+        let destroyed = CdpEvent::new("Target.targetDestroyed", json!({ "targetId": target_id }));
+
+        // Dropping the PageThread sends Shutdown and joins, dropping the
+        // Isolate on its own thread (the only safe place).
+        self.pages.remove(&target_id);
+        self.sessions.retain(|_, v| v != &target_id);
+
+        let resp = CdpResponse::success(req.id, json!({ "success": true }), req.session_id.clone());
+        forward(reply_tx, &[detached, destroyed], &resp);
+    }
+
+    fn attach_to_target(&mut self, req: &CdpRequest, reply_tx: &mpsc::UnboundedSender<String>) {
+        let target_id = match req.params.get("targetId").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => {
+                let r = CdpResponse::error(req.id, -32602, "targetId required".into(), req.session_id.clone());
+                forward(reply_tx, &[], &r);
+                return;
+            }
+        };
+        let session_id = format!("{}-session", target_id);
+        let (url, exists) = match self.pages.get(&target_id) {
+            Some(e) => (e.url.clone(), true),
+            None => (String::new(), false),
+        };
+        if exists {
+            self.sessions.insert(session_id.clone(), target_id.clone());
+        }
+        let attached = CdpEvent::new(
+            "Target.attachedToTarget",
+            json!({
+                "sessionId": session_id,
+                "targetInfo": {
+                    "targetId": target_id,
+                    "type": "page",
+                    "title": "",
+                    "url": url,
+                    "attached": true,
+                    "canAccessOpener": false,
+                    "browserContextId": self.browser_context_id,
+                },
+                "waitingForDebugger": false,
+            }),
+        );
+        let resp = CdpResponse::success(req.id, json!({ "sessionId": session_id }), req.session_id.clone());
+        forward(reply_tx, &[attached], &resp);
+    }
+
+    fn get_targets(&mut self, req: &CdpRequest, reply_tx: &mpsc::UnboundedSender<String>) {
+        let targets: Vec<_> = self
+            .pages
+            .iter()
+            .map(|(id, e)| {
+                json!({
+                    "targetId": id,
+                    "type": "page",
+                    "title": e.title,
+                    "url": e.url,
+                    "attached": true,
+                    "canAccessOpener": false,
+                    "browserContextId": self.browser_context_id,
+                })
+            })
+            .collect();
+        let resp = CdpResponse::success(req.id, json!({ "targetInfos": targets }), req.session_id.clone());
+        forward(reply_tx, &[], &resp);
+    }
+
+    fn set_discover_targets(&mut self, req: &CdpRequest, reply_tx: &mpsc::UnboundedSender<String>) {
+        let mut events = vec![CdpEvent::new(
+            "Target.targetCreated",
+            json!({
+                "targetInfo": {
+                    "targetId": "browser",
+                    "type": "browser",
+                    "title": "",
+                    "url": "",
+                    "attached": true,
+                    "canAccessOpener": false,
+                    "browserContextId": "",
+                }
+            }),
+        )];
+        for (id, e) in &self.pages {
+            events.push(CdpEvent::new(
+                "Target.targetCreated",
+                json!({
+                    "targetInfo": {
+                        "targetId": id,
+                        "type": "page",
+                        "title": e.title,
+                        "url": e.url,
+                        "attached": false,
+                        "canAccessOpener": false,
+                        "browserContextId": self.browser_context_id,
+                    }
+                }),
+            ));
+        }
+        let resp = CdpResponse::success(req.id, json!({}), req.session_id.clone());
+        forward(reply_tx, &events, &resp);
+    }
+
+    fn get_target_info(&mut self, req: &CdpRequest, reply_tx: &mpsc::UnboundedSender<String>) {
+        let info = match req.params.get("targetId").and_then(|v| v.as_str()) {
+            Some(id) => match self.pages.get(id) {
+                Some(e) => json!({
+                    "targetInfo": {
+                        "targetId": id,
+                        "type": "page",
+                        "title": e.title,
+                        "url": e.url,
+                        "attached": true,
+                        "canAccessOpener": false,
+                        "browserContextId": self.browser_context_id,
+                    }
+                }),
+                None => {
+                    let r = CdpResponse::error(req.id, -32000, "Target not found".into(), req.session_id.clone());
+                    forward(reply_tx, &[], &r);
+                    return;
+                }
+            },
+            None => json!({
+                "targetInfo": {
+                    "targetId": "browser",
+                    "type": "browser",
+                    "title": "",
+                    "url": "",
+                    "attached": true,
+                    "canAccessOpener": false,
+                }
+            }),
+        };
+        let resp = CdpResponse::success(req.id, info, req.session_id.clone());
+        forward(reply_tx, &[], &resp);
+    }
+}
+
+/// Forward a handler's queued events (Chromium semantics: events that are a
+/// side-effect of a command arrive BEFORE the command response) and then the
+/// response itself, to the connection's writer.
+fn forward(reply_tx: &mpsc::UnboundedSender<String>, events: &[CdpEvent], response: &CdpResponse) {
+    for event in events {
+        if let Ok(json) = serde_json::to_string(event) {
+            let _ = reply_tx.send(json);
+        }
+    }
+    if let Ok(json) = serde_json::to_string(response) {
+        let _ = reply_tx.send(json);
+    }
+}
+
 async fn cdp_processor(
     mut rx: mpsc::UnboundedReceiver<ServerMessage>,
     proxy: Option<String>,
@@ -300,572 +845,113 @@ async fn cdp_processor(
     user_agent: Option<String>,
     allow_file_access: bool,
     storage_dir: Option<std::path::PathBuf>,
+    render: obscura_browser::RenderSettings,
 ) {
-    let mut ctx = if storage_dir.is_some() {
-        // Use storage-aware context creation with security settings
-        CdpContext::new_with_storage(proxy, stealth, user_agent, storage_dir)
-    } else {
-        CdpContext::new_with_security(proxy, stealth, user_agent, allow_file_access)
+    let router_ctx = CdpContext::new_with_security_and_render(
+        proxy,
+        stealth,
+        user_agent,
+        allow_file_access,
+        storage_dir,
+        render,
+    );
+    let shared = router_ctx.default_context.clone();
+    let browser_context_id = shared.id.clone();
+    let allow_file = shared.allow_file_access;
+
+    let mut router = Router {
+        ctx: router_ctx,
+        shared,
+        browser_context_id,
+        allow_file,
+        pages: HashMap::new(),
+        sessions: HashMap::new(),
+        page_counter: 0,
     };
-    let (itx, irx) = mpsc::unbounded_channel::<obscura_js::ops::InterceptedRequest>();
-    ctx.intercept_tx = Some(itx);
-    let mut intercept_rx: Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>> = Some(irx);
-    let mut intercepted_paused: HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>> = HashMap::new();
 
-    // Issue #19 follow-up: messages deferred from inside
-    // `process_with_interception` because routing them through
-    // `process_cdp_message → dispatch` while a nav was in flight would have
-    // tripped V8's TryGetCurrent invariant. Drained at the top of each
-    // outer iteration so they get processed sequentially with no other nav
-    // in flight.
-    let mut deferred: std::collections::VecDeque<ServerMessage> =
-        std::collections::VecDeque::new();
-
-    // Subscribe to Ctrl-C once. The future is single-shot, so we break out of
-    // the outer loop when it fires and never poll it again. Without this the
-    // accept loop just exits and any cookies set during the session are lost
-    // before `BrowserContext::save_cookies()` runs.
+    // Subscribe to Ctrl-C once so cookies are persisted on shutdown.
     let mut shutdown = Box::pin(tokio::signal::ctrl_c());
 
     loop {
-        // Drain any deferred messages from the previous interception window
-        // before pulling new ones off the wire. Each is processed with no
-        // nav-task spawn_local in flight, so dispatch's v8_lock can claim
-        // the only Isolate cleanly.
-        let msg = if let Some(d) = deferred.pop_front() {
-            d
-        } else {
-            tokio::select! {
-                msg = rx.recv() => match msg {
-                    Some(m) => m,
-                    None => break,
-                },
-                _ = &mut shutdown => {
-                    tracing::info!("Shutdown signal received");
-                    break;
-                }
+        let msg = tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(m) => m,
+                None => break,
+            },
+            _ = &mut shutdown => {
+                info!("Shutdown signal received");
+                break;
             }
         };
 
         match msg {
             ServerMessage::NewConnection { reply_tx } => {
-                let _ = reply_tx.send(
-                    json!({"__init": true})
-                        .to_string(),
-                );
+                let _ = reply_tx.send(json!({"__init": true}).to_string());
             }
             ServerMessage::Cdp(cdp_msg) => {
-                let is_navigation = cdp_msg.text.contains("Page.navigate");
-                let has_interception = ctx.fetch_intercept.enabled;
-
-                if is_navigation && has_interception {
-                    process_with_interception(
-                        &cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut rx,
-                        &mut intercept_rx, &mut intercepted_paused,
-                        &mut deferred,
-                    ).await;
-                } else {
-                    if cdp_msg.text.contains("Fetch.") {
-                        handle_fetch_resolution(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx, &mut intercepted_paused);
-                    }
-                    process_cdp_message(&cdp_msg.text, &mut ctx, &cdp_msg.reply_tx).await;
-                }
-            }
-        }
-
-    }
-
-    // Single exit point handles both Ctrl-C shutdown and the channel being
-    // closed by the accept thread. Without this any cookies set during the
-    // session are dropped on the floor.
-    ctx.default_context.save_cookies();
-}
-
-fn handle_fetch_resolution(
-    text: &str,
-    _ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
-) {
-    if let Ok(req) = serde_json::from_str::<CdpRequest>(text) {
-        let method = req.method.as_str();
-        let request_id = req.params.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::info!("INTERCEPTION resolution: {} for {}, paused_count={}", method, request_id, intercepted_paused.len());
-
-        if let Some(resolver) = intercepted_paused.remove(request_id) {
-            tracing::info!("INTERCEPTION resolved: {}", request_id);
-            let resolution = match method {
-                "Fetch.continueRequest" => obscura_js::ops::InterceptResolution::Continue {
-                    url: None, method: None, headers: None, body: None,
-                },
-                "Fetch.fulfillRequest" => {
-                    let status = req.params.get("responseCode").and_then(|v| v.as_u64()).unwrap_or(200) as u16;
-                    let raw_body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    let body = decode_base64(raw_body);
-                    let headers = req.params.get("responseHeaders")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|h| {
-                            Some((h.get("name")?.as_str()?.to_string(), h.get("value")?.as_str()?.to_string()))
-                        }).collect())
-                        .unwrap_or_default();
-                    obscura_js::ops::InterceptResolution::Fulfill { status, headers, body }
-                }
-                "Fetch.failRequest" => {
-                    let reason = req.params.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed").to_string();
-                    obscura_js::ops::InterceptResolution::Fail { reason }
-                }
-                _ => return,
-            };
-            let _ = resolver.send(resolution);
-            let resp = crate::types::CdpResponse::success(req.id, json!({}), req.session_id);
-            if let Ok(json) = serde_json::to_string(&resp) {
-                let _ = reply_tx.send(json);
-            }
-        }
-    }
-}
-
-async fn process_with_interception(
-    text: &str,
-    ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
-    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
-    intercept_rx: &mut Option<mpsc::UnboundedReceiver<obscura_js::ops::InterceptedRequest>>,
-    intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
-    deferred: &mut std::collections::VecDeque<ServerMessage>,
-) {
-    let req: CdpRequest = match serde_json::from_str(text) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Invalid CDP: {}", e);
-            return;
-        }
-    };
-
-    tracing::info!("INTERCEPTION navigate: {} (id={})", req.method, req.id);
-
-    let session_id = &req.session_id;
-    let page_id = session_id
-        .as_ref()
-        .and_then(|sid| ctx.sessions.get(sid))
-        .cloned();
-
-    let page_id = match page_id {
-        Some(id) => id,
-        None => {
-            process_cdp_message(text, ctx, reply_tx).await;
-            return;
-        }
-    };
-
-    let page_index = ctx.pages.iter().position(|p| p.id == page_id);
-    let mut page = match page_index {
-        Some(idx) => ctx.pages.remove(idx),
-        None => {
-            process_cdp_message(text, ctx, reply_tx).await;
-            return;
-        }
-    };
-
-    // Issue #19 follow-up: V8 only allows ONE entered Isolate per OS thread.
-    // The regular dispatch path enforces this via `get_session_page_mut`
-    // (which `suspend_js`'es every other page before letting the target
-    // page run JS). The interception path here bypasses that — it removes
-    // the target page and spawns a nav task — so we have to enforce the
-    // same invariant explicitly. Otherwise nav-2's `init_js` constructs
-    // Isolate-2 while page-1's Isolate-1 is still alive in ctx.pages, and
-    // the next V8 scope unwind aborts the process via `Context::Exit`'s
-    // `heap->isolate() == Isolate::TryGetCurrent()` check.
-    for other in ctx.pages.iter_mut() {
-        if other.has_js() {
-            other.suspend_js();
-        }
-    }
-
-    let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let wait_until = req.params.get("waitUntil")
-        .and_then(|v| {
-            if let Some(s) = v.as_str() {
-                Some(obscura_browser::WaitUntil::from_str(s))
-            } else if let Some(arr) = v.as_array() {
-                arr.iter()
-                    .filter_map(|item| item.as_str())
-                    .map(obscura_browser::WaitUntil::from_str)
-                    .max_by_key(|w| match w {
-                        obscura_browser::WaitUntil::DomContentLoaded => 0,
-                        obscura_browser::WaitUntil::Load => 1,
-                        obscura_browser::WaitUntil::NetworkIdle2 => 2,
-                        obscura_browser::WaitUntil::NetworkIdle0 => 3,
-                    })
-            } else {
-                None
-            }
-        })
-        .unwrap_or(obscura_browser::WaitUntil::Load);
-
-    let preload_scripts: Vec<String> = ctx.preload_scripts.iter().map(|(_, s)| s.clone()).collect();
-
-    if let Some(tx) = &ctx.intercept_tx {
-        page.set_intercept_tx(tx.clone());
-    }
-
-    let session_for_events = req.session_id.clone();
-    let frame_id = page.frame_id.clone();
-    let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
-
-    let (nav_done_tx, mut nav_done_rx) = mpsc::channel::<(obscura_browser::Page, Result<(), String>)>(1);
-    let url_owned = url.to_string();
-
-    tokio::task::spawn_local(async move {
-        // Issue #19: serialize V8 work across pages. The interception path
-        // spawns navigation here while the parent task continues to pump
-        // CDP messages via `dispatch` (which also acquires this lock); both
-        // sides must coordinate or V8 aborts the process at concurrency >= 5.
-        let _v8_guard = obscura_js::v8_lock::global().lock().await;
-        let result = page.navigate_with_wait(&url_owned, wait_until).await.map_err(|e| e.to_string());
-        for source in &preload_scripts {
-            if let Err(e) = page.execute_preload_script(source) {
-                tracing::debug!("Preload script error: {}", e);
-            }
-        }
-        drop(_v8_guard);
-        let _ = nav_done_tx.send((page, result)).await;
-    });
-
-    let navigate_result: Result<(), String>;
-    let page_back: Option<obscura_browser::Page>;
-
-    // Issue #19 follow-up (PR #36 maintainer's fetch-intercept repro):
-    // While the spawned nav task is executing V8 (potentially parked on
-    // `op_fetch_url`'s `resolve_rx.await` *with Isolate-N still entered*),
-    // we must NOT let the parent's `select!` route foreign Cdp messages
-    // through `process_cdp_message → dispatch → page handlers`, because
-    // those handlers call `get_session_page_mut` which `suspend_js`'es
-    // OTHER pages (drops their `JsRuntime`, which calls
-    // `JsRealmInner::destroy`). That trips V8's
-    // `heap->isolate() == Isolate::TryGetCurrent()` invariant and aborts
-    // the process via `V8_Fatal`.
-    //
-    // The `obscura_js::v8_lock` mutex doesn't save us here: it's a
-    // `tokio::sync::Mutex` that is released around `.await`s inside V8
-    // ops, so it doesn't actually keep the V8 enter/exit pair contiguous
-    // on the thread.
-    //
-    // Park foreign Cdp messages into the outer deferred queue so the
-    // outer `cdp_processor` loop processes them after this nav fully
-    // completes (and its JsRuntime is no longer in flight on the
-    // LocalSet).
-    loop {
-        let has_irx = intercept_rx.is_some();
-
-        tokio::select! {
-            Some((returned_page, result)) = nav_done_rx.recv() => {
-                page_back = Some(returned_page);
-                navigate_result = result;
-                break;
-            }
-            Some(intercepted) = async {
-                if let Some(ref mut irx) = intercept_rx {
-                    irx.recv().await
-                } else {
-                    std::future::pending().await
-                }
-            }, if has_irx => {
-                tracing::info!("INTERCEPTION: requestPaused for {} {} (sending to client)", intercepted.method, intercepted.url);
-                let rws_event = json!({
-                    "method": "Network.requestWillBeSent",
-                    "params": {
-                        "requestId": intercepted.request_id,
-                        "loaderId": "",
-                        "documentURL": "",
-                        "request": {
-                            "url": intercepted.url,
-                            "method": intercepted.method,
-                            "headers": intercepted.headers,
-                            "initialPriority": "High",
-                            "referrerPolicy": "strict-origin-when-cross-origin",
-                        },
-                        "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
-                        "wallTime": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
-                        "initiator": {"type": "script"},
-                        "type": intercepted.resource_type,
-                        "frameId": frame_id,
-                    },
-                    "sessionId": session_for_events,
-                });
-                let _ = reply_tx.send(rws_event.to_string());
-
-                let event_json = json!({
-                    "method": "Fetch.requestPaused",
-                    "params": {
-                        "requestId": intercepted.request_id,
-                        "request": {
-                            "url": intercepted.url,
-                            "method": intercepted.method,
-                            "headers": intercepted.headers,
-                            "initialPriority": "High",
-                            "referrerPolicy": "strict-origin-when-cross-origin",
-                        },
-                        "frameId": frame_id,
-                        "resourceType": intercepted.resource_type,
-                        "networkId": intercepted.request_id,
-                        "responseErrorReason": null,
-                        "responseStatusCode": null,
-                        "responseHeaders": null,
-                    },
-                    "sessionId": session_for_events,
-                });
-                let event_str = event_json.to_string();
-                tracing::info!("INTERCEPTION event JSON: {}", &event_str[..event_str.len().min(300)]);
-                let _ = reply_tx.send(event_str);
-                intercepted_paused.insert(intercepted.request_id.clone(), intercepted.resolver);
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
-            Some(msg) = rx.recv() => {
-                tracing::info!("INTERCEPTION select: received CDP message during navigation");
-                match msg {
-                    ServerMessage::NewConnection { reply_tx: new_tx } => {
-                        // Safe: no V8 enter, just bookkeeping.
-                        let pid = ctx.create_page();
-                        let sid = format!("{}-session", pid);
-                        ctx.sessions.insert(sid.clone(), pid.clone());
-                        let _ = new_tx.send(json!({"__init": true, "pageId": pid, "sessionId": sid}).to_string());
-                    }
-                    ServerMessage::Cdp(msg) => {
-                        if msg.text.contains("Fetch.continueRequest")
-                            || msg.text.contains("Fetch.fulfillRequest")
-                            || msg.text.contains("Fetch.failRequest")
-                        {
-                            // Safe: only flips a oneshot to resume the parked
-                            // op inside the spawned nav task. No V8 enter on
-                            // this side; the actual V8 work happens back on
-                            // the nav task's thread.
-                            handle_fetch_resolution(&msg.text, ctx, &msg.reply_tx, intercepted_paused);
-                        } else {
-                            // UNSAFE during nav: would route through dispatch,
-                            // which can `suspend_js` other pages and trip the
-                            // V8 invariant. Defer until nav completes —
-                            // pushed to the outer `cdp_processor` queue so
-                            // it's processed sequentially with no nav task
-                            // in flight.
-                            if deferred.len() >= MAX_DEFERRED_MESSAGES {
-                                tracing::warn!("INTERCEPTION: deferred queue full ({}), returning error to client", MAX_DEFERRED_MESSAGES);
-                                if let Ok(req) = serde_json::from_str::<CdpRequest>(&msg.text) {
-                                    let resp = crate::types::CdpResponse::error(
-                                        req.id,
-                                        -32000,
-                                        "Server busy: navigation in progress, try again later".to_string(),
-                                        req.session_id,
-                                    );
-                                    if let Ok(json) = serde_json::to_string(&resp) {
-                                        let _ = msg.reply_tx.send(json);
-                                    }
-                                }
-                            } else {
-                                tracing::info!("INTERCEPTION: deferring CDP message until nav completes");
-                                deferred.push_back(ServerMessage::Cdp(msg));
-                            }
-                        }
-                    }
-                }
+                router.route(&cdp_msg.text, &cdp_msg.reply_tx).await;
             }
         }
     }
 
-    // Deferred messages are handled by the outer `cdp_processor` loop
-    // (it drains `deferred` before pulling the next message off `rx`).
-
-    let mut page = page_back.expect("navigation task should return the page");
-
-    let network_events: Vec<_> = page.network_events.drain(..).collect();
-    let page_url = page.url_string();
-    let page_id_for_events = page.id.clone();
-    let reached_network_idle = page.lifecycle.is_network_idle();
-
-    ctx.pages.push(page);
-
-    let response = match navigate_result {
-        Ok(()) => crate::types::CdpResponse::success(
-            req.id,
-            json!({"frameId": frame_id, "loaderId": loader_id}),
-            req.session_id.clone(),
-        ),
-        Err(e) => crate::types::CdpResponse::error(req.id, -32000, e, req.session_id.clone()),
-    };
-
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = reply_tx.send(json);
-    }
-
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-    let es = session_for_events;
-
-    for event in [
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "init", "timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Runtime.executionContextsCleared".into(), params: json!({}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.frameNavigated".into(), params: json!({"frame": {"id": frame_id, "loaderId": loader_id, "url": page_url, "domainAndRegistry": "", "securityOrigin": page_url, "mimeType": "text/html", "adFrameStatus": {"adFrameType": "none"}}, "type": "Navigation"}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Runtime.executionContextCreated".into(), params: json!({"context": {"id": 2, "origin": page_url, "name": "", "uniqueId": format!("ctx-nav-{}", page_id_for_events), "auxData": {"isDefault": true, "type": "default", "frameId": frame_id}}}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() },
-    ] {
-        if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
-    }
-
-    for net_event in &network_events {
-        for event in [
-            crate::types::CdpEvent { method: "Network.requestWillBeSent".into(), params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "documentURL": page_url, "request": {"url": net_event.url, "method": net_event.method, "headers": net_event.headers}, "timestamp": net_event.timestamp, "wallTime": net_event.timestamp, "initiator": {"type": "other"}, "type": net_event.resource_type, "frameId": frame_id}), session_id: es.clone() },
-            crate::types::CdpEvent { method: "Network.responseReceived".into(), params: json!({"requestId": net_event.request_id, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": ""}, "frameId": frame_id}), session_id: es.clone() },
-            crate::types::CdpEvent { method: "Network.loadingFinished".into(), params: json!({"requestId": net_event.request_id, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}), session_id: es.clone() },
-        ] {
-            if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
-        }
-    }
-
-    for event in [
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "DOMContentLoaded", "timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.domContentEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "load", "timestamp": ts}), session_id: es.clone() },
-        crate::types::CdpEvent { method: "Page.loadEventFired".into(), params: json!({"timestamp": ts}), session_id: es.clone() },
-    ] {
-        if let Ok(json) = serde_json::to_string(&event) { let _ = reply_tx.send(json); }
-    }
-    if reached_network_idle {
-        let idle_event = crate::types::CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": ts}), session_id: es.clone() };
-        if let Ok(json) = serde_json::to_string(&idle_event) { let _ = reply_tx.send(json); }
-    }
-    let stop_event = crate::types::CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id}), session_id: es };
-    if let Ok(json) = serde_json::to_string(&stop_event) { let _ = reply_tx.send(json); }
-}
-
-async fn process_cdp_message(
-    text: &str,
-    ctx: &mut CdpContext,
-    reply_tx: &mpsc::UnboundedSender<String>,
-) {
-    let req: CdpRequest = match serde_json::from_str(text) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("Invalid CDP: {}: {}", e, &text[..text.len().min(200)]);
-            return;
-        }
-    };
-
-    tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
-
-    let response = dispatch::dispatch(&req, ctx).await;
-
-    // Chromium CDP semantics: events emitted as a side-effect of a command
-    // (e.g. Target.targetCreated + Target.attachedToTarget from
-    // Target.createTarget) MUST arrive BEFORE the command's response.
-    // Playwright awaits the response and immediately reads state wired up
-    // by those events; if the response lands first, accessing
-    // Target._page errors with "Cannot read properties of undefined".
-    for event in ctx.pending_events.drain(..) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            let _ = reply_tx.send(json);
-        }
-    }
-
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = reply_tx.send(json);
-    }
-
-    if let Some((nav_url, nav_method, nav_body)) = check_pending_navigation(ctx, &req.session_id) {
-        tracing::info!("JS-triggered nav: {} {} (body: {} bytes)", nav_method, nav_url, nav_body.len());
-        let nav_req = CdpRequest {
-            id: 0,
-            method: "Page.navigate".to_string(),
-            params: json!({"url": nav_url, "__method": nav_method, "__body": nav_body}),
-            session_id: req.session_id.clone(),
-        };
-        let _ = dispatch::dispatch(&nav_req, ctx).await;
-        for event in ctx.pending_events.drain(..) {
-            if let Ok(json) = serde_json::to_string(&event) {
-                let _ = reply_tx.send(json);
-            }
-        }
-    }
-}
-
-fn decode_base64(input: &str) -> String {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = input.bytes().filter_map(val).collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let b = [
-            chunk.first().copied().unwrap_or(0),
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-            chunk.get(3).copied().unwrap_or(0),
-        ];
-        out.push((b[0] << 2) | (b[1] >> 4));
-        if chunk.len() > 2 { out.push((b[1] << 4) | (b[2] >> 2)); }
-        if chunk.len() > 3 { out.push((b[2] << 6) | b[3]); }
-    }
-    String::from_utf8_lossy(&out).to_string()
+    // Dropping the router drops every PageThread (each joins its thread and
+    // drops its Isolate there). Persist cookies from the shared context.
+    router.ctx.default_context.save_cookies();
+    drop(router);
 }
 
 fn fast_path_response(text: &str) -> Option<String> {
     let req: CdpRequest = serde_json::from_str(text).ok()?;
 
     let result = match req.method.as_str() {
-        "Network.enable" | "Network.setCacheDisabled" | "Network.setRequestInterception" |
-        "Page.enable" | "Page.setLifecycleEventsEnabled" | "Page.setInterceptFileChooserDialog" |
-        "Runtime.runIfWaitingForDebugger" | "Runtime.discardConsoleEntries" |
-        "Performance.enable" | "Log.enable" | "Security.enable" |
-        "Emulation.setDeviceMetricsOverride" | "Emulation.setTouchEmulationEnabled" |
-        "CSS.enable" | "Accessibility.enable" | "ServiceWorker.enable" |
-        "Inspector.enable" | "Debugger.enable" | "Profiler.enable" |
-        "HeapProfiler.enable" | "Overlay.enable" | "Storage.enable" |
-        "Target.setAutoAttach" => {
-            Some(json!({}))
-        }
-        "Browser.getVersion" => {
-            Some(json!({
-                "protocolVersion": "1.3",
-                "product": "Obscura/0.1.0",
-                "revision": "0",
-                "userAgent": "Obscura/0.1.0",
-                "jsVersion": "V8",
-            }))
-        }
-        "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
-            Some(json!({}))
-        }
+        "Network.enable"
+        | "Network.setCacheDisabled"
+        | "Network.setRequestInterception"
+        | "Page.enable"
+        | "Page.setLifecycleEventsEnabled"
+        | "Page.setInterceptFileChooserDialog"
+        | "Runtime.runIfWaitingForDebugger"
+        | "Runtime.discardConsoleEntries"
+        | "Performance.enable"
+        | "Log.enable"
+        | "Security.enable"
+        | "Emulation.setDeviceMetricsOverride"
+        | "Emulation.setTouchEmulationEnabled"
+        | "CSS.enable"
+        | "Accessibility.enable"
+        | "ServiceWorker.enable"
+        | "Inspector.enable"
+        | "Debugger.enable"
+        | "Profiler.enable"
+        | "HeapProfiler.enable"
+        | "Overlay.enable"
+        | "Storage.enable"
+        | "Target.setAutoAttach" => Some(json!({})),
+        "Browser.getVersion" => Some(json!({
+            "protocolVersion": "1.3",
+            "product": "Obscura/0.1.0",
+            "revision": "0",
+            "userAgent": "Obscura/0.1.0",
+            "jsVersion": "V8",
+        })),
+        "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => Some(json!({})),
         // Critical: Puppeteer calls this as the *first* CDP command on connect
         // (`BrowserConnector._connectToCdpBrowser`). If another client or a long
-        // `Page.navigate` / interception holds the single `cdp_processor` task,
-        // queued Target commands starve and Puppeteer hits protocolTimeout on
-        // `Target.getBrowserContexts`. Fast-path bypasses the queue — same payload
-        // as `domains::target::handle` when default context id is `"default"`.
-        "Target.getBrowserContexts" => {
-            Some(json!({ "browserContextIds": ["default"] }))
-        }
+        // `Page.navigate` holds the single `cdp_processor` task, queued Target
+        // commands starve and Puppeteer hits protocolTimeout on
+        // `Target.getBrowserContexts`. Fast-path bypasses the queue — same
+        // payload as `domains::target::handle` when default context id is
+        // `"default"`.
+        "Target.getBrowserContexts" => Some(json!({ "browserContextIds": ["default"] })),
         _ => None,
     };
 
     if let Some(value) = result {
-        let resp = crate::types::CdpResponse::success(req.id, value, req.session_id);
+        let resp = CdpResponse::success(req.id, value, req.session_id);
         serde_json::to_string(&resp).ok()
     } else {
         None
     }
-}
-
-fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Option<(String, String, String)> {
-    let page_id = session_id
-        .as_ref()
-        .and_then(|sid| ctx.sessions.get(sid))?;
-    let page = ctx.pages.iter().find(|p| &p.id == page_id)?;
-    page.take_pending_navigation()
 }
 
 async fn handle_connection_ws(
@@ -909,7 +995,7 @@ async fn handle_connection_ws(
             Message::Text(text) => {
                 if text.contains("\"Browser.close\"") {
                     if let Ok(req) = serde_json::from_str::<CdpRequest>(&text) {
-                        let resp = crate::types::CdpResponse::success(req.id, json!({}), None);
+                        let resp = CdpResponse::success(req.id, json!({}), None);
                         if let Ok(json) = serde_json::to_string(&resp) {
                             let _ = reply_tx.send(json);
                         }

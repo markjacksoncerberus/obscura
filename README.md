@@ -90,9 +90,39 @@ cargo build --release
 
 # With stealth mode (anti-detection + tracker blocking)
 cargo build --release --features stealth
+
+# With the Blitz-backed renderer (real screenshots + layout geometry)
+cargo build --release --features render
 ```
 
-Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)). First build takes ~5 min (V8 compiles from source, cached after).
+Requires Rust 1.75+ ([rustup.rs](https://rustup.rs)); the optional `render` feature needs Rust 1.89+. First build takes ~5 min (V8 compiles from source, cached after); `render` adds the Stylo/Parley/vello_cpu stack on top.
+
+## Rendering
+
+By default Obscura is a DOM + JavaScript engine with no visual output — fast and lean. The optional `render` feature compiles in [Blitz](https://github.com/DioxusLabs/blitz), a pure-Rust HTML/CSS layout + paint engine, to produce **real screenshots** and **real layout geometry** entirely on the CPU (no GPU, no system fonts — a single font is bundled for deterministic output).
+
+It is controlled by a 3-way flag, `--render-mode`:
+
+| Mode | Behavior |
+| --- | --- |
+| `never` (default) | The renderer is never instantiated. Zero cost; screenshots and layout metrics are unavailable. |
+| `on-demand` | Lay out and paint only when something needs pixels or geometry (a screenshot, `Page.getLayoutMetrics`, `DOM.getBoxModel`). Cached until the DOM changes. |
+| `always` | Keep layout resolved after every navigation, so the first screenshot has no build latency. |
+
+Screenshots always reflect the page's **current** DOM — including content added or mutated by JavaScript — because each render serializes the live post-JS DOM.
+
+```bash
+# Real PNG screenshots over CDP (Puppeteer/Playwright page.screenshot()):
+obscura serve --features render --render-mode on-demand
+#                ^ build flag      ^ runtime flag
+
+# Pick a default viewport:
+obscura serve --render-mode always --window-size 1440x900 --device-scale-factor 2
+```
+
+Build without the feature (the default), or run with `--render-mode never`, and none of the rendering stack is loaded. Docker: `docker build --build-arg FEATURES=render -t obscura:render .`
+
+> The renderer aims to paint pages correctly and look reasonable — not to match Chrome pixel-for-pixel. JavaScript still runs in V8 (Blitz itself executes no JS).
 
 ## Quick Start
 

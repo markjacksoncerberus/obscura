@@ -6,11 +6,17 @@ edition.workspace = true
 [features]
 default = []
 stealth = ["obscura-net/stealth"]
+# Compile in the Blitz-backed HTML/CSS renderer (screenshots + real layout
+# geometry). Off by default: pulls a large dependency tree (Stylo, Parley,
+# vello_cpu) and bumps the effective MSRV to 1.89. Even when on, rendering stays
+# off at runtime until `--render-mode on-demand|always`.
+render = ["dep:obscura-render"]
 
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
 obscura-js = { workspace = true }
+obscura-render = { workspace = true, optional = true }
 tokio = { workspace = true }
 futures = "0.3"
 url = { workspace = true }
@@ -19,3 +25,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
+
+[dev-dependencies]
+# Used only by the render integration tests to decode and inspect screenshots.
+image = { version = "0.25", default-features = false, features = ["png"] }
