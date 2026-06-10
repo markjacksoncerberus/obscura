@@ -38,6 +38,32 @@ Function.prototype.toString = function() {
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 _nativeFns.add(Function.prototype.toString);
 
+// Engine internals must not pollute the page's `window`. Real browsers don't
+// expose runtime plumbing as enumerable globals, and a page that did
+// `window._cache = ...` would otherwise clobber ours. Pre-declaring each name
+// as a non-enumerable, writable, configurable property means every later
+// `globalThis.<name> = ...` assignment — including the ones the Rust<->JS eval
+// bridge creates (__obscura_objects, __obscura_oid, __obscura_await_*) — keeps
+// it off Object.keys(window)/for-in while staying reachable by direct name
+// (which the bridge needs). This runs before any of these are assigned.
+for (const _n of [
+  '__obscura_errors', '__obscura_objects', '__obscura_oid',
+  '__obscura_await_meta', '__obscura_await_rejected', '__obscura_ua',
+  '__obscura_focused', '__obscura_click_target',
+  '_wrap', '_cache',
+  '__mutationObservers', '__mutationDeliveryScheduled',
+  '__scheduleMutationDelivery', '__notifyMutation',
+]) {
+  try {
+    Object.defineProperty(globalThis, _n, {
+      value: globalThis[_n], // preserve anything already assigned (e.g. __obscura_errors)
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+  } catch (_e) { /* already defined non-config: leave it */ }
+}
+
 [Error, TypeError, ReferenceError, SyntaxError, RangeError, URIError, EvalError].forEach(E => {
   try {
     Object.defineProperty(E.prototype, 'name', {
@@ -1333,7 +1359,11 @@ globalThis.navigator = {
   doNotTrack: null,
   deviceMemory: 8,
   connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false },
-  get webdriver() { return undefined; },
+  // A real, non-automated Chrome exposes navigator.webdriver === false (the
+  // property is present and false). Returning `undefined` is itself an
+  // automation tell — detectors flag `webdriver !== false` / `!('webdriver' in
+  // navigator)`. Match real Chrome.
+  get webdriver() { return false; },
   pdfViewerEnabled: true,
   get plugins() {
     const p = [
