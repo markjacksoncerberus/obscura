@@ -734,6 +734,21 @@ class Element extends Node {
         break;
     }
   }
+  // Shared placement for insertAdjacentElement/Text. Position is case-insensitive;
+  // beforebegin/afterend return null when there's no parent (per spec).
+  _insertAdjacentNode(position, node) {
+    const parent = this.parentNode;
+    switch (String(position).toLowerCase()) {
+      case 'beforebegin': if (!parent) return null; parent.insertBefore(node, this); return node;
+      case 'afterbegin': this.insertBefore(node, this.firstChild); return node;
+      case 'beforeend': this.appendChild(node); return node;
+      case 'afterend': if (!parent) return null; parent.insertBefore(node, this.nextSibling); return node;
+      default:
+        throw new DOMException("Failed to execute 'insertAdjacentElement' on 'Element': The value provided ('" + position + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.", "SyntaxError");
+    }
+  }
+  insertAdjacentElement(position, element) { return this._insertAdjacentNode(position, element); }
+  insertAdjacentText(position, text) { this._insertAdjacentNode(position, document.createTextNode(String(text))); }
   addEventListener(type, handler, opts) {
     if (!handler) return;
     // opts may be a boolean (capture) or { capture, once, passive }.
@@ -2884,6 +2899,7 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
   Element.prototype.focus, Element.prototype.blur,
   Element.prototype.cloneNode, Element.prototype.attachShadow,
   Element.prototype.insertAdjacentHTML, Element.prototype.scrollIntoView,
+  Element.prototype.insertAdjacentElement, Element.prototype.insertAdjacentText,
   Element.prototype.append, Element.prototype.prepend, Element.prototype.remove,
   Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
   HTMLFormElement.prototype.reset,

@@ -1939,6 +1939,39 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_adjacent_text_and_element() {
+        // testharness.js calls el.insertAdjacentText('afterend', ...) when rendering
+        // results — its absence crashed heavy WPT result rendering. Cover all four
+        // positions for both insertAdjacentText and insertAdjacentElement.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body><div id='t'><span>x</span></div></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const t = document.getElementById('t');\n\
+                   t.insertAdjacentText('afterbegin', 'A');\n\
+                   t.insertAdjacentText('beforeend', 'B');\n\
+                   const e = document.createElement('i'); e.textContent = 'E';\n\
+                   const ret = t.insertAdjacentElement('beforebegin', e);\n\
+                   t.insertAdjacentText('afterend', 'C');\n\
+                   return [\n\
+                     t.textContent,                              /* A x B */\n\
+                     t.previousSibling && t.previousSibling.tagName, /* I */\n\
+                     t.nextSibling && t.nextSibling.textContent,  /* C */\n\
+                     ret === e,                                   /* returns the element */\n\
+                     typeof t.insertAdjacentText                  /* function */\n\
+                   ];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["AxB", "I", "C", true, "function"]),
+            "insertAdjacentText/Element placement wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_element_from_point_is_function() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let kind = rt.evaluate("typeof document.elementFromPoint").unwrap();
