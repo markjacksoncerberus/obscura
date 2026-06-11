@@ -358,7 +358,9 @@ class Node {
   get nextSibling() { return _wrap(+_dom("next_sibling", this._nid)); }
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
-    if (!c) return c;
+    // WebIDL: the argument must be a Node — null/undefined/plain objects throw TypeError.
+    if (c == null || typeof c !== 'object' || typeof c._nid !== 'number')
+      throw new TypeError("Failed to execute 'appendChild': parameter 1 is not of type 'Node'");
     // DOM "ensure pre-insertion validity": the parent must be a Document,
     // DocumentFragment, or Element — not a Text/Comment/etc.
     if (this.nodeType !== 1 && this.nodeType !== 9 && this.nodeType !== 11)
@@ -366,6 +368,9 @@ class Node {
     // The node must not be an inclusive ancestor of the parent.
     if (c._nid === this._nid || (typeof c.contains === 'function' && c.contains(this)))
       throw new DOMException("The new child is an ancestor of the parent", "HierarchyRequestError");
+    // A Document is not a valid child of any node.
+    if (c.nodeType === 9)
+      throw new DOMException("A Document cannot be inserted into the tree", "HierarchyRequestError");
     // A DocumentFragment is inserted by moving each of its children, leaving it empty.
     if (c.nodeType === 11) {
       const kids = Array.prototype.slice.call(c.childNodes);
@@ -429,7 +434,9 @@ class Node {
     return oldChild;
   }
   insertBefore(n, ref) {
-    if (!n) return n;
+    // WebIDL: the node must be a Node (the reference child may be null).
+    if (n == null || typeof n !== 'object' || typeof n._nid !== 'number')
+      throw new TypeError("Failed to execute 'insertBefore': parameter 1 is not of type 'Node'");
     if (!ref) { this.appendChild(n); return n; }
     // Same pre-insertion validity as appendChild.
     if (this.nodeType !== 1 && this.nodeType !== 9 && this.nodeType !== 11)
