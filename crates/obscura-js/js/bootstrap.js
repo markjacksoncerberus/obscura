@@ -926,7 +926,8 @@ class Element extends Node {
         // parent (the srcdoc document is same-origin with its host).
         const parentUrl = _domParse("document_url") || 'about:blank';
         this._iframeDoc = new _IframeDocument(srcdoc, 'about:srcdoc', this, parentUrl);
-        this._iframeWin = new _IframeWindow(this._iframeDoc, parentUrl);
+        // location.href === 'about:srcdoc', but origin inherited from the parent.
+        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:srcdoc', parentUrl);
         _registerIframe(this);
         _executeFrameScripts(this); // async; frame scripts run against the frame win
       } else if (srcAttr && srcAttr !== 'about:blank' && !this._srcLoadStarted) {
@@ -2969,7 +2970,7 @@ class _IframeDocument {
 }
 
 class _IframeWindow {
-  constructor(doc, url) {
+  constructor(doc, url, originUrl) {
     this.document = doc;
     this._url = url;
     this.self = this;
@@ -3006,6 +3007,12 @@ class _IframeWindow {
       };
     } catch(e) {
       this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
+    }
+    // For an about:srcdoc frame, location.href is 'about:srcdoc' but the origin is
+    // the parent's (the srcdoc document is same-origin with its host) — pass the
+    // parent URL as originUrl to override just the origin (HTML spec).
+    if (originUrl) {
+      try { this.location.origin = new URL(originUrl).origin; } catch(e) {}
     }
   }
 

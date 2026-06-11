@@ -1925,14 +1925,15 @@ mod tests {
                    f.setAttribute('srcdoc', '<body>hi</body>');\n\
                    document.body.appendChild(f);\n\
                    const cd = f.contentDocument;\n\
-                   return [cd.URL, cd.baseURI];\n\
+                   const loc = f.contentWindow.location;\n\
+                   return [cd.URL, cd.baseURI, loc.href, loc.origin];\n\
                  })()",
             )
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!(["about:srcdoc", "http://example.com/test"]),
-            "srcdoc URL should be about:srcdoc with parent baseURI: {:?}",
+            serde_json::json!(["about:srcdoc", "http://example.com/test", "about:srcdoc", "http://example.com"]),
+            "srcdoc: document.URL + location.href == about:srcdoc, baseURI + origin inherited from parent: {:?}",
             result
         );
     }
