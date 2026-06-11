@@ -890,6 +890,7 @@ class Element extends Node {
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       }
       _registerIframe(el);
+      await _executeFrameScripts(el); // run same-origin frame scripts before load
       if (typeof el.onload === 'function') {
         try { el.onload(); } catch(e) {}
       } else {
@@ -914,8 +915,19 @@ class Element extends Node {
       return null; // Cross-origin: blocked
     }
     if (!this._iframeDoc) {
-      this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-      this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+      // `srcdoc` documents are same-origin with the host page, so their scripts
+      // run. A bare/blank iframe builds an empty about:blank doc (no scripts).
+      const srcdoc = this.getAttribute('srcdoc');
+      if (srcdoc) {
+        const url = _domParse("document_url") || 'about:srcdoc';
+        this._iframeDoc = new _IframeDocument(srcdoc, url, this);
+        this._iframeWin = new _IframeWindow(this._iframeDoc, url);
+        _registerIframe(this);
+        _executeFrameScripts(this); // async; frame scripts run against the frame win
+      } else {
+        this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+      }
     }
     return this._iframeDoc;
   }
@@ -1512,6 +1524,69 @@ for (let _i = 0; _i < 64; _i++) {
 // Registration is now live; this just back-links frameElement for any caller.
 const _registerIframe = function(iframeEl) {
   if (iframeEl && iframeEl._iframeWin) iframeEl._iframeWin.frameElement = iframeEl;
+};
+
+// ---- Same-origin iframe script execution (iframe increment 4, Option C) ----
+// We have ONE V8 context per page (deno_core 0.350 removed the public realm API),
+// so a frame is not a true separate realm. Instead we run each frame <script> by
+// compiling it with new Function() and shadowing the frame's globals as params —
+// the script sees its OWN window/document/location/parent/top. NOT real isolation
+// (shared intrinsics; bare globals like setTimeout and undeclared assignments still
+// resolve to the top window), but enough for same-origin frame scripts to drive
+// their own document. Classic scripts stay sloppy-mode to match real semantics.
+const _runFrameScript = function(code, win, url) {
+  if (!code || !win) return;
+  try {
+    const fn = new Function(
+      'window', 'self', 'document', 'location', 'parent', 'top', 'frames',
+      'frameElement', 'globalThis',
+      code + '\n//# sourceURL=' + (url || 'about:blank-frame')
+    );
+    fn.call(win, win, win, win.document, win.location, win.parent, win.top,
+            win.frames, win.frameElement, win);
+  } catch (e) {
+    _reportError(e);
+  }
+};
+
+// Run all <script>s in a freshly-built frame document, in document order. Inline
+// scripts run synchronously; same-origin <script src> is fetched then run. Skips
+// module scripts (increment 4 step 4) and non-JS types. Idempotent per frame.
+// Returns a promise that resolves once every script has run, so callers can fire
+// the frame's `load` after scripts (matching browser ordering).
+const _executeFrameScripts = async function(iframeEl) {
+  if (!iframeEl || iframeEl._frameScriptsRan) return;
+  const win = iframeEl._iframeWin, doc = iframeEl._iframeDoc;
+  if (!win || !doc) return;
+  iframeEl._frameScriptsRan = true;
+  let scripts = [];
+  try { scripts = Array.from(doc.querySelectorAll('script')); } catch (e) {}
+  for (const s of scripts) {
+    const type = (s.getAttribute('type') || '').toLowerCase();
+    if (type && type !== 'text/javascript' && type !== 'application/javascript') {
+      continue; // module / non-JS: not supported yet
+    }
+    const src = s.getAttribute('src');
+    if (src) {
+      let full = src;
+      try { full = new URL(src, doc._url || win._url).href; } catch (e) {}
+      try {
+        const resp = await fetch(full, { mode: 'no-cors' });
+        if (resp.ok || resp.type === 'opaque') {
+          _runFrameScript(await resp.text(), win, full);
+        }
+      } catch (e) { _reportError(e); }
+    } else {
+      _runFrameScript(s.textContent || '', win, doc._url);
+    }
+  }
+  // Frame DOMContentLoaded — reaches window listeners (real). document-level
+  // dispatch is a stub on _IframeDocument today; increment 4 step 2 makes it real.
+  try {
+    const dcl = new Event('DOMContentLoaded');
+    win.dispatchEvent?.(dcl);
+    if (typeof win.onDOMContentLoaded === 'function') win.onDOMContentLoaded(dcl);
+  } catch (e) {}
 };
 globalThis.navigator = {
   get userAgent() { return __obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },

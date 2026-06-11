@@ -1823,6 +1823,30 @@ mod tests {
     }
 
     #[test]
+    fn test_iframe_srcdoc_script_executes_against_frame_window() {
+        // iframe increment 4 (Option C): a same-origin srcdoc frame's inline
+        // <script> runs, sees its OWN document, and reaches parent via window.parent.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body><script>parent.__frameSignal = 42; document.body.setAttribute(\\'data-x\\', \\'ran\\');<\\/script></body>');\n\
+                   document.body.appendChild(f);\n\
+                   const cd = f.contentDocument; /* triggers frame script execution */\n\
+                   return [globalThis.__frameSignal === 42, cd.body.getAttribute('data-x') === 'ran'];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true]),
+            "frame script should run, touch its own document, and reach parent: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_element_from_point_is_function() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let kind = rt.evaluate("typeof document.elementFromPoint").unwrap();
