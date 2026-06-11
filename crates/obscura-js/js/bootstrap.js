@@ -1526,6 +1526,60 @@ const _registerIframe = function(iframeEl) {
   if (iframeEl && iframeEl._iframeWin) iframeEl._iframeWin.frameElement = iframeEl;
 };
 
+// ---- Event-listener core keyed by an arbitrary registry key (iframe inc 4 step 2) ----
+// Mirrors the Element addEventListener/removeEventListener/dispatchEvent logic
+// (capture/once/passive, boolean-or-options, spec dedupe, handleEvent objects,
+// dispatch snapshot) but keyed by an explicit value instead of `this._nid`, so
+// synthetic targets that have no node id — the iframe document and window — can
+// reuse the same spec-correct behavior. Elements keep their own _nid-keyed copy.
+let _syntheticKeyCounter = 0;
+const _nextSyntheticKey = function() { return 'syn:' + (++_syntheticKeyCounter); };
+const _addListenerByKey = function(key, type, handler, opts) {
+  if (!handler) return;
+  const o = (typeof opts === 'boolean') ? { capture: opts } : (opts || {});
+  const cap = !!o.capture;
+  if (!_eventRegistry[key]) _eventRegistry[key] = {};
+  if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
+  const list = _eventRegistry[key][type];
+  if (list.some(e => e.handler === handler && e.capture === cap)) return;
+  list.push({ handler, capture: cap, once: !!o.once, passive: !!o.passive });
+};
+const _removeListenerByKey = function(key, type, handler, opts) {
+  const cap = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
+  if (_eventRegistry[key] && _eventRegistry[key][type]) {
+    _eventRegistry[key][type] =
+      _eventRegistry[key][type].filter(e => !(e.handler === handler && e.capture === cap));
+  }
+};
+// Dispatch `event` on `target` using registry `key`. If the event bubbles and
+// `bubbleTo` is given, it propagates there next (frame document -> frame window,
+// matching the real Document -> Window event path for DOMContentLoaded etc.).
+const _dispatchByKey = function(target, key, event, bubbleTo) {
+  if (!event) return true;
+  if (!event.target) event.target = target;
+  event.currentTarget = target;
+  const entries = ((_eventRegistry[key] || {})[event.type] || []).slice();
+  for (const e of entries) {
+    const h = e.handler;
+    if (e.once) _removeListenerByKey(key, event.type, h, { capture: e.capture });
+    try {
+      if (typeof h === 'function') {
+        h.call(target, event);
+      } else {
+        const he = h && h.handleEvent;
+        if (typeof he !== 'function')
+          throw new TypeError("Failed to invoke event listener: 'handleEvent' is not a function");
+        he.call(h, event);
+      }
+    } catch (err) { _reportError(err); }
+    if (event._immediatePropagationStopped) break;
+  }
+  if (event.bubbles && !event._propagationStopped && bubbleTo) {
+    bubbleTo.dispatchEvent(event);
+  }
+  return !event.defaultPrevented;
+};
+
 // ---- Same-origin iframe script execution (iframe increment 4, Option C) ----
 // We have ONE V8 context per page (deno_core 0.350 removed the public realm API),
 // so a frame is not a true separate realm. Instead we run each frame <script> by
@@ -1580,12 +1634,14 @@ const _executeFrameScripts = async function(iframeEl) {
       _runFrameScript(s.textContent || '', win, doc._url);
     }
   }
-  // Frame DOMContentLoaded — reaches window listeners (real). document-level
-  // dispatch is a stub on _IframeDocument today; increment 4 step 2 makes it real.
+  // Frame lifecycle: DOMContentLoaded fires at the frame document and bubbles to
+  // the frame window (real Document -> Window path); then `load` fires at the
+  // frame window. Both reach document.addEventListener / window.addEventListener
+  // inside the frame now that those are real (increment 4 step 2).
   try {
-    const dcl = new Event('DOMContentLoaded');
-    win.dispatchEvent?.(dcl);
-    if (typeof win.onDOMContentLoaded === 'function') win.onDOMContentLoaded(dcl);
+    doc.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+    if (typeof win.onload === 'function') { try { win.onload(new Event('load')); } catch (e) {} }
+    win.dispatchEvent(new Event('load'));
   } catch (e) {}
 };
 globalThis.navigator = {
@@ -2785,6 +2841,7 @@ class _IframeDocument {
     this.contentType = 'text/html';
     this.visibilityState = 'visible';
     this.hidden = false;
+    this._evtKey = _nextSyntheticKey();
 
     this._root = document.createElement('html');
     this._head = document.createElement('head');
@@ -2860,9 +2917,12 @@ class _IframeDocument {
   get implementation() { return document.implementation; }
   get styleSheets() { return []; }
 
-  addEventListener() {}
-  removeEventListener() {}
-  dispatchEvent() { return true; }
+  addEventListener(type, handler, opts) { _addListenerByKey(this._evtKey, type, handler, opts); }
+  removeEventListener(type, handler, opts) { _removeListenerByKey(this._evtKey, type, handler, opts); }
+  dispatchEvent(event) {
+    // Document events bubble to the frame's window (real Document -> Window path).
+    return _dispatchByKey(this, this._evtKey, event, this._iframeEl?.contentWindow);
+  }
 
   write(html) {
     if (this._body) this._body.innerHTML += html;
@@ -2882,6 +2942,7 @@ class _IframeWindow {
     this.window = this;
     this.frames = this;
     this.frameElement = null;
+    this._evtKey = _nextSyntheticKey();
     this.length = 0;
     this.name = '';
     this.closed = false;
@@ -2929,20 +2990,11 @@ class _IframeWindow {
   clearInterval(id) { globalThis.clearInterval(id); }
   requestAnimationFrame(fn) { return globalThis.requestAnimationFrame(fn); }
 
-  addEventListener(type, fn) {
-    if (!this._listeners) this._listeners = {};
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(fn);
-  }
-  removeEventListener(type, fn) {
-    if (this._listeners?.[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
-    }
-  }
+  addEventListener(type, handler, opts) { _addListenerByKey(this._evtKey, type, handler, opts); }
+  removeEventListener(type, handler, opts) { _removeListenerByKey(this._evtKey, type, handler, opts); }
   dispatchEvent(event) {
-    const handlers = this._listeners?.[event?.type] || [];
-    for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
-    return true;
+    // Frame window is the top of the frame's propagation tree — no further bubble.
+    return _dispatchByKey(this, this._evtKey, event);
   }
 
   getComputedStyle(el) { return globalThis.getComputedStyle(el); }

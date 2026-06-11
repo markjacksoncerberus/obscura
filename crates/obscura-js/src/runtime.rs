@@ -1847,6 +1847,35 @@ mod tests {
     }
 
     #[test]
+    fn test_iframe_frame_lifecycle_events_reach_listeners() {
+        // iframe increment 4 step 2: a frame script's document/window event
+        // listeners fire. DOMContentLoaded dispatched at the frame document
+        // bubbles to the frame window; `load` fires at the frame window.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   const code = \"window.__hits = [];\" +\n\
+                     \"document.addEventListener('DOMContentLoaded', () => window.__hits.push('doc-dcl'));\" +\n\
+                     \"window.addEventListener('DOMContentLoaded', () => window.__hits.push('win-dcl'));\" +\n\
+                     \"window.addEventListener('load', () => window.__hits.push('win-load'));\";\n\
+                   f.setAttribute('srcdoc', '<body><scr'+'ipt>'+code+'</scr'+'ipt></body>');\n\
+                   document.body.appendChild(f);\n\
+                   const w = f.contentWindow; /* builds frame + runs scripts + fires lifecycle */\n\
+                   return w.__hits;\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["doc-dcl", "win-dcl", "win-load"]),
+            "frame document+window lifecycle listeners should all fire in order: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_element_from_point_is_function() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let kind = rt.evaluate("typeof document.elementFromPoint").unwrap();
