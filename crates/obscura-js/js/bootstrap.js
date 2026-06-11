@@ -875,6 +875,7 @@ class Element extends Node {
     }
   }
   _loadIframeSrc(url) {
+    this._srcLoadStarted = true; // markup-src auto-load (below) won't double-fire
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -918,12 +919,22 @@ class Element extends Node {
       // `srcdoc` documents are same-origin with the host page, so their scripts
       // run. A bare/blank iframe builds an empty about:blank doc (no scripts).
       const srcdoc = this.getAttribute('srcdoc');
+      const srcAttr = this.getAttribute('src');
       if (srcdoc) {
         const url = _domParse("document_url") || 'about:srcdoc';
         this._iframeDoc = new _IframeDocument(srcdoc, url, this);
         this._iframeWin = new _IframeWindow(this._iframeDoc, url);
         _registerIframe(this);
         _executeFrameScripts(this); // async; frame scripts run against the frame win
+      } else if (srcAttr && srcAttr !== 'about:blank' && !this._srcLoadStarted) {
+        // Markup `<iframe src>`: the `set src` setter only fires on JS assignment,
+        // not during parse, so a markup-loaded frame never started loading. Return
+        // a provisional blank doc synchronously, then load the real src async via
+        // the same path as an assigned src (cross-origin reads still blocked by the
+        // origin check above once the real doc lands).
+        this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+        this._loadIframeSrc(srcAttr);
       } else {
         this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
         this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
@@ -2974,13 +2985,16 @@ class _IframeWindow {
   }
 
   postMessage(data, origin) {
+    // Per spec, targetWindow.postMessage delivers `message` to targetWindow —
+    // here the frame's own window (`this`), which now has real event dispatch.
     const event = new MessageEvent('message', {
       data: data,
       origin: this.location.origin,
-      source: this,
+      source: globalThis,
     });
     Promise.resolve().then(() => {
-      globalThis.dispatchEvent?.(event);
+      this.dispatchEvent?.(event);
+      if (typeof this.onmessage === 'function') { try { this.onmessage(event); } catch (e) {} }
     });
   }
 
