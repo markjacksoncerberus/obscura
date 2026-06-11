@@ -852,8 +852,20 @@ class Element extends Node {
   get src() { return this.getAttribute("src") || ""; }
   set src(v) {
     this.setAttribute("src", v);
-    if (this.localName === 'iframe' && v && v !== 'about:blank') {
-      this._loadIframeSrc(v);
+    if (this.localName === 'iframe') {
+      if (v && v !== 'about:blank') {
+        this._loadIframeSrc(v);
+      } else {
+        // about:blank (or empty): ensure a blank document exists and fire load,
+        // mirroring how real browsers load the initial about:blank document.
+        this.contentDocument; // side effect: creates _iframeDoc + _iframeWin
+        _registerIframe(this);
+        const el = this;
+        Promise.resolve().then(() => {
+          try { if (typeof el.onload === 'function') el.onload(new Event('load')); } catch (e) {}
+          try { el.dispatchEvent(new Event('load')); } catch (e) {}
+        });
+      }
     }
   }
   _loadIframeSrc(url) {
@@ -906,6 +918,8 @@ class Element extends Node {
     if (!this._iframeWin) {
       this.contentDocument; // side effect: creates _iframeDoc + _iframeWin
     }
+    // Back-link frameElement so code inside the frame can find its host element.
+    if (this._iframeWin && !this._iframeWin.frameElement) this._iframeWin.frameElement = this;
     return this._iframeWin;
   }
   get action() {
@@ -1466,16 +1480,32 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
 });
 
 
-const _iframeRegistry = [];
-const _registerIframe = function(iframeEl) {
-  const idx = _iframeRegistry.length;
-  _iframeRegistry.push(iframeEl);
-  globalThis.length = _iframeRegistry.length;
-  Object.defineProperty(globalThis, idx, {
-    get() { return iframeEl._iframeWin || null; },
+// Child browsing contexts. Per HTML, `window.frames === window`, and `window[i]`
+// / `window.length` reflect the <iframe> elements in the document. We compute
+// these live from the tree so EVERY creation path works (markup, innerHTML,
+// createElement+append, or src assignment) — not just `el.src = "..."`.
+const _frameWindowAt = function(i) {
+  let list;
+  try { list = document.querySelectorAll('iframe'); } catch (e) { return undefined; }
+  const el = list && list[i];
+  return el ? el.contentWindow : undefined;
+};
+Object.defineProperty(globalThis, 'length', {
+  get() { try { return document.querySelectorAll('iframe').length; } catch (e) { return 0; } },
+  configurable: true,
+});
+// window[0..N] index into the child frames. A fixed window of getters covers the
+// realistic case (pages essentially never exceed this many frames).
+for (let _i = 0; _i < 64; _i++) {
+  Object.defineProperty(globalThis, _i, {
+    get() { return _frameWindowAt(_i); },
     configurable: true,
     enumerable: false,
   });
+}
+// Registration is now live; this just back-links frameElement for any caller.
+const _registerIframe = function(iframeEl) {
+  if (iframeEl && iframeEl._iframeWin) iframeEl._iframeWin.frameElement = iframeEl;
 };
 globalThis.navigator = {
   get userAgent() { return __obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
