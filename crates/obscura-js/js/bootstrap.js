@@ -2718,21 +2718,28 @@ class _IframeDocument {
     this._root.appendChild(this._body);
     // These structural nodes belong to THIS document, not the main one.
     this._root._ownerDoc = this; this._head._ownerDoc = this; this._body._ownerDoc = this;
-    var bodyContent = html
+    // Parse the whole document into body (one html5ever fragment parse, which
+    // handles pages with OR without explicit <head>/<body> tags — WPT pages and
+    // many real pages omit them), then lift the metadata elements into <head>,
+    // mirroring the parser's implicit head construction. <script> is never moved
+    // and is never executed (there is no per-iframe JS realm yet).
+    var inner = html
       .replace(/^<!DOCTYPE[^>]*>/i, '')
       .replace(/<\/?html[^>]*>/gi, '')
-      .replace(/<head[^>]*>[\s\S]*?<\/head>/gi, '')
+      .replace(/<\/?head[^>]*>/gi, '')
       .replace(/<\/?body[^>]*>/gi, '')
-      .replace(/^\s+/, ''); // trim leading whitespace (before <body> content)
-    if (bodyContent) {
-      this._body.innerHTML = bodyContent;
+      .replace(/^\s+/, '');
+    if (inner) {
+      this._body.innerHTML = inner;
+      try {
+        const metas = this._body.querySelectorAll('title, meta, link, base, style');
+        for (let i = 0; i < metas.length; i++) this._head.appendChild(metas[i]);
+      } catch (e) {}
     }
 
     this._title = '';
-    if (this._head) {
-      const titleEl = this._head.querySelector('title');
-      if (titleEl) this._title = titleEl.textContent;
-    }
+    const titleEl = this._head.querySelector('title') || this._body.querySelector('title');
+    if (titleEl) this._title = titleEl.textContent;
   }
 
   get documentElement() { return this._root; }
