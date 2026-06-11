@@ -25,6 +25,31 @@ globalThis.dispatchEvent = function(event) {
   return !event.defaultPrevented;
 };
 
+// Report an uncaught listener exception the way the platform does: fire an
+// `error` event on the window (EventWatcher/onerror observe this), then fall
+// back to onerror(message, ...). Used by event dispatch per the DOM spec.
+const _reportError = function(err) {
+  try { console.error(err); } catch (e) {}
+  let ev;
+  try {
+    ev = (typeof ErrorEvent === 'function')
+      ? new ErrorEvent('error', { error: err, message: (err && err.message) || String(err), cancelable: true })
+      : null;
+  } catch (e) { ev = null; }
+  if (!ev) ev = { type: 'error', error: err, message: (err && err.message) || String(err),
+                  defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  try {
+    const handlers = (__windowListeners['error'] || []).slice();
+    for (const h of handlers) {
+      try { (typeof h === 'function' ? h : h.handleEvent).call(globalThis, ev); } catch (e) {}
+    }
+  } catch (e) {}
+  try {
+    if (typeof globalThis.onerror === 'function' && !ev.defaultPrevented)
+      globalThis.onerror(ev.message, '', 0, 0, err);
+  } catch (e) {}
+};
+
 const _dom = (cmd, a1, a2) => Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
 
 const _nativeFns = new Set();
@@ -725,9 +750,18 @@ class Element extends Node {
       // `once` listeners are removed before invocation (per spec).
       if (e.once) this.removeEventListener(event.type, h, { capture: e.capture });
       try {
-        if (typeof h === 'function') h.call(this, event);
-        else if (h && typeof h.handleEvent === 'function') h.handleEvent(event);
-      } catch(err) { console.error(err); }
+        if (typeof h === 'function') {
+          // A callable listener is called directly; its `handleEvent` (if any) is ignored.
+          h.call(this, event);
+        } else {
+          // Object listener: Get `handleEvent` ONCE per dispatch (may be a getter),
+          // and it must be callable — otherwise this is a TypeError.
+          const he = h && h.handleEvent;
+          if (typeof he !== 'function')
+            throw new TypeError("Failed to invoke event listener: 'handleEvent' is not a function");
+          he.call(h, event);
+        }
+      } catch(err) { _reportError(err); }
       if (event._immediatePropagationStopped) break;
     }
     if (event.bubbles && !event._propagationStopped && this.parentNode) {
@@ -2330,6 +2364,7 @@ globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(
 globalThis.Event = class Event {
   constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return true; }
+  get srcElement() { return this.target; } // legacy alias for target
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
 };
