@@ -38,6 +38,38 @@ Function.prototype.toString = function() {
 const _markNative = function(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; };
 _nativeFns.add(Function.prototype.toString);
 
+// WHATWG DOMException — a real standard global (was previously undefined, so any
+// `throw new DOMException(...)` raised a ReferenceError instead of the right error).
+class DOMException extends Error {
+  constructor(message = "", name = "Error") {
+    super(message);
+    this.name = name;
+    this.message = message == null ? "" : String(message);
+  }
+  get code() { return DOMException._codes[this.name] || 0; }
+}
+DOMException._codes = {
+  IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+  InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+  NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+  SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+  InvalidAccessError: 15, SecurityError: 18, NetworkError: 19, AbortError: 20,
+  URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
+  InvalidNodeTypeError: 24, DataCloneError: 25,
+};
+// Legacy numeric code constants live on the interface object.
+Object.assign(DOMException, {
+  INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3,
+  WRONG_DOCUMENT_ERR: 4, INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6,
+  NO_MODIFICATION_ALLOWED_ERR: 7, NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9,
+  INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11, SYNTAX_ERR: 12,
+  INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15,
+  VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18, NETWORK_ERR: 19,
+  ABORT_ERR: 20, URL_MISMATCH_ERR: 21, QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23,
+  INVALID_NODE_TYPE_ERR: 24, DATA_CLONE_ERR: 25,
+});
+globalThis.DOMException = _markNative(DOMException);
+
 // Engine internals must not pollute the page's `window`. ALL runtime plumbing —
 // including the Rust<->JS eval bridge state — is now declared as top-level
 // lexical bindings (let/const). Those live in the global *lexical* environment,
@@ -302,6 +334,19 @@ class Node {
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
     if (!c) return c;
+    // DOM "ensure pre-insertion validity": the parent must be a Document,
+    // DocumentFragment, or Element — not a Text/Comment/etc.
+    if (this.nodeType !== 1 && this.nodeType !== 9 && this.nodeType !== 11)
+      throw new DOMException("Cannot append a child to this node type", "HierarchyRequestError");
+    // The node must not be an inclusive ancestor of the parent.
+    if (c._nid === this._nid || (typeof c.contains === 'function' && c.contains(this)))
+      throw new DOMException("The new child is an ancestor of the parent", "HierarchyRequestError");
+    // A DocumentFragment is inserted by moving each of its children, leaving it empty.
+    if (c.nodeType === 11) {
+      const kids = Array.prototype.slice.call(c.childNodes);
+      for (let i = 0; i < kids.length; i++) this.appendChild(kids[i]);
+      return c;
+    }
     const _prev = __mutationObservers?.length ? +_dom("last_child", this._nid) : -1;
     _dom("append_child", this._nid, c._nid);
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [c._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null });
@@ -361,6 +406,21 @@ class Node {
   insertBefore(n, ref) {
     if (!n) return n;
     if (!ref) { this.appendChild(n); return n; }
+    // Same pre-insertion validity as appendChild.
+    if (this.nodeType !== 1 && this.nodeType !== 9 && this.nodeType !== 11)
+      throw new DOMException("Cannot insert a child into this node type", "HierarchyRequestError");
+    if (n._nid === this._nid || (typeof n.contains === 'function' && n.contains(this)))
+      throw new DOMException("The new child is an ancestor of the parent", "HierarchyRequestError");
+    // The reference child must actually be a child of this node.
+    const _refParent = ref.parentNode;
+    if (!_refParent || _refParent._nid !== this._nid)
+      throw new DOMException("The reference child is not a child of this node", "NotFoundError");
+    // A DocumentFragment inserts each of its children before the reference, then empties.
+    if (n.nodeType === 11) {
+      const kids = Array.prototype.slice.call(n.childNodes);
+      for (let i = 0; i < kids.length; i++) this.insertBefore(kids[i], ref);
+      return n;
+    }
     _dom("insert_before", n._nid, ref._nid);
     if (__mutationObservers?.length) {
       const _prev = +_dom("prev_sibling", n._nid);
