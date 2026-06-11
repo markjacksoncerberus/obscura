@@ -1876,6 +1876,68 @@ mod tests {
     }
 
     #[test]
+    fn test_iframe_inline_module_script_runs_strict() {
+        // iframe increment 4 step 4: an inline <script type=module> with no static
+        // import/export runs (strict-mode) against the frame window.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body><scr'+'ipt type=\"module\">parent.__mod = 7;</scr'+'ipt></body>');\n\
+                   document.body.appendChild(f);\n\
+                   f.contentDocument;\n\
+                   return globalThis.__mod;\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(result.as_f64(), Some(7.0), "inline frame module should run: {:?}", result);
+    }
+
+    #[test]
+    fn test_iframe_module_with_import_is_skipped_not_fatal() {
+        // A frame module with a top-level import can't run under Option C (no
+        // per-frame realm) — it must be SKIPPED, not throw and not partially run.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body><scr'+'ipt type=\"module\">import x from \"y\"; parent.__bad = 1;</scr'+'ipt></body>');\n\
+                   document.body.appendChild(f);\n\
+                   f.contentDocument;\n\
+                   return globalThis.__bad === undefined;\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true), "module with import must be skipped: {:?}", result);
+    }
+
+    #[test]
+    fn test_iframe_srcdoc_url_semantics() {
+        // about:srcdoc: document.URL is 'about:srcdoc'; baseURI is the parent's URL
+        // (http://example.com/test from setup_runtime).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body>hi</body>');\n\
+                   document.body.appendChild(f);\n\
+                   const cd = f.contentDocument;\n\
+                   return [cd.URL, cd.baseURI];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["about:srcdoc", "http://example.com/test"]),
+            "srcdoc URL should be about:srcdoc with parent baseURI: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_element_from_point_is_function() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let kind = rt.evaluate("typeof document.elementFromPoint").unwrap();

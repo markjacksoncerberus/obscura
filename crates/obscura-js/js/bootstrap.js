@@ -921,9 +921,12 @@ class Element extends Node {
       const srcdoc = this.getAttribute('srcdoc');
       const srcAttr = this.getAttribute('src');
       if (srcdoc) {
-        const url = _domParse("document_url") || 'about:srcdoc';
-        this._iframeDoc = new _IframeDocument(srcdoc, url, this);
-        this._iframeWin = new _IframeWindow(this._iframeDoc, url);
+        // srcdoc: document.URL is 'about:srcdoc'; the base URL (for relative
+        // <script src> + baseURI) and the window's location/origin come from the
+        // parent (the srcdoc document is same-origin with its host).
+        const parentUrl = _domParse("document_url") || 'about:blank';
+        this._iframeDoc = new _IframeDocument(srcdoc, 'about:srcdoc', this, parentUrl);
+        this._iframeWin = new _IframeWindow(this._iframeDoc, parentUrl);
         _registerIframe(this);
         _executeFrameScripts(this); // async; frame scripts run against the frame win
       } else if (srcAttr && srcAttr !== 'about:blank' && !this._srcLoadStarted) {
@@ -1624,17 +1627,34 @@ const _executeFrameScripts = async function(iframeEl) {
   const win = iframeEl._iframeWin, doc = iframeEl._iframeDoc;
   if (!win || !doc) return;
   iframeEl._frameScriptsRan = true;
+  const base = doc._baseUrl || doc._url || win._url; // relative <script src> base
   let scripts = [];
   try { scripts = Array.from(doc.querySelectorAll('script')); } catch (e) {}
   for (const s of scripts) {
     const type = (s.getAttribute('type') || '').toLowerCase();
-    if (type && type !== 'text/javascript' && type !== 'application/javascript') {
-      continue; // module / non-JS: not supported yet
+    const isModule = type === 'module';
+    if (type && type !== 'text/javascript' && type !== 'application/javascript' && !isModule) {
+      continue; // non-JS type (application/json, importmap, speculationrules, ...)
     }
     const src = s.getAttribute('src');
+    if (isModule) {
+      // Faithful ES module execution needs a per-frame realm + module map to bind
+      // `import`/`export` and a frame-scoped `document` — unavailable under Option C
+      // (one page realm; new Function can't host import/export). Best effort: run an
+      // INLINE module with no static import/export as strict-mode code against the
+      // frame window; skip (with a clear warning, never a silent no-op) a module
+      // that has a src or top-level import/export.
+      const code = s.textContent || '';
+      if (src || /(^|[\n;{}])\s*(?:import|export)\b/.test(code)) {
+        console.warn('[obscura] iframe <script type=module> with src or import/export is not supported (no per-frame realm): ' + (src || 'inline'));
+        continue;
+      }
+      _runFrameScript('"use strict";\n' + code, win, base);
+      continue;
+    }
     if (src) {
       let full = src;
-      try { full = new URL(src, doc._url || win._url).href; } catch (e) {}
+      try { full = new URL(src, base).href; } catch (e) {}
       try {
         const resp = await fetch(full, { mode: 'no-cors' });
         if (resp.ok || resp.type === 'opaque') {
@@ -1642,7 +1662,7 @@ const _executeFrameScripts = async function(iframeEl) {
         }
       } catch (e) { _reportError(e); }
     } else {
-      _runFrameScript(s.textContent || '', win, doc._url);
+      _runFrameScript(s.textContent || '', win, base);
     }
   }
   // Frame lifecycle: DOMContentLoaded fires at the frame document and bubbles to
@@ -2842,8 +2862,12 @@ globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNode
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
 class _IframeDocument {
-  constructor(html, url, iframeEl) {
+  constructor(html, url, iframeEl, baseUrl) {
     this._url = url;
+    // Base URL for resolving relative resources / baseURI. Usually === url, but
+    // for an about:srcdoc document document.URL is 'about:srcdoc' while the base
+    // (and relative <script src> resolution) is the parent's URL (HTML spec).
+    this._baseUrl = baseUrl || url;
     this._iframeEl = iframeEl;
     this.nodeType = 9;
     this.nodeName = '#document';
@@ -2892,6 +2916,7 @@ class _IframeDocument {
   set title(v) { this._title = v; }
   get URL() { return this._url; }
   get documentURI() { return this._url; }
+  get baseURI() { return this._baseUrl; }
   get location() { return this._iframeEl?.contentWindow?.location; }
   get defaultView() { return this._iframeEl?.contentWindow; }
   get ownerDocument() { return null; }
