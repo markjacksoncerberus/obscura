@@ -414,6 +414,7 @@ class Node {
         if (code) { try { (0, eval)(code); } catch(e) { console.error('Dynamic inline script error:', e.message); } }
       }
     }
+    if (c instanceof Element && c.localName === 'iframe') _connectIframe(c);
     return c;
   }
   removeChild(c) {
@@ -460,10 +461,12 @@ class Node {
       return n;
     }
     _dom("insert_before", n._nid, ref._nid);
+    n._ownerDoc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
     if (__mutationObservers?.length) {
       const _prev = +_dom("prev_sibling", n._nid);
       __notifyMutation('childList', this._nid, [n._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: ref._nid });
     }
+    if (n instanceof Element && n.localName === 'iframe') _connectIframe(n);
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -866,16 +869,15 @@ class Element extends Node {
         // mirroring how real browsers load the initial about:blank document.
         this.contentDocument; // side effect: creates _iframeDoc + _iframeWin
         _registerIframe(this);
-        const el = this;
-        Promise.resolve().then(() => {
-          try { if (typeof el.onload === 'function') el.onload(new Event('load')); } catch (e) {}
-          try { el.dispatchEvent(new Event('load')); } catch (e) {}
-        });
+        _scheduleFrameElementLoad(this);
       }
     }
   }
   _loadIframeSrc(url) {
     this._srcLoadStarted = true; // markup-src auto-load (below) won't double-fire
+    this._loadEventFired = false; // a (re)load fires a fresh element load event
+    const _gen = _bumpFrameLoadGen(this); // supersede any pending about:blank load
+    const _self = this;
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -892,17 +894,12 @@ class Element extends Node {
       }
       _registerIframe(el);
       await _executeFrameScripts(el); // run same-origin frame scripts before load
-      if (typeof el.onload === 'function') {
-        try { el.onload(); } catch(e) {}
-      } else {
-        var onloadAttr = el.getAttribute('onload');
-        if (onloadAttr) try { (0, eval)(onloadAttr); } catch(e) {}
-      }
+      if (_self._loadGen === _gen) _fireIframeElementLoad(el);
     }).catch(() => {
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       _registerIframe(el);
-      if (typeof el.onload === 'function') try { el.onload(); } catch(e) {}
+      if (_self._loadGen === _gen) _fireIframeElementLoad(el);
     });
   }
   get contentDocument() {
@@ -1675,6 +1672,54 @@ const _executeFrameScripts = async function(iframeEl) {
     if (typeof win.onload === 'function') { try { win.onload(new Event('load')); } catch (e) {} }
     win.dispatchEvent(new Event('load'));
   } catch (e) {}
+};
+
+// Fire the `load` event on the iframe ELEMENT (the parent-side event, distinct
+// from the frame window's load). Per spec it's a trusted, non-bubbling,
+// non-cancelable Event targeted at the iframe element. Guarded so one load fires
+// at most once per load pass (reset by _loadIframeSrc / src reassignment).
+const _fireIframeElementLoad = function(el) {
+  if (!el || el._loadEventFired) return;
+  el._loadEventFired = true;
+  const ev = new Event('load'); // isTrusted=true, bubbles=false, cancelable=false
+  ev.target = el;
+  try { el.dispatchEvent(ev); } catch (e) {}
+  if (typeof el.onload === 'function') { try { el.onload(ev); } catch (e) {} }
+  else { const a = el.getAttribute && el.getAttribute('onload'); if (a) { try { (0, eval)(a); } catch (e) {} } }
+};
+
+// Schedule a deferred element load and return its generation token. Each new load
+// (e.g. a src navigation) bumps el._loadGen; a pending deferred load only fires if
+// its generation is still current — so the initial about:blank load of a srcless
+// frame is correctly SUPERSEDED when `src` is set synchronously afterwards (HTML's
+// "the load event must not fire until the load has matured" — see WPT
+// content_document_changes_only_after_load_matures).
+const _bumpFrameLoadGen = function(el) { return (el._loadGen = (el._loadGen || 0) + 1); };
+const _scheduleFrameElementLoad = function(el) {
+  const gen = _bumpFrameLoadGen(el);
+  el._loadEventFired = false;
+  Promise.resolve().then(() => { if (el._loadGen === gen) _fireIframeElementLoad(el); });
+};
+
+// Begin loading a frame when its <iframe> is inserted into the document (HTML's
+// "browsing-context connected" hook). Real browsers start loading on insertion,
+// not lazily on contentDocument access — so a bare/srcdoc/markup-src frame fires
+// its `load` after being appended. Idempotent per element; only when connected.
+const _connectIframe = function(el) {
+  if (!el || el.localName !== 'iframe') return;
+  if (el._frameConnected || !el.isConnected) return;
+  el._frameConnected = true;
+  const srcdoc = el.getAttribute('srcdoc');
+  const src = el.getAttribute('src');
+  if (srcdoc != null) {
+    el.contentDocument; // builds the srcdoc doc + runs frame scripts (idempotent)
+    _scheduleFrameElementLoad(el);
+  } else if (src && src !== 'about:blank' && !src.startsWith('about:')) {
+    if (!el._srcLoadStarted) el._loadIframeSrc(src); // fires element load on completion
+  } else {
+    el.contentDocument; // initial about:blank document
+    _scheduleFrameElementLoad(el);
+  }
 };
 globalThis.navigator = {
   get userAgent() { return __obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
