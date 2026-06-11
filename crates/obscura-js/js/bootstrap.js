@@ -310,7 +310,9 @@ class Node {
   constructor(nid) { this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
-  get ownerDocument() { return globalThis.document; }
+  // A node's owner is the main document unless it was created by / adopted into
+  // another document (e.g. an iframe's contentDocument), which tags `_ownerDoc`.
+  get ownerDocument() { return this._ownerDoc || globalThis.document; }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
     const _watching = __mutationObservers?.length;
@@ -358,8 +360,10 @@ class Node {
   get nextSibling() { return _wrap(+_dom("next_sibling", this._nid)); }
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
-    // WebIDL: the argument must be a Node — null/undefined/plain objects throw TypeError.
-    if (c == null || typeof c !== 'object' || typeof c._nid !== 'number')
+    // WebIDL: the argument must be a Node — null/undefined/plain objects throw
+    // TypeError. A Node has either a tree id (_nid) or a numeric nodeType
+    // (synthetic Document wrappers like an iframe's contentDocument).
+    if (c == null || typeof c !== 'object' || (typeof c._nid !== 'number' && typeof c.nodeType !== 'number'))
       throw new TypeError("Failed to execute 'appendChild': parameter 1 is not of type 'Node'");
     // DOM "ensure pre-insertion validity": the parent must be a Document,
     // DocumentFragment, or Element — not a Text/Comment/etc.
@@ -379,6 +383,8 @@ class Node {
     }
     const _prev = __mutationObservers?.length ? +_dom("last_child", this._nid) : -1;
     _dom("append_child", this._nid, c._nid);
+    // Adopt the node into this parent's node document (updates ownerDocument).
+    c._ownerDoc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [c._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null });
     if (c instanceof Element && c.tagName === 'SCRIPT') {
       const scriptType = c.getAttribute('type') || '';
@@ -435,7 +441,7 @@ class Node {
   }
   insertBefore(n, ref) {
     // WebIDL: the node must be a Node (the reference child may be null).
-    if (n == null || typeof n !== 'object' || typeof n._nid !== 'number')
+    if (n == null || typeof n !== 'object' || (typeof n._nid !== 'number' && typeof n.nodeType !== 'number'))
       throw new TypeError("Failed to execute 'insertBefore': parameter 1 is not of type 'Node'");
     if (!ref) { this.appendChild(n); return n; }
     // Same pre-insertion validity as appendChild.
@@ -2710,6 +2716,8 @@ class _IframeDocument {
     this._body = document.createElement('body');
     this._root.appendChild(this._head);
     this._root.appendChild(this._body);
+    // These structural nodes belong to THIS document, not the main one.
+    this._root._ownerDoc = this; this._head._ownerDoc = this; this._body._ownerDoc = this;
     var bodyContent = html
       .replace(/^<!DOCTYPE[^>]*>/i, '')
       .replace(/<\/?html[^>]*>/gi, '')
@@ -2755,11 +2763,13 @@ class _IframeDocument {
   getElementsByClassName(cls) {
     return this._root.querySelectorAll('.' + cls);
   }
-  createElement(tag) { return document.createElement(tag); }
-  createElementNS(ns, tag) { return document.createElementNS(ns, tag); }
-  createTextNode(text) { return document.createTextNode(text); }
-  createComment(text) { return document.createComment(text); }
-  createDocumentFragment() { return document.createDocumentFragment(); }
+  // Nodes created by this document are owned by it (ownerDocument === frameDoc)
+  // until adopted into another document by insertion.
+  createElement(tag) { const n = document.createElement(tag); n._ownerDoc = this; return n; }
+  createElementNS(ns, tag) { const n = document.createElementNS(ns, tag); n._ownerDoc = this; return n; }
+  createTextNode(text) { const n = document.createTextNode(text); n._ownerDoc = this; return n; }
+  createComment(text) { const n = document.createComment(text); n._ownerDoc = this; return n; }
+  createDocumentFragment() { const n = document.createDocumentFragment(); n._ownerDoc = this; return n; }
   createEvent(type) { return document.createEvent(type); }
   hasFocus() { return false; }
 
