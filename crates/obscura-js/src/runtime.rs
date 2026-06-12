@@ -1939,6 +1939,35 @@ mod tests {
     }
 
     #[test]
+    fn test_iframe_srcdoc_reprocessing() {
+        // iframe backlog #2: changing/removing srcdoc reprocesses the frame so its
+        // contentDocument reflects the new content (and removing falls back to blank).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body>first</body>');\n\
+                   document.body.appendChild(f);\n\
+                   const a = f.contentDocument.body.textContent;\n\
+                   f.srcdoc = '<body>second</body>';   /* property -> setAttribute -> reprocess */\n\
+                   const b = f.contentDocument.body.textContent;\n\
+                   const propGet = f.srcdoc;            /* reflects attribute */\n\
+                   f.removeAttribute('srcdoc');         /* reprocess -> about:blank */\n\
+                   const c = f.contentDocument.body.textContent;\n\
+                   return [a, b, propGet, c];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["first", "second", "<body>second</body>", ""]),
+            "srcdoc reprocessing wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_insert_adjacent_text_and_element() {
         // testharness.js calls el.insertAdjacentText('afterend', ...) when rendering
         // results — its absence crashed heavy WPT result rendering. Cover all four

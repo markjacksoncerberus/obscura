@@ -654,12 +654,17 @@ class Element extends Node {
     const _old = __mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
     _dom("set_attribute", this._nid, n + "\0" + String(v));
     if (__mutationObservers?.length) __notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
+    // Changing srcdoc on an iframe reprocesses the frame (src goes through the
+    // src property setter's own load path).
+    if (n === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
   }
   setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
   removeAttribute(n) {
     const _old = __mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
     _dom("remove_attribute", this._nid, n);
     if (__mutationObservers?.length) __notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
+    // Removing srcdoc reprocesses: the frame falls back to src or about:blank.
+    if (n === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
   }
   removeAttributeNS(ns, n) { this.removeAttribute(n); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
@@ -873,6 +878,9 @@ class Element extends Node {
   set placeholder(v) { this.setAttribute("placeholder", v); }
   get href() { return this.getAttribute("href") || ""; }
   set href(v) { this.setAttribute("href", v); }
+  // iframe srcdoc reflects the attribute; setting it reprocesses via setAttribute.
+  get srcdoc() { return this.getAttribute("srcdoc") || ""; }
+  set srcdoc(v) { this.setAttribute("srcdoc", v == null ? "" : String(v)); }
   get src() { return this.getAttribute("src") || ""; }
   set src(v) {
     this.setAttribute("src", v);
@@ -1720,10 +1728,10 @@ const _scheduleFrameElementLoad = function(el) {
 // "browsing-context connected" hook). Real browsers start loading on insertion,
 // not lazily on contentDocument access — so a bare/srcdoc/markup-src frame fires
 // its `load` after being appended. Idempotent per element; only when connected.
-const _connectIframe = function(el) {
-  if (!el || el.localName !== 'iframe') return;
-  if (el._frameConnected || !el.isConnected) return;
-  el._frameConnected = true;
+// Load the frame document per the element's current src/srcdoc attributes
+// (HTML "process the iframe attributes": srcdoc takes precedence over src;
+// neither → about:blank). Schedules the element load event.
+const _loadFrameFromAttributes = function(el) {
   const srcdoc = el.getAttribute('srcdoc');
   const src = el.getAttribute('src');
   if (srcdoc != null) {
@@ -1735,6 +1743,23 @@ const _connectIframe = function(el) {
     el.contentDocument; // initial about:blank document
     _scheduleFrameElementLoad(el);
   }
+};
+const _connectIframe = function(el) {
+  if (!el || el.localName !== 'iframe') return;
+  if (el._frameConnected || !el.isConnected) return;
+  el._frameConnected = true;
+  _loadFrameFromAttributes(el);
+};
+// Re-run the load process after a src/srcdoc attribute changes on an already-
+// processed frame (HTML reprocesses the iframe attributes on mutation). Discards
+// the old document + script/load state, then reloads from the current attributes
+// and fires a fresh load. The gen guard in _scheduleFrameElementLoad/_loadIframeSrc
+// supersedes any still-pending load from the previous document.
+const _reprocessIframe = function(el) {
+  if (!el || el.localName !== 'iframe') return;
+  el._iframeDoc = null; el._iframeWin = null;
+  el._frameScriptsRan = false; el._srcLoadStarted = false; el._loadEventFired = false;
+  _loadFrameFromAttributes(el);
 };
 globalThis.navigator = {
   get userAgent() { return __obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
