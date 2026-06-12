@@ -1939,6 +1939,37 @@ mod tests {
     }
 
     #[test]
+    fn test_named_window_access() {
+        // HTML named property access on Window: <el id=foo> -> window.foo. Must be
+        // a live lookup, non-enumerable (off Object.keys/for-in), must not shadow a
+        // real global, and assigning replaces it with a normal property.
+        let mut rt = setup_runtime(
+            "<!DOCTYPE html><html><body><iframe id='myframe'></iframe><div id='document'></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   __exposeNamedGlobals(); /* Rust runs this before page scripts */\n\
+                   const byId = (typeof myframe !== 'undefined') && myframe.tagName === 'IFRAME';\n\
+                   const live = (window.myframe === document.getElementById('myframe'));\n\
+                   const enumHidden = !Object.keys(globalThis).includes('myframe');\n\
+                   const noShadow = (document === globalThis.document); /* id='document' didn't clobber */\n\
+                   const dyn = (function(){ const d = document.createElement('div'); d.id = 'made'; document.body.appendChild(d); return window.made === d; })();\n\
+                   globalThis.myframe = 42; /* assignment replaces the getter */\n\
+                   const assignable = (globalThis.myframe === 42);\n\
+                   return [byId, live, enumHidden, noShadow, dyn, assignable];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true, true, true, true, true]),
+            "named window access wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_iframe_srcdoc_reprocessing() {
         // iframe backlog #2: changing/removing srcdoc reprocesses the frame so its
         // contentDocument reflects the new content (and removing falls back to blank).

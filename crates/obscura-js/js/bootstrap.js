@@ -415,6 +415,7 @@ class Node {
       }
     }
     if (c instanceof Element && c.localName === 'iframe') _connectIframe(c);
+    if (c instanceof Element && c.id) __defineNamedGlobal(c.id);
     return c;
   }
   removeChild(c) {
@@ -657,6 +658,8 @@ class Element extends Node {
     // Changing srcdoc on an iframe reprocesses the frame (src goes through the
     // src property setter's own load path).
     if (n === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
+    // An id'd element is reachable as a Window-named global.
+    if (n === 'id' && v) __defineNamedGlobal(String(v));
   }
   setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
   removeAttribute(n) {
@@ -1760,6 +1763,43 @@ const _reprocessIframe = function(el) {
   el._iframeDoc = null; el._iframeWin = null;
   el._frameScriptsRan = false; el._srcLoadStarted = false; el._loadEventFired = false;
   _loadFrameFromAttributes(el);
+};
+
+// ---- Named property access on Window (HTML: <el id=foo> -> window.foo) ----
+// Real browsers expose an element's id (and certain elements' name) as a global,
+// so legacy scripts reach `myframe` directly. We model it with a non-enumerable,
+// configurable LIVE getter on globalThis: it stays off Object.keys/for-in (the
+// engine-hygiene stance is about hiding internals, not standard web content), it
+// NEVER shadows a real global/Web API (spec: named access doesn't override
+// existing properties), and assigning to it replaces it with a normal property
+// (so `var foo`/`foo = x` still work). _namedGlobals (a lexical Set, itself off
+// getOwnPropertyNames) tracks which names we defined so re-scans stay idempotent.
+const _namedGlobals = new Set();
+const __defineNamedGlobal = function(name) {
+  if (!name || typeof name !== 'string') return;
+  if (_namedGlobals.has(name)) return;   // already exposed by us
+  if (name in globalThis) return;        // don't shadow a real global / Web API
+  _namedGlobals.add(name);
+  Object.defineProperty(globalThis, name, {
+    configurable: true,
+    enumerable: false,
+    get() { return document.getElementById(name) || null; },
+    set(v) {
+      _namedGlobals.delete(name);
+      Object.defineProperty(globalThis, name, { value: v, writable: true, configurable: true, enumerable: true });
+    },
+  });
+};
+// Scan the current document for id'd elements and expose them. Called from Rust
+// right before page scripts run (covers markup), and on dynamic id changes.
+const __exposeNamedGlobals = function() {
+  try {
+    const els = document.querySelectorAll('[id]');
+    for (let i = 0; i < els.length; i++) {
+      const id = els[i].getAttribute && els[i].getAttribute('id');
+      if (id) __defineNamedGlobal(id);
+    }
+  } catch (e) {}
 };
 globalThis.navigator = {
   get userAgent() { return __obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
