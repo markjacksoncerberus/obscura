@@ -1939,6 +1939,29 @@ mod tests {
     }
 
     #[test]
+    fn test_url_host_setter() {
+        // WHATWG host setter: ignore stuff after a delimiter, parse :port, keep
+        // existing port when hostname-only is set.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const a = new URL('http://example.net/path'); a.host = 'example.com:8080/stuff';\n\
+                   const b = new URL('http://example.net/path'); b.host = 'example.com:8080#x';\n\
+                   const c = new URL('http://example.net:8080/p'); c.hostname = 'foo.com';\n\
+                   return [a.host, a.href, b.host, c.host, c.port];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["example.com:8080", "http://example.com:8080/path", "example.com:8080", "foo.com:8080", "8080"]),
+            "host setter wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_url_searchparams() {
         // Real URLSearchParams: form-urlencoded parse/serialize (+ for space) and
         // two-way sync with the owning URL (mutate params -> URL.search updates;

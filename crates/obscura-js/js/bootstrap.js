@@ -2800,7 +2800,7 @@ _markNative(AbortSignal.prototype.addEventListener); _markNative(AbortSignal.pro
 _markNative(AbortController); _markNative(AbortController.prototype.abort);
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
-if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
+if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([String(k),String(v)]);} get(k){const e=this._d.find(([a])=>a===String(k));return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===String(k)).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===String(k));} set(k,v){this.delete(k);this.append(k,v);} delete(k){this._d=this._d.filter(([a])=>a!==String(k));} keys(){return this._d.map(([k])=>k)[Symbol.iterator]();} values(){return this._d.map(([,v])=>v)[Symbol.iterator]();} entries(){return this._d.map(([k,v])=>[k,v])[Symbol.iterator]();} [Symbol.iterator](){return this.entries();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k,this));} };
 // decodeURIComponent throws on a malformed % sequence; WHATWG form/percent
 // decoding keeps invalid sequences literal. Best-effort + never throws.
 const _safeDecodeURIComponent = function(s) {
@@ -2841,7 +2841,8 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
         if (a.length !== 2) throw new TypeError("Failed to construct 'URLSearchParams': Invalid tuple");
         this._p.push([String(a[0]), String(a[1])]);
       }
-    } else if (init && typeof init === 'object') {
+    } else if (init && (typeof init === 'object' || typeof init === 'function')) {
+      // Record init: own enumerable string keys (functions are objects too).
       for (const k of Object.keys(init)) this._p.push([String(k), String(init[k])]);
     }
   }
@@ -2892,10 +2893,14 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
       .map(([pair]) => pair);
     this._update();
   }
-  forEach(cb, thisArg) { for (const [k, v] of this._p.slice()) cb.call(thisArg, v, k, this); }
-  *keys() { for (const [k] of this._p.slice()) yield k; }
-  *values() { for (const [, v] of this._p.slice()) yield v; }
-  *entries() { for (const [k, v] of this._p.slice()) yield [k, v]; }
+  forEach(cb, thisArg) {
+    // Spec: a live index walk — entries appended during iteration are visited,
+    // and deletions shift subsequent indices (not a snapshot).
+    for (let i = 0; i < this._p.length; i++) { const [k, v] = this._p[i]; cb.call(thisArg, v, k, this); }
+  }
+  *keys() { for (let i = 0; i < this._p.length; i++) yield this._p[i][0]; }
+  *values() { for (let i = 0; i < this._p.length; i++) yield this._p[i][1]; }
+  *entries() { for (let i = 0; i < this._p.length; i++) { const p = this._p[i]; yield [p[0], p[1]]; } }
   [Symbol.iterator]() { return this.entries(); }
   toString() { return this._p.map(([k, v]) => _formEncode(k) + '=' + _formEncode(v)).join('&'); }
 };

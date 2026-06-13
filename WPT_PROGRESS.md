@@ -18,13 +18,14 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-13.
 |------|:------:|:------:|:------:|----------------|
 | `url/url-constructor.any.html` | 1/890 | **833/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057` |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
-| `url/url-setters.any.html` | 5/279 | **188/279** | ⬆️ | The Setters' Sigil (op_url_set + accessor URL) |
+| `url/url-setters.any.html` | 5/279 | **226/279** | ⬆️ | Setters' Sigil + host/port/tab-strip batch |
 | `url/url-searchparams.any.html` | 1/4 | **4/4** | ✅ 100% | Real URLSearchParams (form codec + URL two-way sync) |
 | `url/urlsearchparams-sort.any.html` | n/a | **17/17** | ✅ 100% | ″ |
 | `url/urlsearchparams-stringifier.any.html` | n/a | **14/14** | ✅ 100% | ″ |
+| `url/urlsearchparams-foreach.any.html` | 2/6 | **6/6** | ✅ 100% | live (index) iteration |
 | `url/urlsearchparams-{append,set,getall,has}.any.html` | n/a | **4/4, 2/2, 2/2, 4/4** | ✅ | ″ |
-| `url/urlsearchparams-constructor.any.html` | n/a | **21/27** | ⬆️ | ″ |
-| `url/urlsearchparams-{delete,foreach}.any.html` | n/a | **6/8, 2/6** | ⬆️ | ″ (forEach live-mutation + 2-arg delete edge cases remain) |
+| `url/urlsearchparams-constructor.any.html` | n/a | **22/27** | ⬆️ | ″ + FormData iterator |
+| `url/urlsearchparams-delete.any.html` | n/a | **6/8** | ⬆️ | (data: opaque trailing-space cases remain) |
 | `html/.../the-iframe-element/srcdoc_process_attributes.html` | 0/3 | **3/3** | ✅ | blob: src `cf483fe` + reprocessing `609cdd4` |
 | `html/.../the-iframe-element/srcdoc-attribute-reset.html` | 0/1 | **1/1** | ✅ | named-window `6822deb` + reprocessing `609cdd4` |
 | `html/.../the-iframe-element/iframe-load-event.html` | 0/2 | **2/2** | ✅ | load-on-insertion `229ff83` |

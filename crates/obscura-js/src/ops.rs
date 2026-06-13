@@ -909,6 +909,64 @@ fn op_url_parse(#[string] input: String, #[string] base: String) -> String {
     }
 }
 
+fn url_is_special(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https" | "ws" | "wss" | "ftp" | "file")
+}
+
+/// Truncate a `host` setter value at the first /?# delimiter (\ too for special
+/// schemes); the remainder (host[:port]) is split separately.
+fn truncate_host(value: &str, special: bool) -> &str {
+    let mut end = value.len();
+    for (i, c) in value.char_indices() {
+        if c == '/' || c == '?' || c == '#' || (special && c == '\\') {
+            end = i;
+            break;
+        }
+    }
+    &value[..end]
+}
+
+/// Split "host[:port]" honoring an [IPv6] literal; returns (host, port-digits?).
+fn split_host_port(v: &str) -> (&str, Option<&str>) {
+    if v.starts_with('[') {
+        if let Some(rb) = v.find(']') {
+            return (&v[..=rb], v[rb + 1..].strip_prefix(':'));
+        }
+    }
+    match v.find(':') {
+        Some(i) => (&v[..i], Some(&v[i + 1..])),
+        None => (v, None),
+    }
+}
+
+/// `hostname` setter value: like `truncate_host` but `:` also stops (outside an
+/// [IPv6] literal) since hostname carries no port.
+fn hostname_prefix(value: &str, special: bool) -> &str {
+    if value.starts_with('[') {
+        if let Some(rb) = value.find(']') {
+            return &value[..=rb];
+        }
+    }
+    let mut end = value.len();
+    for (i, c) in value.char_indices() {
+        if c == '/' || c == '?' || c == '#' || c == ':' || (special && c == '\\') {
+            end = i;
+            break;
+        }
+    }
+    &value[..end]
+}
+
+/// Apply the WHATWG port-parser: leading ASCII digits, set if any.
+fn set_port_from(u: &mut url::Url, raw: &str) {
+    let digits: String = raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        if let Ok(p) = digits.parse::<u16>() {
+            let _ = u.set_port(Some(p));
+        }
+    }
+}
+
 /// WHATWG URL component setters (url.protocol = ..., url.host = ..., etc.) backing
 /// the JS `URL` accessor setters. Re-parses `href`, applies the `url` crate setter
 /// for `part`, and returns the updated components. A setter that the spec rejects
@@ -916,11 +974,30 @@ fn op_url_parse(#[string] input: String, #[string] base: String) -> String {
 #[op2]
 #[string]
 fn op_url_set(#[string] href: String, #[string] part: String, #[string] value: String) -> String {
-    let mut u = match url::Url::parse(&href) {
-        Ok(u) => u,
-        Err(_) => return "{\"valid\":false}".to_string(),
-    };
-    match part.as_str() {
+    // WHATWG strips all tab (U+0009), LF (U+000A) and CR (U+000D) from setter input.
+    let value: String = value.chars().filter(|c| *c != '\t' && *c != '\n' && *c != '\r').collect();
+    // The `url` crate's setters can panic internally on some adversarial inputs
+    // (e.g. an empty host that corrupts internal offsets — url-2.5.8 lib.rs:2881).
+    // Catch it so a URL setter can NEVER abort the process; a panic = no-op setter.
+    let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut u = match url::Url::parse(&href) {
+            Ok(u) => u,
+            Err(_) => return None,
+        };
+        apply_url_setter(&mut u, &part, &value);
+        Some(url_components_json(&u))
+    }));
+    match applied {
+        Ok(Some(json)) => json,
+        Ok(None) => "{\"valid\":false}".to_string(),
+        Err(_) => url::Url::parse(&href)
+            .map(|u| url_components_json(&u))
+            .unwrap_or_else(|_| "{\"valid\":false}".to_string()),
+    }
+}
+
+fn apply_url_setter(u: &mut url::Url, part: &str, value: &str) {
+    match part {
         "protocol" => {
             // Accept "https", "https:", "https:..." — the scheme is up to the ':'.
             let scheme = value.split(':').next().unwrap_or("");
@@ -933,21 +1010,50 @@ fn op_url_set(#[string] href: String, #[string] part: String, #[string] value: S
             let _ = u.set_password(if value.is_empty() { None } else { Some(&value) });
         }
         "hostname" => {
-            let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
+            if !u.cannot_be_a_base() {
+                let special = url_is_special(u.scheme());
+                let v = hostname_prefix(&value, special);
+                if v.is_empty() {
+                    if !special {
+                        let _ = u.set_host(None);
+                    }
+                } else {
+                    let _ = u.set_host(Some(v));
+                }
+            }
         }
         "host" => {
-            // host may carry a :port; set_host accepts "host:port".
-            let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
+            // WHATWG host setter: stop at the first /?# (and \ for special), then
+            // split host[:port] (IPv6-aware); the port parser takes leading digits.
+            if !u.cannot_be_a_base() {
+                let special = url_is_special(u.scheme());
+                let v = truncate_host(&value, special);
+                if v.is_empty() {
+                    if !special {
+                        let _ = u.set_host(None);
+                    }
+                } else {
+                    let (host, port) = split_host_port(v);
+                    if u.set_host(Some(host)).is_ok() {
+                        if let Some(ps) = port {
+                            set_port_from(u, ps);
+                        }
+                    }
+                }
+            }
         }
         "port" => {
             if value.is_empty() {
                 let _ = u.set_port(None);
-            } else if let Ok(p) = value.parse::<u16>() {
-                let _ = u.set_port(Some(p));
+            } else {
+                set_port_from(u, value);
             }
         }
         "pathname" => {
-            u.set_path(&value);
+            // Opaque-path URLs (mailto:, data:, sc:original) can't have their path set.
+            if !u.cannot_be_a_base() {
+                u.set_path(&value);
+            }
         }
         "search" => {
             let q = value.strip_prefix('?').unwrap_or(&value);
@@ -959,7 +1065,6 @@ fn op_url_set(#[string] href: String, #[string] part: String, #[string] value: S
         }
         _ => {}
     }
-    url_components_json(&u)
 }
 
 pub fn build_extension() -> Extension {
