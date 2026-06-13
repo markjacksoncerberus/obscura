@@ -1939,6 +1939,52 @@ mod tests {
     }
 
     #[test]
+    fn test_url_blob_origin_and_malformed_query() {
+        // blob: origin is the INNER origin only when inner scheme is http(s) (WHATWG);
+        // blob:ftp/ws/etc -> null. And a malformed % in the query must not throw.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const httpInner = new URL('blob:https://example.org/x').origin;\n\
+                   const ftpInner = new URL('blob:ftp://host/path').origin;\n\
+                   let threw = false; let href = '';\n\
+                   try { href = new URL('http://h/p?%GH&a=b').href; } catch (e) { threw = true; }\n\
+                   return [httpInner, ftpInner, threw, href.includes('%GH')];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["https://example.org", "null", false, true]),
+            "blob origin / malformed-query handling wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_url_empty_query_fragment() {
+        // WHATWG: empty fragment/query -> hash/search getters are "" (the leading
+        // #/? only appears when non-empty), though href keeps the trailing char.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const a = new URL('http://x/foo?bar=baz#');\n\
+                   const b = new URL('http://x/foo?');\n\
+                   return [a.hash, a.href.endsWith('#'), b.search, b.href.endsWith('?')];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["", true, "", true]),
+            "empty fragment/query should give empty hash/search but keep href: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_url_whatwg_parsing() {
         // Capabilities the old regex couldn't do, now via the Rust url crate:
         // userinfo, port, dot-segment normalization, query/hash split, throwing on

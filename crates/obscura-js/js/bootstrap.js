@@ -2781,11 +2781,19 @@ _markNative(AbortController); _markNative(AbortController.prototype.abort);
 if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
 if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([k,v]);} get(k){const e=this._d.find(([a])=>a===k);return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===k).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===k);} entries(){return this._d[Symbol.iterator]();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k));} };
+// decodeURIComponent throws on a malformed % sequence; WHATWG form/percent
+// decoding keeps invalid sequences literal. Best-effort + never throws.
+const _safeDecodeURIComponent = function(s) {
+  try { return decodeURIComponent(s); }
+  catch (e) {
+    return String(s).replace(/%[0-9A-Fa-f]{2}/g, m => { try { return decodeURIComponent(m); } catch (_) { return m; } });
+  }
+};
 if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class {
   constructor(init=""){
     this._p=[];
     if(typeof init==="string"){
-      init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this.append(decodeURIComponent(k),decodeURIComponent(v.join("=")));});
+      init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this.append(_safeDecodeURIComponent(k),_safeDecodeURIComponent(v.join("=")));});
     } else if (init && typeof init[Symbol.iterator] === 'function') {
       for (const pair of init) if (pair && pair.length >= 2) this.append(pair[0], pair[1]);
     } else if (init && typeof init === 'object') {

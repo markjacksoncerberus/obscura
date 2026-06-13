@@ -838,6 +838,22 @@ async fn op_sleep(#[number] millis: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
 
+/// Compute a URL's origin per WHATWG. The `url` crate returns the inner origin
+/// for ANY blob: inner scheme, but the spec only adopts the inner origin when it
+/// is http(s) — otherwise (blob:ftp/ws/wss/blob, parse failure) the origin is
+/// opaque ("null").
+fn url_origin(u: &url::Url) -> String {
+    if u.scheme() == "blob" {
+        return match url::Url::parse(u.path()) {
+            Ok(inner) if inner.scheme() == "http" || inner.scheme() == "https" => {
+                inner.origin().ascii_serialization()
+            }
+            _ => "null".to_string(),
+        };
+    }
+    u.origin().ascii_serialization()
+}
+
 /// WHATWG URL parsing backing the JS `URL` class. Uses the `url` crate (real
 /// spec parser) instead of a regex. Returns the components as JSON; `valid:false`
 /// (so JS throws TypeError) when the input can't be parsed (with the given base).
@@ -859,8 +875,17 @@ fn op_url_parse(#[string] input: String, #[string] base: String) -> String {
                 (Some(h), None) => h.to_string(),
                 _ => String::new(),
             };
-            let search = u.query().map(|q| format!("?{}", q)).unwrap_or_default();
-            let hash = u.fragment().map(|f| format!("#{}", f)).unwrap_or_default();
+            // WHATWG: the `search`/`hash` getters are "" for a null OR EMPTY
+            // query/fragment (the leading ?/# only appears when non-empty), even
+            // though href keeps a trailing ?/# the input had.
+            let search = match u.query() {
+                Some(q) if !q.is_empty() => format!("?{}", q),
+                _ => String::new(),
+            };
+            let hash = match u.fragment() {
+                Some(f) if !f.is_empty() => format!("#{}", f),
+                _ => String::new(),
+            };
             serde_json::json!({
                 "valid": true,
                 "href": u.as_str(),
@@ -871,7 +896,7 @@ fn op_url_parse(#[string] input: String, #[string] base: String) -> String {
                 "pathname": u.path(),
                 "search": search,
                 "hash": hash,
-                "origin": u.origin().ascii_serialization(),
+                "origin": url_origin(&u),
                 "username": u.username(),
                 "password": u.password().unwrap_or(""),
             })
