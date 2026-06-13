@@ -854,6 +854,41 @@ fn url_origin(u: &url::Url) -> String {
     u.origin().ascii_serialization()
 }
 
+/// Serialize a parsed URL's WHATWG components to JSON (shared by parse + set).
+fn url_components_json(u: &url::Url) -> String {
+    let host_with_port = match (u.host_str(), u.port()) {
+        (Some(h), Some(p)) => format!("{}:{}", h, p),
+        (Some(h), None) => h.to_string(),
+        _ => String::new(),
+    };
+    // WHATWG: the `search`/`hash` getters are "" for a null OR EMPTY query/fragment
+    // (the leading ?/# only appears when non-empty), even though href keeps a
+    // trailing ?/# the input had.
+    let search = match u.query() {
+        Some(q) if !q.is_empty() => format!("?{}", q),
+        _ => String::new(),
+    };
+    let hash = match u.fragment() {
+        Some(f) if !f.is_empty() => format!("#{}", f),
+        _ => String::new(),
+    };
+    serde_json::json!({
+        "valid": true,
+        "href": u.as_str(),
+        "protocol": format!("{}:", u.scheme()),
+        "host": host_with_port,
+        "hostname": u.host_str().unwrap_or(""),
+        "port": u.port().map(|p| p.to_string()).unwrap_or_default(),
+        "pathname": u.path(),
+        "search": search,
+        "hash": hash,
+        "origin": url_origin(u),
+        "username": u.username(),
+        "password": u.password().unwrap_or(""),
+    })
+    .to_string()
+}
+
 /// WHATWG URL parsing backing the JS `URL` class. Uses the `url` crate (real
 /// spec parser) instead of a regex. Returns the components as JSON; `valid:false`
 /// (so JS throws TypeError) when the input can't be parsed (with the given base).
@@ -869,41 +904,62 @@ fn op_url_parse(#[string] input: String, #[string] base: String) -> String {
         }
     };
     match parsed {
-        Ok(u) => {
-            let host_with_port = match (u.host_str(), u.port()) {
-                (Some(h), Some(p)) => format!("{}:{}", h, p),
-                (Some(h), None) => h.to_string(),
-                _ => String::new(),
-            };
-            // WHATWG: the `search`/`hash` getters are "" for a null OR EMPTY
-            // query/fragment (the leading ?/# only appears when non-empty), even
-            // though href keeps a trailing ?/# the input had.
-            let search = match u.query() {
-                Some(q) if !q.is_empty() => format!("?{}", q),
-                _ => String::new(),
-            };
-            let hash = match u.fragment() {
-                Some(f) if !f.is_empty() => format!("#{}", f),
-                _ => String::new(),
-            };
-            serde_json::json!({
-                "valid": true,
-                "href": u.as_str(),
-                "protocol": format!("{}:", u.scheme()),
-                "host": host_with_port,
-                "hostname": u.host_str().unwrap_or(""),
-                "port": u.port().map(|p| p.to_string()).unwrap_or_default(),
-                "pathname": u.path(),
-                "search": search,
-                "hash": hash,
-                "origin": url_origin(&u),
-                "username": u.username(),
-                "password": u.password().unwrap_or(""),
-            })
-            .to_string()
-        }
+        Ok(u) => url_components_json(&u),
         Err(_) => "{\"valid\":false}".to_string(),
     }
+}
+
+/// WHATWG URL component setters (url.protocol = ..., url.host = ..., etc.) backing
+/// the JS `URL` accessor setters. Re-parses `href`, applies the `url` crate setter
+/// for `part`, and returns the updated components. A setter that the spec rejects
+/// is a no-op (the url crate returns Err) — we keep the prior value, never throw.
+#[op2]
+#[string]
+fn op_url_set(#[string] href: String, #[string] part: String, #[string] value: String) -> String {
+    let mut u = match url::Url::parse(&href) {
+        Ok(u) => u,
+        Err(_) => return "{\"valid\":false}".to_string(),
+    };
+    match part.as_str() {
+        "protocol" => {
+            // Accept "https", "https:", "https:..." — the scheme is up to the ':'.
+            let scheme = value.split(':').next().unwrap_or("");
+            let _ = u.set_scheme(scheme);
+        }
+        "username" => {
+            let _ = u.set_username(&value);
+        }
+        "password" => {
+            let _ = u.set_password(if value.is_empty() { None } else { Some(&value) });
+        }
+        "hostname" => {
+            let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
+        }
+        "host" => {
+            // host may carry a :port; set_host accepts "host:port".
+            let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
+        }
+        "port" => {
+            if value.is_empty() {
+                let _ = u.set_port(None);
+            } else if let Ok(p) = value.parse::<u16>() {
+                let _ = u.set_port(Some(p));
+            }
+        }
+        "pathname" => {
+            u.set_path(&value);
+        }
+        "search" => {
+            let q = value.strip_prefix('?').unwrap_or(&value);
+            u.set_query(if value.is_empty() { None } else { Some(q) });
+        }
+        "hash" => {
+            let f = value.strip_prefix('#').unwrap_or(&value);
+            u.set_fragment(if value.is_empty() { None } else { Some(f) });
+        }
+        _ => {}
+    }
+    url_components_json(&u)
 }
 
 pub fn build_extension() -> Extension {
@@ -918,6 +974,7 @@ pub fn build_extension() -> Extension {
             op_navigate(),
             op_sleep(),
             op_url_parse(),
+            op_url_set(),
         ]),
         ..Default::default()
     }

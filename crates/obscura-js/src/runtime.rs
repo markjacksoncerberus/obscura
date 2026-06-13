@@ -1939,6 +1939,32 @@ mod tests {
     }
 
     #[test]
+    fn test_url_setters() {
+        // URL component setters re-serialize via the url crate (op_url_set).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const u = new URL('https://example.com/path?q=1#h');\n\
+                   u.protocol = 'http:';\n\
+                   u.hostname = 'other.com';\n\
+                   u.port = '8080';\n\
+                   u.pathname = '/new';\n\
+                   u.search = '?x=2';\n\
+                   u.hash = '#frag';\n\
+                   return [u.href, u.host, u.pathname, u.search, u.hash, u.protocol];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["http://other.com:8080/new?x=2#frag", "other.com:8080", "/new", "?x=2", "#frag", "http:"]),
+            "URL setters wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_url_blob_origin_and_malformed_query() {
         // blob: origin is the INNER origin only when inner scheme is http(s) (WHATWG);
         // blob:ftp/ws/etc -> null. And a malformed % in the query must not throw.

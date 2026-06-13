@@ -18,6 +18,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-13.
 |------|:------:|:------:|:------:|----------------|
 | `url/url-constructor.any.html` | 1/890 | **833/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057` |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
+| `url/url-setters.any.html` | 5/279 | **188/279** | ⬆️ | The Setters' Sigil (op_url_set + accessor URL) |
 | `html/.../the-iframe-element/srcdoc_process_attributes.html` | 0/3 | **3/3** | ✅ | blob: src `cf483fe` + reprocessing `609cdd4` |
 | `html/.../the-iframe-element/srcdoc-attribute-reset.html` | 0/1 | **1/1** | ✅ | named-window `6822deb` + reprocessing `609cdd4` |
 | `html/.../the-iframe-element/iframe-load-event.html` | 0/2 | **2/2** | ✅ | load-on-insertion `229ff83` |
@@ -31,8 +32,8 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-13.
 
 | Test | Latest | Next move |
 |------|:------:|-----------|
-| `url/url-setters.any.html` | 5/279 | **The Setters' Sigil** — URL setters need re-parse-on-assignment (convert plain props → getter/setters that re-run `op_url_parse`). |
-| `url/url-searchparams.any.html` | 1/4 | Build out a fuller `URLSearchParams` (current is a minimal stub). |
+| `url/url-searchparams.any.html` | 1/4 | Build out a fuller `URLSearchParams` (current is a minimal stub); add two-way sync with `URL.search`. |
+| `url/url-setters.any.html` (remaining) | 188/279 | The remaining ~91 need searchParams↔URL two-way sync, host/port special-scheme edge cases, and more setter-rejection nuances. |
 
 ## Regression baselines (touched-adjacent, watched for regressions)
 

@@ -2251,23 +2251,37 @@ if (typeof URL === 'undefined' || !URL.prototype) {
         base == null ? '' : String(base)
       ));
       if (!res.valid) throw new TypeError("Failed to construct 'URL': Invalid URL");
-      this.href = res.href;
-      this.protocol = res.protocol;
-      this.username = res.username;
-      this.password = res.password;
-      this.host = res.host;
-      this.hostname = res.hostname;
-      this.port = res.port;
-      this.pathname = res.pathname;
-      this.search = res.search;
-      this.hash = res.hash;
-      this.origin = res.origin;
-      this.searchParams = new URLSearchParams(this.search);
+      this._c = res;   // current components
+      this._sp = null; // cached URLSearchParams
     }
-    toString() { return this.href; }
-    toJSON() { return this.href; }
-    static createObjectURL() { return 'blob:null/fake-' + Math.random().toString(36).slice(2); }
-    static revokeObjectURL() {}
+    // Setting a component re-applies it through the url crate (op_url_set); a
+    // setter the spec rejects is a no-op (op returns the unchanged components).
+    _apply(part, value) {
+      const res = JSON.parse(Deno.core.ops.op_url_set(this._c.href, part, value == null ? '' : String(value)));
+      if (res.valid) { this._c = res; this._sp = null; }
+    }
+    get href() { return this._c.href; }
+    set href(v) {
+      const res = JSON.parse(Deno.core.ops.op_url_parse(v == null ? '' : String(v), ''));
+      if (!res.valid) throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL");
+      this._c = res; this._sp = null;
+    }
+    get origin() { return this._c.origin; }
+    get protocol() { return this._c.protocol; } set protocol(v) { this._apply('protocol', v); }
+    get username() { return this._c.username; } set username(v) { this._apply('username', v); }
+    get password() { return this._c.password; } set password(v) { this._apply('password', v); }
+    get host() { return this._c.host; }         set host(v) { this._apply('host', v); }
+    get hostname() { return this._c.hostname; } set hostname(v) { this._apply('hostname', v); }
+    get port() { return this._c.port; }         set port(v) { this._apply('port', v); }
+    get pathname() { return this._c.pathname; } set pathname(v) { this._apply('pathname', v); }
+    get search() { return this._c.search; }     set search(v) { this._apply('search', v); }
+    get hash() { return this._c.hash; }         set hash(v) { this._apply('hash', v); }
+    get searchParams() {
+      if (!this._sp) this._sp = new URLSearchParams(this._c.search);
+      return this._sp;
+    }
+    toString() { return this._c.href; }
+    toJSON() { return this._c.href; }
   };
 }
 
