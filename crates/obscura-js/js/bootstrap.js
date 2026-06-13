@@ -2244,47 +2244,24 @@ _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 if (typeof URL === 'undefined' || !URL.prototype) {
   globalThis.URL = class URL {
     constructor(url, base) {
-      let full = url;
-      if (base && !url.includes('://')) {
-        var bm = base.match(/^(https?:\/\/[^\/\?#]+)(\/[^?#]*)?/);
-        if (bm) {
-          var bOrigin = bm[1];
-          var bPath = bm[2] || '/';
-          if (url.startsWith('/')) {
-            full = bOrigin + url;
-          } else if (url.startsWith('?') || url.startsWith('#')) {
-            full = bOrigin + bPath + url;
-          } else {
-            var dir = bPath.substring(0, bPath.lastIndexOf('/') + 1);
-            full = bOrigin + dir + url;
-          }
-        }
-      }
-      const m = full.match(/^(https?):\/\/([^\/\?#]+)(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
-      if (m) {
-        this.protocol = m[1] + ':';
-        this.host = m[2]; this.hostname = m[2].split(':')[0];
-        this.port = m[2].includes(':') ? m[2].split(':')[1] : '';
-        this.pathname = m[3] || '/';
-        this.search = m[4] || ''; this.hash = m[5] || '';
-      } else {
-        // Non-http(s) / opaque-path schemes (blob:, data:, about:, mailto:, ...):
-        // extract the scheme as the protocol; the remainder is an opaque path with
-        // no host. Their origin is opaque ("null").
-        const sm = full.match(/^([a-z][a-z0-9+.\-]*):([\s\S]*)$/i);
-        if (sm) {
-          this.protocol = sm[1].toLowerCase() + ':';
-          this.host = ''; this.hostname = ''; this.port = '';
-          this.pathname = sm[2]; this.search = ''; this.hash = '';
-        } else {
-          this.protocol = ''; this.host = ''; this.hostname = '';
-          this.port = ''; this.pathname = full; this.search = ''; this.hash = '';
-        }
-      }
-      this.href = full;
-      this.origin = (this.host && (this.protocol === 'http:' || this.protocol === 'https:'))
-        ? this.protocol + '//' + this.host
-        : 'null';
+      // Real WHATWG parsing via the Rust `url` crate (op), not a regex. Throws
+      // TypeError on invalid input (with the given base), matching the spec.
+      const res = JSON.parse(Deno.core.ops.op_url_parse(
+        url == null ? '' : String(url),
+        base == null ? '' : String(base)
+      ));
+      if (!res.valid) throw new TypeError("Failed to construct 'URL': Invalid URL");
+      this.href = res.href;
+      this.protocol = res.protocol;
+      this.username = res.username;
+      this.password = res.password;
+      this.host = res.host;
+      this.hostname = res.hostname;
+      this.port = res.port;
+      this.pathname = res.pathname;
+      this.search = res.search;
+      this.hash = res.hash;
+      this.origin = res.origin;
       this.searchParams = new URLSearchParams(this.search);
     }
     toString() { return this.href; }

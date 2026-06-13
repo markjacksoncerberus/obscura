@@ -1939,6 +1939,30 @@ mod tests {
     }
 
     #[test]
+    fn test_url_whatwg_parsing() {
+        // Capabilities the old regex couldn't do, now via the Rust url crate:
+        // userinfo, port, dot-segment normalization, query/hash split, throwing on
+        // invalid input, and relative resolution against a path base.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const a = new URL('https://user:pass@host.com:8080/a/b/../c?x=1#frag');\n\
+                   let threw = false; try { new URL('not a valid url'); } catch (e) { threw = (e instanceof TypeError); }\n\
+                   const rel = new URL('../d', 'https://host.com/a/b/c').href;\n\
+                   return [a.pathname, a.search, a.hash, a.username, a.password, a.port, a.host, threw, rel];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["/a/c", "?x=1", "#frag", "user", "pass", "8080", "host.com:8080", true, "https://host.com/a/d"]),
+            "WHATWG URL parsing wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_url_opaque_scheme_protocol() {
         // URL parser must extract the protocol for opaque-path schemes (blob:,
         // data:, about:) — previously only http(s) matched, so blob: protocol was ''

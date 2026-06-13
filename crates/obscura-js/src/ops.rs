@@ -838,6 +838,49 @@ async fn op_sleep(#[number] millis: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
 
+/// WHATWG URL parsing backing the JS `URL` class. Uses the `url` crate (real
+/// spec parser) instead of a regex. Returns the components as JSON; `valid:false`
+/// (so JS throws TypeError) when the input can't be parsed (with the given base).
+#[op2]
+#[string]
+fn op_url_parse(#[string] input: String, #[string] base: String) -> String {
+    let parsed = if base.is_empty() {
+        url::Url::parse(&input)
+    } else {
+        match url::Url::parse(&base) {
+            Ok(b) => b.join(&input),
+            Err(e) => Err(e),
+        }
+    };
+    match parsed {
+        Ok(u) => {
+            let host_with_port = match (u.host_str(), u.port()) {
+                (Some(h), Some(p)) => format!("{}:{}", h, p),
+                (Some(h), None) => h.to_string(),
+                _ => String::new(),
+            };
+            let search = u.query().map(|q| format!("?{}", q)).unwrap_or_default();
+            let hash = u.fragment().map(|f| format!("#{}", f)).unwrap_or_default();
+            serde_json::json!({
+                "valid": true,
+                "href": u.as_str(),
+                "protocol": format!("{}:", u.scheme()),
+                "host": host_with_port,
+                "hostname": u.host_str().unwrap_or(""),
+                "port": u.port().map(|p| p.to_string()).unwrap_or_default(),
+                "pathname": u.path(),
+                "search": search,
+                "hash": hash,
+                "origin": u.origin().ascii_serialization(),
+                "username": u.username(),
+                "password": u.password().unwrap_or(""),
+            })
+            .to_string()
+        }
+        Err(_) => "{\"valid\":false}".to_string(),
+    }
+}
+
 pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
@@ -849,6 +892,7 @@ pub fn build_extension() -> Extension {
             op_set_cookie(),
             op_navigate(),
             op_sleep(),
+            op_url_parse(),
         ]),
         ..Default::default()
     }
