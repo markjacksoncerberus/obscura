@@ -1939,6 +1939,42 @@ mod tests {
     }
 
     #[test]
+    fn test_url_searchparams() {
+        // Real URLSearchParams: form-urlencoded parse/serialize (+ for space) and
+        // two-way sync with the owning URL (mutate params -> URL.search updates;
+        // set URL.search -> params reflect).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const u = new URL('https://x.com/?a=1&b=2');\n\
+                   const sp = u.searchParams;\n\
+                   sp.append('c', 'hi there');\n\
+                   const r1 = u.search;                       /* ?a=1&b=2&c=hi+there */\n\
+                   sp.set('a', '9');\n\
+                   const r2 = u.search;                       /* ?a=9&b=2&c=hi+there */\n\
+                   u.search = 'z=1';                          /* URL -> params */\n\
+                   const r3 = sp.get('z') + ',' + sp.has('a') + ',' + sp.size;  /* 1,false,1 */\n\
+                   const sp2 = new URLSearchParams('p=a%20b&q=c+d');\n\
+                   const r4 = sp2.get('p') + ',' + sp2.get('q') + ',' + sp2.toString(); /* a b,c d,p=a+b&q=c+d */\n\
+                   return [r1, r2, r3, r4];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "?a=1&b=2&c=hi+there",
+                "?a=9&b=2&c=hi+there",
+                "1,false,1",
+                "a b,c d,p=a+b&q=c+d"
+            ]),
+            "URLSearchParams / two-way sync wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_url_setters() {
         // URL component setters re-serialize via the url crate (op_url_set).
         let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");

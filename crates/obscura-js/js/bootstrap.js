@@ -2258,13 +2258,19 @@ if (typeof URL === 'undefined' || !URL.prototype) {
     // setter the spec rejects is a no-op (op returns the unchanged components).
     _apply(part, value) {
       const res = JSON.parse(Deno.core.ops.op_url_set(this._c.href, part, value == null ? '' : String(value)));
-      if (res.valid) { this._c = res; this._sp = null; }
+      // Refresh (not replace) any live searchParams from the new query.
+      if (res.valid) { this._c = res; if (this._sp) this._sp._setList(this._c.search); }
+    }
+    // Called by the owning searchParams when its list mutates (two-way sync).
+    _setSearchFromParams(str) {
+      const res = JSON.parse(Deno.core.ops.op_url_set(this._c.href, 'search', str));
+      if (res.valid) this._c = res;
     }
     get href() { return this._c.href; }
     set href(v) {
       const res = JSON.parse(Deno.core.ops.op_url_parse(v == null ? '' : String(v), ''));
       if (!res.valid) throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL");
-      this._c = res; this._sp = null;
+      this._c = res; if (this._sp) this._sp._setList(this._c.search);
     }
     get origin() { return this._c.origin; }
     get protocol() { return this._c.protocol; } set protocol(v) { this._apply('protocol', v); }
@@ -2277,7 +2283,7 @@ if (typeof URL === 'undefined' || !URL.prototype) {
     get search() { return this._c.search; }     set search(v) { this._apply('search', v); }
     get hash() { return this._c.hash; }         set hash(v) { this._apply('hash', v); }
     get searchParams() {
-      if (!this._sp) this._sp = new URLSearchParams(this._c.search);
+      if (!this._sp) { this._sp = new URLSearchParams(this._c.search); this._sp._url = this; }
       return this._sp;
     }
     toString() { return this._c.href; }
@@ -2803,24 +2809,95 @@ const _safeDecodeURIComponent = function(s) {
     return String(s).replace(/%[0-9A-Fa-f]{2}/g, m => { try { return decodeURIComponent(m); } catch (_) { return m; } });
   }
 };
-if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class {
-  constructor(init=""){
-    this._p=[];
-    if(typeof init==="string"){
-      init.replace(/^\?/,"").split("&").forEach(p=>{const[k,...v]=p.split("=");if(k)this.append(_safeDecodeURIComponent(k),_safeDecodeURIComponent(v.join("=")));});
+// application/x-www-form-urlencoded byte serializer (WHATWG): space -> '+', the
+// set *-._0-9A-Za-z stays literal, everything else is %XX (uppercase).
+const _formEncode = function(s) {
+  const bytes = unescape(encodeURIComponent(String(s)));
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) {
+    const c = bytes.charCodeAt(i);
+    if (c === 0x20) out += '+';
+    else if (c === 0x2A || c === 0x2D || c === 0x2E || c === 0x5F ||
+             (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A))
+      out += String.fromCharCode(c);
+    else out += '%' + c.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return out;
+};
+// Form decode: '+' -> space, then percent-decode (best-effort, never throws).
+const _formDecode = function(s) { return _safeDecodeURIComponent(String(s).replace(/\+/g, ' ')); };
+
+if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class URLSearchParams {
+  constructor(init = "") {
+    this._p = [];   // list of [name, value]
+    this._url = null; // back-ref to an owning URL for two-way sync (set by URL)
+    if (typeof init === 'string') {
+      this._parseString(init);
+    } else if (init instanceof URLSearchParams) {
+      this._p = init._p.map(([k, v]) => [k, v]);
     } else if (init && typeof init[Symbol.iterator] === 'function') {
-      for (const pair of init) if (pair && pair.length >= 2) this.append(pair[0], pair[1]);
+      for (const pair of init) {
+        const a = Array.from(pair);
+        if (a.length !== 2) throw new TypeError("Failed to construct 'URLSearchParams': Invalid tuple");
+        this._p.push([String(a[0]), String(a[1])]);
+      }
     } else if (init && typeof init === 'object') {
-      Object.keys(init).forEach(k => this.append(k, init[k]));
+      for (const k of Object.keys(init)) this._p.push([String(k), String(init[k])]);
     }
   }
-  append(k,v){this._p.push([String(k),String(v)]);}
-  get(k){const p=this._p.find(([key])=>key===String(k)); return p?p[1]:null;}
-  set(k,v){this.delete(k); this.append(k,v);}
-  delete(k){k=String(k); this._p=this._p.filter(([key])=>key!==k);}
-  has(k){k=String(k); return this._p.some(([key])=>key===k);}
-  toString(){return this._p.map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");}
-  forEach(cb){this._p.forEach(([k,v])=>cb(v,k,this));}
+  // application/x-www-form-urlencoded parser.
+  _parseString(s) {
+    s = String(s).replace(/^\?/, '');
+    if (!s) return;
+    for (const piece of s.split('&')) {
+      if (!piece) continue;
+      const eq = piece.indexOf('=');
+      const name = eq === -1 ? piece : piece.slice(0, eq);
+      const value = eq === -1 ? '' : piece.slice(eq + 1);
+      this._p.push([_formDecode(name), _formDecode(value)]);
+    }
+  }
+  _setList(s) { this._p = []; this._parseString(s); }       // refresh w/o back-update
+  _update() { if (this._url) this._url._setSearchFromParams(this.toString()); }
+  get size() { return this._p.length; }
+  append(k, v) { this._p.push([String(k), String(v)]); this._update(); }
+  delete(k, v) {
+    k = String(k);
+    this._p = (v === undefined)
+      ? this._p.filter(([key]) => key !== k)
+      : this._p.filter(([key, val]) => !(key === k && val === String(v)));
+    this._update();
+  }
+  get(k) { k = String(k); const p = this._p.find(([key]) => key === k); return p ? p[1] : null; }
+  getAll(k) { k = String(k); return this._p.filter(([key]) => key === k).map(([, v]) => v); }
+  has(k, v) {
+    k = String(k);
+    return v === undefined ? this._p.some(([key]) => key === k)
+                           : this._p.some(([key, val]) => key === k && val === String(v));
+  }
+  set(k, v) {
+    k = String(k); v = String(v);
+    let done = false; const next = [];
+    for (const [key, val] of this._p) {
+      if (key === k) { if (!done) { next.push([k, v]); done = true; } }
+      else next.push([key, val]);
+    }
+    if (!done) next.push([k, v]);
+    this._p = next; this._update();
+  }
+  sort() {
+    this._p = this._p
+      .map((pair, i) => [pair, i])
+      .sort((a, b) => (a[0][0] < b[0][0] ? -1 : a[0][0] > b[0][0] ? 1 : a[1] - b[1]))
+      .map(([pair]) => pair);
+    this._update();
+  }
+  forEach(cb, thisArg) { for (const [k, v] of this._p.slice()) cb.call(thisArg, v, k, this); }
+  *keys() { for (const [k] of this._p.slice()) yield k; }
+  *values() { for (const [, v] of this._p.slice()) yield v; }
+  *entries() { for (const [k, v] of this._p.slice()) yield [k, v]; }
+  [Symbol.iterator]() { return this.entries(); }
+  toString() { return this._p.map(([k, v]) => _formEncode(k) + '=' + _formEncode(v)).join('&'); }
 };
 
 globalThis.DOMParser = class { parseFromString(s,t) { return globalThis.document; } };
