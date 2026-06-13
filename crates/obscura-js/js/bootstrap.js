@@ -905,13 +905,20 @@ class Element extends Node {
     const _gen = _bumpFrameLoadGen(this); // supersede any pending about:blank load
     const _self = this;
     let fullUrl = url;
-    if (!url.includes('://')) {
+    // Resolve only RELATIVE urls against the document base. A url that already has
+    // a scheme (blob:, data:, about:, http(s):) is absolute — resolving blob: vs an
+    // https base would rewrite it to https and lose the blob: protocol.
+    if (!url.includes('://') && !/^[a-z][a-z0-9+.\-]*:/i.test(url)) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
     const el = this;
     fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
+      // Superseded by a newer load (e.g. srcdoc set while this was in flight)?
+      // Don't clobber the current document or fire a stale load.
+      if (_self._loadGen !== _gen) return;
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
+        if (_self._loadGen !== _gen) return; // re-check after the awaited body
         el._iframeDoc = new _IframeDocument(html, fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       } else {
@@ -922,10 +929,11 @@ class Element extends Node {
       await _executeFrameScripts(el); // run same-origin frame scripts before load
       if (_self._loadGen === _gen) _fireIframeElementLoad(el);
     }).catch(() => {
+      if (_self._loadGen !== _gen) return; // superseded — leave the current doc intact
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
       el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       _registerIframe(el);
-      if (_self._loadGen === _gen) _fireIframeElementLoad(el);
+      _fireIframeElementLoad(el);
     });
   }
   get contentDocument() {
@@ -1975,6 +1983,16 @@ globalThis.fetch = async (input, init = {}) => {
     : (input instanceof Request
       ? input.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
+  // blob: object URLs resolve from the in-page object-URL store (no network).
+  if (typeof url === 'string' && url.startsWith('blob:')) {
+    if (Object.prototype.hasOwnProperty.call(__blobStore, url)) {
+      return new Response(__blobStore[url], {
+        status: 200, statusText: '',
+        headers: { 'content-type': __blobTypes[url] || 'text/plain' },
+      });
+    }
+    return new Response('', { status: 404, statusText: '' });
+  }
   if (url && !url.includes('://')) {
     try {
       const base = _domParse("document_url") || "about:blank";
@@ -2250,10 +2268,23 @@ if (typeof URL === 'undefined' || !URL.prototype) {
         this.pathname = m[3] || '/';
         this.search = m[4] || ''; this.hash = m[5] || '';
       } else {
-        this.protocol = ''; this.host = ''; this.hostname = '';
-        this.port = ''; this.pathname = full; this.search = ''; this.hash = '';
+        // Non-http(s) / opaque-path schemes (blob:, data:, about:, mailto:, ...):
+        // extract the scheme as the protocol; the remainder is an opaque path with
+        // no host. Their origin is opaque ("null").
+        const sm = full.match(/^([a-z][a-z0-9+.\-]*):([\s\S]*)$/i);
+        if (sm) {
+          this.protocol = sm[1].toLowerCase() + ':';
+          this.host = ''; this.hostname = ''; this.port = '';
+          this.pathname = sm[2]; this.search = ''; this.hash = '';
+        } else {
+          this.protocol = ''; this.host = ''; this.hostname = '';
+          this.port = ''; this.pathname = full; this.search = ''; this.hash = '';
+        }
       }
-      this.href = full; this.origin = this.protocol + '//' + this.host;
+      this.href = full;
+      this.origin = (this.host && (this.protocol === 'http:' || this.protocol === 'https:'))
+        ? this.protocol + '//' + this.host
+        : 'null';
       this.searchParams = new URLSearchParams(this.search);
     }
     toString() { return this.href; }
@@ -3680,17 +3711,26 @@ globalThis.Worker = class Worker {
 };
 
 const __blobStore = {};
+const __blobTypes = {};
 const _origCreateObjectURL = URL.createObjectURL;
 URL.createObjectURL = function(blob) {
-  if (blob && typeof blob.text === 'function') {
-    const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
-    blob.text().then(text => { __blobStore[id] = text; });
-    return id;
+  const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
+  if (blob) {
+    __blobTypes[id] = blob.type || '';
+    // Store the content SYNCHRONOUSLY when available (our Blob keeps _data), so a
+    // consumer that fetches the URL on the next tick (e.g. an iframe src load)
+    // sees the content. Fall back to async text() for other blob-likes.
+    if (typeof blob._data === 'string') {
+      __blobStore[id] = blob._data;
+    } else if (typeof blob.text === 'function') {
+      blob.text().then(text => { __blobStore[id] = text; });
+    }
   }
-  return 'blob:obscura/fallback';
+  return id;
 };
 URL.revokeObjectURL = function(url) {
   delete __blobStore[url];
+  delete __blobTypes[url];
 };
 
 globalThis.scrollTo = function(x, y) {};

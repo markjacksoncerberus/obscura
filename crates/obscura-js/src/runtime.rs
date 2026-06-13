@@ -1939,6 +1939,53 @@ mod tests {
     }
 
     #[test]
+    fn test_url_opaque_scheme_protocol() {
+        // URL parser must extract the protocol for opaque-path schemes (blob:,
+        // data:, about:) — previously only http(s) matched, so blob: protocol was ''
+        // (broke iframe blob: src location.protocol). Origin of opaque schemes is null.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const blob = new URL('blob:obscura/abc');\n\
+                   const data = new URL('data:text/html,hi');\n\
+                   const http = new URL('https://example.com/p?q=1');\n\
+                   return [blob.protocol, blob.origin, data.protocol, http.protocol, http.origin];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["blob:", "null", "data:", "https:", "https://example.com"]),
+            "URL opaque-scheme parsing wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_blob_object_url_stored_synchronously() {
+        // iframe backlog #1 (race fix): URL.createObjectURL must store the blob
+        // content + type SYNCHRONOUSLY so a consumer fetching the URL on the next
+        // tick (e.g. an iframe src load) sees it. (The async iframe load itself is
+        // CDP-verified.)
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const u = URL.createObjectURL(new Blob(['hello'], { type: 'text/html' }));\n\
+                   return [u.startsWith('blob:'), __blobStore[u], __blobTypes[u]];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, "hello", "text/html"]),
+            "blob object URL should store content+type synchronously: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_named_window_access() {
         // HTML named property access on Window: <el id=foo> -> window.foo. Must be
         // a live lookup, non-enumerable (off Object.keys/for-in), must not shadow a
