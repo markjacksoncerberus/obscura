@@ -592,6 +592,12 @@ class Comment extends CharacterData {
   cloneNode() { return document.createComment(this.data); }
 }
 
+// An attribute qualifiedName must match the XML Name production, else
+// InvalidCharacterError (DOM spec). Covers ASCII + common Unicode name chars.
+const _XML_NAME = /^[A-Za-z_:À-ÖØ-öø-˿Ͱ-￿][A-Za-z0-9_:.\-·À-ÖØ-öø-ͽͿ-￿]*$/;
+const _validateAttrName = function(n) {
+  if (!_XML_NAME.test(n)) throw new DOMException("'" + n + "' is not a valid attribute name.", "InvalidCharacterError");
+};
 // A token must be non-empty and contain no ASCII whitespace (DOM spec).
 const _validateToken = function(t) {
   t = String(t);
@@ -712,8 +718,11 @@ class Element extends Node {
   set classList(v) { this.classList.value = v == null ? '' : String(v); }
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
-  getAttribute(n) { return _domParse("get_attribute", this._nid, n); }
+  getAttribute(n) { return _domParse("get_attribute", this._nid, String(n).toLowerCase()); }
   setAttribute(n, v) {
+    n = String(n);
+    _validateAttrName(n);
+    n = n.toLowerCase(); // HTML element in an HTML document -> ASCII lowercase
     const _old = __mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
     _dom("set_attribute", this._nid, n + "\0" + String(v));
     if (__mutationObservers?.length) __notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
@@ -724,7 +733,19 @@ class Element extends Node {
     if (n === 'id' && v) __defineNamedGlobal(String(v));
   }
   setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
+  toggleAttribute(name, force) {
+    name = String(name);
+    _validateAttrName(name);
+    name = name.toLowerCase();
+    if (this.hasAttribute(name)) {
+      if (force === undefined || force === false) { this.removeAttribute(name); return false; }
+      return true;
+    }
+    if (force === undefined || force === true) { this.setAttribute(name, ''); return true; }
+    return false;
+  }
   removeAttribute(n) {
+    n = String(n).toLowerCase();
     const _old = __mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
     _dom("remove_attribute", this._nid, n);
     if (__mutationObservers?.length) __notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
@@ -733,6 +754,8 @@ class Element extends Node {
   }
   removeAttributeNS(ns, n) { this.removeAttribute(n); }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
+  hasAttributeNS(ns, n) { return _domParse("get_attribute", this._nid, String(n)) !== null; }
+  toggleAttributeNS(ns, n, force) { return this.toggleAttribute(n, force); } // simplified
   hasAttributes() { return true; } // Simplified
   get attributes() {
     const el = this;

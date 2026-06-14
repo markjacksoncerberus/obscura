@@ -1939,6 +1939,34 @@ mod tests {
     }
 
     #[test]
+    fn test_attribute_lowercase_toggle_validate() {
+        // HTML setAttribute lowercases the name; toggleAttribute add/remove/force;
+        // invalid name -> InvalidCharacterError.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const el = document.createElement('div');\n\
+                   el.setAttribute('FOO', '1');\n\
+                   const a = [el.getAttribute('foo'), el.getAttribute('FOO'), el.hasAttribute('FOO')];\n\
+                   const t1 = el.toggleAttribute('Bar');\n\
+                   const t2 = el.toggleAttribute('bar');\n\
+                   const t3 = el.toggleAttribute('baz', true);\n\
+                   const t4 = el.toggleAttribute('baz', true);\n\
+                   let threw = false; try { el.setAttribute('', 'x'); } catch (e) { threw = e.name === 'InvalidCharacterError'; }\n\
+                   return [a, t1, t2, el.hasAttribute('bar'), t3, t4, el.getAttribute('baz'), threw];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([["1", "1", true], true, false, false, true, true, "", true]),
+            "attribute lowercase/toggle/validate wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_queryselector_invalid_throws() {
         // Invalid selectors throw SyntaxError; valid-but-unimplemented pseudo-
         // classes (e.g. :required) parse and just match nothing (no throw).

@@ -23,6 +23,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-13.
 | `dom/lists/DOMTokenList-value.html` | 0/1 | **1/1** | ✅ | ″ |
 | `dom/lists/DOMTokenList-iteration.html` | 0/6 | **5/6** | ⬆️ | ″ |
 | `dom/lists/DOMTokenList-coverage-for-attributes.html` | n/a | **150/175** | ⬆️ | ″ |
+| `dom/nodes/attributes.html` | 4/67 | **11/67** | ⬆️ | toggleAttribute + HTML lowercasing + name validation (rest needs Attr-node model) |
 | `url/url-setters.any.html` | 5/279 | **226/279** | ⬆️ | Setters' Sigil + host/port/tab-strip batch |
 | `url/url-searchparams.any.html` | 1/4 | **4/4** | ✅ 100% | Real URLSearchParams (form codec + URL two-way sync) |
 | `url/urlsearchparams-sort.any.html` | n/a | **17/17** | ✅ 100% | ″ |
