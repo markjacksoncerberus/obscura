@@ -493,23 +493,22 @@ class Node {
   cloneNode(deep) {
     const t = this.nodeType;
     if (t === 1) {
-      if (deep) {
-        const wrapper = document.createElement('div');
-        wrapper.innerHTML = _domParse("outer_html", this._nid) || "";
-        const clone = wrapper.firstChild;
-        return clone;
-      }
       const el = document.createElement(this.nodeName.toLowerCase());
-      const html = _domParse("outer_html", this._nid) || "";
-      const attrMatch = html.match(/^<[a-zA-Z][^\s>]*([\s\S]*?)>/);
-      if (attrMatch && attrMatch[1]) {
-        const attrStr = attrMatch[1].trim();
-        const re = /([a-zA-Z_:][a-zA-Z0-9_.:-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+)))?/g;
-        let m;
-        while ((m = re.exec(attrStr)) !== null) {
-          const name = m[1];
-          const val = m[2] !== undefined ? m[2] : m[3] !== undefined ? m[3] : m[4] || "";
-          if (name !== this.nodeName.toLowerCase()) el.setAttribute(name, val);
+      // Copy attributes directly (O(attrs)) rather than serializing+reparsing
+      // outerHTML per element — the latter made a deep clone O(N²) and stalled
+      // the Range cloneContents/extractContents harness.
+      const attrs = this.attributes;
+      if (attrs) for (let i = 0; i < attrs.length; i++) el.setAttribute(attrs[i].name, attrs[i].value);
+      if (this._ns) el._ns = this._ns;
+      if (deep) {
+        // Recurse over real children rather than parsing outerHTML into a <div>:
+        // a <div>'s fragment parser DROPS <html>/<head>/<body> wrappers (they are
+        // not valid in a div context) and hoists their contents, so cloning a
+        // document's documentElement used to collapse to its first descendant.
+        const kids = this.childNodes;
+        for (let i = 0; i < kids.length; i++) {
+          const c = (kids[i] && kids[i].cloneNode) ? kids[i].cloneNode(true) : null;
+          if (c) el.appendChild(c);
         }
       }
       return el;
@@ -1596,13 +1595,18 @@ class DetachedDocument extends Document {
   get location() { return null; }
   get doctype() { return this._doctype || null; }
   get implementation() { return globalThis.document.implementation; }
+  // Live getters: a DetachedDocument's tree can be mutated after construction
+  // (the WPT range harness does `removeChild(documentElement)` then appends a
+  // cloned root), so these must reflect the CURRENT children rather than the
+  // nodes cached at construction. _docEl/_headEl/_bodyEl remain only as build-
+  // time scaffolding.
   get documentElement() {
-    if (this._docEl) return this._docEl;
-    for (const k of this.childNodes) if (k.nodeType === 1) return k;
+    const kids = this.childNodes;
+    for (let i = 0; i < kids.length; i++) if (kids[i] && kids[i].nodeType === 1) return kids[i];
     return null;
   }
-  get head() { return this._headEl || null; }
-  get body() { return this._bodyEl || null; }
+  get head() { return this._kind === 'html' ? this.querySelector('head') : null; }
+  get body() { return this._kind === 'html' ? this.querySelector('body') : null; }
   querySelector(s) { return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
@@ -1838,6 +1842,56 @@ const _runFrameScript = function(code, win, url) {
   }
 };
 
+// Best-effort scan of a script's TOP-LEVEL declarations (function/var/let/const/
+// class) at line starts. Covers the WPT pattern of one declaration per line; not
+// a parser, so it can miss comma-list `var a, b` tails (harmless: those stay
+// frame-local, which is all the frame's own code needs — only names the PARENT
+// reads off contentWindow, like run()/setupRangeTests, must be hoisted).
+const _scanTopLevelDecls = function(code) {
+  const names = new Set();
+  const re = /(?:^|\n)[ \t]*(?:async[ \t]+)?(?:function[ \t]*\*?|var|let|const|class)[ \t]+([A-Za-z_$][\w$]*)/g;
+  let m;
+  while ((m = re.exec(code))) names.add(m[1]);
+  return names;
+};
+
+// Run a frame's classic scripts as ONE concatenated program so they share a
+// single variable environment — exactly like a real frame's scripts sharing one
+// global. Then attach each top-level declaration to the frame window, so the
+// parent realm can reach `iframe.contentWindow.run()` / `.setupRangeTests` etc.
+// (Under Option C, top-level decls in a `new Function` body are function-locals
+// that never touch the window — this hoist is what bridges that gap.) Reads of
+// those names from within the frame resolve through the shared scope, and direct
+// `eval()` inside the frame's functions still sees the frame's variables (the WPT
+// range/traversal iframes rely on `eval(window.testRangeInput)`).
+const _runFrameProgram = function(parts, win, baseUrl) {
+  if (!parts || !parts.length || !win) return;
+  const names = new Set();
+  let body = '';
+  for (const p of parts) {
+    body += '\n' + (p.code || '') + '\n//# sourceURL=' + (p.url || baseUrl || 'about:blank-frame') + '\n';
+    for (const n of _scanTopLevelDecls(p.code || '')) names.add(n);
+  }
+  let tail = '';
+  for (const n of names) tail += 'try{window[' + JSON.stringify(n) + ']=' + n + ';}catch(__e){}';
+  try {
+    // Wrap the body in try/finally: even if a frame script throws part-way, the
+    // top-level declarations (function declarations are hoisted to the top of the
+    // wrapper) are still attached to the frame window. The parent realm drives the
+    // frame through contentWindow.run()/setupRangeTests(), so dropping those on a
+    // mid-script throw would silently break the entire frame.
+    const fn = new Function(
+      'window', 'self', 'document', 'location', 'parent', 'top', 'frames',
+      'frameElement', 'globalThis',
+      'try {\n' + body + '\n} finally {\n' + tail + '\n}'
+    );
+    fn.call(win, win, win, win.document, win.location, win.parent, win.top,
+            win.frames, win.frameElement, win);
+  } catch (e) {
+    _reportError(e);
+  }
+};
+
 // Run all <script>s in a freshly-built frame document, in document order. Inline
 // scripts run synchronously; same-origin <script src> is fetched then run. Skips
 // module scripts (increment 4 step 4) and non-JS types. Idempotent per frame.
@@ -1851,6 +1905,10 @@ const _executeFrameScripts = async function(iframeEl) {
   const base = doc._baseUrl || doc._url || win._url; // relative <script src> base
   let scripts = [];
   try { scripts = Array.from(doc.querySelectorAll('script')); } catch (e) {}
+  // Classic scripts are collected and run as ONE concatenated program (shared
+  // frame scope); modules run individually (best-effort), flushing any pending
+  // classic parts first so execution order is preserved.
+  const parts = [];
   for (const s of scripts) {
     const type = (s.getAttribute('type') || '').toLowerCase();
     const isModule = type === 'module';
@@ -1859,6 +1917,7 @@ const _executeFrameScripts = async function(iframeEl) {
     }
     const src = s.getAttribute('src');
     if (isModule) {
+      if (parts.length) _runFrameProgram(parts.splice(0), win, base);
       // Faithful ES module execution needs a per-frame realm + module map to bind
       // `import`/`export` and a frame-scoped `document` — unavailable under Option C
       // (one page realm; new Function can't host import/export). Best effort: run an
@@ -1879,13 +1938,14 @@ const _executeFrameScripts = async function(iframeEl) {
       try {
         const resp = await fetch(full, { mode: 'no-cors' });
         if (resp.ok || resp.type === 'opaque') {
-          _runFrameScript(await resp.text(), win, full);
+          parts.push({ code: await resp.text(), url: full });
         }
       } catch (e) { _reportError(e); }
     } else {
-      _runFrameScript(s.textContent || '', win, base);
+      parts.push({ code: s.textContent || '', url: base });
     }
   }
+  if (parts.length) _runFrameProgram(parts, win, base);
   // Frame lifecycle: DOMContentLoaded fires at the frame document and bubbles to
   // the frame window (real Document -> Window path); then `load` fires at the
   // frame window. Both reach document.addEventListener / window.addEventListener
@@ -3942,99 +4002,81 @@ for (const Cls of [Element, Document, DocumentFragment, DetachedDocument]) {
   XMLSerializer, XMLSerializer.prototype.serializeToString,
 ].forEach(fn => { if (typeof fn === 'function') _markNative(fn); });
 
-class _IframeDocument {
+// A frame's content document is a REAL node-backed document (extends
+// DetachedDocument → Document → Node), so it answers childNodes / firstChild /
+// appendChild / removeChild / insertBefore / doctype with true tree semantics.
+// The WPT range content-op harness depends on this (`restoreIframe` mutates the
+// document directly). Earlier this was a hand-rolled shim that only exposed
+// documentElement/head/body, so document-as-Node operations threw or returned
+// undefined and the harness could not run.
+class _IframeDocument extends DetachedDocument {
   constructor(html, url, iframeEl, baseUrl) {
+    super('html'); // builds <html><head></head><body></body> on a real doc node
     this._url = url;
     // Base URL for resolving relative resources / baseURI. Usually === url, but
     // for an about:srcdoc document document.URL is 'about:srcdoc' while the base
     // (and relative <script src> resolution) is the parent's URL (HTML spec).
     this._baseUrl = baseUrl || url;
     this._iframeEl = iframeEl;
-    this.nodeType = 9;
-    this.nodeName = '#document';
-    this.readyState = 'complete';
-    this.characterSet = 'UTF-8';
-    this.contentType = 'text/html';
-    this.visibilityState = 'visible';
-    this.hidden = false;
     this._evtKey = _nextSyntheticKey();
-
-    this._root = document.createElement('html');
-    this._head = document.createElement('head');
-    this._body = document.createElement('body');
-    this._root.appendChild(this._head);
-    this._root.appendChild(this._body);
-    // These structural nodes belong to THIS document, not the main one.
-    this._root._ownerDoc = this; this._head._ownerDoc = this; this._body._ownerDoc = this;
-    // Parse the whole document into body (one html5ever fragment parse, which
-    // handles pages with OR without explicit <head>/<body> tags — WPT pages and
-    // many real pages omit them), then lift the metadata elements into <head>,
-    // mirroring the parser's implicit head construction. <script> is never moved
-    // and is never executed (there is no per-iframe JS realm yet).
-    var inner = html
-      .replace(/^<!DOCTYPE[^>]*>/i, '')
+    // Parse the markup into <body> (one html5ever fragment parse, which handles
+    // pages with OR without explicit <head>/<body> — WPT pages often omit them),
+    // then lift the metadata elements into <head>, mirroring the parser's
+    // implicit head construction. <script> is left in the tree and executed
+    // later by _executeFrameScripts (innerHTML never runs scripts).
+    var inner = String(html || '')
+      .replace(/^﻿?\s*<!DOCTYPE[^>]*>/i, '')
       .replace(/<\/?html[^>]*>/gi, '')
       .replace(/<\/?head[^>]*>/gi, '')
       .replace(/<\/?body[^>]*>/gi, '')
       .replace(/^\s+/, '');
     if (inner) {
-      this._body.innerHTML = inner;
       try {
-        const metas = this._body.querySelectorAll('title, meta, link, base, style');
-        for (let i = 0; i < metas.length; i++) this._head.appendChild(metas[i]);
+        const body = this.body;
+        if (body) {
+          body.innerHTML = inner;
+          const head = this.head;
+          const metas = body.querySelectorAll('title, meta, link, base, style');
+          if (head) for (let i = 0; i < metas.length; i++) head.appendChild(metas[i]);
+        }
       } catch (e) {}
     }
-
-    this._title = '';
-    const titleEl = this._head.querySelector('title') || this._body.querySelector('title');
-    if (titleEl) this._title = titleEl.textContent;
   }
 
-  get documentElement() { return this._root; }
-  get head() { return this._head; }
-  get body() { return this._body; }
-  get title() { return this._title; }
-  set title(v) { this._title = v; }
+  // Live structural getters: restoreIframe() rebuilds the tree (removes <html>,
+  // appends a fresh clone), so these MUST reflect the current children rather
+  // than nodes captured at construction.
+  get documentElement() {
+    const kids = this.childNodes;
+    for (let i = 0; i < kids.length; i++) if (kids[i] && kids[i].nodeType === 1) return kids[i];
+    return null;
+  }
+  get head() { return this.querySelector('head'); }
+  get body() { return this.querySelector('body'); }
+  get title() { const t = this.querySelector('title'); return t ? t.textContent : ''; }
+  set title(v) {
+    let t = this.querySelector('title');
+    if (!t) { const h = this.head; if (h) { t = this.createElement('title'); h.appendChild(t); } }
+    if (t) t.textContent = String(v);
+  }
   get URL() { return this._url; }
   get documentURI() { return this._url; }
   get baseURI() { return this._baseUrl; }
   get location() { return this._iframeEl?.contentWindow?.location; }
-  get defaultView() { return this._iframeEl?.contentWindow; }
+  get defaultView() { return this._iframeEl?.contentWindow || null; }
   get ownerDocument() { return null; }
   get compatMode() { return 'CSS1Compat'; }
-  get activeElement() { return this._body; }
-
-  getElementById(id) {
-    return this._root.querySelector('#' + id);
-  }
-  querySelector(sel) {
-    return this._root.querySelector(sel);
-  }
-  querySelectorAll(sel) {
-    return this._root.querySelectorAll(sel);
-  }
-  getElementsByTagName(tag) {
-    return this._root.querySelectorAll(tag);
-  }
-  getElementsByClassName(cls) {
-    return this._root.querySelectorAll('.' + cls);
-  }
-  // Nodes created by this document are owned by it (ownerDocument === frameDoc)
-  // until adopted into another document by insertion.
-  createElement(tag) { const n = document.createElement(tag); n._ownerDoc = this; return n; }
-  createElementNS(ns, tag) { const n = document.createElementNS(ns, tag); n._ownerDoc = this; return n; }
-  createTextNode(text) { const n = document.createTextNode(text); n._ownerDoc = this; return n; }
-  createComment(text) { const n = document.createComment(text); n._ownerDoc = this; return n; }
-  createProcessingInstruction(target, data) { const n = _createPIValidated(target, data); n._ownerDoc = this; return n; }
-  createCDATASection(data) { throw new DOMException("This operation is not supported for HTML documents.", "NotSupportedError"); }
-  createDocumentFragment() { const n = document.createDocumentFragment(); n._ownerDoc = this; return n; }
-  createEvent(type) { return document.createEvent(type); }
-  hasFocus() { return false; }
-
+  get contentType() { return 'text/html'; }
+  get characterSet() { return 'UTF-8'; }
+  get readyState() { return 'complete'; }
+  get visibilityState() { return 'visible'; }
+  get hidden() { return false; }
+  get activeElement() { return this.body; }
   get cookie() { return ''; }
   set cookie(v) {}
-  get implementation() { return document.implementation; }
+  get implementation() { return globalThis.document.implementation; }
   get styleSheets() { return []; }
+  hasFocus() { return false; }
 
   addEventListener(type, handler, opts) { _addListenerByKey(this._evtKey, type, handler, opts); }
   removeEventListener(type, handler, opts) { _removeListenerByKey(this._evtKey, type, handler, opts); }
@@ -4043,11 +4085,9 @@ class _IframeDocument {
     return _dispatchByKey(this, this._evtKey, event, this._iframeEl?.contentWindow);
   }
 
-  write(html) {
-    if (this._body) this._body.innerHTML += html;
-  }
+  write(html) { const b = this.body; if (b) b.innerHTML += html; }
   writeln(html) { this.write(html + '\n'); }
-  open() { if (this._body) this._body.innerHTML = ''; }
+  open() { const b = this.body; if (b) b.innerHTML = ''; }
   close() {}
 }
 

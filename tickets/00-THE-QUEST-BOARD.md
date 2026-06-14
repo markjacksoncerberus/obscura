@@ -25,7 +25,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | 4/8+ | ⚔️⚔️ | ~? |
 | 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | ⚔️ traversal **DONE**; ranges 90%+ | ⚔️⚔️⚔️ | iframe content-ops left |
 | 11 | [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | 1/3+ | ⚔️⚔️ | ~? |
-| 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `html/.../the-iframe-element` | mostly held | ⚔️⚔️ | ~20 |
+| 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ **+2046** (5 tests 0→) | ⚔️⚔️⚔️ | surround/clone tails + re-land FIX B |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -70,6 +70,21 @@ engine **hardened against URL-triggered crashes**.
   `*-of-type`, +151); CSS2 pseudo-elements parse-but-never-match (+80); `querySelector`
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
+
+**Session 2026-06-14 #3 (Quest #12 The Iframe Frontier):**
+- **Content-op ranges — +2046 subtests, all 5 tests 0→.** `Range-insertNode`
+  0→909/1840, `surroundContents` 0→698/1840, `cloneContents` 0→177/187,
+  `deleteContents` 0→103/125, `extractContents` 0→159/187. Root unlock: real
+  per-iframe JS realms — frame classic scripts run as one concatenated program and
+  their top-level declarations are hoisted onto the frame window (in a `finally`, so
+  a mid-script throw still attaches `run`/`setupRangeTests`); the parent realm drives
+  the frame via `contentWindow.run()`. Plus a **node-backed `_IframeDocument`**
+  (extends `DetachedDocument` → real childNodes/firstChild/appendChild/removeChild/
+  doctype, live documentElement/head/body) and a **recursive `cloneNode(deep)`**
+  (was `outerHTML`-into-`<div>`, which dropped `<html>/<head>/<body>` and was O(N²)).
+  Zero regressions; 143 unit tests green. See Scroll #12 for the deferred FIX-B fork
+  (frame platform-globals snapshot — reverted; exposed a clone node-identity hang in
+  `surroundContents`).
 
 **Session 2026-06-14 #2 (Quest #10 The Traversal Labyrinth):**
 - **Traversal — CONQUERED.** Real `NodeIterator` (1→766/766, was a TreeWalker alias),
