@@ -243,7 +243,18 @@ impl<'a> Element for DomElement<'a> {
     type Impl = ObscuraSelector;
 
     fn opaque(&self) -> OpaqueElement {
-        OpaqueElement::new(self)
+        // `self` is a throwaway stack temporary (DomElement is Copy and rebuilt
+        // per node from a NodeId, since the tree stores clones). Using its
+        // address would give an unstable, aliasing identity that corrupts the
+        // selectors crate's NthIndexCache — breaking :nth-child(An+B) and the
+        // *-of-type pseudo-classes. Derive a stable, unique, non-null identity
+        // from the (stable) tree reference plus the node's arena index instead.
+        let id = (self.tree as *const DomTree as usize)
+            .wrapping_add((self.node_id.index() + 1).wrapping_mul(8));
+        // SAFETY: () is zero-sized (align 1), so a reference to it only needs to
+        // be non-null and aligned; `id` is non-null and we never dereference it
+        // for data — selectors uses it solely for identity/equality.
+        unsafe { OpaqueElement::new(&*(id as *const ())) }
     }
 
     fn parent_element(&self) -> Option<Self> {
@@ -703,6 +714,35 @@ mod tests {
 
         // :hover never matches in a headless tree.
         assert!(tree.query_selector_all(":hover").unwrap().is_empty());
+    }
+
+    #[test]
+    fn structural_nth_and_of_type_pseudo_classes() {
+        // Regression: a stable opaque() identity is required for the selectors
+        // crate's NthIndexCache; without it An+B and *-of-type were broken.
+        let tree = parse_html(
+            r#"<ul><li id=a>1</li><li id=b>2</li><li id=c>3</li><li id=d>4</li><li id=e>5</li></ul>
+               <p><em id=ea>a</em><b id=bb>b</b><em id=ec>c</em><i id=id>d</i><em id=ee>e</em></p>"#,
+        );
+        let ids = |sel: &str| {
+            let mut v: Vec<String> = tree
+                .query_selector_all(sel)
+                .unwrap()
+                .iter()
+                .map(|&n| tree.get_node(n).unwrap().get_attribute("id").unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids("li:nth-child(2)"), vec!["b"]);
+        assert_eq!(ids("li:nth-child(odd)"), vec!["a", "c", "e"]);
+        assert_eq!(ids("li:nth-child(2n+1)"), vec!["a", "c", "e"]);
+        assert_eq!(ids("li:nth-last-child(2)"), vec!["d"]);
+        assert_eq!(ids("em:first-of-type"), vec!["ea"]);
+        assert_eq!(ids("em:last-of-type"), vec!["ee"]);
+        assert_eq!(ids("em:nth-of-type(2)"), vec!["ec"]);
+        assert_eq!(ids("li:first-child"), vec!["a"]);
+        assert_eq!(ids("li:last-child"), vec!["e"]);
     }
 
     #[test]

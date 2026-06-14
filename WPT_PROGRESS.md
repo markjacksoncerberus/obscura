@@ -18,7 +18,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-13.
 |------|:------:|:------:|:------:|----------------|
 | `url/url-constructor.any.html` | 1/890 | **833/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057` |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
-| `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1646/1977** | ⬆️ | throw-on-invalid-selector + frame-window realm fallback |
+| `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1797/1977** | ⬆️ | + stable `opaque()` identity → :nth-*/`*-of-type` fixed (Quest #01) |
 | `dom/nodes/Element-classlist.html` | ~0 | **1315/1420** | ⬆️ | Real DOMTokenList |
 | `dom/lists/DOMTokenList-value.html` | 0/1 | **1/1** | ✅ | ″ |
 | `dom/lists/DOMTokenList-iteration.html` | 0/6 | **5/6** | ⬆️ | ″ |
