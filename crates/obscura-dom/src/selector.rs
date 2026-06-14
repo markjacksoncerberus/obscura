@@ -105,6 +105,11 @@ pub enum PseudoClass {
     Enabled,
     Disabled,
     Checked,
+    /// `:link` / `:any-link` — a/area/link with an href. (We have no browsing
+    /// history, so every link is unvisited and :link == :any-link.)
+    Link,
+    /// `:visited` — never matches (no history; also the privacy-safe default).
+    Visited,
     /// `:lang(en, fr, …)` — matched against the element's language (its nearest
     /// ancestor-or-self `lang` attribute), per the CSS prefix rule.
     Lang(Vec<String>),
@@ -160,6 +165,8 @@ impl ToCss for PseudoClass {
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
+            PseudoClass::Link => dest.write_str(":link"),
+            PseudoClass::Visited => dest.write_str(":visited"),
             PseudoClass::Lang(langs) => {
                 dest.write_str(":lang(")?;
                 for (i, l) in langs.iter().enumerate() {
@@ -219,6 +226,8 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
+            "link" | "any-link" => Ok(PseudoClass::Link),
+            "visited" => Ok(PseudoClass::Visited),
             other if is_known_pseudo_class(other) => Ok(PseudoClass::Other(other.to_string())),
             _ => Err(cssparser::ParseError {
                 kind: cssparser::ParseErrorKind::Custom(
@@ -522,6 +531,9 @@ impl<'a> Element for DomElement<'a> {
                     }
                 })
                 .unwrap_or(false),
+            // :link / :any-link match a/area/link with href; :visited never does.
+            PseudoClass::Link => self.is_link(),
+            PseudoClass::Visited => false,
             // :lang(...) matches against the element's language, which is the
             // value of the nearest `lang` attribute on the element or an ancestor.
             // A range matches if it equals the language or is a prefix of it
@@ -836,6 +848,30 @@ mod tests {
         assert_eq!(ids("em:nth-of-type(2)"), vec!["ec"]);
         assert_eq!(ids("li:first-child"), vec!["a"]);
         assert_eq!(ids("li:last-child"), vec!["e"]);
+    }
+
+    #[test]
+    fn link_pseudo_classes() {
+        let tree = parse_html(
+            r#"<a id=a href="x">link</a><a id=b>no href</a>
+               <area id=c href="y"><link id=d href="z" rel=stylesheet><span id=e>x</span>"#,
+        );
+        let ids = |sel: &str| {
+            let mut v: Vec<String> = tree
+                .query_selector_all(sel)
+                .unwrap()
+                .iter()
+                .filter_map(|&n| tree.get_node(n).unwrap().get_attribute("id").map(|s| s.to_string()))
+                .collect();
+            v.sort();
+            v
+        };
+        // :link / :any-link match a/area/link WITH href; not the bare <a> or <span>.
+        assert_eq!(ids(":link"), vec!["a", "c", "d"]);
+        assert_eq!(ids(":any-link"), vec!["a", "c", "d"]);
+        assert_eq!(ids("a:link"), vec!["a"]);
+        // :visited never matches (no history).
+        assert!(ids(":visited").is_empty());
     }
 
     #[test]
