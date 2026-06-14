@@ -1827,6 +1827,27 @@ const _dispatchByKey = function(target, key, event, bubbleTo) {
 // (shared intrinsics; bare globals like setTimeout and undeclared assignments still
 // resolve to the top window), but enough for same-origin frame scripts to drive
 // their own document. Classic scripts stay sloppy-mode to match real semantics.
+// Report an error raised by an iframe's own script. In a real browser such an
+// error fires the FRAME window's `error` event, NOT the parent's — so it must
+// not reach the host page's global error handlers (e.g. testharness's window
+// 'error' listener, which would otherwise flag the whole harness as Errored even
+// though every subtest ran). We dispatch to the frame window's own listeners and
+// log; we deliberately do not touch globalThis or win.onerror (the latter would
+// fall through to the parent's onerror via the _IframeWindow proxy).
+const _reportFrameError = function(err, win) {
+  try { console.error(err); } catch (e) {}
+  if (!win || typeof win.dispatchEvent !== 'function') return;
+  let ev;
+  try {
+    ev = (typeof ErrorEvent === 'function')
+      ? new ErrorEvent('error', { error: err, message: (err && err.message) || String(err), cancelable: true })
+      : null;
+  } catch (e) { ev = null; }
+  if (!ev) ev = { type: 'error', error: err, message: (err && err.message) || String(err),
+                  defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+  try { win.dispatchEvent(ev); } catch (e) {}
+};
+
 const _runFrameScript = function(code, win, url) {
   if (!code || !win) return;
   try {
@@ -1838,7 +1859,7 @@ const _runFrameScript = function(code, win, url) {
     fn.call(win, win, win, win.document, win.location, win.parent, win.top,
             win.frames, win.frameElement, win);
   } catch (e) {
-    _reportError(e);
+    _reportFrameError(e, win);
   }
 };
 
@@ -1888,7 +1909,7 @@ const _runFrameProgram = function(parts, win, baseUrl) {
     fn.call(win, win, win, win.document, win.location, win.parent, win.top,
             win.frames, win.frameElement, win);
   } catch (e) {
-    _reportError(e);
+    _reportFrameError(e, win);
   }
 };
 

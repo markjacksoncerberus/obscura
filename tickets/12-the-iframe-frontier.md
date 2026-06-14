@@ -142,16 +142,31 @@ unit tests green.
    instead of per-element `outerHTML` serialization (was O(N²), stalled
    cloneContents/extractContents).
 
-**Deferred (the FIX-B fork):** a *more* spec-correct change — a pristine
-platform-globals snapshot so a frame window doesn't see PAGE globals (testharness
-`setup`, a test's `testDiv`) — was implemented then REVERTED. It made
-`"setup" in frameWindow` correctly false, so `setupRangeTests` ran at frame LOAD and
-`referenceDoc` then carried `testDiv`; restoreIframe deep-CLONED that subtree, and a
-**latent non-canonical node-identity bug in the clone** (a frame `comment` testNode)
-hung `surroundContents` (cell i=0,j=18 — collapsed range + comment newParent; could
-not repro in isolation, only via the referenceDoc-clone round-trip). Without FIX B
-the mirage keeps `testDiv` out of `referenceDoc`, so restoreIframe builds it FRESH
-(canonical nodes) — no hang. **Next move:** find why a cloned comment's identity is
-non-canonical, fix it, then re-land FIX B to recover the remaining surround/clone/
-delete/extract subtests AND flip clone/delete/extract harness status ERROR→OK.
+### Follow-up — 2026-06-14 (session #4): harness ERROR→OK via frame error isolation
+
+The session-#3 plan ("fix a cloned-node identity bug, re-land FIX B") rested on two
+wrong premises — both disproven this session:
+
+- **There is no cloned-node identity bug.** An invariant checker that replicates
+  restoreIframe's exact clone round-trip and walks the rebuilt tree asserting
+  `child.parentNode === node` found **0 violations** (the `comment` testNode is fully
+  canonical). The session-#3 "hang" was not node identity.
+- **FIX B (pristine platform-globals snapshot, so a frame doesn't see page globals
+  like testharness `setup`) is net-negative.** It recovers ZERO subtests — the
+  `testDiv` it lets `setupRangeTests` build at frame load goes into `referenceDoc`,
+  which restoreIframe then deep-clones EVERY subtest only for `setupRangeTests` to
+  immediately remove + rebuild it (pure wasted clone work) → big tests ~2× slower and
+  an intermittent iframe-load-race TIMEOUT (delete/surround, moved between runs).
+  Committed (no-FIX-B) state stress-tested 3× = rock-stable; FIX B = flaky. Reverted.
+
+**What the harness ERROR actually was, and the real fix.** The ERROR was the frame's
+own `testDiv.style` throw at load (testDiv undefined under the `"setup" in window`
+mirage) being surfaced via `_reportError` to the PARENT page's window `error`
+listeners — exactly what testharness listens on — so the whole harness was flagged
+Errored even though every subtest ran. In a real browser a frame-script error fires
+the FRAME window's error event, not the parent's. Added **`_reportFrameError(err,
+win)`** (dispatches to the frame window's own listeners + console; never touches
+globalThis/parent), used by `_runFrameScript`/`_runFrameProgram`. Result: all five
+content-op tests now **harness OK**, identical pass counts (909/698/177/103/159),
+**zero timeouts**, rock-stable across runs. FIX B abandoned.
 
