@@ -429,6 +429,7 @@ class Node {
   }
   removeChild(c) {
     if (!c) return c;
+    __obscura_runNodeIteratorPreRemove(c);
     let _prev = -1, _next = -1;
     if (__mutationObservers?.length) {
       _prev = +_dom("prev_sibling", c._nid);
@@ -440,6 +441,7 @@ class Node {
   }
   replaceChild(newChild, oldChild) {
     if (!oldChild || !newChild) return oldChild;
+    __obscura_runNodeIteratorPreRemove(oldChild);
     let _prev = -1, _next = -1;
     if (__mutationObservers?.length) {
       _prev = +_dom("prev_sibling", oldChild._nid);
@@ -3277,6 +3279,28 @@ function __obscura_whatToShow(v) {
 function __obscura_nodeFilterArg(f) {
   return (f === undefined || f === null) ? null : f;
 }
+function __obscura_isInclusiveAncestor(ancestor, descendant) {
+  for (let n = descendant; n; n = n.parentNode) if (n === ancestor) return true;
+  return false;
+}
+// "First node following the last inclusive descendant of node" — i.e. the next
+// node in tree order that is outside node's subtree (or null).
+function __obscura_nextNodeDescendants(node) {
+  while (node && !node.nextSibling) node = node.parentNode;
+  return node ? node.nextSibling : null;
+}
+
+// Live NodeIterator registry (WeakRefs, pruned lazily) for the DOM "removing
+// steps": when a node is removed, every NodeIterator must adjust its reference.
+const __obscura_liveNodeIterators = [];
+function __obscura_runNodeIteratorPreRemove(toBeRemoved) {
+  const list = __obscura_liveNodeIterators;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const it = list[i].deref();
+    if (!it) { list.splice(i, 1); continue; }
+    it._preRemove(toBeRemoved);
+  }
+}
 
 globalThis.NodeIterator = class NodeIterator {
   constructor(root, whatToShow, filter) {
@@ -3286,6 +3310,21 @@ globalThis.NodeIterator = class NodeIterator {
     this._whatToShow = whatToShow >>> 0;
     this._filter = filter || null;
     this._active = false;
+    __obscura_liveNodeIterators.push(new WeakRef(this));
+  }
+  // DOM "NodeIterator pre-removing steps" — run BEFORE toBeRemoved detaches.
+  _preRemove(node) {
+    // No-op unless node is a strict descendant of root that contains reference.
+    if (__obscura_isInclusiveAncestor(node, this._root)) return;
+    if (!__obscura_isInclusiveAncestor(node, this._reference)) return;
+    if (!this._beforeReference) {
+      this._reference = __obscura_precedingNode(node, null);
+      return;
+    }
+    const next = __obscura_nextNodeDescendants(node);
+    if (next) { this._reference = next; return; }
+    this._reference = __obscura_precedingNode(node, null);
+    this._beforeReference = false;
   }
   get root() { return this._root; }
   get referenceNode() { return this._reference; }
