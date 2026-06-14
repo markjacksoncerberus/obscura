@@ -315,6 +315,13 @@ class Node {
   static DOCUMENT_NODE = 9;
   static DOCUMENT_TYPE_NODE = 10;
   static DOCUMENT_FRAGMENT_NODE = 11;
+  static NOTATION_NODE = 12;
+  static DOCUMENT_POSITION_DISCONNECTED = 0x01;
+  static DOCUMENT_POSITION_PRECEDING = 0x02;
+  static DOCUMENT_POSITION_FOLLOWING = 0x04;
+  static DOCUMENT_POSITION_CONTAINS = 0x08;
+  static DOCUMENT_POSITION_CONTAINED_BY = 0x10;
+  static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 0x20;
 
   constructor(nid) { this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
@@ -512,11 +519,18 @@ class Node {
     return null;
   }
   compareDocumentPosition(other) {
-    if (!other) return 0;
-    if (this._nid === other._nid) return 0;
-    if (this.contains(other)) return 16 | 4; // DOCUMENT_POSITION_CONTAINED_BY | FOLLOWING
-    if (other.contains && other.contains(this)) return 8 | 2; // DOCUMENT_POSITION_CONTAINS | PRECEDING
-    return 4; // DOCUMENT_POSITION_FOLLOWING
+    if (this === other) return 0;
+    // Disconnected (different roots): DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a
+    // consistent PRECEDING/FOLLOWING tiebreak (stable per node pair).
+    if (__obscura_furthestAncestor(this) !== __obscura_furthestAncestor(other)) {
+      return 1 | 32 | (this._nid < other._nid ? 4 : 2);
+    }
+    // other is an ancestor of this -> other CONTAINS this and PRECEDES it.
+    if (__obscura_isInclusiveAncestor(other, this)) return 8 | 2;
+    // other is a descendant of this -> other is CONTAINED_BY this and FOLLOWS it.
+    if (__obscura_isInclusiveAncestor(this, other)) return 16 | 4;
+    // Siblings/cousins: if this follows other in tree order, other PRECEDES this.
+    return __obscura_isFollowing(this, other) ? 2 : 4;
   }
   getRootNode() { return globalThis.document; }
   normalize() {} // no-op
@@ -1390,7 +1404,11 @@ class Document extends Node {
     const Cls = map[String(type || '').toLowerCase()] || Event;
     return new Cls('');
   }
-  createRange() { return { setStart(){}, setEnd(){}, collapse(){}, selectNodeContents(){}, cloneContents(){ return document.createDocumentFragment(); } }; }
+  createRange() {
+    const r = new Range();
+    r.setStart(this, 0); r.setEnd(this, 0);
+    return r;
+  }
   addEventListener(type, fn, opts) {
     if (typeof fn !== 'function') return;
     if (!this._listeners) this._listeners = {};
@@ -1522,6 +1540,10 @@ class DocumentType extends Node {
     this._name = name;
     this._publicId = publicId;
     this._systemId = systemId;
+    // Canonical wrapper for this node id, so document.doctype and
+    // document.childNodes[i] (resolved via _wrap) are the SAME object — node
+    // identity that the DOM ranges/traversal tests rely on.
+    if (!isNaN(nid) && nid >= 0) _cache.set(nid, this);
   }
   get nodeType() { return 10; }
   get nodeName() { return this._name; }
@@ -1621,6 +1643,12 @@ const _wrap = function(nid) {
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
+  else if (t === 10) {
+    // DocumentType: its constructor seeds the cache itself, so return directly.
+    const info = _domParse("document_doctype");
+    return new DocumentType(nid, _domParse("node_name", nid) || (info && info.name) || "",
+                            (info && info.publicId) || "", (info && info.systemId) || "");
+  }
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -3227,6 +3255,11 @@ globalThis.ProcessingInstruction = ProcessingInstruction;
 globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
+// WebIDL constants are exposed on BOTH the interface object and instances, so
+// mirror Node's static constants onto the prototype (node.ELEMENT_NODE, etc.).
+for (const k of Object.getOwnPropertyNames(Node)) {
+  if (/^[A-Z_]+$/.test(k) && typeof Node[k] === "number") Node.prototype[k] = Node[k];
+}
 globalThis.Element = Element;
 globalThis.Document = Document;
 globalThis.EventTarget = Node;
@@ -3486,7 +3519,364 @@ globalThis.TreeWalker = class TreeWalker {
   }
 };
 
-globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNodeContents(){} deleteContents(){} cloneContents(){ return document.createDocumentFragment(); } insertNode(){} getBoundingClientRect(){return {x:0,y:0,width:0,height:0,top:0,right:0,bottom:0,left:0};} };
+// ---------------------------------------------------------------------------
+// Range (DOM §5). Backed by two boundary points (container, offset). All the
+// comparison/positioning/mutation algorithms below follow the DOM Standard.
+// ---------------------------------------------------------------------------
+function __obscura_furthestAncestor(node) {
+  let root = node;
+  while (root.parentNode != null) root = root.parentNode;
+  return root;
+}
+function __obscura_nodeLength(node) {
+  const t = node.nodeType;
+  if (t === 10) return 0;                       // DocumentType
+  if (t === 3 || t === 8 || t === 7) return node.data.length; // CharacterData / PI
+  return node.childNodes.length;
+}
+function __obscura_nodeIndex(node) {
+  let i = 0;
+  for (let n = node.previousSibling; n; n = n.previousSibling) i++;
+  return i;
+}
+// True iff `a` follows `b` in tree order (preorder), within the same tree.
+function __obscura_isFollowing(a, b) {
+  if (a === b) return false;
+  const aAnc = []; for (let n = a; n; n = n.parentNode) aAnc.push(n);
+  const bAnc = []; for (let n = b; n; n = n.parentNode) bAnc.push(n);
+  if (aAnc[aAnc.length - 1] !== bAnc[bAnc.length - 1]) return false; // different roots
+  aAnc.reverse(); bAnc.reverse();
+  let i = 0;
+  while (i < aAnc.length && i < bAnc.length && aAnc[i] === bAnc[i]) i++;
+  if (i >= aAnc.length) return false; // a is an ancestor of b -> a precedes b
+  if (i >= bAnc.length) return true;  // b is an ancestor of a -> a follows b
+  for (let n = bAnc[i].nextSibling; n; n = n.nextSibling) if (n === aAnc[i]) return true;
+  return false;
+}
+// Position of boundary point (nodeA,offsetA) relative to (nodeB,offsetB):
+// -1 before, 0 equal, 1 after.
+function __obscura_bpCompare(nodeA, offsetA, nodeB, offsetB) {
+  if (nodeA === nodeB) return offsetA < offsetB ? -1 : (offsetA > offsetB ? 1 : 0);
+  if (__obscura_isFollowing(nodeA, nodeB)) return -__obscura_bpCompare(nodeB, offsetB, nodeA, offsetA);
+  if (__obscura_isInclusiveAncestor(nodeA, nodeB)) {
+    let child = nodeB;
+    while (child.parentNode !== nodeA) child = child.parentNode;
+    if (__obscura_nodeIndex(child) < offsetA) return 1;
+  }
+  return -1;
+}
+function __obscura_nodeDocument(n) {
+  return n.nodeType === 9 ? n : (n.ownerDocument || globalThis.document);
+}
+
+globalThis.Range = class Range {
+  constructor() {
+    this._sc = globalThis.document; this._so = 0;
+    this._ec = globalThis.document; this._eo = 0;
+  }
+  get startContainer() { return this._sc; }
+  get startOffset() { return this._so; }
+  get endContainer() { return this._ec; }
+  get endOffset() { return this._eo; }
+  get collapsed() { return this._sc === this._ec && this._so === this._eo; }
+  get commonAncestorContainer() {
+    let c = this._sc;
+    while (!__obscura_isInclusiveAncestor(c, this._ec)) c = c.parentNode;
+    return c;
+  }
+  get [Symbol.toStringTag]() { return "Range"; }
+  _root() { return __obscura_furthestAncestor(this._sc); }
+
+  // --- setting boundary points -------------------------------------------
+  setStart(node, offset) {
+    if (node.nodeType === 10) throw new DOMException("Range start cannot be a doctype", "InvalidNodeTypeError");
+    offset = offset >>> 0;
+    if (offset > __obscura_nodeLength(node)) throw new DOMException("Range offset out of bounds", "IndexSizeError");
+    if (__obscura_furthestAncestor(node) !== this._root() || __obscura_bpCompare(node, offset, this._ec, this._eo) === 1) {
+      this._ec = node; this._eo = offset;
+    }
+    this._sc = node; this._so = offset;
+  }
+  setEnd(node, offset) {
+    if (node.nodeType === 10) throw new DOMException("Range end cannot be a doctype", "InvalidNodeTypeError");
+    offset = offset >>> 0;
+    if (offset > __obscura_nodeLength(node)) throw new DOMException("Range offset out of bounds", "IndexSizeError");
+    if (__obscura_furthestAncestor(node) !== this._root() || __obscura_bpCompare(node, offset, this._sc, this._so) === -1) {
+      this._sc = node; this._so = offset;
+    }
+    this._ec = node; this._eo = offset;
+  }
+  setStartBefore(node) { const p = node.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, __obscura_nodeIndex(node)); }
+  setStartAfter(node) { const p = node.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, __obscura_nodeIndex(node) + 1); }
+  setEndBefore(node) { const p = node.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, __obscura_nodeIndex(node)); }
+  setEndAfter(node) { const p = node.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, __obscura_nodeIndex(node) + 1); }
+  collapse(toStart) {
+    if (toStart) { this._ec = this._sc; this._eo = this._so; }
+    else { this._sc = this._ec; this._so = this._eo; }
+  }
+  selectNode(node) {
+    const parent = node.parentNode;
+    if (!parent) throw new DOMException("node has no parent", "InvalidNodeTypeError");
+    const index = __obscura_nodeIndex(node);
+    this._sc = parent; this._so = index;
+    this._ec = parent; this._eo = index + 1;
+  }
+  selectNodeContents(node) {
+    if (node.nodeType === 10) throw new DOMException("cannot select a doctype's contents", "InvalidNodeTypeError");
+    this._sc = node; this._so = 0;
+    this._ec = node; this._eo = __obscura_nodeLength(node);
+  }
+
+  // --- comparisons -------------------------------------------------------
+  compareBoundaryPoints(how, sourceRange) {
+    how = (how >>> 0) & 0xFFFF; // WebIDL: how is an unsigned short
+    if (how !== 0 && how !== 1 && how !== 2 && how !== 3)
+      throw new DOMException("invalid comparison type", "NotSupportedError");
+    if (this._root() !== sourceRange._root())
+      throw new DOMException("ranges are in different trees", "WrongDocumentError");
+    let tc, to, oc, oo;
+    if (how === 0) { tc = this._sc; to = this._so; oc = sourceRange._sc; oo = sourceRange._so; }       // START_TO_START
+    else if (how === 1) { tc = this._ec; to = this._eo; oc = sourceRange._sc; oo = sourceRange._so; }   // START_TO_END
+    else if (how === 2) { tc = this._ec; to = this._eo; oc = sourceRange._ec; oo = sourceRange._eo; }   // END_TO_END
+    else { tc = this._sc; to = this._so; oc = sourceRange._ec; oo = sourceRange._eo; }                  // END_TO_START
+    return __obscura_bpCompare(tc, to, oc, oo);
+  }
+  comparePoint(node, offset) {
+    if (__obscura_furthestAncestor(node) !== this._root())
+      throw new DOMException("node is in a different tree", "WrongDocumentError");
+    if (node.nodeType === 10) throw new DOMException("node is a doctype", "InvalidNodeTypeError");
+    offset = offset >>> 0;
+    if (offset > __obscura_nodeLength(node)) throw new DOMException("offset out of bounds", "IndexSizeError");
+    if (__obscura_bpCompare(node, offset, this._sc, this._so) === -1) return -1;
+    if (__obscura_bpCompare(node, offset, this._ec, this._eo) === 1) return 1;
+    return 0;
+  }
+  isPointInRange(node, offset) {
+    if (__obscura_furthestAncestor(node) !== this._root()) return false;
+    if (node.nodeType === 10) throw new DOMException("node is a doctype", "InvalidNodeTypeError");
+    offset = offset >>> 0;
+    if (offset > __obscura_nodeLength(node)) throw new DOMException("offset out of bounds", "IndexSizeError");
+    if (__obscura_bpCompare(node, offset, this._sc, this._so) === -1) return false;
+    if (__obscura_bpCompare(node, offset, this._ec, this._eo) === 1) return false;
+    return true;
+  }
+  intersectsNode(node) {
+    if (__obscura_furthestAncestor(node) !== this._root()) return false;
+    const parent = node.parentNode;
+    if (!parent) return true;
+    const offset = __obscura_nodeIndex(node);
+    return __obscura_bpCompare(parent, offset, this._ec, this._eo) === -1
+        && __obscura_bpCompare(parent, offset + 1, this._sc, this._so) === 1;
+  }
+
+  // --- contained / partially-contained helpers ---------------------------
+  _contains(node) {
+    return __obscura_furthestAncestor(node) === this._root()
+        && __obscura_bpCompare(node, 0, this._sc, this._so) === 1
+        && __obscura_bpCompare(node, __obscura_nodeLength(node), this._ec, this._eo) === -1;
+  }
+  _partiallyContains(node) {
+    return __obscura_isInclusiveAncestor(node, this._sc) !== __obscura_isInclusiveAncestor(node, this._ec);
+  }
+
+  // --- content operations ------------------------------------------------
+  cloneRange() {
+    const r = new Range();
+    r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo;
+    return r;
+  }
+  detach() { /* no-op per DOM spec */ }
+
+  toString() {
+    let s = "";
+    const sc = this._sc, so = this._so, ec = this._ec, eo = this._eo;
+    if (sc === ec && sc.nodeType === 3) return sc.data.slice(so, eo);
+    if (sc.nodeType === 3) s += sc.data.slice(so);
+    const common = this.commonAncestorContainer;
+    const self = this;
+    (function rec(n) {
+      for (let c = n.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3
+            && __obscura_bpCompare(c, 0, sc, so) === 1
+            && __obscura_bpCompare(c, c.data.length, ec, eo) === -1) {
+          s += c.data;
+        }
+        rec(c);
+      }
+    })(common);
+    if (ec.nodeType === 3) s += ec.data.slice(0, eo);
+    return s;
+  }
+
+  _firstPartiallyContainedChild(common) {
+    if (__obscura_isInclusiveAncestor(this._sc, this._ec)) return null;
+    for (let c = common.firstChild; c; c = c.nextSibling) if (this._partiallyContains(c)) return c;
+    return null;
+  }
+  _lastPartiallyContainedChild(common) {
+    if (__obscura_isInclusiveAncestor(this._ec, this._sc)) return null;
+    for (let c = common.lastChild; c; c = c.previousSibling) if (this._partiallyContains(c)) return c;
+    return null;
+  }
+  _containedChildren(common) {
+    const out = [];
+    for (let c = common.firstChild; c; c = c.nextSibling) if (this._contains(c)) out.push(c);
+    return out;
+  }
+
+  cloneContents() {
+    const frag = __obscura_nodeDocument(this._sc).createDocumentFragment();
+    if (this.collapsed) return frag;
+    const sc = this._sc, so = this._so, ec = this._ec, eo = this._eo;
+    if (sc === ec && (sc.nodeType === 3 || sc.nodeType === 8 || sc.nodeType === 7)) {
+      const clone = sc.cloneNode(false);
+      clone.data = sc.substringData(so, eo - so);
+      frag.appendChild(clone);
+      return frag;
+    }
+    const common = this.commonAncestorContainer;
+    const first = this._firstPartiallyContainedChild(common);
+    const last = this._lastPartiallyContainedChild(common);
+    const contained = this._containedChildren(common);
+    if (first && (first.nodeType === 3 || first.nodeType === 8 || first.nodeType === 7)) {
+      const clone = sc.cloneNode(false);
+      clone.data = sc.substringData(so, __obscura_nodeLength(sc) - so);
+      frag.appendChild(clone);
+    } else if (first) {
+      const clone = first.cloneNode(false);
+      frag.appendChild(clone);
+      const sub = new Range(); sub._sc = sc; sub._so = so; sub._ec = first; sub._eo = __obscura_nodeLength(first);
+      clone.appendChild(sub.cloneContents());
+    }
+    for (const child of contained) frag.appendChild(child.cloneNode(true));
+    if (last && (last.nodeType === 3 || last.nodeType === 8 || last.nodeType === 7)) {
+      const clone = ec.cloneNode(false);
+      clone.data = ec.substringData(0, eo);
+      frag.appendChild(clone);
+    } else if (last) {
+      const clone = last.cloneNode(false);
+      frag.appendChild(clone);
+      const sub = new Range(); sub._sc = last; sub._so = 0; sub._ec = ec; sub._eo = eo;
+      clone.appendChild(sub.cloneContents());
+    }
+    return frag;
+  }
+
+  extractContents() {
+    const frag = __obscura_nodeDocument(this._sc).createDocumentFragment();
+    if (this.collapsed) return frag;
+    const sc = this._sc, so = this._so, ec = this._ec, eo = this._eo;
+    if (sc === ec && (sc.nodeType === 3 || sc.nodeType === 8 || sc.nodeType === 7)) {
+      const clone = sc.cloneNode(false);
+      clone.data = sc.substringData(so, eo - so);
+      frag.appendChild(clone);
+      sc.deleteData(so, eo - so);
+      return frag;
+    }
+    const common = this.commonAncestorContainer;
+    const first = this._firstPartiallyContainedChild(common);
+    const last = this._lastPartiallyContainedChild(common);
+    const contained = this._containedChildren(common);
+    // Where the range collapses to after extraction.
+    let newNode, newOffset;
+    if (__obscura_isInclusiveAncestor(sc, ec)) { newNode = sc; newOffset = so; }
+    else {
+      let reference = sc;
+      while (reference.parentNode && !__obscura_isInclusiveAncestor(reference.parentNode, ec)) reference = reference.parentNode;
+      newNode = reference.parentNode; newOffset = __obscura_nodeIndex(reference) + 1;
+    }
+    if (first && (first.nodeType === 3 || first.nodeType === 8 || first.nodeType === 7)) {
+      const clone = sc.cloneNode(false);
+      clone.data = sc.substringData(so, __obscura_nodeLength(sc) - so);
+      frag.appendChild(clone);
+      sc.deleteData(so, __obscura_nodeLength(sc) - so);
+    } else if (first) {
+      const clone = first.cloneNode(false);
+      frag.appendChild(clone);
+      const sub = new Range(); sub._sc = sc; sub._so = so; sub._ec = first; sub._eo = __obscura_nodeLength(first);
+      clone.appendChild(sub.extractContents());
+    }
+    for (const child of contained) frag.appendChild(child);
+    if (last && (last.nodeType === 3 || last.nodeType === 8 || last.nodeType === 7)) {
+      const clone = ec.cloneNode(false);
+      clone.data = ec.substringData(0, eo);
+      frag.appendChild(clone);
+      ec.deleteData(0, eo);
+    } else if (last) {
+      const clone = last.cloneNode(false);
+      frag.appendChild(clone);
+      const sub = new Range(); sub._sc = last; sub._so = 0; sub._ec = ec; sub._eo = eo;
+      clone.appendChild(sub.extractContents());
+    }
+    this._sc = newNode; this._so = newOffset; this._ec = newNode; this._eo = newOffset;
+    return frag;
+  }
+
+  deleteContents() {
+    if (this.collapsed) return;
+    const sc = this._sc, so = this._so, ec = this._ec, eo = this._eo;
+    if (sc === ec && (sc.nodeType === 3 || sc.nodeType === 8 || sc.nodeType === 7)) {
+      sc.deleteData(so, eo - so);
+      return;
+    }
+    // Top-level contained nodes (omit those whose parent is also contained).
+    const toRemove = [];
+    const self = this;
+    (function rec(n) {
+      for (let c = n.firstChild; c; c = c.nextSibling) {
+        if (self._contains(c)) toRemove.push(c);
+        else rec(c);
+      }
+    })(this.commonAncestorContainer);
+    let newNode, newOffset;
+    if (__obscura_isInclusiveAncestor(sc, ec)) { newNode = sc; newOffset = so; }
+    else {
+      let reference = sc;
+      while (reference.parentNode && !__obscura_isInclusiveAncestor(reference.parentNode, ec)) reference = reference.parentNode;
+      newNode = reference.parentNode; newOffset = __obscura_nodeIndex(reference) + 1;
+    }
+    if (sc.nodeType === 3 || sc.nodeType === 8 || sc.nodeType === 7) sc.deleteData(so, __obscura_nodeLength(sc) - so);
+    for (const n of toRemove) n.parentNode && n.parentNode.removeChild(n);
+    if (ec.nodeType === 3 || ec.nodeType === 8 || ec.nodeType === 7) ec.deleteData(0, eo);
+    this._sc = newNode; this._so = newOffset; this._ec = newNode; this._eo = newOffset;
+  }
+
+  insertNode(node) {
+    const sc = this._sc;
+    if (sc.nodeType === 7 || sc.nodeType === 8 || (sc.nodeType === 3 && !sc.parentNode) || node === sc)
+      throw new DOMException("cannot insert at this boundary", "HierarchyRequestError");
+    let referenceNode = (sc.nodeType === 3) ? sc : (sc.childNodes[this._so] || null);
+    const parent = referenceNode === null ? sc : referenceNode.parentNode;
+    if (sc.nodeType === 3) referenceNode = sc.splitText(this._so);
+    if (node === referenceNode) referenceNode = node.nextSibling;
+    if (node.parentNode) node.parentNode.removeChild(node);
+    let newOffset = referenceNode === null ? __obscura_nodeLength(parent) : __obscura_nodeIndex(referenceNode);
+    newOffset += (node.nodeType === 11) ? __obscura_nodeLength(node) : 1;
+    parent.insertBefore(node, referenceNode);
+    if (this.collapsed) { this._ec = parent; this._eo = newOffset; }
+  }
+
+  surroundContents(newParent) {
+    // No non-Text node may be partially contained.
+    for (let n = this._sc; n && n !== this.commonAncestorContainer; n = n.parentNode)
+      if (this._partiallyContains(n) && n.nodeType !== 3) throw new DOMException("partially contained non-Text node", "InvalidStateError");
+    for (let n = this._ec; n && n !== this.commonAncestorContainer; n = n.parentNode)
+      if (this._partiallyContains(n) && n.nodeType !== 3) throw new DOMException("partially contained non-Text node", "InvalidStateError");
+    const t = newParent.nodeType;
+    if (t === 9 || t === 10 || t === 11) throw new DOMException("invalid newParent", "InvalidNodeTypeError");
+    const fragment = this.extractContents();
+    while (newParent.firstChild) newParent.removeChild(newParent.firstChild);
+    this.insertNode(newParent);
+    newParent.appendChild(fragment);
+    this.selectNode(newParent);
+  }
+
+  getBoundingClientRect() { return new DOMRect(); }
+  getClientRects() { const l = []; l.item = () => null; return l; }
+};
+Range.START_TO_START = 0; Range.START_TO_END = 1; Range.END_TO_END = 2; Range.END_TO_START = 3;
+Range.prototype.START_TO_START = 0; Range.prototype.START_TO_END = 1;
+Range.prototype.END_TO_END = 2; Range.prototype.END_TO_START = 3;
 
 // WebIDL conformance for querySelector(All): the selector is a DOMString, so it
 // must be stringified (null -> "null", undefined -> "undefined"), and calling
