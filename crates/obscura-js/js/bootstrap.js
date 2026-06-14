@@ -307,9 +307,13 @@ const _styleProxy = (decl) => new Proxy(decl, {
 
 class Node {
   static ELEMENT_NODE = 1;
+  static ATTRIBUTE_NODE = 2;
   static TEXT_NODE = 3;
+  static CDATA_SECTION_NODE = 4;
+  static PROCESSING_INSTRUCTION_NODE = 7;
   static COMMENT_NODE = 8;
   static DOCUMENT_NODE = 9;
+  static DOCUMENT_TYPE_NODE = 10;
   static DOCUMENT_FRAGMENT_NODE = 11;
 
   constructor(nid) { this._nid = nid; }
@@ -591,6 +595,48 @@ class Comment extends CharacterData {
   get nodeType() { return 8; }
   cloneNode() { return document.createComment(this.data); }
 }
+
+// CDATASection is a Text subtype (valid only inside XML documents). We back it
+// with a real text node so tree ops (appendChild, ranges, traversal) work; the
+// wrapper just reports nodeType 4 / "#cdata-section".
+class CDATASection extends Text {
+  get nodeName() { return "#cdata-section"; }
+  get nodeType() { return 4; }
+  cloneNode() { return _makeCDATA(this.data); }
+}
+
+// ProcessingInstruction is CharacterData with a target. Backed by a real comment
+// node for tree storage; reports nodeType 7 and nodeName === target.
+class ProcessingInstruction extends CharacterData {
+  constructor(nid, target) { super(nid); this._target = String(target); }
+  get nodeName() { return this._target; }
+  get nodeType() { return 7; }
+  get target() { return this._target; }
+  cloneNode() { return _makePI(this._target, this.data); }
+}
+
+const _makeCDATA = function(data) {
+  const nid = +_dom("create_text_node", String(data ?? ""));
+  const n = new CDATASection(nid);
+  _cache.set(nid, n);
+  return n;
+};
+const _makePI = function(target, data) {
+  const nid = +_dom("create_comment_node", String(data ?? ""));
+  const n = new ProcessingInstruction(nid, target);
+  _cache.set(nid, n);
+  return n;
+};
+// Document.createProcessingInstruction works in any document but validates its
+// target (XML Name) and data (must not contain "?>") per the DOM spec.
+const _createPIValidated = function(target, data) {
+  target = String(target); data = String(data ?? "");
+  if (!_XML_NAME.test(target))
+    throw new DOMException("The string '" + target + "' is not a valid name.", "InvalidCharacterError");
+  if (data.indexOf("?>") !== -1)
+    throw new DOMException("The data provided ('" + data + "') contains '?>'.", "InvalidCharacterError");
+  return _makePI(target, data);
+};
 
 // An attribute qualifiedName must match the XML Name production, else
 // InvalidCharacterError (DOM spec). Covers ASCII + common Unicode name chars.
@@ -1241,6 +1287,13 @@ class Element extends Node {
 }
 
 class Document extends Node {
+  // `new Document(nid)` (numeric) wraps a real document node (the main document,
+  // or a node-type-9 node from the tree). `new Document()` with no id creates a
+  // fresh, empty XML document per the DOM spec (used by WPT range/traversal setup).
+  constructor(nid) {
+    super(typeof nid === 'number' ? nid : -1);
+    if (typeof nid !== 'number') return new DetachedDocument('xml');
+  }
   get documentElement() { return _wrapEl(+_dom("document_element")); }
   get head() { return this.querySelector("head"); }
   get body() { return this.querySelector("body"); }
@@ -1301,6 +1354,12 @@ class Document extends Node {
     _cache.set(nid, n);
     return n;
   }
+  // Per DOM spec, createCDATASection throws on an HTML document; XML documents
+  // (DetachedDocument with kind 'xml') override this to actually create one.
+  createCDATASection(data) {
+    throw new DOMException("This operation is not supported for HTML documents.", "NotSupportedError");
+  }
+  createProcessingInstruction(target, data) { return _createPIValidated(target, data); }
   createDocumentFragment() {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
@@ -1445,8 +1504,29 @@ class Document extends Node {
   get activeElement() { return __obscura_focused || this.body; }
   get implementation() {
     return {
-      createHTMLDocument(title) { return globalThis.document; },
-      createDocument() { return globalThis.document; },
+      createHTMLDocument(title) {
+        const doc = new DetachedDocument('html');
+        if (title !== undefined) {
+          const t = doc.createElement('title');
+          t.textContent = String(title);
+          doc.head.appendChild(t);
+        }
+        return doc;
+      },
+      createDocument(namespace, qualifiedName, doctype) {
+        const doc = new DetachedDocument('xml');
+        if (doctype) { doc.appendChild(doctype); doc._doctype = doctype; }
+        if (qualifiedName) {
+          const el = doc.createElementNS(namespace || null, qualifiedName);
+          doc.appendChild(el);
+          doc._docEl = el;
+        }
+        return doc;
+      },
+      createDocumentType(qualifiedName, publicId, systemId) {
+        const nid = +_dom("create_comment_node", "");
+        return new DocumentType(nid, String(qualifiedName), String(publicId ?? ""), String(systemId ?? ""));
+      },
       hasFeature() { return true; },
     };
   }
@@ -1528,6 +1608,76 @@ class DocumentType extends Node {
   get publicId() { return this._publicId; }
   get systemId() { return this._systemId; }
   get ownerDocument() { return globalThis.document; }
+}
+
+// A standalone document not attached to the page (from `new Document()`,
+// implementation.createDocument / createHTMLDocument). Backed by a real
+// DocumentFragment node so tree operations (appendChild, childNodes, ranges,
+// traversal) all flow through the existing Rust tree ops; it merely reports
+// nodeType 9 and scopes its queries/factories to its own subtree, so nodes it
+// owns never pollute the main page. `nodeType`/`nodeName` are inherited from
+// Document (9 / "#document").
+class DetachedDocument extends Document {
+  constructor(kind) {
+    super(+_dom("create_document_fragment"));
+    this._kind = kind === 'html' ? 'html' : 'xml';
+    this._doctype = null;
+    this._docEl = null;
+    this._headEl = null;
+    this._bodyEl = null;
+    this._title = '';
+    if (this._kind === 'html') {
+      const html = this.createElement('html');
+      const head = this.createElement('head');
+      const body = this.createElement('body');
+      html.appendChild(head);
+      html.appendChild(body);
+      this.appendChild(html);
+      this._docEl = html; this._headEl = head; this._bodyEl = body;
+    }
+  }
+  get ownerDocument() { return null; }
+  get contentType() { return this._kind === 'html' ? "text/html" : "application/xml"; }
+  get compatMode() { return "CSS1Compat"; }
+  get characterSet() { return "UTF-8"; }
+  get title() { const t = this.querySelector('title'); return t ? t.textContent : (this._title || ""); }
+  set title(v) { this._title = String(v); }
+  get URL() { return "about:blank"; }
+  get documentURI() { return "about:blank"; }
+  get defaultView() { return null; }
+  get location() { return null; }
+  get doctype() { return this._doctype || null; }
+  get implementation() { return globalThis.document.implementation; }
+  get documentElement() {
+    if (this._docEl) return this._docEl;
+    for (const k of this.childNodes) if (k.nodeType === 1) return k;
+    return null;
+  }
+  get head() { return this._headEl || null; }
+  get body() { return this._bodyEl || null; }
+  querySelector(s) { return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
+  querySelectorAll(s) {
+    const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
+    const list = ids.map(_wrapEl).filter(Boolean);
+    list.item = (i) => list[i] || null;
+    return list;
+  }
+  getElementById(id) { return this.querySelector('#' + String(id).replace(/["\\]/g, '\\$&')); }
+  getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
+  getElementsByClassName(c) { return this.querySelectorAll('.' + String(c)); }
+  // Factories: create real nodes via the main document's ops, then tag this doc
+  // as their owner.
+  createElement(t) { const n = super.createElement(t); if (n) n._ownerDoc = this; return n; }
+  createElementNS(ns, t) { const n = super.createElementNS(ns, t); if (n) n._ownerDoc = this; return n; }
+  createTextNode(t) { const n = super.createTextNode(t); n._ownerDoc = this; return n; }
+  createComment(t) { const n = super.createComment(t); n._ownerDoc = this; return n; }
+  createDocumentFragment() { const n = super.createDocumentFragment(); n._ownerDoc = this; return n; }
+  createProcessingInstruction(target, data) { const n = _createPIValidated(target, data); n._ownerDoc = this; return n; }
+  createCDATASection(data) {
+    if (this._kind === 'html')
+      throw new DOMException("This operation is not supported for HTML documents.", "NotSupportedError");
+    const n = _makeCDATA(data); n._ownerDoc = this; return n;
+  }
 }
 
 const _cache = new Map();
@@ -3129,6 +3279,8 @@ globalThis.SVGSVGElement = Element;
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;
+globalThis.CDATASection = CDATASection;
+globalThis.ProcessingInstruction = ProcessingInstruction;
 globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
@@ -3268,6 +3420,8 @@ class _IframeDocument {
   createElementNS(ns, tag) { const n = document.createElementNS(ns, tag); n._ownerDoc = this; return n; }
   createTextNode(text) { const n = document.createTextNode(text); n._ownerDoc = this; return n; }
   createComment(text) { const n = document.createComment(text); n._ownerDoc = this; return n; }
+  createProcessingInstruction(target, data) { const n = _createPIValidated(target, data); n._ownerDoc = this; return n; }
+  createCDATASection(data) { throw new DOMException("This operation is not supported for HTML documents.", "NotSupportedError"); }
   createDocumentFragment() { const n = document.createDocumentFragment(); n._ownerDoc = this; return n; }
   createEvent(type) { return document.createEvent(type); }
   hasFocus() { return false; }

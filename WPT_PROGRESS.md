@@ -24,6 +24,9 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-13.
 | `dom/lists/DOMTokenList-iteration.html` | 0/6 | **5/6** | ⬆️ | ″ |
 | `dom/lists/DOMTokenList-coverage-for-attributes.html` | n/a | **150/175** | ⬆️ | ″ |
 | `dom/nodes/attributes.html` | 4/67 | **11/67** | ⬆️ | toggleAttribute + HTML lowercasing + name validation (rest needs Attr-node model) |
+| `dom/traversal/TreeWalker.html` | n/a (no-results) | **300/761** | ⬆️ | Quest #13 Gate A: createCDATASection/PI + standalone docs |
+| `dom/traversal/NodeIterator.html` | n/a (no-results) | **1/766** | ⬆️ | ″ (NodeIterator still aliases TreeWalker — Scroll #10) |
+| `dom/ranges/Range-comparePoint.html` | n/a (no-results) | **0/5580** | 🔓 | ″ — region now measurable; Range still stubbed (Scroll #10) |
 | `url/url-setters.any.html` | 5/279 | **226/279** | ⬆️ | Setters' Sigil + host/port/tab-strip batch |
 | `url/url-searchparams.any.html` | 1/4 | **4/4** | ✅ 100% | Real URLSearchParams (form codec + URL two-way sync) |
 | `url/urlsearchparams-sort.any.html` | n/a | **17/17** | ✅ 100% | ″ |
@@ -52,7 +55,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-13.
 
 | Test | Latest | Notes |
 |------|:------:|-------|
-| `dom/nodes/Node-cloneNode.html` | 98/135 | Stable; unblocked from a render crash by `insertAdjacentText` `259fe6b`. |
+| `dom/nodes/Node-cloneNode.html` | 99/135 | 98→99 from the Comment/PI `textContent` fix (Quest #13). |
 | `dom/nodes/Node-isConnected.html` | 1/2 | Pre-existing gap, unchanged. |
 | `dom/nodes/Document-getElementById.html` | 4/18 | Pre-existing getElementById edge cases. |
 | `dom/nodes/Node-insertBefore.html` | ⚠️ timeout | Heavy test; separate perf issue (not a correctness regression). |

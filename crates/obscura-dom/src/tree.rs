@@ -655,6 +655,16 @@ impl DomTree {
 
     pub fn text_content(&self, node_id: NodeId) -> String {
         let inner = self.inner.borrow();
+        // A CharacterData node's textContent is its OWN data. For Element /
+        // Document / DocumentFragment it is the concatenation of descendant Text
+        // nodes (excluding Comment/PI), which collect_text_inner handles.
+        if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
+            match &node.data {
+                NodeData::Text { contents } | NodeData::Comment { contents } => return contents.clone(),
+                NodeData::ProcessingInstruction { data, .. } => return data.clone(),
+                _ => {}
+            }
+        }
         let mut result = String::new();
         collect_text_inner(&inner, node_id, &mut result);
         result

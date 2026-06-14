@@ -24,6 +24,33 @@ probe of the JS/DOM features testharness leans on.
 
 ---
 
+## ✅ Gate A — `Document.createCDATASection` — RAISED (2026-06-14)
+
+**Done in `bootstrap.js` + `obscura-dom/src/tree.rs`.** `could-not-run: 0` across
+the previously-gated ranges/traversal suite. Results after the fix:
+`TreeWalker 300/761`, `NodeIterator 1/766`, `Range-comparePoint 0/5580` (loads),
+the heavy `Range-{cloneContents,deleteContents,extractContents}` now run (harness
+TIMEOUT — they do real work against the still-stubbed `Range`; that's Scroll #10).
+Bonus: a latent `Comment`/`PI` `textContent` bug fixed along the way bumped
+`Node-cloneNode` 98→99. No regressions (`Node-appendChild` 11/11,
+`Element-classlist` 1315/1420 held).
+
+What shipped:
+- `Document.prototype.createCDATASection` (throws on HTML docs per spec) +
+  `createProcessingInstruction` (validates target Name / rejects `?>`).
+- `CDATASection` (nodeType 4) and `ProcessingInstruction` (nodeType 7) classes,
+  real-node-backed; exposed as globals; Node type constants added.
+- `DetachedDocument` — a standalone document (backed by a real document node)
+  for `new Document()`, `implementation.createDocument` / `createHTMLDocument`,
+  plus `implementation.createDocumentType`. Scoped queries/factories so synthetic
+  docs never pollute the live page (verified).
+- `tree.rs::text_content` now returns a CharacterData node's own data for
+  Comment/PI (Element/Document still exclude comments — verified).
+
+---
+
+### Original scouting notes (kept for the chronicles)
+
 ## ⚔️ Gate A — `Document.createCDATASection` (HIGH LEVERAGE) — CONFIRMED
 
 **Symptom:** every `dom/ranges/*` and `dom/traversal/*` test reports *no-results*.
