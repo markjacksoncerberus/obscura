@@ -169,6 +169,8 @@ impl ToCss for PseudoClass {
 pub enum PseudoElement {
     Before,
     After,
+    FirstLine,
+    FirstLetter,
 }
 
 impl parser::PseudoElement for PseudoElement {
@@ -180,6 +182,8 @@ impl ToCss for PseudoElement {
         match self {
             PseudoElement::Before => dest.write_str("::before"),
             PseudoElement::After => dest.write_str("::after"),
+            PseudoElement::FirstLine => dest.write_str("::first-line"),
+            PseudoElement::FirstLetter => dest.write_str("::first-letter"),
         }
     }
 }
@@ -208,6 +212,30 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
                     SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
                 ),
                 location: _location,
+            }),
+        }
+    }
+
+    fn parse_pseudo_element(
+        &self,
+        location: cssparser::SourceLocation,
+        name: CowRcStr<'i>,
+    ) -> Result<PseudoElement, cssparser::ParseError<'i, Self::Error>> {
+        // The CSS2 pseudo-elements are valid in both one-colon (legacy) and
+        // two-colon syntax; the crate routes both here. They never match a real
+        // element (match_pseudo_element returns false), so a selector using them
+        // parses successfully and simply selects nothing — which is what WPT's
+        // "pseudo-element ... not matching" subtests expect (vs. throwing).
+        match name.as_ref().to_ascii_lowercase().as_str() {
+            "before" => Ok(PseudoElement::Before),
+            "after" => Ok(PseudoElement::After),
+            "first-line" => Ok(PseudoElement::FirstLine),
+            "first-letter" => Ok(PseudoElement::FirstLetter),
+            _ => Err(cssparser::ParseError {
+                kind: cssparser::ParseErrorKind::Custom(
+                    SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
+                ),
+                location,
             }),
         }
     }
@@ -743,6 +771,24 @@ mod tests {
         assert_eq!(ids("em:nth-of-type(2)"), vec!["ec"]);
         assert_eq!(ids("li:first-child"), vec!["a"]);
         assert_eq!(ids("li:last-child"), vec!["e"]);
+    }
+
+    #[test]
+    fn css2_pseudo_elements_parse_but_never_match() {
+        // Regression: the four CSS2 pseudo-elements must PARSE (one- and
+        // two-colon) and select nothing, rather than throwing a parse error.
+        let tree = parse_html("<p>hi<span>x</span></p>");
+        for sel in [
+            "::before", "::after", "::first-line", "::first-letter",
+            ":before", ":after", ":first-line", ":first-letter",
+            "p::first-line", "span:first-letter",
+        ] {
+            let r = tree.query_selector_all(sel);
+            assert!(r.is_ok(), "selector {sel:?} should parse, got {r:?}");
+            assert!(r.unwrap().is_empty(), "selector {sel:?} should match nothing");
+        }
+        // An unknown pseudo-element still errors (so querySelector throws).
+        assert!(tree.query_selector_all("::bogus-pe").is_err());
     }
 
     #[test]

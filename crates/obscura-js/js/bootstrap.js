@@ -3289,6 +3289,22 @@ globalThis.Document = Document;
 globalThis.EventTarget = Node;
 globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNodeContents(){} deleteContents(){} cloneContents(){ return document.createDocumentFragment(); } insertNode(){} getBoundingClientRect(){return {x:0,y:0,width:0,height:0,top:0,right:0,bottom:0,left:0};} };
 
+// WebIDL conformance for querySelector(All): the selector is a DOMString, so it
+// must be stringified (null -> "null", undefined -> "undefined"), and calling
+// with no argument is a TypeError (arity). Centralized here over every ParentNode
+// implementation rather than duplicated in each method body.
+for (const Cls of [Element, Document, DocumentFragment, DetachedDocument]) {
+  for (const m of ['querySelector', 'querySelectorAll']) {
+    const orig = Cls.prototype[m];
+    if (typeof orig !== 'function') continue;
+    Cls.prototype[m] = function(s) {
+      if (arguments.length < 1)
+        throw new TypeError("Failed to execute '" + m + "': 1 argument required, but only 0 present.");
+      return orig.call(this, String(s));
+    };
+  }
+}
+
 [
   navigator.getBattery, navigator.getGamepads, navigator.sendBeacon,
   navigator.javaEnabled, navigator.serviceWorker?.register,
