@@ -23,7 +23,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | mixed | ⚔️⚔️ | ~? |
 | 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | 2/6+ | ⚔️⚔️ | ~? |
 | 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | 4/8+ | ⚔️⚔️ | ~? |
-| 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | 🔓 301+/7606 | ⚔️⚔️⚔️ | ~? |
+| 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | ⚔️ traversal **DONE**; ranges 90%+ | ⚔️⚔️⚔️ | iframe content-ops left |
 | 11 | [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | 1/3+ | ⚔️⚔️ | ~? |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `html/.../the-iframe-element` | mostly held | ⚔️⚔️ | ~20 |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
@@ -32,16 +32,18 @@ Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️�
 
 ---
 
-## 🗺️ Captain's Counsel (recommended order — updated 2026-06-14)
+## 🗺️ Captain's Counsel (recommended order — updated 2026-06-14, session 2)
 
-With **#13 secured** and **#01 driven to 1917/1977**, the field has shifted. Next moves:
+With **#10 traversal conquered and ranges driven to 90%+**, the field has shifted again:
 
-1. **The Traversal Labyrinth (10)** — freshly *unlocked* by #13. `dom/ranges` + `dom/traversal`
-   now produce results (~7,600 measurable subtests) but mostly fail because `Range`,
-   `createRange`, and `NodeIterator` are still **no-op stubs** in `bootstrap.js`
-   (`globalThis.Range`, `Document.createRange` ≈ line 3290; `createNodeIterator` aliases
-   `createTreeWalker`). Building a real Range/StaticRange + a true NodeIterator is the big
-   prize on the board now. Highest bounty available.
+1. **The Iframe Frontier (12)** — now the keystone. The remaining `dom/ranges` content-op
+   tests (`Range-insertNode`, `surroundContents`, `cloneContents`, `deleteContents`,
+   `extractContents` — ~6,000 subtests) are blocked NOT by Range (verified correct in
+   isolation) but by their **cross-iframe comparison harness**: `actualIframe`/`expectedIframe`
+   with `iframe.contentWindow.setupRangeTests()`, `contentWindow.testRange`, per-iframe JS
+   realms. Unblock real iframe content-document realms and a big bounty falls. (The
+   `restoreIframe` `while(contentDocument.firstChild)` loops also *hang* today — same node-
+   identity class we keep hitting; fix once, cash many tests.)
 2. **The Selector Sorcery (01)** — finish the tail (see Scroll 01 for the bucketed 60).
    The cheap remaining strikes are gone; what's left is namespace selectors, shadow-DOM
    pseudo-elements, a real `NodeList` type, and a harness node-identity mystery.
@@ -68,3 +70,25 @@ engine **hardened against URL-triggered crashes**.
   `*-of-type`, +151); CSS2 pseudo-elements parse-but-never-match (+80); `querySelector`
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
+
+**Session 2026-06-14 #2 (Quest #10 The Traversal Labyrinth):**
+- **Traversal — CONQUERED.** Real `NodeIterator` (1→766/766, was a TreeWalker alias),
+  spec `TreeWalker` (300→761/761, real FILTER_REJECT subtree-pruning vs SKIP, active
+  flag, validating currentNode), `NodeIterator-removal` 0→23/23 (pre-removing steps +
+  WeakRef live-iterator registry), full `NodeFilter` constant set, `createHTMLDocument`
+  now prepends `<!DOCTYPE html>`. Commits `070ab6f`, `1f7a428`.
+- **Range — built from a no-op stub.** Boundary-point model + all comparison/positioning/
+  selection/mutation algorithms (content ops verified correct in isolation):
+  `comparePoint` 0→5518/5580, `Range-set` 0→10838/10920, `compareBoundaryPoints`
+  0→8665/9313, `isPointInRange` 0→5521/5733, `intersectsNode` 0→2356/2356,
+  `stringifier` 5/5, + selectNode/collapse/cloneRange/commonAncestor 96–100%. `828ee41`.
+- **Node identity — the keystone bug, fixed.** The global `document`, `DetachedDocument`
+  fragments, and `DocumentType` nodes now each have ONE canonical wrapper (seeded into
+  `_cache`), so `documentElement.parentNode === document`, `doctype === childNodes[i]`,
+  etc. This was the long-standing "harness node-identity mystery" — it gated traversal,
+  un-hung `Range-set`, and as a bonus made `compareDocumentPosition` real (hardcoded `4`
+  → true tree order; +DOCUMENT_POSITION_* consts) → `Node-compareDocumentPosition`
+  →1444/1444. Zero regressions; 143 unit tests green.
+- **Left for #12:** the iframe-harness ranges content-op tests (~6k subtests) and the
+  CDATA-in-HTML fixture (`paras[5]`, ~few hundred subtests, needs real CDATA nodes in
+  the Rust DOM rather than coalescing text nodes).

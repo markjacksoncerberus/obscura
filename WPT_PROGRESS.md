@@ -24,9 +24,18 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-13.
 | `dom/lists/DOMTokenList-iteration.html` | 0/6 | **5/6** | ⬆️ | ″ |
 | `dom/lists/DOMTokenList-coverage-for-attributes.html` | n/a | **150/175** | ⬆️ | ″ |
 | `dom/nodes/attributes.html` | 4/67 | **11/67** | ⬆️ | toggleAttribute + HTML lowercasing + name validation (rest needs Attr-node model) |
-| `dom/traversal/TreeWalker.html` | n/a (no-results) | **300/761** | ⬆️ | Quest #13 Gate A: createCDATASection/PI + standalone docs |
-| `dom/traversal/NodeIterator.html` | n/a (no-results) | **1/766** | ⬆️ | ″ (NodeIterator still aliases TreeWalker — Scroll #10) |
-| `dom/ranges/Range-comparePoint.html` | n/a (no-results) | **0/5580** | 🔓 | ″ — region now measurable; Range still stubbed (Scroll #10) |
+| `dom/traversal/TreeWalker.html` | 300/761 | **761/761** | ✅ 100% | Quest #10: real spec TreeWalker (REJECT/SKIP) + node identity `828ee41`/`070ab6f` |
+| `dom/traversal/NodeIterator.html` | 1/766 | **766/766** | ✅ 100% | Quest #10: real NodeIterator (was a TreeWalker alias) `070ab6f` |
+| `dom/traversal/NodeIterator-removal.html` | 0/23 | **23/23** | ✅ 100% | Quest #10: pre-removing steps + live-iterator registry `1f7a428` |
+| `dom/traversal/{reject,skip,skip-most,acceptNode,basic,currentNode,...}` | mixed | **all green** | ✅ | Quest #10 |
+| `dom/ranges/Range-comparePoint.html` | 0/5580 | **5518/5580** | ⬆️ | Quest #10: real Range + boundary-point compare `828ee41` (rest = CDATA-in-HTML fixture) |
+| `dom/ranges/Range-set.html` | 0/10920 | **10838/10920** | ⬆️ | Quest #10: real setStart/End + doctype identity (un-hung the test) `828ee41` |
+| `dom/ranges/Range-compareBoundaryPoints.html` | 0/9313 | **8665/9313** | ⬆️ | Quest #10: compareBoundaryPoints + `how` unsigned-short coercion `828ee41` |
+| `dom/ranges/Range-isPointInRange.html` | 0/5733 | **5521/5733** | ⬆️ | Quest #10 `828ee41` |
+| `dom/ranges/Range-intersectsNode.html` | 0/2356 | **2356/2356** | ✅ 100% | Quest #10 `828ee41` |
+| `dom/ranges/Range-stringifier.html` | 0/5 | **5/5** | ✅ 100% | Quest #10: Range.toString `828ee41` |
+| `dom/ranges/Range-{selectNode,collapse,cloneRange,commonAncestorContainer,constructor,attributes,detach}` | stub | **96–100%** | ⬆️ | Quest #10 `828ee41` |
+| `dom/nodes/Node-compareDocumentPosition.html` | n/a | **1444/1444** | ✅ 100% | Quest #10: real compareDocumentPosition + DOCUMENT_POSITION_* consts `828ee41` |
 | `url/url-setters.any.html` | 5/279 | **226/279** | ⬆️ | Setters' Sigil + host/port/tab-strip batch |
 | `url/url-searchparams.any.html` | 1/4 | **4/4** | ✅ 100% | Real URLSearchParams (form codec + URL two-way sync) |
 | `url/urlsearchparams-sort.any.html` | n/a | **17/17** | ✅ 100% | ″ |

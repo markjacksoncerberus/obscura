@@ -5,14 +5,25 @@
 > let `setupRangeTests` complete. Now they produce results (~7,600 subtests) but
 > mostly fail because the underlying objects are stubs.
 
-## Current hold (2026-06-14)
+## ✅ MOSTLY CONQUERED (2026-06-14 session #2 — commits `070ab6f`, `1f7a428`, `828ee41`)
 
-| Test | Hold | Note |
-|------|:----:|------|
-| `dom/traversal/TreeWalker.html` | 300/761 | real `createTreeWalker` exists; gaps remain |
-| `dom/traversal/NodeIterator.html` | 1/766 | **aliases TreeWalker** — not a real NodeIterator |
-| `dom/ranges/Range-comparePoint.html` | 0/5580 | loads; `Range` is a stub |
-| `dom/ranges/Range-{clone,delete,extract}Contents.html` | run → TIMEOUT | heavy; do real work against stubs |
+Traversal is 100%. Range is real and ~90%+ on every non-iframe test. What was done:
+- Real `NodeIterator` (1→766/766), spec `TreeWalker` (300→761/761), `NodeIterator-removal`
+  0→23/23, full `NodeFilter` constants, `createHTMLDocument` doctype.
+- Real `Range` (boundary points + all algorithms; content ops correct in isolation):
+  comparePoint 5518/5580, set 10838/10920, compareBoundaryPoints 8665/9313,
+  isPointInRange 5521/5733, intersectsNode 2356/2356, stringifier 5/5, +rest 96–100%.
+- The keystone: **canonical node-wrapper identity** (document, DetachedDocument, DocumentType
+  all seed `_cache`) — fixed `compareDocumentPosition` too (→1444/1444).
+
+### What remains (NOT Range bugs)
+| Test | Hold | Blocker |
+|------|:----:|---------|
+| `Range-{insertNode,surroundContents,cloneContents,deleteContents,extractContents}` | 0/TIMEOUT | **cross-iframe harness** — `actualIframe`/`expectedIframe` + `contentWindow.setupRangeTests()`. Range itself is verified correct in isolation. → **Quest #12 Iframe Frontier.** `restoreIframe`'s `while(contentDocument.firstChild)` also hangs (node identity on iframe contentDocument). |
+| comparePoint/compareBoundaryPoints/isPointInRange tails | ~few hundred | **CDATA-in-HTML** fixture (`paras[5]` = `createCDATASection` nodes). CDATA is backed by text nodes that coalesce; needs a real CDATA node type in `obscura-dom`. |
+
+### Original analysis (for reference)
+| `dom/traversal/Range-comparePoint.html` | 0/5580 | loads; `Range` is a stub |
 
 ## The beasts (all in `crates/obscura-js/js/bootstrap.js`)
 
