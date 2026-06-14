@@ -105,6 +105,9 @@ pub enum PseudoClass {
     Enabled,
     Disabled,
     Checked,
+    /// `:lang(en, fr, …)` — matched against the element's language (its nearest
+    /// ancestor-or-self `lang` attribute), per the CSS prefix rule.
+    Lang(Vec<String>),
     /// A standard CSS pseudo-class we accept as valid (so querySelector does not
     /// throw) but don't implement matching for — it never matches.
     Other(String),
@@ -157,6 +160,16 @@ impl ToCss for PseudoClass {
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
+            PseudoClass::Lang(langs) => {
+                dest.write_str(":lang(")?;
+                for (i, l) in langs.iter().enumerate() {
+                    if i > 0 {
+                        dest.write_str(", ")?;
+                    }
+                    dest.write_str(l)?;
+                }
+                dest.write_str(")")
+            }
             PseudoClass::Other(name) => {
                 dest.write_str(":")?;
                 dest.write_str(name)
@@ -238,6 +251,29 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
                 location,
             }),
         }
+    }
+
+    fn parse_non_ts_functional_pseudo_class<'t>(
+        &self,
+        name: CowRcStr<'i>,
+        parser: &mut cssparser::Parser<'i, 't>,
+        _after_part: bool,
+    ) -> Result<PseudoClass, cssparser::ParseError<'i, Self::Error>> {
+        if name.eq_ignore_ascii_case("lang") {
+            // :lang() takes a comma-separated list of language ranges (idents or
+            // strings); the list must be non-empty.
+            let mut langs = Vec::new();
+            loop {
+                langs.push(parser.expect_ident_or_string()?.as_ref().to_owned());
+                if parser.try_parse(|p| p.expect_comma()).is_err() {
+                    break;
+                }
+            }
+            if !langs.is_empty() {
+                return Ok(PseudoClass::Lang(langs));
+            }
+        }
+        Err(parser.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name)))
     }
 }
 
@@ -486,6 +522,35 @@ impl<'a> Element for DomElement<'a> {
                     }
                 })
                 .unwrap_or(false),
+            // :lang(...) matches against the element's language, which is the
+            // value of the nearest `lang` attribute on the element or an ancestor.
+            // A range matches if it equals the language or is a prefix of it
+            // followed by "-" (case-insensitive); "*" matches any non-empty lang.
+            PseudoClass::Lang(ranges) => {
+                let mut cur = Some(self.node_id);
+                let mut lang = String::new();
+                while let Some(id) = cur {
+                    match self
+                        .tree
+                        .with_node(id, |n| (n.get_attribute("lang").map(|s| s.to_string()), n.parent))
+                    {
+                        Some((Some(v), _)) => {
+                            lang = v;
+                            break;
+                        }
+                        Some((None, parent)) => cur = parent,
+                        None => break,
+                    }
+                }
+                let lang = lang.to_ascii_lowercase();
+                ranges.iter().any(|r| {
+                    let r = r.to_ascii_lowercase();
+                    if r == "*" {
+                        return !lang.is_empty();
+                    }
+                    !r.is_empty() && (lang == r || lang.starts_with(&(r + "-")))
+                })
+            }
             // Accepted-but-unimplemented standard pseudo-classes never match.
             PseudoClass::Other(_) => false,
         }
@@ -771,6 +836,35 @@ mod tests {
         assert_eq!(ids("em:nth-of-type(2)"), vec!["ec"]);
         assert_eq!(ids("li:first-child"), vec!["a"]);
         assert_eq!(ids("li:last-child"), vec!["e"]);
+    }
+
+    #[test]
+    fn lang_pseudo_class_with_inheritance() {
+        let tree = parse_html(
+            r#"<div lang="en">
+                 <p id=a>x</p>
+                 <p id=b lang="fr">y</p>
+                 <p id=c lang="en-US">z</p>
+               </div>
+               <p id=d>nolang</p>"#,
+        );
+        let ids = |sel: &str| {
+            let mut v: Vec<String> = tree
+                .query_selector_all(sel)
+                .unwrap()
+                .iter()
+                .filter_map(|&n| tree.get_node(n).unwrap().get_attribute("id").map(|s| s.to_string()))
+                .collect();
+            v.sort();
+            v
+        };
+        // a inherits en; c is en-US (prefix match); b is fr; d has no language.
+        assert_eq!(ids(":lang(en)"), vec!["a", "c"]);
+        assert_eq!(ids(":lang(fr)"), vec!["b"]);
+        assert_eq!(ids(":lang(en-US)"), vec!["c"]);
+        assert_eq!(ids(":lang(en, fr)"), vec!["a", "b", "c"]);
+        // p:lang(en) excludes the no-language and fr paragraphs.
+        assert_eq!(ids("p:lang(en)"), vec!["a", "c"]);
     }
 
     #[test]
