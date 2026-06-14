@@ -23,10 +23,10 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | mixed | ⚔️⚔️ | ~? |
 | 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | 2/6+ | ⚔️⚔️ | ~? |
 | 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | 4/8+ | ⚔️⚔️ | ~? |
-| 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | ~0 | ⚔️⚔️⚔️ | ~? |
+| 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | 🔓 301+/7606 | ⚔️⚔️⚔️ | ~? |
 | 11 | [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | 1/3+ | ⚔️⚔️ | ~? |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `html/.../the-iframe-element` | mostly held | ⚔️⚔️ | ~20 |
-| 13 | [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | — | ⚔️⚔️ | unlocks many |
+| ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
 
