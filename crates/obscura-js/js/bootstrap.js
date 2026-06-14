@@ -1407,98 +1407,12 @@ class Document extends Node {
     return !event.defaultPrevented;
   }
   createTreeWalker(root, whatToShow, filter) {
-    whatToShow = whatToShow || 0xFFFFFFFF; // NodeFilter.SHOW_ALL
-    const walker = {
-      root: root,
-      currentNode: root,
-      whatToShow: whatToShow,
-      filter: filter || null,
-      _accept(node) {
-        const nodeType = node.nodeType;
-        const show = (whatToShow >> (nodeType - 1)) & 1;
-        if (!show) return false;
-        if (this.filter) {
-          if (typeof this.filter === 'function') return this.filter(node) === 1;
-          if (this.filter.acceptNode) return this.filter.acceptNode(node) === 1;
-        }
-        return true;
-      },
-      nextNode() {
-        let node = this.currentNode;
-        let child = node.firstChild;
-        while (child) {
-          if (this._accept(child)) { this.currentNode = child; return child; }
-          if (child.firstChild) { child = child.firstChild; continue; }
-          if (child.nextSibling) { child = child.nextSibling; continue; }
-          let parent = child.parentNode;
-          while (parent && parent !== this.root) {
-            if (parent.nextSibling) { child = parent.nextSibling; break; }
-            parent = parent.parentNode;
-          }
-          if (!parent || parent === this.root) return null;
-        }
-        return null;
-      },
-      previousNode() {
-        let node = this.currentNode;
-        if (node === this.root) return null;
-        let sibling = node.previousSibling;
-        if (sibling) {
-          while (sibling.lastChild) sibling = sibling.lastChild;
-          if (this._accept(sibling)) { this.currentNode = sibling; return sibling; }
-        }
-        let parent = node.parentNode;
-        if (parent && parent !== this.root && this._accept(parent)) {
-          this.currentNode = parent;
-          return parent;
-        }
-        return null;
-      },
-      firstChild() {
-        let child = this.currentNode.firstChild;
-        while (child) {
-          if (this._accept(child)) { this.currentNode = child; return child; }
-          child = child.nextSibling;
-        }
-        return null;
-      },
-      lastChild() {
-        let child = this.currentNode.lastChild;
-        while (child) {
-          if (this._accept(child)) { this.currentNode = child; return child; }
-          child = child.previousSibling;
-        }
-        return null;
-      },
-      nextSibling() {
-        let sibling = this.currentNode.nextSibling;
-        while (sibling) {
-          if (this._accept(sibling)) { this.currentNode = sibling; return sibling; }
-          sibling = sibling.nextSibling;
-        }
-        return null;
-      },
-      previousSibling() {
-        let sibling = this.currentNode.previousSibling;
-        while (sibling) {
-          if (this._accept(sibling)) { this.currentNode = sibling; return sibling; }
-          sibling = sibling.previousSibling;
-        }
-        return null;
-      },
-      parentNode() {
-        let parent = this.currentNode.parentNode;
-        if (parent && parent !== this.root && this._accept(parent)) {
-          this.currentNode = parent;
-          return parent;
-        }
-        return null;
-      },
-    };
-    return walker;
+    if (!(root instanceof Node)) throw new TypeError("createTreeWalker: root must be a Node");
+    return new TreeWalker(root, __obscura_whatToShow(whatToShow), __obscura_nodeFilterArg(filter));
   }
   createNodeIterator(root, whatToShow, filter) {
-    return this.createTreeWalker(root, whatToShow, filter);
+    if (!(root instanceof Node)) throw new TypeError("createNodeIterator: root must be a Node");
+    return new NodeIterator(root, __obscura_whatToShow(whatToShow), __obscura_nodeFilterArg(filter));
   }
   getSelection() { return globalThis.getSelection(); }
   get activeElement() { return __obscura_focused || this.body; }
@@ -1506,6 +1420,11 @@ class Document extends Node {
     return {
       createHTMLDocument(title) {
         const doc = new DetachedDocument('html');
+        // Spec: createHTMLDocument prepends a <!DOCTYPE html> before <html>.
+        const dt = this.createDocumentType('html', '', '');
+        dt._ownerDoc = doc;
+        doc.insertBefore(dt, doc.documentElement);
+        doc._doctype = dt;
         if (title !== undefined) {
           const t = doc.createElement('title');
           t.textContent = String(title);
@@ -1620,6 +1539,11 @@ class DocumentType extends Node {
 class DetachedDocument extends Document {
   constructor(kind) {
     super(+_dom("create_document_fragment"));
+    // Make THIS object the canonical wrapper for its backing node, so that a
+    // child's `.parentNode` (which resolves via _wrap) returns this same
+    // DetachedDocument rather than a fresh plain Document wrapper. Required for
+    // node-identity (isInclusiveDescendant) over foreign/xml document roots.
+    _cache.set(this._nid, this);
     this._kind = kind === 'html' ? 'html' : 'xml';
     this._doctype = null;
     this._docEl = null;
@@ -2934,7 +2858,24 @@ globalThis.customElements = {
   whenDefined(name) { return Promise.resolve(this._registry.get(name)); },
   upgrade() {},
 };
-globalThis.NodeFilter = { SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_ALL: 0xFFFFFFFF };
+globalThis.NodeFilter = {
+  SHOW_ALL: 0xFFFFFFFF,
+  SHOW_ELEMENT: 0x1,
+  SHOW_ATTRIBUTE: 0x2,
+  SHOW_TEXT: 0x4,
+  SHOW_CDATA_SECTION: 0x8,
+  SHOW_ENTITY_REFERENCE: 0x10,
+  SHOW_ENTITY: 0x20,
+  SHOW_PROCESSING_INSTRUCTION: 0x40,
+  SHOW_COMMENT: 0x80,
+  SHOW_DOCUMENT: 0x100,
+  SHOW_DOCUMENT_TYPE: 0x200,
+  SHOW_DOCUMENT_FRAGMENT: 0x400,
+  SHOW_NOTATION: 0x800,
+  FILTER_ACCEPT: 1,
+  FILTER_REJECT: 2,
+  FILTER_SKIP: 3,
+};
 globalThis.ResizeObserver = class { constructor(){} observe(){} unobserve(){} disconnect(){} };
 globalThis.IntersectionObserver = class {
   constructor(callback) { this._callback = callback; }
@@ -3287,6 +3228,225 @@ globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
 globalThis.EventTarget = Node;
+// ---------------------------------------------------------------------------
+// Tree traversal primitives shared by NodeIterator + TreeWalker (DOM §6).
+// "following/preceding node within root" = standard tree-order step, bounded so
+// we never escape the traverser's root subtree.
+// ---------------------------------------------------------------------------
+function __obscura_followingNode(node, root) {
+  if (node.firstChild) return node.firstChild;
+  let n = node;
+  while (n && n !== root) {
+    if (n.nextSibling) return n.nextSibling;
+    n = n.parentNode;
+  }
+  return null;
+}
+function __obscura_precedingNode(node, root) {
+  if (node === root) return null;
+  if (node.previousSibling) {
+    let n = node.previousSibling;
+    while (n.lastChild) n = n.lastChild;
+    return n;
+  }
+  return node.parentNode;
+}
+// "filter a node" (DOM §6.1): guards the active flag, applies whatToShow, then
+// invokes the NodeFilter callback. Returns FILTER_ACCEPT/REJECT/SKIP.
+function __obscura_filterNode(traverser, node) {
+  if (traverser._active) {
+    throw new DOMException("NodeFilter is already in use", "InvalidStateError");
+  }
+  const bit = 1 << (node.nodeType - 1);
+  if (!(bit & traverser._whatToShow)) return 3; // FILTER_SKIP
+  const filter = traverser._filter;
+  if (!filter) return 1; // FILTER_ACCEPT
+  traverser._active = true;
+  let result;
+  try {
+    result = (typeof filter === "function") ? filter(node) : filter.acceptNode(node);
+  } finally {
+    traverser._active = false;
+  }
+  return Number(result);
+}
+// WebIDL coercion for the whatToShow argument (unsigned long, default SHOW_ALL).
+function __obscura_whatToShow(v) {
+  return v === undefined ? 0xFFFFFFFF : (v >>> 0);
+}
+function __obscura_nodeFilterArg(f) {
+  return (f === undefined || f === null) ? null : f;
+}
+
+globalThis.NodeIterator = class NodeIterator {
+  constructor(root, whatToShow, filter) {
+    this._root = root;
+    this._reference = root;
+    this._beforeReference = true;
+    this._whatToShow = whatToShow >>> 0;
+    this._filter = filter || null;
+    this._active = false;
+  }
+  get root() { return this._root; }
+  get referenceNode() { return this._reference; }
+  get pointerBeforeReferenceNode() { return this._beforeReference; }
+  get whatToShow() { return this._whatToShow; }
+  get filter() { return this._filter; }
+  get [Symbol.toStringTag]() { return "NodeIterator"; }
+
+  _traverse(forward) {
+    let node = this._reference;
+    let before = this._beforeReference;
+    for (;;) {
+      if (forward) {
+        if (before) {
+          before = false;
+        } else {
+          const next = __obscura_followingNode(node, this._root);
+          if (!next) return null;
+          node = next;
+        }
+      } else {
+        if (!before) {
+          before = true;
+        } else {
+          const prev = __obscura_precedingNode(node, this._root);
+          if (!prev) return null;
+          node = prev;
+        }
+      }
+      if (__obscura_filterNode(this, node) === 1) {
+        this._reference = node;
+        this._beforeReference = before;
+        return node;
+      }
+    }
+  }
+  nextNode() { return this._traverse(true); }
+  previousNode() { return this._traverse(false); }
+  detach() { /* no-op per DOM spec */ }
+};
+
+globalThis.TreeWalker = class TreeWalker {
+  constructor(root, whatToShow, filter) {
+    this._root = root;
+    this._currentNode = root;
+    this._whatToShow = whatToShow >>> 0;
+    this._filter = filter || null;
+    this._active = false;
+  }
+  get root() { return this._root; }
+  get whatToShow() { return this._whatToShow; }
+  get filter() { return this._filter; }
+  get currentNode() { return this._currentNode; }
+  set currentNode(value) {
+    // currentNode is a non-nullable Node attribute: non-Node values throw.
+    if (!(value instanceof Node)) throw new TypeError("currentNode must be a Node");
+    this._currentNode = value;
+  }
+  get [Symbol.toStringTag]() { return "TreeWalker"; }
+
+  // DOM §6.2 "traverse children" (type: true = first, false = last).
+  _traverseChildren(first) {
+    let node = first ? this.currentNode.firstChild : this.currentNode.lastChild;
+    while (node) {
+      const result = __obscura_filterNode(this, node);
+      if (result === 1) { this.currentNode = node; return node; }
+      if (result === 3) {
+        const child = first ? node.firstChild : node.lastChild;
+        if (child) { node = child; continue; }
+      }
+      // FILTER_REJECT, or FILTER_SKIP with no children: move to a sibling,
+      // climbing out until we find one (without escaping root/currentNode).
+      while (node) {
+        const sibling = first ? node.nextSibling : node.previousSibling;
+        if (sibling) { node = sibling; break; }
+        const parent = node.parentNode;
+        if (!parent || parent === this._root || parent === this.currentNode) return null;
+        node = parent;
+      }
+    }
+    return null;
+  }
+  // DOM §6.2 "traverse siblings" (type: true = next, false = previous).
+  _traverseSiblings(next) {
+    let node = this.currentNode;
+    if (node === this._root) return null;
+    for (;;) {
+      let sibling = next ? node.nextSibling : node.previousSibling;
+      while (sibling) {
+        node = sibling;
+        const result = __obscura_filterNode(this, node);
+        if (result === 1) { this.currentNode = node; return node; }
+        sibling = next ? node.firstChild : node.lastChild;
+        if (result === 2 || !sibling) {
+          sibling = next ? node.nextSibling : node.previousSibling;
+        }
+      }
+      node = node.parentNode;
+      if (!node || node === this._root) return null;
+      if (__obscura_filterNode(this, node) === 1) return null;
+    }
+  }
+  firstChild() { return this._traverseChildren(true); }
+  lastChild() { return this._traverseChildren(false); }
+  nextSibling() { return this._traverseSiblings(true); }
+  previousSibling() { return this._traverseSiblings(false); }
+  parentNode() {
+    let node = this.currentNode;
+    while (node && node !== this._root) {
+      node = node.parentNode;
+      if (node && __obscura_filterNode(this, node) === 1) {
+        this.currentNode = node;
+        return node;
+      }
+    }
+    return null;
+  }
+  nextNode() {
+    let node = this.currentNode;
+    let result = 1; // FILTER_ACCEPT
+    for (;;) {
+      while (result !== 2 && node.firstChild) {
+        node = node.firstChild;
+        result = __obscura_filterNode(this, node);
+        if (result === 1) { this.currentNode = node; return node; }
+      }
+      let sibling = null;
+      let temporary = node;
+      while (temporary) {
+        if (temporary === this._root) return null;
+        sibling = temporary.nextSibling;
+        if (sibling) { node = sibling; break; }
+        temporary = temporary.parentNode;
+      }
+      if (!sibling) return null;
+      result = __obscura_filterNode(this, node);
+      if (result === 1) { this.currentNode = node; return node; }
+    }
+  }
+  previousNode() {
+    let node = this.currentNode;
+    while (node !== this._root) {
+      let sibling = node.previousSibling;
+      while (sibling) {
+        node = sibling;
+        let result = __obscura_filterNode(this, node);
+        while (result !== 2 && node.lastChild) {
+          node = node.lastChild;
+          result = __obscura_filterNode(this, node);
+        }
+        if (result === 1) { this.currentNode = node; return node; }
+        sibling = node.previousSibling;
+      }
+      if (node === this._root || !node.parentNode) return null;
+      node = node.parentNode;
+      if (__obscura_filterNode(this, node) === 1) { this.currentNode = node; return node; }
+    }
+    return null;
+  }
+};
+
 globalThis.Range = class Range { setStart(){} setEnd(){} collapse(){} selectNodeContents(){} deleteContents(){} cloneContents(){ return document.createDocumentFragment(); } insertNode(){} getBoundingClientRect(){return {x:0,y:0,width:0,height:0,top:0,right:0,bottom:0,left:0};} };
 
 // WebIDL conformance for querySelector(All): the selector is a DOMString, so it
@@ -4389,7 +4549,18 @@ globalThis.__obscura_init = function() {
   _fpCache = null;
   _installWasmStreamingFallback();
 
-  globalThis.document = new Document(+_dom("document_node_id"));
+  // __obscura_init runs at runtime construction, BEFORE any DOM is loaded, so
+  // op_dom("document_node_id") returns "null" (NaN). The main document is the
+  // tree root (node 0) — and every per-node op already coerces the document's
+  // missing id to 0 (unwrap_or(0) on the Rust side), so 0 is the correct nid.
+  let _docNid = +_dom("document_node_id");
+  if (!Number.isInteger(_docNid) || _docNid < 0) _docNid = 0;
+  globalThis.document = new Document(_docNid);
+  // Seed the wrapper cache so `_wrap(_docNid)` (documentElement.parentNode,
+  // getRootNode, range containers, ...) returns the SAME object as the global
+  // `document`. Without this the document node has two distinct wrappers and
+  // node-identity checks like isInclusiveDescendant(node, document) break.
+  _cache.set(_docNid, globalThis.document);
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];
