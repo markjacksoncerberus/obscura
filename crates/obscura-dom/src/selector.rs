@@ -105,6 +105,25 @@ pub enum PseudoClass {
     Enabled,
     Disabled,
     Checked,
+    /// A standard CSS pseudo-class we accept as valid (so querySelector does not
+    /// throw) but don't implement matching for — it never matches.
+    Other(String),
+}
+
+/// Standard CSS pseudo-class names that are syntactically valid (so a selector
+/// using them must NOT throw), beyond the ones we actively match. Genuinely
+/// unknown names are rejected (-> SyntaxError) by the parser.
+fn is_known_pseudo_class(name: &str) -> bool {
+    matches!(
+        name,
+        "link" | "visited" | "any-link" | "local-link" | "target" | "target-within"
+            | "focus-within" | "focus-visible" | "indeterminate" | "default" | "required"
+            | "optional" | "valid" | "invalid" | "in-range" | "out-of-range" | "read-only"
+            | "read-write" | "placeholder-shown" | "autofill" | "current" | "past" | "future"
+            | "playing" | "paused" | "user-invalid" | "user-valid" | "blank" | "defined"
+            | "fullscreen" | "modal" | "picture-in-picture" | "popover-open" | "open"
+            | "muted" | "volume-locked" | "seeking" | "buffering" | "stalled"
+    )
 }
 
 impl parser::NonTSPseudoClass for PseudoClass {
@@ -138,6 +157,10 @@ impl ToCss for PseudoClass {
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
+            PseudoClass::Other(name) => {
+                dest.write_str(":")?;
+                dest.write_str(name)
+            }
         }
     }
 }
@@ -179,6 +202,7 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
+            other if is_known_pseudo_class(other) => Ok(PseudoClass::Other(other.to_string())),
             _ => Err(cssparser::ParseError {
                 kind: cssparser::ParseErrorKind::Custom(
                     SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
@@ -423,6 +447,8 @@ impl<'a> Element for DomElement<'a> {
                     }
                 })
                 .unwrap_or(false),
+            // Accepted-but-unimplemented standard pseudo-classes never match.
+            PseudoClass::Other(_) => false,
         }
     }
 

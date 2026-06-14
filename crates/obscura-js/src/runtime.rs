@@ -1939,6 +1939,33 @@ mod tests {
     }
 
     #[test]
+    fn test_queryselector_invalid_throws() {
+        // Invalid selectors throw SyntaxError; valid-but-unimplemented pseudo-
+        // classes (e.g. :required) parse and just match nothing (no throw).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body><p class='x'>hi</p></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const ts = (fn) => { try { fn(); return false; } catch (e) { return e.name === 'SyntaxError'; } };\n\
+                   return [\n\
+                     ts(() => document.querySelector('>')),\n\
+                     ts(() => document.querySelector(':foobarbaz')),\n\
+                     ts(() => document.querySelector('[att=]')),\n\
+                     !ts(() => document.querySelectorAll(':required')),\n\
+                     document.querySelectorAll('.x').length,\n\
+                   ];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true, true, true, 1]),
+            "querySelector throw/no-throw wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_classlist_domtokenlist() {
         // Real DOMTokenList: literal value, ordered-set length, iteration, the
         // [object DOMTokenList] tag, and add/remove/toggle/replace re-serialize.

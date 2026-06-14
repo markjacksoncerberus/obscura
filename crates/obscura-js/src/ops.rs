@@ -112,24 +112,30 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "get_element_by_id" => {
             dom.get_element_by_id(&arg1).map(|id| id.index().to_string()).unwrap_or("-1".into())
         }
-        "query_selector" => {
-            dom.query_selector(&arg1).ok().flatten().map(|id| id.index().to_string()).unwrap_or("-1".into())
-        }
-        "query_selector_all" => {
-            let ids: Vec<i32> = dom.query_selector_all(&arg1).ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
-            serde_json::to_string(&ids).unwrap_or("[]".into())
-        }
+        // "ERR" => invalid selector (JS throws SyntaxError); "-1"/"[]" => no match.
+        "query_selector" => match dom.query_selector(&arg1) {
+            Ok(Some(id)) => id.index().to_string(),
+            Ok(None) => "-1".into(),
+            Err(_) => "ERR".into(),
+        },
+        "query_selector_all" => match dom.query_selector_all(&arg1) {
+            Ok(ids) => serde_json::to_string(&ids.iter().map(|id| id.index() as i32).collect::<Vec<_>>()).unwrap_or("[]".into()),
+            Err(_) => "ERR".into(),
+        },
         "query_selector_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            dom.query_selector_from(NodeId::new(root_nid), &arg2).ok().flatten()
-                .map(|id| id.index().to_string()).unwrap_or("-1".into())
+            match dom.query_selector_from(NodeId::new(root_nid), &arg2) {
+                Ok(Some(id)) => id.index().to_string(),
+                Ok(None) => "-1".into(),
+                Err(_) => "ERR".into(),
+            }
         }
         "query_selector_all_scoped" => {
             let root_nid = arg1.parse::<u32>().unwrap_or(0);
-            let ids: Vec<i32> = dom.query_selector_all_from(NodeId::new(root_nid), &arg2).ok()
-                .map(|ids| ids.iter().map(|id| id.index() as i32).collect()).unwrap_or_default();
-            serde_json::to_string(&ids).unwrap_or("[]".into())
+            match dom.query_selector_all_from(NodeId::new(root_nid), &arg2) {
+                Ok(ids) => serde_json::to_string(&ids.iter().map(|id| id.index() as i32).collect::<Vec<_>>()).unwrap_or("[]".into()),
+                Err(_) => "ERR".into(),
+            }
         }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);

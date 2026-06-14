@@ -197,6 +197,11 @@ const _eventRegistry = {};
 const _formValues = {};
 const _formChecked = {};
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
+// The selector ops return "ERR" for an invalid selector (vs "-1"/"[]" for no
+// match) so querySelector/All can throw SyntaxError per spec.
+const _qsThrow = (sel) => { throw new DOMException("'" + sel + "' is not a valid selector.", "SyntaxError"); };
+const _qsOne = (raw, sel) => { if (raw === 'ERR') _qsThrow(sel); const n = +raw; return n >= 0 ? _wrapEl(n) : null; };
+const _qsIds = (raw, sel) => { if (raw === 'ERR') _qsThrow(sel); try { return JSON.parse(raw) || []; } catch (e) { return []; } };
 const _consoleFn = (level, args) => {
   try { Deno.core.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
@@ -755,9 +760,9 @@ class Element extends Node {
     return list;
   }
   getAttributeNS(ns, n) { return this.getAttribute(n); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  querySelector(s) { return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;
     list.forEach = Array.prototype.forEach.bind(list);
@@ -1243,9 +1248,9 @@ class Document extends Node {
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelector(s) { return _qsOne(_dom("query_selector", s), s); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all", s) || [];
+    const ids = _qsIds(_dom("query_selector_all", s), s);
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;
     list.forEach = Array.prototype.forEach.bind(list);
@@ -1466,9 +1471,9 @@ class DocumentFragment extends Node {
   get nodeName() { return "#document-fragment"; }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  querySelector(s) { return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;
     return list;
@@ -3309,6 +3314,14 @@ class _IframeWindow {
     if (originUrl) {
       try { this.location.origin = new URL(originUrl).origin; } catch(e) {}
     }
+    // Same-origin frames share the page's single JS realm, so anything the frame
+    // window doesn't define itself (global constructors like DOMException/Node/
+    // Event, etc.) falls through to globalThis. Frame-specific props (document,
+    // location, parent, top, frames, self, window) are defined above and win.
+    return new Proxy(this, {
+      get(t, p, r) { return (p in t) ? Reflect.get(t, p, r) : globalThis[p]; },
+      has(t, p) { return (p in t) || (p in globalThis); },
+    });
   }
 
   postMessage(data, origin) {
