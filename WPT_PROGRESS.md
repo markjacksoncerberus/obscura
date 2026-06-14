@@ -18,6 +18,10 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-13.
 |------|:------:|:------:|:------:|----------------|
 | `url/url-constructor.any.html` | 1/890 | **833/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057` |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
+| `dom/nodes/Element-classlist.html` | ~0 | **1315/1420** | ⬆️ | Real DOMTokenList |
+| `dom/lists/DOMTokenList-value.html` | 0/1 | **1/1** | ✅ | ″ |
+| `dom/lists/DOMTokenList-iteration.html` | 0/6 | **5/6** | ⬆️ | ″ |
+| `dom/lists/DOMTokenList-coverage-for-attributes.html` | n/a | **150/175** | ⬆️ | ″ |
 | `url/url-setters.any.html` | 5/279 | **226/279** | ⬆️ | Setters' Sigil + host/port/tab-strip batch |
 | `url/url-searchparams.any.html` | 1/4 | **4/4** | ✅ 100% | Real URLSearchParams (form codec + URL two-way sync) |
 | `url/urlsearchparams-sort.any.html` | n/a | **17/17** | ✅ 100% | ″ |

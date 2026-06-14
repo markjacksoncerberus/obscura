@@ -1939,6 +1939,41 @@ mod tests {
     }
 
     #[test]
+    fn test_classlist_domtokenlist() {
+        // Real DOMTokenList: literal value, ordered-set length, iteration, the
+        // [object DOMTokenList] tag, and add/remove/toggle/replace re-serialize.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const el = document.createElement('span');\n\
+                   el.className = '   a  a b ';\n\
+                   const cl = el.classList;\n\
+                   const tag = Object.prototype.toString.call(cl);\n\
+                   const before = [cl.value, cl.length, cl.item(0), cl.contains('a'), [...cl].join(','), cl[1]];\n\
+                   cl.add('c'); cl.remove('b'); cl.toggle('d');\n\
+                   const mid = el.className + '|' + cl.contains('c') + ',' + cl.contains('b') + ',' + cl.contains('d');\n\
+                   const replaced = cl.replace('a', 'z');\n\
+                   return [tag, before, mid, replaced, el.className, el.classList === cl];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "[object DOMTokenList]",
+                ["   a  a b ", 2, "a", true, "a,b", "b"],
+                "a c d|true,false,true",
+                true,
+                "z c d",
+                true
+            ]),
+            "classList/DOMTokenList wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_url_host_setter() {
         // WHATWG host setter: ignore stuff after a delimiter, parse :port, keep
         // existing port when hostname-only is set.

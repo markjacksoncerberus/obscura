@@ -587,6 +587,71 @@ class Comment extends CharacterData {
   cloneNode() { return document.createComment(this.data); }
 }
 
+// A token must be non-empty and contain no ASCII whitespace (DOM spec).
+const _validateToken = function(t) {
+  t = String(t);
+  if (t === '') throw new DOMException("The token provided must not be empty.", "SyntaxError");
+  if (/[ \t\r\n\f]/.test(t)) throw new DOMException("The token provided ('" + t + "') contains HTML space characters, which are not valid in tokens.", "InvalidCharacterError");
+};
+// Live DOMTokenList backed by an element attribute (class for classList, etc.).
+globalThis.DOMTokenList = class DOMTokenList {
+  constructor(el, attr) { this._el = el; this._attr = attr; }
+  get [Symbol.toStringTag]() { return 'DOMTokenList'; }
+  _ordered() {
+    const seen = new Set(), out = [];
+    for (const t of (this._el.getAttribute(this._attr) || '').split(/[ \t\r\n\f]+/)) {
+      if (t && !seen.has(t)) { seen.add(t); out.push(t); }
+    }
+    return out;
+  }
+  _write(tokens) { this._el.setAttribute(this._attr, tokens.join(' ')); }
+  get value() { return this._el.getAttribute(this._attr) || ''; }
+  set value(v) { this._el.setAttribute(this._attr, String(v)); }
+  get length() { return this._ordered().length; }
+  item(i) { i = i >>> 0; const t = this._ordered(); return i < t.length ? t[i] : null; }
+  contains(t) { return this._ordered().includes(String(t)); }
+  add(...tokens) { tokens.forEach(_validateToken); const o = this._ordered(); for (const t of tokens) if (!o.includes(String(t))) o.push(String(t)); this._write(o); }
+  remove(...tokens) { tokens.forEach(_validateToken); const rm = new Set(tokens.map(String)); this._write(this._ordered().filter(t => !rm.has(t))); }
+  toggle(token, force) {
+    token = String(token); _validateToken(token);
+    if (this.contains(token)) { if (force === true) return true; this.remove(token); return false; }
+    if (force === false) return false; this.add(token); return true;
+  }
+  replace(oldT, newT) {
+    oldT = String(oldT); newT = String(newT); _validateToken(oldT); _validateToken(newT);
+    const o = this._ordered(); const i = o.indexOf(oldT);
+    if (i < 0) return false;
+    o[i] = newT;
+    const seen = new Set(), out = [];
+    for (const t of o) if (!seen.has(t)) { seen.add(t); out.push(t); }
+    this._write(out); return true;
+  }
+  supports() { throw new TypeError("DOMTokenList has no supported tokens."); }
+  forEach(cb, thisArg) { this._ordered().forEach((t, i) => cb.call(thisArg, t, i, this)); }
+  *keys() { const t = this._ordered(); for (let i = 0; i < t.length; i++) yield i; }
+  *values() { yield* this._ordered(); }
+  *entries() { const t = this._ordered(); for (let i = 0; i < t.length; i++) yield [i, t[i]]; }
+  [Symbol.iterator]() { return this.values(); }
+  toString() { return this._el.getAttribute(this._attr) || ''; }
+};
+// Wrap so integer-indexed access (classList[0]) works alongside the methods.
+const _makeTokenList = function(el, attr) {
+  const list = new DOMTokenList(el, attr);
+  return new Proxy(list, {
+    get(target, prop, recv) {
+      if (typeof prop === 'string' && /^[0-9]+$/.test(prop)) {
+        const i = parseInt(prop, 10);
+        return i < target.length ? target.item(i) : undefined; // out of range -> undefined
+      }
+      return Reflect.get(target, prop, recv);
+    },
+    has(target, prop) {
+      if (typeof prop === 'string' && /^[0-9]+$/.test(prop)) return parseInt(prop, 10) < target.length;
+      return Reflect.has(target, prop);
+    },
+  });
+};
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -635,19 +700,11 @@ class Element extends Node {
   get nextElementSibling() { let s = this.nextSibling; while(s && s.nodeType !== 1) s = s.nextSibling; return s; }
   get previousElementSibling() { let s = this.previousSibling; while(s && s.nodeType !== 1) s = s.previousSibling; return s; }
   get classList() {
-    const el = this;
-    const obj = {
-      add: (...c) => { const s = new Set((el.className||"").split(/\s+/).filter(Boolean)); c.forEach(x=>s.add(x)); el.className=[...s].join(" "); },
-      remove: (...c) => { const s = new Set((el.className||"").split(/\s+/).filter(Boolean)); c.forEach(x=>s.delete(x)); el.className=[...s].join(" "); },
-      contains: c => (el.className||"").split(/\s+/).includes(c),
-      toggle: (c, force) => { const has = obj.contains(c); if(force===true||(!has&&force!==false)){obj.add(c);return true;} obj.remove(c); return false; },
-      get length() { return (el.className||"").split(/\s+/).filter(Boolean).length; },
-      item: i => (el.className||"").split(/\s+/).filter(Boolean)[i] || null,
-      forEach: (cb) => (el.className||"").split(/\s+/).filter(Boolean).forEach(cb),
-      toString: () => el.className || "",
-    };
-    return obj;
+    if (!this._classList) this._classList = _makeTokenList(this, 'class');
+    return this._classList;
   }
+  // classList is [PutForwards=value]: `el.classList = 'x'` sets the class attr.
+  set classList(v) { this.classList.value = v == null ? '' : String(v); }
   get style() { return this._style; }
   set style(v) { if (typeof v === "string") this._style.cssText = v; }
   getAttribute(n) { return _domParse("get_attribute", this._nid, n); }
