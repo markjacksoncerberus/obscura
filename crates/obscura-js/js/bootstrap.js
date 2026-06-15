@@ -2223,6 +2223,9 @@ class DetachedDocument extends Document {
     // DetachedDocument rather than a fresh plain Document wrapper. Required for
     // node-identity (isInclusiveDescendant) over foreign/xml document roots.
     _cache.set(this._nid, this);
+    // This fragment-backed node is a real document, not a plain DocumentFragment;
+    // tell the matcher so `:root` matches its document element (but not a fragment's).
+    _dom('mark_real_document', this._nid);
     this._kind = kind === 'html' ? 'html' : 'xml';
     // createElement semantics: 'html' (ASCII-lowercase + HTML namespace) vs XML-family
     // ('xml' → namespaceURI null, 'xhtml' → HTMLNS), both case-preserving. _IframeDocument

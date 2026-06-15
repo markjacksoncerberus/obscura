@@ -702,14 +702,14 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn is_root(&self) -> bool {
+        // :root matches the document element — an element whose parent is a real
+        // document. A plain DocumentFragment shares the Document backing kind but
+        // is NOT a document, so its child element is not a root (WPT: ":root ...
+        // not matching document root element" in the fragment context).
         self.tree
             .with_node(self.node_id, |n| {
                 n.parent
-                    .map(|parent_id| {
-                        self.tree
-                            .with_node(parent_id, |p| p.is_document())
-                            .unwrap_or(false)
-                    })
+                    .map(|parent_id| self.tree.is_real_document(parent_id))
                     .unwrap_or(false)
             })
             .unwrap_or(false)

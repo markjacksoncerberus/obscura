@@ -420,6 +420,12 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             dom.set_target_id(if arg1.is_empty() { None } else { Some(arg1.clone()) });
             "true".into()
         }
+        "mark_real_document" => {
+            // arg1 = a detached/iframe document's backing node id. Lets :root tell a
+            // real document's root element from a plain DocumentFragment's child.
+            dom.mark_real_document(NodeId::new(arg1.parse::<u32>().unwrap_or(0)));
+            "true".into()
+        }
         "create_document_fragment" => {
             dom.new_node(NodeData::Document).index().to_string()
         }

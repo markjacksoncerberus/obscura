@@ -1,6 +1,6 @@
 use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -276,6 +276,11 @@ pub(crate) struct DomTreeInner {
     // The id named by the current document's URL fragment, for `:target`. JS sets
     // it from the queried document's URL right before a `:target` query.
     pub(crate) target_id: Option<String>,
+    // Nodes that are *real documents* (detached/iframe documents). They share the
+    // create_document_fragment backing (NodeData::Document) with plain
+    // DocumentFragments, so this set is how `:root` tells "document element of a
+    // document" from "root of a fragment". The main document (NodeId 0) is always real.
+    pub(crate) real_documents: HashSet<NodeId>,
 }
 
 impl DomTree {
@@ -300,6 +305,7 @@ impl DomTree {
                 checked_state: HashMap::new(),
                 focused: None,
                 target_id: None,
+                real_documents: HashSet::new(),
             }),
         }
     }
@@ -364,6 +370,18 @@ impl DomTree {
 
     pub fn target_id(&self) -> Option<String> {
         self.inner.borrow().target_id.clone()
+    }
+
+    /// Mark a node as a real document (detached/iframe document) so `:root` can
+    /// distinguish it from a plain DocumentFragment with the same backing kind.
+    pub fn mark_real_document(&self, id: NodeId) {
+        self.inner.borrow_mut().real_documents.insert(id);
+    }
+
+    /// Whether `id` is a real document: the main document, or one explicitly marked.
+    pub fn is_real_document(&self, id: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        id == inner.document || inner.real_documents.contains(&id)
     }
 
     pub fn focused(&self) -> Option<NodeId> {
