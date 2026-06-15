@@ -415,6 +415,11 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             Some(n) => n.raw().to_string(),
             None => "-1".into(),
         },
+        "set_target_id" => {
+            // arg1 = the queried document's URL fragment (empty clears it). Drives :target.
+            dom.set_target_id(if arg1.is_empty() { None } else { Some(arg1.clone()) });
+            "true".into()
+        }
         "create_document_fragment" => {
             dom.new_node(NodeData::Document).index().to_string()
         }

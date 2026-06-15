@@ -18,7 +18,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 |------|:------:|:------:|:------:|----------------|
 | `url/url-constructor.any.html` | 1/890 | **833/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057` |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
-| `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1965/1975** | ⬆️ | Quest #01 + #05 `namespaceURI`; +16 real foreign-ns `createElementNS` (Quest #11); +16 `::slotted()` parse-but-never-match; +10 iframe docs preserve `<html>/<head>/<body>` attrs (fixes html/body/:root/:lang in iframe ctx) + `:link` matches only `a`/`area` (Quest #01) |
+| `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1969/1975** | ⬆️ | Quest #01 + #05 `namespaceURI`; +16 real foreign-ns `createElementNS` (Quest #11); +16 `::slotted()` parse-but-never-match; +10 iframe docs preserve `<html>/<head>/<body>` attrs + `:link` only `a`/`area`; +4 real `:target` (URL-fragment id, primed onto the tree per query) (Quest #01) |
 | `dom/nodes/Document-createElement.html` | 0/147 | **147/147** | ✅ 100% | Quest #05: WebIDL coercion + InvalidCharacterError validation + ASCII-only casing + real `namespaceURI`/`prefix`; XML-document iframes (case-sensitive createElement, parsed-root documentElement) + iframes-delay-parent-load |
 | `dom/nodes/Element-classlist.html` | ~0 | **1315/1420** | ⬆️ | Real DOMTokenList |
 | `dom/lists/DOMTokenList-value.html` | 0/1 | **1/1** | ✅ | ″ |

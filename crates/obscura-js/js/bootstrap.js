@@ -222,6 +222,23 @@ const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2));
 const _qsThrow = (sel) => { throw new DOMException("'" + sel + "' is not a valid selector.", "SyntaxError"); };
 const _qsOne = (raw, sel) => { if (raw === 'ERR') _qsThrow(sel); const n = +raw; return n >= 0 ? _wrapEl(n) : null; };
 const _qsIds = (raw, sel) => { if (raw === 'ERR') _qsThrow(sel); try { return JSON.parse(raw) || []; } catch (e) { return []; } };
+// :target matches the element whose id equals the queried document's URL fragment.
+// Prime the Rust matcher with that fragment just before a query — gated on the
+// selector mentioning "target" (its only consumer), so the common path stays free.
+// Staleness is harmless: only :target reads it and every :target query re-primes.
+const _primeTarget = (s, node) => {
+  if (s.indexOf('target') < 0) return;
+  let frag = '';
+  try {
+    // Resolve the node's document by walking to its root — an in-iframe element's
+    // ownerDocument can resolve to the main document, so don't trust it directly.
+    let doc = node;
+    while (doc && doc.nodeType !== 9 && doc.parentNode) doc = doc.parentNode;
+    const u = (doc && doc.nodeType === 9 && doc.URL) || '';
+    const i = u.indexOf('#'); if (i >= 0) frag = decodeURIComponent(u.slice(i + 1));
+  } catch (e) {}
+  _dom('set_target_id', frag);
+};
 const _consoleFn = (level, args) => {
   try { Deno.core.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
@@ -1424,8 +1441,9 @@ class Element extends Node {
     return attr;
   }
   get attributes() { return _buildNamedNodeMap(this); }
-  querySelector(s) { return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
+  querySelector(s) { _primeTarget(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
+    _primeTarget(s, this);
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;
@@ -1924,8 +1942,9 @@ class Document extends Node {
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
-  querySelector(s) { return _qsOne(_dom("query_selector", s), s); }
+  querySelector(s) { _primeTarget(s, this); return _qsOne(_dom("query_selector", s), s); }
   querySelectorAll(s) {
+    _primeTarget(s, this);
     const ids = _qsIds(_dom("query_selector_all", s), s);
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;
@@ -2141,8 +2160,9 @@ class DocumentFragment extends Node {
   get nodeName() { return "#document-fragment"; }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
-  querySelector(s) { return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
+  querySelector(s) { _primeTarget(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
+    _primeTarget(s, this);
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;
@@ -2245,8 +2265,9 @@ class DetachedDocument extends Document {
   }
   get head() { return this._kind === 'html' ? this.querySelector('head') : null; }
   get body() { return this._kind === 'html' ? this.querySelector('body') : null; }
-  querySelector(s) { return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
+  querySelector(s) { _primeTarget(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
+    _primeTarget(s, this);
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
     const list = ids.map(_wrapEl).filter(Boolean);
     list.item = (i) => list[i] || null;

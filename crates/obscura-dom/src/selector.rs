@@ -110,6 +110,8 @@ pub enum PseudoClass {
     Link,
     /// `:visited` — never matches (no history; also the privacy-safe default).
     Visited,
+    /// `:target` — the element whose id equals the document's URL fragment.
+    Target,
     /// `:lang(en, fr, …)` — matched against the element's language (its nearest
     /// ancestor-or-self `lang` attribute), per the CSS prefix rule.
     Lang(Vec<String>),
@@ -167,6 +169,7 @@ impl ToCss for PseudoClass {
             PseudoClass::Checked => dest.write_str(":checked"),
             PseudoClass::Link => dest.write_str(":link"),
             PseudoClass::Visited => dest.write_str(":visited"),
+            PseudoClass::Target => dest.write_str(":target"),
             PseudoClass::Lang(langs) => {
                 dest.write_str(":lang(")?;
                 for (i, l) in langs.iter().enumerate() {
@@ -238,6 +241,7 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "checked" => Ok(PseudoClass::Checked),
             "link" | "any-link" => Ok(PseudoClass::Link),
             "visited" => Ok(PseudoClass::Visited),
+            "target" => Ok(PseudoClass::Target),
             other if is_known_pseudo_class(other) => Ok(PseudoClass::Other(other.to_string())),
             _ => Err(cssparser::ParseError {
                 kind: cssparser::ParseErrorKind::Custom(
@@ -561,6 +565,17 @@ impl<'a> Element for DomElement<'a> {
             // :link / :any-link match a/area/link with href; :visited never does.
             PseudoClass::Link => self.is_link(),
             PseudoClass::Visited => false,
+            // :target — the element whose id equals the document's URL fragment
+            // (set by JS on the tree before the query). Empty fragment → no match.
+            PseudoClass::Target => match self.tree.target_id() {
+                Some(t) if !t.is_empty() => self
+                    .tree
+                    .with_node(self.node_id, |n| {
+                        n.get_attribute("id").map(|v| v == t.as_str()).unwrap_or(false)
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            },
             // :lang(...) matches against the element's language, which is the
             // value of the nearest `lang` attribute on the element or an ancestor.
             // A range matches if it equals the language or is a prefix of it
@@ -965,6 +980,31 @@ mod tests {
             assert!(r.unwrap().is_empty(), "selector {sel:?} should match nothing");
         }
         assert!(tree.query_selector_all("::bogus-fn(x)").is_err());
+    }
+
+    #[test]
+    fn target_pseudo_class_matches_url_fragment_id() {
+        let tree = parse_html(r#"<div id="a"></div><section id="b"></section>"#);
+        let ids = |sel: &str| {
+            let mut v: Vec<String> = tree
+                .query_selector_all(sel)
+                .unwrap()
+                .iter()
+                .filter_map(|&n| tree.get_node(n).unwrap().get_attribute("id").map(|s| s.to_string()))
+                .collect();
+            v.sort();
+            v
+        };
+        // No fragment set → :target matches nothing.
+        assert!(ids(":target").is_empty());
+        // Fragment "b" → only #b matches (and compound forms agree).
+        tree.set_target_id(Some("b".to_string()));
+        assert_eq!(ids(":target"), vec!["b"]);
+        assert_eq!(ids("section:target"), vec!["b"]);
+        assert!(ids("div:target").is_empty());
+        // Empty fragment clears it.
+        tree.set_target_id(Some(String::new()));
+        assert!(ids(":target").is_empty());
     }
 
     #[test]

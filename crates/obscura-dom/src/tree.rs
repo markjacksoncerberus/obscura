@@ -273,6 +273,9 @@ pub(crate) struct DomTreeInner {
     // JS sets `el.checked`; `focused` is the single focused element.
     pub(crate) checked_state: HashMap<NodeId, bool>,
     pub(crate) focused: Option<NodeId>,
+    // The id named by the current document's URL fragment, for `:target`. JS sets
+    // it from the queried document's URL right before a `:target` query.
+    pub(crate) target_id: Option<String>,
 }
 
 impl DomTree {
@@ -296,6 +299,7 @@ impl DomTree {
                 pending_mutations: Vec::new(),
                 checked_state: HashMap::new(),
                 focused: None,
+                target_id: None,
             }),
         }
     }
@@ -350,6 +354,16 @@ impl DomTree {
     /// Phase 0b: the focused element (drives `:focus` and `document.activeElement`).
     pub fn set_focus(&self, id: Option<NodeId>) {
         self.inner.borrow_mut().focused = id;
+    }
+
+    /// The id named by the current document's URL fragment, for `:target`. An
+    /// empty string clears it (no fragment → `:target` matches nothing).
+    pub fn set_target_id(&self, value: Option<String>) {
+        self.inner.borrow_mut().target_id = value.filter(|s| !s.is_empty());
+    }
+
+    pub fn target_id(&self) -> Option<String> {
+        self.inner.borrow().target_id.clone()
     }
 
     pub fn focused(&self) -> Option<NodeId> {
