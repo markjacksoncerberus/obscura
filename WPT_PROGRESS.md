@@ -25,6 +25,12 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `dom/lists/DOMTokenList-iteration.html` | 0/6 | **5/6** | ⬆️ | ″ |
 | `dom/lists/DOMTokenList-coverage-for-attributes.html` | n/a | **150/175** | ⬆️ | ″ |
 | `dom/nodes/attributes.html` | 4/67 | **67/67** | ✅ 100% | Quest #02: real `Attr` node + `NamedNodeMap` + namespace-aware Rust storage/ops + get/setAttributeNode(NS) + createAttribute(NS) + validate-and-extract + style-attr reflection |
+| `dom/nodes/Element-getElementsByClassName.html` | 1/3 | **3/3** | ✅ 100% | Quest #11: live `HTMLCollection` + Rust class-match op |
+| `dom/nodes/Element-children.html` | 0/2 | **2/2** | ✅ 100% | Quest #11: `.children` → live `HTMLCollection` (named props, single-pass tree order) |
+| `dom/collections/HTMLCollection-empty-name.html` | 0/7 | **7/7** | ✅ 100% | Quest #11: empty-name guard in named access |
+| `dom/nodes/Element-getElementsByTagName.html` | 4/19 | **12/19** | ⬆️ | Quest #11: `HTMLCollection` + spec tag-match (HTML-ns case-fold); tail needs real foreign-ns `createElementNS` |
+| `dom/nodes/Document-getElementsByTagName.html` | 3/18 | **11/18** | ⬆️ | Quest #11 ″ (tail = foreign-ns element creation) |
+| `dom/nodes/Element-getElementsByTagNameNS.html` | 0/16 | **7/16** | ⬆️ | Quest #11: `get_elements_by_tag_name_ns` op (tail = foreign-ns element creation) |
 | `dom/traversal/TreeWalker.html` | 300/761 | **761/761** | ✅ 100% | Quest #10: real spec TreeWalker (REJECT/SKIP) + node identity `828ee41`/`070ab6f` |
 | `dom/traversal/NodeIterator.html` | 1/766 | **766/766** | ✅ 100% | Quest #10: real NodeIterator (was a TreeWalker alias) `070ab6f` |
 | `dom/traversal/NodeIterator-removal.html` | 0/23 | **23/23** | ✅ 100% | Quest #10: pre-removing steps + live-iterator registry `1f7a428` |

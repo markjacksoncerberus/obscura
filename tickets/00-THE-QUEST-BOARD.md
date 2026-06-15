@@ -24,7 +24,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | 2/6+ | ⚔️⚔️ | ~? |
 | 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | 4/8+ | ⚔️⚔️ | ~? |
 | 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | ⚔️ traversal **DONE**; ranges 90%+ | ⚔️⚔️⚔️ | iframe content-ops left |
-| 11 | [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | 1/3+ | ⚔️⚔️ | ~? |
+| 11 | [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | ⚔️ live `HTMLCollection` landed (+33); tail = foreign-ns createElementNS | ⚔️⚔️ | ~23 |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ **+2046** (5 tests 0→) | ⚔️⚔️⚔️ | surround/clone tails + re-land FIX B |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
 
@@ -70,6 +70,24 @@ engine **hardened against URL-triggered crashes**.
   `*-of-type`, +151); CSS2 pseudo-elements parse-but-never-match (+80); `querySelector`
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
+
+**Session 2026-06-14 #5 (knight Claudius — Quest #11 The Collections Armory — increment 1, +33):**
+- **A live `HTMLCollection` (Proxy) + Rust matching ops.** New Rust ops
+  `get_elements_by_tag_name` (spec match: HTML-ns case-folded vs non-HTML
+  case-sensitive, `*` = all), `get_elements_by_tag_name_ns` (`*` wildcards, ``=null
+  ns), `get_elements_by_class_name` — all over `dom.descendants`, tree order.
+  JS `globalThis.HTMLCollection` + a Proxy giving WebIDL semantics: live indexed
+  access, supported-property-name access (id of any element + name of any HTML-ns
+  element, single tree-order pass), expandos, index-set protection,
+  `ownKeys`/`getOwnPropertyDescriptor`. Wired `getElementsByTagName(NS)`,
+  `getElementsByClassName`, and `.children` on Element + Document. Added a minimal
+  `globalThis.NodeList` so `x instanceof NodeList` is answerable.
+- **Results:** `getElementsByClassName` 1→3/3, `Element-children` 0→2/2,
+  `HTMLCollection-empty-name` 0→7/7 (all 100%); `getElementsByTagName` 4→12/19,
+  `Document-getElementsByTagName` 3→11/18, `getElementsByTagNameNS` 0→7/16.
+  **Zero regressions.** The remaining ~23 all need **real foreign-namespace
+  `createElementNS`** (today it fakes `_ns` on the JS wrapper; the Rust node stays
+  HTML-ns lowercased) — the clear next lever (also helps namespaceURI/cloneNode).
 
 **Session 2026-06-14 #5 (knight Claudius — Quest #02 The Attr-Node Codex — CONQUERED 11 → 67/67):**
 - **A real `Attr` node model over namespace-aware Rust storage.** Rust (`tree.rs`/

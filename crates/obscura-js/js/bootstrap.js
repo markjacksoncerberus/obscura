@@ -818,6 +818,107 @@ const _buildNamedNodeMap = function(el) {
   }
   return map;
 };
+
+// --- HTMLCollection (live) --------------------------------------------------
+// Minimal NodeList global so `x instanceof NodeList` is answerable (our static
+// query results are plain arrays, deliberately NOT NodeList instances).
+globalThis.NodeList = class NodeList {};
+
+// A live HTMLCollection. Contents come from a refresh() thunk re-evaluated on
+// every access (so the collection stays live); the page sees a Proxy giving the
+// WebIDL semantics: live indexed access, supported-property-name (named) access,
+// expandos, index-set protection, and spec own-property behaviour.
+globalThis.HTMLCollection = class HTMLCollection {
+  get [Symbol.toStringTag]() { return 'HTMLCollection'; }
+};
+const _hcRefresh = new WeakMap(); // proxy -> refresh thunk (returns Element[])
+const _hcItems = (c) => _hcRefresh.get(c)();
+// An HTMLCollection's supported property names are, in a single tree-order pass:
+// the non-empty `id` of any element, then the non-empty `name` of any element in
+// the HTML namespace. (The restricted a/applet/img/… tag list is Document's rule,
+// not HTMLCollection's.) namedItem returns the first element matching by id or name.
+const _hcNamedItem = function(items, key) {
+  if (key === '') return null;
+  for (const el of items) {
+    if (el.id === key) return el;
+    if (el.namespaceURI === _HTML_NS && el.getAttribute('name') === key) return el;
+  }
+  return null;
+};
+const _hcSupportedNames = function(items) {
+  const names = [], seen = new Set();
+  for (const el of items) {
+    const id = el.id;
+    if (id && !seen.has(id)) { seen.add(id); names.push(id); }
+    if (el.namespaceURI === _HTML_NS) {
+      const nm = el.getAttribute('name');
+      if (nm && !seen.has(nm)) { seen.add(nm); names.push(nm); }
+    }
+  }
+  return names;
+};
+HTMLCollection.prototype.item = function(i) {
+  const items = _hcItems(this); i = i >>> 0; return i < items.length ? items[i] : null;
+};
+HTMLCollection.prototype.namedItem = function(key) { return _hcNamedItem(_hcItems(this), String(key)); };
+HTMLCollection.prototype[Symbol.iterator] = function* () { for (const el of _hcItems(this)) yield el; };
+Object.defineProperty(HTMLCollection.prototype, 'length', {
+  configurable: true, enumerable: false, get() { return _hcItems(this).length; },
+});
+const _hcIsIndex = (p) => typeof p === 'string' && /^(0|[1-9][0-9]*)$/.test(p);
+const _makeHTMLCollection = function(refresh) {
+  const target = Object.create(HTMLCollection.prototype);
+  const supportedNames = () => _hcSupportedNames(refresh());
+  const namedGet = (key) => _hcNamedItem(refresh(), key) ?? undefined;
+  const proxy = new Proxy(target, {
+    get(t, p, r) {
+      if (_hcIsIndex(p)) { const items = refresh(), i = +p; return i < items.length ? items[i] : undefined; }
+      // Named (supported-property-name) access only when not an expando or proto member.
+      if (typeof p === 'string' && !Reflect.has(t, p)) { const el = namedGet(p); if (el !== undefined) return el; }
+      return Reflect.get(t, p, r);
+    },
+    set(t, p, v) {
+      if (_hcIsIndex(p)) return false;       // indexed properties are read-only
+      return Reflect.set(t, p, v);           // expandos (receiver = target, no recursion)
+    },
+    has(t, p) {
+      if (_hcIsIndex(p)) return +p < refresh().length;
+      if (Reflect.has(t, p)) return true;
+      return typeof p === 'string' && namedGet(p) !== undefined;
+    },
+    ownKeys(t) {
+      const keys = [], n = refresh().length;
+      for (let i = 0; i < n; i++) keys.push(String(i));
+      for (const nm of supportedNames()) if (!keys.includes(nm)) keys.push(nm);
+      for (const k of Reflect.ownKeys(t)) if (!keys.includes(k)) keys.push(k); // expandos
+      return keys;
+    },
+    getOwnPropertyDescriptor(t, p) {
+      if (_hcIsIndex(p)) {
+        const items = refresh(), i = +p;
+        if (i < items.length) return { value: items[i], writable: false, enumerable: true, configurable: true };
+        return undefined;
+      }
+      if (typeof p === 'string' && !Reflect.getOwnPropertyDescriptor(t, p)) {
+        const el = namedGet(p);
+        if (el !== undefined) return { value: el, writable: false, enumerable: false, configurable: true };
+      }
+      return Reflect.getOwnPropertyDescriptor(t, p);
+    },
+  });
+  _hcRefresh.set(proxy, refresh);
+  return proxy;
+};
+// Shared getElementsBy* builders (live HTMLCollections over a root node id).
+const _gebTagName = (nid, qname, htmlDoc) =>
+  _makeHTMLCollection(() => (_domParse("get_elements_by_tag_name", nid, String(qname) + "\0" + (htmlDoc ? "1" : "0")) || []).map(_wrapEl).filter(Boolean));
+const _gebTagNameNS = (nid, ns, local) => {
+  const nsArg = ns === "*" ? "*" : (ns == null || ns === "" ? "" : String(ns));
+  return _makeHTMLCollection(() => (_domParse("get_elements_by_tag_name_ns", nid, nsArg + "\0" + String(local)) || []).map(_wrapEl).filter(Boolean));
+};
+const _gebClassName = (nid, names) =>
+  _makeHTMLCollection(() => (_domParse("get_elements_by_class_name", nid, String(names)) || []).map(_wrapEl).filter(Boolean));
+
 // A token must be non-empty and contain no ASCII whitespace (DOM spec).
 const _validateToken = function(t) {
   t = String(t);
@@ -924,8 +1025,7 @@ class Element extends Node {
   get innerText() { return this.textContent; }
   set innerText(v) { this.textContent = v; }
   get children() {
-    const ids = _domParse("element_children", this._nid) || [];
-    return ids.map(_wrapEl).filter(Boolean);
+    return _makeHTMLCollection(() => (_domParse("element_children", this._nid) || []).map(_wrapEl).filter(Boolean));
   }
   get content() {
     if (this.localName !== 'template') return undefined;
@@ -1101,8 +1201,9 @@ class Element extends Node {
     list.forEach = Array.prototype.forEach.bind(list);
     return list;
   }
-  getElementsByTagName(t) { return this.querySelectorAll(t); }
-  getElementsByClassName(c) { return this.querySelectorAll("." + c); }
+  getElementsByTagName(t) { return _gebTagName(this._nid, t, this.ownerDocument ? this.ownerDocument._isHTMLDoc !== false : true); }
+  getElementsByTagNameNS(ns, local) { return _gebTagNameNS(this._nid, ns, local); }
+  getElementsByClassName(c) { return _gebClassName(this._nid, c); }
   matches(s) {
     const parent = this.parentNode;
     if (!parent || !parent.querySelectorAll) return false;
@@ -1598,8 +1699,9 @@ class Document extends Node {
     list.forEach = Array.prototype.forEach.bind(list);
     return list;
   }
-  getElementsByTagName(t) { return this.querySelectorAll(t); }
-  getElementsByClassName(c) { return this.querySelectorAll("." + c); }
+  getElementsByTagName(t) { return _gebTagName(this._nid, t, this._isHTMLDoc); }
+  getElementsByTagNameNS(ns, local) { return _gebTagNameNS(this._nid, ns, local); }
+  getElementsByClassName(c) { return _gebClassName(this._nid, c); }
   getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
   createElement(t) {
     // WebIDL: localName is a (non-nullable) DOMString — undefined -> "undefined",
@@ -1892,8 +1994,7 @@ class DetachedDocument extends Document {
     return list;
   }
   getElementById(id) { return this.querySelector('#' + String(id).replace(/["\\]/g, '\\$&')); }
-  getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
-  getElementsByClassName(c) { return this.querySelectorAll('.' + String(c)); }
+  // getElementsByTagName/NS/ClassName inherited from Document (live HTMLCollections).
   // Factories: create real nodes via the main document's ops, then tag this doc
   // as their owner.
   createElement(t) {

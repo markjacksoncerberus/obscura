@@ -437,6 +437,94 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 .map(|id| id.index() as i32).collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
+        // Descendant elements matching a qualified name, in tree order. arg2 =
+        // "<qualifiedName>\0<htmlFlag>". For an HTML document, HTML-namespace
+        // elements match case-insensitively (compared to the ASCII-lowercased
+        // argument) while other namespaces match case-sensitively; "*" matches all.
+        "get_elements_by_tag_name" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let (qname, html_flag) = arg2.split_once('\0').unwrap_or((arg2.as_str(), "1"));
+            let is_html = html_flag == "1";
+            let lowered = qname.to_ascii_lowercase();
+            let star = qname == "*";
+            let ids: Vec<i32> = dom
+                .descendants(NodeId::new(nid))
+                .into_iter()
+                .filter_map(|id| {
+                    dom.get_node(id).and_then(|n| {
+                        n.as_element().and_then(|name| {
+                            let eqn = match &name.prefix {
+                                Some(p) => format!("{}:{}", p.as_ref(), name.local.as_ref()),
+                                None => name.local.as_ref().to_string(),
+                            };
+                            let m = if star {
+                                true
+                            } else if is_html {
+                                if name.ns.as_ref() == "http://www.w3.org/1999/xhtml" {
+                                    eqn == lowered
+                                } else {
+                                    eqn == qname
+                                }
+                            } else {
+                                eqn == qname
+                            };
+                            if m { Some(id.index() as i32) } else { None }
+                        })
+                    })
+                })
+                .collect();
+            serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
+        // Descendant elements matching (namespace, localName); "*" wildcards
+        // either part, "" namespace means the null namespace. Case-sensitive.
+        "get_elements_by_tag_name_ns" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let (ns, local) = arg2.split_once('\0').unwrap_or(("", arg2.as_str()));
+            let ns_star = ns == "*";
+            let local_star = local == "*";
+            let ids: Vec<i32> = dom
+                .descendants(NodeId::new(nid))
+                .into_iter()
+                .filter_map(|id| {
+                    dom.get_node(id).and_then(|n| {
+                        n.as_element().and_then(|name| {
+                            let ns_match = ns_star || name.ns.as_ref() == ns;
+                            let local_match = local_star || name.local.as_ref() == local;
+                            if ns_match && local_match { Some(id.index() as i32) } else { None }
+                        })
+                    })
+                })
+                .collect();
+            serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
+        // Descendant elements that have ALL of the given (space-separated)
+        // classes. Case-sensitive (standards mode).
+        "get_elements_by_class_name" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let classes: Vec<&str> = arg2.split_whitespace().collect();
+            let ids: Vec<i32> = if classes.is_empty() {
+                vec![]
+            } else {
+                dom.descendants(NodeId::new(nid))
+                    .into_iter()
+                    .filter_map(|id| {
+                        dom.get_node(id).and_then(|n| {
+                            if !n.is_element() {
+                                return None;
+                            }
+                            let cls = n.get_attribute("class").unwrap_or("");
+                            let have: Vec<&str> = cls.split_whitespace().collect();
+                            if classes.iter().all(|c| have.contains(c)) {
+                                Some(id.index() as i32)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect()
+            };
+            serde_json::to_string(&ids).unwrap_or("[]".into())
+        }
         "has_child_nodes" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.get_node(NodeId::new(nid)).map(|n| n.first_child.is_some()).unwrap_or(false).to_string()
