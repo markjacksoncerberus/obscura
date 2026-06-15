@@ -191,6 +191,11 @@ pub enum PseudoElement {
     After,
     FirstLine,
     FirstLetter,
+    // ::slotted(<compound-selector>) — a functional pseudo-element. We parse and
+    // retain its argument text but never match it (it only ever matches assigned
+    // nodes inside a shadow tree, which we don't model), so a selector using it
+    // parses successfully and selects nothing — what WPT expects (vs. throwing).
+    Slotted(String),
 }
 
 impl parser::PseudoElement for PseudoElement {
@@ -204,6 +209,11 @@ impl ToCss for PseudoElement {
             PseudoElement::After => dest.write_str("::after"),
             PseudoElement::FirstLine => dest.write_str("::first-line"),
             PseudoElement::FirstLetter => dest.write_str("::first-letter"),
+            PseudoElement::Slotted(arg) => {
+                dest.write_str("::slotted(")?;
+                dest.write_str(arg)?;
+                dest.write_str(")")
+            }
         }
     }
 }
@@ -260,6 +270,23 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
                 location,
             }),
         }
+    }
+
+    fn parse_functional_pseudo_element<'t>(
+        &self,
+        name: CowRcStr<'i>,
+        arguments: &mut cssparser::Parser<'i, 't>,
+    ) -> Result<PseudoElement, cssparser::ParseError<'i, Self::Error>> {
+        // ::slotted(...) parses-but-never-matches (see PseudoElement::Slotted). We
+        // capture the argument's source text for round-tripping and consume the
+        // remaining tokens so the functional block parses cleanly.
+        if name.eq_ignore_ascii_case("slotted") {
+            let start = arguments.position();
+            while arguments.next().is_ok() {}
+            let arg = arguments.slice_from(start).trim().to_string();
+            return Ok(PseudoElement::Slotted(arg));
+        }
+        Err(arguments.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name)))
     }
 
     fn parse_non_ts_functional_pseudo_class<'t>(
@@ -919,6 +946,20 @@ mod tests {
         }
         // An unknown pseudo-element still errors (so querySelector throws).
         assert!(tree.query_selector_all("::bogus-pe").is_err());
+    }
+
+    #[test]
+    fn slotted_functional_pseudo_element_parses_but_never_matches() {
+        // Regression: ::slotted(<compound>) must PARSE and select nothing rather
+        // than throwing. cssparser auto-closes the unterminated-paren form at EOF,
+        // so it parses too. An unknown functional pseudo-element still errors.
+        let tree = parse_html("<p>hi<span>x</span></p>");
+        for sel in ["::slotted(foo)", "::slotted(foo", "::slotted(*)", "span::slotted(a)"] {
+            let r = tree.query_selector_all(sel);
+            assert!(r.is_ok(), "selector {sel:?} should parse, got {r:?}");
+            assert!(r.unwrap().is_empty(), "selector {sel:?} should match nothing");
+        }
+        assert!(tree.query_selector_all("::bogus-fn(x)").is_err());
     }
 
     #[test]
