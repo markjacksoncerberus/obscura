@@ -1,9 +1,17 @@
-# Scroll I — The Selector Sorcery
+# Scroll I — The Selector Sorcery ✅ SECURED
 
-> Realm: `dom/nodes/ParentNode-querySelector-All.html`. Hold: **1917/1977 (97.0%)**
-> as of 2026-06-14. Engine: the real Servo `selectors` 0.26 crate; our glue lives
-> in `crates/obscura-dom/src/selector.rs`. Measure with
+> Realm: `dom/nodes/ParentNode-querySelector-All.html`. Hold: **1975/1975 (100%)**
+> as of 2026-06-15 (session #14). Engine: the real Servo `selectors` 0.26 crate;
+> our glue lives in `crates/obscura-dom/src/selector.rs`. Measure with
 > `scripts/wpt_run.py dom/nodes/ParentNode-querySelector-All.html`.
+>
+> **Conquered (session #14):** `::slotted()` parse-but-never-match; iframe docs
+> preserve `<html>/<head>/<body>` attrs (fixing html/body/`:root`/`:lang` in the
+> iframe ctx); `:link` only `a`/`area`; real `:target`; real `NodeList`
+> (`extends Array`); `:root` distinguishes a real document from a fragment. The
+> namespace-selector + `*-of-type` clusters had already fallen via the namespace
+> work in Quests #02/#05/#11. **Total subtest count is now 1975 (was 1977; the
+> harness reports two fewer with the realms fully resolved).**
 
 ## Won this campaign (2026-06-14)
 

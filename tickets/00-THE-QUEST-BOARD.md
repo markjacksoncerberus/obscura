@@ -17,7 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
-| 01 | [The Selector Sorcery](01-the-selector-sorcery.md) | `dom/nodes/ParentNode-querySelector-All` | 1917/1977 | ⚔️⚔️ | ~60 left |
+| ~~01~~ | ✅ [The Selector Sorcery](01-the-selector-sorcery.md) | `dom/nodes/ParentNode-querySelector-All` | **1975/1975** | ⚔️⚔️ | **SECURED 100%** |
 | ~~02~~ | ✅ [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | **67/67** | ⚔️⚔️⚔️ | **SECURED** |
 | 03 | [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | 1315/1420 | ⚔️⚔️ | ~105 |
 | 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | 833+226 | ⚔️⚔️⚔️ | ~110 |
@@ -102,6 +102,28 @@ engine **hardened against URL-triggered crashes**.
   67, appendChild 11, replaceChild 28, cloneNode 103, normalize 3, isEqualNode 9,
   lookupNamespaceURI 75, qsa 1939, classlist 1315, getElementsByTagName 19,
   Node-properties 710 unchanged).
+
+**Session 2026-06-15 #14 (knight Claudius — Quest #01 The Selector Sorcery — `ParentNode-querySelector-All` 1939→1975/1975 SECURED 100%):**
+Five increments cleared the entire tail:
+- **`::slotted()`** functional pseudo-element parses-but-never-matches (mirror of
+  the CSS2 pseudo-element fix; cssparser auto-closes the unterminated-paren form). **+16.**
+- **Iframe docs preserve `<html>/<head>/<body>` attributes.** `_IframeDocument`
+  regex-stripped those start tags (with their attrs) before parsing into a synthetic
+  scaffold; now it copies the start-tag attributes onto the scaffold first. Fixes
+  the html/body type selectors, `:root`, AND `:lang` inheritance (lang lived on
+  `<html>`) in the iframe Document context. Paired with **`:link` matches only
+  `a`/`area`** (not `<link>` elements). **+10.**
+- **Real `:target`** — DomTree `target_id` + `PseudoClass::Target`; JS primes the
+  queried document's URL fragment (resolved by walking the node to its document
+  root) before a `:target` query. **+4.**
+- **Real `NodeList`** — `extends Array` (keeps indexing/iteration/spread/array
+  methods internal callers rely on), `Symbol.species → Array`; qsa returns it. **+4.**
+- **`:root` distinguishes a real document from a fragment** — `create_document_fragment`
+  backs both, so a `real_documents` set (DetachedDocument marks its node; main doc
+  is implicit) lets `is_root()` match a document's root element but not a fragment's
+  child. **+2.**
+- Zero regressions throughout; selector.rs unit tests 17→19; obscura-dom 40/40.
+  Bonus: Element-matches 624→630.
 
 **Session 2026-06-15 #11 (knight Claudius — Quest #06 Node-* — `Node-isEqualNode` 4→9/9 CONQUERED):**
 - **Spec per-interface `isEqualNode`** (was a nodeName/nodeValue approximation).
