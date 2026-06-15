@@ -28,7 +28,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | 4/8+ | ⚔️⚔️ | ~? |
 | 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | ⚔️ traversal **DONE**; ranges 90%+ | ⚔️⚔️⚔️ | iframe content-ops left |
 | ~~11~~ | ✅ [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | **getElementsBy\* all 100%** | ⚔️⚔️ | **SECURED** |
-| 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ **+2046** (5 tests 0→) | ⚔️⚔️⚔️ | surround/clone tails + re-land FIX B |
+| 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ insertNode **1531**, surround **1247** | ⚔️⚔️⚔️ | +1171 this session (validity + live doctype); tails = doctype-order + range-setup IndexSizeError |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -102,6 +102,23 @@ engine **hardened against URL-triggered crashes**.
   67, appendChild 11, replaceChild 28, cloneNode 103, normalize 3, isEqualNode 9,
   lookupNamespaceURI 75, qsa 1939, classlist 1315, getElementsByTagName 19,
   Node-properties 710 unchanged).
+
+**Session 2026-06-15 #16 (knight Claudius — Quest #12 Range content-ops — `Range-insertNode` 909→1531, `Range-surroundContents` 698→1247, +1171):**
+- **Pre-insertion validity before the text split.** `Range.insertNode` split the
+  start Text node *before* validating the node, so an invalid insert (Document,
+  misplaced doctype, ancestor) threw only after mutating — failing the "resulting
+  DOM unchanged" checks. New `__obscura_ensurePreInsertionValidity` (throw-only:
+  parent type, host-including ancestor, reference-child, node-type, Text-in-Document
+  / doctype-outside-Document) runs first. **insertNode +200.**
+- **Live `DetachedDocument.doctype`.** The getter returned a construction-time cache,
+  so a doctype appended/moved later (the Range tests' iframe setup does exactly this)
+  was invisible — the tree comparison saw a null `.doctype` and the whole subtree
+  mismatched. Now it scans children for a DocumentType. **insertNode +422,
+  surroundContents +549** — one small primitive, ~970 subtests.
+- Zero regressions (replaceChild 29, isEqualNode 9, Node-properties 726, classlist
+  1420, qsa 1975, extractContents 159, cloneContents 177). Remaining ~309 insertNode
+  tails are thin & varied: a doctype-ordering mismatch in the tree compare + an
+  IndexSizeError in some range setups (e.g. paras[5] CDATA offsets).
 
 **Session 2026-06-15 #15 (knight Claudius — Quest #03 The ClassList Mutation-Echo — `Element-classlist` 1315→1420/1420 SECURED 100%):**
 The whole tail was three fixes, all rooted in mutation timing + DOMTokenList spec edges:
