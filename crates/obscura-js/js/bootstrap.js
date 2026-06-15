@@ -1051,9 +1051,22 @@ const _buildNamedNodeMap = function(el) {
 };
 
 // --- HTMLCollection (live) --------------------------------------------------
-// Minimal NodeList global so `x instanceof NodeList` is answerable (our static
-// query results are plain arrays, deliberately NOT NodeList instances).
-globalThis.NodeList = class NodeList {};
+// A real (static) NodeList — the type querySelectorAll returns. It extends Array
+// so results keep working with indexing, length, iteration, spread and array
+// methods (lots of internal callers rely on that) while `x instanceof NodeList`
+// now holds. Derived operations (map/filter/slice) yield plain Arrays via
+// Symbol.species, matching the spec's non-Array NodeList.
+globalThis.NodeList = class NodeList extends Array {
+  static get [Symbol.species]() { return Array; }
+  item(i) { i = i >>> 0; return i < this.length ? this[i] : null; }
+};
+// Build a NodeList from an array of nodes (Array's variadic/number-arg constructor
+// is unsafe for this, so assign indices explicitly).
+const _makeNodeList = (nodes) => {
+  const nl = new globalThis.NodeList();
+  for (let i = 0; i < nodes.length; i++) nl[i] = nodes[i];
+  return nl;
+};
 
 // A live HTMLCollection. Contents come from a refresh() thunk re-evaluated on
 // every access (so the collection stays live); the page sees a Proxy giving the
@@ -1445,10 +1458,7 @@ class Element extends Node {
   querySelectorAll(s) {
     _primeTarget(s, this);
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
-    const list = ids.map(_wrapEl).filter(Boolean);
-    list.item = (i) => list[i] || null;
-    list.forEach = Array.prototype.forEach.bind(list);
-    return list;
+    return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementsByTagName(t) { return _gebTagName(this._nid, t, this.ownerDocument ? this.ownerDocument._isHTMLDoc !== false : true); }
   getElementsByTagNameNS(ns, local) { return _gebTagNameNS(this._nid, ns, local); }
@@ -1946,10 +1956,7 @@ class Document extends Node {
   querySelectorAll(s) {
     _primeTarget(s, this);
     const ids = _qsIds(_dom("query_selector_all", s), s);
-    const list = ids.map(_wrapEl).filter(Boolean);
-    list.item = (i) => list[i] || null;
-    list.forEach = Array.prototype.forEach.bind(list);
-    return list;
+    return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementsByTagName(t) { return _gebTagName(this._nid, t, this._isHTMLDoc); }
   getElementsByTagNameNS(ns, local) { return _gebTagNameNS(this._nid, ns, local); }
@@ -2164,9 +2171,7 @@ class DocumentFragment extends Node {
   querySelectorAll(s) {
     _primeTarget(s, this);
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
-    const list = ids.map(_wrapEl).filter(Boolean);
-    list.item = (i) => list[i] || null;
-    return list;
+    return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
@@ -2269,9 +2274,7 @@ class DetachedDocument extends Document {
   querySelectorAll(s) {
     _primeTarget(s, this);
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
-    const list = ids.map(_wrapEl).filter(Boolean);
-    list.item = (i) => list[i] || null;
-    return list;
+    return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementById(id) { return this.querySelector('#' + String(id).replace(/["\\]/g, '\\$&')); }
   // getElementsByTagName/NS/ClassName inherited from Document (live HTMLCollections).
