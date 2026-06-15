@@ -74,6 +74,23 @@ engine **hardened against URL-triggered crashes**.
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
 
+**Session 2026-06-15 #13 (knight Claudius — Quest #06 Node-* — `Node-properties` 710→726/726 CONQUERED + `Node-replaceChild` →29/29):**
+- **Four small spec-correctness fixes** bucketed from the tail:
+  1. `nodeValue` (get/set) now covers every CharacterData kind — ProcessingInstruction(7)
+     and CDATASection(4), not just Text(3)/Comment(8). Fixes PI `nodeValue`.
+  2. `textContent` is `null` for Document(9) and DocumentType(10) — getter returns
+     null, setter is a no-op (it used to wipe the document's children).
+  3. `charset`/`inputEncoding` added as aliases of `characterSet` on all Document classes.
+  4. `DocumentType.ownerDocument` honors its real node document (`_ownerDoc`), and
+     `createDocument` sets the adopted doctype's `_ownerDoc`. (createHTMLDocument
+     already did.)
+- **710 → 726/726 (full conquest).** **Bonus:** fix #4 also closed the last
+  `Node-replaceChild` subtest (cross-document doctype replace) — **28 → 29/29**.
+- Zero regressions (createElement 147, createElementNS 596, attributes 67, appendChild
+  11, cloneNode 103, normalize 3, isEqualNode 9, baseURI 9, lookupNamespaceURI 75, qsa
+  1939, classlist 1315, getElementsByTagName 19, **Node-textContent 81/81**,
+  Range-insertNode 909, Range-extractContents 159, iframe 2).
+
 **Session 2026-06-15 #12 (knight Claudius — Quest #06 Node-* — `Node-baseURI` 0→9/9 CONQUERED):**
 - **`baseURI` on `Node` and `Attr`** (was undefined → 0/9). New `_documentBaseURL(doc)`
   helper implements HTML's "document base URL": the first `<base>` with an `href`

@@ -349,11 +349,18 @@ class Node {
   // A node's owner is the main document unless it was created by / adopted into
   // another document (e.g. an iframe's contentDocument), which tags `_ownerDoc`.
   get ownerDocument() { return this._ownerDoc || globalThis.document; }
-  get textContent() { return _domParse("text_content", this._nid) ?? ""; }
+  get textContent() {
+    // Per spec, textContent is null for Document(9) and DocumentType(10);
+    // for everything else it's the concatenated descendant text data.
+    const t = this.nodeType;
+    if (t === 9 || t === 10) return null;
+    return _domParse("text_content", this._nid) ?? "";
+  }
   set textContent(v) {
     const _watching = __mutationObservers?.length;
     const t = this.nodeType;
-    if (t === 3 || t === 8) {
+    if (t === 9 || t === 10) return; // no-op for Document / DocumentType
+    if (t === 3 || t === 4 || t === 7 || t === 8) {
       // Character data node: setting textContent replaces its data.
       const _old = _watching ? (_domParse("text_content", this._nid) ?? "") : null;
       _dom("set_text_content", this._nid, String(v ?? ""));
@@ -371,13 +378,15 @@ class Node {
     if (_watching) __notifyMutation('childList', this._nid, added, children);
   }
   get nodeValue() {
+    // nodeValue is the data for every CharacterData kind: Text(3), CDATASection(4),
+    // ProcessingInstruction(7), Comment(8). For all other nodes it is null.
     const t = this.nodeType;
-    if (t === 3 || t === 8) return _domParse("text_content", this._nid) ?? "";
+    if (t === 3 || t === 4 || t === 7 || t === 8) return _domParse("text_content", this._nid) ?? "";
     return null;
   }
   set nodeValue(v) {
     const t = this.nodeType;
-    if (t === 3 || t === 8) {
+    if (t === 3 || t === 4 || t === 7 || t === 8) {
       const _old = __mutationObservers?.length ? (_domParse("text_content", this._nid) ?? "") : null;
       _dom("set_text_content", this._nid, String(v ?? ""));
       if (__mutationObservers?.length) __notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
@@ -1906,6 +1915,8 @@ class Document extends Node {
   get ownerDocument() { return null; } // Document has no ownerDocument
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
+  get charset() { return this.characterSet; }        // legacy alias of characterSet
+  get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
   get contentType() { return "text/html"; }
   // Whether this is an HTML document (drives attribute-name lowercasing).
   get _isHTMLDoc() { return true; }
@@ -2071,7 +2082,7 @@ class Document extends Node {
         } else if (namespace === "http://www.w3.org/2000/svg") {
           doc._contentType = "image/svg+xml";
         }
-        if (doctype) { doc.appendChild(doctype); doc._doctype = doctype; }
+        if (doctype) { doctype._ownerDoc = doc; doc.appendChild(doctype); doc._doctype = doctype; }
         if (qualifiedName) {
           const el = doc.createElementNS(namespace || null, qualifiedName);
           doc.appendChild(el);
@@ -2167,7 +2178,9 @@ class DocumentType extends Node {
   get name() { return this._name; }
   get publicId() { return this._publicId; }
   get systemId() { return this._systemId; }
-  get ownerDocument() { return globalThis.document; }
+  // A doctype's node document is the doc it was created in or appended into
+  // (createHTMLDocument / createDocument set _ownerDoc); defaults to the page.
+  get ownerDocument() { return this._ownerDoc || globalThis.document; }
 }
 
 // A standalone document not attached to the page (from `new Document()`,
@@ -2210,6 +2223,8 @@ class DetachedDocument extends Document {
   get _isHTMLDoc() { return this._kind === 'html'; }
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
+  get charset() { return this.characterSet; }        // legacy alias of characterSet
+  get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
   get title() { const t = this.querySelector('title'); return t ? t.textContent : (this._title || ""); }
   set title(v) { this._title = String(v); }
   get URL() { return "about:blank"; }
@@ -4808,6 +4823,8 @@ class _IframeDocument extends DetachedDocument {
   get compatMode() { return 'CSS1Compat'; }
   get contentType() { return 'text/html'; }
   get characterSet() { return 'UTF-8'; }
+  get charset() { return this.characterSet; }        // legacy alias of characterSet
+  get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
   get readyState() { return 'complete'; }
   get visibilityState() { return 'visible'; }
   get hidden() { return false; }

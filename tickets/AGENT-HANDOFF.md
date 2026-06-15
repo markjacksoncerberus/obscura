@@ -123,8 +123,8 @@ the highest-ROI vein right now. Measured baselines:
 | ~~`dom/nodes/Node-isEqualNode.html`~~ | **9/9 ✅** | CONQUERED (session #11) — spec per-interface equality + `createDocument(xhtmlNS)`→xhtml+xml. |
 | ~~`dom/nodes/Node-normalize.html`~~ | **3/4** | Real `normalize()` (session #10); last fail needs XML `DOMParser`/`createCDATASection`. |
 | ~~`dom/nodes/Node-baseURI.html`~~ | **9/9 ✅** | CONQUERED (session #12) — `Node`/`Attr` `baseURI` via HTML document base URL. |
-| `dom/nodes/Node-replaceChild.html` | 28/29 | Last fail = **cross-document doctype replace**; needs `DetachedDocument` to track its doctype as a real adoptable child (the `_doctype` cache goes stale). Shared with several `createHTMLDocument` tests. |
-| `dom/nodes/Node-properties.html` | 710/726 | A grab-bag tail — `--verbose` to bucket. |
+| ~~`dom/nodes/Node-replaceChild.html`~~ | **29/29 ✅** | CONQUERED (session #13) — cross-document doctype replace closed by the doctype ownerDocument/adoption fix. |
+| ~~`dom/nodes/Node-properties.html`~~ | **726/726 ✅** | CONQUERED (session #13) — nodeValue PI/CDATA, textContent null for doc/doctype, charset/inputEncoding, doctype ownerDocument. |
 
 Other good realms: **#03 ClassList tail** (`Element-classlist` 1315/1420, bankable),
 **#01 Selector tail** (`querySelector-All` 1939/1975 — namespace selectors, a real
