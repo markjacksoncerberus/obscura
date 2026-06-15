@@ -20,7 +20,10 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
 | `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1975/1975** | ✅ 100% | **Quest #01 SECURED.** `namespaceURI` + foreign-ns `createElementNS`; `::slotted()` parse-but-never-match; iframe docs preserve `<html>/<head>/<body>` attrs; `:link` only `a`/`area`; real `:target` (URL-fragment id); real `NodeList` (`extends Array`, species→Array); `:root` matches a real document's root but not a fragment's child (Rust `real_documents` set) |
 | `dom/nodes/Document-createElement.html` | 0/147 | **147/147** | ✅ 100% | Quest #05: WebIDL coercion + InvalidCharacterError validation + ASCII-only casing + real `namespaceURI`/`prefix`; XML-document iframes (case-sensitive createElement, parsed-root documentElement) + iframes-delay-parent-load |
-| `dom/nodes/Element-classlist.html` | ~0 | **1315/1420** | ⬆️ | Real DOMTokenList |
+| `dom/nodes/Element-classlist.html` | ~0 | **1420/1420** | ✅ 100% | **Quest #03 SECURED.** Real DOMTokenList + eager mutation drain (synchronous `takeRecords()` sees the record; `replace()` mutation-count) + `_write` skips materializing an empty attr when absent (`remove()` keeps null class null) + `replace()` empty-before-whitespace token validation |
+| `dom/nodes/MutationObserver-childList.html` | 26/38 | **31/38** | ⬆️ | bonus: eager `__notifyMutation` drain (synchronous `takeRecords`) |
+| `dom/nodes/MutationObserver-takeRecords.html` | 1/3 | **3/3** | ✅ 100% | ″ |
+| `dom/nodes/MutationObserver-disconnect.html` | 1/2 | **2/2** | ✅ 100% | ″ |
 | `dom/lists/DOMTokenList-value.html` | 0/1 | **1/1** | ✅ | ″ |
 | `dom/lists/DOMTokenList-iteration.html` | 0/6 | **5/6** | ⬆️ | ″ |
 | `dom/lists/DOMTokenList-coverage-for-attributes.html` | n/a | **150/175** | ⬆️ | ″ |

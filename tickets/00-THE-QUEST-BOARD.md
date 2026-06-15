@@ -19,7 +19,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 |---|--------|-------|:----:|:----------:|:------:|
 | ~~01~~ | ✅ [The Selector Sorcery](01-the-selector-sorcery.md) | `dom/nodes/ParentNode-querySelector-All` | **1975/1975** | ⚔️⚔️ | **SECURED 100%** |
 | ~~02~~ | ✅ [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | **67/67** | ⚔️⚔️⚔️ | **SECURED** |
-| 03 | [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | 1315/1420 | ⚔️⚔️ | ~105 |
+| ~~03~~ | ✅ [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | **1420/1420** | ⚔️⚔️ | **SECURED 100%** |
 | 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | 833+226 | ⚔️⚔️⚔️ | ~110 |
 | ~~05~~ | ✅ [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | **147/147** | ⚔️⚔️⚔️ | **SECURED** |
 | 06 | [The Node-Smithing Vaults](06-the-node-smithing-vaults.md) | `dom/nodes/Node-*` | mixed | ⚔️⚔️ | ~150 |
@@ -102,6 +102,26 @@ engine **hardened against URL-triggered crashes**.
   67, appendChild 11, replaceChild 28, cloneNode 103, normalize 3, isEqualNode 9,
   lookupNamespaceURI 75, qsa 1939, classlist 1315, getElementsByTagName 19,
   Node-properties 710 unchanged).
+
+**Session 2026-06-15 #15 (knight Claudius — Quest #03 The ClassList Mutation-Echo — `Element-classlist` 1315→1420/1420 SECURED 100%):**
+The whole tail was three fixes, all rooted in mutation timing + DOMTokenList spec edges:
+- **Eager mutation drain.** `__notifyMutation` now drains the Rust mutation queue
+  immediately (then schedules async delivery) instead of only scheduling. A
+  synchronous `takeRecords()` — which the classList test calls right after each op —
+  now sees the record, and mutations that no *current* observer targets (e.g. a
+  setup `setAttribute` before `observe()`) are discarded rather than leaking into a
+  later observer. The classList `replace()` mutation-count assertion is the only
+  DOMTokenList method whose count the test checks. **+90.** (A first attempt that
+  drained inside `takeRecords()` regressed to 949 — it pulled *stale* pre-`observe()`
+  records; draining at mutation time, when target lists are accurate, is the fix.)
+- **`_write` doesn't materialize an empty attribute** when the attribute is absent
+  and the token set is empty (DOM update steps), so `remove()` on a null class
+  leaves it null. **+10.**
+- **`replace()` validates empty (SyntaxError) on both tokens before whitespace
+  (InvalidCharacterError)**, so `replace(" ", "")` throws SyntaxError. **+5.**
+- **Bonus, zero regressions:** the eager drain also lifted MutationObserver-childList
+  26→31, -takeRecords 1→3, -disconnect 1→2 (+8). Verified by rebuilding the parent
+  commit to compare. qsa 1975, attributes 67, Node-properties 726, createElement 147 held.
 
 **Session 2026-06-15 #14 (knight Claudius — Quest #01 The Selector Sorcery — `ParentNode-querySelector-All` 1939→1975/1975 SECURED 100%):**
 Five increments cleared the entire tail:
