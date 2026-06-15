@@ -620,7 +620,34 @@ class Node {
     return __obscura_isFollowing(this, other) ? 2 : 4;
   }
   getRootNode() { return globalThis.document; }
-  normalize() {} // no-op
+  // DOM §4.5 normalize(): for each descendant exclusive Text node, drop it if
+  // empty, else absorb its following contiguous exclusive Text siblings and
+  // remove them. CDATASection (nodeType 4) is NOT an exclusive Text node, so the
+  // nodeType === 3 test skips it correctly. (We don't model live Range endpoint
+  // adjustment here; the WPT normalize test doesn't exercise it.)
+  normalize() {
+    const texts = [];
+    const collect = (n) => {
+      for (let c = n.firstChild; c; c = c.nextSibling) {
+        if (c.nodeType === 3) texts.push(c);
+        else collect(c);
+      }
+    };
+    collect(this);
+    for (const node of texts) {
+      const parent = node.parentNode;
+      if (!parent) continue; // already removed as part of an earlier run
+      if (node.data.length === 0) { parent.removeChild(node); continue; }
+      let merged = "";
+      const toRemove = [];
+      for (let sib = node.nextSibling; sib && sib.nodeType === 3; sib = sib.nextSibling) {
+        merged += sib.data;
+        toRemove.push(sib);
+      }
+      if (merged) node.data = node.data + merged;
+      for (const r of toRemove) r.parentNode.removeChild(r);
+    }
+  }
   isEqualNode(other) {
     if (!other) return false;
     if (this._nid === other._nid) return true;

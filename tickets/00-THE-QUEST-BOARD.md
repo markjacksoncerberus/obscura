@@ -74,6 +74,19 @@ engine **hardened against URL-triggered crashes**.
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
 
+**Session 2026-06-15 #10 (knight Claudius — Quest #06 Node-* — `Node-normalize` 0→3/4):**
+- **Real `normalize()`** (was a no-op stub). DOM §4.5: walk every descendant
+  exclusive Text node in tree order; drop it if empty, else absorb its following
+  contiguous Text siblings (`nodeType === 3`) and remove them. CDATASection is
+  nodeType 4, so the same predicate skips it for free. Snapshot-then-process with a
+  `parentNode` liveness check so nodes already absorbed by an earlier run are skipped
+  (and removed nodes keep their old `data`, as the test asserts). Range-endpoint
+  adjustment intentionally omitted — the WPT test doesn't exercise it.
+- **0 → 3/4.** Zero regressions (createElement 147, attributes 67, appendChild 11,
+  replaceChild 28, cloneNode 103, isEqualNode 4). Last fail = the XML subtest
+  (`new DOMParser().parseFromString(…, "text/xml")` + `createCDATASection`/
+  `createProcessingInstruction`) — the deferred XML realm, not a normalize gap.
+
 **Session 2026-06-15 #9 (knight Claudius — Quest #06 Node-* — `Node-replaceChild` 5→28/29):**
 - **Full DOM "replace" algorithm.** Pre-replacement validity (parent type, node
   inclusive-ancestor, child-is-a-child → NotFoundError, valid node type, Text-in-
