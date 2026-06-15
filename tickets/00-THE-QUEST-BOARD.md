@@ -74,6 +74,18 @@ engine **hardened against URL-triggered crashes**.
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
 
+**Session 2026-06-15 #12 (knight Claudius — Quest #06 Node-* — `Node-baseURI` 0→9/9 CONQUERED):**
+- **`baseURI` on `Node` and `Attr`** (was undefined → 0/9). New `_documentBaseURL(doc)`
+  helper implements HTML's "document base URL": the first `<base>` with an `href`
+  attribute resolved against the document URL (via the real `URL` parser), else the
+  document's own URL (fallback base). `Node.baseURI` resolves the node document
+  (a document node is its own node document); `Attr.baseURI` delegates through its
+  `ownerDocument`. The iframe-doc `baseURI` getter still overrides for srcdoc/about:blank.
+- **0 → 9/9.** Zero regressions (createElement 147, createElementNS 596, attributes
+  67, appendChild 11, replaceChild 28, cloneNode 103, normalize 3, isEqualNode 9,
+  lookupNamespaceURI 75, qsa 1939, classlist 1315, getElementsByTagName 19,
+  Node-properties 710 unchanged).
+
 **Session 2026-06-15 #11 (knight Claudius — Quest #06 Node-* — `Node-isEqualNode` 4→9/9 CONQUERED):**
 - **Spec per-interface `isEqualNode`** (was a nodeName/nodeValue approximation).
   DOM §4.5: switch on nodeType — DocumentType (name/publicId/systemId), Element

@@ -122,7 +122,7 @@ the highest-ROI vein right now. Measured baselines:
 |---|---|---|
 | ~~`dom/nodes/Node-isEqualNode.html`~~ | **9/9 ✅** | CONQUERED (session #11) — spec per-interface equality + `createDocument(xhtmlNS)`→xhtml+xml. |
 | ~~`dom/nodes/Node-normalize.html`~~ | **3/4** | Real `normalize()` (session #10); last fail needs XML `DOMParser`/`createCDATASection`. |
-| `dom/nodes/Node-baseURI.html` | 0/9 | `baseURI` via `<base href>` resolution + document URL. |
+| ~~`dom/nodes/Node-baseURI.html`~~ | **9/9 ✅** | CONQUERED (session #12) — `Node`/`Attr` `baseURI` via HTML document base URL. |
 | `dom/nodes/Node-replaceChild.html` | 28/29 | Last fail = **cross-document doctype replace**; needs `DetachedDocument` to track its doctype as a real adoptable child (the `_doctype` cache goes stale). Shared with several `createHTMLDocument` tests. |
 | `dom/nodes/Node-properties.html` | 710/726 | A grab-bag tail — `--verbose` to bucket. |
 

@@ -620,6 +620,12 @@ class Node {
     return __obscura_isFollowing(this, other) ? 2 : 4;
   }
   getRootNode() { return globalThis.document; }
+  // DOM: baseURI returns the node document's document base URL, serialized. A
+  // document node is its own node document.
+  get baseURI() {
+    const doc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
+    return _documentBaseURL(doc);
+  }
   // DOM §4.5 normalize(): for each descendant exclusive Text node, drop it if
   // empty, else absorb its following contiguous exclusive Text siblings and
   // remove them. CDATASection (nodeType 4) is NOT an exclusive Text node, so the
@@ -759,6 +765,26 @@ const _locatePrefix = function(node, namespace) {
   const p = node.parentNode;
   return (p && p.nodeType === 1) ? _locatePrefix(p, namespace) : null;
 };
+// HTML "document base URL": the frozen base URL of the first <base> element with
+// an href attribute (resolved against the document's URL), or — absent any such
+// element — the document's own URL (the fallback base URL). Backs Node/Attr
+// .baseURI. We don't model preceding-base chaining; resolving each href against
+// the document URL matches browsers for every realistic single/zero <base> case.
+const _documentBaseURL = function(doc) {
+  const fallback = (doc && typeof doc.URL === 'string' && doc.URL)
+    ? doc.URL : (globalThis.document.URL || "about:blank");
+  try {
+    const bases = doc.getElementsByTagName('base');
+    for (let i = 0; i < bases.length; i++) {
+      const href = bases[i].getAttribute('href');
+      if (href != null) {
+        try { return new URL(href, fallback).href; } catch (e) { return fallback; }
+      }
+    }
+  } catch (e) {}
+  return fallback;
+};
+
 class CharacterData extends Node {
   get data() {
     return _domParse("text_content", this._nid) ?? "";
@@ -929,6 +955,7 @@ globalThis.Attr = class Attr {
   get textContent() { return this.value; }
   set textContent(v) { this.value = v; }
   get ownerDocument() { return this._ownerEl ? this._ownerEl.ownerDocument : (this.__ownerDoc || globalThis.document); }
+  get baseURI() { return _documentBaseURL(this.ownerDocument); }
   get childNodes() { return []; }
   get firstChild() { return null; }
   get parentNode() { return null; }
