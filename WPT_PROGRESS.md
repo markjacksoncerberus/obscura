@@ -33,6 +33,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `dom/nodes/Element-getElementsByTagNameNS.html` | 0/16 | **16/16** | ✅ 100% | Quest #11: `get_elements_by_tag_name_ns` op + foreign-ns elements |
 | `dom/nodes/Document-createElementNS.html` | 85/596 | **596/596** | ✅ 100% | Quest #11: real `create_element_ns` op + validate-and-extract + case-preserved `localName`/`tagName`/`nodeName`/`prefix` + real `HTMLElement`/`HTMLUnknownElement`/`HTMLSpanElement` hierarchy (ns-aware class) |
 | `dom/nodes/Element-tagName.html` | 3/6 | **5/6** | ⬆️ | Quest #11: case-preserved tagName + `importNode` clones into the target document; last needs real `DOMParser` XML |
+| `dom/nodes/Node-lookupNamespaceURI.html` | 0/75 | **75/75** | ✅ 100% | Quest #06: `lookupNamespaceURI`/`lookupPrefix`/`isDefaultNamespace` (locate-a-namespace walk; element own-ns before xmlns attrs; `xml`/`xmlns` built-ins; Attr delegates to owner) |
 | `dom/traversal/TreeWalker.html` | 300/761 | **761/761** | ✅ 100% | Quest #10: real spec TreeWalker (REJECT/SKIP) + node identity `828ee41`/`070ab6f` |
 | `dom/traversal/NodeIterator.html` | 1/766 | **766/766** | ✅ 100% | Quest #10: real NodeIterator (was a TreeWalker alias) `070ab6f` |
 | `dom/traversal/NodeIterator-removal.html` | 0/23 | **23/23** | ✅ 100% | Quest #10: pre-removing steps + live-iterator registry `1f7a428` |

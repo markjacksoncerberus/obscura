@@ -71,6 +71,20 @@ engine **hardened against URL-triggered crashes**.
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
 
+**Session 2026-06-15 #8 (knight Claudius — Quest #06 Node-* — `Node-lookupNamespaceURI` 0→75/75):**
+- **DOM namespace resolution** (`lookupNamespaceURI`/`lookupPrefix`/`isDefaultNamespace`
+  on Node + the standalone Attr). Recursive "locate a namespace"/"locate a prefix":
+  an element's own namespace (when its prefix matches) wins over its `xmlns`
+  attributes; `xml`/`xmlns` are built-in at the element level; Attr resolves through
+  its owner element; Document through its documentElement; DocumentType/Fragment → null.
+  Directly leverages the real namespace/Attr/HTMLElement machinery from #02/#11.
+- **0 → 75/75 (100%).** Zero regressions (createElementNS 596, attributes 67,
+  appendChild 11, cloneNode 103, getElementsByTagName 19). Two bugs caught in the
+  loop: `lookupNamespaceURI(null)` was `String(null)`→"null" (default-namespace
+  lookups broke), and Attr (a standalone class) needed the methods mirrored.
+- Remaining Node-* veins for next time: `Node-replaceChild` 5/29 (mutation
+  pre-insertion validity), `Node-isEqualNode` 4/9, `Node-normalize` 0/4.
+
 **Session 2026-06-15 #7 (knight Claudius — the createElementNS tail — CONQUERED 587→596/596):**
 - **`importNode` into the target document** (Tail A): `cloneNode(deep, _targetDoc)`
   threads the importing document so the copy's `ownerDocument` (and `tagName`

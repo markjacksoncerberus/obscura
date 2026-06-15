@@ -595,8 +595,66 @@ class Node {
     return true;
   }
   isSameNode(other) { return other && this._nid === other._nid; }
+  // DOM namespace resolution (§4.4). An empty-string prefix means the default
+  // namespace (null prefix). See _locateNamespace / _locatePrefix below.
+  lookupNamespaceURI(prefix) {
+    return _locateNamespace(this, (prefix == null || prefix === '') ? null : String(prefix));
+  }
+  lookupPrefix(namespace) {
+    if (namespace == null || namespace === '') return null;
+    return _locatePrefix(this, String(namespace));
+  }
+  isDefaultNamespace(namespace) {
+    const ns = (namespace == null || namespace === '') ? null : String(namespace);
+    return _locateNamespace(this, null) === ns;
+  }
   addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
 }
+// "Locate a namespace" (DOM §4.4): resolve `prefix` (null = default) to a
+// namespace URI by walking up the element chain. The element's own namespace (when
+// its prefix matches) wins over its xmlns attributes; "xml"/"xmlns" are built-in.
+const _locateNamespace = function(node, prefix) {
+  if (!node) return null;
+  const t = node.nodeType;
+  if (t === 1) { // Element
+    if (prefix === 'xml') return _XML_NS;
+    if (prefix === 'xmlns') return _XMLNS_NS;
+    if (node.namespaceURI != null && node.prefix === prefix) return node.namespaceURI;
+    const attrs = node.attributes;
+    for (let i = 0; i < attrs.length; i++) {
+      const a = attrs[i];
+      if (a.namespaceURI === _XMLNS_NS && a.prefix === 'xmlns' && a.localName === prefix) return a.value || null;
+      if (a.namespaceURI === _XMLNS_NS && a.prefix === null && a.localName === 'xmlns' && prefix === null) return a.value || null;
+    }
+    const p = node.parentNode;
+    return (p && p.nodeType === 1) ? _locateNamespace(p, prefix) : null;
+  }
+  if (t === 9) { const de = node.documentElement; return de ? _locateNamespace(de, prefix) : null; }
+  if (t === 2) { return node.ownerElement ? _locateNamespace(node.ownerElement, prefix) : null; }
+  if (t === 10 || t === 11) return null; // DocumentType, DocumentFragment
+  const p = node.parentNode; // Text/Comment/PI: use the parent element
+  return (p && p.nodeType === 1) ? _locateNamespace(p, prefix) : null;
+};
+// "Locate a prefix" (DOM §4.4): find a prefix bound to `namespace`.
+const _locatePrefix = function(node, namespace) {
+  if (!node) return null;
+  const t = node.nodeType;
+  if (t === 1) {
+    if (node.namespaceURI === namespace && node.prefix != null) return node.prefix;
+    const attrs = node.attributes;
+    for (let i = 0; i < attrs.length; i++) {
+      const a = attrs[i];
+      if (a.prefix === 'xmlns' && a.value === namespace) return a.localName;
+    }
+    const p = node.parentNode;
+    return (p && p.nodeType === 1) ? _locatePrefix(p, namespace) : null;
+  }
+  if (t === 9) { const de = node.documentElement; return de ? _locatePrefix(de, namespace) : null; }
+  if (t === 2) { return node.ownerElement ? _locatePrefix(node.ownerElement, namespace) : null; }
+  if (t === 10 || t === 11) return null;
+  const p = node.parentNode;
+  return (p && p.nodeType === 1) ? _locatePrefix(p, namespace) : null;
+};
 class CharacterData extends Node {
   get data() {
     return _domParse("text_content", this._nid) ?? "";
@@ -771,6 +829,11 @@ globalThis.Attr = class Attr {
   get firstChild() { return null; }
   get parentNode() { return null; }
   cloneNode() { return new Attr(this._ns, this._prefix, this._local, this.value); }
+  // Attr is not a Node subclass here, so mirror the namespace-resolution API
+  // (it resolves through the owner element — see _locateNamespace, nodeType 2).
+  lookupNamespaceURI(prefix) { return _locateNamespace(this, (prefix == null || prefix === '') ? null : String(prefix)); }
+  lookupPrefix(namespace) { return (namespace == null || namespace === '') ? null : _locatePrefix(this, String(namespace)); }
+  isDefaultNamespace(namespace) { return _locateNamespace(this, null) === ((namespace == null || namespace === '') ? null : String(namespace)); }
 };
 // Detach an Attr from its element, snapshotting the live value first.
 const _detachAttr = function(a) { if (a._ownerEl) { a._detachedValue = a.value; a._ownerEl = null; } };
