@@ -518,7 +518,12 @@ class Node {
       // outerHTML per element — the latter made a deep clone O(N²) and stalled
       // the Range cloneContents/extractContents harness.
       const attrs = this.attributes;
-      if (attrs) for (let i = 0; i < attrs.length; i++) el.setAttribute(attrs[i].name, attrs[i].value);
+      if (attrs) for (let i = 0; i < attrs.length; i++) {
+        const a = attrs[i];
+        // Preserve the namespace/prefix of namespaced attributes on the clone.
+        if (a.namespaceURI != null) el._rawSetNS(a.namespaceURI, a.prefix, a.localName, a.value);
+        else el.setAttribute(a.name, a.value);
+      }
       if (this._ns) el._ns = this._ns;
       if (deep) {
         // Recurse over real children rather than parsing outerHTML into a <div>:
@@ -676,8 +681,142 @@ const _createPIValidated = function(target, data) {
 // An attribute qualifiedName must match the XML Name production, else
 // InvalidCharacterError (DOM spec). Covers ASCII + common Unicode name chars.
 const _XML_NAME = /^[A-Za-z_:À-ÖØ-öø-˿Ͱ-￿][A-Za-z0-9_:.\-·À-ÖØ-öø-ͽͿ-￿]*$/;
+// --- DOM attribute / Attr model --------------------------------------------
+const _HTML_NS  = "http://www.w3.org/1999/xhtml";
+const _XML_NS   = "http://www.w3.org/XML/1998/namespace";
+const _XMLNS_NS = "http://www.w3.org/2000/xmlns/";
+
+// setAttribute / toggleAttribute validate the qualified name against the Name
+// production. We reject the empty string and names containing ASCII whitespace
+// or a NUL (the cases real content actually hits); the DOM/WPT name productions
+// treat the rest — ":", "0", "~", "'", etc. — as valid attribute names.
 const _validateAttrName = function(n) {
-  if (!_XML_NAME.test(n)) throw new DOMException("'" + n + "' is not a valid attribute name.", "InvalidCharacterError");
+  if (n === '' || /[\0 \t\r\n\f]/.test(n))
+    throw new DOMException("'" + n + "' is not a valid attribute name.", "InvalidCharacterError");
+};
+// setAttributeNS additionally validates against the QName production: an NCName,
+// or prefix:local with both parts non-empty and exactly one colon.
+const _validateQName = function(qname) {
+  _validateAttrName(qname);
+  const parts = qname.split(':');
+  if (parts.length > 2 || parts.some(p => p === ''))
+    throw new DOMException("'" + qname + "' is not a valid qualified name.", "InvalidCharacterError");
+};
+// DOM "validate and extract" for setAttributeNS / createAttributeNS. Returns
+// {namespace, prefix, local} or throws InvalidCharacterError / NamespaceError.
+const _validateAndExtract = function(namespace, qname) {
+  const ns = (namespace === '' || namespace === undefined || namespace === null) ? null : String(namespace);
+  qname = String(qname);
+  _validateQName(qname);
+  let prefix = null, local = qname;
+  const ci = qname.indexOf(':');
+  if (ci !== -1) { prefix = qname.slice(0, ci); local = qname.slice(ci + 1); }
+  if (prefix !== null && ns === null)
+    throw new DOMException("A namespace is required to use a prefix.", "NamespaceError");
+  if (prefix === 'xml' && ns !== _XML_NS)
+    throw new DOMException("The 'xml' prefix may only be used with the XML namespace.", "NamespaceError");
+  if ((qname === 'xmlns' || prefix === 'xmlns') && ns !== _XMLNS_NS)
+    throw new DOMException("The 'xmlns' qualified name/prefix requires the XMLNS namespace.", "NamespaceError");
+  if (ns === _XMLNS_NS && qname !== 'xmlns' && prefix !== 'xmlns')
+    throw new DOMException("The XMLNS namespace requires the 'xmlns' qualified name or prefix.", "NamespaceError");
+  return { namespace: ns, prefix, local };
+};
+
+// A real Attr node (nodeType 2). When attached to an element its value reads/
+// writes through the element's namespace-aware DOM ops (so it stays live);
+// while detached (createAttribute, or after removal) it holds its own value.
+globalThis.Attr = class Attr {
+  constructor(ns, prefix, local, value) {
+    this._ownerEl = null;
+    this._ns = ns == null ? null : String(ns);
+    this._prefix = prefix == null ? null : String(prefix);
+    this._local = String(local);
+    this._detachedValue = value == null ? "" : String(value);
+  }
+  get [Symbol.toStringTag]() { return 'Attr'; }
+  get nodeType() { return 2; }
+  get ownerElement() { return this._ownerEl; }
+  get namespaceURI() { return this._ns; }
+  get prefix() { return this._prefix; }
+  get localName() { return this._local; }
+  get name() { return this._prefix ? this._prefix + ":" + this._local : this._local; }
+  get nodeName() { return this.name; }
+  get specified() { return true; }
+  get value() {
+    if (this._ownerEl) { const v = this._ownerEl._rawGetNS(this._ns, this._local); return v == null ? "" : v; }
+    return this._detachedValue;
+  }
+  set value(v) {
+    v = (v == null) ? "" : String(v);
+    if (this._ownerEl) this._ownerEl._rawSetNS(this._ns, this._prefix, this._local, v);
+    else this._detachedValue = v;
+  }
+  get nodeValue() { return this.value; }
+  set nodeValue(v) { this.value = v; }
+  get textContent() { return this.value; }
+  set textContent(v) { this.value = v; }
+  get ownerDocument() { return this._ownerEl ? this._ownerEl.ownerDocument : (this.__ownerDoc || globalThis.document); }
+  get childNodes() { return []; }
+  get firstChild() { return null; }
+  get parentNode() { return null; }
+  cloneNode() { return new Attr(this._ns, this._prefix, this._local, this.value); }
+};
+// Detach an Attr from its element, snapshotting the live value first.
+const _detachAttr = function(a) { if (a._ownerEl) { a._detachedValue = a.value; a._ownerEl = null; } };
+
+// A real NamedNodeMap (el.attributes). All state lives off-instance (in a
+// WeakMap) so the ONLY own properties are the numeric indices (enumerable) and
+// the qualified-name keys (non-enumerable) — `length`/`item`/`getNamedItem` are
+// prototype members, matching real browsers' getOwnPropertyNames output.
+const _nnmData = new WeakMap();
+globalThis.NamedNodeMap = class NamedNodeMap {
+  get [Symbol.toStringTag]() { return 'NamedNodeMap'; }
+  get length() { return _nnmData.get(this).items.length; }
+  item(i) { const items = _nnmData.get(this).items; i = i >>> 0; return i < items.length ? items[i] : null; }
+  getNamedItem(qname) {
+    const d = _nnmData.get(this);
+    qname = String(qname);
+    if (d.ownerEl && d.ownerEl._htmlAttr) qname = _asciiLower(qname);
+    for (const a of d.items) if (a.name === qname) return a;
+    return null;
+  }
+  getNamedItemNS(ns, local) {
+    ns = (ns === '' || ns == null) ? null : String(ns); local = String(local);
+    for (const a of _nnmData.get(this).items) if (a._ns === ns && a._local === local) return a;
+    return null;
+  }
+  setNamedItem(attr) { return _nnmData.get(this).ownerEl.setAttributeNode(attr); }
+  setNamedItemNS(attr) { return _nnmData.get(this).ownerEl.setAttributeNodeNS(attr); }
+  removeNamedItem(qname) {
+    const a = this.getNamedItem(qname);
+    if (!a) throw new DOMException("No attribute named '" + qname + "'.", "NotFoundError");
+    return _nnmData.get(this).ownerEl.removeAttributeNode(a);
+  }
+  removeNamedItemNS(ns, local) {
+    const a = this.getNamedItemNS(ns, local);
+    if (!a) throw new DOMException("No such attribute.", "NotFoundError");
+    return _nnmData.get(this).ownerEl.removeAttributeNode(a);
+  }
+};
+// Snapshot an element's attributes into a fresh NamedNodeMap. The Attr objects
+// come from the element's identity cache (so el.attributes[i] === getAttributeNode).
+const _buildNamedNodeMap = function(el) {
+  const items = el._syncAttrNodes();
+  const map = new NamedNodeMap();
+  _nnmData.set(map, { ownerEl: el, items });
+  for (let i = 0; i < items.length; i++)
+    Object.defineProperty(map, i, { value: items[i], enumerable: true, configurable: true });
+  // Qualified-name own props are non-enumerable and come after the indices. For
+  // an HTML element in an HTML document only all-lowercase qnames get one.
+  const htmlLower = el._htmlAttr, seen = new Set();
+  for (const a of items) {
+    const qn = a.name;
+    if (seen.has(qn)) continue;
+    seen.add(qn);
+    if (htmlLower && qn !== _asciiLower(qn)) continue;
+    Object.defineProperty(map, qn, { value: a, enumerable: false, configurable: true });
+  }
+  return map;
 };
 // A token must be non-empty and contain no ASCII whitespace (DOM spec).
 const _validateToken = function(t) {
@@ -805,72 +944,155 @@ class Element extends Node {
   // classList is [PutForwards=value]: `el.classList = 'x'` sets the class attr.
   set classList(v) { this.classList.value = v == null ? '' : String(v); }
   get style() { return this._style; }
-  set style(v) { if (typeof v === "string") this._style.cssText = v; }
-  getAttribute(n) { return _domParse("get_attribute", this._nid, String(n).toLowerCase()); }
-  setAttribute(n, v) {
-    n = String(n);
-    _validateAttrName(n);
-    n = n.toLowerCase(); // HTML element in an HTML document -> ASCII lowercase
-    const _old = __mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
-    _dom("set_attribute", this._nid, n + "\0" + String(v));
-    if (__mutationObservers?.length) __notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
+  // [PutForwards=cssText]: also reflect to the `style` content attribute so it is
+  // observable via getAttribute/hasAttribute/toggleAttribute and rendered.
+  set style(v) { v = (v == null) ? "" : String(v); this._style.cssText = v; this.setAttribute("style", v); }
+  // Should attribute names be ASCII-lowercased for this element? Only for an
+  // element in the HTML namespace inside an HTML document. Cached (immutable).
+  get _htmlAttr() {
+    if (this.__htmlAttr === undefined) {
+      const doc = this._ownerDoc;
+      const docIsHtml = doc ? (doc._isHTMLDoc !== false) : true;
+      this.__htmlAttr = (this.namespaceURI === _HTML_NS) && docIsHtml;
+    }
+    return this.__htmlAttr;
+  }
+  // Low-level namespace-keyed get/set/remove used by Attr nodes and the NS APIs.
+  _rawGetNS(ns, local) { return _domParse("get_attribute_ns", this._nid, (ns || '') + "\0" + local); }
+  _rawSetNS(ns, prefix, local, value) {
+    _dom("set_attribute_ns", this._nid, (ns || '') + "\0" + (prefix || '') + "\0" + local + "\0" + String(value));
+    __notifyMutation();
+  }
+  _rawRemoveNS(ns, local) {
+    _dom("remove_attribute_ns", this._nid, (ns || '') + "\0" + local);
+    __notifyMutation();
+  }
+  // Reconcile the per-element Attr identity cache against the live attribute
+  // list, minting wrappers for new attributes and detaching removed ones.
+  // Returns the ordered array of live Attr nodes.
+  _syncAttrNodes() {
+    const raw = _domParse("attribute_list", this._nid) || [];
+    const cache = this._attrNodes || (this._attrNodes = new Map());
+    const live = new Set(), out = [];
+    for (const r of raw) {
+      const key = (r.ns || '') + '|' + r.local;
+      live.add(key);
+      let a = cache.get(key);
+      if (!a || a._ownerEl !== this) {
+        a = new Attr(r.ns, r.prefix, r.local, r.value);
+        a._ownerEl = this;
+        cache.set(key, a);
+      }
+      out.push(a);
+    }
+    for (const [key, a] of cache) if (!live.has(key)) { _detachAttr(a); cache.delete(key); }
+    return out;
+  }
+  getAttribute(qname) {
+    qname = String(qname);
+    if (this._htmlAttr) qname = _asciiLower(qname);
+    return _domParse("get_attribute", this._nid, qname);
+  }
+  getAttributeNS(ns, local) {
+    return this._rawGetNS((ns === '' || ns == null) ? '' : String(ns), String(local));
+  }
+  setAttribute(qname, v) {
+    qname = String(qname);
+    _validateAttrName(qname);
+    if (this._htmlAttr) qname = _asciiLower(qname);
+    _dom("set_attribute", this._nid, qname + "\0" + String(v));
+    __notifyMutation();
     // Changing srcdoc on an iframe reprocesses the frame (src goes through the
     // src property setter's own load path).
-    if (n === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
+    if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
     // An id'd element is reachable as a Window-named global.
-    if (n === 'id' && v) __defineNamedGlobal(String(v));
+    if (qname === 'id' && v) __defineNamedGlobal(String(v));
   }
-  setAttributeNS(ns, n, v) { this.setAttribute(n, v); } // Simplified NS handling
-  toggleAttribute(name, force) {
-    name = String(name);
-    _validateAttrName(name);
-    name = name.toLowerCase();
-    if (this.hasAttribute(name)) {
-      if (force === undefined || force === false) { this.removeAttribute(name); return false; }
-      return true;
+  setAttributeNS(namespace, qname, v) {
+    const { namespace: ns, prefix, local } = _validateAndExtract(namespace, qname);
+    this._rawSetNS(ns, prefix, local, String(v));
+    if (ns === null && local === 'id' && v) __defineNamedGlobal(String(v));
+  }
+  toggleAttribute(qname, force) {
+    qname = String(qname);
+    _validateAttrName(qname);
+    if (this._htmlAttr) qname = _asciiLower(qname);
+    const has = _domParse("get_attribute", this._nid, qname) !== null;
+    if (!has) {
+      if (force === undefined || force === true) { this.setAttribute(qname, ''); return true; }
+      return false;
     }
-    if (force === undefined || force === true) { this.setAttribute(name, ''); return true; }
-    return false;
+    if (force === undefined || force === false) { this.removeAttribute(qname); return false; }
+    return true;
   }
-  removeAttribute(n) {
-    n = String(n).toLowerCase();
-    const _old = __mutationObservers?.length ? _domParse("get_attribute", this._nid, n) : null;
-    _dom("remove_attribute", this._nid, n);
-    if (__mutationObservers?.length) __notifyMutation('attributes', this._nid, [], [], n, { oldValue: _old });
+  removeAttribute(qname) {
+    qname = String(qname);
+    if (this._htmlAttr) qname = _asciiLower(qname);
+    // Detach the cached Attr (snapshotting its live value) BEFORE the removal,
+    // so a node later re-attached elsewhere keeps its value.
+    const doomed = this.getAttributeNode(qname);
+    const val = doomed ? doomed.value : null;
+    _dom("remove_attribute", this._nid, qname);
+    if (doomed) {
+      doomed._ownerEl = null; doomed._detachedValue = val;
+      this._attrNodes.delete((doomed._ns || '') + '|' + doomed._local);
+    }
+    __notifyMutation();
     // Removing srcdoc reprocesses: the frame falls back to src or about:blank.
-    if (n === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
+    if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
   }
-  removeAttributeNS(ns, n) { this.removeAttribute(n); }
-  hasAttribute(n) { return this.getAttribute(n) !== null; }
-  hasAttributeNS(ns, n) { return _domParse("get_attribute", this._nid, String(n)) !== null; }
-  toggleAttributeNS(ns, n, force) { return this.toggleAttribute(n, force); } // simplified
-  hasAttributes() { return true; } // Simplified
-  get attributes() {
-    const el = this;
-    const names = _domParse("attribute_names", el._nid) || [];
-    const list = names.map((name) => ({
-      name,
-      localName: name,
-      value: el.getAttribute(name) ?? "",
-      namespaceURI: null,
-      prefix: null,
-      specified: true,
-      ownerElement: el,
-      nodeName: name,
-      nodeValue: el.getAttribute(name) ?? "",
-      nodeType: 2,
-    }));
-    list.length = names.length;
-    list.getNamedItem = (n) => names.includes(n) ? list[names.indexOf(n)] : null;
-    list.setNamedItem = (a) => { if (a && a.name) el.setAttribute(a.name, a.value); return a; };
-    list.removeNamedItem = (n) => { const a = list.getNamedItem(n); if (a) el.removeAttribute(n); return a; };
-    list.item = (i) => list[i] || null;
-    for (let i = 0; i < names.length; i++) {
-      Object.defineProperty(list, names[i], { value: list[i], configurable: true, enumerable: false });
+  removeAttributeNS(ns, local) {
+    ns = (ns === '' || ns == null) ? '' : String(ns); local = String(local);
+    const doomed = this.getAttributeNodeNS(ns, local);
+    const val = doomed ? doomed.value : null;
+    this._rawRemoveNS(ns, local);
+    if (doomed) {
+      doomed._ownerEl = null; doomed._detachedValue = val;
+      this._attrNodes.delete((doomed._ns || '') + '|' + doomed._local);
     }
-    return list;
   }
-  getAttributeNS(ns, n) { return this.getAttribute(n); }
+  hasAttribute(qname) { return this.getAttribute(qname) !== null; }
+  hasAttributeNS(ns, local) { return this.getAttributeNS(ns, local) !== null; }
+  toggleAttributeNS(ns, n, force) { return this.toggleAttribute(n, force); } // simplified
+  hasAttributes() { return (_domParse("attribute_list", this._nid) || []).length > 0; }
+  getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
+  getAttributeNode(qname) {
+    qname = String(qname);
+    if (this._htmlAttr) qname = _asciiLower(qname);
+    for (const a of this._syncAttrNodes()) if (a.name === qname) return a;
+    return null;
+  }
+  getAttributeNodeNS(ns, local) {
+    ns = (ns === '' || ns == null) ? null : String(ns); local = String(local);
+    for (const a of this._syncAttrNodes()) if (a._ns === ns && a._local === local) return a;
+    return null;
+  }
+  // The "set an attribute" algorithm shared by setAttributeNode/NS.
+  _setAttrNode(attr) {
+    if (!(attr instanceof Attr)) throw new TypeError("Argument is not an Attr");
+    if (attr._ownerEl !== null && attr._ownerEl !== this)
+      throw new DOMException("The attribute is in use by another element.", "InUseAttributeError");
+    const oldAttr = this.getAttributeNodeNS(attr._ns, attr._local);
+    if (oldAttr === attr) return attr; // replacing an attr by itself
+    const oldVal = oldAttr ? oldAttr.value : null;
+    this._rawSetNS(attr._ns, attr._prefix, attr._local, attr.value);
+    if (oldAttr) { oldAttr._ownerEl = null; oldAttr._detachedValue = oldVal; }
+    attr._ownerEl = this;
+    this._attrNodes.set((attr._ns || '') + '|' + attr._local, attr);
+    return oldAttr || null;
+  }
+  setAttributeNode(attr) { this._attrNodes || (this._attrNodes = new Map()); return this._setAttrNode(attr); }
+  setAttributeNodeNS(attr) { this._attrNodes || (this._attrNodes = new Map()); return this._setAttrNode(attr); }
+  removeAttributeNode(attr) {
+    if (!(attr instanceof Attr) || attr._ownerEl !== this)
+      throw new DOMException("The attribute is not owned by this element.", "NotFoundError");
+    const val = attr.value;
+    this._rawRemoveNS(attr._ns, attr._local);
+    (this._attrNodes || (this._attrNodes = new Map())).delete((attr._ns || '') + '|' + attr._local);
+    attr._ownerEl = null; attr._detachedValue = val;
+    return attr;
+  }
+  get attributes() { return _buildNamedNodeMap(this); }
   querySelector(s) { return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
@@ -1362,6 +1584,8 @@ class Document extends Node {
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
   get contentType() { return "text/html"; }
+  // Whether this is an HTML document (drives attribute-name lowercasing).
+  get _isHTMLDoc() { return true; }
   get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
@@ -1410,6 +1634,19 @@ class Document extends Node {
     throw new DOMException("This operation is not supported for HTML documents.", "NotSupportedError");
   }
   createProcessingInstruction(target, data) { return _createPIValidated(target, data); }
+  // Create a detached Attr node. createAttribute lowercases for HTML documents;
+  // createAttributeNS validates+extracts the qualified name (case-preserving).
+  createAttribute(localName) {
+    localName = (localName === undefined) ? "undefined" : String(localName);
+    _validateAttrName(localName);
+    if (this._isHTMLDoc) localName = _asciiLower(localName);
+    const a = new Attr(null, null, localName, ""); a.__ownerDoc = this; return a;
+  }
+  createAttributeNS(namespace, qualifiedName) {
+    const { namespace: ns, prefix, local } =
+      _validateAndExtract(namespace, (qualifiedName === undefined) ? "undefined" : String(qualifiedName));
+    const a = new Attr(ns, prefix, local, ""); a.__ownerDoc = this; return a;
+  }
   createDocumentFragment() {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
@@ -1624,6 +1861,7 @@ class DetachedDocument extends Document {
   }
   get ownerDocument() { return null; }
   get contentType() { return this._kind === 'html' ? "text/html" : "application/xml"; }
+  get _isHTMLDoc() { return this._kind === 'html'; }
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
   get title() { const t = this.querySelector('title'); return t ? t.textContent : (this._title || ""); }

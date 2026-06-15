@@ -15,7 +15,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
 | 01 | [The Selector Sorcery](01-the-selector-sorcery.md) | `dom/nodes/ParentNode-querySelector-All` | 1917/1977 | ⚔️⚔️ | ~60 left |
-| 02 | [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | 11/67 | ⚔️⚔️⚔️ | ~56 |
+| ~~02~~ | ✅ [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | **67/67** | ⚔️⚔️⚔️ | **SECURED** |
 | 03 | [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | 1315/1420 | ⚔️⚔️ | ~105 |
 | 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | 833+226 | ⚔️⚔️⚔️ | ~110 |
 | ~~05~~ | ✅ [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | **147/147** | ⚔️⚔️⚔️ | **SECURED** |
@@ -32,22 +32,24 @@ Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️�
 
 ---
 
-## 🗺️ Captain's Counsel (recommended order — updated 2026-06-14, session 4)
+## 🗺️ Captain's Counsel (recommended order — updated 2026-06-14, session 5)
 
-With **#05 Element Forge SECURED (147/147)** — and its XML-document + iframes-delay-load
-machinery now in the engine — the field stands thus:
+With **#02 Attr-Node Codex SECURED (67/67)** — a real `Attr`/`NamedNodeMap` model
+over namespace-aware Rust attribute storage — the field stands thus:
 
-1. **The Attr-Node Codex (02)** (11/67) — the next foundational DOM model: make `Attr`
-   a real node type (`ownerElement`, `namespaceURI`, live `value` reflection,
-   `NamedNodeMap`). Ripples across many realms; the right keystone now.
-2. **The Selector Sorcery (01)** — finish the tail (see Scroll 01 for the bucketed ~52).
-   The cheap remaining strikes are gone; what's left is namespace selectors, shadow-DOM
-   pseudo-elements, a real `NodeList` type, and a harness node-identity mystery.
-3. **The Iframe Frontier (12) tails** — `Range-insertNode`/`surroundContents` per-subtest
-   correctness gaps (909/698 of 1840) on ground we already hold. Grinding but bankable.
-4. The smaller, self-contained realms (08–11) for steady morale and breadth.
-5. **New leverage:** XML-document mode (`_createElementXML`, kind detection) + the
-   iframes-delay-parent-load fix may unblock OTHER iframe/XML tests — worth a sweep.
+1. **The Collections Armory (11)** + **Node-Smithing Vaults (06)** — now the most
+   leveraged ground: `getElementsByTagName(NS)` and the `Node-*` family are
+   measurable and the new `Attr`/`NamedNodeMap`/namespace machinery directly
+   supports them (`Element-getElementsByTagName` sits at 4/19 today).
+2. **The Selector Sorcery (01)** — finish the tail (see Scroll 01 for the bucketed ~52):
+   namespace selectors, shadow-DOM pseudo-elements, a real `NodeList` type, and a
+   harness node-identity mystery. Namespaced attributes are now real, which helps.
+3. **The ClassList Mutation-Echo (03)** (1315/1420) — bankable tail on held ground.
+4. **The Iframe Frontier (12) tails** — `Range-insertNode`/`surroundContents`
+   per-subtest correctness (909/698 of 1840). Grinding but bankable.
+5. The smaller self-contained realms (08 Encoding, 09 FileAPI) for breadth.
+6. **Standing leverage:** XML-document mode + iframes-delay-load (#05) and the new
+   namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
@@ -68,6 +70,23 @@ engine **hardened against URL-triggered crashes**.
   `*-of-type`, +151); CSS2 pseudo-elements parse-but-never-match (+80); `querySelector`
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
+
+**Session 2026-06-14 #5 (knight Claudius — Quest #02 The Attr-Node Codex — CONQUERED 11 → 67/67):**
+- **A real `Attr` node model over namespace-aware Rust storage.** Rust (`tree.rs`/
+  `ops.rs`): namespace + qualified-name attribute methods alongside the local-keyed
+  ones the selector/serializer use; ops `get/set/remove_attribute_ns` +
+  `attribute_list`; existing get/set/remove switched to qualified-name matching.
+  JS (`bootstrap.js`): real `Attr` (live value while attached, own value while
+  detached) + `NamedNodeMap` (off-instance `WeakMap` state → correct
+  `getOwnPropertyNames` shape) + per-element identity cache
+  (`el.attributes[i] === getAttributeNode(name)`) + `get/setAttributeNode(NS)` +
+  `removeAttributeNode` + `createAttribute(NS)` + DOM validate-and-extract
+  (`xml`/`xmlns` `NamespaceError` rules) + HTML-only attribute lowercasing.
+- **Two stragglers pinned by CDP probe:** moved-Attr value loss (snapshot the
+  value *before* the removal op) and `el.style = "…"` now reflecting to the
+  `style` content attribute (also a rendering-fidelity win).
+- **Bonus** `Node-cloneNode` 99→101 (namespace-aware clone copy). **Zero
+  regressions** across every held realm; real-page captures clean.
 
 **Session 2026-06-14 #4 (Quest #05 The Element Forge — CONQUERED 0 → 147/147):**
 - **The XML siege — XML+XHTML document iframes.** The remaining 98 subtests needed

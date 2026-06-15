@@ -24,7 +24,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `dom/lists/DOMTokenList-value.html` | 0/1 | **1/1** | ✅ | ″ |
 | `dom/lists/DOMTokenList-iteration.html` | 0/6 | **5/6** | ⬆️ | ″ |
 | `dom/lists/DOMTokenList-coverage-for-attributes.html` | n/a | **150/175** | ⬆️ | ″ |
-| `dom/nodes/attributes.html` | 4/67 | **11/67** | ⬆️ | toggleAttribute + HTML lowercasing + name validation (rest needs Attr-node model) |
+| `dom/nodes/attributes.html` | 4/67 | **67/67** | ✅ 100% | Quest #02: real `Attr` node + `NamedNodeMap` + namespace-aware Rust storage/ops + get/setAttributeNode(NS) + createAttribute(NS) + validate-and-extract + style-attr reflection |
 | `dom/traversal/TreeWalker.html` | 300/761 | **761/761** | ✅ 100% | Quest #10: real spec TreeWalker (REJECT/SKIP) + node identity `828ee41`/`070ab6f` |
 | `dom/traversal/NodeIterator.html` | 1/766 | **766/766** | ✅ 100% | Quest #10: real NodeIterator (was a TreeWalker alias) `070ab6f` |
 | `dom/traversal/NodeIterator-removal.html` | 0/23 | **23/23** | ✅ 100% | Quest #10: pre-removing steps + live-iterator registry `1f7a428` |
@@ -70,7 +70,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 
 | Test | Latest | Notes |
 |------|:------:|-------|
-| `dom/nodes/Node-cloneNode.html` | 99/135 | 98→99 from the Comment/PI `textContent` fix (Quest #13). |
+| `dom/nodes/Node-cloneNode.html` | 101/135 | 99→101 from namespace-aware clone attribute copy (Quest #02). |
 | `dom/nodes/Node-isConnected.html` | 1/2 | Pre-existing gap, unchanged. |
 | `dom/nodes/Document-getElementById.html` | 4/18 | Pre-existing getElementById edge cases. |
 | `dom/nodes/Node-insertBefore.html` | ⚠️ timeout | Heavy test; separate perf issue (not a correctness regression). |

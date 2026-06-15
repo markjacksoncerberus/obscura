@@ -182,7 +182,18 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let val = dom.get_node(NodeId::new(nid)).and_then(|n| n.get_attribute(&arg2).map(|s| s.to_string()));
+            let val = dom
+                .get_node(NodeId::new(nid))
+                .and_then(|n| n.get_attribute_qualified(&arg2).map(|s| s.to_string()));
+            serde_json::to_string(&val).unwrap_or("null".into())
+        }
+        // Namespace-aware getter: arg2 = "<ns>\0<local>" ("" ns = null namespace).
+        "get_attribute_ns" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let (ns, local) = arg2.split_once('\0').unwrap_or(("", arg2.as_str()));
+            let val = dom
+                .get_node(NodeId::new(nid))
+                .and_then(|n| n.get_attribute_ns(ns, local).map(|s| s.to_string()));
             serde_json::to_string(&val).unwrap_or("null".into())
         }
         "attribute_names" => {
@@ -191,11 +202,40 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 .get_node(NodeId::new(nid))
                 .map(|n| {
                     n.attrs()
-                        .map(|a| a.iter().map(|x| x.name.local.as_ref().to_string()).collect())
+                        .map(|a| a.iter().map(|x| x.qualified_name()).collect())
                         .unwrap_or_default()
                 })
                 .unwrap_or_default();
             serde_json::to_string(&names).unwrap_or("[]".into())
+        }
+        // Ordered attribute list as [{ns,prefix,local,name,value}] for building
+        // the JS Attr/NamedNodeMap wrappers. ns/prefix are null when absent.
+        "attribute_list" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let list: Vec<serde_json::Value> = dom
+                .get_node(NodeId::new(nid))
+                .map(|n| {
+                    n.attrs()
+                        .map(|attrs| {
+                            attrs
+                                .iter()
+                                .map(|a| {
+                                    let ns = a.name.ns.as_ref();
+                                    let prefix = a.name.prefix.as_ref().map(|p| p.as_ref());
+                                    serde_json::json!({
+                                        "ns": if ns.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(ns.to_string()) },
+                                        "prefix": prefix,
+                                        "local": a.name.local.as_ref(),
+                                        "name": a.qualified_name(),
+                                        "value": a.value,
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            serde_json::to_string(&list).unwrap_or("[]".into())
         }
         "set_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -203,17 +243,55 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             if let Some((name, value)) = arg2.split_once('\0') {
                 let old = dom
                     .get_node(node_id)
-                    .and_then(|n| n.get_attribute(name).map(|s| s.to_string()));
+                    .and_then(|n| n.get_attribute_qualified(name).map(|s| s.to_string()));
                 if name == "id" {
-                    dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
+                    dom.with_node_mut(node_id, |n| n.set_attribute_qualified(name, value.to_string()));
                     dom.update_id_index(node_id, old.as_deref(), Some(value));
                 } else {
-                    dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
+                    dom.with_node_mut(node_id, |n| n.set_attribute_qualified(name, value.to_string()));
                 }
                 // Phase 0c: attribute mutation record (the op writes via
                 // with_node_mut, so it can't ride a child-list tree method).
                 dom.record_attribute_mutation(node_id, name, old);
             }
+            "true".into()
+        }
+        // Namespace-aware setter: arg2 = "<ns>\0<prefix>\0<local>\0<value>"
+        // ("" ns = null namespace, "" prefix = no prefix).
+        "set_attribute_ns" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let node_id = NodeId::new(nid);
+            let parts: Vec<&str> = arg2.splitn(4, '\0').collect();
+            if parts.len() == 4 {
+                let (ns, prefix, local, value) = (parts[0], parts[1], parts[2], parts[3]);
+                let prefix_opt = if prefix.is_empty() { None } else { Some(prefix) };
+                let old = dom
+                    .get_node(node_id)
+                    .and_then(|n| n.get_attribute_ns(ns, local).map(|s| s.to_string()));
+                dom.with_node_mut(node_id, |n| {
+                    n.set_attribute_ns(ns, prefix_opt, local, value.to_string())
+                });
+                // A null-namespace "id" still feeds the id index / named globals.
+                if ns.is_empty() && local == "id" {
+                    dom.update_id_index(node_id, old.as_deref(), Some(value));
+                }
+                dom.record_attribute_mutation(node_id, local, old);
+            }
+            "true".into()
+        }
+        // arg2 = "<ns>\0<local>"
+        "remove_attribute_ns" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let node_id = NodeId::new(nid);
+            let (ns, local) = arg2.split_once('\0').unwrap_or(("", arg2.as_str()));
+            let old = dom
+                .get_node(node_id)
+                .and_then(|n| n.get_attribute_ns(ns, local).map(|s| s.to_string()));
+            dom.with_node_mut(node_id, |n| n.remove_attribute_ns(ns, local));
+            if ns.is_empty() && local == "id" {
+                dom.update_id_index(node_id, old.as_deref(), None);
+            }
+            dom.record_attribute_mutation(node_id, local, old);
             "true".into()
         }
         "inner_html" => {
@@ -246,12 +324,11 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             let node_id = NodeId::new(nid);
             let old = dom
                 .get_node(node_id)
-                .and_then(|n| n.get_attribute(&arg2).map(|s| s.to_string()));
-            dom.with_node_mut(node_id, |n| {
-                if let NodeData::Element { attrs, .. } = &mut n.data {
-                    attrs.retain(|a| a.name.local.as_ref() != arg2.as_str());
-                }
-            });
+                .and_then(|n| n.get_attribute_qualified(&arg2).map(|s| s.to_string()));
+            if arg2 == "id" {
+                dom.update_id_index(node_id, old.as_deref(), None);
+            }
+            dom.with_node_mut(node_id, |n| n.remove_attribute_qualified(&arg2));
             dom.record_attribute_mutation(node_id, &arg2, old);
             "true".into()
         }

@@ -1,4 +1,4 @@
-use html5ever::{LocalName, Namespace, QualName};
+use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -30,6 +30,17 @@ impl fmt::Display for NodeId {
 pub struct Attribute {
     pub name: QualName,
     pub value: String,
+}
+
+impl Attribute {
+    /// The attribute's qualified name: `prefix:local` when a prefix is present,
+    /// otherwise just the local name. This is the DOM `Attr.name` / `nodeName`.
+    pub fn qualified_name(&self) -> String {
+        match &self.name.prefix {
+            Some(p) => format!("{}:{}", p.as_ref(), self.name.local.as_ref()),
+            None => self.name.local.as_ref().to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +133,89 @@ impl Node {
                     name: QualName::new(None, Namespace::default(), LocalName::from(name)),
                     value,
                 });
+            }
+        }
+    }
+
+    // --- Namespace- and qualified-name-aware attribute access (DOM Attr model).
+    // The Rust `Attribute` already carries a full `QualName` (ns/prefix/local);
+    // these methods key on it so an element can hold several attributes that
+    // share a local name but differ in namespace (per the DOM spec). The plain
+    // `get_attribute`/`set_attribute` above stay keyed by local name for the
+    // selector engine and serializer, which only ever look up bare locals.
+
+    /// First attribute whose qualified name (`prefix:local` or `local`) equals
+    /// `qname`. This is what `Element.getAttribute(qualifiedName)` resolves to.
+    pub fn get_attribute_qualified(&self, qname: &str) -> Option<&str> {
+        self.attrs()?
+            .iter()
+            .find(|a| a.qualified_name() == qname)
+            .map(|a| a.value.as_str())
+    }
+
+    /// Set the value of the first attribute matching `qname`, or append a new
+    /// null-namespace attribute whose local name is the whole `qname`.
+    pub fn set_attribute_qualified(&mut self, qname: &str, value: String) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            if let Some(attr) = attrs.iter_mut().find(|a| a.qualified_name() == qname) {
+                attr.value = value;
+            } else {
+                attrs.push(Attribute {
+                    name: QualName::new(None, Namespace::default(), LocalName::from(qname)),
+                    value,
+                });
+            }
+        }
+    }
+
+    /// Remove the first attribute matching the qualified name `qname`.
+    pub fn remove_attribute_qualified(&mut self, qname: &str) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            if let Some(pos) = attrs.iter().position(|a| a.qualified_name() == qname) {
+                attrs.remove(pos);
+            }
+        }
+    }
+
+    /// First attribute matching (namespace, local name). The empty string for
+    /// `ns` denotes the null namespace. Matching is case-sensitive.
+    pub fn get_attribute_ns(&self, ns: &str, local: &str) -> Option<&str> {
+        self.attrs()?
+            .iter()
+            .find(|a| a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
+            .map(|a| a.value.as_str())
+    }
+
+    /// Set the (namespace, local) attribute, replacing the value of an existing
+    /// match (keeping its prefix, per spec) or appending a new attribute.
+    pub fn set_attribute_ns(&mut self, ns: &str, prefix: Option<&str>, local: &str, value: String) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            if let Some(attr) = attrs
+                .iter_mut()
+                .find(|a| a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
+            {
+                attr.value = value;
+            } else {
+                attrs.push(Attribute {
+                    name: QualName::new(
+                        prefix.map(Prefix::from),
+                        Namespace::from(ns),
+                        LocalName::from(local),
+                    ),
+                    value,
+                });
+            }
+        }
+    }
+
+    /// Remove the first attribute matching (namespace, local name).
+    pub fn remove_attribute_ns(&mut self, ns: &str, local: &str) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            if let Some(pos) = attrs
+                .iter()
+                .position(|a| a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
+            {
+                attrs.remove(pos);
             }
         }
     }
