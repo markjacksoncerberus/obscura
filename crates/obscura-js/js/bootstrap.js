@@ -2272,7 +2272,12 @@ class DetachedDocument extends Document {
   get documentURI() { return "about:blank"; }
   get defaultView() { return null; }
   get location() { return null; }
-  get doctype() { return this._doctype || null; }
+  get doctype() {
+    // Live: reflect the actual doctype child rather than a value cached at
+    // construction — the WPT Range tests append/move a doctype after the fact.
+    for (let c = this.firstChild; c; c = c.nextSibling) if (c.nodeType === 10) return c;
+    return null;
+  }
   get implementation() { return globalThis.document.implementation; }
   // Live getters: a DetachedDocument's tree can be mutated after construction
   // (the WPT range harness does `removeChild(documentElement)` then appends a
