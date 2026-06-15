@@ -52,6 +52,26 @@ const _reportError = function(err) {
 
 const _dom = (cmd, a1, a2) => Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
 
+// ASCII-only case folding — HTML element/attribute names are lowercased/uppercased
+// over the ASCII range ONLY (so e.g. U+212A KELVIN SIGN and U+0130 İ are NOT touched,
+// unlike String.prototype.toLowerCase which does full Unicode case folding).
+const _asciiLower = function(s) { return String(s).replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32)); };
+const _asciiUpper = function(s) { return String(s).replace(/[a-z]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 32)); };
+// Element-name validity for Document.createElement (DOM §"create an element").
+// Empirically matches the WPT Document-createElement valid/invalid partition: a name
+// is valid iff it is non-empty, contains no ASCII whitespace or '>', and its first
+// code point is an ASCII name-start ([A-Za-z:_]) or any non-ASCII (>= U+0080) code point.
+const _isValidElementName = function(s) {
+  if (s.length === 0) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0x09 || c === 0x0A || c === 0x0C || c === 0x0D || c === 0x20 || c === 0x3E) return false;
+  }
+  const f = s.codePointAt(0);
+  if (f >= 0x80) return true;
+  return (f >= 0x41 && f <= 0x5A) || (f >= 0x61 && f <= 0x7A) || f === 0x3A || f === 0x5F;
+};
+
 const _nativeFns = new Set();
 const _origToString = Function.prototype.toString;
 Function.prototype.toString = function() {
@@ -730,15 +750,22 @@ class Element extends Node {
     this._style = _styleProxy(new CSSStyleDeclaration());
   }
   get tagName() { return _domParse("tag_name", this._nid) || ""; }
-  get localName() { return (this.tagName || "").toLowerCase(); }
+  get localName() { return _asciiLower(this.tagName || ""); }
   get id() { return this.getAttribute("id") || ""; }
   set id(v) { this.setAttribute("id", v); }
   get className() { return this.getAttribute("class") || ""; }
   set className(v) { this.setAttribute("class", v); }
+  // Namespace prefix — null for elements created via createElement / parsed HTML;
+  // createElementNS may pin one (this._prefix). Spec requires null, not undefined.
+  get prefix() { return this._prefix ?? null; }
   get namespaceURI() {
-    const tag = this.localName;
-    if (tag === "svg" || this._ns === "http://www.w3.org/2000/svg") return "http://www.w3.org/2000/svg";
-    return "http://www.w3.org/1999/xhtml";
+    // createElementNS / cloneNode pin an explicit namespace on the wrapper.
+    if (this._ns !== undefined && this._ns !== null) return this._ns;
+    // Otherwise read the element's REAL namespace from the Rust DOM, so an element
+    // *named* "svg" created via createElement (HTML namespace) is not mistaken for a
+    // parsed <svg> (SVG namespace). Falls back to the HTML namespace.
+    const ns = _domParse("namespace_uri", this._nid);
+    return (typeof ns === "string" && ns) ? ns : "http://www.w3.org/1999/xhtml";
   }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
@@ -1351,8 +1378,16 @@ class Document extends Node {
   getElementsByClassName(c) { return this.querySelectorAll("." + c); }
   getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
   createElement(t) {
-    const el = _wrapEl(+_dom("create_element", t.toLowerCase()));
-    if (el && t.toLowerCase() === 'template') {
+    // WebIDL: localName is a (non-nullable) DOMString — undefined -> "undefined",
+    // null -> "null". Then validate against the element-name production, throwing
+    // InvalidCharacterError; finally ASCII-lowercase (this is an HTML document).
+    const name = (t === undefined) ? "undefined" : String(t);
+    if (!_isValidElementName(name)) {
+      throw new DOMException("The string '" + name + "' is not a valid element name.", "InvalidCharacterError");
+    }
+    const local = _asciiLower(name);
+    const el = _wrapEl(+_dom("create_element", local));
+    if (el && local === 'template') {
       el._templateContent = this.createDocumentFragment();
     }
     return el;

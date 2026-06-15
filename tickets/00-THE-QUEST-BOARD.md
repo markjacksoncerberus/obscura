@@ -18,7 +18,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 02 | [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | 11/67 | ⚔️⚔️⚔️ | ~56 |
 | 03 | [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | 1315/1420 | ⚔️⚔️ | ~105 |
 | 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | 833+226 | ⚔️⚔️⚔️ | ~110 |
-| 05 | [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | 0/147 | ⚔️⚔️⚔️ | ~147 |
+| 05 | [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | 49/147 | ⚔️⚔️⚔️ | XML+XHTML docs (98) left |
 | 06 | [The Node-Smithing Vaults](06-the-node-smithing-vaults.md) | `dom/nodes/Node-*` | mixed | ⚔️⚔️ | ~150 |
 | 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | mixed | ⚔️⚔️ | ~? |
 | 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | 2/6+ | ⚔️⚔️ | ~? |
@@ -70,6 +70,24 @@ engine **hardened against URL-triggered crashes**.
   `*-of-type`, +151); CSS2 pseudo-elements parse-but-never-match (+80); `querySelector`
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
+
+**Session 2026-06-14 #4 (Quest #05 The Element Forge — HTML doc taken):**
+- **`Document-createElement` 0 → 49/147.** Every HTML-document subtest now passes.
+  Four fixes: (1) WebIDL string coercion — `createElement(null)`→`"null"`,
+  `undefined`→`"undefined"` (was crashing on `arg.toLowerCase()`); (2) element-name
+  validation throwing `InvalidCharacterError` for the `invalid` set (empty / leading
+  digit·`-`·`.`·`<`·`}` / whitespace / `>`), via `_isValidElementName`; (3) **ASCII-only**
+  case folding (`_asciiLower`/`_asciiUpper`) so `marK` (KELVIN), `İ`, `ı` survive
+  instead of being Unicode-folded by `String.prototype.toLowerCase`; (4) real
+  `namespaceURI` (new Rust `op_dom "namespace_uri"` reading the node's actual `QualName.ns`
+  — so `createElement('svg')` is HTML-namespaced, not mistaken for a parsed `<svg>`) +
+  a `prefix` getter returning `null` not `undefined`. **Bonus:** the real `namespaceURI`
+  lifted `querySelector-All` 1917→1923. Zero regressions (104 unit + held realms green).
+- **Left for #05:** the XML (49) + XHTML (49) subtests — they need real **XML-document
+  mode in iframes**. `_IframeDocument` is hardcoded `super('html')` with a synthetic
+  `<html><head><body>` and HTML parsing; the `.xml`/`.xhtml` fixtures need a document
+  whose `documentElement` is the parsed root (`<foo>`) and an XML-mode `createElement`
+  (case-preserved `localName`/`tagName`, `namespaceURI` `null`/HTMLNS). A distinct siege.
 
 **Session 2026-06-14 #3 (Quest #12 The Iframe Frontier):**
 - **Content-op ranges — +2046 subtests, all 5 tests 0→.** `Range-insertNode`

@@ -175,6 +175,11 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             let name = dom.get_node(NodeId::new(nid)).and_then(|n| n.as_element().map(|name| name.local.as_ref().to_ascii_uppercase())).unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
+        "namespace_uri" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let ns = dom.get_node(NodeId::new(nid)).and_then(|n| n.as_element().map(|name| name.ns.as_ref().to_string()));
+            serde_json::to_string(&ns).unwrap_or("null".into())
+        }
         "get_attribute" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let val = dom.get_node(NodeId::new(nid)).and_then(|n| n.get_attribute(&arg2).map(|s| s.to_string()));
