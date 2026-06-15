@@ -4407,6 +4407,26 @@ function __obscura_nodeDocument(n) {
   return n.nodeType === 9 ? n : (n.ownerDocument || globalThis.document);
 }
 
+// DOM "ensure pre-insertion validity" of `node` into `parent` before `child` —
+// the throw-only half (no mutation), so Range.insertNode can validate before it
+// splits text. Covers the parent/ancestor/reference checks plus the node-type
+// rules that reject inserting a Document, a misplaced doctype, or Text into a
+// Document. (Document-parent cardinality rules are handled by insertBefore.)
+function __obscura_ensurePreInsertionValidity(node, parent, child) {
+  const pt = parent.nodeType;
+  if (pt !== 1 && pt !== 9 && pt !== 11)
+    throw new DOMException("Cannot insert into this node type", "HierarchyRequestError");
+  if (node._nid === parent._nid || (typeof node.contains === 'function' && node.contains(parent)))
+    throw new DOMException("The node is an inclusive ancestor of the insertion parent", "HierarchyRequestError");
+  if (child != null && (!child.parentNode || child.parentNode._nid !== parent._nid))
+    throw new DOMException("The reference child is not a child of the parent", "NotFoundError");
+  const nt = node.nodeType;
+  if (nt !== 1 && nt !== 3 && nt !== 4 && nt !== 7 && nt !== 8 && nt !== 10 && nt !== 11)
+    throw new DOMException("The node is not a valid child (e.g. a Document)", "HierarchyRequestError");
+  if (((nt === 3 || nt === 4) && pt === 9) || (nt === 10 && pt !== 9))
+    throw new DOMException("Invalid node/parent combination", "HierarchyRequestError");
+}
+
 globalThis.Range = class Range {
   constructor() {
     this._sc = globalThis.document; this._so = 0;
@@ -4685,6 +4705,10 @@ globalThis.Range = class Range {
       throw new DOMException("cannot insert at this boundary", "HierarchyRequestError");
     let referenceNode = (sc.nodeType === 3) ? sc : (sc.childNodes[this._so] || null);
     const parent = referenceNode === null ? sc : referenceNode.parentNode;
+    // Spec step: ensure pre-insertion validity BEFORE any mutation (the text split
+    // below), so an invalid node (Document, misplaced doctype, ancestor, …) throws
+    // with the DOM left untouched.
+    __obscura_ensurePreInsertionValidity(node, parent, referenceNode);
     if (sc.nodeType === 3) referenceNode = sc.splitText(this._so);
     if (node === referenceNode) referenceNode = node.nextSibling;
     if (node.parentNode) node.parentNode.removeChild(node);

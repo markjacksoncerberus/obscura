@@ -54,7 +54,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `dom/ranges/Range-stringifier.html` | 0/5 | **5/5** | ✅ 100% | Quest #10: Range.toString `828ee41` |
 | `dom/ranges/Range-{selectNode,collapse,cloneRange,commonAncestorContainer,constructor,attributes,detach}` | stub | **96–100%** | ⬆️ | Quest #10 `828ee41` |
 | `dom/nodes/Node-compareDocumentPosition.html` | n/a | **1444/1444** | ✅ 100% | Quest #10: real compareDocumentPosition + DOCUMENT_POSITION_* consts `828ee41` |
-| `dom/ranges/Range-insertNode.html` | 0/1840 | **909/1840** | ⬆️ | Quest #12: real per-iframe JS realms (frame-script decl hoist) + node-backed iframe doc + recursive cloneNode |
+| `dom/ranges/Range-insertNode.html` | 0/1840 | **1109/1840** | ⬆️ | Quest #12: real per-iframe JS realms + node-backed iframe doc; +200 from spec pre-insertion-validity run BEFORE the text split (rejects inserting a Document, misplaced doctype, or an ancestor — leaving the DOM untouched on throw). Remaining: doctype/foreignDoctype need iframe docs to expose `.doctype` |
 | `dom/ranges/Range-surroundContents.html` | 0/1840 | **698/1840** | ⬆️ | Quest #12 ″ |
 | `dom/ranges/Range-cloneContents.html` | 0/187 | **177/187** | ⬆️ | Quest #12 ″ |
 | `dom/ranges/Range-deleteContents.html` | 0/125 | **103/125** | ⬆️ | Quest #12 ″ |
