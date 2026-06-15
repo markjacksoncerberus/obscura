@@ -4771,6 +4771,25 @@ class _IframeDocument extends DetachedDocument {
       } catch (e) {}
       return;
     }
+    // The explicit <html>/<head>/<body> start tags get stripped below (we parse
+    // into a synthetic scaffold), which would discard any attributes on them.
+    // Real parsers merge those attributes onto the implicit html/head/body, and
+    // WPT relies on it (e.g. <html id=html lang=en>, <body id=body>), so copy
+    // them onto the scaffold elements first — reusing the real attribute parser.
+    const _copyStartTagAttrs = (tagName, target) => {
+      if (!target) return;
+      const m = String(html || '').match(new RegExp('<' + tagName + '\\b([^>]*)>', 'i'));
+      if (!m || !m[1] || !m[1].trim()) return;
+      try {
+        const tmp = globalThis.document.createElement('div');
+        tmp.innerHTML = '<div' + m[1] + '></div>';
+        const probe = tmp.firstElementChild;
+        if (probe) { const at = probe.attributes; for (let i = 0; i < at.length; i++) target.setAttribute(at[i].name, at[i].value); }
+      } catch (e) {}
+    };
+    _copyStartTagAttrs('html', this.documentElement);
+    _copyStartTagAttrs('head', this.head);
+    _copyStartTagAttrs('body', this.body);
     // Parse the markup into <body> (one html5ever fragment parse, which handles
     // pages with OR without explicit <head>/<body> — WPT pages often omit them),
     // then lift the metadata elements into <head>, mirroring the parser's

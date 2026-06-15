@@ -610,7 +610,10 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |n| {
                 n.as_element()
                     .map(|name| {
-                        matches!(name.local.as_ref(), "a" | "area" | "link")
+                        // :link / :visited apply only to a and area elements with an
+                        // href — NOT <link> elements (WPT: "not matching link elements
+                        // with href attributes").
+                        matches!(name.local.as_ref(), "a" | "area")
                             && n.get_attribute("href").is_some()
                     })
                     .unwrap_or(false)
@@ -893,9 +896,11 @@ mod tests {
             v.sort();
             v
         };
-        // :link / :any-link match a/area/link WITH href; not the bare <a> or <span>.
-        assert_eq!(ids(":link"), vec!["a", "c", "d"]);
-        assert_eq!(ids(":any-link"), vec!["a", "c", "d"]);
+        // :link / :any-link match a and area WITH href — NOT <link> elements (d)
+        // (WPT: "not matching link elements with href attributes"), nor the bare
+        // href-less <a> (b) or <span> (e).
+        assert_eq!(ids(":link"), vec!["a", "c"]);
+        assert_eq!(ids(":any-link"), vec!["a", "c"]);
         assert_eq!(ids("a:link"), vec!["a"]);
         // :visited never matches (no history).
         assert!(ids(":visited").is_empty());
