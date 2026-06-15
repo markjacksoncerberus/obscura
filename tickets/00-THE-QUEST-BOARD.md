@@ -74,6 +74,21 @@ engine **hardened against URL-triggered crashes**.
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
 
+**Session 2026-06-15 #11 (knight Claudius — Quest #06 Node-* — `Node-isEqualNode` 4→9/9 CONQUERED):**
+- **Spec per-interface `isEqualNode`** (was a nodeName/nodeValue approximation).
+  DOM §4.5: switch on nodeType — DocumentType (name/publicId/systemId), Element
+  (namespaceURI + prefix + localName, then attribute-**set** equality matched by
+  ns+localName+value, *ignoring prefix*), ProcessingInstruction (target/data),
+  Text/CDATA/Comment (data) — then equal child count + recursive child equality.
+- **Root-cause the documents subtest:** `createDocument(xhtmlNS, …)` now sets the
+  doc's content type to `application/xhtml+xml`, so its `createElement` produces
+  HTML-namespace head/body — structurally identical to `createHTMLDocument`. (SVG
+  ns → image/svg+xml.) The 'xhtml' createMode + `_contentType` plumbing already
+  existed; createDocument just wasn't using it.
+- **4 → 9/9.** Zero regressions (createElement 147, createElementNS 596, attributes
+  67, appendChild 11, replaceChild 28, cloneNode 103, normalize 3, lookupNamespaceURI
+  75, qsa 1939, classlist 1315, Range-insertNode 909, getElementsByTagName 19, iframe 2).
+
 **Session 2026-06-15 #10 (knight Claudius — Quest #06 Node-* — `Node-normalize` 0→3/4):**
 - **Real `normalize()`** (was a no-op stub). DOM §4.5: walk every descendant
   exclusive Text node in tree order; drop it if empty, else absorb its following

@@ -648,19 +648,47 @@ class Node {
       for (const r of toRemove) r.parentNode.removeChild(r);
     }
   }
+  // DOM §4.5 isEqualNode(): "A and B are equal" — same interface, the
+  // type-specific data below equal, then recursively equal children in order.
+  // Note the spec compares Elements on namespace/prefix/localName (NOT nodeName)
+  // and compares attributes by namespace+localName+value, ignoring prefix.
   isEqualNode(other) {
     if (!other) return false;
     if (this._nid === other._nid) return true;
     if (this.nodeType !== other.nodeType) return false;
-    if (this.nodeName !== other.nodeName) return false;
-    if (this.nodeValue !== other.nodeValue) return false;
-    const a = this.attributes ? this.attributes : null;
-    const b = other.attributes ? other.attributes : null;
-    if ((a && a.length) || (b && b.length)) {
-      if (!a || !b || a.length !== b.length) return false;
-      for (let i = 0; i < a.length; i++) {
-        if (other.getAttribute(a[i].name) !== a[i].value) return false;
+    switch (this.nodeType) {
+      case 10: // DocumentType
+        if (this.name !== other.name || this.publicId !== other.publicId
+            || this.systemId !== other.systemId) return false;
+        break;
+      case 1: { // Element
+        if ((this.namespaceURI ?? null) !== (other.namespaceURI ?? null)) return false;
+        if ((this.prefix ?? null) !== (other.prefix ?? null)) return false;
+        if (this.localName !== other.localName) return false;
+        const a = this.attributes, b = other.attributes;
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+          const at = a[i];
+          let found = false;
+          for (let j = 0; j < b.length; j++) {
+            const bt = b[j];
+            if ((at.namespaceURI ?? null) === (bt.namespaceURI ?? null)
+                && at.localName === bt.localName && at.value === bt.value) { found = true; break; }
+          }
+          if (!found) return false;
+        }
+        break;
       }
+      case 7: // ProcessingInstruction — target + data
+        if (this.target !== other.target || this.data !== other.data) return false;
+        break;
+      case 2: // Attr — namespace + localName + value (prefix ignored)
+        if ((this.namespaceURI ?? null) !== (other.namespaceURI ?? null)
+            || this.localName !== other.localName || this.value !== other.value) return false;
+        break;
+      case 3: case 4: case 8: // Text / CDATASection / Comment — data
+        if (this.data !== other.data) return false;
+        break;
     }
     const cA = this.childNodes || [];
     const cB = other.childNodes || [];
@@ -2006,6 +2034,16 @@ class Document extends Node {
       },
       createDocument(namespace, qualifiedName, doctype) {
         const doc = new DetachedDocument('xml');
+        // DOM §createDocument: the document's content type derives from `namespace`,
+        // and createElement's element namespace follows from the content type. The
+        // XHTML namespace yields application/xhtml+xml, in which createElement makes
+        // HTML-namespace elements (so this matches createHTMLDocument structurally);
+        // SVG → image/svg+xml; anything else → application/xml.
+        if (namespace === "http://www.w3.org/1999/xhtml") {
+          doc._createMode = 'xhtml'; doc._contentType = "application/xhtml+xml";
+        } else if (namespace === "http://www.w3.org/2000/svg") {
+          doc._contentType = "image/svg+xml";
+        }
         if (doctype) { doc.appendChild(doctype); doc._doctype = doctype; }
         if (qualifiedName) {
           const el = doc.createElementNS(namespace || null, qualifiedName);
@@ -2141,7 +2179,7 @@ class DetachedDocument extends Document {
     }
   }
   get ownerDocument() { return null; }
-  get contentType() { return this._kind === 'html' ? "text/html" : "application/xml"; }
+  get contentType() { return this._contentType || (this._kind === 'html' ? "text/html" : "application/xml"); }
   get _isHTMLDoc() { return this._kind === 'html'; }
   get compatMode() { return "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
