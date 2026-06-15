@@ -19,7 +19,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `url/url-constructor.any.html` | 1/890 | **833/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057` |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
 | `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1923/1975** | ⬆️ | Quest #01: stable `opaque()` (:nth-*/`*-of-type`) + CSS2 pseudo-elements + qs WebIDL coercion + `:lang()` + `:link`/`:any-link`; +6 from real `namespaceURI` (Quest #05) |
-| `dom/nodes/Document-createElement.html` | 0/147 | **49/147** | ⬆️ | Quest #05: WebIDL string coercion + InvalidCharacterError name validation + ASCII-only casing + real `namespaceURI`/`prefix` (HTML doc 49/49; XML+XHTML 98 need XML-document iframes) |
+| `dom/nodes/Document-createElement.html` | 0/147 | **147/147** | ✅ 100% | Quest #05: WebIDL coercion + InvalidCharacterError validation + ASCII-only casing + real `namespaceURI`/`prefix`; XML-document iframes (case-sensitive createElement, parsed-root documentElement) + iframes-delay-parent-load |
 | `dom/nodes/Element-classlist.html` | ~0 | **1315/1420** | ⬆️ | Real DOMTokenList |
 | `dom/lists/DOMTokenList-value.html` | 0/1 | **1/1** | ✅ | ″ |
 | `dom/lists/DOMTokenList-iteration.html` | 0/6 | **5/6** | ⬆️ | ″ |

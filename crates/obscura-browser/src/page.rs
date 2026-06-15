@@ -547,16 +547,36 @@ impl Page {
 
         if let Some(js) = &mut self.js {
             // Spec order: readyState -> interactive, fire DOMContentLoaded on both
-            // document and window, then readyState -> complete, fire load.
-            let _ = js.execute_script("<load-events>",
+            // document and window, then start loading any markup <iframe>s so they
+            // can populate BEFORE the parent load event (a connected iframe is a
+            // "delay the load event" resource — the load event must wait for it).
+            let _ = js.execute_script("<dcl-events>",
                 "globalThis.__documentReadyState__ = 'interactive';\n\
                  try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 try { if (typeof __startFrameLoads === 'function') __startFrameLoads(); } catch(e) {}");
+        }
+
+        // Drain in-flight subresource/iframe fetches so frame documents are
+        // populated before load fires.
+        self.pump_until_idle().await;
+
+        if let Some(js) = &mut self.js {
+            // readyState -> complete, fire load (now that delaying resources settled).
+            let _ = js.execute_script("<load-event>",
+                "globalThis.__documentReadyState__ = 'complete';\n\
                  if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 globalThis.__documentReadyState__ = 'complete';\n\
                  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}");
         }
 
+        // Pump again so async work kicked off by load handlers settles.
+        self.pump_until_idle().await;
+    }
+
+    /// Run the JS event loop until network goes idle (no in-flight requests for two
+    /// consecutive checks) or a short deadline elapses. Used to drain post-
+    /// DOMContentLoaded and post-load async work (subresource/iframe fetches, etc.).
+    async fn pump_until_idle(&mut self) {
         if let Some(js) = &mut self.js {
             let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(500);
             let mut idle_count = 0u32;

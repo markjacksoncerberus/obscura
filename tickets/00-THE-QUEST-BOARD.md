@@ -18,7 +18,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 02 | [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | 11/67 | ⚔️⚔️⚔️ | ~56 |
 | 03 | [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | 1315/1420 | ⚔️⚔️ | ~105 |
 | 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | 833+226 | ⚔️⚔️⚔️ | ~110 |
-| 05 | [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | 49/147 | ⚔️⚔️⚔️ | XML+XHTML docs (98) left |
+| ~~05~~ | ✅ [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | **147/147** | ⚔️⚔️⚔️ | **SECURED** |
 | 06 | [The Node-Smithing Vaults](06-the-node-smithing-vaults.md) | `dom/nodes/Node-*` | mixed | ⚔️⚔️ | ~150 |
 | 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | mixed | ⚔️⚔️ | ~? |
 | 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | 2/6+ | ⚔️⚔️ | ~? |
@@ -32,24 +32,22 @@ Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️�
 
 ---
 
-## 🗺️ Captain's Counsel (recommended order — updated 2026-06-14, session 2)
+## 🗺️ Captain's Counsel (recommended order — updated 2026-06-14, session 4)
 
-With **#10 traversal conquered and ranges driven to 90%+**, the field has shifted again:
+With **#05 Element Forge SECURED (147/147)** — and its XML-document + iframes-delay-load
+machinery now in the engine — the field stands thus:
 
-1. **The Iframe Frontier (12)** — now the keystone. The remaining `dom/ranges` content-op
-   tests (`Range-insertNode`, `surroundContents`, `cloneContents`, `deleteContents`,
-   `extractContents` — ~6,000 subtests) are blocked NOT by Range (verified correct in
-   isolation) but by their **cross-iframe comparison harness**: `actualIframe`/`expectedIframe`
-   with `iframe.contentWindow.setupRangeTests()`, `contentWindow.testRange`, per-iframe JS
-   realms. Unblock real iframe content-document realms and a big bounty falls. (The
-   `restoreIframe` `while(contentDocument.firstChild)` loops also *hang* today — same node-
-   identity class we keep hitting; fix once, cash many tests.)
-2. **The Selector Sorcery (01)** — finish the tail (see Scroll 01 for the bucketed 60).
+1. **The Attr-Node Codex (02)** (11/67) — the next foundational DOM model: make `Attr`
+   a real node type (`ownerElement`, `namespaceURI`, live `value` reflection,
+   `NamedNodeMap`). Ripples across many realms; the right keystone now.
+2. **The Selector Sorcery (01)** — finish the tail (see Scroll 01 for the bucketed ~52).
    The cheap remaining strikes are gone; what's left is namespace selectors, shadow-DOM
    pseudo-elements, a real `NodeList` type, and a harness node-identity mystery.
-3. **The Attr-Node Codex (02)** and **The Element Forge (05)** — foundational DOM models
-   that ripple across *many* other realms once built.
+3. **The Iframe Frontier (12) tails** — `Range-insertNode`/`surroundContents` per-subtest
+   correctness gaps (909/698 of 1840) on ground we already hold. Grinding but bankable.
 4. The smaller, self-contained realms (08–11) for steady morale and breadth.
+5. **New leverage:** XML-document mode (`_createElementXML`, kind detection) + the
+   iframes-delay-parent-load fix may unblock OTHER iframe/XML tests — worth a sweep.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
@@ -71,8 +69,29 @@ engine **hardened against URL-triggered crashes**.
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
 
-**Session 2026-06-14 #4 (Quest #05 The Element Forge — HTML doc taken):**
-- **`Document-createElement` 0 → 49/147.** Every HTML-document subtest now passes.
+**Session 2026-06-14 #4 (Quest #05 The Element Forge — CONQUERED 0 → 147/147):**
+- **The XML siege — XML+XHTML document iframes.** The remaining 98 subtests needed
+  real XML-document mode in frames. `_IframeDocument` now takes a `kind`
+  (html/xhtml/xml from content-type or `.xml`/`.xhtml` extension): an **xml** doc gets
+  NO synthetic scaffold — its `documentElement` is the parsed root (`<foo>`); **xhtml**
+  scaffolds like html but creates elements case-sensitively. `DetachedDocument` gained
+  a `_createMode` + `_createElementXML` (case-preserved `localName`===`tagName`,
+  `prefix` null, `namespaceURI` null for XML / HTMLNS for XHTML — pinned as own-props
+  shadowing the HTML-casing getters). **Keystone:** the parent `load` event now WAITS
+  for markup iframes (HTML "delay-the-load-event") — a new `__startFrameLoads()` fires
+  at DOMContentLoaded and `page.rs` pumps to network-idle (`pump_until_idle`) BEFORE
+  dispatching `load`; without this the test reads the frames before they finish loading.
+  XHTML trailing-`</html>\n` text-node trimmed. Zero regressions (Quest #12 range
+  iframes 909/177/103 intact, all held realms green, 104+35 unit, real-page capture OK).
+- **HTML doc (the first 49).** WebIDL string coercion — `createElement(null)`→`"null"`,
+  `undefined`→`"undefined"` (was crashing on `arg.toLowerCase()`); `_isValidElementName`
+  → `InvalidCharacterError` for the invalid set; **ASCII-only** `_asciiLower`/`_asciiUpper`
+  (so `marK`(KELVIN)/`İ`/`ı` survive); real `namespaceURI` (new Rust `op_dom "namespace_uri"`
+  reading `QualName.ns` — `createElement('svg')` is HTML-ns) + `prefix`→`null`. Bonus:
+  lifted `querySelector-All` 1917→1923. Commit `db7f923`.
+
+**Session 2026-06-14 #4-prior (Quest #05 The Element Forge — HTML doc taken):**
+- **`Document-createElement` 0 → 49/147.** Every HTML-document subtest passes.
   Four fixes: (1) WebIDL string coercion — `createElement(null)`→`"null"`,
   `undefined`→`"undefined"` (was crashing on `arg.toLowerCase()`); (2) element-name
   validation throwing `InvalidCharacterError` for the `invalid` set (empty / leading

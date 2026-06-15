@@ -1092,7 +1092,7 @@ class Element extends Node {
       if (resp.ok || resp.type === 'opaque') {
         const html = await resp.text();
         if (_self._loadGen !== _gen) return; // re-check after the awaited body
-        el._iframeDoc = new _IframeDocument(html, fullUrl, el);
+        el._iframeDoc = new _IframeDocument(html, fullUrl, el, undefined, _iframeDocKind(fullUrl, resp));
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
       } else {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
@@ -1603,6 +1603,10 @@ class DetachedDocument extends Document {
     // node-identity (isInclusiveDescendant) over foreign/xml document roots.
     _cache.set(this._nid, this);
     this._kind = kind === 'html' ? 'html' : 'xml';
+    // createElement semantics: 'html' (ASCII-lowercase + HTML namespace) vs XML-family
+    // ('xml' → namespaceURI null, 'xhtml' → HTMLNS), both case-preserving. _IframeDocument
+    // promotes this to 'xhtml' for application/xhtml+xml documents.
+    this._createMode = this._kind === 'html' ? 'html' : 'xml';
     this._doctype = null;
     this._docEl = null;
     this._headEl = null;
@@ -1654,7 +1658,32 @@ class DetachedDocument extends Document {
   getElementsByClassName(c) { return this.querySelectorAll('.' + String(c)); }
   // Factories: create real nodes via the main document's ops, then tag this doc
   // as their owner.
-  createElement(t) { const n = super.createElement(t); if (n) n._ownerDoc = this; return n; }
+  createElement(t) {
+    // XML/XHTML documents create elements case-sensitively: localName === tagName ===
+    // the given name (no ASCII-lowercasing), prefix null, namespace null (XML) or the
+    // HTML namespace (XHTML). HTML documents keep the inherited (lowercasing) path.
+    if (this._createMode && this._createMode !== 'html') {
+      return this._createElementXML(t, this._createMode === 'xhtml' ? "http://www.w3.org/1999/xhtml" : null);
+    }
+    const n = super.createElement(t); if (n) n._ownerDoc = this; return n;
+  }
+  _createElementXML(t, ns) {
+    const name = (t === undefined) ? "undefined" : String(t);
+    if (!_isValidElementName(name)) {
+      throw new DOMException("The string '" + name + "' is not a valid element name.", "InvalidCharacterError");
+    }
+    const el = _wrapEl(+_dom("create_element", name));
+    if (el) {
+      // Pin the case-sensitive identity directly on the wrapper, shadowing the
+      // ASCII-casing prototype getters used for HTML elements.
+      Object.defineProperty(el, 'localName',    { value: name, configurable: true });
+      Object.defineProperty(el, 'tagName',      { value: name, configurable: true });
+      Object.defineProperty(el, 'prefix',       { value: null, configurable: true });
+      Object.defineProperty(el, 'namespaceURI', { value: ns,   configurable: true });
+      el._ownerDoc = this;
+    }
+    return el;
+  }
   createElementNS(ns, t) { const n = super.createElementNS(ns, t); if (n) n._ownerDoc = this; return n; }
   createTextNode(t) { const n = super.createTextNode(t); n._ownerDoc = this; return n; }
   createComment(t) { const n = super.createComment(t); n._ownerDoc = this; return n; }
@@ -2033,6 +2062,19 @@ const _fireIframeElementLoad = function(el) {
 // frame is correctly SUPERSEDED when `src` is set synchronously afterwards (HTML's
 // "the load event must not fire until the load has matured" — see WPT
 // content_document_changes_only_after_load_matures).
+// Classify a loaded frame document as 'html', 'xhtml' (application/xhtml+xml) or
+// 'xml' (text/xml, application/xml, *+xml) from the response content-type, falling
+// back to the URL extension. Drives whether _IframeDocument builds an HTML scaffold
+// and how its createElement behaves (case-folding + namespace).
+const _iframeDocKind = function(url, resp) {
+  let ct = '';
+  try { ct = String(resp && resp.headers && resp.headers.get('content-type') || '').toLowerCase(); } catch (e) {}
+  const path = String(url || '').toLowerCase().split('#')[0].split('?')[0];
+  if (ct.indexOf('application/xhtml+xml') !== -1 || path.endsWith('.xhtml')) return 'xhtml';
+  if (ct.indexOf('/xml') !== -1 || ct.indexOf('+xml') !== -1 || path.endsWith('.xml')) return 'xml';
+  return 'html';
+};
+
 const _bumpFrameLoadGen = function(el) { return (el._loadGen = (el._loadGen || 0) + 1); };
 const _scheduleFrameElementLoad = function(el) {
   const gen = _bumpFrameLoadGen(el);
@@ -2065,6 +2107,17 @@ const _connectIframe = function(el) {
   if (el._frameConnected || !el.isConnected) return;
   el._frameConnected = true;
   _loadFrameFromAttributes(el);
+};
+// Begin loading every markup <iframe> already present in the document. Markup
+// frames aren't inserted via the JS appendChild hook, so they otherwise only start
+// loading lazily on contentDocument access. Driven from the Rust load sequence at
+// DOMContentLoaded so frames are fetched (and their fetches counted in-flight)
+// BEFORE the parent `load` event fires — a connected iframe delays the load event.
+globalThis.__startFrameLoads = function() {
+  try {
+    const frames = document.querySelectorAll('iframe');
+    for (let i = 0; i < frames.length; i++) { try { _connectIframe(frames[i]); } catch (e) {} }
+  } catch (e) {}
 };
 // Re-run the load process after a src/srcdoc attribute changes on an already-
 // processed frame (HTML reprocesses the iframe attributes on mutation). Discards
@@ -4066,8 +4119,12 @@ for (const Cls of [Element, Document, DocumentFragment, DetachedDocument]) {
 // documentElement/head/body, so document-as-Node operations threw or returned
 // undefined and the harness could not run.
 class _IframeDocument extends DetachedDocument {
-  constructor(html, url, iframeEl, baseUrl) {
-    super('html'); // builds <html><head></head><body></body> on a real doc node
+  constructor(html, url, iframeEl, baseUrl, kind) {
+    // An XML document (application/xml) has NO synthetic html/head/body scaffold —
+    // its documentElement is the parsed root element. XHTML scaffolds like HTML but
+    // creates elements case-sensitively (promoted via _createMode below).
+    super(kind === 'xml' ? 'xml' : 'html');
+    if (kind === 'xhtml') this._createMode = 'xhtml';
     this._url = url;
     // Base URL for resolving relative resources / baseURI. Usually === url, but
     // for an about:srcdoc document document.URL is 'about:srcdoc' while the base
@@ -4075,6 +4132,23 @@ class _IframeDocument extends DetachedDocument {
     this._baseUrl = baseUrl || url;
     this._iframeEl = iframeEl;
     this._evtKey = _nextSyntheticKey();
+    if (kind === 'xml') {
+      // XML document: the parsed root element IS the documentElement (no synthetic
+      // <html>/<head>/<body>). Parse the markup, drop any XML prolog / doctype, and
+      // append the resulting top-level nodes straight onto the document node.
+      const xmlSrc = String(html || '')
+        .replace(/^﻿/, '')
+        .replace(/^\s*<\?xml[^>]*\?>\s*/i, '')
+        .replace(/^\s*<!DOCTYPE[^>]*>\s*/i, '')
+        .replace(/^\s+/, '');
+      try {
+        const tmp = globalThis.document.createElement('div');
+        tmp.innerHTML = xmlSrc;
+        const kids = Array.prototype.slice.call(tmp.childNodes);
+        for (let i = 0; i < kids.length; i++) this.appendChild(kids[i]);
+      } catch (e) {}
+      return;
+    }
     // Parse the markup into <body> (one html5ever fragment parse, which handles
     // pages with OR without explicit <head>/<body> — WPT pages often omit them),
     // then lift the metadata elements into <head>, mirroring the parser's
@@ -4086,6 +4160,9 @@ class _IframeDocument extends DetachedDocument {
       .replace(/<\/?head[^>]*>/gi, '')
       .replace(/<\/?body[^>]*>/gi, '')
       .replace(/^\s+/, '');
+    // XHTML: trailing whitespace after </html> would otherwise land as a stray text
+    // node in <body>, polluting documentElement.textContent (XML has no such node).
+    if (kind === 'xhtml') inner = inner.replace(/\s+$/, '');
     if (inner) {
       try {
         const body = this.body;
