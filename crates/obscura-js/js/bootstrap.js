@@ -510,9 +510,13 @@ class Node {
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
-  cloneNode(deep) {
+  // _targetDoc (internal): the document the clone is created in. Defaults to the
+  // source's ownerDocument; importNode passes the importing document so the
+  // clone's ownerDocument — and thus tagName casing — reflects the new document.
+  cloneNode(deep, _targetDoc) {
     const t = this.nodeType;
     if (t === 1) {
+      const doc = _targetDoc || this.ownerDocument || document;
       const ns = this.namespaceURI;
       // Foreign/null-namespace elements, and HTML elements created via
       // createElementNS (which may be case-preserved), are recreated with their
@@ -520,9 +524,10 @@ class Node {
       let el;
       if (ns !== _HTML_NS || this._localName !== undefined) {
         const px = this.prefix;
-        el = (this.ownerDocument || document).createElementNS(ns, px ? px + ":" + this.localName : this.localName);
+        el = doc.createElementNS(ns, px ? px + ":" + this.localName : this.localName);
       } else {
-        el = document.createElement(this.nodeName.toLowerCase());
+        el = doc.createElement(this.nodeName.toLowerCase());
+        el._ownerDoc = doc;
       }
       // Copy attributes directly (O(attrs)) rather than serializing+reparsing
       // outerHTML per element — the latter made a deep clone O(N²) and stalled
@@ -541,14 +546,14 @@ class Node {
         // document's documentElement used to collapse to its first descendant.
         const kids = this.childNodes;
         for (let i = 0; i < kids.length; i++) {
-          const c = (kids[i] && kids[i].cloneNode) ? kids[i].cloneNode(true) : null;
+          const c = (kids[i] && kids[i].cloneNode) ? kids[i].cloneNode(true, _targetDoc) : null;
           if (c) el.appendChild(c);
         }
       }
       return el;
     }
-    if (t === 3) return document.createTextNode(this.textContent);
-    if (t === 8) return document.createComment(this.nodeValue || "");
+    if (t === 3) return (_targetDoc || document).createTextNode(this.textContent);
+    if (t === 8) return (_targetDoc || document).createComment(this.nodeValue || "");
     return null;
   }
   compareDocumentPosition(other) {
@@ -1746,12 +1751,16 @@ class Document extends Node {
     // local + prefix) so the selector engine / getElementsByTagName / serializer
     // all see the true namespace — not a faked HTML node.
     const { namespace: nsv, prefix, local } = _validateAndExtract(namespace, qualifiedName);
-    const el = _wrapEl(+_dom("create_element_ns", (nsv || '') + "\0" + (prefix || '') + "\0" + local));
-    if (el) {
-      el._ns = nsv; el._nsSet = true; el._prefix = prefix; el._localName = local;
-      el._ownerDoc = this;
-      if (nsv === _HTML_NS && local === 'template') el._templateContent = this.createDocumentFragment();
-    }
+    const nid = +_dom("create_element_ns", (nsv || '') + "\0" + (prefix || '') + "\0" + local);
+    if (nid < 0 || isNaN(nid)) return null;
+    // Only HTML-namespace elements get an HTMLElement-based interface; the local
+    // name is matched case-sensitively (so "SPAN" → HTMLUnknownElement).
+    const C = (nsv === _HTML_NS) ? _htmlClassForLocal(local) : Element;
+    let el = _cache.get(nid);
+    if (!el) { el = new C(nid); _cache.set(nid, el); }
+    el._ns = nsv; el._nsSet = true; el._prefix = prefix; el._localName = local;
+    el._ownerDoc = this;
+    if (nsv === _HTML_NS && local === 'template') el._templateContent = this.createDocumentFragment();
     return el;
   }
   createTextNode(t) { return _wrap(+_dom("create_text_node", String(t))); }
@@ -2067,10 +2076,27 @@ class DetachedDocument extends Document {
 }
 
 const _cache = new Map();
+// Map an HTML element's canonical lowercase tag to its interface class. Distinct
+// interfaces resolve to their class; recognized-but-generic tags to HTMLElement;
+// anything unrecognized (or non-lowercase, via createElementNS) to
+// HTMLUnknownElement. Classes are looked up on globalThis at call time so this is
+// independent of definition order.
+const _KNOWN_HTML_TAGS = new Set(('a abbr address area article aside audio b base bdi bdo blockquote body br ' +
+  'button canvas caption cite code col colgroup data datalist dd del details dfn dialog div dl dt em embed ' +
+  'fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 head header hgroup hr html i iframe img input ins ' +
+  'kbd label legend li link main map mark menu meta meter nav noscript object ol optgroup option output p ' +
+  'param picture pre progress q rp rt ruby s samp script section select slot small source span strong style ' +
+  'sub summary sup table tbody td template textarea tfoot th thead time title tr track u ul var video wbr').split(' '));
+const _htmlClassForLocal = function(local) {
+  if (local === 'span') return globalThis.HTMLSpanElement;
+  if (local === 'form') return globalThis.HTMLFormElement;
+  return _KNOWN_HTML_TAGS.has(local) ? globalThis.HTMLElement : globalThis.HTMLUnknownElement;
+};
+// Default wrap path (parsed elements + createElement): elements are HTML, so map
+// by their canonical (lowercased) tag name.
 const _elementClassFor = function(nid) {
   const tag = _domParse("tag_name", nid);
-  if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
-  return Element;
+  return tag ? _htmlClassForLocal(_asciiLower(tag)) : (globalThis.HTMLElement || Element);
 };
 const _wrap = function(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
@@ -3738,52 +3764,59 @@ globalThis.scrollX = 0; globalThis.scrollY = 0;
 
 globalThis.CSS = { supports(){return false;}, escape(s){return s;} };
 
-globalThis.HTMLElement = Element;
-globalThis.HTMLDivElement = Element;
-globalThis.HTMLSpanElement = Element;
-globalThis.HTMLParagraphElement = Element;
-globalThis.HTMLAnchorElement = Element;
-globalThis.HTMLImageElement = Element;
-globalThis.HTMLInputElement = Element;
-globalThis.HTMLButtonElement = Element;
-globalThis.HTMLFormElement = class HTMLFormElement extends Element {
+// HTMLElement is a real subclass of Element: only elements in the HTML namespace
+// are HTMLElement instances (foreign / non-HTML elements stay plain Element).
+globalThis.HTMLElement = class HTMLElement extends Element {};
+// Unknown / non-conforming HTML tag names (e.g. uppercase via createElementNS).
+globalThis.HTMLUnknownElement = class HTMLUnknownElement extends globalThis.HTMLElement {};
+globalThis.HTMLSpanElement = class HTMLSpanElement extends globalThis.HTMLElement {};
+globalThis.HTMLFormElement = class HTMLFormElement extends globalThis.HTMLElement {
   get elements() { return this.querySelectorAll("input, select, textarea, button, fieldset, output, object"); }
   get length() { return this.elements.length; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable
   // 'submit' event and (if not prevented) builds form data and navigates.
   reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
 };
-globalThis.HTMLSelectElement = Element;
-globalThis.HTMLTextAreaElement = Element;
-globalThis.HTMLLabelElement = Element;
-globalThis.HTMLTableElement = Element;
-globalThis.HTMLIFrameElement = Element;
-globalThis.HTMLCanvasElement = Element;
-globalThis.HTMLVideoElement = Element;
-globalThis.HTMLAudioElement = Element;
-globalThis.HTMLScriptElement = Element;
-globalThis.HTMLStyleElement = Element;
-globalThis.HTMLLinkElement = Element;
-globalThis.HTMLMetaElement = Element;
-globalThis.HTMLHeadElement = Element;
-globalThis.HTMLBodyElement = Element;
-globalThis.HTMLHtmlElement = Element;
-globalThis.HTMLBRElement = Element;
-globalThis.HTMLHRElement = Element;
-globalThis.HTMLUListElement = Element;
-globalThis.HTMLOListElement = Element;
-globalThis.HTMLLIElement = Element;
-globalThis.HTMLPreElement = Element;
-globalThis.HTMLHeadingElement = Element;
-globalThis.HTMLTemplateElement = Element;
-globalThis.HTMLSlotElement = Element;
-globalThis.HTMLOptionElement = Element;
-globalThis.HTMLDataListElement = Element;
-globalThis.HTMLFieldSetElement = Element;
-globalThis.HTMLLegendElement = Element;
-globalThis.HTMLProgressElement = Element;
-globalThis.HTMLDetailsElement = Element;
-globalThis.HTMLDialogElement = Element;
+// The remaining specific interfaces don't yet carry distinct behaviour, so they
+// alias HTMLElement (still correct for `instanceof HTMLElement`/`Element`).
+const _HTMLEl = globalThis.HTMLElement;
+globalThis.HTMLDivElement = _HTMLEl;
+globalThis.HTMLParagraphElement = _HTMLEl;
+globalThis.HTMLAnchorElement = _HTMLEl;
+globalThis.HTMLImageElement = _HTMLEl;
+globalThis.HTMLInputElement = _HTMLEl;
+globalThis.HTMLButtonElement = _HTMLEl;
+globalThis.HTMLSelectElement = _HTMLEl;
+globalThis.HTMLTextAreaElement = _HTMLEl;
+globalThis.HTMLLabelElement = _HTMLEl;
+globalThis.HTMLTableElement = _HTMLEl;
+globalThis.HTMLIFrameElement = _HTMLEl;
+globalThis.HTMLCanvasElement = _HTMLEl;
+globalThis.HTMLVideoElement = _HTMLEl;
+globalThis.HTMLAudioElement = _HTMLEl;
+globalThis.HTMLScriptElement = _HTMLEl;
+globalThis.HTMLStyleElement = _HTMLEl;
+globalThis.HTMLLinkElement = _HTMLEl;
+globalThis.HTMLMetaElement = _HTMLEl;
+globalThis.HTMLHeadElement = _HTMLEl;
+globalThis.HTMLBodyElement = _HTMLEl;
+globalThis.HTMLHtmlElement = _HTMLEl;
+globalThis.HTMLBRElement = _HTMLEl;
+globalThis.HTMLHRElement = _HTMLEl;
+globalThis.HTMLUListElement = _HTMLEl;
+globalThis.HTMLOListElement = _HTMLEl;
+globalThis.HTMLLIElement = _HTMLEl;
+globalThis.HTMLPreElement = _HTMLEl;
+globalThis.HTMLHeadingElement = _HTMLEl;
+globalThis.HTMLTemplateElement = _HTMLEl;
+globalThis.HTMLSlotElement = _HTMLEl;
+globalThis.HTMLOptionElement = _HTMLEl;
+globalThis.HTMLDataListElement = _HTMLEl;
+globalThis.HTMLFieldSetElement = _HTMLEl;
+globalThis.HTMLLegendElement = _HTMLEl;
+globalThis.HTMLProgressElement = _HTMLEl;
+globalThis.HTMLDetailsElement = _HTMLEl;
+globalThis.HTMLDialogElement = _HTMLEl;
 globalThis.SVGElement = Element;
 globalThis.SVGSVGElement = Element;
 globalThis.CharacterData = CharacterData;
@@ -5483,7 +5516,9 @@ if (typeof URLPattern === 'undefined') {
 }
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
-  Document.prototype.importNode = function(node, deep) { return node?.cloneNode(!!deep) || null; };
+  // Clone `node` INTO this document, so the copy's ownerDocument (and tagName
+  // casing) reflects the importing document, not the source's.
+  Document.prototype.importNode = function(node, deep) { return node ? node.cloneNode(!!deep, this) : null; };
 }
 
 // Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:

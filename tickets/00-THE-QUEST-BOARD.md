@@ -71,6 +71,21 @@ engine **hardened against URL-triggered crashes**.
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
 
+**Session 2026-06-15 #7 (knight Claudius — the createElementNS tail — CONQUERED 587→596/596):**
+- **`importNode` into the target document** (Tail A): `cloneNode(deep, _targetDoc)`
+  threads the importing document so the copy's `ownerDocument` (and `tagName`
+  casing) reflects it; `document.importNode` passes `this`. `Element-tagName` 3→5.
+- **Real `HTMLElement` hierarchy** (Tail B): `HTMLElement` is now a true subclass
+  of `Element` (was an alias, so everything was an HTMLElement); added
+  `HTMLUnknownElement`/`HTMLSpanElement`; `createElementNS` picks the wrapper class
+  by namespace (non-HTML → `Element`; HTML → specific by lowercase tag, else
+  `HTMLUnknownElement`), `_elementClassFor` maps the parsed/createElement path.
+  Closed the 9 `instanceof` subtests → **`Document-createElementNS` 596/596 (100%)**.
+- **Bonus** `Node-cloneNode` 101→103. **Zero regressions** (appendChild 11,
+  classlist 1315, handleEvent 6, qsa 1939, children 2, getElementsByClassName 3,
+  iframe-load 2, Range 909, createElement 147, attributes 67); capture + instanceof
+  sanity clean. Last `Element-tagName` fail (1) needs real `DOMParser` XML parsing.
+
 **Session 2026-06-15 #6 (knight Claudius — foreign-namespace createElementNS — Quest #11 SECURED, createElementNS 85→587):**
 - **Real foreign-namespace element creation.** New Rust op `create_element_ns`
   builds a node with a true `QualName` (namespace + prefix + case-preserved local)

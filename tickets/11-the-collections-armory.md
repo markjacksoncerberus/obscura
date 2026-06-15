@@ -31,9 +31,23 @@ This unblocked the getElementsByTagName family to 100% (the matching ops now see
 real namespaces), lifted `querySelector-All` by 16 (namespace/type selectors), and
 took `Document-createElementNS` 85 → 587/596. Zero regressions; captures clean.
 
-**Remaining tail (12):** `tagName`/`nodeName` must update when an element's
-`ownerDocument` changes — i.e. `document.importNode` / `adoptNode`, which don't
-exist yet. A small, well-scoped follow-up.
+## Increment 3 — the tail: `importNode` + a real `HTMLElement` hierarchy
+
+- **`importNode` into the target document.** `cloneNode(deep, _targetDoc)` threads
+  the importing document so the copy's `ownerDocument` (hence `tagName` casing)
+  reflects it; `document.importNode(node, deep)` passes `this`. (`Element-tagName`
+  3 → 5/6.)
+- **A real `HTMLElement` hierarchy.** `HTMLElement` was an alias for `Element`, so
+  *every* element was an `instanceof HTMLElement`. Now `HTMLElement extends Element`,
+  with `HTMLUnknownElement`/`HTMLSpanElement` subclasses; `createElementNS` picks
+  the wrapper class by namespace (non-HTML → plain `Element`; HTML → the specific
+  class by exact lowercase tag, else `HTMLUnknownElement`), and `_elementClassFor`
+  maps the parsed/`createElement` path. This closed the 9 `instanceof` subtests →
+  **`Document-createElementNS` 596/596 (100%)**.
+
+Bonus: `Node-cloneNode` 101 → 103. Zero regressions. The single remaining
+`Element-tagName` subtest needs a real `DOMParser` (XML parseFromString) — a
+distinct feature, not part of this realm.
 
 ---
 
