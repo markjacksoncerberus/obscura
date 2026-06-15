@@ -1180,7 +1180,13 @@ globalThis.DOMTokenList = class DOMTokenList {
     }
     return out;
   }
-  _write(tokens) { this._el.setAttribute(this._attr, tokens.join(' ')); }
+  _write(tokens) {
+    // DOMTokenList update steps: if the attribute is absent and the token set is
+    // empty, do nothing — don't materialize an empty attribute (WPT: remove() on a
+    // node with a null class attribute must leave it null).
+    if (tokens.length === 0 && this._el.getAttribute(this._attr) === null) return;
+    this._el.setAttribute(this._attr, tokens.join(' '));
+  }
   get value() { return this._el.getAttribute(this._attr) || ''; }
   set value(v) { this._el.setAttribute(this._attr, String(v)); }
   get length() { return this._ordered().length; }
@@ -1194,7 +1200,14 @@ globalThis.DOMTokenList = class DOMTokenList {
     if (force === false) return false; this.add(token); return true;
   }
   replace(oldT, newT) {
-    oldT = String(oldT); newT = String(newT); _validateToken(oldT); _validateToken(newT);
+    oldT = String(oldT); newT = String(newT);
+    // Per spec the empty-token check (SyntaxError) runs for BOTH tokens before the
+    // whitespace check (InvalidCharacterError) for either, so replace(" ", "")
+    // throws SyntaxError (the empty newToken), not InvalidCharacterError.
+    if (oldT === '' || newT === '')
+      throw new DOMException("The token provided must not be empty.", "SyntaxError");
+    if (/[ \t\r\n\f]/.test(oldT) || /[ \t\r\n\f]/.test(newT))
+      throw new DOMException("The token provided contains HTML space characters, which are not valid in tokens.", "InvalidCharacterError");
     const o = this._ordered(); const i = o.indexOf(oldT);
     if (i < 0) return false;
     o[i] = newT;
@@ -3688,7 +3701,14 @@ const __scheduleMutationDelivery = function() {
 // a delivery tick, which drains the Rust queue. The (type, ...) args are kept
 // for call-site compatibility but no longer used — Rust is the record source.
 const __notifyMutation = function() {
-  if (__mutationObservers.length) __scheduleMutationDelivery();
+  if (!__mutationObservers.length) return;
+  // Drain the Rust queue NOW, while each observer's target list still reflects the
+  // moment of this mutation, then schedule async delivery. Eager draining is what
+  // lets a synchronous takeRecords() (as the classList tests do right after an op)
+  // observe the record, and it discards mutations that no current observer targets
+  // (e.g. a setAttribute before observe()) instead of leaking them later.
+  __drainMutations();
+  __scheduleMutationDelivery();
 };
 
 globalThis.ShadowRoot = class ShadowRoot {};
