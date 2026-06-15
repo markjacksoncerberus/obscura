@@ -1,9 +1,43 @@
-# ⚔️ Quest #11 — The Collections Armory (increment 1 landed)
+# ✅ Quest #11 — The Collections Armory — SECURED
 
 > *Realm:* `dom/collections`, `dom/nodes/Element-getElementsBy*`, `.children`
 > *Difficulty:* ⚔️⚔️
-> *Status:* live `HTMLCollection` built (+33 subtests); tail blocked on
-> foreign-namespace element creation.
+> *Status:* **getElementsByTagName 19/19, getElementsByTagNameNS 16/16,
+> Document-getElementsByTagName 18/18 — all 100%.** Bonus: `createElementNS`
+> 85→587/596, `querySelector-All` +16.
+
+---
+
+## Increment 2 — real foreign-namespace `createElementNS` (the keystone)
+
+The Collections tail was blocked because `createElementNS` faked the namespace on
+the JS wrapper while the Rust node (which the matching ops read) stayed
+HTML-namespaced and lowercased. Fixed at the root:
+
+- **Rust** `create_element_ns` op builds a node with a true `QualName`
+  (namespace + prefix + case-preserved local).
+- **JS** `Document.createElementNS` rewritten with the real DOM validate-and-extract
+  (split on first colon; local must be a valid element name; a colon requires a
+  non-empty prefix; `xml`/`xmlns` `NamespaceError` rules), then creates the real
+  node and pins `_ns`/`_nsSet`/`_prefix`/`_localName` on the wrapper.
+- **Getters** fixed: `namespaceURI` honours an explicit null namespace;
+  `localName`/`tagName` are case-preserved (HTML-namespace elements in an HTML
+  document uppercase the qualified name); **`nodeName` now returns `tagName`**
+  (it had been a separate uppercasing op — fixing it alone recovered ~250
+  `createElementNS` subtests).
+- `cloneNode` recreates foreign / case-preserved elements via `createElementNS`.
+
+This unblocked the getElementsByTagName family to 100% (the matching ops now see
+real namespaces), lifted `querySelector-All` by 16 (namespace/type selectors), and
+took `Document-createElementNS` 85 → 587/596. Zero regressions; captures clean.
+
+**Remaining tail (12):** `tagName`/`nodeName` must update when an element's
+`ownerDocument` changes — i.e. `document.importNode` / `adoptNode`, which don't
+exist yet. A small, well-scoped follow-up.
+
+---
+
+## Increment 1 — the live HTMLCollection
 
 ---
 

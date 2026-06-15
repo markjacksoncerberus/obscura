@@ -424,6 +424,20 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 attrs: vec![], template_contents: None, mathml_annotation_xml_integration_point: false,
             }).index().to_string()
         }
+        // Create an element with a real QualName (namespace + prefix + case-
+        // preserved local). arg1 = "<ns>\0<prefix>\0<local>" ("" ns = null
+        // namespace, "" prefix = no prefix). Used by createElementNS.
+        "create_element_ns" => {
+            let parts: Vec<&str> = arg1.splitn(3, '\0').collect();
+            let ns = parts.first().copied().unwrap_or("");
+            let prefix = parts.get(1).copied().unwrap_or("");
+            let local = parts.get(2).copied().unwrap_or("");
+            let prefix_opt = if prefix.is_empty() { None } else { Some(html5ever::Prefix::from(prefix)) };
+            dom.new_node(NodeData::Element {
+                name: html5ever::QualName::new(prefix_opt, html5ever::Namespace::from(ns), html5ever::LocalName::from(local)),
+                attrs: vec![], template_contents: None, mathml_annotation_xml_integration_point: false,
+            }).index().to_string()
+        }
         "create_text_node" => {
             dom.new_node(NodeData::Text { contents: arg1.clone() }).index().to_string()
         }

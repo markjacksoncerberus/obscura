@@ -18,7 +18,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 |------|:------:|:------:|:------:|----------------|
 | `url/url-constructor.any.html` | 1/890 | **833/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057` |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
-| `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1923/1975** | ⬆️ | Quest #01: stable `opaque()` (:nth-*/`*-of-type`) + CSS2 pseudo-elements + qs WebIDL coercion + `:lang()` + `:link`/`:any-link`; +6 from real `namespaceURI` (Quest #05) |
+| `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1939/1975** | ⬆️ | Quest #01 + #05 `namespaceURI`; +16 from real foreign-ns `createElementNS` (Quest #11) helping namespace/type selectors |
 | `dom/nodes/Document-createElement.html` | 0/147 | **147/147** | ✅ 100% | Quest #05: WebIDL coercion + InvalidCharacterError validation + ASCII-only casing + real `namespaceURI`/`prefix`; XML-document iframes (case-sensitive createElement, parsed-root documentElement) + iframes-delay-parent-load |
 | `dom/nodes/Element-classlist.html` | ~0 | **1315/1420** | ⬆️ | Real DOMTokenList |
 | `dom/lists/DOMTokenList-value.html` | 0/1 | **1/1** | ✅ | ″ |
@@ -28,9 +28,10 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `dom/nodes/Element-getElementsByClassName.html` | 1/3 | **3/3** | ✅ 100% | Quest #11: live `HTMLCollection` + Rust class-match op |
 | `dom/nodes/Element-children.html` | 0/2 | **2/2** | ✅ 100% | Quest #11: `.children` → live `HTMLCollection` (named props, single-pass tree order) |
 | `dom/collections/HTMLCollection-empty-name.html` | 0/7 | **7/7** | ✅ 100% | Quest #11: empty-name guard in named access |
-| `dom/nodes/Element-getElementsByTagName.html` | 4/19 | **12/19** | ⬆️ | Quest #11: `HTMLCollection` + spec tag-match (HTML-ns case-fold); tail needs real foreign-ns `createElementNS` |
-| `dom/nodes/Document-getElementsByTagName.html` | 3/18 | **11/18** | ⬆️ | Quest #11 ″ (tail = foreign-ns element creation) |
-| `dom/nodes/Element-getElementsByTagNameNS.html` | 0/16 | **7/16** | ⬆️ | Quest #11: `get_elements_by_tag_name_ns` op (tail = foreign-ns element creation) |
+| `dom/nodes/Element-getElementsByTagName.html` | 4/19 | **19/19** | ✅ 100% | Quest #11: `HTMLCollection` + spec tag-match + real foreign-ns `createElementNS` |
+| `dom/nodes/Document-getElementsByTagName.html` | 3/18 | **18/18** | ✅ 100% | Quest #11 ″ |
+| `dom/nodes/Element-getElementsByTagNameNS.html` | 0/16 | **16/16** | ✅ 100% | Quest #11: `get_elements_by_tag_name_ns` op + foreign-ns elements |
+| `dom/nodes/Document-createElementNS.html` | 85/596 | **587/596** | ⬆️ | Quest #11: real `create_element_ns` Rust op + validate-and-extract + case-preserved `localName`/`tagName`/`nodeName`/`prefix`; tail (12) needs `importNode`/adoptNode |
 | `dom/traversal/TreeWalker.html` | 300/761 | **761/761** | ✅ 100% | Quest #10: real spec TreeWalker (REJECT/SKIP) + node identity `828ee41`/`070ab6f` |
 | `dom/traversal/NodeIterator.html` | 1/766 | **766/766** | ✅ 100% | Quest #10: real NodeIterator (was a TreeWalker alias) `070ab6f` |
 | `dom/traversal/NodeIterator-removal.html` | 0/23 | **23/23** | ✅ 100% | Quest #10: pre-removing steps + live-iterator registry `1f7a428` |

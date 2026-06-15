@@ -24,7 +24,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | 2/6+ | ⚔️⚔️ | ~? |
 | 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | 4/8+ | ⚔️⚔️ | ~? |
 | 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | ⚔️ traversal **DONE**; ranges 90%+ | ⚔️⚔️⚔️ | iframe content-ops left |
-| 11 | [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | ⚔️ live `HTMLCollection` landed (+33); tail = foreign-ns createElementNS | ⚔️⚔️ | ~23 |
+| ~~11~~ | ✅ [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | **getElementsBy\* all 100%** | ⚔️⚔️ | **SECURED** |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ **+2046** (5 tests 0→) | ⚔️⚔️⚔️ | surround/clone tails + re-land FIX B |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
 
@@ -70,6 +70,26 @@ engine **hardened against URL-triggered crashes**.
   `*-of-type`, +151); CSS2 pseudo-elements parse-but-never-match (+80); `querySelector`
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
+
+**Session 2026-06-15 #6 (knight Claudius — foreign-namespace createElementNS — Quest #11 SECURED, createElementNS 85→587):**
+- **Real foreign-namespace element creation.** New Rust op `create_element_ns`
+  builds a node with a true `QualName` (namespace + prefix + case-preserved local)
+  instead of a faked HTML node. JS `Document.createElementNS` rewritten:
+  validate-and-extract (the real algorithm — split on first colon, local must be a
+  valid element name, colon needs a non-empty prefix; xml/xmlns `NamespaceError`
+  rules), then create the real node and pin `_ns`/`_nsSet`/`_prefix`/`_localName`
+  on the wrapper. Getters fixed: `namespaceURI` (honours an explicit null),
+  `localName`/`tagName` (case-preserved; HTML-ns-in-HTML-doc uppercases),
+  **`nodeName` now === `tagName`** (was a separate uppercasing op — the keystone:
+  +250 createElementNS subtests). `cloneNode` recreates foreign/case-preserved
+  elements via `createElementNS`.
+- **Results:** `Document-createElementNS` 85→**587/596**; **`getElementsByTagName`
+  19/19, `getElementsByTagNameNS` 16/16, `Document-getElementsByTagName` 18/18 —
+  all 100% (Quest #11 SECURED)**; `querySelector-All` 1923→**1939** (+16, foreign-ns
+  helps namespace/type selectors); `cloneNode` held 101. **Zero regressions**
+  across createElement/attributes/appendChild/classlist/TreeWalker/
+  compareDocumentPosition/iframe/Range; captures clean. Tail (12 subtests) needs
+  `importNode`/`adoptNode` (tagName recompute on ownerDocument change).
 
 **Session 2026-06-14 #5 (knight Claudius — Quest #11 The Collections Armory — increment 1, +33):**
 - **A live `HTMLCollection` (Proxy) + Rust matching ops.** New Rust ops

@@ -513,7 +513,17 @@ class Node {
   cloneNode(deep) {
     const t = this.nodeType;
     if (t === 1) {
-      const el = document.createElement(this.nodeName.toLowerCase());
+      const ns = this.namespaceURI;
+      // Foreign/null-namespace elements, and HTML elements created via
+      // createElementNS (which may be case-preserved), are recreated with their
+      // real namespace/prefix/case; plain HTML elements take the fast path.
+      let el;
+      if (ns !== _HTML_NS || this._localName !== undefined) {
+        const px = this.prefix;
+        el = (this.ownerDocument || document).createElementNS(ns, px ? px + ":" + this.localName : this.localName);
+      } else {
+        el = document.createElement(this.nodeName.toLowerCase());
+      }
       // Copy attributes directly (O(attrs)) rather than serializing+reparsing
       // outerHTML per element — the latter made a deep clone O(N²) and stalled
       // the Range cloneContents/extractContents harness.
@@ -524,7 +534,6 @@ class Node {
         if (a.namespaceURI != null) el._rawSetNS(a.namespaceURI, a.prefix, a.localName, a.value);
         else el.setAttribute(a.name, a.value);
       }
-      if (this._ns) el._ns = this._ns;
       if (deep) {
         // Recurse over real children rather than parsing outerHTML into a <div>:
         // a <div>'s fragment parser DROPS <html>/<head>/<body> wrappers (they are
@@ -694,23 +703,20 @@ const _validateAttrName = function(n) {
   if (n === '' || /[\0 \t\r\n\f]/.test(n))
     throw new DOMException("'" + n + "' is not a valid attribute name.", "InvalidCharacterError");
 };
-// setAttributeNS additionally validates against the QName production: an NCName,
-// or prefix:local with both parts non-empty and exactly one colon.
-const _validateQName = function(qname) {
-  _validateAttrName(qname);
-  const parts = qname.split(':');
-  if (parts.length > 2 || parts.some(p => p === ''))
-    throw new DOMException("'" + qname + "' is not a valid qualified name.", "InvalidCharacterError");
-};
-// DOM "validate and extract" for setAttributeNS / createAttributeNS. Returns
-// {namespace, prefix, local} or throws InvalidCharacterError / NamespaceError.
+// DOM "validate and extract" of a (namespace, qualifiedName), as browsers
+// actually implement it (matching the WPT createElementNS / attributes tables):
+// split on the FIRST colon; the local part must be a valid element name (first
+// char a name-start char; no ASCII whitespace or ">"), and a colon requires a
+// non-empty prefix. Used by createElementNS, setAttributeNS, createAttributeNS.
+// Returns {namespace, prefix, local} or throws InvalidCharacterError/NamespaceError.
 const _validateAndExtract = function(namespace, qname) {
   const ns = (namespace === '' || namespace === undefined || namespace === null) ? null : String(namespace);
-  qname = String(qname);
-  _validateQName(qname);
+  qname = (qname === undefined) ? 'undefined' : String(qname);
   let prefix = null, local = qname;
   const ci = qname.indexOf(':');
   if (ci !== -1) { prefix = qname.slice(0, ci); local = qname.slice(ci + 1); }
+  if (local === '' || prefix === '' || !_isValidElementName(local))
+    throw new DOMException("'" + qname + "' is not a valid qualified name.", "InvalidCharacterError");
   if (prefix !== null && ns === null)
     throw new DOMException("A namespace is required to use a prefix.", "NamespaceError");
   if (prefix === 'xml' && ns !== _XML_NS)
@@ -989,8 +995,23 @@ class Element extends Node {
     super(nid);
     this._style = _styleProxy(new CSSStyleDeclaration());
   }
-  get tagName() { return _domParse("tag_name", this._nid) || ""; }
-  get localName() { return _asciiLower(this.tagName || ""); }
+  get tagName() {
+    // createElementNS pins a case-preserved identity: the tagName is the qualified
+    // name, ASCII-uppercased only for HTML-namespace elements in an HTML document.
+    if (this._localName !== undefined) {
+      const qual = this._prefix ? this._prefix + ":" + this._localName : this._localName;
+      const doc = this._ownerDoc;
+      const htmlDoc = doc ? doc._isHTMLDoc !== false : true;
+      return (this._ns === _HTML_NS && htmlDoc) ? _asciiUpper(qual) : qual;
+    }
+    return _domParse("tag_name", this._nid) || "";
+  }
+  get localName() {
+    if (this._localName !== undefined) return this._localName;
+    return _asciiLower(this.tagName || "");
+  }
+  // An element's nodeName is its tagName (qualified name, HTML-uppercased).
+  get nodeName() { return this.tagName; }
   get id() { return this.getAttribute("id") || ""; }
   set id(v) { this.setAttribute("id", v); }
   get className() { return this.getAttribute("class") || ""; }
@@ -999,7 +1020,9 @@ class Element extends Node {
   // createElementNS may pin one (this._prefix). Spec requires null, not undefined.
   get prefix() { return this._prefix ?? null; }
   get namespaceURI() {
-    // createElementNS / cloneNode pin an explicit namespace on the wrapper.
+    // createElementNS pins an explicit namespace (which may legitimately be null).
+    if (this._nsSet) return this._ns;
+    // cloneNode etc. may pin a non-null namespace.
     if (this._ns !== undefined && this._ns !== null) return this._ns;
     // Otherwise read the element's REAL namespace from the Rust DOM, so an element
     // *named* "svg" created via createElement (HTML namespace) is not mistaken for a
@@ -1718,9 +1741,17 @@ class Document extends Node {
     }
     return el;
   }
-  createElementNS(ns, t) {
-    const el = this.createElement(t);
-    if (el) el._ns = ns;
+  createElementNS(namespace, qualifiedName) {
+    // Validate+extract, then create a REAL foreign-namespace node (case-preserved
+    // local + prefix) so the selector engine / getElementsByTagName / serializer
+    // all see the true namespace — not a faked HTML node.
+    const { namespace: nsv, prefix, local } = _validateAndExtract(namespace, qualifiedName);
+    const el = _wrapEl(+_dom("create_element_ns", (nsv || '') + "\0" + (prefix || '') + "\0" + local));
+    if (el) {
+      el._ns = nsv; el._nsSet = true; el._prefix = prefix; el._localName = local;
+      el._ownerDoc = this;
+      if (nsv === _HTML_NS && local === 'template') el._templateContent = this.createDocumentFragment();
+    }
     return el;
   }
   createTextNode(t) { return _wrap(+_dom("create_text_node", String(t))); }
