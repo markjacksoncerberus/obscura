@@ -8,6 +8,9 @@
 Measured via `scripts/wpt_run.py` over CDP against a `--features render` server.
 Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
+> 🤝 **New here?** Start with [`AGENT-HANDOFF.md`](AGENT-HANDOFF.md) — the dev loop,
+> hard-won gotchas, architecture map, and concrete next moves.
+
 ---
 
 ## ⚔️ Open Quests
