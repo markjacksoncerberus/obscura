@@ -466,18 +466,67 @@ class Node {
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [], [c._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
     return c;
   }
-  replaceChild(newChild, oldChild) {
-    if (!oldChild || !newChild) return oldChild;
-    __obscura_runNodeIteratorPreRemove(oldChild);
-    let _prev = -1, _next = -1;
-    if (__mutationObservers?.length) {
-      _prev = +_dom("prev_sibling", oldChild._nid);
-      _next = +_dom("next_sibling", oldChild._nid);
+  // DOM "replace" (§4.2.3): replace `child` with `node`, returning `child`.
+  replaceChild(node, child) {
+    const _isNode = (x) => x != null && typeof x === 'object' && (typeof x._nid === 'number' || typeof x.nodeType === 'number');
+    if (!_isNode(node)) throw new TypeError("Failed to execute 'replaceChild': parameter 1 is not of type 'Node'");
+    if (!_isNode(child)) throw new TypeError("Failed to execute 'replaceChild': parameter 2 is not of type 'Node'");
+    const pt = this.nodeType;
+    // 1. Parent must be a Document, DocumentFragment, or Element.
+    if (pt !== 1 && pt !== 9 && pt !== 11)
+      throw new DOMException("Cannot replace a child in this node type", "HierarchyRequestError");
+    // 2. node must not be an inclusive ancestor of parent.
+    if (node._nid === this._nid || (typeof node.contains === 'function' && node.contains(this)))
+      throw new DOMException("The new child is an ancestor of the parent", "HierarchyRequestError");
+    // 3. child must be a child of parent.
+    const cp = child.parentNode;
+    if (!cp || cp._nid !== this._nid)
+      throw new DOMException("The node to be replaced is not a child of this node", "NotFoundError");
+    // 4. node must be a DocumentFragment, DocumentType, Element, or CharacterData.
+    const nt = node.nodeType;
+    if (nt !== 1 && nt !== 3 && nt !== 4 && nt !== 7 && nt !== 8 && nt !== 10 && nt !== 11)
+      throw new DOMException("The new child is not a valid node", "HierarchyRequestError");
+    // 5. Text in a Document, or a doctype outside a Document, is invalid.
+    if ((nt === 3 && pt === 9) || (nt === 10 && pt !== 9))
+      throw new DOMException("Invalid child for this parent", "HierarchyRequestError");
+    // 6. Document-parent constraints (evaluated excluding `child`).
+    if (pt === 9) {
+      const kids = Array.prototype.slice.call(this.childNodes);
+      const idx = (n) => kids.findIndex(k => k._nid === n._nid);
+      const childIdx = idx(child);
+      const elemChildren = kids.filter(k => k.nodeType === 1);
+      const doctypeChild = kids.find(k => k.nodeType === 10) || null;
+      const doctypeIdx = doctypeChild ? idx(doctypeChild) : -1;
+      const otherElement = elemChildren.some(e => e._nid !== child._nid);
+      const doctypeFollows = doctypeChild && childIdx < doctypeIdx;
+      const HRE = (m) => { throw new DOMException(m, "HierarchyRequestError"); };
+      if (nt === 11) {
+        const fk = Array.prototype.slice.call(node.childNodes);
+        const fe = fk.filter(k => k.nodeType === 1).length;
+        if (fe > 1 || fk.some(k => k.nodeType === 3 || k.nodeType === 4)) HRE("Invalid fragment for a document");
+        if (fe === 1 && (otherElement || doctypeFollows)) HRE("Document may have only one element child");
+      } else if (nt === 1) {
+        if (otherElement || doctypeFollows) HRE("Document may have only one element child");
+      } else if (nt === 10) {
+        if ((doctypeChild && doctypeChild._nid !== child._nid) ||
+            elemChildren.some(e => idx(e) < childIdx)) HRE("Misplaced doctype");
+      }
     }
-    _dom("insert_before", newChild._nid, oldChild._nid);
-    _dom("remove_child", oldChild._nid);
-    if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [newChild._nid], [oldChild._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
-    return oldChild;
+    // 7. referenceChild = child's next sibling, unless that is node (then node's next sibling).
+    let ref = child.nextSibling;
+    if (ref && ref._nid === node._nid) ref = node.nextSibling;
+    // Replace: remove child, then insert node (a fragment inserts its children).
+    this.removeChild(child);
+    // Removing child may already leave node correctly positioned (the
+    // replace-with-adjacent-sibling case); only (re)insert when it isn't.
+    const inParent = node.parentNode && node.parentNode._nid === this._nid;
+    const alreadyPlaced = inParent &&
+      (ref ? (node.nextSibling && node.nextSibling._nid === ref._nid) : node.nextSibling == null);
+    if (!alreadyPlaced) {
+      if (ref && ref.parentNode && ref.parentNode._nid === this._nid) this.insertBefore(node, ref);
+      else this.appendChild(node);
+    }
+    return child;
   }
   insertBefore(n, ref) {
     // WebIDL: the node must be a Node (the reference child may be null).

@@ -71,6 +71,20 @@ engine **hardened against URL-triggered crashes**.
   WebIDL coercion (+~6); `:lang()` with ancestor inheritance (+26); `:link`/`:any-link`/
   `:visited` (+8). Commits `1342890`, `a6d8257`, `bc515c1`, `60b138d`.
 
+**Session 2026-06-15 #9 (knight Claudius — Quest #06 Node-* — `Node-replaceChild` 5→28/29):**
+- **Full DOM "replace" algorithm.** Pre-replacement validity (parent type, node
+  inclusive-ancestor, child-is-a-child → NotFoundError, valid node type, Text-in-
+  Document / doctype-outside-Document) + the Document-parent constraints evaluated
+  excluding `child` (at-most-one element child, doctype/element ordering, fragment
+  element/text limits). Then the reference-child adjustment + remove/insert via our
+  existing primitives. Caught a Rust `insert_before` adjacency quirk (replace-with-
+  next-sibling dropped the node) — guarded by skipping the re-insert when the node
+  is already correctly placed after removal.
+- **5 → 28/29.** Zero regressions (appendChild 11, cloneNode 103, lookupNamespaceURI
+  75, createElementNS 596, Range-insertNode 909, attributes 67, classlist 1315, qsa
+  1939, iframe 2, getElementsByTagName 19). Last fail = cross-document doctype
+  replace (needs DetachedDocument doctype node tracking — a distinct fix).
+
 **Session 2026-06-15 #8 (knight Claudius — Quest #06 Node-* — `Node-lookupNamespaceURI` 0→75/75):**
 - **DOM namespace resolution** (`lookupNamespaceURI`/`lookupPrefix`/`isDefaultNamespace`
   on Node + the standalone Attr). Recursive "locate a namespace"/"locate a prefix":
