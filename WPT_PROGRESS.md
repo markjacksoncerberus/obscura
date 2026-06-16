@@ -112,6 +112,9 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-16.
 | `FileAPI/reading-data-section/{readAsText,readAsArrayBuffer,readAsDataURL,readAsBinaryString,FileReader-multiple-reads,filereader_events,filereader_abort,FileReader-event-handler-attributes}` | low | **all 100%** | ✅ | **Quest #09.** real FileReader: async reads, ProgressEvent, on* handler attrs, abort |
 | `FileAPI/reading-data-section/filereader_result.any.html` | 0/12 | **8/12** | ⬆️ | **Quest #09.** result/readyState semantics (4 left = event-loop microtask-drain timing) |
 
+| `domparsing/DOMParser-parseFromString-html.html` | 4/10 | **9/10** | ⬆️ | **Quest #14 Inc 1.** Real `DOMParser.parseFromString('text/html')` → detached HTML doc (was a stub returning the live `document`!) + `compatMode` (DOCTYPE→CSS1Compat else BackCompat) + invalid-type TypeError; last = scripting-disabled noscript parse |
+| `domparsing/XMLSerializer-serializeToString.html` | 1/29 | **3/29** | ⬆️ | **Quest #14 Inc 1** (html-mode parse helps a couple); rest needs a real namespace-aware XML parser + spec XMLSerializer (Inc 2) |
+
 ¹ url-origin was never measured under the old regex URL parser (would have been low). ² baseline from earlier sessions, logged for context.
 
 ## Open quests (measured, not yet tackled)

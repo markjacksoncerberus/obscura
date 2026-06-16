@@ -30,6 +30,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~11~~ | ✅ [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | **getElementsBy\* all 100%** | ⚔️⚔️ | **SECURED** |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ insertNode **1531**, surround **1247** | ⚔️⚔️⚔️ | +1171 this session (validity + live doctype); tails = doctype-order + range-setup IndexSizeError |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
+| 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️ real `DOMParser('text/html')` DONE (9/10) | ⚔️⚔️⚔️ | Inc 1: +7 (detached HTML doc, was returning the LIVE document!); Inc 2 = real namespace-aware XML parser + spec XMLSerializer (the long-deferred keystone; unlocks Node-normalize/tagName tails too) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
 
@@ -55,6 +56,20 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-16 (knight Claudius — Quest #14 The Parsing Foundry opened, +7):**
+- **Real `DOMParser.parseFromString`** (was a stub returning the LIVE `globalThis.document`
+  — a footgun where mutating a "parsed" doc mutated the real page). `text/html` now builds
+  a real detached HTML document via `_IframeDocument`; `compatMode` reflects the DOCTYPE
+  (CSS1Compat vs BackCompat); XML types build a detached doc with the right contentType +
+  page URL; invalid type → TypeError. Made `_IframeDocument`'s compatMode/contentType/location
+  getters honor the parser-set fields. **parseFromString-html 4→9/10, XMLSerializer 1→3/29.**
+  Zero regressions (qsa 1975, classlist 1420, createElement 147, iframe-load 2/2). Inc 2 (the
+  real keystone) = a namespace-aware XML parser + spec XMLSerializer — Scroll #14.
+- **Also: the honest territory map.** A 25-realm stratified WPT baseline sweep
+  (`scripts/wpt_baseline.py`) — the scriptable DOM core is 90–100% (traversal/events/
+  collections/encoding/FileAPI), the frontiers are `fetch` (~18%), `domparsing` (~11%),
+  CSSOM (~6%, needs render), `html/webappapis` (~36%: structuredClone is a JSON stub).
 
 **Session 2026-06-16 (knight Claudius — Quest #04 The URL Swamps — Increment 3, +7):**
 - **`///` special-authority-ignore-slashes.** For a special (non-`file`) base, a

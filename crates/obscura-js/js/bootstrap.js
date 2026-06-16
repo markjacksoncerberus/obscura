@@ -1905,7 +1905,7 @@ class Document extends Node {
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
-  get compatMode() { return "CSS1Compat"; }
+  get compatMode() { return this._compatMode || "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
   get charset() { return this.characterSet; }        // legacy alias of characterSet
   get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
@@ -2199,7 +2199,7 @@ class DetachedDocument extends Document {
   get ownerDocument() { return null; }
   get contentType() { return this._contentType || (this._kind === 'html' ? "text/html" : "application/xml"); }
   get _isHTMLDoc() { return this._kind === 'html'; }
-  get compatMode() { return "CSS1Compat"; }
+  get compatMode() { return this._compatMode || "CSS1Compat"; }
   get characterSet() { return "UTF-8"; }
   get charset() { return this.characterSet; }        // legacy alias of characterSet
   get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
@@ -4456,7 +4456,35 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
   toString() { return this._p.map(([k, v]) => _formEncode(k) + '=' + _formEncode(v)).join('&'); }
 };
 
-globalThis.DOMParser = class { parseFromString(s,t) { return globalThis.document; } };
+globalThis.DOMParser = class DOMParser {
+  parseFromString(str, type) {
+    str = (str == null) ? '' : String(str);
+    type = String(type);
+    const XML_TYPES = ['text/xml', 'application/xml', 'application/xhtml+xml', 'image/svg+xml'];
+    if (type === 'text/html') {
+      // Parse into a REAL detached HTML document (was a stub returning the live
+      // page — a footgun: mutating the "parsed" doc mutated the real page).
+      const doc = new _IframeDocument(str, 'about:blank', null, 'about:blank', 'html');
+      doc._contentType = 'text/html';
+      // Quirks: no-quirks (CSS1Compat) iff a `<!DOCTYPE html>` leads the input,
+      // else quirks (BackCompat). (Full quirks-mode table is out of scope here.)
+      doc._compatMode = /^[﻿\s]*<!doctype\s+html\s*>/i.test(str) ? 'CSS1Compat' : 'BackCompat';
+      return doc;
+    }
+    if (XML_TYPES.includes(type)) {
+      // Best-effort XML document (full namespace-aware XML parsing + a spec
+      // XMLSerializer are the next increment). Builds a detached doc — never the
+      // live page — and carries the spec metadata the WPT tests check.
+      const kind = (type === 'application/xhtml+xml') ? 'xhtml' : 'xml';
+      const pageURL = (_domParse('document_url') || 'about:blank');
+      const doc = new _IframeDocument(str, pageURL, null, pageURL, kind);
+      doc._contentType = type;
+      return doc;
+    }
+    throw new TypeError("Failed to execute 'parseFromString' on 'DOMParser': "
+      + "The provided value '" + type + "' is not a valid enum value of type SupportedType.");
+  }
+};
 globalThis.XMLSerializer = class XMLSerializer {
   serializeToString(node) {
     if (!node) return "";
@@ -5421,11 +5449,12 @@ class _IframeDocument extends DetachedDocument {
   get URL() { return this._url; }
   get documentURI() { return this._url; }
   get baseURI() { return this._baseUrl; }
-  get location() { return this._iframeEl?.contentWindow?.location; }
+  // A DOMParser-built document has no iframe element → location is null (spec).
+  get location() { return this._iframeEl ? (this._iframeEl.contentWindow?.location ?? null) : null; }
   get defaultView() { return this._iframeEl?.contentWindow || null; }
   get ownerDocument() { return null; }
-  get compatMode() { return 'CSS1Compat'; }
-  get contentType() { return 'text/html'; }
+  get compatMode() { return this._compatMode || 'CSS1Compat'; }
+  get contentType() { return this._contentType || 'text/html'; }
   get characterSet() { return 'UTF-8'; }
   get charset() { return this.characterSet; }        // legacy alias of characterSet
   get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
