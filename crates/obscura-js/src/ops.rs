@@ -1073,14 +1073,48 @@ fn url_components_json(u: &url::Url) -> String {
         Some(f) if !f.is_empty() => format!("#{}", f),
         _ => String::new(),
     };
+
+    // --- Path-serialization fix-ups for rust-url vs WHATWG divergences ---
+    // The path ends at the first query/fragment delimiter in the serialized href.
+    let mut href = u.as_str().to_string();
+    let mut pathname = u.path().to_string();
+    let path_end = href.find(|c| c == '?' || c == '#').unwrap_or(href.len());
+
+    if u.cannot_be_a_base() {
+        // Opaque path: the WHATWG opaque-path serializer percent-encodes a single
+        // trailing U+0020 — the last char before ?/#/EOF — as %20. rust-url keeps
+        // the literal space ONLY when a query/fragment follows (it trims a pure
+        // trailing space at EOF), so only the delimited cases are recoverable here.
+        if pathname.ends_with(' ') {
+            pathname.truncate(pathname.len() - 1);
+            pathname.push_str("%20");
+        }
+        let scheme_end = u.scheme().len() + 1; // index past the ':'
+        if path_end > scheme_end && href.as_bytes()[path_end - 1] == b' ' {
+            href.replace_range(path_end - 1..path_end, "%20");
+        }
+    } else {
+        // Non-opaque path: rust-url's path percent-encode set omits U+005E (^);
+        // WHATWG encodes it. A bare ^ can only occur in the path (scheme/authority/
+        // port never hold a literal ^), so encode it across the path region only —
+        // a ^ in the query/fragment stays literal.
+        if pathname.contains('^') {
+            pathname = pathname.replace('^', "%5E");
+        }
+        if href[..path_end].contains('^') {
+            let fixed = href[..path_end].replace('^', "%5E");
+            href.replace_range(..path_end, &fixed);
+        }
+    }
+
     serde_json::json!({
         "valid": true,
-        "href": u.as_str(),
+        "href": href,
         "protocol": format!("{}:", u.scheme()),
         "host": host_with_port,
         "hostname": u.host_str().unwrap_or(""),
         "port": u.port().map(|p| p.to_string()).unwrap_or_default(),
-        "pathname": u.path(),
+        "pathname": pathname,
         "search": search,
         "hash": hash,
         "origin": url_origin(u),

@@ -20,7 +20,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~01~~ | ✅ [The Selector Sorcery](01-the-selector-sorcery.md) | `dom/nodes/ParentNode-querySelector-All` | **1975/1975** | ⚔️⚔️ | **SECURED 100%** |
 | ~~02~~ | ✅ [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | **67/67** | ⚔️⚔️⚔️ | **SECURED** |
 | ~~03~~ | ✅ [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | **1420/1420** | ⚔️⚔️ | **SECURED 100%** |
-| 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | ⚔️ stripping **260/260** + statics **8/8** DONE; setters 232 | ⚔️⚔️⚔️ | Increment 1: +50 (userinfo no-strip, statics, hostname/port); remaining = rust-url-vs-WHATWG file/opaque/empty-host divergences |
+| 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | ⚔️ stripping **260/260** + statics **8/8** DONE; constructor 840, setters 241 | ⚔️⚔️⚔️ | Inc 1+2: +66 (userinfo no-strip, statics, hostname/port, path `^`, opaque-space); remaining = rust-url-vs-WHATWG file/empty-host/`/.`/`///` divergences |
 | ~~05~~ | ✅ [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | **147/147** | ⚔️⚔️⚔️ | **SECURED** |
 | 06 | [The Node-Smithing Vaults](06-the-node-smithing-vaults.md) | `dom/nodes/Node-*` | mixed | ⚔️⚔️ | ~150 |
 | 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | ⚔️ spec dispatch **DONE**; core 100% | ⚔️⚔️ | +110 this session (capturing/bubbling, event classes, trusted); tails = heavy cloneNode fixtures + synthetic-click |
@@ -55,6 +55,14 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-16 (knight Claudius — Quest #04 The URL Swamps — Increment 2, +16):**
+- Two spec-correct post-processing fix-ups in `url_components_json`:
+  **(1) path `^`→`%5E`** — rust-url's path percent-encode set omits U+005E; encode it
+  across the path region only (query/fragment `^` stays literal). **(2) opaque-path
+  trailing space → `%20`** — the WHATWG opaque-path serializer encodes the single
+  space before `?`/`#`/EOF; recoverable only when a delimiter follows (rust-url trims
+  the pure-trailing case). **constructor 833→840, setters 232→241.** Zero regressions.
 
 **Session 2026-06-16 (knight Claudius — Quest #04 The URL Swamps — Increment 1, +50):**
 - **userinfo setters stop stripping tab/newline.** `op_url_set` stripped `\t\n\r`

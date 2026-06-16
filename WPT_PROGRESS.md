@@ -16,7 +16,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-16.
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
-| `url/url-constructor.any.html` | 1/890 | **833/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057` |
+| `url/url-constructor.any.html` | 1/890 | **840/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057`; Quest #04 Inc 2 (path `^`→`%5E`, opaque trailing-space `%20`) |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
 | `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1975/1975** | ✅ 100% | **Quest #01 SECURED.** `namespaceURI` + foreign-ns `createElementNS`; `::slotted()` parse-but-never-match; iframe docs preserve `<html>/<head>/<body>` attrs; `:link` only `a`/`area`; real `:target` (URL-fragment id); real `NodeList` (`extends Array`, species→Array); `:root` matches a real document's root but not a fragment's child (Rust `real_documents` set) |
 | `dom/nodes/Document-createElement.html` | 0/147 | **147/147** | ✅ 100% | Quest #05: WebIDL coercion + InvalidCharacterError validation + ASCII-only casing + real `namespaceURI`/`prefix`; XML-document iframes (case-sensitive createElement, parsed-root documentElement) + iframes-delay-parent-load |
@@ -59,7 +59,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-16.
 | `dom/ranges/Range-cloneContents.html` | 0/187 | **177/187** | ⬆️ | Quest #12 ″ |
 | `dom/ranges/Range-deleteContents.html` | 0/125 | **103/125** | ⬆️ | Quest #12 ″ |
 | `dom/ranges/Range-extractContents.html` | 0/187 | **159/187** | ⬆️ | Quest #12 ″ (+2046 content-op subtests total, from 0) |
-| `url/url-setters.any.html` | 5/279 | **232/279** | ⬆️ | Setters' Sigil + Quest #04 Increment 1 (userinfo no-strip, hostname `:` reject, port whitespace no-op) |
+| `url/url-setters.any.html` | 5/279 | **241/279** | ⬆️ | Setters' Sigil + Quest #04 Inc 1 (userinfo no-strip, hostname `:` reject, port whitespace) + Inc 2 (path `^`, opaque trailing-space) |
 | `url/url-setters-stripping.any.html` | 224/260 | **260/260** | ✅ 100% | **Quest #04 Increment 1.** userinfo (username/password) setters percent-encode tab/LF/CR (`%09`/`%0A`/`%0D`) instead of stripping — strip moved per-part into `apply_url_setter` |
 | `url/url-statics-parse.any.html` | 0/8 | **8/8** | ✅ 100% | **Quest #04 Increment 1.** `URL.parse`/`URL.canParse` statics (parse→URL\|null, never throws) |
 | `url/url-searchparams.any.html` | 1/4 | **4/4** | ✅ 100% | Real URLSearchParams (form codec + URL two-way sync) |

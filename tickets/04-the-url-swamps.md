@@ -20,13 +20,13 @@
 
 ## 📊 Standing (measured 2026-06-16)
 
-| Test | Start | After Increment 1 | Note |
-|------|:-----:|:-----------------:|------|
-| `url-statics-parse.any`        | 0/8     | **8/8** ✅ | `URL.parse`/`canParse` added |
-| `url-setters-stripping.any`    | 224/260 | **260/260** ✅ | userinfo no-strip |
-| `url-setters.any`              | 226/279 | **232/279** | +6 (userinfo/hostname/port) |
-| `url-constructor.any`          | 833/890 | 833/890 | hard buckets remain |
-| `url-origin.any`               | 403/403 | **403/403** ✅ | held |
+| Test | Start | Inc 1 | Inc 2 | Note |
+|------|:-----:|:-----:|:-----:|------|
+| `url-statics-parse.any`        | 0/8     | **8/8** ✅   | 8/8 ✅ | `URL.parse`/`canParse` |
+| `url-setters-stripping.any`    | 224/260 | **260/260** ✅ | 260/260 ✅ | userinfo no-strip |
+| `url-setters.any`              | 226/279 | 232/279 | **241/279** | +15 |
+| `url-constructor.any`          | 833/890 | 833/890 | **840/890** | +7 |
+| `url-origin.any`               | 403/403 | 403/403 ✅ | 403/403 ✅ | held |
 
 ---
 
@@ -49,6 +49,23 @@ Tractable keystones, all small & safe:
    **setters +1.**
 
 ---
+
+## ⚔️ Increment 2 — SECURED (+16, zero regressions)
+
+Two spec-correct fix-ups in `url_components_json` (post-processing rust-url's output):
+1. **Path `^`→`%5E`** (bucket G). rust-url's path percent-encode set omits U+005E;
+   WHATWG encodes it. A bare `^` only occurs in the path, so encode it across the
+   path region of `href`/`pathname` (a `^` in query/fragment stays literal).
+   **constructor +2, setters +1.**
+2. **Opaque-path trailing space → `%20`** (bucket C, partial). The WHATWG opaque-path
+   serializer encodes the single space immediately before `?`/`#`/EOF. rust-url keeps
+   the literal space only when a query/fragment follows (it trims a pure trailing
+   space at EOF), so only the delimited cases are recoverable. **constructor +5,
+   setters +8.** The pure-trailing (`data:space ?query`.search='') cases remain
+   unrecoverable from rust-url output.
+
+Held: url-origin 403/403, url-with-fetch 16, url-with-xhr 14, url-format 6,
+stripping 260, statics 8, searchparams 4.
 
 ## 🐉 Remaining beasts (bucketed) — the hard ground
 
