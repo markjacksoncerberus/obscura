@@ -73,6 +73,20 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `html/.../the-iframe-element/content_document_changes_only_after_load_matures.html` | 1/1 | **1/1** | ✅ | held (gen-guard `229ff83`) |
 | `dom/nodes/Node-appendChild.html` | 1/11² | **11/11** | ✅ | iframe increments 1–3 (prior) |
 | `dom/events/EventListener-handleEvent.html` | 1/6² | **6/6** | ✅ | spec dispatch (prior) |
+| `dom/events/Event-subclasses-constructors.html` | 10/49 | **49/49** | ✅ 100% | **Quest #07.** Event-class hierarchy: UIEvent (view/detail) → Mouse/Keyboard/Focus/Composition/Input; null-options → empty dict; `view` type-check |
+| `dom/events/EventTarget-dispatchEvent.html` | 4/25 | **25/25** | ✅ 100% | **Quest #07.** WebIDL TypeError on non-Event; `_initialized` flag → InvalidStateError; spec dispatch |
+| `dom/events/Event-cancelBubble.html` | 0/8 | **8/8** | ✅ 100% | **Quest #07.** `cancelBubble` get/set + spec capturing/bubbling |
+| `dom/events/Event-returnValue.html` | 0/7 | **7/7** | ✅ 100% | **Quest #07.** `returnValue` get/set |
+| `dom/events/Event-propagation.html` | 4/7 | **7/7** | ✅ 100% | **Quest #07.** dispatch clears stop-flags on completion |
+| `dom/events/Event-initEvent.html` | 11/12 | **12/12** | ✅ 100% | **Quest #07.** mandatory-arg TypeError |
+| `dom/events/Event-constants.html` | 0/4 | **4/4** | ✅ 100% | **Quest #07.** eventPhase NONE/CAPTURING/AT_TARGET/BUBBLING constants |
+| `dom/events/CustomEvent.html` | 1/3 | **3/3** | ✅ 100% | **Quest #07.** `detail` defaults null; initCustomEvent mandatory-arg |
+| `dom/events/EventListenerOptions-capture.html` | 2/4 | **4/4** | ✅ 100% | **Quest #07.** flatten options (read getters) before null-callback check; non-dict opts → capture bool |
+| `dom/events/Event-type.html` / `Event-type-empty.html` | — | **3/3, 2/2** | ✅ | **Quest #07.** `type` String-coercion |
+| `dom/events/Event-stopPropagation-cancel-bubbling.html` | 0/1 | **1/1** | ✅ | **Quest #07.** legacy `window.event` set during dispatch |
+| `dom/events/Event-dispatch-{order,order-at-target,omitted-capture,propagation-stopped,bubble-canceled,handlers-changed,reenter,target-removed,target-moved,multiple-stopPropagation,multiple-cancelBubble}.html` | mostly 0/1 | **all 1/1** | ✅ | **Quest #07.** capturing→target→bubbling path to window |
+| `dom/events/Event-dispatch-detached-click.html` / `Event-defaultPrevented-after-dispatch.html` / `EventTarget-this-of-listener.html` / `Event-stopImmediatePropagation.html` / `EventTarget-dispatchEvent-returnvalue.html` | — | **2/2, 2/2, 6/6, 1/1, 2/2** | ✅ | **Quest #07.** |
+| `dom/events/Event-dispatch-redispatch.html` | 2/4 | **3/4** | ⬆️ | **Quest #07.** trusted DOMContentLoaded/load; public dispatch clears isTrusted (last fail = synthetic click) |
 
 ¹ url-origin was never measured under the old regex URL parser (would have been low). ² baseline from earlier sessions, logged for context.
 

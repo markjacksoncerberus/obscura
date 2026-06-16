@@ -23,7 +23,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | 833+226 | ⚔️⚔️⚔️ | ~110 |
 | ~~05~~ | ✅ [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | **147/147** | ⚔️⚔️⚔️ | **SECURED** |
 | 06 | [The Node-Smithing Vaults](06-the-node-smithing-vaults.md) | `dom/nodes/Node-*` | mixed | ⚔️⚔️ | ~150 |
-| 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | mixed | ⚔️⚔️ | ~? |
+| 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | ⚔️ spec dispatch **DONE**; core 100% | ⚔️⚔️ | +110 this session (capturing/bubbling, event classes, trusted); tails = heavy cloneNode fixtures + synthetic-click |
 | 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | 2/6+ | ⚔️⚔️ | ~? |
 | 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | 4/8+ | ⚔️⚔️ | ~? |
 | 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | ⚔️ traversal **DONE**; ranges 90%+ | ⚔️⚔️⚔️ | iframe content-ops left |
@@ -55,6 +55,30 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-16 (knight Claudius — Quest #07 The Event Amphitheater — spec dispatch, +110):**
+- **Unified spec-compliant event dispatch (DOM §2.9).** Replaced a bubble-only
+  recursion (no capturing phase, no path to window, plus a stale `addEventListener(){}`
+  no-op stub on `Node` that surfaced once Element/Document's own copies were removed)
+  with one `_dispatchSpec`: every EventTarget (node / Document / window / iframe
+  win+doc) stores listeners in one `_eventRegistry` keyed by `_evtRegKey`, and
+  dispatch runs capturing (root→target) then bubbling (target→root) over a path
+  built by `_eventParent` (parentNode → document.defaultView → window).
+- **Event surface:** eventPhase constants, `cancelBubble`/`returnValue`,
+  `composedPath()`, instance `isTrusted`, `type` coercion, `initEvent`/
+  `initCustomEvent` mandatory-arg + `_initialized` flag; WebIDL guards
+  (`dispatchEvent(null)`→TypeError, uninitialized/in-flight→InvalidStateError);
+  option flattening before the null-callback check.
+- **Event-class hierarchy:** UIEvent(view/detail) → Mouse/Keyboard/Focus/Composition/
+  Input; Wheel/Pointer → Mouse; null-options → empty dict.
+- **Trusted model:** public dispatch clears `isTrusted` (after the state check);
+  UA events (frame load, main DOMContentLoaded/load) dispatch directly to stay
+  trusted; legacy `window.event` set during dispatch.
+- **Headline:** Event-subclasses-constructors 10→**49/49**, EventTarget-dispatchEvent
+  4→**25/25**, Event-cancelBubble 0→**8/8**, Event-returnValue **7/7**, Event-propagation
+  4→**7/7**, Event-constants 0→**4/4**, CustomEvent 1→**3/3**, EventListenerOptions-capture
+  2→**4/4**, ~15 dispatch tests 0→1/1. **~110+ subtests, zero regressions.**
+
 
 URL realm (`constructor 1→833`, `origin →403/403`, `setters 5→226`, `searchparams 1→4/4` + family),
 `Element-classlist ~0→1315/1420`, `Node-appendChild 1→11/11`, `EventListener-handleEvent 1→6/6`,

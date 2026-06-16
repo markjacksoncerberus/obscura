@@ -8,22 +8,14 @@ globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.prevent
 globalThis.onerror = function(msg, src, line, col, error) {
   __obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
 };
-const __windowListeners = {};
-globalThis.addEventListener = function(type, fn) {
-  if (!__windowListeners[type]) __windowListeners[type] = [];
-  __windowListeners[type].push(fn);
-};
-globalThis.removeEventListener = function(type, fn) {
-  if (__windowListeners[type]) {
-    __windowListeners[type] = __windowListeners[type].filter(h => h !== fn);
-  }
-};
-globalThis.dispatchEvent = function(event) {
-  if (!event) return true;
-  const handlers = __windowListeners[event.type] || [];
-  for (const h of handlers) { try { h.call(globalThis, event); } catch(e) { console.error(e); } }
-  return !event.defaultPrevented;
-};
+// The window is an EventTarget like any other: its listeners live in the shared
+// _eventRegistry (key 'window') and it dispatches through the unified spec path,
+// so a window listener participates in capturing/bubbling for events dispatched
+// on descendant nodes. The core (_addListener/_dispatchSpec) is defined later but
+// only referenced when these are CALLED (at runtime, after bootstrap loads).
+globalThis.addEventListener = function(type, fn, opts) { _addListener(globalThis, type, fn, opts); };
+globalThis.removeEventListener = function(type, fn, opts) { _removeListener(globalThis, type, fn, opts); };
+globalThis.dispatchEvent = function(event) { return _dispatchPublic(globalThis, event); };
 
 // Report an uncaught listener exception the way the platform does: fire an
 // `error` event on the window (EventWatcher/onerror observe this), then fall
@@ -39,9 +31,14 @@ const _reportError = function(err) {
   if (!ev) ev = { type: 'error', error: err, message: (err && err.message) || String(err),
                   defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
   try {
-    const handlers = (__windowListeners['error'] || []).slice();
-    for (const h of handlers) {
-      try { (typeof h === 'function' ? h : h.handleEvent).call(globalThis, ev); } catch (e) {}
+    // Deliver to the window's 'error' listeners directly (not via dispatchEvent —
+    // this is called from inside a dispatch's catch, and re-entering dispatch on
+    // the same event object would throw). The window is the whole path for a
+    // window-targeted error event, so capture/bubble listeners both apply.
+    const entries = ((_eventRegistry['window'] || {})['error'] || []).slice();
+    for (const e of entries) {
+      const h = e && e.handler;
+      try { (typeof h === 'function' ? h : h && h.handleEvent).call(globalThis, ev); } catch (_) {}
     }
   } catch (e) {}
   try {
@@ -361,6 +358,12 @@ class Node {
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 0x20;
 
   constructor(nid) { this._nid = nid; }
+  // EventTarget surface — shared by every node kind (Element, Document, Text,
+  // CharacterData, DocumentFragment, DocumentType). All route through the unified
+  // spec dispatch keyed by the node's _nid.
+  addEventListener(type, handler, opts) { _addListener(this, type, handler, opts); }
+  removeEventListener(type, handler, opts) { _removeListener(this, type, handler, opts); }
+  dispatchEvent(event) { return _dispatchPublic(this, event); }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   // A node's owner is the main document unless it was created by / adopted into
@@ -744,7 +747,6 @@ class Node {
     const ns = (namespace == null || namespace === '') ? null : String(namespace);
     return _locateNamespace(this, null) === ns;
   }
-  addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
 }
 // "Locate a namespace" (DOM §4.4): resolve `prefix` (null = default) to a
 // namespace URI by walking up the element chain. The element's own namespace (when
@@ -1525,57 +1527,6 @@ class Element extends Node {
   }
   insertAdjacentElement(position, element) { return this._insertAdjacentNode(position, element); }
   insertAdjacentText(position, text) { this._insertAdjacentNode(position, document.createTextNode(String(text))); }
-  addEventListener(type, handler, opts) {
-    if (!handler) return;
-    // opts may be a boolean (capture) or { capture, once, passive }.
-    const o = (typeof opts === 'boolean') ? { capture: opts } : (opts || {});
-    const cap = !!o.capture;
-    const key = this._nid;
-    if (!_eventRegistry[key]) _eventRegistry[key] = {};
-    if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
-    const list = _eventRegistry[key][type];
-    // Per spec, a duplicate (type, handler, capture) registration is ignored.
-    if (list.some(e => e.handler === handler && e.capture === cap)) return;
-    list.push({ handler, capture: cap, once: !!o.once, passive: !!o.passive });
-  }
-  removeEventListener(type, handler, opts) {
-    const key = this._nid;
-    const cap = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
-    if (_eventRegistry[key] && _eventRegistry[key][type]) {
-      _eventRegistry[key][type] =
-        _eventRegistry[key][type].filter(e => !(e.handler === handler && e.capture === cap));
-    }
-  }
-  dispatchEvent(event) {
-    if (!event) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
-    // Snapshot: listeners added during this dispatch must not run for it.
-    const entries = ((_eventRegistry[this._nid] || {})[event.type] || []).slice();
-    for (const e of entries) {
-      const h = e.handler;
-      // `once` listeners are removed before invocation (per spec).
-      if (e.once) this.removeEventListener(event.type, h, { capture: e.capture });
-      try {
-        if (typeof h === 'function') {
-          // A callable listener is called directly; its `handleEvent` (if any) is ignored.
-          h.call(this, event);
-        } else {
-          // Object listener: Get `handleEvent` ONCE per dispatch (may be a getter),
-          // and it must be callable — otherwise this is a TypeError.
-          const he = h && h.handleEvent;
-          if (typeof he !== 'function')
-            throw new TypeError("Failed to invoke event listener: 'handleEvent' is not a function");
-          he.call(h, event);
-        }
-      } catch(err) { _reportError(err); }
-      if (event._immediatePropagationStopped) break;
-    }
-    if (event.bubbles && !event._propagationStopped && this.parentNode) {
-      this.parentNode.dispatchEvent(event);
-    }
-    return !event.defaultPrevented;
-  }
   click() {
     const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
     if (!cancelled) {
@@ -2051,6 +2002,7 @@ class Document extends Node {
       'focusevent': FocusEvent,
       'inputevent': InputEvent,
       'uievent': UIEvent, 'uievents': UIEvent,
+      'compositionevent': CompositionEvent,
       'wheelevent': WheelEvent,
       'pointerevent': PointerEvent,
       'errorevent': ErrorEvent,
@@ -2059,29 +2011,14 @@ class Document extends Node {
       'transitionevent': TransitionEvent,
     };
     const Cls = map[String(type || '').toLowerCase()] || Event;
-    return new Cls('');
+    const e = new Cls('');
+    e._initialized = false; // createEvent yields an uninitialized event (needs initEvent)
+    return e;
   }
   createRange() {
     const r = new Range();
     r.setStart(this, 0); r.setEnd(this, 0);
     return r;
-  }
-  addEventListener(type, fn, opts) {
-    if (typeof fn !== 'function') return;
-    if (!this._listeners) this._listeners = {};
-    if (!this._listeners[type]) this._listeners[type] = [];
-    if (!this._listeners[type].includes(fn)) this._listeners[type].push(fn);
-  }
-  removeEventListener(type, fn) {
-    if (this._listeners?.[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== fn);
-    }
-  }
-  dispatchEvent(event) {
-    if (!event) return true;
-    const handlers = (this._listeners?.[event.type] || []).slice();
-    for (const h of handlers) { try { h.call(this, event); } catch(e) { console.error('document event error:', e); } }
-    return !event.defaultPrevented;
   }
   createTreeWalker(root, whatToShow, filter) {
     if (!(root instanceof Node)) throw new TypeError("createTreeWalker: root must be a Node");
@@ -2498,33 +2435,71 @@ const _registerIframe = function(iframeEl) {
 let _syntheticKeyCounter = 0;
 const _nextSyntheticKey = function() { return 'syn:' + (++_syntheticKeyCounter); };
 const _addListenerByKey = function(key, type, handler, opts) {
-  if (!handler) return;
-  const o = (typeof opts === 'boolean') ? { capture: opts } : (opts || {});
-  const cap = !!o.capture;
+  // §"flatten more" — read capture/once/passive (may be getters) BEFORE the
+  // null-callback check, and treat a non-dictionary options value as the capture
+  // boolean (so e.g. addEventListener(t, fn, 2.3) captures).
+  const o = (typeof opts === 'object' && opts !== null) ? opts : { capture: !!opts };
+  const cap = !!o.capture, once = !!o.once, passive = !!o.passive;
+  if (handler == null) return; // a null callback is ignored (after flattening)
   if (!_eventRegistry[key]) _eventRegistry[key] = {};
   if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
   const list = _eventRegistry[key][type];
   if (list.some(e => e.handler === handler && e.capture === cap)) return;
-  list.push({ handler, capture: cap, once: !!o.once, passive: !!o.passive });
+  list.push({ handler, capture: cap, once, passive });
 };
 const _removeListenerByKey = function(key, type, handler, opts) {
-  const cap = (typeof opts === 'boolean') ? opts : !!(opts && opts.capture);
+  const cap = !!((typeof opts === 'object' && opts !== null) ? opts.capture : opts);
   if (_eventRegistry[key] && _eventRegistry[key][type]) {
     _eventRegistry[key][type] =
       _eventRegistry[key][type].filter(e => !(e.handler === handler && e.capture === cap));
   }
 };
-// Dispatch `event` on `target` using registry `key`. If the event bubbles and
-// `bubbleTo` is given, it propagates there next (frame document -> frame window,
-// matching the real Document -> Window event path for DOMContentLoaded etc.).
-const _dispatchByKey = function(target, key, event, bubbleTo) {
-  if (!event) return true;
-  if (!event.target) event.target = target;
+// ---- Unified spec-compliant event dispatch (DOM §2.9) ----
+// Every EventTarget — element/text node, Document, the window, and synthetic
+// iframe window/document targets — stores listeners in the one _eventRegistry,
+// keyed below, and dispatches through the same capturing/target/bubbling path.
+//
+// Registry key for any EventTarget: the window, a node (by _nid), or any other
+// target by a lazily-assigned synthetic _evtKey.
+const _evtRegKey = function(t) {
+  if (t === globalThis) return 'window';
+  if (t && typeof t._nid === 'number') return t._nid;
+  if (t && t._evtKey) return t._evtKey;
+  if (t) {
+    const k = _nextSyntheticKey();
+    try { Object.defineProperty(t, '_evtKey', { value: k, enumerable: false, configurable: true }); }
+    catch (e) { t._evtKey = k; }
+    return k;
+  }
+  return null;
+};
+// The parent in the event-propagation tree: a node's parentNode, a document's
+// browsing-context window (defaultView), and nothing above a window.
+const _eventParent = function(node) {
+  if (!node || node === globalThis) return null;
+  if (node.nodeType === 9) return node.defaultView || null;
+  if (typeof node.nodeType !== 'number') return null; // window-like target
+  return node.parentNode || null;
+};
+// DOM §2.9 "inner invoke" for one struct of the event path: run the target's
+// listeners that match the current phase, honoring once / stopImmediatePropagation
+// and re-checking removal against the live list.
+const _invokeListeners = function(target, event, phase) {
+  // §2.9 invoke step: if propagation was stopped, this struct is skipped entirely.
+  if (event._propagationStopped) return;
   event.currentTarget = target;
-  const entries = ((_eventRegistry[key] || {})[event.type] || []).slice();
-  for (const e of entries) {
+  const key = _evtRegKey(target);
+  const reg = _eventRegistry[key];
+  if (!reg) return;
+  const listeners = (reg[event.type] || []).slice();
+  for (const e of listeners) {
+    if (event._immediatePropagationStopped) break;
+    const live = (_eventRegistry[key] || {})[event.type];
+    if (!live || live.indexOf(e) === -1) continue; // removed since the snapshot
+    if (phase === 'capturing' && !e.capture) continue;
+    if (phase === 'bubbling' && e.capture) continue;
+    if (e.once) _removeListenerByKey(key, event.type, e.handler, { capture: e.capture });
     const h = e.handler;
-    if (e.once) _removeListenerByKey(key, event.type, h, { capture: e.capture });
     try {
       if (typeof h === 'function') {
         h.call(target, event);
@@ -2535,12 +2510,71 @@ const _dispatchByKey = function(target, key, event, bubbleTo) {
         he.call(h, event);
       }
     } catch (err) { _reportError(err); }
-    if (event._immediatePropagationStopped) break;
   }
-  if (event.bubbles && !event._propagationStopped && bubbleTo) {
-    bubbleTo.dispatchEvent(event);
+};
+// DOM §2.9 dispatch: build the propagation path (target -> ancestors -> document
+// -> window), then run the capturing pass (root..target), then the bubbling pass
+// (target..root). Returns false iff the event was canceled. The stop-propagation
+// and canceled flags are NOT reset here (the constructor / initEvent own that), so
+// an event whose propagation was stopped before dispatch invokes no listeners.
+const _dispatchSpec = function(target, event, fromPublic) {
+  // WebIDL: dispatchEvent's argument is a non-nullable Event.
+  if (!(event instanceof Event))
+    throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
+  // §2.8 dispatchEvent step 1: in-flight or uninitialized events cannot be dispatched.
+  if (event._dispatchFlag || event._initialized === false)
+    throw new DOMException("The event is already being dispatched, or has not been initialized.", "InvalidStateError");
+  // §2.8 step 2: a public dispatchEvent makes the event untrusted — AFTER the
+  // state check above, so a throwing re-dispatch leaves isTrusted intact.
+  if (fromPublic) event._isTrusted = false;
+  event._dispatchFlag = true;
+  if (!event.target) event.target = target;
+  // Legacy window.event: reflects the event currently being dispatched (some
+  // scripts read the global `event` instead of the listener parameter).
+  const _prevWindowEvent = globalThis.event;
+  try { globalThis.event = event; } catch (e) {}
+
+  const path = [];
+  for (let n = target; n; n = _eventParent(n)) path.push(n);
+  event._composedPath = path;
+
+  // Capturing pass: root -> target (inclusive). The target struct is AT_TARGET.
+  for (let i = path.length - 1; i >= 0; i--) {
+    const item = path[i];
+    event.eventPhase = (item === target) ? 2 : 1;
+    _invokeListeners(item, event, 'capturing');
   }
+  // Bubbling pass: target -> root. Non-target structs only when the event bubbles.
+  for (let i = 0; i < path.length; i++) {
+    const item = path[i];
+    if (item === target) event.eventPhase = 2;
+    else if (event.bubbles) event.eventPhase = 3;
+    else continue;
+    _invokeListeners(item, event, 'bubbling');
+  }
+
+  // §2.9 clean-up: clear the stop-propagation flags so the event can be dispatched
+  // again (the canceled / defaultPrevented flag intentionally persists).
+  event.eventPhase = 0;
+  event.currentTarget = null;
+  event._composedPath = null;
+  event._propagationStopped = false;
+  event._immediatePropagationStopped = false;
+  event._dispatchFlag = false;
+  try { globalThis.event = _prevWindowEvent; } catch (e) {}
   return !event.defaultPrevented;
+};
+// The public EventTarget.dispatchEvent: §2.8 sets isTrusted to false, then runs
+// the dispatch algorithm. UA-originated events (a frame's load, DOMContentLoaded)
+// instead call _dispatchSpec directly so their trusted flag survives.
+const _dispatchPublic = function(target, event) {
+  return _dispatchSpec(target, event, true);
+};
+const _addListener = function(target, type, handler, opts) {
+  _addListenerByKey(_evtRegKey(target), String(type), handler, opts);
+};
+const _removeListener = function(target, type, handler, opts) {
+  _removeListenerByKey(_evtRegKey(target), String(type), handler, opts);
 };
 
 // ---- Same-origin iframe script execution (iframe increment 4, Option C) ----
@@ -2709,9 +2743,11 @@ const _executeFrameScripts = async function(iframeEl) {
 const _fireIframeElementLoad = function(el) {
   if (!el || el._loadEventFired) return;
   el._loadEventFired = true;
-  const ev = new Event('load'); // isTrusted=true, bubbles=false, cancelable=false
+  const ev = new Event('load'); // bubbles=false, cancelable=false
+  ev.isTrusted = true; // UA-originated load event
   ev.target = el;
-  try { el.dispatchEvent(ev); } catch (e) {}
+  // Dispatch directly (not the public dispatchEvent, which would clear isTrusted).
+  try { _dispatchSpec(el, ev); } catch (e) {}
   if (typeof el.onload === 'function') { try { el.onload(ev); } catch (e) {} }
   else { const a = el.getAttribute && el.getAttribute('onload'); if (a) { try { (0, eval)(a); } catch (e) {} } }
 };
@@ -3763,63 +3799,169 @@ globalThis.IntersectionObserver = class {
 globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
 
 globalThis.Event = class Event {
-  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
-  get isTrusted() { return true; }
+  constructor(t,o) {
+    o = (o == null) ? {} : o; // a null/undefined dictionary is the empty dictionary
+    this.type = (t === undefined) ? "" : String(t);
+    this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;
+    this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;
+    this.timeStamp=Date.now();
+    this._propagationStopped=false;this._immediatePropagationStopped=false;
+    this._isTrusted=false;this._dispatchFlag=false;this._composedPath=null;
+    this._initialized=true; // constructed events are initialized; createEvent unsets this
+  }
+  // isTrusted is false for script-dispatched events; the engine marks UA-originated
+  // events (e.g. a frame's load) trusted via the internal setter.
+  get isTrusted() { return this._isTrusted === true; }
+  set isTrusted(v) { this._isTrusted = !!v; }
   get srcElement() { return this.target; } // legacy alias for target
-  preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
-  initEvent(type,bubbles,cancelable) { this.type=type;this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  // The frozen propagation path during dispatch; [] when not dispatching.
+  composedPath() { return (this.currentTarget && this._composedPath) ? this._composedPath.slice() : []; }
+  // Legacy aliases backed by the stop-propagation / canceled state.
+  get cancelBubble() { return this._propagationStopped; }
+  set cancelBubble(v) { if (v) this._propagationStopped = true; }
+  get returnValue() { return !this.defaultPrevented; }
+  set returnValue(v) { if (v === false && this.cancelable) this.defaultPrevented = true; }
+  preventDefault() { if (this.cancelable) this.defaultPrevented=true; }
+  stopPropagation(){ this._propagationStopped=true; }
+  stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
+  initEvent(type,bubbles,cancelable) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent': 1 argument required, but only 0 present.");
+    if (this._dispatchFlag) return; // no-op while dispatching
+    this._initialized=true;
+    this.type = (type === undefined) ? "" : String(type);
+    this.bubbles=!!bubbles;this.cancelable=!!cancelable;
+    this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false;
+    this._isTrusted=false;this.target=null;
+  }
 };
+// eventPhase constants — on the interface object AND the prototype (so instances
+// see them through the chain); testharness's `name in object` accepts inherited.
+for (const [k, v] of [["NONE",0],["CAPTURING_PHASE",1],["AT_TARGET",2],["BUBBLING_PHASE",3]]) {
+  Object.defineProperty(Event, k, { value: v, enumerable: true, writable: false, configurable: false });
+  Object.defineProperty(Event.prototype, k, { value: v, enumerable: true, writable: false, configurable: false });
+}
 globalThis.CustomEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.detail=o.detail; }
+  constructor(t,o={}) { super(t,o);this.detail=(o.detail !== undefined ? o.detail : null); }
   // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
   // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
   // instead of new CustomEvent(...). See issue #41.
   initCustomEvent(type,bubbles,cancelable,detail) {
-    this.type = type;
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initCustomEvent': 1 argument required, but only 0 present.");
+    if (this._dispatchFlag) return;
+    this._initialized = true;
+    this.type = (type === undefined) ? "" : String(type);
     this.bubbles = !!bubbles;
     this.cancelable = !!cancelable;
-    this.detail = detail;
+    this.defaultPrevented = false;
+    this._propagationStopped = false; this._immediatePropagationStopped = false;
+    this._isTrusted = false; this.target = null;
+    this.detail = (detail !== undefined ? detail : null);
   }
 };
-globalThis.MouseEvent = class extends Event {
-  constructor(t,o={}) {
+// Shared EventModifierInit getModifierState (Mouse/Keyboard).
+const _modifierState = function(ev, key) {
+  switch (key) {
+    case 'Control': return !!ev.ctrlKey;
+    case 'Shift': return !!ev.shiftKey;
+    case 'Alt': return !!ev.altKey;
+    case 'Meta': return !!ev.metaKey;
+    case 'AltGraph': return !!ev.modifierAltGraph;
+    case 'CapsLock': return !!ev.modifierCapsLock;
+    case 'NumLock': return !!ev.modifierNumLock;
+    default: return false;
+  }
+};
+// UIEvent — base for the visual/input event interfaces (view, detail). Defined
+// before its subclasses (MouseEvent etc.) so `extends UIEvent` resolves.
+globalThis.UIEvent = class UIEvent extends Event {
+  constructor(t,o) {
+    o = (o == null) ? {} : o;
     super(t,o);
-    this.screenX = o.screenX || 0;
-    this.screenY = o.screenY || 0;
-    this.clientX = o.clientX || 0;
-    this.clientY = o.clientY || 0;
+    let view = (o.view !== undefined) ? o.view : null;
+    // WebIDL: view is Window? — a non-object, non-null value can't convert.
+    if (view !== null && typeof view !== 'object')
+      throw new TypeError("Failed to construct 'UIEvent': member view is not a Window.");
+    this.view = view;
+    this.detail = (o.detail != null) ? o.detail : 0;
+  }
+  initUIEvent(type, bubbles, cancelable, view, detail) {
+    this.initEvent(type, bubbles, cancelable);
+    this.view = view !== undefined ? view : null;
+    this.detail = detail !== undefined ? detail : 0;
+  }
+};
+globalThis.MouseEvent = class MouseEvent extends UIEvent {
+  constructor(t,o) {
+    o = (o == null) ? {} : o;
+    super(t,o);
+    this.screenX = o.screenX ?? 0;
+    this.screenY = o.screenY ?? 0;
+    this.clientX = o.clientX ?? 0;
+    this.clientY = o.clientY ?? 0;
     this.ctrlKey = !!o.ctrlKey;
     this.shiftKey = !!o.shiftKey;
     this.altKey = !!o.altKey;
     this.metaKey = !!o.metaKey;
     this.button = o.button ?? 0;
     this.buttons = o.buttons ?? 0;
-    this.relatedTarget = o.relatedTarget || null;
-    this.detail = o.detail || 0;
+    this.relatedTarget = o.relatedTarget ?? null;
+    // Legacy/derived coordinates (best-effort; no layout box here).
+    this.pageX = this.clientX; this.pageY = this.clientY;
+    this.x = this.clientX; this.y = this.clientY;
+    this.offsetX = 0; this.offsetY = 0;
+    this.movementX = o.movementX ?? 0; this.movementY = o.movementY ?? 0;
   }
+  getModifierState(k) { return _modifierState(this, k); }
 };
-globalThis.KeyboardEvent = class extends Event { constructor(t,o={}) { super(t,o);this.key=o.key||"";this.code=o.code||""; } };
-globalThis.FocusEvent = class extends Event {};
-globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
-globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
-globalThis.PointerEvent = class extends Event { constructor(t,o={}) { super(t,o); } };
-globalThis.AnimationEvent = class extends Event {};
-globalThis.TransitionEvent = class extends Event {};
-globalThis.UIEvent = class extends Event {};
-globalThis.WheelEvent = class extends MouseEvent {
-  constructor(t,o={}) {
+globalThis.WheelEvent = class WheelEvent extends MouseEvent {
+  constructor(t,o) {
+    o = (o == null) ? {} : o;
     super(t,o);
-    this.deltaX = o.deltaX || 0;
-    this.deltaY = o.deltaY || 0;
-    this.deltaZ = o.deltaZ || 0;
-    this.deltaMode = o.deltaMode || 0;
+    this.deltaX = o.deltaX ?? 0;
+    this.deltaY = o.deltaY ?? 0;
+    this.deltaZ = o.deltaZ ?? 0;
+    this.deltaMode = o.deltaMode ?? 0;
   }
 };
-globalThis.PopStateEvent = class extends Event {};
-globalThis.HashChangeEvent = class extends Event {};
-globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data; } };
-globalThis.ClipboardEvent = class extends Event {};
-globalThis.SubmitEvent = class extends Event {};
+globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
+  constructor(t,o) {
+    o = (o == null) ? {} : o;
+    super(t,o);
+    this.ctrlKey = !!o.ctrlKey;
+    this.shiftKey = !!o.shiftKey;
+    this.altKey = !!o.altKey;
+    this.metaKey = !!o.metaKey;
+    this.key = o.key !== undefined ? String(o.key) : "";
+    this.code = o.code !== undefined ? String(o.code) : "";
+    this.location = o.location ?? 0;
+    this.repeat = !!o.repeat;
+    this.isComposing = !!o.isComposing;
+    this.charCode = o.charCode ?? 0;
+    this.keyCode = o.keyCode ?? 0;
+    this.which = o.which ?? 0;
+  }
+  getModifierState(k) { return _modifierState(this, k); }
+};
+globalThis.FocusEvent = class FocusEvent extends UIEvent {
+  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.relatedTarget = o.relatedTarget ?? null; }
+};
+globalThis.CompositionEvent = class CompositionEvent extends UIEvent {
+  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.data = o.data !== undefined ? String(o.data) : ""; }
+};
+globalThis.InputEvent = class InputEvent extends UIEvent {
+  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.data = o.data !== undefined ? o.data : null; this.inputType = o.inputType || ""; this.isComposing = !!o.isComposing; }
+};
+globalThis.ErrorEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o);this.message=o.message||"";this.filename=o.filename||"";this.lineno=o.lineno||0;this.colno=o.colno||0;this.error=o.error??null; } };
+globalThis.PointerEvent = class PointerEvent extends MouseEvent {
+  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.pointerId=o.pointerId??0; this.pointerType=o.pointerType||""; this.isPrimary=!!o.isPrimary; this.pressure=o.pressure??0; this.width=o.width??1; this.height=o.height??1; }
+};
+globalThis.AnimationEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.animationName=o.animationName||""; this.elapsedTime=o.elapsedTime??0; this.pseudoElement=o.pseudoElement||""; } };
+globalThis.TransitionEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.propertyName=o.propertyName||""; this.elapsedTime=o.elapsedTime??0; this.pseudoElement=o.pseudoElement||""; } };
+globalThis.PopStateEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.state=o.state??null; } };
+globalThis.HashChangeEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.oldURL=o.oldURL||""; this.newURL=o.newURL||""; } };
+globalThis.MessageEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o);this.data=o.data??null;this.origin=o.origin||"";this.lastEventId=o.lastEventId||"";this.source=o.source??null;this.ports=o.ports||[]; } };
+globalThis.ClipboardEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.clipboardData=o.clipboardData??null; } };
+globalThis.SubmitEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.submitter=o.submitter??null; } };
 
 const _abortError = function(name, msg) { if (typeof DOMException === 'function') return new DOMException(msg, name); const e = new Error(msg); e.name = name; return e; };
 globalThis.AbortSignal = class AbortSignal {
@@ -4933,8 +5075,9 @@ class _IframeDocument extends DetachedDocument {
   addEventListener(type, handler, opts) { _addListenerByKey(this._evtKey, type, handler, opts); }
   removeEventListener(type, handler, opts) { _removeListenerByKey(this._evtKey, type, handler, opts); }
   dispatchEvent(event) {
-    // Document events bubble to the frame's window (real Document -> Window path).
-    return _dispatchByKey(this, this._evtKey, event, this._iframeEl?.contentWindow);
+    // Document events bubble to the frame's window via the unified path
+    // (_eventParent follows this document's defaultView -> contentWindow).
+    return _dispatchPublic(this, event);
   }
 
   write(html) { const b = this.body; if (b) b.innerHTML += html; }
@@ -5022,7 +5165,7 @@ class _IframeWindow {
   removeEventListener(type, handler, opts) { _removeListenerByKey(this._evtKey, type, handler, opts); }
   dispatchEvent(event) {
     // Frame window is the top of the frame's propagation tree — no further bubble.
-    return _dispatchByKey(this, this._evtKey, event);
+    return _dispatchPublic(this, event);
   }
 
   getComputedStyle(el) { return globalThis.getComputedStyle(el); }

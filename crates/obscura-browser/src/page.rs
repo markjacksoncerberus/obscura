@@ -552,8 +552,8 @@ impl Page {
             // "delay the load event" resource — the load event must wait for it).
             let _ = js.execute_script("<dcl-events>",
                 "globalThis.__documentReadyState__ = 'interactive';\n\
-                 try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
-                 try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
+                 try { var __dcl=new Event('DOMContentLoaded', {bubbles:false,cancelable:false}); __dcl.isTrusted=true; _dispatchSpec(document, __dcl); } catch(e) {}\n\
+                 try { var __dclw=new Event('DOMContentLoaded', {bubbles:false,cancelable:false}); __dclw.isTrusted=true; _dispatchSpec(window, __dclw); } catch(e) {}\n\
                  try { if (typeof __startFrameLoads === 'function') __startFrameLoads(); } catch(e) {}");
         }
 
@@ -566,7 +566,7 @@ impl Page {
             let _ = js.execute_script("<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
                  if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}");
+                 try { var __ld=new Event('load', {bubbles:false,cancelable:false}); __ld.isTrusted=true; _dispatchSpec(window, __ld); } catch(e) {}");
         }
 
         // Pump again so async work kicked off by load handlers settles.
