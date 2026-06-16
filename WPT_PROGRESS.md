@@ -99,7 +99,10 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `encoding/legacy-mb-schinese/gbk/gbk-decoder.any.html` | best-effort | **82/82** | ✅ 100% | **Quest #08b.** |
 | `encoding/iso-2022-jp-decoder.any.html` | best-effort | **34/34** | ✅ 100% | **Quest #08b.** stateful ISO-2022-JP via `encoding_rs` op |
 | `encoding/textdecoder-eof.any.html` | 1/2 | **2/2** | ✅ 100% | **Quest #08b.** legacy streaming via whole-buffer re-decode + suffix diff (Big5 `stream:true`) |
-| `encoding/textdecoder-mistakes.any.html` | 83/87 | **84/87** | ⬆️ | **Quest #08b.** ASCII-only label lowercasing (U+212A KELVIN no longer folds to 'k'); tails = 2 utf-16-truncated + iso-2022-jp fatal-stream state |
+| `encoding/textdecoder-mistakes.any.html` | 83/87 | **86/87** | ⬆️ | **Quest #08b.** ASCII-only label lowercasing (U+212A KELVIN no longer folds to 'k') + utf-16 EOF coalesces pending lead-surrogate/odd-byte into ONE U+FFFD; tail = iso-2022-jp fatal-stream state |
+| `FileAPI/url/url-format.any.html` | 3/6 | **6/6** | ✅ 100% | **Quest #09b.** blob: URL = `blob:{origin}/{uuid-v4}` |
+| `FileAPI/url/url-with-fetch.any.html` | 1/16 | **16/16** | ✅ 100% | **Quest #09b.** byte-backed blob store; fragment-strip, GET-only, reject (TypeError) on revoked/query/path; Request snapshots blob at construction |
+| `FileAPI/url/url-with-xhr.any.html` | ~0/14 | **14/14** | ✅ 100% | **Quest #09b.** same store via XHR→fetch; XHR `open()` snapshots blob; catch path now fires `onreadystatechange` (was a hang) + statusText 'OK' |
 | `FileAPI/blob/Blob-constructor.any.html` | 36/73 | **69/73** | ⬆️ | **Quest #09.** byte-backed Blob; WebIDL sequence/dict guards; type normalization |
 | `FileAPI/blob/Blob-slice.any.html` | 60/150 | **144/150** | ⬆️ | **Quest #09.** spec slice (relative start/end, contentType) |
 | `FileAPI/blob/{Blob-array-buffer,Blob-text,Blob-bytes,Blob-constructor-endings}` | low | **all 100%** | ✅ | **Quest #09.** arrayBuffer()/text()/bytes(); native-EOL endings |

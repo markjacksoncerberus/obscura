@@ -3037,15 +3037,25 @@ globalThis.fetch = async (input, init = {}) => {
     : (input instanceof Request
       ? input.url
       : ((typeof URL === 'function' && input instanceof URL) ? input.href : (input?.url || input?.href || String(input || ""))));
-  // blob: object URLs resolve from the in-page object-URL store (no network).
-  if (typeof url === 'string' && url.startsWith('blob:')) {
-    if (Object.prototype.hasOwnProperty.call(__blobStore, url)) {
-      return new Response(__blobStore[url], {
-        status: 200, statusText: '',
-        headers: { 'content-type': __blobTypes[url] || 'text/plain' },
+  // blob: object URLs resolve from the in-page object-URL store (no network). A
+  // Request constructed from a blob: URL snapshots its bytes, so it still fetches
+  // after the URL is revoked. Per spec: only GET; the fragment is ignored for
+  // identity, but a query/path/anything-else mismatch (or a revoked URL) must
+  // make fetch REJECT (TypeError), not resolve with an error response.
+  const _blobSnap = (input instanceof Request) ? input._blobSnapshot : null;
+  if (_blobSnap || (typeof url === 'string' && url.startsWith('blob:'))) {
+    const method = (init.method || (input instanceof Request ? input.method : 'GET') || 'GET').toUpperCase();
+    const key = (typeof url === 'string') ? url.split('#')[0] : '';
+    let bytes, type;
+    if (Object.prototype.hasOwnProperty.call(__blobStore, key)) { bytes = __blobStore[key]; type = __blobTypes[key] || ''; }
+    else if (_blobSnap) { bytes = _blobSnap.bytes; type = _blobSnap.type; }
+    if (method === 'GET' && bytes !== undefined) {
+      return new Response(bytes, {
+        status: 200, statusText: 'OK',
+        headers: type ? { 'content-type': type } : {},
       });
     }
-    return new Response('', { status: 404, statusText: '' });
+    throw new TypeError("Failed to fetch: blob URL not found, revoked, or non-GET method");
   }
   if (url && !url.includes('://')) {
     try {
@@ -3137,6 +3147,14 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
   open(method, url, async_) {
     this._method = method;
     this._url = url;
+    // Snapshot a blob: URL's bytes at open() (spec: the request references the
+    // blob now) so a revokeObjectURL before send() doesn't break the fetch.
+    this._blobSnapshot = null;
+    if (typeof url === 'string' && url.startsWith('blob:')) {
+      const _bk = url.split('#')[0];
+      if (Object.prototype.hasOwnProperty.call(__blobStore, _bk))
+        this._blobSnapshot = { bytes: __blobStore[_bk], type: __blobTypes[_bk] || '' };
+    }
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
@@ -3182,7 +3200,10 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       } catch(e) {}
     }
 
-    fetch(url, {
+    // Carry an open()-time blob snapshot through to fetch via a Request.
+    let _input = url;
+    if (this._blobSnapshot) { _input = new Request(url, { method: this._method }); _input._blobSnapshot = this._blobSnapshot; }
+    fetch(_input, {
       method: this._method,
       headers: this._headers,
       body: body || undefined,
@@ -3233,8 +3254,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     }).catch((err) => {
       if (xhr._aborted) return;
       xhr.status = 0;
-      xhr.readyState = 4;
-      xhr._fireEvent('readystatechange');
+      xhr._setReadyState(4); // sets readyState + fires readystatechange AND onreadystatechange
       if (err && err.__aborted) {
         xhr._aborted = true;
         xhr._fireEvent('abort');
@@ -3362,9 +3382,16 @@ if (typeof Request === 'undefined') {
   globalThis.Request = class Request {
     constructor(input, init = {}) {
       if (typeof input === 'string') { this.url = input; }
-      else if (input instanceof Request) { this.url = input.url; init = { ...input, ...init }; }
+      else if (input instanceof Request) { this.url = input.url; if (input._blobSnapshot) this._blobSnapshot = input._blobSnapshot; init = { ...input, ...init }; }
       else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
       else { this.url = input?.url || input?.href || String(input); }
+      // Snapshot blob: contents now (spec: a request takes a reference to the blob
+      // when created) so a later revokeObjectURL doesn't break the fetch.
+      if (!this._blobSnapshot && typeof this.url === 'string' && this.url.startsWith('blob:')) {
+        const _bk = this.url.split('#')[0];
+        if (Object.prototype.hasOwnProperty.call(__blobStore, _bk))
+          this._blobSnapshot = { bytes: __blobStore[_bk], type: __blobTypes[_bk] || '' };
+      }
       this.method = (init.method || 'GET').toUpperCase();
       this.headers = new Headers(init.headers);
       this.body = init.body || null;
@@ -3375,7 +3402,7 @@ if (typeof Request === 'undefined') {
       this.signal = init.signal || { aborted: false, addEventListener(){}, removeEventListener(){} };
       this.cache = init.cache || 'default';
     }
-    clone() { return new Request(this.url, { method: this.method, headers: this.headers, body: this.body }); }
+    clone() { const r = new Request(this.url, { method: this.method, headers: this.headers, body: this.body }); if (this._blobSnapshot) r._blobSnapshot = this._blobSnapshot; return r; }
     async text() { return this.body ? String(this.body) : ''; }
     async json() { return JSON.parse(await this.text()); }
     async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }
@@ -3601,8 +3628,10 @@ const _decodeUtf16 = function(bytes, le, fatal, st, flush) {
     out += String.fromCharCode(unit);
   }
   if (flush) {
-    if (st.lead !== null) { st.lead = null; if (fatal) _encFatal(); out += '�'; }
-    if (st.pend >= 0) { st.pend = -1; if (fatal) _encFatal(); out += '�'; } // trailing odd byte
+    // WHATWG utf-16 decoder, end-of-queue: if EITHER a lead surrogate or a lead
+    // (odd) byte is still pending, that is a SINGLE error — not one per pending
+    // item ("does not produce more chars than truncated").
+    if (st.lead !== null || st.pend >= 0) { st.lead = null; st.pend = -1; if (fatal) _encFatal(); out += '�'; }
   }
   return out;
 };
@@ -5948,9 +5977,10 @@ globalThis.Worker = class Worker {
     const worker = this;
 
     if (typeof url === 'string' && (url.startsWith('blob:') || url.startsWith('http'))) {
-      const blobContent = __blobStore?.[url];
-      if (blobContent) {
-        this._code = blobContent;
+      const blobContent = __blobStore?.[url.split('#')[0]];
+      if (blobContent != null) {
+        // Blob store now holds bytes; worker source must be text.
+        this._code = (blobContent instanceof Uint8Array) ? new TextDecoder().decode(blobContent) : blobContent;
       } else {
         (async () => {
           try {
@@ -6010,19 +6040,34 @@ globalThis.Worker = class Worker {
 
 const __blobStore = {};
 const __blobTypes = {};
+// A v4 UUID (8-4-4-4-12 with version nibble 4 and the 8/9/a/b variant) — the
+// FileAPI spec requires a blob: URL's path to be a valid UUID.
+const _uuidV4 = function() {
+  let s = '';
+  for (let i = 0; i < 36; i++) {
+    if (i === 8 || i === 13 || i === 18 || i === 23) s += '-';
+    else if (i === 14) s += '4';
+    else if (i === 19) s += (8 + Math.floor(Math.random() * 4)).toString(16);
+    else s += Math.floor(Math.random() * 16).toString(16);
+  }
+  return s;
+};
 const _origCreateObjectURL = URL.createObjectURL;
 URL.createObjectURL = function(blob) {
-  const id = 'blob:obscura/' + Math.random().toString(36).substring(2);
+  // Spec format: "blob:" + serialized origin + "/" + UUID (e.g.
+  // blob:https://host/<uuid>); origin "null" pages get blob:null/<uuid>.
+  const origin = (function() {
+    try { return new URL(_domParse("document_url") || "about:blank").origin; }
+    catch (e) { return 'null'; }
+  })();
+  const id = 'blob:' + (origin && origin !== 'null' ? origin : 'null') + '/' + _uuidV4();
   if (blob) {
     __blobTypes[id] = blob.type || '';
-    // Store the content SYNCHRONOUSLY when available (our Blob keeps _data), so a
-    // consumer that fetches the URL on the next tick (e.g. an iframe src load)
-    // sees the content. Fall back to async text() for other blob-likes.
-    if (typeof blob._data === 'string') {
-      __blobStore[id] = blob._data;
-    } else if (typeof blob.text === 'function') {
-      blob.text().then(text => { __blobStore[id] = text; });
-    }
+    // Store the BYTES synchronously (byte-backed Blob) so a consumer fetching on
+    // the next tick sees exact binary content; fall back for other blob-likes.
+    if (blob._bytes instanceof Uint8Array) __blobStore[id] = blob._bytes.slice();
+    else if (typeof blob._data === 'string') __blobStore[id] = blob._data;
+    else if (typeof blob.text === 'function') blob.text().then(text => { __blobStore[id] = text; });
   }
   return id;
 };

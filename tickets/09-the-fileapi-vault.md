@@ -44,11 +44,43 @@ reads). Rebuilt all three in `bootstrap.js`:
 
 **~153 → ~330 subtests (measured). Zero regressions.**
 
+## The second siege — blob: URL byte store (session 2026-06-16, #09b)
+
+The first siege left `createObjectURL` minting `blob:obscura/<rand>` and storing blob
+*text* (lossy, async). Rebuilt the object-URL layer around the byte-backed Blob:
+
+- **Spec URL format** `blob:{serialized origin}/{uuid-v4}` (origin from the page URL;
+  `blob:null/<uuid>` for opaque origins). `_uuidV4` emits a valid 8-4-4-4-12 v4 UUID so
+  `new URL(blobUrl).pathname` matches the FileAPI UUID regex. → `url-format` 3/6→**6/6**.
+- **Byte store**: `createObjectURL` snapshots `blob._bytes` synchronously; `fetch` of a
+  blob: URL strips the fragment for identity, allows **only GET**, and **rejects with
+  TypeError** (not a 404 Response) on a revoked/query/path mismatch — so `promise_rejects_js`
+  works. → `url-with-fetch` 1/16→**16/16**.
+- **Request/XHR snapshotting**: `new Request(blobUrl)` and `XMLHttpRequest.open(…, blobUrl)`
+  capture the blob's bytes at construction/open, so a `revokeObjectURL` before the actual
+  fetch still succeeds (`clone()` carries the snapshot too).
+- **XHR fixes surfaced here**: the error/catch path now goes through `_setReadyState(4)` so
+  `onreadystatechange` fires (it previously called `_fireEvent('readystatechange')`, which
+  intentionally skips the on-handler → `xhr_should_fail` hung); blob responses report
+  `statusText: 'OK'`. → `url-with-xhr` ~0/14→**14/14**.
+
+### Scoreboard (#09b)
+
+| Test | Before | After |
+|------|:------:|:-----:|
+| url-format | 3/6 | **6/6** |
+| url-with-fetch | 1/16 | **16/16** |
+| url-with-xhr | ~0/14 | **14/14** |
+
+**+~34 subtests. Zero regressions** (Blob-constructor 69, Blob-slice 144, File-constructor 49,
+filereader_events 2, Element-classlist 1420 all held).
+
 ## The honest tail
 - A few Blob/File subtests need element `toString` fidelity (`String(htmlBodyElement)`
   → `"[object HTMLBodyElement]"`), SharedArrayBuffer, and deep WebIDL getter-order.
 - `filereader_result`'s last 4 ("result is null during progress") depend on a *second*
   read's trailing `loadend` firing after the promise_test completes — sensitive to
   Obscura's microtask-drain-between-macrotasks timing (the `loadstart` variant passes).
-- Not pursued: the blob: URL **byte** store (currently string-keyed — `FileAPI/url/*`),
-  `FileList`, worker-context reads.
+- `FileAPI/url/url-reload` (blob survives a page reload) and `url-in-tags` (blob in
+  `<img>`/`<script>`/`<video>` src) need the navigation / tag-resource-loading subsystems,
+  not just the store — left as tails. `FileList`, worker-context reads also not pursued.

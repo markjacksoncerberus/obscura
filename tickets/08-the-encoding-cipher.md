@@ -78,11 +78,12 @@ fatal 36, streaming 32, encodeInto 110, Element-classlist 1420 all held).
 ## The honest tail
 - **SharedArrayBuffer** inputs (1 subtest in `textdecoder-copy`) — no SAB support.
 - 1 `encodeInto` subtest is a deep WebIDL getter-evaluation-order edge.
-- `textdecoder-mistakes` (3): 2 are the JS **utf-16 decoder** emitting an extra U+FFFD on a
-  truncated trailing unit ("does not produce more chars than truncated"); 1 is
-  `fatal stream: iso-2022-jp`, which needs the decoder's escape-sequence **state to persist
-  across a thrown error mid-stream** — impossible with the stateless re-decode (would need a
-  persistent `encoding_rs::Decoder` kept alive per `TextDecoder`).
+- `textdecoder-mistakes` (1 left, 86/87): the 2 utf-16-truncated subtests are FIXED — the
+  utf-16 decoder now coalesces a pending lead-surrogate and/or pending odd byte at EOF into
+  a *single* U+FFFD (WHATWG end-of-queue is one error, not one per pending item). The
+  remaining `fatal stream: iso-2022-jp` needs the decoder's escape-sequence **state to
+  persist across a thrown error mid-stream** — impossible with the stateless re-decode
+  (would need a persistent `encoding_rs::Decoder` kept alive per `TextDecoder`).
 - The `*-decode.html` (Ishida) suites decode via an iframe served in the legacy charset —
   that's the **HTML-parser charset** path, a separate subsystem, not `TextDecoder`.
 - `unsupported-encodings` / `replacement-encodings` test the **XHR `overrideMimeType`
