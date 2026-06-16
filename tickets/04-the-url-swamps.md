@@ -20,13 +20,15 @@
 
 ## 📊 Standing (measured 2026-06-16)
 
-| Test | Start | Inc 1 | Inc 2 | Note |
-|------|:-----:|:-----:|:-----:|------|
-| `url-statics-parse.any`        | 0/8     | **8/8** ✅   | 8/8 ✅ | `URL.parse`/`canParse` |
-| `url-setters-stripping.any`    | 224/260 | **260/260** ✅ | 260/260 ✅ | userinfo no-strip |
-| `url-setters.any`              | 226/279 | 232/279 | **241/279** | +15 |
-| `url-constructor.any`          | 833/890 | 833/890 | **840/890** | +7 |
-| `url-origin.any`               | 403/403 | 403/403 ✅ | 403/403 ✅ | held |
+| Test | Start | Inc 1 | Inc 2 | Inc 3 | Note |
+|------|:-----:|:-----:|:-----:|:-----:|------|
+| `url-statics-parse.any`        | 0/8     | **8/8** ✅   | 8/8 ✅ | 8/8 ✅ | `URL.parse`/`canParse` |
+| `url-setters-stripping.any`    | 224/260 | **260/260** ✅ | 260/260 ✅ | 260/260 ✅ | userinfo no-strip |
+| `url-setters.any`              | 226/279 | 232/279 | **241/279** | 241/279 | +15 |
+| `url-constructor.any`          | 833/890 | 833/890 | 840/890 | **847/890** | +14 |
+| `url-origin.any`               | 403/403 | 403/403 ✅ | 403/403 ✅ | 403/403 ✅ | held |
+
+**Session total: +73** (statics +8, stripping +36, setters +15, constructor +14).
 
 ---
 
@@ -67,7 +69,23 @@ Two spec-correct fix-ups in `url_components_json` (post-processing rust-url's ou
 Held: url-origin 403/403, url-with-fetch 16, url-with-xhr 14, url-format 6,
 stripping 260, statics 8, searchparams 4.
 
+## ⚔️ Increment 3 — SECURED (+7, zero regressions)
+
+**`///` special-authority-ignore-slashes** (bucket D). For a special (non-`file`)
+base, a scheme-relative ref with 3+ leading slashes/backslashes skips ALL of them
+before reading the authority (`///host` ≡ `//host`); rust-url instead rejects the
+3+-slash form. `collapse_special_authority_slashes` (in `op_url_parse`) collapses the
+leading slash/backslash run to exactly `//` before `b.join(...)`. Gated to
+special-non-`file` bases (file preserves extra slashes as path). **constructor 840→847.**
+Held: url-setters 241, url-with-fetch 16, url-with-xhr 14, url-origin 403/403.
+
 ## 🐉 Remaining beasts (bucketed) — the hard ground
+
+> After Increments 1–3, the remaining ~43 constructor + ~38 setter fails are the
+> genuinely structural rust-url-vs-WHATWG divergences below. Buckets C (partial), D,
+> and G are now cleared; A, B, E, F, H remain. The clean long-term keystone is a
+> **real WHATWG basic URL parser** to replace rust-url — likely a user-decision-worthy
+> architectural siege, since rust-url also underpins fetch/XHR/blob/origin.
 
 These are **rust-url vs WHATWG structural divergences**. rust-url normalizes more
 aggressively than WHATWG and can't represent some states (empty-host-with-authority,

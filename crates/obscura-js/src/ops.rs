@@ -1134,13 +1134,37 @@ fn op_url_parse(#[string] input: String, #[string] base: String) -> String {
         url::Url::parse(&input)
     } else {
         match url::Url::parse(&base) {
-            Ok(b) => b.join(&input),
+            Ok(b) => {
+                let rel = collapse_special_authority_slashes(&input, &b);
+                b.join(&rel)
+            }
             Err(e) => Err(e),
         }
     };
     match parsed {
         Ok(u) => url_components_json(&u),
         Err(_) => "{\"valid\":false}".to_string(),
+    }
+}
+
+/// WHATWG "special authority ignore slashes state": for a special (non-`file`)
+/// base, a scheme-relative reference starting with 3+ leading slashes/backslashes
+/// skips ALL of them before reading the authority — so `///host` ≡ `//host`.
+/// rust-url instead rejects the 3+-slash form (empty host), so collapse the leading
+/// slash/backslash run to exactly `//`. `file:` has distinct slash semantics
+/// (extra slashes are preserved as path) and is left untouched.
+fn collapse_special_authority_slashes(input: &str, base: &url::Url) -> String {
+    if !url_is_special(base.scheme()) || base.scheme() == "file" {
+        return input.to_string();
+    }
+    let run = input
+        .chars()
+        .take_while(|c| *c == '/' || *c == '\\')
+        .count();
+    if run >= 3 {
+        format!("//{}", &input[run..])
+    } else {
+        input.to_string()
     }
 }
 

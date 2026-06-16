@@ -20,7 +20,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~01~~ | ✅ [The Selector Sorcery](01-the-selector-sorcery.md) | `dom/nodes/ParentNode-querySelector-All` | **1975/1975** | ⚔️⚔️ | **SECURED 100%** |
 | ~~02~~ | ✅ [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | **67/67** | ⚔️⚔️⚔️ | **SECURED** |
 | ~~03~~ | ✅ [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | **1420/1420** | ⚔️⚔️ | **SECURED 100%** |
-| 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | ⚔️ stripping **260/260** + statics **8/8** DONE; constructor 840, setters 241 | ⚔️⚔️⚔️ | Inc 1+2: +66 (userinfo no-strip, statics, hostname/port, path `^`, opaque-space); remaining = rust-url-vs-WHATWG file/empty-host/`/.`/`///` divergences |
+| 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | ⚔️ stripping **260/260** + statics **8/8** DONE; constructor 847, setters 241 | ⚔️⚔️⚔️ | Inc 1–3: **+73** (userinfo no-strip, statics, hostname/port, path `^`, opaque-space, `///` slash-skip); remaining = rust-url-vs-WHATWG `file:`/empty-host/`/.` divergences (real WHATWG parser is the keystone) |
 | ~~05~~ | ✅ [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | **147/147** | ⚔️⚔️⚔️ | **SECURED** |
 | 06 | [The Node-Smithing Vaults](06-the-node-smithing-vaults.md) | `dom/nodes/Node-*` | mixed | ⚔️⚔️ | ~150 |
 | 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | ⚔️ spec dispatch **DONE**; core 100% | ⚔️⚔️ | +110 this session (capturing/bubbling, event classes, trusted); tails = heavy cloneNode fixtures + synthetic-click |
@@ -55,6 +55,14 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-16 (knight Claudius — Quest #04 The URL Swamps — Increment 3, +7):**
+- **`///` special-authority-ignore-slashes.** For a special (non-`file`) base, a
+  scheme-relative ref with 3+ leading slashes/backslashes skips them all before the
+  authority (`///host` ≡ `//host`); rust-url rejects it. `collapse_special_authority_slashes`
+  collapses the leading run to `//` before `b.join`. **constructor 840→847.** Zero
+  regressions. Remaining constructor fails are `file:` drive-letter/slash + non-special
+  backslash — rust-url structural divergences (a real WHATWG parser is the keystone).
 
 **Session 2026-06-16 (knight Claudius — Quest #04 The URL Swamps — Increment 2, +16):**
 - Two spec-correct post-processing fix-ups in `url_components_json`:

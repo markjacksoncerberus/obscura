@@ -16,7 +16,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-16.
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
-| `url/url-constructor.any.html` | 1/890 | **840/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057`; Quest #04 Inc 2 (path `^`→`%5E`, opaque trailing-space `%20`) |
+| `url/url-constructor.any.html` | 1/890 | **847/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057`; Quest #04 Inc 2 (path `^`→`%5E`, opaque trailing-space `%20`) + Inc 3 (`///` special-authority slash-skip) |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
 | `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1975/1975** | ✅ 100% | **Quest #01 SECURED.** `namespaceURI` + foreign-ns `createElementNS`; `::slotted()` parse-but-never-match; iframe docs preserve `<html>/<head>/<body>` attrs; `:link` only `a`/`area`; real `:target` (URL-fragment id); real `NodeList` (`extends Array`, species→Array); `:root` matches a real document's root but not a fragment's child (Rust `real_documents` set) |
 | `dom/nodes/Document-createElement.html` | 0/147 | **147/147** | ✅ 100% | Quest #05: WebIDL coercion + InvalidCharacterError validation + ASCII-only casing + real `namespaceURI`/`prefix`; XML-document iframes (case-sensitive createElement, parsed-root documentElement) + iframes-delay-parent-load |
