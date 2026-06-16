@@ -24,7 +24,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~05~~ | ✅ [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | **147/147** | ⚔️⚔️⚔️ | **SECURED** |
 | 06 | [The Node-Smithing Vaults](06-the-node-smithing-vaults.md) | `dom/nodes/Node-*` | mixed | ⚔️⚔️ | ~150 |
 | 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | ⚔️ spec dispatch **DONE**; core 100% | ⚔️⚔️ | +110 this session (capturing/bubbling, event classes, trusted); tails = heavy cloneNode fixtures + synthetic-click |
-| 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | ⚔️ TextEncoder/Decoder **DONE** (~3900) | ⚔️⚔️ | +3800 this session; tails = Big5/legacy multi-byte index tables + SharedArrayBuffer |
+| 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | ⚔️ TextEncoder/Decoder + **legacy encodings DONE** (~7800) | ⚔️⚔️ | #08b: +3900 (all single-byte + gb18030/gbk/big5/euc/sjis/iso-2022-jp via `encoding_rs` op); tails = SAB, utf-16-truncated, iso-2022-jp fatal-stream state |
 | 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | ⚔️ Blob/File/FileReader **DONE** (~330) | ⚔️⚔️ | +180 this session; tails = element-toString, SAB, blob-URL store, FileList |
 | 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | ⚔️ traversal **DONE**; ranges 90%+ | ⚔️⚔️⚔️ | iframe content-ops left |
 | ~~11~~ | ✅ [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | **getElementsBy\* all 100%** | ⚔️⚔️ | **SECURED** |
@@ -55,6 +55,24 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-16 (knight Claudius — Quest #08b Legacy Encodings — ~+3900):**
+- **The expensive ground: legacy encodings via `encoding_rs`.** Instead of embedding the
+  large WHATWG index tables in JS, added a Rust op `op_text_decode` backed by `encoding_rs`
+  (Gecko's reference encoder, already a workspace dep) and routed every non-utf encoding
+  through it. `textdecoder-fatal-single-byte` ~half→**7168/7168** (all ISO-8859-*/KOI8/
+  windows-125x, every byte), `gb18030-decoder` **275/275**, `gbk-decoder` **82/82**,
+  `iso-2022-jp-decoder` **34/34**.
+- **Stateless streaming trick:** with `last=false` `encoding_rs` holds back partial
+  trailing sequences, so re-decoding a growing buffer only extends prior output — JS
+  slices the new suffix. Wins `textdecoder-eof` Big5 `stream:true` (1/2→**2/2**) with no
+  persistent Rust decoder state.
+- **ASCII-only label lowercasing** — JS `.toLowerCase()` folds U+212A KELVIN→'k' and
+  wrongly validated `'Koi8-r'`; fixed (`textdecoder-mistakes` 83→**84/87**).
+- Tails (documented): SharedArrayBuffer; 2 utf-16-truncated subtests (JS utf-16 decoder);
+  `fatal stream: iso-2022-jp` (needs decoder state to survive a mid-stream throw); the
+  Ishida `*-decode.html` (HTML-parser charset) and XHR `overrideMimeType` suites are
+  separate subsystems.
 
 **Session 2026-06-16 (knight Claudius — Quests #08 Encoding + #09 FileAPI — ~+4000):**
 - **#08 The Encoding Cipher — real TextEncoder/TextDecoder (~101 → ~3900).** Embedded

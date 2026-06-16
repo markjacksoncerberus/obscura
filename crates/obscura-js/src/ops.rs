@@ -1268,6 +1268,58 @@ fn apply_url_setter(u: &mut url::Url, part: &str, value: &str) {
     }
 }
 
+/// Decode bytes per the WHATWG Encoding Standard using `encoding_rs` (Gecko's
+/// reference implementation), covering the legacy single-byte and multi-byte
+/// encodings the JS `TextDecoder` can't table-decode itself (ISO-8859-*, KOI8,
+/// windows-125x, Big5, gbk/gb18030, EUC-jp/kr, Shift_JIS, ISO-2022-JP, …).
+///
+/// `name` is the already-resolved WHATWG encoding name. utf-8/utf-16/x-user-defined
+/// stay in JS; `replacement` never reaches here (the constructor throws). BOM
+/// handling is intentionally off — legacy encodings have no BOM, and the JS side
+/// owns BOM stripping for the utf encodings.
+///
+/// When `fatal` is set and the input is malformed, returns Err so the JS caller
+/// can throw a `TypeError`; otherwise errors become U+FFFD via replacement.
+///
+/// `stream` selects the decoder's `last` flag (`last = !stream`). Streaming is
+/// stateless across calls: the JS side feeds the whole accumulated buffer each
+/// time and slices off the newly-emitted suffix. With `last == false` the
+/// decoder holds back any incomplete trailing sequence, so decoding a growing
+/// prefix only ever *extends* the prior output — which makes that suffix diff
+/// correct without persisting a `Decoder` between op calls.
+#[op2]
+#[string]
+fn op_text_decode(
+    #[string] name: String,
+    #[buffer] data: &[u8],
+    fatal: bool,
+    stream: bool,
+) -> Result<String, deno_error::JsErrorBox> {
+    use encoding_rs::DecoderResult;
+    let enc = encoding_rs::Encoding::for_label_no_replacement(name.as_bytes())
+        .ok_or_else(|| deno_error::JsErrorBox::generic(format!("unknown encoding: {name}")))?;
+    let last = !stream;
+    let mut decoder = enc.new_decoder_without_bom_handling();
+    if fatal {
+        let cap = decoder
+            .max_utf8_buffer_length_without_replacement(data.len())
+            .unwrap_or(data.len() * 4 + 16);
+        let mut out = String::with_capacity(cap);
+        let (res, _read) = decoder.decode_to_string_without_replacement(data, &mut out, last);
+        match res {
+            DecoderResult::InputEmpty => Ok(out),
+            _ => Err(deno_error::JsErrorBox::generic("decode error")),
+        }
+    } else {
+        let cap = decoder
+            .max_utf8_buffer_length(data.len())
+            .unwrap_or(data.len() * 4 + 16);
+        let mut out = String::with_capacity(cap);
+        let (_res, _read, _had) = decoder.decode_to_string(data, &mut out, last);
+        Ok(out)
+    }
+}
+
 pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
@@ -1281,6 +1333,7 @@ pub fn build_extension() -> Extension {
             op_sleep(),
             op_url_parse(),
             op_url_set(),
+            op_text_decode(),
         ]),
         ..Default::default()
     }

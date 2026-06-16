@@ -2383,6 +2383,7 @@ dependencies = [
  "base64",
  "deno_core",
  "deno_error",
+ "encoding_rs",
  "html5ever 0.29.1",
  "obscura-dom",
  "obscura-net",

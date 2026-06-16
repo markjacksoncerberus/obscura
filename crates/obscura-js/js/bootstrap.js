@@ -3531,7 +3531,10 @@ const _LABEL_TO_NAME = (function() {
 // "Get an encoding" (WHATWG): trim leading/trailing ASCII whitespace, ASCII
 // lowercase, look up. Returns the canonical name or null on failure.
 const _getEncodingName = function(label) {
-  const s = String(label).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '').toLowerCase();
+  // ASCII lowercase only — JS .toLowerCase() is Unicode-aware and would fold
+  // e.g. U+212A (KELVIN SIGN) to 'k', wrongly validating 'Koi8-r'.
+  const s = String(label).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')
+    .replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
   return _LABEL_TO_NAME[s] || null;
 };
 // windows-1252 bytes 0x80-0x9F -> code point (0x00-0x7F and 0xA0-0xFF are identity).
@@ -3612,6 +3615,17 @@ const _decodeWin1252 = function(bytes) {
   return out;
 };
 
+// Decode legacy encodings via encoding_rs (Rust op_text_decode). On a fatal
+// malformed input the op throws a generic Error; surface it as the spec's
+// TypeError. `name` is the already-resolved WHATWG encoding name.
+const _decodeLegacy = function(name, bytes, fatal, stream) {
+  try {
+    return Deno.core.ops.op_text_decode(name, bytes, !!fatal, !!stream);
+  } catch (e) {
+    throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding " + name + ".");
+  }
+};
+
 if (typeof TextEncoder === 'undefined') {
   globalThis.TextEncoder = class TextEncoder {
     get encoding() { return 'utf-8'; }
@@ -3686,15 +3700,35 @@ if (typeof TextDecoder === 'undefined') {
         this._u8 = { cp: 0, needed: 0, seen: 0, lower: 0x80, upper: 0xBF };
         this._u16 = { lead: null, pend: -1 };
         this._bomSeen = false;
+        this._legacyBuf = null;
+        this._legacyEmitted = 0;
       }
       this._doNotFlush = stream;
       const flush = !stream;
+      // Legacy single-/multi-byte encodings: decode through encoding_rs (Rust op).
+      // Streaming is stateless: accumulate the whole buffer and re-decode it each
+      // call with last=!stream. With last=false encoding_rs holds back incomplete
+      // trailing sequences, so the decode of a growing prefix only extends prior
+      // output — we slice off the newly-emitted suffix to honour incremental
+      // streaming (matches textdecoder-eof's stream:true Big5 cases).
+      if (name !== 'utf-8' && name !== 'utf-16le' && name !== 'utf-16be' && name !== 'x-user-defined') {
+        let buf;
+        if (this._legacyBuf && this._legacyBuf.length) {
+          buf = new Uint8Array(this._legacyBuf.length + bytes.length);
+          buf.set(this._legacyBuf, 0); buf.set(bytes, this._legacyBuf.length);
+        } else buf = bytes;
+        this._legacyBuf = buf;
+        const full = _decodeLegacy(name, buf, this._fatal, stream);
+        const suffix = full.slice(this._legacyEmitted);
+        if (stream) { this._legacyEmitted = full.length; return suffix; }
+        this._legacyBuf = null; this._legacyEmitted = 0;
+        return suffix;
+      }
       let out;
       if (name === 'utf-16le') out = _decodeUtf16(bytes, true, this._fatal, this._u16, flush);
       else if (name === 'utf-16be') out = _decodeUtf16(bytes, false, this._fatal, this._u16, flush);
-      else if (name === 'windows-1252') out = _decodeWin1252(bytes);
       else if (name === 'x-user-defined') { out = ''; for (let i = 0; i < bytes.length; i++) { const b = bytes[i]; out += String.fromCharCode(b < 0x80 ? b : 0xF780 + (b - 0x80)); } }
-      else out = _decodeUtf8(bytes, this._fatal, this._u8, flush); // utf-8 + best-effort fallback
+      else out = _decodeUtf8(bytes, this._fatal, this._u8, flush); // utf-8
       // BOM removal (utf-8 / utf-16): once, at the start of the stream, unless ignoreBOM.
       if (!this._ignoreBOM && (name === 'utf-8' || name === 'utf-16le' || name === 'utf-16be') && !this._bomSeen && out.length > 0) {
         if (out.charCodeAt(0) === 0xFEFF) out = out.slice(1);

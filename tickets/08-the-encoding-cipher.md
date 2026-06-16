@@ -42,9 +42,48 @@ no streaming. Rebuilt the **Encoding API** in `bootstrap.js`:
 
 **~101 → ~3900 subtests. Zero regressions.**
 
+## The second siege — legacy encodings via encoding_rs (session 2026-06-16, #08b)
+
+The first siege left every legacy encoding as a utf-8 best-effort stub. Rather than
+embed the (large) WHATWG index tables in JS, we routed all non-utf encodings through
+**`encoding_rs`** — Gecko's reference implementation, already a workspace dependency —
+behind a new Rust op `op_text_decode(name, bytes, fatal, stream)` (`crates/obscura-js/src/ops.rs`).
+
+- `TextDecoder.decode` keeps utf-8 / utf-16le / utf-16be / x-user-defined on the JS
+  decoders (streaming/BOM already 100%); everything else (ISO-8859-*, KOI8, windows-125x,
+  Big5, gbk/gb18030, EUC-jp/kr, Shift_JIS, ISO-2022-JP) goes to the op.
+- **Streaming without persistent Rust state:** with `last=false` `encoding_rs` holds back
+  incomplete trailing sequences, so decoding a *growing* buffer only ever extends prior
+  output. JS accumulates the whole buffer, re-decodes each call, and slices off the new
+  suffix — incremental streaming that's correct for the stateless re-decode (wins the
+  Big5 `stream:true` cases in `textdecoder-eof`).
+- Fatal malformed input → op returns `Err` → JS throws `TypeError`.
+- **`_getEncodingName` now ASCII-lowercases** (not JS `.toLowerCase()`, which folds
+  U+212A KELVIN SIGN → 'k' and wrongly validated `'Koi8-r'`).
+
+### Scoreboard (#08b)
+
+| Test | Before | After |
+|------|:------:|:-----:|
+| textdecoder-fatal-single-byte (8 variants) | ~half | **7168/7168** |
+| gb18030-decoder | best-effort | **275/275** |
+| gbk-decoder | best-effort | **82/82** |
+| iso-2022-jp-decoder | best-effort | **34/34** |
+| textdecoder-eof | 1/2 | **2/2** |
+| textdecoder-mistakes | 83/87 | **84/87** |
+
+**~+3900 subtests. Zero regressions** (api-invalid-label 3421, textdecoder-labels 222,
+fatal 36, streaming 32, encodeInto 110, Element-classlist 1420 all held).
+
 ## The honest tail
-- **Big5 / legacy multi-byte** (gbk, gb18030, euc-jp/kr, shift_jis, iso-2022-*) decode
-  best-effort only — full correctness needs the WHATWG index tables (large). Costs the
-  2 Big5 subtests in `textdecoder-eof` and the single-byte/multibyte decoder suites.
 - **SharedArrayBuffer** inputs (1 subtest in `textdecoder-copy`) — no SAB support.
 - 1 `encodeInto` subtest is a deep WebIDL getter-evaluation-order edge.
+- `textdecoder-mistakes` (3): 2 are the JS **utf-16 decoder** emitting an extra U+FFFD on a
+  truncated trailing unit ("does not produce more chars than truncated"); 1 is
+  `fatal stream: iso-2022-jp`, which needs the decoder's escape-sequence **state to persist
+  across a thrown error mid-stream** — impossible with the stateless re-decode (would need a
+  persistent `encoding_rs::Decoder` kept alive per `TextDecoder`).
+- The `*-decode.html` (Ishida) suites decode via an iframe served in the legacy charset —
+  that's the **HTML-parser charset** path, a separate subsystem, not `TextDecoder`.
+- `unsupported-encodings` / `replacement-encodings` test the **XHR `overrideMimeType`
+  charset** path (data: URL + XHR), also out of scope for the decoder op.

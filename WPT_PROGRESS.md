@@ -94,6 +94,12 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `encoding/encodeInto.any.html` | 44/111 | **110/111** | ⬆️ | **Quest #08.** code-point-aware encodeInto + lone-surrogate→U+FFFD |
 | `encoding/textencoder-constructor-non-utf.any.html` | 54/79 | **79/79** | ✅ 100% | **Quest #08.** |
 | `encoding/{api-basics,textdecoder-arguments,textdecoder-ignorebom,textdecoder-byte-order-marks,textdecoder-utf16-surrogates,api-surrogates-utf8,textdecoder-fatal-streaming,textencoder-utf16-surrogates}.any.html` | mixed/low | **all 100%** | ✅ | **Quest #08.** utf-8/utf-16le/utf-16be/windows-1252 decode, BOM, fatal |
+| `encoding/textdecoder-fatal-single-byte.any.html` (8 variants) | ~half | **7168/7168** | ✅ 100% | **Quest #08b.** every byte × every single-byte encoding (ISO-8859-*, KOI8, windows-125x, …) via `encoding_rs` Rust op |
+| `encoding/legacy-mb-schinese/gb18030/gb18030-decoder.any.html` | best-effort | **275/275** | ✅ 100% | **Quest #08b.** gb18030/gbk via `encoding_rs` op |
+| `encoding/legacy-mb-schinese/gbk/gbk-decoder.any.html` | best-effort | **82/82** | ✅ 100% | **Quest #08b.** |
+| `encoding/iso-2022-jp-decoder.any.html` | best-effort | **34/34** | ✅ 100% | **Quest #08b.** stateful ISO-2022-JP via `encoding_rs` op |
+| `encoding/textdecoder-eof.any.html` | 1/2 | **2/2** | ✅ 100% | **Quest #08b.** legacy streaming via whole-buffer re-decode + suffix diff (Big5 `stream:true`) |
+| `encoding/textdecoder-mistakes.any.html` | 83/87 | **84/87** | ⬆️ | **Quest #08b.** ASCII-only label lowercasing (U+212A KELVIN no longer folds to 'k'); tails = 2 utf-16-truncated + iso-2022-jp fatal-stream state |
 | `FileAPI/blob/Blob-constructor.any.html` | 36/73 | **69/73** | ⬆️ | **Quest #09.** byte-backed Blob; WebIDL sequence/dict guards; type normalization |
 | `FileAPI/blob/Blob-slice.any.html` | 60/150 | **144/150** | ⬆️ | **Quest #09.** spec slice (relative start/end, contentType) |
 | `FileAPI/blob/{Blob-array-buffer,Blob-text,Blob-bytes,Blob-constructor-endings}` | low | **all 100%** | ✅ | **Quest #09.** arrayBuffer()/text()/bytes(); native-EOL endings |
