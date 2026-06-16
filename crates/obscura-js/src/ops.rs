@@ -1175,8 +1175,11 @@ fn set_port_from(u: &mut url::Url, raw: &str) {
 #[op2]
 #[string]
 fn op_url_set(#[string] href: String, #[string] part: String, #[string] value: String) -> String {
-    // WHATWG strips all tab (U+0009), LF (U+000A) and CR (U+000D) from setter input.
-    let value: String = value.chars().filter(|c| *c != '\t' && *c != '\n' && *c != '\r').collect();
+    // NOTE: tab (U+0009) / LF (U+000A) / CR (U+000D) stripping is now applied
+    // PER-PART inside `apply_url_setter` — WHATWG only strips for the setters that
+    // re-run the basic URL parser (protocol/host/hostname/port/pathname/search/
+    // hash); the username/password setters percent-encode the value directly, so
+    // a tab/newline there becomes %09/%0A/%0D (not removed).
     // The `url` crate's setters can panic internally on some adversarial inputs
     // (e.g. an empty host that corrupts internal offsets — url-2.5.8 lib.rs:2881).
     // Catch it so a URL setter can NEVER abort the process; a panic = no-op setter.
@@ -1197,74 +1200,100 @@ fn op_url_set(#[string] href: String, #[string] part: String, #[string] value: S
     }
 }
 
-fn apply_url_setter(u: &mut url::Url, part: &str, value: &str) {
+/// Remove all ASCII tab/LF/CR — the basic URL parser's first step, applied to the
+/// parser-based component setters (not username/password, which encode directly).
+fn strip_tab_newline(v: &str) -> String {
+    v.chars().filter(|c| *c != '\t' && *c != '\n' && *c != '\r').collect()
+}
+
+fn apply_url_setter(u: &mut url::Url, part: &str, raw: &str) {
     match part {
-        "protocol" => {
-            // Accept "https", "https:", "https:..." — the scheme is up to the ':'.
-            let scheme = value.split(':').next().unwrap_or("");
-            let _ = u.set_scheme(scheme);
-        }
+        // The userinfo setters DON'T strip tab/newline — they UTF-8 percent-encode
+        // the value with the userinfo encode set, so \t/\n/\r become %09/%0A/%0D.
         "username" => {
-            let _ = u.set_username(&value);
+            let _ = u.set_username(raw);
         }
         "password" => {
-            let _ = u.set_password(if value.is_empty() { None } else { Some(&value) });
+            let _ = u.set_password(if raw.is_empty() { None } else { Some(raw) });
         }
-        "hostname" => {
-            if !u.cannot_be_a_base() {
-                let special = url_is_special(u.scheme());
-                let v = hostname_prefix(&value, special);
-                if v.is_empty() {
-                    if !special {
-                        let _ = u.set_host(None);
-                    }
-                } else {
-                    let _ = u.set_host(Some(v));
+        // Port state: the LITERAL empty string clears the port; a value that is
+        // only tab/newline (empty after stripping but non-empty raw) is a no-op,
+        // per the basic URL parser's port state with state override.
+        "port" => {
+            if raw.is_empty() {
+                let _ = u.set_port(None);
+            } else {
+                let v = strip_tab_newline(raw);
+                if !v.is_empty() {
+                    set_port_from(u, &v);
                 }
             }
         }
-        "host" => {
-            // WHATWG host setter: stop at the first /?# (and \ for special), then
-            // split host[:port] (IPv6-aware); the port parser takes leading digits.
-            if !u.cannot_be_a_base() {
-                let special = url_is_special(u.scheme());
-                let v = truncate_host(&value, special);
-                if v.is_empty() {
-                    if !special {
-                        let _ = u.set_host(None);
-                    }
-                } else {
-                    let (host, port) = split_host_port(v);
-                    if u.set_host(Some(host)).is_ok() {
-                        if let Some(ps) = port {
-                            set_port_from(u, ps);
+        _ => {
+            let value = strip_tab_newline(raw);
+            match part {
+                "protocol" => {
+                    // Accept "https", "https:", "https:..." — scheme is up to the ':'.
+                    let scheme = value.split(':').next().unwrap_or("");
+                    let _ = u.set_scheme(scheme);
+                }
+                "hostname" => {
+                    if !u.cannot_be_a_base() {
+                        let special = url_is_special(u.scheme());
+                        // hostname state rejects a ':' (host-invalid-code-point) →
+                        // the WHOLE setter fails, leaving the host unchanged. (An
+                        // [IPv6] literal legitimately contains ':'.)
+                        let candidate = truncate_host(&value, special);
+                        if !candidate.starts_with('[') && candidate.contains(':') {
+                            return;
+                        }
+                        let v = hostname_prefix(&value, special);
+                        if v.is_empty() {
+                            if !special {
+                                let _ = u.set_host(None);
+                            }
+                        } else {
+                            let _ = u.set_host(Some(v));
                         }
                     }
                 }
+                "host" => {
+                    // WHATWG host setter: stop at the first /?# (and \ for special),
+                    // then split host[:port] (IPv6-aware); port parser takes digits.
+                    if !u.cannot_be_a_base() {
+                        let special = url_is_special(u.scheme());
+                        let v = truncate_host(&value, special);
+                        if v.is_empty() {
+                            if !special {
+                                let _ = u.set_host(None);
+                            }
+                        } else {
+                            let (host, port) = split_host_port(v);
+                            if u.set_host(Some(host)).is_ok() {
+                                if let Some(ps) = port {
+                                    set_port_from(u, ps);
+                                }
+                            }
+                        }
+                    }
+                }
+                "pathname" => {
+                    // Opaque-path URLs (mailto:, data:, sc:original) can't be set.
+                    if !u.cannot_be_a_base() {
+                        u.set_path(&value);
+                    }
+                }
+                "search" => {
+                    let q = value.strip_prefix('?').unwrap_or(&value);
+                    u.set_query(if value.is_empty() { None } else { Some(q) });
+                }
+                "hash" => {
+                    let f = value.strip_prefix('#').unwrap_or(&value);
+                    u.set_fragment(if value.is_empty() { None } else { Some(f) });
+                }
+                _ => {}
             }
         }
-        "port" => {
-            if value.is_empty() {
-                let _ = u.set_port(None);
-            } else {
-                set_port_from(u, value);
-            }
-        }
-        "pathname" => {
-            // Opaque-path URLs (mailto:, data:, sc:original) can't have their path set.
-            if !u.cannot_be_a_base() {
-                u.set_path(&value);
-            }
-        }
-        "search" => {
-            let q = value.strip_prefix('?').unwrap_or(&value);
-            u.set_query(if value.is_empty() { None } else { Some(q) });
-        }
-        "hash" => {
-            let f = value.strip_prefix('#').unwrap_or(&value);
-            u.set_fragment(if value.is_empty() { None } else { Some(f) });
-        }
-        _ => {}
     }
 }
 

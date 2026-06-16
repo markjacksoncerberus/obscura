@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
+Branch: `engine-per-page-threads`. Last updated: 2026-06-16.
 
 ## Scoreboard
 
@@ -59,7 +59,9 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `dom/ranges/Range-cloneContents.html` | 0/187 | **177/187** | ⬆️ | Quest #12 ″ |
 | `dom/ranges/Range-deleteContents.html` | 0/125 | **103/125** | ⬆️ | Quest #12 ″ |
 | `dom/ranges/Range-extractContents.html` | 0/187 | **159/187** | ⬆️ | Quest #12 ″ (+2046 content-op subtests total, from 0) |
-| `url/url-setters.any.html` | 5/279 | **226/279** | ⬆️ | Setters' Sigil + host/port/tab-strip batch |
+| `url/url-setters.any.html` | 5/279 | **232/279** | ⬆️ | Setters' Sigil + Quest #04 Increment 1 (userinfo no-strip, hostname `:` reject, port whitespace no-op) |
+| `url/url-setters-stripping.any.html` | 224/260 | **260/260** | ✅ 100% | **Quest #04 Increment 1.** userinfo (username/password) setters percent-encode tab/LF/CR (`%09`/`%0A`/`%0D`) instead of stripping — strip moved per-part into `apply_url_setter` |
+| `url/url-statics-parse.any.html` | 0/8 | **8/8** | ✅ 100% | **Quest #04 Increment 1.** `URL.parse`/`URL.canParse` statics (parse→URL\|null, never throws) |
 | `url/url-searchparams.any.html` | 1/4 | **4/4** | ✅ 100% | Real URLSearchParams (form codec + URL two-way sync) |
 | `url/urlsearchparams-sort.any.html` | n/a | **17/17** | ✅ 100% | ″ |
 | `url/urlsearchparams-stringifier.any.html` | n/a | **14/14** | ✅ 100% | ″ |

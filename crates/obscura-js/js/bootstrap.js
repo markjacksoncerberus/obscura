@@ -3362,6 +3362,14 @@ if (typeof URL === 'undefined' || !URL.prototype) {
     }
     toString() { return this._c.href; }
     toJSON() { return this._c.href; }
+    // WHATWG static methods: parse() returns a URL or null (never throws);
+    // canParse() returns whether the input parses (with the optional base).
+    static parse(url, base) {
+      try { return new URL(url, base); } catch (e) { return null; }
+    }
+    static canParse(url, base) {
+      try { new URL(url, base); return true; } catch (e) { return false; }
+    }
   };
 }
 
