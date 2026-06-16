@@ -3475,43 +3475,235 @@ globalThis.ResizeObserver = class ResizeObserver {
   disconnect() { this._targets = []; }
 };
 
+// ---- Encoding API (TextEncoder / TextDecoder) ----
+// WHATWG encoding label table (canonical name -> labels), straight from
+// https://encoding.spec.whatwg.org/encodings.json. Powers label validation and
+// the `encoding` attribute. We fully decode utf-8 / utf-16le / utf-16be /
+// windows-1252; other (legacy multi-byte) encodings carry the correct name and
+// decode best-effort.
+const _ENCODING_LABELS = {
+  "utf-8": ["unicode-1-1-utf-8","unicode11utf8","unicode20utf8","utf-8","utf8","x-unicode20utf8"],
+  "ibm866": ["866","cp866","csibm866","ibm866"],
+  "iso-8859-2": ["csisolatin2","iso-8859-2","iso-ir-101","iso8859-2","iso88592","iso_8859-2","iso_8859-2:1987","l2","latin2"],
+  "iso-8859-3": ["csisolatin3","iso-8859-3","iso-ir-109","iso8859-3","iso88593","iso_8859-3","iso_8859-3:1988","l3","latin3"],
+  "iso-8859-4": ["csisolatin4","iso-8859-4","iso-ir-110","iso8859-4","iso88594","iso_8859-4","iso_8859-4:1988","l4","latin4"],
+  "iso-8859-5": ["csisolatincyrillic","cyrillic","iso-8859-5","iso-ir-144","iso8859-5","iso88595","iso_8859-5","iso_8859-5:1988"],
+  "iso-8859-6": ["arabic","asmo-708","csiso88596e","csiso88596i","csisolatinarabic","ecma-114","iso-8859-6","iso-8859-6-e","iso-8859-6-i","iso-ir-127","iso8859-6","iso88596","iso_8859-6","iso_8859-6:1987"],
+  "iso-8859-7": ["csisolatingreek","ecma-118","elot_928","greek","greek8","iso-8859-7","iso-ir-126","iso8859-7","iso88597","iso_8859-7","iso_8859-7:1987","sun_eu_greek"],
+  "iso-8859-8": ["csiso88598e","csisolatinhebrew","hebrew","iso-8859-8","iso-8859-8-e","iso-ir-138","iso8859-8","iso88598","iso_8859-8","iso_8859-8:1988","visual"],
+  "iso-8859-8-i": ["csiso88598i","iso-8859-8-i","logical"],
+  "iso-8859-10": ["csisolatin6","iso-8859-10","iso-ir-157","iso8859-10","iso885910","l6","latin6"],
+  "iso-8859-13": ["iso-8859-13","iso8859-13","iso885913"],
+  "iso-8859-14": ["iso-8859-14","iso8859-14","iso885914"],
+  "iso-8859-15": ["csisolatin9","iso-8859-15","iso8859-15","iso885915","iso_8859-15","l9"],
+  "iso-8859-16": ["iso-8859-16"],
+  "koi8-r": ["cskoi8r","koi","koi8","koi8-r","koi8_r"],
+  "koi8-u": ["koi8-ru","koi8-u"],
+  "macintosh": ["csmacintosh","mac","macintosh","x-mac-roman"],
+  "windows-874": ["dos-874","iso-8859-11","iso8859-11","iso885911","tis-620","windows-874"],
+  "windows-1250": ["cp1250","windows-1250","x-cp1250"],
+  "windows-1251": ["cp1251","windows-1251","x-cp1251"],
+  "windows-1252": ["ansi_x3.4-1968","ascii","cp1252","cp819","csisolatin1","ibm819","iso-8859-1","iso-ir-100","iso8859-1","iso88591","iso_8859-1","iso_8859-1:1987","l1","latin1","us-ascii","windows-1252","x-cp1252"],
+  "windows-1253": ["cp1253","windows-1253","x-cp1253"],
+  "windows-1254": ["cp1254","csisolatin5","iso-8859-9","iso-ir-148","iso8859-9","iso88599","iso_8859-9","iso_8859-9:1989","l5","latin5","windows-1254","x-cp1254"],
+  "windows-1255": ["cp1255","windows-1255","x-cp1255"],
+  "windows-1256": ["cp1256","windows-1256","x-cp1256"],
+  "windows-1257": ["cp1257","windows-1257","x-cp1257"],
+  "windows-1258": ["cp1258","windows-1258","x-cp1258"],
+  "x-mac-cyrillic": ["x-mac-cyrillic","x-mac-ukrainian"],
+  "gbk": ["chinese","csgb2312","csiso58gb231280","gb2312","gb_2312","gb_2312-80","gbk","iso-ir-58","x-gbk"],
+  "gb18030": ["gb18030"],
+  "big5": ["big5","big5-hkscs","cn-big5","csbig5","x-x-big5"],
+  "euc-jp": ["cseucpkdfmtjapanese","euc-jp","x-euc-jp"],
+  "iso-2022-jp": ["csiso2022jp","iso-2022-jp"],
+  "shift_jis": ["csshiftjis","ms932","ms_kanji","shift-jis","shift_jis","sjis","windows-31j","x-sjis"],
+  "euc-kr": ["cseuckr","csksc56011987","euc-kr","iso-ir-149","korean","ks_c_5601-1987","ks_c_5601-1989","ksc5601","ksc_5601","windows-949"],
+  "replacement": ["csiso2022kr","hz-gb-2312","iso-2022-cn","iso-2022-cn-ext","iso-2022-kr","replacement"],
+  "utf-16be": ["unicodefffe","utf-16be"],
+  "utf-16le": ["csunicode","iso-10646-ucs-2","ucs-2","unicode","unicodefeff","utf-16","utf-16le"],
+  "x-user-defined": ["x-user-defined"],
+};
+const _LABEL_TO_NAME = (function() {
+  const m = Object.create(null);
+  for (const name in _ENCODING_LABELS) for (const l of _ENCODING_LABELS[name]) m[l] = name;
+  return m;
+})();
+// "Get an encoding" (WHATWG): trim leading/trailing ASCII whitespace, ASCII
+// lowercase, look up. Returns the canonical name or null on failure.
+const _getEncodingName = function(label) {
+  const s = String(label).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '').toLowerCase();
+  return _LABEL_TO_NAME[s] || null;
+};
+// windows-1252 bytes 0x80-0x9F -> code point (0x00-0x7F and 0xA0-0xFF are identity).
+const _WIN1252 = [0x20AC,0x81,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,0x02C6,0x2030,0x0160,0x2039,0x0152,0x8D,0x017D,0x8F,0x90,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x02DC,0x2122,0x0161,0x203A,0x0153,0x9D,0x017E,0x0178];
+const _encFatal = function() { throw new TypeError("The encoded data was not valid."); };
+// WHATWG utf-8 decoder (per-byte lower/upper bounds; fatal -> throw, else U+FFFD).
+// `st` carries decoder state across streaming calls; `flush` emits a final U+FFFD
+// for a truncated sequence and resets the state.
+const _decodeUtf8 = function(bytes, fatal, st, flush) {
+  let out = '', i = 0;
+  while (i < bytes.length) {
+    const b = bytes[i];
+    if (st.needed === 0) {
+      if (b <= 0x7F) out += String.fromCharCode(b);
+      else if (b >= 0xC2 && b <= 0xDF) { st.needed = 1; st.cp = b & 0x1F; }
+      else if (b >= 0xE0 && b <= 0xEF) { st.needed = 2; st.cp = b & 0x0F; if (b === 0xE0) st.lower = 0xA0; if (b === 0xED) st.upper = 0x9F; }
+      else if (b >= 0xF0 && b <= 0xF4) { st.needed = 3; st.cp = b & 0x07; if (b === 0xF0) st.lower = 0x90; if (b === 0xF4) st.upper = 0x8F; }
+      else { if (fatal) _encFatal(); out += '�'; }
+      i++;
+      continue;
+    }
+    if (b < st.lower || b > st.upper) { // invalid continuation: reset, reprocess b
+      st.cp = 0; st.needed = 0; st.seen = 0; st.lower = 0x80; st.upper = 0xBF;
+      if (fatal) _encFatal(); out += '�';
+      continue; // do NOT advance i — reprocess this byte as a fresh lead
+    }
+    st.lower = 0x80; st.upper = 0xBF;
+    st.cp = (st.cp << 6) | (b & 0x3F);
+    i++; st.seen++;
+    if (st.seen === st.needed) {
+      const cp = st.cp;
+      if (cp > 0xFFFF) { const s = cp - 0x10000; out += String.fromCharCode(0xD800 + (s >> 10), 0xDC00 + (s & 0x3FF)); }
+      else out += String.fromCharCode(cp);
+      st.cp = 0; st.needed = 0; st.seen = 0;
+    }
+  }
+  if (flush && st.needed !== 0) {
+    st.cp = 0; st.needed = 0; st.seen = 0; st.lower = 0x80; st.upper = 0xBF;
+    if (fatal) _encFatal(); out += '�';
+  }
+  return out;
+};
+// utf-16 decoder (le/be) with unpaired-surrogate handling; `st` retains a pending
+// odd byte and a pending lead surrogate across streaming calls.
+const _decodeUtf16 = function(bytes, le, fatal, st, flush) {
+  let out = '', i = 0;
+  const nextUnit = function() {
+    let b1;
+    if (st.pend >= 0) { b1 = st.pend; st.pend = -1; }
+    else { if (i >= bytes.length) return -1; b1 = bytes[i++]; }
+    if (i >= bytes.length) { st.pend = b1; return -1; } // no second byte yet
+    const b2 = bytes[i++];
+    return le ? (b2 << 8) | b1 : (b1 << 8) | b2;
+  };
+  let unit;
+  while ((unit = nextUnit()) >= 0) {
+    if (st.lead !== null) {
+      const l = st.lead; st.lead = null;
+      if (unit >= 0xDC00 && unit <= 0xDFFF) { out += String.fromCharCode(l, unit); continue; }
+      if (fatal) _encFatal(); out += '�'; // unpaired lead; reprocess unit below
+    }
+    if (unit >= 0xD800 && unit <= 0xDBFF) { st.lead = unit; continue; }
+    if (unit >= 0xDC00 && unit <= 0xDFFF) { if (fatal) _encFatal(); out += '�'; continue; }
+    out += String.fromCharCode(unit);
+  }
+  if (flush) {
+    if (st.lead !== null) { st.lead = null; if (fatal) _encFatal(); out += '�'; }
+    if (st.pend >= 0) { st.pend = -1; if (fatal) _encFatal(); out += '�'; } // trailing odd byte
+  }
+  return out;
+};
+const _decodeWin1252 = function(bytes) {
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    out += String.fromCharCode(b < 0x80 || b >= 0xA0 ? b : _WIN1252[b - 0x80]);
+  }
+  return out;
+};
+
 if (typeof TextEncoder === 'undefined') {
   globalThis.TextEncoder = class TextEncoder {
     get encoding() { return 'utf-8'; }
-    encode(str) {
-      str = String(str);
+    encode(input) {
+      const str = (input === undefined) ? '' : String(input);
       const buf = [];
       for (let i = 0; i < str.length; i++) {
         let c = str.charCodeAt(i);
+        if (c >= 0xD800 && c <= 0xDBFF) {
+          const next = str.charCodeAt(i + 1);
+          if (next >= 0xDC00 && next <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (next - 0xDC00); i++; }
+          else c = 0xFFFD; // unpaired high surrogate
+        } else if (c >= 0xDC00 && c <= 0xDFFF) c = 0xFFFD; // unpaired low surrogate
         if (c < 0x80) buf.push(c);
-        else if (c < 0x800) { buf.push(0xC0|(c>>6), 0x80|(c&0x3F)); }
-        else if (c < 0xD800 || c >= 0xE000) { buf.push(0xE0|(c>>12), 0x80|((c>>6)&0x3F), 0x80|(c&0x3F)); }
-        else { c = 0x10000 + (((c & 0x3FF) << 10) | (str.charCodeAt(++i) & 0x3FF)); buf.push(0xF0|(c>>18), 0x80|((c>>12)&0x3F), 0x80|((c>>6)&0x3F), 0x80|(c&0x3F)); }
+        else if (c < 0x800) buf.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+        else if (c < 0x10000) buf.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+        else buf.push(0xF0 | (c >> 18), 0x80 | ((c >> 12) & 0x3F), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
       }
       return new Uint8Array(buf);
     }
-    encodeInto(str, dest) { const enc = this.encode(str); dest.set(enc.slice(0, dest.length)); return { read: str.length, written: Math.min(enc.length, dest.length) }; }
+    encodeInto(source, dest) {
+      source = (source === undefined) ? '' : String(source);
+      if (!(dest instanceof Uint8Array)) throw new TypeError("Failed to execute 'encodeInto' on 'TextEncoder': argument 2 is not a Uint8Array.");
+      const cap = dest.length;
+      let read = 0, written = 0;
+      for (let i = 0; i < source.length; i++) {
+        let c = source.charCodeAt(i), units = 1;
+        if (c >= 0xD800 && c <= 0xDBFF) {
+          const next = source.charCodeAt(i + 1);
+          if (next >= 0xDC00 && next <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (next - 0xDC00); units = 2; }
+          else c = 0xFFFD;
+        } else if (c >= 0xDC00 && c <= 0xDFFF) c = 0xFFFD;
+        const need = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+        if (written + need > cap) break;
+        if (c < 0x80) dest[written++] = c;
+        else if (c < 0x800) { dest[written++] = 0xC0 | (c >> 6); dest[written++] = 0x80 | (c & 0x3F); }
+        else if (c < 0x10000) { dest[written++] = 0xE0 | (c >> 12); dest[written++] = 0x80 | ((c >> 6) & 0x3F); dest[written++] = 0x80 | (c & 0x3F); }
+        else { dest[written++] = 0xF0 | (c >> 18); dest[written++] = 0x80 | ((c >> 12) & 0x3F); dest[written++] = 0x80 | ((c >> 6) & 0x3F); dest[written++] = 0x80 | (c & 0x3F); }
+        read += units;
+        i += units - 1;
+      }
+      return { read, written };
+    }
   };
+  _markNative(TextEncoder); _markNative(TextEncoder.prototype.encode); _markNative(TextEncoder.prototype.encodeInto);
 }
 if (typeof TextDecoder === 'undefined') {
   globalThis.TextDecoder = class TextDecoder {
-    constructor(label) { this.encoding = label || 'utf-8'; }
-    decode(buf) {
-      if (!buf) return '';
-      const bytes = ArrayBuffer.isView(buf)
-        ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
-        : new Uint8Array(buf);
-      let str = '', i = 0;
-      while (i < bytes.length) {
-        let c = bytes[i++];
-        if (c < 0x80) str += String.fromCharCode(c);
-        else if (c < 0xE0) str += String.fromCharCode(((c&0x1F)<<6)|(bytes[i++]&0x3F));
-        else if (c < 0xF0) { const b1=bytes[i++], b2=bytes[i++]; str += String.fromCharCode(((c&0x0F)<<12)|((b1&0x3F)<<6)|(b2&0x3F)); }
-        else { const b1=bytes[i++], b2=bytes[i++], b3=bytes[i++]; const cp=((c&0x07)<<18)|((b1&0x3F)<<12)|((b2&0x3F)<<6)|(b3&0x3F); if(cp>0xFFFF){const s=cp-0x10000;str+=String.fromCharCode(0xD800+(s>>10),0xDC00+(s&0x3FF));}else str+=String.fromCharCode(cp); }
+    constructor(label, options) {
+      const name = _getEncodingName(label === undefined ? 'utf-8' : label);
+      // WHATWG: failure or the replacement encoding -> RangeError.
+      if (!name || name === 'replacement')
+        throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
+      this._name = name;
+      const o = (options == null) ? {} : options;
+      this._fatal = !!o.fatal;
+      this._ignoreBOM = !!o.ignoreBOM;
+    }
+    get encoding() { return this._name; }
+    get fatal() { return this._fatal; }
+    get ignoreBOM() { return this._ignoreBOM; }
+    decode(input, options) {
+      let bytes;
+      if (input === undefined) bytes = new Uint8Array(0);
+      else if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+      else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+      else throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+      const stream = !!(options && options.stream);
+      const name = this._name;
+      // Reset decoder state when not continuing a previous streaming call.
+      if (!this._doNotFlush) {
+        this._u8 = { cp: 0, needed: 0, seen: 0, lower: 0x80, upper: 0xBF };
+        this._u16 = { lead: null, pend: -1 };
+        this._bomSeen = false;
       }
-      return str;
+      this._doNotFlush = stream;
+      const flush = !stream;
+      let out;
+      if (name === 'utf-16le') out = _decodeUtf16(bytes, true, this._fatal, this._u16, flush);
+      else if (name === 'utf-16be') out = _decodeUtf16(bytes, false, this._fatal, this._u16, flush);
+      else if (name === 'windows-1252') out = _decodeWin1252(bytes);
+      else if (name === 'x-user-defined') { out = ''; for (let i = 0; i < bytes.length; i++) { const b = bytes[i]; out += String.fromCharCode(b < 0x80 ? b : 0xF780 + (b - 0x80)); } }
+      else out = _decodeUtf8(bytes, this._fatal, this._u8, flush); // utf-8 + best-effort fallback
+      // BOM removal (utf-8 / utf-16): once, at the start of the stream, unless ignoreBOM.
+      if (!this._ignoreBOM && (name === 'utf-8' || name === 'utf-16le' || name === 'utf-16be') && !this._bomSeen && out.length > 0) {
+        if (out.charCodeAt(0) === 0xFEFF) out = out.slice(1);
+        this._bomSeen = true;
+      }
+      return out;
     }
   };
+  _markNative(TextDecoder); _markNative(TextDecoder.prototype.decode);
 }
 
 globalThis.matchMedia = _markNative(function matchMedia(q) { return { matches: false, media: q, addListener(){}, removeListener(){}, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} }; });
@@ -3962,6 +4154,7 @@ globalThis.HashChangeEvent = class extends Event { constructor(t,o) { o = (o == 
 globalThis.MessageEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o);this.data=o.data??null;this.origin=o.origin||"";this.lastEventId=o.lastEventId||"";this.source=o.source??null;this.ports=o.ports||[]; } };
 globalThis.ClipboardEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.clipboardData=o.clipboardData??null; } };
 globalThis.SubmitEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.submitter=o.submitter??null; } };
+globalThis.ProgressEvent = class ProgressEvent extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.lengthComputable=!!o.lengthComputable; this.loaded=o.loaded??0; this.total=o.total??0; } };
 
 const _abortError = function(name, msg) { if (typeof DOMException === 'function') return new DOMException(msg, name); const e = new Error(msg); e.name = name; return e; };
 globalThis.AbortSignal = class AbortSignal {
@@ -3982,8 +4175,111 @@ globalThis.AbortController = class AbortController {
 _markNative(AbortSignal); _markNative(AbortSignal.abort); _markNative(AbortSignal.timeout); _markNative(AbortSignal.any);
 _markNative(AbortSignal.prototype.addEventListener); _markNative(AbortSignal.prototype.removeEventListener); _markNative(AbortSignal.prototype.dispatchEvent); _markNative(AbortSignal.prototype.throwIfAborted);
 _markNative(AbortController); _markNative(AbortController.prototype.abort);
-if (typeof Blob === "undefined") globalThis.Blob = class Blob { constructor(parts=[],opts={}){this._data=parts.join("");this.size=this._data.length;this.type=opts.type||"";} async text(){return this._data;} };
-if (typeof File === "undefined") globalThis.File = class extends Blob { constructor(parts,name,opts){super(parts,opts);this.name=name;} };
+// Base64 over raw bytes (for FileReader.readAsDataURL).
+const _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const _b64FromBytes = function(b) {
+  let r = "";
+  for (let i = 0; i < b.length; i += 3) {
+    const a = b[i], bb = b[i + 1], cc = b[i + 2];
+    r += _B64[a >> 2] + _B64[((a & 3) << 4) | ((bb ?? 0) >> 4)] +
+         (i + 1 < b.length ? _B64[((bb & 15) << 2) | ((cc ?? 0) >> 6)] : "=") +
+         (i + 2 < b.length ? _B64[cc & 63] : "=");
+  }
+  return r;
+};
+// Platform-native line ending, matching what the page would compute from navigator.platform.
+const _nativeEOL = (typeof navigator !== 'undefined' && navigator.platform && String(navigator.platform).startsWith('Win')) ? '\r\n' : '\n';
+// A blob/file type string is normalized: blanked if it contains a non-printable-ASCII
+// char, then ASCII-lowercased.
+const _normalizeBlobType = function(t) {
+  if (t === undefined) return '';
+  t = String(t);
+  for (let i = 0; i < t.length; i++) { const c = t.charCodeAt(i); if (c < 0x20 || c > 0x7E) return ''; }
+  return t.toLowerCase();
+};
+const _blobPartsToBytes = function(parts, endings) {
+  const chunks = [];
+  let total = 0;
+  for (const part of parts) {
+    let chunk;
+    if (part instanceof Blob) chunk = part._bytes;
+    else if (ArrayBuffer.isView(part)) chunk = new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
+    else if (part instanceof ArrayBuffer) chunk = new Uint8Array(part.slice(0));
+    else { let s = String(part); if (endings === 'native') s = s.replace(/\r\n|\r|\n/g, _nativeEOL); chunk = new TextEncoder().encode(s); }
+    chunks.push(chunk); total += chunk.length;
+  }
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { merged.set(c, off); off += c.length; }
+  return merged;
+};
+if (typeof Blob === "undefined") {
+  globalThis.Blob = class Blob {
+    // Rest param so Blob.length === 0 (all WebIDL arguments are optional).
+    constructor(...args) {
+      let blobParts = args.length > 0 ? args[0] : undefined;
+      const options = args[1];
+      if (blobParts === undefined) blobParts = [];
+      // WebIDL sequence: the value must be an Object (a primitive string is iterable
+      // but still rejected), and it must be iterable.
+      else if (Object(blobParts) !== blobParts || typeof blobParts[Symbol.iterator] !== 'function')
+        throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence.");
+      // WebIDL dictionary: a non-nullish, non-object options value is a TypeError.
+      if (options !== undefined && options !== null && Object(options) !== options)
+        throw new TypeError("Failed to construct 'Blob': The provided value is not of type 'BlobPropertyBag'.");
+      const opts = (options == null) ? {} : options;
+      let endings = opts.endings === undefined ? 'transparent' : String(opts.endings);
+      if (endings !== 'transparent' && endings !== 'native')
+        throw new TypeError("Failed to construct 'Blob': The provided value '" + endings + "' is not a valid enum value of type EndingType.");
+      this._bytes = _blobPartsToBytes(Array.from(blobParts), endings);
+      this._type = _normalizeBlobType(opts.type);
+    }
+    get size() { return this._bytes.length; }
+    get type() { return this._type; }
+    get [Symbol.toStringTag]() { return 'Blob'; }
+    slice(start, end, contentType) {
+      const len = this._bytes.length;
+      let s = start === undefined ? 0 : Math.trunc(start) || 0;
+      let e = end === undefined ? len : Math.trunc(end) || 0;
+      s = s < 0 ? Math.max(len + s, 0) : Math.min(s, len);
+      e = e < 0 ? Math.max(len + e, 0) : Math.min(e, len);
+      const out = new Blob([]);
+      out._bytes = this._bytes.slice(s, Math.max(e, s));
+      out._type = _normalizeBlobType(contentType);
+      return out;
+    }
+    async text() { return new TextDecoder('utf-8').decode(this._bytes); }
+    async arrayBuffer() { return this._bytes.buffer.slice(this._bytes.byteOffset, this._bytes.byteOffset + this._bytes.byteLength); }
+    async bytes() { return this._bytes.slice(); }
+    stream() {
+      const bytes = this._bytes;
+      if (typeof ReadableStream === 'function') {
+        return new ReadableStream({ start(c) { if (bytes.length) c.enqueue(bytes.slice()); c.close(); } });
+      }
+      return undefined;
+    }
+  };
+  _markNative(Blob); _markNative(Blob.prototype.slice); _markNative(Blob.prototype.text);
+  _markNative(Blob.prototype.arrayBuffer); _markNative(Blob.prototype.bytes);
+}
+if (typeof File === "undefined") {
+  globalThis.File = class File extends Blob {
+    // ...rest keeps File.length === 2 (fileBits + fileName required).
+    constructor(fileBits, fileName, ...rest) {
+      if (arguments.length < 2)
+        throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + " present.");
+      const options = rest[0];
+      super(fileBits, options);
+      this._name = String(fileName);
+      const opts = (options == null) ? {} : options;
+      this._lastModified = opts.lastModified !== undefined ? Number(opts.lastModified) : Date.now();
+    }
+    get name() { return this._name; }
+    get lastModified() { return this._lastModified; }
+    get [Symbol.toStringTag]() { return 'File'; }
+  };
+  _markNative(File);
+}
 if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([String(k),String(v)]);} get(k){const e=this._d.find(([a])=>a===String(k));return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===String(k)).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===String(k));} set(k,v){this.delete(k);this.append(k,v);} delete(k){this._d=this._d.filter(([a])=>a!==String(k));} keys(){return this._d.map(([k])=>k)[Symbol.iterator]();} values(){return this._d.map(([,v])=>v)[Symbol.iterator]();} entries(){return this._d.map(([k,v])=>[k,v])[Symbol.iterator]();} [Symbol.iterator](){return this.entries();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k,this));} };
 // decodeURIComponent throws on a malformed % sequence; WHATWG form/percent
 // decoding keeps invalid sequences literal. Best-effort + never throws.
@@ -5850,14 +6146,89 @@ if (typeof Audio === 'undefined') {
 
 if (typeof FileReader === 'undefined') {
   globalThis.FileReader = class FileReader {
-    constructor() { this.result = null; this.readyState = 0; this.onload = null; this.onerror = null; }
-    readAsText(blob) { if (blob?.text) blob.text().then(t => { this.result = t; this.readyState = 2; if (this.onload) this.onload({target:this}); }); }
-    readAsDataURL(blob) { this.result = 'data:;base64,'; this.readyState = 2; if (this.onload) setTimeout(() => this.onload({target:this}), 0); }
-    readAsArrayBuffer(blob) { this.result = new ArrayBuffer(0); this.readyState = 2; if (this.onload) setTimeout(() => this.onload({target:this}), 0); }
-    abort() { this.readyState = 0; }
-    addEventListener(t, fn) { if (t === 'load') this.onload = fn; }
-    removeEventListener() {}
+    constructor() {
+      this.result = null; this.readyState = 0; this.error = null;
+      this._evtKey = _nextSyntheticKey();
+      this._aborted = false;
+    }
+    get [Symbol.toStringTag]() { return 'FileReader'; }
+    addEventListener(t, h, o) { _addListenerByKey(this._evtKey, String(t), h, o); }
+    removeEventListener(t, h, o) { _removeListenerByKey(this._evtKey, String(t), h, o); }
+    dispatchEvent(ev) { return _dispatchPublic(this, ev); }
+    _fire(type) {
+      let ev;
+      try { ev = new ProgressEvent(type, { lengthComputable: false, loaded: 0, total: 0 }); }
+      catch (e) { ev = new Event(type); }
+      ev.isTrusted = true;
+      _dispatchSpec(this, ev);
+    }
+    _read(blob, kind, encoding) {
+      if (this.readyState === 1) throw new DOMException("The object is already busy reading Blobs.", "InvalidStateError");
+      if (!(blob instanceof Blob)) throw new TypeError("Failed to execute 'read' on 'FileReader': parameter 1 is not of type 'Blob'.");
+      this.readyState = 1; this.result = null; this.error = null; this._aborted = false;
+      const bytes = blob._bytes ? blob._bytes.slice() : new Uint8Array(0);
+      const type = blob.type || '';
+      const self = this;
+      // Each event fires in its OWN task (chained setTimeout), so microtasks —
+      // EventWatcher re-arming, promise_test completion — drain between events.
+      // loadstart is never synchronous; an empty blob emits no progress event.
+      const steps = [
+        () => self._fire('loadstart'),
+        () => { if (bytes.length > 0) self._fire('progress'); },
+        () => {
+          try {
+            let result;
+            if (kind === 'text') result = new TextDecoder(encoding && _getEncodingName(encoding) ? encoding : 'utf-8').decode(bytes);
+            else if (kind === 'arraybuffer') result = bytes.buffer.slice(0);
+            else if (kind === 'binary') { let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); result = s; }
+            else if (kind === 'dataurl') result = 'data:' + (type || 'application/octet-stream') + ';base64,' + _b64FromBytes(bytes);
+            self.result = result; self.readyState = 2;
+            self._fire('load');
+          } catch (e) {
+            self.result = null; self.error = e; self.readyState = 2;
+            self._fire('error');
+          }
+        },
+        () => self._fire('loadend'),
+      ];
+      let idx = 0;
+      const run = function() {
+        if (self._aborted) return;
+        steps[idx++]();
+        if (idx < steps.length) setTimeout(run, 0);
+      };
+      setTimeout(run, 0);
+    }
+    readAsText(blob, encoding) { this._read(blob, 'text', encoding); }
+    readAsArrayBuffer(blob) { this._read(blob, 'arraybuffer'); }
+    readAsBinaryString(blob) { this._read(blob, 'binary'); }
+    readAsDataURL(blob) { this._read(blob, 'dataurl'); }
+    abort() {
+      // EMPTY or DONE: clear result, leave readyState unchanged.
+      if (this.readyState === 0 || this.readyState === 2) { this.result = null; return; }
+      // LOADING: terminate the read, then fire abort + loadend.
+      this._aborted = true; this.result = null; this.readyState = 2;
+      this._fire('abort'); this._fire('loadend');
+    }
   };
+  FileReader.EMPTY = 0; FileReader.LOADING = 1; FileReader.DONE = 2;
+  FileReader.prototype.EMPTY = 0; FileReader.prototype.LOADING = 1; FileReader.prototype.DONE = 2;
+  // Event-handler IDL attributes (onload, onerror, …) registered as listeners so
+  // they participate in dispatch like any other listener.
+  for (const h of ['loadstart', 'progress', 'load', 'abort', 'error', 'loadend']) {
+    Object.defineProperty(FileReader.prototype, 'on' + h, {
+      configurable: true, enumerable: true,
+      get() { return this['_on' + h] || null; },
+      set(fn) {
+        const cur = this['_on' + h];
+        if (cur) this.removeEventListener(h, cur);
+        this['_on' + h] = (typeof fn === 'function') ? fn : null;
+        if (this['_on' + h]) this.addEventListener(h, this['_on' + h]);
+      },
+    });
+  }
+  _markNative(FileReader); _markNative(FileReader.prototype.readAsText); _markNative(FileReader.prototype.readAsArrayBuffer);
+  _markNative(FileReader.prototype.readAsDataURL); _markNative(FileReader.prototype.readAsBinaryString); _markNative(FileReader.prototype.abort);
 }
 
 if (typeof EventSource === 'undefined') {

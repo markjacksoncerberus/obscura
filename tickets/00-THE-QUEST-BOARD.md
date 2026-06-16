@@ -24,8 +24,8 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~05~~ | ✅ [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | **147/147** | ⚔️⚔️⚔️ | **SECURED** |
 | 06 | [The Node-Smithing Vaults](06-the-node-smithing-vaults.md) | `dom/nodes/Node-*` | mixed | ⚔️⚔️ | ~150 |
 | 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | ⚔️ spec dispatch **DONE**; core 100% | ⚔️⚔️ | +110 this session (capturing/bubbling, event classes, trusted); tails = heavy cloneNode fixtures + synthetic-click |
-| 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | 2/6+ | ⚔️⚔️ | ~? |
-| 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | 4/8+ | ⚔️⚔️ | ~? |
+| 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | ⚔️ TextEncoder/Decoder **DONE** (~3900) | ⚔️⚔️ | +3800 this session; tails = Big5/legacy multi-byte index tables + SharedArrayBuffer |
+| 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | ⚔️ Blob/File/FileReader **DONE** (~330) | ⚔️⚔️ | +180 this session; tails = element-toString, SAB, blob-URL store, FileList |
 | 10 | [The Traversal Labyrinth](10-the-traversal-labyrinth.md) | `dom/ranges`, `dom/traversal` | ⚔️ traversal **DONE**; ranges 90%+ | ⚔️⚔️⚔️ | iframe content-ops left |
 | ~~11~~ | ✅ [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | **getElementsBy\* all 100%** | ⚔️⚔️ | **SECURED** |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ insertNode **1531**, surround **1247** | ⚔️⚔️⚔️ | +1171 this session (validity + live doctype); tails = doctype-order + range-setup IndexSizeError |
@@ -55,6 +55,29 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-16 (knight Claudius — Quests #08 Encoding + #09 FileAPI — ~+4000):**
+- **#08 The Encoding Cipher — real TextEncoder/TextDecoder (~101 → ~3900).** Embedded
+  the WHATWG label table (40 names, 228 labels) → `_getEncodingName` (trim ASCII ws,
+  lowercase) powers RangeError on unknown/replacement labels (`api-invalid-label`
+  0→**3421/3421**) and the `encoding` attribute (`textdecoder-labels` 0→**222/222**).
+  Full WHATWG **utf-8** decoder (per-byte lower/upper bounds, fatal→TypeError;
+  `textdecoder-fatal` 0→36/36), **utf-16le/be** with unpaired-surrogate handling,
+  **windows-1252** + **x-user-defined**; **stateful streaming** (`{stream:true}` +
+  flush; `textdecoder-streaming` 32/32, `-arguments` 4/4); BOM removal + ignoreBOM;
+  code-point-aware `encodeInto` + lone-surrogate→U+FFFD (44→110/111).
+- **#09 The FileAPI Vault — byte-backed Blob/File + real FileReader (~153 → ~330).**
+  `Blob` over a `Uint8Array` (WebIDL sequence/dict guards — primitives throw,
+  `Blob.length===0`; type normalization; `slice`/`text`/`arrayBuffer`/`bytes`/`stream`;
+  native-EOL `endings`); `File extends Blob` (name/lastModified, `File.length===2`);
+  `FileReader` on the unified event machinery — async reads (`readAsText`/`ArrayBuffer`/
+  `DataURL`/`BinaryString`), `ProgressEvent`, on* handler attributes, abort, events as
+  separate tasks. Blob-array-buffer/text/bytes/endings + readAs*/multiple-reads/events/
+  event-handler-attributes/abort all **100%**.
+- Zero regressions (events 25/25, classlist 1420, qsa 1975, Node-properties 726,
+  handleEvent 6, iframe-load 2). Tails: Big5/legacy multi-byte (index tables),
+  SharedArrayBuffer, element-`toString`, blob-URL byte store, `filereader_result`'s
+  last 4 (event-loop microtask-drain timing).
 
 **Session 2026-06-16 (knight Claudius — Quest #07 The Event Amphitheater — spec dispatch, +110):**
 - **Unified spec-compliant event dispatch (DOM §2.9).** Replaced a bubble-only

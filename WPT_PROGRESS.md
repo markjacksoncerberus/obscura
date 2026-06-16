@@ -87,6 +87,19 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-14.
 | `dom/events/Event-dispatch-{order,order-at-target,omitted-capture,propagation-stopped,bubble-canceled,handlers-changed,reenter,target-removed,target-moved,multiple-stopPropagation,multiple-cancelBubble}.html` | mostly 0/1 | **all 1/1** | ✅ | **Quest #07.** capturing→target→bubbling path to window |
 | `dom/events/Event-dispatch-detached-click.html` / `Event-defaultPrevented-after-dispatch.html` / `EventTarget-this-of-listener.html` / `Event-stopImmediatePropagation.html` / `EventTarget-dispatchEvent-returnvalue.html` | — | **2/2, 2/2, 6/6, 1/1, 2/2** | ✅ | **Quest #07.** |
 | `dom/events/Event-dispatch-redispatch.html` | 2/4 | **3/4** | ⬆️ | **Quest #07.** trusted DOMContentLoaded/load; public dispatch clears isTrusted (last fail = synthetic click) |
+| `encoding/api-invalid-label.any.html` | 0/3421 | **3421/3421** | ✅ 100% | **Quest #08.** WHATWG label table + RangeError on unknown/replacement labels |
+| `encoding/textdecoder-labels.any.html` | 0/222 | **222/222** | ✅ 100% | **Quest #08.** label→name normalization (trim ASCII ws, lowercase) |
+| `encoding/textdecoder-fatal.any.html` | 0/36 | **36/36** | ✅ 100% | **Quest #08.** WHATWG utf-8 decoder, per-byte bounds, fatal→TypeError |
+| `encoding/textdecoder-streaming.any.html` | n/a | **32/32** | ✅ 100% | **Quest #08.** stateful streaming decoder (`{stream:true}` + flush) |
+| `encoding/encodeInto.any.html` | 44/111 | **110/111** | ⬆️ | **Quest #08.** code-point-aware encodeInto + lone-surrogate→U+FFFD |
+| `encoding/textencoder-constructor-non-utf.any.html` | 54/79 | **79/79** | ✅ 100% | **Quest #08.** |
+| `encoding/{api-basics,textdecoder-arguments,textdecoder-ignorebom,textdecoder-byte-order-marks,textdecoder-utf16-surrogates,api-surrogates-utf8,textdecoder-fatal-streaming,textencoder-utf16-surrogates}.any.html` | mixed/low | **all 100%** | ✅ | **Quest #08.** utf-8/utf-16le/utf-16be/windows-1252 decode, BOM, fatal |
+| `FileAPI/blob/Blob-constructor.any.html` | 36/73 | **69/73** | ⬆️ | **Quest #09.** byte-backed Blob; WebIDL sequence/dict guards; type normalization |
+| `FileAPI/blob/Blob-slice.any.html` | 60/150 | **144/150** | ⬆️ | **Quest #09.** spec slice (relative start/end, contentType) |
+| `FileAPI/blob/{Blob-array-buffer,Blob-text,Blob-bytes,Blob-constructor-endings}` | low | **all 100%** | ✅ | **Quest #09.** arrayBuffer()/text()/bytes(); native-EOL endings |
+| `FileAPI/file/File-constructor.any.html` | 23/51 | **49/51** | ⬆️ | **Quest #09.** File extends Blob; name/lastModified; arg validation |
+| `FileAPI/reading-data-section/{readAsText,readAsArrayBuffer,readAsDataURL,readAsBinaryString,FileReader-multiple-reads,filereader_events,filereader_abort,FileReader-event-handler-attributes}` | low | **all 100%** | ✅ | **Quest #09.** real FileReader: async reads, ProgressEvent, on* handler attrs, abort |
+| `FileAPI/reading-data-section/filereader_result.any.html` | 0/12 | **8/12** | ⬆️ | **Quest #09.** result/readyState semantics (4 left = event-loop microtask-drain timing) |
 
 ¹ url-origin was never measured under the old regex URL parser (would have been low). ² baseline from earlier sessions, logged for context.
 
