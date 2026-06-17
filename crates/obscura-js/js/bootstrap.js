@@ -4907,8 +4907,42 @@ const _mkStore = () => { var s = Object.create(Storage.prototype); s._data = {};
 globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
 
-globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
-globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=[]; for(let i=0;i<s.length;i+=4){const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]); r.push((a<<2)|(b>>4)); if(cc>=0)r.push(((b&15)<<4)|(cc>>2)); if(d>=0)r.push(((cc&3)<<6)|d);} return String.fromCharCode(...r); });
+// btoa / atob — HTML spec base64 over a BYTE string (NOT UTF-8: the old stub
+// TextEncoder-encoded, so btoa("\x80") gave "woA=" instead of "gA==").
+const _B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const _B64_LOOKUP = (() => { const m = Object.create(null); for (let i = 0; i < _B64_ALPHABET.length; i++) m[_B64_ALPHABET[i]] = i; return m; })();
+globalThis.btoa = function btoa(data) {
+  data = String(data);
+  for (let i = 0; i < data.length; i++) {
+    if (data.charCodeAt(i) > 0xFF)
+      throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError");
+  }
+  let out = "";
+  for (let i = 0; i < data.length; i += 3) {
+    const a = data.charCodeAt(i);
+    const b = i + 1 < data.length ? data.charCodeAt(i + 1) : 0;
+    const c = i + 2 < data.length ? data.charCodeAt(i + 2) : 0;
+    out += _B64_ALPHABET[a >> 2];
+    out += _B64_ALPHABET[((a & 0x03) << 4) | (b >> 4)];
+    out += (i + 1 < data.length) ? _B64_ALPHABET[((b & 0x0F) << 2) | (c >> 6)] : "=";
+    out += (i + 2 < data.length) ? _B64_ALPHABET[c & 0x3F] : "=";
+  }
+  return out;
+};
+globalThis.atob = function atob(data) {
+  // WHATWG Infra "forgiving-base64 decode".
+  data = String(data).replace(/[\t\n\f\r ]/g, "");      // strip ASCII whitespace
+  if (data.length % 4 === 0) data = data.replace(/==?$/, ""); // strip ≤2 trailing '='
+  if (data.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(data)) // bad length / stray '=' / junk
+    throw new DOMException("The string to be decoded is not correctly encoded.", "InvalidCharacterError");
+  let out = "", buffer = 0, bits = 0;
+  for (let i = 0; i < data.length; i++) {
+    buffer = (buffer << 6) | _B64_LOOKUP[data[i]];
+    bits += 6;
+    if (bits >= 8) { bits -= 8; out += String.fromCharCode((buffer >> bits) & 0xFF); }
+  }
+  return out;
+};
 
 globalThis.history = { length:1, state:null, pushState(){}, replaceState(){}, go(){}, back(){}, forward(){}, scrollRestoration:"auto" };
 globalThis.screenX = 0; globalThis.screenY = 0;

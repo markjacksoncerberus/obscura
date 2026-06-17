@@ -57,6 +57,16 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-16 (knight Claudius — Base64 Cipher, atob/btoa 164→380/380, +216):**
+- **Real HTML-spec `btoa`/`atob` over a BYTE string.** The old `btoa` stub
+  TextEncoder-encoded its arg (UTF-8!), so `btoa("\x80")` gave `"woA="` instead of
+  `"gA=="`. Now `btoa` validates each code unit ≤ 0xFF (else InvalidCharacterError) and
+  base64-encodes the latin1 bytes; `atob` implements WHATWG Infra **forgiving-base64
+  decode** (strip ASCII whitespace, strip ≤2 trailing `=` only when len%4==0, fail on
+  len%4==1 / stray `=` / non-alphabet junk, streaming 6→8-bit decode). **base64.any
+  164→380/380 (100%).** Zero regressions (readAsDataURL 4/4, url-with-fetch 16/16, Blob
+  69/73, filereader_result 8/12, qsa 1975, classlist 1420). Pure JS, ~10 lines each.
+
 **Session 2026-06-16 (knight Claudius — Quest #14 Inc 2: the XML keystone, +46):**
 - **A real namespace-aware XML `DOMParser` + the W3C `XMLSerializer`** — the keystone
   the campaign deferred for many sessions. All in `bootstrap.js`, no new Rust, built on
