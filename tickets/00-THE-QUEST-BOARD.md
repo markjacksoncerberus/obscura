@@ -30,6 +30,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~11~~ | ✅ [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | **getElementsBy\* all 100%** | ⚔️⚔️ | **SECURED** |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ insertNode **1531**, surround **1247** | ⚔️⚔️⚔️ | +1171 this session (validity + live doctype); tails = doctype-order + range-setup IndexSizeError |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
+| ~~18~~ | ✅ [The Timekeeper's Ledger](18-the-timekeepers-ledger.md) | `user-timing/*`, `hr-time/*` | **mark 22/22 + realm** | ⚔️⚔️ | **SECURED** — real User Timing L3 (was a no-op `performance`): mark/measure/getEntries/clear + PerformanceEntry/Mark/Measure/Timing + ~70 realm subtests. Caps: obsolete L1/L2 `mark(timingAttr)`-throws subtests; `<body onload>` load-event gap |
 | ~~17~~ | ✅ [The Entropy Gate](17-the-entropy-gate.md) | `WebCryptoAPI/getRandomValues` | **39/39** | ⚔️ | **SECURED 100%** — real `crypto.getRandomValues` contract (was a `Math.random` fill @ 23/39); **+16**. Added `TypeMismatchError:17` to `DOMException._codes` + the modern `QuotaExceededError` interface |
 | ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
@@ -58,6 +59,40 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #18 — The Timekeeper's Ledger, User Timing L3, ~+70):**
+- **A real User Timing Level 3** replacing a no-op `performance` (mark()/measure() did
+  nothing; getEntries* always returned `[]`). All in `bootstrap.js`, pure JS:
+  - **`PerformanceEntry` / `PerformanceMark` / `PerformanceMeasure` / `PerformanceTiming`**
+    classes (+ globals) and a **`Performance`** class with an entry buffer.
+  - `mark(name, opts)` → a `PerformanceMark` (opts validated: non-object/negative
+    `startTime` → `TypeError`); `measure(name, startOrOptions, endMark)` with the L3
+    options dict (`start`/`end`/`duration`/`detail`) AND positional mark names;
+    `getEntries`/`getEntriesByName`/`getEntriesByType` (startTime-sorted),
+    `clearMarks`/`clearMeasures`; `mark()`/`measure()` with no name → `TypeError`.
+  - **`now()` is now relative to `timeOrigin`** (high-res, monotonic, ≥0) — was the raw
+    `Date.now()`. `performance.toJSON()` + `PerformanceTiming.toJSON()` (full 21-attribute
+    set). `performance` gained a minimal **EventTarget** (addEventListener/dispatchEvent
+    with `once`) so `hr-time/basic` "extends EventTarget" passes.
+  - **"Convert a mark to a timestamp"**: a PerformanceTiming attribute name resolves to its
+    value (0 → `InvalidAccessError`); positional start/end are DOMStrings (a number is
+    string-coerced, so `51.15` → not-a-mark → `SyntaxError`); unknown name → `SyntaxError`.
+    Load-phase timing attrs (DOMContentLoaded/load/unload/redirect/TLS) are 0 — realistic
+    mid-load AND what the spec treats as empty.
+  - **Results:** `user-timing/mark.any` **0→22/22**; `measure-exceptions` **→13/13**;
+    `mark-errors` 10/10, `mark-measure-return-objects` 5/5, `measure_exceptions_navigation_timing`
+    4/4, `measure_navigation_timing` 1/1, `measure` 1/1, `user-timing-tojson` 2/2,
+    `mark-measure-feature-detection` 2/2, `invoke_without_parameter` 2/2; `hr-time/basic`
+    4→5, `hr-time/performance-tojson` 0→1. Zero regressions (structured-clone 141/152,
+    getRandomValues 39/39, hr-time/monotonic-clock 2/2, qsa 1975, classlist 1420, base64
+    380/380, url-origin 403/403, createElement 147, encoding 3421).
+  - **Honest caps (not the algorithm):** `mark_exceptions` (1/22) and
+    `invoke_with_timing_attributes` (21/42) are gated by OBSOLETE L1/L2 subtests that assert
+    `mark(timingAttribute)` throws `SyntaxError` — removed in L3, so current browsers fail
+    them too. `clearMarks`/`clearMeasures`/`measures`/`measure_associated_with_navigation_timing`
+    are **could-not-run**: they run tests from `<body onload=…>`, and the load event isn't
+    firing for testharness pages — a separate load-lifecycle gap (a future quest), not User
+    Timing. Scroll `tickets/18-the-timekeepers-ledger.md`.
 
 **Session 2026-06-17 (Quest #17 — The Entropy Gate, getRandomValues 23→39/39, +16):**
 - **A real `crypto.getRandomValues` contract** replacing a `Math.random` fill that honored

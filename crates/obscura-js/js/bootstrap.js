@@ -4872,21 +4872,194 @@ globalThis.XMLSerializer = class XMLSerializer {
     return _xmlSerNode(node, null, map, { value: 1 });
   }
 };
-globalThis.performance = globalThis.performance || {
-  now: () => Date.now(),
-  mark(){}, measure(){},
-  clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
-  setResourceTimingBufferSize(){},
-  timeOrigin: 0,
-  timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
-  navigation: { type: 0, redirectCount: 0 },
-  memory: {
-    jsHeapSizeLimit: 2172649472,
-    totalJSHeapSize: 19321856,
-    usedJSHeapSize: 16781520,
-  },
+// Performance + User Timing (Level 3). The old `performance` was a bag of
+// no-ops: mark()/measure() did nothing and getEntries* always returned []. This
+// is the real thing — a PerformanceEntry buffer with mark/measure/clear, the
+// PerformanceEntry/Mark/Measure classes, a high-res now() relative to timeOrigin,
+// PerformanceTiming.toJSON, and a minimal EventTarget surface (performance fires
+// events like `resourcetimingbufferfull`).
+class PerformanceEntry {
+  constructor(name, entryType, startTime, duration) {
+    this._name = String(name); this._entryType = entryType;
+    this._startTime = startTime; this._duration = duration;
+  }
+  get name() { return this._name; }
+  get entryType() { return this._entryType; }
+  get startTime() { return this._startTime; }
+  get duration() { return this._duration; }
+  toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; }
+}
+globalThis.PerformanceEntry = _markNative(PerformanceEntry);
+
+class PerformanceMark extends PerformanceEntry {
+  constructor(markName, markOptions) {
+    // markOptions is an optional WebIDL dictionary: a non-nullish, non-object
+    // value (Number, NaN, Infinity, String, …) is a TypeError.
+    if (markOptions !== undefined && markOptions !== null && (typeof markOptions !== "object"))
+      throw new TypeError("Failed to construct 'PerformanceMark': The provided value is not of type 'PerformanceMarkOptions'.");
+    const opts = (markOptions == null) ? {} : markOptions;
+    let startTime;
+    if (opts.startTime !== undefined) {
+      startTime = Number(opts.startTime);
+      if (startTime < 0)
+        throw new TypeError("Failed to construct 'PerformanceMark': 'startTime' cannot be negative.");
+    } else {
+      startTime = globalThis.performance ? globalThis.performance.now() : 0;
+    }
+    super(markName, "mark", startTime, 0);
+    this._detail = (opts.detail === undefined) ? null : opts.detail;
+  }
+  get detail() { return this._detail; }
+  toJSON() { const j = super.toJSON(); j.detail = this.detail; return j; }
+}
+globalThis.PerformanceMark = _markNative(PerformanceMark);
+
+class PerformanceMeasure extends PerformanceEntry {
+  constructor(measureName, startTime, duration, detail) {
+    super(measureName, "measure", startTime, duration);
+    this._detail = (detail === undefined) ? null : detail;
+  }
+  get detail() { return this._detail; }
+  toJSON() { const j = super.toJSON(); j.detail = this.detail; return j; }
+}
+globalThis.PerformanceMeasure = _markNative(PerformanceMeasure);
+
+class PerformanceTiming {
+  constructor(t0) {
+    // Attributes for phases that have happened by the time user script runs carry
+    // t0; ones that have NOT yet occurred during page load (DOMContentLoaded/load)
+    // or never apply here (unload/redirect/TLS-on-http) are 0 — which is also what
+    // User Timing's "convert a mark to a timestamp" treats as empty (InvalidAccessError).
+    this.navigationStart = t0; this.unloadEventStart = 0; this.unloadEventEnd = 0;
+    this.redirectStart = 0; this.redirectEnd = 0; this.fetchStart = t0;
+    this.domainLookupStart = t0; this.domainLookupEnd = t0; this.connectStart = t0;
+    this.connectEnd = t0; this.secureConnectionStart = 0; this.requestStart = t0;
+    this.responseStart = t0; this.responseEnd = t0; this.domLoading = t0;
+    this.domInteractive = 0; this.domContentLoadedEventStart = 0;
+    this.domContentLoadedEventEnd = 0; this.domComplete = 0;
+    this.loadEventStart = 0; this.loadEventEnd = 0;
+  }
+  toJSON() { const o = {}; for (const k of Object.keys(this)) o[k] = this[k]; return o; }
+}
+// The PerformanceTiming attribute names a mark name may legacy-resolve against.
+const _PERF_TIMING_ATTRS = {
+  navigationStart: 1, unloadEventStart: 1, unloadEventEnd: 1, redirectStart: 1,
+  redirectEnd: 1, fetchStart: 1, domainLookupStart: 1, domainLookupEnd: 1,
+  connectStart: 1, connectEnd: 1, secureConnectionStart: 1, requestStart: 1,
+  responseStart: 1, responseEnd: 1, domLoading: 1, domInteractive: 1,
+  domContentLoadedEventStart: 1, domContentLoadedEventEnd: 1, domComplete: 1,
+  loadEventStart: 1, loadEventEnd: 1,
 };
+globalThis.PerformanceTiming = _markNative(PerformanceTiming);
+
+class Performance {
+  constructor() {
+    this._entries = [];
+    this._listeners = [];
+    this.timeOrigin = 0;
+    this.timing = new PerformanceTiming(0);
+    this.navigation = { type: 0, redirectCount: 0, toJSON() { return { type: 0, redirectCount: 0 }; } };
+    this.memory = { jsHeapSizeLimit: 2172649472, totalJSHeapSize: 19321856, usedJSHeapSize: 16781520 };
+  }
+  now() {
+    const t = Date.now() - this.timeOrigin;
+    return t < 0 ? 0 : t;
+  }
+  mark(markName, markOptions) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'mark' on 'Performance': 1 argument required, but only 0 present.");
+    const m = new PerformanceMark(markName, markOptions);
+    this._entries.push(m);
+    return m;
+  }
+  // Resolve a mark NAME (always string-coerced): a PerformanceTiming attribute
+  // (0 → InvalidAccessError), else the most-recent mark entry, else SyntaxError.
+  _resolveMarkName(mark) {
+    const name = String(mark);
+    if (_PERF_TIMING_ATTRS[name] === 1) {
+      const v = this.timing ? this.timing[name] : 0;
+      if (!v) throw new DOMException("Failed to execute 'measure' on 'Performance': '" + name +
+        "' cannot have a timing value of 0.", "InvalidAccessError");
+      return v - this.timeOrigin;
+    }
+    for (let i = this._entries.length - 1; i >= 0; i--)
+      if (this._entries[i].entryType === "mark" && this._entries[i].name === name) return this._entries[i].startTime;
+    throw new DOMException("Failed to execute 'measure' on 'Performance': The mark '" + name + "' does not exist.", "SyntaxError");
+  }
+  // Resolve an options start/end value: a number is a raw timestamp; otherwise
+  // it is treated as a mark name.
+  _resolveTimestamp(value) {
+    if (typeof value === "number") return value;
+    return this._resolveMarkName(value);
+  }
+  measure(measureName, startOrOptions, endMark) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'measure' on 'Performance': 1 argument required, but only 0 present.");
+    let startTime = 0, endTime, detail = null;
+    if (startOrOptions !== null && startOrOptions !== undefined && typeof startOrOptions === "object") {
+      if (endMark !== undefined)
+        throw new TypeError("Failed to execute 'measure' on 'Performance': An end mark must not be supplied alongside a MeasureOptions object.");
+      const o = startOrOptions;
+      detail = (o.detail === undefined) ? null : o.detail;
+      const hasStart = o.start !== undefined, hasEnd = o.end !== undefined, hasDur = o.duration !== undefined;
+      if (hasStart && hasEnd && hasDur)
+        throw new TypeError("Failed to execute 'measure' on 'Performance': Cannot supply start, end, and duration together.");
+      if (hasStart) startTime = this._resolveTimestamp(o.start);
+      if (hasEnd) endTime = this._resolveTimestamp(o.end);
+      if (hasDur) {
+        const d = Number(o.duration);
+        if (hasStart && !hasEnd) endTime = startTime + d;
+        else if (hasEnd && !hasStart) startTime = endTime - d;
+      }
+      if (endTime === undefined) endTime = this.now();
+    } else {
+      // Positional form: startMark/endMark are DOMStrings (a number is coerced to
+      // a string and looked up as a mark name, not used as a raw timestamp).
+      startTime = (startOrOptions !== undefined) ? this._resolveMarkName(startOrOptions) : 0;
+      endTime = (endMark !== undefined) ? this._resolveMarkName(endMark) : this.now();
+    }
+    const m = new PerformanceMeasure(measureName, startTime, endTime - startTime, detail);
+    this._entries.push(m);
+    return m;
+  }
+  getEntries() { return this._entries.slice().sort((a, b) => a.startTime - b.startTime); }
+  getEntriesByType(type) { return this.getEntries().filter((e) => e.entryType === String(type)); }
+  getEntriesByName(name, type) {
+    const n = String(name);
+    return this.getEntries().filter((e) => e.name === n && (type === undefined || e.entryType === String(type)));
+  }
+  clearMarks(name) {
+    this._entries = this._entries.filter((e) => !(e.entryType === "mark" && (name === undefined || e.name === String(name))));
+  }
+  clearMeasures(name) {
+    this._entries = this._entries.filter((e) => !(e.entryType === "measure" && (name === undefined || e.name === String(name))));
+  }
+  clearResourceTimings() {}
+  setResourceTimingBufferSize() {}
+  toJSON() {
+    return { timeOrigin: this.timeOrigin, timing: this.timing ? this.timing.toJSON() : undefined, navigation: this.navigation };
+  }
+  // Minimal self-contained EventTarget surface (so `performance` can dispatch).
+  addEventListener(type, cb, opts) {
+    if (cb == null) return;
+    const once = (typeof opts === "object" && opts) ? !!opts.once : false;
+    this._listeners.push({ type: String(type), cb, once });
+  }
+  removeEventListener(type, cb) {
+    this._listeners = this._listeners.filter((l) => !(l.type === String(type) && l.cb === cb));
+  }
+  dispatchEvent(event) {
+    const type = event && event.type;
+    const matched = this._listeners.filter((l) => l.type === type);
+    for (const l of matched) {
+      if (l.once) this._listeners = this._listeners.filter((x) => x !== l);
+      try { (typeof l.cb === "function" ? l.cb : l.cb.handleEvent).call(this, event); } catch (e) {}
+    }
+    return !(event && event.defaultPrevented);
+  }
+}
+globalThis.Performance = _markNative(Performance);
+globalThis.performance = globalThis.performance || new Performance();
 
 Object.defineProperty(Document.prototype, 'fonts', {
   get() {
@@ -7123,7 +7296,9 @@ globalThis.__obscura_init = function() {
 
   const t0 = Date.now();
   globalThis.performance.timeOrigin = t0;
-  globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  globalThis.performance.timing = (typeof PerformanceTiming === "function")
+    ? new PerformanceTiming(t0)
+    : { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
 
   const hide = (obj, props) => {
     for (const p of props) {
