@@ -3134,6 +3134,7 @@ globalThis.fetch = async (input, init = {}) => {
   const body = init.body ? String(init.body) : "";
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
+  const _resStart = (globalThis.performance && performance.now) ? performance.now() : 0;
   const _fetchPromise = Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
   const raw = _signal
     ? await Promise.race([_fetchPromise, new Promise((_, reject) => { _signal.addEventListener('abort', () => { reject(_signal.reason !== undefined ? _signal.reason : _abortError('AbortError', 'The operation was aborted')); }); })])
@@ -3150,6 +3151,15 @@ globalThis.fetch = async (input, init = {}) => {
   }
   const respType = parsed.status === 0 ? "opaque" : (fetchMode === "no-cors" ? "opaque" : "basic");
   const responseBody = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
+  // Resource Timing: record the completed network fetch on the performance
+  // timeline (entryType "resource"). Opaque cross-origin responses still get an
+  // entry, with body sizes left at 0 (no TAO opt-in).
+  try {
+    if (globalThis.performance && performance._addResourceEntry) {
+      const _sz = (respType === "opaque") ? 0 : (responseBody && (responseBody.byteLength != null ? responseBody.byteLength : responseBody.length)) || 0;
+      performance._addResourceEntry(parsed.url || url, "fetch", _resStart, performance.now(), { enc: _sz, dec: _sz, status: parsed.status });
+    }
+  } catch (e) {}
   return new Response(responseBody, {
     status: parsed.status,
     statusText: "",
@@ -5146,8 +5156,35 @@ class Performance {
   clearMeasures(name) {
     this._entries = this._entries.filter((e) => !(e.entryType === "measure" && (name === undefined || e.name === String(name))));
   }
-  clearResourceTimings() {}
-  setResourceTimingBufferSize() {}
+  clearResourceTimings() {
+    this._entries = this._entries.filter((e) => e.entryType !== "resource");
+  }
+  setResourceTimingBufferSize(n) { this._resourceBufferSize = Number(n) || 0; }
+  // Record a fetched resource on the timeline and notify observers. Called by
+  // fetch()/XHR when a network request completes. Network sub-phases are
+  // collapsed (fetchStart === request phases === startTime); responseStart/End
+  // carry the completion time so duration > 0 for any real network round-trip.
+  _addResourceEntry(name, initiatorType, startTime, endTime, sizes) {
+    if (typeof PerformanceResourceTiming !== "function") return null;
+    if (endTime < startTime) endTime = startTime;
+    const e = new PerformanceResourceTiming(name, "resource", startTime);
+    e.initiatorType = initiatorType || "";
+    e.nextHopProtocol = "http/1.1";
+    e.fetchStart = startTime;
+    e.domainLookupStart = startTime; e.domainLookupEnd = startTime;
+    e.connectStart = startTime; e.connectEnd = startTime;
+    e.requestStart = startTime; e.responseStart = endTime; e.responseEnd = endTime;
+    e._duration = endTime - startTime;
+    if (sizes) {
+      e.encodedBodySize = sizes.enc || 0;
+      e.decodedBodySize = (sizes.dec != null ? sizes.dec : sizes.enc) || 0;
+      e.transferSize = (sizes.enc || 0) + 300;
+      if (sizes.status) e.responseStatus = sizes.status;
+    }
+    this._entries.push(e);
+    try { _queuePerformanceEntry(e); } catch (ex) {}
+    return e;
+  }
   toJSON() {
     return { timeOrigin: this.timeOrigin, timing: this.timing ? this.timing.toJSON() : undefined, navigation: this.navigation };
   }
@@ -5177,7 +5214,7 @@ globalThis.performance = globalThis.performance || new Performance();
 // The entry types Obscura can actually generate timeline entries for. Must be in
 // strict alphabetical order (supportedEntryTypes asserts types[i-1] < types[i])
 // and frozen+cached (the attribute must return the same array each access).
-const _PERF_SUPPORTED_ENTRY_TYPES = Object.freeze(['mark', 'measure', 'navigation']);
+const _PERF_SUPPORTED_ENTRY_TYPES = Object.freeze(['mark', 'measure', 'navigation', 'resource']);
 
 // Registered observers + the single pending-delivery task (HTML "queue a
 // PerformanceObserver task": one task flushes every observer with a non-empty

@@ -505,6 +505,13 @@ impl Page {
                         resp.body.len(),
                     );
                     if let Some(js) = &mut self.js {
+                        // Resource Timing: record this <script src> on the timeline
+                        // before executing it, so a later inline script observes it.
+                        let rt = format!(
+                            "try {{ if (performance._addResourceEntry) {{ var __s=performance.now(); performance._addResourceEntry({:?}, \"script\", __s, performance.now(), {{ enc:{}, dec:{}, status:{} }}); }} }} catch(e) {{}}",
+                            url, resp.body.len(), code.len(), resp.status
+                        );
+                        let _ = js.execute_script("<resource-timing>", &rt);
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
                         }
