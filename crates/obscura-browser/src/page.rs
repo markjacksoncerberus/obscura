@@ -579,7 +579,8 @@ impl Page {
                  try { var __dcl=new Event('DOMContentLoaded', {bubbles:false,cancelable:false}); __dcl.isTrusted=true; _dispatchSpec(document, __dcl); } catch(e) {}\n\
                  try { var __dclw=new Event('DOMContentLoaded', {bubbles:false,cancelable:false}); __dclw.isTrusted=true; _dispatchSpec(window, __dclw); } catch(e) {}\n\
                  try { if (typeof __navTimingDCL === 'function') __navTimingDCL(); } catch(e) {}\n\
-                 try { if (typeof __startFrameLoads === 'function') __startFrameLoads(); } catch(e) {}");
+                 try { if (typeof __startFrameLoads === 'function') __startFrameLoads(); } catch(e) {}\n\
+                 try { if (typeof __startResourceLoads === 'function') __startResourceLoads(); } catch(e) {}");
         }
 
         // Drain in-flight subresource/iframe fetches so frame documents are

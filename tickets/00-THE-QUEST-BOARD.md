@@ -33,7 +33,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~18~~ | ✅ [The Timekeeper's Ledger](18-the-timekeepers-ledger.md) | `user-timing/*`, `hr-time/*` | **mark 22/22 + realm** | ⚔️⚔️ | **SECURED** — real User Timing L3 (was a no-op `performance`): mark/measure/getEntries/clear + PerformanceEntry/Mark/Measure/Timing + ~70 realm subtests. Caps: obsolete L1/L2 `mark(timingAttr)`-throws subtests; `<body onload>` load-event gap |
 | ~~17~~ | ✅ [The Entropy Gate](17-the-entropy-gate.md) | `WebCryptoAPI/getRandomValues` | **39/39** | ⚔️ | **SECURED 100%** — real `crypto.getRandomValues` contract (was a `Math.random` fill @ 23/39); **+16**. Added `TypeMismatchError:17` to `DOMException._codes` + the modern `QuotaExceededError` interface |
 | ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
-| 23 | [The Element Ledger](23-the-element-ledger.md) | `resource-timing/*` element loads (+ perf-timeline) | ⚔️ inc 1 — po-observe 1/1, dynamic-insertion 5/6 | ⚔️⚔️ | **inc 1 ~+10.** Element subresource loads (`<img>`, JS-inserted `<link>`/`<script>`/`<object>`) emit `resource` entries + fire load/error; iframe/XHR report correct initiatorType. Next: markup `<img>`/`<link>` scan, font→css, redirect timing, buffer-full |
+| 23 | [The Element Ledger](23-the-element-ledger.md) | `resource-timing/*` element loads (+ perf-timeline) | ⚔️ po-observe 1/1, dynamic-insertion 5/6, img 1/1, link 5/8 | ⚔️⚔️ | **inc 1+2 ~+16.** Element subresource loads (`<img>`, `<link>`, `<script>`, `<object>` — both JS-inserted AND markup) emit `resource` entries + fire load/error; iframe/XHR report correct initiatorType. Next: css-embedded "css" entries, `img.src` resolved-URL reflection, font→css, redirect timing, buffer-full |
 | ~~22~~ | ✅ [The Resource Ledger](22-the-resource-ledger.md) | `resource-timing/*` (+ perf-timeline) | **buffered-flag 1/1, clear-resource-timings 1/1, case-sensitivity 3/3** | ⚔️⚔️ | **SECURED — +4.** `PerformanceResourceTiming` entries for `fetch()`/XHR + page `<script src>` loads; real `clearResourceTimings`. Caps: element loads (img/link/iframe), TAO cross-origin, buffer-full family |
 | ~~21~~ | ✅ [The Navigator's Almanac](21-the-navigators-almanac.md) | `navigation-timing/*` | **~20 subtests across 9 tests** | ⚔️⚔️ | **SECURED — ~+20.** Real `PerformanceNavigationTiming` (+ `PerformanceResourceTiming` base): nav entry present from the start, queued to observers at load; honest body sizes from the Rust response; `readystatechange` at interactive/complete. Caps: exact-byte-size/host-URL value tests, per-iframe nav timing, real redirect-chain timing |
 | ~~20~~ | ✅ [The Observer's Gallery](20-the-observers-gallery.md) | `performance-timeline/*` | **PO suite 11/11 + idl 35/58** | ⚔️⚔️ | **SECURED — ~+15.** Real `PerformanceObserver` (was a no-op stub): observe(entryTypes/type+buffered), disconnect/takeRecords, supportedEntryTypes, PerformanceObserverEntryList, task-queued delivery from mark()/measure(). Cap: po-observe + 2 case-sensitivity subtests need resource/navigation timing entries |
@@ -64,6 +64,18 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #23 — The Element Ledger, inc 2, ~+6):**
+- **Markup subresource scan.** Inc 1 only loaded elements inserted via JS; MARKUP
+  `<img src>`/`<link rel=stylesheet>` (parsed by html5ever) never did. New
+  `__startResourceLoads()` (beside `__startFrameLoads`) scans `img[src]`/`link`/`object`
+  and loads them, wired into `page.rs`'s `<dcl-events>` step so the fetches settle
+  before `load` (bounded by `pump_until_idle`'s 500ms). `modulepreload` → "other".
+- **Results:** initiator-type/img 0→1/1, link 0→5/8, the-img-element/relevant-mutations
+  70→71. Zero regressions (verified by stashing inc 2 and re-measuring on inc 1).
+- **Caps:** css-embedded resources ("css", needs a CSS resource walker); `getEntriesByName(img.src)`
+  tests need `img.src` IDL to return the *resolved* URL (broad shared-getter change, deferred);
+  svg/embed/video/audio/input element types. Scroll `tickets/23-the-element-ledger.md`.
 
 **Session 2026-06-17 (Quest #23 — The Element Ledger, inc 1, ~+10):**
 - **Element subresource loads now emit `PerformanceResourceTiming` entries** (the #22 cap).

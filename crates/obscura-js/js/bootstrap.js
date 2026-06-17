@@ -2854,10 +2854,11 @@ const _connectResourceElement = function(el) {
   if (ln === 'link') {
     const rel = String(el.getAttribute('rel') || el.rel || '').toLowerCase();
     const href = el.getAttribute('href');
-    // Resource-fetching link relations all report initiatorType "link".
+    // Resource-fetching link relations report initiatorType "link", except
+    // modulepreload (a module graph fetch) which reports "other".
     if (href && /(^|\s)(stylesheet|preload|prefetch|icon|manifest|modulepreload)(\s|$)/.test(rel)) {
       el._resConnected = true;
-      _loadElementResource(el, href, 'link');
+      _loadElementResource(el, href, /(^|\s)modulepreload(\s|$)/.test(rel) ? 'other' : 'link');
     }
   } else if (ln === 'object') {
     const data = el.getAttribute('data') || el.data;
@@ -2926,6 +2927,26 @@ globalThis.__startFrameLoads = function() {
   try {
     const frames = document.querySelectorAll('iframe');
     for (let i = 0; i < frames.length; i++) { try { _connectIframe(frames[i]); } catch (e) {} }
+  } catch (e) {}
+};
+// Begin loading markup subresource elements present in the static document
+// (<img src>, <link rel=stylesheet/...>, <object data>) — like markup iframes,
+// these are parsed in Rust and never travel through the JS appendChild/setter
+// hooks, so they would otherwise emit no Resource Timing entry and never fire a
+// load event. Driven from the Rust load sequence at DOMContentLoaded so the
+// fetches are counted in-flight before the load event (subresources delay load).
+// Markup <script src> is handled separately by page.rs. Idempotent per element.
+globalThis.__startResourceLoads = function() {
+  try {
+    const imgs = document.querySelectorAll('img[src]');
+    for (let i = 0; i < imgs.length; i++) {
+      const el = imgs[i];
+      if (el._resLoadGen) continue; // already loading (e.g. via the src setter)
+      const src = el.getAttribute('src');
+      if (src) { try { _loadElementResource(el, src, 'img'); } catch (e) {} }
+    }
+    const others = document.querySelectorAll('link, object');
+    for (let i = 0; i < others.length; i++) { try { _connectResourceElement(others[i]); } catch (e) {} }
   } catch (e) {}
 };
 // Re-run the load process after a src/srcdoc attribute changes on an already-

@@ -81,6 +81,49 @@ iframe-load 2/2, nav2-test-attributes-exist 1/1.
 
 ---
 
+## Increment 2 — markup subresource scan (~+6), SECURED
+
+### The gap
+Inc 1 only loaded elements that travelled through the JS `appendChild`/setter
+hooks. MARKUP `<img src>` and `<link rel=stylesheet>` (parsed by html5ever in
+Rust) never do, so `initiator-type/img.html` (markup `<img>`) and `link.html`
+(markup `<link>` in `<head>`) stayed capped.
+
+### The work
+- **`globalThis.__startResourceLoads()`** (new, beside `__startFrameLoads`):
+  scans the static document for `img[src]` (not already loading), `link`, and
+  `object`, and starts each load via `_loadElementResource` /
+  `_connectResourceElement`. Idempotent per element.
+- Wired into `page.rs` at the `<dcl-events>` step, right after `__startFrameLoads()`,
+  so the markup-resource fetches are counted in-flight and (bounded by
+  `pump_until_idle`'s 500ms deadline) settle before the load event — subresources
+  delay load, like iframes.
+- **`modulepreload` → initiatorType "other"** (all other resource-fetching link
+  rels → "link").
+
+### Results
+| Test | Before | After |
+|------|:------:|:-----:|
+| `resource-timing/initiator-type/img.html` | 0/1 | **1/1** |
+| `resource-timing/initiator-type/link.html` | 0/8 | **5/8** |
+| `the-img-element/relevant-mutations.html` | 70/113 | **71/113** |
+
+**Zero regressions** (full core sweep re-run: qsa 1975, classlist 1420, createElement
+147, url-origin 403, mark.any 22/22, structured-clone 141/152, getRandomValues 39/39,
+po-disconnect 3/3, url-with-fetch 16/16, iframe-load 2/2, measures 119/119,
+nav2-test-attributes-exist 1/1; relevant-mutations *gained* 1). Verified the markup
+scan is timing-safe by stashing inc 2 and re-measuring relevant-mutations on inc 1.
+
+### Caps (inc 2)
+- **css-embedded resources → "css"** (link.html's last 3): `@import`/`url()` inside a
+  loaded stylesheet should emit "css"-initiated entries — needs a CSS resource walker.
+- **`status-codes-create-entry`** and friends query `performance.getEntriesByName(img.src)`:
+  our `img.src` getter returns the RAW attribute, but the IDL `src`/`href` reflection
+  should return the *resolved absolute URL*. Fixing that is a broad, separate change
+  (the getter is shared across all elements) — left as-is to avoid regression risk.
+- **svg/embed/video/audio/input** initiator-type tests use other element types — varied,
+  not pursued.
+
 ## The dev loop
 Build `cargo build --release --features render`; restart the serve process; measure
 ONE test at a time with `scripts/wpt_run.py <path> --timeout 90`, `scripts/wpt_fails.py`
