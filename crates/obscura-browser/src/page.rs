@@ -446,8 +446,12 @@ impl Page {
                 async move {
                     let parsed =
                         Url::parse(&url).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
+                    let t0 = std::time::Instant::now();
                     match client.fetch(&parsed).await {
-                        Ok(resp) => Some((idx, url, resp)),
+                        Ok(resp) => {
+                            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                            Some((idx, url, resp, elapsed_ms))
+                        }
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
                             None
@@ -459,14 +463,16 @@ impl Page {
 
         let fetch_results = futures::future::join_all(fetch_futures).await;
 
-        let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
-            std::collections::HashMap::new();
+        let mut fetched: std::collections::HashMap<
+            usize,
+            (String, String, obscura_net::Response, f64),
+        > = std::collections::HashMap::new();
         for result in fetch_results {
-            if let Some((idx, url, resp)) = result {
+            if let Some((idx, url, resp, elapsed_ms)) = result {
                 // Script bodies: only the HTTP Content-Type charset matters
                 // (no in-band meta-charset for JS).
                 let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
-                fetched.insert(idx, (url, code, resp));
+                fetched.insert(idx, (url, code, resp, elapsed_ms));
             }
         }
 
@@ -494,7 +500,7 @@ impl Page {
 
         for (i, script) in all_to_execute.iter().enumerate() {
             if script.src.is_some() {
-                if let Some((url, code, resp)) = fetched.remove(&i) {
+                if let Some((url, code, resp, elapsed_ms)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
                     self.record_network_event(
                         &url,
@@ -507,9 +513,11 @@ impl Page {
                     if let Some(js) = &mut self.js {
                         // Resource Timing: record this <script src> on the timeline
                         // before executing it, so a later inline script observes it.
+                        // startTime = end - (real fetch elapsed) so duration reflects
+                        // the actual network time (> 0), not a collapsed instant.
                         let rt = format!(
-                            "try {{ if (performance._addResourceEntry) {{ var __s=performance.now(); performance._addResourceEntry({:?}, \"script\", __s, performance.now(), {{ enc:{}, dec:{}, status:{} }}); }} }} catch(e) {{}}",
-                            url, resp.body.len(), code.len(), resp.status
+                            "try {{ if (performance._addResourceEntry) {{ var __e=performance.now(); var __s=__e-{:.6}; if (__s<0) __s=0; performance._addResourceEntry({:?}, \"script\", __s, __e, {{ enc:{}, dec:{}, status:{} }}); }} }} catch(e) {{}}",
+                            elapsed_ms, url, resp.body.len(), code.len(), resp.status
                         );
                         let _ = js.execute_script("<resource-timing>", &rt);
                         if let Err(e) = js.execute_script_guarded(&url, &code) {

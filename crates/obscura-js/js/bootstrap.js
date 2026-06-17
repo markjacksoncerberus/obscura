@@ -1248,6 +1248,26 @@ const _makeTokenList = function(el, attr) {
   });
 };
 
+// HTML "reflect a content attribute as a URL" getter (used by `img.src`,
+// `a.href`, etc.). Per the spec the IDL getter does NOT return the raw attribute:
+// an absent attribute reads as "", and a present one is parsed against the
+// element's base URL and returned as a serialized ABSOLUTE URL. Only if parsing
+// fails is the raw value returned. Resolving here is what lets
+// `performance.getEntriesByName(img.src)` match the absolute entry name recorded
+// by `_loadElementResource`.
+const _reflectURL = function (el, attr) {
+  const v = el.getAttribute(attr);
+  if (v == null) return "";
+  let base;
+  try { base = el.baseURI; } catch (e) {}
+  try { return new URL(v, base || undefined).href; } catch (e) { return v; }
+};
+// Elements whose `src`/`href` IDL attributes are URL-reflecting (resolve on get).
+// Scoped deliberately tight: every OTHER element keeps the raw-attribute getter,
+// so this change can't perturb non-URL `src`/`href` reads elsewhere.
+const _URL_REFLECT_SRC = new Set(['img', 'script', 'iframe', 'audio', 'video', 'source', 'track', 'embed', 'input', 'frame']);
+const _URL_REFLECT_HREF = new Set(['a', 'area', 'link']);
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -1603,14 +1623,20 @@ class Element extends Node {
   set name(v) { this.setAttribute("name", v); }
   get placeholder() { return this.getAttribute("placeholder") || ""; }
   set placeholder(v) { this.setAttribute("placeholder", v); }
-  get href() { return this.getAttribute("href") || ""; }
+  get href() {
+    if (_URL_REFLECT_HREF.has(this.localName)) return _reflectURL(this, "href");
+    return this.getAttribute("href") || "";
+  }
   set href(v) { this.setAttribute("href", v); }
   get rel() { return this.getAttribute("rel") || ""; }
   set rel(v) { this.setAttribute("rel", v); }
   // iframe srcdoc reflects the attribute; setting it reprocesses via setAttribute.
   get srcdoc() { return this.getAttribute("srcdoc") || ""; }
   set srcdoc(v) { this.setAttribute("srcdoc", v == null ? "" : String(v)); }
-  get src() { return this.getAttribute("src") || ""; }
+  get src() {
+    if (_URL_REFLECT_SRC.has(this.localName)) return _reflectURL(this, "src");
+    return this.getAttribute("src") || "";
+  }
   set src(v) {
     this.setAttribute("src", v);
     // <img>: setting src starts a fetch (whether or not the element is

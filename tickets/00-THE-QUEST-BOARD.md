@@ -34,6 +34,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~17~~ | ✅ [The Entropy Gate](17-the-entropy-gate.md) | `WebCryptoAPI/getRandomValues` | **39/39** | ⚔️ | **SECURED 100%** — real `crypto.getRandomValues` contract (was a `Math.random` fill @ 23/39); **+16**. Added `TypeMismatchError:17` to `DOMException._codes` + the modern `QuotaExceededError` interface |
 | ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
 | 23 | [The Element Ledger](23-the-element-ledger.md) | `resource-timing/*` element loads (+ perf-timeline) | ⚔️ po-observe 1/1, dynamic-insertion 5/6, img 1/1, link 5/8 | ⚔️⚔️ | **inc 1+2 ~+16.** Element subresource loads (`<img>`, `<link>`, `<script>`, `<object>` — both JS-inserted AND markup) emit `resource` entries + fire load/error; iframe/XHR report correct initiatorType. Next: css-embedded "css" entries, `img.src` resolved-URL reflection, font→css, redirect timing, buffer-full |
+| ~~24~~ | ✅ [The Resolved Reflection](24-the-resolved-reflection.md) | `resource-timing/status-codes-create-entry` (+ `getEntriesByName(el.src)` family) | **status-codes 0→1/1** | ⚔️ | **SECURED — +1, foundational.** URL-reflecting IDL getters (`img/script/iframe.src`, `a/link/area.href`) now return the RESOLVED absolute URL (was the raw attribute), so `getEntriesByName(img.src)` matches the absolute entry name. Page `<script src>` `resource` entries carry the real fetch-elapsed `duration` (was a collapsed 0). Scoped tight (per-localName sets), zero regressions. Caps: TAO/cross-origin family, `<base>`-loader divergence |
 | ~~22~~ | ✅ [The Resource Ledger](22-the-resource-ledger.md) | `resource-timing/*` (+ perf-timeline) | **buffered-flag 1/1, clear-resource-timings 1/1, case-sensitivity 3/3** | ⚔️⚔️ | **SECURED — +4.** `PerformanceResourceTiming` entries for `fetch()`/XHR + page `<script src>` loads; real `clearResourceTimings`. Caps: element loads (img/link/iframe), TAO cross-origin, buffer-full family |
 | ~~21~~ | ✅ [The Navigator's Almanac](21-the-navigators-almanac.md) | `navigation-timing/*` | **~20 subtests across 9 tests** | ⚔️⚔️ | **SECURED — ~+20.** Real `PerformanceNavigationTiming` (+ `PerformanceResourceTiming` base): nav entry present from the start, queued to observers at load; honest body sizes from the Rust response; `readystatechange` at interactive/complete. Caps: exact-byte-size/host-URL value tests, per-iframe nav timing, real redirect-chain timing |
 | ~~20~~ | ✅ [The Observer's Gallery](20-the-observers-gallery.md) | `performance-timeline/*` | **PO suite 11/11 + idl 35/58** | ⚔️⚔️ | **SECURED — ~+15.** Real `PerformanceObserver` (was a no-op stub): observe(entryTypes/type+buffered), disconnect/takeRecords, supportedEntryTypes, PerformanceObserverEntryList, task-queued delivery from mark()/measure(). Cap: po-observe + 2 case-sensitivity subtests need resource/navigation timing entries |
@@ -64,6 +65,31 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #24 — The Resolved Reflection, +1, foundational):**
+- **URL-reflecting IDL attributes now return the resolved absolute URL.** The
+  shared `Element` `src`/`href` getters returned the raw content attribute, so
+  `img.src` on `<img src="resources/foo.py">` gave the relative string while the
+  Resource Timing ledger (Scroll #23) filed the entry under the absolute URL —
+  `getEntriesByName(img.src)` matched nothing. New `_reflectURL(el, attr)`
+  (bootstrap.js) implements the HTML "reflect as a URL" getter (absent → `""`;
+  else `new URL(value, el.baseURI).href`; parse-fail → raw), gated to the
+  genuinely URL-reflecting elements via `_URL_REFLECT_SRC`
+  (img/script/iframe/audio/video/source/track/embed/input/frame) and
+  `_URL_REFLECT_HREF` (a/area/link) so non-URL reads stay raw.
+- **Honest page-`<script src>` entry duration.** The page-script `resource` entry
+  was injected with `startTime === endTime` (`duration 0`); the test also asserts
+  `duration > 0`. `page.rs` now times each script fetch with `std::time::Instant`
+  and records `startTime = now - elapsed`, so `duration` is the real network time.
+- **Results:** `resource-timing/status-codes-create-entry` 0→**1/1**. Zero
+  regressions (clean-server sweep: qsa 1975, classlist 1420, createElement 147,
+  url-origin 403, mark 22/22, structured-clone 141/152, getRandomValues 39/39,
+  po-disconnect 3/3, url-with-fetch 16/16, iframe-load 2/2, measures 119/119,
+  nav2-attributes 1/1, po-observe 1/1, case-sensitivity.any 3/3, img 1/1, link
+  5/8, dynamic-insertion 5/6, clear-resource-timings 1/1; relevant-mutations
+  70/113, flaky 69↔70 unrelated). **Caps:** TAO/cross-origin `getEntriesByName`
+  family; `<base>`-tag divergence between the getter (`baseURI`) and the loader
+  (`document_url`). Scroll `tickets/24-the-resolved-reflection.md`.
 
 **Session 2026-06-17 (Quest #23 — The Element Ledger, inc 2, ~+6):**
 - **Markup subresource scan.** Inc 1 only loaded elements inserted via JS; MARKUP
