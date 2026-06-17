@@ -33,6 +33,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~18~~ | ✅ [The Timekeeper's Ledger](18-the-timekeepers-ledger.md) | `user-timing/*`, `hr-time/*` | **mark 22/22 + realm** | ⚔️⚔️ | **SECURED** — real User Timing L3 (was a no-op `performance`): mark/measure/getEntries/clear + PerformanceEntry/Mark/Measure/Timing + ~70 realm subtests. Caps: obsolete L1/L2 `mark(timingAttr)`-throws subtests; `<body onload>` load-event gap |
 | ~~17~~ | ✅ [The Entropy Gate](17-the-entropy-gate.md) | `WebCryptoAPI/getRandomValues` | **39/39** | ⚔️ | **SECURED 100%** — real `crypto.getRandomValues` contract (was a `Math.random` fill @ 23/39); **+16**. Added `TypeMismatchError:17` to `DOMException._codes` + the modern `QuotaExceededError` interface |
 | ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
+| ~~19~~ | ✅ [The Load Bell](19-the-load-bell.md) | *load-lifecycle* — `<body onload>` → `window.onload` | **clearMarks 57/57, clearMeasures 57/57, measures 119/119** | ⚔️⚔️ | **SECURED — +233.** `<body onload=…>` is an HTML *window* event handler; it was never wired to `window.onload`, so testharness pages running tests from `<body onload>` came back could-not-run. `__installBodyWindowHandlers()` compiles body/frameset window-reflecting on\* content attrs onto `window.on*` before parser scripts run. General fix — unlocks any load-gated test |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -59,6 +60,31 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #19 — The Load Bell, +233):**
+- **`<body onload>` is a *window* event handler — now wired.** Testharness pages
+  that run their tests from `<body onload=onload_test()>` + `setup({explicit_done:true})`
+  came back **could-not-run**: the document `load` event fired on the window, but the
+  body's `onload` content attribute (an HTML window event handler) was never wired to
+  `window.onload`, so the handler — and its `done()` — never ran.
+- **`__installBodyWindowHandlers()`** (`bootstrap.js` ~2903) scans `document.body`
+  (and `<frameset>`) for the window-reflecting `on*` content attribute set, compiles
+  each with `new Function('event', attr)`, and assigns it to `globalThis.on<name>`.
+  Called from the `<ready-state>` step in `page.rs` (~472), **before** parser scripts
+  run — body already exists in the static snapshot, and a later `window.onload = fn`
+  in a page script overrides it (safe script-wins ordering). `onerror` excluded to
+  preserve the engine's error-reporting bridge. No double-fire (`_dispatchSpec` invokes
+  only registered listeners, not `on*` props; the explicit `window.onload()` in
+  `<load-event>` is the single call).
+- **Results:** `user-timing/clearMarks` 0→**57/57**, `clearMeasures` 0→**57/57**,
+  `measures` 0→**119/119** (all were could-not-run). General fix — any load-gated test
+  now runs. Zero regressions (mark.any 22/22, measure-exceptions 13/13, hr-time/basic
+  5/5, qsa 1975, classlist 1420, createElement 147, structured-clone 141/152,
+  getRandomValues 39/39, base64 380/380, url-origin 403/403, XMLSerializer 27/29).
+- **Honest cap:** `measure_associated_with_navigation_timing.html` now runs but
+  no-results — it needs nonzero `loadEventEnd`/`domComplete`, which must stay 0 for the
+  secured `measure-exceptions` (0-valued attr → `InvalidAccessError`). Real
+  navigation-timing population is a separate quest. Scroll `tickets/19-the-load-bell.md`.
 
 **Session 2026-06-17 (Quest #18 — The Timekeeper's Ledger, User Timing L3, ~+70):**
 - **A real User Timing Level 3** replacing a no-op `performance` (mark()/measure() did

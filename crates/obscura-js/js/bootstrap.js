@@ -2899,6 +2899,36 @@ const __exposeNamedGlobals = function() {
     }
   } catch (e) {}
 };
+
+// HTML "Window-reflecting body element event handler set" + the body/frameset
+// window event handlers: an on* content attribute on <body> (or <frameset>) is
+// an event handler for the WINDOW, not the element (e.g. `<body onload=...>` ===
+// `window.onload`). We compile each such attribute and install it as
+// window.on<name>. This runs before parser-discovered scripts execute, so a
+// later `window.onload = fn` in a page script overrides it (the safe ordering).
+// The <load-event> step then invokes window.onload. `onerror` is intentionally
+// excluded to preserve the engine's default window.onerror reporting bridge.
+const _BODY_WINDOW_HANDLERS = ['onload', 'onresize', 'onscroll', 'onblur', 'onfocus',
+  'onhashchange', 'onlanguagechange', 'onmessage', 'onmessageerror', 'onoffline',
+  'ononline', 'onpagehide', 'onpageshow', 'onpopstate', 'onrejectionhandled',
+  'onstorage', 'onunhandledrejection', 'onunload', 'onbeforeunload',
+  'onafterprint', 'onbeforeprint'];
+const __installBodyWindowHandlers = function() {
+  try {
+    const sources = [];
+    if (document.body) sources.push(document.body);
+    const root = document.documentElement;
+    if (root && root.querySelector) { const fs = root.querySelector('frameset'); if (fs) sources.push(fs); }
+    for (const el of sources) {
+      if (!el || !el.getAttribute) continue;
+      for (const on of _BODY_WINDOW_HANDLERS) {
+        const attr = el.getAttribute(on);
+        if (attr == null) continue;
+        try { globalThis[on] = new Function('event', attr); } catch (e) {}
+      }
+    }
+  } catch (e) {}
+};
 globalThis.navigator = {
   get userAgent() { return __obscura_ua || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"; },
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },

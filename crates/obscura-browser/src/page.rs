@@ -473,7 +473,7 @@ impl Page {
                 "<ready-state>",
                 // Also expose markup id'd elements as Window-named globals
                 // (<el id=foo> -> window.foo) before page scripts run.
-                "globalThis.__documentReadyState__ = 'loading'; __exposeNamedGlobals();",
+                "globalThis.__documentReadyState__ = 'loading'; __exposeNamedGlobals(); __installBodyWindowHandlers();",
             );
         }
 
