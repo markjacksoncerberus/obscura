@@ -95,7 +95,7 @@ DOMException._codes = {
   InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
   NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
   SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
-  InvalidAccessError: 15, SecurityError: 18, NetworkError: 19, AbortError: 20,
+  InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18, NetworkError: 19, AbortError: 20,
   URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
   InvalidNodeTypeError: 24, DataCloneError: 25,
 };
@@ -111,6 +111,22 @@ Object.assign(DOMException, {
   INVALID_NODE_TYPE_ERR: 24, DATA_CLONE_ERR: 25,
 });
 globalThis.DOMException = _markNative(DOMException);
+
+// QuotaExceededError — the modern WHATWG interface (a DOMException subclass with
+// nullable `quota`/`requested`), distinct from a bare `new DOMException(…,
+// "QuotaExceededError")`. WPT's assert_throws_quotaexceedederror requires both
+// the extra accessors and `e.constructor === self.QuotaExceededError`.
+class QuotaExceededError extends DOMException {
+  constructor(message = "", options = undefined) {
+    super(message, "QuotaExceededError");
+    const o = (options == null) ? {} : options;
+    this._quota = (o.quota === undefined) ? null : o.quota;
+    this._requested = (o.requested === undefined) ? null : o.requested;
+  }
+  get quota() { return this._quota; }
+  get requested() { return this._requested; }
+}
+globalThis.QuotaExceededError = _markNative(QuotaExceededError);
 
 // Engine internals must not pollute the page's `window`. ALL runtime plumbing —
 // including the Rust<->JS eval bridge state — is now declared as top-level
@@ -4891,7 +4907,54 @@ Object.defineProperty(Document.prototype, 'fonts', {
   },
   configurable: true,
 });
-globalThis.crypto = globalThis.crypto || { getRandomValues(arr) { for(let i=0;i<arr.length;i++) arr[i]=Math.floor(Math.random()*256); return arr; }, randomUUID(){ return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==="x"?r:(r&3|8)).toString(16);}); } };
+// crypto.getRandomValues / randomUUID — Web Crypto "Crypto" surface. The old
+// stub ignored the WebIDL/spec contract entirely (no type check, no quota, and
+// it mutated non-integer views). This enforces the real semantics:
+//   - non-ArrayBufferView arg            → TypeError
+//   - a non-integer view (Float*, DataView) → TypeMismatchError
+//   - byteLength > 65536                 → QuotaExceededError
+//   - otherwise fill the bytes and return the SAME view.
+// NOTE: entropy is still Math.random (not a CSPRNG) — a known follow-up; this
+// change is conformance only and does not weaken anything vs. the prior stub.
+globalThis.crypto = globalThis.crypto || (function () {
+  const _toStr = Object.prototype.toString;
+  const _intViews = {
+    "[object Int8Array]": 1, "[object Uint8Array]": 1, "[object Uint8ClampedArray]": 1,
+    "[object Int16Array]": 1, "[object Uint16Array]": 1,
+    "[object Int32Array]": 1, "[object Uint32Array]": 1,
+    "[object BigInt64Array]": 1, "[object BigUint64Array]": 1,
+  };
+  function _fillRandomBytes(u8) {
+    for (let i = 0; i < u8.length; i++) u8[i] = (Math.random() * 256) | 0;
+  }
+  const _hex = new Array(256);
+  for (let i = 0; i < 256; i++) _hex[i] = (i + 0x100).toString(16).slice(1);
+  return {
+    getRandomValues(view) {
+      if (!ArrayBuffer.isView(view))
+        throw new TypeError("Failed to execute 'getRandomValues' on 'Crypto': parameter 1 is not of type 'ArrayBufferView'.");
+      const brand = _toStr.call(view);
+      if (!_intViews[brand])
+        throw new DOMException("The provided ArrayBufferView is of type '" + brand.slice(8, -1) +
+          "', which is not an integer array type.", "TypeMismatchError");
+      if (view.byteLength > 65536)
+        throw new QuotaExceededError("The ArrayBufferView's byte length (" + view.byteLength +
+          ") exceeds the number of bytes of entropy available via this API (65536).");
+      _fillRandomBytes(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+      return view;
+    },
+    randomUUID() {
+      const b = new Uint8Array(16);
+      _fillRandomBytes(b);
+      b[6] = (b[6] & 0x0f) | 0x40; // version 4
+      b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+      const h = _hex;
+      return h[b[0]] + h[b[1]] + h[b[2]] + h[b[3]] + "-" + h[b[4]] + h[b[5]] + "-" +
+        h[b[6]] + h[b[7]] + "-" + h[b[8]] + h[b[9]] + "-" +
+        h[b[10]] + h[b[11]] + h[b[12]] + h[b[13]] + h[b[14]] + h[b[15]];
+    },
+  };
+})();
 // structuredClone — a real WHATWG StructuredSerialize/StructuredDeserialize.
 // Replaces the old `JSON.parse(JSON.stringify(v))` footgun (which dropped
 // undefined/NaN/Infinity, corrupted -0, threw on BigInt and cyclic refs, and

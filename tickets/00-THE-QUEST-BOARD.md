@@ -30,6 +30,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~11~~ | ✅ [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | **getElementsBy\* all 100%** | ⚔️⚔️ | **SECURED** |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ insertNode **1531**, surround **1247** | ⚔️⚔️⚔️ | +1171 this session (validity + live doctype); tails = doctype-order + range-setup IndexSizeError |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
+| ~~17~~ | ✅ [The Entropy Gate](17-the-entropy-gate.md) | `WebCryptoAPI/getRandomValues` | **39/39** | ⚔️ | **SECURED 100%** — real `crypto.getRandomValues` contract (was a `Math.random` fill @ 23/39); **+16**. Added `TypeMismatchError:17` to `DOMException._codes` + the modern `QuotaExceededError` interface |
 | ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
@@ -57,6 +58,29 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #17 — The Entropy Gate, getRandomValues 23→39/39, +16):**
+- **A real `crypto.getRandomValues` contract** replacing a `Math.random` fill that honored
+  none of the spec (no type check, no quota, and it *threw* on BigInt arrays because it
+  assigned `Math.floor(...)` numbers to a `BigInt64Array`). Now: non-`ArrayBufferView` →
+  `TypeError`; a float/`DataView` view (`Float16Array`/`Float32Array`/`DataView`) →
+  `TypeMismatchError`; `byteLength > 65536` → `QuotaExceededError`; otherwise fill the
+  bytes through a `Uint8Array` view over the buffer (so every integer view — incl.
+  `BigInt64Array`/`BigUint64Array` and subclasses — fills cleanly) and return the SAME view.
+- **Two shared-surface fixes the test demanded:** (1) `DOMException._codes` was missing
+  `TypeMismatchError: 17`, so its `code` getter returned 0 (the legacy `TYPE_MISMATCH_ERR`
+  constant existed but the name→code map didn't) — added it. (2) WPT's
+  `assert_throws_quotaexceedederror` requires the **modern `QuotaExceededError` interface**
+  (a `DOMException` subclass with nullable `quota`/`requested`, and `e.constructor ===
+  self.QuotaExceededError`), not a bare `new DOMException(…, "QuotaExceededError")` — added
+  the class + global.
+- **getRandomValues 23→39/39 (100%).** `randomUUID` was already 3/3 (its old format was
+  valid). Zero regressions (structured-clone 141/152, qsa 1975, classlist 1420, base64
+  380/380, url-origin 403/403, createElement 147, encoding 3421, parseFromString-xml 20/20,
+  Element-tagName 6/6, Node-normalize 4/4).
+- **Honest caveat:** entropy is still `Math.random`, not a CSPRNG — a real security
+  follow-up (needs a Rust-exposed secure RNG op). This change is conformance only and does
+  not weaken anything vs. the prior stub. Scroll `tickets/17-the-entropy-gate.md`.
 
 **Session 2026-06-17 (Quest #16 — The Clone Forge, structuredClone 29→141/152, +112):**
 - **A real WHATWG StructuredSerialize/StructuredDeserialize** replacing the
