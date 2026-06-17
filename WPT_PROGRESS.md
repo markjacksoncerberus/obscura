@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-16.
+Branch: `engine-per-page-threads`. Last updated: 2026-06-17.
 
 ## Scoreboard
 
@@ -18,6 +18,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-16.
 |------|:------:|:------:|:------:|----------------|
 | `url/url-constructor.any.html` | 1/890 | **847/890** | ⬆️ | URL Grimoire `656e7ea` + cleanup `2c67057`; Quest #04 Inc 2 (path `^`→`%5E`, opaque trailing-space `%20`) + Inc 3 (`///` special-authority slash-skip) |
 | `url/url-origin.any.html` | n/a¹ | **403/403** | ✅ 100% | URL Grimoire + cleanup `2c67057` |
+| `html/webappapis/structured-clone/structured-clone.any.html` | 29/152 | **141/152** | ⬆️ 93% | **Quest #16 The Clone Forge.** Real WHATWG StructuredSerialize/Deserialize (replaced the `JSON.parse(JSON.stringify)` footgun): `memory` Map for cycles/identity, brand dispatch over primitives/BigInt/boxed/Date/RegExp/Error-family/ArrayBuffer+TypedArrays+DataView/Map/Set/Blob/File, DataCloneError for symbols·functions·non-serializable platform objects (Response/Request)·SAB, ArrayBuffer transfer (V8 `.transfer()`/`.detached`) + `crossOriginIsolated=false`. 10 left = engine gaps (FileList iface, OOB-TypedArray detection, real MessagePort/ImageBitmap/OffscreenCanvas transferables) |
 | `dom/nodes/ParentNode-querySelector-All.html` | 1396/1977 | **1975/1975** | ✅ 100% | **Quest #01 SECURED.** `namespaceURI` + foreign-ns `createElementNS`; `::slotted()` parse-but-never-match; iframe docs preserve `<html>/<head>/<body>` attrs; `:link` only `a`/`area`; real `:target` (URL-fragment id); real `NodeList` (`extends Array`, species→Array); `:root` matches a real document's root but not a fragment's child (Rust `real_documents` set) |
 | `dom/nodes/Document-createElement.html` | 0/147 | **147/147** | ✅ 100% | Quest #05: WebIDL coercion + InvalidCharacterError validation + ASCII-only casing + real `namespaceURI`/`prefix`; XML-document iframes (case-sensitive createElement, parsed-root documentElement) + iframes-delay-parent-load |
 | `dom/nodes/Element-classlist.html` | ~0 | **1420/1420** | ✅ 100% | **Quest #03 SECURED.** Real DOMTokenList + eager mutation drain (synchronous `takeRecords()` sees the record; `replace()` mutation-count) + `_write` skips materializing an empty attr when absent (`remove()` keeps null class null) + `replace()` empty-before-whitespace token validation |

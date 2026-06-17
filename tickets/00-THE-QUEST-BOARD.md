@@ -30,6 +30,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~11~~ | ✅ [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | **getElementsBy\* all 100%** | ⚔️⚔️ | **SECURED** |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ insertNode **1531**, surround **1247** | ⚔️⚔️⚔️ | +1171 this session (validity + live doctype); tails = doctype-order + range-setup IndexSizeError |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
+| ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -56,6 +57,39 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #16 — The Clone Forge, structuredClone 29→141/152, +112):**
+- **A real WHATWG StructuredSerialize/StructuredDeserialize** replacing the
+  `globalThis.structuredClone = (v) => JSON.parse(JSON.stringify(v))` footgun (which
+  dropped `undefined`/`NaN`/`±Infinity`, corrupted `-0`, threw on `BigInt` and **every
+  cyclic ref**, and lost all platform types). Pure JS @ `bootstrap.js`, no new Rust.
+  - Recursive `_clone(value, memory, transferSet)` with a **`memory` Map** keyed by the
+    original → clone (checked before recursing, container inserted before its contents)
+    so cycles and shared references are preserved.
+  - **Brand dispatch** via `Object.prototype.toString`: primitives & BigInt survive
+    verbatim; boxed Boolean/Number/String/BigInt; Date; RegExp (lastIndex→0); the Error
+    family (name→standard ctor, own message + own cause only, custom props dropped);
+    ArrayBuffer (resizable-aware) + all TypedArrays + DataView (length-tracking preserved);
+    Map/Set; Blob/File (copy the `_bytes` store directly — byte-exact for invalid-UTF-8
+    blobs; `Object.create(proto)` collapses subclasses to the closest serializable type);
+    arrays (holes + non-index props); ordinary objects (own enumerable string keys only,
+    clone proto = `%Object.prototype%`).
+  - **`DataCloneError`** for symbols, functions, non-serializable platform objects
+    (`Response`/`Request`), and `SharedArrayBuffer` (we're not cross-origin-isolated).
+  - **ArrayBuffer transfer** using V8's `ArrayBuffer.prototype.transfer()`/`.detached`
+    (copy bytes → build fresh buffer w/ preserved `maxByteLength` → detach source);
+    detached/non-ArrayBuffer entries in the transfer list → `DataCloneError`.
+  - Interface objects (`Blob`/`File`/`Response`/`Request`) captured at load so a clone
+    still works after the page deletes the global; added `crossOriginIsolated = false`.
+  - **structured-clone.any 29→141/152 (+112).** Zero regressions (qsa 1975, classlist
+    1420, createElement 147, base64 380/380, url-origin 403/403, encoding 3421,
+    parseFromString-xml 20/20, XMLSerializer 27/29, Element-tagName 6/6, Node-normalize 4/4).
+  - **10 honest losses, all engine gaps (not the algorithm):** 3× FileList (no FileList
+    interface), 2× OOB-TypedArray (V8 reports an OOB TA as length-0/offset-0 — undetectable
+    in pure JS; the OOB **DataView** cases DO pass since `.byteLength` throws), MessagePort
+    /ImageBitmap/OffscreenCanvas transfer + detached/deleted MessagePort (no real
+    transferable-platform machinery). Bonus `structuredclone_0.html` still TIMEOUTs — it's
+    a cross-document `postMessage`/`MessageChannel` test, unrelated to the clone algorithm.
 
 **Session 2026-06-16 (knight Claudius — Base64 Cipher, atob/btoa 164→380/380, +216):**
 - **Real HTML-spec `btoa`/`atob` over a BYTE string.** The old `btoa` stub

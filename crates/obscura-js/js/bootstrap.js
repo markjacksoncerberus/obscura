@@ -4892,7 +4892,164 @@ Object.defineProperty(Document.prototype, 'fonts', {
   configurable: true,
 });
 globalThis.crypto = globalThis.crypto || { getRandomValues(arr) { for(let i=0;i<arr.length;i++) arr[i]=Math.floor(Math.random()*256); return arr; }, randomUUID(){ return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,c=>{const r=Math.random()*16|0;return(c==="x"?r:(r&3|8)).toString(16);}); } };
-globalThis.structuredClone = globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v)));
+// structuredClone — a real WHATWG StructuredSerialize/StructuredDeserialize.
+// Replaces the old `JSON.parse(JSON.stringify(v))` footgun (which dropped
+// undefined/NaN/Infinity, corrupted -0, threw on BigInt and cyclic refs, and
+// lost every platform type). Pure JS, recursive, with a `memory` Map that
+// preserves identity and cycles (insert the new container BEFORE recursing).
+globalThis.structuredClone = globalThis.structuredClone || (function () {
+  // Capture interface objects at load time so a clone still works (and stays
+  // `instanceof` the right type) after a page deletes the global — see the
+  // "interface deleted from the global … must still deserialize" WPT subtests.
+  const _Blob = globalThis.Blob, _File = globalThis.File;
+  const _Response = globalThis.Response, _Request = globalThis.Request;
+  const _toStr = Object.prototype.toString;
+  const _hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  const _ErrorCtors = { Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError };
+  const _dataClone = (msg) => new DOMException(msg, "DataCloneError");
+
+  // Clone (or, when in transferSet, MOVE) an ArrayBuffer, preserving resizable
+  // buffers' maxByteLength. Bytes are copied out before any transfer-detach.
+  function _cloneArrayBuffer(buf, transferSet) {
+    if (buf.detached) throw _dataClone("An ArrayBuffer is detached and could not be cloned.");
+    const len = buf.byteLength;
+    const resizable = buf.resizable === true;
+    const maxByteLength = resizable ? buf.maxByteLength : undefined;
+    const bytes = new Uint8Array(len); bytes.set(new Uint8Array(buf, 0, len));
+    if (transferSet && transferSet.has(buf)) { try { buf.transfer(); } catch (e) {} } // detach the source
+    const out = resizable ? new ArrayBuffer(len, { maxByteLength }) : new ArrayBuffer(len);
+    new Uint8Array(out).set(bytes);
+    return out;
+  }
+
+  function _clone(value, memory, transferSet) {
+    // Primitives survive verbatim — including undefined, ±0, NaN, ±Infinity, BigInt.
+    if (value === null) return null;
+    const t = typeof value;
+    if (t === "undefined" || t === "boolean" || t === "number" || t === "string" || t === "bigint") return value;
+    if (t === "symbol") throw _dataClone("A Symbol value could not be cloned.");
+    if (t === "function") throw _dataClone("A function could not be cloned.");
+
+    // Object — preserve identity / break cycles.
+    if (memory.has(value)) return memory.get(value);
+    const brand = _toStr.call(value);
+
+    // Boxed primitives.
+    if (brand === "[object Boolean]") { const o = new Boolean(value.valueOf()); memory.set(value, o); return o; }
+    if (brand === "[object Number]")  { const o = new Number(value.valueOf());  memory.set(value, o); return o; }
+    if (brand === "[object String]")  { const o = new String(value.valueOf());  memory.set(value, o); return o; }
+    if (brand === "[object BigInt]")  { const o = Object(value.valueOf());       memory.set(value, o); return o; }
+    if (brand === "[object Symbol]")  throw _dataClone("A Symbol value could not be cloned.");
+
+    // Date / RegExp (RegExp lastIndex resets to 0 — the constructor does that).
+    if (brand === "[object Date]")   { const o = new Date(value.getTime());           memory.set(value, o); return o; }
+    if (brand === "[object RegExp]") { const o = new RegExp(value.source, value.flags); memory.set(value, o); return o; }
+
+    // Error family — name (mapped to a standard constructor), own message, and
+    // own cause only. Custom own properties are deliberately NOT carried over.
+    if (brand === "[object Error]" || value instanceof Error) {
+      const Ctor = _hasOwn(_ErrorCtors, value.name) ? _ErrorCtors[value.name] : Error;
+      const msg = _hasOwn(value, "message") ? String(value.message) : undefined;
+      let o;
+      if (_hasOwn(value, "cause")) {
+        o = new Ctor(msg, { cause: undefined }); memory.set(value, o);
+        try { o.cause = _clone(value.cause, memory, transferSet); } catch (e) {}
+      } else {
+        o = new Ctor(msg); memory.set(value, o);
+      }
+      return o;
+    }
+
+    // Buffers & views.
+    if (brand === "[object ArrayBuffer]") { const o = _cloneArrayBuffer(value, transferSet); memory.set(value, o); return o; }
+    if (brand === "[object SharedArrayBuffer]") {
+      // SABs are only cloneable in a cross-origin-isolated agent; we are not one.
+      throw _dataClone("A SharedArrayBuffer could not be cloned.");
+    }
+    if (brand === "[object DataView]") {
+      let byteOffset, byteLength;
+      try { byteOffset = value.byteOffset; byteLength = value.byteLength; }
+      catch (e) { throw _dataClone("A DataView is out of bounds and could not be cloned."); }
+      const tracking = value.buffer.resizable === true && (byteOffset + byteLength === value.buffer.byteLength);
+      const buf = _clone(value.buffer, memory, transferSet);
+      const o = tracking ? new DataView(buf, byteOffset) : new DataView(buf, byteOffset, byteLength);
+      memory.set(value, o); return o;
+    }
+    if (ArrayBuffer.isView(value)) { // a TypedArray (DataView handled above)
+      const Ctor = globalThis[brand.slice(8, -1)] || value.constructor;
+      const byteOffset = value.byteOffset, length = value.length;
+      const tracking = value.buffer.resizable === true && (byteOffset + value.byteLength === value.buffer.byteLength);
+      const buf = _clone(value.buffer, memory, transferSet);
+      const o = tracking ? new Ctor(buf, byteOffset) : new Ctor(buf, byteOffset, length);
+      memory.set(value, o); return o;
+    }
+
+    // Map / Set (not in the WPT battery, but part of the algorithm).
+    if (brand === "[object Map]") {
+      const o = new Map(); memory.set(value, o);
+      value.forEach((v, k) => o.set(_clone(k, memory, transferSet), _clone(v, memory, transferSet)));
+      return o;
+    }
+    if (brand === "[object Set]") {
+      const o = new Set(); memory.set(value, o);
+      value.forEach((v) => o.add(_clone(v, memory, transferSet)));
+      return o;
+    }
+
+    // File before Blob (File extends Blob). Object.create(proto) collapses any
+    // subclass to its closest serializable interface and copies the byte store
+    // directly (no re-encoding — keeps invalid-UTF-8 blobs byte-exact).
+    if (_File && value instanceof _File) {
+      const o = Object.create(_File.prototype);
+      o._bytes = value._bytes.slice(); o._type = value._type;
+      o._name = value._name; o._lastModified = value._lastModified;
+      memory.set(value, o); return o;
+    }
+    if (_Blob && value instanceof _Blob) {
+      const o = Object.create(_Blob.prototype);
+      o._bytes = value._bytes.slice(); o._type = value._type;
+      memory.set(value, o); return o;
+    }
+
+    // Non-serializable platform objects (no serialization steps) → DataCloneError.
+    if ((_Response && value instanceof _Response) || (_Request && value instanceof _Request))
+      throw _dataClone("An object could not be cloned.");
+
+    // Arrays — preserve length (holes), copy own enumerable string keys (which
+    // skips holes and symbol keys); shared/cyclic refs resolve via `memory`.
+    if (Array.isArray(value)) {
+      const o = new Array(value.length); memory.set(value, o);
+      const keys = Object.keys(value);
+      for (let i = 0; i < keys.length; i++) o[keys[i]] = _clone(value[keys[i]], memory, transferSet);
+      return o;
+    }
+
+    // Ordinary objects — the clone's prototype is %Object.prototype% (so an
+    // exotic input like Object.prototype itself loses its exotic-ness), only own
+    // enumerable string-keyed properties are carried (a throwing getter rejects).
+    const o = {}; memory.set(value, o);
+    const keys = Object.keys(value);
+    for (let i = 0; i < keys.length; i++) o[keys[i]] = _clone(value[keys[i]], memory, transferSet);
+    return o;
+  }
+
+  return function structuredClone(value, options) {
+    const transferList = (options && options.transfer != null) ? options.transfer : [];
+    const transferSet = new Set();
+    for (const item of transferList) {
+      // Only ArrayBuffers are transferable in this engine; everything else
+      // (Blob, MessagePort, …) is non-transferable here → DataCloneError.
+      if (_toStr.call(item) !== "[object ArrayBuffer]")
+        throw _dataClone("Value in transfer list could not be transferred.");
+      if (item.detached) throw _dataClone("A detached ArrayBuffer could not be transferred.");
+      transferSet.add(item);
+    }
+    return _clone(value, new Map(), transferSet);
+  };
+})();
+// We are not a cross-origin-isolated agent (no COOP+COEP), so SharedArrayBuffer
+// is not cloneable — code (and the structured-clone WPT SAB subtest) checks this.
+if (typeof globalThis.crossOriginIsolated === "undefined") globalThis.crossOriginIsolated = false;
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
 globalThis.Storage = function Storage() {};
