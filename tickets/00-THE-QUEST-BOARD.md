@@ -33,6 +33,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~18~~ | ✅ [The Timekeeper's Ledger](18-the-timekeepers-ledger.md) | `user-timing/*`, `hr-time/*` | **mark 22/22 + realm** | ⚔️⚔️ | **SECURED** — real User Timing L3 (was a no-op `performance`): mark/measure/getEntries/clear + PerformanceEntry/Mark/Measure/Timing + ~70 realm subtests. Caps: obsolete L1/L2 `mark(timingAttr)`-throws subtests; `<body onload>` load-event gap |
 | ~~17~~ | ✅ [The Entropy Gate](17-the-entropy-gate.md) | `WebCryptoAPI/getRandomValues` | **39/39** | ⚔️ | **SECURED 100%** — real `crypto.getRandomValues` contract (was a `Math.random` fill @ 23/39); **+16**. Added `TypeMismatchError:17` to `DOMException._codes` + the modern `QuotaExceededError` interface |
 | ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
+| ~~20~~ | ✅ [The Observer's Gallery](20-the-observers-gallery.md) | `performance-timeline/*` | **PO suite 11/11 + idl 35/58** | ⚔️⚔️ | **SECURED — ~+15.** Real `PerformanceObserver` (was a no-op stub): observe(entryTypes/type+buffered), disconnect/takeRecords, supportedEntryTypes, PerformanceObserverEntryList, task-queued delivery from mark()/measure(). Cap: po-observe + 2 case-sensitivity subtests need resource/navigation timing entries |
 | ~~19~~ | ✅ [The Load Bell](19-the-load-bell.md) | *load-lifecycle* — `<body onload>` → `window.onload` | **clearMarks 57/57, clearMeasures 57/57, measures 119/119** | ⚔️⚔️ | **SECURED — +233.** `<body onload=…>` is an HTML *window* event handler; it was never wired to `window.onload`, so testharness pages running tests from `<body onload>` came back could-not-run. `__installBodyWindowHandlers()` compiles body/frameset window-reflecting on\* content attrs onto `window.on*` before parser scripts run. General fix — unlocks any load-gated test |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
@@ -60,6 +61,30 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #20 — The Observer's Gallery, ~+15):**
+- **A real `PerformanceObserver`** replacing `class{constructor(){} observe(){} disconnect(){}}`.
+  All in `bootstrap.js` after the `Performance` class (~5093), built on Scroll #18's entry buffer.
+  - `observe({entryTypes})` (replaces observed set) / `observe({type, buffered})` (accumulates;
+    buffered:true seeds from the global timeline) with `InvalidModificationError` on mode-mix and
+    `SyntaxError` on both/neither; `disconnect()`; `takeRecords()`; cached frozen
+    `supportedEntryTypes = ['mark','measure']`; `PerformanceObserverEntryList`
+    (getEntries/ByType/ByName, startTime-sorted).
+  - **Delivery:** `mark()`/`measure()` call `_queuePerformanceEntry` → append to matching observers'
+    buffers → one `setTimeout(0)` task (`_schedulePerfTask`/`_flushPerfObservers`); the flush clears
+    the scheduled flag first so a callback that observes() schedules a fresh task (chains
+    `multiple-buffered-flag-observers`). `takeRecords()` drains before the task → callback skipped.
+  - idlharness tidy-ups: `Symbol.toStringTag` on both, non-enumerable interface objects (matches
+    real Chrome), EntryList WebIDL length 0 (reads `arguments[0]`).
+  - **Results:** supportedEntryTypes 2/2, po-disconnect 3/3, po-takeRecords 1/1, po-entries-sort 1/1,
+    observer-buffered-false 1/1, buffered-flag-after-timeout 1/1, multiple-buffered-flag-observers 1/1,
+    case-sensitivity 1/3, idlharness 31→35/58. Zero regressions (mark.any 22/22, measure-exceptions
+    13/13, clearMarks 57/57, hr-time/basic 5/5, monotonic-clock 2/2, qsa 1975, classlist 1420,
+    createElement 147, structured-clone 141/152, getRandomValues 39/39, base64 380/380, url-origin
+    403/403, XMLSerializer 27/29).
+  - **Cap:** `po-observe` (TIMEOUT) + the other 2 `case-sensitivity` subtests need `resource`/`navigation`
+    timeline entries (resource/navigation timing — not implemented). The observer is complete; it has
+    nothing to deliver for those types. Scroll `tickets/20-the-observers-gallery.md`.
 
 **Session 2026-06-17 (Quest #19 — The Load Bell, +233):**
 - **`<body onload>` is a *window* event handler — now wired.** Testharness pages

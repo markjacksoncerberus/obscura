@@ -4125,7 +4125,9 @@ globalThis.IntersectionObserver = class {
   unobserve() {}
   disconnect() {}
 };
-globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
+// PerformanceObserver — the real implementation lives just after the `Performance`
+// class + `globalThis.performance` are defined (it needs the entry buffer to read
+// buffered entries and to be notified on mark()/measure()).
 
 globalThis.Event = class Event {
   constructor(t,o) {
@@ -5000,6 +5002,7 @@ class Performance {
       throw new TypeError("Failed to execute 'mark' on 'Performance': 1 argument required, but only 0 present.");
     const m = new PerformanceMark(markName, markOptions);
     this._entries.push(m);
+    _queuePerformanceEntry(m);
     return m;
   }
   // Resolve a mark NAME (always string-coerced): a PerformanceTiming attribute
@@ -5050,6 +5053,7 @@ class Performance {
     }
     const m = new PerformanceMeasure(measureName, startTime, endTime - startTime, detail);
     this._entries.push(m);
+    _queuePerformanceEntry(m);
     return m;
   }
   getEntries() { return this._entries.slice().sort((a, b) => a.startTime - b.startTime); }
@@ -5090,6 +5094,131 @@ class Performance {
 }
 globalThis.Performance = _markNative(Performance);
 globalThis.performance = globalThis.performance || new Performance();
+
+// ---- PerformanceObserver (Performance Timeline Level 2) ----------------------
+// The entry types Obscura can actually generate timeline entries for. Must be in
+// strict alphabetical order (supportedEntryTypes asserts types[i-1] < types[i])
+// and frozen+cached (the attribute must return the same array each access).
+const _PERF_SUPPORTED_ENTRY_TYPES = Object.freeze(['mark', 'measure']);
+
+// Registered observers + the single pending-delivery task (HTML "queue a
+// PerformanceObserver task": one task flushes every observer with a non-empty
+// buffer). _perfTaskScheduled is cleared at the start of a flush so an observer
+// queued *from within* a callback schedules a fresh task.
+const _perfObservers = [];
+let _perfTaskScheduled = false;
+const _flushPerfObservers = function () {
+  _perfTaskScheduled = false;
+  // Snapshot: a callback may observe()/disconnect() mid-flush.
+  const snapshot = _perfObservers.slice();
+  for (const obs of snapshot) {
+    if (!obs._buffer.length) continue;
+    const records = obs._buffer;
+    obs._buffer = [];
+    const list = new PerformanceObserverEntryList(records);
+    try { obs._callback.call(obs, list, obs); } catch (e) { _reportError(e); }
+  }
+};
+const _schedulePerfTask = function () {
+  if (_perfTaskScheduled) return;
+  _perfTaskScheduled = true;
+  setTimeout(_flushPerfObservers, 0);
+};
+// Called by performance.mark()/measure() once an entry joins the timeline:
+// append it to every observer watching that entryType, then queue delivery.
+const _queuePerformanceEntry = function (entry) {
+  for (const obs of _perfObservers) {
+    if (obs._types[entry.entryType]) {
+      obs._buffer.push(entry);
+      _schedulePerfTask();
+    }
+  }
+};
+
+class PerformanceObserverEntryList {
+  // WebIDL: PerformanceObserverEntryList has no constructor, so its interface
+  // object length must be 0 — read the entries from arguments instead of a
+  // declared parameter.
+  constructor() { this._entries = (arguments[0] || []).slice(); }
+  getEntries() { return this._entries.slice().sort((a, b) => a.startTime - b.startTime); }
+  getEntriesByType(type) { return this.getEntries().filter((e) => e.entryType === String(type)); }
+  getEntriesByName(name, type) {
+    const n = String(name);
+    return this.getEntries().filter((e) => e.name === n && (type === undefined || e.entryType === String(type)));
+  }
+}
+Object.defineProperty(PerformanceObserverEntryList.prototype, Symbol.toStringTag,
+  { value: 'PerformanceObserverEntryList', configurable: true });
+// Interface objects are non-enumerable on the global (matches real browsers +
+// WebIDL; idlharness asserts `self`'s interface properties are not enumerable).
+Object.defineProperty(globalThis, 'PerformanceObserverEntryList',
+  { value: _markNative(PerformanceObserverEntryList), writable: true, enumerable: false, configurable: true });
+
+class PerformanceObserver {
+  constructor(callback) {
+    if (typeof callback !== 'function')
+      throw new TypeError("Failed to construct 'PerformanceObserver': parameter 1 is not of type 'Function'.");
+    this._callback = callback;
+    this._buffer = [];
+    this._types = Object.create(null); // entryType -> true (currently observed)
+    this._mode = null;                  // 'multiple' (entryTypes) | 'single' (type)
+  }
+  observe(options) {
+    options = options || {};
+    const hasEntryTypes = options.entryTypes !== undefined;
+    const hasType = options.type !== undefined;
+    if (hasEntryTypes && hasType)
+      throw new SyntaxError("Failed to execute 'observe' on 'PerformanceObserver': entryTypes and type cannot both be provided.");
+    if (!hasEntryTypes && !hasType)
+      throw new SyntaxError("Failed to execute 'observe' on 'PerformanceObserver': either entryTypes or type must be provided.");
+
+    if (hasEntryTypes) {
+      // entryTypes form: REPLACES the observed set. Cannot follow a type-form observe().
+      if (this._mode === 'single')
+        throw new DOMException("Failed to execute 'observe' on 'PerformanceObserver': This observer has performed observe({type:...}) in the past.", "InvalidModificationError");
+      this._mode = 'multiple';
+      const list = Array.from(options.entryTypes || []).map(String)
+        .filter((t) => _PERF_SUPPORTED_ENTRY_TYPES.indexOf(t) !== -1);
+      // (Unsupported types are dropped per spec; an all-unsupported list leaves
+      // nothing observed and never fires.)
+      this._types = Object.create(null);
+      for (const t of list) this._types[t] = true;
+    } else {
+      // type form: ACCUMULATES. Cannot follow an entryTypes-form observe().
+      if (this._mode === 'multiple')
+        throw new DOMException("Failed to execute 'observe' on 'PerformanceObserver': This observer has performed observe({entryTypes:...}) in the past.", "InvalidModificationError");
+      this._mode = 'single';
+      const t = String(options.type);
+      if (_PERF_SUPPORTED_ENTRY_TYPES.indexOf(t) === -1) return; // unsupported → ignore (with a warning, per spec)
+      this._types[t] = true;
+      // buffered flag: seed the observer buffer with already-recorded entries of
+      // this type from the global timeline, then queue a delivery task.
+      if (options.buffered) {
+        for (const e of performance._entries)
+          if (e.entryType === t) this._buffer.push(e);
+        if (this._buffer.length) _schedulePerfTask();
+      }
+    }
+    if (_perfObservers.indexOf(this) === -1) _perfObservers.push(this);
+  }
+  disconnect() {
+    const i = _perfObservers.indexOf(this);
+    if (i !== -1) _perfObservers.splice(i, 1);
+    this._buffer = [];
+    this._types = Object.create(null);
+    this._mode = null;
+  }
+  takeRecords() {
+    const records = this._buffer;
+    this._buffer = [];
+    return records.slice().sort((a, b) => a.startTime - b.startTime);
+  }
+  static get supportedEntryTypes() { return _PERF_SUPPORTED_ENTRY_TYPES; }
+}
+Object.defineProperty(PerformanceObserver.prototype, Symbol.toStringTag,
+  { value: 'PerformanceObserver', configurable: true });
+Object.defineProperty(globalThis, 'PerformanceObserver',
+  { value: _markNative(PerformanceObserver), writable: true, enumerable: false, configurable: true });
 
 Object.defineProperty(Document.prototype, 'fonts', {
   get() {
