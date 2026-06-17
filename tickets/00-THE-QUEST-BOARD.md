@@ -30,7 +30,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~11~~ | ✅ [The Collections Armory](11-the-collections-armory.md) | `dom/collections`, getElementsBy* | **getElementsBy\* all 100%** | ⚔️⚔️ | **SECURED** |
 | 12 | [The Iframe Frontier](12-the-iframe-frontier.md) | `dom/ranges` content-ops (per-iframe realms) | ⚔️ insertNode **1531**, surround **1247** | ⚔️⚔️⚔️ | +1171 this session (validity + live doctype); tails = doctype-order + range-setup IndexSizeError |
 | ~~13~~ | ✅ [The Harness Gates](13-the-harness-gates.md) | *meta* — could-not-run / no-results | **SECURED** | ⚔️⚔️ | unlocked #10 |
-| 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️ real `DOMParser('text/html')` DONE (9/10) | ⚔️⚔️⚔️ | Inc 1: +7 (detached HTML doc, was returning the LIVE document!); Inc 2 = real namespace-aware XML parser + spec XMLSerializer (the long-deferred keystone; unlocks Node-normalize/tagName tails too) |
+| 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
 
@@ -56,6 +56,32 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-16 (knight Claudius — Quest #14 Inc 2: the XML keystone, +46):**
+- **A real namespace-aware XML `DOMParser` + the W3C `XMLSerializer`** — the keystone
+  the campaign deferred for many sessions. All in `bootstrap.js`, no new Rust, built on
+  the existing `createElementNS`/`setAttributeNS` namespace machinery.
+  - **`_parseXMLDocument`** — a hand-rolled XML tokenizer (deliberately NOT html5ever
+    nor xml5ever: html5ever lowercases + HTML-namespaces; xml5ever implements *XML5*
+    which is error-recovering and can never emit a `parsererror`). Tracks an xmlns scope
+    stack, resolves element/attr prefixes to declared URIs, builds the tree with real
+    namespaces; text/CDATA/comment/PI/entity-ref/`<?xml?>` handling; non-well-formed →
+    a Gecko-style `parsererror` document.
+  - **`globalThis.XMLDocument`** defined so `!(doc instanceof XMLDocument)` holds — per
+    the HTML spec, DOMParser's XML branch returns a plain `Document` (unlike
+    createDocument/XHR). All four XML types route through the real parser.
+  - **The W3C XML serialization algorithm** — namespace prefix map, generate-a-prefix
+    (`ns${i}`), record-namespace-information, xmlns reset/redundancy, nearest-prefix
+    selection, attr `&#x9;/&#xA;/&#xD;` escaping, `<div/>` self-close vs HTML `<div></div>`.
+  - **Footgun fixed:** `new DocumentFragment()` (no nid) didn't allocate a backing node →
+    `_nid` undefined → Rust ops read node 0 (the LIVE page!). Now allocates; also added
+    DocumentFragment `append`/`prepend`/`childElementCount`.
+  - **parseFromString-xml 0→20/20 (100%), XMLSerializer 3→27/29**; retroactively
+    **Node-normalize 3→4/4**, **Element-tagName 5→6/6**. Zero regressions (qsa 1975,
+    classlist 1420, createElement 147, url-origin 403, encoding 3421, iframe-load 2/2,
+    content_document 1/1, isEqualNode 9/9, Range-clone/extract 177/159, cloneNode 103,
+    appendChild 11/11). 2 serializer tails left are hard spec edges (XLink prefix =
+    Chrome-specific; `xmlns=""` keep-vs-drop = mutually exclusive DOM-Parsing spec issue).
 
 **Session 2026-06-16 (knight Claudius — Quest #14 The Parsing Foundry opened, +7):**
 - **Real `DOMParser.parseFromString`** (was a stub returning the LIVE `globalThis.document`

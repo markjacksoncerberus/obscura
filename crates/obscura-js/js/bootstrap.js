@@ -2113,6 +2113,15 @@ class Document extends Node {
 }
 
 class DocumentFragment extends Node {
+  // The web-facing `new DocumentFragment()` must allocate a REAL backing node;
+  // without one, `_nid` is undefined and Rust tree ops fall back to node 0 (the
+  // live page document) — the same footgun the old DOMParser stub had.
+  // document.createDocumentFragment() still passes a real nid.
+  constructor(nid) {
+    if (nid === undefined) nid = +_dom("create_document_fragment");
+    super(nid);
+    _cache.set(nid, this);
+  }
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
@@ -2129,7 +2138,18 @@ class DocumentFragment extends Node {
   }
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
+  get childElementCount() { return this.children.length; }
   getElementById(id) { return null; }
+  // ParentNode mixin (Element defines these too; DocumentFragment extends Node
+  // directly, so it needs its own copy).
+  append(...nodes) { for (const n of nodes) this.appendChild(typeof n === "string" ? document.createTextNode(n) : n); }
+  prepend(...nodes) {
+    const ref = this.firstChild;
+    for (const n of nodes) {
+      const node = (typeof n === "string") ? document.createTextNode(n) : n;
+      if (ref) this.insertBefore(node, ref); else this.appendChild(node);
+    }
+  }
   cloneNode(deep) {
     const frag = document.createDocumentFragment();
     if (deep) frag.innerHTML = this.innerHTML;
@@ -4456,6 +4476,351 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
   toString() { return this._p.map(([k, v]) => _formEncode(k) + '=' + _formEncode(v)).join('&'); }
 };
 
+// Namespace of the error document Gecko/Blink build for non-well-formed XML; the
+// WPT DOMParser-parseFromString-xml tests assert on it by name.
+const _PARSERERROR_NS = "http://www.mozilla.org/newlayout/xml/parsererror.xml";
+
+// ===========================================================================
+// A real, namespace-aware XML parser (DOMParser text/xml & friends).
+//
+// html5ever is an HTML parser — it lowercases tag names and forces the HTML
+// namespace, so `<foo/>` could never get namespaceURI===null through it. This
+// hand-rolled parser tokenizes XML, tracks xmlns scope, and builds the DOM via
+// the real createElementNS / setAttributeNS machinery (so the selector engine,
+// getElementsByTagName and the XMLSerializer all see true namespaces). On a
+// well-formedness error it reports failure so the caller can build a
+// `parsererror` document, matching browsers.
+//
+// Returns { ok:true, nodes:[...] } (document-level children, in order) or
+// { ok:false, message }.
+// ===========================================================================
+function _parseXMLDocument(src, doc) {
+  const s = String(src);
+  const N = s.length;
+  let i = 0;
+  const out = [];
+  // Namespace scope stack: each frame maps prefix -> namespace URI ('' = the
+  // default namespace). The base frame carries the two built-in prefixes.
+  const NSStack = [Object.assign(Object.create(null), { '': null, xml: _XML_NS, xmlns: _XMLNS_NS })];
+  const resolve = (prefix) => {
+    for (let k = NSStack.length - 1; k >= 0; k--) if (prefix in NSStack[k]) return NSStack[k][prefix];
+    return undefined;
+  };
+  const fail = (msg) => { throw { __xmlwf: true, message: msg || 'not well-formed' }; };
+  const isWS = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+  const isNameStart = (c) => /[A-Za-z_:]/.test(c) || c.charCodeAt(0) >= 0x80;
+  const isNameChar = (c) => isNameStart(c) || c === '-' || c === '.' || (c >= '0' && c <= '9') || c === '·';
+  const skipWS = () => { while (i < N && isWS(s[i])) i++; };
+  const readName = () => {
+    if (i >= N || !isNameStart(s[i])) fail('expected name');
+    const start = i; i++;
+    while (i < N && isNameChar(s[i])) i++;
+    return s.slice(start, i);
+  };
+  const splitQName = (qn) => { const c = qn.indexOf(':'); return c < 0 ? { prefix: null, local: qn } : { prefix: qn.slice(0, c), local: qn.slice(c + 1) }; };
+  const decode = (str) => {
+    if (str.indexOf('&') < 0) return str;
+    return str.replace(/&(#x[0-9A-Fa-f]+|#[0-9]+|[A-Za-z][A-Za-z0-9]*);/g, (m, e) => {
+      if (e[0] === '#') {
+        const cp = (e[1] === 'x' || e[1] === 'X') ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+        try { return String.fromCodePoint(cp); } catch (_) { return m; }
+      }
+      switch (e) { case 'amp': return '&'; case 'lt': return '<'; case 'gt': return '>'; case 'quot': return '"'; case 'apos': return "'"; }
+      return m; // unknown entity — leave literal (lenient)
+    });
+  };
+
+  const parsePI = (parent) => {
+    i += 2; // '<?'
+    const target = readName();
+    skipWS();
+    const e = s.indexOf('?>', i);
+    if (e < 0) fail('unterminated processing instruction');
+    const data = s.slice(i, e);
+    i = e + 2;
+    try { parent.appendChild(doc.createProcessingInstruction(target, data)); } catch (_) { /* invalid PI target — drop */ }
+  };
+
+  const parseElement = () => {
+    i++; // '<'
+    const qname = readName();
+    const rawAttrs = [];
+    const seen = Object.create(null);
+    let selfClose = false;
+    while (true) {
+      const hadWS = i < N && isWS(s[i]);
+      skipWS();
+      if (i >= N) fail('eof in start tag');
+      const c = s[i];
+      if (c === '>') { i++; break; }
+      if (c === '/') { i++; if (s[i] !== '>') fail('expected >'); i++; selfClose = true; break; }
+      if (!hadWS) fail('expected whitespace before attribute');
+      const an = readName();
+      if (an in seen) fail('duplicate attribute');
+      seen[an] = true;
+      skipWS();
+      if (s[i] !== '=') fail('expected =');
+      i++; skipWS();
+      const q = s[i];
+      if (q !== '"' && q !== "'") fail('expected quote');
+      i++;
+      const vs = i;
+      while (i < N && s[i] !== q) { if (s[i] === '<') fail('< in attribute value'); i++; }
+      if (i >= N) fail('unterminated attribute value');
+      const rv = s.slice(vs, i);
+      i++; // closing quote
+      rawAttrs.push([an, decode(rv)]);
+    }
+    // The element's own xmlns declarations are in scope for itself and its attrs.
+    const frame = Object.create(null);
+    for (const [an, av] of rawAttrs) {
+      if (an === 'xmlns') frame[''] = (av === '' ? null : av);
+      else if (an.lastIndexOf('xmlns:', 0) === 0) { const p = an.slice(6); if (p) frame[p] = (av === '' ? null : av); }
+    }
+    NSStack.push(frame);
+    const eq = splitQName(qname);
+    let ens;
+    if (eq.prefix === null) ens = resolve('');
+    else { ens = resolve(eq.prefix); if (ens === undefined || ens === null) fail('undeclared prefix ' + eq.prefix); }
+    if (ens === undefined) ens = null;
+    const el = doc.createElementNS(ens, qname);
+    for (const [an, av] of rawAttrs) {
+      if (an === 'xmlns') el.setAttributeNS(_XMLNS_NS, 'xmlns', av);
+      else if (an.lastIndexOf('xmlns:', 0) === 0) el.setAttributeNS(_XMLNS_NS, an, av);
+      else {
+        const aq = splitQName(an);
+        if (aq.prefix === null) el.setAttributeNS(null, an, av); // unprefixed attrs are in no namespace
+        else { const ans = resolve(aq.prefix); if (ans === undefined || ans === null) fail('undeclared attribute prefix ' + aq.prefix); el.setAttributeNS(ans, an, av); }
+      }
+    }
+    if (!selfClose) parseContent(el, qname);
+    NSStack.pop();
+    return el;
+  };
+
+  function parseContent(el, qname) {
+    let text = '';
+    const flush = () => { if (text.length) { el.appendChild(doc.createTextNode(decode(text))); text = ''; } };
+    while (i < N) {
+      if (s[i] === '<') {
+        if (s.startsWith('<!--', i)) { flush(); const e = s.indexOf('-->', i + 4); if (e < 0) fail('unterminated comment'); el.appendChild(doc.createComment(s.slice(i + 4, e))); i = e + 3; continue; }
+        if (s.startsWith('<![CDATA[', i)) { flush(); const e = s.indexOf(']]>', i + 9); if (e < 0) fail('unterminated CDATA section'); el.appendChild(doc.createCDATASection(s.slice(i + 9, e))); i = e + 3; continue; }
+        if (s.startsWith('<?', i)) { flush(); parsePI(el); continue; }
+        if (s.startsWith('</', i)) {
+          flush(); i += 2;
+          const en = readName(); skipWS();
+          if (s[i] !== '>') fail('malformed end tag'); i++;
+          if (en !== qname) fail('mismatched end tag');
+          return;
+        }
+        flush(); el.appendChild(parseElement()); continue;
+      }
+      text += s[i]; i++;
+    }
+    fail('unexpected end of input, expected </' + qname + '>');
+  }
+
+  try {
+    if (s[i] === '﻿') i++;
+    skipWS();
+    // XML declaration (not a node).
+    if (s.startsWith('<?xml', i) && (i + 5 >= N || isWS(s[i + 5]) || s[i + 5] === '?')) {
+      const e = s.indexOf('?>', i);
+      if (e < 0) fail('unterminated XML declaration');
+      i = e + 2;
+    }
+    let root = null;
+    while (i < N) {
+      skipWS();
+      if (i >= N) break;
+      if (s[i] !== '<') fail(root ? 'text after document element' : 'content before document element');
+      if (s.startsWith('<!--', i)) { const e = s.indexOf('-->', i + 4); if (e < 0) fail('unterminated comment'); out.push(doc.createComment(s.slice(i + 4, e))); i = e + 3; continue; }
+      if (s.startsWith('<!DOCTYPE', i)) { const e = s.indexOf('>', i); if (e < 0) fail('unterminated doctype'); i = e + 1; continue; }
+      if (s.startsWith('<?', i)) { parsePI({ appendChild: (n) => out.push(n) }); continue; }
+      if (s.startsWith('</', i)) fail('unexpected end tag');
+      if (root) fail('more than one document element');
+      root = parseElement();
+      out.push(root);
+    }
+    if (!root) fail('no document element');
+    return { ok: true, nodes: out };
+  } catch (err) {
+    // A real well-formedness error OR a DOMException from createElementNS /
+    // setAttributeNS (e.g. an invalid name) → not well-formed.
+    return { ok: false, message: (err && err.message) || 'not well-formed' };
+  }
+}
+
+// ===========================================================================
+// XMLSerializer — the W3C "DOM Parsing and Serialization" XML serialization
+// algorithm (namespace prefix map, prefix generation, xmlns reset/redundancy).
+// ===========================================================================
+const _XML_VOID = new Set('area base basefont bgsound br col embed frame hr img input keygen link menuitem meta param source track wbr'.split(' '));
+const _xmlAttrList = (node) => {
+  if (node == null || node._nid == null) return [];
+  return (_domParse('attribute_list', node._nid) || []).map((r) => ({
+    namespaceURI: (r.ns == null || r.ns === '') ? null : r.ns,
+    prefix: (r.prefix == null || r.prefix === '') ? null : r.prefix,
+    localName: r.local,
+    value: r.value == null ? '' : r.value,
+  }));
+};
+const _xmlMapCopy = (m) => { const n = new Map(); for (const [k, v] of m) n.set(k, v.slice()); return n; };
+const _xmlMapAdd = (m, ns, prefix) => { const l = m.get(ns); if (l) l.push(prefix); else m.set(ns, [prefix]); };
+const _xmlMapFound = (m, ns, prefix) => { const l = m.get(ns); return !!l && l.indexOf(prefix) >= 0; };
+const _xmlRetrievePrefix = (m, preferred, ns) => {
+  const l = m.get(ns);
+  if (!l) return null;
+  let cand = null;
+  for (const p of l) { cand = p; if (p === preferred) return p; }
+  return cand;
+};
+const _xmlGenPrefix = (m, ns, idx) => { const gp = 'ns' + idx.value; idx.value += 1; _xmlMapAdd(m, ns, gp); return gp; };
+const _xmlEscText = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const _xmlEscAttr = (v) => String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/\t/g, '&#x9;').replace(/\n/g, '&#xA;').replace(/\r/g, '&#xD;');
+
+const _xmlRecordNS = (node, map, localPrefixesMap) => {
+  let dflt = null;
+  for (const a of _xmlAttrList(node)) {
+    if (a.namespaceURI !== _XMLNS_NS) continue;
+    if (a.prefix === null) { dflt = a.value; continue; } // xmlns="..."
+    const prefixDef = a.localName;
+    let nsDef = a.value;
+    if (nsDef === _XML_NS) continue;
+    if (nsDef === '') nsDef = null;
+    if (_xmlMapFound(map, nsDef, prefixDef)) continue;
+    _xmlMapAdd(map, nsDef, prefixDef);
+    localPrefixesMap[prefixDef] = (nsDef === null ? '' : nsDef);
+  }
+  return dflt;
+};
+
+const _xmlSerAttrs = (node, map, idx, localPrefixesMap, ignoreNsDefAttr) => {
+  let result = '';
+  const elNs = node.namespaceURI == null ? null : node.namespaceURI;
+  for (const attr of _xmlAttrList(node)) {
+    const attributeNamespace = attr.namespaceURI;
+    // A no-namespace attribute literally named "xmlns" acts as a default-namespace
+    // declaration; browsers drop it when it disagrees with the element's real
+    // namespace ("Drop inconsistent xmlns by matching on local name").
+    if (attributeNamespace === null && attr.prefix === null && attr.localName === 'xmlns') {
+      const declVal = attr.value === '' ? null : attr.value;
+      if (elNs !== declVal) continue;
+    }
+    let candidatePrefix = null;
+    if (attributeNamespace !== null) {
+      candidatePrefix = _xmlRetrievePrefix(map, attr.prefix, attributeNamespace);
+      if (attributeNamespace === _XMLNS_NS) {
+        if (attr.value === _XML_NS ||
+            (attr.prefix === null && ignoreNsDefAttr) ||
+            (attr.prefix !== null &&
+              (!(attr.localName in localPrefixesMap) || localPrefixesMap[attr.localName] !== attr.value) &&
+              _xmlMapFound(map, attr.value, attr.localName))) {
+          continue;
+        }
+        if (attr.prefix === 'xmlns') candidatePrefix = 'xmlns';
+      } else if (candidatePrefix === null) {
+        candidatePrefix = _xmlGenPrefix(map, attributeNamespace, idx);
+        result += ' xmlns:' + candidatePrefix + '="' + _xmlEscAttr(attributeNamespace) + '"';
+      }
+    }
+    result += ' ';
+    if (candidatePrefix !== null) result += candidatePrefix + ':';
+    result += attr.localName + '="' + _xmlEscAttr(attr.value) + '"';
+  }
+  return result;
+};
+
+const _xmlSerElement = (node, namespace, prefixMap, idx) => {
+  let markup = '<';
+  let qualifiedName = '';
+  let skipEndTag = false;
+  let ignoreNsDefAttr = false;
+  const map = _xmlMapCopy(prefixMap);
+  const localPrefixesMap = Object.create(null);
+  const localDefaultNamespace = _xmlRecordNS(node, map, localPrefixesMap);
+  let inheritedNs = namespace;
+  const ns = node.namespaceURI == null ? null : node.namespaceURI;
+
+  if (inheritedNs === ns) {
+    if (localDefaultNamespace !== null) ignoreNsDefAttr = true;
+    qualifiedName = (ns === _XML_NS) ? 'xml:' + node.localName : node.localName;
+    markup += qualifiedName;
+  } else {
+    let prefix = node.prefix;
+    let candidatePrefix = _xmlRetrievePrefix(map, prefix, ns);
+    if (prefix === 'xmlns') candidatePrefix = 'xmlns';
+    if (candidatePrefix !== null) {
+      qualifiedName = candidatePrefix + ':' + node.localName;
+      if (localDefaultNamespace !== null && localDefaultNamespace !== _XML_NS) {
+        inheritedNs = localDefaultNamespace === '' ? null : localDefaultNamespace;
+      }
+      markup += qualifiedName;
+    } else if (prefix !== null) {
+      if (prefix in localPrefixesMap) prefix = _xmlGenPrefix(map, ns, idx);
+      else _xmlMapAdd(map, ns, prefix);
+      qualifiedName = prefix + ':' + node.localName;
+      markup += qualifiedName + ' xmlns:' + prefix + '="' + _xmlEscAttr(ns == null ? '' : ns) + '"';
+      if (localDefaultNamespace !== null) inheritedNs = localDefaultNamespace === '' ? null : localDefaultNamespace;
+    } else if (localDefaultNamespace === null || localDefaultNamespace !== ns) {
+      ignoreNsDefAttr = true;
+      qualifiedName = node.localName;
+      inheritedNs = ns;
+      markup += qualifiedName + ' xmlns="' + _xmlEscAttr(ns == null ? '' : ns) + '"';
+    } else {
+      qualifiedName = node.localName;
+      inheritedNs = ns;
+      markup += qualifiedName;
+    }
+  }
+
+  markup += _xmlSerAttrs(node, map, idx, localPrefixesMap, ignoreNsDefAttr);
+
+  const isHTML = ns === _HTML_NS;
+  const kids = node.childNodes;
+  const empty = !kids || kids.length === 0;
+  if (isHTML && empty && _XML_VOID.has(node.localName)) { markup += ' /'; skipEndTag = true; }
+  else if (!isHTML && empty) { markup += '/'; skipEndTag = true; }
+  markup += '>';
+  if (skipEndTag) return markup;
+  for (let k = 0; k < kids.length; k++) markup += _xmlSerNode(kids[k], inheritedNs, map, idx);
+  markup += '</' + qualifiedName + '>';
+  return markup;
+};
+
+const _xmlSerDoctype = (node) => {
+  let s = '<!DOCTYPE ' + (node.name || '');
+  if (node.publicId) s += ' PUBLIC "' + node.publicId + '"';
+  else if (node.systemId) s += ' SYSTEM';
+  if (node.systemId) s += ' "' + node.systemId + '"';
+  return s + '>';
+};
+
+function _xmlSerNode(node, namespace, map, idx) {
+  if (!node) return '';
+  switch (node.nodeType) {
+    case 1: return _xmlSerElement(node, namespace, map, idx);
+    case 3: return _xmlEscText(node.data != null ? node.data : (node.textContent || ''));
+    case 4: return '<![CDATA[' + (node.data != null ? node.data : (node.textContent || '')) + ']]>';
+    case 7: return '<?' + node.target + ' ' + (node.data || '') + '?>';
+    case 8: return '<!--' + (node.data != null ? node.data : (node.textContent || '')) + '-->';
+    case 9:
+    case 11: {
+      const kids = node.childNodes; let out = '';
+      for (let k = 0; k < kids.length; k++) out += _xmlSerNode(kids[k], namespace, map, idx);
+      return out;
+    }
+    case 10: return _xmlSerDoctype(node);
+    default: return '';
+  }
+}
+
+// Per the HTML spec, DOMParser's XML branch returns a Document (NOT an
+// XMLDocument — unlike createDocument / XHR.responseXML); the WPT tests assert
+// `!(doc instanceof XMLDocument)`. Defining the interface lets that evaluate.
+globalThis.XMLDocument = class XMLDocument extends Document {};
+
 globalThis.DOMParser = class DOMParser {
   parseFromString(str, type) {
     str = (str == null) ? '' : String(str);
@@ -4472,12 +4837,11 @@ globalThis.DOMParser = class DOMParser {
       return doc;
     }
     if (XML_TYPES.includes(type)) {
-      // Best-effort XML document (full namespace-aware XML parsing + a spec
-      // XMLSerializer are the next increment). Builds a detached doc — never the
-      // live page — and carries the spec metadata the WPT tests check.
-      const kind = (type === 'application/xhtml+xml') ? 'xhtml' : 'xml';
+      // All XML-family types are parsed by the namespace-aware XML parser (XHTML
+      // and SVG are XML). Builds a detached doc — never the live page — carrying
+      // the spec metadata the WPT tests check.
       const pageURL = (_domParse('document_url') || 'about:blank');
-      const doc = new _IframeDocument(str, pageURL, null, pageURL, kind);
+      const doc = new _IframeDocument(str, pageURL, null, pageURL, 'xml');
       doc._contentType = type;
       return doc;
     }
@@ -4487,27 +4851,9 @@ globalThis.DOMParser = class DOMParser {
 };
 globalThis.XMLSerializer = class XMLSerializer {
   serializeToString(node) {
-    if (!node) return "";
-    if (node.nodeType === 10) {
-      let s = "<!DOCTYPE " + (node.name || "html");
-      if (node.publicId) s += ' PUBLIC "' + node.publicId + '"';
-      if (node.systemId) {
-        if (!node.publicId) s += " SYSTEM";
-        s += ' "' + node.systemId + '"';
-      }
-      s += ">";
-      return s;
-    }
-    if (node.outerHTML !== undefined) return node.outerHTML;
-    if (node.nodeType === 9) {
-      let s = "";
-      if (node.doctype) s += this.serializeToString(node.doctype);
-      if (node.documentElement) s += node.documentElement.outerHTML;
-      return s;
-    }
-    if (node.nodeType === 3) return node.textContent || "";
-    if (node.nodeType === 8) return "<!--" + (node.textContent || "") + "-->";
-    return "";
+    const map = new Map();
+    map.set(_XML_NS, ['xml']);
+    return _xmlSerNode(node, null, map, { value: 1 });
   }
 };
 globalThis.performance = globalThis.performance || {
@@ -5369,19 +5715,17 @@ class _IframeDocument extends DetachedDocument {
     this._evtKey = _nextSyntheticKey();
     if (kind === 'xml') {
       // XML document: the parsed root element IS the documentElement (no synthetic
-      // <html>/<head>/<body>). Parse the markup, drop any XML prolog / doctype, and
-      // append the resulting top-level nodes straight onto the document node.
-      const xmlSrc = String(html || '')
-        .replace(/^﻿/, '')
-        .replace(/^\s*<\?xml[^>]*\?>\s*/i, '')
-        .replace(/^\s*<!DOCTYPE[^>]*>\s*/i, '')
-        .replace(/^\s+/, '');
-      try {
-        const tmp = globalThis.document.createElement('div');
-        tmp.innerHTML = xmlSrc;
-        const kids = Array.prototype.slice.call(tmp.childNodes);
-        for (let i = 0; i < kids.length; i++) this.appendChild(kids[i]);
-      } catch (e) {}
+      // <html>/<head>/<body>). A REAL namespace-aware XML parser (not html5ever)
+      // builds the tree so `<foo/>` yields namespaceURI===null and prefixes resolve
+      // to their declared URIs. Non-well-formed input → a Gecko-style parsererror.
+      const r = _parseXMLDocument(String(html || ''), this);
+      if (r.ok) {
+        for (let k = 0; k < r.nodes.length; k++) this.appendChild(r.nodes[k]);
+      } else {
+        const pe = this.createElementNS(_PARSERERROR_NS, 'parsererror');
+        try { pe.appendChild(this.createTextNode('This page contains the following errors:' + (r.message ? '\nerror: ' + r.message : ''))); } catch (e) {}
+        this.appendChild(pe);
+      }
       return;
     }
     // The explicit <html>/<head>/<body> start tags get stripped below (we parse
