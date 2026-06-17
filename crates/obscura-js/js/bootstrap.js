@@ -474,28 +474,16 @@ class Node {
       }
       const src = c.getAttribute('src');
       if (src) {
-        const fullUrl = src.startsWith('http') ? src : new URL(src, globalThis.location?.href || 'http://localhost/').href;
-        const pageOrigin = (function() { try { return new URL(globalThis.location?.href || "about:blank").origin; } catch(e) { return ""; } })();
-        (async () => {
-          try {
-            const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
-            const parsed = JSON.parse(raw);
-            if (parsed.body) {
-              try { (0, eval)(parsed.body); } catch(e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
-            }
-            if (typeof c.onload === 'function') try { c.onload(new Event('load')); } catch(e) {}
-              try { c.dispatchEvent(new Event('load')); } catch(e) {}
-          } catch(e) {
-            console.error('Dynamic script fetch error:', e.message);
-            if (typeof c.onerror === 'function') try { c.onerror(e); } catch(ex) {}
-          }
-        })();
+        // Fetch + execute the external script, record a Resource Timing entry
+        // (initiatorType "script"), and fire its load/error event.
+        _loadElementResource(c, src, 'script', { eval: true });
       } else {
         const code = c.textContent;
         if (code) { try { (0, eval)(code); } catch(e) { console.error('Dynamic inline script error:', e.message); } }
       }
     }
     if (c instanceof Element && c.localName === 'iframe') _connectIframe(c);
+    if (c instanceof Element) _connectResourceElement(c);
     if (c instanceof Element && c.id) __defineNamedGlobal(c.id);
     return c;
   }
@@ -600,6 +588,7 @@ class Node {
       __notifyMutation('childList', this._nid, [n._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: ref._nid });
     }
     if (n instanceof Element && n.localName === 'iframe') _connectIframe(n);
+    if (n instanceof Element) _connectResourceElement(n);
     return n;
   }
   contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
@@ -1616,12 +1605,20 @@ class Element extends Node {
   set placeholder(v) { this.setAttribute("placeholder", v); }
   get href() { return this.getAttribute("href") || ""; }
   set href(v) { this.setAttribute("href", v); }
+  get rel() { return this.getAttribute("rel") || ""; }
+  set rel(v) { this.setAttribute("rel", v); }
   // iframe srcdoc reflects the attribute; setting it reprocesses via setAttribute.
   get srcdoc() { return this.getAttribute("srcdoc") || ""; }
   set srcdoc(v) { this.setAttribute("srcdoc", v == null ? "" : String(v)); }
   get src() { return this.getAttribute("src") || ""; }
   set src(v) {
     this.setAttribute("src", v);
+    // <img>: setting src starts a fetch (whether or not the element is
+    // connected) which records a Resource Timing entry and fires load/error.
+    if (this.localName === 'img') {
+      if (v) _loadElementResource(this, v, 'img');
+      return;
+    }
     if (this.localName === 'iframe') {
       if (v && v !== 'about:blank') {
         this._loadIframeSrc(v);
@@ -1647,7 +1644,7 @@ class Element extends Node {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
     const el = this;
-    fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
+    fetch(fullUrl, {mode: 'no-cors', _initiatorType: 'iframe'}).then(async resp => {
       // Superseded by a newer load (e.g. srcdoc set while this was in flight)?
       // Don't clobber the current document or fire a stale load.
       if (_self._loadGen !== _gen) return;
@@ -2788,6 +2785,86 @@ const _fireIframeElementLoad = function(el) {
   else { const a = el.getAttribute && el.getAttribute('onload'); if (a) { try { (0, eval)(a); } catch (e) {} } }
 };
 
+// Fire a trusted `error` event on an element whose subresource failed to load.
+const _fireElementError = function(el) {
+  if (!el || el._loadEventFired) return;
+  el._loadEventFired = true;
+  const ev = new Event('error'); // bubbles=false, cancelable=false
+  ev.isTrusted = true;
+  ev.target = el;
+  try { _dispatchSpec(el, ev); } catch (e) {}
+  if (typeof el.onerror === 'function') { try { el.onerror(ev); } catch (e) {} }
+  else { const a = el.getAttribute && el.getAttribute('onerror'); if (a) { try { (0, eval)(a); } catch (e) {} } }
+};
+
+// Load a subresource referenced by an element (<img src>, <link href>,
+// <script src>, <object data>): fetch the bytes, record a
+// PerformanceResourceTiming entry on the timeline, then fire the element's
+// `load` (or `error`) event. `initiatorType` is the Resource Timing value for
+// the element ("img"/"link"/"script"/"object"). For scripts, the fetched body
+// is executed before the load event. Each call bumps a per-element generation
+// token so a superseding src/href reassignment doesn't fire a stale event.
+const _loadElementResource = function(el, url, initiatorType, opts) {
+  opts = opts || {};
+  if (!el || !url) return;
+  let fullUrl = url;
+  // Resolve relative URLs against the document base (absolute URLs untouched).
+  if (!/^[a-z][a-z0-9+.\-]*:/i.test(url)) {
+    try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch (e) {}
+  }
+  const gen = (el._resLoadGen = (el._resLoadGen || 0) + 1);
+  el._loadEventFired = false;
+  const start = (globalThis.performance && performance.now) ? performance.now() : 0;
+  const pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
+  (async () => {
+    try {
+      const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
+      if (el._resLoadGen !== gen) return; // superseded by a newer load
+      const parsed = JSON.parse(raw);
+      // Hard network failure (blocked / CORS) → no entry, fire error.
+      if (parsed.blocked || parsed.corsBlocked) { _fireElementError(el); return; }
+      // We got an HTTP response (any status): record a resource entry with the
+      // honest body size from the response, then fire load (2xx/3xx) or error.
+      const status = parsed.status || 0;
+      try {
+        if (globalThis.performance && performance._addResourceEntry) {
+          const body = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
+          const sz = (body && (body.byteLength != null ? body.byteLength : body.length)) || 0;
+          performance._addResourceEntry(parsed.url || fullUrl, initiatorType, start, performance.now(), { enc: sz, dec: sz, status: status });
+        }
+      } catch (e) {}
+      if (opts.eval && parsed.body) {
+        try { (0, eval)(parsed.body); } catch (e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
+      }
+      if (status === 0 || status >= 400) _fireElementError(el);
+      else _fireIframeElementLoad(el);
+    } catch (e) {
+      if (el._resLoadGen !== gen) return;
+      _fireElementError(el);
+    }
+  })();
+};
+
+// Begin loading a non-iframe subresource element when it becomes connected
+// (<link rel=stylesheet/preload/...>, <object data>). <img>/<script> load on
+// src assignment / appendChild respectively, so they are handled elsewhere.
+const _connectResourceElement = function(el) {
+  if (!el || !(el instanceof Element) || el._resConnected) return;
+  const ln = el.localName;
+  if (ln === 'link') {
+    const rel = String(el.getAttribute('rel') || el.rel || '').toLowerCase();
+    const href = el.getAttribute('href');
+    // Resource-fetching link relations all report initiatorType "link".
+    if (href && /(^|\s)(stylesheet|preload|prefetch|icon|manifest|modulepreload)(\s|$)/.test(rel)) {
+      el._resConnected = true;
+      _loadElementResource(el, href, 'link');
+    }
+  } else if (ln === 'object') {
+    const data = el.getAttribute('data') || el.data;
+    if (data) { el._resConnected = true; _loadElementResource(el, data, 'object'); }
+  }
+};
+
 // Schedule a deferred element load and return its generation token. Each new load
 // (e.g. a src navigation) bumps el._loadGen; a pending deferred load only fires if
 // its generation is still current — so the initial about:blank load of a srcless
@@ -3157,7 +3234,10 @@ globalThis.fetch = async (input, init = {}) => {
   try {
     if (globalThis.performance && performance._addResourceEntry) {
       const _sz = (respType === "opaque") ? 0 : (responseBody && (responseBody.byteLength != null ? responseBody.byteLength : responseBody.length)) || 0;
-      performance._addResourceEntry(parsed.url || url, "fetch", _resStart, performance.now(), { enc: _sz, dec: _sz, status: parsed.status });
+      // Internal callers (XHR, iframe navigation) pass `_initiatorType` so the
+      // entry reports the right element type; the public fetch() default is "fetch".
+      const _it = (init && init._initiatorType) || "fetch";
+      performance._addResourceEntry(parsed.url || url, _it, _resStart, performance.now(), { enc: _sz, dec: _sz, status: parsed.status });
     }
   } catch (e) {}
   return new Response(responseBody, {
@@ -3284,6 +3364,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       headers: this._headers,
       body: body || undefined,
       mode: 'cors',
+      _initiatorType: 'xmlhttprequest',
     }).then(async (resp) => {
       if (xhr._aborted) return;
 
@@ -7316,11 +7397,14 @@ if (typeof DOMMatrix === 'undefined') {
 }
 
 if (typeof Image === 'undefined') {
-  globalThis.Image = class Image {
-    constructor(w, h) { this.width = w || 0; this.height = h || 0; this.src = ''; this.onload = null; this.onerror = null; this.complete = false; this.naturalWidth = 0; this.naturalHeight = 0; }
-    addEventListener() {} removeEventListener() {}
-    setAttribute(k, v) { this[k] = v; if (k === 'src' && this.onload) setTimeout(() => { this.complete = true; this.onload(); }, 0); }
-    getAttribute(k) { return this[k]; }
+  // Legacy Image() factory: produce a real <img> element so setting .src flows
+  // through the element resource-load path (fetch → Resource Timing entry →
+  // load/error event), exactly like a created or parsed <img>.
+  globalThis.Image = function Image(w, h) {
+    const img = document.createElement('img');
+    if (w !== undefined && w !== null) img.width = w;
+    if (h !== undefined && h !== null) img.height = h;
+    return img;
   };
 }
 
