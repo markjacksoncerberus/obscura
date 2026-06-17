@@ -2,5 +2,6 @@ target/
 .DS_Store
 
 shots/
-.claude/
+.claude/*
+!.claude/commands/
 out/
