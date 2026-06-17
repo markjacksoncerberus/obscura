@@ -5204,6 +5204,14 @@ class Performance {
   constructor() {
     this._entries = [];
     this._listeners = [];
+    // Resource Timing buffer (Resource Timing Level 2 §"resource timing buffer"):
+    // primary resource entries live in `_entries` (entryType "resource"); the
+    // secondary buffer holds entries that overflowed while the primary is full,
+    // pending a `fire a buffer full event` task. Default size limit is 250.
+    this._resourceBufferSize = 250;
+    this._resourceSecondary = [];
+    this._bufferFullPending = false;
+    this._onresourcetimingbufferfull = null;
     this.timeOrigin = 0;
     this.timing = new PerformanceTiming(0);
     this.navigation = { type: 0, redirectCount: 0, toJSON() { return { type: 0, redirectCount: 0 }; } };
@@ -5284,16 +5292,33 @@ class Performance {
   clearMeasures(name) {
     this._entries = this._entries.filter((e) => !(e.entryType === "measure" && (name === undefined || e.name === String(name))));
   }
+  // Resource Timing Level 2 §"clear resource timings": remove every resource
+  // entry from the primary buffer and reset the current size to 0. The secondary
+  // buffer is deliberately NOT touched (a pending buffer-full task may still copy
+  // those entries into the freshly-cleared primary buffer).
   clearResourceTimings() {
     this._entries = this._entries.filter((e) => e.entryType !== "resource");
   }
-  setResourceTimingBufferSize(n) { this._resourceBufferSize = Number(n) || 0; }
-  // Record a fetched resource on the timeline and notify observers. Called by
-  // fetch()/XHR when a network request completes. Network sub-phases are
-  // collapsed (fetchStart === request phases === startTime); responseStart/End
-  // carry the completion time so duration > 0 for any real network round-trip.
-  _addResourceEntry(name, initiatorType, startTime, endTime, sizes) {
-    if (typeof PerformanceResourceTiming !== "function") return null;
+  // §"set resource timing buffer size": just update the limit. Coerced to an
+  // unsigned long (NaN/negative → 0); does not fire events or copy buffers.
+  setResourceTimingBufferSize(n) {
+    let v = Math.trunc(Number(n));
+    if (!isFinite(v) || v < 0) v = 0;
+    this._resourceBufferSize = v;
+  }
+  // Number of resource entries currently in the primary buffer === the spec's
+  // "resource timing buffer current size" (the two move together).
+  _resourceCount() {
+    let c = 0;
+    for (const e of this._entries) if (e.entryType === "resource") c++;
+    return c;
+  }
+  // §"can add resource timing entry": true iff the primary buffer has room.
+  _canAddResource() { return this._resourceCount() < this._resourceBufferSize; }
+  // Build a resource entry. Network sub-phases are collapsed (fetchStart ===
+  // request phases === startTime); responseStart/End carry the completion time so
+  // duration > 0 for any real network round-trip.
+  _makeResourceEntry(name, initiatorType, startTime, endTime, sizes) {
     if (endTime < startTime) endTime = startTime;
     const e = new PerformanceResourceTiming(name, "resource", startTime);
     e.initiatorType = initiatorType || "";
@@ -5309,9 +5334,59 @@ class Performance {
       e.transferSize = (sizes.enc || 0) + 300;
       if (sizes.status) e.responseStatus = sizes.status;
     }
-    this._entries.push(e);
-    try { _queuePerformanceEntry(e); } catch (ex) {}
     return e;
+  }
+  // Record a fetched resource on the timeline and notify observers. Called by
+  // fetch()/XHR/element loads when a request completes. Runs the §"add a
+  // PerformanceResourceTiming entry" algorithm: straight into the primary buffer
+  // when there is room and no buffer-full task is pending, otherwise into the
+  // secondary buffer (scheduling a `fire a buffer full event` task).
+  _addResourceEntry(name, initiatorType, startTime, endTime, sizes) {
+    if (typeof PerformanceResourceTiming !== "function") return null;
+    const e = this._makeResourceEntry(name, initiatorType, startTime, endTime, sizes);
+    this._storeResourceEntry(e);
+    return e;
+  }
+  // §"add a PerformanceResourceTiming entry".
+  _storeResourceEntry(e) {
+    if (this._canAddResource() && !this._bufferFullPending) {
+      this._entries.push(e);
+      try { _queuePerformanceEntry(e); } catch (ex) {}
+      return;
+    }
+    if (!this._bufferFullPending) {
+      this._bufferFullPending = true;
+      // Queue on a macrotask (the performance timeline task source) so that any
+      // synchronous code following the overflowing load — e.g. a
+      // setResourceTimingBufferSize() — runs before the buffer-full event fires.
+      setTimeout(() => { try { this._fireResourceBufferFull(); } catch (ex) {} }, 0);
+    }
+    this._resourceSecondary.push(e);
+  }
+  // §"fire a buffer full event": move entries from the secondary buffer into the
+  // primary one, firing `resourcetimingbufferfull` whenever the primary is full,
+  // and dropping the remainder if no progress can be made (overflow guard).
+  _fireResourceBufferFull() {
+    while (this._resourceSecondary.length > 0) {
+      const excessBefore = this._resourceSecondary.length;
+      if (!this._canAddResource()) {
+        this.dispatchEvent(new Event("resourcetimingbufferfull"));
+      }
+      // Copy secondary buffer: drain into the primary while there is room.
+      while (this._resourceSecondary.length > 0 && this._canAddResource()) {
+        const entry = this._resourceSecondary.shift();
+        this._entries.push(entry);
+        try { _queuePerformanceEntry(entry); } catch (ex) {}
+      }
+      const excessAfter = this._resourceSecondary.length;
+      // No progress (the event didn't make room) → drop everything and stop, so
+      // the loop can never spin forever.
+      if (excessBefore <= excessAfter) {
+        this._resourceSecondary = [];
+        break;
+      }
+    }
+    this._bufferFullPending = false;
   }
   toJSON() {
     return { timeOrigin: this.timeOrigin, timing: this.timing ? this.timing.toJSON() : undefined, navigation: this.navigation };
@@ -5327,6 +5402,12 @@ class Performance {
   }
   dispatchEvent(event) {
     const type = event && event.type;
+    // The `on<type>` content-attribute handler fires alongside the listeners (it
+    // behaves as a listener registered when first assigned).
+    const onHandler = this["on" + type];
+    if (typeof onHandler === "function") {
+      try { onHandler.call(this, event); } catch (e) {}
+    }
     const matched = this._listeners.filter((l) => l.type === type);
     for (const l of matched) {
       if (l.once) this._listeners = this._listeners.filter((x) => x !== l);
@@ -5334,6 +5415,8 @@ class Performance {
     }
     return !(event && event.defaultPrevented);
   }
+  get onresourcetimingbufferfull() { return this._onresourcetimingbufferfull; }
+  set onresourcetimingbufferfull(fn) { this._onresourcetimingbufferfull = (typeof fn === "function") ? fn : null; }
 }
 globalThis.Performance = _markNative(Performance);
 globalThis.performance = globalThis.performance || new Performance();

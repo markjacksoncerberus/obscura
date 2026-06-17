@@ -35,6 +35,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
 | 23 | [The Element Ledger](23-the-element-ledger.md) | `resource-timing/*` element loads (+ perf-timeline) | ⚔️ po-observe 1/1, dynamic-insertion 5/6, img 1/1, link 5/8 | ⚔️⚔️ | **inc 1+2 ~+16.** Element subresource loads (`<img>`, `<link>`, `<script>`, `<object>` — both JS-inserted AND markup) emit `resource` entries + fire load/error; iframe/XHR report correct initiatorType. Next: css-embedded "css" entries, `img.src` resolved-URL reflection, font→css, redirect timing, buffer-full |
 | ~~24~~ | ✅ [The Resolved Reflection](24-the-resolved-reflection.md) | `resource-timing/status-codes-create-entry` (+ `getEntriesByName(el.src)` family) | **status-codes 0→1/1** | ⚔️ | **SECURED — +1, foundational.** URL-reflecting IDL getters (`img/script/iframe.src`, `a/link/area.href`) now return the RESOLVED absolute URL (was the raw attribute), so `getEntriesByName(img.src)` matches the absolute entry name. Page `<script src>` `resource` entries carry the real fetch-elapsed `duration` (was a collapsed 0). Scoped tight (per-localName sets), zero regressions. Caps: TAO/cross-origin family, `<base>`-loader divergence |
+| ~~25~~ | ✅ [The Buffer Ledger](25-the-buffer-ledger.md) | `resource-timing/buffer-full-*` | **8 tests 0→1/1** | ⚔️⚔️ | **SECURED — +8.** Real Resource Timing buffer (was unbounded, no event): primary buffer w/ size limit 250 + secondary buffer; `resourcetimingbufferfull` event + `onresourcetimingbufferfull` handler + the "fire a buffer full event" task (copy-secondary-buffer + no-progress overflow guard); `setResourceTimingBufferSize`/`clearResourceTimings` per spec. Zero regressions. Caps: `xhr_sync`-ordering tests (×4) need real synchronous XHR (Obscura's XHR is always async); `buffer-full-eventually` times out (250 sequential network loads exceed harness wall-clock) |
 | ~~22~~ | ✅ [The Resource Ledger](22-the-resource-ledger.md) | `resource-timing/*` (+ perf-timeline) | **buffered-flag 1/1, clear-resource-timings 1/1, case-sensitivity 3/3** | ⚔️⚔️ | **SECURED — +4.** `PerformanceResourceTiming` entries for `fetch()`/XHR + page `<script src>` loads; real `clearResourceTimings`. Caps: element loads (img/link/iframe), TAO cross-origin, buffer-full family |
 | ~~21~~ | ✅ [The Navigator's Almanac](21-the-navigators-almanac.md) | `navigation-timing/*` | **~20 subtests across 9 tests** | ⚔️⚔️ | **SECURED — ~+20.** Real `PerformanceNavigationTiming` (+ `PerformanceResourceTiming` base): nav entry present from the start, queued to observers at load; honest body sizes from the Rust response; `readystatechange` at interactive/complete. Caps: exact-byte-size/host-URL value tests, per-iframe nav timing, real redirect-chain timing |
 | ~~20~~ | ✅ [The Observer's Gallery](20-the-observers-gallery.md) | `performance-timeline/*` | **PO suite 11/11 + idl 35/58** | ⚔️⚔️ | **SECURED — ~+15.** Real `PerformanceObserver` (was a no-op stub): observe(entryTypes/type+buffered), disconnect/takeRecords, supportedEntryTypes, PerformanceObserverEntryList, task-queued delivery from mark()/measure(). Cap: po-observe + 2 case-sensitivity subtests need resource/navigation timing entries |
@@ -65,6 +66,38 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #25 — The Buffer Ledger, +8):**
+- **The Resource Timing buffer is real.** `performance._addResourceEntry` used to
+  push every resource entry straight onto the timeline with no size limit and no
+  `resourcetimingbufferfull` event — so every `buffer-full-*` test hung forever
+  waiting for an event that could never fire. Implemented the Resource Timing
+  Level 2 buffer model in the `Performance` class (bootstrap.js): a primary buffer
+  (the resource entries already in `_entries`) with a **size limit of 250**, a
+  **secondary buffer** for overflow, the **`resourcetimingbufferfull`** event +
+  **`onresourcetimingbufferfull`** handler attribute, and the **"fire a buffer
+  full event"** task (queued on `setTimeout(0)` so synchronous follow-up code —
+  e.g. a `setResourceTimingBufferSize()` — runs first). The task fires the event
+  while the primary is full, copies the secondary buffer in while there is room,
+  and drops the remainder when no progress can be made (the spec's overflow
+  guard). `setResourceTimingBufferSize` now just sets the limit; `clearResourceTimings`
+  resets the primary (untouched secondary still copies in afterward).
+- **8 tests 0→1/1:** `buffer-full-then-decreased`, `-when-populate-entries`,
+  `-set-to-current-buffer`, `-decrease-buffer-during-callback`,
+  `-increase-buffer-during-callback`, `-store-and-clear-during-callback`,
+  `-add-after-full-event`, `-add-entries-during-callback-that-drop`.
+- **Zero regressions** (fresh-server sweep): qsa 1975, classlist 1420, iframe-load
+  2/2, mark.any 22/22, measures 119/119, structured-clone 141/152, clear-resource-timings
+  1/1, buffered-flag 1/1, status-codes-create-entry 1/1, po-disconnect 3/3,
+  po-observe 5/6 (the 1 fail = pre-existing `observe({entryTypes:"mark"})` WebIDL
+  coercion, not this change).
+- **Honest caps:** four `buffer-full-*` tests drive entries through `load.xhr_sync`
+  and assert on **synchronous-XHR** ordering; Obscura's `XMLHttpRequest.send` is
+  always async (`fetch().then()`), so those orderings can't be honored without a
+  blocking Rust sync-XHR op (architectural). `buffer-full-eventually` loads ~250
+  images sequentially over the real network to fill the default buffer — it
+  exceeds the harness wall-clock and times out (the algorithm is correct; this is
+  a network/timing cap). Scroll `tickets/25-the-buffer-ledger.md`.
 
 **Session 2026-06-17 (Quest #24 — The Resolved Reflection, +1, foundational):**
 - **URL-reflecting IDL attributes now return the resolved absolute URL.** The
