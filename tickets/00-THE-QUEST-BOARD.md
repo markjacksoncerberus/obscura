@@ -33,6 +33,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~18~~ | ✅ [The Timekeeper's Ledger](18-the-timekeepers-ledger.md) | `user-timing/*`, `hr-time/*` | **mark 22/22 + realm** | ⚔️⚔️ | **SECURED** — real User Timing L3 (was a no-op `performance`): mark/measure/getEntries/clear + PerformanceEntry/Mark/Measure/Timing + ~70 realm subtests. Caps: obsolete L1/L2 `mark(timingAttr)`-throws subtests; `<body onload>` load-event gap |
 | ~~17~~ | ✅ [The Entropy Gate](17-the-entropy-gate.md) | `WebCryptoAPI/getRandomValues` | **39/39** | ⚔️ | **SECURED 100%** — real `crypto.getRandomValues` contract (was a `Math.random` fill @ 23/39); **+16**. Added `TypeMismatchError:17` to `DOMException._codes` + the modern `QuotaExceededError` interface |
 | ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
+| ~~21~~ | ✅ [The Navigator's Almanac](21-the-navigators-almanac.md) | `navigation-timing/*` | **~20 subtests across 9 tests** | ⚔️⚔️ | **SECURED — ~+20.** Real `PerformanceNavigationTiming` (+ `PerformanceResourceTiming` base): nav entry present from the start, queued to observers at load; honest body sizes from the Rust response; `readystatechange` at interactive/complete. Caps: exact-byte-size/host-URL value tests, per-iframe nav timing, real redirect-chain timing |
 | ~~20~~ | ✅ [The Observer's Gallery](20-the-observers-gallery.md) | `performance-timeline/*` | **PO suite 11/11 + idl 35/58** | ⚔️⚔️ | **SECURED — ~+15.** Real `PerformanceObserver` (was a no-op stub): observe(entryTypes/type+buffered), disconnect/takeRecords, supportedEntryTypes, PerformanceObserverEntryList, task-queued delivery from mark()/measure(). Cap: po-observe + 2 case-sensitivity subtests need resource/navigation timing entries |
 | ~~19~~ | ✅ [The Load Bell](19-the-load-bell.md) | *load-lifecycle* — `<body onload>` → `window.onload` | **clearMarks 57/57, clearMeasures 57/57, measures 119/119** | ⚔️⚔️ | **SECURED — +233.** `<body onload=…>` is an HTML *window* event handler; it was never wired to `window.onload`, so testharness pages running tests from `<body onload>` came back could-not-run. `__installBodyWindowHandlers()` compiles body/frameset window-reflecting on\* content attrs onto `window.on*` before parser scripts run. General fix — unlocks any load-gated test |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
@@ -61,6 +62,34 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #21 — The Navigator's Almanac, ~+20):**
+- **A real `PerformanceNavigationTiming` entry** (+ `PerformanceResourceTiming` base class)
+  for the document navigation. `bootstrap.js` (classes ~4958, `__navTimingDCL`/`__navTimingLoad`,
+  nav-entry creation in `__obscura_init`) + `page.rs` (body-size plumbing, readystatechange,
+  hook calls).
+  - The nav entry is created at startup and pushed to `performance._entries` so
+    `getEntriesByType('navigation')` is populated from the very start (head sync script);
+    its document-lifecycle phases (`domInteractive`…`loadEventEnd`) are filled at the real
+    DCL/load moments; at load it's queued to observers (so an observer registered during
+    parse fires). `'navigation'` added to `supportedEntryTypes`.
+  - **Honest body sizes** from the real Rust document response: a new `Page.document_body_size:
+    Option<(encoded,decoded)>` captured at fetch, seeded into the entry at the `<ready-state>`
+    step (`transferSize = encoded + 300`). Not synthesized.
+  - **`readystatechange`** now dispatched on `document` (+ `document.onreadystatechange`) at
+    interactive (DCL) and complete (load).
+  - **Results:** nav2-test-attributes-exist 1/1, nav2-test-instance-accessible-from-the-start
+    1/1, nav2-test-navigation-type-navigate 1/1, po-navigation 1/1, buffered-flag.window 1/1,
+    test-navigation-attributes-exist 4/4, test-navigation-redirectCount-none 5/5,
+    test-document-onload 0/2→3/3, test-document-readiness-exist 1→3/3, idlharness 36/161.
+    Zero regressions (mark.any 22/22, measures 119/119, measure-exceptions 13/13, po-* suite,
+    qsa 1975, classlist 1420, createElement 147, EventTarget-dispatchEvent 25/25, Node-properties
+    726, structured-clone 141/152, base64 380/380, url-origin 403/403).
+  - **Caps:** exact-byte-size (5949) + host-config-URL value tests (nav2-test-attributes-values /
+    instance-accessors), per-iframe nav timing (unique-nav-instances), real redirect-chain timing
+    (timing-persistent). **Next: Resource Timing entries** (base class now exists; needs the
+    resource-load paths to emit entries) — unlocks resource-timing/*, po-observe, case-sensitivity.
+    Scroll `tickets/21-the-navigators-almanac.md`.
 
 **Session 2026-06-17 (Quest #20 — The Observer's Gallery, ~+15):**
 - **A real `PerformanceObserver`** replacing `class{constructor(){} observe(){} disconnect(){}}`.

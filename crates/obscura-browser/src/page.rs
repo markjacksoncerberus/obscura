@@ -145,6 +145,10 @@ pub struct Page {
     /// The viewport this page lays out and paints against. Starts from the
     /// context's default; `Emulation.setDeviceMetricsOverride` mutates it.
     pub viewport: ViewportConfig,
+    /// (encoded, decoded) byte size of the last main-document response body —
+    /// feeds the PerformanceNavigationTiming entry's encoded/decoded/transfer
+    /// body sizes. `None` until the first document loads.
+    document_body_size: Option<(usize, usize)>,
     /// Cached resolved layout/paint, keyed by a hash of the last snapshot.
     /// `None` until the first render in `on-demand`/`always` mode.
     #[cfg(feature = "render")]
@@ -210,6 +214,7 @@ impl Page {
             intercept_block_patterns: Vec::new(),
             intercept_tx: None,
             viewport,
+            document_body_size: None,
             #[cfg(feature = "render")]
             render_cache: None,
             #[cfg(feature = "stealth")]
@@ -468,12 +473,22 @@ impl Page {
         // Spec: readyState is "loading" while parser-discovered scripts execute.
         // Scripts that check readyState === 'loading' will register DOMContentLoaded
         // listeners instead of calling their callback immediately.
+        // Seed the navigation entry's body sizes from the real document response
+        // (transferSize = encoded body + a ~300-byte header estimate, per the
+        // Resource Timing spec). Empty when no document size is known.
+        let nav_sizes_js = match self.document_body_size {
+            Some((enc, dec)) => format!(
+                " try {{ var __n=performance&&performance._navEntry; if(__n){{ __n.encodedBodySize={}; __n.decodedBodySize={}; __n.transferSize={}; __n.responseStatus=200; __n.responseEnd=performance.now(); }} }} catch(e) {{}}",
+                enc, dec, enc + 300
+            ),
+            None => String::new(),
+        };
         if let Some(js) = &mut self.js {
             let _ = js.execute_script(
                 "<ready-state>",
                 // Also expose markup id'd elements as Window-named globals
                 // (<el id=foo> -> window.foo) before page scripts run.
-                "globalThis.__documentReadyState__ = 'loading'; __exposeNamedGlobals(); __installBodyWindowHandlers();",
+                &format!("globalThis.__documentReadyState__ = 'loading'; __exposeNamedGlobals(); __installBodyWindowHandlers();{}", nav_sizes_js),
             );
         }
 
@@ -552,8 +567,11 @@ impl Page {
             // "delay the load event" resource — the load event must wait for it).
             let _ = js.execute_script("<dcl-events>",
                 "globalThis.__documentReadyState__ = 'interactive';\n\
+                 try { if (typeof document.onreadystatechange === 'function') document.onreadystatechange(); } catch(e) {}\n\
+                 try { var __rsc=new Event('readystatechange'); __rsc.isTrusted=true; _dispatchSpec(document, __rsc); } catch(e) {}\n\
                  try { var __dcl=new Event('DOMContentLoaded', {bubbles:false,cancelable:false}); __dcl.isTrusted=true; _dispatchSpec(document, __dcl); } catch(e) {}\n\
                  try { var __dclw=new Event('DOMContentLoaded', {bubbles:false,cancelable:false}); __dclw.isTrusted=true; _dispatchSpec(window, __dclw); } catch(e) {}\n\
+                 try { if (typeof __navTimingDCL === 'function') __navTimingDCL(); } catch(e) {}\n\
                  try { if (typeof __startFrameLoads === 'function') __startFrameLoads(); } catch(e) {}");
         }
 
@@ -565,8 +583,11 @@ impl Page {
             // readyState -> complete, fire load (now that delaying resources settled).
             let _ = js.execute_script("<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
+                 try { if (typeof document.onreadystatechange === 'function') document.onreadystatechange(); } catch(e) {}\n\
+                 try { var __rsc=new Event('readystatechange'); __rsc.isTrusted=true; _dispatchSpec(document, __rsc); } catch(e) {}\n\
                  if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
-                 try { var __ld=new Event('load', {bubbles:false,cancelable:false}); __ld.isTrusted=true; _dispatchSpec(window, __ld); } catch(e) {}");
+                 try { var __ld=new Event('load', {bubbles:false,cancelable:false}); __ld.isTrusted=true; _dispatchSpec(window, __ld); } catch(e) {}\n\
+                 try { if (typeof __navTimingLoad === 'function') __navTimingLoad(); } catch(e) {}");
         }
 
         // Pump again so async work kicked off by load handlers settles.
@@ -775,6 +796,9 @@ impl Page {
         // page (GBK, Big5, Shift-JIS, Windows-125x, EUC-KR, ISO-8859-x)
         // came through as replacement characters.
         let body_text = obscura_net::decode_response(&response.body, response.content_type());
+        // Encoded = the bytes received over the wire (content-decoded by the HTTP
+        // client); decoded = after charset decoding. Feeds PerformanceNavigationTiming.
+        self.document_body_size = Some((response.body.len(), body_text.len()));
         let dom = parse_html(&body_text);
 
         self.title = dom

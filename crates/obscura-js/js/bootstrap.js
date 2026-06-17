@@ -4956,6 +4956,84 @@ class PerformanceMeasure extends PerformanceEntry {
 }
 globalThis.PerformanceMeasure = _markNative(PerformanceMeasure);
 
+// Resource Timing: the network-phase timing attributes shared by resource and
+// navigation entries. All are settable plain properties (filled in as timing
+// becomes known); the document itself is fetched by the Rust layer, so the main
+// navigation entry leaves the network phases at 0 (they occurred before
+// timeOrigin) and only fills the document-lifecycle phases below.
+class PerformanceResourceTiming extends PerformanceEntry {
+  constructor(name, entryType, startTime) {
+    super(name, entryType || "resource", startTime || 0, 0);
+    this.initiatorType = "";
+    this.deliveryType = "";
+    this.nextHopProtocol = "";
+    this.workerStart = 0;
+    this.redirectStart = 0;
+    this.redirectEnd = 0;
+    this.fetchStart = 0;
+    this.domainLookupStart = 0;
+    this.domainLookupEnd = 0;
+    this.connectStart = 0;
+    this.connectEnd = 0;
+    this.secureConnectionStart = 0;
+    this.requestStart = 0;
+    this.responseStart = 0;
+    this.firstInterimResponseStart = 0;
+    this.responseEnd = 0;
+    this.responseStatus = 0;
+    this.transferSize = 0;
+    this.encodedBodySize = 0;
+    this.decodedBodySize = 0;
+    this.serverTiming = [];
+  }
+  toJSON() {
+    const j = super.toJSON();
+    for (const k of ['initiatorType', 'deliveryType', 'nextHopProtocol', 'workerStart',
+      'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart', 'domainLookupEnd',
+      'connectStart', 'connectEnd', 'secureConnectionStart', 'requestStart', 'responseStart',
+      'responseEnd', 'responseStatus', 'transferSize', 'encodedBodySize', 'decodedBodySize'])
+      j[k] = this[k];
+    j.serverTiming = this.serverTiming;
+    return j;
+  }
+}
+globalThis.PerformanceResourceTiming = _markNative(PerformanceResourceTiming);
+
+// Navigation Timing Level 2: the single PerformanceNavigationTiming entry for the
+// document. Created at startup so getEntriesByType('navigation') is populated from
+// the start; the document-lifecycle phases (domInteractive … loadEventEnd) are
+// filled in by __navTimingDCL / __navTimingLoad as the load progresses, and the
+// entry is queued to observers at loadEventEnd.
+class PerformanceNavigationTiming extends PerformanceResourceTiming {
+  constructor(name) {
+    super(name, "navigation", 0);
+    this.initiatorType = "navigation";
+    this.nextHopProtocol = "http/1.1";
+    this.unloadEventStart = 0;
+    this.unloadEventEnd = 0;
+    this.domInteractive = 0;
+    this.domContentLoadedEventStart = 0;
+    this.domContentLoadedEventEnd = 0;
+    this.domComplete = 0;
+    this.loadEventStart = 0;
+    this.loadEventEnd = 0;
+    this.type = "navigate";
+    this.redirectCount = 0;
+    this.activationStart = 0;
+    this.criticalCHRestart = 0;
+    this.notRestoredReasons = null;
+  }
+  toJSON() {
+    const j = super.toJSON();
+    for (const k of ['unloadEventStart', 'unloadEventEnd', 'domInteractive',
+      'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete',
+      'loadEventStart', 'loadEventEnd', 'type', 'redirectCount'])
+      j[k] = this[k];
+    return j;
+  }
+}
+globalThis.PerformanceNavigationTiming = _markNative(PerformanceNavigationTiming);
+
 class PerformanceTiming {
   constructor(t0) {
     // Attributes for phases that have happened by the time user script runs carry
@@ -5099,7 +5177,7 @@ globalThis.performance = globalThis.performance || new Performance();
 // The entry types Obscura can actually generate timeline entries for. Must be in
 // strict alphabetical order (supportedEntryTypes asserts types[i-1] < types[i])
 // and frozen+cached (the attribute must return the same array each access).
-const _PERF_SUPPORTED_ENTRY_TYPES = Object.freeze(['mark', 'measure']);
+const _PERF_SUPPORTED_ENTRY_TYPES = Object.freeze(['mark', 'measure', 'navigation']);
 
 // Registered observers + the single pending-delivery task (HTML "queue a
 // PerformanceObserver task": one task flushes every observer with a non-empty
@@ -5219,6 +5297,33 @@ Object.defineProperty(PerformanceObserver.prototype, Symbol.toStringTag,
   { value: 'PerformanceObserver', configurable: true });
 Object.defineProperty(globalThis, 'PerformanceObserver',
   { value: _markNative(PerformanceObserver), writable: true, enumerable: false, configurable: true });
+
+// ---- Navigation Timing lifecycle hooks (called from page.rs) -----------------
+// The single navigation entry is created at startup (see __obscura_init). These
+// fill its document-lifecycle phases at the real DOMContentLoaded / load moments
+// and (at load) queue it to observers registered during parsing.
+const __navTimingDCL = function () {
+  const p = globalThis.performance, nav = p && p._navEntry;
+  if (!nav) return;
+  // The document URL isn't finalized at __obscura_init (the entry is created with
+  // a provisional "about:blank"); refresh it now that the page has parsed.
+  try { const u = _domParse("document_url"); if (u) nav._name = u; } catch (e) {}
+  const t = p.now();
+  if (!nav.domInteractive) nav.domInteractive = t;
+  if (!nav.domContentLoadedEventStart) nav.domContentLoadedEventStart = t;
+  nav.domContentLoadedEventEnd = p.now();
+};
+const __navTimingLoad = function () {
+  const p = globalThis.performance, nav = p && p._navEntry;
+  if (!nav) return;
+  try { const u = _domParse("document_url"); if (u) nav._name = u; } catch (e) {}
+  const t = p.now();
+  if (!nav.domComplete) nav.domComplete = t;
+  if (!nav.loadEventStart) nav.loadEventStart = t;
+  nav.loadEventEnd = p.now();
+  nav._duration = nav.loadEventEnd; // duration === loadEventEnd per spec
+  try { _queuePerformanceEntry(nav); } catch (e) {} // notify observers (registered during parse)
+};
 
 Object.defineProperty(Document.prototype, 'fonts', {
   get() {
@@ -7458,6 +7563,19 @@ globalThis.__obscura_init = function() {
   globalThis.performance.timing = (typeof PerformanceTiming === "function")
     ? new PerformanceTiming(t0)
     : { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+
+  // Create the single PerformanceNavigationTiming entry up-front so
+  // getEntriesByType('navigation') is populated for the document's whole lifetime
+  // (the spec exposes it from the start); document-lifecycle phases are filled in
+  // by __navTimingDCL / __navTimingLoad as the load progresses.
+  try {
+    if (typeof PerformanceNavigationTiming === "function" && globalThis.performance && !globalThis.performance._navEntry) {
+      const navUrl = _domParse("document_url") || (globalThis.location && location.href) || "";
+      const nav = new PerformanceNavigationTiming(navUrl);
+      globalThis.performance._navEntry = nav;
+      globalThis.performance._entries.push(nav);
+    }
+  } catch (e) {}
 
   const hide = (obj, props) => {
     for (const p of props) {
