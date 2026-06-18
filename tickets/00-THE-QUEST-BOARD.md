@@ -46,6 +46,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 29 | [The Entity-Body Forge](29-the-entity-body-forge.md) | `xhr/*` request body + Content-Type | ⚔️ send-content-type-charset 19/19, send-content-type-string 1/1, send-entity-body-{none,empty,get-head,get-head-async} all green | ⚔️⚔️ | **SECURED — +19.** WHATWG "extract a body" + XHR §send() Content-Type: `_extractRequestBody` (String/Document/Blob/BufferSource/FormData/URLSearchParams), real `_parseMimeType`/`_serializeMimeType` + charset→UTF-8 adjustment (only when present & not already utf-8), GET/HEAD discard the body, POST/PUT null body emits `Content-Length: 0`. Caps: request-header-NAME case (hyper lowercases → `setrequestheader-content-type` values correct but capped), `status-*` custom reason phrase (h2), `.asis` |
 | ~~31~~ | ✅ [The Charset Decipher](31-the-charset-decipher.md) | `xhr/*` response decoding | **responsetext-decoding 37/37, responsedocument-decoding 6/6** | ⚔️⚔️ | **SECURED — +19.** XHR decoded every response as UTF-8; the fetch core already hands JS the raw bytes (`bodyBase64`). New §"text response" + document decoding: `_xhrFinalEncoding` (override>Content-Type charset), `_xhrDecode` (Encoding §decode — BOM sniff picks the encoding, `TextDecoder` strips it), XML-declaration sniff (default `""` type) + HTML `<meta charset>` prescan (document). Pure JS, no new Rust. Caps: `responseText` throwing-getter for non-text responseTypes (next), XML-parser well-formedness edge |
 | ~~30~~ | ✅ [The Response Document](30-the-response-document.md) | `xhr/*` `responseXML` | **media-type 15/15, get-twice 4/4** | ⚔️⚔️ | **SECURED — +11.** XHR §"document response": `responseXML` was a constant `null`. New lazy, cached `_getDocumentResponse()` — final MIME type via `_parseMimeType` (missing/unparseable Content-Type → `text/xml`), XML/HTML detection, parse via `_IframeDocument` (parsererror→null), default `""` type never parses HTML; `.response`/`.responseXML` share one cached object (identity). Caps: `responsexml-document-properties` (full XML doc metadata + lastModified/redirect.py); charset-aware response decoding |
+| ~~32~~ | ✅ [The Throwing Getter](32-the-throwing-getter.md) | `xhr/*` `responseText` | **non-document-types 5/5** | ⚔️ | **SECURED — +4.** `responseText` was a plain data property (never threw); per §the-responsetext-attribute it must throw `InvalidStateError` when `responseType` is not `""`/`"text"`. Refactored to a getter backed by `_responseText` (all send paths assign the backing field) — empty string until LOADING/DONE, else the decoded text. `responseXML` already threw. Pure JS, no new Rust. The response-attributes vein is now clean. Caps: `responsexml-document-properties` (full XML doc metadata quest) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -72,6 +73,27 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-18 (Quest #32 The Throwing Getter — XHR `responseText`, +4):**
+- `responseText` was a plain **data property** (assigned in the constructor,
+  `open()`, and every send completion), so it never threw. Per §the-responsetext-
+  attribute it must throw `InvalidStateError` when `responseType` is not `""` or
+  `"text"`. (`responseXML` already threw for non-`""`/`"document"` since #30.)
+- Refactored to a **getter backed by `_responseText`**: throws for the wrong
+  responseType; empty string until LOADING/DONE; else the decoded text. All five
+  former assignment sites now write the backing field (a plain assignment against
+  a getter-only property throws `TypeError` in a class body's strict mode). The
+  async path also stores the decoded text in a local and uses it in the
+  `responseType` switch so the switch never trips the throwing getter.
+- Wins: `responsexml-non-document-types` 1→5/5. **+4**, pure JS, no new Rust,
+  zero regressions (responsetext-decoding 37/37, responsexml-media-type 15/15,
+  get-twice 4/4, response-json 4/4, data-uri 10/10, send-content-type-charset
+  19/19; ritual qsa 1975, classlist 1420, createElement 147, mark 22/22, measures
+  119/119, structured-clone 141/152, getRandomValues 39/39, url-setters-stripping
+  260/260). Scroll `32-the-throwing-getter.md`.
+- **Next leverage:** the response-attributes vein is now clean. Consider a fresh
+  realm (`fetch/`, `dom/` heavy fixtures) or the `responsexml-document-properties`
+  full-XML-document-metadata quest (named in #30).
 
 **Session 2026-06-18 (Quest #31 The Charset Decipher — XHR response decoding, +19):**
 - XHR decoded every response body as UTF-8 (`await resp.text()` / `new

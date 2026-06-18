@@ -3651,7 +3651,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this.readyState = 0;
     this.status = 0;
     this.statusText = "";
-    this.responseText = "";
+    this._responseText = "";
     this.responseURL = "";
     this.responseType = "";
     this.response = null;
@@ -3712,7 +3712,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this._aborted = false;
     this.status = 0;
     this.statusText = "";
-    this.responseText = "";
+    this._responseText = "";
     this.response = null;
     // Invalidate any cached "document response" + raw bytes from a previous cycle.
     this._responseDocComputed = false;
@@ -3810,7 +3810,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       if (xhr._aborted) return;
 
       xhr._responseBytes = bytes;
-      xhr.responseText = _xhrResponseText(xhr);
+      const _text = _xhrResponseText(xhr);
+      xhr._responseText = _text;
       xhr._setReadyState(3); // LOADING
 
       switch (xhr.responseType) {
@@ -3819,7 +3820,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
           break;
         case 'text':
         case '':
-          xhr.response = xhr.responseText;
+          xhr.response = _text;
           break;
         case 'arraybuffer':
           xhr.response = bytes.slice().buffer;
@@ -3834,7 +3835,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
           xhr.response = xhr._getDocumentResponse();
           break;
         default:
-          xhr.response = xhr.responseText;
+          xhr.response = _text;
       }
 
       xhr._setReadyState(4); // DONE
@@ -3902,7 +3903,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     } catch (err) {
       this._sendFlag = false;
       this.status = 0; this.statusText = '';
-      this.responseText = ''; this.response = null;
+      this._responseText = ''; this.response = null;
       this._setReadyState(4);
       throw new DOMException('Network request failed', 'NetworkError');
     }
@@ -3916,7 +3917,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this._responseBytes = (respBytes != null) ? respBytes
       : (respText != null ? new TextEncoder().encode(respText) : new Uint8Array());
     const text = _xhrResponseText(this);
-    this.responseText = text;
+    this._responseText = text;
     switch (this.responseType) {
       case 'json': try { this.response = JSON.parse(new TextDecoder().decode(this._responseBytes)); } catch (e) { this.response = null; } break;
       case 'arraybuffer': this.response = this._responseBytes.slice().buffer; break;
@@ -3940,6 +3941,17 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this._setReadyState(4);
     this._fireEvent('load');
     this._fireEvent('loadend');
+  }
+
+  // §the responseText attribute. Only valid for responseType "" or "text"
+  // (else InvalidStateError); the empty string until LOADING/DONE, then the
+  // decoded text response (responsexml-non-document-types). Backed by
+  // `_responseText` — the send paths assign that field, not this getter.
+  get responseText() {
+    if (this.responseType !== '' && this.responseType !== 'text')
+      throw new DOMException("responseText is only available if responseType is '' or 'text'.", 'InvalidStateError');
+    if (this.readyState !== 3 && this.readyState !== 4) return '';
+    return this._responseText || '';
   }
 
   // §the responseXML attribute. Only valid for responseType "" or "document";
