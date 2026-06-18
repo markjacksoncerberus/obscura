@@ -41,6 +41,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~21~~ | ✅ [The Navigator's Almanac](21-the-navigators-almanac.md) | `navigation-timing/*` | **~20 subtests across 9 tests** | ⚔️⚔️ | **SECURED — ~+20.** Real `PerformanceNavigationTiming` (+ `PerformanceResourceTiming` base): nav entry present from the start, queued to observers at load; honest body sizes from the Rust response; `readystatechange` at interactive/complete. Caps: exact-byte-size/host-URL value tests, per-iframe nav timing, real redirect-chain timing |
 | ~~20~~ | ✅ [The Observer's Gallery](20-the-observers-gallery.md) | `performance-timeline/*` | **PO suite 11/11 + idl 35/58** | ⚔️⚔️ | **SECURED — ~+15.** Real `PerformanceObserver` (was a no-op stub): observe(entryTypes/type+buffered), disconnect/takeRecords, supportedEntryTypes, PerformanceObserverEntryList, task-queued delivery from mark()/measure(). Cap: po-observe + 2 case-sensitivity subtests need resource/navigation timing entries |
 | ~~19~~ | ✅ [The Load Bell](19-the-load-bell.md) | *load-lifecycle* — `<body onload>` → `window.onload` | **clearMarks 57/57, clearMeasures 57/57, measures 119/119** | ⚔️⚔️ | **SECURED — +233.** `<body onload=…>` is an HTML *window* event handler; it was never wired to `window.onload`, so testharness pages running tests from `<body onload>` came back could-not-run. `__installBodyWindowHandlers()` compiles body/frameset window-reflecting on\* content attrs onto `window.on*` before parser scripts run. General fix — unlocks any load-gated test |
+| 27 | [The XHR Foundry](27-the-xhr-foundry.md) | `xhr/*` (XMLHttpRequest) | ⚔️ data-uri 10/10, setrequestheader-bogus-name 71/71, -value 5/5, open-method-bogus 8/8 | ⚔️⚔️ | **OPENED — +94.** Async correctness, no new architecture: `fetch()` resolves `data:` URLs in-process (WHATWG data: URL processor); real `setRequestHeader` validation (ByteString→TypeError, token/value→SyntaxError, normalize+combine); `open()` method validation (non-token→SyntaxError, CONNECT/TRACE/TRACK→SecurityError, uppercase well-known). **Next = synchronous XHR** (blocking Rust op — unlocks ~18 sync tests + the #25/#26 resource-timing tails); also `.asis` raw-response cap, `headers-normalize-response`, forbidden request-headers |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -67,6 +68,36 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-18 (Quest #27 — The XHR Foundry OPENED, +94):**
+- **A new realm.** With the resource-timing vein (#21–#26) thinning to architectural
+  caps (sync XHR, cross-origin TAO), opened `xhr/*` (231 tests, baselined largely
+  dark). Three pure-JS fixes in `bootstrap.js`, **no new architecture**:
+- **`data:` URLs in `fetch()` (+10, `data-uri.htm` 0→10/10).** `op_fetch_url` is
+  reqwest-backed (HTTP only), so a `data:` fetch errored and XHR fired `error`. New
+  `_processDataURL` runs the WHATWG **"data: URL processor"** (MIME essence +
+  percent-decode + `;base64`); the synthesized `Response` carries `content-type` only
+  (no Content-Length, per the test) and a `HEAD` request yields an empty body.
+- **`setRequestHeader` validation (+76, bogus-name 0→71, bogus-value 0→5).** Was a
+  bare `_headers[name]=value`. Now: WebIDL ByteString coercion (code unit >0xFF →
+  `TypeError`; missing 2nd arg → `TypeError`), OPENED-state check, value normalized,
+  name must be an HTTP **token** + value a **header value** (no `\0`/`\r`/`\n`) → else
+  `SyntaxError`, then case-insensitive **combine**.
+- **`open()` method validation (+8, `open-method-bogus.htm` 0→8/8).** Non-token method
+  → `SyntaxError`; forbidden CONNECT/TRACE/TRACK → `SecurityError`; byte-uppercase the
+  well-known methods (DELETE/GET/HEAD/OPTIONS/POST/PUT).
+- **Zero regressions** (fresh-server sweep): qsa 1975, classlist 1420, createElement
+  147, mark 22/22, measures 119/119, structured-clone 141/152, getRandomValues 39/39,
+  url-setters-stripping 260/260, url-with-xhr 14/14, url-with-fetch 16/16,
+  clear-resource-timings 1/1, status-codes 1/1, buffered-flag.any 1/1, response-json
+  4/4, content-type 16/21 (peak; bounces 13↔16 on cross-origin network timing — a
+  documented flaky cap, not this work).
+- **Caps / Next:** **synchronous XHR** (blocking Rust op) is the widest remaining
+  lever — it's the *same* cap named in #25 (×4) and #26 (×2), and would unlock the
+  `*-sync.htm` family (~18), `open-method-case-*` (15), `responseurl` (2),
+  `allow-empty-value` (3), plus the resource-timing tails. Also: `.asis` raw-response
+  tests (reqwest/serving cap), `headers-normalize-response` (async, winnable), forbidden
+  request-headers, a real send flag. Scroll `tickets/27-the-xhr-foundry.md`.
 
 **Session 2026-06-17 (Quest #26 — The Content-Type Ledger, +16):**
 - **`PerformanceResourceTiming.contentType` now exists.** Resource entries had no

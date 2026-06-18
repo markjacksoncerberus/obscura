@@ -3240,6 +3240,46 @@ const _installWasmStreamingFallback = function() {
 };
 _installWasmStreamingFallback();
 
+// Percent-decode a byte string (WHATWG Infra "percent-decode"). The input is the
+// URL-serialized data: path, which is ASCII; any non-ASCII / unsafe byte is
+// already %-encoded, so we walk code units and decode %XX runs to raw bytes.
+const _percentDecodeBytes = function(str) {
+  const s = String(str);
+  const out = [];
+  const _isHex = (ch) => (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '%' && i + 2 < s.length && _isHex(s[i + 1]) && _isHex(s[i + 2])) {
+      out.push(parseInt(s.substr(i + 1, 2), 16));
+      i += 2;
+    } else {
+      out.push(s.charCodeAt(i) & 0xff);
+    }
+  }
+  return new Uint8Array(out);
+};
+
+// WHATWG "data: URL processor" (https://fetch.spec.whatwg.org/#data-url-processor).
+// Returns { mimeType, bytes } or null on failure (no comma / bad base64).
+const _processDataURL = function(url) {
+  let input = String(url).slice(5); // strip "data:"
+  const hashIdx = input.indexOf('#'); // exclude the fragment
+  if (hashIdx !== -1) input = input.slice(0, hashIdx);
+  const comma = input.indexOf(',');
+  if (comma === -1) return null;
+  let mimeType = input.slice(0, comma).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+  let bytes = _percentDecodeBytes(input.slice(comma + 1));
+  if (/;[ ]*base64$/i.test(mimeType)) {
+    // isomorphic-decode the %-decoded bytes, then forgiving-base64 decode.
+    let stringBody = '';
+    for (let i = 0; i < bytes.length; i++) stringBody += String.fromCharCode(bytes[i]);
+    bytes = _base64ToUint8Array(stringBody.replace(/[\t\n\f\r ]+/g, ''));
+    mimeType = mimeType.slice(0, mimeType.length - 6).replace(/[ ]+$/, '').replace(/;$/, '');
+  }
+  if (mimeType.startsWith(';')) mimeType = 'text/plain' + mimeType;
+  if (mimeType === '') mimeType = 'text/plain;charset=US-ASCII';
+  return { mimeType, bytes };
+};
+
 globalThis.fetch = async (input, init = {}) => {
   const _signal = init.signal || (input instanceof Request ? input.signal : null);
   if (_signal && _signal.aborted) {
@@ -3269,6 +3309,20 @@ globalThis.fetch = async (input, init = {}) => {
       });
     }
     throw new TypeError("Failed to fetch: blob URL not found, revoked, or non-GET method");
+  }
+  // data: URLs are resolved in-process (no network). reqwest can't fetch them,
+  // so handle the WHATWG "data: URL processor" here and synthesize the Response.
+  if (typeof url === 'string' && url.startsWith('data:')) {
+    const dataResult = _processDataURL(url);
+    if (dataResult === null) throw new TypeError('Failed to fetch: invalid data: URL');
+    const _m = (init.method || (input instanceof Request ? input.method : 'GET') || 'GET').toUpperCase();
+    // A HEAD request yields the headers but an empty body.
+    const _bytes = _m === 'HEAD' ? new Uint8Array() : dataResult.bytes;
+    return new Response(_bytes, {
+      status: 200, statusText: 'OK',
+      headers: { 'content-type': dataResult.mimeType },
+      url,
+    });
   }
   if (url && !url.includes('://')) {
     try {
@@ -3335,6 +3389,26 @@ if (typeof Headers === "undefined") {
   };
 }
 
+// RFC 7230 token (a.k.a. a "method"/"header name"): one or more `tchar`s, where
+// tchar = ALPHA / DIGIT / "!#$%&'*+-.^_`|~". Used by XHR open()/setRequestHeader().
+const _HTTP_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const _isHTTPToken = (s) => _HTTP_TOKEN_RE.test(s);
+// WebIDL ByteString coercion: every code unit must be ≤ 0xFF, else TypeError.
+const _toByteString = (v, what) => {
+  const s = String(v);
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) > 0xff) throw new TypeError("Failed to execute on 'XMLHttpRequest': " + (what || 'argument') + " is not a valid ByteString.");
+  }
+  return s;
+};
+// A "header value" has no 0x00/0x0A/0x0D and no leading/trailing HTTP whitespace.
+const _isHeaderValue = (s) => !/[\0\r\n]/.test(s) && !/^[\t\n\r ]|[\t\n\r ]$/.test(s);
+// "Normalize" a header value: strip leading & trailing HTTP whitespace bytes.
+const _normalizeHeaderValue = (s) => s.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+// Methods byte-uppercased on normalization, and the forbidden (SecurityError) set.
+const _XHR_NORMALIZE_METHODS = new Set(['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT']);
+const _XHR_FORBIDDEN_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK']);
+
 globalThis.XMLHttpRequest = class XMLHttpRequest {
   static UNSENT = 0;
   static OPENED = 1;
@@ -3372,6 +3446,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
   }
 
   open(method, url, async_) {
+    // §open: method is a ByteString. Coerce (>0xFF → TypeError), validate it is
+    // a token (else SyntaxError), reject forbidden methods (SecurityError), then
+    // byte-uppercase the well-known methods. (`open-method-bogus` etc.)
+    method = _toByteString(method, "method");
+    if (!_isHTTPToken(method)) throw new DOMException("'" + method + "' is not a valid HTTP method.", 'SyntaxError');
+    if (_XHR_FORBIDDEN_METHODS.has(method.toUpperCase())) throw new DOMException("'" + method + "' HTTP method is unsupported.", 'SecurityError');
+    if (_XHR_NORMALIZE_METHODS.has(method.toUpperCase())) method = method.toUpperCase();
     this._method = method;
     // The url argument may be a URL object (the resource-timing loaders pass
     // `new URL(path, origin)`); the spec parses it to a string. Coerce so the
@@ -3397,6 +3478,19 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
   }
 
   setRequestHeader(name, value) {
+    // §setRequestHeader. WebIDL: both args are required ByteStrings.
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': 2 arguments required.");
+    name = _toByteString(name, "name");
+    value = _toByteString(value, "value");
+    if (this.readyState !== 1) throw new DOMException("The object's state must be OPENED.", 'InvalidStateError');
+    if (this._sendFlag) throw new DOMException("The object is in the wrong state.", 'InvalidStateError');
+    value = _normalizeHeaderValue(value);
+    if (!_isHTTPToken(name) || !_isHeaderValue(value)) throw new DOMException("Invalid header name or value.", 'SyntaxError');
+    // Combine with any existing value for a case-insensitive name match.
+    const lower = name.toLowerCase();
+    for (const k of Object.keys(this._headers)) {
+      if (k.toLowerCase() === lower) { this._headers[k] = this._headers[k] + ', ' + value; return; }
+    }
     this._headers[name] = value;
   }
 
