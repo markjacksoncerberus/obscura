@@ -36,7 +36,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | 23 | [The Element Ledger](23-the-element-ledger.md) | `resource-timing/*` element loads (+ perf-timeline) | ⚔️ po-observe 1/1, dynamic-insertion 5/6, img 1/1, link 5/8 | ⚔️⚔️ | **inc 1+2 ~+16.** Element subresource loads (`<img>`, `<link>`, `<script>`, `<object>` — both JS-inserted AND markup) emit `resource` entries + fire load/error; iframe/XHR report correct initiatorType. Next: css-embedded "css" entries, `img.src` resolved-URL reflection, font→css, redirect timing, buffer-full |
 | ~~24~~ | ✅ [The Resolved Reflection](24-the-resolved-reflection.md) | `resource-timing/status-codes-create-entry` (+ `getEntriesByName(el.src)` family) | **status-codes 0→1/1** | ⚔️ | **SECURED — +1, foundational.** URL-reflecting IDL getters (`img/script/iframe.src`, `a/link/area.href`) now return the RESOLVED absolute URL (was the raw attribute), so `getEntriesByName(img.src)` matches the absolute entry name. Page `<script src>` `resource` entries carry the real fetch-elapsed `duration` (was a collapsed 0). Scoped tight (per-localName sets), zero regressions. Caps: TAO/cross-origin family, `<base>`-loader divergence |
 | ~~26~~ | ✅ [The Content-Type Ledger](26-the-content-type-ledger.md) | `resource-timing/content-type` | **0→16/21** | ⚔️ | **SECURED — +16.** New `PerformanceResourceTiming.contentType` (MIME essence of the response Content-Type), exposed for non-opaque responses (same-origin + crossorigin CORS loads; opaque cross-origin → ""). `_loadElementResource` now honors the element `crossOrigin` attr → CORS fetch mode. Bug fix: `XMLHttpRequest.open(url)` coerces a `URL`-object url to string (was `url.includes is not a function`). Caps: cross-origin no-cors XHR (our XHR is cors-mode → blocked) + cross-origin redirect TAO |
-| ~~25~~ | ✅ [The Buffer Ledger](25-the-buffer-ledger.md) | `resource-timing/buffer-full-*` | **8 tests 0→1/1** | ⚔️⚔️ | **SECURED — +8.** Real Resource Timing buffer (was unbounded, no event): primary buffer w/ size limit 250 + secondary buffer; `resourcetimingbufferfull` event + `onresourcetimingbufferfull` handler + the "fire a buffer full event" task (copy-secondary-buffer + no-progress overflow guard); `setResourceTimingBufferSize`/`clearResourceTimings` per spec. Zero regressions. Caps: `xhr_sync`-ordering tests (×4) need real synchronous XHR (Obscura's XHR is always async); `buffer-full-eventually` times out (250 sequential network loads exceed harness wall-clock) |
+| ~~25~~ | ✅ [The Buffer Ledger](25-the-buffer-ledger.md) | `resource-timing/buffer-full-*` | **12 tests 0→1/1** | ⚔️⚔️ | **SECURED — +8, then +4 harvest (post-#28).** Real Resource Timing buffer (was unbounded, no event): primary buffer w/ size limit 250 + secondary buffer; `resourcetimingbufferfull` event + `onresourcetimingbufferfull` handler + the "fire a buffer full event" task (copy-secondary-buffer + no-progress overflow guard); `setResourceTimingBufferSize`/`clearResourceTimings` per spec. **Harvest:** the ×4 `xhr_sync`-ordering tails (add-then-clear, then-increased, add-entries-during-callback, inspect-buffer-during-callback) — capped on #25 because sync XHR didn't exist — turned green once `_sendSync` was taught to record a `resource` entry (#28 landed sync XHR; this added the entry). Zero regressions. Cap left: `buffer-full-eventually` times out (250 sequential network loads exceed harness wall-clock) |
 | ~~22~~ | ✅ [The Resource Ledger](22-the-resource-ledger.md) | `resource-timing/*` (+ perf-timeline) | **buffered-flag 1/1, clear-resource-timings 1/1, case-sensitivity 3/3** | ⚔️⚔️ | **SECURED — +4.** `PerformanceResourceTiming` entries for `fetch()`/XHR + page `<script src>` loads; real `clearResourceTimings`. Caps: element loads (img/link/iframe), TAO cross-origin, buffer-full family |
 | ~~21~~ | ✅ [The Navigator's Almanac](21-the-navigators-almanac.md) | `navigation-timing/*` | **~20 subtests across 9 tests** | ⚔️⚔️ | **SECURED — ~+20.** Real `PerformanceNavigationTiming` (+ `PerformanceResourceTiming` base): nav entry present from the start, queued to observers at load; honest body sizes from the Rust response; `readystatechange` at interactive/complete. Caps: exact-byte-size/host-URL value tests, per-iframe nav timing, real redirect-chain timing |
 | ~~20~~ | ✅ [The Observer's Gallery](20-the-observers-gallery.md) | `performance-timeline/*` | **PO suite 11/11 + idl 35/58** | ⚔️⚔️ | **SECURED — ~+15.** Real `PerformanceObserver` (was a no-op stub): observe(entryTypes/type+buffered), disconnect/takeRecords, supportedEntryTypes, PerformanceObserverEntryList, task-queued delivery from mark()/measure(). Cap: po-observe + 2 case-sensitivity subtests need resource/navigation timing entries |
@@ -69,6 +69,28 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-18 (Quest #25 harvest — sync XHR resource entries, +4):**
+- With sync XHR landed in #28, harvested the ×4 `buffer-full-*` tails that #25 named as
+  its widest cap (`add-then-clear`, `then-increased`, `add-entries-during-callback`,
+  `inspect-buffer-during-callback`). These tests drive the Resource Timing buffer *only*
+  through `load.xhr_sync()`.
+- **Root cause:** `_sendSync` populated status/headers/responseText but never called
+  `performance._addResourceEntry`, so a synchronous XHR added **zero** timeline entries
+  → every assertion saw an empty buffer. The async path (`fetch()`) already recorded an
+  entry; sync was the gap.
+- **Fix (bootstrap.js, ~3 lines + a start-time capture):** `_sendSync` now records a
+  completed `resource` entry on the timeline (initiatorType `xmlhttprequest`, honest
+  byte size from the response bytes, `_entryContentType` MIME essence) right before the
+  DONE transition — exactly mirroring the async fetch path. Pure JS, no new Rust.
+- **Wins:** the 4 tails 0→1/1 each (**+4**). All 12 `buffer-full-*` tests now green.
+  Zero regressions (qsa 1975, classlist 1420, createElement 147, mark 22/22, measures
+  119/119, structured-clone 141/152, getRandomValues 39/39, url-setters-stripping
+  260/260, data-uri 10/10, setrequestheader-bogus-name 71/71, open-method-bogus 8/8,
+  buffered-flag/clear-resource-timings/status-codes 1/1, content-type 16/21 unchanged).
+- **Cap left:** `buffer-full-eventually` (250 sequential network loads exceed harness
+  wall-clock). Content-type cross-origin no-cors XHR tail still capped (sync XHR is
+  cors-mode). Scroll [`25-the-buffer-ledger.md`](25-the-buffer-ledger.md).
 
 **Session 2026-06-18 (Quest #28 — The Synchronous XHR Keystone, ~+49):**
 - **The root-cause primitive behind the whole `xhr/*` realm.** WPT's XHR suite leans

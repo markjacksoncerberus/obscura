@@ -3618,6 +3618,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     // request fires no loadstart/progress, and a network error throws a
     // NetworkError DOMException after moving to DONE.
     this._sendFlag = true;
+    const _resStart = (globalThis.performance && performance.now) ? performance.now() : 0;
     let url = this._url;
     const isData = typeof url === 'string' && url.startsWith('data:');
     const isBlob = (typeof url === 'string' && url.startsWith('blob:')) || !!this._blobSnapshot;
@@ -3669,6 +3670,18 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       case 'document': this.response = text; break;
       case 'text': case '': default: this.response = text;
     }
+    // Resource Timing: a synchronous XHR records a completed "resource" entry
+    // on the performance timeline just like the async path (fetch()). WPT's
+    // buffer-full suite drives the buffer purely through load.xhr_sync().
+    try {
+      if (globalThis.performance && performance._addResourceEntry) {
+        const _sz = (respBytes && (respBytes.byteLength != null ? respBytes.byteLength : respBytes.length))
+          || (respText ? respText.length : 0) || 0;
+        const _pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
+        const _ct = _entryContentType(this.responseURL || finalUrl || url, respHeaders, _pageOrigin);
+        performance._addResourceEntry(this.responseURL || finalUrl || url, 'xmlhttprequest', _resStart, performance.now(), { enc: _sz, dec: _sz, status: status, contentType: _ct });
+      }
+    } catch (e) {}
     this._sendFlag = false;
     this._setReadyState(4);
     this._fireEvent('load');

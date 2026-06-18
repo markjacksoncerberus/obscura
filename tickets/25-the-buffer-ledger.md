@@ -104,15 +104,16 @@ po-disconnect 3/3, po-observe 5/6 (the 1 fail is the pre-existing
 
 ## Honest caps / next
 
-- **Synchronous XHR (×4 fails).** `buffer-full-then-increased`,
+- **✅ HARVESTED (session 2026-06-18, +4).** `buffer-full-then-increased`,
   `-add-then-clear`, `-add-entries-during-callback`, and
   `-inspect-buffer-during-callback` drive entries through `load.xhr_sync`
-  (`xhr.open(..., /*async=*/false)`) and assert on the **synchronous** ordering of
-  the resulting entries. Obscura's `XMLHttpRequest.send` is always asynchronous
-  (`fetch().then(...)`), so the entry is added a task later, not inline — these
-  orderings can't be honored without a real blocking sync-XHR Rust op. This is the
-  widest remaining buffer-full cap and an architectural decision (sync XHR also
-  affects other realms).
+  (`xhr.open(..., /*async=*/false)`). They were capped here because sync XHR
+  didn't exist. Quest #28 landed the blocking `op_fetch_url_sync` + `_sendSync`,
+  but `_sendSync` populated status/headers/text and **never recorded a `resource`
+  timeline entry**, so the buffer stayed empty. The fix: `_sendSync` now runs the
+  same `performance._addResourceEntry` path the async `fetch()` uses (initiatorType
+  `xmlhttprequest`, honest byte size, `_entryContentType` MIME essence) right before
+  the DONE transition. All four 0→1/1; **all 12 `buffer-full-*` tests now green**.
 - **`buffer-full-eventually`** fills the *default* 250-entry buffer by loading
   images recursively over the real network; ~250 sequential fetches to wpt.live
   exceed the harness wall-clock and the test times out. The algorithm is correct
