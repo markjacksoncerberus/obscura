@@ -3551,6 +3551,94 @@ const _normalizeHeaderValue = (s) => s.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
 const _XHR_NORMALIZE_METHODS = new Set(['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT']);
 const _XHR_FORBIDDEN_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK']);
 
+// ── XHR response decoding (XHR §"text response" + §"document response") ──────
+// The fetch core hands JS the RAW response bytes (`bodyBase64`), never a charset-
+// chosen string, so charset selection happens here per the Encoding/XHR specs.
+
+// "Get a final MIME type" → a parsed MIME record. The override MIME type wins;
+// otherwise the response Content-Type; a missing/unparseable value defaults to
+// text/xml (per "get a response MIME type").
+function _xhrFinalMimeRec(xhr) {
+  let rec = null;
+  if (xhr._overrideMime) rec = _parseMimeType(xhr._overrideMime);
+  else { const ct = xhr.getResponseHeader('content-type'); if (ct != null) rec = _parseMimeType(ct); }
+  if (rec === null) rec = { type: 'text', subtype: 'xml', params: [] };
+  return rec;
+}
+
+// "Get a final encoding": the charset of the override MIME type, else of the
+// final MIME type, mapped through "get an encoding". Returns a canonical
+// encoding name or null (no/unknown charset).
+function _xhrFinalEncoding(xhr) {
+  let label = null;
+  if (xhr._overrideMime) {
+    const r = _parseMimeType(xhr._overrideMime);
+    if (r) { const c = r.params.find((p) => p[0] === 'charset'); if (c) label = c[1]; }
+  }
+  if (label == null) {
+    const ct = xhr.getResponseHeader('content-type');
+    if (ct != null) { const r = _parseMimeType(ct); if (r) { const c = r.params.find((p) => p[0] === 'charset'); if (c) label = c[1]; } }
+  }
+  if (label == null) return null;
+  return _getEncodingName(label); // null if the label is unknown
+}
+
+// "Decode" (Encoding §decode): BOM-sniff to pick the encoding — a BOM overrides
+// the fallback — then decode. TextDecoder strips a leading matching BOM for the
+// Unicode encodings, so feeding it the whole buffer yields the right result.
+function _xhrDecode(bytes, fallbackEnc) {
+  let enc = fallbackEnc || 'utf-8';
+  if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) enc = 'utf-8';
+  else if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) enc = 'utf-16be';
+  else if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) enc = 'utf-16le';
+  try { return new TextDecoder(enc).decode(bytes); }
+  catch (e) { try { return new TextDecoder('utf-8').decode(bytes); } catch (e2) { return ''; } }
+}
+
+// XML encoding sniff: read the (ASCII) XML declaration for an `encoding=` pseudo-
+// attribute. Returns a canonical encoding name or null.
+function _sniffXMLEncoding(bytes) {
+  const n = Math.min(bytes.length, 1024);
+  let s = '';
+  for (let i = 0; i < n; i++) s += String.fromCharCode(bytes[i]);
+  const m = /^\s*<\?xml\s[^>]*?encoding\s*=\s*("([^"]*)"|'([^']*)')/.exec(s);
+  if (m) return _getEncodingName(m[2] !== undefined ? m[2] : m[3]);
+  return null;
+}
+
+// HTML prescan (simplified "prescan a byte stream to determine its encoding"):
+// find a <meta charset=…> (or http-equiv content-type) declaration in the first
+// 1024 bytes. utf-16 → utf-8 and x-user-defined → windows-1252 per the algorithm.
+function _prescanMetaCharset(bytes) {
+  const n = Math.min(bytes.length, 1024);
+  let s = '';
+  for (let i = 0; i < n; i++) s += String.fromCharCode(bytes[i]);
+  let enc = null;
+  let m = /<meta[^>]+charset\s*=\s*["']?\s*([^"'\s/>;]+)/i.exec(s);
+  if (m) enc = _getEncodingName(m[1]);
+  if (!enc) return null;
+  if (enc === 'utf-16be' || enc === 'utf-16le') return 'utf-8';
+  if (enc === 'x-user-defined') return 'windows-1252';
+  return enc;
+}
+
+// §"text response" — decode the received bytes to xhr.responseText. The default
+// ("") responseType additionally sniffs an XML-ish response's declared encoding;
+// the explicit "text" type never does.
+function _xhrResponseText(xhr) {
+  const bytes = xhr._responseBytes;
+  if (!bytes || bytes.length === 0) return '';
+  let charset = _xhrFinalEncoding(xhr);
+  if (xhr.responseType === '' && charset === null) {
+    const rec = _xhrFinalMimeRec(xhr);
+    const isXML = rec.subtype.endsWith('+xml')
+      || (rec.type === 'text' && rec.subtype === 'xml')
+      || (rec.type === 'application' && rec.subtype === 'xml');
+    if (isXML) charset = _sniffXMLEncoding(bytes);
+  }
+  return _xhrDecode(bytes, charset);
+}
+
 globalThis.XMLHttpRequest = class XMLHttpRequest {
   static UNSENT = 0;
   static OPENED = 1;
@@ -3626,9 +3714,10 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this.statusText = "";
     this.responseText = "";
     this.response = null;
-    // Invalidate any cached "document response" from a previous request cycle.
+    // Invalidate any cached "document response" + raw bytes from a previous cycle.
     this._responseDocComputed = false;
     this._responseDocCache = null;
+    this._responseBytes = null;
     // open() moves the object to OPENED; per spec readystatechange only fires
     // when the state actually changes, so a redundant open() on an
     // already-OPENED object is silent (open-open-sync-send).
@@ -3715,25 +3804,28 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
 
       xhr._setReadyState(2); // HEADERS_RECEIVED
 
-      const text = await resp.text();
+      // Charset-aware decoding works off the RAW response bytes, not resp.text()
+      // (which is utf-8-only) — see _xhrResponseText / _getDocumentResponse.
+      const bytes = (resp._bodyBytes instanceof Uint8Array) ? resp._bodyBytes : new Uint8Array();
       if (xhr._aborted) return;
 
-      xhr.responseText = text;
+      xhr._responseBytes = bytes;
+      xhr.responseText = _xhrResponseText(xhr);
       xhr._setReadyState(3); // LOADING
 
       switch (xhr.responseType) {
         case 'json':
-          try { xhr.response = JSON.parse(text); } catch(e) { xhr.response = null; }
+          try { xhr.response = JSON.parse(new TextDecoder().decode(bytes)); } catch(e) { xhr.response = null; }
           break;
         case 'text':
         case '':
-          xhr.response = text;
+          xhr.response = xhr.responseText;
           break;
         case 'arraybuffer':
-          xhr.response = new TextEncoder().encode(text).buffer;
+          xhr.response = bytes.slice().buffer;
           break;
         case 'blob':
-          xhr.response = new Blob([text]);
+          xhr.response = new Blob([bytes]);
           break;
         case 'document':
           // §"document response": parse the body per its final MIME type into a
@@ -3742,7 +3834,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
           xhr.response = xhr._getDocumentResponse();
           break;
         default:
-          xhr.response = text;
+          xhr.response = xhr.responseText;
       }
 
       xhr._setReadyState(4); // DONE
@@ -3819,12 +3911,16 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this.responseURL = (typeof finalUrl === 'string' ? finalUrl.split('#')[0] : '') || '';
     this._responseHeaders = {};
     for (const [k, v] of Object.entries(respHeaders || {})) this._responseHeaders[k] = v;
-    const text = (respText != null) ? respText : (respBytes ? new TextDecoder().decode(respBytes) : '');
+    // Charset-aware decoding works off the raw response bytes (utf-8-decoded
+    // p.body is only a fallback when the envelope carried no base64 body).
+    this._responseBytes = (respBytes != null) ? respBytes
+      : (respText != null ? new TextEncoder().encode(respText) : new Uint8Array());
+    const text = _xhrResponseText(this);
     this.responseText = text;
     switch (this.responseType) {
-      case 'json': try { this.response = JSON.parse(text); } catch (e) { this.response = null; } break;
-      case 'arraybuffer': this.response = (respBytes ? respBytes.buffer : new TextEncoder().encode(text).buffer); break;
-      case 'blob': this.response = new Blob([respBytes || text]); break;
+      case 'json': try { this.response = JSON.parse(new TextDecoder().decode(this._responseBytes)); } catch (e) { this.response = null; } break;
+      case 'arraybuffer': this.response = this._responseBytes.slice().buffer; break;
+      case 'blob': this.response = new Blob([this._responseBytes]); break;
       case 'document': this.response = this._getDocumentResponse(); break;
       case 'text': case '': default: this.response = text;
     }
@@ -3865,16 +3961,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this._responseDocCache = null;
 
     // 1. If the response's body is null, return (→ null).
-    const text = this.responseText;
-    if (text == null || text === '') return null;
+    const bytes = this._responseBytes;
+    if (!bytes || bytes.length === 0) return null;
 
     // Final MIME type = override MIME type if set, else the response MIME type;
     // "get a response MIME type" defaults a missing/unparseable Content-Type to
     // text/xml — which is why "", "bogus", "application", "bogus+xml" all parse.
-    let rec = null;
-    if (this._overrideMime) rec = _parseMimeType(this._overrideMime);
-    else { const ct = this.getResponseHeader('content-type'); if (ct != null) rec = _parseMimeType(ct); }
-    if (rec === null) rec = { type: 'text', subtype: 'xml', params: [] };
+    const rec = _xhrFinalMimeRec(this);
 
     const isHTML = (rec.type === 'text' && rec.subtype === 'html');
     const isXML = rec.subtype.endsWith('+xml')
@@ -3884,6 +3977,15 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     // default ("") responseType never parses HTML — only an explicit "document".
     if (!isHTML && !isXML) return null;
     if (this.responseType === '' && isHTML) return null;
+
+    // Decode the bytes for the DOCUMENT (distinct from §text response): the
+    // override/Content-Type charset wins; otherwise an HTML response is meta-
+    // prescanned and an XML response reads its declaration; else UTF-8. A BOM
+    // still wins inside _xhrDecode.
+    let docCharset = _xhrFinalEncoding(this);
+    if (docCharset === null) docCharset = isHTML ? _prescanMetaCharset(bytes) : _sniffXMLEncoding(bytes);
+    const text = _xhrDecode(bytes, docCharset);
+    if (text === '') return null;
 
     const pageURL = this.responseURL || (_domParse('document_url') || 'about:blank');
     let doc = null;
