@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-17.
+Branch: `engine-per-page-threads`. Last updated: 2026-06-18.
 
 ## Scoreboard
 
@@ -48,6 +48,11 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-17.
 | `xhr/{send-sync-no-response-event-load,send-sync-no-response-event-loadend}.htm` | 0/1, 0/1 | **1/1, 1/1** | ✅ | Quest #28: sync `send()` fires `load`/`loadend` as real `ProgressEvent`s (`_fireEvent` now builds ProgressEvents for the progress family) |
 | `xhr/send-redirect-infinite-sync.htm` | 0/1 | **1/1** | ✅ | Quest #28: sync redirect-limit handling (core's manual SSRF-revalidated redirect loop, cap 10) |
 | `xhr/responseurl.html` | 0/2 | **1/2** | ⬆️ | Quest #28: `responseURL` set synchronously (fragment stripped). Last fail = cross-origin/redirect final-URL (redirect-chain origin tracking, cap) |
+| `xhr/send-content-type-charset.htm` | 12/19 | **19/19** | ✅ 100% | **Quest #29 The Entity-Body Forge.** Real WHATWG MIME parse/serialize (`_parseMimeType`/`_serializeMimeType`) + XHR §send() charset adjustment: an author Content-Type's `charset` is set to UTF-8 *only* when the type parses, has a charset, and it isn't already `utf-8` (case-insensitive). Handles param dedup, name-lowercasing, value-case preservation, quoted-string unescaping, invalid-MIME passthrough |
+| `xhr/send-content-type-string.htm` | 0/1 | **1/1** | ✅ 100% | Quest #29: a string body derives `text/plain;charset=UTF-8` (was `String(body)` with no Content-Type) |
+| `xhr/{send-entity-body-get-head,send-entity-body-get-head-async}.htm` | 0/2, 0/2 | **2/2, 2/2** | ✅ | Quest #29: GET/HEAD discard `send()`'s body argument (no entity body sent) |
+| `xhr/{send-entity-body-none,send-entity-body-empty}.htm` | 2/6, 1/3 | **6/6, 3/3** | ✅ | Quest #29: a null/empty body on POST/PUT still emits `Content-Length: 0` (set explicitly in the op — h2 omits it for an empty body) |
+| `xhr/setrequestheader-content-type.htm` | 3/34 | **4/34** | ⬆️ | Quest #29: every body type now derives the correct Content-Type **value** (String/Document/Blob/BufferSource/FormData/URLSearchParams — verified by the failure messages). The remaining 30 are **capped on the request header NAME case** (the server echoes `content-type` lowercased; hyper/`http` lowercases request header names — same cap as `setrequestheader-allow-empty-value`) |
 | `performance-timeline/idlharness.any.html` | 31/58 | **35/58** | ⬆️ | Quest #20: `PerformanceObserver`/`PerformanceObserverEntryList` `Symbol.toStringTag`, non-enumerable interface objects, EntryList WebIDL length 0. Remaining = engine-wide non-enumerable class methods + navigation/resource members |
 | `navigation-timing/{nav2-test-attributes-exist,nav2-test-instance-accessible-from-the-start,nav2-test-navigation-type-navigate,po-navigation,buffered-flag.window}.html` | 0 | **1/1 ×5** | ✅ | **Quest #21 The Navigator's Almanac.** A real `PerformanceNavigationTiming` entry (entryType "navigation", from the start in `getEntriesByType('navigation')`, queued to observers at load) + `PerformanceResourceTiming` base class. **+5** |
 | `navigation-timing/{test-navigation-attributes-exist,test-navigation-redirectCount-none}.html` | 0 | **4/4, 5/5** | ✅ | Quest #21: legacy `performance.navigation` (type/redirectCount) namespace verified |

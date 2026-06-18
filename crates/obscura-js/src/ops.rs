@@ -818,6 +818,12 @@ async fn perform_fetch_core(
 
         if !current_body.is_empty() {
             req = req.body(current_body.clone());
+        } else if current_method == reqwest::Method::POST || current_method == reqwest::Method::PUT {
+            // Fetch §HTTP-network-or-cache: a null/empty body still emits
+            // `Content-Length: 0` for POST and PUT (WPT send-entity-body-*).
+            // An empty body alone doesn't reliably surface the header (h2 omits
+            // it), so set it explicitly.
+            req = req.body(Vec::<u8>::new()).header(reqwest::header::CONTENT_LENGTH, "0");
         }
 
         if let Some(ref counter) = in_flight {

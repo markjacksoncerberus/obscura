@@ -43,6 +43,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~19~~ | ✅ [The Load Bell](19-the-load-bell.md) | *load-lifecycle* — `<body onload>` → `window.onload` | **clearMarks 57/57, clearMeasures 57/57, measures 119/119** | ⚔️⚔️ | **SECURED — +233.** `<body onload=…>` is an HTML *window* event handler; it was never wired to `window.onload`, so testharness pages running tests from `<body onload>` came back could-not-run. `__installBodyWindowHandlers()` compiles body/frameset window-reflecting on\* content attrs onto `window.on*` before parser scripts run. General fix — unlocks any load-gated test |
 | 27 | [The XHR Foundry](27-the-xhr-foundry.md) | `xhr/*` (XMLHttpRequest) | ⚔️ data-uri 10/10, setrequestheader-bogus-name 71/71, -value 5/5, open-method-bogus 8/8 | ⚔️⚔️ | **OPENED — +94.** Async correctness, no new architecture: `fetch()` resolves `data:` URLs in-process (WHATWG data: URL processor); real `setRequestHeader` validation (ByteString→TypeError, token/value→SyntaxError, normalize+combine); `open()` method validation (non-token→SyntaxError, CONNECT/TRACE/TRACK→SecurityError, uppercase well-known) |
 | 28 | [The Synchronous XHR Keystone](28-the-sync-xhr-keystone.md) | `xhr/*` synchronous (`open(...,false)`) | ⚔️ headers-normalize 15/15, open-method-case-{in,}sensitive 6/6+9/9, responsetype-set-sync 5/5, sync-event/sequencing all green | ⚔️⚔️⚔️ | **SECURED — ~+49.** Blocking Rust op `op_fetch_url_sync` (factored out of `op_fetch_url`'s network core) makes `send()` block until the response — safe on per-page threads. `open()` records `_async` + InvalidAccessError + state-change-gated readystatechange; new `_sendSync()` (data:/blob: in-process, NetworkError on failure); `_fireEvent` builds real ProgressEvents. Zero regressions. Caps: charset-aware query encoding, `.asis` raw-response, hyper-lowercased request header names |
+| 29 | [The Entity-Body Forge](29-the-entity-body-forge.md) | `xhr/*` request body + Content-Type | ⚔️ send-content-type-charset 19/19, send-content-type-string 1/1, send-entity-body-{none,empty,get-head,get-head-async} all green | ⚔️⚔️ | **SECURED — +19.** WHATWG "extract a body" + XHR §send() Content-Type: `_extractRequestBody` (String/Document/Blob/BufferSource/FormData/URLSearchParams), real `_parseMimeType`/`_serializeMimeType` + charset→UTF-8 adjustment (only when present & not already utf-8), GET/HEAD discard the body, POST/PUT null body emits `Content-Length: 0`. Caps: request-header-NAME case (hyper lowercases → `setrequestheader-content-type` values correct but capped), `status-*` custom reason phrase (h2), `.asis` |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -69,6 +70,28 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-18 (Quest #29 The Entity-Body Forge — XHR request body + Content-Type, +19):**
+- `send(body)` was coercing every body type with `String(body)` and deriving no
+  request `Content-Type`. Implemented the WHATWG "extract a body" algorithm
+  (`_extractRequestBody`: String/Document/Blob/BufferSource/FormData/URLSearchParams)
+  + the XHR §send() Content-Type rules, with a real `_parseMimeType`/
+  `_serializeMimeType` MIME parser so the charset→UTF-8 adjustment is exact
+  (param dedup, name-lowercasing, value-case preservation, quoted-string
+  unescaping, already-`utf-8` and invalid-MIME passthrough).
+- GET/HEAD now discard `send()`'s body argument; a null/empty POST/PUT body emits
+  `Content-Length: 0` (set explicitly in `perform_fetch_core` — h2 omits it for an
+  empty body). Both async `send()` and blocking `_sendSync()` share the logic.
+- Wins: send-content-type-charset 12→19, send-content-type-string 0→1,
+  send-entity-body-none 2→6, -empty 1→3, -get-head 0→2, -get-head-async 0→2,
+  setrequestheader-content-type 3→4 (values all correct, rest capped). **+19**,
+  zero regressions.
+- **Honest caps named:** `setrequestheader-content-type` (30 left) + the whole
+  `status-*` family (~73 subtests, widest XHR tail) are **transport caps** —
+  request-header NAME case is lowercased by hyper/`http` (and h2 requires it), and
+  custom HTTP reason phrases don't exist over h2 / aren't exposed by reqwest. Not
+  failures — architecturally unwinnable for us. Next winnable = the **response**
+  side: `responsexml-media-type` (7/15) + charset-aware response decoding.
 
 **Session 2026-06-18 (Quest #25 harvest — sync XHR resource entries, +4):**
 - With sync XHR landed in #28, harvested the ×4 `buffer-full-*` tails that #25 named as

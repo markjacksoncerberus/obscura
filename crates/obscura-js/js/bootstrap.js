@@ -3221,6 +3221,148 @@ const _arrayBufferFromBytes = function(bytes) {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 };
 
+// WHATWG "extract a body" (Fetch §body) + the XHR send() request Content-Type
+// rules (XHR §the-send()-method). `send(body)` was coercing every body type
+// with String(body) and never deriving a Content-Type, so a String/Document/
+// Blob/FormData/URLSearchParams request sent the wrong (or no) Content-Type.
+// _extractRequestBody returns { text, type, kind } where `text` is the serialized
+// request body for the op, `type` is the body's computed Content-Type (null when
+// the body type implies none), and `kind` ∈ {string,document,urlsearchparams,
+// blob,buffersource,formdata} (selects the charset-adjustment rule below). null
+// body → null.
+const _XHR_CHARSET_ADJUST = new Set(['string', 'document', 'urlsearchparams']);
+function _extractRequestBody(body) {
+  if (body == null) return null;
+  // Document (nodeType 9): serialize; an HTML document → text/html, else XML.
+  if (typeof body === 'object' && body.nodeType === 9) {
+    let text = '';
+    try { text = new XMLSerializer().serializeToString(body.documentElement || body); } catch (e) {}
+    const isHTML = ((body.contentType || '').toLowerCase() === 'text/html');
+    return { text, type: isHTML ? 'text/html;charset=UTF-8' : 'application/xml;charset=UTF-8', kind: 'document' };
+  }
+  // Blob/File: the blob's own type (none when the blob has no type).
+  if (typeof Blob !== 'undefined' && body instanceof Blob) {
+    let text = '';
+    try { text = new TextDecoder().decode(body._bytes || new Uint8Array()); } catch (e) {}
+    return { text, type: body.type ? body.type : null, kind: 'blob' };
+  }
+  // BufferSource (ArrayBuffer or any ArrayBufferView): no Content-Type.
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    const u8 = (body instanceof ArrayBuffer)
+      ? new Uint8Array(body)
+      : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+    let text = '';
+    try { text = new TextDecoder().decode(u8); } catch (e) {}
+    return { text, type: null, kind: 'buffersource' };
+  }
+  // FormData → multipart/form-data with a generated boundary.
+  if (typeof FormData !== 'undefined' && body instanceof FormData) {
+    const boundary = '----ObscuraFormBoundary' + _uuidV4().replace(/-/g, '');
+    let text = '';
+    try {
+      for (const [k, v] of (body._d || [])) {
+        text += '--' + boundary + '\r\nContent-Disposition: form-data; name="' + k + '"\r\n\r\n' + v + '\r\n';
+      }
+      text += '--' + boundary + '--\r\n';
+    } catch (e) {}
+    return { text, type: 'multipart/form-data; boundary=' + boundary, kind: 'formdata' };
+  }
+  // URLSearchParams → application/x-www-form-urlencoded.
+  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+    return { text: body.toString(), type: 'application/x-www-form-urlencoded;charset=UTF-8', kind: 'urlsearchparams' };
+  }
+  // Anything else is converted to a USVString → text/plain.
+  return { text: String(body), type: 'text/plain;charset=UTF-8', kind: 'string' };
+}
+
+// XHR §send() step: given the extracted body, set the request Content-Type on the
+// author headers map (mutated in place). If the author set no Content-Type, use the
+// body's. If the author DID set one, then for Document/string/URLSearchParams bodies
+// only, adjust an existing `charset` parameter to UTF-8 (Blob/BufferSource/FormData
+// keep the author value verbatim — see the WPT setrequestheader-content-type cases).
+function _applyRequestContentType(headers, extracted) {
+  if (!extracted || extracted.type == null) return;
+  let ctKey = null;
+  for (const k of Object.keys(headers)) { if (k.toLowerCase() === 'content-type') { ctKey = k; break; } }
+  if (ctKey === null) { headers['Content-Type'] = extracted.type; return; }
+  if (_XHR_CHARSET_ADJUST.has(extracted.kind)) {
+    const adjusted = _adjustCharsetToUTF8(headers[ctKey]);
+    if (adjusted !== null) headers[ctKey] = adjusted;
+  }
+}
+
+// WHATWG MIME Sniffing §"parse a MIME type". Returns {type, subtype, params}
+// (params an ordered array of [name, value] with lowercased names, deduplicated,
+// values verbatim) or null on failure (no valid type/subtype essence).
+function _parseMimeType(input) {
+  if (typeof input !== 'string') return null;
+  const s = input.replace(/^[ \t\n\r]+|[ \t\n\r]+$/g, '');
+  let i = 0;
+  let type = '';
+  while (i < s.length && s[i] !== '/') type += s[i++];
+  if (type === '' || i >= s.length || !_isHTTPToken(type)) return null;
+  i++; // '/'
+  let subtype = '';
+  while (i < s.length && s[i] !== ';') subtype += s[i++];
+  subtype = subtype.replace(/[ \t\n\r]+$/, '');
+  if (subtype === '' || !_isHTTPToken(subtype)) return null;
+  const rec = { type: type.toLowerCase(), subtype: subtype.toLowerCase(), params: [] };
+  const isQSChar = (c) => { const x = c.charCodeAt(0); return x === 0x09 || (x >= 0x20 && x <= 0x7e) || x >= 0x80; };
+  while (i < s.length) {
+    i++; // ';'
+    while (i < s.length && /[ \t\n\r]/.test(s[i])) i++;
+    let name = '';
+    while (i < s.length && s[i] !== ';' && s[i] !== '=') name += s[i++];
+    name = name.toLowerCase();
+    if (i < s.length && s[i] === ';') continue; // bare token, no value
+    if (i >= s.length) break;
+    i++; // '='
+    let value = '';
+    if (s[i] === '"') {
+      i++;
+      while (i < s.length) {
+        if (s[i] === '\\') { if (i + 1 < s.length) { value += s[i + 1]; i += 2; } else { value += '\\'; i++; } continue; }
+        if (s[i] === '"') { i++; break; }
+        value += s[i++];
+      }
+      while (i < s.length && s[i] !== ';') i++; // skip to next ';'
+    } else {
+      while (i < s.length && s[i] !== ';') value += s[i++];
+      value = value.replace(/[ \t\n\r]+$/, '');
+    }
+    if (name !== '' && _isHTTPToken(name) && value !== '' &&
+        [...value].every(isQSChar) && !rec.params.some(p => p[0] === name)) {
+      rec.params.push([name, value]);
+    }
+  }
+  return rec;
+}
+
+// WHATWG MIME "serialize a MIME type": type/subtype + each param (value quoted
+// only when it is not a non-empty HTTP token).
+function _serializeMimeType(rec) {
+  let out = rec.type + '/' + rec.subtype;
+  for (const [k, v] of rec.params) {
+    out += ';' + k + '=';
+    if (v !== '' && _isHTTPToken(v)) out += v;
+    else out += '"' + v.replace(/(["\\])/g, '\\$1') + '"';
+  }
+  return out;
+}
+
+// XHR §send(): adjust a Content-Type's `charset` to UTF-8. Per spec this happens
+// ONLY when the type parses, has a `charset` parameter, and that charset is not
+// already an ASCII-case-insensitive match for "utf-8". Otherwise the author value
+// is left untouched (return null = no change).
+function _adjustCharsetToUTF8(value) {
+  const rec = _parseMimeType(value);
+  if (rec === null) return null;
+  const cs = rec.params.find(p => p[0] === 'charset');
+  if (!cs || cs[1].toLowerCase() === 'utf-8') return null;
+  cs[1] = 'UTF-8';
+  return _serializeMimeType(rec);
+}
+
 const _installWasmStreamingFallback = function() {
   if (typeof WebAssembly === 'undefined') return;
   if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
@@ -3543,13 +3685,19 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       } catch(e) {}
     }
 
+    // Extract the request body + derive/adjust its Content-Type (XHR §send()).
+    // GET/HEAD never carry a body (the spec discards send()'s argument).
+    const _extracted = (this._method === 'GET' || this._method === 'HEAD') ? null : _extractRequestBody(body);
+    _applyRequestContentType(this._headers, _extracted);
+    const _reqBody = _extracted ? _extracted.text : undefined;
+
     // Carry an open()-time blob snapshot through to fetch via a Request.
     let _input = url;
     if (this._blobSnapshot) { _input = new Request(url, { method: this._method }); _input._blobSnapshot = this._blobSnapshot; }
     fetch(_input, {
       method: this._method,
       headers: this._headers,
-      body: body || undefined,
+      body: _reqBody,
       mode: 'cors',
       _initiatorType: 'xmlhttprequest',
     }).then(async (resp) => {
@@ -3640,8 +3788,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
         if (this._method !== 'GET' || bytes === undefined) throw new Error('blob URL not found');
         respBytes = bytes; status = 200; statusText = 'OK'; respHeaders = type ? { 'content-type': type } : {}; finalUrl = url;
       } else {
+        // Extract the request body + derive/adjust its Content-Type (XHR §send()).
+        // GET/HEAD never carry a body (the spec discards send()'s argument).
+        const _extracted = (this._method === 'GET' || this._method === 'HEAD') ? null : _extractRequestBody(body);
+        _applyRequestContentType(this._headers, _extracted);
+        const _reqBody = _extracted ? _extracted.text : "";
         const pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
-        const raw = Deno.core.ops.op_fetch_url_sync(url, this._method, JSON.stringify(this._headers), body != null ? String(body) : "", pageOrigin, 'cors');
+        const raw = Deno.core.ops.op_fetch_url_sync(url, this._method, JSON.stringify(this._headers), _reqBody, pageOrigin, 'cors');
         const p = JSON.parse(raw);
         if (p.blocked || p.corsBlocked || (p.status === 0 && p.error)) throw new Error(p.error || p.corsError || 'network error');
         status = p.status; statusText = ''; respHeaders = p.headers || {};
