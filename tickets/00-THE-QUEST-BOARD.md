@@ -48,6 +48,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~30~~ | ✅ [The Response Document](30-the-response-document.md) | `xhr/*` `responseXML` | **media-type 15/15, get-twice 4/4** | ⚔️⚔️ | **SECURED — +11.** XHR §"document response": `responseXML` was a constant `null`. New lazy, cached `_getDocumentResponse()` — final MIME type via `_parseMimeType` (missing/unparseable Content-Type → `text/xml`), XML/HTML detection, parse via `_IframeDocument` (parsererror→null), default `""` type never parses HTML; `.response`/`.responseXML` share one cached object (identity). Caps: `responsexml-document-properties` (full XML doc metadata + lastModified/redirect.py); charset-aware response decoding |
 | ~~32~~ | ✅ [The Throwing Getter](32-the-throwing-getter.md) | `xhr/*` `responseText` | **non-document-types 5/5** | ⚔️ | **SECURED — +4.** `responseText` was a plain data property (never threw); per §the-responsetext-attribute it must throw `InvalidStateError` when `responseType` is not `""`/`"text"`. Refactored to a getter backed by `_responseText` (all send paths assign the backing field) — empty string until LOADING/DONE, else the decoded text. `responseXML` already threw. Pure JS, no new Rust. The response-attributes vein is now clean. Caps: `responsexml-document-properties` (full XML doc metadata quest) |
 | ~~33~~ | ✅ [The Interface Armory](33-the-interface-armory.md) | `dom/nodes/Node-cloneNode*` (+ HTML element interface objects) | **Node-cloneNode 135/135** | ⚔️⚔️ | **SECURED — +34.** Most `HTML*Element` interface objects were a single shared alias of `HTMLElement` and a large tail was missing → `typeName in window` false. Now each is a distinct subclass of `HTMLElement` + a canonical `_HTML_IFACE_BY_TAG` tag→interface map, so `createElement(t) instanceof HTMLXxxElement` is honest. Added `DocumentType.cloneNode` + `DetachedDocument.cloneNode`. Caps: DOMParser HTML doc drops `<!DOCTYPE>` (parse-path gap); `document.adoptNode` unimplemented (next quick win) |
+| ~~34~~ | ✅ [The Adoption Papers](34-the-adoption-papers.md) | `dom/nodes/Document-adoptNode` (+ insert-adopt) | **Document-adoptNode 4/4, Node-mutation-adoptNode 2/2** | ⚔️ | **SECURED — +5.** `document.adoptNode` was unimplemented (`adoptNode is not a function`). Real DOM §dom-document-adoptnode: detach from any parent, deep-retarget the node document of the whole subtree (`_setNodeDocumentDeep`), adopting a Document throws `NotSupportedError`; inherited by `DetachedDocument`. Also fixed insertion (`appendChild`/`insertBefore`) to run the §insert "adopt into the parent's node document" step **deeply** when crossing documents (was retagging only the direct child) — hot-path safe via a same-document cheap compare. Pure JS, no new Rust. Caps: DocumentFragment/ShadowRoot adopt subtests (need a working `new Document()` web ctor, template-content owner document, `attachShadow`), `remove-and-adopt-thcrash` (`window.open()` popup document) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -74,6 +75,45 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-18 (Quest #34 The Adoption Papers — `document.adoptNode` +
+deep insert-adopt, +5):**
+- `dom/nodes/Document-adoptNode.html` was 0/4 — `document.adoptNode` was simply
+  **unimplemented** (`adoptNode is not a function`). The named next quick win
+  from Quest #33.
+- **Fix (pure JS, no new Rust):** Obscura tracks a node's node document with the
+  wrapper's `_ownerDoc` tag (default = the page document; cached wrappers keep it
+  stable). So adoption is a *detach + deep retag* — the backing nodes stay in the
+  shared Rust arena (an adopted-but-not-inserted subtree just lives there
+  unparented). New `Document.adoptNode(node)` (inherited by `DetachedDocument`):
+  TypeError for non-Nodes, `NotSupportedError` for a Document, else run
+  `_adoptNodeInto(node, this)` = DOM §concept-node-adopt (remove from parent; when
+  the destination differs from the node's current document, `_setNodeDocumentDeep`
+  retargets the node and every descendant).
+- **Second win — insert-adopt depth:** `appendChild`/`insertBefore` only retagged
+  the **direct** child's `_ownerDoc`, so a foreign subtree's descendants kept
+  their old `ownerDocument` after insertion. Now insertion runs the §insert
+  "adopt into the parent's node document" step deeply (and an element's attributes
+  follow via `_ownerEl`), but only when the node actually crosses documents — a
+  cheap `ownerDocument !== targetDoc` compare keeps the hot same-document path
+  walk-free. Fixed `Node-mutation-adoptNode` "simple append of foreign div" +
+  "owner docs of attributes".
+- Wins: Document-adoptNode 0→**4/4**, Node-mutation-adoptNode 1→**2/2**. **+5**,
+  zero regressions (qsa 1975, classlist 1420, createElement 147, createElementNS
+  596, cloneNode 135, isEqualNode 9/9, appendChild 11/11, mark 22/22, measures
+  119/119, structured-clone 141/152, getRandomValues 39/39, url-setters-stripping
+  260/260). Scroll `34-the-adoption-papers.md`.
+- **Caps (honest):** `adoption.window` (1/6) + the `remove-and-adopt-thcrash`
+  test need machinery Obscura doesn't model yet — a working `new Document()` web
+  constructor (its `_nid` is NaN → ops fall back to node 0, the live document),
+  template-content owner documents (`template.content.ownerDocument !==
+  document`), `attachShadow`/ShadowRoot, and `window.open()` popup documents
+  (`popup.document` is null). Each is a wider quest.
+- **Next leverage:** the `new Document()` web constructor (a real backing
+  fragment node + a distinct node document) would unlock the `adoption.window`
+  DocumentFragment subtests AND is a foundational primitive (template content,
+  `createDocumentFragment` identity); else a fresh realm (`dom/` Node-* family,
+  `fetch/`).
 
 **Session 2026-06-18 (Quest #33 The Interface Armory — HTML element interface
 objects + Node/Document/DocumentType cloning, +34):**

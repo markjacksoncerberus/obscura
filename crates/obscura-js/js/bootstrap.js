@@ -464,8 +464,13 @@ class Node {
     }
     const _prev = __mutationObservers?.length ? +_dom("last_child", this._nid) : -1;
     _dom("append_child", this._nid, c._nid);
-    // Adopt the node into this parent's node document (updates ownerDocument).
-    c._ownerDoc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
+    // Insert §"adopt node into the parent's node document": when the node comes
+    // from a different document, retarget the node document of it AND its whole
+    // subtree (otherwise descendants keep their old ownerDocument). Same-document
+    // appends — the overwhelmingly common case — skip the walk via a cheap compare.
+    const _adoptDoc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
+    if (c.ownerDocument !== _adoptDoc) _setNodeDocumentDeep(c, _adoptDoc);
+    else c._ownerDoc = _adoptDoc;
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [c._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null });
     if (c instanceof Element && c.tagName === 'SCRIPT') {
       const scriptType = c.getAttribute('type') || '';
@@ -582,7 +587,10 @@ class Node {
       return n;
     }
     _dom("insert_before", n._nid, ref._nid);
-    n._ownerDoc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
+    // Adopt deeply when crossing documents (see appendChild); cheap compare otherwise.
+    const _adoptDoc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
+    if (n.ownerDocument !== _adoptDoc) _setNodeDocumentDeep(n, _adoptDoc);
+    else n._ownerDoc = _adoptDoc;
     if (__mutationObservers?.length) {
       const _prev = +_dom("prev_sibling", n._nid);
       __notifyMutation('childList', this._nid, [n._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: ref._nid });
@@ -1913,6 +1921,23 @@ class Element extends Node {
   }
 }
 
+// DOM §concept-node-adopt: remove `node` from any parent, then — when the
+// destination document differs from its current node document — retarget the
+// node document of `node` and every descendant to `doc`. Obscura tracks a node's
+// document via the wrapper's `_ownerDoc` tag (default = the page document), so
+// adoption is a detach + a deep retag; the backing nodes stay in the shared Rust
+// arena (an adopted-but-not-inserted subtree simply lives there unparented).
+function _setNodeDocumentDeep(node, doc) {
+  node._ownerDoc = doc;
+  for (let c = node.firstChild; c; c = c.nextSibling) _setNodeDocumentDeep(c, doc);
+}
+function _adoptNodeInto(node, doc) {
+  const oldDoc = node.ownerDocument;
+  const parent = node.parentNode;
+  if (parent) parent.removeChild(node);
+  if (doc !== oldDoc) _setNodeDocumentDeep(node, doc);
+}
+
 class Document extends Node {
   // `new Document(nid)` (numeric) wraps a real document node (the main document,
   // or a node-type-9 node from the tree). `new Document()` with no id creates a
@@ -2028,6 +2053,18 @@ class Document extends Node {
     const frag = new DocumentFragment(nid);
     _cache.set(nid, frag);
     return frag;
+  }
+  // DOM §dom-document-adoptnode: detach `node` from any parent and make this
+  // document its node document (and the node document of its whole subtree).
+  // Adopting a Document throws NotSupportedError.
+  adoptNode(node) {
+    if (node == null || typeof node !== 'object' ||
+        (typeof node._nid !== 'number' && typeof node.nodeType !== 'number'))
+      throw new TypeError("Failed to execute 'adoptNode' on 'Document': parameter 1 is not of type 'Node'.");
+    if (node.nodeType === 9)
+      throw new DOMException("The node provided is a document, which may not be adopted.", "NotSupportedError");
+    _adoptNodeInto(node, this);
+    return node;
   }
   // Legacy DOM Level 2 event factory. Spec returns an event of the requested
   // class with an empty type until init*Event() is called. We previously
