@@ -47,6 +47,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~31~~ | ✅ [The Charset Decipher](31-the-charset-decipher.md) | `xhr/*` response decoding | **responsetext-decoding 37/37, responsedocument-decoding 6/6** | ⚔️⚔️ | **SECURED — +19.** XHR decoded every response as UTF-8; the fetch core already hands JS the raw bytes (`bodyBase64`). New §"text response" + document decoding: `_xhrFinalEncoding` (override>Content-Type charset), `_xhrDecode` (Encoding §decode — BOM sniff picks the encoding, `TextDecoder` strips it), XML-declaration sniff (default `""` type) + HTML `<meta charset>` prescan (document). Pure JS, no new Rust. Caps: `responseText` throwing-getter for non-text responseTypes (next), XML-parser well-formedness edge |
 | ~~30~~ | ✅ [The Response Document](30-the-response-document.md) | `xhr/*` `responseXML` | **media-type 15/15, get-twice 4/4** | ⚔️⚔️ | **SECURED — +11.** XHR §"document response": `responseXML` was a constant `null`. New lazy, cached `_getDocumentResponse()` — final MIME type via `_parseMimeType` (missing/unparseable Content-Type → `text/xml`), XML/HTML detection, parse via `_IframeDocument` (parsererror→null), default `""` type never parses HTML; `.response`/`.responseXML` share one cached object (identity). Caps: `responsexml-document-properties` (full XML doc metadata + lastModified/redirect.py); charset-aware response decoding |
 | ~~32~~ | ✅ [The Throwing Getter](32-the-throwing-getter.md) | `xhr/*` `responseText` | **non-document-types 5/5** | ⚔️ | **SECURED — +4.** `responseText` was a plain data property (never threw); per §the-responsetext-attribute it must throw `InvalidStateError` when `responseType` is not `""`/`"text"`. Refactored to a getter backed by `_responseText` (all send paths assign the backing field) — empty string until LOADING/DONE, else the decoded text. `responseXML` already threw. Pure JS, no new Rust. The response-attributes vein is now clean. Caps: `responsexml-document-properties` (full XML doc metadata quest) |
+| ~~33~~ | ✅ [The Interface Armory](33-the-interface-armory.md) | `dom/nodes/Node-cloneNode*` (+ HTML element interface objects) | **Node-cloneNode 135/135** | ⚔️⚔️ | **SECURED — +34.** Most `HTML*Element` interface objects were a single shared alias of `HTMLElement` and a large tail was missing → `typeName in window` false. Now each is a distinct subclass of `HTMLElement` + a canonical `_HTML_IFACE_BY_TAG` tag→interface map, so `createElement(t) instanceof HTMLXxxElement` is honest. Added `DocumentType.cloneNode` + `DetachedDocument.cloneNode`. Caps: DOMParser HTML doc drops `<!DOCTYPE>` (parse-path gap); `document.adoptNode` unimplemented (next quick win) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -73,6 +74,36 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-18 (Quest #33 The Interface Armory — HTML element interface
+objects + Node/Document/DocumentType cloning, +34):**
+- `dom/nodes/Node-cloneNode.html` sat at 103/135; the 32 fails were all
+  `HTMLXxxElement is not supported`. Obscura defined most `HTML*Element`
+  interfaces as a **single shared alias of `HTMLElement`**, and a large tail
+  (`HTMLAreaElement`, `HTMLBaseElement`, `HTMLTableColElement`, `HTMLModElement`,
+  `HTMLObjectElement`, the deprecated `HTMLDirectoryElement`/`HTMLFontElement`/
+  `HTMLFrameElement`/`HTMLFrameSetElement`, …) was simply **missing** →
+  `typeName in window` was false.
+- **Root-cause fix (pure JS):** each `HTML*Element` is now a distinct subclass of
+  `HTMLElement` (`HTMLAreaElement !== HTMLDivElement`, as the platform requires;
+  behaviour stays shared on `Element.prototype`), `HTMLMediaElement` is the base
+  of audio/video, and a canonical `_HTML_IFACE_BY_TAG` tag→interface map drives
+  `_htmlClassForLocal`, so `createElement('area') instanceof HTMLAreaElement` is
+  genuinely true.
+- The last 3 cloneNode fails were a different bug: cloning a `DocumentType` or a
+  `Document` (createDocument/createHTMLDocument) returned `null` (no `cloneNode`).
+  Added `DocumentType.cloneNode` + `DetachedDocument.cloneNode(deep)` (same
+  kind/contentType/compatMode/title; clone starts empty; children only when deep).
+- Wins: Node-cloneNode 103→**135/135**, cloneNode-document-with-doctype 0→**2/3**.
+  **+34**, no new Rust, zero regressions (qsa 1975, classlist 1420, createElement
+  147, createElementNS 596, isEqualNode 9/9, Element-tagName 6/6, mark 22/22,
+  structured-clone 141/152, getRandomValues 39/39, url-setters-stripping 260/260,
+  XMLSerializer 27/29). Scroll `33-the-interface-armory.md`.
+- **Next leverage:** `document.adoptNode` is unimplemented (`Document-adoptNode`
+  0/4 — a small self-contained sibling of cloneNode, good next quick win); the
+  DOMParser HTML-doc `<!DOCTYPE>` drop (`_IframeDocument` parse-path gap) caps the
+  last doctype-clone subtest; the new distinct interface objects are the
+  foundation for the html/dom element idlharness tail.
 
 **Session 2026-06-18 (Quest #32 The Throwing Getter — XHR `responseText`, +4):**
 - `responseText` was a plain **data property** (assigned in the constructor,

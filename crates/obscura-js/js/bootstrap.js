@@ -2215,6 +2215,12 @@ class DocumentType extends Node {
   // A doctype's node document is the doc it was created in or appended into
   // (createHTMLDocument / createDocument set _ownerDoc); defaults to the page.
   get ownerDocument() { return this._ownerDoc || globalThis.document; }
+  // §clone a node: a fresh detached doctype with the same name/publicId/systemId.
+  cloneNode() {
+    const dt = new DocumentType(+_dom("create_comment_node", ""), this._name, this._publicId, this._systemId);
+    dt._ownerDoc = this._ownerDoc;
+    return dt;
+  }
 }
 
 // A standalone document not attached to the page (from `new Document()`,
@@ -2275,6 +2281,22 @@ class DetachedDocument extends Document {
     return null;
   }
   get implementation() { return globalThis.document.implementation; }
+  // §clone a node (document): a new document of the same kind carrying the same
+  // encoding/content type/URL/mode; children are copied only for a deep clone.
+  cloneNode(deep) {
+    const copy = new DetachedDocument(this._kind);
+    // A clone starts empty — drop the kind-'html' auto-built <html><head><body>.
+    for (let c = copy.firstChild; c; ) { const n = c.nextSibling; copy.removeChild(c); c = n; }
+    copy._contentType = this._contentType;
+    copy._compatMode  = this._compatMode;
+    copy._createMode  = this._createMode;
+    copy._title       = this._title;
+    if (deep) for (const k of this.childNodes) {
+      const c = (k && k.cloneNode) ? k.cloneNode(true) : null;
+      if (c) copy.appendChild(c);
+    }
+    return copy;
+  }
   // Live getters: a DetachedDocument's tree can be mutated after construction
   // (the WPT range harness does `removeChild(documentElement)` then appends a
   // cloned root), so these must reflect the CURRENT children rather than the
@@ -2347,9 +2369,43 @@ const _KNOWN_HTML_TAGS = new Set(('a abbr address area article aside audio b bas
   'kbd label legend li link main map mark menu meta meter nav noscript object ol optgroup option output p ' +
   'param picture pre progress q rp rt ruby s samp script section select slot small source span strong style ' +
   'sub summary sup table tbody td template textarea tfoot th thead time title tr track u ul var video wbr').split(' '));
+// Canonical HTML tag → interface-object name (HTML spec element index). Tags not
+// listed but recognized (in _KNOWN_HTML_TAGS) use the generic HTMLElement; any
+// other name → HTMLUnknownElement. Interface objects resolve on globalThis at
+// call time, so this stays independent of the definition-order block far below.
+const _HTML_IFACE_BY_TAG = {
+  a:'HTMLAnchorElement', area:'HTMLAreaElement', audio:'HTMLAudioElement',
+  base:'HTMLBaseElement', blockquote:'HTMLQuoteElement', q:'HTMLQuoteElement',
+  body:'HTMLBodyElement', br:'HTMLBRElement', button:'HTMLButtonElement',
+  canvas:'HTMLCanvasElement', caption:'HTMLTableCaptionElement',
+  col:'HTMLTableColElement', colgroup:'HTMLTableColElement', data:'HTMLDataElement',
+  datalist:'HTMLDataListElement', del:'HTMLModElement', ins:'HTMLModElement',
+  details:'HTMLDetailsElement', dialog:'HTMLDialogElement', dir:'HTMLDirectoryElement',
+  div:'HTMLDivElement', dl:'HTMLDListElement', embed:'HTMLEmbedElement',
+  fieldset:'HTMLFieldSetElement', font:'HTMLFontElement', form:'HTMLFormElement',
+  frame:'HTMLFrameElement', frameset:'HTMLFrameSetElement', h1:'HTMLHeadingElement',
+  h2:'HTMLHeadingElement', h3:'HTMLHeadingElement', h4:'HTMLHeadingElement',
+  h5:'HTMLHeadingElement', h6:'HTMLHeadingElement', head:'HTMLHeadElement',
+  hr:'HTMLHRElement', html:'HTMLHtmlElement', iframe:'HTMLIFrameElement',
+  img:'HTMLImageElement', input:'HTMLInputElement', label:'HTMLLabelElement',
+  legend:'HTMLLegendElement', li:'HTMLLIElement', link:'HTMLLinkElement',
+  listing:'HTMLPreElement', map:'HTMLMapElement', marquee:'HTMLMarqueeElement',
+  menu:'HTMLMenuElement', meta:'HTMLMetaElement', meter:'HTMLMeterElement',
+  object:'HTMLObjectElement', ol:'HTMLOListElement', optgroup:'HTMLOptGroupElement',
+  option:'HTMLOptionElement', output:'HTMLOutputElement', p:'HTMLParagraphElement',
+  param:'HTMLParamElement', picture:'HTMLPictureElement', pre:'HTMLPreElement',
+  progress:'HTMLProgressElement', script:'HTMLScriptElement', select:'HTMLSelectElement',
+  slot:'HTMLSlotElement', source:'HTMLSourceElement', span:'HTMLSpanElement',
+  style:'HTMLStyleElement', table:'HTMLTableElement', tbody:'HTMLTableSectionElement',
+  td:'HTMLTableCellElement', template:'HTMLTemplateElement', textarea:'HTMLTextAreaElement',
+  tfoot:'HTMLTableSectionElement', th:'HTMLTableCellElement', thead:'HTMLTableSectionElement',
+  time:'HTMLTimeElement', title:'HTMLTitleElement', tr:'HTMLTableRowElement',
+  track:'HTMLTrackElement', ul:'HTMLUListElement', video:'HTMLVideoElement',
+  xmp:'HTMLPreElement',
+};
 const _htmlClassForLocal = function(local) {
-  if (local === 'span') return globalThis.HTMLSpanElement;
-  if (local === 'form') return globalThis.HTMLFormElement;
+  const ifaceName = _HTML_IFACE_BY_TAG[local];
+  if (ifaceName) return globalThis[ifaceName] || globalThis.HTMLElement;
   return _KNOWN_HTML_TAGS.has(local) ? globalThis.HTMLElement : globalThis.HTMLUnknownElement;
 };
 // Default wrap path (parsed elements + createElement): elements are HTML, so map
@@ -6432,46 +6488,40 @@ globalThis.HTMLFormElement = class HTMLFormElement extends globalThis.HTMLElemen
   // 'submit' event and (if not prevented) builds form data and navigates.
   reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
 };
-// The remaining specific interfaces don't yet carry distinct behaviour, so they
-// alias HTMLElement (still correct for `instanceof HTMLElement`/`Element`).
-const _HTMLEl = globalThis.HTMLElement;
-globalThis.HTMLDivElement = _HTMLEl;
-globalThis.HTMLParagraphElement = _HTMLEl;
-globalThis.HTMLAnchorElement = _HTMLEl;
-globalThis.HTMLImageElement = _HTMLEl;
-globalThis.HTMLInputElement = _HTMLEl;
-globalThis.HTMLButtonElement = _HTMLEl;
-globalThis.HTMLSelectElement = _HTMLEl;
-globalThis.HTMLTextAreaElement = _HTMLEl;
-globalThis.HTMLLabelElement = _HTMLEl;
-globalThis.HTMLTableElement = _HTMLEl;
-globalThis.HTMLIFrameElement = _HTMLEl;
-globalThis.HTMLCanvasElement = _HTMLEl;
-globalThis.HTMLVideoElement = _HTMLEl;
-globalThis.HTMLAudioElement = _HTMLEl;
-globalThis.HTMLScriptElement = _HTMLEl;
-globalThis.HTMLStyleElement = _HTMLEl;
-globalThis.HTMLLinkElement = _HTMLEl;
-globalThis.HTMLMetaElement = _HTMLEl;
-globalThis.HTMLHeadElement = _HTMLEl;
-globalThis.HTMLBodyElement = _HTMLEl;
-globalThis.HTMLHtmlElement = _HTMLEl;
-globalThis.HTMLBRElement = _HTMLEl;
-globalThis.HTMLHRElement = _HTMLEl;
-globalThis.HTMLUListElement = _HTMLEl;
-globalThis.HTMLOListElement = _HTMLEl;
-globalThis.HTMLLIElement = _HTMLEl;
-globalThis.HTMLPreElement = _HTMLEl;
-globalThis.HTMLHeadingElement = _HTMLEl;
-globalThis.HTMLTemplateElement = _HTMLEl;
-globalThis.HTMLSlotElement = _HTMLEl;
-globalThis.HTMLOptionElement = _HTMLEl;
-globalThis.HTMLDataListElement = _HTMLEl;
-globalThis.HTMLFieldSetElement = _HTMLEl;
-globalThis.HTMLLegendElement = _HTMLEl;
-globalThis.HTMLProgressElement = _HTMLEl;
-globalThis.HTMLDetailsElement = _HTMLEl;
-globalThis.HTMLDialogElement = _HTMLEl;
+// The remaining specific interfaces are distinct constructors (each a real
+// subclass of HTMLElement) — per WebIDL the platform exposes a separate interface
+// object per element family, and `HTMLAreaElement !== HTMLDivElement`. Behaviour
+// (src/href reflection, etc.) lives on Element.prototype and is shared, so an
+// empty subclass body loses nothing while making `createElement(t) instanceof
+// HTMLXxxElement` honest. HTMLForm/HTMLSpan above already carry behaviour.
+// HTMLMediaElement is the shared base of audio/video.
+globalThis.HTMLMediaElement = class HTMLMediaElement extends globalThis.HTMLElement {};
+const _defIface = (name, base) => {
+  if (globalThis[name]) return;                       // keep already-defined (form/span)
+  const C = { [name]: class extends (base || globalThis.HTMLElement) {} }[name];
+  globalThis[name] = C;
+};
+[ 'HTMLDivElement','HTMLParagraphElement','HTMLAnchorElement','HTMLImageElement',
+  'HTMLInputElement','HTMLButtonElement','HTMLSelectElement','HTMLTextAreaElement',
+  'HTMLLabelElement','HTMLTableElement','HTMLIFrameElement','HTMLCanvasElement',
+  'HTMLScriptElement','HTMLStyleElement','HTMLLinkElement','HTMLMetaElement',
+  'HTMLHeadElement','HTMLBodyElement','HTMLHtmlElement','HTMLBRElement',
+  'HTMLHRElement','HTMLUListElement','HTMLOListElement','HTMLLIElement',
+  'HTMLPreElement','HTMLHeadingElement','HTMLTemplateElement','HTMLSlotElement',
+  'HTMLOptionElement','HTMLDataListElement','HTMLFieldSetElement','HTMLLegendElement',
+  'HTMLProgressElement','HTMLDetailsElement','HTMLDialogElement',
+  // Previously-missing interfaces (the cloneNode/idlharness tail):
+  'HTMLAreaElement','HTMLBaseElement','HTMLQuoteElement','HTMLTableCaptionElement',
+  'HTMLTableColElement','HTMLDataElement','HTMLModElement','HTMLDirectoryElement',
+  'HTMLDListElement','HTMLEmbedElement','HTMLFontElement','HTMLFrameElement',
+  'HTMLFrameSetElement','HTMLMapElement','HTMLMarqueeElement','HTMLMenuElement',
+  'HTMLMeterElement','HTMLObjectElement','HTMLOptGroupElement','HTMLOutputElement',
+  'HTMLParamElement','HTMLPictureElement','HTMLSourceElement','HTMLTableSectionElement',
+  'HTMLTableCellElement','HTMLTimeElement','HTMLTitleElement','HTMLTableRowElement',
+  'HTMLTrackElement',
+].forEach(n => _defIface(n));
+globalThis.HTMLAudioElement = class HTMLAudioElement extends globalThis.HTMLMediaElement {};
+globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMediaElement {};
 globalThis.SVGElement = Element;
 globalThis.SVGSVGElement = Element;
 globalThis.CharacterData = CharacterData;
