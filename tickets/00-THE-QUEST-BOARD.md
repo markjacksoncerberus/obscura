@@ -35,6 +35,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~16~~ | ✅ [The Clone Forge](16-the-clone-forge.md) | `html/webappapis/structured-clone` | **141/152** | ⚔️⚔️ | **SECURED 93%** — real structuredClone (was a `JSON` stub @ 29/152); **+112**. 10 left are engine gaps (FileList/MessagePort/ImageBitmap/OffscreenCanvas/OOB-TA) |
 | 23 | [The Element Ledger](23-the-element-ledger.md) | `resource-timing/*` element loads (+ perf-timeline) | ⚔️ po-observe 1/1, dynamic-insertion 5/6, img 1/1, link 5/8 | ⚔️⚔️ | **inc 1+2 ~+16.** Element subresource loads (`<img>`, `<link>`, `<script>`, `<object>` — both JS-inserted AND markup) emit `resource` entries + fire load/error; iframe/XHR report correct initiatorType. Next: css-embedded "css" entries, `img.src` resolved-URL reflection, font→css, redirect timing, buffer-full |
 | ~~24~~ | ✅ [The Resolved Reflection](24-the-resolved-reflection.md) | `resource-timing/status-codes-create-entry` (+ `getEntriesByName(el.src)` family) | **status-codes 0→1/1** | ⚔️ | **SECURED — +1, foundational.** URL-reflecting IDL getters (`img/script/iframe.src`, `a/link/area.href`) now return the RESOLVED absolute URL (was the raw attribute), so `getEntriesByName(img.src)` matches the absolute entry name. Page `<script src>` `resource` entries carry the real fetch-elapsed `duration` (was a collapsed 0). Scoped tight (per-localName sets), zero regressions. Caps: TAO/cross-origin family, `<base>`-loader divergence |
+| ~~26~~ | ✅ [The Content-Type Ledger](26-the-content-type-ledger.md) | `resource-timing/content-type` | **0→16/21** | ⚔️ | **SECURED — +16.** New `PerformanceResourceTiming.contentType` (MIME essence of the response Content-Type), exposed for non-opaque responses (same-origin + crossorigin CORS loads; opaque cross-origin → ""). `_loadElementResource` now honors the element `crossOrigin` attr → CORS fetch mode. Bug fix: `XMLHttpRequest.open(url)` coerces a `URL`-object url to string (was `url.includes is not a function`). Caps: cross-origin no-cors XHR (our XHR is cors-mode → blocked) + cross-origin redirect TAO |
 | ~~25~~ | ✅ [The Buffer Ledger](25-the-buffer-ledger.md) | `resource-timing/buffer-full-*` | **8 tests 0→1/1** | ⚔️⚔️ | **SECURED — +8.** Real Resource Timing buffer (was unbounded, no event): primary buffer w/ size limit 250 + secondary buffer; `resourcetimingbufferfull` event + `onresourcetimingbufferfull` handler + the "fire a buffer full event" task (copy-secondary-buffer + no-progress overflow guard); `setResourceTimingBufferSize`/`clearResourceTimings` per spec. Zero regressions. Caps: `xhr_sync`-ordering tests (×4) need real synchronous XHR (Obscura's XHR is always async); `buffer-full-eventually` times out (250 sequential network loads exceed harness wall-clock) |
 | ~~22~~ | ✅ [The Resource Ledger](22-the-resource-ledger.md) | `resource-timing/*` (+ perf-timeline) | **buffered-flag 1/1, clear-resource-timings 1/1, case-sensitivity 3/3** | ⚔️⚔️ | **SECURED — +4.** `PerformanceResourceTiming` entries for `fetch()`/XHR + page `<script src>` loads; real `clearResourceTimings`. Caps: element loads (img/link/iframe), TAO cross-origin, buffer-full family |
 | ~~21~~ | ✅ [The Navigator's Almanac](21-the-navigators-almanac.md) | `navigation-timing/*` | **~20 subtests across 9 tests** | ⚔️⚔️ | **SECURED — ~+20.** Real `PerformanceNavigationTiming` (+ `PerformanceResourceTiming` base): nav entry present from the start, queued to observers at load; honest body sizes from the Rust response; `readystatechange` at interactive/complete. Caps: exact-byte-size/host-URL value tests, per-iframe nav timing, real redirect-chain timing |
@@ -66,6 +67,35 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-17 (Quest #26 — The Content-Type Ledger, +16):**
+- **`PerformanceResourceTiming.contentType` now exists.** Resource entries had no
+  `contentType` member, so `entry.contentType` was `undefined` for every resource —
+  `content-type.html` was 0/21. Added the attribute (the MIME **essence** —
+  `type/subtype`, params stripped, lowercased — of the response `Content-Type`,
+  which `op_fetch_url` already returns in `headers`), exposed for **non-opaque**
+  responses only: same-origin loads, and crossorigin **CORS** loads that pass the
+  access-control check; opaque cross-origin (no-cors) → `""`.
+- **`crossOrigin` → CORS fetch mode.** `_loadElementResource` hard-coded `no-cors`,
+  so a `crossOrigin="anonymous"` image/script/stylesheet got an opaque response and
+  `contentType: ""`. It now honors the element's `crossOrigin` attribute and fetches
+  in **cors** mode, making the CORS-allowed cross-origin responses non-opaque (and
+  exposing their content-type) — won 4 cross-origin subtests.
+- **Bug fix: `XMLHttpRequest.open(URL)`** — the `xhr_async` loader passes a `URL`
+  object as the url; `open` stored it verbatim and `send()` then threw
+  `url.includes is not a function`. `open` now coerces a non-string url to a string
+  (the spec parses it anyway). Unblocks any test that opens an XHR with a URL object.
+- **Results:** `content-type.html` **0→16/21** (+16: 7 same-origin, 5 cross-origin
+  no-cors `""`, 4 cross-origin CORS). **Zero regressions** (fresh-server sweep: qsa
+  1975, classlist 1420, mark 22/22, measures 119/119, structured-clone 141/152,
+  getRandomValues 39/39, url-with-xhr 14/14, url-with-fetch 16/16, buffered-flag 1/1,
+  clear-resource-timings 1/1, status-codes 1/1, initiator-type-for-script 1/1,
+  image-sequence 3/3, po-observe 5/6 [pre-existing fail]).
+- **Caps (the remaining 5):** cross-origin **no-cors XHR** (×2) — Obscura's XHR is
+  always cors-mode, so a cross-origin XHR without ACAO is blocked → no entry →
+  timeout; cross-origin **redirect TAO** (×3) — after a cross-origin redirect the
+  final URL can be same-origin, so the origin check over-exposes; needs real
+  redirect-chain origin/TAO tracking. Scroll `tickets/26-the-content-type-ledger.md`.
 
 **Session 2026-06-17 (Quest #25 — The Buffer Ledger, +8):**
 - **The Resource Timing buffer is real.** `performance._addResourceEntry` used to

@@ -2830,6 +2830,21 @@ const _fireElementError = function(el) {
 // the element ("img"/"link"/"script"/"object"). For scripts, the fetched body
 // is executed before the load event. Each call bumps a per-element generation
 // token so a superseding src/href reassignment doesn't fire a stale event.
+// The MIME "essence" (type/subtype, parameters stripped, lowercased) of a
+// response's Content-Type header, for PerformanceResourceTiming.contentType.
+// `headers` is the lowercased-key map from op_fetch_url.
+const _mimeEssence = function(headers) {
+  if (!headers) return "";
+  const ct = headers['content-type'] || headers['Content-Type'] || "";
+  return String(ct).split(';')[0].trim().toLowerCase();
+};
+// contentType is exposed only when the resource is same-origin with the document
+// (a TAO opt-in would also qualify cross-origin, but we don't read TAO yet).
+const _entryContentType = function(resourceUrl, headers, pageOrigin) {
+  try { if (new URL(resourceUrl).origin === pageOrigin) return _mimeEssence(headers); } catch (e) {}
+  return "";
+};
+
 const _loadElementResource = function(el, url, initiatorType, opts) {
   opts = opts || {};
   if (!el || !url) return;
@@ -2842,9 +2857,13 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
   el._loadEventFired = false;
   const start = (globalThis.performance && performance.now) ? performance.now() : 0;
   const pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
+  // A crossorigin element (`img.crossOrigin = "anonymous"` etc.) makes a CORS
+  // request; the response is then non-opaque when the access-control check passes,
+  // which exposes contentType (Resource Timing) even cross-origin.
+  const _useCors = !!(el && (el.crossOrigin === 'anonymous' || el.crossOrigin === 'use-credentials'));
   (async () => {
     try {
-      const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
+      const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, _useCors ? "cors" : "no-cors");
       if (el._resLoadGen !== gen) return; // superseded by a newer load
       const parsed = JSON.parse(raw);
       // Hard network failure (blocked / CORS) → no entry, fire error.
@@ -2856,7 +2875,11 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
         if (globalThis.performance && performance._addResourceEntry) {
           const body = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || "");
           const sz = (body && (body.byteLength != null ? body.byteLength : body.length)) || 0;
-          performance._addResourceEntry(parsed.url || fullUrl, initiatorType, start, performance.now(), { enc: sz, dec: sz, status: status });
+          // Non-opaque response → expose contentType: same-origin, or a CORS
+          // request that passed (we only reach here when not corsBlocked).
+          let _ct = "";
+          try { if (_useCors || new URL(parsed.url || fullUrl).origin === pageOrigin) _ct = _mimeEssence(parsed.headers); } catch (e) {}
+          performance._addResourceEntry(parsed.url || fullUrl, initiatorType, start, performance.now(), { enc: sz, dec: sz, status: status, contentType: _ct });
         }
       } catch (e) {}
       if (opts.eval && parsed.body) {
@@ -3284,7 +3307,8 @@ globalThis.fetch = async (input, init = {}) => {
       // Internal callers (XHR, iframe navigation) pass `_initiatorType` so the
       // entry reports the right element type; the public fetch() default is "fetch".
       const _it = (init && init._initiatorType) || "fetch";
-      performance._addResourceEntry(parsed.url || url, _it, _resStart, performance.now(), { enc: _sz, dec: _sz, status: parsed.status });
+      const _ct = _entryContentType(parsed.url || url, parsed.headers, pageOrigin);
+      performance._addResourceEntry(parsed.url || url, _it, _resStart, performance.now(), { enc: _sz, dec: _sz, status: parsed.status, contentType: _ct });
     }
   } catch (e) {}
   return new Response(responseBody, {
@@ -3349,6 +3373,10 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
 
   open(method, url, async_) {
     this._method = method;
+    // The url argument may be a URL object (the resource-timing loaders pass
+    // `new URL(path, origin)`); the spec parses it to a string. Coerce so the
+    // string ops below (.startsWith / .includes) work.
+    if (url != null && typeof url !== 'string') url = String(url);
     this._url = url;
     // Snapshot a blob: URL's bytes at open() (spec: the request references the
     // blob now) so a revokeObjectURL before send() doesn't break the fetch.
@@ -5105,6 +5133,10 @@ class PerformanceResourceTiming extends PerformanceEntry {
     this.initiatorType = "";
     this.deliveryType = "";
     this.nextHopProtocol = "";
+    // Resource Timing 2 §contentType — the essence (type/subtype, params stripped)
+    // of the response's Content-Type. Exposed only for same-origin (or TAO-passed)
+    // responses; "" for opaque cross-origin ones.
+    this.contentType = "";
     this.workerStart = 0;
     this.redirectStart = 0;
     this.redirectEnd = 0;
@@ -5126,7 +5158,7 @@ class PerformanceResourceTiming extends PerformanceEntry {
   }
   toJSON() {
     const j = super.toJSON();
-    for (const k of ['initiatorType', 'deliveryType', 'nextHopProtocol', 'workerStart',
+    for (const k of ['initiatorType', 'deliveryType', 'nextHopProtocol', 'contentType', 'workerStart',
       'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart', 'domainLookupEnd',
       'connectStart', 'connectEnd', 'secureConnectionStart', 'requestStart', 'responseStart',
       'responseEnd', 'responseStatus', 'transferSize', 'encodedBodySize', 'decodedBodySize'])
@@ -5333,6 +5365,7 @@ class Performance {
       e.decodedBodySize = (sizes.dec != null ? sizes.dec : sizes.enc) || 0;
       e.transferSize = (sizes.enc || 0) + 300;
       if (sizes.status) e.responseStatus = sizes.status;
+      if (sizes.contentType != null) e.contentType = sizes.contentType;
     }
     return e;
   }
