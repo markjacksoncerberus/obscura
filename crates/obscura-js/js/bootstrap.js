@@ -3564,7 +3564,6 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this.status = 0;
     this.statusText = "";
     this.responseText = "";
-    this.responseXML = null;
     this.responseURL = "";
     this.responseType = "";
     this.response = null;
@@ -3627,6 +3626,9 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this.statusText = "";
     this.responseText = "";
     this.response = null;
+    // Invalidate any cached "document response" from a previous request cycle.
+    this._responseDocComputed = false;
+    this._responseDocCache = null;
     // open() moves the object to OPENED; per spec readystatechange only fires
     // when the state actually changes, so a redundant open() on an
     // already-OPENED object is silent (open-open-sync-send).
@@ -3734,7 +3736,10 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
           xhr.response = new Blob([text]);
           break;
         case 'document':
-          xhr.response = text; // simplified
+          // §"document response": parse the body per its final MIME type into a
+          // Document (or null). Cached so `.response` and `.responseXML` return
+          // the SAME object (responsexml-get-twice).
+          xhr.response = xhr._getDocumentResponse();
           break;
         default:
           xhr.response = text;
@@ -3820,7 +3825,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       case 'json': try { this.response = JSON.parse(text); } catch (e) { this.response = null; } break;
       case 'arraybuffer': this.response = (respBytes ? respBytes.buffer : new TextEncoder().encode(text).buffer); break;
       case 'blob': this.response = new Blob([respBytes || text]); break;
-      case 'document': this.response = text; break;
+      case 'document': this.response = this._getDocumentResponse(); break;
       case 'text': case '': default: this.response = text;
     }
     // Resource Timing: a synchronous XHR records a completed "resource" entry
@@ -3839,6 +3844,64 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this._setReadyState(4);
     this._fireEvent('load');
     this._fireEvent('loadend');
+  }
+
+  // §the responseXML attribute. Only valid for responseType "" or "document";
+  // returns null until DONE, then the (cached) document response.
+  get responseXML() {
+    if (this.responseType !== '' && this.responseType !== 'document')
+      throw new DOMException("responseXML is only available if responseType is '' or 'document'.", 'InvalidStateError');
+    if (this.readyState !== 4) return null;
+    return this._getDocumentResponse();
+  }
+
+  // §"document response": parse the response body into a Document per its final
+  // MIME type, or null. Cached so repeated reads — and `.response` for a
+  // "document" responseType — return the very same object (object identity is
+  // asserted by responsexml-get-twice).
+  _getDocumentResponse() {
+    if (this._responseDocComputed) return this._responseDocCache;
+    this._responseDocComputed = true;
+    this._responseDocCache = null;
+
+    // 1. If the response's body is null, return (→ null).
+    const text = this.responseText;
+    if (text == null || text === '') return null;
+
+    // Final MIME type = override MIME type if set, else the response MIME type;
+    // "get a response MIME type" defaults a missing/unparseable Content-Type to
+    // text/xml — which is why "", "bogus", "application", "bogus+xml" all parse.
+    let rec = null;
+    if (this._overrideMime) rec = _parseMimeType(this._overrideMime);
+    else { const ct = this.getResponseHeader('content-type'); if (ct != null) rec = _parseMimeType(ct); }
+    if (rec === null) rec = { type: 'text', subtype: 'xml', params: [] };
+
+    const isHTML = (rec.type === 'text' && rec.subtype === 'html');
+    const isXML = rec.subtype.endsWith('+xml')
+      || (rec.type === 'text' && rec.subtype === 'xml')
+      || (rec.type === 'application' && rec.subtype === 'xml');
+    // If the final MIME type is neither HTML nor XML, return (→ null). And the
+    // default ("") responseType never parses HTML — only an explicit "document".
+    if (!isHTML && !isXML) return null;
+    if (this.responseType === '' && isHTML) return null;
+
+    const pageURL = this.responseURL || (_domParse('document_url') || 'about:blank');
+    let doc = null;
+    try {
+      if (isHTML) {
+        doc = new _IframeDocument(text, pageURL, null, pageURL, 'html');
+        doc._contentType = 'text/html';
+      } else {
+        doc = new _IframeDocument(text, pageURL, null, pageURL, 'xml');
+        doc._contentType = _serializeMimeType(rec);
+        // If the XML is not well-formed the parser yields a Gecko parsererror
+        // root; the document response is null in that case.
+        const de = doc.documentElement;
+        if (de && de.namespaceURI === _PARSERERROR_NS) doc = null;
+      }
+    } catch (e) { doc = null; }
+    this._responseDocCache = doc;
+    return doc;
   }
 
   abort() {
