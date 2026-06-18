@@ -3454,6 +3454,17 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     if (_XHR_FORBIDDEN_METHODS.has(method.toUpperCase())) throw new DOMException("'" + method + "' HTTP method is unsupported.", 'SecurityError');
     if (_XHR_NORMALIZE_METHODS.has(method.toUpperCase())) method = method.toUpperCase();
     this._method = method;
+    // §open async flag: WebIDL `optional boolean async = true` — absent or
+    // explicit `undefined` → async; an explicit `false` → synchronous send().
+    this._async = (async_ === undefined) ? true : !!async_;
+    this._sendFlag = false;
+    // §open: a synchronous request in a Window context is forbidden once a
+    // non-default timeout or a responseType has been set → InvalidAccessError
+    // (open-method-responsetype-set-sync). Thrown before any state change so no
+    // readystatechange fires.
+    if (this._async === false && (this.timeout !== 0 || this.responseType !== '')) {
+      throw new DOMException("Synchronous XHR requests must not have a timeout or responseType set.", 'InvalidAccessError');
+    }
     // The url argument may be a URL object (the resource-timing loaders pass
     // `new URL(path, origin)`); the spec parses it to a string. Coerce so the
     // string ops below (.startsWith / .includes) work.
@@ -3474,7 +3485,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this.statusText = "";
     this.responseText = "";
     this.response = null;
-    this._setReadyState(1);
+    // open() moves the object to OPENED; per spec readystatechange only fires
+    // when the state actually changes, so a redundant open() on an
+    // already-OPENED object is silent (open-open-sync-send).
+    if (this.readyState !== 1) { this._setReadyState(1); }
+    else { this.readyState = 1; }
   }
 
   setRequestHeader(name, value) {
@@ -3513,6 +3528,9 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
   send(body) {
     if (this.readyState !== 1) return;
     if (this._aborted) return;
+
+    // Synchronous mode (`open(..., false)`) blocks until the response arrives.
+    if (this._async === false) { this._sendSync(body); return; }
 
     const xhr = this;
     this._fireEvent('loadstart');
@@ -3594,6 +3612,69 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     });
   }
 
+  _sendSync(body) {
+    // Synchronous send: block on the response via op_fetch_url_sync, populate
+    // state, then fire the DONE transition + load/loadend. Per §send, a sync
+    // request fires no loadstart/progress, and a network error throws a
+    // NetworkError DOMException after moving to DONE.
+    this._sendFlag = true;
+    let url = this._url;
+    const isData = typeof url === 'string' && url.startsWith('data:');
+    const isBlob = (typeof url === 'string' && url.startsWith('blob:')) || !!this._blobSnapshot;
+    if (typeof url === 'string' && url && !url.includes('://') && !isData && !isBlob) {
+      try { url = new URL(url, _domParse("document_url") || "about:blank").href; } catch (e) {}
+    }
+    let status, statusText, respHeaders, respBytes = null, respText = null, finalUrl;
+    try {
+      if (isData) {
+        const d = _processDataURL(url);
+        if (d === null) throw new Error('invalid data URL');
+        respBytes = (this._method === 'HEAD') ? new Uint8Array() : d.bytes;
+        status = 200; statusText = 'OK'; respHeaders = { 'content-type': d.mimeType }; finalUrl = url;
+      } else if (isBlob) {
+        const key = (typeof url === 'string') ? url.split('#')[0] : '';
+        let bytes, type;
+        if (Object.prototype.hasOwnProperty.call(__blobStore, key)) { bytes = __blobStore[key]; type = __blobTypes[key] || ''; }
+        else if (this._blobSnapshot) { bytes = this._blobSnapshot.bytes; type = this._blobSnapshot.type; }
+        if (this._method !== 'GET' || bytes === undefined) throw new Error('blob URL not found');
+        respBytes = bytes; status = 200; statusText = 'OK'; respHeaders = type ? { 'content-type': type } : {}; finalUrl = url;
+      } else {
+        const pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
+        const raw = Deno.core.ops.op_fetch_url_sync(url, this._method, JSON.stringify(this._headers), body != null ? String(body) : "", pageOrigin, 'cors');
+        const p = JSON.parse(raw);
+        if (p.blocked || p.corsBlocked || (p.status === 0 && p.error)) throw new Error(p.error || p.corsError || 'network error');
+        status = p.status; statusText = ''; respHeaders = p.headers || {};
+        respBytes = p.bodyBase64 ? _base64ToUint8Array(p.bodyBase64) : null;
+        respText = (respBytes == null) ? (p.body || '') : null;
+        finalUrl = p.url || url;
+      }
+    } catch (err) {
+      this._sendFlag = false;
+      this.status = 0; this.statusText = '';
+      this.responseText = ''; this.response = null;
+      this._setReadyState(4);
+      throw new DOMException('Network request failed', 'NetworkError');
+    }
+    this.status = status;
+    this.statusText = statusText || '';
+    this.responseURL = (typeof finalUrl === 'string' ? finalUrl.split('#')[0] : '') || '';
+    this._responseHeaders = {};
+    for (const [k, v] of Object.entries(respHeaders || {})) this._responseHeaders[k] = v;
+    const text = (respText != null) ? respText : (respBytes ? new TextDecoder().decode(respBytes) : '');
+    this.responseText = text;
+    switch (this.responseType) {
+      case 'json': try { this.response = JSON.parse(text); } catch (e) { this.response = null; } break;
+      case 'arraybuffer': this.response = (respBytes ? respBytes.buffer : new TextEncoder().encode(text).buffer); break;
+      case 'blob': this.response = new Blob([respBytes || text]); break;
+      case 'document': this.response = text; break;
+      case 'text': case '': default: this.response = text;
+    }
+    this._sendFlag = false;
+    this._setReadyState(4);
+    this._fireEvent('load');
+    this._fireEvent('loadend');
+  }
+
   abort() {
     this._aborted = true;
     if (this.readyState > 0 && this.readyState < 4) {
@@ -3624,7 +3705,18 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
   }
 
   _fireEvent(type) {
-    const event = { type, target: this, currentTarget: this, bubbles: false };
+    // readystatechange is a plain Event; the rest (loadstart/progress/load/
+    // loadend/error/abort/timeout) are ProgressEvents, so handlers that test
+    // `e instanceof ProgressEvent` see the right type.
+    let event;
+    if (type === 'readystatechange') {
+      event = { type, target: this, currentTarget: this, bubbles: false };
+    } else {
+      try { event = new ProgressEvent(type, { lengthComputable: false, loaded: 0, total: 0 }); }
+      catch (e) { event = { type, target: this, currentTarget: this, bubbles: false }; }
+      try { Object.defineProperty(event, 'target', { value: this, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(event, 'currentTarget', { value: this, configurable: true }); } catch (e) {}
+    }
     const handlers = this._listeners[type] || [];
     for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
     const prop = 'on' + type;

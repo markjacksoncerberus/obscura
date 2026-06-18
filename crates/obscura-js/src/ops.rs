@@ -700,8 +700,35 @@ async fn op_fetch_url(
         }
     }
 
-    let client = build_request_client(proxy_url.as_deref())
-        .map_err(deno_error::JsErrorBox::generic)?;
+    // The actual network round-trip lives in `perform_fetch_core` so the blocking
+    // `op_fetch_url_sync` (synchronous XHR) can reuse it from a worker thread.
+    perform_fetch_core(
+        url, method, headers_json, origin, mode, body, cookie_jar, in_flight, proxy_url,
+    )
+    .await
+    .map_err(deno_error::JsErrorBox::generic)
+}
+
+/// The shared network core behind both `op_fetch_url` (async) and
+/// `op_fetch_url_sync` (blocking, for synchronous XHR). Builds a per-request
+/// reqwest client, runs the CORS preflight when required, follows redirects
+/// manually (re-validating every hop against the SSRF policy), threads cookies,
+/// and returns the JSON response envelope. Network/transport failures come back
+/// as `Err(String)`; policy blocks (SSRF, CORS, redirect-limit) come back as
+/// `Ok(json{blocked|corsBlocked})` — identical to the pre-refactor behaviour.
+#[allow(clippy::too_many_arguments)]
+async fn perform_fetch_core(
+    url: String,
+    method: String,
+    headers_json: String,
+    origin: String,
+    mode: String,
+    body: String,
+    cookie_jar: Option<Arc<CookieJar>>,
+    in_flight: Option<Arc<std::sync::atomic::AtomicU32>>,
+    proxy_url: Option<String>,
+) -> Result<String, String> {
+    let client = build_request_client(proxy_url.as_deref())?;
 
     let request_origin = url::Url::parse(&url)
         .ok()
@@ -743,7 +770,7 @@ async fn op_fetch_url(
             )
             .send()
             .await
-            .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+            .map_err(|e| format!("CORS preflight failed: {}", e))?;
 
         let allowed_origin = preflight
             .headers()
@@ -752,10 +779,10 @@ async fn op_fetch_url(
             .unwrap_or("");
 
         if allowed_origin != "*" && allowed_origin != page_origin {
-            return Err(deno_error::JsErrorBox::generic(format!(
+            return Err(format!(
                 "CORS preflight: Origin '{}' not allowed by Access-Control-Allow-Origin '{}'",
                 page_origin, allowed_origin
-            )));
+            ));
         }
     }
 
@@ -801,7 +828,7 @@ async fn op_fetch_url(
             if let Some(ref counter) = in_flight {
                 counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
-            deno_error::JsErrorBox::generic(e.to_string())
+            e.to_string()
         })?;
 
         if let Some(ref counter) = in_flight {
@@ -908,7 +935,7 @@ async fn op_fetch_url(
     let resp_bytes = response
         .bytes()
         .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
     let resp_body_base64 = BASE64.encode(&resp_bytes);
 
@@ -922,6 +949,81 @@ async fn op_fetch_url(
         "headers": resp_headers,
     })
     .to_string())
+}
+
+// Synchronous XHR (`open(method, url, false)`). The XHR spec blocks the calling
+// thread until the response arrives. On the `engine-per-page-threads` model each
+// page owns its JS thread, so blocking here freezes only this page — never the
+// whole engine. We run the same `perform_fetch_core` on a throwaway worker thread
+// (its own current-thread Tokio runtime) and block the JS thread on a channel;
+// this avoids re-entering the page's own runtime, which would panic. Request
+// interception is intentionally skipped (sync XHR + CDP interception on a single
+// thread would deadlock, and WPT never intercepts), but SSRF validation, the
+// blocked-URL list, cookies, proxy, and CORS all still apply via the core.
+#[op2]
+#[string]
+fn op_fetch_url_sync(
+    state: &mut OpState,
+    #[string] url: String,
+    #[string] method: String,
+    #[string] headers_json: String,
+    #[string] body: String,
+    #[string] origin: String,
+    #[string] mode: String,
+) -> Result<String, deno_error::JsErrorBox> {
+    if let Ok(parsed_url) = url::Url::parse(&url) {
+        if let Err(e) = validate_fetch_url(&parsed_url) {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": url, "headers": {},
+                "blocked": true, "error": e,
+            })
+            .to_string());
+        }
+    }
+
+    let (cookie_jar, in_flight, proxy_url, blocked_urls) = {
+        let gs = state.borrow::<SharedState>().clone();
+        let gs = gs.borrow();
+        (
+            gs.cookie_jar.clone(),
+            gs.http_client.as_ref().map(|c| c.in_flight.clone()),
+            gs.http_client.as_ref().and_then(|c| c.proxy_url().map(|s| s.to_string())),
+            gs.blocked_urls.clone(),
+        )
+    };
+
+    for pattern in &blocked_urls {
+        if pattern == "*" || url.contains(pattern) || glob_match(pattern, &url) {
+            return Ok(serde_json::json!({
+                "status": 0, "body": "", "url": url, "headers": {}, "blocked": true,
+            })
+            .to_string());
+        }
+    }
+
+    // Run the async network core to completion on a dedicated worker thread and
+    // block the JS thread on the result. `SharedState` holds `Rc`s (not `Send`),
+    // so we clone out only the `Send` pieces above before crossing the boundary.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(Err(format!("sync fetch runtime: {}", e)));
+                return;
+            }
+        };
+        let res = rt.block_on(perform_fetch_core(
+            url, method, headers_json, origin, mode, body, cookie_jar, in_flight, proxy_url,
+        ));
+        let _ = tx.send(res);
+    });
+
+    match rx.recv() {
+        Ok(Ok(json)) => Ok(json),
+        Ok(Err(e)) => Err(deno_error::JsErrorBox::generic(e)),
+        Err(e) => Err(deno_error::JsErrorBox::generic(format!("sync fetch channel: {}", e))),
+    }
 }
 
 fn glob_match(pattern: &str, url: &str) -> bool {
@@ -1414,6 +1516,7 @@ pub fn build_extension() -> Extension {
             op_dom(),
             op_console_msg(),
             op_fetch_url(),
+            op_fetch_url_sync(),
             op_get_cookies(),
             op_set_cookie(),
             op_navigate(),

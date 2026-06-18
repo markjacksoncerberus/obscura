@@ -41,7 +41,8 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~21~~ | ✅ [The Navigator's Almanac](21-the-navigators-almanac.md) | `navigation-timing/*` | **~20 subtests across 9 tests** | ⚔️⚔️ | **SECURED — ~+20.** Real `PerformanceNavigationTiming` (+ `PerformanceResourceTiming` base): nav entry present from the start, queued to observers at load; honest body sizes from the Rust response; `readystatechange` at interactive/complete. Caps: exact-byte-size/host-URL value tests, per-iframe nav timing, real redirect-chain timing |
 | ~~20~~ | ✅ [The Observer's Gallery](20-the-observers-gallery.md) | `performance-timeline/*` | **PO suite 11/11 + idl 35/58** | ⚔️⚔️ | **SECURED — ~+15.** Real `PerformanceObserver` (was a no-op stub): observe(entryTypes/type+buffered), disconnect/takeRecords, supportedEntryTypes, PerformanceObserverEntryList, task-queued delivery from mark()/measure(). Cap: po-observe + 2 case-sensitivity subtests need resource/navigation timing entries |
 | ~~19~~ | ✅ [The Load Bell](19-the-load-bell.md) | *load-lifecycle* — `<body onload>` → `window.onload` | **clearMarks 57/57, clearMeasures 57/57, measures 119/119** | ⚔️⚔️ | **SECURED — +233.** `<body onload=…>` is an HTML *window* event handler; it was never wired to `window.onload`, so testharness pages running tests from `<body onload>` came back could-not-run. `__installBodyWindowHandlers()` compiles body/frameset window-reflecting on\* content attrs onto `window.on*` before parser scripts run. General fix — unlocks any load-gated test |
-| 27 | [The XHR Foundry](27-the-xhr-foundry.md) | `xhr/*` (XMLHttpRequest) | ⚔️ data-uri 10/10, setrequestheader-bogus-name 71/71, -value 5/5, open-method-bogus 8/8 | ⚔️⚔️ | **OPENED — +94.** Async correctness, no new architecture: `fetch()` resolves `data:` URLs in-process (WHATWG data: URL processor); real `setRequestHeader` validation (ByteString→TypeError, token/value→SyntaxError, normalize+combine); `open()` method validation (non-token→SyntaxError, CONNECT/TRACE/TRACK→SecurityError, uppercase well-known). **Next = synchronous XHR** (blocking Rust op — unlocks ~18 sync tests + the #25/#26 resource-timing tails); also `.asis` raw-response cap, `headers-normalize-response`, forbidden request-headers |
+| 27 | [The XHR Foundry](27-the-xhr-foundry.md) | `xhr/*` (XMLHttpRequest) | ⚔️ data-uri 10/10, setrequestheader-bogus-name 71/71, -value 5/5, open-method-bogus 8/8 | ⚔️⚔️ | **OPENED — +94.** Async correctness, no new architecture: `fetch()` resolves `data:` URLs in-process (WHATWG data: URL processor); real `setRequestHeader` validation (ByteString→TypeError, token/value→SyntaxError, normalize+combine); `open()` method validation (non-token→SyntaxError, CONNECT/TRACE/TRACK→SecurityError, uppercase well-known) |
+| 28 | [The Synchronous XHR Keystone](28-the-sync-xhr-keystone.md) | `xhr/*` synchronous (`open(...,false)`) | ⚔️ headers-normalize 15/15, open-method-case-{in,}sensitive 6/6+9/9, responsetype-set-sync 5/5, sync-event/sequencing all green | ⚔️⚔️⚔️ | **SECURED — ~+49.** Blocking Rust op `op_fetch_url_sync` (factored out of `op_fetch_url`'s network core) makes `send()` block until the response — safe on per-page threads. `open()` records `_async` + InvalidAccessError + state-change-gated readystatechange; new `_sendSync()` (data:/blob: in-process, NetworkError on failure); `_fireEvent` builds real ProgressEvents. Zero regressions. Caps: charset-aware query encoding, `.asis` raw-response, hyper-lowercased request header names |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -68,6 +69,40 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-18 (Quest #28 — The Synchronous XHR Keystone, ~+49):**
+- **The root-cause primitive behind the whole `xhr/*` realm.** WPT's XHR suite leans
+  heavily on `open(method, url, false)` (sync) because it lets a test `send()` then read
+  `responseText`/`getResponseHeader()` on the next line. Obscura's `send()` was *always*
+  async (`fetch().then()`), so the next-line read saw `""`/`null` — files that looked
+  like header/method/URL tests were all blocked on one missing thing: a **blocking
+  `send()`**. This was the single widest Cap named across #25, #26, and #27.
+- **Rust:** factored `op_fetch_url`'s network core into a standalone async
+  `perform_fetch_core` (preflight + SSRF-revalidated redirect loop + cookies + envelope),
+  and added a blocking **`op_fetch_url_sync`** (`#[op2]`) that runs the core on a
+  throwaway worker-thread runtime and **blocks the page's JS thread** on a channel.
+  Safe on `engine-per-page-threads`: only that page blocks, never the engine. Interception
+  is skipped (would deadlock the one thread; WPT never intercepts); cookies/proxy/CORS/SSRF
+  all still apply. The async `op_fetch_url` now delegates to the same core — **behaviour
+  preserving** (every async XHR/fetch realm held).
+- **JS:** `open()` records `_async` (was dropped) + throws `InvalidAccessError` for sync +
+  timeout/responseType + only fires `readystatechange` on a real state change (redundant
+  `open()` is silent → `[1,4]`). New `_sendSync()` blocks via the op, handles `data:`/`blob:`
+  in-process, populates state synchronously, fires DONE + `load`/`loadend` (no loadstart for
+  sync), and throws `NetworkError` on a transport/CORS/SSRF failure or malformed response
+  header. `_fireEvent` now builds real `ProgressEvent`s for the progress family.
+- **Wins:** headers-normalize-response 0→15, open-method-case-insensitive 0→6,
+  open-method-case-sensitive 0→9, open-method-responsetype-set-sync 0→5, open-url-fragment
+  0→4, response-method 1→3, event-readystate-sync-open 0→2, open-open-sync-send 0→1,
+  open-sync-open-send 0→1, send-sync-no-response-event-{load,loadend} 0→1 each,
+  send-redirect-infinite-sync 0→1, responseurl 0→1. **Zero regressions** (qsa 1975, classlist
+  1420, createElement 147, mark 22/22, measures 119/119, structured-clone 141/152,
+  getRandomValues 39/39, url-setters 260/260, url-with-fetch 16/16, url-with-xhr 14/14;
+  async XHR held: data-uri 10/10, setrequestheader 71/71+5/5, open-method-bogus 8/8,
+  response-json 4/4). Caps: `open-url-encoding` (charset-aware query encoding), `.asis`
+  raw-response (reqwest/serving), `setrequestheader-allow-empty-value` (hyper lowercases
+  request header names), `send-data-unexpected-tostring` (re-entrant mid-stringify).
+  Scroll `tickets/28-the-sync-xhr-keystone.md`.
 
 **Session 2026-06-18 (Quest #27 — The XHR Foundry OPENED, +94):**
 - **A new realm.** With the resource-timing vein (#21–#26) thinning to architectural
