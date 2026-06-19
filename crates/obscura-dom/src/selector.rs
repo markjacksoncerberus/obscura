@@ -341,6 +341,56 @@ impl<'a> DomElement<'a> {
     pub fn new(tree: &'a DomTree, node_id: NodeId) -> Self {
         DomElement { tree, node_id }
     }
+
+    /// `:required` / `:optional` — match a form control to which the `required`
+    /// attribute applies (input of a requirable type, select, textarea), split by
+    /// whether it currently carries the attribute. `want_required` selects which
+    /// half. Elements the attribute can't apply to match neither pseudo.
+    fn match_required_optional(&self, want_required: bool) -> bool {
+        self.tree
+            .with_node(self.node_id, |n| {
+                let name = match n.as_element() {
+                    Some(qn) => qn.local.as_ref(),
+                    None => return false,
+                };
+                let can_require = match name {
+                    "select" | "textarea" => true,
+                    "input" => {
+                        let t = n
+                            .get_attribute("type")
+                            .map(|t| t.to_ascii_lowercase())
+                            .unwrap_or_else(|| "text".into());
+                        // The required attribute applies to these input types (a
+                        // missing/empty type is text). NOT: hidden/range/color/
+                        // submit/image/reset/button.
+                        matches!(
+                            t.as_str(),
+                            "" | "text"
+                                | "search"
+                                | "url"
+                                | "tel"
+                                | "email"
+                                | "password"
+                                | "date"
+                                | "month"
+                                | "week"
+                                | "time"
+                                | "datetime-local"
+                                | "number"
+                                | "checkbox"
+                                | "radio"
+                                | "file"
+                        )
+                    }
+                    _ => false,
+                };
+                if !can_require {
+                    return false;
+                }
+                want_required == n.get_attribute("required").is_some()
+            })
+            .unwrap_or(false)
+    }
 }
 
 impl<'a> std::fmt::Debug for DomElement<'a> {
@@ -619,8 +669,20 @@ impl<'a> Element for DomElement<'a> {
                     !r.is_empty() && (lang == r || lang.starts_with(&(r + "-")))
                 })
             }
-            // Accepted-but-unimplemented standard pseudo-classes never match.
-            PseudoClass::Other(_) => false,
+            PseudoClass::Other(name) => match name.as_str() {
+                // :required / :optional are pure tag + type + attribute state, so
+                // we evaluate them straight off the tree (no JS round-trip needed).
+                "required" => self.match_required_optional(true),
+                "optional" => self.match_required_optional(false),
+                // The constraint-validation live-state pseudo-classes read the
+                // bitmask JS pushed right before the query (see `validity_state`).
+                "valid" => self.tree.validity_state(self.node_id) & 1 != 0,
+                "invalid" => self.tree.validity_state(self.node_id) & 2 != 0,
+                "in-range" => self.tree.validity_state(self.node_id) & 4 != 0,
+                "out-of-range" => self.tree.validity_state(self.node_id) & 8 != 0,
+                // Other accepted-but-unimplemented standard pseudo-classes never match.
+                _ => false,
+            },
         }
     }
 

@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~44~~ | ✅ [The Living Verdict](44-the-living-verdict.md) | `html/semantics/selectors/pseudo-classes/{required-optional,valid-invalid,inrange-outofrange,…}` (+ `Element-closest`, dynamic constraint tails) | **required-optional 6/6, valid-invalid 30/30, inrange 6/6, time-reversed 4/4, fieldset-disconnected 2/2, closest 29/29** | ⚔️⚔️ | **SECURED — +34.** The constraint-validation **live-state selector pseudo-classes** were all dark — the Servo `selectors` crate parses them but `PseudoClass::Other` always returned `false`. `:required`/`:optional` now evaluate straight off the tree in the Rust matcher (input of a requirable type / select / textarea, split by the attribute). `:valid`/`:invalid`/`:in-range`/`:out-of-range` read a per-node validity bitmask (`validity_state` side-map, like `:checked`) that JS computes via the #43 `_cvCompute` engine and **primes** onto the nodes before the query (a `_primeValidity` sibling of `_primeTarget`, gated on a `valid`/`range` substring so the hot qsa path pays nothing; `<form>`/`<fieldset>` aggregate over owned/descendant candidates). Closed the named #43 caps (2 dynamic `matches(":invalid")` tests + `Element-closest` 29/29). Bonus: `select.value` now reflects selectedness; `type=range` clamps so it's never out-of-range. Zero regressions (stash-proved the `:disabled`/`:default` sibling fails pre-existing). Caps: `:read-write`/`:read-only` (editing hosts/designMode/custom elements — deferred), `getComputedStyle` `-type-change`/`-hidden` variants (CSS cascade), `test_driver.send_keys` |
 | ~~43~~ | ✅ [The Charter of Constraints](43-the-charter-of-constraints.md) | `html/semantics/forms/constraints/*` (constraint validation API) | **willValidate 67/67, checkValidity 122/122, valueMissing 71/71, valid 33/33, patternMismatch 85/85, range 49+47, +14 more** | ⚔️⚔️⚔️ | **SECURED — +877.** The entire constraint validation API was absent. New `ValidityState` + `willValidate`/`validity`/`validationMessage`/`checkValidity`/`reportValidity`/`setCustomValidity` on the 7 listed interfaces + `HTMLFormElement`, with the full `_cvCompute` validity algorithm: mutable-gated `valueMissing` (group-aware radio), `email`/`url` `typeMismatch`, raw-then-anchored `pattern` (`v` flag), typed range/step (reversed ranges, Blink float-tolerant step, step base min→@value→default), barred-from-CV `willValidate` (disabled-fieldset propagation, datalist, readonly), always-false tooLong/tooShort/badInput, `customError`. Plus reflected attrs (required/readonly/pattern/min/max/step/multiple/maxlength/minlength/textarea.defaultValue) and checkbox/radio activation on `click()`. Pure JS, zero regressions. Caps: `:valid`/`:invalid` selector matching (2 dynamic tests + closest 29/29 — needs the Rust matcher to reach JS validity); `test_driver.send_keys` (3 textarea subtests); 1 sub-ULP `stepMismatch` (needs decimal arithmetic) |
 | ~~42~~ | ✅ [The Logical Lens](42-the-logical-lens.md) | `css/selectors/{is-where,has}-*`, `ParentNode-querySelector-scope`, `Element-closest` | **is-where 33/33, has 78/78, scope 4/4, closest 28/29** | ⚔️ | **SECURED — +116.** `:is()`/`:where()`/`:has()` and the `:scope` scoping root were all dark — the Servo `selectors` crate implements their matching already, but `parse_is_and_where()`/`parse_has()` default `false` (so the selectors threw `SyntaxError` and blanked every test) and `MatchingContext.scope_element` was always `None` (so `:scope` == `:root` even for element-rooted queries). Enabled the two parse hooks + thread a per-query scope element (element-rooted → the element; document-rooted → `None`/`:root` unchanged; `closest` holds the context element fixed across the ancestor walk via a `"<node>,<scope>"` op arg so `:has(> :scope)` resolves right). Pure selector-engine plumbing, no DOM model change. Caps: `:invalid` (form constraint-validation), `getComputedStyle` specificity/cascade tests (CSS-cascade frontier), render reftests |
 | ~~01~~ | ✅ [The Selector Sorcery](01-the-selector-sorcery.md) | `dom/nodes/ParentNode-querySelector-All` | **1975/1975** | ⚔️⚔️ | **SECURED 100%** |
@@ -84,6 +85,34 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-19 (Quest #44 The Living Verdict — constraint-validation
+live-state selector pseudo-classes, +34):** The `:required`/`:optional`/`:valid`/
+`:invalid`/`:in-range`/`:out-of-range` pseudo-classes were all dark — the Servo
+`selectors` crate *parses* them (`is_known_pseudo_class`) but they fell to
+`PseudoClass::Other`, whose match arm always returns `false`. This was the
+**recurring cap named by #41, #42, and #43** (`:valid`/`:invalid` selector
+matching). Split by strategy: `:required`/`:optional` are pure tag+type+attribute
+state, evaluated straight off the tree in a new `DomElement::match_required_optional`
+(input of a requirable type / select / textarea, split by the `required` attr).
+`:valid`/`:invalid`/`:in-range`/`:out-of-range` need the JS verdict, so — mirroring
+`:checked`/`:target` — a `validity_state: HashMap<NodeId,u8>` side-map on the tree
+(bits `1/2/4/8`), set via a new `set_validity_flags` op, read by the matcher; JS
+computes the bitmask with the #43 `_cvCompute` engine and **primes** every
+validity-bearing element before the query (`_primeValidity`, a `_primeTarget`
+sibling gated on a `valid`/`range` substring so qsa 1975 / classlist 1420 pay
+nothing). `<form>`/`<fieldset>` aggregate over owned/descendant candidates. Two
+correctness finds: `type=range` clamps its value (never out-of-range), and
+`select.value` now reflects option selectedness (`§dom-select-value`) instead of a
+nonexistent `value` attribute. **Wins:** required-optional 0→6, valid-invalid
+17→30, inrange-outofrange 0→6, time-reversed 0→4, valid-invalid-fieldset-disconnected
+0→2, the two dynamic `matches(":invalid")` tests 0→1 each (the #43 cap), Element-closest
+28→29. **+34, zero regressions** (proven by stash-rebuild that the `:disabled`/
+`:default`/`:indeterminate` sibling-test fails are pre-existing; #43 constraint
+suite preserved — valueMissing 71/71, valid 33/33). Caps: `:read-write`/`:read-only`
+(editing hosts/designMode/custom elements — deferred), `getComputedStyle`
+`-type-change`/`-hidden` variants (CSS cascade), `test_driver.send_keys`. Scroll
+`tickets/44-the-living-verdict.md`.
 
 **Session 2026-06-19 (Quest #43 The Charter of Constraints — the constraint
 validation API, +877):** The entire `html/semantics/forms/constraints/` realm was

@@ -276,6 +276,13 @@ pub(crate) struct DomTreeInner {
     // The id named by the current document's URL fragment, for `:target`. JS sets
     // it from the queried document's URL right before a `:target` query.
     pub(crate) target_id: Option<String>,
+    // Live constraint-validation selector state, set by JS right before a
+    // `:valid`/`:invalid`/`:in-range`/`:out-of-range` query (the Rust matcher
+    // can't call back into the JS validity engine). A per-node bitmask:
+    // 1 = :valid, 2 = :invalid, 4 = :in-range, 8 = :out-of-range. Treated as a
+    // query-time snapshot — replaced wholesale on each prime so stale entries
+    // never linger.
+    pub(crate) validity_state: HashMap<NodeId, u8>,
     // Nodes that are *real documents* (detached/iframe documents). They share the
     // create_document_fragment backing (NodeData::Document) with plain
     // DocumentFragments, so this set is how `:root` tells "document element of a
@@ -305,6 +312,7 @@ impl DomTree {
                 checked_state: HashMap::new(),
                 focused: None,
                 target_id: None,
+                validity_state: HashMap::new(),
                 real_documents: HashSet::new(),
             }),
         }
@@ -355,6 +363,24 @@ impl DomTree {
             .and_then(|n| n.as_ref())
             .map(|n| n.get_attribute("checked").is_some())
             .unwrap_or(false)
+    }
+
+    /// Replace the live constraint-validation selector state wholesale. JS
+    /// computes the bitmask for every validity-bearing element in the document
+    /// and pushes the full set right before a `:valid`/`:invalid`/`:in-range`/
+    /// `:out-of-range` query, so the map is always a fresh snapshot.
+    pub fn set_validity_state_bulk(&self, entries: &[(NodeId, u8)]) {
+        let mut inner = self.inner.borrow_mut();
+        inner.validity_state.clear();
+        for (id, flags) in entries {
+            inner.validity_state.insert(*id, *flags);
+        }
+    }
+
+    /// The validity bitmask JS last pushed for this node (0 = none of the
+    /// constraint-validation pseudo-classes apply).
+    pub fn validity_state(&self, id: NodeId) -> u8 {
+        self.inner.borrow().validity_state.get(&id).copied().unwrap_or(0)
     }
 
     /// Phase 0b: the focused element (drives `:focus` and `document.activeElement`).

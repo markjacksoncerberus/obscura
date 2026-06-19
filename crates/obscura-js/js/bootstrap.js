@@ -261,6 +261,67 @@ const _primeTarget = (s, node) => {
   } catch (e) {}
   _dom('set_target_id', frag);
 };
+// The constraint-validation live-state pseudo-classes (:valid/:invalid/:in-range/
+// :out-of-range) can't be matched by the Rust selector engine alone — validity is
+// computed by the JS engine (`_cvCompute`). So, exactly like `:target`, we prime:
+// when a selector references one of them, compute every validity-bearing element's
+// bitmask (1=:valid 2=:invalid 4=:in-range 8=:out-of-range) and push the snapshot
+// to Rust before the query runs. Gated on a cheap substring test so the hot
+// querySelectorAll path pays nothing when no such pseudo is present.
+const _RANGE_LIMIT_TYPES = ['number', 'range', 'date', 'month', 'week', 'time', 'datetime-local'];
+const _VALIDITY_TAGS = 'input,select,textarea,button,output,object,fieldset,form';
+const _VALIDITY_TAG_SET = new Set(['input', 'select', 'textarea', 'button', 'output', 'object', 'fieldset', 'form']);
+const _selControlInvalid = (el) => { try { return _cvWillValidate(el) && !_cvCompute(el).valid; } catch (e) { return false; } };
+const _primeValidity = (s, node) => {
+  if (s.indexOf('valid') < 0 && s.indexOf('range') < 0) return;
+  try {
+    // Resolve the queried node's root by walking up — it may be the document, or a
+    // disconnected subtree's top element (matches()/closest() run on detached nodes).
+    let root = node;
+    while (root && root.parentNode) root = root.parentNode;
+    if (!root || !root.querySelectorAll) return;
+    // querySelectorAll never returns the scope itself, so add it when the root is
+    // itself a validity-bearing element (e.g. matches() on a detached <fieldset>).
+    const all = Array.from(root.querySelectorAll(_VALIDITY_TAGS));
+    if (root.nodeType === 1 && _VALIDITY_TAG_SET.has(root.localName)) all.push(root);
+    const parts = [];
+    for (const el of all) {
+      let flags = 0;
+      const tag = el.localName;
+      if (tag === 'form') {
+        // :invalid iff the form owns ≥1 invalid candidate control, else :valid.
+        let bad = false;
+        try { for (const c of el.elements) { if (_selControlInvalid(c)) { bad = true; break; } } } catch (e) {}
+        flags = bad ? 2 : 1;
+      } else if (tag === 'fieldset') {
+        // :invalid iff a descendant candidate control is invalid, else :valid.
+        let bad = false;
+        try { for (const c of el.querySelectorAll('input,select,textarea,button,output,object')) { if (_selControlInvalid(c)) { bad = true; break; } } } catch (e) {}
+        flags = bad ? 2 : 1;
+      } else if (_cvWillValidate(el)) {
+        const v = _cvCompute(el);
+        const t = tag === 'input' ? _cvInputType(el) : '';
+        // A range control's value sanitization clamps it into [min,max], so it can
+        // never suffer a range over/underflow — recompute validity without them.
+        const isRange = t === 'range';
+        const overflow = isRange ? false : v.rangeOverflow;
+        const underflow = isRange ? false : v.rangeUnderflow;
+        const valid = isRange
+          ? !(v.valueMissing || v.typeMismatch || v.patternMismatch || v.tooLong ||
+              v.tooShort || v.stepMismatch || v.badInput || v.customError)
+          : v.valid;
+        flags |= valid ? 1 : 2;
+        // "Has range limitations": a range input always (default min 0/max 100),
+        // else a min/max-bearing numeric/temporal input.
+        if (isRange || (_RANGE_LIMIT_TYPES.indexOf(t) >= 0 && (el.hasAttribute('min') || el.hasAttribute('max')))) {
+          flags |= (overflow || underflow) ? 8 : 4;
+        }
+      }
+      if (flags) parts.push(el._nid + ':' + flags);
+    }
+    _dom('set_validity_flags', parts.join(','));
+  } catch (e) {}
+};
 const _consoleFn = (level, args) => {
   try { Deno.core.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
@@ -1606,9 +1667,10 @@ class Element extends Node {
     return attr;
   }
   get attributes() { return _buildNamedNodeMap(this); }
-  querySelector(s) { _primeTarget(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
+  querySelector(s) { _primeTarget(s, this); _primeValidity(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
     _primeTarget(s, this);
+    _primeValidity(s, this);
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
     return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }
@@ -1623,6 +1685,7 @@ class Element extends Node {
   matches(s) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'matches' on 'Element': 1 argument required, but only 0 present.");
     const sel = String(s);
+    _primeValidity(sel, this);
     const raw = _dom("element_matches", this._nid, sel);
     if (raw === 'ERR') _qsThrow(sel);
     return raw === 'true';
@@ -1635,6 +1698,7 @@ class Element extends Node {
   closest(s) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'closest' on 'Element': 1 argument required, but only 0 present.");
     const sel = String(s);
+    _primeValidity(sel, this);
     let el = this;
     // The `:scope` scoping root stays fixed at the context element (`this`) for
     // every ancestor we test — pass it as "<ancestor>,<this>" so `:has(> :scope)`
@@ -1731,6 +1795,17 @@ class Element extends Node {
     if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     const tag = this.localName;
     if (tag === 'textarea') return this.textContent;
+    if (tag === 'select') {
+      // §dom-select-value: the value of the first option whose selectedness is
+      // true (its value attribute, else its trimmed text), else "". A non-multiple
+      // select with no explicit selection has its first option selected by default.
+      const opts = this.options;
+      let chosen = null;
+      for (const o of opts) { if (o.selected) { chosen = o; break; } }
+      if (!chosen && !this.multiple && opts.length) chosen = opts[0];
+      if (!chosen) return "";
+      return chosen.hasAttribute("value") ? chosen.getAttribute("value") : (chosen.textContent || "").trim();
+    }
     return this.getAttribute("value") || "";
   }
   set value(v) {
@@ -2242,11 +2317,13 @@ class Document extends Node {
   }
   querySelector(s) {
     _primeTarget(s, this);
+    _primeValidity(s, this);
     if (this._standalone) return _qsOne(_dom("query_selector_scoped", this._nid, s), s);
     return _qsOne(_dom("query_selector", s), s);
   }
   querySelectorAll(s) {
     _primeTarget(s, this);
+    _primeValidity(s, this);
     const ids = this._standalone
       ? _qsIds(_dom("query_selector_all_scoped", this._nid, s), s)
       : _qsIds(_dom("query_selector_all", s), s);
@@ -2526,9 +2603,10 @@ class DocumentFragment extends Node {
   get nodeName() { return "#document-fragment"; }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
-  querySelector(s) { _primeTarget(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
+  querySelector(s) { _primeTarget(s, this); _primeValidity(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
     _primeTarget(s, this);
+    _primeValidity(s, this);
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
     return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }
@@ -2664,9 +2742,10 @@ class DetachedDocument extends Document {
   }
   get head() { return this._kind === 'html' ? this.querySelector('head') : null; }
   get body() { return this._kind === 'html' ? this.querySelector('body') : null; }
-  querySelector(s) { _primeTarget(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
+  querySelector(s) { _primeTarget(s, this); _primeValidity(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
     _primeTarget(s, this);
+    _primeValidity(s, this);
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
     return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }

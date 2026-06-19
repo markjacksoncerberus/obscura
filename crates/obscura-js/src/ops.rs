@@ -434,6 +434,23 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             Some(n) => n.raw().to_string(),
             None => "-1".into(),
         },
+        "set_validity_flags" => {
+            // arg1 = "nid:flags,nid:flags,..." — the full snapshot of every
+            // validity-bearing element's constraint-validation pseudo bitmask
+            // (1=:valid 2=:invalid 4=:in-range 8=:out-of-range). Replaces the map.
+            let entries: Vec<(NodeId, u8)> = arg1
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .filter_map(|pair| {
+                    let mut it = pair.split(':');
+                    let nid = it.next()?.parse::<u32>().ok()?;
+                    let flags = it.next()?.parse::<u8>().ok()?;
+                    Some((NodeId::new(nid), flags))
+                })
+                .collect();
+            dom.set_validity_state_bulk(&entries);
+            "true".into()
+        }
         "set_target_id" => {
             // arg1 = the queried document's URL fragment (empty clears it). Drives :target.
             dom.set_target_id(if arg1.is_empty() { None } else { Some(arg1.clone()) });

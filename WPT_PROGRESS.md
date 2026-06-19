@@ -10,12 +10,20 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-19.
+Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #44).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/selectors/pseudo-classes/required-optional.html` | 0/6 | **6/6** | ✅ 100% | **Quest #44 The Living Verdict.** `:required`/`:optional` matched nothing (accepted-but-`Other` → always false). Now evaluated straight off the tree in the Rust matcher: a form control to which `required` applies (input of a requirable type, select, textarea), split by whether the attribute is present. **+6** |
+| `html/semantics/selectors/pseudo-classes/valid-invalid.html` | 17/30 | **30/30** | ✅ 100% | **Quest #44.** `:valid`/`:invalid` for candidate controls + `<form>`/`<fieldset>` aggregates, via a JS-computed validity bitmask primed onto the node before the query runs. **+13** |
+| `html/semantics/selectors/pseudo-classes/inrange-outofrange.html` | 0/6 | **6/6** | ✅ 100% | **Quest #44.** `:in-range`/`:out-of-range` for candidates with range limitations; a `type=range` clamps its value so it's never out-of-range. **+6** |
+| `html/semantics/selectors/pseudo-classes/inrange-outofrange-time-reversed.html` | 0/4 | **4/4** | ✅ 100% | **Quest #44.** Reversed min>max ranges (over+underflow together) flow through the same bitmask. **+4** |
+| `html/semantics/selectors/pseudo-classes/valid-invalid-fieldset-disconnected.html` | 0/2 | **2/2** | ✅ 100% | **Quest #44.** Priming resolves a detached subtree's root (matches() on a disconnected `<fieldset>`) + includes the root itself; `select.value` now reflects selectedness. **+2** |
+| `html/semantics/forms/constraints/input-pattern-dynamic-value.html` | 0/1 | **1/1** | ✅ 100% | **Quest #44.** The named #43 cap: `el.matches(":invalid")` after a dynamic value change now matches. **+1** |
+| `html/semantics/forms/constraints/input-number-validity-dynamic-value-no-change.html` | 0/1 | **1/1** | ✅ 100% | **Quest #44.** Same — the recurring `:invalid` selector cap, now closed. **+1** |
+| `dom/nodes/Element-closest.html` | 28/29 | **29/29** | ✅ 100% | **Quest #44.** The last subtest needed `:invalid` to match — closed via the validity bitmask. **+1** |
 | `html/semantics/forms/constraints/form-validation-willValidate.html` | 0/67 | **67/67** | ✅ 100% | **Quest #43 The Charter of Constraints.** The constraint validation API was entirely absent. New `willValidate` = NOT barred-from-CV (fieldset/output/object, input hidden/button/reset, non-submit button, disabled — incl. inside a disabled fieldset, readonly attr, datalist ancestor). **+67** |
 | `html/semantics/forms/constraints/form-validation-willValidate-datalist.html` | 0/17 | **17/17** | ✅ 100% | **Quest #43.** Datalist-ancestor barring. **+17** |
 | `html/semantics/forms/constraints/form-validation-checkValidity.html` | 0/122 | **122/122** | ✅ 100% | **Quest #43.** `checkValidity()` (element + form) fires a cancelable `invalid` event and returns `!willValidate || validity.valid`. **+122** |
