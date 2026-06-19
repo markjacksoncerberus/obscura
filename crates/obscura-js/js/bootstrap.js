@@ -5152,12 +5152,32 @@ const _COLOR_PROPS = new Set([
 const _serColor = (r, g, b, a) => {
   const c = (x) => Math.max(0, Math.min(255, Math.round(x)));
   r = c(r); g = c(g); b = c(b);
+  // Alpha clamps to [0, 1] (e.g. an out-of-range alpha like -10 → 0).
+  if (a === undefined || a === null || Number.isNaN(a)) a = 1;
+  a = Math.max(0, Math.min(1, a));
   if (a >= 1) return `rgb(${r}, ${g}, ${b})`;
   return `rgba(${r}, ${g}, ${b}, ${Math.round(a * 1000) / 1000})`;
 };
+// Convert HSL components (h in degrees, s/l in [0,1]) to 0-255 RGB.
+const _hslToRgb = (h, s, l) => {
+  h = ((h % 360) + 360) % 360;
+  s = Math.max(0, Math.min(1, s));
+  l = Math.max(0, Math.min(1, l));
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else { r = c; b = x; }
+  return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+};
 const _computeColor = (value) => {
   if (!value) return value;
-  let s = value.trim();
+  let s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
   const low = s.toLowerCase();
   if (low === 'transparent') return 'rgba(0, 0, 0, 0)';
   if (low === 'currentcolor' || low === 'inherit' || low === 'initial' || low === 'unset') return value;
@@ -5173,18 +5193,73 @@ const _computeColor = (value) => {
     else return value;
     return _serColor(r, g, b, a);
   }
+  // `none` (CSS Color 4) is treated as the missing-component value 0.
+  const _alpha = (p) => p === 'none' ? 0 : (p.endsWith('%') ? parseFloat(p) / 100 : parseFloat(p));
   m = /^rgba?\(([^)]*)\)$/i.exec(s);
   if (m) {
     const parts = m[1].split(/[,\/\s]+/).filter((x) => x.length);
     if (parts.length >= 3) {
-      const num = (p) => p.endsWith('%') ? parseFloat(p) * 255 / 100 : parseFloat(p);
+      const num = (p) => p === 'none' ? 0 : (p.endsWith('%') ? parseFloat(p) * 255 / 100 : parseFloat(p));
       const r = num(parts[0]), g = num(parts[1]), b = num(parts[2]);
-      let a = 1;
-      if (parts.length >= 4) a = parts[3].endsWith('%') ? parseFloat(parts[3]) / 100 : parseFloat(parts[3]);
+      const a = parts.length >= 4 ? _alpha(parts[3]) : 1;
+      return _serColor(r, g, b, a);
+    }
+  }
+  m = /^hsla?\(([^)]*)\)$/i.exec(s);
+  if (m) {
+    const parts = m[1].split(/[,\/\s]+/).filter((x) => x.length);
+    if (parts.length >= 3) {
+      const h = parts[0] === 'none' ? 0 : parseFloat(parts[0]);
+      const sat = parts[1] === 'none' ? 0 : parseFloat(parts[1]) / 100;
+      const lig = parts[2] === 'none' ? 0 : parseFloat(parts[2]) / 100;
+      const a = parts.length >= 4 ? _alpha(parts[3]) : 1;
+      const [r, g, b] = _hslToRgb(h, sat, lig);
       return _serColor(r, g, b, a);
     }
   }
   return value;
+};
+// Is `value` a syntactically valid CSS <color>? Used by CSS.supports().
+const _isValidColor = (value) => {
+  if (!value) return false;
+  const low = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim().toLowerCase();
+  if (low === 'transparent' || low === 'currentcolor' || _CSS_NAMED_COLORS[low]) return true;
+  if (/^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(low)) return true;
+  if (/^rgba?\([^)]*\)$/i.test(low) || /^hsla?\([^)]*\)$/i.test(low)) {
+    const inner = low.replace(/^[a-z]+\(|\)$/g, '');
+    const parts = inner.split(/[,\/\s]+/).filter((x) => x.length);
+    return parts.length >= 3 && parts.every((p) => p === 'none' || !Number.isNaN(parseFloat(p)));
+  }
+  return false;
+};
+// Computed `color` of an element, honouring inheritance and `currentColor`.
+// A missing/`inherit`/`currentcolor` value inherits the parent's color; the
+// document root falls back to the initial value rgb(0, 0, 0).
+const _specifiedColor = (el) => {
+  // The element's own specified `color`: the live inline style declaration
+  // (set via `el.style.color = …`) wins, then the author-stylesheet cascade
+  // (which also folds in a `style=""` attribute).
+  try {
+    const s = el && el.style;
+    if (s && s.getPropertyValue) {
+      const v = s.getPropertyValue('color');
+      if (v) return v;
+    }
+  } catch (e) {}
+  try { return _cascadeResolve(_buildCascade(el), 'color') || ''; } catch (e) { return ''; }
+};
+const _computedColorOf = (el) => {
+  let cur = el;
+  let guard = 0;
+  while (cur && guard++ < 200) {
+    let v = _specifiedColor(cur);
+    v = (v || '').trim();
+    const low = v.toLowerCase();
+    if (!v || low === 'inherit' || low === 'currentcolor') { cur = cur.parentElement; continue; }
+    if (low === 'initial' || low === 'unset') return 'rgb(0, 0, 0)';
+    return _computeColor(v);
+  }
+  return 'rgb(0, 0, 0)';
 };
 const _GCS_INLINE_SPEC = Number.MAX_SAFE_INTEGER;
 const _buildCascade = (el) => {
@@ -5235,6 +5310,17 @@ const _cascadeResolve = (sources, name) => {
   }
   return best ? best.d.value : '';
 };
+// CSS property registry (kebab + camelCase) — the set of properties our
+// computed-style / CSS.supports machinery understands. Drives the proxy `has`
+// trap (so `'color' in getComputedStyle(el)` is true) and CSS.supports().
+const _toCamel = (k) => k.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+const _CSS_KNOWN_PROPS = (() => {
+  const set = new Set();
+  const add = (k) => { set.add(k); set.add(_toCamel(k)); };
+  for (const k of Object.keys(_GCS_DEFAULTS)) add(k);
+  for (const k of _COLOR_PROPS) add(k);
+  return set;
+})();
 globalThis.getComputedStyle = (el, _pseudo) => {
   if (!el) el = document.body || {};
   const style = el?.style || el?._style || new CSSStyleDeclaration();
@@ -5242,7 +5328,15 @@ globalThis.getComputedStyle = (el, _pseudo) => {
   const resolve = (name) => {
     // name as authored: custom property, kebab, or camelCase.
     const kebab = name.startsWith('--') ? name : name.replace(/([A-Z])/g, '-$1').toLowerCase();
-    const norm = (v) => (_COLOR_PROPS.has(kebab) ? _computeColor(v) : v);
+    // `color` is inherited: resolve through the ancestor chain (also handles
+    // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
+    if (kebab === 'color') return _computedColorOf(el);
+    const norm = (v) => {
+      if (!_COLOR_PROPS.has(kebab)) return v;
+      // `currentColor` on a non-`color` property resolves to the element's color.
+      if (String(v).trim().toLowerCase() === 'currentcolor') return _computedColorOf(el);
+      return _computeColor(v);
+    };
     const cascaded = _cascadeResolve(sources, kebab);
     if (cascaded !== '') return norm(cascaded);
     // Inline declaration object fallback (props stored as authored).
@@ -5258,6 +5352,10 @@ globalThis.getComputedStyle = (el, _pseudo) => {
       if (prop in target) return target[prop];
       if (typeof prop === 'string') return resolve(prop);
       return undefined;
+    },
+    has(target, prop) {
+      if (prop in target) return true;
+      return typeof prop === 'string' && _CSS_KNOWN_PROPS.has(prop);
     }
   });
 };
@@ -7099,7 +7197,25 @@ globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 
-globalThis.CSS = { supports(){return false;}, escape(s){return s;} };
+globalThis.CSS = {
+  supports(prop, value) {
+    // Two-argument form: CSS.supports(property, value).
+    if (arguments.length >= 2) {
+      const name = String(prop).trim().toLowerCase();
+      const val = String(value).trim();
+      if (!val) return false;
+      if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
+      if (_COLOR_PROPS.has(name)) return _isValidColor(val);
+      return true;
+    }
+    // One-argument condition form: CSS.supports("property: value").
+    const cond = String(prop);
+    const idx = cond.indexOf(':');
+    if (idx < 0) return false;
+    return globalThis.CSS.supports(cond.slice(0, idx).trim(), cond.slice(idx + 1).trim());
+  },
+  escape(s){return s;}
+};
 
 // HTMLElement is a real subclass of Element: only elements in the HTML namespace
 // are HTMLElement instances (foreign / non-HTML elements stay plain Element).

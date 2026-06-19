@@ -90,6 +90,39 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-19 (Quest #49 The Computed Verdict — computed-value plumbing + the
+colour engine, +536):** After #47 built an author-stylesheet *cascade* for `getComputedStyle`,
+the *computed-value* side of CSS was still dark. The whole `css/*/parsing/*-computed.html`
+family runs through the shared helper `/css/support/computed-testcommon.js`, which gates
+**every** subtest on two assertions before reading a value: `'prop' in getComputedStyle(el)`
+and `CSS.supports(prop, specified)`. Both failed for us — the computed-style Proxy had no `has`
+trap (so `'color' in gCS` was `false` → `color-computed.html` a clean 0/16, all on that first
+assert), and `CSS.supports` was hardcoded `() => false`. Two tiny shared primitives blocking a
+wide tail. Fix (pure JS, `bootstrap.js`, no new Rust): a Proxy **`has` trap** + property
+registry `_CSS_KNOWN_PROPS`; a **real `CSS.supports`** (two-arg + one-arg condition form;
+unknown properties still `false` to bound the blast radius; `<color>` values validated via new
+`_isValidColor`); **`color` inheritance** (`getComputedStyle(el).color` resolves through the
+ancestor chain — live inline `style.color` → author cascade → inherit; `currentColor`/`inherit`
+walk up; root falls back to initial `rgb(0,0,0)`); and an extended `_computeColor` —
+`hsl()`/`hsla()` → sRGB (new `_hslToRgb`), alpha clamped to `[0,1]`, the CSS Color 4 `none`
+keyword treated as 0, and CSS comments stripped from values. **Wins (all from baseline 0,
+gated on the first `in` assert):** color-computed 0→16, color-computed-hex-color 0→6,
+color-computed-named-color 0→455, color-computed-rgb 0→59. **+536, zero regressions** (swept
+the #47 colour-via-cascade tests has-specificity 8 / is-specificity 1 / not-specificity 8 /
+is-nested 2 / important-vs-inline-001 4 / inrange-outofrange-type-change 2 / checked-type-change
+1 — the highest risk — plus qsa 1975, classlist 1420, matches 669, closest 29, valid-invalid 30,
+readwrite-readonly 25, disabled 7, createElement 147, mark 22, structured-clone 141/152,
+getRandomValues 39; obscura-dom unit 40/40). **Caps:** color-computed-rgb 59/99 (remaining 40 =
+`calc()`/`var()`/CSS-escaped identifiers — need a calc evaluator + value tokenizer);
+`alpha(from …)` relative-colour (CSS Color 5, bleeding edge — we correctly return `false`);
+`opacity-computed` 3/30 (a different property — clamp/percentage/calc, clean follow-up);
+`color-computed-hsl` could-not-run for a harness reason (bootstrap not attaching, unrelated to
+colour). **NEXT:** the `has`-trap + `CSS.supports` primitives are now a foundation for the whole
+`*-computed.html` family — `opacity-computed` + simple numeric computed values next, then CSS
+inheritance + initial values for non-colour properties (`inherit-initial.html` 0/4 — an
+initial-values table + `inherit`/`initial`/`unset` resolution + a generalised inheritance walk),
+else a fresh realm. Scroll `tickets/49-the-computed-verdict.md`.
+
 **Session 2026-06-19 (Quest #48 The Indeterminate Verdict — the remaining HTML selector
 pseudo-classes, +10):** After #44–#46 finished the live-state form selector family, three
 HTML pseudo-classes were still dark: the Servo `selectors` crate *parses* `:indeterminate`/
