@@ -49,6 +49,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~32~~ | ✅ [The Throwing Getter](32-the-throwing-getter.md) | `xhr/*` `responseText` | **non-document-types 5/5** | ⚔️ | **SECURED — +4.** `responseText` was a plain data property (never threw); per §the-responsetext-attribute it must throw `InvalidStateError` when `responseType` is not `""`/`"text"`. Refactored to a getter backed by `_responseText` (all send paths assign the backing field) — empty string until LOADING/DONE, else the decoded text. `responseXML` already threw. Pure JS, no new Rust. The response-attributes vein is now clean. Caps: `responsexml-document-properties` (full XML doc metadata quest) |
 | ~~33~~ | ✅ [The Interface Armory](33-the-interface-armory.md) | `dom/nodes/Node-cloneNode*` (+ HTML element interface objects) | **Node-cloneNode 135/135** | ⚔️⚔️ | **SECURED — +34.** Most `HTML*Element` interface objects were a single shared alias of `HTMLElement` and a large tail was missing → `typeName in window` false. Now each is a distinct subclass of `HTMLElement` + a canonical `_HTML_IFACE_BY_TAG` tag→interface map, so `createElement(t) instanceof HTMLXxxElement` is honest. Added `DocumentType.cloneNode` + `DetachedDocument.cloneNode`. Caps: DOMParser HTML doc drops `<!DOCTYPE>` (parse-path gap); `document.adoptNode` unimplemented (next quick win) |
 | ~~34~~ | ✅ [The Adoption Papers](34-the-adoption-papers.md) | `dom/nodes/Document-adoptNode` (+ insert-adopt) | **Document-adoptNode 4/4, Node-mutation-adoptNode 2/2** | ⚔️ | **SECURED — +5.** `document.adoptNode` was unimplemented (`adoptNode is not a function`). Real DOM §dom-document-adoptnode: detach from any parent, deep-retarget the node document of the whole subtree (`_setNodeDocumentDeep`), adopting a Document throws `NotSupportedError`; inherited by `DetachedDocument`. Also fixed insertion (`appendChild`/`insertBefore`) to run the §insert "adopt into the parent's node document" step **deeply** when crossing documents (was retagging only the direct child) — hot-path safe via a same-document cheap compare. Pure JS, no new Rust. Caps: DocumentFragment/ShadowRoot adopt subtests (need a working `new Document()` web ctor, template-content owner document, `attachShadow`), `remove-and-adopt-thcrash` (`window.open()` popup document) |
+| ~~35~~ | ✅ [The Insertion Concord](35-the-insertion-concord.md) | `dom/nodes/{ParentNode-append,prepend,replaceChildren,ChildNode-before,after,replaceWith}` | **before/after/replaceWith 45/45+45/45+33/33, append 25/25, prepend 22/22, replaceChildren 25/29** | ⚔️⚔️ | **SECURED — +177.** The whole ParentNode/ChildNode mutation family shared crooked, duplicated "convert nodes into a node" logic that only handled `typeof === "string"` (so `null`/`undefined`/numbers threw instead of becoming Text nodes), `before`/`after`/`replaceWith` lacked the viable-sibling algorithm (so `child.before(x, child)` **crashed the engine** → the three suites were dark), and `replaceChildren` was missing entirely. One shared spec-correct core (`_convertNodesIntoNode` + `_cn*`/`_pn*` mixins on Element/CharacterData/DocumentType/DocumentFragment/Document) + §ensure-pre-insertion-validity steps 5–6 added to `appendChild`/`insertBefore`. Bonus: insertAdjacentElement/Text 5→6 each. Caps: `replaceChildren` atomic "replace all" MutationObserver record (needs a Rust suppress-observers flag) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
@@ -75,6 +76,49 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-18 (Quest #35 The Insertion Concord — ParentNode/ChildNode
+mutation methods, +177):**
+- The DOM mutation-method family — `append`/`prepend`/`before`/`after`/
+  `replaceWith`, plus the entirely-missing `replaceChildren` — each carried its
+  own ad-hoc "convert nodes into a node" that only handled `typeof === "string"`.
+  Three defects: (a) non-Node args (`null`/`undefined`/numbers) were *rejected*
+  by `appendChild` instead of WebIDL-stringified into Text nodes; (b)
+  `before`/`after`/`replaceWith` had no viable-sibling algorithm, so
+  `child.before(x, child)` (context node among its own args) **crashed the
+  engine** — `ChildNode-before/after/replaceWith` were dark (could-not-run);
+  (c) `replaceChildren` didn't exist.
+- **Fix (pure JS, no new Rust):** one shared spec core — `_convertNodesIntoNode`
+  (stringify non-Nodes, gather multiples into a DocumentFragment) + `_pnAppend/
+  _pnPrepend/_pnReplaceChildren` (ParentNode) + `_cnBefore/_cnAfter/
+  _cnReplaceWith/_cnRemove` (ChildNode, with the viable-sibling walk) — installed
+  once onto Element/DocumentFragment/Document (ParentNode) and Element/
+  CharacterData/DocumentType (ChildNode; doctype had *none* of these before).
+  Also added §ensure-pre-insertion-validity **steps 5–6** to
+  `appendChild`/`insertBefore` (Text-into-document, doctype-into-non-document,
+  document element/doctype cardinality → `HierarchyRequestError`); cheap on the
+  hot path (gated to document parents).
+- Wins: ChildNode-before/after/replaceWith **0→45/45/33** (+123), append
+  11→**25/25** (+14), prepend 9→**22/22** (+13), replaceChildren 0→**25/29**
+  (+25), insertAdjacentElement/Text 5→**6/6** each (+2 bonus). **+177**, zero
+  regressions (qsa 1975, classlist 1420, createElement 147, createElementNS 596,
+  Node-appendChild 11, Node-replaceChild 29, cloneNode 135, isEqualNode 9,
+  attributes 67, mark 22/22, measures 119/119, structured-clone 141/152,
+  getRandomValues 39/39, url-setters-stripping 260/260). Scroll
+  `35-the-insertion-concord.md`.
+- **Caps (honest):** `replaceChildren`'s last 4/29 (2 "right order" fails + 2
+  MutationRecord timeouts) need the spec's **atomic "replace all"** — per-node
+  ops with the suppress-observers flag + ONE combined `childList` record. Records
+  come entirely from the Rust queue, so that needs a **Rust suppress-observers
+  flag / `replace_all` op** (touches the shared mutation system classlist/
+  attributes depend on) — deferred, not risked for +4. `Node-removeChild.html`
+  is a PRE-EXISTING no-results (verified via stash-rebuild — `frames[0].document`
+  fixture, not a regression).
+- **Next leverage:** the `replaceChildren` atomic-record Rust op (also unlocks
+  spec-correct innerHTML/textContent replace-all granularity); else the standing
+  `new Document()` web ctor (Quest #34's named foundational primitive —
+  `adoption.window` DocumentFragment subtests, template content, importNode); or
+  a fresh realm.
 
 **Session 2026-06-18 (Quest #34 The Adoption Papers — `document.adoptNode` +
 deep insert-adopt, +5):**

@@ -456,6 +456,10 @@ class Node {
     // A Document is not a valid child of any node.
     if (c.nodeType === 9)
       throw new DOMException("A Document cannot be inserted into the tree", "HierarchyRequestError");
+    // §ensure-pre-insertion-validity steps 5–6 (Text/doctype placement +
+    // document element/doctype cardinality). Checked BEFORE fragment expansion
+    // so a multi-element fragment into a document is rejected atomically.
+    _checkInsertConstraints(this, c, null);
     // A DocumentFragment is inserted by moving each of its children, leaving it empty.
     if (c.nodeType === 11) {
       const kids = Array.prototype.slice.call(c.childNodes);
@@ -580,6 +584,11 @@ class Node {
     const _refParent = ref.parentNode;
     if (!_refParent || _refParent._nid !== this._nid)
       throw new DOMException("The reference child is not a child of this node", "NotFoundError");
+    if (n.nodeType === 9)
+      throw new DOMException("A Document cannot be inserted into the tree", "HierarchyRequestError");
+    // §ensure-pre-insertion-validity steps 5–6 (see appendChild), before the
+    // fragment is expanded so the whole fragment is validated as a unit.
+    _checkInsertConstraints(this, n, ref);
     // A DocumentFragment inserts each of its children before the reference, then empties.
     if (n.nodeType === 11) {
       const kids = Array.prototype.slice.call(n.childNodes);
@@ -1909,16 +1918,9 @@ class Element extends Node {
     }
     return false;
   }
-  remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-  append(...nodes) { for (const n of nodes) { if (typeof n === "string") this.appendChild(document.createTextNode(n)); else this.appendChild(n); } }
-  prepend(...nodes) {
-    const ref = this.firstChild;
-    for (const n of nodes) {
-      const node = (typeof n === "string") ? document.createTextNode(n) : n;
-      if (ref) this.insertBefore(node, ref);
-      else this.appendChild(node);
-    }
-  }
+  // remove() + the append/prepend/replaceChildren ParentNode methods are mixed
+  // onto Element.prototype below (see the "_pn*/_cn*" assignments) so the whole
+  // mutation family shares one spec-correct "convert nodes into a node" core.
 }
 
 // DOM §concept-node-adopt: remove `node` from any parent, then — when the
@@ -1936,6 +1938,116 @@ function _adoptNodeInto(node, doc) {
   const parent = node.parentNode;
   if (parent) parent.removeChild(node);
   if (doc !== oldDoc) _setNodeDocumentDeep(node, doc);
+}
+
+// ---- ParentNode / ChildNode mutation mixins (DOM §parentnode, §childnode) ----
+// These five methods (append/prepend/before/after/replaceWith), plus
+// replaceChildren, all share one core: WHATWG "convert nodes into a node".
+// The WebIDL signature is `(Node or DOMString)... nodes`, so any argument that
+// is NOT a Node has already been coerced to a string by the time it reaches us
+// — null → "null", undefined → "undefined", a number → its decimal string.
+// We therefore turn every non-Node argument into a Text node (NOT reject it),
+// and gather multiple nodes into a single DocumentFragment so the insertion is
+// atomic. Defined once here and shared across Element / DocumentFragment /
+// Document (ParentNode) and Element / CharacterData / DocumentType (ChildNode).
+function _isNodeArg(x) {
+  return x != null && typeof x === 'object' &&
+    (typeof x._nid === 'number' || typeof x.nodeType === 'number');
+}
+function _convertNodesIntoNode(nodes, doc) {
+  const mapped = nodes.map(n => _isNodeArg(n) ? n : doc.createTextNode(String(n)));
+  if (mapped.length === 1) return mapped[0];
+  const frag = doc.createDocumentFragment();
+  for (const m of mapped) frag.appendChild(m);
+  return frag;
+}
+// The node document in which to mint the Text nodes: a document is its own node
+// document; any other node uses its ownerDocument (falling back to the page).
+function _insertDoc(node) {
+  return (node && node.nodeType === 9) ? node
+    : (node && node.ownerDocument) || globalThis.document;
+}
+// §dom-parentnode-append / -prepend / -replacechildren
+function _pnAppend(...nodes) {
+  this.appendChild(_convertNodesIntoNode(nodes, _insertDoc(this)));
+}
+function _pnPrepend(...nodes) {
+  this.insertBefore(_convertNodesIntoNode(nodes, _insertDoc(this)), this.firstChild);
+}
+function _pnReplaceChildren(...nodes) {
+  const node = _convertNodesIntoNode(nodes, _insertDoc(this));
+  // §replace-all ensures pre-insertion validity FIRST, then removes the old
+  // children — so e.g. a second element into a document is rejected while the
+  // existing element child is still present (validating after the removal would
+  // see an empty document and wrongly succeed).
+  _checkInsertConstraints(this, node, null);
+  while (this.firstChild) this.removeChild(this.firstChild);
+  this.appendChild(node);
+}
+// §dom-childnode-before / -after / -replacewith. The "viable" sibling is the
+// nearest sibling that is NOT itself one of the nodes being inserted (so
+// `child.before(x, child)` and friends place things correctly).
+function _cnBefore(...nodes) {
+  const parent = this.parentNode;
+  if (!parent) return;
+  let viable = this.previousSibling;
+  while (viable && nodes.includes(viable)) viable = viable.previousSibling;
+  const node = _convertNodesIntoNode(nodes, _insertDoc(this));
+  parent.insertBefore(node, viable ? viable.nextSibling : parent.firstChild);
+}
+function _cnAfter(...nodes) {
+  const parent = this.parentNode;
+  if (!parent) return;
+  let viable = this.nextSibling;
+  while (viable && nodes.includes(viable)) viable = viable.nextSibling;
+  const node = _convertNodesIntoNode(nodes, _insertDoc(this));
+  parent.insertBefore(node, viable);
+}
+function _cnReplaceWith(...nodes) {
+  const parent = this.parentNode;
+  if (!parent) return;
+  let viable = this.nextSibling;
+  while (viable && nodes.includes(viable)) viable = viable.nextSibling;
+  const node = _convertNodesIntoNode(nodes, _insertDoc(this));
+  // If converting the nodes didn't already detach `this` from `parent`,
+  // replace in place; otherwise insert before the viable next sibling.
+  if (this.parentNode === parent) parent.replaceChild(node, this);
+  else parent.insertBefore(node, viable);
+}
+function _cnRemove() { if (this.parentNode) this.parentNode.removeChild(this); }
+
+// DOM §ensure-pre-insertion-validity steps 5–6 — the type/cardinality
+// constraints beyond "parent accepts children" + "node is not an ancestor",
+// which appendChild/insertBefore already check inline. `child` is the reference
+// node the new node goes before (null when appending at the end). Step 5 (Text
+// may not be a document child; a doctype may ONLY be a document child) is two
+// cheap comparisons on the hot path; step 6 (document element/doctype
+// cardinality + ordering) only runs for the rare document-parent case.
+function _checkInsertConstraints(parent, node, child) {
+  const pt = parent.nodeType, nt = node.nodeType;
+  if ((nt === 3 && pt === 9) || (nt === 10 && pt !== 9))
+    throw new DOMException("Invalid child for this parent", "HierarchyRequestError");
+  if (pt !== 9) return;
+  const kids = Array.prototype.slice.call(parent.childNodes);
+  const idx = (n) => kids.findIndex(k => k._nid === n._nid);
+  const childIdx = child ? idx(child) : kids.length;
+  const hasElementChild = kids.some(k => k.nodeType === 1);
+  const doctypeChild = kids.find(k => k.nodeType === 10) || null;
+  const doctypeAfterChild = !!(doctypeChild && child && idx(doctypeChild) > childIdx);
+  const elementBeforeChild = !!(child && kids.some(k => k.nodeType === 1 && idx(k) < childIdx));
+  const HRE = (m) => { throw new DOMException(m, "HierarchyRequestError"); };
+  if (nt === 11) {
+    const fk = Array.prototype.slice.call(node.childNodes);
+    const fe = fk.filter(k => k.nodeType === 1).length;
+    if (fe > 1 || fk.some(k => k.nodeType === 3 || k.nodeType === 4)) HRE("Invalid fragment for a document");
+    if (fe === 1 && (hasElementChild || (child && child.nodeType === 10) || doctypeAfterChild))
+      HRE("Document may have only one element child");
+  } else if (nt === 1) {
+    if (hasElementChild || (child && child.nodeType === 10) || doctypeAfterChild)
+      HRE("Document may have only one element child");
+  } else if (nt === 10) {
+    if (doctypeChild || elementBeforeChild || (!child && hasElementChild)) HRE("Misplaced doctype");
+  }
 }
 
 class Document extends Node {
@@ -2216,16 +2328,8 @@ class DocumentFragment extends Node {
   get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
   get childElementCount() { return this.children.length; }
   getElementById(id) { return null; }
-  // ParentNode mixin (Element defines these too; DocumentFragment extends Node
-  // directly, so it needs its own copy).
-  append(...nodes) { for (const n of nodes) this.appendChild(typeof n === "string" ? document.createTextNode(n) : n); }
-  prepend(...nodes) {
-    const ref = this.firstChild;
-    for (const n of nodes) {
-      const node = (typeof n === "string") ? document.createTextNode(n) : n;
-      if (ref) this.insertBefore(node, ref); else this.appendChild(node);
-    }
-  }
+  // ParentNode append/prepend/replaceChildren are mixed onto the prototype below
+  // (shared with Element/Document via the "_pn*" assignments).
   cloneNode(deep) {
     const frag = document.createDocumentFragment();
     if (deep) frag.innerHTML = this.innerHTML;
@@ -4290,50 +4394,25 @@ if (typeof Response === 'undefined') {
   };
 }
 
-if (!Element.prototype.replaceWith) {
-  Element.prototype.replaceWith = function(...nodes) {
-    const parent = this.parentNode;
-    if (!parent) return;
-    for (const n of nodes) {
-      if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), this);
-      else parent.insertBefore(n, this);
-    }
-    parent.removeChild(this);
-  };
-  _markNative(Element.prototype.replaceWith);
+// Install the shared ParentNode / ChildNode mutation mixins (defined as the
+// `_pn*` / `_cn*` module functions, all built on the spec "convert nodes into a
+// node" core) onto every interface that exposes them:
+//   ParentNode (append/prepend/replaceChildren) → Element, DocumentFragment, Document
+//   ChildNode  (before/after/replaceWith/remove) → Element, CharacterData, DocumentType
+// CharacterData covers Text/Comment/ProcessingInstruction; DocumentType is a
+// ChildNode too (and previously lacked these entirely — `doctype.remove` threw).
+// Frameworks (Svelte 5, Vue, Lit) anchor on Comment/Text nodes and call these.
+for (const Proto of [Element.prototype, DocumentFragment.prototype, Document.prototype]) {
+  Proto.append = _markNative(_pnAppend);
+  Proto.prepend = _markNative(_pnPrepend);
+  Proto.replaceChildren = _markNative(_pnReplaceChildren);
 }
-if (!Element.prototype.before) {
-  Element.prototype.before = function(...nodes) {
-    const parent = this.parentNode;
-    if (!parent) return;
-    for (const n of nodes) {
-      if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), this);
-      else parent.insertBefore(n, this);
-    }
-  };
-  _markNative(Element.prototype.before);
+for (const Proto of [Element.prototype, CharacterData.prototype, DocumentType.prototype]) {
+  Proto.before = _markNative(_cnBefore);
+  Proto.after = _markNative(_cnAfter);
+  Proto.replaceWith = _markNative(_cnReplaceWith);
+  Proto.remove = _markNative(_cnRemove);
 }
-if (!Element.prototype.after) {
-  Element.prototype.after = function(...nodes) {
-    const parent = this.parentNode;
-    if (!parent) return;
-    const ref = this.nextSibling;
-    for (const n of nodes) {
-      if (typeof n === 'string') parent.insertBefore(document.createTextNode(n), ref);
-      else parent.insertBefore(n, ref);
-    }
-  };
-  _markNative(Element.prototype.after);
-}
-
-// ChildNode mixin: also mix before/after/replaceWith/remove into
-// CharacterData.prototype (covers Text, Comment, ProcessingInstruction).
-// These are the same implementations as Element.prototype — frameworks
-// (Svelte 5, Vue, Lit) anchor on Comment/Text nodes and call these methods.
-if (!CharacterData.prototype.before) CharacterData.prototype.before = Element.prototype.before;
-if (!CharacterData.prototype.after) CharacterData.prototype.after = Element.prototype.after;
-if (!CharacterData.prototype.replaceWith) CharacterData.prototype.replaceWith = Element.prototype.replaceWith;
-if (!CharacterData.prototype.remove) CharacterData.prototype.remove = Element.prototype.remove;
 
 if (!('isConnected' in Node.prototype)) {
   Object.defineProperty(Node.prototype, 'isConnected', {
