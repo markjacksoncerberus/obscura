@@ -10,12 +10,20 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #46).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #47).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/selectors/has-specificity.html` | 0/8 | **8/8** | ✅ 100% | **Quest #47 The Cascade Crown.** `getComputedStyle` had no author-stylesheet cascade — just inline style + a defaults table. Built a real cascade: gather `<style>` rules, ask the Rust selector engine which match (and at what specificity — it honours `:is()`/`:where()`/`:has()`), resolve a property to the winner by importance → specificity → source order. `:has()` complex-selector specificity now decides. **+8** |
+| `css/selectors/is-specificity.html` | 0/1 | **1/1** | ✅ 100% | **Quest #47.** `:is()` takes its highest-specificity argument; combinator chains resolve to the right declared length. **+1** |
+| `css/selectors/is-nested.html` | 0/2 | **2/2** | ✅ 100% | **Quest #47.** Nested `:is()` specificity (inside and outside the argument) + computed `color` serialization. **+2** |
+| `css/selectors/is-where-pseudo-classes.html` | 0/1 | **1/1** | ✅ 100% | **Quest #47.** `:is()`/`:where()` combined with `:enabled`/`:disabled`/`:nth-child` in author rules, resolved by the cascade. **+1** |
+| `css/selectors/not-specificity.html` | 0/8 | **8/8** | ✅ 100% | **Quest #47.** `:not()` contributes its argument's specificity; cascade picks the winner. **+8** |
+| `html/semantics/selectors/pseudo-classes/readwrite-readonly-type-change.html` | 0/1 | **1/1** | ✅ 100% | **Quest #47.** The named #44/#45 cap: a `<style>` rule paints by `:read-write`/`:read-only`; `getComputedStyle` now reads the applied colour through the cascade. **+1** |
+| `html/semantics/selectors/pseudo-classes/checked-type-change.html` | 0/1 | **1/1** | ✅ 100% | **Quest #47.** `:checked` rule's applied colour read back via the cascade. **+1** |
+| `html/semantics/selectors/pseudo-classes/inrange-outofrange-type-change.html` | 0/2 | **2/2** | ✅ 100% | **Quest #47.** The cascade primes the JS validity side-map before matching, so `:in-range`/`:out-of-range` author rules resolve. **+2** |
 | `html/semantics/selectors/pseudo-classes/disabled.html` | 0/7 | **7/7** | ✅ 100% | **Quest #46 The Disabled Lineage.** `:disabled`/`:enabled` only consulted the element's *own* `disabled` attribute. Now "actually disabled" per HTML, live off the Rust tree: own attr, an `<option>` whose `<optgroup>` parent is disabled, and any disable-able element inside a disabled `<fieldset>` — except within that fieldset's first `<legend>` — including nested fieldsets. `:enabled` is the exact complement over the disable-able set (input/button/select/textarea/optgroup/option/fieldset). **+7** |
 | `html/semantics/selectors/pseudo-classes/enabled.html` | 1/1 | **1/1** | ✅ 100% | **Quest #46.** Held — `:enabled` rewired to `is_disableable && !is_actually_disabled` with no change to the matched set (still excludes `a`/`area`/`link`). **±0** |
 | `html/semantics/selectors/pseudo-classes/readwrite-readonly.html` | 5/25 | **25/25** | ✅ 100% | **Quest #45 The Mutable Charter.** `:read-write`/`:read-only` matched nothing (accepted-but-`Other` → always false). Now evaluated live off the tree in the Rust matcher: input (readonly-applicable type, no `readonly`, not disabled) / textarea / `contenteditable` editing-host ancestor walk; everything else is `:read-only`. `document.designMode` (was undefined) now pushes a document-global flag the engine reads during matching. **+20** |

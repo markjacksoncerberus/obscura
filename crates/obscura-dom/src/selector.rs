@@ -1139,6 +1139,46 @@ impl DomTree {
         }
         Ok(results)
     }
+
+    /// For the CSS cascade: parse `selector` (a style-rule selector list) and,
+    /// among the complex selectors that match `node`, return the HIGHEST
+    /// specificity (packed u32 as the selectors crate computes it — correctly
+    /// honouring `:is()`/`:where()`/`:has()`). Returns `Ok(None)` when the element
+    /// matches no selector in the list, the node is not an element, or the
+    /// selector fails to parse. The per-selector specificity (not the list's) is
+    /// what the cascade needs: a rule `.a, #b` contributes `#b`'s specificity when
+    /// it matched via `#b`. Scope is left as `:root` (author stylesheets resolve
+    /// `:scope` to the document element).
+    pub fn selector_match_specificity(
+        &self,
+        node: NodeId,
+        selector: &str,
+    ) -> Option<u32> {
+        let selector_list = parse_selector(selector).ok()?;
+        if !self.with_node(node, |n| n.is_element()).unwrap_or(false) {
+            return None;
+        }
+        let mut caches = selectors::context::SelectorCaches::default();
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            &mut caches,
+            QuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        let element = DomElement::new(self, node);
+        let mut best: Option<u32> = None;
+        for sel in selector_list.slice() {
+            if selectors::matching::matches_selector(sel, 0, None, &element, &mut context) {
+                let spec = sel.specificity();
+                if best.map_or(true, |b| spec > b) {
+                    best = Some(spec);
+                }
+            }
+        }
+        best
+    }
 }
 
 #[cfg(test)]

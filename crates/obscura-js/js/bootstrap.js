@@ -5028,46 +5028,231 @@ if (typeof TextDecoder === 'undefined') {
 }
 
 globalThis.matchMedia = _markNative(function matchMedia(q) { return { matches: false, media: q, addListener(){}, removeListener(){}, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} }; });
-globalThis.getComputedStyle = (el) => {
+// ── CSS author-stylesheet cascade (for getComputedStyle) ─────────────────────
+// A minimal but spec-shaped cascade: gather `<style>` rules, ask the Rust
+// selector engine which match this element and at what specificity (it honours
+// :is()/:where()/:has() correctly), then resolve a property to the winning
+// declaration by importance → specificity → source order. Inline `style` is the
+// highest-priority author origin at each importance level. Enough for the
+// specificity/cascade WPTs; absolute declared values pass straight through (no
+// layout). NOT a layout engine — used/computed values that need layout (auto
+// widths, percentage resolution) still fall back to the defaults table.
+const _GCS_DEFAULTS = {
+  display: 'block', visibility: 'visible', opacity: '1',
+  position: 'static', overflow: 'visible',
+  transform: 'none', transition: 'none', animation: 'none',
+  float: 'none', clear: 'none',
+  width: 'auto', height: 'auto',
+  top: 'auto', left: 'auto', right: 'auto', bottom: 'auto',
+  margin: '0px', padding: '0px',
+  'margin-top': '0px', 'margin-right': '0px', 'margin-bottom': '0px', 'margin-left': '0px',
+  'padding-top': '0px', 'padding-right': '0px', 'padding-bottom': '0px', 'padding-left': '0px',
+  'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
+  color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
+  'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
+  'z-index': 'auto', 'pointer-events': 'auto',
+  'box-sizing': 'content-box', cursor: 'auto',
+};
+const _cssParseDecls = (body) => {
+  // body is the inside of a `{ ... }` block (or an inline style string).
+  const out = {};
+  for (const part of String(body).split(';')) {
+    const idx = part.indexOf(':');
+    if (idx < 0) continue;
+    const rawName = part.slice(0, idx).trim();
+    if (!rawName) continue;
+    let value = part.slice(idx + 1).trim();
+    let important = false;
+    const m = /!\s*important\s*$/i.exec(value);
+    if (m) { important = true; value = value.slice(0, m.index).trim(); }
+    // Custom properties keep their case; standard properties are ASCII-lowercased.
+    const name = rawName.startsWith('--') ? rawName : rawName.toLowerCase();
+    out[name] = { value, important };
+  }
+  return out;
+};
+const _cssSplitRules = (cssText) => {
+  // Returns [{ selectorText, decls }]; skips at-rules (and their nested blocks).
+  const css = String(cssText).replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [];
+  let i = 0;
+  const n = css.length;
+  while (i < n) {
+    let j = i;
+    while (j < n && css[j] !== '{' && css[j] !== '}') j++;
+    if (j >= n) break;
+    if (css[j] === '}') { i = j + 1; continue; }
+    const prelude = css.slice(i, j).trim();
+    let depth = 1, k = j + 1;
+    while (k < n && depth > 0) {
+      if (css[k] === '{') depth++;
+      else if (css[k] === '}') depth--;
+      k++;
+    }
+    const body = css.slice(j + 1, k - 1);
+    i = k;
+    if (!prelude || prelude[0] === '@') continue; // skip @media/@supports/etc.
+    rules.push({ selectorText: prelude, decls: _cssParseDecls(body) });
+  }
+  return rules;
+};
+const _sheetRuleCache = new WeakMap(); // styleEl -> { text, rules }
+const _styleSheetRules = (styleEl) => {
+  let text = '';
+  try { text = styleEl.textContent || ''; } catch { text = ''; }
+  const cached = _sheetRuleCache.get(styleEl);
+  if (cached && cached.text === text) return cached.rules;
+  const rules = _cssSplitRules(text);
+  _sheetRuleCache.set(styleEl, { text, rules });
+  return rules;
+};
+// Computed-value serialization for <color> properties: named/hex/rgb()/rgba()
+// → `rgb(r, g, b)` (or `rgba(r, g, b, a)` when alpha < 1), matching how browsers
+// serialize a computed color. Other values pass through unchanged.
+const _CSS_NAMED_COLORS = {
+  aliceblue:'#f0f8ff',antiquewhite:'#faebd7',aqua:'#00ffff',aquamarine:'#7fffd4',azure:'#f0ffff',
+  beige:'#f5f5dc',bisque:'#ffe4c4',black:'#000000',blanchedalmond:'#ffebcd',blue:'#0000ff',
+  blueviolet:'#8a2be2',brown:'#a52a2a',burlywood:'#deb887',cadetblue:'#5f9ea0',chartreuse:'#7fff00',
+  chocolate:'#d2691e',coral:'#ff7f50',cornflowerblue:'#6495ed',cornsilk:'#fff8dc',crimson:'#dc143c',
+  cyan:'#00ffff',darkblue:'#00008b',darkcyan:'#008b8b',darkgoldenrod:'#b8860b',darkgray:'#a9a9a9',
+  darkgreen:'#006400',darkgrey:'#a9a9a9',darkkhaki:'#bdb76b',darkmagenta:'#8b008b',darkolivegreen:'#556b2f',
+  darkorange:'#ff8c00',darkorchid:'#9932cc',darkred:'#8b0000',darksalmon:'#e9967a',darkseagreen:'#8fbc8f',
+  darkslateblue:'#483d8b',darkslategray:'#2f4f4f',darkslategrey:'#2f4f4f',darkturquoise:'#00ced1',darkviolet:'#9400d3',
+  deeppink:'#ff1493',deepskyblue:'#00bfff',dimgray:'#696969',dimgrey:'#696969',dodgerblue:'#1e90ff',
+  firebrick:'#b22222',floralwhite:'#fffaf0',forestgreen:'#228b22',fuchsia:'#ff00ff',gainsboro:'#dcdcdc',
+  ghostwhite:'#f8f8ff',gold:'#ffd700',goldenrod:'#daa520',gray:'#808080',green:'#008000',
+  greenyellow:'#adff2f',grey:'#808080',honeydew:'#f0fff0',hotpink:'#ff69b4',indianred:'#cd5c5c',
+  indigo:'#4b0082',ivory:'#fffff0',khaki:'#f0e68c',lavender:'#e6e6fa',lavenderblush:'#fff0f5',
+  lawngreen:'#7cfc00',lemonchiffon:'#fffacd',lightblue:'#add8e6',lightcoral:'#f08080',lightcyan:'#e0ffff',
+  lightgoldenrodyellow:'#fafad2',lightgray:'#d3d3d3',lightgreen:'#90ee90',lightgrey:'#d3d3d3',lightpink:'#ffb6c1',
+  lightsalmon:'#ffa07a',lightseagreen:'#20b2aa',lightskyblue:'#87cefa',lightslategray:'#778899',lightslategrey:'#778899',
+  lightsteelblue:'#b0c4de',lightyellow:'#ffffe0',lime:'#00ff00',limegreen:'#32cd32',linen:'#faf0e6',
+  magenta:'#ff00ff',maroon:'#800000',mediumaquamarine:'#66cdaa',mediumblue:'#0000cd',mediumorchid:'#ba55d3',
+  mediumpurple:'#9370db',mediumseagreen:'#3cb371',mediumslateblue:'#7b68ee',mediumspringgreen:'#00fa9a',mediumturquoise:'#48d1cc',
+  mediumvioletred:'#c71585',midnightblue:'#191970',mintcream:'#f5fffa',mistyrose:'#ffe4e1',moccasin:'#ffe4b5',
+  navajowhite:'#ffdead',navy:'#000080',oldlace:'#fdf5e6',olive:'#808000',olivedrab:'#6b8e23',
+  orange:'#ffa500',orangered:'#ff4500',orchid:'#da70d6',palegoldenrod:'#eee8aa',palegreen:'#98fb98',
+  paleturquoise:'#afeeee',palevioletred:'#db7093',papayawhip:'#ffefd5',peachpuff:'#ffdab9',peru:'#cd853f',
+  pink:'#ffc0cb',plum:'#dda0dd',powderblue:'#b0e0e6',purple:'#800080',rebeccapurple:'#663399',
+  red:'#ff0000',rosybrown:'#bc8f8f',royalblue:'#4169e1',saddlebrown:'#8b4513',salmon:'#fa8072',
+  sandybrown:'#f4a460',seagreen:'#2e8b57',seashell:'#fff5ee',sienna:'#a0522d',silver:'#c0c0c0',
+  skyblue:'#87ceeb',slateblue:'#6a5acd',slategray:'#708090',slategrey:'#708090',snow:'#fffafa',
+  springgreen:'#00ff7f',steelblue:'#4682b4',tan:'#d2b48c',teal:'#008080',thistle:'#d8bfd8',
+  tomato:'#ff6347',turquoise:'#40e0d0',violet:'#ee82ee',wheat:'#f5deb3',white:'#ffffff',
+  whitesmoke:'#f5f5f5',yellow:'#ffff00',yellowgreen:'#9acd32',
+};
+const _COLOR_PROPS = new Set([
+  'color','background-color','border-top-color','border-right-color','border-bottom-color',
+  'border-left-color','outline-color','text-decoration-color','column-rule-color','caret-color',
+]);
+const _serColor = (r, g, b, a) => {
+  const c = (x) => Math.max(0, Math.min(255, Math.round(x)));
+  r = c(r); g = c(g); b = c(b);
+  if (a >= 1) return `rgb(${r}, ${g}, ${b})`;
+  return `rgba(${r}, ${g}, ${b}, ${Math.round(a * 1000) / 1000})`;
+};
+const _computeColor = (value) => {
+  if (!value) return value;
+  let s = value.trim();
+  const low = s.toLowerCase();
+  if (low === 'transparent') return 'rgba(0, 0, 0, 0)';
+  if (low === 'currentcolor' || low === 'inherit' || low === 'initial' || low === 'unset') return value;
+  if (_CSS_NAMED_COLORS[low]) s = _CSS_NAMED_COLORS[low];
+  let m = /^#([0-9a-f]{3,8})$/i.exec(s);
+  if (m) {
+    const h = m[1];
+    let r, g, b, a = 1;
+    if (h.length === 3) { r = parseInt(h[0] + h[0], 16); g = parseInt(h[1] + h[1], 16); b = parseInt(h[2] + h[2], 16); }
+    else if (h.length === 4) { r = parseInt(h[0] + h[0], 16); g = parseInt(h[1] + h[1], 16); b = parseInt(h[2] + h[2], 16); a = parseInt(h[3] + h[3], 16) / 255; }
+    else if (h.length === 6) { r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16); }
+    else if (h.length === 8) { r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16); a = parseInt(h.slice(6, 8), 16) / 255; }
+    else return value;
+    return _serColor(r, g, b, a);
+  }
+  m = /^rgba?\(([^)]*)\)$/i.exec(s);
+  if (m) {
+    const parts = m[1].split(/[,\/\s]+/).filter((x) => x.length);
+    if (parts.length >= 3) {
+      const num = (p) => p.endsWith('%') ? parseFloat(p) * 255 / 100 : parseFloat(p);
+      const r = num(parts[0]), g = num(parts[1]), b = num(parts[2]);
+      let a = 1;
+      if (parts.length >= 4) a = parts[3].endsWith('%') ? parseFloat(parts[3]) / 100 : parseFloat(parts[3]);
+      return _serColor(r, g, b, a);
+    }
+  }
+  return value;
+};
+const _GCS_INLINE_SPEC = Number.MAX_SAFE_INTEGER;
+const _buildCascade = (el) => {
+  // Returns the list of matched declaration sources for `el`, each
+  // { spec, order, decls }, including inline style as the highest source.
+  const sources = [];
+  const nid = el && el._nid;
+  if (typeof nid === 'number' && nid >= 0) {
+    const doc = (el.ownerDocument) || globalThis.document;
+    let styleEls = [];
+    try { styleEls = doc.querySelectorAll('style'); } catch { styleEls = []; }
+    // Flatten all rules in document order, then prime the JS-computed live-state
+    // side-maps (:target, :valid/:invalid/:in-range/:out-of-range) once over the
+    // combined selector text so the Rust matcher sees them — same machinery the
+    // querySelector path uses. Gated cheaply inside _primeTarget/_primeValidity.
+    const flat = [];
+    for (const styleEl of styleEls) {
+      for (const rule of _styleSheetRules(styleEl)) flat.push(rule);
+    }
+    const combined = flat.map((r) => r.selectorText).join(' ');
+    try { _primeTarget(combined, el); _primeValidity(combined, el); } catch (e) {}
+    let order = 0;
+    for (const rule of flat) {
+      const spec = parseInt(_dom('selector_match_specificity', String(nid), rule.selectorText), 10);
+      if (spec >= 0) sources.push({ spec, order: order++, decls: rule.decls });
+    }
+    // Inline style — highest author source at each importance level.
+    let inlineText = '';
+    try { inlineText = el.getAttribute && el.getAttribute('style'); } catch { inlineText = ''; }
+    if (inlineText) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC, decls: _cssParseDecls(inlineText) });
+  }
+  return sources;
+};
+const _cascadeResolve = (sources, name) => {
+  // Cascade winner for property `name` (a CSS property / custom-property name):
+  // !important beats normal; within the same importance, higher specificity
+  // wins, ties broken by later source order.
+  let best = null;
+  for (const s of sources) {
+    const d = s.decls[name];
+    if (d === undefined) continue;
+    if (best === null
+        || (d.important && !best.d.important)
+        || (d.important === best.d.important
+            && (s.spec > best.s.spec || (s.spec === best.s.spec && s.order >= best.s.order)))) {
+      best = { s, d };
+    }
+  }
+  return best ? best.d.value : '';
+};
+globalThis.getComputedStyle = (el, _pseudo) => {
   if (!el) el = document.body || {};
   const style = el?.style || el?._style || new CSSStyleDeclaration();
+  const sources = _buildCascade(el);
+  const resolve = (name) => {
+    // name as authored: custom property, kebab, or camelCase.
+    const kebab = name.startsWith('--') ? name : name.replace(/([A-Z])/g, '-$1').toLowerCase();
+    const norm = (v) => (_COLOR_PROPS.has(kebab) ? _computeColor(v) : v);
+    const cascaded = _cascadeResolve(sources, kebab);
+    if (cascaded !== '') return norm(cascaded);
+    // Inline declaration object fallback (props stored as authored).
+    const inline = (style.getPropertyValue && (style.getPropertyValue(kebab) || style.getPropertyValue(name))) || '';
+    if (inline) return norm(inline);
+    return _GCS_DEFAULTS[kebab] || _GCS_DEFAULTS[name] || '';
+  };
   return new Proxy(style, {
     get(target, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
-      if (prop in target) return target[prop];
-      if (typeof prop === 'string') {
-        const v = target.getPropertyValue ? target.getPropertyValue(prop) : '';
-        if (v) return v;
-        const defaults = {
-          display: 'block', visibility: 'visible', opacity: '1',
-          position: 'static', overflow: 'visible',
-          transform: 'none', transition: 'none', animation: 'none',
-          float: 'none', clear: 'none',
-          width: 'auto', height: 'auto',
-          top: 'auto', left: 'auto', right: 'auto', bottom: 'auto',
-          margin: '0px', padding: '0px',
-          'margin-top': '0px', 'margin-right': '0px', 'margin-bottom': '0px', 'margin-left': '0px',
-          'padding-top': '0px', 'padding-right': '0px', 'padding-bottom': '0px', 'padding-left': '0px',
-          'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
-          color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
-          'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
-          'z-index': 'auto', 'pointer-events': 'auto',
-          'box-sizing': 'content-box', cursor: 'auto',
-        };
-        const kebabProp = prop.replace(/([A-Z])/g, '-$1').toLowerCase();
-        if (defaults[prop]) return defaults[prop];
-        if (defaults[kebabProp]) return defaults[kebabProp];
-        return '';
-      }
-      if (prop === 'getPropertyValue') {
-        return (name) => {
-          const v = target.getPropertyValue ? target.getPropertyValue(name) : '';
-          if (v) return v;
-          const defaults = {transform:'none',opacity:'1',display:'block',visibility:'visible'};
-          return defaults[name] || defaults[name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase())] || '';
-        };
-      }
+      if (prop === 'getPropertyValue') return (name) => resolve(String(name));
       if (prop === 'length') return 0;
+      if (prop in target) return target[prop];
+      if (typeof prop === 'string') return resolve(prop);
       return undefined;
     }
   });

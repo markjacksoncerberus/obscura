@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~47~~ | ✅ [The Cascade Crown](47-the-cascade-crown.md) | `css/selectors/*specificity*` + `…/pseudo-classes/*-type-change` (the `getComputedStyle`/CSS-cascade wall) | **+24** | ⚔️⚔️ | **SECURED — +24.** `getComputedStyle` had **no author-stylesheet cascade** — only inline style + a defaults table — so every "inject `<style>` rules, read the winner back" test died (the recurring wall named by #42–#46). Built a real cascade on top of the existing Servo selector engine: new Rust op `selector_match_specificity` (matches? + highest matching-complex-selector specificity, `:is`/`:where`/`:has`-correct), JS gathers `<style>` rules, primes the live-state side-maps (`:target`/validity), and resolves each property by **importance → specificity → source order**; inline style is the top source. Added computed-value `<color>` serialization (named/hex/rgb → `rgb(r, g, b)`). has-specificity 0→8, is-specificity 0→1, is-nested 0→2, is-where-pseudo-classes 0→1, not-specificity 0→8, readwrite-readonly-type-change 0→1, checked-type-change 0→1, inrange-outofrange-type-change 0→2. Zero regressions. Caps: inheritance/layout/computed-values still absent; `:indeterminate`/`:placeholder-shown`/`:optional`-for-hidden are separate matching gaps; CSSOM/shadow/`:dir`/`:visited`/reftests out of realm |
 | ~~46~~ | ✅ [The Disabled Lineage](46-the-disabled-lineage.md) | `html/semantics/selectors/pseudo-classes/disabled` (+ `enabled` held) | **7/7** | ⚔️ | **SECURED — +7.** `:disabled`/`:enabled` only checked the element's *own* `disabled` attribute (the separate matcher gap named by #45). Now "actually disabled" per HTML, matched **live off the Rust tree**: own attr, an `<option>` whose `<optgroup>` parent is disabled, and any disable-able element (input/button/select/textarea/optgroup/option/fieldset) inside a disabled `<fieldset>` — except within that fieldset's first `<legend>` — covering nested fieldsets via a single `prev_id == first_legend_child` ancestor-walk compare. `:enabled` is the exact complement over the disable-able set. Pure-Rust, no per-query priming. Zero regressions. The live-state form/structural pseudo family is now complete. Caps: `getComputedStyle`/CSS cascade (recurring wall) |
 | ~~45~~ | ✅ [The Mutable Charter](45-the-mutable-charter.md) | `html/semantics/selectors/pseudo-classes/readwrite-readonly` (`:read-write`/`:read-only`) | **25/25** | ⚔️ | **SECURED — +20.** The last live-state form pseudo-classes (the #44 cap) were dark — parsed but `PseudoClass::Other` → always false (deceptive 5/25: only the empty-match subtests passed). Now matched **live off the tree** in the Rust matcher: an `input` to which `readonly` applies (no `readonly`, not disabled) / `textarea` / any element editable via a `contenteditable` editing-host ancestor walk → `:read-write`; every other element → `:read-only`. `document.designMode` (previously undefined entirely) gets a real get/set that pushes a document-global flag the engine reads during matching — so the design-mode subtests (predicted a cap) are green too. Pure-Rust matching, no per-query priming. Zero regressions. Caps: `readwrite-readonly-type-change` (getComputedStyle/CSS cascade), `:disabled` disabled-propagation (separate matcher gap) |
 | ~~44~~ | ✅ [The Living Verdict](44-the-living-verdict.md) | `html/semantics/selectors/pseudo-classes/{required-optional,valid-invalid,inrange-outofrange,…}` (+ `Element-closest`, dynamic constraint tails) | **required-optional 6/6, valid-invalid 30/30, inrange 6/6, time-reversed 4/4, fieldset-disconnected 2/2, closest 29/29** | ⚔️⚔️ | **SECURED — +34.** The constraint-validation **live-state selector pseudo-classes** were all dark — the Servo `selectors` crate parses them but `PseudoClass::Other` always returned `false`. `:required`/`:optional` now evaluate straight off the tree in the Rust matcher (input of a requirable type / select / textarea, split by the attribute). `:valid`/`:invalid`/`:in-range`/`:out-of-range` read a per-node validity bitmask (`validity_state` side-map, like `:checked`) that JS computes via the #43 `_cvCompute` engine and **primes** onto the nodes before the query (a `_primeValidity` sibling of `_primeTarget`, gated on a `valid`/`range` substring so the hot qsa path pays nothing; `<form>`/`<fieldset>` aggregate over owned/descendant candidates). Closed the named #43 caps (2 dynamic `matches(":invalid")` tests + `Element-closest` 29/29). Bonus: `select.value` now reflects selectedness; `type=range` clamps so it's never out-of-range. Zero regressions (stash-proved the `:disabled`/`:default` sibling fails pre-existing). Caps: `:read-write`/`:read-only` (editing hosts/designMode/custom elements — deferred), `getComputedStyle` `-type-change`/`-hidden` variants (CSS cascade), `test_driver.send_keys` |
@@ -87,6 +88,37 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-19 (Quest #47 The Cascade Crown — author-stylesheet cascade for
+`getComputedStyle`, +24):** For six quests the selector *matcher* grew strong, but every
+test asking "and which rule WINS?" died at `getComputedStyle` — which had no
+author-stylesheet cascade at all (just inline style + a defaults table). This is the
+exact `getComputedStyle`/CSS-cascade wall named as the top "next leverage" by #42–#46.
+Built a real cascade on top of the existing Servo selector engine (which already computes
+correct specificity for `:is()`/`:where()`/`:has()`): new Rust `DomTree::selector_match_specificity`
+(parse the rule's selector list → highest specificity among the *complex selectors that
+match* the element, else None; per-selector not per-list, so `.a, #b` contributes `#b`'s
+specificity) + op `selector_match_specificity`. JS rewrote `getComputedStyle`: a minimal
+CSS tokenizer (`_cssSplitRules`/`_cssParseDecls`, skips @-rules, caches per `<style>`),
+`_buildCascade(el)` flattens all rules in document order + primes the JS live-state
+side-maps once (`_primeTarget`/`_primeValidity` — so `:target`/`:valid`/`:in-range` author
+rules resolve), `_cascadeResolve` picks the winner by importance → specificity → source
+order (inline style is the top source via `spec = MAX_SAFE_INTEGER`). Added computed-value
+`<color>` serialization (`_computeColor`: full named-colour table / `#hex` 3-8 / rgb()/rgba()
+→ `rgb(r, g, b)` or `rgba(…, a)`), applied to colour properties only. **Wins:** has-specificity
+0→8, is-specificity 0→1, is-nested 0→2, is-where-pseudo-classes 0→1, not-specificity 0→8,
+readwrite-readonly-type-change 0→1 (the named #44/#45 cap), checked-type-change 0→1,
+inrange-outofrange-type-change 0→2. **+24, zero regressions** (qsa 1975, classlist 1420,
+matches 669, closest 29, createElement 147, createElementNS 596, cloneNode 135,
+valid-invalid 30, required-optional 6, readwrite-readonly 25, disabled 7, enabled 1, mark 22,
+structured-clone 141/152, getRandomValues 39; obscura-dom unit 40/40). NOT a layout engine —
+no inheritance/initial-values/shorthand/`auto`/percentage/layout. CAPS: `indeterminate-type-change`/
+`placeholder-shown-type-change` need the `:indeterminate`/`:placeholder-shown` pseudos (matching
+gaps); `required-optional-hidden` wants `:optional` to match `type=hidden` (a form-matcher tweak,
+deferred to avoid risking the family for +1); `is-where-error-recovery`/`*-shadow`/`dir-style-*`/
+`is-where-visited` need CSSOM/shadow/`:dir`/`:visited`; `*-ref.html` are render reftests. NEXT:
+inheritance + a few computed-value normalizations (opens `css/css-cascade/` basics), the small
+matching pseudos above, or a fresh realm. Scroll `tickets/47-the-cascade-crown.md`.
 
 **Session 2026-06-19 (Quest #46 The Disabled Lineage — `:disabled`/`:enabled`
 propagation, +7):** The `:disabled`/`:enabled` matcher arm consulted only the element's

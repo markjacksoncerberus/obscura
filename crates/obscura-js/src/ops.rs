@@ -156,6 +156,16 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 Err(_) => "ERR".into(),
             }
         }
+        // CSS cascade: highest specificity among the rule selector's complex
+        // selectors that match this element, or "-1" if none match / non-element /
+        // parse error. arg1 = node nid, arg2 = the rule's selector text.
+        "selector_match_specificity" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            match dom.selector_match_specificity(NodeId::new(nid), &arg2) {
+                Some(spec) => spec.to_string(),
+                None => "-1".into(),
+            }
+        }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.get_node(NodeId::new(nid)).map(|n| match &n.data {
