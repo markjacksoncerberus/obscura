@@ -139,9 +139,18 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         // Element.matches / closest / webkitMatchesSelector. "ERR" => invalid
         // selector (JS throws SyntaxError); "true"/"false" => the match result.
+        // arg1 is "<node>" (matches: scope == node) or "<node>,<scope>" (closest:
+        // node is the ancestor under test, scope is the fixed context element so
+        // `:scope` resolves to it across the whole ancestor walk).
         "element_matches" => {
-            let nid = arg1.parse::<u32>().unwrap_or(0);
-            match dom.element_matches(NodeId::new(nid), &arg2) {
+            let (node_nid, scope_nid) = match arg1.split_once(',') {
+                Some((n, s)) => (n.parse::<u32>().unwrap_or(0), s.parse::<u32>().ok()),
+                None => {
+                    let n = arg1.parse::<u32>().unwrap_or(0);
+                    (n, Some(n))
+                }
+            };
+            match dom.element_matches(NodeId::new(node_nid), &arg2, scope_nid.map(NodeId::new)) {
                 Ok(true) => "true".into(),
                 Ok(false) => "false".into(),
                 Err(_) => "ERR".into(),

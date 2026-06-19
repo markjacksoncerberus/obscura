@@ -227,6 +227,20 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
     type Impl = ObscuraSelector;
     type Error = SelectorParseErrorKind<'i>;
 
+    // Enable the Selectors-4 logical-combination pseudo-classes. The selectors
+    // crate already implements their matching (`Component::Is`/`Where`/`Has`);
+    // these hooks only gate PARSING (default off). `:is()`/`:where()` use
+    // forgiving selector-list parsing; `:has()` uses a forgiving relative
+    // selector list, matched against the candidate's real descendants/siblings
+    // (our `DomElement` implements the needed traversal).
+    fn parse_is_and_where(&self) -> bool {
+        true
+    }
+
+    fn parse_has(&self) -> bool {
+        true
+    }
+
     fn parse_non_ts_pseudo_class(
         &self,
         _location: cssparser::SourceLocation,
@@ -732,6 +746,20 @@ pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, S
 }
 
 impl DomTree {
+    /// The opaque identity to use as the `:scope` scoping root for a query rooted
+    /// at `node`, or `None` when `node` is not an element. With `None` the
+    /// selectors crate falls back to `:scope` == `:root` (the document element),
+    /// which is the correct behaviour for a document-rooted query
+    /// (`document.querySelector(":scope")`); for an element-rooted query
+    /// (`el.querySelector(":scope > p")`) the scoping root is `el` itself.
+    fn scope_opaque_for(&self, node: NodeId) -> Option<OpaqueElement> {
+        if self.with_node(node, |n| n.is_element()).unwrap_or(false) {
+            Some(DomElement::new(self, node).opaque())
+        } else {
+            None
+        }
+    }
+
     pub fn query_selector(&self, selector: &str) -> Result<Option<NodeId>, String> {
         self.query_selector_from(self.document(), selector)
     }
@@ -746,6 +774,7 @@ impl DomTree {
         selector: &str,
     ) -> Result<Option<NodeId>, String> {
         let selector_list = parse_selector(selector)?;
+        let scope = self.scope_opaque_for(root);
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
             MatchingMode::Normal,
@@ -755,6 +784,7 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        context.scope_element = scope;
 
         for desc_id in self.descendants(root) {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
@@ -772,16 +802,26 @@ impl DomTree {
         Ok(None)
     }
 
-    /// Match a single element against a selector list (DOM `Element.matches`).
-    /// Parses the selector (Err on invalid syntax → JS throws SyntaxError); a
-    /// non-element node never matches. Combinators walk the element's real
-    /// ancestors/siblings in the arena, so this is correct for detached subtrees.
-    pub fn element_matches(&self, node: NodeId, selector: &str) -> Result<bool, String> {
+    /// Match a single element against a selector list (DOM `Element.matches` /
+    /// `Element.closest`). Parses the selector (Err on invalid syntax → JS throws
+    /// SyntaxError); a non-element node never matches. Combinators walk the
+    /// element's real ancestors/siblings in the arena, so this is correct for
+    /// detached subtrees. `scope` is the `:scope` scoping root — for `matches()`
+    /// it is the element itself; for `closest()` it is the original context
+    /// element, held fixed across the ancestor walk (so `:has(> :scope)` resolves
+    /// `:scope` to the context node, not the ancestor under test).
+    pub fn element_matches(
+        &self,
+        node: NodeId,
+        selector: &str,
+        scope: Option<NodeId>,
+    ) -> Result<bool, String> {
         let selector_list = parse_selector(selector)?;
         let is_element = self.with_node(node, |n| n.is_element()).unwrap_or(false);
         if !is_element {
             return Ok(false);
         }
+        let scope = scope.and_then(|s| self.scope_opaque_for(s));
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
             MatchingMode::Normal,
@@ -791,6 +831,7 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        context.scope_element = scope;
         let element = DomElement::new(self, node);
         Ok(selectors::matching::matches_selector_list(
             &selector_list,
@@ -805,6 +846,7 @@ impl DomTree {
         selector: &str,
     ) -> Result<Vec<NodeId>, String> {
         let selector_list = parse_selector(selector)?;
+        let scope = self.scope_opaque_for(root);
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
             MatchingMode::Normal,
@@ -814,6 +856,7 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        context.scope_element = scope;
         let mut results = Vec::new();
 
         for desc_id in self.descendants(root) {

@@ -1636,8 +1636,11 @@ class Element extends Node {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'closest' on 'Element': 1 argument required, but only 0 present.");
     const sel = String(s);
     let el = this;
+    // The `:scope` scoping root stays fixed at the context element (`this`) for
+    // every ancestor we test — pass it as "<ancestor>,<this>" so `:has(> :scope)`
+    // resolves `:scope` to `this`, not the ancestor under test.
     while (el && el.nodeType === 1) {
-      const raw = _dom("element_matches", el._nid, sel);
+      const raw = _dom("element_matches", el._nid + "," + this._nid, sel);
       if (raw === 'ERR') _qsThrow(sel);
       if (raw === 'true') return el;
       el = el.parentNode;

@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~42~~ | ✅ [The Logical Lens](42-the-logical-lens.md) | `css/selectors/{is-where,has}-*`, `ParentNode-querySelector-scope`, `Element-closest` | **is-where 33/33, has 78/78, scope 4/4, closest 28/29** | ⚔️ | **SECURED — +116.** `:is()`/`:where()`/`:has()` and the `:scope` scoping root were all dark — the Servo `selectors` crate implements their matching already, but `parse_is_and_where()`/`parse_has()` default `false` (so the selectors threw `SyntaxError` and blanked every test) and `MatchingContext.scope_element` was always `None` (so `:scope` == `:root` even for element-rooted queries). Enabled the two parse hooks + thread a per-query scope element (element-rooted → the element; document-rooted → `None`/`:root` unchanged; `closest` holds the context element fixed across the ancestor walk via a `"<node>,<scope>"` op arg so `:has(> :scope)` resolves right). Pure selector-engine plumbing, no DOM model change. Caps: `:invalid` (form constraint-validation), `getComputedStyle` specificity/cascade tests (CSS-cascade frontier), render reftests |
 | ~~01~~ | ✅ [The Selector Sorcery](01-the-selector-sorcery.md) | `dom/nodes/ParentNode-querySelector-All` | **1975/1975** | ⚔️⚔️ | **SECURED 100%** |
 | ~~02~~ | ✅ [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | **67/67** | ⚔️⚔️⚔️ | **SECURED** |
 | ~~03~~ | ✅ [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | **1420/1420** | ⚔️⚔️ | **SECURED 100%** |
@@ -82,6 +83,34 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-19 (Quest #42 The Logical Lens — `:is()`/`:where()`/`:has()` +
+the `:scope` scoping root, +116):** The Selectors-4 logical/relative pseudo-classes
+were entirely dark — not because matching was missing (the Servo `selectors` crate
+implements `Component::Is`/`Where`/`Has` and `:scope` already) but because PARSING
+them was gated off: `parse_is_and_where()` and `parse_has()` default to `false`, so
+`:is(...)`/`:where(...)`/`:has(...)` were rejected as unknown and threw `SyntaxError`,
+blanking every test (is-where-basic 0/15, has-basic 0/18, has-relative-argument 0/35,
+has-matches-to-uninserted 0/12, has-argument-with-explicit-scope 0/13, is-where-not
+0/18). Separately `:scope` always fell back to `:root` because every `MatchingContext`
+had `scope_element: None` (correct for `document.querySelector(":scope")`, wrong for
+`div.querySelector(":scope > p")`). Fix (all in `selector.rs` + a 1-line op tweak +
+1-line `bootstrap.js` tweak, NO new architecture): override the two parse hooks; add
+`scope_opaque_for(node)` (element → its opaque, non-element → `None`) and thread it
+into all four matching entry points via the public `context.scope_element` field —
+element-rooted queries scope to the element, document-rooted stay `:root`, and
+`closest` holds the context element fixed across the ancestor walk (passed as
+`"<node>,<scope>"` through the 2-arg op) so `:has(> :scope)` resolves to the context
+node. Wins: is-where-basic 15/15, is-where-not 18/18, has-basic 18/18,
+has-relative-argument 35/35, has-matches-to-uninserted 12/12,
+has-argument-with-explicit-scope 13/13, querySelector-scope 2→4/4, Element-closest
+25→28/29. Zero regressions (qsa 1975, matches/webkitMatches 669/669 each, classlist
+1420, createElement 147, createElementNS 596, cloneNode 135, TreeWalker 761, mark 22,
+structured-clone 141/152, getRandomValues 39, url-setters-stripping 260; selector unit
+tests 19/19). Caps: `:invalid` (form constraint-validation, the closest 28/29 tail);
+`getComputedStyle` specificity/cascade tests (has-specificity 0/8, is-nested 0/2 — the
+CSS-cascade frontier, not selector matching); render reftests. Scroll
+`tickets/42-the-logical-lens.md`.
 
 **Session 2026-06-19 (Quest #41 The Reflection's Mirror — the `Element.matches()`
 family, +700):**
