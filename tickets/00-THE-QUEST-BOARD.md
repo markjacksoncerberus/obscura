@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~46~~ | ✅ [The Disabled Lineage](46-the-disabled-lineage.md) | `html/semantics/selectors/pseudo-classes/disabled` (+ `enabled` held) | **7/7** | ⚔️ | **SECURED — +7.** `:disabled`/`:enabled` only checked the element's *own* `disabled` attribute (the separate matcher gap named by #45). Now "actually disabled" per HTML, matched **live off the Rust tree**: own attr, an `<option>` whose `<optgroup>` parent is disabled, and any disable-able element (input/button/select/textarea/optgroup/option/fieldset) inside a disabled `<fieldset>` — except within that fieldset's first `<legend>` — covering nested fieldsets via a single `prev_id == first_legend_child` ancestor-walk compare. `:enabled` is the exact complement over the disable-able set. Pure-Rust, no per-query priming. Zero regressions. The live-state form/structural pseudo family is now complete. Caps: `getComputedStyle`/CSS cascade (recurring wall) |
 | ~~45~~ | ✅ [The Mutable Charter](45-the-mutable-charter.md) | `html/semantics/selectors/pseudo-classes/readwrite-readonly` (`:read-write`/`:read-only`) | **25/25** | ⚔️ | **SECURED — +20.** The last live-state form pseudo-classes (the #44 cap) were dark — parsed but `PseudoClass::Other` → always false (deceptive 5/25: only the empty-match subtests passed). Now matched **live off the tree** in the Rust matcher: an `input` to which `readonly` applies (no `readonly`, not disabled) / `textarea` / any element editable via a `contenteditable` editing-host ancestor walk → `:read-write`; every other element → `:read-only`. `document.designMode` (previously undefined entirely) gets a real get/set that pushes a document-global flag the engine reads during matching — so the design-mode subtests (predicted a cap) are green too. Pure-Rust matching, no per-query priming. Zero regressions. Caps: `readwrite-readonly-type-change` (getComputedStyle/CSS cascade), `:disabled` disabled-propagation (separate matcher gap) |
 | ~~44~~ | ✅ [The Living Verdict](44-the-living-verdict.md) | `html/semantics/selectors/pseudo-classes/{required-optional,valid-invalid,inrange-outofrange,…}` (+ `Element-closest`, dynamic constraint tails) | **required-optional 6/6, valid-invalid 30/30, inrange 6/6, time-reversed 4/4, fieldset-disconnected 2/2, closest 29/29** | ⚔️⚔️ | **SECURED — +34.** The constraint-validation **live-state selector pseudo-classes** were all dark — the Servo `selectors` crate parses them but `PseudoClass::Other` always returned `false`. `:required`/`:optional` now evaluate straight off the tree in the Rust matcher (input of a requirable type / select / textarea, split by the attribute). `:valid`/`:invalid`/`:in-range`/`:out-of-range` read a per-node validity bitmask (`validity_state` side-map, like `:checked`) that JS computes via the #43 `_cvCompute` engine and **primes** onto the nodes before the query (a `_primeValidity` sibling of `_primeTarget`, gated on a `valid`/`range` substring so the hot qsa path pays nothing; `<form>`/`<fieldset>` aggregate over owned/descendant candidates). Closed the named #43 caps (2 dynamic `matches(":invalid")` tests + `Element-closest` 29/29). Bonus: `select.value` now reflects selectedness; `type=range` clamps so it's never out-of-range. Zero regressions (stash-proved the `:disabled`/`:default` sibling fails pre-existing). Caps: `:read-write`/`:read-only` (editing hosts/designMode/custom elements — deferred), `getComputedStyle` `-type-change`/`-hidden` variants (CSS cascade), `test_driver.send_keys` |
 | ~~43~~ | ✅ [The Charter of Constraints](43-the-charter-of-constraints.md) | `html/semantics/forms/constraints/*` (constraint validation API) | **willValidate 67/67, checkValidity 122/122, valueMissing 71/71, valid 33/33, patternMismatch 85/85, range 49+47, +14 more** | ⚔️⚔️⚔️ | **SECURED — +877.** The entire constraint validation API was absent. New `ValidityState` + `willValidate`/`validity`/`validationMessage`/`checkValidity`/`reportValidity`/`setCustomValidity` on the 7 listed interfaces + `HTMLFormElement`, with the full `_cvCompute` validity algorithm: mutable-gated `valueMissing` (group-aware radio), `email`/`url` `typeMismatch`, raw-then-anchored `pattern` (`v` flag), typed range/step (reversed ranges, Blink float-tolerant step, step base min→@value→default), barred-from-CV `willValidate` (disabled-fieldset propagation, datalist, readonly), always-false tooLong/tooShort/badInput, `customError`. Plus reflected attrs (required/readonly/pattern/min/max/step/multiple/maxlength/minlength/textarea.defaultValue) and checkbox/radio activation on `click()`. Pure JS, zero regressions. Caps: `:valid`/`:invalid` selector matching (2 dynamic tests + closest 29/29 — needs the Rust matcher to reach JS validity); `test_driver.send_keys` (3 textarea subtests); 1 sub-ULP `stepMismatch` (needs decimal arithmetic) |
@@ -86,6 +87,30 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-19 (Quest #46 The Disabled Lineage — `:disabled`/`:enabled`
+propagation, +7):** The `:disabled`/`:enabled` matcher arm consulted only the element's
+*own* `disabled` attribute (the separate matcher gap named by #45's caps). `disabled.html`
+was a deceptive 0/7 — even the base subtest needs inputs inside a disabled `<fieldset>`
+(but outside its `<legend>`) to match. Implemented as **pure-Rust live matching** (no
+priming, like #45): new inherent `DomElement::{is_disableable, is_actually_disabled,
+is_disabled_by_fieldset, first_legend_child_id}` in `selector.rs`. An element is "actually
+disabled" iff it is disable-able (input/button/select/textarea/optgroup/option/fieldset)
+AND (own `disabled` attr / an `<option>` whose `<optgroup>` parent is disabled / a disabled
+`<fieldset>` ancestor). The fieldset walk tracks `prev_id` (the gateway child of each
+ancestor) so the first-`<legend>` exclusion is a single `first_legend_child_id() ==
+Some(prev_id)` compare; nested fieldsets fall out naturally. `:disabled` =
+`is_actually_disabled()`, `:enabled` = `is_disableable() && !is_actually_disabled()`.
+disabled 0→7/7, enabled held 1/1. Zero regressions (qsa 1975, classlist 1420, matches 669,
+closest 29, readwrite-readonly 25, valid-invalid 30, required-optional 6, has-basic 18,
+is-where-basic 15, tagName 6, cloneNode 135, createElement 147, createElementNS 596,
+willValidate 67, checkValidity 122, mark 22, structured-clone 141/152, getRandomValues 39,
+url-setters-stripping 260; obscura-dom unit tests 40/40). NOTE: the test expects
+`optgroup`/`option`/nested-`fieldset` inside a disabled fieldset to match `:disabled` too
+(real-browser behaviour, slightly beyond strict spec text) — we follow the test. NEXT: the
+live-state form/structural pseudo family is now COMPLETE; the recurring wall is CSS cascade
+/ `getComputedStyle`, else a fresh realm (`fetch/`, `html/dom/` reflection). Scroll
+`tickets/46-the-disabled-lineage.md`.
 
 **Session 2026-06-19 (Quest #45 The Mutable Charter — `:read-write`/`:read-only`
 live-state pseudo-classes, +20):** The last live-state form selector pseudo-classes

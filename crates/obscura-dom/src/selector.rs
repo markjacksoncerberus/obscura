@@ -485,6 +485,118 @@ impl<'a> DomElement<'a> {
         }
         false
     }
+
+    /// Whether the element is "actually disabled" per HTML — backs `:disabled`
+    /// (matches iff true) and `:enabled` (a disable-able element that is NOT
+    /// actually disabled). The disable-able elements are
+    /// button/input/select/textarea/optgroup/option/fieldset; every other element
+    /// matches neither pseudo-class. An element is disabled by its own `disabled`
+    /// attribute, an `<option>` also by its parent `<optgroup>`'s, and any of these
+    /// inside a disabled `<fieldset>` — except within that fieldset's first
+    /// `<legend>` — is disabled too (covering nested fieldsets). All read live off
+    /// the tree, so toggling `disabled` / reparenting + requerying just works.
+    fn is_disableable(&self) -> bool {
+        self.tree
+            .with_node(self.node_id, |n| {
+                matches!(
+                    n.as_element().map(|qn| qn.local.as_ref()),
+                    Some(
+                        "input"
+                            | "button"
+                            | "select"
+                            | "textarea"
+                            | "optgroup"
+                            | "option"
+                            | "fieldset"
+                    )
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn is_actually_disabled(&self) -> bool {
+        if !self.is_disableable() {
+            return false;
+        }
+        // 1) Own `disabled` attribute.
+        let (has_disabled, is_option) = self
+            .tree
+            .with_node(self.node_id, |n| {
+                (
+                    n.get_attribute("disabled").is_some(),
+                    n.as_element().map(|qn| qn.local.as_ref() == "option").unwrap_or(false),
+                )
+            })
+            .unwrap_or((false, false));
+        if has_disabled {
+            return true;
+        }
+        // 2) An `<option>` whose parent `<optgroup>` carries a `disabled` attribute.
+        if is_option {
+            if let Some(parent) = self.parent_element() {
+                let parent_disabled_optgroup = parent
+                    .tree
+                    .with_node(parent.node_id, |n| {
+                        n.as_element()
+                            .map(|qn| qn.local.as_ref() == "optgroup")
+                            .unwrap_or(false)
+                            && n.get_attribute("disabled").is_some()
+                    })
+                    .unwrap_or(false);
+                if parent_disabled_optgroup {
+                    return true;
+                }
+            }
+        }
+        // 3) A descendant of a disabled `<fieldset>`, but not within that fieldset's
+        //    first `<legend>` element child.
+        self.is_disabled_by_fieldset()
+    }
+
+    fn is_disabled_by_fieldset(&self) -> bool {
+        // Walk ancestors. The direct child of an ancestor on `self`'s upward path is
+        // `prev_id`; if an ancestor is a disabled `<fieldset>` and `self` did NOT
+        // enter it through its first `<legend>` child, `self` is disabled.
+        let mut prev_id = self.node_id;
+        let mut parent = self.parent_element();
+        while let Some(p) = parent {
+            let is_disabled_fieldset = p
+                .tree
+                .with_node(p.node_id, |n| {
+                    n.as_element().map(|qn| qn.local.as_ref() == "fieldset").unwrap_or(false)
+                        && n.get_attribute("disabled").is_some()
+                })
+                .unwrap_or(false);
+            if is_disabled_fieldset && p.first_legend_child_id() != Some(prev_id) {
+                return true;
+            }
+            prev_id = p.node_id;
+            parent = p.parent_element();
+        }
+        false
+    }
+
+    /// The node id of this element's first child element that is a `<legend>`, if any.
+    fn first_legend_child_id(&self) -> Option<NodeId> {
+        let node = self.tree.get_node(self.node_id)?;
+        let mut current = node.first_child;
+        while let Some(child_id) = current {
+            let child = self.tree.get_node(child_id)?;
+            if child.is_element() {
+                let is_legend = self
+                    .tree
+                    .with_node(child_id, |n| {
+                        n.as_element().map(|qn| qn.local.as_ref() == "legend").unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if is_legend {
+                    return Some(child_id);
+                }
+            }
+            current = child.next_sibling;
+        }
+        None
+    }
 }
 
 impl<'a> std::fmt::Debug for DomElement<'a> {
@@ -684,26 +796,18 @@ impl<'a> Element for DomElement<'a> {
             PseudoClass::Hover | PseudoClass::Active => false,
             // Phase 0b: live focus state.
             PseudoClass::Focus => self.tree.focused() == Some(self.node_id),
-            // :disabled/:enabled from tag + attribute; :checked from live state.
-            PseudoClass::Disabled | PseudoClass::Enabled | PseudoClass::Checked => self
+            // :disabled/:enabled = "actually disabled" per HTML (own attr, option's
+            // optgroup, or a disabled <fieldset> ancestor); :checked from live state.
+            PseudoClass::Disabled => self.is_actually_disabled(),
+            PseudoClass::Enabled => self.is_disableable() && !self.is_actually_disabled(),
+            PseudoClass::Checked => self
                 .tree
                 .with_node(self.node_id, |n| {
                     let name = match n.as_element() {
                         Some(qn) => qn.local.as_ref(),
                         None => return false,
                     };
-                    let form_disableable = matches!(
-                        name,
-                        "input" | "button" | "select" | "textarea" | "optgroup" | "option"
-                            | "fieldset"
-                    );
                     match pc {
-                        PseudoClass::Disabled => {
-                            form_disableable && n.get_attribute("disabled").is_some()
-                        }
-                        PseudoClass::Enabled => {
-                            form_disableable && n.get_attribute("disabled").is_none()
-                        }
                         PseudoClass::Checked => {
                             let is_check_radio = name == "input"
                                 && n.get_attribute("type")

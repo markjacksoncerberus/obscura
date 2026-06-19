@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #45).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #46).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/selectors/pseudo-classes/disabled.html` | 0/7 | **7/7** | ✅ 100% | **Quest #46 The Disabled Lineage.** `:disabled`/`:enabled` only consulted the element's *own* `disabled` attribute. Now "actually disabled" per HTML, live off the Rust tree: own attr, an `<option>` whose `<optgroup>` parent is disabled, and any disable-able element inside a disabled `<fieldset>` — except within that fieldset's first `<legend>` — including nested fieldsets. `:enabled` is the exact complement over the disable-able set (input/button/select/textarea/optgroup/option/fieldset). **+7** |
+| `html/semantics/selectors/pseudo-classes/enabled.html` | 1/1 | **1/1** | ✅ 100% | **Quest #46.** Held — `:enabled` rewired to `is_disableable && !is_actually_disabled` with no change to the matched set (still excludes `a`/`area`/`link`). **±0** |
 | `html/semantics/selectors/pseudo-classes/readwrite-readonly.html` | 5/25 | **25/25** | ✅ 100% | **Quest #45 The Mutable Charter.** `:read-write`/`:read-only` matched nothing (accepted-but-`Other` → always false). Now evaluated live off the tree in the Rust matcher: input (readonly-applicable type, no `readonly`, not disabled) / textarea / `contenteditable` editing-host ancestor walk; everything else is `:read-only`. `document.designMode` (was undefined) now pushes a document-global flag the engine reads during matching. **+20** |
 | `html/semantics/selectors/pseudo-classes/required-optional.html` | 0/6 | **6/6** | ✅ 100% | **Quest #44 The Living Verdict.** `:required`/`:optional` matched nothing (accepted-but-`Other` → always false). Now evaluated straight off the tree in the Rust matcher: a form control to which `required` applies (input of a requirable type, select, textarea), split by whether the attribute is present. **+6** |
 | `html/semantics/selectors/pseudo-classes/valid-invalid.html` | 17/30 | **30/30** | ✅ 100% | **Quest #44.** `:valid`/`:invalid` for candidate controls + `<form>`/`<fieldset>` aggregates, via a JS-computed validity bitmask primed onto the node before the query runs. **+13** |
