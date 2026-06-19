@@ -2330,7 +2330,18 @@ class Document extends Node {
         return doc;
       },
       createDocument(namespace, qualifiedName, doctype) {
-        const doc = new DetachedDocument('xml');
+        // WebIDL: createDocument(namespace, qualifiedName, [optional] doctype) —
+        // namespace + qualifiedName are required (so <2 args → TypeError), and
+        // `doctype` is a nullable DocumentType (null/undefined → none, anything
+        // else that isn't a DocumentType → TypeError during argument conversion).
+        if (arguments.length < 2) {
+          throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': 2 arguments required, but only " + arguments.length + " present.");
+        }
+        if (doctype !== null && doctype !== undefined && !(doctype instanceof DocumentType)) {
+          throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': parameter 3 is not of type 'DocumentType'.");
+        }
+        // A new XMLDocument (its prototype must be EXACTLY XMLDocument.prototype).
+        const doc = new XMLDocument('xml');
         // DOM §createDocument: the document's content type derives from `namespace`,
         // and createElement's element namespace follows from the content type. The
         // XHTML namespace yields application/xhtml+xml, in which createElement makes
@@ -2341,12 +2352,18 @@ class Document extends Node {
         } else if (namespace === "http://www.w3.org/2000/svg") {
           doc._contentType = "image/svg+xml";
         }
+        // WebIDL argument coercion: namespace is `DOMString?` (null/undefined → null,
+        // else stringified), qualifiedName is `[LegacyNullToEmptyString] DOMString`
+        // (null → "", but undefined → the string "undefined"). _validateAndExtract
+        // also maps "" → null namespace, matching the test's expected namespaceURI.
+        const ns = (namespace === null || namespace === undefined) ? null : String(namespace);
+        const qname = (qualifiedName === null) ? "" : String(qualifiedName);
+        // Spec order: create the document element FIRST (so an invalid name throws
+        // before any node is appended), then append the doctype, then the element.
+        let element = null;
+        if (qname !== "") element = doc.createElementNS(ns, qname);
         if (doctype) { doctype._ownerDoc = doc; doc.appendChild(doctype); doc._doctype = doctype; }
-        if (qualifiedName) {
-          const el = doc.createElementNS(namespace || null, qualifiedName);
-          doc.appendChild(el);
-          doc._docEl = el;
-        }
+        if (element) { doc.appendChild(element); doc._docEl = element; }
         return doc;
       },
       createDocumentType(qualifiedName, publicId, systemId) {
@@ -5826,10 +5843,14 @@ function _xmlSerNode(node, namespace, map, idx) {
   }
 }
 
-// Per the HTML spec, DOMParser's XML branch returns a Document (NOT an
-// XMLDocument — unlike createDocument / XHR.responseXML); the WPT tests assert
-// `!(doc instanceof XMLDocument)`. Defining the interface lets that evaluate.
-globalThis.XMLDocument = class XMLDocument extends Document {};
+// `DOMImplementation.createDocument` (and XHR.responseXML) return an XMLDocument;
+// the WPT createDocument suite asserts `Object.getPrototypeOf(doc) === XMLDocument.prototype`
+// EXACTLY, so the returned object must be a direct XMLDocument instance — hence it
+// extends DetachedDocument (a real fragment-backed detached document) rather than the
+// abstract Document. DOMParser's XML branch deliberately returns a plain
+// `_IframeDocument` (also `extends DetachedDocument`, a SIBLING of XMLDocument) so the
+// HTML-spec assertion `!(doc instanceof XMLDocument)` still holds for parsed documents.
+globalThis.XMLDocument = class XMLDocument extends DetachedDocument {};
 
 globalThis.DOMParser = class DOMParser {
   parseFromString(str, type) {
