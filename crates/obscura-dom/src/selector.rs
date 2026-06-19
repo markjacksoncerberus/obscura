@@ -342,10 +342,12 @@ impl<'a> DomElement<'a> {
         DomElement { tree, node_id }
     }
 
-    /// `:required` / `:optional` — match a form control to which the `required`
-    /// attribute applies (input of a requirable type, select, textarea), split by
-    /// whether it currently carries the attribute. `want_required` selects which
-    /// half. Elements the attribute can't apply to match neither pseudo.
+    /// `:required` / `:optional`. `:required` matches a form control to which the
+    /// `required` attribute applies (input of a requirable type, select, textarea)
+    /// that currently carries it. `:optional` matches *any* input/select/textarea
+    /// that is not `:required` — including types the attribute can't apply to (e.g.
+    /// `type=hidden`/`submit`), which are optional by virtue of never being required
+    /// (per WPT `required-optional-hidden`). All other elements match neither.
     fn match_required_optional(&self, want_required: bool) -> bool {
         self.tree
             .with_node(self.node_id, |n| {
@@ -353,6 +355,9 @@ impl<'a> DomElement<'a> {
                     Some(qn) => qn.local.as_ref(),
                     None => return false,
                 };
+                if !matches!(name, "input" | "select" | "textarea") {
+                    return false;
+                }
                 let can_require = match name {
                     "select" | "textarea" => true,
                     "input" => {
@@ -384,10 +389,8 @@ impl<'a> DomElement<'a> {
                     }
                     _ => false,
                 };
-                if !can_require {
-                    return false;
-                }
-                want_required == n.get_attribute("required").is_some()
+                let is_required = can_require && n.get_attribute("required").is_some();
+                want_required == is_required
             })
             .unwrap_or(false)
     }
@@ -596,6 +599,283 @@ impl<'a> DomElement<'a> {
             current = child.next_sibling;
         }
         None
+    }
+
+    /// The local name of this node if it is an element, lower-cased input `type`
+    /// helper aside.
+    fn local_name(&self) -> Option<String> {
+        self.tree
+            .with_node(self.node_id, |n| n.as_element().map(|qn| qn.local.as_ref().to_string()))
+            .flatten()
+    }
+
+    /// The lower-cased `type` of an `<input>` (missing/empty → `text`).
+    fn input_type(&self) -> String {
+        self.tree
+            .with_node(self.node_id, |n| {
+                n.get_attribute("type").map(|t| t.to_ascii_lowercase())
+            })
+            .flatten()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "text".into())
+    }
+
+    /// `:indeterminate` — matches:
+    /// - an `<input type=checkbox>` whose `indeterminate` IDL flag is set;
+    /// - an `<input type=radio>` whose radio button group contains no checked
+    ///   member (a nameless radio is a group of one — itself);
+    /// - a `<progress>` element with no `value` content attribute.
+    fn match_indeterminate(&self) -> bool {
+        match self.local_name().as_deref() {
+            Some("input") => match self.input_type().as_str() {
+                "checkbox" => self.tree.indeterminate(self.node_id),
+                "radio" => {
+                    let name = self
+                        .tree
+                        .with_node(self.node_id, |n| {
+                            n.get_attribute("name").map(|s| s.to_string())
+                        })
+                        .flatten()
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        // Nameless radios form no shared group: indeterminate iff
+                        // this radio itself is not checked.
+                        !self.tree.checked(self.node_id)
+                    } else {
+                        !self.radio_group_has_checked(&name)
+                    }
+                }
+                _ => false,
+            },
+            Some("progress") => self
+                .tree
+                .with_node(self.node_id, |n| n.get_attribute("value").is_none())
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// The topmost ancestor of this node (its tree root), found by walking parents.
+    fn root_node(&self) -> NodeId {
+        let mut cur = self.node_id;
+        while let Some(parent) = self.tree.get_node(cur).and_then(|n| n.parent) {
+            cur = parent;
+        }
+        cur
+    }
+
+    /// Whether any `<input type=radio>` with the given non-empty `name`, in the
+    /// same tree as this element, is currently checked. (Form-owner partitioning of
+    /// radio groups is not modelled; rare in practice — noted as a cap.)
+    fn radio_group_has_checked(&self, name: &str) -> bool {
+        let mut stack = vec![self.root_node()];
+        while let Some(id) = stack.pop() {
+            let node = match self.tree.get_node(id) {
+                Some(n) => n,
+                None => continue,
+            };
+            let is_named_radio = node
+                .as_element()
+                .map(|qn| qn.local.as_ref() == "input")
+                .unwrap_or(false)
+                && node
+                    .get_attribute("type")
+                    .map(|t| t.eq_ignore_ascii_case("radio"))
+                    .unwrap_or(false)
+                && node.get_attribute("name") == Some(name);
+            if is_named_radio && self.tree.checked(id) {
+                return true;
+            }
+            let mut child = node.first_child;
+            while let Some(cid) = child {
+                stack.push(cid);
+                child = self.tree.get_node(cid).and_then(|n| n.next_sibling);
+            }
+        }
+        false
+    }
+
+    /// `:placeholder-shown` — an `<input>` of a placeholder-applicable type, or a
+    /// `<textarea>`, that has a non-empty `placeholder` attribute and an empty
+    /// value. (Value is read off the content attribute / text content; a value set
+    /// only via the JS `.value` IDL is not visible here — noted as a cap.)
+    fn match_placeholder_shown(&self) -> bool {
+        let local = match self.local_name() {
+            Some(l) => l,
+            None => return false,
+        };
+        match local.as_str() {
+            "input" => {
+                let applies = matches!(
+                    self.input_type().as_str(),
+                    "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+                );
+                if !applies {
+                    return false;
+                }
+                self.tree
+                    .with_node(self.node_id, |n| {
+                        let has_placeholder =
+                            n.get_attribute("placeholder").map(|p| !p.is_empty()).unwrap_or(false);
+                        let value_empty =
+                            n.get_attribute("value").map(|v| v.is_empty()).unwrap_or(true);
+                        has_placeholder && value_empty
+                    })
+                    .unwrap_or(false)
+            }
+            "textarea" => {
+                let has_placeholder = self
+                    .tree
+                    .with_node(self.node_id, |n| {
+                        n.get_attribute("placeholder").map(|p| !p.is_empty()).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                has_placeholder && self.textarea_value_is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a `<textarea>` has no text content (its default value is empty).
+    fn textarea_value_is_empty(&self) -> bool {
+        let node = match self.tree.get_node(self.node_id) {
+            Some(n) => n,
+            None => return true,
+        };
+        let mut child = node.first_child;
+        while let Some(cid) = child {
+            if let Some(c) = self.tree.get_node(cid) {
+                if let Some(text) = c.text_content_of_text_node() {
+                    if !text.is_empty() {
+                        return false;
+                    }
+                }
+                child = c.next_sibling;
+            } else {
+                break;
+            }
+        }
+        true
+    }
+
+    /// `:default` — matches a checkbox/radio carrying the `checked` content
+    /// attribute, an `<option>` carrying the `selected` content attribute, or a
+    /// submit button (`<button type=submit>`, `<input type=submit|image>`) that is
+    /// its form owner's default button (the first such submit button in tree order
+    /// owned by that form).
+    fn match_default(&self) -> bool {
+        let local = match self.local_name() {
+            Some(l) => l,
+            None => return false,
+        };
+        match local.as_str() {
+            "input" => match self.input_type().as_str() {
+                "checkbox" | "radio" => self
+                    .tree
+                    .with_node(self.node_id, |n| n.get_attribute("checked").is_some())
+                    .unwrap_or(false),
+                "submit" | "image" => self.is_form_default_button(),
+                _ => false,
+            },
+            "button" => {
+                if self.is_submit_button() {
+                    self.is_form_default_button()
+                } else {
+                    false
+                }
+            }
+            "option" => self
+                .tree
+                .with_node(self.node_id, |n| n.get_attribute("selected").is_some())
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// Whether this element is a "submit button": an `<input type=submit|image>`
+    /// or a `<button>` whose type is submit (the missing/invalid default).
+    fn is_submit_button(&self) -> bool {
+        match self.local_name().as_deref() {
+            Some("input") => matches!(self.input_type().as_str(), "submit" | "image"),
+            Some("button") => {
+                // A button's type defaults to "submit"; only an explicit
+                // "button"/"reset" opts out (any other value, incl. invalid, is submit).
+                let t = self
+                    .tree
+                    .with_node(self.node_id, |n| {
+                        n.get_attribute("type").map(|t| t.to_ascii_lowercase())
+                    })
+                    .flatten();
+                !matches!(t.as_deref(), Some("button") | Some("reset"))
+            }
+            _ => false,
+        }
+    }
+
+    /// This element's form owner: the `<form>` named by its `form` attribute if
+    /// present (and that id resolves to a form), else its nearest `<form>` ancestor.
+    fn form_owner(&self) -> Option<NodeId> {
+        let form_attr = self
+            .tree
+            .with_node(self.node_id, |n| n.get_attribute("form").map(|s| s.to_string()))
+            .flatten();
+        if let Some(id) = form_attr {
+            // An explicit `form` attribute associates with the form of that id, or
+            // nothing if it doesn't resolve to a form element.
+            let target = self.tree.get_element_by_id(&id)?;
+            let is_form = self
+                .tree
+                .with_node(target, |n| {
+                    n.as_element().map(|qn| qn.local.as_ref() == "form").unwrap_or(false)
+                })
+                .unwrap_or(false);
+            return if is_form { Some(target) } else { None };
+        }
+        // Otherwise the nearest ancestor <form>.
+        let mut parent = self.parent_element();
+        while let Some(p) = parent {
+            let is_form = p
+                .tree
+                .with_node(p.node_id, |n| {
+                    n.as_element().map(|qn| qn.local.as_ref() == "form").unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if is_form {
+                return Some(p.node_id);
+            }
+            parent = p.parent_element();
+        }
+        None
+    }
+
+    /// Whether this submit button is its form owner's default button — i.e. it has
+    /// a form owner and is the first submit button (in tree order) owned by it.
+    fn is_form_default_button(&self) -> bool {
+        let owner = match self.form_owner() {
+            Some(o) => o,
+            None => return false,
+        };
+        // Scan the tree in document (pre-order) order for the first submit button
+        // whose form owner is `owner`.
+        let mut stack = vec![self.root_node()];
+        // A simple pre-order DFS: push children in reverse so they pop in order.
+        while let Some(id) = stack.pop() {
+            let candidate = DomElement::new(self.tree, id);
+            if candidate.is_submit_button() && candidate.form_owner() == Some(owner) {
+                return id == self.node_id;
+            }
+            // Collect children, then push reversed for pre-order traversal.
+            let mut kids = Vec::new();
+            let mut child = self.tree.get_node(id).and_then(|n| n.first_child);
+            while let Some(cid) = child {
+                kids.push(cid);
+                child = self.tree.get_node(cid).and_then(|n| n.next_sibling);
+            }
+            for cid in kids.into_iter().rev() {
+                stack.push(cid);
+            }
+        }
+        false
     }
 }
 
@@ -883,6 +1163,15 @@ impl<'a> Element for DomElement<'a> {
                 // ancestor walk) plus the design-mode global flag.
                 "read-write" => self.match_read_write_read_only(true),
                 "read-only" => self.match_read_write_read_only(false),
+                // :indeterminate — a checkbox whose `indeterminate` IDL is set, a
+                // radio whose group has no checked member, or a valueless <progress>.
+                "indeterminate" => self.match_indeterminate(),
+                // :placeholder-shown — an input/textarea currently showing its
+                // placeholder text (placeholder set, value empty, applicable type).
+                "placeholder-shown" => self.match_placeholder_shown(),
+                // :default — a form's default submit button, a checkbox/radio with
+                // the `checked` attribute, or an option with the `selected` attribute.
+                "default" => self.match_default(),
                 // Other accepted-but-unimplemented standard pseudo-classes never match.
                 _ => false,
             },

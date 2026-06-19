@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~48~~ | ✅ [The Indeterminate Verdict](48-the-indeterminate-verdict.md) | `html/semantics/selectors/pseudo-classes/{indeterminate,default,placeholder-shown,required-optional-hidden}` | **indeterminate 6/6, default 2/2, placeholder-shown-type-change 1/1, required-optional-hidden 1/1** | ⚔️ | **SECURED — +10.** The last three HTML selector pseudo-classes were parsed but `PseudoClass::Other` → false. All added to the Rust matcher, tree-derived: **`:indeterminate`** (checkbox via a new eager `indeterminate` IDL side-map + JS `el.indeterminate`; radio whose name-group has no checked member, nameless = self; valueless `<progress>`), **`:placeholder-shown`** (placeholder-applicable input/textarea, non-empty `placeholder`, empty value), **`:default`** (checkbox/radio with the `checked` attr, option with `selected`, or a submit button that is its form owner's default button — form owner via `form` attr else nearest ancestor `<form>`, first submit in tree order). Plus spec-correct **`:optional`** (now matches any input/select/textarea not `:required`, incl. `type=hidden`/`submit`). Zero regressions; the live-state form/structural pseudo family is now complete. Caps: `:placeholder-shown` live `.value` IDL, radio-group form-owner partitioning, `css/selectors/indeterminate*` reftests |
 | ~~47~~ | ✅ [The Cascade Crown](47-the-cascade-crown.md) | `css/selectors/*specificity*` + `…/pseudo-classes/*-type-change` (the `getComputedStyle`/CSS-cascade wall) | **+24** | ⚔️⚔️ | **SECURED — +24.** `getComputedStyle` had **no author-stylesheet cascade** — only inline style + a defaults table — so every "inject `<style>` rules, read the winner back" test died (the recurring wall named by #42–#46). Built a real cascade on top of the existing Servo selector engine: new Rust op `selector_match_specificity` (matches? + highest matching-complex-selector specificity, `:is`/`:where`/`:has`-correct), JS gathers `<style>` rules, primes the live-state side-maps (`:target`/validity), and resolves each property by **importance → specificity → source order**; inline style is the top source. Added computed-value `<color>` serialization (named/hex/rgb → `rgb(r, g, b)`). has-specificity 0→8, is-specificity 0→1, is-nested 0→2, is-where-pseudo-classes 0→1, not-specificity 0→8, readwrite-readonly-type-change 0→1, checked-type-change 0→1, inrange-outofrange-type-change 0→2. Zero regressions. Caps: inheritance/layout/computed-values still absent; `:indeterminate`/`:placeholder-shown`/`:optional`-for-hidden are separate matching gaps; CSSOM/shadow/`:dir`/`:visited`/reftests out of realm |
 | ~~46~~ | ✅ [The Disabled Lineage](46-the-disabled-lineage.md) | `html/semantics/selectors/pseudo-classes/disabled` (+ `enabled` held) | **7/7** | ⚔️ | **SECURED — +7.** `:disabled`/`:enabled` only checked the element's *own* `disabled` attribute (the separate matcher gap named by #45). Now "actually disabled" per HTML, matched **live off the Rust tree**: own attr, an `<option>` whose `<optgroup>` parent is disabled, and any disable-able element (input/button/select/textarea/optgroup/option/fieldset) inside a disabled `<fieldset>` — except within that fieldset's first `<legend>` — covering nested fieldsets via a single `prev_id == first_legend_child` ancestor-walk compare. `:enabled` is the exact complement over the disable-able set. Pure-Rust, no per-query priming. Zero regressions. The live-state form/structural pseudo family is now complete. Caps: `getComputedStyle`/CSS cascade (recurring wall) |
 | ~~45~~ | ✅ [The Mutable Charter](45-the-mutable-charter.md) | `html/semantics/selectors/pseudo-classes/readwrite-readonly` (`:read-write`/`:read-only`) | **25/25** | ⚔️ | **SECURED — +20.** The last live-state form pseudo-classes (the #44 cap) were dark — parsed but `PseudoClass::Other` → always false (deceptive 5/25: only the empty-match subtests passed). Now matched **live off the tree** in the Rust matcher: an `input` to which `readonly` applies (no `readonly`, not disabled) / `textarea` / any element editable via a `contenteditable` editing-host ancestor walk → `:read-write`; every other element → `:read-only`. `document.designMode` (previously undefined entirely) gets a real get/set that pushes a document-global flag the engine reads during matching — so the design-mode subtests (predicted a cap) are green too. Pure-Rust matching, no per-query priming. Zero regressions. Caps: `readwrite-readonly-type-change` (getComputedStyle/CSS cascade), `:disabled` disabled-propagation (separate matcher gap) |
@@ -88,6 +89,31 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-19 (Quest #48 The Indeterminate Verdict — the remaining HTML selector
+pseudo-classes, +10):** After #44–#46 finished the live-state form selector family, three
+HTML pseudo-classes were still dark: the Servo `selectors` crate *parses* `:indeterminate`/
+`:placeholder-shown`/`:default` but they fall to `PseudoClass::Other` → `false`. All added to
+the Rust matcher (`crates/obscura-dom/src/selector.rs`), tree-derived (the #44–#46 pattern).
+**`:indeterminate`** — a checkbox whose `indeterminate` IDL flag is set (new Rust side-map +
+JS `HTMLInputElement.indeterminate` get/set, *eager* so no per-query priming), a radio whose
+group (same non-empty name, same tree; nameless = a group of one) has no checked member, or a
+`<progress>` with no `value` attribute. **`:placeholder-shown`** — an input of a
+placeholder-applicable type (or textarea) with a non-empty `placeholder` and empty value.
+**`:default`** — a checkbox/radio with the `checked` attribute, an `<option>` with `selected`,
+or a submit button that is its form owner's default button (form owner via the `form`
+attribute else nearest ancestor `<form>`; first submit button in tree order owned by that
+form). Plus spec-correct **`:optional`** (restructured `match_required_optional`): now matches
+*any* input/select/textarea not `:required`, including `type=hidden`/`submit` — optional by
+never being required (what `required-optional-hidden` and browsers assert). **Wins:**
+indeterminate 1→6, indeterminate-type-change 0→1, placeholder-shown-type-change 0→1, default
+0→2, required-optional-hidden 0→1. **+10, zero regressions** (qsa 1975, classlist 1420, matches
+669, closest 29, valid-invalid 30, required-optional 6, readwrite-readonly 25, disabled 7,
+enabled 1, inrange-outofrange 6, has-specificity 8, not-specificity 8; obscura-dom unit 40/40).
+Caps: `:placeholder-shown` live `.value` IDL, radio-group form-owner partitioning,
+`css/selectors/indeterminate*` reftests. The live-state form/structural selector pseudo-class
+family is now complete. NEXT: CSS inheritance + computed-value normalizations (builds on the
+#47 cascade, opens `css/css-cascade/`), or a fresh realm (`fetch/`, `html/dom/` reflection).
 
 **Session 2026-06-19 (Quest #47 The Cascade Crown — author-stylesheet cascade for
 `getComputedStyle`, +24):** For six quests the selector *matcher* grew strong, but every

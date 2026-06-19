@@ -1819,6 +1819,10 @@ class Element extends Node {
   // selector engine (:checked) and consistent across all access paths.
   get checked() { return _dom("get_checked", this._nid, "") === "1"; }
   set checked(v) { _dom("set_checked", this._nid, v ? "1" : "0"); }
+  // The `indeterminate` IDL flag lives in the Rust DOM so :indeterminate (which
+  // the selector engine evaluates) reflects JS-set state across all access paths.
+  get indeterminate() { return _dom("get_indeterminate", this._nid, "") === "1"; }
+  set indeterminate(v) { _dom("set_indeterminate", this._nid, v ? "1" : "0"); }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");

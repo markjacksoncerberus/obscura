@@ -272,6 +272,10 @@ pub(crate) struct DomTreeInner {
     // places). `checked_state` overrides the `checked` attribute default once
     // JS sets `el.checked`; `focused` is the single focused element.
     pub(crate) checked_state: HashMap<NodeId, bool>,
+    // The `indeterminate` IDL state of checkboxes (set by JS `el.indeterminate =
+    // …`). Unlike `checked`, it has no content-attribute default, so a missing
+    // entry means false. Read by `:indeterminate` for checkbox inputs.
+    pub(crate) indeterminate_state: HashMap<NodeId, bool>,
     pub(crate) focused: Option<NodeId>,
     // The id named by the current document's URL fragment, for `:target`. JS sets
     // it from the queried document's URL right before a `:target` query.
@@ -314,6 +318,7 @@ impl DomTree {
                 mutations_enabled: false,
                 pending_mutations: Vec::new(),
                 checked_state: HashMap::new(),
+                indeterminate_state: HashMap::new(),
                 focused: None,
                 target_id: None,
                 validity_state: HashMap::new(),
@@ -368,6 +373,17 @@ impl DomTree {
             .and_then(|n| n.as_ref())
             .map(|n| n.get_attribute("checked").is_some())
             .unwrap_or(false)
+    }
+
+    /// Set a checkbox's `indeterminate` IDL state (drives `:indeterminate`).
+    pub fn set_indeterminate(&self, id: NodeId, indeterminate: bool) {
+        self.inner.borrow_mut().indeterminate_state.insert(id, indeterminate);
+    }
+
+    /// A checkbox's `indeterminate` IDL state. No content-attribute default, so a
+    /// node JS never touched is not indeterminate.
+    pub fn indeterminate(&self, id: NodeId) -> bool {
+        self.inner.borrow().indeterminate_state.get(&id).copied().unwrap_or(false)
     }
 
     /// Replace the live constraint-validation selector state wholesale. JS

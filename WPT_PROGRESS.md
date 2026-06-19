@@ -10,12 +10,17 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #47).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #48).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/selectors/pseudo-classes/indeterminate.html` | 1/6 | **6/6** | ✅ 100% | **Quest #48 The Indeterminate Verdict.** `:indeterminate` matched nothing (parsed but `PseudoClass::Other`→false). Now pure-Rust off the tree: a checkbox whose `indeterminate` IDL flag is set (new Rust side-map + JS `el.indeterminate` get/set, eager — no priming), an `<input type=radio>` whose radio-button group (same non-empty name, same tree; nameless → itself) contains no checked member, and a `<progress>` with no `value` attribute. **+5** |
+| `html/semantics/selectors/pseudo-classes/indeterminate-type-change.html` | 0/1 | **1/1** | ✅ 100% | **Quest #48.** `input.type` text→radio flips `:indeterminate`; the #47 cascade reads the applied colour back via the matcher. **+1** |
+| `html/semantics/selectors/pseudo-classes/placeholder-shown-type-change.html` | 0/1 | **1/1** | ✅ 100% | **Quest #48.** New `:placeholder-shown` matcher — input of a placeholder-applicable type (or textarea) with a non-empty `placeholder` and empty value; type submit→text flips it, read via the cascade. **+1** |
+| `html/semantics/selectors/pseudo-classes/default.html` | 0/2 | **2/2** | ✅ 100% | **Quest #48.** New `:default` matcher — a checkbox/radio with the `checked` attribute, an `<option>` with `selected`, or a submit button (`<button>`/`<input type=submit\|image>`) that is its form owner's default button (first submit button in tree order owned by that form; form owner via the `form` attribute else nearest ancestor `<form>`). **+2** |
+| `html/semantics/selectors/pseudo-classes/required-optional-hidden.html` | 0/1 | **1/1** | ✅ 100% | **Quest #48.** Spec-correct `:optional` — now matches *any* input/select/textarea not `:required`, including `type=hidden`/`submit` (optional by never being required). `:required` unchanged. **+1** |
 | `css/selectors/has-specificity.html` | 0/8 | **8/8** | ✅ 100% | **Quest #47 The Cascade Crown.** `getComputedStyle` had no author-stylesheet cascade — just inline style + a defaults table. Built a real cascade: gather `<style>` rules, ask the Rust selector engine which match (and at what specificity — it honours `:is()`/`:where()`/`:has()`), resolve a property to the winner by importance → specificity → source order. `:has()` complex-selector specificity now decides. **+8** |
 | `css/selectors/is-specificity.html` | 0/1 | **1/1** | ✅ 100% | **Quest #47.** `:is()` takes its highest-specificity argument; combinator chains resolve to the right declared length. **+1** |
 | `css/selectors/is-nested.html` | 0/2 | **2/2** | ✅ 100% | **Quest #47.** Nested `:is()` specificity (inside and outside the argument) + computed `color` serialization. **+2** |

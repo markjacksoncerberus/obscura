@@ -432,6 +432,16 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             let nid = arg1.parse::<u32>().unwrap_or(0);
             if dom.checked(NodeId::new(nid)) { "1".into() } else { "0".into() }
         }
+        // Checkbox `indeterminate` IDL state (drives `:indeterminate`).
+        "set_indeterminate" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.set_indeterminate(NodeId::new(nid), arg2 == "1");
+            "true".into()
+        }
+        "get_indeterminate" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            if dom.indeterminate(NodeId::new(nid)) { "1".into() } else { "0".into() }
+        }
         "set_focus" => {
             if arg1.is_empty() {
                 dom.set_focus(None);
