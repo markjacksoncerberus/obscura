@@ -843,13 +843,19 @@ const _documentBaseURL = function(doc) {
   return fallback;
 };
 
+// Private sentinel: passed as the 2nd arg to Text/Comment constructors by
+// internal wrappers so they treat the 1st arg as an already-real nid rather
+// than as web constructor DOMString data.
+const _NID_TOKEN = Symbol("nid");
+
 class CharacterData extends Node {
   get data() {
     return _domParse("text_content", this._nid) ?? "";
   }
   set data(v) {
+    // [LegacyNullToEmptyString]: null → "" (but undefined → "undefined", 0 → "0").
     const _old = __mutationObservers?.length ? (_domParse("text_content", this._nid) ?? "") : null;
-    _dom("set_text_content", this._nid, String(v ?? ""));
+    _dom("set_text_content", this._nid, String(v === null ? "" : v));
     if (__mutationObservers?.length) __notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
   }
   get length() { return this.data.length; }
@@ -872,11 +878,32 @@ class CharacterData extends Node {
 }
 
 class Text extends CharacterData {
+  // `new Text(data)` is the web constructor: it allocates a REAL backing text
+  // node holding `data` (WebIDL DOMString — undefined→"", null→"null", 42→"42").
+  // Internal callers (_wrap, createTextNode, CDATASection) pass an already-real
+  // numeric nid plus the private _NID_TOKEN sentinel, so a web `new Text(42)`
+  // (data "42") is never confused with a wrap of node #42.
+  constructor(data, _tok) {
+    if (_tok === _NID_TOKEN) { super(data); return; }
+    super(+_dom("create_text_node", data === undefined ? "" : String(data)));
+    _cache.set(this._nid, this);
+  }
   get nodeName() { return "#text"; }
   get nodeType() { return 3; }
-  get wholeText() { return this.data; }
+  get wholeText() {
+    // §wholeText: concatenated data of the contiguous Text nodes (this node plus
+    // its run of Text siblings on both sides), in tree order.
+    let start = this;
+    while (start.previousSibling && start.previousSibling.nodeType === 3) start = start.previousSibling;
+    let result = "";
+    for (let n = start; n && n.nodeType === 3; n = n.nextSibling) result += n.data;
+    return result;
+  }
   splitText(offset) {
+    offset = offset >>> 0; // WebIDL unsigned long
     const d = this.data;
+    // §splitText step 2: offset > length → IndexSizeError.
+    if (offset > d.length) throw new DOMException("The index is not in the allowed range.", "IndexSizeError");
     const tail = d.substring(offset);
     this.data = d.substring(0, offset);
     const newNid = +_dom("create_text_node", tail);
@@ -891,6 +918,13 @@ class Text extends CharacterData {
 }
 
 class Comment extends CharacterData {
+  // `new Comment(data)` web constructor — see Text above for the _NID_TOKEN
+  // convention that keeps web data args distinct from internal nid wraps.
+  constructor(data, _tok) {
+    if (_tok === _NID_TOKEN) { super(data); return; }
+    super(+_dom("create_comment_node", data === undefined ? "" : String(data)));
+    _cache.set(this._nid, this);
+  }
   get nodeName() { return "#comment"; }
   get nodeType() { return 8; }
   cloneNode() { return document.createComment(this.data); }
@@ -917,7 +951,7 @@ class ProcessingInstruction extends CharacterData {
 
 const _makeCDATA = function(data) {
   const nid = +_dom("create_text_node", String(data ?? ""));
-  const n = new CDATASection(nid);
+  const n = new CDATASection(nid, _NID_TOKEN);
   _cache.set(nid, n);
   return n;
 };
@@ -2198,7 +2232,7 @@ class Document extends Node {
   createTextNode(t) { return _wrap(+_dom("create_text_node", String(t))); }
   createComment(t) {
     const nid = +_dom("create_comment_node", String(t ?? ""));
-    const n = new Comment(nid);
+    const n = new Comment(nid, _NID_TOKEN);
     _cache.set(nid, n);
     return n;
   }
@@ -2622,8 +2656,8 @@ const _wrap = function(nid) {
   const t = +_dom("node_type", nid);
   let n;
   if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
-  else if (t === 3) n = new Text(nid);
-  else if (t === 8) n = new Comment(nid);
+  else if (t === 3) n = new Text(nid, _NID_TOKEN);
+  else if (t === 8) n = new Comment(nid, _NID_TOKEN);
   else if (t === 9) n = new Document(nid);
   else if (t === 10) {
     // DocumentType: its constructor seeds the cache itself, so return directly.
