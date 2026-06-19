@@ -16,6 +16,32 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-19.
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/forms/constraints/form-validation-willValidate.html` | 0/67 | **67/67** | ✅ 100% | **Quest #43 The Charter of Constraints.** The constraint validation API was entirely absent. New `willValidate` = NOT barred-from-CV (fieldset/output/object, input hidden/button/reset, non-submit button, disabled — incl. inside a disabled fieldset, readonly attr, datalist ancestor). **+67** |
+| `html/semantics/forms/constraints/form-validation-willValidate-datalist.html` | 0/17 | **17/17** | ✅ 100% | **Quest #43.** Datalist-ancestor barring. **+17** |
+| `html/semantics/forms/constraints/form-validation-checkValidity.html` | 0/122 | **122/122** | ✅ 100% | **Quest #43.** `checkValidity()` (element + form) fires a cancelable `invalid` event and returns `!willValidate || validity.valid`. **+122** |
+| `html/semantics/forms/constraints/form-validation-reportValidity.html` | 0/122 | **122/122** | ✅ 100% | **Quest #43.** `reportValidity()` (no UI ⇒ same as checkValidity). **+122** |
+| `html/semantics/forms/constraints/form-validation-validate.html` | 0/8 | **8/8** | ✅ 100% | **Quest #43.** Form static validation + disabled-fieldset propagation (`_cvIsDisabled` skips the fieldset's first legend). **+8** |
+| `html/semantics/forms/constraints/inputwillvalidate.html` | 0/2 | **2/2** | ✅ 100% | **Quest #43.** **+2** |
+| `html/semantics/forms/constraints/form-validation-validity-valueMissing.html` | 0/71 | **71/71** | ✅ 100% | **Quest #43.** `valueMissing` per control type — mutable-gated for text-like/typed + textarea, ungated for checkbox/radio/file/select; typed inputs use value-sanitization (invalid typed string ⇒ empty). **+71** |
+| `html/semantics/forms/constraints/form-validation-validity-valid.html` | 0/33 | **33/33** | ✅ 100% | **Quest #43.** `valid` = AND of all states. **+33** |
+| `html/semantics/forms/constraints/form-validation-validity-typeMismatch.html` | 0/11 | **11/11** | ✅ 100% | **Quest #43.** `email`/`url` after whitespace-strip sanitization; email honours `multiple`. **+11** |
+| `html/semantics/forms/constraints/form-validation-validity-patternMismatch.html` | 0/85 | **85/85** | ✅ 100% | **Quest #43.** Raw pattern validated first (so `"a)(b"` is rejected/ignored), then anchored `^(?:…)$` with the `v` flag. **+85** |
+| `html/semantics/forms/constraints/form-validation-validity-rangeOverflow.html` | 0/49 | **49/49** | ✅ 100% | **Quest #43.** Typed comparable-number parsers; reversed ranges flag over+underflow together. **+49** |
+| `html/semantics/forms/constraints/form-validation-validity-rangeUnderflow.html` | 0/47 | **47/47** | ✅ 100% | **Quest #43.** **+47** |
+| `html/semantics/forms/constraints/form-validation-validity-stepMismatch.html` | 0/28 | **27/28** | ⬆️ cap | **Quest #43.** Blink's float-tolerant snap-and-compare; step base = min→value-attr→default. Last fail (`step=3e-15`) needs decimal arithmetic. **+27** |
+| `html/semantics/forms/constraints/form-validation-validity-tooLong.html` | 0/63 | **63/63** | ✅ 100% | **Quest #43.** Always `false` (requires interactive editing). **+63** |
+| `html/semantics/forms/constraints/form-validation-validity-tooShort.html` | 0/63 | **63/63** | ✅ 100% | **Quest #43.** Always `false`. **+63** |
+| `html/semantics/forms/constraints/form-validation-validity-customError.html` | 0/4 | **4/4** | ✅ 100% | **Quest #43.** `setCustomValidity`/`validationMessage` (`""` when barred). **+4** |
+| `html/semantics/forms/constraints/form-validation-validity-badInput.html` | 0/11 | **11/11** | ✅ 100% | **Quest #43.** Always `false` via API. **+11** |
+| `html/semantics/forms/constraints/form-validation-validity-valueMissing-weekmonth.html` | 0/19 | **19/19** | ✅ 100% | **Quest #43.** **+19** |
+| `html/semantics/forms/constraints/form-validation-validity-valid-weekmonth.html` | 0/8 | **8/8** | ✅ 100% | **Quest #43.** **+8** |
+| `html/semantics/forms/constraints/form-validation-validity-rangeOverflow-weekmonth.html` | 0/19 | **19/19** | ✅ 100% | **Quest #43.** **+19** |
+| `html/semantics/forms/constraints/form-validation-validity-rangeUnderflow-weekmonth.html` | 0/19 | **19/19** | ✅ 100% | **Quest #43.** **+19** |
+| `html/semantics/forms/constraints/form-validation-validity-textarea-defaultValue.html` | 0/5 | **2/5** | ⬆️ cap | **Quest #43.** Added `textarea.defaultValue`; the 3 remaining need `test_driver.send_keys`. **+2** |
+| `html/semantics/forms/constraints/radio-valueMissing.html` | 0/6 | **6/6** | ✅ 100% | **Quest #43.** Group-aware radio valueMissing (`_cvRadioGroup`); `ValidityState` `Symbol.toStringTag`. **+6** |
+| `html/semantics/forms/constraints/radio-group-valueMissing.html` | 0/2 | **2/2** | ✅ 100% | **Quest #43.** Live group state + `radio.click()` checks the radio. **+2** |
+| `html/semantics/forms/constraints/input-pattern-dynamic-value.html` | 0/1 | 0/1 | ✋ cap | **Quest #43.** Needs `:invalid` selector matching (Rust engine can't call JS validity). |
+| `html/semantics/forms/constraints/input-number-validity-dynamic-value-no-change.html` | 0/1 | 0/1 | ✋ cap | **Quest #43.** Needs `:valid`/`:invalid` selector matching. |
 | `css/selectors/is-where-basic.html` | 0/15 | **15/15** | ✅ 100% | **Quest #42 The Logical Lens.** `:is()`/`:where()` didn't parse — the `selectors` crate's `parse_is_and_where()` hook defaults `false`, so the selector threw `SyntaxError` and blanked the test. Overrode the hook (matching was already implemented). **+15** |
 | `css/selectors/is-where-not.html` | 0/18 | **18/18** | ✅ 100% | **Quest #42.** Same parse gate (`:is`/`:where`/`:not` combos). **+18** |
 | `css/selectors/has-basic.html` | 0/18 | **18/18** | ✅ 100% | **Quest #42.** `:has()` didn't parse — `parse_has()` defaults `false`. The crate's `relative_selector` module + `match_relative_selectors` walk descendants/siblings via `first_element_child`/`next_sibling_element` (already on our `DomElement`), so enabling the hook lights it up. **+18** |

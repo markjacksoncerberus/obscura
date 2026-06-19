@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~43~~ | ✅ [The Charter of Constraints](43-the-charter-of-constraints.md) | `html/semantics/forms/constraints/*` (constraint validation API) | **willValidate 67/67, checkValidity 122/122, valueMissing 71/71, valid 33/33, patternMismatch 85/85, range 49+47, +14 more** | ⚔️⚔️⚔️ | **SECURED — +877.** The entire constraint validation API was absent. New `ValidityState` + `willValidate`/`validity`/`validationMessage`/`checkValidity`/`reportValidity`/`setCustomValidity` on the 7 listed interfaces + `HTMLFormElement`, with the full `_cvCompute` validity algorithm: mutable-gated `valueMissing` (group-aware radio), `email`/`url` `typeMismatch`, raw-then-anchored `pattern` (`v` flag), typed range/step (reversed ranges, Blink float-tolerant step, step base min→@value→default), barred-from-CV `willValidate` (disabled-fieldset propagation, datalist, readonly), always-false tooLong/tooShort/badInput, `customError`. Plus reflected attrs (required/readonly/pattern/min/max/step/multiple/maxlength/minlength/textarea.defaultValue) and checkbox/radio activation on `click()`. Pure JS, zero regressions. Caps: `:valid`/`:invalid` selector matching (2 dynamic tests + closest 29/29 — needs the Rust matcher to reach JS validity); `test_driver.send_keys` (3 textarea subtests); 1 sub-ULP `stepMismatch` (needs decimal arithmetic) |
 | ~~42~~ | ✅ [The Logical Lens](42-the-logical-lens.md) | `css/selectors/{is-where,has}-*`, `ParentNode-querySelector-scope`, `Element-closest` | **is-where 33/33, has 78/78, scope 4/4, closest 28/29** | ⚔️ | **SECURED — +116.** `:is()`/`:where()`/`:has()` and the `:scope` scoping root were all dark — the Servo `selectors` crate implements their matching already, but `parse_is_and_where()`/`parse_has()` default `false` (so the selectors threw `SyntaxError` and blanked every test) and `MatchingContext.scope_element` was always `None` (so `:scope` == `:root` even for element-rooted queries). Enabled the two parse hooks + thread a per-query scope element (element-rooted → the element; document-rooted → `None`/`:root` unchanged; `closest` holds the context element fixed across the ancestor walk via a `"<node>,<scope>"` op arg so `:has(> :scope)` resolves right). Pure selector-engine plumbing, no DOM model change. Caps: `:invalid` (form constraint-validation), `getComputedStyle` specificity/cascade tests (CSS-cascade frontier), render reftests |
 | ~~01~~ | ✅ [The Selector Sorcery](01-the-selector-sorcery.md) | `dom/nodes/ParentNode-querySelector-All` | **1975/1975** | ⚔️⚔️ | **SECURED 100%** |
 | ~~02~~ | ✅ [The Attr-Node Codex](02-the-attr-node-codex.md) | `dom/nodes/attributes` | **67/67** | ⚔️⚔️⚔️ | **SECURED** |
@@ -83,6 +84,46 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-19 (Quest #43 The Charter of Constraints — the constraint
+validation API, +877):** The entire `html/semantics/forms/constraints/` realm was
+dark — `willValidate`, `validity`, `validationMessage`, `checkValidity()`,
+`reportValidity()`, `setCustomValidity()` and the `ValidityState` interface did not
+exist on any form control. Built the whole engine in one cohesive pure-JS block
+(no new Rust) on the 7 form-associated "listed" interfaces (input/button/select/
+textarea/fieldset/object/output) + `HTMLFormElement`: a real `ValidityState` (with
+`Symbol.toStringTag`) whose getters read a live `_cvCompute` flag set; barred-from-
+constraint-validation `willValidate` (fieldset/output/object, input
+hidden/button/reset, non-submit `<button>`, disabled — incl. **inside a disabled
+fieldset**, readonly attribute, datalist ancestor); per-type `valueMissing`
+(mutable-gated for text-like/typed inputs + textarea, ungated for
+checkbox/radio/file/select, **group-aware** radio); `email`/`url` `typeMismatch`
+after whitespace-strip sanitization; `patternMismatch` that validates the **raw**
+pattern first (so `"a)(b"` is rejected/ignored) then matches the anchored `^(?:…)$`
+with the `v` flag; typed `rangeOverflow`/`rangeUnderflow`/`stepMismatch` via
+comparable-number parsers (date/time/datetime-local/month/week/number, ISO-week →
+Monday ms; reversed ranges flag over+underflow together; Blink's float-tolerant
+snap-and-compare step test; step base = min → `value` attribute → default);
+always-`false` tooLong/tooShort/badInput (require interactive editing); `customError`
++ barred-aware `validationMessage`; `checkValidity`/`reportValidity` (element +
+form) firing a cancelable `invalid` event. Added the reflected attributes the suite
+drives (required/readOnly/pattern/min/max/step/multiple/maxLength/minLength,
+textarea.defaultValue) and the checkbox/radio pre-click activation step on
+`HTMLElement.click()`. Wins (all 0→): willValidate 67, willValidate-datalist 17,
+checkValidity 122, reportValidity 122, validate 8, inputwillvalidate 2, valueMissing
+71, valid 33, typeMismatch 11, patternMismatch 85, rangeOverflow 49, rangeUnderflow
+47, stepMismatch 27/28, tooLong 63, tooShort 63, customError 4, badInput 11,
+valueMissing-weekmonth 19, valid-weekmonth 8, rangeOverflow/Underflow-weekmonth 19+19,
+textarea-defaultValue 2/5, radio-valueMissing 6, radio-group-valueMissing 2.
+**+877, zero regressions** (qsa 1975, classlist 1420, createElement 147,
+createElementNS 596, cloneNode 135, matches/webkitMatches 669/669, closest 28/29,
+tagName 6, TreeWalker 761, mark 22, structured-clone 141/152, getRandomValues 39,
+url-setters-stripping 260; checkbox 1/6 + radio 3/12 unchanged greens — verified by
+stash-rebuild that `click()` activation lost no passes). Caps: `:valid`/`:invalid`
+selector matching (the 2 dynamic-value tests + closest 29/29 — the Rust selector
+engine can't call JS validity); `test_driver.send_keys` (3 textarea subtests); one
+sub-ULP `stepMismatch` (`step=3e-15` — needs decimal arithmetic). Scroll
+`tickets/43-the-charter-of-constraints.md`.
 
 **Session 2026-06-19 (Quest #42 The Logical Lens — `:is()`/`:where()`/`:has()` +
 the `:scope` scoping root, +116):** The Selectors-4 logical/relative pseudo-classes

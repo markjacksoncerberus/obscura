@@ -1680,7 +1680,14 @@ class Element extends Node {
   insertAdjacentElement(position, element) { return this._insertAdjacentNode(position, element); }
   insertAdjacentText(position, text) { this._insertAdjacentNode(position, document.createTextNode(String(text))); }
   click() {
+    // Pre-click activation: a checkbox toggles its checkedness, a radio becomes
+    // checked. Reverted if the click event's default action is prevented.
+    const _ct = this.localName === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
+    let _preChecked = null;
+    if (_ct === 'checkbox') { _preChecked = this.checked; this.checked = !this.checked; }
+    else if (_ct === 'radio') { _preChecked = this.checked; this.checked = true; }
     const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
+    if (cancelled && _preChecked !== null) this.checked = _preChecked;
     if (!cancelled) {
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
@@ -6861,6 +6868,431 @@ const _defIface = (name, base) => {
 ].forEach(n => _defIface(n));
 globalThis.HTMLAudioElement = class HTMLAudioElement extends globalThis.HTMLMediaElement {};
 globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMediaElement {};
+
+// ---------------------------------------------------------------------------
+// The constraint validation API (HTML §form-control-infrastructure / §the-constraint-validation-api).
+//   willValidate · validity (ValidityState) · validationMessage ·
+//   checkValidity() · reportValidity() · setCustomValidity()
+// Installed on the 7 form-associated "listed" interfaces: input, button,
+// select, textarea, fieldset, object, output. Pure JS — validity is computed
+// on demand from the element's reflected attributes + value. No render/UI, so
+// the states that require interactive user editing (tooLong/tooShort/badInput)
+// are always false here, matching what the WPT suite asserts.
+// ---------------------------------------------------------------------------
+
+// `v`-flag support is needed for the `pattern` attribute's regular expressions
+// (HTML compiles `pattern` with the `v` flag); fall back to `u` if the engine
+// predates it. An invalid expression under the chosen flag is simply ignored.
+const _CV_RE_FLAG = (() => { try { new RegExp("", "v"); return "v"; } catch (e) { return "u"; } })();
+
+// --- typed-value parsers (HTML "valid …" string microsyntaxes) -------------
+// Each returns a comparable Number (ms-from-epoch, ms-from-midnight, or a
+// unit count) for in-range/step math, or null when the string is not valid
+// (which, after value sanitization, is equivalent to an empty control value).
+function _cvDaysInMonth(y, m) {
+  return [31, (y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0)) ? 29 : 28,
+          31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1];
+}
+function _cvParseNumber(s) {
+  s = String(s);
+  if (!/^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?$/.test(s)) return null;
+  const n = parseFloat(s);
+  return isFinite(n) ? n : null;
+}
+function _cvParseDate(s) {
+  const m = /^(\d{4,})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  const y = +m[1], mo = +m[2], d = +m[3];
+  if (y < 1 || mo < 1 || mo > 12 || d < 1 || d > _cvDaysInMonth(y, mo)) return null;
+  return Date.UTC(y, mo - 1, d);
+}
+function _cvParseTime(s) {
+  const m = /^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(s);
+  if (!m) return null;
+  const h = +m[1], mi = +m[2], se = m[3] ? +m[3] : 0;
+  if (h > 23 || mi > 59 || se > 59) return null;
+  const fr = m[4] ? +((m[4] + "00").slice(0, 3)) : 0;
+  return (h * 3600 + mi * 60 + se) * 1000 + fr;
+}
+function _cvParseDateTimeLocal(s) {
+  const m = /^(\d{4,}-\d{2}-\d{2})[T ](\d.*)$/.exec(s);
+  if (!m) return null;
+  const d = _cvParseDate(m[1]); if (d == null) return null;
+  const t = _cvParseTime(m[2]); if (t == null) return null;
+  return d + t;
+}
+function _cvParseMonth(s) {
+  const m = /^(\d{4,})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  const y = +m[1], mo = +m[2];
+  if (y < 1 || mo < 1 || mo > 12) return null;
+  return (y - 1970) * 12 + (mo - 1);
+}
+function _cvIsoWeekToMs(y, w) {
+  const jan4 = Date.UTC(y, 0, 4);
+  const dow = (new Date(jan4).getUTCDay() + 6) % 7; // Monday = 0
+  return (jan4 - dow * 86400000) + (w - 1) * 604800000;
+}
+function _cvParseWeek(s) {
+  const m = /^(\d{4,})-W(\d{2})$/.exec(s);
+  if (!m) return null;
+  const y = +m[1], w = +m[2];
+  if (y < 1 || w < 1 || w > 53) return null;
+  return _cvIsoWeekToMs(y, w);
+}
+// Strip leading/trailing ASCII whitespace (the email/url value sanitization).
+function _cvStripWS(s) { return s.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, ""); }
+// HTML's "valid e-mail address" production.
+const _CV_EMAIL_RE = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+const _CV_TEXTLIKE = new Set(["text", "search", "tel", "url", "email", "password"]);
+const _CV_TYPED    = new Set(["number", "range", "date", "month", "week", "time", "datetime-local"]);
+const _CV_PERIODIC = new Set(["date", "month", "week", "time", "datetime-local"]);
+// readonly "applies" to (and so bars valueMissing for) these input types.
+const _CV_READONLY_APPLIES = new Set(["text", "search", "tel", "url", "email", "password",
+                                      "date", "month", "week", "time", "datetime-local", "number"]);
+
+function _cvInputType(el) { return (el.type || "text").toLowerCase(); }
+function _cvHasDatalistAncestor(el) {
+  let p = el.parentNode;
+  while (p && p.nodeType === 1) { if (p.localName === "datalist") return true; p = p.parentNode; }
+  return false;
+}
+function _cvFirstLegend(fs) {
+  for (let c = fs.firstChild; c; c = c.nextSibling) if (c.nodeType === 1 && c.localName === "legend") return c;
+  return null;
+}
+// A control is "actually disabled" if its own disabled attribute is set, or it
+// descends from a disabled fieldset and is not inside that fieldset's first
+// legend (HTML §enabling-and-disabling-form-controls).
+function _cvIsDisabled(el) {
+  if (el.hasAttribute("disabled")) return true;
+  let n = el.parentNode;
+  while (n && n.nodeType === 1) {
+    if (n.localName === "fieldset" && n.hasAttribute("disabled")) {
+      const legend = _cvFirstLegend(n);
+      if (!(legend && legend.contains && legend.contains(el))) return true;
+    }
+    n = n.parentNode;
+  }
+  return false;
+}
+// HTML "barred from constraint validation" → willValidate is its negation.
+function _cvWillValidate(el) {
+  const tag = el.localName;
+  if (tag === "fieldset" || tag === "output" || tag === "object") return false;
+  if (_cvIsDisabled(el)) return false;
+  if (_cvHasDatalistAncestor(el)) return false;
+  if (tag === "input") {
+    const t = _cvInputType(el);
+    if (t === "hidden" || t === "button" || t === "reset") return false;
+    if (el.hasAttribute("readonly")) return false; // bars regardless of whether it "applies"
+    return true;
+  }
+  if (tag === "button") return (el.type || "submit").toLowerCase() === "submit";
+  if (tag === "textarea") return !el.hasAttribute("readonly");
+  if (tag === "select") return true;
+  return false;
+}
+// Radio button group: elements sharing a (non-empty) name, the same form owner,
+// and the same tree. Reported per-member, so we collect the whole group.
+function _cvFormOwner(el) {
+  let p = el.parentNode;
+  while (p && p.nodeType === 1) { if (p.localName === "form") return p; p = p.parentNode; }
+  return null;
+}
+function _cvRadioGroup(el) {
+  const name = el.name || "";
+  if (name === "") return [el];
+  let root = el;
+  while (root.parentNode) root = root.parentNode;
+  let list = null;
+  try { if (root.querySelectorAll) list = root.querySelectorAll("input"); } catch (e) { list = null; }
+  if (!list) return [el];
+  const owner = _cvFormOwner(el);
+  const group = [];
+  for (const c of list) {
+    if (c.localName === "input" && _cvInputType(c) === "radio" &&
+        (c.name || "") === name && _cvFormOwner(c) === owner) group.push(c);
+  }
+  return group.length ? group : [el];
+}
+// "mutable" = editable; gates valueMissing for text-like/typed inputs + textarea.
+function _cvIsMutable(el) {
+  if (_cvIsDisabled(el)) return false;
+  const tag = el.localName;
+  if (tag === "textarea") return !el.hasAttribute("readonly");
+  if (tag === "input") {
+    const t = _cvInputType(el);
+    if (_CV_READONLY_APPLIES.has(t) && el.hasAttribute("readonly")) return false;
+  }
+  return true;
+}
+// Parse a typed input's value/min/max/step bound into a comparable number.
+function _cvTyped(t, s) {
+  switch (t) {
+    case "number": case "range": return _cvParseNumber(s);
+    case "date": return _cvParseDate(s);
+    case "time": return _cvParseTime(s);
+    case "datetime-local": return _cvParseDateTimeLocal(s);
+    case "month": return _cvParseMonth(s);
+    case "week": return _cvParseWeek(s);
+  }
+  return null;
+}
+// Is the (sanitized) control value empty? — drives valueMissing.
+function _cvValueEmpty(el) {
+  const tag = el.localName;
+  if (tag !== "input") return el.value === "";       // textarea / select
+  const t = _cvInputType(el);
+  if (_CV_TYPED.has(t)) return _cvTyped(t, el.value) == null;
+  return el.value === "";                             // text-like + everything else
+}
+function _cvCompilePattern(p) {
+  // The raw pattern must itself compile (so e.g. "a)(b" — which would become a
+  // valid expression only once wrapped — is rejected and the constraint ignored).
+  try { new RegExp(p, _CV_RE_FLAG); } catch (e) { return null; }
+  try { return new RegExp("^(?:" + p + ")$", _CV_RE_FLAG); } catch (e) { return null; }
+}
+// Per-type step scale (value units → comparable-number units) and default step.
+function _cvStepInfo(t) {
+  switch (t) {
+    case "number": case "range":    return { scale: 1, def: 1 };
+    case "date":                    return { scale: 86400000, def: 1 };
+    case "month":                   return { scale: 1, def: 1 };
+    case "week":                    return { scale: 604800000, def: 1 };
+    case "time":                    return { scale: 1000, def: 60 };
+    case "datetime-local":          return { scale: 1000, def: 60 };
+  }
+  return null;
+}
+function _cvDefaultStepBase(t) {
+  if (t === "week") return _cvIsoWeekToMs(1970, 1);
+  return 0; // epoch / midnight / month-0 / number-0
+}
+
+// Compute the full set of validity flags for a form control.
+function _cvCompute(el) {
+  const tag = el.localName;
+  const flags = {
+    valueMissing: false, typeMismatch: false, patternMismatch: false,
+    tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false,
+    stepMismatch: false, badInput: false, customError: false, valid: true,
+  };
+  flags.customError = !!el._customValidity;
+
+  const t = tag === "input" ? _cvInputType(el) : "";
+
+  // --- valueMissing ---------------------------------------------------------
+  if (tag === "input" && t === "radio") {
+    // Reported on every group member: missing iff some member is required and
+    // none are checked. A radio with no name is never in a group.
+    if ((el.name || "") !== "") {
+      const group = _cvRadioGroup(el);
+      flags.valueMissing = group.some(r => r.hasAttribute("required")) && !group.some(r => r.checked);
+    }
+  } else if (el.hasAttribute("required")) {
+    if (tag === "input" && t === "checkbox") {
+      flags.valueMissing = !el.checked;
+    } else if (tag === "input" && t === "file") {
+      const files = el.files;
+      flags.valueMissing = !files || files.length === 0;
+    } else if (tag === "select") {
+      flags.valueMissing = el.value === "";
+    } else if (tag === "input" && (_CV_TEXTLIKE.has(t) || _CV_TYPED.has(t)) || tag === "textarea") {
+      flags.valueMissing = _cvIsMutable(el) && _cvValueEmpty(el);
+    }
+  }
+
+  // --- typeMismatch (email / url) ------------------------------------------
+  if (tag === "input" && (t === "email" || t === "url")) {
+    const raw = _cvStripWS(el.value);
+    if (raw !== "") {
+      if (t === "email") {
+        if (el.hasAttribute("multiple")) {
+          flags.typeMismatch = raw.split(",").some(tok => !_CV_EMAIL_RE.test(_cvStripWS(tok)));
+        } else {
+          flags.typeMismatch = !_CV_EMAIL_RE.test(raw);
+        }
+      } else { // url
+        try { new URL(raw); } catch (e) { flags.typeMismatch = true; }
+      }
+    }
+  }
+
+  // --- patternMismatch (text-like inputs) ----------------------------------
+  if (tag === "input" && _CV_TEXTLIKE.has(t) && el.hasAttribute("pattern")) {
+    const val = el.value;
+    if (val !== "") {
+      const re = _cvCompilePattern(el.getAttribute("pattern"));
+      if (re) {
+        if (t === "email" && el.hasAttribute("multiple")) {
+          flags.patternMismatch = val.split(",").some(tok => !re.test(tok));
+        } else {
+          flags.patternMismatch = !re.test(val);
+        }
+      }
+    }
+  }
+
+  // --- range + step (typed inputs) -----------------------------------------
+  if (tag === "input" && _CV_TYPED.has(t)) {
+    const v = _cvTyped(t, el.value);
+    if (v != null) {
+      const maxN = el.hasAttribute("max") ? _cvTyped(t, el.getAttribute("max")) : null;
+      const minN = el.hasAttribute("min") ? _cvTyped(t, el.getAttribute("min")) : null;
+      if (minN != null && maxN != null && minN > maxN && _CV_PERIODIC.has(t)) {
+        // reversed range: in (max, min) means simultaneously over- and underflow.
+        if (v > maxN && v < minN) { flags.rangeOverflow = true; flags.rangeUnderflow = true; }
+      } else {
+        if (maxN != null && v > maxN) flags.rangeOverflow = true;
+        if (minN != null && v < minN) flags.rangeUnderflow = true;
+      }
+      const si = _cvStepInfo(t);
+      const stepAttr = el.getAttribute("step");
+      if (si && stepAttr !== "any") {
+        let stepNum = si.def;
+        if (stepAttr != null && stepAttr !== "") {
+          const parsed = parseFloat(stepAttr);
+          if (isFinite(parsed) && parsed > 0) stepNum = parsed;
+        }
+        const stepUnit = stepNum * si.scale;
+        // Step base: min if present & valid, else the value content attribute if
+        // present & valid, else the type default.
+        let base = _cvDefaultStepBase(t);
+        if (minN != null) base = minN;
+        else if (el.hasAttribute("value")) { const vb = _cvTyped(t, el.getAttribute("value")); if (vb != null) base = vb; }
+        if (stepUnit > 0) {
+          // Blink's float-tolerant test: snap to the nearest step, then compare
+          // in the value domain with an error budget of step/2^23. When the
+          // float noise of the round-trip exceeds the step itself (very small
+          // step vs. large value), the misalignment is unrepresentable and the
+          // value is treated as a multiple — no mismatch.
+          const aligned = base + Math.round((v - base) / stepUnit) * stepUnit;
+          const diff = Math.abs(v - aligned);
+          const accept = stepUnit / 8388608; // 2^23
+          if (diff > accept && diff < stepUnit - accept) flags.stepMismatch = true;
+        }
+      }
+    }
+  }
+
+  flags.valid = !(flags.valueMissing || flags.typeMismatch || flags.patternMismatch ||
+                  flags.tooLong || flags.tooShort || flags.rangeUnderflow || flags.rangeOverflow ||
+                  flags.stepMismatch || flags.badInput || flags.customError);
+  return flags;
+}
+
+globalThis.ValidityState = class ValidityState {
+  constructor(el) { Object.defineProperty(this, "_el", { value: el }); }
+  get valueMissing()    { return _cvCompute(this._el).valueMissing; }
+  get typeMismatch()    { return _cvCompute(this._el).typeMismatch; }
+  get patternMismatch() { return _cvCompute(this._el).patternMismatch; }
+  get tooLong()         { return _cvCompute(this._el).tooLong; }
+  get tooShort()        { return _cvCompute(this._el).tooShort; }
+  get rangeUnderflow()  { return _cvCompute(this._el).rangeUnderflow; }
+  get rangeOverflow()   { return _cvCompute(this._el).rangeOverflow; }
+  get stepMismatch()    { return _cvCompute(this._el).stepMismatch; }
+  get badInput()        { return _cvCompute(this._el).badInput; }
+  get customError()     { return _cvCompute(this._el).customError; }
+  get valid()           { return _cvCompute(this._el).valid; }
+  get [Symbol.toStringTag]() { return "ValidityState"; }
+};
+
+const _CV_API = {
+  willValidate: { configurable: true, get() { return _cvWillValidate(this); } },
+  validity: { configurable: true, get() { return new globalThis.ValidityState(this); } },
+  validationMessage: {
+    configurable: true,
+    get() {
+      if (!_cvWillValidate(this)) return "";
+      if (this._customValidity) return this._customValidity;
+      return ""; // no UA-authored messages for the built-in states (untested)
+    },
+  },
+  setCustomValidity: { configurable: true, writable: true, value: function (msg) { this._customValidity = msg == null ? "" : String(msg); } },
+  checkValidity: {
+    configurable: true, writable: true,
+    value: function () {
+      if (_cvWillValidate(this) && !_cvCompute(this).valid) {
+        this.dispatchEvent(new Event("invalid", { cancelable: true, bubbles: false }));
+        return false;
+      }
+      return true;
+    },
+  },
+  reportValidity: {
+    configurable: true, writable: true,
+    value: function () { return this.checkValidity(); },
+  },
+};
+for (const name of ["HTMLInputElement", "HTMLButtonElement", "HTMLSelectElement",
+                    "HTMLTextAreaElement", "HTMLFieldSetElement", "HTMLObjectElement",
+                    "HTMLOutputElement"]) {
+  Object.defineProperties(globalThis[name].prototype, _CV_API);
+}
+
+// HTMLFormElement static validation: validate every candidate control.
+Object.defineProperties(globalThis.HTMLFormElement.prototype, {
+  checkValidity: {
+    configurable: true, writable: true,
+    value: function () {
+      let ok = true;
+      for (const el of this.elements) {
+        if (_cvWillValidate(el) && !_cvCompute(el).valid) {
+          el.dispatchEvent(new Event("invalid", { cancelable: true, bubbles: false }));
+          ok = false;
+        }
+      }
+      return ok;
+    },
+  },
+  reportValidity: { configurable: true, writable: true, value: function () { return this.checkValidity(); } },
+});
+
+// --- reflected content attributes the constraint validation tests rely on --
+function _cvReflBool(proto, prop, attr) {
+  Object.defineProperty(proto, prop, {
+    configurable: true,
+    get() { return this.hasAttribute(attr); },
+    set(v) { if (v) this.setAttribute(attr, ""); else this.removeAttribute(attr); },
+  });
+}
+function _cvReflStr(proto, prop, attr) {
+  Object.defineProperty(proto, prop, {
+    configurable: true,
+    get() { return this.getAttribute(attr) || ""; },
+    set(v) { this.setAttribute(attr, v == null ? "" : String(v)); },
+  });
+}
+function _cvReflLong(proto, prop, attr) {
+  Object.defineProperty(proto, prop, {
+    configurable: true,
+    get() { const a = this.getAttribute(attr); if (a == null) return -1; const n = parseInt(a, 10); return isNaN(n) ? -1 : n; },
+    set(v) { this.setAttribute(attr, String(v)); },
+  });
+}
+{
+  const Input = globalThis.HTMLInputElement.prototype;
+  const Textarea = globalThis.HTMLTextAreaElement.prototype;
+  const Select = globalThis.HTMLSelectElement.prototype;
+  for (const P of [Input, Select, Textarea]) _cvReflBool(P, "required", "required");
+  for (const P of [Input, Textarea]) { _cvReflBool(P, "readOnly", "readonly"); _cvReflLong(P, "maxLength", "maxlength"); _cvReflLong(P, "minLength", "minlength"); }
+  _cvReflBool(Input, "multiple", "multiple");
+  _cvReflBool(Select, "multiple", "multiple");
+  _cvReflStr(Input, "pattern", "pattern");
+  _cvReflStr(Input, "min", "min");
+  _cvReflStr(Input, "max", "max");
+  _cvReflStr(Input, "step", "step");
+  // <textarea> default value is its child text content; the (non-dirty) value
+  // tracks it. Setting it programmatically is not a user edit.
+  Object.defineProperty(Textarea, "defaultValue", {
+    configurable: true,
+    get() { return this.textContent; },
+    set(v) { this.textContent = v == null ? "" : String(v); },
+  });
+}
+
 globalThis.SVGElement = Element;
 globalThis.SVGSVGElement = Element;
 globalThis.CharacterData = CharacterData;
