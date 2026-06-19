@@ -2314,6 +2314,11 @@ class Document extends Node {
   getSelection() { return globalThis.getSelection(); }
   get activeElement() { return __obscura_focused || this.body; }
   get implementation() {
+    // The implementation is "associated" with the document it was read from
+    // (`document.implementation` for the page, `doc.implementation` for a
+    // createHTMLDocument/createDocument/iframe document). `createDocumentType`'s
+    // returned doctype takes THIS document as its node document — so capture it.
+    const _implDoc = this;
     return {
       createHTMLDocument(title) {
         const doc = new DetachedDocument('html');
@@ -2367,8 +2372,28 @@ class Document extends Node {
         return doc;
       },
       createDocumentType(qualifiedName, publicId, systemId) {
+        // WebIDL: createDocumentType(DOMString name, DOMString publicId,
+        // DOMString systemId) — all three are required (so <3 args → TypeError)
+        // and plain (non-nullable) DOMStrings.
+        if (arguments.length < 3) {
+          throw new TypeError("Failed to execute 'createDocumentType' on 'DOMImplementation': 3 arguments required, but only " + arguments.length + " present.");
+        }
+        const name = String(qualifiedName);
+        // DOM §createDocumentType: throw InvalidCharacterError if `name` is not a
+        // "valid doctype name" — i.e. it contains ASCII whitespace (TAB/LF/FF/CR/
+        // SPACE), U+0000 NULL, or U+003E '>'. The empty string IS valid. (Note:
+        // this is deliberately looser than createElementNS's QName check — a
+        // doctype name like ":foo"/"foo:"/"prefix::local"/"@" is allowed here.)
+        if (/[\u0000\u0009\u000A\u000C\u000D\u0020>]/.test(name)) {
+          throw new DOMException("'" + name + "' is not a valid doctype name.", "InvalidCharacterError");
+        }
         const nid = +_dom("create_comment_node", "");
-        return new DocumentType(nid, String(qualifiedName), String(publicId ?? ""), String(systemId ?? ""));
+        const dt = new DocumentType(nid, name, String(publicId), String(systemId));
+        // The new doctype's node document is the implementation's associated
+        // document (the page for `document.implementation`, the detached/iframe
+        // document for `doc.implementation`).
+        dt._ownerDoc = _implDoc;
+        return dt;
       },
       hasFeature() { return true; },
     };
@@ -2533,7 +2558,9 @@ class DetachedDocument extends Document {
     for (let c = this.firstChild; c; c = c.nextSibling) if (c.nodeType === 10) return c;
     return null;
   }
-  get implementation() { return globalThis.document.implementation; }
+  // `implementation` is inherited from Document so the returned DOMImplementation
+  // is associated with THIS detached document — `doc.implementation.createDocumentType`
+  // must give the new doctype `doc` (not the page) as its node document.
   // §clone a node (document): a new document of the same kind carrying the same
   // encoding/content type/URL/mode; children are copied only for a deep clone.
   cloneNode(deep) {
@@ -7591,7 +7618,9 @@ class _IframeDocument extends DetachedDocument {
   get activeElement() { return this.body; }
   get cookie() { return ''; }
   set cookie(v) {}
-  get implementation() { return globalThis.document.implementation; }
+  // Inherit `implementation` from Document/DetachedDocument so the returned
+  // DOMImplementation is associated with this iframe document (correct node
+  // document for `iframeDoc.implementation.createDocumentType`).
   get styleSheets() { return []; }
   hasFocus() { return false; }
 
