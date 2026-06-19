@@ -47,7 +47,16 @@ const _reportError = function(err) {
   } catch (e) {}
 };
 
-const _dom = (cmd, a1, a2) => Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+// Generation counter bumped on every structural tree mutation. Live `childNodes`
+// NodeLists cache their snapshot against this so repeated reads in a hot loop
+// (serialization, slice, etc.) don't re-query Rust on every access, while still
+// reflecting any mutation the instant one happens.
+let _treeGen = 0;
+const _MUTATING_DOM_CMDS = new Set(['append_child', 'remove_child', 'insert_before', 'set_inner_html', 'set_text_content']);
+const _dom = (cmd, a1, a2) => {
+  if (_MUTATING_DOM_CMDS.has(cmd)) _treeGen++;
+  return Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+};
 
 // ASCII-only case folding — HTML element/attribute names are lowercased/uppercased
 // over the ASCII range ONLY (so e.g. U+212A KELVIN SIGN and U+0130 İ are NOT touched,
@@ -431,9 +440,8 @@ class Node {
   get parentNode() { return _wrap(+_dom("parent_node", this._nid)); }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
   get childNodes() {
-    const ids = _domParse("child_nodes", this._nid) || [];
-    const list = ids.map(_wrap).filter(Boolean);
-    list.item = (i) => list[i] || null;
+    let list = _childNodesCache.get(this);
+    if (!list) { list = _makeLiveChildNodes(this); _childNodesCache.set(this, list); }
     return list;
   }
   get firstChild() { return _wrap(+_dom("first_child", this._nid)); }
@@ -1090,6 +1098,59 @@ const _makeNodeList = (nodes) => {
   const nl = new globalThis.NodeList();
   for (let i = 0; i < nodes.length; i++) nl[i] = nodes[i];
   return nl;
+};
+
+// A live, cached NodeList for `Node.childNodes`. Per WHATWG DOM the same object is
+// returned every time (cached on the node) and reflects tree mutations (live). The
+// target is a real NodeList instance, so `list instanceof NodeList` holds and the
+// iterator/keys/values/entries/forEach identities are Array.prototype's — exactly
+// what `Node-childNodes.html` asserts. A Proxy serves integer-index and `length`
+// from the live tree; a generation-counter snapshot (`_treeGen`) keeps repeated
+// reads between mutations cheap. Indexed slots are read-only; expandos pass through.
+const _childNodesCache = new WeakMap(); // node -> live NodeList proxy
+const _nlIsIndex = (p) => typeof p === 'string' && /^(0|[1-9][0-9]*)$/.test(p);
+const _makeLiveChildNodes = (node) => {
+  const target = new globalThis.NodeList();
+  let snap = null, snapGen = -1;
+  const items = () => {
+    if (snap === null || snapGen !== _treeGen) {
+      const ids = _domParse("child_nodes", node._nid) || [];
+      snap = ids.map(_wrap).filter(Boolean);
+      snapGen = _treeGen;
+    }
+    return snap;
+  };
+  return new Proxy(target, {
+    get(t, p, r) {
+      if (p === 'length') return items().length;
+      if (_nlIsIndex(p)) { const it = items(), i = +p; return i < it.length ? it[i] : undefined; }
+      return Reflect.get(t, p, r);
+    },
+    set(t, p, v, r) {
+      if (_nlIsIndex(p) || p === 'length') return true; // read-only, silently ignored
+      return Reflect.set(t, p, v, r);                   // expandos
+    },
+    has(t, p) {
+      if (_nlIsIndex(p)) return +p < items().length;
+      return Reflect.has(t, p);
+    },
+    ownKeys(t) {
+      const keys = [], n = items().length;
+      for (let i = 0; i < n; i++) keys.push(String(i));
+      keys.push('length');
+      for (const k of Reflect.ownKeys(t)) if (!keys.includes(k)) keys.push(k);
+      return keys;
+    },
+    getOwnPropertyDescriptor(t, p) {
+      if (_nlIsIndex(p)) {
+        const it = items(), i = +p;
+        if (i < it.length) return { value: it[i], writable: false, enumerable: true, configurable: true };
+        return undefined;
+      }
+      if (p === 'length') return { value: items().length, writable: true, enumerable: false, configurable: false };
+      return Reflect.getOwnPropertyDescriptor(t, p);
+    },
+  });
 };
 
 // A live HTMLCollection. Contents come from a refresh() thunk re-evaluated on

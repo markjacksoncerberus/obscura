@@ -51,6 +51,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~34~~ | ✅ [The Adoption Papers](34-the-adoption-papers.md) | `dom/nodes/Document-adoptNode` (+ insert-adopt) | **Document-adoptNode 4/4, Node-mutation-adoptNode 2/2** | ⚔️ | **SECURED — +5.** `document.adoptNode` was unimplemented (`adoptNode is not a function`). Real DOM §dom-document-adoptnode: detach from any parent, deep-retarget the node document of the whole subtree (`_setNodeDocumentDeep`), adopting a Document throws `NotSupportedError`; inherited by `DetachedDocument`. Also fixed insertion (`appendChild`/`insertBefore`) to run the §insert "adopt into the parent's node document" step **deeply** when crossing documents (was retagging only the direct child) — hot-path safe via a same-document cheap compare. Pure JS, no new Rust. Caps: DocumentFragment/ShadowRoot adopt subtests (need a working `new Document()` web ctor, template-content owner document, `attachShadow`), `remove-and-adopt-thcrash` (`window.open()` popup document) |
 | ~~35~~ | ✅ [The Insertion Concord](35-the-insertion-concord.md) | `dom/nodes/{ParentNode-append,prepend,replaceChildren,ChildNode-before,after,replaceWith}` | **before/after/replaceWith 45/45+45/45+33/33, append 25/25, prepend 22/22, replaceChildren 25/29** | ⚔️⚔️ | **SECURED — +177.** The whole ParentNode/ChildNode mutation family shared crooked, duplicated "convert nodes into a node" logic that only handled `typeof === "string"` (so `null`/`undefined`/numbers threw instead of becoming Text nodes), `before`/`after`/`replaceWith` lacked the viable-sibling algorithm (so `child.before(x, child)` **crashed the engine** → the three suites were dark), and `replaceChildren` was missing entirely. One shared spec-correct core (`_convertNodesIntoNode` + `_cn*`/`_pn*` mixins on Element/CharacterData/DocumentType/DocumentFragment/Document) + §ensure-pre-insertion-validity steps 5–6 added to `appendChild`/`insertBefore`. Bonus: insertAdjacentElement/Text 5→6 each. Caps: `replaceChildren` atomic "replace all" MutationObserver record (needs a Rust suppress-observers flag) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
+| ~~36~~ | ✅ [The Living Roster](36-the-living-roster.md) | `dom/nodes/Node-childNodes` | **6/6** | ⚔️⚔️ | **SECURED — +5.** `Node.childNodes` returned a fresh plain array each call (no identity, not live). Now a cached, live `NodeList` Proxy per node: the target is a real `NodeList extends Array` (so `instanceof` + the `Array.prototype` iterator/keys/values/entries/forEach identities hold), Proxy traps serve integer-index + `length` from the live tree, the proxy is cached on the node for identity, and a `_treeGen` counter (bumped by the 5 structural `op_dom` mutators) keeps repeated reads between mutations cheap. Pure JS, no new Rust. Zero regressions (TreeWalker 761/761 a key signal) |
 
 Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️⚔️⚔️ an architectural siege.
 
@@ -76,6 +77,30 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-18 (Quest #36 The Living Roster — live, cached
+`Node.childNodes`, +5):**
+- `Node.childNodes` returned a **fresh plain array** every call, so it failed
+  identity (`node.childNodes === node.childNodes`), liveness (a held reference
+  reflecting append/remove), and the `instanceof NodeList` / iterator-identity
+  subtests — `Node-childNodes.html` 1/6.
+- **Fix (pure JS, no new Rust):** a **cached, live `NodeList` Proxy** per node.
+  The target is a real `NodeList extends Array`, so `instanceof` + the
+  `Array.prototype` iterator/keys/values/entries/forEach identities the test
+  demands come for free; Proxy traps serve integer-index + `length` from the live
+  tree; the proxy is cached on the node (`_childNodesCache` WeakMap) for identity.
+  A `_treeGen` generation counter — bumped inside the `_dom` wrapper by the five
+  structural mutators (`append_child`/`remove_child`/`insert_before`/
+  `set_inner_html`/`set_text_content`) — lets each NodeList cache its snapshot, so
+  hot read loops don't re-query Rust per index while still reflecting any mutation
+  instantly.
+- **Win:** Node-childNodes 1→**6/6**. **+5.** Zero regressions (qsa 1975,
+  classlist 1420, createElement 147, createElementNS 596, TreeWalker 761/761
+  [heavy childNodes user], cloneNode 135, isEqualNode 9, attributes 67,
+  Node-append/replaceChild 11/29, mark 22/22, measures 119/119, structured-clone
+  141/152, getRandomValues 39/39, url-setters-stripping 260/260; Range-cloneContents
+  181/187 ≥ baseline, MutationObserver-childList 31/38 = baseline). Scroll
+  `36-the-living-roster.md`.
 
 **Session 2026-06-18 (Quest #35 The Insertion Concord — ParentNode/ChildNode
 mutation methods, +177):**
