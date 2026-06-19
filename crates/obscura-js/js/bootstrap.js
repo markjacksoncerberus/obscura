@@ -2147,16 +2147,44 @@ function _checkInsertConstraints(parent, node, child) {
 
 class Document extends Node {
   // `new Document(nid)` (numeric) wraps a real document node (the main document,
-  // or a node-type-9 node from the tree). `new Document()` with no id creates a
-  // fresh, empty XML document per the DOM spec (used by WPT range/traversal setup).
+  // or a node-type-9 node from the tree). `new Document()` with NO id is the DOM
+  // §dom-document constructor: a fresh, empty, STANDALONE document. Unlike the
+  // DetachedDocument subclass used by createDocument/iframes, a `new Document()`
+  // must keep `Document.prototype` as its immediate prototype (so
+  // `new Document() instanceof XMLDocument` is false and `Object.getPrototypeOf(doc)
+  // === Document.prototype`), yet still own a real backing node + scope its reads to
+  // its own subtree. So instead of returning a subclass, we set this instance up as
+  // standalone (the `_standalone` branches in the getters below give it the XML-type,
+  // about:blank, self-scoped semantics).
   constructor(nid) {
-    super(typeof nid === 'number' ? nid : -1);
-    if (typeof nid !== 'number') return new DetachedDocument('xml');
+    if (typeof nid === 'number') { super(nid); return; }
+    super(+_dom("create_document_fragment"));
+    // Be the canonical wrapper for the backing node so a child's parentNode resolves
+    // back to THIS document; mark it a real document so `:root` matches its root.
+    _cache.set(this._nid, this);
+    _dom('mark_real_document', this._nid);
+    // XML-type, non-HTML: application/xml content type, case-preserving createElement
+    // yielding plain Element, characterSet UTF-8.
+    this._standalone = true;
+    this._kind = 'xml';
+    this._createMode = 'xml';
   }
-  get documentElement() { return _wrapEl(+_dom("document_element")); }
+  get documentElement() {
+    if (this._standalone) {
+      for (let c = this.firstChild; c; c = c.nextSibling) if (c.nodeType === 1) return c;
+      return null;
+    }
+    return _wrapEl(+_dom("document_element"));
+  }
   get head() { return this.querySelector("head"); }
   get body() { return this.querySelector("body"); }
   get doctype() {
+    // A standalone document reflects its actual doctype child live (the page document
+    // keeps the cached fast path below).
+    if (this._standalone) {
+      for (let c = this.firstChild; c; c = c.nextSibling) if (c.nodeType === 10) return c;
+      return null;
+    }
     if (this._doctype !== undefined) return this._doctype;
     const info = _domParse("document_doctype");
     if (info && info.name) {
@@ -2168,11 +2196,11 @@ class Document extends Node {
   }
   get title() { return _domParse("document_title") ?? ""; }
   set title(v) {}
-  get URL() { return _domParse("document_url") ?? ""; }
+  get URL() { return this._standalone ? "about:blank" : (_domParse("document_url") ?? ""); }
   get documentURI() { return this.URL; }
-  get location() { return globalThis.location; }
-  set location(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
-  get defaultView() { return globalThis; }
+  get location() { return this._standalone ? null : globalThis.location; }
+  set location(url) { if (this._standalone) return; Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
+  get defaultView() { return this._standalone ? null : globalThis; }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
@@ -2180,17 +2208,26 @@ class Document extends Node {
   get characterSet() { return "UTF-8"; }
   get charset() { return this.characterSet; }        // legacy alias of characterSet
   get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
-  get contentType() { return "text/html"; }
+  get contentType() { return this._standalone ? "application/xml" : "text/html"; }
   // Whether this is an HTML document (drives attribute-name lowercasing).
-  get _isHTMLDoc() { return true; }
+  get _isHTMLDoc() { return this._standalone ? false : true; }
   get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
-  getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
-  querySelector(s) { _primeTarget(s, this); return _qsOne(_dom("query_selector", s), s); }
+  getElementById(id) {
+    if (this._standalone) return this.querySelector('#' + String(id).replace(/["\\]/g, '\\$&'));
+    return _wrapEl(+_dom("get_element_by_id", id));
+  }
+  querySelector(s) {
+    _primeTarget(s, this);
+    if (this._standalone) return _qsOne(_dom("query_selector_scoped", this._nid, s), s);
+    return _qsOne(_dom("query_selector", s), s);
+  }
   querySelectorAll(s) {
     _primeTarget(s, this);
-    const ids = _qsIds(_dom("query_selector_all", s), s);
+    const ids = this._standalone
+      ? _qsIds(_dom("query_selector_all_scoped", this._nid, s), s)
+      : _qsIds(_dom("query_selector_all", s), s);
     return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementsByTagName(t) { return _gebTagName(this._nid, t, this._isHTMLDoc); }
@@ -2198,6 +2235,10 @@ class Document extends Node {
   getElementsByClassName(c) { return _gebClassName(this._nid, c); }
   getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
   createElement(t) {
+    // A standalone (XML-type) document creates elements case-sensitively, in the
+    // null namespace, with a plain Element interface (per §createElement: namespace
+    // is null unless the document is HTML / application/xhtml+xml).
+    if (this._standalone) return _createElementXMLInto(this, t, null);
     // WebIDL: localName is a (non-nullable) DOMString — undefined -> "undefined",
     // null -> "null". Then validate against the element-name production, throwing
     // InvalidCharacterError; finally ASCII-lowercase (this is an HTML document).
@@ -2229,19 +2270,30 @@ class Document extends Node {
     if (nsv === _HTML_NS && local === 'template') el._templateContent = this.createDocumentFragment();
     return el;
   }
-  createTextNode(t) { return _wrap(+_dom("create_text_node", String(t))); }
+  createTextNode(t) {
+    const n = _wrap(+_dom("create_text_node", String(t)));
+    if (n && this._standalone) n._ownerDoc = this;
+    return n;
+  }
   createComment(t) {
     const nid = +_dom("create_comment_node", String(t ?? ""));
     const n = new Comment(nid, _NID_TOKEN);
     _cache.set(nid, n);
+    if (this._standalone) n._ownerDoc = this;
     return n;
   }
   // Per DOM spec, createCDATASection throws on an HTML document; XML documents
-  // (DetachedDocument with kind 'xml') override this to actually create one.
+  // (a standalone `new Document()`, or a DetachedDocument with kind 'xml') create one.
   createCDATASection(data) {
-    throw new DOMException("This operation is not supported for HTML documents.", "NotSupportedError");
+    if (!this._standalone)
+      throw new DOMException("This operation is not supported for HTML documents.", "NotSupportedError");
+    const n = _makeCDATA(data); n._ownerDoc = this; return n;
   }
-  createProcessingInstruction(target, data) { return _createPIValidated(target, data); }
+  createProcessingInstruction(target, data) {
+    const n = _createPIValidated(target, data);
+    if (n && this._standalone) n._ownerDoc = this;
+    return n;
+  }
   // Create a detached Attr node. createAttribute lowercases for HTML documents;
   // createAttributeNS validates+extracts the qualified name (case-preserving).
   createAttribute(localName) {
@@ -2259,6 +2311,7 @@ class Document extends Node {
     const nid = +_dom("create_document_fragment");
     const frag = new DocumentFragment(nid);
     _cache.set(nid, frag);
+    if (this._standalone) frag._ownerDoc = this;
     return frag;
   }
   // DOM §dom-document-adoptnode: detach `node` from any parent and make this
@@ -2608,23 +2661,7 @@ class DetachedDocument extends Document {
     }
     const n = super.createElement(t); if (n) n._ownerDoc = this; return n;
   }
-  _createElementXML(t, ns) {
-    const name = (t === undefined) ? "undefined" : String(t);
-    if (!_isValidElementName(name)) {
-      throw new DOMException("The string '" + name + "' is not a valid element name.", "InvalidCharacterError");
-    }
-    const el = _wrapEl(+_dom("create_element", name));
-    if (el) {
-      // Pin the case-sensitive identity directly on the wrapper, shadowing the
-      // ASCII-casing prototype getters used for HTML elements.
-      Object.defineProperty(el, 'localName',    { value: name, configurable: true });
-      Object.defineProperty(el, 'tagName',      { value: name, configurable: true });
-      Object.defineProperty(el, 'prefix',       { value: null, configurable: true });
-      Object.defineProperty(el, 'namespaceURI', { value: ns,   configurable: true });
-      el._ownerDoc = this;
-    }
-    return el;
-  }
+  _createElementXML(t, ns) { return _createElementXMLInto(this, t, ns); }
   createElementNS(ns, t) { const n = super.createElementNS(ns, t); if (n) n._ownerDoc = this; return n; }
   createTextNode(t) { const n = super.createTextNode(t); n._ownerDoc = this; return n; }
   createComment(t) { const n = super.createComment(t); n._ownerDoc = this; return n; }
@@ -2721,6 +2758,34 @@ const _wrapEl = function(nid) {
   _cache.set(nid, n);
   return n;
 };
+// Create an element for an XML/XHTML document: case-PRESERVING local name (no ASCII
+// lowercasing) and the given namespace. Only HTML-namespace (XHTML) elements keep an
+// HTMLElement subclass interface; XML (null-namespace) elements are plain Element —
+// so `new Document().createElement("a").constructor === Element` (not HTMLAnchorElement).
+// The case-preserved identity is pinned as own properties shadowing the casing
+// prototype getters used for HTML elements.
+function _createElementXMLInto(doc, t, ns) {
+  const name = (t === undefined) ? "undefined" : String(t);
+  if (!_isValidElementName(name)) {
+    throw new DOMException("The string '" + name + "' is not a valid element name.", "InvalidCharacterError");
+  }
+  const nid = +_dom("create_element", name);
+  if (nid < 0 || isNaN(nid)) return null;
+  let el;
+  if (ns === _HTML_NS) {
+    el = _wrapEl(nid); // XHTML: HTML-namespace element keeps its HTMLElement interface
+  } else {
+    el = _cache.get(nid) || new Element(nid); _cache.set(nid, el); // XML: plain Element
+  }
+  if (el) {
+    Object.defineProperty(el, 'localName',    { value: name, configurable: true });
+    Object.defineProperty(el, 'tagName',      { value: name, configurable: true });
+    Object.defineProperty(el, 'prefix',       { value: null, configurable: true });
+    Object.defineProperty(el, 'namespaceURI', { value: ns,   configurable: true });
+    el._ownerDoc = doc;
+  }
+  return el;
+}
 
 // _wrap / _cache are module-local (declared above); no need to expose them on
 // the page's window — page scripts can neither see nor clobber them.

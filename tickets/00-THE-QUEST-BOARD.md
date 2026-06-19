@@ -51,6 +51,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~34~~ | ✅ [The Adoption Papers](34-the-adoption-papers.md) | `dom/nodes/Document-adoptNode` (+ insert-adopt) | **Document-adoptNode 4/4, Node-mutation-adoptNode 2/2** | ⚔️ | **SECURED — +5.** `document.adoptNode` was unimplemented (`adoptNode is not a function`). Real DOM §dom-document-adoptnode: detach from any parent, deep-retarget the node document of the whole subtree (`_setNodeDocumentDeep`), adopting a Document throws `NotSupportedError`; inherited by `DetachedDocument`. Also fixed insertion (`appendChild`/`insertBefore`) to run the §insert "adopt into the parent's node document" step **deeply** when crossing documents (was retagging only the direct child) — hot-path safe via a same-document cheap compare. Pure JS, no new Rust. Caps: DocumentFragment/ShadowRoot adopt subtests (need a working `new Document()` web ctor, template-content owner document, `attachShadow`), `remove-and-adopt-thcrash` (`window.open()` popup document) |
 | ~~35~~ | ✅ [The Insertion Concord](35-the-insertion-concord.md) | `dom/nodes/{ParentNode-append,prepend,replaceChildren,ChildNode-before,after,replaceWith}` | **before/after/replaceWith 45/45+45/45+33/33, append 25/25, prepend 22/22, replaceChildren 25/29** | ⚔️⚔️ | **SECURED — +177.** The whole ParentNode/ChildNode mutation family shared crooked, duplicated "convert nodes into a node" logic that only handled `typeof === "string"` (so `null`/`undefined`/numbers threw instead of becoming Text nodes), `before`/`after`/`replaceWith` lacked the viable-sibling algorithm (so `child.before(x, child)` **crashed the engine** → the three suites were dark), and `replaceChildren` was missing entirely. One shared spec-correct core (`_convertNodesIntoNode` + `_cn*`/`_pn*` mixins on Element/CharacterData/DocumentType/DocumentFragment/Document) + §ensure-pre-insertion-validity steps 5–6 added to `appendChild`/`insertBefore`. Bonus: insertAdjacentElement/Text 5→6 each. Caps: `replaceChildren` atomic "replace all" MutationObserver record (needs a Rust suppress-observers flag) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
+| ~~40~~ | ✅ [The Standalone Charter](40-the-standalone-charter.md) | `dom/nodes/Document-constructor` (the `new Document()` web ctor) | **5/5** | ⚔️ | **SECURED — +2.** The `new Document()` web constructor named "next leverage" since #34. It returned a `DetachedDocument` subclass, so `Object.getPrototypeOf(doc) !== Document.prototype` AND its XML `createElement` used `_wrapEl` (HTML interface) → `createElement("a").constructor !== Element`. Now `new Document()` is a genuine `Document` instance set up as **standalone** (real fragment backing node + `_standalone`/`_kind:'xml'`/`_createMode:'xml'`): base-class getters branch on `_standalone` for application/xml content type, about:blank URL, self-scoped queries, non-HTML createElement (case-preserving plain `Element` via shared `_createElementXMLInto`), and a working `createCDATASection`. Caught & fixed a latent regression: `dom/common.js` does `new Document().createCDATASection(...)` — the base throwing version aborted the whole harness (TreeWalker/Range went dark). Pure JS, no new Rust, zero regressions. Caps: template-content owner doc + `attachShadow` (adoption.window 3/6 tail) |
 | ~~39~~ | ✅ [The Doctype Charter](39-the-doctype-charter.md) | `dom/nodes/DOMImplementation-createDocumentType` | **82/82** | ⚔️ | **SECURED — +81.** Exposed by #38. `createDocumentType` had no "valid doctype name" check (a name is valid unless it contains ASCII whitespace / U+0000 / `>`; empty string valid — *looser* than QName, so `:foo`/`foo:`/`prefix::local`/`@` are fine; only `"edi:>"`/`"edi:a "` throw `InvalidCharacterError`) and gave the wrong `ownerDocument`: `DetachedDocument`/`_IframeDocument` overrode `get implementation()` to return the **page's** impl, so `doc.implementation.createDocumentType(...)` owned to the page not `doc`. Fix: `Document.get implementation()` captures `this` + sets the doctype's `_ownerDoc`; delegating overrides removed (inherit the bound getter); `<3 args` → `TypeError`. Pure JS, no new Rust |
 | ~~38~~ | ✅ [The Document Charter](38-the-document-charter.md) | `dom/nodes/DOMImplementation-createDocument` (+ `adoption.window`) | **createDocument 434/434** | ⚔️⚔️ | **SECURED — +116.** The widest DOM frontier left (the `new Document()` footgun named since #34). 114 fails were all document-identity `assert_equals` (distinct objects, not `===`). `XMLDocument` was `class extends Document {}` (abstract, no backing node) and `createDocument` returned a `DetachedDocument`, so `Object.getPrototypeOf(doc) === XMLDocument.prototype` never held. Now `XMLDocument extends DetachedDocument` (a real fragment-backed node — distinct backing Document, no node-0 fallback); `createDocument` returns `new XMLDocument('xml')` + full WebIDL validation/coercion + spec node order. `adoption.window` 1→3/6 came free. Caps: `createDocumentType` 1/82 (next quest), ShadowRoot/popup adoption, `new Document()` web ctor (Document-constructor 3/5) |
 | ~~37~~ | ✅ [The Wordsmith's Charter](37-the-wordsmiths-charter.md) | `dom/nodes/{Text,Comment}-constructor`, `CharacterData-data`, `Text-splitText`, `Text-wholeText` | **constructors 15/16+15/16, data 16/16, splitText 6/6, wholeText 1/1** | ⚔️ | **SECURED — +30.** `Text`/`Comment` had no web constructor — they inherited `Node(nid)`, so `new Text("42")` stuffed the data string into `_nid` (→ ops fell back to the live document, `.data` returned the page body). Added real `new Text/Comment(data)` constructors (allocate a backing node; a private `_NID_TOKEN` sentinel keeps internal nid-wraps distinct from web data so `new Text(42)`→data `"42"`). Harvested 3 nearby gaps: `data` setter `[LegacyNullToEmptyString]` (`undefined`→`"undefined"`), `splitText` IndexSizeError on out-of-range offset, real `wholeText` (contiguous Text-node concatenation). Pure JS, no new Rust. Caps: cross-global iframe-realm ownerDocument (the shared 15/16 fail); next frontier = `DOMImplementation-createDocument` 320/434 needs distinct backing Document nodes (`new Document()` footgun) |
@@ -80,6 +81,60 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-19 (Quest #40 The Standalone Charter — the `new Document()`
+web constructor, +2):**
+- `dom/nodes/Document-constructor.html` was **3/5** — the `new Document()` web
+  ctor named as "next leverage" since #34/#36/#38. Two fails:
+  1. **`Object.getPrototypeOf(doc) === Document.prototype`** — `new Document()`
+     returned `new DetachedDocument('xml')`, so the immediate prototype was
+     `DetachedDocument.prototype`, not `Document.prototype` (and a DetachedDocument's
+     prototype tricks can't be reconciled with prototype identity).
+  2. **`doc.createElement("a").constructor === Element`** — the XML createElement
+     path (`_createElementXML`) used `_wrapEl`, which picks an HTML interface class
+     (HTMLAnchorElement) by tag; per §createElement, an XML (null-namespace)
+     document must yield a plain `Element`.
+- **Fix (pure JS, `bootstrap.js`, no new Rust):** `new Document()` is now a genuine
+  `Document` instance, set up as **standalone** — a real fragment backing node
+  (`create_document_fragment` + `mark_real_document`, cached as its own canonical
+  wrapper) plus `_standalone`/`_kind:'xml'`/`_createMode:'xml'`. The base `Document`
+  getters/methods branch on `this._standalone`: `documentElement`/`doctype` scan its
+  own children, queries route to the `*_scoped` ops, `URL`/`documentURI` →
+  `about:blank`, `location`/`defaultView` → `null`, `contentType` →
+  `application/xml`, `_isHTMLDoc` → `false`, and `createElement` goes through a new
+  shared module helper **`_createElementXMLInto(doc, name, ns)`** (case-preserving
+  local name; HTML-namespace → HTMLElement subclass, XML null-namespace → plain
+  `Element`). The factory methods (`createTextNode`/`createComment`/
+  `createDocumentFragment`/`createProcessingInstruction`) tag `_ownerDoc = this`
+  when standalone, and `createCDATASection` creates a real CDATA node (instead of
+  the HTML-document throw). `DetachedDocument._createElementXML` now delegates to the
+  shared helper (xhtml path byte-identical via `_wrapEl`; the only behavior change is
+  XML createElement now yields plain `Element` — more spec-correct).
+- **The latent landmine:** `dom/common.js` (shared by TreeWalker, Range, and many
+  `dom/` tests) does `const xmlDocument = new Document();
+  xmlDocument.createCDATASection("1234")`. The base `createCDATASection` throws
+  `NotSupportedError` on HTML documents — so a naïve standalone Document would have
+  thrown there and **aborted the whole harness**, darkening TreeWalker/Range to
+  could-not-run. Caught it in the regression sweep (TreeWalker 761→could-not-run) and
+  fixed by making standalone documents create CDATA. A reminder that `new Document()`
+  is load-bearing far beyond its own test.
+- **Win:** Document-constructor 3→**5/5** (+2). **Zero regressions** (Document-
+  createElement 147, createElementNS 596, createDocument 434/434, createDocumentType
+  82/82, createHTMLDocument 12/13, cloneNode 135, adoptNode 4/4, adoption.window 3/6
+  [restored — standalone factories tag `_ownerDoc`], DOMParser-xml 20/20, XMLSerializer
+  27/29, responsexml-media-type 15/15, TreeWalker 761/761, Range-cloneContents 181/187,
+  qsa 1975, classlist 1420, Element-tagName 6/6, structured-clone 141/152, mark 22/22,
+  getRandomValues 39/39, url-setters-stripping 260/260).
+- **Caps / next leverage:** `adoption.window` 3/6 tail needs **template-content owner
+  documents** (`template.content.ownerDocument !== document`) + **`attachShadow`/
+  ShadowRoot** (both named since #34). The `dom/nodes/` document-creation vein is now
+  fully clean (create{Document,DocumentType,Element,ElementNS,HTMLDocument} +
+  `new Document()` all green/capped). Best next regions: a **fresh realm** (`dom/`
+  Node-* heavy fixtures, `fetch/`, `html/dom/` reflection), or the standing
+  `replaceChildren` atomic-record Rust op (#35 cap). PATH GOTCHA discovered: the bare
+  `structured-clone.any.html` path now **404s on wpt.live** (bodyLen=42) — the live
+  path is `html/webappapis/structured-clone/structured-clone.any.html` (141/152).
+  Scroll `tickets/40-the-standalone-charter.md`.
 
 **Session 2026-06-18 (Quest #39 The Doctype Charter —
 `DOMImplementation.createDocumentType`, +81):**
