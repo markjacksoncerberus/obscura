@@ -137,6 +137,16 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 Err(_) => "ERR".into(),
             }
         }
+        // Element.matches / closest / webkitMatchesSelector. "ERR" => invalid
+        // selector (JS throws SyntaxError); "true"/"false" => the match result.
+        "element_matches" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            match dom.element_matches(NodeId::new(nid), &arg2) {
+                Ok(true) => "true".into(),
+                Ok(false) => "false".into(),
+                Err(_) => "ERR".into(),
+            }
+        }
         "node_type" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             dom.get_node(NodeId::new(nid)).map(|n| match &n.data {

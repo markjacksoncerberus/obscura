@@ -51,6 +51,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~34~~ | ✅ [The Adoption Papers](34-the-adoption-papers.md) | `dom/nodes/Document-adoptNode` (+ insert-adopt) | **Document-adoptNode 4/4, Node-mutation-adoptNode 2/2** | ⚔️ | **SECURED — +5.** `document.adoptNode` was unimplemented (`adoptNode is not a function`). Real DOM §dom-document-adoptnode: detach from any parent, deep-retarget the node document of the whole subtree (`_setNodeDocumentDeep`), adopting a Document throws `NotSupportedError`; inherited by `DetachedDocument`. Also fixed insertion (`appendChild`/`insertBefore`) to run the §insert "adopt into the parent's node document" step **deeply** when crossing documents (was retagging only the direct child) — hot-path safe via a same-document cheap compare. Pure JS, no new Rust. Caps: DocumentFragment/ShadowRoot adopt subtests (need a working `new Document()` web ctor, template-content owner document, `attachShadow`), `remove-and-adopt-thcrash` (`window.open()` popup document) |
 | ~~35~~ | ✅ [The Insertion Concord](35-the-insertion-concord.md) | `dom/nodes/{ParentNode-append,prepend,replaceChildren,ChildNode-before,after,replaceWith}` | **before/after/replaceWith 45/45+45/45+33/33, append 25/25, prepend 22/22, replaceChildren 25/29** | ⚔️⚔️ | **SECURED — +177.** The whole ParentNode/ChildNode mutation family shared crooked, duplicated "convert nodes into a node" logic that only handled `typeof === "string"` (so `null`/`undefined`/numbers threw instead of becoming Text nodes), `before`/`after`/`replaceWith` lacked the viable-sibling algorithm (so `child.before(x, child)` **crashed the engine** → the three suites were dark), and `replaceChildren` was missing entirely. One shared spec-correct core (`_convertNodesIntoNode` + `_cn*`/`_pn*` mixins on Element/CharacterData/DocumentType/DocumentFragment/Document) + §ensure-pre-insertion-validity steps 5–6 added to `appendChild`/`insertBefore`. Bonus: insertAdjacentElement/Text 5→6 each. Caps: `replaceChildren` atomic "replace all" MutationObserver record (needs a Rust suppress-observers flag) |
 | 14 | [The Parsing Foundry](14-the-parsing-foundry.md) | `domparsing/*` | ⚔️⚔️ KEYSTONE SECURED — XML parser + serializer (xml 20/20, serializer 27/29, html 9/10) | ⚔️⚔️⚔️ | Inc 1 +7 (detached HTML doc, was returning the LIVE document!); **Inc 2 +46** (real namespace-aware XML parser + W3C XMLSerializer; unlocked Node-normalize 4/4 + Element-tagName 6/6). Tails: createContextualFragment/insert_adjacent_html (HTML fragment-in-context) |
+| ~~41~~ | ✅ [The Reflection's Mirror](41-the-reflections-mirror.md) | `dom/nodes/Element-{matches,webkitMatchesSelector,closest}` | **matches 669/669, webkitMatchesSelector 669/669** | ⚔️ | **SECURED — +700.** `webkitMatchesSelector` was entirely missing (`is not a function`, 661 dark subtests) and `matches()` used `parent.querySelectorAll(s)` — returning `false` for a detached (parentless) element WITHOUT parsing the selector (so 33 invalid-selector→`SyntaxError` subtests passed through silently), no arg-count `TypeError`, and mis-coerced `matches(null)`/`matches(undefined)`. New `element_matches` Rust op over the real selector engine (parse → invalid throws `SyntaxError`; combinators see true ancestors even when detached); `matches`/`closest`/new `webkitMatchesSelector` route through it with WebIDL DOMString coercion (0 args → `TypeError`). Caps: `Element-closest` 25/29 — the 4 left need a scope-element MatchingContext (`:scope` ×3) + form-validity pseudo-classes (`:invalid` ×1) |
 | ~~40~~ | ✅ [The Standalone Charter](40-the-standalone-charter.md) | `dom/nodes/Document-constructor` (the `new Document()` web ctor) | **5/5** | ⚔️ | **SECURED — +2.** The `new Document()` web constructor named "next leverage" since #34. It returned a `DetachedDocument` subclass, so `Object.getPrototypeOf(doc) !== Document.prototype` AND its XML `createElement` used `_wrapEl` (HTML interface) → `createElement("a").constructor !== Element`. Now `new Document()` is a genuine `Document` instance set up as **standalone** (real fragment backing node + `_standalone`/`_kind:'xml'`/`_createMode:'xml'`): base-class getters branch on `_standalone` for application/xml content type, about:blank URL, self-scoped queries, non-HTML createElement (case-preserving plain `Element` via shared `_createElementXMLInto`), and a working `createCDATASection`. Caught & fixed a latent regression: `dom/common.js` does `new Document().createCDATASection(...)` — the base throwing version aborted the whole harness (TreeWalker/Range went dark). Pure JS, no new Rust, zero regressions. Caps: template-content owner doc + `attachShadow` (adoption.window 3/6 tail) |
 | ~~39~~ | ✅ [The Doctype Charter](39-the-doctype-charter.md) | `dom/nodes/DOMImplementation-createDocumentType` | **82/82** | ⚔️ | **SECURED — +81.** Exposed by #38. `createDocumentType` had no "valid doctype name" check (a name is valid unless it contains ASCII whitespace / U+0000 / `>`; empty string valid — *looser* than QName, so `:foo`/`foo:`/`prefix::local`/`@` are fine; only `"edi:>"`/`"edi:a "` throw `InvalidCharacterError`) and gave the wrong `ownerDocument`: `DetachedDocument`/`_IframeDocument` overrode `get implementation()` to return the **page's** impl, so `doc.implementation.createDocumentType(...)` owned to the page not `doc`. Fix: `Document.get implementation()` captures `this` + sets the doctype's `_ownerDoc`; delegating overrides removed (inherit the bound getter); `<3 args` → `TypeError`. Pure JS, no new Rust |
 | ~~38~~ | ✅ [The Document Charter](38-the-document-charter.md) | `dom/nodes/DOMImplementation-createDocument` (+ `adoption.window`) | **createDocument 434/434** | ⚔️⚔️ | **SECURED — +116.** The widest DOM frontier left (the `new Document()` footgun named since #34). 114 fails were all document-identity `assert_equals` (distinct objects, not `===`). `XMLDocument` was `class extends Document {}` (abstract, no backing node) and `createDocument` returned a `DetachedDocument`, so `Object.getPrototypeOf(doc) === XMLDocument.prototype` never held. Now `XMLDocument extends DetachedDocument` (a real fragment-backed node — distinct backing Document, no node-0 fallback); `createDocument` returns `new XMLDocument('xml')` + full WebIDL validation/coercion + spec node order. `adoption.window` 1→3/6 came free. Caps: `createDocumentType` 1/82 (next quest), ShadowRoot/popup adoption, `new Document()` web ctor (Document-constructor 3/5) |
@@ -81,6 +82,40 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-19 (Quest #41 The Reflection's Mirror — the `Element.matches()`
+family, +700):**
+- Three sibling tests share one algorithm ("match an element against a selector
+  list"): `Element-matches.html` was **630/669**, `Element-webkitMatchesSelector.html`
+  was **8/669** (a byte-copy of the matches test calling the vendor-prefixed alias),
+  `Element-closest.html` **25/29**.
+- **Root causes:** (1) `webkitMatchesSelector` did not exist at all (`is not a
+  function` → 661 dark subtests); it's a legacy alias of `matches()`. (2) `matches()`
+  did `parent.querySelectorAll(s)` then checked membership — so a **detached
+  (parentless) element returned `false` without ever parsing the selector**, and
+  the 33 "Detached Element.matches: Invalid …" subtests (expecting `SyntaxError`)
+  silently passed through; it also lacked the no-arg `TypeError` and mis-coerced
+  `matches(null)`/`matches(undefined)`; and querying the parent's descendants is
+  structurally wrong for combinators that reach above the parent. (3) `closest()`
+  inherited those gaps.
+- **Fix (1 small Rust fn + 1 op + a JS rewrite):** new `DomTree::element_matches`
+  (`selector.rs`) — a one-element analogue of `query_selector_from` that
+  `parse_selector(...)?` (invalid → `Err` → `"ERR"`) and runs `matches_selector_list`
+  against the element (the matcher walks the real arena ancestors, so combinators
+  are correct even when detached); new `"element_matches"` op (`ops.rs`) →
+  `"ERR"`/`"true"`/`"false"`; `matches`/`closest`/new `webkitMatchesSelector` in
+  `bootstrap.js` all route through it with `arguments.length<1`→`TypeError`,
+  `String(s)` DOMString coercion, and `"ERR"`→`_qsThrow` (the same `SyntaxError`
+  helper `querySelectorAll` uses). Added `webkitMatchesSelector` to the
+  `_markNative` list.
+- **Wins:** webkitMatchesSelector 8→**669/669** (+661), matches 630→**669/669**
+  (+39); closest 25/29 unchanged. **+700, zero regressions** (qsa 1975, classlist
+  1420, createElement 147, createElementNS 596, Element-tagName 6/6, cloneNode 135,
+  getElementsByTagNameNS 16/16, TreeWalker 761/761, mark 22/22, structured-clone
+  141/152, getRandomValues 39/39, url-setters-stripping 260/260).
+- **Caps:** `Element-closest` 25/29 — `:scope` ×3 needs a scope-element
+  MatchingContext, `:invalid` ×1 needs form-validity pseudo-classes (both separate
+  gaps). Scroll `tickets/41-the-reflections-mirror.md`.
 
 **Session 2026-06-19 (Quest #40 The Standalone Charter — the `new Document()`
 web constructor, +2):**

@@ -1615,19 +1615,31 @@ class Element extends Node {
   getElementsByTagName(t) { return _gebTagName(this._nid, t, this.ownerDocument ? this.ownerDocument._isHTMLDoc !== false : true); }
   getElementsByTagNameNS(ns, local) { return _gebTagNameNS(this._nid, ns, local); }
   getElementsByClassName(c) { return _gebClassName(this._nid, c); }
+  // Element.matches(selectors) — §dom-element-matches. `selectors` is a required
+  // DOMString (0 args → TypeError; null/undefined coerce via ToString to
+  // "null"/"undefined", matching an element of that tag name). Routes through the
+  // real selector engine so an invalid selector throws SyntaxError and combinators
+  // see the element's true ancestors even when it's detached (parentless).
   matches(s) {
-    const parent = this.parentNode;
-    if (!parent || !parent.querySelectorAll) return false;
-    const matches = parent.querySelectorAll(s);
-    for (let i = 0; i < matches.length; i++) {
-      if (matches[i]._nid === this._nid) return true;
-    }
-    return false;
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'matches' on 'Element': 1 argument required, but only 0 present.");
+    const sel = String(s);
+    const raw = _dom("element_matches", this._nid, sel);
+    if (raw === 'ERR') _qsThrow(sel);
+    return raw === 'true';
+  }
+  // Legacy vendor-prefixed alias of matches() — same algorithm and validation.
+  webkitMatchesSelector(s) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'webkitMatchesSelector' on 'Element': 1 argument required, but only 0 present.");
+    return this.matches(String(s));
   }
   closest(s) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'closest' on 'Element': 1 argument required, but only 0 present.");
+    const sel = String(s);
     let el = this;
-    while (el) {
-      if (el.nodeType === 1 && el.matches && el.matches(s)) return el;
+    while (el && el.nodeType === 1) {
+      const raw = _dom("element_matches", el._nid, sel);
+      if (raw === 'ERR') _qsThrow(sel);
+      if (raw === 'true') return el;
       el = el.parentNode;
     }
     return null;
@@ -7536,6 +7548,7 @@ for (const Cls of [Element, Document, DocumentFragment, DetachedDocument]) {
   Element.prototype.querySelector, Element.prototype.querySelectorAll,
   Element.prototype.getElementsByTagName, Element.prototype.getElementsByClassName,
   Element.prototype.matches, Element.prototype.closest,
+  Element.prototype.webkitMatchesSelector,
   Element.prototype.getBoundingClientRect, Element.prototype.getClientRects,
   Element.prototype.checkVisibility,
   Element.prototype.addEventListener, Element.prototype.removeEventListener,

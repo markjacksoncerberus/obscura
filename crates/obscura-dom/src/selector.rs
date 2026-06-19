@@ -772,6 +772,33 @@ impl DomTree {
         Ok(None)
     }
 
+    /// Match a single element against a selector list (DOM `Element.matches`).
+    /// Parses the selector (Err on invalid syntax → JS throws SyntaxError); a
+    /// non-element node never matches. Combinators walk the element's real
+    /// ancestors/siblings in the arena, so this is correct for detached subtrees.
+    pub fn element_matches(&self, node: NodeId, selector: &str) -> Result<bool, String> {
+        let selector_list = parse_selector(selector)?;
+        let is_element = self.with_node(node, |n| n.is_element()).unwrap_or(false);
+        if !is_element {
+            return Ok(false);
+        }
+        let mut caches = selectors::context::SelectorCaches::default();
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            &mut caches,
+            QuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        let element = DomElement::new(self, node);
+        Ok(selectors::matching::matches_selector_list(
+            &selector_list,
+            &element,
+            &mut context,
+        ))
+    }
+
     pub fn query_selector_all_from(
         &self,
         root: NodeId,
