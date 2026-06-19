@@ -283,6 +283,10 @@ pub(crate) struct DomTreeInner {
     // query-time snapshot — replaced wholesale on each prime so stale entries
     // never linger.
     pub(crate) validity_state: HashMap<NodeId, u8>,
+    // Whether the document is in design mode (`document.designMode = "on"`). When
+    // set, every element is editable, so plain elements match `:read-write` (and
+    // none match `:read-only`). A document-global flag JS pushes on assignment.
+    pub(crate) design_mode: bool,
     // Nodes that are *real documents* (detached/iframe documents). They share the
     // create_document_fragment backing (NodeData::Document) with plain
     // DocumentFragments, so this set is how `:root` tells "document element of a
@@ -313,6 +317,7 @@ impl DomTree {
                 focused: None,
                 target_id: None,
                 validity_state: HashMap::new(),
+                design_mode: false,
                 real_documents: HashSet::new(),
             }),
         }
@@ -381,6 +386,16 @@ impl DomTree {
     /// constraint-validation pseudo-classes apply).
     pub fn validity_state(&self, id: NodeId) -> u8 {
         self.inner.borrow().validity_state.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Set whether the document is in design mode (drives `:read-write`/`:read-only`).
+    pub fn set_design_mode(&self, on: bool) {
+        self.inner.borrow_mut().design_mode = on;
+    }
+
+    /// Whether the document is in design mode (every element is then editable).
+    pub fn design_mode(&self) -> bool {
+        self.inner.borrow().design_mode
     }
 
     /// Phase 0b: the focused element (drives `:focus` and `document.activeElement`).

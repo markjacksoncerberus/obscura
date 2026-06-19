@@ -391,6 +391,100 @@ impl<'a> DomElement<'a> {
             })
             .unwrap_or(false)
     }
+
+    /// `:read-write` / `:read-only`. An element is `:read-write` if it is a mutable
+    /// form control (an `input` to which `readonly` *applies*, or a `textarea`,
+    /// without a `readonly` attribute and not disabled) OR it is editable (inside a
+    /// `contenteditable` editing host, or the document is in design mode). Every
+    /// other element is `:read-only`. Non-elements match neither. `want_read_write`
+    /// picks the half. All inputs are read live off the tree (so toggling
+    /// readonly/disabled/contenteditable + requerying just works).
+    fn match_read_write_read_only(&self, want_read_write: bool) -> bool {
+        let is_element = self
+            .tree
+            .with_node(self.node_id, |n| n.as_element().is_some())
+            .unwrap_or(false);
+        if !is_element {
+            return false;
+        }
+        self.is_read_write() == want_read_write
+    }
+
+    fn is_read_write(&self) -> bool {
+        let local = self
+            .tree
+            .with_node(self.node_id, |n| {
+                n.as_element().map(|qn| qn.local.as_ref().to_string())
+            })
+            .flatten();
+        match local.as_deref() {
+            Some("input") => self
+                .tree
+                .with_node(self.node_id, |n| {
+                    let t = n
+                        .get_attribute("type")
+                        .map(|t| t.to_ascii_lowercase())
+                        .unwrap_or_else(|| "text".into());
+                    // `readonly` applies only to these input types (missing → text).
+                    let applies = matches!(
+                        t.as_str(),
+                        "" | "text"
+                            | "search"
+                            | "url"
+                            | "tel"
+                            | "email"
+                            | "password"
+                            | "date"
+                            | "month"
+                            | "week"
+                            | "time"
+                            | "datetime-local"
+                            | "number"
+                    );
+                    applies
+                        && n.get_attribute("readonly").is_none()
+                        && n.get_attribute("disabled").is_none()
+                })
+                .unwrap_or(false),
+            Some("textarea") => self
+                .tree
+                .with_node(self.node_id, |n| {
+                    n.get_attribute("readonly").is_none()
+                        && n.get_attribute("disabled").is_none()
+                })
+                .unwrap_or(false),
+            // Any other element is read-write iff it is editable.
+            Some(_) => self.is_editable(),
+            None => false,
+        }
+    }
+
+    /// Whether a (non-form-control) element is editable: the document is in design
+    /// mode, or the nearest self-or-ancestor with an explicit `contenteditable`
+    /// value resolves to editable ("" / "true" / "plaintext-only", not "false").
+    fn is_editable(&self) -> bool {
+        if self.tree.design_mode() {
+            return true;
+        }
+        let mut cur = Some(DomElement::new(self.tree, self.node_id));
+        while let Some(el) = cur {
+            let v = el
+                .tree
+                .with_node(el.node_id, |n| {
+                    n.get_attribute("contenteditable").map(|s| s.to_ascii_lowercase())
+                })
+                .flatten();
+            if let Some(v) = v {
+                match v.as_str() {
+                    "false" => return false,
+                    "inherit" => {}
+                    _ => return true,
+                }
+            }
+            cur = el.parent_element();
+        }
+        false
+    }
 }
 
 impl<'a> std::fmt::Debug for DomElement<'a> {
@@ -680,6 +774,11 @@ impl<'a> Element for DomElement<'a> {
                 "invalid" => self.tree.validity_state(self.node_id) & 2 != 0,
                 "in-range" => self.tree.validity_state(self.node_id) & 4 != 0,
                 "out-of-range" => self.tree.validity_state(self.node_id) & 8 != 0,
+                // :read-write / :read-only are mutability state — evaluated live off
+                // the tree (input/textarea readonly+disabled+type, contenteditable
+                // ancestor walk) plus the design-mode global flag.
+                "read-write" => self.match_read_write_read_only(true),
+                "read-only" => self.match_read_write_read_only(false),
                 // Other accepted-but-unimplemented standard pseudo-classes never match.
                 _ => false,
             },

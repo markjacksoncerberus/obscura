@@ -451,6 +451,12 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             dom.set_validity_state_bulk(&entries);
             "true".into()
         }
+        "set_design_mode" => {
+            // arg1 = "1" to enable design mode (every element editable → matches
+            // :read-write), anything else disables it. Drives :read-write/:read-only.
+            dom.set_design_mode(arg1 == "1");
+            "true".into()
+        }
         "set_target_id" => {
             // arg1 = the queried document's URL fragment (empty clears it). Drives :target.
             dom.set_target_id(if arg1.is_empty() { None } else { Some(arg1.clone()) });

@@ -2293,6 +2293,18 @@ class Document extends Node {
   }
   get title() { return _domParse("document_title") ?? ""; }
   set title(v) {}
+  // designMode: "on" makes every element an editing host → plain elements match
+  // :read-write (and none match :read-only). Push the flag to the Rust selector
+  // engine, which reads it live during matching. Per spec the setter is an
+  // ASCII-case-insensitive match against "on"/"off"; any other value is ignored.
+  get designMode() { return this._designMode ? "on" : "off"; }
+  set designMode(v) {
+    const s = String(v).toLowerCase();
+    if (s === "on") this._designMode = true;
+    else if (s === "off") this._designMode = false;
+    else return;
+    _dom("set_design_mode", this._designMode ? "1" : "0");
+  }
   get URL() { return this._standalone ? "about:blank" : (_domParse("document_url") ?? ""); }
   get documentURI() { return this.URL; }
   get location() { return this._standalone ? null : globalThis.location; }

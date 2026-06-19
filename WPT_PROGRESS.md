@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #44).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #45).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/selectors/pseudo-classes/readwrite-readonly.html` | 5/25 | **25/25** | ✅ 100% | **Quest #45 The Mutable Charter.** `:read-write`/`:read-only` matched nothing (accepted-but-`Other` → always false). Now evaluated live off the tree in the Rust matcher: input (readonly-applicable type, no `readonly`, not disabled) / textarea / `contenteditable` editing-host ancestor walk; everything else is `:read-only`. `document.designMode` (was undefined) now pushes a document-global flag the engine reads during matching. **+20** |
 | `html/semantics/selectors/pseudo-classes/required-optional.html` | 0/6 | **6/6** | ✅ 100% | **Quest #44 The Living Verdict.** `:required`/`:optional` matched nothing (accepted-but-`Other` → always false). Now evaluated straight off the tree in the Rust matcher: a form control to which `required` applies (input of a requirable type, select, textarea), split by whether the attribute is present. **+6** |
 | `html/semantics/selectors/pseudo-classes/valid-invalid.html` | 17/30 | **30/30** | ✅ 100% | **Quest #44.** `:valid`/`:invalid` for candidate controls + `<form>`/`<fieldset>` aggregates, via a JS-computed validity bitmask primed onto the node before the query runs. **+13** |
 | `html/semantics/selectors/pseudo-classes/inrange-outofrange.html` | 0/6 | **6/6** | ✅ 100% | **Quest #44.** `:in-range`/`:out-of-range` for candidates with range limitations; a `type=range` clamps its value so it's never out-of-range. **+6** |
