@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~52~~ | ✅ [The Inherited Verdict](52-the-inherited-verdict.md) | `css/css-cascade/inherit-initial` + `css/css-color/inheritance` (CSS-wide keyword resolution + per-property inheritance) | **inherit-initial 4/4, inheritance 4/4** | ⚔️⚔️ | **SECURED — +7.** `getComputedStyle` echoed the CSS-wide keywords verbatim (`z-index:inherit`→`"inherit"` not `"auto"`; `opacity:initial`→`"initial"` not `"1"`). Generalised the colour-only computed-value machinery into a property-agnostic engine on top of #47's cascade + #49/#50's colour/opacity normalizers: `_specifiedValue` (cascade-first, live-decl fallback; `color` decl-first), `_INHERITED_PROPS`, `_initialOf` (`_GCS_DEFAULTS` doubles as the initial-values table), `_normComputed`, and **`_computedPropOf`** — resolve `initial`→initial, `inherit`→parent's computed value (root→initial), `unset`/`revert`→inherit-if-inherited-else-initial, per-property inheritance through the ancestor chain. `getComputedStyle.resolve` routes every modelled standard prop through it. Fixed a latent bug: `_computedColorOf` treated `unset` as `initial` but `color` inherits (now `_computedPropOf(el,'color',0)`). Pure JS, no new Rust. Zero regressions (caught+fixed a mid-flight `currentColor`-on-`color` drop). Caps: broader `css/*/inheritance.html` tail gated on the **property model** (each family needs initial value + inherited flag + computed serialization), not the engine; `var()` substitution; `color-computed-hsl` could-not-run. **PATH GOTCHA: wpt.live now 404s extensionless paths — every test path needs its `.html`.** |
 | ~~51~~ | ✅ [The Channelled Verdict](51-the-channelled-verdict.md) | `css/css-color/parsing/color-computed-rgb` (`calc()` inside `rgb()` channels) | **95/99** | ⚔️⚔️ | **SECURED — +36.** #50's named follow-up: reuse `_evalMath` inside `rgb()`/`rgba()` channels. The 40 fails were calc constants/non-finite (16), `sign()`+`<length>` (18), escaped function names (2), plus `var()`/`cqw` caps (4). `_isValidColor`'s `[^)]*` regex couldn't span a nested `calc()` (so `CSS.supports` returned `false`), and `_computeColor` split channels with `parseFloat`. Added `_splitTopLevel` (paren-aware split), `_unescapeIdent` (`r\67 b`→`rgb`), `_resolveChannel` (NaN/±∞→bounds), `_rgbComponents`; rewrote name/inner extraction; extended `_evalMath` with `<length>` dimension tokens (`em`=16px…), calc constants (`infinity`/`nan`/`pi`/`e`), `sign()`/`abs()`, and a non-finite passthrough. Opacity byte-identical. **59→95.** Zero regressions. Caps: `var(--x)` (custom-property cascade) ×2, `2cqw` (layout) ×2 |
 | ~~50~~ | ✅ [The Calculated Verdict](50-the-calculated-verdict.md) | `css/css-color/parsing/opacity-computed` (computed `opacity` + the `calc()`/`min()`/`max()`/`clamp()` math evaluator) | **30/30** | ⚔️ | **SECURED — +27.** Computed `opacity` echoed the specified value back (`50%`, `-2`, `calc(1 + 1)` all returned unchanged — `getComputedStyle`'s `norm` step only normalized `<color>` properties). Added `_evalMath` — a hand-tokenized recursive-descent evaluator for `calc()`/`min()`/`max()`/`clamp()` plus raw `<number>`/`<percentage>` (percent → fraction in the unitless opacity context) — with `_serNumber` (computed-number serialization) and `_computeOpacity` (clamp to `[0, 1]`), wired into `norm`. Pure JS, no new Rust. The math evaluator is a **reusable primitive** — the named cap for `color-computed-rgb`'s 40 `calc()` cases. Zero regressions. Caps: `opacity-valid`/`opacity-invalid` need a specified-value `calc()`-simplification serializer + per-property grammar validation on the hot `CSSStyleDeclaration` setter (separate quest); `var()`/escaped idents still unresolved |
 | ~~49~~ | ✅ [The Computed Verdict](49-the-computed-verdict.md) | `css/css-color/parsing/*-computed.html` (the shared computed-value harness) | **color-computed 16/16, hex 6/6, named 455/455, rgb 59/99** | ⚔️⚔️ | **SECURED — +536.** The whole `*-computed.html` family was gated `0` on two shared asserts: `'prop' in getComputedStyle(el)` (the Proxy had no `has` trap) and `CSS.supports(prop, val)` (hardcoded `false`). Added a `has` trap + `_CSS_KNOWN_PROPS` registry, a real two/one-arg `CSS.supports`, `color` inheritance through the ancestor chain, and an extended `_computeColor` (hsl→rgb, alpha clamp, the `none` keyword, comment stripping). Pure JS. Zero regressions. Caps: rgb 40 = `calc()`/`var()`/escaped idents; `opacity-computed` (next); inheritance/initial for non-colour props |
@@ -92,6 +93,31 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-20 (Quest #52 The Inherited Verdict — CSS-wide keyword resolution
++ per-property inheritance in `getComputedStyle`, +7):** After #47 (cascade) and
+#49/#50 (computed colour/opacity), `getComputedStyle` still echoed the CSS-wide
+keywords verbatim for every non-colour property — `inherit-initial.html` **0/4**
+(`z-index:inherit`→`"inherit"` not `"auto"`; also `position`/`overflow`/
+`background-color`), `css-color/inheritance.html` **1/4** (`opacity:initial`→
+`"initial"`; `color:unset`→`rgb(0,0,0)` instead of inheriting — a latent bug, since
+`color` inherits). Generalised the colour-only machinery into a property-agnostic
+computed-value engine (pure JS, no new Rust): **`_specifiedValue`** (cascade-first so
+`!important` resolves, live-CSSOM-decl fallback; `color` decl-first), **`_INHERITED_PROPS`**,
+**`_initialOf`** (`_GCS_DEFAULTS` doubles as the initial-values table), **`_normComputed`**
+(colour/opacity serialization), and **`_computedPropOf`** — `initial`→initial,
+`inherit`→parent's computed value (root→initial), `unset`/`revert`→inherit-if-inherited-
+else-initial, walking the ancestor chain. `getComputedStyle.resolve` routes every modelled
+standard property through it; `_computedColorOf` collapses to `_computedPropOf(el,'color',0)`
+(fixing the `unset` bug). Driven by the shared `inheritance-testcommon.js` that gates the
+whole `css/*/inheritance.html` family. **inherit-initial 0→4, inheritance 1→4. +7, zero
+regressions** (caught+fixed a mid-flight `currentColor`-on-`color` drop → restored
+color-computed 16/16 + named 455/455; swept has/not/is-specificity, the `-type-change`
+family, qsa/classlist/matches/closest, structured-clone, obscura-dom 40/40). Caps: the
+broader inheritance tail (css-text 0/42, css-ui 3/28, css-fonts 3/39) is gated on the
+**property model** (each family needs initial value + inherited flag + computed
+serialization), NOT the engine. **PATH GOTCHA: wpt.live now 404s extensionless paths —
+every test path must carry its `.html`.** Scroll `tickets/52-the-inherited-verdict.md`.
 
 **Session 2026-06-19 (Quest #51 The Channelled Verdict — `calc()` inside `rgb()`
 channels, +36):** #50's named follow-up. `color-computed-rgb.html` sat at **59/99**;

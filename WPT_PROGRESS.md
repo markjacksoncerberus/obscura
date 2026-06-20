@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #51).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #52).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-cascade/inherit-initial.html` | 0/4 | **4/4** | ✅ 100% | **Quest #52 The Inherited Verdict.** `getComputedStyle` echoed the CSS-wide keywords verbatim — `z-index:inherit` on the root computed to `"inherit"` (expected `"auto"`), likewise `position`/`overflow`/`background-color`. Generalised the colour-only machinery into a property-agnostic computed-value engine: `_specifiedValue`/`_initialOf`/`_normComputed`/`_computedPropOf` resolve `initial`→initial value, `inherit`→parent's computed value (root→initial), `unset`/`revert`→inherit-if-inherited-else-initial, with a per-property inheritance table (`_INHERITED_PROPS`). Pure JS, no new Rust. **+4** |
+| `css/css-color/inheritance.html` | 1/4 | **4/4** | ✅ 100% | **Quest #52.** Same engine: `opacity:initial`→`"1"`, `opacity:inherit`→parent's value. Fixed a latent colour bug — `_computedColorOf` treated `unset` as `initial` (`rgb(0,0,0)`) but `color` inherits, so `color:unset` must inherit (`_computedColorOf` is now `_computedPropOf(el,'color',0)`). Driven by the shared `inheritance-testcommon.js` (the whole `css/*/inheritance.html` family). **+3** |
 | `css/css-color/parsing/opacity-computed.html` | 3/30 | **30/30** | ✅ 100% | **Quest #50 The Calculated Verdict.** Computed `opacity` echoed the specified value back (`50%`, `-2`, `calc(1 + 1)` returned unchanged). Added `_evalMath` — a recursive-descent evaluator for `calc()`/`min()`/`max()`/`clamp()` + raw `<number>`/`<percentage>` (percent in a unitless context → fraction) — plus `_serNumber` and `_computeOpacity` (clamp to `[0, 1]`). Wired into the `getComputedStyle` `norm` step. The math evaluator is a reusable primitive (the named cap for `color-computed-rgb`'s 40 calc cases). **+27.** Caps: `opacity-valid`/`opacity-invalid` need a specified-value `calc()`-simplification serializer + per-property grammar validation on the hot `CSSStyleDeclaration` setter (separate quest) |
 | `css/css-color/parsing/color-computed.html` | 0/16 | **16/16** | ✅ 100% | **Quest #49 The Computed Verdict.** The shared `computed-testcommon.js` harness gates every computed-value subtest on `'prop' in getComputedStyle(el)` and `CSS.supports(prop, val)` — both failed (no Proxy `has` trap; `CSS.supports` was hardcoded `false`). Added a `has` trap + property registry, a real two/one-arg `CSS.supports`, color inheritance (`color`/`currentColor` resolve up the tree), and extended `_computeColor` (hsl→rgb, alpha clamp, the `none` keyword, comment stripping). **+16** |
 | `css/css-color/parsing/color-computed-hex-color.html` | 0/6 | **6/6** | ✅ 100% | **Quest #49.** Unblocked by the same `has`-trap + `CSS.supports` primitives; #47's hex serializer already produced `rgb(r, g, b)`. **+6** |

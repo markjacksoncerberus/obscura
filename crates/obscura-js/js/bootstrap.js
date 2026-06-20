@@ -5445,32 +5445,84 @@ const _computeOpacity = (value) => {
 // Computed `color` of an element, honouring inheritance and `currentColor`.
 // A missing/`inherit`/`currentcolor` value inherits the parent's color; the
 // document root falls back to the initial value rgb(0, 0, 0).
-const _specifiedColor = (el) => {
-  // The element's own specified `color`: the live inline style declaration
-  // (set via `el.style.color = …`) wins, then the author-stylesheet cascade
-  // (which also folds in a `style=""` attribute).
-  try {
-    const s = el && el.style;
-    if (s && s.getPropertyValue) {
-      const v = s.getPropertyValue('color');
-      if (v) return v;
-    }
-  } catch (e) {}
-  try { return _cascadeResolve(_buildCascade(el), 'color') || ''; } catch (e) { return ''; }
+const _specifiedValue = (el, kebab) => {
+  // The element's own specified value for `kebab`. `el.style[prop] = …`
+  // (the live CSSOM declaration) does NOT reflect to the style="" attribute the
+  // cascade reads, so a CSSOM-set value lives only on the live decl. `color`
+  // (the historically decl-set property) consults the live decl first; other
+  // properties stay cascade-first so author `!important` rules resolve correctly,
+  // falling back to the live decl only when the cascade is silent.
+  const liveDecl = () => {
+    try {
+      const s = el && el.style;
+      if (s && s.getPropertyValue) return s.getPropertyValue(kebab) || '';
+    } catch (e) {}
+    return '';
+  };
+  const cascade = () => {
+    try { return _cascadeResolve(_buildCascade(el), kebab) || ''; } catch (e) { return ''; }
+  };
+  if (kebab === 'color') { const d = liveDecl(); return d || cascade(); }
+  const c = cascade(); return c || liveDecl();
 };
-const _computedColorOf = (el) => {
-  let cur = el;
-  let guard = 0;
-  while (cur && guard++ < 200) {
-    let v = _specifiedColor(cur);
-    v = (v || '').trim();
-    const low = v.toLowerCase();
-    if (!v || low === 'inherit' || low === 'currentcolor') { cur = cur.parentElement; continue; }
-    if (low === 'initial' || low === 'unset') return 'rgb(0, 0, 0)';
+const _specifiedColor = (el) => _specifiedValue(el, 'color');
+// Properties that inherit by default — for these an absent value or the
+// `unset`/`revert` keyword resolves to the parent's computed value; for every
+// other property those resolve to the property's initial value. Only the
+// properties our computed-style engine actually models need appear here.
+const _INHERITED_PROPS = new Set([
+  'color', 'font-size', 'font-weight', 'line-height', 'visibility',
+  'cursor', 'pointer-events',
+]);
+const _CSS_WIDE = new Set(['initial', 'inherit', 'unset', 'revert', 'revert-layer']);
+// Initial (computed) value for a property. The defaults table doubles as the
+// initial-values table; colour properties not present in it fall back to a
+// sensible initial.
+const _initialOf = (kebab) => {
+  if (kebab in _GCS_DEFAULTS) return _GCS_DEFAULTS[kebab];
+  if (_COLOR_PROPS.has(kebab)) return kebab === 'background-color' ? 'rgba(0, 0, 0, 0)' : 'rgb(0, 0, 0)';
+  return '';
+};
+// Serialize a resolved specified value into its computed form (colour/opacity
+// normalization; every other property passes through unchanged).
+const _normComputed = (el, kebab, v) => {
+  if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
+    if (String(v).trim().toLowerCase() === 'currentcolor') {
+      return kebab === 'color' ? _computeColor(_initialOf('color')) : _computedColorOf(el);
+    }
     return _computeColor(v);
   }
-  return 'rgb(0, 0, 0)';
+  return v;
 };
+// Computed value of `kebab` for `el`, resolving the CSS-wide keywords
+// (`initial`/`inherit`/`unset`/`revert`) and per-property inheritance through
+// the ancestor chain. `revert`/`revert-layer` are approximated as `unset`
+// (we model no UA/user origins or cascade layers).
+const _computedPropOf = (el, kebab, guard) => {
+  guard = guard || 0;
+  if (!el || guard > 200) return _normComputed(el, kebab, _initialOf(kebab));
+  const v = String(_specifiedValue(el, kebab) || '').trim();
+  const low = v.toLowerCase();
+  const inheritFrom = () => (el.parentElement
+    ? _computedPropOf(el.parentElement, kebab, guard + 1)
+    : _normComputed(el, kebab, _initialOf(kebab)));
+  if (!v) {
+    return _INHERITED_PROPS.has(kebab) ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab));
+  }
+  // `currentColor` on the `color` property itself resolves to the inherited
+  // colour (the computed `color` of the parent) — on a non-`color` property it
+  // resolves to this element's own colour (handled in _normComputed).
+  if (kebab === 'color' && low === 'currentcolor') return inheritFrom();
+  if (_CSS_WIDE.has(low)) {
+    if (low === 'initial') return _normComputed(el, kebab, _initialOf(kebab));
+    if (low === 'inherit') return inheritFrom();
+    // unset / revert / revert-layer: inherit for inherited properties, else initial.
+    return _INHERITED_PROPS.has(kebab) ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab));
+  }
+  return _normComputed(el, kebab, v);
+};
+const _computedColorOf = (el) => _computedPropOf(el, 'color', 0);
 const _GCS_INLINE_SPEC = Number.MAX_SAFE_INTEGER;
 const _buildCascade = (el) => {
   // Returns the list of matched declaration sources for `el`, each
@@ -5540,19 +5592,18 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     const kebab = name.startsWith('--') ? name : name.replace(/([A-Z])/g, '-$1').toLowerCase();
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
-    if (kebab === 'color') return _computedColorOf(el);
-    const norm = (v) => {
-      if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
-      if (!_COLOR_PROPS.has(kebab)) return v;
-      // `currentColor` on a non-`color` property resolves to the element's color.
-      if (String(v).trim().toLowerCase() === 'currentcolor') return _computedColorOf(el);
-      return _computeColor(v);
-    };
+    // Modelled standard properties resolve through the full computed-value
+    // engine: CSS-wide keywords (initial/inherit/unset/revert), per-property
+    // inheritance through the ancestor chain, and colour/opacity normalization.
+    if (!kebab.startsWith('--') && (_CSS_KNOWN_PROPS.has(kebab) || _COLOR_PROPS.has(kebab))) {
+      return _computedPropOf(el, kebab, 0);
+    }
+    // Custom properties and unmodelled properties: echo the cascaded/inline
+    // specified value verbatim (no inheritance/initial machinery here yet).
     const cascaded = _cascadeResolve(sources, kebab);
-    if (cascaded !== '') return norm(cascaded);
-    // Inline declaration object fallback (props stored as authored).
+    if (cascaded !== '') return cascaded;
     const inline = (style.getPropertyValue && (style.getPropertyValue(kebab) || style.getPropertyValue(name))) || '';
-    if (inline) return norm(inline);
+    if (inline) return inline;
     return _GCS_DEFAULTS[kebab] || _GCS_DEFAULTS[name] || '';
   };
   return new Proxy(style, {
