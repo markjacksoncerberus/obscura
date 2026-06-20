@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #53).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #54).
 
 ## Scoreboard
 
@@ -30,6 +30,11 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #53).
 | `css/css-flexbox/inheritance.html` | 0/20 | **20/20** | ✅ 100% | **Quest #53.** flex-basis/direction/grow/shrink/wrap, order (+ the shared align/justify props) — none inherit. **+20** |
 | `css/css-grid/inheritance.html` | 0/20 | **20/20** | ✅ 100% | **Quest #53.** grid-auto-*/grid-template-*/grid-row|column-start|end — none inherit. **+20** |
 | `css/css-content/inheritance.html` | 0/6 | **6/6** | ✅ 100% | **Quest #53.** quotes (inherited); bookmark-level/bookmark-state (not). **+6** |
+| `css/css-scroll-snap/inheritance.html` | 0/38 | **38/38** | ✅ 100% | **Quest #54 The Snapped Verdict.** 8 scroll-margin-* (`0px`) + 8 scroll-padding-* (`auto`) + scroll-snap-align/stop/type — 19 properties, none inherit. Pure data into `_GCS_DEFAULTS`; the #52/#53 engine resolves the rest. **+38** |
+| `css/css-transitions/inheritance.html` | 0/8 | **8/8** | ✅ 100% | **Quest #54.** transition-delay/duration (`0s`), transition-property (`all`), transition-timing-function (`ease`) — none inherit. **+8** |
+| `css/css-color-adjust/inheritance.html` | 0/8 | **8/8** | ✅ 100% | **Quest #54.** color-scheme (`normal`), color-adjust + print-color-adjust (`economy`), forced-color-adjust (`auto`) — all four inherit (added to `_INHERITED_PROPS`). **+8** |
+| `css/css-shapes/inheritance.html` | 0/6 | **6/6** | ✅ 100% | **Quest #54.** shape-image-threshold (`0`), shape-margin (`0px`), shape-outside (`none`) — none inherit. **+6** |
+| `css/css-will-change/inheritance.html` | 0/2 | **2/2** | ✅ 100% | **Quest #54.** will-change (`auto`) — does not inherit. **+2** |
 | `css/css-multicol/inheritance.html` | 1/14 | **14/14** | ✅ 100% | **Quest #53.** column-count/fill/span/width/rule-style, column-rule-width (`medium`), column-rule-color (`currentColor` initial) — none inherit. **+13** |
 | `css/css-cascade/inherit-initial.html` | 0/4 | **4/4** | ✅ 100% | **Quest #52 The Inherited Verdict.** `getComputedStyle` echoed the CSS-wide keywords verbatim — `z-index:inherit` on the root computed to `"inherit"` (expected `"auto"`), likewise `position`/`overflow`/`background-color`. Generalised the colour-only machinery into a property-agnostic computed-value engine: `_specifiedValue`/`_initialOf`/`_normComputed`/`_computedPropOf` resolve `initial`→initial value, `inherit`→parent's computed value (root→initial), `unset`/`revert`→inherit-if-inherited-else-initial, with a per-property inheritance table (`_INHERITED_PROPS`). Pure JS, no new Rust. **+4** |
 | `css/css-color/inheritance.html` | 1/4 | **4/4** | ✅ 100% | **Quest #52.** Same engine: `opacity:initial`→`"1"`, `opacity:inherit`→parent's value. Fixed a latent colour bug — `_computedColorOf` treated `unset` as `initial` (`rgb(0,0,0)`) but `color` inherits, so `color:unset` must inherit (`_computedColorOf` is now `_computedPropOf(el,'color',0)`). Driven by the shared `inheritance-testcommon.js` (the whole `css/*/inheritance.html` family). **+3** |

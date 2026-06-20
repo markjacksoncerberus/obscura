@@ -5129,6 +5129,27 @@ const _GCS_DEFAULTS = {
   'column-count': 'auto', 'column-fill': 'balance', 'column-rule-color': 'currentColor',
   'column-rule-style': 'none', 'column-rule-width': 'medium', 'column-span': 'none',
   'column-width': 'auto',
+  // css-shapes — none inherit. shape-image-threshold is a <number>.
+  'shape-image-threshold': '0', 'shape-margin': '0px', 'shape-outside': 'none',
+  // css-scroll-snap — none inherit. scroll-margin-* default 0px, scroll-padding-* auto.
+  'scroll-margin-block-end': '0px', 'scroll-margin-block-start': '0px',
+  'scroll-margin-bottom': '0px', 'scroll-margin-inline-end': '0px',
+  'scroll-margin-inline-start': '0px', 'scroll-margin-left': '0px',
+  'scroll-margin-right': '0px', 'scroll-margin-top': '0px',
+  'scroll-padding-block-end': 'auto', 'scroll-padding-block-start': 'auto',
+  'scroll-padding-bottom': 'auto', 'scroll-padding-inline-end': 'auto',
+  'scroll-padding-inline-start': 'auto', 'scroll-padding-left': 'auto',
+  'scroll-padding-right': 'auto', 'scroll-padding-top': 'auto',
+  'scroll-snap-align': 'none', 'scroll-snap-stop': 'normal', 'scroll-snap-type': 'none',
+  // css-transitions — none inherit. (The `transition` shorthand default is above.)
+  'transition-delay': '0s', 'transition-duration': '0s',
+  'transition-property': 'all', 'transition-timing-function': 'ease',
+  // css-will-change — does not inherit.
+  'will-change': 'auto',
+  // css-color-adjust — every property in this family inherits. color-adjust is a
+  // legacy alias for print-color-adjust (initial `economy`).
+  'color-scheme': 'normal', 'color-adjust': 'economy',
+  'forced-color-adjust': 'auto', 'print-color-adjust': 'economy',
 };
 const _cssParseDecls = (body) => {
   // body is the inside of a `{ ... }` block (or an inline style string).
@@ -5582,6 +5603,8 @@ const _INHERITED_PROPS = new Set([
   'border-collapse', 'border-spacing', 'caption-side', 'empty-cells',
   // css-content: quotes inherits.
   'quotes',
+  // css-color-adjust: every property in this family inherits.
+  'color-scheme', 'color-adjust', 'forced-color-adjust', 'print-color-adjust',
 ]);
 const _CSS_WIDE = new Set(['initial', 'inherit', 'unset', 'revert', 'revert-layer']);
 // Initial (computed) value for a property. The defaults table doubles as the

@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~54~~ | ✅ [The Snapped Verdict](54-the-snapped-verdict.md) | 5 more `css/*/inheritance.html` realms (scroll-snap/transitions/color-adjust/shapes/will-change) | **all 5 at 100%** | ⚔️ | **SECURED — +62.** Same pure-DATA shape as #53: 34 properties → `_GCS_DEFAULTS` (scroll-margin/padding-* + scroll-snap-*, transition-delay/duration/property/timing-function, shape-*, will-change, the 4 color-adjust props), the 4 color-adjust props also → `_INHERITED_PROPS` (the only inherited family of the five). Identity serialization is the #52/#53 engine's default echo — no new serializer, NO new Rust. Zero regressions. Caps: the cheap identity-serializing `inheritance.html` tail is now largely exhausted; remaining families (css-backgrounds/position/sizing) need real layout/unit resolution. Next: custom-property `var()` cascade, a specified-value serializer (`serialize-values` 0/697), or a fresh realm. |
 | ~~53~~ | ✅ [The Propertied Verdict](53-the-propertied-verdict.md) | 15 `css/*/inheritance.html` realms (property-family modelling) | **all 15 at 100%** | ⚔️⚔️ | **SECURED — +263.** The shared `inheritance-testcommon.js` gates every subtest on `prop in getComputedStyle` first, but #52's engine only registered ~30 properties. Registered ~120 properties across css-text/ui/fonts/text-decor/writing-modes/lists/overflow/break/images/tables/align/flexbox/grid/content/multicol (initial value in `_GCS_DEFAULTS`, inherited flag in `_INHERITED_PROPS`; identity serialization is the engine's default echo). Real correctness win: `_buildCascade` now injects the live CSSOM decl (`el.style.foo=`, which never reflects to the `style=""` attribute) as the top *normal* author source, so it beats normal author rules (author `!important` still wins). `currentColor`-initial colour props (caret/outline/text-decoration/text-emphasis/column-rule-color) + `_FONT_SIZE_KEYWORDS` (`medium`→`16px`). Pure JS, no new Rust. Zero regressions. Caps: `display` skipped (spec-initial `inline` ≠ our UA default `block`); families needing real layout/unit resolution; the specified-value serialization family (`serialize-values` 0/697) is a separate engine. |
 | ~~52~~ | ✅ [The Inherited Verdict](52-the-inherited-verdict.md) | `css/css-cascade/inherit-initial` + `css/css-color/inheritance` (CSS-wide keyword resolution + per-property inheritance) | **inherit-initial 4/4, inheritance 4/4** | ⚔️⚔️ | **SECURED — +7.** `getComputedStyle` echoed the CSS-wide keywords verbatim (`z-index:inherit`→`"inherit"` not `"auto"`; `opacity:initial`→`"initial"` not `"1"`). Generalised the colour-only computed-value machinery into a property-agnostic engine on top of #47's cascade + #49/#50's colour/opacity normalizers: `_specifiedValue` (cascade-first, live-decl fallback; `color` decl-first), `_INHERITED_PROPS`, `_initialOf` (`_GCS_DEFAULTS` doubles as the initial-values table), `_normComputed`, and **`_computedPropOf`** — resolve `initial`→initial, `inherit`→parent's computed value (root→initial), `unset`/`revert`→inherit-if-inherited-else-initial, per-property inheritance through the ancestor chain. `getComputedStyle.resolve` routes every modelled standard prop through it. Fixed a latent bug: `_computedColorOf` treated `unset` as `initial` but `color` inherits (now `_computedPropOf(el,'color',0)`). Pure JS, no new Rust. Zero regressions (caught+fixed a mid-flight `currentColor`-on-`color` drop). Caps: broader `css/*/inheritance.html` tail gated on the **property model** (each family needs initial value + inherited flag + computed serialization), not the engine; `var()` substitution; `color-computed-hsl` could-not-run. **PATH GOTCHA: wpt.live now 404s extensionless paths — every test path needs its `.html`.** |
 | ~~51~~ | ✅ [The Channelled Verdict](51-the-channelled-verdict.md) | `css/css-color/parsing/color-computed-rgb` (`calc()` inside `rgb()` channels) | **95/99** | ⚔️⚔️ | **SECURED — +36.** #50's named follow-up: reuse `_evalMath` inside `rgb()`/`rgba()` channels. The 40 fails were calc constants/non-finite (16), `sign()`+`<length>` (18), escaped function names (2), plus `var()`/`cqw` caps (4). `_isValidColor`'s `[^)]*` regex couldn't span a nested `calc()` (so `CSS.supports` returned `false`), and `_computeColor` split channels with `parseFloat`. Added `_splitTopLevel` (paren-aware split), `_unescapeIdent` (`r\67 b`→`rgb`), `_resolveChannel` (NaN/±∞→bounds), `_rgbComponents`; rewrote name/inner extraction; extended `_evalMath` with `<length>` dimension tokens (`em`=16px…), calc constants (`infinity`/`nan`/`pi`/`e`), `sign()`/`abs()`, and a non-finite passthrough. Opacity byte-identical. **59→95.** Zero regressions. Caps: `var(--x)` (custom-property cascade) ×2, `2cqw` (layout) ×2 |
@@ -94,6 +95,29 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-20 (Quest #54 The Snapped Verdict — five more CSS
+property-inheritance realms, +62):** Continued #53's "next leverage (a)" — model
+more `inheritance.html` families. Five were still dark, every subtest dying at
+`prop in getComputedStyle` → false: **css-scroll-snap** (0/38: 8× scroll-margin-*
+`0px`, 8× scroll-padding-* `auto`, scroll-snap-align/stop/type), **css-transitions**
+(0/8: transition-delay/duration `0s`, transition-property `all`,
+transition-timing-function `ease`), **css-color-adjust** (0/8: color-scheme `normal`,
+color-adjust/print-color-adjust `economy`, forced-color-adjust `auto` — **all four
+inherit**), **css-shapes** (0/6: shape-image-threshold `0`, shape-margin `0px`,
+shape-outside `none`), **css-will-change** (0/2: will-change `auto`). Pure DATA, same
+shape as #53: 34 properties → `_GCS_DEFAULTS`, the 4 color-adjust props →
+`_INHERITED_PROPS`; identity serialization is the #52/#53 engine's default echo, so no
+new serializer and NO new Rust. **All five families 100%; +62. ZERO regressions**
+(swept the #53 fifteen families, inherit-initial 4, css-color/inheritance 4,
+color-computed 16/455, opacity 30, matches 669, closest 29, createElement 147,
+has/not-specificity 8/8, valid-invalid 30, disabled 7, classlist 1420; obscura-dom
+40/40). **CAPS:** the cheap identity-serializing `inheritance.html` tail is now largely
+exhausted — remaining families (css-backgrounds [could-not-run, wpt.live `bodyLen=42`],
+css-position, css-sizing) need real layout/unit resolution, a separate engine. **NEXT:**
+CSS custom-property cascade + `var()` substitution (opens `css/css-variables/`), a
+specified-value serialization engine (`serialize-values` 0/697), or a fresh realm.
+Scroll `tickets/54-the-snapped-verdict.md`.
 
 **Session 2026-06-20 (Quest #53 The Propertied Verdict — modelling 15 CSS
 property-inheritance realms, +263):** The shared `/css/support/inheritance-testcommon.js`
