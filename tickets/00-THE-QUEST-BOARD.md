@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~53~~ | ✅ [The Propertied Verdict](53-the-propertied-verdict.md) | 15 `css/*/inheritance.html` realms (property-family modelling) | **all 15 at 100%** | ⚔️⚔️ | **SECURED — +263.** The shared `inheritance-testcommon.js` gates every subtest on `prop in getComputedStyle` first, but #52's engine only registered ~30 properties. Registered ~120 properties across css-text/ui/fonts/text-decor/writing-modes/lists/overflow/break/images/tables/align/flexbox/grid/content/multicol (initial value in `_GCS_DEFAULTS`, inherited flag in `_INHERITED_PROPS`; identity serialization is the engine's default echo). Real correctness win: `_buildCascade` now injects the live CSSOM decl (`el.style.foo=`, which never reflects to the `style=""` attribute) as the top *normal* author source, so it beats normal author rules (author `!important` still wins). `currentColor`-initial colour props (caret/outline/text-decoration/text-emphasis/column-rule-color) + `_FONT_SIZE_KEYWORDS` (`medium`→`16px`). Pure JS, no new Rust. Zero regressions. Caps: `display` skipped (spec-initial `inline` ≠ our UA default `block`); families needing real layout/unit resolution; the specified-value serialization family (`serialize-values` 0/697) is a separate engine. |
 | ~~52~~ | ✅ [The Inherited Verdict](52-the-inherited-verdict.md) | `css/css-cascade/inherit-initial` + `css/css-color/inheritance` (CSS-wide keyword resolution + per-property inheritance) | **inherit-initial 4/4, inheritance 4/4** | ⚔️⚔️ | **SECURED — +7.** `getComputedStyle` echoed the CSS-wide keywords verbatim (`z-index:inherit`→`"inherit"` not `"auto"`; `opacity:initial`→`"initial"` not `"1"`). Generalised the colour-only computed-value machinery into a property-agnostic engine on top of #47's cascade + #49/#50's colour/opacity normalizers: `_specifiedValue` (cascade-first, live-decl fallback; `color` decl-first), `_INHERITED_PROPS`, `_initialOf` (`_GCS_DEFAULTS` doubles as the initial-values table), `_normComputed`, and **`_computedPropOf`** — resolve `initial`→initial, `inherit`→parent's computed value (root→initial), `unset`/`revert`→inherit-if-inherited-else-initial, per-property inheritance through the ancestor chain. `getComputedStyle.resolve` routes every modelled standard prop through it. Fixed a latent bug: `_computedColorOf` treated `unset` as `initial` but `color` inherits (now `_computedPropOf(el,'color',0)`). Pure JS, no new Rust. Zero regressions (caught+fixed a mid-flight `currentColor`-on-`color` drop). Caps: broader `css/*/inheritance.html` tail gated on the **property model** (each family needs initial value + inherited flag + computed serialization), not the engine; `var()` substitution; `color-computed-hsl` could-not-run. **PATH GOTCHA: wpt.live now 404s extensionless paths — every test path needs its `.html`.** |
 | ~~51~~ | ✅ [The Channelled Verdict](51-the-channelled-verdict.md) | `css/css-color/parsing/color-computed-rgb` (`calc()` inside `rgb()` channels) | **95/99** | ⚔️⚔️ | **SECURED — +36.** #50's named follow-up: reuse `_evalMath` inside `rgb()`/`rgba()` channels. The 40 fails were calc constants/non-finite (16), `sign()`+`<length>` (18), escaped function names (2), plus `var()`/`cqw` caps (4). `_isValidColor`'s `[^)]*` regex couldn't span a nested `calc()` (so `CSS.supports` returned `false`), and `_computeColor` split channels with `parseFloat`. Added `_splitTopLevel` (paren-aware split), `_unescapeIdent` (`r\67 b`→`rgb`), `_resolveChannel` (NaN/±∞→bounds), `_rgbComponents`; rewrote name/inner extraction; extended `_evalMath` with `<length>` dimension tokens (`em`=16px…), calc constants (`infinity`/`nan`/`pi`/`e`), `sign()`/`abs()`, and a non-finite passthrough. Opacity byte-identical. **59→95.** Zero regressions. Caps: `var(--x)` (custom-property cascade) ×2, `2cqw` (layout) ×2 |
 | ~~50~~ | ✅ [The Calculated Verdict](50-the-calculated-verdict.md) | `css/css-color/parsing/opacity-computed` (computed `opacity` + the `calc()`/`min()`/`max()`/`clamp()` math evaluator) | **30/30** | ⚔️ | **SECURED — +27.** Computed `opacity` echoed the specified value back (`50%`, `-2`, `calc(1 + 1)` all returned unchanged — `getComputedStyle`'s `norm` step only normalized `<color>` properties). Added `_evalMath` — a hand-tokenized recursive-descent evaluator for `calc()`/`min()`/`max()`/`clamp()` plus raw `<number>`/`<percentage>` (percent → fraction in the unitless opacity context) — with `_serNumber` (computed-number serialization) and `_computeOpacity` (clamp to `[0, 1]`), wired into `norm`. Pure JS, no new Rust. The math evaluator is a **reusable primitive** — the named cap for `color-computed-rgb`'s 40 `calc()` cases. Zero regressions. Caps: `opacity-valid`/`opacity-invalid` need a specified-value `calc()`-simplification serializer + per-property grammar validation on the hot `CSSStyleDeclaration` setter (separate quest); `var()`/escaped idents still unresolved |
@@ -93,6 +94,33 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-20 (Quest #53 The Propertied Verdict — modelling 15 CSS
+property-inheritance realms, +263):** The shared `/css/support/inheritance-testcommon.js`
+drives the whole `css/*/inheritance.html` family; #52 built the property-agnostic
+computed-value engine (resolves `initial`/`inherit`/`unset`/`revert` + ancestor-chain
+inheritance) but registered only ~30 properties, so every other `inheritance.html`
+died at assert #1 (`prop in getComputedStyle` → false). Registered ~120 properties
+across **15 families** (css-text, css-ui, css-fonts, css-text-decor, css-writing-modes,
+css-lists, css-overflow, css-break, css-images, css-tables, css-align, css-flexbox,
+css-grid, css-content, css-multicol) — initial value in `_GCS_DEFAULTS`, inherited flag
+in `_INHERITED_PROPS`; identity serialization (keyword/length/number) is the engine's
+default echo, so it was almost pure data. Three small engine fixes: (1) `_buildCascade`
+now injects the live CSSOM declaration (`el.style.foo=`, which does NOT reflect into the
+`style=""` attribute the cascade reads) as the **highest-priority normal author source**,
+so a CSSOM-set value beats a normal author rule — an author `!important` rule still wins
+(`important-vs-inline-001` preserved); `_specifiedValue` is now cascade-authoritative.
+(2) `currentColor`-initial colour properties (caret/outline/text-decoration/text-emphasis/
+column-rule-color) resolve to the element's own colour. (3) `_FONT_SIZE_KEYWORDS` so
+`font-size: medium` computes to `16px`. Pure JS, no new Rust. **All 15 families now
+100%; +263 (8→271). Zero regressions** (qsa 1975, classlist 1420, matches 669, closest
+29, createElement 147, cloneNode 135, color-computed 16/455/95/30, opacity 30,
+inherit-initial 4, css-color/inheritance 4, has/not/is-specificity, is-nested,
+is-where-pseudo-classes, valid-invalid 30, readwrite-readonly 25, disabled 7,
+getRandomValues 39, mark 22; obscura-dom 40/40). Caps: `display` skipped (spec-initial
+`inline` ≠ UA-default `block`, regression risk for +1); families needing real layout/unit
+resolution; the specified-value serialization engine (`serialize-values` 0/697) is
+separate. Scroll `tickets/53-the-propertied-verdict.md`.
 
 **Session 2026-06-20 (Quest #52 The Inherited Verdict — CSS-wide keyword resolution
 + per-property inheritance in `getComputedStyle`, +7):** After #47 (cascade) and

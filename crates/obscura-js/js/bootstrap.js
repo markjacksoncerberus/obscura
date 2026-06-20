@@ -5056,6 +5056,79 @@ const _GCS_DEFAULTS = {
   'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
   'z-index': 'auto', 'pointer-events': 'auto',
   'box-sizing': 'content-box', cursor: 'auto',
+  // css-text properties (all inherited) — initial computed values per spec.
+  // Computed serialization for these is identity (keyword / simple length),
+  // so the #52 inheritance engine resolves initial/inherit/unset directly.
+  'hanging-punctuation': 'none', hyphens: 'manual', 'letter-spacing': 'normal',
+  'line-break': 'auto', 'overflow-wrap': 'normal', 'tab-size': '8',
+  'text-align': 'start', 'text-align-all': 'start', 'text-align-last': 'auto',
+  'text-fit': 'none', 'text-indent': '0px', 'text-justify': 'auto',
+  'text-transform': 'none', 'text-wrap': 'wrap', 'text-wrap-mode': 'wrap',
+  'text-wrap-style': 'auto', 'white-space': 'normal', 'white-space-collapse': 'collapse',
+  'word-break': 'normal', 'word-spacing': '0px', 'word-wrap': 'normal',
+  // css-fonts properties (all inherited). font-size/font-weight/line-height
+  // already modelled above. font-family has no fixed initial in the spec
+  // (implementation-defined) so the test skips its initial assertion.
+  'font-family': '', 'font-feature-settings': 'normal', 'font-kerning': 'auto',
+  'font-language-override': 'normal', 'font-optical-sizing': 'auto',
+  'font-size-adjust': 'none', 'font-stretch': '100%', 'font-style': 'normal',
+  'font-synthesis': 'weight style small-caps position', 'font-variant': 'normal',
+  'font-variant-alternates': 'normal', 'font-variant-caps': 'normal',
+  'font-variant-east-asian': 'normal', 'font-variant-emoji': 'normal',
+  'font-variant-ligatures': 'normal', 'font-variant-numeric': 'normal',
+  'font-variant-position': 'normal', 'font-variation-settings': 'normal',
+  // css-ui properties. caret-color/outline-color are <color> (in _COLOR_PROPS);
+  // their initial is `currentColor`, which the colour normalizer resolves to
+  // the element's own computed colour. outline-width initial `medium` matches
+  // the test's mediumWidth reference (a cascaded `border-top-width: medium`).
+  appearance: 'none', 'caret-color': 'currentColor', 'caret-shape': 'auto',
+  'nav-down': 'auto', 'nav-left': 'auto', 'nav-right': 'auto', 'nav-up': 'auto',
+  'outline-color': 'currentColor', 'outline-offset': '0px', 'outline-style': 'none',
+  'outline-width': 'medium', resize: 'none', 'user-select': 'auto',
+  // css-text-decor. text-decoration-color/text-emphasis-color are <color> with a
+  // `currentColor` initial. text-decoration-* do not inherit; the rest do.
+  'text-decoration-color': 'currentColor', 'text-decoration-line': 'none',
+  'text-decoration-style': 'solid', 'text-emphasis-color': 'currentColor',
+  'text-emphasis-position': 'auto', 'text-emphasis-style': 'none', 'text-shadow': 'none',
+  'text-underline-position': 'auto', 'text-decoration-skip-ink': 'auto',
+  // css-writing-modes. unicode-bidi does not inherit; the rest do.
+  direction: 'ltr', 'text-combine-upright': 'none', 'text-orientation': 'mixed',
+  'unicode-bidi': 'normal', 'writing-mode': 'horizontal-tb',
+  // css-lists. counter-* do not inherit; the list-style-* properties do.
+  'counter-increment': 'none', 'counter-reset': 'none', 'list-style-image': 'none',
+  'list-style-position': 'outside', 'list-style-type': 'disc',
+  // css-overflow. Only block-ellipsis inherits.
+  'block-ellipsis': 'no-ellipsis', continue: 'normal', 'max-lines': 'auto',
+  'overflow-block': 'visible', 'overflow-inline': 'visible', 'overflow-x': 'visible',
+  'overflow-y': 'visible', 'text-overflow': 'clip', 'scrollbar-gutter': 'auto',
+  // css-break. orphans/widows inherit; the break-* and box-decoration-break do not.
+  'box-decoration-break': 'slice', 'break-after': 'auto', 'break-before': 'auto',
+  'break-inside': 'auto', orphans: '2', widows: '2',
+  // css-images. image-orientation/image-rendering inherit; object-* do not.
+  'image-orientation': 'from-image', 'image-rendering': 'auto', 'object-fit': 'fill',
+  'object-position': '50% 50%',
+  // css-tables. table-layout does not inherit; the rest do.
+  'border-collapse': 'separate', 'border-spacing': '0px', 'caption-side': 'top',
+  'empty-cells': 'show', 'table-layout': 'auto',
+  // css-align (shared with css-flexbox) — none inherit.
+  'align-content': 'normal', 'align-items': 'normal', 'align-self': 'auto',
+  'column-gap': 'normal', 'justify-content': 'normal', 'justify-items': 'legacy center',
+  'justify-self': 'auto', 'row-gap': 'normal',
+  // css-flexbox (the flex-specific properties) — none inherit.
+  'flex-basis': 'auto', 'flex-direction': 'row', 'flex-grow': '0', 'flex-shrink': '1',
+  'flex-wrap': 'nowrap', order: '0',
+  // css-grid — none inherit.
+  'grid-auto-columns': 'auto', 'grid-auto-flow': 'row', 'grid-auto-rows': 'auto',
+  'grid-column-end': 'auto', 'grid-column-start': 'auto', 'grid-row-end': 'auto',
+  'grid-row-start': 'auto', 'grid-template-areas': 'none', 'grid-template-columns': 'none',
+  'grid-template-rows': 'none',
+  // css-content. quotes inherits; bookmark-* do not.
+  quotes: 'auto', 'bookmark-level': 'none', 'bookmark-state': 'open',
+  // css-multicol — none inherit. column-rule-color is <color> with a currentColor
+  // initial; column-rule-width's `medium` matches the test's mediumWidth reference.
+  'column-count': 'auto', 'column-fill': 'balance', 'column-rule-color': 'currentColor',
+  'column-rule-style': 'none', 'column-rule-width': 'medium', 'column-span': 'none',
+  'column-width': 'auto',
 };
 const _cssParseDecls = (body) => {
   // body is the inside of a `{ ... }` block (or an inline style string).
@@ -5148,6 +5221,7 @@ const _CSS_NAMED_COLORS = {
 const _COLOR_PROPS = new Set([
   'color','background-color','border-top-color','border-right-color','border-bottom-color',
   'border-left-color','outline-color','text-decoration-color','column-rule-color','caret-color',
+  'text-emphasis-color',
 ]);
 const _serColor = (r, g, b, a) => {
   const c = (x) => Math.max(0, Math.min(255, Math.round(x)));
@@ -5462,8 +5536,10 @@ const _specifiedValue = (el, kebab) => {
   const cascade = () => {
     try { return _cascadeResolve(_buildCascade(el), kebab) || ''; } catch (e) { return ''; }
   };
-  if (kebab === 'color') { const d = liveDecl(); return d || cascade(); }
-  const c = cascade(); return c || liveDecl();
+  // The cascade now incorporates the live CSSOM decl as its top normal source,
+  // so it is authoritative for every property (the liveDecl fallback only covers
+  // the case where building the cascade threw).
+  return cascade() || liveDecl();
 };
 const _specifiedColor = (el) => _specifiedValue(el, 'color');
 // Properties that inherit by default — for these an absent value or the
@@ -5473,6 +5549,39 @@ const _specifiedColor = (el) => _specifiedValue(el, 'color');
 const _INHERITED_PROPS = new Set([
   'color', 'font-size', 'font-weight', 'line-height', 'visibility',
   'cursor', 'pointer-events',
+  // css-text: every property in this family inherits.
+  'hanging-punctuation', 'hyphens', 'letter-spacing', 'line-break',
+  'overflow-wrap', 'tab-size', 'text-align', 'text-align-all', 'text-align-last',
+  'text-fit', 'text-indent', 'text-justify', 'text-transform', 'text-wrap',
+  'text-wrap-mode', 'text-wrap-style', 'white-space', 'white-space-collapse',
+  'word-break', 'word-spacing', 'word-wrap',
+  // css-fonts: every property in this family inherits.
+  'font-family', 'font-feature-settings', 'font-kerning', 'font-language-override',
+  'font-optical-sizing', 'font-size-adjust', 'font-stretch', 'font-style',
+  'font-synthesis', 'font-variant', 'font-variant-alternates', 'font-variant-caps',
+  'font-variant-east-asian', 'font-variant-emoji', 'font-variant-ligatures',
+  'font-variant-numeric', 'font-variant-position', 'font-variation-settings',
+  // css-ui: caret-color, caret-shape and cursor inherit (the outline-* and
+  // nav-* properties and appearance/resize/user-select do NOT).
+  'caret-color', 'caret-shape',
+  // css-text-decor: text-emphasis-* / text-shadow / text-underline-position /
+  // text-decoration-skip-ink inherit (text-decoration-* do NOT).
+  'text-emphasis-color', 'text-emphasis-position', 'text-emphasis-style',
+  'text-shadow', 'text-underline-position', 'text-decoration-skip-ink',
+  // css-writing-modes: all but unicode-bidi inherit.
+  'direction', 'text-combine-upright', 'text-orientation', 'writing-mode',
+  // css-lists: the list-style-* properties inherit (counter-* do NOT).
+  'list-style-image', 'list-style-position', 'list-style-type',
+  // css-overflow: only block-ellipsis inherits.
+  'block-ellipsis',
+  // css-break: orphans/widows inherit.
+  'orphans', 'widows',
+  // css-images: image-orientation/image-rendering inherit.
+  'image-orientation', 'image-rendering',
+  // css-tables: all but table-layout inherit.
+  'border-collapse', 'border-spacing', 'caption-side', 'empty-cells',
+  // css-content: quotes inherits.
+  'quotes',
 ]);
 const _CSS_WIDE = new Set(['initial', 'inherit', 'unset', 'revert', 'revert-layer']);
 // Initial (computed) value for a property. The defaults table doubles as the
@@ -5485,8 +5594,19 @@ const _initialOf = (kebab) => {
 };
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
+const _FONT_SIZE_KEYWORDS = {
+  // Absolute <font-size> keywords → computed px, scaled from medium = 16px
+  // (the spec's recommended factor table; default monospace adjustment omitted).
+  'xx-small': '10px', 'x-small': '12px', small: '13px', medium: '16px',
+  large: '18px', 'x-large': '24px', 'xx-large': '32px', 'xxx-large': '48px',
+};
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  if (kebab === 'font-size') {
+    const k = String(v).trim().toLowerCase();
+    if (k in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[k];
+    return v;
+  }
   if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
     if (String(v).trim().toLowerCase() === 'currentcolor') {
       return kebab === 'color' ? _computeColor(_initialOf('color')) : _computedColorOf(el);
@@ -5552,6 +5672,23 @@ const _buildCascade = (el) => {
     let inlineText = '';
     try { inlineText = el.getAttribute && el.getAttribute('style'); } catch { inlineText = ''; }
     if (inlineText) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC, decls: _cssParseDecls(inlineText) });
+    // Live CSSOM inline declarations (`el.style.foo = …`) set through the object
+    // model do NOT reflect into the style="" attribute read above, yet they are
+    // the highest-priority *normal* author source — above every <style> rule (an
+    // author !important rule still beats them, handled by _cascadeResolve). Inject
+    // them as an inline-level source so a CSSOM-set value wins over author rules.
+    let liveProps = null;
+    try { liveProps = el.style && el.style._props; } catch { liveProps = null; }
+    if (liveProps) {
+      const decls = {};
+      let any = false;
+      for (const k in liveProps) {
+        const name = k.startsWith('--') ? k : k.replace(/([A-Z])/g, '-$1').toLowerCase();
+        decls[name] = { value: liveProps[k], important: false };
+        any = true;
+      }
+      if (any) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 1, decls });
+    }
   }
   return sources;
 };

@@ -10,12 +10,27 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #52).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #53).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-text/inheritance.html` | 0/42 | **42/42** | ✅ 100% | **Quest #53 The Propertied Verdict.** The #52 computed-value engine resolves initial/inherit/unset, but only ~30 properties were registered, so every other `inheritance.html` failed at `prop in getComputedStyle`. Registered ~120 properties (initial value in `_GCS_DEFAULTS`, inherited flag in `_INHERITED_PROPS`); identity serialization (keyword/length/number) is the engine's default echo. Pure JS, no new Rust. **+42** |
+| `css/css-ui/inheritance.html` | 3/28 | **28/28** | ✅ 100% | **Quest #53.** Plus the real win: a live CSSOM decl (`el.style.outlineStyle='initial'`) must beat a *normal* author rule (`#target{outline-style:dotted}`), but it doesn't reflect to the `style=""` attribute. `_buildCascade` now injects `el.style._props` as the top normal author source (author `!important` still wins). `caret-color`/`outline-color` get a `currentColor` initial. **+25** |
+| `css/css-fonts/inheritance.html` | 3/39 | **39/39** | ✅ 100% | **Quest #53.** 18 font properties registered + `_FONT_SIZE_KEYWORDS` so `font-size: medium` computes to `16px` (the test's `mediumFontSize` reference). **+36** |
+| `css/css-text-decor/inheritance.html` | 1/18 | **18/18** | ✅ 100% | **Quest #53.** text-decoration-*/text-emphasis-*/text-shadow/text-underline-position; `text-decoration-color`/`text-emphasis-color` get a `currentColor` initial (`text-emphasis-color` added to `_COLOR_PROPS`). **+17** |
+| `css/css-writing-modes/inheritance.html` | 0/10 | **10/10** | ✅ 100% | **Quest #53.** direction/writing-mode/text-orientation/text-combine-upright (inherited) + unicode-bidi (not). **+10** |
+| `css/css-lists/inheritance.html` | 0/10 | **10/10** | ✅ 100% | **Quest #53.** list-style-* (inherited) + counter-increment/counter-reset (not). **+10** |
+| `css/css-overflow/inheritance.html` | 0/18 | **18/18** | ✅ 100% | **Quest #53.** overflow-x/y/block/inline, text-overflow, scrollbar-gutter, max-lines, continue (not inherited); block-ellipsis (inherited). **+18** |
+| `css/css-break/inheritance.html` | 0/12 | **12/12** | ✅ 100% | **Quest #53.** break-before/after/inside, box-decoration-break (not); orphans/widows (inherited). **+12** |
+| `css/css-images/inheritance.html` | 0/8 | **8/8** | ✅ 100% | **Quest #53.** image-orientation/image-rendering (inherited); object-fit/object-position (not). **+8** |
+| `css/css-tables/inheritance.html` | 0/10 | **10/10** | ✅ 100% | **Quest #53.** border-collapse/border-spacing/caption-side/empty-cells (inherited); table-layout (not). **+10** |
+| `css/css-align/inheritance.html` | 0/16 | **16/16** | ✅ 100% | **Quest #53.** align-/justify-content/items/self, row-gap/column-gap — none inherit. **+16** |
+| `css/css-flexbox/inheritance.html` | 0/20 | **20/20** | ✅ 100% | **Quest #53.** flex-basis/direction/grow/shrink/wrap, order (+ the shared align/justify props) — none inherit. **+20** |
+| `css/css-grid/inheritance.html` | 0/20 | **20/20** | ✅ 100% | **Quest #53.** grid-auto-*/grid-template-*/grid-row|column-start|end — none inherit. **+20** |
+| `css/css-content/inheritance.html` | 0/6 | **6/6** | ✅ 100% | **Quest #53.** quotes (inherited); bookmark-level/bookmark-state (not). **+6** |
+| `css/css-multicol/inheritance.html` | 1/14 | **14/14** | ✅ 100% | **Quest #53.** column-count/fill/span/width/rule-style, column-rule-width (`medium`), column-rule-color (`currentColor` initial) — none inherit. **+13** |
 | `css/css-cascade/inherit-initial.html` | 0/4 | **4/4** | ✅ 100% | **Quest #52 The Inherited Verdict.** `getComputedStyle` echoed the CSS-wide keywords verbatim — `z-index:inherit` on the root computed to `"inherit"` (expected `"auto"`), likewise `position`/`overflow`/`background-color`. Generalised the colour-only machinery into a property-agnostic computed-value engine: `_specifiedValue`/`_initialOf`/`_normComputed`/`_computedPropOf` resolve `initial`→initial value, `inherit`→parent's computed value (root→initial), `unset`/`revert`→inherit-if-inherited-else-initial, with a per-property inheritance table (`_INHERITED_PROPS`). Pure JS, no new Rust. **+4** |
 | `css/css-color/inheritance.html` | 1/4 | **4/4** | ✅ 100% | **Quest #52.** Same engine: `opacity:initial`→`"1"`, `opacity:inherit`→parent's value. Fixed a latent colour bug — `_computedColorOf` treated `unset` as `initial` (`rgb(0,0,0)`) but `color` inherits, so `color:unset` must inherit (`_computedColorOf` is now `_computedPropOf(el,'color',0)`). Driven by the shared `inheritance-testcommon.js` (the whole `css/*/inheritance.html` family). **+3** |
 | `css/css-color/parsing/opacity-computed.html` | 3/30 | **30/30** | ✅ 100% | **Quest #50 The Calculated Verdict.** Computed `opacity` echoed the specified value back (`50%`, `-2`, `calc(1 + 1)` returned unchanged). Added `_evalMath` — a recursive-descent evaluator for `calc()`/`min()`/`max()`/`clamp()` + raw `<number>`/`<percentage>` (percent in a unitless context → fraction) — plus `_serNumber` and `_computeOpacity` (clamp to `[0, 1]`). Wired into the `getComputedStyle` `norm` step. The math evaluator is a reusable primitive (the named cap for `color-computed-rgb`'s 40 calc cases). **+27.** Caps: `opacity-valid`/`opacity-invalid` need a specified-value `calc()`-simplification serializer + per-property grammar validation on the hot `CSSStyleDeclaration` setter (separate quest) |
