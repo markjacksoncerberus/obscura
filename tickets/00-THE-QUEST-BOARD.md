@@ -17,6 +17,8 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~50~~ | ✅ [The Calculated Verdict](50-the-calculated-verdict.md) | `css/css-color/parsing/opacity-computed` (computed `opacity` + the `calc()`/`min()`/`max()`/`clamp()` math evaluator) | **30/30** | ⚔️ | **SECURED — +27.** Computed `opacity` echoed the specified value back (`50%`, `-2`, `calc(1 + 1)` all returned unchanged — `getComputedStyle`'s `norm` step only normalized `<color>` properties). Added `_evalMath` — a hand-tokenized recursive-descent evaluator for `calc()`/`min()`/`max()`/`clamp()` plus raw `<number>`/`<percentage>` (percent → fraction in the unitless opacity context) — with `_serNumber` (computed-number serialization) and `_computeOpacity` (clamp to `[0, 1]`), wired into `norm`. Pure JS, no new Rust. The math evaluator is a **reusable primitive** — the named cap for `color-computed-rgb`'s 40 `calc()` cases. Zero regressions. Caps: `opacity-valid`/`opacity-invalid` need a specified-value `calc()`-simplification serializer + per-property grammar validation on the hot `CSSStyleDeclaration` setter (separate quest); `var()`/escaped idents still unresolved |
+| ~~49~~ | ✅ [The Computed Verdict](49-the-computed-verdict.md) | `css/css-color/parsing/*-computed.html` (the shared computed-value harness) | **color-computed 16/16, hex 6/6, named 455/455, rgb 59/99** | ⚔️⚔️ | **SECURED — +536.** The whole `*-computed.html` family was gated `0` on two shared asserts: `'prop' in getComputedStyle(el)` (the Proxy had no `has` trap) and `CSS.supports(prop, val)` (hardcoded `false`). Added a `has` trap + `_CSS_KNOWN_PROPS` registry, a real two/one-arg `CSS.supports`, `color` inheritance through the ancestor chain, and an extended `_computeColor` (hsl→rgb, alpha clamp, the `none` keyword, comment stripping). Pure JS. Zero regressions. Caps: rgb 40 = `calc()`/`var()`/escaped idents; `opacity-computed` (next); inheritance/initial for non-colour props |
 | ~~48~~ | ✅ [The Indeterminate Verdict](48-the-indeterminate-verdict.md) | `html/semantics/selectors/pseudo-classes/{indeterminate,default,placeholder-shown,required-optional-hidden}` | **indeterminate 6/6, default 2/2, placeholder-shown-type-change 1/1, required-optional-hidden 1/1** | ⚔️ | **SECURED — +10.** The last three HTML selector pseudo-classes were parsed but `PseudoClass::Other` → false. All added to the Rust matcher, tree-derived: **`:indeterminate`** (checkbox via a new eager `indeterminate` IDL side-map + JS `el.indeterminate`; radio whose name-group has no checked member, nameless = self; valueless `<progress>`), **`:placeholder-shown`** (placeholder-applicable input/textarea, non-empty `placeholder`, empty value), **`:default`** (checkbox/radio with the `checked` attr, option with `selected`, or a submit button that is its form owner's default button — form owner via `form` attr else nearest ancestor `<form>`, first submit in tree order). Plus spec-correct **`:optional`** (now matches any input/select/textarea not `:required`, incl. `type=hidden`/`submit`). Zero regressions; the live-state form/structural pseudo family is now complete. Caps: `:placeholder-shown` live `.value` IDL, radio-group form-owner partitioning, `css/selectors/indeterminate*` reftests |
 | ~~47~~ | ✅ [The Cascade Crown](47-the-cascade-crown.md) | `css/selectors/*specificity*` + `…/pseudo-classes/*-type-change` (the `getComputedStyle`/CSS-cascade wall) | **+24** | ⚔️⚔️ | **SECURED — +24.** `getComputedStyle` had **no author-stylesheet cascade** — only inline style + a defaults table — so every "inject `<style>` rules, read the winner back" test died (the recurring wall named by #42–#46). Built a real cascade on top of the existing Servo selector engine: new Rust op `selector_match_specificity` (matches? + highest matching-complex-selector specificity, `:is`/`:where`/`:has`-correct), JS gathers `<style>` rules, primes the live-state side-maps (`:target`/validity), and resolves each property by **importance → specificity → source order**; inline style is the top source. Added computed-value `<color>` serialization (named/hex/rgb → `rgb(r, g, b)`). has-specificity 0→8, is-specificity 0→1, is-nested 0→2, is-where-pseudo-classes 0→1, not-specificity 0→8, readwrite-readonly-type-change 0→1, checked-type-change 0→1, inrange-outofrange-type-change 0→2. Zero regressions. Caps: inheritance/layout/computed-values still absent; `:indeterminate`/`:placeholder-shown`/`:optional`-for-hidden are separate matching gaps; CSSOM/shadow/`:dir`/`:visited`/reftests out of realm |
 | ~~46~~ | ✅ [The Disabled Lineage](46-the-disabled-lineage.md) | `html/semantics/selectors/pseudo-classes/disabled` (+ `enabled` held) | **7/7** | ⚔️ | **SECURED — +7.** `:disabled`/`:enabled` only checked the element's *own* `disabled` attribute (the separate matcher gap named by #45). Now "actually disabled" per HTML, matched **live off the Rust tree**: own attr, an `<option>` whose `<optgroup>` parent is disabled, and any disable-able element (input/button/select/textarea/optgroup/option/fieldset) inside a disabled `<fieldset>` — except within that fieldset's first `<legend>` — covering nested fieldsets via a single `prev_id == first_legend_child` ancestor-walk compare. `:enabled` is the exact complement over the disable-able set. Pure-Rust, no per-query priming. Zero regressions. The live-state form/structural pseudo family is now complete. Caps: `getComputedStyle`/CSS cascade (recurring wall) |
@@ -90,8 +92,34 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-19 (Quest #50 The Calculated Verdict — computed `opacity` + the
+`calc()`/`min()`/`max()`/`clamp()` math evaluator, +27):** #49 opened the
+`*-computed.html` family and built a computed-value engine for colour; its named
+follow-up ("opacity + simple numeric computed values") was still dark — `opacity-computed.html`
+at **3/30**. `getComputedStyle`'s `norm` step only normalized `<color>` properties, so
+computed `opacity` echoed the *specified* value verbatim (`50%` → `"50%"`, `-2` → `"-2"`,
+`calc(1 + 1)` → `"calc(1 + 1)"`). Built **`_evalMath(input, percentBase)`** — a
+hand-tokenized recursive-descent evaluator that collapses a CSS math expression
+(`calc()`/`min()`/`max()`/`clamp()` + raw `<number>`/`<percentage>`) to a plain number;
+intentionally unit-agnostic (every term → a number; percent → `(p/100)·percentBase`,
+`base = 1` for unitless opacity) — enough for opacity and number channels, not a general
+length calculator. Plus `_serNumber` (computed-number serialization: round float noise,
+drop trailing zeros, `-0`→`0`) and `_computeOpacity` (clamp to `[0, 1]`), wired into
+`norm` ahead of the colour branch. Pure JS, no new Rust. The math evaluator is a
+**reusable primitive** — the named cap for `color-computed-rgb`'s 40 `calc()` cases (next:
+reuse it inside `rgb()`/`hsl()` channels with `percentBase = 255`). **Win:**
+opacity-computed 3→**30/30** (+27). **Zero regressions** (qsa 1975, classlist 1420,
+matches 669, closest 29, valid-invalid 30, readwrite-readonly 25, disabled 7,
+has-specificity 8, not-specificity 8, is-nested 2, createElement 147, color-computed 16,
+color-computed-hex-color 6, color-computed-named-color 455, color-computed-rgb 59,
+structured-clone 141/152, getRandomValues 39, mark 22, url-setters-stripping 260;
+obscura-dom unit 40/40). Caps: `opacity-valid`/`opacity-invalid` need a specified-value
+`calc()`-simplification serializer + per-property grammar validation on the hot
+`CSSStyleDeclaration` setter (separate quest); `var()`/escaped idents unresolved. Scroll
+`tickets/50-the-calculated-verdict.md`.
+
 **Session 2026-06-19 (Quest #49 The Computed Verdict — computed-value plumbing + the
-colour engine, +536):** After #47 built an author-stylesheet *cascade* for `getComputedStyle`,
+colour engine, +536):** After #47 built an author-stylesheet *cascade* for `getComputedStyle`, After #47 built an author-stylesheet *cascade* for `getComputedStyle`,
 the *computed-value* side of CSS was still dark. The whole `css/*/parsing/*-computed.html`
 family runs through the shared helper `/css/support/computed-testcommon.js`, which gates
 **every** subtest on two assertions before reading a value: `'prop' in getComputedStyle(el)`

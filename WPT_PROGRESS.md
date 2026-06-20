@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #49).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-19 (Quest #50).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-color/parsing/opacity-computed.html` | 3/30 | **30/30** | ✅ 100% | **Quest #50 The Calculated Verdict.** Computed `opacity` echoed the specified value back (`50%`, `-2`, `calc(1 + 1)` returned unchanged). Added `_evalMath` — a recursive-descent evaluator for `calc()`/`min()`/`max()`/`clamp()` + raw `<number>`/`<percentage>` (percent in a unitless context → fraction) — plus `_serNumber` and `_computeOpacity` (clamp to `[0, 1]`). Wired into the `getComputedStyle` `norm` step. The math evaluator is a reusable primitive (the named cap for `color-computed-rgb`'s 40 calc cases). **+27.** Caps: `opacity-valid`/`opacity-invalid` need a specified-value `calc()`-simplification serializer + per-property grammar validation on the hot `CSSStyleDeclaration` setter (separate quest) |
 | `css/css-color/parsing/color-computed.html` | 0/16 | **16/16** | ✅ 100% | **Quest #49 The Computed Verdict.** The shared `computed-testcommon.js` harness gates every computed-value subtest on `'prop' in getComputedStyle(el)` and `CSS.supports(prop, val)` — both failed (no Proxy `has` trap; `CSS.supports` was hardcoded `false`). Added a `has` trap + property registry, a real two/one-arg `CSS.supports`, color inheritance (`color`/`currentColor` resolve up the tree), and extended `_computeColor` (hsl→rgb, alpha clamp, the `none` keyword, comment stripping). **+16** |
 | `css/css-color/parsing/color-computed-hex-color.html` | 0/6 | **6/6** | ✅ 100% | **Quest #49.** Unblocked by the same `has`-trap + `CSS.supports` primitives; #47's hex serializer already produced `rgb(r, g, b)`. **+6** |
 | `css/css-color/parsing/color-computed-named-color.html` | 0/455 | **455/455** | ✅ 100% | **Quest #49.** All 147 CSS named colors + `transparent`/`currentColor` through the cascade; comment stripping won the last subtest (`/**/transparent`). **+455** |

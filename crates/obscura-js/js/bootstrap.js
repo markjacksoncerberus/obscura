@@ -5232,6 +5232,112 @@ const _isValidColor = (value) => {
   }
   return false;
 };
+// Evaluate a CSS math expression — calc()/min()/max()/clamp() plus a raw
+// <number> or <percentage> — down to a plain JS number. `percentBase` is what
+// 100% resolves to (1 for unitless contexts like `opacity`). Returns null when
+// the value is not a (resolvable) numeric math expression. A small recursive-
+// descent parser over a hand-tokenized stream; intentionally unit-agnostic
+// (every term collapses to a number) — enough for opacity and number channels,
+// not a general length/unit calculator.
+const _evalMath = (input, percentBase) => {
+  const s = String(input).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (s === '') return null;
+  const toks = [];
+  let i = 0;
+  const n = s.length;
+  const isDigit = (c) => c >= '0' && c <= '9';
+  while (i < n) {
+    const c = s[i];
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f') { i++; continue; }
+    if (c === '(' || c === ')' || c === ',' || c === '+' || c === '-' || c === '*' || c === '/') {
+      toks.push({ t: c }); i++; continue;
+    }
+    if (isDigit(c) || (c === '.' && isDigit(s[i + 1]))) {
+      let j = i;
+      while (j < n && isDigit(s[j])) j++;
+      if (s[j] === '.') { j++; while (j < n && isDigit(s[j])) j++; }
+      if (s[j] === 'e' || s[j] === 'E') {
+        let k = j + 1;
+        if (s[k] === '+' || s[k] === '-') k++;
+        if (isDigit(s[k])) { k++; while (k < n && isDigit(s[k])) k++; j = k; }
+      }
+      const num = parseFloat(s.slice(i, j));
+      let pct = false;
+      if (s[j] === '%') { pct = true; j++; }
+      toks.push({ t: 'num', v: num, pct });
+      i = j; continue;
+    }
+    if (/[a-zA-Z]/.test(c)) {
+      let j = i;
+      while (j < n && /[a-zA-Z0-9-]/.test(s[j])) j++;
+      toks.push({ t: 'ident', v: s.slice(i, j).toLowerCase() });
+      i = j; continue;
+    }
+    return null;
+  }
+  let p = 0;
+  let failed = false;
+  const peek = () => toks[p];
+  const fail = () => { failed = true; return 0; };
+  const parseExpr = () => {
+    let v = parseTerm();
+    while (!failed && peek() && (peek().t === '+' || peek().t === '-')) {
+      const op = toks[p++].t;
+      const r = parseTerm();
+      v = op === '+' ? v + r : v - r;
+    }
+    return v;
+  };
+  const parseTerm = () => {
+    let v = parseFactor();
+    while (!failed && peek() && (peek().t === '*' || peek().t === '/')) {
+      const op = toks[p++].t;
+      const r = parseFactor();
+      v = op === '*' ? v * r : v / r;
+    }
+    return v;
+  };
+  const parseFactor = () => {
+    const tok = peek();
+    if (!tok) return fail();
+    if (tok.t === '+') { p++; return parseFactor(); }
+    if (tok.t === '-') { p++; return -parseFactor(); }
+    if (tok.t === 'num') { p++; return tok.pct ? (tok.v / 100) * percentBase : tok.v; }
+    if (tok.t === '(') { p++; const v = parseExpr(); if (!peek() || peek().t !== ')') return fail(); p++; return v; }
+    if (tok.t === 'ident') {
+      const name = toks[p++].v;
+      if (!peek() || peek().t !== '(') return fail();
+      p++;
+      const args = [parseExpr()];
+      while (!failed && peek() && peek().t === ',') { p++; args.push(parseExpr()); }
+      if (!peek() || peek().t !== ')') return fail();
+      p++;
+      if (name === 'calc') return args.length === 1 ? args[0] : fail();
+      if (name === 'min') return Math.min(...args);
+      if (name === 'max') return Math.max(...args);
+      if (name === 'clamp') return args.length === 3 ? Math.max(args[0], Math.min(args[1], args[2])) : fail();
+      return fail();
+    }
+    return fail();
+  };
+  const result = parseExpr();
+  if (failed || p !== toks.length || !isFinite(result)) return null;
+  return result;
+};
+// Serialize a computed CSS <number>: round away float noise, drop trailing
+// zeros, normalize -0 to 0. (0.6 → "0.6", 1 → "1", 0.5 → "0.5".)
+const _serNumber = (x) => {
+  let r = Math.round(x * 1e6) / 1e6;
+  if (Object.is(r, -0)) r = 0;
+  return String(r);
+};
+// Computed value of `opacity`: a <number> or <percentage> (incl. math
+// functions), clamped to [0, 1]. Returns null if the value isn't numeric.
+const _computeOpacity = (value) => {
+  const num = _evalMath(value, 1);
+  if (num === null) return null;
+  return _serNumber(Math.max(0, Math.min(1, num)));
+};
 // Computed `color` of an element, honouring inheritance and `currentColor`.
 // A missing/`inherit`/`currentcolor` value inherits the parent's color; the
 // document root falls back to the initial value rgb(0, 0, 0).
@@ -5332,6 +5438,7 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
     if (kebab === 'color') return _computedColorOf(el);
     const norm = (v) => {
+      if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
       if (!_COLOR_PROPS.has(kebab)) return v;
       // `currentColor` on a non-`color` property resolves to the element's color.
       if (String(v).trim().toLowerCase() === 'currentcolor') return _computedColorOf(el);
