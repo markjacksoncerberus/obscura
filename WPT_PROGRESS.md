@@ -10,12 +10,19 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #54).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #55).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-variables/variable-definition.html` | 11/73 | **71/73** | ✅ 97% | **Quest #55 The Custom Verdict.** Rewrote `CSSStyleDeclaration` (custom-prop name validation, whitespace canonicalization, `!important` tracking), fixed the `style` Proxy `set` trap (was storing `cssText` as a plain prop), lazily synced the `style` content attribute into the live decl, gave `getComputedStyle` real custom-property inheritance + CSS-wide keyword resolution. Pure JS, no new Rust. **+60.** Caps: unknown-property drop (`-var4`, ×2) |
+| `css/css-variables/variable-definition-cascading.html` | 5/9 | **9/9** | ✅ 100% | **Quest #55.** Custom properties always inherit; `_computedCustomProp` walks the ancestor chain. **+4** |
+| `css/css-variables/variable-definition-keywords.html` | 0/8 | **8/8** | ✅ 100% | **Quest #55.** CSS-wide keywords on custom props: computed `initial`→`""`, `inherit`/`unset`/`revert`→parent; specified style echoes the keyword verbatim (needed the content-attribute sync). **+8** |
+| `css/css-variables/variable-substitution-basic.html` | 5/13 | **11/13** | ✅ 85% | **Quest #55.** `var()` substitution: `_substituteVars` replaces `var(--name,fallback)` recursively; an unresolvable var() makes the property invalid-at-computed-time (→ initial/inherited). **+6.** Caps: token-boundary cases (`var(--n)px`→`0px`) need a real tokenizer |
+| `css/css-variables/variable-cssText.html` | 1/11 | **8/11** | ✅ 73% | **Quest #55.** `cssText` getter/setter serialization with `!important` + custom-prop values. **+7.** Caps: shorthand expansion, unknown-prop drop, comment preservation |
+| `css/css-variables/variable-created-element.html` | 1/3 | **3/3** | ✅ 100% | **Quest #55.** +2 |
+| `css/css-variables/variable-created-document.html` | 1/2 | **2/2** | ✅ 100% | **Quest #55.** +1 |
 | `css/css-text/inheritance.html` | 0/42 | **42/42** | ✅ 100% | **Quest #53 The Propertied Verdict.** The #52 computed-value engine resolves initial/inherit/unset, but only ~30 properties were registered, so every other `inheritance.html` failed at `prop in getComputedStyle`. Registered ~120 properties (initial value in `_GCS_DEFAULTS`, inherited flag in `_INHERITED_PROPS`); identity serialization (keyword/length/number) is the engine's default echo. Pure JS, no new Rust. **+42** |
 | `css/css-ui/inheritance.html` | 3/28 | **28/28** | ✅ 100% | **Quest #53.** Plus the real win: a live CSSOM decl (`el.style.outlineStyle='initial'`) must beat a *normal* author rule (`#target{outline-style:dotted}`), but it doesn't reflect to the `style=""` attribute. `_buildCascade` now injects `el.style._props` as the top normal author source (author `!important` still wins). `caret-color`/`outline-color` get a `currentColor` initial. **+25** |
 | `css/css-fonts/inheritance.html` | 3/39 | **39/39** | ✅ 100% | **Quest #53.** 18 font properties registered + `_FONT_SIZE_KEYWORDS` so `font-size: medium` computes to `16px` (the test's `mediumFontSize` reference). **+36** |

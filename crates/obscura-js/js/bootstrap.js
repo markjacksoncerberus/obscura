@@ -402,13 +402,88 @@ class MessageChannel {
 globalThis.MessageChannel = MessageChannel;
 globalThis.MessagePort = class MessagePort { constructor(){} postMessage(){} close(){} addEventListener(){} removeEventListener(){} };
 
+// ── Custom-property (CSS variable) name/value rules ──────────────────────────
+// A valid custom-property name is "--" followed by ≥1 character, with no internal
+// whitespace (`--`, `--foo bar` are invalid; `--foo`, `---` are valid).
+const _isValidCustomPropName = (name) => name.length > 2 && name.startsWith('--') && !/\s/.test(name);
+// Canonicalize a custom-property value: leading/trailing whitespace is trimmed,
+// internal whitespace preserved; an empty (all-whitespace) value becomes a single
+// space — the empty-value form the CSSOM round-trips (`--x: ;` reads back as " ").
+const _canonCustomValue = (value) => { const t = String(value).trim(); return t === '' ? ' ' : t; };
+// Parse a declaration block (an inline style string / cssText) into an ordered
+// list of { name, value, important }. Invalid custom-property names are dropped;
+// standard names are ASCII-lowercased (custom names keep their case); standard
+// values are trimmed (empty → dropped), custom values canonicalized.
+const _parseStyleDecls = (text) => {
+  const out = [];
+  for (const part of String(text == null ? '' : text).split(';')) {
+    const idx = part.indexOf(':');
+    if (idx < 0) continue;
+    let name = part.slice(0, idx).trim();
+    if (!name) continue;
+    let value = part.slice(idx + 1);
+    let important = false;
+    const m = /!\s*important\s*$/i.exec(value);
+    if (m) { important = true; value = value.slice(0, m.index); }
+    if (name.startsWith('--')) {
+      if (!_isValidCustomPropName(name)) continue;
+      value = _canonCustomValue(value);
+    } else {
+      name = name.toLowerCase();
+      value = value.trim();
+      if (value === '') continue;
+    }
+    out.push({ name, value, important });
+  }
+  return out;
+};
+
 class CSSStyleDeclaration {
-  constructor() { this._props = {}; }
-  setProperty(name, value) { this._props[name] = String(value); }
-  removeProperty(name) { const old = this._props[name]; delete this._props[name]; return old || ""; }
-  getPropertyValue(name) { return this._props[name] || ""; }
-  get cssText() { return Object.entries(this._props).map(([k,v]) => `${k}: ${v}`).join("; "); }
-  set cssText(v) { this._props = {}; if(v) v.split(";").forEach(p => { const [k,...rest]=p.split(":"); if(k&&rest.length) this._props[k.trim()]=rest.join(":").trim(); }); }
+  constructor() { this._props = {}; this._priority = {}; }
+  setProperty(name, value, priority) {
+    name = String(name);
+    const custom = name.startsWith('--');
+    if (custom) { if (!_isValidCustomPropName(name)) return; }
+    else name = name.toLowerCase();
+    value = String(value == null ? '' : value);
+    if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
+    const stored = custom ? _canonCustomValue(value) : value.trim();
+    if (!custom && stored === '') { this.removeProperty(name); return; }
+    this._props[name] = stored;
+    this._priority[name] = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+  }
+  removeProperty(name) {
+    name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
+    const old = this._props[key];
+    delete this._props[key]; delete this._priority[key];
+    return old || "";
+  }
+  getPropertyValue(name) {
+    name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
+    return this._props[key] || "";
+  }
+  getPropertyPriority(name) {
+    name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
+    return this._priority[key] || "";
+  }
+  get cssText() {
+    const parts = [];
+    for (const k in this._props) {
+      const imp = this._priority[k] === 'important' ? ' !important' : '';
+      parts.push(`${k}: ${this._props[k]}${imp};`);
+    }
+    return parts.join(" ");
+  }
+  set cssText(v) {
+    this._props = {}; this._priority = {};
+    for (const d of _parseStyleDecls(v)) {
+      // !important within a declaration block is not overridden by a later normal
+      // declaration of the same property; otherwise later wins.
+      if (this._priority[d.name] === 'important' && !d.important) continue;
+      this._props[d.name] = d.value;
+      this._priority[d.name] = d.important ? 'important' : '';
+    }
+  }
   get length() { return Object.keys(this._props).length; }
   item(i) { return Object.keys(this._props)[i] || ""; }
 }
@@ -420,7 +495,12 @@ const _styleProxy = (decl) => new Proxy(decl, {
     return undefined;
   },
   set(t, p, v) {
-    if (typeof p === "string") { t._props[p] = String(v); return true; }
+    if (typeof p === "string") {
+      // Accessors / methods on the declaration (cssText, …) delegate to the real
+      // setter; everything else is a CSS property name stored on _props.
+      if (p in t) { t[p] = v; return true; }
+      t._props[p] = String(v); return true;
+    }
     t[p] = v; return true;
   }
 });
@@ -1517,7 +1597,19 @@ class Element extends Node {
   }
   // classList is [PutForwards=value]: `el.classList = 'x'` sets the class attr.
   set classList(v) { this.classList.value = v == null ? '' : String(v); }
-  get style() { return this._style; }
+  get style() {
+    // One-time lazy sync from the `style` content attribute: HTML parsing sets it
+    // directly in the Rust tree (bypassing JS setAttribute), so the live decl must
+    // be populated on first access. Afterwards JS setAttribute/removeAttribute keep
+    // it in sync, so we never pay the attribute read again (hot-path friendly).
+    if (this._styleSynced === undefined) {
+      this._styleSynced = true;
+      let attr = null;
+      try { attr = this.getAttribute('style'); } catch (e) {}
+      if (attr != null && attr !== '') this._style.cssText = String(attr);
+    }
+    return this._style;
+  }
   // [PutForwards=cssText]: also reflect to the `style` content attribute so it is
   // observable via getAttribute/hasAttribute/toggleAttribute and rendered.
   set style(v) { v = (v == null) ? "" : String(v); this._style.cssText = v; this.setAttribute("style", v); }
@@ -1576,6 +1668,10 @@ class Element extends Node {
     if (this._htmlAttr) qname = _asciiLower(qname);
     _dom("set_attribute", this._nid, qname + "\0" + String(v));
     __notifyMutation();
+    // The `style` content attribute reflects into the live CSSOM declaration so the
+    // specified value is observable via el.style.getPropertyValue (HTML parsing and
+    // setAttribute both land here; setting it replaces the declaration block).
+    if (qname === 'style' && this._style) this._style.cssText = String(v);
     // Changing srcdoc on an iframe reprocesses the frame (src goes through the
     // src property setter's own load path).
     if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
@@ -1612,6 +1708,8 @@ class Element extends Node {
       this._attrNodes.delete((doomed._ns || '') + '|' + doomed._local);
     }
     __notifyMutation();
+    // Removing the `style` attribute empties the live CSSOM declaration.
+    if (qname === 'style' && this._style) this._style.cssText = '';
     // Removing srcdoc reprocesses: the frame falls back to src or about:blank.
     if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
   }
@@ -5645,11 +5743,21 @@ const _normComputed = (el, kebab, v) => {
 const _computedPropOf = (el, kebab, guard) => {
   guard = guard || 0;
   if (!el || guard > 200) return _normComputed(el, kebab, _initialOf(kebab));
-  const v = String(_specifiedValue(el, kebab) || '').trim();
-  const low = v.toLowerCase();
+  let v = String(_specifiedValue(el, kebab) || '').trim();
   const inheritFrom = () => (el.parentElement
     ? _computedPropOf(el.parentElement, kebab, guard + 1)
     : _normComputed(el, kebab, _initialOf(kebab)));
+  // A value containing var() is valid at parse time; substitute references, and if
+  // substitution fails (undefined with no fallback, cycle, …) the property is
+  // invalid at computed-value time → it becomes the inherited or initial value.
+  if (/var\(/i.test(v)) {
+    const sub = _substituteVars(el, v, 0);
+    if (sub == null || sub === '') {
+      return _INHERITED_PROPS.has(kebab) ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab));
+    }
+    v = sub;
+  }
+  const low = v.toLowerCase();
   if (!v) {
     return _INHERITED_PROPS.has(kebab) ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab));
   }
@@ -5666,6 +5774,83 @@ const _computedPropOf = (el, kebab, guard) => {
   return _normComputed(el, kebab, v);
 };
 const _computedColorOf = (el) => _computedPropOf(el, 'color', 0);
+// Computed value of a custom property `name` (a `--*` name) for `el`. Custom
+// properties ALWAYS inherit, and their initial value is the guaranteed-invalid
+// value — which `getPropertyValue` serializes as the empty string. The CSS-wide
+// keywords resolve here (`initial`→empty, `inherit`/`unset`/`revert`→parent's
+// computed value). A custom property explicitly set to the empty value computes
+// to a single space (distinct from "not set", which inherits). var() substitution
+// is intentionally NOT performed here yet — the value passes through verbatim.
+const _computedCustomProp = (el, name, guard) => {
+  guard = guard || 0;
+  if (!el || guard > 200) return '';
+  const inheritFrom = () => (el.parentElement
+    ? _computedCustomProp(el.parentElement, name, guard + 1) : '');
+  const raw = _specifiedValue(el, name);
+  if (raw === '' || raw == null) return inheritFrom();      // not set → inherit
+  const v = String(raw);
+  const low = v.trim().toLowerCase();
+  if (_CSS_WIDE.has(low)) {
+    if (low === 'initial') return '';                        // guaranteed-invalid
+    return inheritFrom();                                     // inherit/unset/revert(-layer)
+  }
+  return v;
+};
+// Split the inside of a `var(...)` into the custom-property name and an optional
+// fallback at the first TOP-LEVEL comma (the fallback may itself contain commas
+// and nested var()/functions, so brackets are tracked).
+const _splitVarArgs = (inner) => {
+  let depth = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    else if (c === ',' && depth === 0) return { name: inner.slice(0, i).trim(), fallback: inner.slice(i + 1) };
+  }
+  return { name: inner.trim(), fallback: null };
+};
+// Substitute every `var(--name, fallback)` reference in `value` with the custom
+// property's computed value (or the fallback when it is guaranteed-invalid),
+// recursively. Token boundaries are preserved by space-padding each insertion and
+// collapsing runs of whitespace — an approximation that yields the right computed
+// serialization for separate tokens (`var(--a)var(--b)` → "a b") without a full
+// tokenizer. Returns null when the value is invalid at computed-value time (an
+// unbalanced var(), an undefined property with no fallback, or a cycle).
+const _substituteVars = (el, value, guard) => {
+  const s = String(value);
+  if (!/var\(/i.test(s)) return s;
+  guard = guard || 0;
+  if (guard > 50) return null;
+  let out = '', i = 0; const n = s.length;
+  while (i < n) {
+    const rest = s.slice(i);
+    const m = /var\(/i.exec(rest);
+    if (!m) { out += rest; break; }
+    out += rest.slice(0, m.index);
+    let k = i + m.index + m[0].length, depth = 1;
+    while (k < n && depth > 0) {
+      const c = s[k];
+      if (c === '(') depth++; else if (c === ')') { depth--; if (depth === 0) break; }
+      k++;
+    }
+    if (depth !== 0) return null;                            // unbalanced var(
+    const inner = s.slice(i + m.index + m[0].length, k);
+    i = k + 1;
+    const { name, fallback } = _splitVarArgs(inner);
+    if (!_isValidCustomPropName(name)) return null;          // var() needs a valid --name
+    let resolved = _computedCustomProp(el, name, 0);
+    if (resolved === '' || resolved == null) {
+      if (fallback == null) return null;                     // undefined & no fallback
+      resolved = _substituteVars(el, fallback, guard + 1);
+      if (resolved == null) return null;
+    } else if (/var\(/i.test(resolved)) {
+      resolved = _substituteVars(el, resolved, guard + 1);   // nested var() in the value
+      if (resolved == null) return null;
+    }
+    out += ' ' + resolved + ' ';
+  }
+  return out.replace(/\s+/g, ' ').trim();
+};
 const _GCS_INLINE_SPEC = Number.MAX_SAFE_INTEGER;
 const _buildCascade = (el) => {
   // Returns the list of matched declaration sources for `el`, each
@@ -5700,14 +5885,14 @@ const _buildCascade = (el) => {
     // the highest-priority *normal* author source — above every <style> rule (an
     // author !important rule still beats them, handled by _cascadeResolve). Inject
     // them as an inline-level source so a CSSOM-set value wins over author rules.
-    let liveProps = null;
-    try { liveProps = el.style && el.style._props; } catch { liveProps = null; }
+    let liveProps = null, livePrio = null;
+    try { liveProps = el.style && el.style._props; livePrio = el.style && el.style._priority; } catch { liveProps = null; }
     if (liveProps) {
       const decls = {};
       let any = false;
       for (const k in liveProps) {
         const name = k.startsWith('--') ? k : k.replace(/([A-Z])/g, '-$1').toLowerCase();
-        decls[name] = { value: liveProps[k], important: false };
+        decls[name] = { value: liveProps[k], important: !!(livePrio && livePrio[k] === 'important') };
         any = true;
       }
       if (any) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 1, decls });
@@ -5750,6 +5935,9 @@ globalThis.getComputedStyle = (el, _pseudo) => {
   const resolve = (name) => {
     // name as authored: custom property, kebab, or camelCase.
     const kebab = name.startsWith('--') ? name : name.replace(/([A-Z])/g, '-$1').toLowerCase();
+    // Custom properties (`--*`) inherit by default and resolve the CSS-wide
+    // keywords through the dedicated engine (no var() substitution yet).
+    if (kebab.startsWith('--')) return _computedCustomProp(el, kebab, 0);
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
     // Modelled standard properties resolve through the full computed-value

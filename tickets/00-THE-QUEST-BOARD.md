@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~55~~ | ✅ [The Custom Verdict](55-the-custom-verdict.md) | `css/css-variables/` (custom-property storage, cascade, inheritance, `var()` substitution) | **definition 71/73, cascading 9/9, keywords 8/8, cssText 8/11, substitution-basic 11/13, created-element 3/3, created-document 2/2** | ⚔️⚔️ | **SECURED — +88.** The standing top "next leverage (a)". Rewrote `CSSStyleDeclaration` (custom-prop name validation + whitespace canonicalization + `!important` tracking + `cssText`/`setProperty`/`getPropertyValue`), fixed the `style` Proxy `set` trap (it stored `style.cssText=…` as a plain prop, losing every declaration), lazily synced the `style` content attribute into the live decl (HTML parsing bypasses JS setAttribute), gave `getComputedStyle` real custom-property inheritance + CSS-wide keyword resolution (`_computedCustomProp`), and added `var()` substitution (`_substituteVars`: recursive name/fallback, cycle guard, invalid→initial/inherited). Pure JS, no new Rust. Zero regressions. Caps: `CSS.supports`+`var()` (the 2 rgb caps), invalid-at-computed-time for `<color>` (`test_variable_legal_values` 23), shorthand expansion (`substitution-shorthands` 51), unknown-property drop, token boundaries, reftests. |
 | ~~54~~ | ✅ [The Snapped Verdict](54-the-snapped-verdict.md) | 5 more `css/*/inheritance.html` realms (scroll-snap/transitions/color-adjust/shapes/will-change) | **all 5 at 100%** | ⚔️ | **SECURED — +62.** Same pure-DATA shape as #53: 34 properties → `_GCS_DEFAULTS` (scroll-margin/padding-* + scroll-snap-*, transition-delay/duration/property/timing-function, shape-*, will-change, the 4 color-adjust props), the 4 color-adjust props also → `_INHERITED_PROPS` (the only inherited family of the five). Identity serialization is the #52/#53 engine's default echo — no new serializer, NO new Rust. Zero regressions. Caps: the cheap identity-serializing `inheritance.html` tail is now largely exhausted; remaining families (css-backgrounds/position/sizing) need real layout/unit resolution. Next: custom-property `var()` cascade, a specified-value serializer (`serialize-values` 0/697), or a fresh realm. |
 | ~~53~~ | ✅ [The Propertied Verdict](53-the-propertied-verdict.md) | 15 `css/*/inheritance.html` realms (property-family modelling) | **all 15 at 100%** | ⚔️⚔️ | **SECURED — +263.** The shared `inheritance-testcommon.js` gates every subtest on `prop in getComputedStyle` first, but #52's engine only registered ~30 properties. Registered ~120 properties across css-text/ui/fonts/text-decor/writing-modes/lists/overflow/break/images/tables/align/flexbox/grid/content/multicol (initial value in `_GCS_DEFAULTS`, inherited flag in `_INHERITED_PROPS`; identity serialization is the engine's default echo). Real correctness win: `_buildCascade` now injects the live CSSOM decl (`el.style.foo=`, which never reflects to the `style=""` attribute) as the top *normal* author source, so it beats normal author rules (author `!important` still wins). `currentColor`-initial colour props (caret/outline/text-decoration/text-emphasis/column-rule-color) + `_FONT_SIZE_KEYWORDS` (`medium`→`16px`). Pure JS, no new Rust. Zero regressions. Caps: `display` skipped (spec-initial `inline` ≠ our UA default `block`); families needing real layout/unit resolution; the specified-value serialization family (`serialize-values` 0/697) is a separate engine. |
 | ~~52~~ | ✅ [The Inherited Verdict](52-the-inherited-verdict.md) | `css/css-cascade/inherit-initial` + `css/css-color/inheritance` (CSS-wide keyword resolution + per-property inheritance) | **inherit-initial 4/4, inheritance 4/4** | ⚔️⚔️ | **SECURED — +7.** `getComputedStyle` echoed the CSS-wide keywords verbatim (`z-index:inherit`→`"inherit"` not `"auto"`; `opacity:initial`→`"initial"` not `"1"`). Generalised the colour-only computed-value machinery into a property-agnostic engine on top of #47's cascade + #49/#50's colour/opacity normalizers: `_specifiedValue` (cascade-first, live-decl fallback; `color` decl-first), `_INHERITED_PROPS`, `_initialOf` (`_GCS_DEFAULTS` doubles as the initial-values table), `_normComputed`, and **`_computedPropOf`** — resolve `initial`→initial, `inherit`→parent's computed value (root→initial), `unset`/`revert`→inherit-if-inherited-else-initial, per-property inheritance through the ancestor chain. `getComputedStyle.resolve` routes every modelled standard prop through it. Fixed a latent bug: `_computedColorOf` treated `unset` as `initial` but `color` inherits (now `_computedPropOf(el,'color',0)`). Pure JS, no new Rust. Zero regressions (caught+fixed a mid-flight `currentColor`-on-`color` drop). Caps: broader `css/*/inheritance.html` tail gated on the **property model** (each family needs initial value + inherited flag + computed serialization), not the engine; `var()` substitution; `color-computed-hsl` could-not-run. **PATH GOTCHA: wpt.live now 404s extensionless paths — every test path needs its `.html`.** |
@@ -95,6 +96,35 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-20 (Quest #55 The Custom Verdict — CSS custom properties &
+`var()` substitution, +88):** Took the standing top "next leverage (a)" since #51.
+The `css/css-variables/` realm rested on two missing/broken primitives. **(1)
+`CSSStyleDeclaration` was a toy** — no custom-property name validation, no
+`!important` tracking, no whitespace canonicalization — and the `style` Proxy
+`set` trap stored `el.style.cssText = "…"` as a plain `_props['cssText']` instead
+of invoking the setter, silently dropping every declaration. **(2)** the `style`
+content attribute set by HTML parsing never reached the live decl, so the
+*specified* value of any authored declaration was invisible. **(3)**
+`getComputedStyle` had no custom-property inheritance/keywords/`var()`. Fix (pure
+JS, no new Rust): rewrote `CSSStyleDeclaration` with `_isValidCustomPropName` /
+`_canonCustomValue` / `_parseStyleDecls` (empty custom value → `" "`, later normal
+never overrides earlier `!important`), fixed the Proxy `set` trap to delegate
+accessors to the real setter, added a one-time lazy `style`-attribute sync in
+`get style` (+ setAttribute/removeAttribute sync), `_computedCustomProp` (custom
+props always inherit; `initial`→`""`, `inherit`/`unset`/`revert`→parent), and
+`_substituteVars`/`_splitVarArgs` (recursive `var(--name,fallback)` with cycle
+guard; unresolvable → invalid-at-computed-time → initial/inherited). Wins:
+variable-definition 11→71, cascading 5→9, keywords 0→8, cssText 1→8,
+substitution-basic 5→11, created-element 1→3, created-document 1→2. **+88, zero
+regressions** (swept qsa 1975, classlist 1420, matches 669, closest 29,
+createElement 147, color-computed 16/455/30, color-computed-rgb 95, the
+inheritance families 42/28/39, has/not-spec 8/8, disabled 7, readwrite-readonly
+25, valid-invalid 30; obscura-dom 40/40; aria-reflection 8/33 proven pre-existing
+by stash). Caps: `CSS.supports`+`var()` (2 rgb caps), invalid-at-computed-time for
+`<color>` (`test_variable_legal_values` 23), shorthand expansion
+(`substitution-shorthands` 51), unknown-property drop, token boundaries, reftests.
+Scroll `tickets/55-the-custom-verdict.md`.
 
 **Session 2026-06-20 (Quest #54 The Snapped Verdict — five more CSS
 property-inheritance realms, +62):** Continued #53's "next leverage (a)" — model
