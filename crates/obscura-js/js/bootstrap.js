@@ -5175,6 +5175,77 @@ const _hslToRgb = (h, s, l) => {
   else { r = c; b = x; }
   return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
 };
+// CSS <length> → px factors for the math evaluator's dimension tokens. Only
+// units with a context-free px value are listed; viewport/container-relative
+// units (vw/cqw/…) are intentionally absent → the evaluator fails on them
+// (we have no layout to resolve them against).
+const _LENGTH_PX = {
+  px: 1, em: 16, rem: 16, ex: 8, ch: 8, ic: 16, cap: 16,
+  in: 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 25.4 / 4, pt: 96 / 72, pc: 16,
+};
+// Unescape a CSS identifier: `\67` (hex, optional trailing whitespace) and
+// `\g` (literal). Used so an escaped function name like `r\67 b`/`r\gb`
+// resolves to `rgb` before we match it.
+const _unescapeIdent = (s) => {
+  let out = '', i = 0;
+  while (i < s.length) {
+    if (s[i] === '\\') {
+      const m = /^[0-9a-fA-F]{1,6}/.exec(s.slice(i + 1));
+      if (m) {
+        const cp = parseInt(m[0], 16);
+        out += (cp === 0 || cp > 0x10FFFF) ? '�' : String.fromCodePoint(cp);
+        i += 1 + m[0].length;
+        if (i < s.length && /[ \t\n\r\f]/.test(s[i])) i++; // one whitespace terminator consumed
+      } else if (i + 1 < s.length) { out += s[i + 1]; i += 2; }
+      else i++; // trailing backslash dropped
+    } else { out += s[i]; i++; }
+  }
+  return out;
+};
+// Split a function's argument string into top-level components, treating comma,
+// slash, and whitespace as separators but never splitting inside nested parens
+// (so a `calc(50% + (… * 10%))` stays one component). Handles legacy
+// `rgb(r, g, b, a)` and modern `rgb(r g b / a)` uniformly.
+const _splitTopLevel = (s) => {
+  const out = []; let depth = 0, cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(') { depth++; cur += c; }
+    else if (c === ')') { depth = Math.max(0, depth - 1); cur += c; }
+    else if (depth === 0 && (c === ',' || c === '/' || c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f')) {
+      if (cur.trim()) out.push(cur.trim()); cur = '';
+    } else cur += c;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+};
+// Resolve a colour channel's raw math result per CSS Color 4: NaN → lower
+// bound (0), +∞ → the channel's upper bound, -∞ → 0. (Finite values are passed
+// through; _serColor does the final clamp/round.) `null` (parse failure) sticks.
+const _resolveChannel = (raw, max) => {
+  if (raw === null) return null;
+  if (Number.isNaN(raw)) return 0;
+  if (raw === Infinity) return max;
+  if (raw === -Infinity) return 0;
+  return raw;
+};
+// Parse the inside of an rgb()/rgba() function into [r, g, b, a] numbers, with
+// each component allowed to be `none`, a <number>/<percentage>, or a full math
+// expression (calc/min/max/clamp/sign with calc constants + length units).
+// Returns null if it isn't a valid 3-or-4-component rgb body.
+const _rgbComponents = (inner) => {
+  const parts = _splitTopLevel(inner);
+  if (parts.length < 3 || parts.length > 4) return null;
+  const chan = (p, max) => {
+    if (p.toLowerCase() === 'none') return 0;
+    return _resolveChannel(_evalMath(p, max === 1 ? 1 : 255, { lengths: true, nonFinite: true }), max);
+  };
+  const r = chan(parts[0], 255), g = chan(parts[1], 255), b = chan(parts[2], 255);
+  if (r === null || g === null || b === null) return null;
+  let a = 1;
+  if (parts.length === 4) { a = chan(parts[3], 1); if (a === null) return null; }
+  return [r, g, b, a];
+};
 const _computeColor = (value) => {
   if (!value) return value;
   let s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
@@ -5193,18 +5264,20 @@ const _computeColor = (value) => {
     else return value;
     return _serColor(r, g, b, a);
   }
-  // `none` (CSS Color 4) is treated as the missing-component value 0.
-  const _alpha = (p) => p === 'none' ? 0 : (p.endsWith('%') ? parseFloat(p) / 100 : parseFloat(p));
-  m = /^rgba?\(([^)]*)\)$/i.exec(s);
-  if (m) {
-    const parts = m[1].split(/[,\/\s]+/).filter((x) => x.length);
-    if (parts.length >= 3) {
-      const num = (p) => p === 'none' ? 0 : (p.endsWith('%') ? parseFloat(p) * 255 / 100 : parseFloat(p));
-      const r = num(parts[0]), g = num(parts[1]), b = num(parts[2]);
-      const a = parts.length >= 4 ? _alpha(parts[3]) : 1;
-      return _serColor(r, g, b, a);
+  // Function-notation colours: extract the name before the first '(' (so an
+  // escaped/capitalised name like `r\67 b`/`RGB` still matches) and the inner
+  // argument string (greedy to the final ')', so nested calc() parens survive).
+  const lp = s.indexOf('(');
+  if (lp > 0 && s.endsWith(')')) {
+    const fname = _unescapeIdent(s.slice(0, lp)).toLowerCase();
+    const inner = s.slice(lp + 1, -1);
+    if (fname === 'rgb' || fname === 'rgba') {
+      const c = _rgbComponents(inner);
+      return c ? _serColor(c[0], c[1], c[2], c[3]) : value;
     }
   }
+  // `none` (CSS Color 4) is treated as the missing-component value 0.
+  const _alpha = (p) => p === 'none' ? 0 : (p.endsWith('%') ? parseFloat(p) / 100 : parseFloat(p));
   m = /^hsla?\(([^)]*)\)$/i.exec(s);
   if (m) {
     const parts = m[1].split(/[,\/\s]+/).filter((x) => x.length);
@@ -5225,21 +5298,28 @@ const _isValidColor = (value) => {
   const low = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim().toLowerCase();
   if (low === 'transparent' || low === 'currentcolor' || _CSS_NAMED_COLORS[low]) return true;
   if (/^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(low)) return true;
-  if (/^rgba?\([^)]*\)$/i.test(low) || /^hsla?\([^)]*\)$/i.test(low)) {
-    const inner = low.replace(/^[a-z]+\(|\)$/g, '');
-    const parts = inner.split(/[,\/\s]+/).filter((x) => x.length);
-    return parts.length >= 3 && parts.every((p) => p === 'none' || !Number.isNaN(parseFloat(p)));
+  const lp = low.indexOf('(');
+  if (lp > 0 && low.endsWith(')')) {
+    const fname = _unescapeIdent(low.slice(0, lp));
+    const inner = low.slice(lp + 1, -1);
+    if (fname === 'rgb' || fname === 'rgba') return _rgbComponents(inner) !== null;
+    if (fname === 'hsl' || fname === 'hsla') {
+      const parts = inner.split(/[,\/\s]+/).filter((x) => x.length);
+      return parts.length >= 3 && parts.every((p) => p === 'none' || !Number.isNaN(parseFloat(p)));
+    }
   }
   return false;
 };
-// Evaluate a CSS math expression — calc()/min()/max()/clamp() plus a raw
-// <number> or <percentage> — down to a plain JS number. `percentBase` is what
-// 100% resolves to (1 for unitless contexts like `opacity`). Returns null when
-// the value is not a (resolvable) numeric math expression. A small recursive-
-// descent parser over a hand-tokenized stream; intentionally unit-agnostic
-// (every term collapses to a number) — enough for opacity and number channels,
-// not a general length/unit calculator.
-const _evalMath = (input, percentBase) => {
+// Evaluate a CSS math expression — calc()/min()/max()/clamp()/sign()/abs() plus
+// a raw <number>/<percentage>/<dimension> — down to a plain JS number.
+// `percentBase` is what 100% resolves to (1 for unitless contexts like
+// `opacity`). `opts.lengths` enables <length> dimension tokens (em/px/…, via
+// `_LENGTH_PX`); `opts.nonFinite` lets ±∞/NaN results through (the caller then
+// clamps, e.g. a colour channel) instead of returning null. Returns null when
+// the value isn't a (resolvable) numeric math expression. A small recursive-
+// descent parser over a hand-tokenized stream.
+const _evalMath = (input, percentBase, opts) => {
+  opts = opts || {};
   const s = String(input).replace(/\/\*[\s\S]*?\*\//g, '').trim();
   if (s === '') return null;
   const toks = [];
@@ -5262,9 +5342,13 @@ const _evalMath = (input, percentBase) => {
         if (isDigit(s[k])) { k++; while (k < n && isDigit(s[k])) k++; j = k; }
       }
       const num = parseFloat(s.slice(i, j));
-      let pct = false;
+      let pct = false, unit = '';
       if (s[j] === '%') { pct = true; j++; }
-      toks.push({ t: 'num', v: num, pct });
+      else if (j < n && /[a-zA-Z]/.test(s[j])) { // dimension: a unit ident glued to the number
+        let u = j; while (u < n && /[a-zA-Z]/.test(s[u])) u++;
+        unit = s.slice(j, u).toLowerCase(); j = u;
+      }
+      toks.push({ t: 'num', v: num, pct, unit });
       i = j; continue;
     }
     if (/[a-zA-Z]/.test(c)) {
@@ -5302,26 +5386,46 @@ const _evalMath = (input, percentBase) => {
     if (!tok) return fail();
     if (tok.t === '+') { p++; return parseFactor(); }
     if (tok.t === '-') { p++; return -parseFactor(); }
-    if (tok.t === 'num') { p++; return tok.pct ? (tok.v / 100) * percentBase : tok.v; }
+    if (tok.t === 'num') {
+      p++;
+      if (tok.pct) return (tok.v / 100) * percentBase;
+      if (tok.unit) {
+        if (!opts.lengths) return fail();
+        const f = _LENGTH_PX[tok.unit];
+        return f === undefined ? fail() : tok.v * f; // unresolvable unit (vw/cqw/…) → fail
+      }
+      return tok.v;
+    }
     if (tok.t === '(') { p++; const v = parseExpr(); if (!peek() || peek().t !== ')') return fail(); p++; return v; }
     if (tok.t === 'ident') {
-      const name = toks[p++].v;
-      if (!peek() || peek().t !== '(') return fail();
+      const name = tok.v;
+      if (toks[p + 1] && toks[p + 1].t === '(') {
+        p += 2; // consume the function name and its '('
+        const args = [parseExpr()];
+        while (!failed && peek() && peek().t === ',') { p++; args.push(parseExpr()); }
+        if (!peek() || peek().t !== ')') return fail();
+        p++;
+        if (name === 'calc') return args.length === 1 ? args[0] : fail();
+        if (name === 'min') return Math.min(...args);
+        if (name === 'max') return Math.max(...args);
+        if (name === 'clamp') return args.length === 3 ? Math.max(args[0], Math.min(args[1], args[2])) : fail();
+        if (name === 'sign') return args.length === 1 ? Math.sign(args[0]) : fail();
+        if (name === 'abs') return args.length === 1 ? Math.abs(args[0]) : fail();
+        return fail();
+      }
+      // Bare numeric constant (CSS calc keywords).
       p++;
-      const args = [parseExpr()];
-      while (!failed && peek() && peek().t === ',') { p++; args.push(parseExpr()); }
-      if (!peek() || peek().t !== ')') return fail();
-      p++;
-      if (name === 'calc') return args.length === 1 ? args[0] : fail();
-      if (name === 'min') return Math.min(...args);
-      if (name === 'max') return Math.max(...args);
-      if (name === 'clamp') return args.length === 3 ? Math.max(args[0], Math.min(args[1], args[2])) : fail();
+      if (name === 'infinity') return Infinity;
+      if (name === 'nan') return NaN;
+      if (name === 'pi') return Math.PI;
+      if (name === 'e') return Math.E;
       return fail();
     }
     return fail();
   };
   const result = parseExpr();
-  if (failed || p !== toks.length || !isFinite(result)) return null;
+  if (failed || p !== toks.length) return null;
+  if (!opts.nonFinite && !isFinite(result)) return null;
   return result;
 };
 // Serialize a computed CSS <number>: round away float noise, drop trailing
