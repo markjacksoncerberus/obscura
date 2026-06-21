@@ -587,12 +587,9 @@ class CSSStyleDeclaration {
     return this._priority[key] || "";
   }
   get cssText() {
-    const parts = [];
-    for (const k in this._props) {
-      const imp = this._priority[k] === 'important' ? ' !important' : '';
-      parts.push(`${k}: ${this._props[k]}${imp};`);
-    }
-    return parts.join(" ");
+    // Serialize a CSS declaration block, recombining box-model longhands into
+    // their shorthand where the CSSOM rules permit (see _serializeDeclBlock).
+    return _serializeDeclBlock(this);
   }
   set cssText(v) {
     this._props = {}; this._priority = {};
@@ -624,7 +621,14 @@ const _cssPropToKebab = (p) => {
 const _styleProxy = (decl) => new Proxy(decl, {
   get(t, p) {
     if (typeof p === "symbol" || p in t) return t[p];
-    if (typeof p === "string") return t.getPropertyValue(_cssPropToKebab(p));
+    if (typeof p === "string") {
+      const kebab = _cssPropToKebab(p);
+      // A box-model shorthand (`el.style.margin`) is reconstructed from the
+      // longhands actually present (CSSOM "serialize a CSS value"); every other
+      // property reads its stored value directly.
+      if (_BOX_SHORTHANDS[kebab]) return _boxShorthandSerialization(t, kebab);
+      return t.getPropertyValue(kebab);
+    }
     return undefined;
   },
   set(t, p, v) {
@@ -5565,6 +5569,165 @@ const _expandShorthand = (sh, value) => {
   }
   if (sh === 'transition') return _expandTransition(value);
   return null;
+};
+
+// ── Shorthand SERIALIZATION (the inverse of the cascade-side expansion above) ──
+// The CSSOM `cssText` getter and the shorthand-property getter (`el.style.margin`)
+// must reconstruct a shorthand from the longhand declarations actually present in
+// the declaration block — "serialize a CSS declaration block" / "serialize a CSS
+// value". We do this on-the-fly, reading the literal `_props` and NEVER mutating
+// stored state, so the cascade (`_buildCascade`) and longhand reads are untouched.
+//
+// Scoped to the box-model families (margin/padding, physical + flow-relative): the
+// only shorthands these CSSOM tests reconstruct. background/border/transition stay
+// stored verbatim (already correct for the tests that exercise them).
+const _BOX_SHORTHANDS = {
+  'margin': ['margin-top', 'margin-right', 'margin-bottom', 'margin-left'],
+  'padding': ['padding-top', 'padding-right', 'padding-bottom', 'padding-left'],
+  'margin-inline': ['margin-inline-start', 'margin-inline-end'],
+  'margin-block': ['margin-block-start', 'margin-block-end'],
+  'padding-inline': ['padding-inline-start', 'padding-inline-end'],
+  'padding-block': ['padding-block-start', 'padding-block-end'],
+};
+// longhand → [shorthands it can be combined into] (no overlaps in the box families)
+const _BOX_LONGHAND_SH = {};
+// longhand → its logical property group ('margin' | 'padding') — physical and
+// flow-relative box edges share one group, the unit of the adjacency rule below.
+const _BOX_LOGICAL_GROUP = {};
+const _shGroup = (sh) => sh.startsWith('padding') ? 'padding' : 'margin';
+for (const sh in _BOX_SHORTHANDS) {
+  for (const l of _BOX_SHORTHANDS[sh]) {
+    (_BOX_LONGHAND_SH[l] = _BOX_LONGHAND_SH[l] || []).push(sh);
+    _BOX_LOGICAL_GROUP[l] = _shGroup(sh);
+  }
+}
+// Split a box value into its per-longhand pieces (4-edge or 2-edge).
+const _expandBoxShorthand = (sh, value) => {
+  const lh = _BOX_SHORTHANDS[sh];
+  const toks = _wsTokens(String(value).trim());
+  let edges;
+  if (lh.length === 4) edges = _boxEdges(toks);
+  else edges = toks.length >= 2 ? [toks[0], toks[1]] : toks.length === 1 ? [toks[0], toks[0]] : null;
+  if (!edges) return null;
+  const out = {};
+  lh.forEach((name, i) => { out[name] = edges[i]; });
+  return out;
+};
+// Collapse per-longhand values back into the shortest equivalent shorthand value.
+const _serializeBoxValue = (sh, values) => {
+  if (values.length === 4) {
+    const [t, r, b, l] = values;
+    if (t === r && r === b && b === l) return t;
+    if (t === b && l === r) return `${t} ${r}`;
+    if (l === r) return `${t} ${r} ${b}`;
+    return `${t} ${r} ${b} ${l}`;
+  }
+  const [s, e] = values;
+  return s === e ? s : `${s} ${e}`;
+};
+// Expand a declaration block (`_props`/`_priority`) into an ordered longhand list,
+// applying last-write-wins across expanded names (a later longhand overriding one
+// produced by an earlier shorthand is moved to the end, matching CSSOM ordering).
+// A box shorthand carrying a var() becomes a pending-substitution value on each
+// longhand (serialized as the empty string individually; recombined only when the
+// whole group survives intact).
+const _styleLonghandList = (decl) => {
+  const list = [];
+  const idxByName = new Map();
+  const put = (name, value, important, pending, sh) => {
+    if (idxByName.has(name)) list[idxByName.get(name)] = null;  // tombstone, reappend
+    list.push({ name, value, important, pending, sh });
+    idxByName.set(name, list.length - 1);
+  };
+  for (const name of Object.keys(decl._props)) {
+    const value = decl._props[name];
+    const important = decl._priority[name] === 'important';
+    if (_BOX_SHORTHANDS[name]) {
+      if (/\bvar\(/i.test(value)) {
+        for (const l of _BOX_SHORTHANDS[name]) put(l, value, important, true, name);
+      } else {
+        const parts = _expandBoxShorthand(name, value);
+        for (const l of _BOX_SHORTHANDS[name]) put(l, parts ? parts[l] : value, important, false, name);
+      }
+    } else {
+      put(name, value, important, false, null);
+    }
+  }
+  return list.filter(Boolean);
+};
+// Reconstruct one shorthand's value from the longhand list, or '' if the longhands
+// are absent / disagree on importance / are a partial pending-substitution group.
+const _boxShorthandValue = (list, sh) => {
+  const group = [];
+  for (const ln of _BOX_SHORTHANDS[sh]) {
+    const d = list.find((x) => x.name === ln);
+    if (!d) return '';
+    group.push(d);
+  }
+  const imp = group[0].important;
+  if (group.some((g) => g.important !== imp)) return '';
+  if (group.some((g) => g.pending)) {
+    if (!group.every((g) => g.pending && g.value === group[0].value && g.sh === group[0].sh)) return '';
+    return group[0].value;
+  }
+  return _serializeBoxValue(sh, group.map((g) => g.value));
+};
+const _boxShorthandSerialization = (decl, sh) => _boxShorthandValue(_styleLonghandList(decl), sh);
+// Serialize a whole declaration block to `cssText`, combining adjacent box
+// longhands into their shorthand where the CSSOM rules permit.
+const _serializeDeclBlock = (decl) => {
+  const list = _styleLonghandList(decl);
+  const out = [];
+  const done = new Set();
+  for (let i = 0; i < list.length; i++) {
+    const d = list[i];
+    if (done.has(d.name)) continue;
+    let handled = false;
+    for (const sh of (_BOX_LONGHAND_SH[d.name] || [])) {
+      const lhNames = _BOX_SHORTHANDS[sh];
+      const idxs = [];
+      let ok = true;
+      for (const ln of lhNames) {
+        let found = -1;
+        for (let k = 0; k < list.length; k++) {
+          if (list[k].name === ln && !done.has(ln)) { found = k; break; }
+        }
+        if (found < 0) { ok = false; break; }
+        idxs.push(found);
+      }
+      if (!ok) continue;
+      const group = idxs.map((k) => list[k]);
+      const imp = group[0].important;
+      if (group.some((g) => g.important !== imp)) continue;
+      let value;
+      if (group.some((g) => g.pending)) {
+        if (!group.every((g) => g.pending && g.value === group[0].value && g.sh === group[0].sh)) continue;
+        value = group[0].value;
+      } else {
+        value = _serializeBoxValue(sh, group.map((g) => g.value));
+        if (value === '') continue;
+      }
+      // Logical-group adjacency: a shorthand is only serialized if no declaration
+      // from the same logical property group (and not part of this group) sits
+      // between its first and last longhand in the block.
+      const first = Math.min(...idxs), last = Math.max(...idxs);
+      const grp = _shGroup(sh);
+      let blocked = false;
+      for (let k = first + 1; k < last; k++) {
+        if (idxs.includes(k)) continue;
+        if (_BOX_LOGICAL_GROUP[list[k].name] === grp) { blocked = true; break; }
+      }
+      if (blocked) continue;
+      out.push(`${sh}: ${value}${imp ? ' !important' : ''};`);
+      for (const ln of lhNames) done.add(ln);
+      handled = true;
+      break;
+    }
+    if (handled) continue;
+    out.push(`${d.name}: ${d.pending ? '' : d.value}${d.important ? ' !important' : ''};`);
+    done.add(d.name);
+  }
+  return out.join(' ');
 };
 const _cssParseDecls = (body) => {
   // body is the inside of a `{ ... }` block (or an inline style string).
