@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~57~~ | ✅ [The Bounded Verdict](57-the-bounded-verdict.md) | `css/css-variables/variable-substitution-{filters,background-properties}` (token-boundary-aware `var()` substitution) | **filters 7/7, background-properties 8/10** | ⚔️ | **SECURED — +14.** #56's "next leverage (1)". `filter: blur(var(--blur))` substituted as `blur( 15px )` (space-padded) instead of `blur(15px)` — the standing token-boundary cap — and `filter`/background longhands weren't registered so they echoed the unsubstituted value. Fix (pure JS, no new Rust): (a) `_substituteVars` now joins each insertion with a new `_joinTok` (separator only when the boundary chars would merge into one token — `(`/`)`/`,`/whitespace need none), so a value lands cleanly inside a function call; (b) registered `filter` + the seven `background-*` longhands in `_GCS_DEFAULTS` (identity computed serialization) so they route through `_computedPropOf` and the substituted value round-trips. filters 0→7, background-properties 1→8. Zero regressions (substitution-basic held 11/13). Caps: the 2 gradient subtests need full gradient canonicalization (drop default `to bottom`/`ellipse farthest-corner`, named→rgb, whitespace) — a gradient serializer; shorthand→longhand (`-shorthands` 13/51). |
 | ~~56~~ | ✅ [The Lawful Verdict](56-the-lawful-verdict.md) | `css/css-variables/test_variable_legal_values` (custom-property `<declaration-value>` validity + invalid-at-computed-time for `<color>`) | **23/23** | ⚔️ | **SECURED — +23.** #55's "next leverage (2)". The test stamps `--test: <value>; background-color: var(--test)` and reads back the computed colour. Allowed values (valid `<declaration-value>`s) substitute a non-colour → property invalid at computed-value time → initial (`transparent`); disallowed values (unmatched `)`/`]`/`}`) drop the declaration → `--test` keeps its prior value. New `_isBalancedDeclValue` (stack-matched brackets; unmatched closers reject, openers OK; strings/comments skipped) wired into all three declaration parsers; `_cssSplitRules` block scanner made nesting-aware (a stray `}` in a value no longer closes the rule early); `_computedPropOf` rejects a `var()`-substituted non-`<color>` as invalid-at-computed-time. Pure JS, no new Rust. Zero regressions. Caps: filter/background substitution (token-boundary cap), shorthand→longhand, non-colour invalid-at-computed-time. |
 | ~~55~~ | ✅ [The Custom Verdict](55-the-custom-verdict.md) | `css/css-variables/` (custom-property storage, cascade, inheritance, `var()` substitution) | **definition 71/73, cascading 9/9, keywords 8/8, cssText 8/11, substitution-basic 11/13, created-element 3/3, created-document 2/2** | ⚔️⚔️ | **SECURED — +88.** The standing top "next leverage (a)". Rewrote `CSSStyleDeclaration` (custom-prop name validation + whitespace canonicalization + `!important` tracking + `cssText`/`setProperty`/`getPropertyValue`), fixed the `style` Proxy `set` trap (it stored `style.cssText=…` as a plain prop, losing every declaration), lazily synced the `style` content attribute into the live decl (HTML parsing bypasses JS setAttribute), gave `getComputedStyle` real custom-property inheritance + CSS-wide keyword resolution (`_computedCustomProp`), and added `var()` substitution (`_substituteVars`: recursive name/fallback, cycle guard, invalid→initial/inherited). Pure JS, no new Rust. Zero regressions. Caps: `CSS.supports`+`var()` (the 2 rgb caps), invalid-at-computed-time for `<color>` (`test_variable_legal_values` 23), shorthand expansion (`substitution-shorthands` 51), unknown-property drop, token boundaries, reftests. |
 | ~~54~~ | ✅ [The Snapped Verdict](54-the-snapped-verdict.md) | 5 more `css/*/inheritance.html` realms (scroll-snap/transitions/color-adjust/shapes/will-change) | **all 5 at 100%** | ⚔️ | **SECURED — +62.** Same pure-DATA shape as #53: 34 properties → `_GCS_DEFAULTS` (scroll-margin/padding-* + scroll-snap-*, transition-delay/duration/property/timing-function, shape-*, will-change, the 4 color-adjust props), the 4 color-adjust props also → `_INHERITED_PROPS` (the only inherited family of the five). Identity serialization is the #52/#53 engine's default echo — no new serializer, NO new Rust. Zero regressions. Caps: the cheap identity-serializing `inheritance.html` tail is now largely exhausted; remaining families (css-backgrounds/position/sizing) need real layout/unit resolution. Next: custom-property `var()` cascade, a specified-value serializer (`serialize-values` 0/697), or a fresh realm. |
@@ -97,6 +98,42 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-20 (Quest #57 The Bounded Verdict — token-boundary-aware
+`var()` substitution into `filter`/`background-*`, +14):** Took #56's "next
+leverage (1)" — the standing token-boundary cap. `variable-substitution-filters`
+(0/7) sets `filter: blur(var(--blur))` with `--blur: 15px` and reads computed
+`filter`, expecting `blur(15px)`; `variable-substitution-background-properties`
+(1/10) does the same for the seven background longhands. Two gaps: (1) `_substituteVars`
+space-padded every insertion (`out += ' ' + resolved + ' '`) then collapsed
+whitespace, yielding `blur( 15px )` — wrong inside a function call; (2) `filter`
+and the `background-*` longhands weren't in `_GCS_DEFAULTS`, so `getComputedStyle`
+echoed the *unsubstituted* `blur(var(--blur))` verbatim (only registered props
+route through `_computedPropOf`, which performs substitution). **Fix (pure JS,
+`bootstrap.js`, NO new Rust):** added `_joinTok(a, b)` — concatenate two CSS-text
+fragments, inserting a single space ONLY when the last char of `a` and the first
+char of `b` are both "tokenish" (`[A-Za-z0-9_.%#-]`+non-ASCII) and would merge
+into one token; a boundary against `(`/`)`/`,`/whitespace needs no separator.
+`_substituteVars` now routes every literal-and-insertion join through `_joinTok`
+(no more blanket pad+collapse), so `blur(` + `15px` + `)` → `blur(15px)` while
+`var(--a)var(--b)` still → `a b`. Registered `filter: none` + the seven
+`background-{attachment,clip,origin,position,repeat,size,image}` initials in
+`_GCS_DEFAULTS` (identity computed serialization, like the #53/#54 families).
+**filters 0→7, background-properties 1→8. +14. ZERO regressions** (swept the
+css-variables family — definition 71/73, cssText 8/11, substitution-basic 11/13,
+created-element 3/3, created-document 2/2, legal-values 23/23, shorthands 13/51;
+color-computed 16/named 455/rgb 95/opacity 30; the five inheritance families
+css-text 42/ui 28/fonts 39/scroll-snap 38/transitions 8; inherit-initial 4,
+css-color/inheritance 4; qsa 1975, classlist 1420, matches 669, closest 29,
+createElement 147, has/not-specificity 8/8, valid-invalid 30, disabled 7,
+readwrite-readonly 25; obscura-dom 40/40). **Caps (honest):** the 2 gradient
+subtests (`background-image-{linear,radial}-gradient`) substitute correctly but
+need full **gradient canonicalization** (`linear-gradient(to bottom, rgb(30,87,0)
+0%,…)` → `linear-gradient(rgb(30, 87, 0) 0%, …)` — drop the default direction/shape,
+named→rgb, normalize whitespace) — a gradient serializer, out of realm; shorthand
+→longhand (`-shorthands` 13/51). **PATH NOTE:** `variable-cascading`/`variable-keywords`
+now **404 on wpt.live** (`bodyLen=42`, HTTP 404 confirmed by curl — NOT a regression;
+`variable-definition` etc. still 200). Scroll `tickets/57-the-bounded-verdict.md`.
 
 **Session 2026-06-20 (Quest #56 The Lawful Verdict — custom-property
 `<declaration-value>` validity + invalid-at-computed-time for `<color>`, +23):**

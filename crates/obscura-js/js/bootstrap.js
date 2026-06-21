@@ -5188,6 +5188,15 @@ const _GCS_DEFAULTS = {
   'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
   'z-index': 'auto', 'pointer-events': 'auto',
   'box-sizing': 'content-box', cursor: 'auto',
+  // css-backgrounds longhands (not inherited) + `filter`. Computed serialization
+  // is identity here (keyword / position / url), which lets var() substitution
+  // into these properties round-trip (`background-clip: var(--foo)` → padding-box,
+  // `filter: blur(var(--blur))` → blur(15px)). background-color is a <color> (in
+  // _COLOR_PROPS); the gradient/image canonicalization is NOT modelled.
+  'background-attachment': 'scroll', 'background-clip': 'border-box',
+  'background-origin': 'padding-box', 'background-position': '0% 0%',
+  'background-repeat': 'repeat', 'background-size': 'auto',
+  'background-image': 'none', filter: 'none',
   // css-text properties (all inherited) — initial computed values per spec.
   // Computed serialization for these is identity (keyword / simple length),
   // so the #52 inheritance engine resolves initial/inherit/unset directly.
@@ -5862,13 +5871,25 @@ const _splitVarArgs = (inner) => {
   }
   return { name: inner.trim(), fallback: null };
 };
+// Join two CSS-text fragments at a substitution boundary. A separator is inserted
+// ONLY when the last char of `a` and the first char of `b` would otherwise merge
+// into a single token — i.e. both are "token" chars (ident/number/percent/hash).
+// A boundary against punctuation (`(`, `)`, `,`, whitespace, …) needs no separator,
+// so `blur(` + `15px` → `blur(15px)` (not `blur( 15px )`) while `var(--a)var(--b)`
+// → "a b". This approximates real tokenization without a full tokenizer.
+const _TOKENISH = /[A-Za-z0-9_.%#\u002D\u0080-\uFFFF]/;
+const _joinTok = (a, b) => {
+  if (!a) return b;
+  if (!b) return a;
+  return (_TOKENISH.test(a[a.length - 1]) && _TOKENISH.test(b[0])) ? a + ' ' + b : a + b;
+};
 // Substitute every `var(--name, fallback)` reference in `value` with the custom
 // property's computed value (or the fallback when it is guaranteed-invalid),
-// recursively. Token boundaries are preserved by space-padding each insertion and
-// collapsing runs of whitespace — an approximation that yields the right computed
-// serialization for separate tokens (`var(--a)var(--b)` → "a b") without a full
-// tokenizer. Returns null when the value is invalid at computed-value time (an
-// unbalanced var(), an undefined property with no fallback, or a cycle).
+// recursively. Token boundaries at each insertion are preserved by _joinTok (a
+// separator only between chars that would merge), so a substituted value lands
+// inside a function call without spurious whitespace. Returns null when the value
+// is invalid at computed-value time (an unbalanced var(), an undefined property
+// with no fallback, or a cycle).
 const _substituteVars = (el, value, guard) => {
   const s = String(value);
   if (!/var\(/i.test(s)) return s;
@@ -5878,8 +5899,8 @@ const _substituteVars = (el, value, guard) => {
   while (i < n) {
     const rest = s.slice(i);
     const m = /var\(/i.exec(rest);
-    if (!m) { out += rest; break; }
-    out += rest.slice(0, m.index);
+    if (!m) { out = _joinTok(out, rest); break; }
+    out = _joinTok(out, rest.slice(0, m.index));
     let k = i + m.index + m[0].length, depth = 1;
     while (k < n && depth > 0) {
       const c = s[k];
@@ -5900,9 +5921,9 @@ const _substituteVars = (el, value, guard) => {
       resolved = _substituteVars(el, resolved, guard + 1);   // nested var() in the value
       if (resolved == null) return null;
     }
-    out += ' ' + resolved + ' ';
+    out = _joinTok(out, String(resolved).trim());
   }
-  return out.replace(/\s+/g, ' ').trim();
+  return out.trim();
 };
 const _GCS_INLINE_SPEC = Number.MAX_SAFE_INTEGER;
 const _buildCascade = (el) => {

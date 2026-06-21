@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #56).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #57).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-variables/variable-substitution-filters.html` | 0/7 | **7/7** | ✅ 100% | **Quest #57 The Bounded Verdict.** Token-boundary-aware `var()` substitution: new `_joinTok` inserts a separator only when the boundary chars would merge into one token, so `filter: blur(var(--blur))` → `blur(15px)` (was `blur( 15px )`). Registered `filter` in `_GCS_DEFAULTS` so it routes through `_computedPropOf`. Pure JS, no new Rust. **+7.** |
+| `css/css-variables/variable-substitution-background-properties.html` | 1/10 | **8/10** | ✅ 80% | **Quest #57 The Bounded Verdict.** Registered the seven `background-*` longhands in `_GCS_DEFAULTS` (identity computed serialization) so a substituted value round-trips (`background-clip: var(--foo)` → `padding-box`); `_joinTok` token-boundary substitution. **+7.** Caps: the 2 gradient subtests need full gradient canonicalization (drop default direction/shape, named→rgb, whitespace) — a gradient serializer. |
 | `css/css-variables/test_variable_legal_values.html` | 0/23 | **23/23** | ✅ 100% | **Quest #56 The Lawful Verdict.** Custom-property `<declaration-value>` validity (new `_isBalancedDeclValue` — unmatched `)`/`]`/`}` reject, openers OK; wired into `_cssParseDecls`/`_parseStyleDecls`/`setProperty`, dropping an invalid value so the prior one survives), a nesting-aware `_cssSplitRules` block scanner (a stray `}` inside a value no longer closes the rule early), and invalid-at-computed-time for `<color>` (`_computedPropOf` rejects a `var()`-substituted non-colour → initial/inherited). Pure JS, no new Rust. **+23.** Caps: filter/background substitution (token-boundary), shorthand→longhand |
 | `css/css-variables/variable-definition.html` | 11/73 | **71/73** | ✅ 97% | **Quest #55 The Custom Verdict.** Rewrote `CSSStyleDeclaration` (custom-prop name validation, whitespace canonicalization, `!important` tracking), fixed the `style` Proxy `set` trap (was storing `cssText` as a plain prop), lazily synced the `style` content attribute into the live decl, gave `getComputedStyle` real custom-property inheritance + CSS-wide keyword resolution. Pure JS, no new Rust. **+60.** Caps: unknown-property drop (`-var4`, ×2) |
 | `css/css-variables/variable-definition-cascading.html` | 5/9 | **9/9** | ✅ 100% | **Quest #55.** Custom properties always inherit; `_computedCustomProp` walks the ancestor chain. **+4** |
