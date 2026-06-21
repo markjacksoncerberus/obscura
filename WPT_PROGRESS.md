@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #57).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #58).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-variables/variable-substitution-shorthands.html` | 13/51 | **51/51** | ✅ 100% | **Quest #58 The Expanded Verdict.** Shorthand→longhand expansion in the cascade: `_SHORTHAND_LONGHANDS` table + `_expandDeclInto` write a pending slot for each longhand a shorthand governs (carrying `_sh` + the whole value), with within-block order/`!important` via `_putDecl`; at computed time `_computedPropOf` substitutes var() then `_expandShorthand` splits the value (box-edge rule for `margin`/`padding`/`border-{width,style,color}`, `<width>‖<style>‖<color>` for `border`/`border-<side>`, layer parse for `transition`) and keeps this longhand's piece. Added the 8 `border-*-{width,style}` longhands to `_GCS_DEFAULTS`. Pure JS, no new Rust. **+38.** |
 | `css/css-variables/variable-substitution-filters.html` | 0/7 | **7/7** | ✅ 100% | **Quest #57 The Bounded Verdict.** Token-boundary-aware `var()` substitution: new `_joinTok` inserts a separator only when the boundary chars would merge into one token, so `filter: blur(var(--blur))` → `blur(15px)` (was `blur( 15px )`). Registered `filter` in `_GCS_DEFAULTS` so it routes through `_computedPropOf`. Pure JS, no new Rust. **+7.** |
 | `css/css-variables/variable-substitution-background-properties.html` | 1/10 | **8/10** | ✅ 80% | **Quest #57 The Bounded Verdict.** Registered the seven `background-*` longhands in `_GCS_DEFAULTS` (identity computed serialization) so a substituted value round-trips (`background-clip: var(--foo)` → `padding-box`); `_joinTok` token-boundary substitution. **+7.** Caps: the 2 gradient subtests need full gradient canonicalization (drop default direction/shape, named→rgb, whitespace) — a gradient serializer. |
 | `css/css-variables/test_variable_legal_values.html` | 0/23 | **23/23** | ✅ 100% | **Quest #56 The Lawful Verdict.** Custom-property `<declaration-value>` validity (new `_isBalancedDeclValue` — unmatched `)`/`]`/`}` reject, openers OK; wired into `_cssParseDecls`/`_parseStyleDecls`/`setProperty`, dropping an invalid value so the prior one survives), a nesting-aware `_cssSplitRules` block scanner (a stray `}` inside a value no longer closes the rule early), and invalid-at-computed-time for `<color>` (`_computedPropOf` rejects a `var()`-substituted non-colour → initial/inherited). Pure JS, no new Rust. **+23.** Caps: filter/background substitution (token-boundary), shorthand→longhand |

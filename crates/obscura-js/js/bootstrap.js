@@ -5186,6 +5186,14 @@ const _GCS_DEFAULTS = {
   'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
   color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
   'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
+  // border-* longhands. Computed serialization is identity (length / keyword), so
+  // a substituted/cascaded value round-trips. The unset computed width is 0px
+  // (the initial border-style is `none`, which forces width to 0); the border-*-color
+  // longhands live in _COLOR_PROPS (currentColor → the element's own colour).
+  'border-top-width': '0px', 'border-right-width': '0px',
+  'border-bottom-width': '0px', 'border-left-width': '0px',
+  'border-top-style': 'none', 'border-right-style': 'none',
+  'border-bottom-style': 'none', 'border-left-style': 'none',
   'z-index': 'auto', 'pointer-events': 'auto',
   'box-sizing': 'content-box', cursor: 'auto',
   // css-backgrounds longhands (not inherited) + `filter`. Computed serialization
@@ -5292,6 +5300,172 @@ const _GCS_DEFAULTS = {
   'color-scheme': 'normal', 'color-adjust': 'economy',
   'forced-color-adjust': 'auto', 'print-color-adjust': 'economy',
 };
+// ---------------------------------------------------------------------------
+// Shorthand → longhand expansion (for the cascade / getComputedStyle).
+//
+// When the cascade resolves a longhand (e.g. `margin-left`), it must also see
+// any shorthand (`margin`, `border`, …) that contributes to it, at that
+// shorthand's place in declaration order. We model this by writing, for each
+// shorthand declaration, BOTH the shorthand name itself and a synthetic slot for
+// every longhand it governs. The slot carries `_sh` (the shorthand name) and the
+// *whole* shorthand value; the value is split into the per-longhand piece lazily
+// at computed-value time (after any var() substitution — a shorthand bearing
+// var() is a pending-substitution value for all its longhands per CSS Variables).
+// ---------------------------------------------------------------------------
+const _SHORTHAND_LONGHANDS = {
+  margin: ['margin-top', 'margin-right', 'margin-bottom', 'margin-left'],
+  padding: ['padding-top', 'padding-right', 'padding-bottom', 'padding-left'],
+  'border-width': ['border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width'],
+  'border-style': ['border-top-style', 'border-right-style', 'border-bottom-style', 'border-left-style'],
+  'border-color': ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color'],
+  'border-top': ['border-top-width', 'border-top-style', 'border-top-color'],
+  'border-right': ['border-right-width', 'border-right-style', 'border-right-color'],
+  'border-bottom': ['border-bottom-width', 'border-bottom-style', 'border-bottom-color'],
+  'border-left': ['border-left-width', 'border-left-style', 'border-left-color'],
+  border: [
+    'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
+    'border-top-style', 'border-right-style', 'border-bottom-style', 'border-left-style',
+    'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color',
+  ],
+  transition: ['transition-property', 'transition-duration', 'transition-timing-function', 'transition-delay'],
+};
+// Set a declaration into a block-level map, respecting within-block cascade
+// order: an !important declaration is never overridden by a later normal one of
+// the same property; otherwise the later declaration wins.
+const _putDecl = (out, name, decl) => {
+  const prev = out[name];
+  if (prev && prev.important && !decl.important) return;
+  out[name] = decl;
+};
+// Write a declaration (name=value) and, if it is a known shorthand, a pending
+// slot for each of its longhands. Used by every declaration-block parser feeding
+// the cascade.
+const _expandDeclInto = (out, name, value, important) => {
+  _putDecl(out, name, { value, important });
+  const lh = _SHORTHAND_LONGHANDS[name];
+  if (lh) for (const l of lh) _putDecl(out, l, { value, important, _sh: name });
+};
+// Split a CSS value into top-level whitespace-separated tokens, keeping bracketed
+// groups (rgb(…), calc(…), …) intact.
+const _wsTokens = (s) => {
+  const out = []; let depth = 0, cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(' || c === '[' || c === '{') { depth++; cur += c; }
+    else if (c === ')' || c === ']' || c === '}') { depth--; cur += c; }
+    else if (/\s/.test(c) && depth === 0) { if (cur) { out.push(cur); cur = ''; } }
+    else cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+};
+// Split a CSS value at top-level commas (for comma-separated layer lists).
+const _commaSplitTop = (s) => {
+  const out = []; let depth = 0, cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(' || c === '[' || c === '{') { depth++; cur += c; }
+    else if (c === ')' || c === ']' || c === '}') { depth--; cur += c; }
+    else if (c === ',' && depth === 0) { out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+};
+// The CSS box-edge rule: 1–4 values → [top, right, bottom, left].
+const _boxEdges = (t) => {
+  if (t.length === 1) return [t[0], t[0], t[0], t[0]];
+  if (t.length === 2) return [t[0], t[1], t[0], t[1]];
+  if (t.length === 3) return [t[0], t[1], t[2], t[1]];
+  if (t.length >= 4) return [t[0], t[1], t[2], t[3]];
+  return null;
+};
+const _LINE_STYLE_KW = new Set([
+  'none', 'hidden', 'dotted', 'dashed', 'solid', 'double', 'groove', 'ridge', 'inset', 'outset',
+]);
+const _LINE_WIDTH_KW = new Set(['thin', 'medium', 'thick']);
+const _isLengthTok = (t) =>
+  /^[+-]?(\d*\.?\d+)(px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vi|vb|vmin|vmax|cm|mm|in|pt|pc|q)$/i.test(t)
+  || /^calc\(/i.test(t) || /^(min|max|clamp)\(/i.test(t);
+// Parse a `border`/`border-<side>` value (`<line-width> || <line-style> || <color>`,
+// any order) into its three longhand pieces, defaulting any omitted component.
+const _parseBorderSide = (value) => {
+  let width = null, style = null, color = null;
+  for (const t of _wsTokens(value)) {
+    const low = t.toLowerCase();
+    if (_LINE_STYLE_KW.has(low)) style = low;
+    else if (_LINE_WIDTH_KW.has(low) || _isLengthTok(t)) width = t;
+    else color = t;
+  }
+  return {
+    width: width == null ? 'medium' : width,
+    style: style == null ? 'none' : style,
+    color: color == null ? 'currentColor' : color,
+  };
+};
+const _isTimeTok = (t) => /^[+-]?(\d*\.?\d+)(s|ms)$/i.test(t);
+const _isTimingFnTok = (t) => {
+  const l = t.toLowerCase();
+  return l === 'ease' || l === 'linear' || l === 'ease-in' || l === 'ease-out'
+    || l === 'ease-in-out' || l === 'step-start' || l === 'step-end'
+    || /^(steps|cubic-bezier|linear)\(/i.test(t);
+};
+// Parse a `transition` value (comma-separated layers; within a layer the first
+// <time> is the duration, the second the delay) into its longhand lists.
+const _expandTransition = (value) => {
+  const layers = _commaSplitTop(value).map((s) => s.trim()).filter((s) => s.length);
+  if (!layers.length) return null;
+  const props = [], durs = [], tfs = [], delays = [];
+  for (const layer of layers) {
+    let prop = 'all', dur = '0s', tf = 'ease', delay = '0s', times = 0;
+    for (const t of _wsTokens(layer)) {
+      if (_isTimeTok(t)) { if (times === 0) dur = t; else delay = t; times++; }
+      else if (_isTimingFnTok(t)) tf = t;
+      else prop = t;
+    }
+    props.push(prop); durs.push(dur); tfs.push(tf); delays.push(delay);
+  }
+  return {
+    'transition-property': props.join(', '),
+    'transition-duration': durs.join(', '),
+    'transition-timing-function': tfs.join(', '),
+    'transition-delay': delays.join(', '),
+  };
+};
+// Split a (already var()-substituted) shorthand value into its longhand pieces,
+// keyed by longhand name. Returns null if the value cannot be parsed.
+const _expandShorthand = (sh, value) => {
+  value = String(value).trim();
+  if (sh === 'margin' || sh === 'padding') {
+    const e = _boxEdges(_wsTokens(value)); if (!e) return null;
+    return {
+      [sh + '-top']: e[0], [sh + '-right']: e[1], [sh + '-bottom']: e[2], [sh + '-left']: e[3],
+    };
+  }
+  if (sh === 'border-width' || sh === 'border-style' || sh === 'border-color') {
+    const suf = sh.slice('border-'.length);
+    const e = _boxEdges(_wsTokens(value)); if (!e) return null;
+    return {
+      ['border-top-' + suf]: e[0], ['border-right-' + suf]: e[1],
+      ['border-bottom-' + suf]: e[2], ['border-left-' + suf]: e[3],
+    };
+  }
+  if (sh === 'border-top' || sh === 'border-right' || sh === 'border-bottom' || sh === 'border-left') {
+    const p = _parseBorderSide(value);
+    return { [sh + '-width']: p.width, [sh + '-style']: p.style, [sh + '-color']: p.color };
+  }
+  if (sh === 'border') {
+    const p = _parseBorderSide(value); const out = {};
+    for (const side of ['top', 'right', 'bottom', 'left']) {
+      out['border-' + side + '-width'] = p.width;
+      out['border-' + side + '-style'] = p.style;
+      out['border-' + side + '-color'] = p.color;
+    }
+    return out;
+  }
+  if (sh === 'transition') return _expandTransition(value);
+  return null;
+};
 const _cssParseDecls = (body) => {
   // body is the inside of a `{ ... }` block (or an inline style string).
   const out = {};
@@ -5309,7 +5483,7 @@ const _cssParseDecls = (body) => {
     // A custom property with an invalid <declaration-value> is dropped — the
     // earlier valid declaration of the same name (if any) is preserved.
     if (name.startsWith('--') && !_isBalancedDeclValue(value)) continue;
-    out[name] = { value, important };
+    _expandDeclInto(out, name, value, important);
   }
   return out;
 };
@@ -5795,28 +5969,39 @@ const _normComputed = (el, kebab, v) => {
 const _computedPropOf = (el, kebab, guard) => {
   guard = guard || 0;
   if (!el || guard > 200) return _normComputed(el, kebab, _initialOf(kebab));
-  let v = String(_specifiedValue(el, kebab) || '').trim();
+  const spec = _specifiedDecl(el, kebab);
+  let v = String(spec.value || '').trim();
+  const sh = spec.sh;
   const inheritFrom = () => (el.parentElement
     ? _computedPropOf(el.parentElement, kebab, guard + 1)
     : _normComputed(el, kebab, _initialOf(kebab)));
+  const invalidAtComputedTime = () => (_INHERITED_PROPS.has(kebab)
+    ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab)));
   // A value containing var() is valid at parse time; substitute references, and if
   // substitution fails (undefined with no fallback, cycle, …) the property is
   // invalid at computed-value time → it becomes the inherited or initial value.
-  if (/var\(/i.test(v)) {
-    const invalidAtComputedTime = () => (_INHERITED_PROPS.has(kebab)
-      ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab)));
+  const varBearing = /var\(/i.test(v);
+  if (varBearing) {
     const sub = _substituteVars(el, v, 0);
     if (sub == null || sub === '') return invalidAtComputedTime();
-    v = sub;
-    // A value substituted from var() that doesn't match the property's grammar is
-    // invalid at computed-value time (→ inherited-or-initial). We validate the
-    // <color> properties (the substituted value must be a real colour, unless it
-    // is a CSS-wide keyword or currentColor, which are resolved further below).
-    if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
-      const low = v.trim().toLowerCase();
-      if (!_CSS_WIDE.has(low) && low !== 'currentcolor' && !_isValidColor(v)) {
-        return invalidAtComputedTime();
-      }
+    v = sub.trim();
+  }
+  // Shorthand → longhand: `v` is the (substituted) whole shorthand value; split it
+  // and keep this longhand's piece. A value that can't be parsed as the shorthand
+  // is invalid at computed-value time.
+  if (sh) {
+    const parts = _expandShorthand(sh, v);
+    if (!parts || parts[kebab] == null) return invalidAtComputedTime();
+    v = String(parts[kebab]).trim();
+  }
+  // A value substituted from var() that doesn't match the property's grammar is
+  // invalid at computed-value time (→ inherited-or-initial). We validate the
+  // <color> properties — after any shorthand extraction, the value must be a real
+  // colour, unless it is a CSS-wide keyword or currentColor (resolved below).
+  if (varBearing && (kebab === 'color' || _COLOR_PROPS.has(kebab))) {
+    const lowc = v.trim().toLowerCase();
+    if (!_CSS_WIDE.has(lowc) && lowc !== 'currentcolor' && !_isValidColor(v)) {
+      return invalidAtComputedTime();
     }
   }
   const low = v.toLowerCase();
@@ -5966,7 +6151,7 @@ const _buildCascade = (el) => {
       let any = false;
       for (const k in liveProps) {
         const name = k.startsWith('--') ? k : k.replace(/([A-Z])/g, '-$1').toLowerCase();
-        decls[name] = { value: liveProps[k], important: !!(livePrio && livePrio[k] === 'important') };
+        _expandDeclInto(decls, name, liveProps[k], !!(livePrio && livePrio[k] === 'important'));
         any = true;
       }
       if (any) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 1, decls });
@@ -5974,10 +6159,10 @@ const _buildCascade = (el) => {
   }
   return sources;
 };
-const _cascadeResolve = (sources, name) => {
-  // Cascade winner for property `name` (a CSS property / custom-property name):
-  // !important beats normal; within the same importance, higher specificity
-  // wins, ties broken by later source order.
+const _cascadeWinner = (sources, name) => {
+  // Winning declaration for property `name` (a CSS property / custom-property
+  // name): !important beats normal; within the same importance, higher
+  // specificity wins, ties broken by later source order. Returns { s, d } or null.
   let best = null;
   for (const s of sources) {
     const d = s.decls[name];
@@ -5989,7 +6174,25 @@ const _cascadeResolve = (sources, name) => {
       best = { s, d };
     }
   }
-  return best ? best.d.value : '';
+  return best;
+};
+const _cascadeResolve = (sources, name) => {
+  const w = _cascadeWinner(sources, name);
+  return w ? w.d.value : '';
+};
+// The element's own specified declaration for `kebab` — the winning value plus
+// the shorthand it was expanded from (`sh`, when this longhand is a pending
+// shorthand slot). Mirrors _specifiedValue's cascade-first / live-decl-fallback.
+const _specifiedDecl = (el, kebab) => {
+  try {
+    const w = _cascadeWinner(_buildCascade(el), kebab);
+    if (w && w.d.value !== '') return { value: String(w.d.value), sh: w.d._sh || null };
+  } catch (e) {}
+  try {
+    const s = el && el.style;
+    if (s && s.getPropertyValue) { const lv = s.getPropertyValue(kebab); if (lv) return { value: String(lv), sh: null }; }
+  } catch (e) {}
+  return { value: '', sh: null };
 };
 // CSS property registry (kebab + camelCase) — the set of properties our
 // computed-style / CSS.supports machinery understands. Drives the proxy `has`

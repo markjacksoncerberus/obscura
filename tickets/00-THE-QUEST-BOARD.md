@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~58~~ | ✅ [The Expanded Verdict](58-the-expanded-verdict.md) | `css/css-variables/variable-substitution-shorthands` (shorthand→longhand expansion in the cascade) | **51/51** | ⚔️⚔️ | **SECURED — +38.** #57's "next leverage (2)". The test stamps shorthand declarations (`margin`/`border`/`border-<side>`/`border-width`/`transition`, many bearing `var()`) and reads back the longhand computed values — but the cascade resolved one property *name* at a time, so `margin: var(--prop)` never reached `margin-left`, and the `border-*-width`/`-style` longhands weren't modelled. Fix (pure JS, no new Rust): `_SHORTHAND_LONGHANDS` + `_expandDeclInto` write a pending slot for each longhand a shorthand governs (carrying `_sh` + the whole value), with within-block order/`!important` via `_putDecl`; at computed time `_computedPropOf` substitutes `var()` then `_expandShorthand` splits the value (box-edge rule for `margin`/`padding`/`border-{width,style,color}`, `<width>‖<style>‖<color>` for `border`/`border-<side>`, layer parse for `transition`) and keeps this longhand's piece. Added the 8 `border-*-{width,style}` longhands to `_GCS_DEFAULTS`. Zero regressions. Caps: shorthand *serialization* (`variable-cssText` 8/11) is the inverse engine; gradient canonicalization (background 8/10); border width/style interaction not modelled; only margin/padding/border*/transition shorthands expanded. |
 | ~~57~~ | ✅ [The Bounded Verdict](57-the-bounded-verdict.md) | `css/css-variables/variable-substitution-{filters,background-properties}` (token-boundary-aware `var()` substitution) | **filters 7/7, background-properties 8/10** | ⚔️ | **SECURED — +14.** #56's "next leverage (1)". `filter: blur(var(--blur))` substituted as `blur( 15px )` (space-padded) instead of `blur(15px)` — the standing token-boundary cap — and `filter`/background longhands weren't registered so they echoed the unsubstituted value. Fix (pure JS, no new Rust): (a) `_substituteVars` now joins each insertion with a new `_joinTok` (separator only when the boundary chars would merge into one token — `(`/`)`/`,`/whitespace need none), so a value lands cleanly inside a function call; (b) registered `filter` + the seven `background-*` longhands in `_GCS_DEFAULTS` (identity computed serialization) so they route through `_computedPropOf` and the substituted value round-trips. filters 0→7, background-properties 1→8. Zero regressions (substitution-basic held 11/13). Caps: the 2 gradient subtests need full gradient canonicalization (drop default `to bottom`/`ellipse farthest-corner`, named→rgb, whitespace) — a gradient serializer; shorthand→longhand (`-shorthands` 13/51). |
 | ~~56~~ | ✅ [The Lawful Verdict](56-the-lawful-verdict.md) | `css/css-variables/test_variable_legal_values` (custom-property `<declaration-value>` validity + invalid-at-computed-time for `<color>`) | **23/23** | ⚔️ | **SECURED — +23.** #55's "next leverage (2)". The test stamps `--test: <value>; background-color: var(--test)` and reads back the computed colour. Allowed values (valid `<declaration-value>`s) substitute a non-colour → property invalid at computed-value time → initial (`transparent`); disallowed values (unmatched `)`/`]`/`}`) drop the declaration → `--test` keeps its prior value. New `_isBalancedDeclValue` (stack-matched brackets; unmatched closers reject, openers OK; strings/comments skipped) wired into all three declaration parsers; `_cssSplitRules` block scanner made nesting-aware (a stray `}` in a value no longer closes the rule early); `_computedPropOf` rejects a `var()`-substituted non-`<color>` as invalid-at-computed-time. Pure JS, no new Rust. Zero regressions. Caps: filter/background substitution (token-boundary cap), shorthand→longhand, non-colour invalid-at-computed-time. |
 | ~~55~~ | ✅ [The Custom Verdict](55-the-custom-verdict.md) | `css/css-variables/` (custom-property storage, cascade, inheritance, `var()` substitution) | **definition 71/73, cascading 9/9, keywords 8/8, cssText 8/11, substitution-basic 11/13, created-element 3/3, created-document 2/2** | ⚔️⚔️ | **SECURED — +88.** The standing top "next leverage (a)". Rewrote `CSSStyleDeclaration` (custom-prop name validation + whitespace canonicalization + `!important` tracking + `cssText`/`setProperty`/`getPropertyValue`), fixed the `style` Proxy `set` trap (it stored `style.cssText=…` as a plain prop, losing every declaration), lazily synced the `style` content attribute into the live decl (HTML parsing bypasses JS setAttribute), gave `getComputedStyle` real custom-property inheritance + CSS-wide keyword resolution (`_computedCustomProp`), and added `var()` substitution (`_substituteVars`: recursive name/fallback, cycle guard, invalid→initial/inherited). Pure JS, no new Rust. Zero regressions. Caps: `CSS.supports`+`var()` (the 2 rgb caps), invalid-at-computed-time for `<color>` (`test_variable_legal_values` 23), shorthand expansion (`substitution-shorthands` 51), unknown-property drop, token boundaries, reftests. |
@@ -98,6 +99,54 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-21 (Quest #58 The Expanded Verdict — shorthand→longhand
+expansion in the cascade, +38):** Took #57's "next leverage (2)".
+`variable-substitution-shorthands` (13/51) stamps shorthand declarations
+(`margin`, `border`, `border-<side>`, `border-width`, `transition` — many
+bearing `var()`) into inline styles and reads back the **longhand** computed
+values (`margin-left`, `border-top-width`, `transition-duration`, …). Obscura's
+cascade resolved one property *name* at a time, so a `margin` declaration never
+reached `margin-left` (→ `0px`), and the `border-*-width`/`-style` longhands
+weren't even modelled (→ `""`). **Fix (pure JS, `bootstrap.js`, NO new Rust):**
+(1) **expansion at parse time into pending slots** — `_SHORTHAND_LONGHANDS` maps
+each shorthand to the longhands it governs; `_expandDeclInto` writes the
+shorthand name **and** a slot per longhand carrying `_sh` (the shorthand name) +
+the *whole* shorthand value; `_putDecl` enforces within-block cascade order (an
+`!important` slot is never clobbered by a later normal one). Wired into
+`_cssParseDecls` (author rules + the `style=""` attribute) and the live-CSSOM
+source in `_buildCascade`. (2) **lazy split at computed time** — `_cascadeResolve`
+refactored onto `_cascadeWinner`; new `_specifiedDecl` returns `{value, sh}`;
+`_computedPropOf` substitutes `var()` (a shorthand with var is one pending value),
+then if `_sh` is set `_expandShorthand` splits the value — the **box-edge rule**
+(`_boxEdges`/`_wsTokens`) for `margin`/`padding`/`border-{width,style,color}`,
+`<line-width> ‖ <line-style> ‖ <color>` (`_parseBorderSide`) for
+`border`/`border-<side>`, and a comma-layer parse (`_commaSplitTop`) for
+`transition` — keeping this longhand's piece (an unparseable shorthand → invalid
+at computed-value time, i.e. target7 `margin: var(--invalid)` → `0px`). (3) the 8
+`border-*-{width,style}` longhands → `_GCS_DEFAULTS` (identity serialization;
+unset width `0px`). The two-source cascade still gets target9 right because CSSOM
+operations are *later in time* = higher cascade `order`, so the re-set
+`style.borderLeft` beats the markup `border-width` for the left edge while the
+other widths keep their `border-width` value. **13→51/51. +38. ZERO regressions**
+(swept css-variables — substitution-basic 11/13, -filters 7/7, -background 8/10,
+-cssText 8/11, -definition 71/73, legal-values 23/23; colour — computed 16/named
+455/rgb 95/hex 6/opacity 30; inheritance — css-color 4, inherit-initial 4,
+css-text 42, css-ui 28, css-fonts 39, css-transitions 8, css-flexbox 20,
+css-grid 20; selectors — has/not-specificity 8/8, valid-invalid 30, disabled 7,
+readwrite-readonly 25; DOM — classlist 1420, matches 669, closest 29,
+createElement 147, getElementsByTagName 19; obscura-dom 40/40). `qsa` /
+`css-backgrounds inheritance` are **wpt.live HTTP 404s** (`bodyLen=42`,
+curl-confirmed — transient serving, not regressions). **Caps:** shorthand
+*serialization* (`variable-cssText` 8/11 — the inverse engine, reconstructing
+`margin:…` from longhands through the CSSOM `cssText` getter); gradient
+canonicalization (background 8/10); border width/style interaction not modelled
+(a `none` style should force width `0`); only margin/padding/border*/transition
+expanded. **NEXT LEVERAGE:** (1) more shorthands (`outline`, `flex`, `gap`/`inset`,
+`list-style`, `text-decoration`, `font`); (2) shorthand serialization (the inverse
+— `variable-cssText` 8→11); (3) gradient canonicalization; (4) a specified-value
+serializer (`serialize-values` 0/697) or a fresh realm. Scroll
+`tickets/58-the-expanded-verdict.md`.
 
 **Session 2026-06-20 (Quest #57 The Bounded Verdict — token-boundary-aware
 `var()` substitution into `filter`/`background-*`, +14):** Took #56's "next
