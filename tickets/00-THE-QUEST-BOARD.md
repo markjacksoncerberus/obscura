@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~61~~ | ✅ [The Positioned Verdict](61-the-positioned-verdict.md) | `css/css-images` + `css/css-backgrounds` `<position>` serialization (object-position / background-position) | **18/18 · 16/16 · 31/31 · 32/32** | ⚔️⚔️ | **SECURED — +60.** A reusable CSS `<position>` value serializer (specified + computed) for `object-position`/`background-position`, which were stored verbatim. `_parsePosition` decomposes 1–4 tokens into horizontal/vertical components — KEY: an offset attaches to an edge keyword ONLY in the 3/4-token edge-offset form (`right 40%` is two components H:`right` V:`40%`, not `right` with a 40% offset). `_serializePositionSpecified` (horizontal-first, fill omitted axis with `center`, retain edge keywords; per comma-layer) wired into `setProperty`/`_parseStyleDecls`; `_serializePositionComputed` (keywords→percentages, `right`/`bottom` edge offset → `100%−off` or `calc(100% ∓ off)` with negative-sign folding, a `%`+length calc kept as calc to round-trip) wired into `_normComputed`. New `_evalMath` `opts.emPx` resolves em against the element's computed font-size (`#target{font-size:40px}` → `calc(10px+0.5em)`→`30px`). Pure JS, no new Rust. Zero regressions (serialize-values held 695 — it generates background-position H-then-V ordered so the reorder swap never fires). Caps: gradient `at <position>` (the natural follow-up, reuses this engine — gradient-position-computed 0/43 needs gradient-param parse + colour computation + default-`at`-drop, i.e. #57's gradient-canon cap); other `<position>` props (transform-origin/perspective-origin/mask-position). |
 | ~~60~~ | ✅ [The Recombined Verdict](60-the-recombined-verdict.md) | `css/cssom/` shorthand serialization (inverse of #58) | **7/7 · 7/11 · 9/11** | ⚔️⚔️ | **SECURED — +6.** #59's "next leverage (1)" — the standing shorthand serialization engine. The CSSOM `cssText` getter + the shorthand-property getter (`el.style.margin`) must reconstruct a box-model shorthand from the longhands actually present. KEY (low-risk): `serialize-values` (695) only ever sets *longhands* and reads `el.style[idl]` (never `.cssText`), so the engine lives entirely in the `cssText` getter + box-shorthand getter, reads the literal `_props` on-the-fly, and **never mutates stored state** — cascade/`setProperty`/longhand reads untouched. New pure-JS helpers: `_styleLonghandList` (expand `_props` → ordered longhand list, last-write-wins reappend, var()-shorthand → pending-substitution longhands), `_serializeDeclBlock` (CSSOM "serialize a CSS declaration block" with logical-group adjacency), `_serializeBoxValue` (collapse 1–4 edges). Scoped to margin/padding (+ `-inline`/`-block`); background/border/transition stay verbatim. `shorthand-serialization` 4→7, `cssstyledeclaration-csstext` 5→7, `variable-cssText` 8→9. Zero regressions. Caps: unknown-property drop (needs a comprehensive valid-prop registry — serialize-values hot-path risk), per-property value validation, computed-style `cssText`/`length`, in-value comment preservation. |
 | ~~59~~ | ✅ [The Serialized Verdict](59-the-serialized-verdict.md) | `css/cssom/serialize-values` (specified-value serialization for the inline `style` object) | **695/697** | ⚔️⚔️ | **SECURED — +580.** #58's "next leverage (4)" (specified-value serializer). The test sets every standard property via `setAttribute('style',…)` and `el.style.prop=…`, then reads the *specified* serialization back off `el.style[idl]`. Root cause: the `style` Proxy stored/read props by the raw JS accessor name (`backgroundColor`) while `setProperty`/`setAttribute`/`cssText` keyed `_props` by **kebab** — so a hyphenated read missed the key → `""` (the 118-pass/579-fail split was single-word vs hyphenated). Fix (pure JS, no new Rust): `_cssPropToKebab` routes every Proxy get/set through one canonical kebab key (+415); `_canonStandardValue` lightly canonicalises numeric tokens (`.5%`→`0.5%`, `-0px`→`0px`) leaving idents/hex/strings/structure intact (+158); serialize-a-url (`url(x)`→`url("x")`) + serialize-a-string (single→double quotes) (+4). Plus a last-write-wins repair to `setProperty` (delete+reinsert) so #58's target9 held at 51/51. Bonus: `cssstyledeclaration-csstext` 2→5. Zero regressions. Caps: `counter()` default-arg drop + font-family quote-drop (the last 2); shorthand SERIALIZATION (the inverse engine — `shorthand-serialization` 4/7, `variable-cssText` 8/11); unknown-property drop + value validation. |
 | ~~58~~ | ✅ [The Expanded Verdict](58-the-expanded-verdict.md) | `css/css-variables/variable-substitution-shorthands` (shorthand→longhand expansion in the cascade) | **51/51** | ⚔️⚔️ | **SECURED — +38.** #57's "next leverage (2)". The test stamps shorthand declarations (`margin`/`border`/`border-<side>`/`border-width`/`transition`, many bearing `var()`) and reads back the longhand computed values — but the cascade resolved one property *name* at a time, so `margin: var(--prop)` never reached `margin-left`, and the `border-*-width`/`-style` longhands weren't modelled. Fix (pure JS, no new Rust): `_SHORTHAND_LONGHANDS` + `_expandDeclInto` write a pending slot for each longhand a shorthand governs (carrying `_sh` + the whole value), with within-block order/`!important` via `_putDecl`; at computed time `_computedPropOf` substitutes `var()` then `_expandShorthand` splits the value (box-edge rule for `margin`/`padding`/`border-{width,style,color}`, `<width>‖<style>‖<color>` for `border`/`border-<side>`, layer parse for `transition`) and keeps this longhand's piece. Added the 8 `border-*-{width,style}` longhands to `_GCS_DEFAULTS`. Zero regressions. Caps: shorthand *serialization* (`variable-cssText` 8/11) is the inverse engine; gradient canonicalization (background 8/10); border width/style interaction not modelled; only margin/padding/border*/transition shorthands expanded. |
@@ -101,6 +102,36 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-21 (Quest #61 The Positioned Verdict — a reusable CSS
+`<position>` value serializer, +60):** `object-position` and `background-position`
+were stored verbatim, so every `*-valid`/`*-computed` case needing canonical
+reordering, axis defaulting, or keyword→percentage resolution failed
+(object-position 11/18·1/16, background-position 23/31·2/32). Built one
+self-contained `<position>` engine (pure JS, no new Rust): **`_parsePosition`**
+decomposes 1–4 tokens into horizontal/vertical components — the KEY subtlety is
+that an offset attaches to an edge keyword **only in the 3/4-token edge-offset
+form** (`right 40%` is two components H:`right` V:`40%`, not `right` with a 40%
+offset; nailed by `right 40%` computing to `100% 40%`). **`_serializePositionSpecified`**
+(horizontal-first order, fill an omitted axis with `center`, retain edge keywords,
+per comma-separated layer) wired into `setProperty`/`_parseStyleDecls`;
+**`_serializePositionComputed`** (keywords→percentages, a `right`/`bottom` edge
+offset → `100%−off` for a percentage or `calc(100% ∓ off)` for a length with the
+negative sign folded into `+`, and a `calc()` mixing `%`+length kept as calc so the
+round-trip assert holds) wired into `_normComputed`. New `_evalMath` `opts.emPx`
+resolves `em` offsets against the element's computed font-size
+(`#target{font-size:40px}` → `calc(10px + 0.5em)` → `30px`). **All four tests 100%
+(18·16·31·32); +60. ZERO regressions** — the hot-path risk was serialize-values
+(695), which generates `background-position` as horizontal-then-vertical-ordered
+combinations, so the reorder swap never fires and output is byte-identical to the
+old verbatim path; swept the css-variables/colour/inheritance/selector/DOM ritual
+lists + obscura-dom 40/40 (`qsa` is a wpt.live HTTP 404 right now, not a
+regression). **Caps:** gradient `at <position>` is the natural follow-up and reuses
+this exact engine (`gradient-position-computed` 0/43 additionally needs
+gradient-param parsing + colour computation of stops + dropping the default
+`at center center` — i.e. #57's standing gradient-canonicalization cap); other
+`<position>`-shaped properties (`transform-origin`/`perspective-origin`/
+`mask-position`). Scroll `tickets/61-the-positioned-verdict.md`.
 
 **Session 2026-06-21 (Quest #60 The Recombined Verdict — shorthand serialization
 engine, +6):** Took #59's "next leverage (1)". The CSSOM `cssText` getter + the

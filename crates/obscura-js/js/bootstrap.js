@@ -546,6 +546,7 @@ const _parseStyleDecls = (text) => {
       value = value.trim();
       if (value === '') continue;
       value = _canonStandardValue(value);
+      if (_POSITION_PROPS.has(name)) value = _serializePositionSpecified(value);
     }
     out.push({ name, value, important });
   }
@@ -562,8 +563,9 @@ class CSSStyleDeclaration {
     value = String(value == null ? '' : value);
     if (custom && value !== '' && !_isBalancedDeclValue(value)) return; // invalid <declaration-value> → ignore
     if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
-    const stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
+    let stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
     if (!custom && stored === '') { this.removeProperty(name); return; }
+    if (!custom && _POSITION_PROPS.has(name)) stored = _serializePositionSpecified(stored);
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
     // iterates _props in insertion order) resolves shared longhands last-write-wins
@@ -6073,6 +6075,9 @@ const _evalMath = (input, percentBase, opts) => {
       if (tok.pct) return (tok.v / 100) * percentBase;
       if (tok.unit) {
         if (!opts.lengths) return fail();
+        // `opts.emPx` overrides em against an element's computed font-size (the
+        // default table assumes em = 16px); rem stays root-relative.
+        if (opts.emPx && tok.unit === 'em') return tok.v * opts.emPx;
         const f = _LENGTH_PX[tok.unit];
         return f === undefined ? fail() : tok.v * f; // unresolvable unit (vw/cqw/…) → fail
       }
@@ -6202,6 +6207,127 @@ const _initialOf = (kebab) => {
   if (_COLOR_PROPS.has(kebab)) return kebab === 'background-color' ? 'rgba(0, 0, 0, 0)' : 'rgb(0, 0, 0)';
   return '';
 };
+// ─── CSS <position> value serialization ──────────────────────────────────────
+// The <position> grammar (object-position, background-position, the gradient
+// `at <position>` clause) admits 1–4 tokens with the two axes in either order.
+// Canonical serialization fixes a horizontal-then-vertical order, fills an omitted
+// axis with `center`, and — for computed values — resolves keywords to percentages.
+// KEY subtlety: an offset attaches to an edge keyword ONLY in the 3/4-token
+// edge-offset form. In the 1/2-token form `right 40%` is two independent
+// components (H:`right`, V:`40%`), NOT `right` with a 40% offset.
+const _POSITION_PROPS = new Set(['object-position', 'background-position']);
+const _POS_H = new Set(['left', 'right']);
+const _POS_V = new Set(['top', 'bottom']);
+// A token is a <length-percentage> (number+unit/%, bare number, or a math fn).
+const _isPosLP = (t) => {
+  const s = String(t).toLowerCase();
+  if (/^(?:calc|min|max|clamp)\(/.test(s)) return true;
+  return /\d/.test(t) && /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?(?:%|[a-z]+)?$/i.test(t);
+};
+// Parse one <position> into { h, v } components (each { kw?, off?, lp? }), or null.
+const _parsePosition = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  const n = toks.length;
+  if (n < 1 || n > 4) return null;
+  const isKw = (t) => { const l = t.toLowerCase(); return l === 'center' || _POS_H.has(l) || _POS_V.has(l); };
+  const comps = [];
+  if (n <= 2) {
+    // 1/2-token form: each token is a lone keyword or length-percentage.
+    for (const t of toks) {
+      if (isKw(t)) comps.push({ kw: t.toLowerCase() });
+      else if (_isPosLP(t)) comps.push({ lp: t });
+      else return null;
+    }
+  } else {
+    // 3/4-token edge-offset form: each component is an edge keyword with an
+    // optional length-percentage offset (`center` never takes an offset).
+    let i = 0;
+    while (i < n) {
+      const l = toks[i].toLowerCase();
+      if (l === 'center') { comps.push({ kw: 'center' }); i++; }
+      else if (_POS_H.has(l) || _POS_V.has(l)) {
+        if (i + 1 < n && _isPosLP(toks[i + 1])) { comps.push({ kw: l, off: toks[i + 1] }); i += 2; }
+        else { comps.push({ kw: l }); i++; }
+      } else return null;
+    }
+    if (comps.length !== 2) return null;
+  }
+  // Assign components to the horizontal / vertical axes.
+  let h, v;
+  if (comps.length === 1) {
+    const c = comps[0];
+    if (c.kw && _POS_H.has(c.kw)) { h = c; v = { kw: 'center' }; }
+    else if (c.kw && _POS_V.has(c.kw)) { h = { kw: 'center' }; v = c; }
+    else if (c.kw === 'center') { h = { kw: 'center' }; v = { kw: 'center' }; }
+    else if (c.lp != null) { h = c; v = { kw: 'center' }; }
+    else return null;
+  } else {
+    const [c1, c2] = comps;
+    const c1V = c1.kw && _POS_V.has(c1.kw);
+    const c2H = c2.kw && _POS_H.has(c2.kw);
+    if (c1V || c2H) { h = c2; v = c1; } else { h = c1; v = c2; }   // reorder to H-first
+    if ((h.kw && _POS_V.has(h.kw)) || (v.kw && _POS_H.has(v.kw))) return null; // axis conflict
+  }
+  return { h, v };
+};
+// Specified-value serialization of one component (edge keywords retained).
+const _posCompSpec = (c) => {
+  if (c.lp != null) return _canonStandardValue(c.lp);
+  if (c.off != null) return c.kw + ' ' + _canonStandardValue(c.off);
+  return c.kw;
+};
+// Canonical specified <position> serialization, per comma-separated layer. A layer
+// that doesn't parse is left untouched so an unexpected value is never corrupted.
+const _serializePositionSpecified = (value) => {
+  const out = [];
+  for (const layer of _commaSplitTop(value)) {
+    const p = _parsePosition(layer);
+    out.push(p ? _posCompSpec(p.h) + ' ' + _posCompSpec(p.v) : layer.trim());
+  }
+  return out.join(', ');
+};
+// Computed serialization of a length-percentage: plain percentages and px pass
+// through; relative units / math expressions resolve to px against `emPx` (the
+// element's computed font-size). Unresolvable → returned canonicalized.
+const _posComputeLen = (tok, emPx) => {
+  const s = String(tok).trim();
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(s)) return _canonStandardValue(s);
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)px$/i.test(s)) return _serNumber(parseFloat(s)) + 'px';
+  // A math expression mixing a percentage with a length can't resolve without
+  // layout (e.g. `calc(100% - 20px)`) — keep it as canonical calc.
+  if (/%/.test(s)) return _canonStandardValue(s);
+  const r = _evalMath(s, 0, { lengths: true, emPx });
+  return r === null ? _canonStandardValue(s) : _serNumber(r) + 'px';
+};
+// Computed value of one axis component (keyword origins → percentages).
+const _posCompComputed = (c, emPx) => {
+  if (c.lp != null) return _posComputeLen(c.lp, emPx);
+  if (c.kw === 'center') return '50%';
+  const fromStart = (c.kw === 'left' || c.kw === 'top');
+  if (c.off == null) return fromStart ? '0%' : '100%';
+  const off = String(c.off).trim();
+  if (fromStart) return _posComputeLen(off, emPx);              // left/top: offset from origin
+  // right/bottom: measured from the far edge → 100% − offset.
+  const pm = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(off);
+  if (pm) return _serNumber(100 - parseFloat(pm[1])) + '%';
+  const lm = /^([+-]?(?:\d+\.?\d*|\.\d+))([a-z]+)$/i.exec(off); // length → calc(100% ∓ |off|)
+  if (lm) {
+    const num = parseFloat(lm[1]);
+    return num < 0 ? 'calc(100% + ' + _serNumber(-num) + lm[2] + ')'
+                   : 'calc(100% - ' + _serNumber(num) + lm[2] + ')';
+  }
+  return _canonStandardValue(off);
+};
+const _serializePositionComputed = (el, value) => {
+  const fs = el ? parseFloat(_computedPropOf(el, 'font-size', 0)) : 16;
+  const emPx = fs > 0 ? fs : 16;
+  const out = [];
+  for (const layer of _commaSplitTop(value)) {
+    const p = _parsePosition(layer);
+    out.push(p ? _posCompComputed(p.h, emPx) + ' ' + _posCompComputed(p.v, emPx) : layer.trim());
+  }
+  return out.join(', ');
+};
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
 const _FONT_SIZE_KEYWORDS = {
@@ -6212,6 +6338,7 @@ const _FONT_SIZE_KEYWORDS = {
 };
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
   if (kebab === 'font-size') {
     const k = String(v).trim().toLowerCase();
     if (k in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[k];
