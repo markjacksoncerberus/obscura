@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~59~~ | ✅ [The Serialized Verdict](59-the-serialized-verdict.md) | `css/cssom/serialize-values` (specified-value serialization for the inline `style` object) | **695/697** | ⚔️⚔️ | **SECURED — +580.** #58's "next leverage (4)" (specified-value serializer). The test sets every standard property via `setAttribute('style',…)` and `el.style.prop=…`, then reads the *specified* serialization back off `el.style[idl]`. Root cause: the `style` Proxy stored/read props by the raw JS accessor name (`backgroundColor`) while `setProperty`/`setAttribute`/`cssText` keyed `_props` by **kebab** — so a hyphenated read missed the key → `""` (the 118-pass/579-fail split was single-word vs hyphenated). Fix (pure JS, no new Rust): `_cssPropToKebab` routes every Proxy get/set through one canonical kebab key (+415); `_canonStandardValue` lightly canonicalises numeric tokens (`.5%`→`0.5%`, `-0px`→`0px`) leaving idents/hex/strings/structure intact (+158); serialize-a-url (`url(x)`→`url("x")`) + serialize-a-string (single→double quotes) (+4). Plus a last-write-wins repair to `setProperty` (delete+reinsert) so #58's target9 held at 51/51. Bonus: `cssstyledeclaration-csstext` 2→5. Zero regressions. Caps: `counter()` default-arg drop + font-family quote-drop (the last 2); shorthand SERIALIZATION (the inverse engine — `shorthand-serialization` 4/7, `variable-cssText` 8/11); unknown-property drop + value validation. |
 | ~~58~~ | ✅ [The Expanded Verdict](58-the-expanded-verdict.md) | `css/css-variables/variable-substitution-shorthands` (shorthand→longhand expansion in the cascade) | **51/51** | ⚔️⚔️ | **SECURED — +38.** #57's "next leverage (2)". The test stamps shorthand declarations (`margin`/`border`/`border-<side>`/`border-width`/`transition`, many bearing `var()`) and reads back the longhand computed values — but the cascade resolved one property *name* at a time, so `margin: var(--prop)` never reached `margin-left`, and the `border-*-width`/`-style` longhands weren't modelled. Fix (pure JS, no new Rust): `_SHORTHAND_LONGHANDS` + `_expandDeclInto` write a pending slot for each longhand a shorthand governs (carrying `_sh` + the whole value), with within-block order/`!important` via `_putDecl`; at computed time `_computedPropOf` substitutes `var()` then `_expandShorthand` splits the value (box-edge rule for `margin`/`padding`/`border-{width,style,color}`, `<width>‖<style>‖<color>` for `border`/`border-<side>`, layer parse for `transition`) and keeps this longhand's piece. Added the 8 `border-*-{width,style}` longhands to `_GCS_DEFAULTS`. Zero regressions. Caps: shorthand *serialization* (`variable-cssText` 8/11) is the inverse engine; gradient canonicalization (background 8/10); border width/style interaction not modelled; only margin/padding/border*/transition shorthands expanded. |
 | ~~57~~ | ✅ [The Bounded Verdict](57-the-bounded-verdict.md) | `css/css-variables/variable-substitution-{filters,background-properties}` (token-boundary-aware `var()` substitution) | **filters 7/7, background-properties 8/10** | ⚔️ | **SECURED — +14.** #56's "next leverage (1)". `filter: blur(var(--blur))` substituted as `blur( 15px )` (space-padded) instead of `blur(15px)` — the standing token-boundary cap — and `filter`/background longhands weren't registered so they echoed the unsubstituted value. Fix (pure JS, no new Rust): (a) `_substituteVars` now joins each insertion with a new `_joinTok` (separator only when the boundary chars would merge into one token — `(`/`)`/`,`/whitespace need none), so a value lands cleanly inside a function call; (b) registered `filter` + the seven `background-*` longhands in `_GCS_DEFAULTS` (identity computed serialization) so they route through `_computedPropOf` and the substituted value round-trips. filters 0→7, background-properties 1→8. Zero regressions (substitution-basic held 11/13). Caps: the 2 gradient subtests need full gradient canonicalization (drop default `to bottom`/`ellipse farthest-corner`, named→rgb, whitespace) — a gradient serializer; shorthand→longhand (`-shorthands` 13/51). |
 | ~~56~~ | ✅ [The Lawful Verdict](56-the-lawful-verdict.md) | `css/css-variables/test_variable_legal_values` (custom-property `<declaration-value>` validity + invalid-at-computed-time for `<color>`) | **23/23** | ⚔️ | **SECURED — +23.** #55's "next leverage (2)". The test stamps `--test: <value>; background-color: var(--test)` and reads back the computed colour. Allowed values (valid `<declaration-value>`s) substitute a non-colour → property invalid at computed-value time → initial (`transparent`); disallowed values (unmatched `)`/`]`/`}`) drop the declaration → `--test` keeps its prior value. New `_isBalancedDeclValue` (stack-matched brackets; unmatched closers reject, openers OK; strings/comments skipped) wired into all three declaration parsers; `_cssSplitRules` block scanner made nesting-aware (a stray `}` in a value no longer closes the rule early); `_computedPropOf` rejects a `var()`-substituted non-`<color>` as invalid-at-computed-time. Pure JS, no new Rust. Zero regressions. Caps: filter/background substitution (token-boundary cap), shorthand→longhand, non-colour invalid-at-computed-time. |
@@ -99,6 +100,36 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-21 (Quest #59 The Serialized Verdict — specified-value
+serialization for the inline `style` object, +580):** Took #58's "next leverage
+(4)". `css/cssom/serialize-values` (697 subtests, the widest single CSS tail left)
+sat at 118/697. Root cause: the `style` Proxy stored & read CSS properties by the
+**raw JS accessor name** (`backgroundColor`) while `setProperty` /
+`setAttribute('style',…)` / `cssText` all keyed `_props` by **kebab**
+(`background-color`) — so `el.style.backgroundColor` after a `background-color`
+set looked up the wrong key and returned `""`. Single-word props passed,
+hyphenated failed: exactly the 118/579 split. Fix (pure JS, no new Rust): (1)
+`_cssPropToKebab` maps every JS accessor to one canonical kebab key (camelCase →
+kebab, leading-cap → vendor prefix, `cssFloat` → `float`, custom/kebab
+passthrough); the Proxy get/set now route through `getPropertyValue`/`setProperty`
+on that key (+415). (2) `_canonStandardValue` — a cheap hand scan that rewrites
+each numeric token (`.5%`→`0.5%`, `-.5`→`-0.5`, `-0px`→`0px`, `+5`→`5`) while
+leaving idents/hex/strings/`url()`/structure byte-identical; wired into
+`_parseStyleDecls` + `setProperty` for standard props only (custom props bypass)
+(+158). (3) serialize-a-url (`url(x)`/`url('x')`→`url("x")`) + serialize-a-string
+(single→double quotes) in the same scan (+4). (4) regression repair: the
+camelCase fix exposed that #58's `target9` passed by accident (a CSSOM re-set used
+to append a *new* camelCase key, landing last in `_buildCascade`'s iteration);
+`setProperty` now deletes+reinserts an existing key so the live-decl cascade
+resolves shared longhands last-write-wins → shorthands held 51/51. Bonus:
+`cssstyledeclaration-csstext` 2→5. **serialize-values 118→695, +580 total. ZERO
+regressions** (stash+rebuild-verified baselines 118 & 2; swept the css-variables,
+colour, inheritance, selector & DOM ritual lists). Caps: `counter()` default-arg
+drop + font-family quote-drop (last 2 of serialize-values); shorthand
+SERIALIZATION (the inverse engine — `shorthand-serialization` 4/7, `variable-cssText`
+8/11); unknown-property drop + per-property value validation. Scroll
+`tickets/59-the-serialized-verdict.md`.
 
 **Session 2026-06-21 (Quest #58 The Expanded Verdict — shorthand→longhand
 expansion in the cascade, +38):** Took #57's "next leverage (2)".

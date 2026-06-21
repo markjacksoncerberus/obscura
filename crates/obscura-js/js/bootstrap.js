@@ -410,6 +410,86 @@ const _isValidCustomPropName = (name) => name.length > 2 && name.startsWith('--'
 // internal whitespace preserved; an empty (all-whitespace) value becomes a single
 // space — the empty-value form the CSSOM round-trips (`--x: ;` reads back as " ").
 const _canonCustomValue = (value) => { const t = String(value).trim(); return t === '' ? ' ' : t; };
+// Canonicalize a single CSS numeric literal (sign + mantissa + optional exponent,
+// no unit) per CSSOM "serialize a <number>": a bare leading decimal point gains a
+// `0` (`.5` → `0.5`, `-.5` → `-0.5`), a leading `+` is dropped, and a negative
+// zero loses its sign (`-0` → `0`). Digits otherwise preserved verbatim.
+const _canonNumberLiteral = (numStr) => {
+  let s = numStr;
+  s = s.replace(/^([+-]?)\.(?=\d)/, '$10.');     // .5 → 0.5 ; -.5 → -0.5
+  if (s[0] === '+') s = s.slice(1);              // +5 → 5
+  if (s[0] === '-' && parseFloat(s) === 0) s = s.slice(1); // -0 / -0px's number → 0
+  return s;
+};
+// Lightly canonicalize a standard-property specified value: rewrite each numeric
+// token (the CSSOM serialization of `.5%`→`0.5%`, `-0px`→`0px`, …) while leaving
+// every other token — idents, hex colours, strings, url()s, structure — byte for
+// byte intact. A hand scan (not a full tokenizer) so it stays cheap on the hot
+// inline-style setter path; custom properties never pass through here.
+const _NUM_AT = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/;
+const _canonStandardValue = (value) => {
+  const s = String(value);
+  const n = s.length;
+  if (n === 0) return s;
+  let out = '', i = 0;
+  while (i < n) {
+    const c = s[i];
+    if (c === '/' && s[i + 1] === '*') {                  // comment — copy verbatim
+      let j = i + 2; while (j < n && !(s[j] === '*' && s[j + 1] === '/')) j++;
+      j = Math.min(n, j + 2); out += s.slice(i, j); i = j; continue;
+    }
+    if (c === '"') {                                       // double-quoted string — copy verbatim
+      let j = i + 1; while (j < n && s[j] !== c) { if (s[j] === '\\') j++; j++; }
+      j = Math.min(n, j + 1); out += s.slice(i, j); i = j; continue;
+    }
+    if (c === "'") {                                       // single-quoted → CSSOM double-quoted
+      let j = i + 1, inner = '';
+      while (j < n && s[j] !== "'") {
+        if (s[j] === '\\') { j++; if (j < n) { inner += s[j] === "'" ? "'" : '\\' + s[j]; j++; } continue; }
+        inner += s[j] === '"' ? '\\"' : s[j]; j++;
+      }
+      j = Math.min(n, j + 1); out += '"' + inner + '"'; i = j; continue;
+    }
+    if (c === '#') {                                       // hash / hex colour — copy verbatim
+      out += c; i++;
+      while (i < n && /[\w-]/.test(s[i])) { out += s[i]; i++; }
+      continue;
+    }
+    // Identifier (incl. vendor `-prefix`, custom-ident, function name): a letter,
+    // `_`, `\` escape, or a `-` NOT introducing a number. Consumed whole so digits
+    // embedded in an ident (`par-num`, `Lucida2`) are never mistaken for numbers.
+    if (/[A-Za-z_\\]/.test(c) || (c === '-' && !_NUM_AT.test(s.slice(i)))) {
+      let ident = c; i++;
+      while (i < n && (/[\w-]/.test(s[i]) || s[i] === '\\')) {
+        if (s[i] === '\\') { ident += s[i]; i++; if (i < n) { ident += s[i]; i++; } continue; }
+        ident += s[i]; i++;
+      }
+      // url( … ) serializes per CSSOM as url("…") — quote the URL (double quotes),
+      // normalizing an unquoted or single-quoted argument.
+      if (ident.toLowerCase() === 'url' && s[i] === '(') {
+        let j = i + 1;
+        while (j < n && /\s/.test(s[j])) j++;
+        let raw = '', ok = true;
+        if (s[j] === '"' || s[j] === "'") {
+          const q = s[j]; j++;
+          while (j < n && s[j] !== q) { if (s[j] === '\\') { j++; if (j < n) { raw += s[j] === '"' ? '\\"' : (s[j] === "'" ? "'" : '\\' + s[j]); j++; } continue; } raw += s[j] === '"' ? '\\"' : s[j]; j++; }
+          j = Math.min(n, j + 1);
+        } else {
+          while (j < n && s[j] !== ')' && !/\s/.test(s[j])) { if (s[j] === '\\') { raw += s[j]; j++; if (j < n) { raw += s[j]; j++; } continue; } raw += s[j]; j++; }
+        }
+        while (j < n && /\s/.test(s[j])) j++;
+        if (s[j] === ')') { out += 'url("' + raw + '")'; i = j + 1; continue; }
+        ok = false;                                       // malformed url(): leave the ident, let '(' flow on
+        if (!ok) { out += ident; continue; }
+      }
+      out += ident; continue;
+    }
+    const m = _NUM_AT.exec(s.slice(i));                    // numeric token
+    if (m && /\d/.test(m[0])) { out += _canonNumberLiteral(m[0]); i += m[0].length; continue; }
+    out += c; i++;
+  }
+  return out;
+};
 // Is `value` a valid <declaration-value> (the grammar a custom property accepts)?
 // Any token sequence is allowed EXCEPT one containing an unmatched `)`, `]`, or
 // `}` — note unmatched OPENERS are fine (`--x: (` is valid). Brackets inside
@@ -465,6 +545,7 @@ const _parseStyleDecls = (text) => {
       name = name.toLowerCase();
       value = value.trim();
       if (value === '') continue;
+      value = _canonStandardValue(value);
     }
     out.push({ name, value, important });
   }
@@ -481,8 +562,13 @@ class CSSStyleDeclaration {
     value = String(value == null ? '' : value);
     if (custom && value !== '' && !_isBalancedDeclValue(value)) return; // invalid <declaration-value> → ignore
     if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
-    const stored = custom ? _canonCustomValue(value) : value.trim();
+    const stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
     if (!custom && stored === '') { this.removeProperty(name); return; }
+    // Re-setting an existing property through the CSSOM makes it the latest-written
+    // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
+    // iterates _props in insertion order) resolves shared longhands last-write-wins
+    // — e.g. `style.borderLeft = …` after a markup `border-width` wins the left edge.
+    if (name in this._props) { delete this._props[name]; delete this._priority[name]; }
     this._props[name] = stored;
     this._priority[name] = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
   }
@@ -522,18 +608,32 @@ class CSSStyleDeclaration {
   item(i) { return Object.keys(this._props)[i] || ""; }
 }
 
+// Map a JS-side style property accessor to its canonical CSS property name (the
+// kebab-case form `_props` is keyed by). camelCase IDL attributes lower-case +
+// hyphenate (`backgroundColor` → `background-color`); a leading capital becomes a
+// vendor prefix (`WebkitTransform` → `-webkit-transform`); `cssFloat` is the IDL
+// alias for `float`; custom properties (`--x`) and already-kebab names pass
+// through unchanged. Keeping every access on one storage key means
+// `el.style.backgroundColor`, `el.style['background-color']`,
+// `setProperty('background-color', …)` and `setAttribute('style', …)` all agree.
+const _cssPropToKebab = (p) => {
+  if (p.startsWith('--')) return p;
+  if (p === 'cssFloat') return 'float';
+  return p.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+};
 const _styleProxy = (decl) => new Proxy(decl, {
   get(t, p) {
     if (typeof p === "symbol" || p in t) return t[p];
-    if (typeof p === "string") return t._props[p] || "";
+    if (typeof p === "string") return t.getPropertyValue(_cssPropToKebab(p));
     return undefined;
   },
   set(t, p, v) {
     if (typeof p === "string") {
       // Accessors / methods on the declaration (cssText, …) delegate to the real
-      // setter; everything else is a CSS property name stored on _props.
+      // setter; everything else is a CSS property name routed through setProperty
+      // (kebab-cased) so all storage stays on one canonical key.
       if (p in t) { t[p] = v; return true; }
-      t._props[p] = String(v); return true;
+      t.setProperty(_cssPropToKebab(p), v == null ? '' : String(v)); return true;
     }
     t[p] = v; return true;
   }
