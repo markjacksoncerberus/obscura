@@ -10,12 +10,17 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #62).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #63).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-masking/parsing/mask-position-valid.html` | 12/23 | **23/23** | ✅ 100% | **Quest #63 The Offset Verdict.** `mask-position` is the full `<position>#` grammar (comma-layered) — identical to `background-position`. Added it to `_POSITION_PROPS` so the #61 specified-`<position>` serializer reorders horizontal-first and fills the omitted axis with `center` (`10%`→`10% center`, `bottom right`→`right bottom`, `top, center, left`→`center top, center center, left center`). Pure JS, no new Rust. **+11.** Cap: `mask-position-computed.html` is a wpt.live 404 (no such test). |
+| `css/motion/parsing/offset-anchor-computed.html` | 0/14 | **14/14** | ✅ 100% | **Quest #63 The Offset Verdict.** `offset-anchor` is a full `<position>` computing like `object-position` (keywords→%, %-calc kept symbolic). Registered in `_GCS_DEFAULTS` (initial `auto`) + `_POSITION_PROPS` so it routes through `_serializePositionComputed`; `auto` parse-fails → passes through verbatim. Two engine refinements (also benefit object/background-position): a far-edge length offset now resolves to px via `_evalMath` (`bottom 20em`→`calc(100% - 800px)`), and a `calc()` mixing one percentage with length terms collapses the lengths to px while keeping `%` symbolic, percentage-first (`calc(20% - 5em)`→`calc(20% - 200px)`) via new `_splitSumTerms`/`_resolvePctLengthCalc`. **+14.** |
+| `css/motion/parsing/offset-position-computed.html` | 0/15 | **15/15** | ✅ 100% | **Quest #63 The Offset Verdict.** Same engine as `offset-anchor`; initial `normal` (both `auto` and `normal` pass through verbatim). `calc(5em + 20%)`→`calc(20% + 200px)` (length resolved + reordered percentage-first). **+15.** |
+| `css/motion/parsing/offset-anchor-parsing-valid.html` | 11/11 | **11/11** | ✅ 100% | **Quest #63 The Offset Verdict.** Already canonical (held); now routed through the `<position>` specified serializer with no change. |
+| `css/motion/parsing/offset-position-parsing-valid.html` | 12/12 | **12/12** | ✅ 100% | **Quest #63 The Offset Verdict.** Already canonical (held); routed through the serializer unchanged. |
 | `css/css-transforms/parsing/transform-origin-valid.html` | 5/16 | **16/16** | ✅ 100% | **Quest #62 The Anchored Verdict.** transform-origin = restricted two-value `<position>` + optional Z `<length>`. `_parseOriginPos` (peel trailing Z, then ≤2-token parse with #61's axis reorder/conflict rules), `_serializeOriginSpecified` (horizontal-first, fill omitted axis `center`, append Z). `center left 6px`→`left center 6px`. Registered in `_GCS_DEFAULTS`. Pure JS, no new Rust. **+11.** |
 | `css/css-transforms/parsing/transform-origin-computed.html` | 0/23 | **23/23** | ✅ 100% | **Quest #62 The Anchored Verdict.** Computed origin resolves to absolute lengths against the element's box (read via `_computedPropOf(el,'width'/'height')` — the test sets explicit px). `_originAxisPx` (keyword→fraction of base, `<lp>`/math via `_evalMath`), Z resolved as a pure length. `10%`→`20px`, `calc(-100% + 10px - 0.5em)` on 200px/em40 →`-210px`. Wired into `_normComputed`. **+23.** |
 | `css/css-transforms/parsing/perspective-origin-valid.html` | 17/18 | **18/18** | ✅ 100% | **Quest #62 The Anchored Verdict.** perspective-origin = full `<position>` (edge-offset forms, no Z) — reuses #61's `_parsePosition` verbatim. `bottom 10% right 20%`→`right 20% bottom 10%`. **+1.** |

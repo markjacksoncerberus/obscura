@@ -5367,6 +5367,10 @@ const _GCS_DEFAULTS = {
   // css-transforms. transform-origin/perspective-origin do not inherit; their
   // computed value resolves to absolute lengths (see _serializeOriginComputed).
   'transform-origin': '50% 50%', 'perspective-origin': '50% 50%',
+  // css-motion. offset-anchor/offset-position are a full <position>; their computed
+  // value resolves like object-position (keywords→%, far-edge/em offsets→px). They
+  // do not inherit. `auto`/`normal` pass through verbatim (not a <position>).
+  'offset-anchor': 'auto', 'offset-position': 'normal',
   // css-tables. table-layout does not inherit; the rest do.
   'border-collapse': 'separate', 'border-spacing': '0px', 'caption-side': 'top',
   'empty-cells': 'show', 'table-layout': 'auto',
@@ -6220,7 +6224,8 @@ const _initialOf = (kebab) => {
 // KEY subtlety: an offset attaches to an edge keyword ONLY in the 3/4-token
 // edge-offset form. In the 1/2-token form `right 40%` is two independent
 // components (H:`right`, V:`40%`), NOT `right` with a 40% offset.
-const _POSITION_PROPS = new Set(['object-position', 'background-position']);
+const _POSITION_PROPS = new Set(['object-position', 'background-position',
+  'mask-position', 'offset-anchor', 'offset-position']);
 const _POS_H = new Set(['left', 'right']);
 const _POS_V = new Set(['top', 'bottom']);
 // A token is a <length-percentage> (number+unit/%, bare number, or a math fn).
@@ -6298,11 +6303,60 @@ const _posComputeLen = (tok, emPx) => {
   const s = String(tok).trim();
   if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(s)) return _canonStandardValue(s);
   if (/^[+-]?(?:\d+\.?\d*|\.\d+)px$/i.test(s)) return _serNumber(parseFloat(s)) + 'px';
-  // A math expression mixing a percentage with a length can't resolve without
-  // layout (e.g. `calc(100% - 20px)`) — keep it as canonical calc.
-  if (/%/.test(s)) return _canonStandardValue(s);
+  // A math expression mixing a percentage with lengths can't fully resolve without
+  // layout, but the length terms still collapse to px (em/rem/…→px) while the
+  // percentage stays symbolic → canonical `calc(P% ± Lpx)` (e.g. `calc(20% - 5em)`
+  // → `calc(20% - 200px)`). Falls back to verbatim canon if it isn't a flat sum.
+  if (/%/.test(s)) {
+    const r = _resolvePctLengthCalc(s, emPx);
+    return r !== null ? r : _canonStandardValue(s);
+  }
   const r = _evalMath(s, 0, { lengths: true, emPx });
   return r === null ? _canonStandardValue(s) : _serNumber(r) + 'px';
+};
+// Split a calc() body into flat top-level additive terms `{sign, text}`, splitting
+// only on a `+`/`-` that sits at paren depth 0 and is whitespace-surrounded (the CSS
+// calc grammar requires that). Nested groups are kept whole inside a term.
+const _splitSumTerms = (body) => {
+  const s = String(body);
+  const terms = [];
+  let depth = 0, cur = '', sign = 1;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '(') { depth++; cur += ch; continue; }
+    if (ch === ')') { depth--; cur += ch; continue; }
+    if (depth === 0 && (ch === '+' || ch === '-') &&
+        i > 0 && /\s/.test(s[i - 1]) && i + 1 < s.length && /\s/.test(s[i + 1])) {
+      if (cur.trim()) terms.push({ sign, text: cur.trim() });
+      sign = ch === '-' ? -1 : 1;
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) terms.push({ sign, text: cur.trim() });
+  return terms.length ? terms : null;
+};
+// Resolve a `calc()` mixing a percentage with length terms into the canonical
+// `calc(P% ± Lpx)` form (percentage first), the lengths summed and resolved to px.
+// Returns null if it isn't a flat sum of % / resolvable-length terms.
+const _resolvePctLengthCalc = (s, emPx) => {
+  const m = /^calc\(([\s\S]*)\)$/i.exec(String(s).trim());
+  if (!m) return null;
+  const terms = _splitSumTerms(m[1]);
+  if (!terms) return null;
+  let pct = 0, px = 0, havePct = false;
+  for (const t of terms) {
+    const pm = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(t.text);
+    if (pm) { pct += t.sign * parseFloat(pm[1]); havePct = true; continue; }
+    const v = _evalMath(t.text, 0, { lengths: true, emPx });
+    if (v === null) return null;
+    px += t.sign * v;
+  }
+  if (!havePct) return null;                       // pure length → caller resolves to a single px
+  if (px === 0) return _serNumber(pct) + '%';
+  return 'calc(' + _serNumber(pct) + '% ' +
+    (px < 0 ? '- ' + _serNumber(-px) : '+ ' + _serNumber(px)) + 'px)';
 };
 // Computed value of one axis component (keyword origins → percentages).
 const _posCompComputed = (c, emPx) => {
@@ -6315,11 +6369,12 @@ const _posCompComputed = (c, emPx) => {
   // right/bottom: measured from the far edge → 100% − offset.
   const pm = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(off);
   if (pm) return _serNumber(100 - parseFloat(pm[1])) + '%';
-  const lm = /^([+-]?(?:\d+\.?\d*|\.\d+))([a-z]+)$/i.exec(off); // length → calc(100% ∓ |off|)
-  if (lm) {
-    const num = parseFloat(lm[1]);
-    return num < 0 ? 'calc(100% + ' + _serNumber(-num) + lm[2] + ')'
-                   : 'calc(100% - ' + _serNumber(num) + lm[2] + ')';
+  // length offset measured from the far edge → 100% − offset, the offset resolved
+  // to px (px stays px, em/rem/etc. → px), the sign folded into the calc operator.
+  const lpx = _evalMath(off, 0, { lengths: true, emPx });
+  if (lpx !== null) {
+    return lpx < 0 ? 'calc(100% + ' + _serNumber(-lpx) + 'px)'
+                   : 'calc(100% - ' + _serNumber(lpx) + 'px)';
   }
   return _canonStandardValue(off);
 };

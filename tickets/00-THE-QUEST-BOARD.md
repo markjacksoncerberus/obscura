@@ -104,6 +104,30 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-21 (Quest #63 The Offset Verdict — `mask-position` /
+`offset-anchor` / `offset-position` `<position>` serialization, +40):** Took #62's
+"next leverage (2)" (more `<position>` props). `mask-position` is the full
+`<position>#` grammar (comma-layered) identical to `background-position`, stored
+verbatim → mask-position-valid 12/23; `offset-anchor`/`offset-position` are a full
+`<position>` computing like object-position but weren't in `_GCS_DEFAULTS` →
+computed 0/14·0/15 (their valid tests were already canonical, passing verbatim).
+Fix (pure JS, no new Rust): added all three to `_POSITION_PROPS`; registered
+`offset-anchor` (initial `auto`) / `offset-position` (initial `normal`) in
+`_GCS_DEFAULTS` (`auto`/`normal` parse-fail → verbatim passthrough). Two computed
+refinements (these tests use `em` in offsets where object-position used only px):
+a far-edge length offset now resolves to px via `_evalMath` (`bottom 20em`→
+`calc(100% - 800px)`); a `calc()` mixing one `%` with length terms collapses the
+lengths to px keeping `%` symbolic, percentage-first (`calc(20% - 5em)`→
+`calc(20% - 200px)`) via new `_splitSumTerms`/`_resolvePctLengthCalc`. Both refinements
+are px-preserving → existing cases unchanged. **mask-position-valid 23/23,
+offset-anchor-computed 14/14, offset-position-computed 15/15; +40. Zero
+regressions** (background-position 31/32, object-position 18/16, both origins
+16/23/18/21 byte-identical; serialize-values 695, matches 669; obscura-dom 40/40).
+Cap: `mask-position-computed.html` is a wpt.live 404 (unwinnable). Next: gradient
+`at <position>` + gradient canon (still the widest adjacent tail; the new calc
+helpers are reusable for gradient stop positions). Scroll
+`tickets/63-the-offset-verdict.md`.
+
 **Session 2026-06-21 (Quest #62 The Anchored Verdict — `transform-origin` /
 `perspective-origin` serialization, +39):** Took #61's "next leverage (2)" (more
 `<position>` props). Both origins were stored verbatim (not in `_GCS_DEFAULTS` →
