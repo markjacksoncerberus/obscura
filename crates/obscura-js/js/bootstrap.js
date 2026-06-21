@@ -548,6 +548,7 @@ const _parseStyleDecls = (text) => {
       value = _canonStandardValue(value);
       if (_POSITION_PROPS.has(name)) value = _serializePositionSpecified(value);
       else if (_ORIGIN_PROPS.has(name)) value = _serializeOriginSpecified(name, value);
+      else if (_GRADIENT_PROPS.has(name)) value = _canonGradients(value, null, false);
     }
     out.push({ name, value, important });
   }
@@ -568,6 +569,7 @@ class CSSStyleDeclaration {
     if (!custom && stored === '') { this.removeProperty(name); return; }
     if (!custom && _POSITION_PROPS.has(name)) stored = _serializePositionSpecified(stored);
     else if (!custom && _ORIGIN_PROPS.has(name)) stored = _serializeOriginSpecified(name, stored);
+    else if (!custom && _GRADIENT_PROPS.has(name)) stored = _canonGradients(stored, null, false);
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
     // iterates _props in insertion order) resolves shared longhands last-write-wins
@@ -6477,6 +6479,84 @@ const _serializeOriginComputed = (el, kebab, value) => {
   }
   return s;
 };
+// ── Gradient canonicalization ──────────────────────────────────────────────
+// `radial-gradient`/`conic-gradient` (and their `repeating-` variants) carry an
+// `[ at <position> ]?` clause that shares the <position> grammar above. Specified
+// serialization canonicalizes that clause (horizontal-first reorder); computed
+// serialization additionally resolves it to percentages/px, drops a default
+// `at center center` (→ `50% 50%`), and computes each colour stop. Non-gradient
+// text (url(), `none`, the commas between multiple background layers) passes
+// through verbatim, so a multi-image list is preserved.
+const _GRADIENT_PROPS = new Set(['background-image']);
+const _GRADIENT_HEAD = /(?:repeating-)?(?:radial|conic)-gradient\(/i;
+// The first comma-separated argument is a gradient configuration (not a colour
+// stop) when it carries an `at`/`from` clause or a shape/size keyword.
+const _isGradientConfig = (arg) => _wsTokens(String(arg).toLowerCase()).some(
+  (t) => t === 'at' || t === 'from' || t === 'circle' || t === 'ellipse'
+    || /^(?:closest|farthest)-(?:side|corner)$/.test(t));
+// Canonicalize the gradient configuration chunk: reorder/compute the `at
+// <position>` clause while keeping any shape/size/angle prelude. In computed mode
+// a position that resolves to `50% 50%` drops the whole `at` clause (returning the
+// bare prelude, possibly empty → the caller filters it out).
+const _canonGradientConfig = (arg, el, computed) => {
+  const toks = _wsTokens(arg);
+  const atIdx = toks.findIndex((t) => t.toLowerCase() === 'at');
+  if (atIdx < 0) return arg;                       // no position clause to touch
+  const prelude = toks.slice(0, atIdx).join(' ');
+  const posStr = toks.slice(atIdx + 1).join(' ');
+  let pos;
+  if (computed) {
+    pos = _serializePositionComputed(el, posStr);
+    if (pos === '50% 50%') return prelude;         // default position → omit `at …`
+  } else {
+    pos = _serializePositionSpecified(posStr);
+  }
+  const clause = 'at ' + pos;
+  return prelude ? prelude + ' ' + clause : clause;
+};
+// Computed serialization of one colour stop: `<color> <length-percentage>{0,2}` →
+// the colour computed (`red`→`rgb(255, 0, 0)`), positions left as-is. A bare
+// transition hint (just a <length-percentage>) has no colour and passes through.
+const _canonGradientStop = (arg, el) => {
+  const toks = _wsTokens(String(arg).trim());
+  if (!toks.length || _isPosLP(toks[0])) return arg;
+  const col = _computeColor(toks[0]) || toks[0];
+  return toks.length > 1 ? col + ' ' + toks.slice(1).join(' ') : col;
+};
+const _canonGradientInner = (inner, el, computed) => {
+  const args = _commaSplitTop(inner).map((a) => a.trim());
+  if (!args.length) return inner;
+  let start = 0;
+  if (_isGradientConfig(args[0])) { args[0] = _canonGradientConfig(args[0], el, computed); start = 1; }
+  if (computed) for (let k = start; k < args.length; k++) args[k] = _canonGradientStop(args[k], el);
+  return args.filter((a) => a !== '').join(', ');
+};
+// Walk a value, transforming each gradient function in place (balanced-paren
+// scan) and leaving every other character untouched.
+const _canonGradients = (value, el, computed) => {
+  const s = String(value);
+  if (!/gradient\(/i.test(s)) return s;            // fast path: no gradient present
+  let out = '', i = 0;
+  while (i < s.length) {
+    const m = _GRADIENT_HEAD.exec(s.slice(i));
+    if (!m) { out += s.slice(i); break; }
+    const start = i + m.index;                      // next gradient head in the slice
+    const before = start > 0 ? s[start - 1] : '';
+    if (before && /[A-Za-z0-9_-]/.test(before)) {   // not a token boundary → skip head
+      out += s.slice(i, start + m[0].length); i = start + m[0].length; continue;
+    }
+    const open = start + m[0].length - 1;           // index of the '('
+    let depth = 0, j = open;
+    for (; j < s.length; j++) {
+      if (s[j] === '(') depth++;
+      else if (s[j] === ')' && --depth === 0) break;
+    }
+    if (j >= s.length) { out += s.slice(start); break; }   // unbalanced → leave as-is
+    out += s.slice(i, start) + m[0] + _canonGradientInner(s.slice(open + 1, j), el, computed) + ')';
+    i = j + 1;
+  }
+  return out;
+};
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
 const _FONT_SIZE_KEYWORDS = {
@@ -6489,6 +6569,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
+  if (_GRADIENT_PROPS.has(kebab)) return _canonGradients(v, el, true);
   if (kebab === 'font-size') {
     const k = String(v).trim().toLowerCase();
     if (k in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[k];
