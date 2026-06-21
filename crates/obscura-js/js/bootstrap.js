@@ -6492,54 +6492,128 @@ const _GRADIENT_HEAD = /(?:repeating-)?(?:linear|radial|conic)-gradient\(/i;
 const _GRADIENT_RADIAL_SIZE = /^(?:closest|farthest)-(?:side|corner)$/;
 const _ANGLE_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:deg|grad|rad|turn)$/i;
 const _isAngle = (t) => _ANGLE_RE.test(t) || /^calc\(/i.test(t);
+// The CSS <color-interpolation-method> color spaces, and the polar subset that
+// admits an optional <hue-interpolation-method>. A gradient may carry an
+// `in <color-space> [ <hue> hue ]?` clause (CSS Images 4 / CSS Color 4).
+const _GRADIENT_COLOR_SPACES = new Set([
+  'srgb', 'srgb-linear', 'display-p3', 'a98-rgb', 'prophoto-rgb', 'rec2020',
+  'lab', 'oklab', 'xyz', 'xyz-d50', 'xyz-d65', 'hsl', 'hwb', 'lch', 'oklch',
+]);
+const _GRADIENT_POLAR_SPACES = new Set(['hsl', 'hwb', 'lch', 'oklch']);
+const _HUE_METHODS = new Set(['shorter', 'longer', 'increasing', 'decreasing']);
+// A colour stop uses non-legacy (CSS Color 4) syntax — which makes the gradient's
+// default interpolation space `oklab` rather than `srgb`.
+const _isNonLegacyColorTok = (t) => /^(?:color|lab|lch|oklab|oklch|hwb)\(/i.test(String(t));
+// Locate the `in <color-space> [ <hue> hue ]?` interpolation-method clause inside a
+// gradient configuration's tokens → { start, len } (len 2 or 4), or null.
+const _interpolationClause = (toks) => {
+  for (let i = 0; i < toks.length; i++) {
+    if (toks[i].toLowerCase() !== 'in') continue;
+    const sp = toks[i + 1] && toks[i + 1].toLowerCase();
+    if (!sp || !_GRADIENT_COLOR_SPACES.has(sp)) continue;
+    let len = 2;
+    if (_GRADIENT_POLAR_SPACES.has(sp)
+        && toks[i + 2] && _HUE_METHODS.has(toks[i + 2].toLowerCase())
+        && toks[i + 3] && toks[i + 3].toLowerCase() === 'hue') len = 4;
+    return { start: i, len };
+  }
+  return null;
+};
+// Canonicalize an interpolation-method clause (tokens starting at `in`). Drops the
+// default space (`srgb` for legacy stops, `oklab` otherwise), canonicalizes the
+// `xyz` alias to `xyz-d65`, and drops the default `shorter hue`. Returns `'in …'`
+// or `''` (the default → the whole clause is omitted).
+const _canonInterpolationMethod = (toks, isLegacy) => {
+  let space = toks[1].toLowerCase();
+  if (space === 'xyz') space = 'xyz-d65';
+  let result = space;
+  if (toks.length > 2) {                              // polar `<hue> hue`
+    const hue = toks[2].toLowerCase();
+    if (hue !== 'shorter') result = space + ' ' + hue + ' hue';
+  }
+  return result === (isLegacy ? 'srgb' : 'oklab') ? '' : 'in ' + result;
+};
 // The first comma-separated argument is a gradient configuration (not a colour
 // stop). For `linear-gradient` it's a direction (`to <side>`/`<angle>`); for
-// `radial`/`conic` it carries an `at`/`from` clause or a shape/size keyword.
+// `radial`/`conic` it carries an `at`/`from` clause or a shape/size keyword. Any
+// type may additionally (or solely) carry an `in <color-space>` clause.
 const _isGradientConfig = (arg, type) => {
   const toks = _wsTokens(String(arg));
   if (!toks.length) return false;
+  if (_interpolationClause(toks)) return true;
   if (type === 'linear')
     return toks[0].toLowerCase() === 'to' || (toks.length === 1 && _isAngle(toks[0]));
-  return toks.some((t) => {
+  if (toks.some((t) => {
     const l = t.toLowerCase();
     return l === 'at' || l === 'from' || l === 'circle' || l === 'ellipse'
       || _GRADIENT_RADIAL_SIZE.test(l);
+  })) return true;
+  // A radial config may be a bare <radial-size> (`50px`, `50% 40em`) — once the
+  // default `ellipse` shape has been dropped at specified time, the size alone must
+  // still be recognized as a config (so computed serialization resolves it). Every
+  // token is size-ish and a colour stop's leading <color> never is. (Conic has no
+  // size, so this is radial-only.)
+  return type === 'radial' && toks.every((t) => {
+    const l = t.toLowerCase();
+    return _isPosLP(t) || _GRADIENT_RADIAL_SIZE.test(l) || l === 'circle' || l === 'ellipse';
   });
 };
-// Computed serialization drops the default radial shape (`ellipse`) and the
-// default size (`farthest-corner`) from the prelude (`ellipse farthest-corner
-// at …` → `at …`); a `circle` shape or any explicit size/length is kept.
-const _canonRadialPrelude = (toks) => toks.filter((t) => {
-  const l = t.toLowerCase();
-  return l !== 'ellipse' && l !== 'farthest-corner';
-});
-// Canonicalize the gradient configuration chunk. Linear: keep the direction,
-// but drop the default `to bottom` at computed time. Radial/conic: reorder/
-// compute the `at <position>` clause while keeping any shape/size/angle prelude
-// (radial defaults dropped at computed time); a position resolving to `50% 50%`
-// drops the whole `at` clause (returning the bare prelude, possibly empty → the
-// caller filters it out).
-const _canonGradientConfig = (arg, el, computed, type) => {
-  const toks = _wsTokens(arg);
+// Canonicalize a radial prelude (shape/size tokens before any `at`): drop the
+// default size `farthest-corner` always, and the default shape `ellipse` when an
+// explicit size is also present (`ellipse 50% 40em` → `50% 40em`); a `circle`
+// shape or an explicit size/length is kept. At computed time length tokens resolve
+// to px (`40em` → `640px`), percentages stay symbolic.
+const _canonRadialPrelude = (toks, computed, emPx) => {
+  const hasSize = toks.some((t) => _GRADIENT_RADIAL_SIZE.test(t.toLowerCase()) || _isPosLP(t));
+  const out = [];
+  for (const t of toks) {
+    const l = t.toLowerCase();
+    if (l === 'farthest-corner') continue;           // default size, always omitted
+    if (l === 'ellipse' && hasSize) continue;        // default shape, drop when a size is present
+    out.push(computed && _isPosLP(t) ? _posComputeLen(t, emPx) : t);
+  }
+  return out;
+};
+// Canonicalize the direction/prelude tokens (interpolation clause already removed).
+// Linear: keep the direction, dropping the default `to bottom` at computed time.
+// Radial/conic: reorder/compute the `at <position>` clause while keeping any
+// shape/size/angle prelude (radial defaults dropped); a position resolving to
+// `50% 50%` drops the whole `at` clause (bare prelude, possibly empty).
+const _canonGradientDirection = (toks, el, computed, type, emPx) => {
   if (type === 'linear') {
     if (computed && toks.join(' ').toLowerCase() === 'to bottom') return '';
     return toks.join(' ');
   }
   const atIdx = toks.findIndex((t) => t.toLowerCase() === 'at');
   let preToks = atIdx < 0 ? toks : toks.slice(0, atIdx);
-  if (type === 'radial' && computed) preToks = _canonRadialPrelude(preToks);
+  if (type === 'radial') preToks = _canonRadialPrelude(preToks, computed, emPx);
   const prelude = preToks.join(' ');
-  if (atIdx < 0) return prelude;                   // no position clause to touch
+  if (atIdx < 0) return prelude;                     // no position clause to touch
   const posStr = toks.slice(atIdx + 1).join(' ');
   let pos;
   if (computed) {
     pos = _serializePositionComputed(el, posStr);
-    if (pos === '50% 50%') return prelude;         // default position → omit `at …`
+    if (pos === '50% 50%') return prelude;           // default position → omit `at …`
   } else {
     pos = _serializePositionSpecified(posStr);
   }
   const clause = 'at ' + pos;
   return prelude ? prelude + ' ' + clause : clause;
+};
+// Canonicalize a gradient configuration chunk: split off the `in <color-space>`
+// interpolation clause (reordered to serialize AFTER the direction), canonicalize
+// each independently, then recombine `<direction> in <space>`.
+const _canonGradientConfig = (arg, el, computed, type, isLegacy) => {
+  const emPx = computed && el ? (parseFloat(_computedPropOf(el, 'font-size', 0)) || 16) : 16;
+  let toks = _wsTokens(arg);
+  let method = '';
+  const ic = _interpolationClause(toks);
+  if (ic) {
+    method = _canonInterpolationMethod(toks.slice(ic.start, ic.start + ic.len), isLegacy);
+    toks = toks.slice(0, ic.start).concat(toks.slice(ic.start + ic.len));
+  }
+  const dir = _canonGradientDirection(toks, el, computed, type, emPx);
+  return dir && method ? dir + ' ' + method : (dir || method);
 };
 // Computed serialization of one colour stop: `<color> <length-percentage>{0,2}` →
 // the colour computed (`red`→`rgb(255, 0, 0)`), positions left as-is. A bare
@@ -6553,8 +6627,17 @@ const _canonGradientStop = (arg, el) => {
 const _canonGradientInner = (inner, el, computed, type) => {
   const args = _commaSplitTop(inner).map((a) => a.trim());
   if (!args.length) return inner;
-  let start = 0;
-  if (_isGradientConfig(args[0], type)) { args[0] = _canonGradientConfig(args[0], el, computed, type); start = 1; }
+  const hasConfig = _isGradientConfig(args[0], type);
+  const start = hasConfig ? 1 : 0;
+  // A gradient interpolates in `oklab` by default, unless every colour stop is a
+  // legacy sRGB colour (named/hex/rgb/hsl), in which case the default is `srgb`.
+  // This selects which interpolation-method space is the (omitted) default.
+  let isLegacy = true;
+  for (let k = start; k < args.length; k++) {
+    const tok = _wsTokens(args[k])[0];
+    if (tok && _isNonLegacyColorTok(tok)) { isLegacy = false; break; }
+  }
+  if (hasConfig) args[0] = _canonGradientConfig(args[0], el, computed, type, isLegacy);
   if (computed) for (let k = start; k < args.length; k++) args[k] = _canonGradientStop(args[k], el);
   return args.filter((a) => a !== '').join(', ');
 };
