@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #61).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #62).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-transforms/parsing/transform-origin-valid.html` | 5/16 | **16/16** | ✅ 100% | **Quest #62 The Anchored Verdict.** transform-origin = restricted two-value `<position>` + optional Z `<length>`. `_parseOriginPos` (peel trailing Z, then ≤2-token parse with #61's axis reorder/conflict rules), `_serializeOriginSpecified` (horizontal-first, fill omitted axis `center`, append Z). `center left 6px`→`left center 6px`. Registered in `_GCS_DEFAULTS`. Pure JS, no new Rust. **+11.** |
+| `css/css-transforms/parsing/transform-origin-computed.html` | 0/23 | **23/23** | ✅ 100% | **Quest #62 The Anchored Verdict.** Computed origin resolves to absolute lengths against the element's box (read via `_computedPropOf(el,'width'/'height')` — the test sets explicit px). `_originAxisPx` (keyword→fraction of base, `<lp>`/math via `_evalMath`), Z resolved as a pure length. `10%`→`20px`, `calc(-100% + 10px - 0.5em)` on 200px/em40 →`-210px`. Wired into `_normComputed`. **+23.** |
+| `css/css-transforms/parsing/perspective-origin-valid.html` | 17/18 | **18/18** | ✅ 100% | **Quest #62 The Anchored Verdict.** perspective-origin = full `<position>` (edge-offset forms, no Z) — reuses #61's `_parsePosition` verbatim. `bottom 10% right 20%`→`right 20% bottom 10%`. **+1.** |
+| `css/css-transforms/parsing/perspective-origin-computed.html` | 17/21 | **21/21** | ✅ 100% | **Quest #62 The Anchored Verdict.** Edge offsets measured from their edge against the box (`right 30%`→`140px`, `right 20px`→`180px` on 200px). Shared `_originAxisPx`/`_serializeOriginComputed`. **+4.** |
 | `css/css-images/parsing/object-position-valid.html` | 11/18 | **18/18** | ✅ 100% | **Quest #61 The Positioned Verdict.** A CSS `<position>` value serializer (specified). Parses 1–4 tokens, fixes horizontal-then-vertical order, fills an omitted axis with `center`, retains edge-offset keywords. KEY: an offset attaches to an edge keyword ONLY in the 3/4-token edge-offset form — `right 40%` is two components (H:`right`, V:`40%`), not `right` with a 40% offset. `_parsePosition` + `_serializePositionSpecified`, wired into `setProperty`/`_parseStyleDecls` for `object-position`/`background-position`. Pure JS, no new Rust. **+7.** |
 | `css/css-images/parsing/object-position-computed.html` | 1/16 | **16/16** | ✅ 100% | **Quest #61 The Positioned Verdict.** Computed `<position>` serialization: keywords → percentages (`left`/`top`=0%, `center`=50%, `right`/`bottom`=100%), edge offsets → `100% − off` (percentage) or `calc(100% ∓ off)` (length, negative sign folded into `+`). em offsets resolve against the element's computed font-size (new `_evalMath` `opts.emPx`). A `calc()` mixing `%`+length stays as calc (round-trips). `_serializePositionComputed` wired into `_normComputed`. **+15.** |
 | `css/css-backgrounds/parsing/background-position-valid.html` | 23/31 | **31/31** | ✅ 100% | **Quest #61 The Positioned Verdict.** Same `<position>` engine, per comma-separated layer; background-position retains the 3/4-token edge-offset form in specified output (`center right 7%` → `right 7% center`). **+8.** |

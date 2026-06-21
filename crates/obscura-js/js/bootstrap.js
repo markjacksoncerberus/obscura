@@ -547,6 +547,7 @@ const _parseStyleDecls = (text) => {
       if (value === '') continue;
       value = _canonStandardValue(value);
       if (_POSITION_PROPS.has(name)) value = _serializePositionSpecified(value);
+      else if (_ORIGIN_PROPS.has(name)) value = _serializeOriginSpecified(name, value);
     }
     out.push({ name, value, important });
   }
@@ -566,6 +567,7 @@ class CSSStyleDeclaration {
     let stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
     if (!custom && stored === '') { this.removeProperty(name); return; }
     if (!custom && _POSITION_PROPS.has(name)) stored = _serializePositionSpecified(stored);
+    else if (!custom && _ORIGIN_PROPS.has(name)) stored = _serializeOriginSpecified(name, stored);
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
     // iterates _props in insertion order) resolves shared longhands last-write-wins
@@ -5362,6 +5364,9 @@ const _GCS_DEFAULTS = {
   // css-images. image-orientation/image-rendering inherit; object-* do not.
   'image-orientation': 'from-image', 'image-rendering': 'auto', 'object-fit': 'fill',
   'object-position': '50% 50%',
+  // css-transforms. transform-origin/perspective-origin do not inherit; their
+  // computed value resolves to absolute lengths (see _serializeOriginComputed).
+  'transform-origin': '50% 50%', 'perspective-origin': '50% 50%',
   // css-tables. table-layout does not inherit; the rest do.
   'border-collapse': 'separate', 'border-spacing': '0px', 'caption-side': 'top',
   'empty-cells': 'show', 'table-layout': 'auto',
@@ -6328,6 +6333,95 @@ const _serializePositionComputed = (el, value) => {
   }
   return out.join(', ');
 };
+// `transform-origin` / `perspective-origin` are a restricted <position> — the
+// two-value form only (no edge-offset 3/4-token grammar) — `transform-origin`
+// additionally taking a trailing Z <length>. The 2D axes reorder / default to
+// `center` exactly like <position>, but the COMPUTED value resolves to absolute
+// lengths against the element's box (percentages → px), unlike object-position.
+const _ORIGIN_PROPS = new Set(['transform-origin', 'perspective-origin']);
+// A <length> token (Z component): a dimension, bare `0`, or a math function —
+// but never a percentage (Z is a pure length per the grammar).
+const _isOriginLength = (t) => {
+  const s = String(t).toLowerCase();
+  if (/^(?:calc|min|max|clamp)\(/.test(s)) return true;
+  if (/%/.test(s)) return false;
+  return /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?[a-z]+$/i.test(s) || /^[+-]?0(?:\.0+)?$/.test(s);
+};
+// Parse `transform-origin`/`perspective-origin` into { h, v, z } (h/v each
+// { kw } or { lp }; z a length token or null when absent/disallowed), or null.
+const _parseOriginPos = (value, allowZ) => {
+  const toks = _wsTokens(String(value).trim());
+  let z = null;
+  if (allowZ && toks.length === 3) {
+    if (!_isOriginLength(toks[2])) return null;
+    z = toks[2];
+    toks.length = 2;
+  }
+  const n = toks.length;
+  if (n < 1 || n > 2) return null;
+  const isKw = (t) => { const l = t.toLowerCase(); return l === 'center' || _POS_H.has(l) || _POS_V.has(l); };
+  const comps = [];
+  for (const t of toks) {
+    if (isKw(t)) comps.push({ kw: t.toLowerCase() });
+    else if (_isPosLP(t)) comps.push({ lp: t });
+    else return null;
+  }
+  let h, v;
+  if (comps.length === 1) {
+    const c = comps[0];
+    if (c.kw && _POS_V.has(c.kw)) { h = { kw: 'center' }; v = c; }
+    else { h = c; v = { kw: 'center' }; }                   // H keyword / center / length
+  } else {
+    const [c1, c2] = comps;
+    const c1V = c1.kw && _POS_V.has(c1.kw);
+    const c2H = c2.kw && _POS_H.has(c2.kw);
+    if (c1V || c2H) { h = c2; v = c1; } else { h = c1; v = c2; }   // reorder to H-first
+    if ((h.kw && _POS_V.has(h.kw)) || (v.kw && _POS_H.has(v.kw))) return null; // axis conflict
+  }
+  return { h, v, z };
+};
+// Parse an origin value: `transform-origin` takes the restricted two-value form
+// plus an optional Z; `perspective-origin` takes the FULL <position> grammar
+// (edge-offset forms like `bottom 10% right 20%`) and never a Z.
+const _parseOrigin = (kebab, value) => {
+  if (kebab === 'transform-origin') return _parseOriginPos(value, true);
+  return _parsePosition(value);
+};
+const _serializeOriginSpecified = (kebab, value) => {
+  const p = _parseOrigin(kebab, value);
+  if (!p) return value.trim();
+  let s = _posCompSpec(p.h) + ' ' + _posCompSpec(p.v);
+  if (p.z != null) s += ' ' + _canonStandardValue(p.z);
+  return s;
+};
+// Computed length (px) of one origin axis component against `base` (the box
+// width or height in px). Keyword origins → fraction of base; an edge offset is
+// measured from that edge (right/bottom → base − offset); lengths/percentages/
+// math resolve against base. Returns null when unresolvable (e.g. auto box).
+const _originAxisPx = (c, base, emPx) => {
+  if (c.lp != null) return _evalMath(c.lp, isFinite(base) ? base : 0, { lengths: true, emPx });
+  if (c.kw === 'center') return isFinite(base) ? 0.5 * base : null;
+  const fromEnd = (c.kw === 'right' || c.kw === 'bottom');
+  if (c.off == null) return isFinite(base) ? (fromEnd ? base : 0) : null;
+  const o = _evalMath(c.off, isFinite(base) ? base : 0, { lengths: true, emPx });
+  if (o === null) return null;
+  return fromEnd ? base - o : o;
+};
+const _serializeOriginComputed = (el, kebab, value) => {
+  const p = _parseOrigin(kebab, value);
+  if (!p) return value.trim();
+  const fs = el ? parseFloat(_computedPropOf(el, 'font-size', 0)) : 16;
+  const emPx = fs > 0 ? fs : 16;
+  const w = el ? parseFloat(_computedPropOf(el, 'width', 0)) : NaN;
+  const h = el ? parseFloat(_computedPropOf(el, 'height', 0)) : NaN;
+  const fmt = (x, c) => (x === null ? _posCompSpec(c) : _serNumber(x) + 'px');
+  let s = fmt(_originAxisPx(p.h, w, emPx), p.h) + ' ' + fmt(_originAxisPx(p.v, h, emPx), p.v);
+  if (p.z != null) {
+    const r = _evalMath(p.z, 0, { lengths: true, emPx });
+    s += ' ' + (r === null ? _canonStandardValue(p.z) : _serNumber(r) + 'px');
+  }
+  return s;
+};
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
 const _FONT_SIZE_KEYWORDS = {
@@ -6339,6 +6433,7 @@ const _FONT_SIZE_KEYWORDS = {
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
+  if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
   if (kebab === 'font-size') {
     const k = String(v).trim().toLowerCase();
     if (k in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[k];
