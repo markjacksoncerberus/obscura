@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #55).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-20 (Quest #56).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-variables/test_variable_legal_values.html` | 0/23 | **23/23** | ✅ 100% | **Quest #56 The Lawful Verdict.** Custom-property `<declaration-value>` validity (new `_isBalancedDeclValue` — unmatched `)`/`]`/`}` reject, openers OK; wired into `_cssParseDecls`/`_parseStyleDecls`/`setProperty`, dropping an invalid value so the prior one survives), a nesting-aware `_cssSplitRules` block scanner (a stray `}` inside a value no longer closes the rule early), and invalid-at-computed-time for `<color>` (`_computedPropOf` rejects a `var()`-substituted non-colour → initial/inherited). Pure JS, no new Rust. **+23.** Caps: filter/background substitution (token-boundary), shorthand→longhand |
 | `css/css-variables/variable-definition.html` | 11/73 | **71/73** | ✅ 97% | **Quest #55 The Custom Verdict.** Rewrote `CSSStyleDeclaration` (custom-prop name validation, whitespace canonicalization, `!important` tracking), fixed the `style` Proxy `set` trap (was storing `cssText` as a plain prop), lazily synced the `style` content attribute into the live decl, gave `getComputedStyle` real custom-property inheritance + CSS-wide keyword resolution. Pure JS, no new Rust. **+60.** Caps: unknown-property drop (`-var4`, ×2) |
 | `css/css-variables/variable-definition-cascading.html` | 5/9 | **9/9** | ✅ 100% | **Quest #55.** Custom properties always inherit; `_computedCustomProp` walks the ancestor chain. **+4** |
 | `css/css-variables/variable-definition-keywords.html` | 0/8 | **8/8** | ✅ 100% | **Quest #55.** CSS-wide keywords on custom props: computed `initial`→`""`, `inherit`/`unset`/`revert`→parent; specified style echoes the keyword verbatim (needed the content-attribute sync). **+8** |

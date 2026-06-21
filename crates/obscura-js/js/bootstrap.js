@@ -410,6 +410,38 @@ const _isValidCustomPropName = (name) => name.length > 2 && name.startsWith('--'
 // internal whitespace preserved; an empty (all-whitespace) value becomes a single
 // space — the empty-value form the CSSOM round-trips (`--x: ;` reads back as " ").
 const _canonCustomValue = (value) => { const t = String(value).trim(); return t === '' ? ' ' : t; };
+// Is `value` a valid <declaration-value> (the grammar a custom property accepts)?
+// Any token sequence is allowed EXCEPT one containing an unmatched `)`, `]`, or
+// `}` — note unmatched OPENERS are fine (`--x: (` is valid). Brackets inside
+// strings and /* */ comments don't count. A closer must match the most recent
+// opener exactly: `(])` is invalid (the `]` doesn't match the open `(`).
+const _isBalancedDeclValue = (value) => {
+  const s = String(value);
+  const n = s.length;
+  const stack = [];
+  let i = 0;
+  while (i < n) {
+    const c = s[i];
+    if (c === '/' && s[i + 1] === '*') {                 // comment
+      i += 2;
+      while (i < n && !(s[i] === '*' && s[i + 1] === '/')) i++;
+      i += 2; continue;
+    }
+    if (c === '"' || c === "'") {                          // string
+      const q = c; i++;
+      while (i < n && s[i] !== q) { if (s[i] === '\\') i++; i++; }
+      i++; continue;
+    }
+    if (c === '(' || c === '[' || c === '{') stack.push(c);
+    else if (c === ')' || c === ']' || c === '}') {
+      const top = stack[stack.length - 1];
+      if ((c === ')' && top === '(') || (c === ']' && top === '[') || (c === '}' && top === '{')) stack.pop();
+      else return false;                                  // unmatched closer
+    }
+    i++;
+  }
+  return true;
+};
 // Parse a declaration block (an inline style string / cssText) into an ordered
 // list of { name, value, important }. Invalid custom-property names are dropped;
 // standard names are ASCII-lowercased (custom names keep their case); standard
@@ -427,6 +459,7 @@ const _parseStyleDecls = (text) => {
     if (m) { important = true; value = value.slice(0, m.index); }
     if (name.startsWith('--')) {
       if (!_isValidCustomPropName(name)) continue;
+      if (!_isBalancedDeclValue(value)) continue;        // invalid <declaration-value> → drop
       value = _canonCustomValue(value);
     } else {
       name = name.toLowerCase();
@@ -446,6 +479,7 @@ class CSSStyleDeclaration {
     if (custom) { if (!_isValidCustomPropName(name)) return; }
     else name = name.toLowerCase();
     value = String(value == null ? '' : value);
+    if (custom && value !== '' && !_isBalancedDeclValue(value)) return; // invalid <declaration-value> → ignore
     if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
     const stored = custom ? _canonCustomValue(value) : value.trim();
     if (!custom && stored === '') { this.removeProperty(name); return; }
@@ -5263,6 +5297,9 @@ const _cssParseDecls = (body) => {
     if (m) { important = true; value = value.slice(0, m.index).trim(); }
     // Custom properties keep their case; standard properties are ASCII-lowercased.
     const name = rawName.startsWith('--') ? rawName : rawName.toLowerCase();
+    // A custom property with an invalid <declaration-value> is dropped — the
+    // earlier valid declaration of the same name (if any) is preserved.
+    if (name.startsWith('--') && !_isBalancedDeclValue(value)) continue;
     out[name] = { value, important };
   }
   return out;
@@ -5279,10 +5316,16 @@ const _cssSplitRules = (cssText) => {
     if (j >= n) break;
     if (css[j] === '}') { i = j + 1; continue; }
     const prelude = css.slice(i, j).trim();
-    let depth = 1, k = j + 1;
-    while (k < n && depth > 0) {
-      if (css[k] === '{') depth++;
-      else if (css[k] === '}') depth--;
+    // Find the matching close-brace, tracking ()/[]/{} nesting so a stray `}`
+    // inside a declaration value (e.g. `--x: (})`) doesn't close the rule early.
+    let k = j + 1; const stack = ['{'];
+    while (k < n && stack.length > 0) {
+      const c = css[k];
+      if (c === '{' || c === '(' || c === '[') stack.push(c);
+      else if (c === '}' || c === ')' || c === ']') {
+        const top = stack[stack.length - 1];
+        if ((c === '}' && top === '{') || (c === ')' && top === '(') || (c === ']' && top === '[')) stack.pop();
+      }
       k++;
     }
     const body = css.slice(j + 1, k - 1);
@@ -5751,11 +5794,21 @@ const _computedPropOf = (el, kebab, guard) => {
   // substitution fails (undefined with no fallback, cycle, …) the property is
   // invalid at computed-value time → it becomes the inherited or initial value.
   if (/var\(/i.test(v)) {
+    const invalidAtComputedTime = () => (_INHERITED_PROPS.has(kebab)
+      ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab)));
     const sub = _substituteVars(el, v, 0);
-    if (sub == null || sub === '') {
-      return _INHERITED_PROPS.has(kebab) ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab));
-    }
+    if (sub == null || sub === '') return invalidAtComputedTime();
     v = sub;
+    // A value substituted from var() that doesn't match the property's grammar is
+    // invalid at computed-value time (→ inherited-or-initial). We validate the
+    // <color> properties (the substituted value must be a real colour, unless it
+    // is a CSS-wide keyword or currentColor, which are resolved further below).
+    if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
+      const low = v.trim().toLowerCase();
+      if (!_CSS_WIDE.has(low) && low !== 'currentcolor' && !_isValidColor(v)) {
+        return invalidAtComputedTime();
+      }
+    }
   }
   const low = v.toLowerCase();
   if (!v) {
