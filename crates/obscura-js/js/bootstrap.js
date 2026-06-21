@@ -6488,21 +6488,48 @@ const _serializeOriginComputed = (el, kebab, value) => {
 // text (url(), `none`, the commas between multiple background layers) passes
 // through verbatim, so a multi-image list is preserved.
 const _GRADIENT_PROPS = new Set(['background-image']);
-const _GRADIENT_HEAD = /(?:repeating-)?(?:radial|conic)-gradient\(/i;
+const _GRADIENT_HEAD = /(?:repeating-)?(?:linear|radial|conic)-gradient\(/i;
+const _GRADIENT_RADIAL_SIZE = /^(?:closest|farthest)-(?:side|corner)$/;
+const _ANGLE_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:deg|grad|rad|turn)$/i;
+const _isAngle = (t) => _ANGLE_RE.test(t) || /^calc\(/i.test(t);
 // The first comma-separated argument is a gradient configuration (not a colour
-// stop) when it carries an `at`/`from` clause or a shape/size keyword.
-const _isGradientConfig = (arg) => _wsTokens(String(arg).toLowerCase()).some(
-  (t) => t === 'at' || t === 'from' || t === 'circle' || t === 'ellipse'
-    || /^(?:closest|farthest)-(?:side|corner)$/.test(t));
-// Canonicalize the gradient configuration chunk: reorder/compute the `at
-// <position>` clause while keeping any shape/size/angle prelude. In computed mode
-// a position that resolves to `50% 50%` drops the whole `at` clause (returning the
-// bare prelude, possibly empty → the caller filters it out).
-const _canonGradientConfig = (arg, el, computed) => {
+// stop). For `linear-gradient` it's a direction (`to <side>`/`<angle>`); for
+// `radial`/`conic` it carries an `at`/`from` clause or a shape/size keyword.
+const _isGradientConfig = (arg, type) => {
+  const toks = _wsTokens(String(arg));
+  if (!toks.length) return false;
+  if (type === 'linear')
+    return toks[0].toLowerCase() === 'to' || (toks.length === 1 && _isAngle(toks[0]));
+  return toks.some((t) => {
+    const l = t.toLowerCase();
+    return l === 'at' || l === 'from' || l === 'circle' || l === 'ellipse'
+      || _GRADIENT_RADIAL_SIZE.test(l);
+  });
+};
+// Computed serialization drops the default radial shape (`ellipse`) and the
+// default size (`farthest-corner`) from the prelude (`ellipse farthest-corner
+// at …` → `at …`); a `circle` shape or any explicit size/length is kept.
+const _canonRadialPrelude = (toks) => toks.filter((t) => {
+  const l = t.toLowerCase();
+  return l !== 'ellipse' && l !== 'farthest-corner';
+});
+// Canonicalize the gradient configuration chunk. Linear: keep the direction,
+// but drop the default `to bottom` at computed time. Radial/conic: reorder/
+// compute the `at <position>` clause while keeping any shape/size/angle prelude
+// (radial defaults dropped at computed time); a position resolving to `50% 50%`
+// drops the whole `at` clause (returning the bare prelude, possibly empty → the
+// caller filters it out).
+const _canonGradientConfig = (arg, el, computed, type) => {
   const toks = _wsTokens(arg);
+  if (type === 'linear') {
+    if (computed && toks.join(' ').toLowerCase() === 'to bottom') return '';
+    return toks.join(' ');
+  }
   const atIdx = toks.findIndex((t) => t.toLowerCase() === 'at');
-  if (atIdx < 0) return arg;                       // no position clause to touch
-  const prelude = toks.slice(0, atIdx).join(' ');
+  let preToks = atIdx < 0 ? toks : toks.slice(0, atIdx);
+  if (type === 'radial' && computed) preToks = _canonRadialPrelude(preToks);
+  const prelude = preToks.join(' ');
+  if (atIdx < 0) return prelude;                   // no position clause to touch
   const posStr = toks.slice(atIdx + 1).join(' ');
   let pos;
   if (computed) {
@@ -6523,11 +6550,11 @@ const _canonGradientStop = (arg, el) => {
   const col = _computeColor(toks[0]) || toks[0];
   return toks.length > 1 ? col + ' ' + toks.slice(1).join(' ') : col;
 };
-const _canonGradientInner = (inner, el, computed) => {
+const _canonGradientInner = (inner, el, computed, type) => {
   const args = _commaSplitTop(inner).map((a) => a.trim());
   if (!args.length) return inner;
   let start = 0;
-  if (_isGradientConfig(args[0])) { args[0] = _canonGradientConfig(args[0], el, computed); start = 1; }
+  if (_isGradientConfig(args[0], type)) { args[0] = _canonGradientConfig(args[0], el, computed, type); start = 1; }
   if (computed) for (let k = start; k < args.length; k++) args[k] = _canonGradientStop(args[k], el);
   return args.filter((a) => a !== '').join(', ');
 };
@@ -6552,7 +6579,9 @@ const _canonGradients = (value, el, computed) => {
       else if (s[j] === ')' && --depth === 0) break;
     }
     if (j >= s.length) { out += s.slice(start); break; }   // unbalanced → leave as-is
-    out += s.slice(i, start) + m[0] + _canonGradientInner(s.slice(open + 1, j), el, computed) + ')';
+    const head = m[0].toLowerCase();
+    const type = head.includes('linear') ? 'linear' : head.includes('radial') ? 'radial' : 'conic';
+    out += s.slice(i, start) + m[0] + _canonGradientInner(s.slice(open + 1, j), el, computed, type) + ')';
     i = j + 1;
   }
   return out;
