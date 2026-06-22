@@ -13,12 +13,21 @@ description = "Headless HTML/CSS rendering for Obscura, backed by the Blitz engi
 # `svg`/`woff` are pure-Rust and keep SVG images and WOFF/WOFF2 web fonts
 # working. `accessibility`, `custom-widget`, and `file_input` are irrelevant to
 # headless rasterization and stay off.
-blitz-dom = { version = "=0.3.0-alpha.4", default-features = false, features = ["svg", "woff"] }
-blitz-html = "=0.3.0-alpha.4"
-blitz-paint = "=0.3.0-alpha.4"
-blitz-traits = "=0.3.0-alpha.4"
-anyrender = "0.10"
-anyrender_vello_cpu = "0.13"
+#
+# IMPORTANT: these `=` versions MUST match the version in the local Blitz fork
+# (`../blitz`, wired via `[patch.crates-io]` in the root Cargo.toml). The patch
+# only applies when the fork's version satisfies this requirement; if they
+# drift (e.g. the fork bumps to a new alpha), cargo SILENTLY drops the patch
+# (`warning: patch ... was not used`) and builds against the upstream registry
+# crate instead — losing every fork fix (SVG currentColor, WOFF2 fonts, …).
+# When bumping the fork, bump these in lockstep and `anyrender*` below to the
+# versions the fork's workspace pins.
+blitz-dom = { version = "=0.3.0-alpha.5", default-features = false, features = ["svg", "woff"] }
+blitz-html = "=0.3.0-alpha.5"
+blitz-paint = "=0.3.0-alpha.5"
+blitz-traits = "=0.3.0-alpha.5"
+anyrender = "0.11"
+anyrender_vello_cpu = "0.14"
 # 2D geometry/paint primitives. Pinned to the same versions Blitz/anyrender
 # resolve to so the `PaintScene` brush/shape types unify across crates.
 peniko = "0.6"
