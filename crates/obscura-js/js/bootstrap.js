@@ -550,7 +550,7 @@ const _parseStyleDecls = (text) => {
       else if (_ORIGIN_PROPS.has(name)) value = _serializeOriginSpecified(name, value);
       else if (_GRADIENT_PROPS.has(name)) {
         if (_imageFuncInvalid(value)) continue;            // invalid image() → drop declaration
-        value = _canonGradients(value, null, false);
+        value = _canonImageSet(_canonGradients(value, null, false));
       } else if (_COLOR_PROPS.has(name)) {
         if (_hasImageFunc(value)) continue;                // image() is not a <color> → drop
         value = _canonColorSpecified(value);
@@ -581,7 +581,7 @@ class CSSStyleDeclaration {
     else if (!custom && _ORIGIN_PROPS.has(name)) stored = _serializeOriginSpecified(name, stored);
     else if (!custom && _GRADIENT_PROPS.has(name)) {
       if (_imageFuncInvalid(stored)) return;               // invalid image() → ignore (keep prior value)
-      stored = _canonGradients(stored, null, false);
+      stored = _canonImageSet(_canonGradients(stored, null, false));
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
       stored = _canonColorSpecified(stored);
@@ -6572,7 +6572,7 @@ const _serializeOriginComputed = (el, kebab, value) => {
 // `at center center` (→ `50% 50%`), and computes each colour stop. Non-gradient
 // text (url(), `none`, the commas between multiple background layers) passes
 // through verbatim, so a multi-image list is preserved.
-const _GRADIENT_PROPS = new Set(['background-image', 'mask-image', 'list-style-image', 'border-image-source']);
+const _GRADIENT_PROPS = new Set(['background-image', 'mask-image', 'list-style-image', 'border-image-source', 'cursor']);
 const _GRADIENT_HEAD = /(?:repeating-)?(?:linear|radial|conic)-gradient\(/i;
 const _GRADIENT_RADIAL_SIZE = /^(?:closest|farthest)-(?:side|corner)$/;
 const _ANGLE_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:deg|grad|rad|turn)$/i;
@@ -6936,6 +6936,45 @@ const _canonGradients = (value, el, computed) => {
   }
   return out;
 };
+// image-set() / -webkit-image-set(): a bare <string> option is shorthand for
+// url(<string>), and CSSOM serializes it wrapped — image-set("a" 1x) →
+// image-set(url("a") 1x). Balanced-paren scan wraps the leading string of each
+// top-level option in url(); the resolution / type() tail and any option that is
+// already a url()/<image>/gradient pass through verbatim, and a nested image-set()
+// inside light-dark()/etc. is reached by the flat head scan. (Strings are already
+// double-quote-normalized by _canonStandardValue, so the wrap is byte-faithful.)
+const _canonImageSet = (value) => {
+  const s = String(value);
+  if (!/image-set\(/i.test(s)) return s;            // fast path: no image-set()
+  let out = '', i = 0;
+  const re = /(?:-webkit-)?image-set\(/gi;
+  while (i < s.length) {
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (!m) { out += s.slice(i); break; }
+    const start = m.index;
+    const before = start > 0 ? s[start - 1] : '';
+    if (before && /[A-Za-z0-9_-]/.test(before)) {   // embedded in a larger ident → not a function head
+      out += s.slice(i, start + m[0].length); i = start + m[0].length; continue;
+    }
+    const open = start + m[0].length - 1;           // index of the '('
+    let depth = 0, j = open;
+    for (; j < s.length; j++) {
+      if (s[j] === '(') depth++;
+      else if (s[j] === ')' && --depth === 0) break;
+    }
+    const closed = j < s.length;
+    const innerRaw = s.slice(open + 1, closed ? j : s.length);
+    const inner = _splitCommaQuoted(innerRaw).map((opt) => {
+      const lead = /^(\s*)("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')(.*)$/s.exec(opt);
+      if (!lead) return opt;                        // no leading <string> → option verbatim
+      return lead[1] + 'url(' + lead[2] + ')' + lead[3];
+    }).join(',');
+    out += s.slice(i, start) + m[0] + inner + ')';
+    i = closed ? j + 1 : s.length;
+  }
+  return out;
+};
 // Resolve every url() token in a computed <image>/<url> value to its absolute URL
 // against the element's document base URL (CSS Values "the computed value of a
 // <url> is the absolute URL" — drafts.csswg.org/css-values/#relative-urls),
@@ -7078,7 +7117,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
-  if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonGradients(v, el, true), el);
+  if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);
   if (kebab === 'content') return _canonContent(v, el, true);
   if (kebab === 'font-size') {
     const k = String(v).trim().toLowerCase();

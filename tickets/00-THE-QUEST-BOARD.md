@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~74~~ | ✅ [The Pointed Verdict](74-the-pointed-verdict.md) | `css/css-ui/parsing/cursor-{computed,valid}` (the `cursor` property — `<image>` items: gradients + `image-set()`) | **37/39 · 45/46** | ⚔️ | **SECURED — +4.** `cursor` was registered for computed defaults but not in `_GRADIENT_PROPS`, so its gradient items serialized verbatim (cursor-computed 36/39) and bare-string `image-set()` options weren't wrapped (cursor-valid 42/46). Fix (pure JS, no new Rust): (1) added `cursor` to `_GRADIENT_PROPS` → its `<image>` items route through the existing `_canonGradients`/`_canonUrls` engine (the trailing hotspot coords + cursor keyword pass through verbatim) — fixed the radial computed case; (2) new `_canonImageSet` balanced-paren-scans `image-set(`/`-webkit-image-set(` heads and wraps a leading bare `<string>` option in `url()` (`image-set("u" 1x)`→`image-set(url("u") 1x)`, incl. nested in `light-dark()`; `_splitCommaQuoted` so a `,` in a string is safe), wired into all `_GRADIENT_PROPS` paths after `_canonGradients`, fast-pathing out when no `image-set(`. **The 2 remaining cursor-computed fails are upstream WPT test bugs** — lines 52/54 have malformed expected values (the gradient's `)` is missing, the trailing keyword pulled inside; line 54 even expects `pointer` for a `crosshair` input). No correct browser passes them; our output is the correct serialization. Zero regressions (surgically scoped: cursor-only + image-set-only; gradient family 18/43/13/1398, color 17, position 32, content-valid 46 byte-identical; obscura-dom 40/40; serialize-values/background-image-valid/mask-image 404-flux but proven zero image-set/cursor refs). Caps: `calc(2 + 0)`→`calc(2)` integer-calc simplification (the last cursor-valid fail; serialize-values hot-path risk, own quest); `light-dark()` resolution; `resolve-relative-to-stylesheet`; valid-prop registry; fresh realm. |
 | ~~73~~ | ✅ [The Storied Verdict](73-the-storied-verdict.md) | `css/css-content/parsing/content-{computed,valid}` (the `content` property — content-list serialization) | **41/41 · 46/46** | ⚔️ | **SECURED — +49.** `content` was never registered for computed style → `getComputedStyle(el).content` returned `""`, failing every `content-computed` support check (0/41); the specified path stored values verbatim, never dropping the default `decimal` counter-style (`content-valid` 38/46). Fix (pure JS, no new Rust): (1) registered `content: 'normal'` in `_GCS_DEFAULTS`; (2) new `_canonContent` wired into `_parseStyleDecls`/`setProperty` (specified) + `_normComputed` (computed) — `_canonCounterFns` drops a default `decimal` `<counter-style>` from `counter()`/`counters()` (`counter(n, dECiMaL)`→`counter(n)`, case-insensitive; custom styles kept; escaped names like `counter(\})` byte-preserved), gradient items route through the existing `_canonGradients`, url()s absolutize via `_canonUrls`; (3) quote-aware `_splitCommaQuoted` (counters() string separators may contain `,`); (4) linear `to <side-or-corner>` reorder in `_canonGradientDirection` (`to top right`→`to right top`, CSSOM order — the one gradient content-item needing a new rule; radial `ellipse`-drop + conic `from <angle>` were already handled). content-computed 0→41, content-valid 38→46. Zero regressions (gradient family 1398/932/18/43/13/3, background-image 13, mask-image 47, serialize-values 696/697, color 17/16, position 32, var-bg 10, shorthand 7, cursor 36/42 unchanged, createElement 147; obscura-dom 40/40). Caps: `cursor` gradient + image-set canon (cursor-computed 36/39, near-free +3); `resolve-relative-to-stylesheet` (external-CSS loading); comprehensive valid-prop registry; fresh realm. |
 | ~~72~~ | ✅ [The Lowercased Verdict](72-the-lowercased-verdict.md) | `css/css-backgrounds/parsing/{background,border}-color-valid` (keyword-`<color>` canonicalization) | **9/9 · 7/7** | ⚔️ | **SECURED — +2.** CSSOM canonical serialization ASCII-lowercases a keyword ident, but #68's `_canonColorSpecified` kept `currentColor`/named/CSS-wide keywords verbatim → `background-color: currentColor` serialized `currentColor` not `currentcolor`. Fix (pure JS, no new Rust): (1) `_canonColorSpecified` returns the lowercased keyword for that branch (legacy hex/rgb/hsl still resolve; modern fns/`var()` still verbatim); (2) new `_canonColorShorthand` + `_COLOR_SHORTHAND_PROPS` (`border-color`/`border-block-color`/`border-inline-color`) splits a value into top-level `<color>` tokens via paren-aware `_splitTopLevel` (`rgb(0, 0, 255)` stays whole) and canonicalizes each, wired into `_parseStyleDecls` + `setProperty`. Zero regressions (serialize-values 695/697, color 17/16/95, gradient/position/image family unchanged; obscura-dom 40/40). Foundational: every 404'd `*-color-valid` longhand + border-color flow-relative shorthands get the `currentColor` green free once served. Caps: `resolve-relative-to-stylesheet` (external-CSS loading); comprehensive valid-prop registry; broaden `_canonUrls` to `cursor`/`content`/`@font-face src`; fresh realm. |
 | ~~70~~ | ✅ [The Resolved Verdict](70-the-resolved-verdict.md) | `css/css-values/urls/resolve-relative-to-base.sub.html` (computed-time URL absolutization) | **2/2** | ⚔️ | **SECURED — +2.** Took #69's "next leverage (1)" — the foundational `<url>`-computed primitive (the `image-set`/`cross-fade` pointers turned out not to exist as WPT tests; the `<url>` family lives in `css/css-values/urls/`). A relative `url()` in an `<image>`/`<url>` property must compute to its absolute URL against the document base URL (`<base href>`), but Obscura stored it verbatim (non-variable `url(images/test.png)`, variable `url("images/test.png")`). New `_canonUrls(value, el)` (pure JS, no new Rust): scans for `url()` tokens (both quoted functional + unquoted url-token forms), resolves each via `new URL(raw, el.baseURI).href`, serializes double-quoted; idempotent/fail-safe — already-absolute or unparseable (`{{token}}`) urls round-trip byte-identical (empirically verified in-engine). Wired into `_normComputed` after `_canonGradients` for `_GRADIENT_PROPS` (also absolutizes `url()`s nested in `image()`/`cross-fade()`). Specified time untouched (relative stays as written). Zero regressions (mask-image-computed 47/47 — its `url("http://{{host}}/")` round-trips byte-identical, the key idempotency proof; gradient family 18/43/1398, color 17/16, serialize-values 695/697, background-position-computed 32, createElement 147; obscura-dom 40/40). Caps: `resolve-relative-to-stylesheet` (0/3, needs external-CSS loading w/ per-stylesheet base); broaden `_canonUrls` to `cursor`/`content`/`@font-face src`; `image-function-invalid` (per-prop validation). |
@@ -112,6 +113,44 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-22 (Quest #74 The Pointed Verdict — `cursor` `<image>` items:
+gradients + `image-set()`, +4):** Took #73's named "next leverage (1)" — the
+near-free `cursor` gradient registration. `cursor` was already in `_GCS_DEFAULTS`
+(so the 36 keyword forms passed computed) but **not** in `_GRADIENT_PROPS`, so its
+gradient items serialized verbatim (cursor-computed 36/39) and bare-string
+`image-set()` options weren't wrapped (cursor-valid 42/46). **Fix (pure JS,
+`bootstrap.js`, NO new Rust):** (1) added `cursor` to `_GRADIENT_PROPS` so its
+`<image>` items route through the existing `_canonGradients`/`_canonUrls` engine —
+the balanced-paren scan canonicalizes each gradient in place and leaves the trailing
+hotspot coords + final cursor keyword (`, auto`) verbatim; (2) new **`_canonImageSet
+(value)`** balanced-paren-scans `image-set(`/`-webkit-image-set(` heads and wraps a
+*leading* bare `<string>` option in `url()` (`image-set("u" 1x)`→`image-set(url("u")
+1x)`, including one nested inside `light-dark()` — the flat head scan reaches it),
+splitting options with the quote-aware `_splitCommaQuoted`; wired into all
+`_GRADIENT_PROPS` specified + computed paths after `_canonGradients`, fast-pathing
+out when there's no `image-set(` token so every other `<image>` prop is
+byte-identical. cursor-computed 36→37, cursor-valid 42→45. **HONEST CAP — the 2
+remaining cursor-computed fails are bugs in the upstream WPT test:** lines 52/54
+have malformed expected values (the gradient's closing `)` is missing and the
+trailing cursor keyword got pulled inside the function; line 54 even expects
+`pointer` for a `crosshair` input). No correct browser passes them — our output is
+the correct, balanced serialization; verified by fetching the raw source and
+counting parens. **+4. ZERO regressions** — surgically scoped (`cursor` ∈
+`_GRADIENT_PROPS` touches only the cursor prop; `_canonImageSet` activates only on
+`image-set(`, absent from every swept test except cursor): gradient-position 18/43,
+image-function-valid 13, gradient-interpolation-method-valid 1398, color-valid 17,
+background-position-computed 32, content-valid 46 all byte-identical;
+`cargo test -p obscura-dom --lib` 40/40. (serialize-values / background-image-valid /
+mask-image-computed were wpt.live HTTP 404 this session — `bodyLen=42` serving flux,
+NOT regressions; both proven unaffected by source inspection — zero cursor/image-set
+references — and by the gradient siblings that did run.) **NEXT LEVERAGE:** (1)
+`calc(2 + 0)`→`calc(2)` integer-calc simplification (the last cursor-valid fail; a
+number/percentage-only `calc()` simplifier, but it carries the serialize-values
+hot-path risk so it deserves its own scoped quest); (2) `light-dark()` resolution
+(CSS Color 5); (3) `resolve-relative-to-stylesheet` (0/3, external-CSS loading +
+per-stylesheet base); (4) comprehensive valid-prop registry; (5) fresh realm. Scroll
+`tickets/74-the-pointed-verdict.md`.
 
 **Session 2026-06-22 (Quest #73 The Storied Verdict — the `content` property:
 content-list serialization, +49):** A baseline sweep of #72's named "next leverage"
