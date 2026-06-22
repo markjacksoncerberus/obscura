@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~72~~ | ✅ [The Lowercased Verdict](72-the-lowercased-verdict.md) | `css/css-backgrounds/parsing/{background,border}-color-valid` (keyword-`<color>` canonicalization) | **9/9 · 7/7** | ⚔️ | **SECURED — +2.** CSSOM canonical serialization ASCII-lowercases a keyword ident, but #68's `_canonColorSpecified` kept `currentColor`/named/CSS-wide keywords verbatim → `background-color: currentColor` serialized `currentColor` not `currentcolor`. Fix (pure JS, no new Rust): (1) `_canonColorSpecified` returns the lowercased keyword for that branch (legacy hex/rgb/hsl still resolve; modern fns/`var()` still verbatim); (2) new `_canonColorShorthand` + `_COLOR_SHORTHAND_PROPS` (`border-color`/`border-block-color`/`border-inline-color`) splits a value into top-level `<color>` tokens via paren-aware `_splitTopLevel` (`rgb(0, 0, 255)` stays whole) and canonicalizes each, wired into `_parseStyleDecls` + `setProperty`. Zero regressions (serialize-values 695/697, color 17/16/95, gradient/position/image family unchanged; obscura-dom 40/40). Foundational: every 404'd `*-color-valid` longhand + border-color flow-relative shorthands get the `currentColor` green free once served. Caps: `resolve-relative-to-stylesheet` (external-CSS loading); comprehensive valid-prop registry; broaden `_canonUrls` to `cursor`/`content`/`@font-face src`; fresh realm. |
 | ~~70~~ | ✅ [The Resolved Verdict](70-the-resolved-verdict.md) | `css/css-values/urls/resolve-relative-to-base.sub.html` (computed-time URL absolutization) | **2/2** | ⚔️ | **SECURED — +2.** Took #69's "next leverage (1)" — the foundational `<url>`-computed primitive (the `image-set`/`cross-fade` pointers turned out not to exist as WPT tests; the `<url>` family lives in `css/css-values/urls/`). A relative `url()` in an `<image>`/`<url>` property must compute to its absolute URL against the document base URL (`<base href>`), but Obscura stored it verbatim (non-variable `url(images/test.png)`, variable `url("images/test.png")`). New `_canonUrls(value, el)` (pure JS, no new Rust): scans for `url()` tokens (both quoted functional + unquoted url-token forms), resolves each via `new URL(raw, el.baseURI).href`, serializes double-quoted; idempotent/fail-safe — already-absolute or unparseable (`{{token}}`) urls round-trip byte-identical (empirically verified in-engine). Wired into `_normComputed` after `_canonGradients` for `_GRADIENT_PROPS` (also absolutizes `url()`s nested in `image()`/`cross-fade()`). Specified time untouched (relative stays as written). Zero regressions (mask-image-computed 47/47 — its `url("http://{{host}}/")` round-trips byte-identical, the key idempotency proof; gradient family 18/43/1398, color 17/16, serialize-values 695/697, background-position-computed 32, createElement 147; obscura-dom 40/40). Caps: `resolve-relative-to-stylesheet` (0/3, needs external-CSS loading w/ per-stylesheet base); broaden `_canonUrls` to `cursor`/`content`/`@font-face src`; `image-function-invalid` (per-prop validation). |
 | ~~69~~ | ✅ [The Composited Verdict](69-the-composited-verdict.md) | `image-function-valid`·`-computed` + `background-image-valid` (`<image>`-function canon: `image()` + `cross-fade()`) | **13/13 · 3/3 · 13/13** | ⚔️ | **SECURED — +7.** Took #68's "next leverage (1)+(2)". Generalized `_canonGradients` from a gradient-only scan to an `<image>`-function scan (pure JS, no new Rust): new `_IMAGE_FUNC_HEAD` adds `image`/`cross-fade` heads, dispatched per-head. `_canonImageInner` canonicalizes `image(<color>)` (specified `_canonColorSpecified` → `image(rgb(0 128 255))`→`image(rgb(0, 128, 255))`, names/modern fns verbatim; computed `_computeColor` → `image(red)`→`image(rgb(255, 0, 0))`, `image(transparent)`→`image(rgba(0, 0, 0, 0))`). `_canonCrossFadeInner`/`_canonCfImage` reorder each `cross-fade()` `<cf-image>` to `<image|colour> <percentage>` (`cross-fade(50% url(…), …)`→`cross-fade(url(…) 50%, …)`, `cross-fade( 1% red, green)`→`cross-fade(red 1%, green)`), nested `<image>` functions recurse. Already wired via `background-image` ∈ `_GRADIENT_PROPS`. image-valid 12→13, image-computed 1→3, background-image-valid 9→13. Zero regressions (gradient family 18/43/1398, color-valid 17/computed 16, serialize-values 695/697, background-position-computed 32, Element-matches 669, createElement 147; obscura-dom 40/40; composing cases `cross-fade(image(green), red)`/nested gradients byte-identical). Caps: url absolutization (document base-URL, foundational `<url>`-computed); `cross-fade()` computed (404 this session, code already in place); `image-set()` canon; valid-prop registry. |
 | ~~68~~ | ✅ [The Tinctured Verdict](68-the-tinctured-verdict.md) | `css/css-color/parsing/color-valid` (specified-value `<color>` serialization) | **17/17** | ⚔️ | **SECURED — +10.** Took #67's "next leverage" via a reachability sweep (the bigger `<image>`/`<url>` tails were wpt.live 404 this session). The inline-`style` specified path stored colours verbatim, so legacy sRGB forms never canonicalized. New `_canonColorSpecified` (pure JS, no new Rust) reuses the existing `_computeColor` for the hex/`rgb`/`hsl`→canonical `rgb()`/`rgba()` conversion (`#234`→`rgb(34, 51, 68)`, `hsl(120, 100%, 50%)`→`rgb(0, 255, 0)`, channel/`%` clamp, 4-arg/slash-alpha→rgba) but — UNLIKE the computed path — keeps named colours/`currentcolor`/`transparent`/CSS-wide/modern functions (`light-dark()`)/`var()` **verbatim** (they only resolve at computed time). Wired into `_parseStyleDecls` + `setProperty` for `_COLOR_PROPS`. The foundational specified-`<color>` primitive: every `*-color-valid` test (background/border/outline/caret/text-decoration-color — all 404 this session) canonicalizes for free once served. Zero regressions (serialize-values 695/697 — its colour list is all fixed points; color-computed 16/16; gradient/position/image family unchanged; obscura-dom 40/40). Caps: `image(<color>)` canon (`image-function` 12/13·1/3 — extend `_canonGradients` to the `image()` wrapper); `cross-fade()` (404); url absolutization; colour-invalid drop. |
@@ -110,6 +111,38 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-22 (Quest #72 The Lowercased Verdict — keyword-`<color>`
+canonicalization, +2):** A reachability sweep of #71's named "next leverage"
+showed the bigger pointers blocked this session — `resolve-relative-to-stylesheet`
+0/3 (needs external-CSS loading + per-stylesheet base, a real build) and the
+comprehensive valid-property registry (serialize-values hot-path risk). The clean,
+loadable tail: the specified-`<color>` keyword case. `_canonColorSpecified` (#68)
+short-circuited `transparent`/`currentcolor`/CSS-wide/named colours to **verbatim**,
+but CSSOM canonical serialization ASCII-lowercases a keyword ident —
+`background-color: currentColor` must serialize `currentcolor`. **Fix (pure JS,
+`bootstrap.js`, NO new Rust):** (1) `_canonColorSpecified` now returns the lowercased
+keyword (`low`) instead of the verbatim `value` for the keyword/CSS-wide branch
+(legacy hex/rgb/hsl still resolve as before; modern functions/`var()` still verbatim).
+(2) New `_canonColorShorthand` + `_COLOR_SHORTHAND_PROPS` (`border-color`/
+`border-block-color`/`border-inline-color`) splits a shorthand value into its
+top-level `<color>` tokens via the paren-aware `_splitTopLevel` (so `rgb(0, 0, 255)`
+stays whole) and canonicalizes each, wired into `_parseStyleDecls` + `setProperty`.
+`background-color-valid` 8→9, `border-color-valid` 6→7. **+2. ZERO regressions** —
+serialize-values 695/697 (its colour list is all-lowercase fixed points; no
+`border-color`), color-valid 17, color-computed 16, color-computed-rgb 95,
+caret/text-decoration/column-rule-color-valid 15/3/2, gradient-position-valid 18,
+image-function-valid 13, background-position-computed 32, shorthand-serialization 7,
+var-substitution-background 10, css-color/inheritance 4, createElement 147; obscura-dom
+40/40. **FOUNDATIONAL:** every wpt.live-404'd `*-color-valid` longhand
+(`border-top/right/bottom/left-color`, `text-emphasis-color`) and the border-color
+flow-relative shorthands get the `currentColor`→`currentcolor` green free once served.
+**Caps / next leverage:** (1) `resolve-relative-to-stylesheet` (0/3, external-CSS
+loading + per-stylesheet base — the broad `<url>`-computed prize). (2) comprehensive
+valid-property registry (csstext unknown-prop drop + per-prop validation; MUST be a
+superset of serialize-values' ~95 props). (3) broaden `_canonUrls` to non-image
+`<url>` props (`cursor`/`content`/`@font-face src`). (4) fresh realm (`fetch/`,
+`html/dom/` reflection). Scroll `tickets/72-the-lowercased-verdict.md`.
 
 **Session 2026-06-21 (Quest #71 The Forbidden Verdict — scoped per-property value
 validation for `image()`, +6):** Took #70's named "next leverage (3)". A reachability

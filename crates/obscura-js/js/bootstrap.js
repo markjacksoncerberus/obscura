@@ -554,6 +554,8 @@ const _parseStyleDecls = (text) => {
       } else if (_COLOR_PROPS.has(name)) {
         if (_hasImageFunc(value)) continue;                // image() is not a <color> → drop
         value = _canonColorSpecified(value);
+      } else if (_COLOR_SHORTHAND_PROPS.has(name)) {
+        value = _canonColorShorthand(value);
       }
     }
     out.push({ name, value, important });
@@ -581,6 +583,8 @@ class CSSStyleDeclaration {
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
       stored = _canonColorSpecified(stored);
+    } else if (!custom && _COLOR_SHORTHAND_PROPS.has(name)) {
+      stored = _canonColorShorthand(stored);
     }
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
@@ -5860,6 +5864,14 @@ const _COLOR_PROPS = new Set([
   'border-left-color','outline-color','text-decoration-color','column-rule-color','caret-color',
   'text-emphasis-color',
 ]);
+// Colour *shorthands* — 1–4 space-separated <color> values (border-color and its
+// flow-relative siblings). Each value canonicalizes independently like a longhand
+// `<color>` (`currentColor`→`currentcolor`); a value with internal spaces/commas
+// (`rgb(0, 0, 255)`) stays whole because `_splitTopLevel` only breaks at paren
+// depth 0. Specified-serialization only (these tests read `el.style[prop]` back).
+const _COLOR_SHORTHAND_PROPS = new Set([
+  'border-color','border-block-color','border-inline-color',
+]);
 const _serColor = (r, g, b, a) => {
   const c = (x) => Math.max(0, Math.min(255, Math.round(x)));
   r = c(r); g = c(g); b = c(b);
@@ -6019,12 +6031,27 @@ const _canonColorSpecified = (value) => {
   if (!value) return value;
   const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
   const low = s.toLowerCase();
-  if (low === 'transparent' || low === 'currentcolor' || _CSS_WIDE.has(low) || _CSS_NAMED_COLORS[low]) return value;
+  // Keyword colours (named/`transparent`/`currentcolor`) and CSS-wide keywords
+  // serialize as the ASCII-lowercased ident — `currentColor`→`currentcolor`,
+  // `Red`→`red` — but otherwise keep their keyword form (they only resolve to an
+  // rgb() at computed-value time, unlike the legacy hex/rgb/hsl forms below).
+  if (low === 'transparent' || low === 'currentcolor' || _CSS_WIDE.has(low) || _CSS_NAMED_COLORS[low]) return low;
   const out = _computeColor(s);
   // _computeColor returns its argument unchanged for anything that isn't a legacy
   // hex/rgb/hsl colour (modern functions, var(), unparseable) — keep the original
   // bytes (incl. any comments _canonStandardValue preserved) in that case.
   return out === s ? value : out;
+};
+// Canonicalize a colour-shorthand value (`border-color` &c.): split into its
+// top-level `<color>` tokens and run each through `_canonColorSpecified`. A lone
+// CSS-wide keyword (`inherit`) or anything that doesn't split into colours round-
+// trips unchanged (each token's `_canonColorSpecified` is identity for already-
+// canonical input), so this never regresses an already-correct value.
+const _canonColorShorthand = (value) => {
+  if (!value) return value;
+  const toks = _splitTopLevel(String(value));
+  if (toks.length === 0) return value;
+  return toks.map((t) => _canonColorSpecified(t)).join(' ');
 };
 // Is `value` a syntactically valid CSS <color>? Used by CSS.supports().
 const _isValidColor = (value) => {
