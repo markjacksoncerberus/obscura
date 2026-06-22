@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #70).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #71).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-images/parsing/image-function-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #71 The Forbidden Verdict.** Scoped per-property value validation for `image()` (pure JS, no new Rust). image() takes a single `<color>`: new `_imageFuncInvalid` rejects `image()`/`image(none)`/`image(red, blue)`/`image(notacolor)`/`image(url(…))` in `_GRADIENT_PROPS`; `_hasImageFunc` rejects image() in a `<color>` prop (`background-color: image(red)`). Invalid value → declaration dropped (property stays unset). `_isColorish` is a permissive (head-only) colour check so all 13 valid image() forms (incl. `light-dark()`/`color-mix()`/`rgb(from …)`) still pass. **+6.** |
 | `css/css-values/urls/resolve-relative-to-base.sub.html` | 0/2 | **2/2** | ✅ 100% | **Quest #70 The Resolved Verdict.** Computed-time URL absolutization (pure JS, no new Rust). New `_canonUrls(value, el)` resolves each `url()` token to its absolute URL via `new URL(raw, el.baseURI).href`, serialized double-quoted (`url(images/test.png)`→`url("http://www.not-wpt.live/images/test.png")` against `<base href>`); handles both quoted and unquoted forms; idempotent/fail-safe on already-absolute or unparseable (`{{token}}`) urls. Wired into `_normComputed` after `_canonGradients` for `_GRADIENT_PROPS`. **+2.** |
 | `css/css-images/parsing/image-function-valid.html` | 12/13 | **13/13** | ✅ 100% | **Quest #69 The Composited Verdict.** Generalized `_canonGradients` from a gradient-only scan to an `<image>`-function scan (pure JS, no new Rust). New `_canonImageInner` canonicalizes `image(<color>)` — `image(rgb(0 128 255))`→`image(rgb(0, 128, 255))` (specified); named/`currentcolor`/modern functions stay verbatim. **+1.** |
 | `css/css-images/parsing/image-function-computed.html` | 1/3 | **3/3** | ✅ 100% | **Quest #69 The Composited Verdict.** Computed `image(<color>)` via `_computeColor` — `image(red)`→`image(rgb(255, 0, 0))`, `image(transparent)`→`image(rgba(0, 0, 0, 0))`. **+2.** |

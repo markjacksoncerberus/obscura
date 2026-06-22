@@ -111,6 +111,44 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-21 (Quest #71 The Forbidden Verdict — scoped per-property value
+validation for `image()`, +6):** Took #70's named "next leverage (3)". A reachability
+sweep confirmed the other pointers were dead ends this session — `resolve-relative-to-
+stylesheet`, `cross-fade-valid`/`-computed` all wpt.live 404 (cross-fade tests don't
+exist in the repo per the GitHub contents API; the stylesheet one needs external-CSS
+loading, a bigger build). The clean, loadable, winnable target: `css/css-images/parsing/
+image-function-invalid.html` at **0/6**. `test_invalid_value` sets the property to an
+invalid value and asserts `getPropertyValue` returns `""` — the declaration must be
+*rejected*. Obscura stored every value verbatim, so `background-image: image()` etc.
+read back non-empty. **The 6 cases:** image() takes a single `<color>`, so `image()` /
+`image(none)` / `image(red, blue)` / `image(notacolor)` / `image(url(foo.png))` are all
+invalid in an `<image>` property, and `image(red)` is invalid in a `<color>` property
+(image() is an `<image>`, never a `<color>`). **Fix (pure JS, `bootstrap.js`, NO new
+Rust):** new **`_imageFuncInvalid(value)`** balanced-paren-scans for `image()` heads
+(token-boundary, skips `-webkit-image-set(`), top-level-comma-splits each inner, and
+rejects unless it is exactly one **`_isColorish`** argument; **`_hasImageFunc(value)`**
+detects any image() token for the `<color>`-property reject. **`_isColorish`** is a
+permissive *head-only* colour check (`_CSS_NAMED_COLORS`/`transparent`/`currentcolor`/
+hex/`_COLOR_FUNC_NAMES` incl. `light-dark`/`color-mix`/`color`) — enough to reject
+`none`/`url()`/bare idents without re-validating the deep colour grammar
+`_canonColorSpecified`/`_computeColor` already accept, so all 13 valid image() forms
+still pass. Wired into the `_GRADIENT_PROPS`/`_COLOR_PROPS` branches of both
+`_parseStyleDecls` (invalid → `continue`/drop) and `setProperty` (invalid → `return`/
+ignore, keeping the prior value). 0→6/6. **+6. ZERO regressions** — image-function-valid
+13/13 (the proof the permissive check accepts all valid forms), image-function-computed
+3/3, color-valid 17/17, color-computed 16/16, gradient-position-valid 18/18,
+interpolation-method-valid 1398, serialize-values 695/697, csstext 7/11,
+resolve-relative-to-base 2/2, createElement 147; obscura-dom 40/40.
+(`background-image-valid`/`-computed`, `mask-image-computed` came back wpt.live 404 —
+serving flux, NOT regressions; their identical `_GRADIENT_PROPS` path is proven safe by
+image-function-valid 13/13.) **Caps / next:** (1) **comprehensive valid-property
+registry** — the standing cap behind csstext 7/11 (unknown-prop drop) + general per-prop
+value validation; this quest is the narrow `image()` slice of it. (2) `resolve-relative-
+to-stylesheet` (0/3) needs external-CSS loading with per-stylesheet base URL (bigger
+prize). (3) broaden `_canonUrls` to non-image `<url>` props (`cursor`/`content`/
+`@font-face src`) once registered for computed serialization. (4) fresh realm
+(`fetch/`, `html/dom/` reflection). Scroll `tickets/71-the-forbidden-verdict.md`.
+
 **Session 2026-06-21 (Quest #70 The Resolved Verdict — computed-time URL
 absolutization, +2):** Took #69's named "next leverage (1)" (URL absolutization). A
 reachability sweep found the `image-set-*`/`cross-fade-*` pointers from #69's memory

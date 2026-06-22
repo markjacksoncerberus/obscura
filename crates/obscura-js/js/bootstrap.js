@@ -548,8 +548,13 @@ const _parseStyleDecls = (text) => {
       value = _canonStandardValue(value);
       if (_POSITION_PROPS.has(name)) value = _serializePositionSpecified(value);
       else if (_ORIGIN_PROPS.has(name)) value = _serializeOriginSpecified(name, value);
-      else if (_GRADIENT_PROPS.has(name)) value = _canonGradients(value, null, false);
-      else if (_COLOR_PROPS.has(name)) value = _canonColorSpecified(value);
+      else if (_GRADIENT_PROPS.has(name)) {
+        if (_imageFuncInvalid(value)) continue;            // invalid image() → drop declaration
+        value = _canonGradients(value, null, false);
+      } else if (_COLOR_PROPS.has(name)) {
+        if (_hasImageFunc(value)) continue;                // image() is not a <color> → drop
+        value = _canonColorSpecified(value);
+      }
     }
     out.push({ name, value, important });
   }
@@ -570,8 +575,13 @@ class CSSStyleDeclaration {
     if (!custom && stored === '') { this.removeProperty(name); return; }
     if (!custom && _POSITION_PROPS.has(name)) stored = _serializePositionSpecified(stored);
     else if (!custom && _ORIGIN_PROPS.has(name)) stored = _serializeOriginSpecified(name, stored);
-    else if (!custom && _GRADIENT_PROPS.has(name)) stored = _canonGradients(stored, null, false);
-    else if (!custom && _COLOR_PROPS.has(name)) stored = _canonColorSpecified(stored);
+    else if (!custom && _GRADIENT_PROPS.has(name)) {
+      if (_imageFuncInvalid(stored)) return;               // invalid image() → ignore (keep prior value)
+      stored = _canonGradients(stored, null, false);
+    } else if (!custom && _COLOR_PROPS.has(name)) {
+      if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
+      stored = _canonColorSpecified(stored);
+    }
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
     // iterates _props in insertion order) resolves shared longhands last-write-wins
@@ -6768,6 +6778,60 @@ const _canonGradientInner = (inner, el, computed, type) => {
 const _canonImageInner = (inner, el, computed) => {
   const arg = inner.trim();
   return computed ? _computeColor(arg) : _canonColorSpecified(arg);
+};
+// Colour-function heads accepted as the single <color> argument of image(). The
+// check is permissive (head only) — that is enough to reject the non-colours the
+// invalid-value tests probe (none / url() / bare idents) without re-validating
+// the deep colour grammar `_canonColorSpecified`/`_computeColor` already accept.
+const _COLOR_FUNC_NAMES = new Set([
+  'rgb','rgba','hsl','hsla','hwb','lab','lch','oklab','oklch','color','color-mix','light-dark',
+]);
+const _isColorish = (s) => {
+  const v = String(s).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (!v) return false;
+  const low = v.toLowerCase();
+  if (low === 'transparent' || low === 'currentcolor' || _CSS_NAMED_COLORS[low]) return true;
+  if (/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(low)) return true;
+  const lp = v.indexOf('(');
+  if (lp > 0 && v.endsWith(')')) return _COLOR_FUNC_NAMES.has(_unescapeIdent(low.slice(0, lp)));
+  return false;
+};
+// CSS Images 4 image() takes a single <color> argument. Return true when `value`
+// (an <image>-property value) contains an image() function that is NOT a single
+// <color> — image() / image(none) / image(a, b) / image(notacolor) / image(url(…))
+// — so the declaration can be dropped (an invalid value leaves the property unset).
+// Other <image> functions (gradients, cross-fade) are scanned past untouched; a
+// nested image() inside them is still validated.
+const _imageFuncInvalid = (value) => {
+  const s = String(value);
+  if (!/image\(/i.test(s)) return false;
+  const re = /image\(/gi;
+  let m;
+  while ((m = re.exec(s))) {
+    const start = m.index;
+    const before = start > 0 ? s[start - 1] : '';
+    if (before && /[A-Za-z0-9_-]/.test(before)) continue;   // e.g. -webkit-image-set( → not image()
+    const open = start + 5;                                  // index of the '(' in "image("
+    let depth = 0, j = open;
+    for (; j < s.length; j++) { if (s[j] === '(') depth++; else if (s[j] === ')' && --depth === 0) break; }
+    const inner = s.slice(open + 1, j < s.length ? j : s.length);
+    const parts = _commaSplitTop(inner).map((p) => p.trim());
+    if (parts.length !== 1 || !_isColorish(parts[0])) return true;
+    re.lastIndex = j < s.length ? j + 1 : s.length;          // resume past this image()
+  }
+  return false;
+};
+// Does `value` contain an image() function token? An image() is an <image>, never
+// a <color>, so its presence in a <color> property makes the declaration invalid.
+const _hasImageFunc = (value) => {
+  const s = String(value);
+  const re = /image\(/gi;
+  let m;
+  while ((m = re.exec(s))) {
+    const before = m.index > 0 ? s[m.index - 1] : '';
+    if (!before || !/[A-Za-z0-9_-]/.test(before)) return true;
+  }
+  return false;
 };
 // Canonicalize one <image> | <color> token inside a cross-fade(): recurse into a
 // nested <image> function (gradient/image()/cross-fade), else canonicalize as a
