@@ -6760,16 +6760,49 @@ const _canonGradientInner = (inner, el, computed, type) => {
   if (computed) for (let k = start; k < args.length; k++) args[k] = _canonGradientStop(args[k], el, type, emPx, lhPx);
   return args.filter((a) => a !== '').join(', ');
 };
-// Walk a value, transforming each gradient function in place (balanced-paren
-// scan) and leaving every other character untouched.
+// Canonicalize the argument of an `image()` <image> function. These tests use
+// the `image( <color> )` form: canonicalize the colour (specified → keep named/
+// modern functions verbatim; computed → resolve to rgb()/rgba()). A url()/other
+// <image-src> form has no recognized colour, so `_canonColorSpecified`/
+// `_computeColor` return it unchanged → passed through verbatim.
+const _canonImageInner = (inner, el, computed) => {
+  const arg = inner.trim();
+  return computed ? _computeColor(arg) : _canonColorSpecified(arg);
+};
+// Canonicalize one <image> | <color> token inside a cross-fade(): recurse into a
+// nested <image> function (gradient/image()/cross-fade), else canonicalize as a
+// <color> (url()/anything else returns unchanged).
+const _canonCfImage = (tok, el, computed) =>
+  (/(?:gradient|cross-fade|image)\(/i.test(tok)
+    ? _canonGradients(tok, el, computed)
+    : (computed ? _computeColor(tok) : _canonColorSpecified(tok)));
+// Canonicalize a cross-fade(): each comma-separated <cf-image> is
+// `<percentage>? && [ <image> | <color> ]` — serialize the image/colour first,
+// the percentage last, single-space separated.
+const _canonCrossFadeInner = (inner, el, computed) => {
+  const args = _commaSplitTop(inner).map((a) => a.trim()).filter((a) => a !== '');
+  return args.map((arg) => {
+    const pct = [], rest = [];
+    for (const t of _wsTokens(arg)) {
+      if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(t)) pct.push(t);
+      else rest.push(t);
+    }
+    const img = rest.map((t) => _canonCfImage(t, el, computed)).join(' ');
+    return pct.length ? (img ? img + ' ' + pct.join(' ') : pct.join(' ')) : img;
+  }).join(', ');
+};
+// Walk a value, transforming each <image> function in place (balanced-paren
+// scan) and leaving every other character untouched. Handles the gradient
+// functions plus `image()` and `cross-fade()`.
+const _IMAGE_FUNC_HEAD = /((?:repeating-)?(?:linear|radial|conic)-gradient|cross-fade|image)\(/i;
 const _canonGradients = (value, el, computed) => {
   const s = String(value);
-  if (!/gradient\(/i.test(s)) return s;            // fast path: no gradient present
+  if (!/(?:gradient|cross-fade|image)\(/i.test(s)) return s;   // fast path: no <image> fn
   let out = '', i = 0;
   while (i < s.length) {
-    const m = _GRADIENT_HEAD.exec(s.slice(i));
+    const m = _IMAGE_FUNC_HEAD.exec(s.slice(i));
     if (!m) { out += s.slice(i); break; }
-    const start = i + m.index;                      // next gradient head in the slice
+    const start = i + m.index;                      // next <image>-fn head in the slice
     const before = start > 0 ? s[start - 1] : '';
     if (before && /[A-Za-z0-9_-]/.test(before)) {   // not a token boundary → skip head
       out += s.slice(i, start + m[0].length); i = start + m[0].length; continue;
@@ -6783,10 +6816,16 @@ const _canonGradients = (value, el, computed) => {
     // A function left unclosed at end-of-value is auto-closed by the CSS parser
     // (`conic-gradient(black 1turn, white` is valid) → treat EOF as the implicit ')'.
     const closed = j < s.length;
-    const head = m[0].toLowerCase();
-    const type = head.includes('linear') ? 'linear' : head.includes('radial') ? 'radial' : 'conic';
-    out += s.slice(i, start) + m[0] +
-      _canonGradientInner(s.slice(open + 1, closed ? j : s.length), el, computed, type) + ')';
+    const head = m[1].toLowerCase();
+    const innerRaw = s.slice(open + 1, closed ? j : s.length);
+    let inner;
+    if (head === 'image') inner = _canonImageInner(innerRaw, el, computed);
+    else if (head === 'cross-fade') inner = _canonCrossFadeInner(innerRaw, el, computed);
+    else {
+      const type = head.includes('linear') ? 'linear' : head.includes('radial') ? 'radial' : 'conic';
+      inner = _canonGradientInner(innerRaw, el, computed, type);
+    }
+    out += s.slice(i, start) + m[0] + inner + ')';
     i = closed ? j + 1 : s.length;
   }
   return out;

@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #68).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #69).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-images/parsing/image-function-valid.html` | 12/13 | **13/13** | ✅ 100% | **Quest #69 The Composited Verdict.** Generalized `_canonGradients` from a gradient-only scan to an `<image>`-function scan (pure JS, no new Rust). New `_canonImageInner` canonicalizes `image(<color>)` — `image(rgb(0 128 255))`→`image(rgb(0, 128, 255))` (specified); named/`currentcolor`/modern functions stay verbatim. **+1.** |
+| `css/css-images/parsing/image-function-computed.html` | 1/3 | **3/3** | ✅ 100% | **Quest #69 The Composited Verdict.** Computed `image(<color>)` via `_computeColor` — `image(red)`→`image(rgb(255, 0, 0))`, `image(transparent)`→`image(rgba(0, 0, 0, 0))`. **+2.** |
+| `css/css-backgrounds/parsing/background-image-valid.html` | 9/13 | **13/13** | ✅ 100% | **Quest #69 The Composited Verdict.** New `_canonCrossFadeInner`/`_canonCfImage`: each `cross-fade()` `<cf-image>` is `<percentage>? && [<image>|<color>]` — serialize the image/colour first, percentage last, single-space (`cross-fade(50% url(…), …)`→`cross-fade(url(…) 50%, …)`, `cross-fade( 1% red, green)`→`cross-fade(red 1%, green)`); nested `<image>` functions recurse. **+4.** |
 | `css/css-color/parsing/color-valid.html` | 7/17 | **17/17** | ✅ 100% | **Quest #68 The Tinctured Verdict.** Specified-value `<color>` serialization for `_COLOR_PROPS` (pure JS, no new Rust). New `_canonColorSpecified` reuses `_computeColor` for the legacy hex/`rgb`/`hsl`→canonical `rgb()`/`rgba()` conversion (`#234`→`rgb(34, 51, 68)`, `hsl(120, 100%, 50%)`→`rgb(0, 255, 0)`, `rgb(100, 200, 300)`→`rgb(100, 200, 255)`, `rgba(2, 3, 4, 50%)`→`rgba(2, 3, 4, 0.5)`) but — unlike the computed path — keeps named colours/`currentcolor`/`transparent`/CSS-wide/modern functions (`light-dark()`)/`var()` **verbatim**. Wired into `_parseStyleDecls` + `setProperty`. **+10.** |
 | `css/css-masking/parsing/mask-image-computed.html` | 0/47 | **47/47** | ✅ 100% | **Quest #67 The Imaged Verdict.** Registered `mask-image` in `_GRADIENT_PROPS`/`_GCS_DEFAULTS` + completed the #64–66 gradient computed canonicalizer (pure JS, no new Rust): radial size clamp-to-`0px` + drop `circle` on explicit length, conic `from <angle>` normalize/drop-default-`0deg`, conic stop angle units (`1turn`→`360deg`), `lh` unit, `currentcolor`→el color, EOF auto-close. **+47.** |
 | `css/css-backgrounds/parsing/background-image-computed.sub.html` | 35/48 | **47/48** | 🟡 98% | **Quest #67 The Imaged Verdict.** Same engine completion (radial size / conic `from` / `lh` / stop calc). 1 cap: `light-dark(none, none)`→`image(rgba(0, 0, 0, 0))` (CSS Color 5, out of realm). **+12.** |
