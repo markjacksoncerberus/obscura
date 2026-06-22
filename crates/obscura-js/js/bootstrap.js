@@ -6058,6 +6058,14 @@ const _canonColorSpecified = (value) => {
     const m = _computeModernColor(s);
     if (m !== null) return m;
   }
+  // color-mix() — canonicalize its SYNTAX at specified time (interpolation method,
+  // component colours, percentages). The cross-space mixing MATH (its computed
+  // value) is a documented cap, not done here. Falls through verbatim on any
+  // unparseable shape (`_canonColorMix` returns null).
+  if (low.startsWith('color-mix(')) {
+    const cm = _canonColorMix(s);
+    if (cm !== null) return cm;
+  }
   const out = _computeColor(s);
   // _computeColor returns its argument unchanged for anything that isn't a legacy
   // hex/rgb/hsl colour (modern functions, var(), unparseable) — keep the original
@@ -6074,6 +6082,89 @@ const _canonColorShorthand = (value) => {
   const toks = _splitTopLevel(String(value));
   if (toks.length === 0) return value;
   return toks.map((t) => _canonColorSpecified(t)).join(' ');
+};
+// ---- color-mix() SPECIFIED-value serialization (CSS Color 5 §serial-color-mix) ----
+// Canonicalize the SYNTAX only — the cross-space mixing MATH (the computed value)
+// is deliberately NOT done here (that needs full colour-space conversion and stays a
+// documented cap). Rules, read straight from the WPT generator:
+//  • interpolation method `in <space> [<hue> hue]?` — keep the space (NEVER the
+//    default-space-drop gradients do), alias `xyz`→`xyz-d65`, drop the default
+//    `shorter hue`. The method may be ABSENT (`color-mix(<c1>, <c2>)`).
+//  • each component <color> canonicalized via `_canonColorSpecified`
+//    (`hsl(120deg 10% 20%)`→`rgb(46, 56, 46)`, `currentcolor`/`red`/modern fns kept).
+//  • each component's <percentage> moves AFTER its colour; a calc()/var() percentage
+//    is kept symbolic in place with NO normalization; otherwise an omitted percentage
+//    is filled to 100%−other and a resulting 50%/50% pair is dropped entirely.
+const _PLAIN_PCT_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)%$/;
+const _isMixPct = (t) => /%$/.test(t) || /^(?:calc|var|min|max|clamp|abs|sign)\(/i.test(t);
+// Split a component into { color, pct } (pct = raw token string or null). The
+// percentage is the lone ws-token that looks like a <percentage> (plain `%` or a
+// math/var function); the colour is the other token. Returns null if ambiguous.
+const _splitMixComponent = (arg) => {
+  const toks = _wsTokens(String(arg).trim());
+  if (toks.length === 1) return _isMixPct(toks[0]) ? null : { color: toks[0], pct: null };
+  if (toks.length === 2) {
+    if (_isMixPct(toks[0]) && !_isMixPct(toks[1])) return { color: toks[1], pct: toks[0] };
+    if (_isMixPct(toks[1]) && !_isMixPct(toks[0])) return { color: toks[0], pct: toks[1] };
+  }
+  return null;
+};
+// Canonicalize a color-mix() interpolation method (tokens after the leading `in`
+// kept). Returns `''` for the DEFAULT (`in oklab`, no hue → omitted entirely),
+// `'in <space>…'` otherwise, or null if not a valid `in <space> [<hue> hue]?`.
+// color-mix admits the gradient interpolation spaces plus `display-p3-linear`
+// (a predefined-linear space); `_GRADIENT_COLOR_SPACES` is referenced lazily here
+// (it's defined later in the file) and left untouched so gradients don't shift.
+const _canonColorMixMethod = (toks) => {
+  if (toks.length < 2 || toks.length > 4 || toks[0].toLowerCase() !== 'in') return null;
+  let space = toks[1].toLowerCase();
+  if (!_GRADIENT_COLOR_SPACES.has(space) && space !== 'display-p3-linear') return null;
+  if (space === 'xyz') space = 'xyz-d65';
+  if (toks.length > 2) {                                  // optional `<hue> hue`
+    if (toks.length !== 4 || !_GRADIENT_POLAR_SPACES.has(space)
+        || !_HUE_METHODS.has(toks[2].toLowerCase()) || toks[3].toLowerCase() !== 'hue') return null;
+    const hue = toks[2].toLowerCase();
+    return hue === 'shorter' ? 'in ' + space : 'in ' + space + ' ' + hue + ' hue';
+  }
+  return space === 'oklab' ? '' : 'in ' + space;          // oklab is color-mix's default space
+};
+const _canonColorMix = (value) => {
+  const s = String(value).trim();
+  if (!/^color-mix\(/i.test(s) || !s.endsWith(')')) return null;
+  const parts = _commaSplitTop(s.slice(s.indexOf('(') + 1, -1)).map((p) => p.trim());
+  let method = '', ci;
+  if (parts.length === 3) {                               // method + two colours
+    method = _canonColorMixMethod(_wsTokens(parts[0]));
+    if (method === null) return null;
+    ci = 1;
+  } else if (parts.length === 2) {                        // missing method — two colours
+    ci = 0;
+  } else return null;
+  const a = _splitMixComponent(parts[ci]);
+  const b = _splitMixComponent(parts[ci + 1]);
+  if (!a || !b) return null;
+  let outA = _canonColorSpecified(a.color);
+  let outB = _canonColorSpecified(b.color);
+  // Percentage normalization. A calc()/var() percentage (numeric value unknown at
+  // specified time) is kept symbolic in place; otherwise resolve, fill the omitted
+  // side to 100%−other, and drop a 50%/50% result.
+  const na = a.pct && _PLAIN_PCT_RE.test(a.pct) ? parseFloat(a.pct) : null;
+  const nb = b.pct && _PLAIN_PCT_RE.test(b.pct) ? parseFloat(b.pct) : null;
+  const symbolic = (a.pct !== null && na === null) || (b.pct !== null && nb === null);
+  if (symbolic) {
+    if (a.pct !== null) outA += ' ' + a.pct;
+    if (b.pct !== null) outB += ' ' + b.pct;
+  } else if (a.pct !== null || b.pct !== null) {
+    let va = na, vb = nb;
+    if (va === null) va = 100 - vb;
+    if (vb === null) vb = 100 - va;
+    if (!(va === 50 && vb === 50)) {
+      outA += ' ' + String(va) + '%';
+      outB += ' ' + String(vb) + '%';
+    }
+  }
+  const head = method ? 'color-mix(' + method + ', ' : 'color-mix(';
+  return head + outA + ', ' + outB + ')';
 };
 // Is `value` a syntactically valid CSS <color>? Used by CSS.supports().
 const _isValidColor = (value) => {

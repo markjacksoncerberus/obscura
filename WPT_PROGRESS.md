@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-22 (Quest #76).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-22 (Quest #77).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-color/parsing/color-valid-color-mix-function.html` | 250/677 | **674/677** | 🔶 99.6% | **Quest #77 The Mingled Verdict.** Specified-value `color-mix()` serialization (pure JS, no new Rust) — SYNTAX canon only, no colour maths. `_canonColorMix` (dispatched from `_canonColorSpecified`): canonicalize the interpolation method (keep space, `xyz`→`xyz-d65`, drop default `shorter hue`, **drop `in oklab`** = color-mix's default space), each component `<color>` via `_canonColorSpecified` (`hsl(120deg 10% 20%)`→`rgb(46, 56, 46)`), each `<percentage>` moved AFTER its colour (calc/var kept symbolic; else fill 100%−other, drop a 50%/50% pair). Handles the missing-method 2-arg form + `display-p3-linear`. **+424.** Cap: the 3 fails are N-ary color-mix (1- or 3-colour percentage distribution). The COMPUTED side (`color-computed-color-mix-function` 0/948) needs cross-space colour maths — a separate engine. |
 | `css/css-color/parsing/color-valid-color-function.html` | 81/340 | **277/340** | 🔶 81% | **Quest #76 The Stated Verdict.** Specified-value modern `<color>` serialization (pure JS, no new Rust). For `lab`/`lch`/`oklab`/`oklch`/`color(<space> …)`/`hwb()` whose channels are all plain `<number>`/`<percentage>`/`<angle>`/`none` (no nested math function), the SPECIFIED value serializes IDENTICALLY to the computed value — so `_canonColorSpecified` reuses `_computeModernColor` when the body has no nested `(`. `color(srgb 10% 10% 10%)`→`color(srgb 0.1 0.1 0.1)`, `color(srgb 200 200 200)` unclamped, alpha resolved/dropped-if-≥1. **+196.** Cap: the 63 fails are all calc-bearing channels — the specified path must PRESERVE `calc()` (unclamped, `%` symbolic), a Wave-2 CSS-math serializer. |
 | `css/css-color/parsing/color-valid-lab.html` | 54/150 | **116/150** | 🔶 77% | **Quest #76 The Stated Verdict.** Same path for `lab`/`lch`/`oklab`/`oklch`: `lab(50% 50% -20%)`→`lab(50 62.5 -25)` (L%→100-ref clamped [0,100], a/b%→125-ref unclamped), hue normalized (`lch(10 20 1.28rad)`→`lch(10 20 73.3386)`), alpha `/ 110%`→dropped. Pure JS, no new Rust. **+62.** Cap: 34 calc-bearing fails (Wave-2 math serializer). |
 | `css/css-color/parsing/color-valid-hwb.html` | 0/38 | **28/38** | 🔶 74% | **Quest #76 The Stated Verdict.** `hwb()` specified value == its computed value (sRGB `rgb()`/`rgba()`): `hwb(120 30% 50%)`→`rgb(77, 128, 77)`, `hwb(none none none)`→`rgb(255, 0, 0)`. Routed through `_computeHwb` via `_computeModernColor`. Pure JS, no new Rust. **+28.** Cap: 10 calc-bearing fails (Wave-2 math serializer). |
