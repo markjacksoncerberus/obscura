@@ -6075,6 +6075,10 @@ const _isValidColor = (value) => {
       return parts.length >= 3 && parts.every((p) => p === 'none' || !Number.isNaN(parseFloat(p)));
     }
   }
+  // Modern colour functions whose computed value we can resolve — lab/lch/oklab/
+  // oklch, color(<space> …), hwb — are valid <color>s. (`_computeModernColor`
+  // returns null for a non-match or an unresolvable channel, e.g. a container unit.)
+  if (_computeModernColor(value) !== null) return true;
   return false;
 };
 // Evaluate a CSS math expression — calc()/min()/max()/clamp()/sign()/abs() plus
@@ -6218,6 +6222,150 @@ const _computeOpacity = (value) => {
   const num = _evalMath(value, 1);
   if (num === null) return null;
   return _serNumber(Math.max(0, Math.min(1, num)));
+};
+
+// ── Modern <color> computed-value serialization (CSS Color 4) ──────────────────
+// The COMPUTED value of the modern colour functions whose result stays in their
+// OWN colour space — lab()/lch()/oklab()/oklch() and color(<space> …) — and of
+// hwb() (which computes to sRGB rgb()/rgba()). UNLIKE the SPECIFIED path
+// (_canonColorSpecified, which must preserve calc() wrappers and leave % in the
+// a/b/C channels unresolved), the computed path resolves every channel to a plain
+// <number>: evaluate its math, resolve <percentage> against the channel's
+// reference range, map NaN→0 / ±∞→bounds, clamp per channel, and `none` is kept
+// verbatim. This lives ONLY in the computed path (_normComputed) — the specified
+// path is untouched, so the `*-valid-*` tests don't regress.
+//
+// Per-channel spec: `base` = the numeric value of `100%` for that channel; `clamp`
+// = [min,max] applied after resolution (null = no clamp); `hue` = a polar-angle
+// channel (deg/rad/grad/turn → degrees, then normalized into [0, 360)).
+const _MODERN_LAB_FNS = {
+  lab:   [{ base: 100, clamp: [0, 100] }, { base: 125, clamp: null }, { base: 125, clamp: null }],
+  oklab: [{ base: 1,   clamp: [0, 1] },   { base: 0.4, clamp: null }, { base: 0.4, clamp: null }],
+  lch:   [{ base: 100, clamp: [0, 100] }, { base: 150, clamp: [0, Infinity] }, { hue: true }],
+  oklch: [{ base: 1,   clamp: [0, 1] },   { base: 0.4, clamp: [0, Infinity] }, { hue: true }],
+};
+// color() predefined colour spaces. `xyz` is an alias that serializes as `xyz-d65`.
+const _COLOR_FN_SPACES = {
+  'srgb': 'srgb', 'srgb-linear': 'srgb-linear', 'a98-rgb': 'a98-rgb',
+  'rec2020': 'rec2020', 'prophoto-rgb': 'prophoto-rgb',
+  'display-p3': 'display-p3', 'display-p3-linear': 'display-p3-linear',
+  'xyz': 'xyz-d65', 'xyz-d50': 'xyz-d50', 'xyz-d65': 'xyz-d65',
+};
+// Resolve one channel of a lab/lch/oklab/oklch/color() function to its computed
+// serialization. Returns the string (`'none'` or a serialized <number>), or null
+// if the math can't resolve (e.g. a container-relative unit like cqw — no layout).
+const _modernChannel = (tok, spec) => {
+  if (String(tok).trim().toLowerCase() === 'none') return 'none';
+  if (spec.hue) {
+    let v = _evalMath(tok, 0, { angle: true, lengths: true, nonFinite: true });
+    if (v === null) return null;
+    if (Number.isNaN(v)) v = 0;
+    if (!isFinite(v)) return null;
+    v = ((v % 360) + 360) % 360;
+    // Hue serializes at 6 significant figures (`1.28rad` → `73.3386`), matching
+    // the gradient <angle> serializer.
+    return _serNumber(parseFloat(v.toPrecision(6)));
+  }
+  let v = _evalMath(tok, spec.base, { lengths: true, nonFinite: true });
+  if (v === null) return null;
+  if (Number.isNaN(v)) v = 0;               // NaN (e.g. calc(0/0)) → lower bound
+  if (spec.clamp) {
+    if (v === Infinity) v = spec.clamp[1];
+    else if (v === -Infinity) v = spec.clamp[0];
+    else v = Math.max(spec.clamp[0], Math.min(spec.clamp[1], v));
+  } else if (!isFinite(v)) {
+    return null;                            // unclamped ±∞ has no computed test — bail
+  }
+  return _serNumber(v);
+};
+// Resolve a modern colour's alpha to its computed serialization. Returns:
+//   ''      → alpha is ≥ 1 (and not `none`); the `/ <alpha>` is dropped
+//   'none'  → keep `/ none`
+//   '<num>' → keep `/ <num>` (a value in [0, 1))
+//   null    → the math couldn't resolve
+const _modernAlpha = (tok) => {
+  if (String(tok).trim().toLowerCase() === 'none') return 'none';
+  let a = _evalMath(tok, 1, { lengths: true, nonFinite: true });
+  if (a === null) return null;
+  if (Number.isNaN(a)) a = 0;
+  a = Math.max(0, Math.min(1, a));
+  if (a >= 1) return '';
+  return _serNumber(a);
+};
+// Serialize a channel list + optional alpha into the `c1 c2 c3[ / a]` body, or
+// null on any unresolvable channel/alpha.
+const _modernBody = (chanToks, specs, alphaTok) => {
+  const out = [];
+  for (let i = 0; i < specs.length; i++) {
+    const r = _modernChannel(chanToks[i], specs[i]);
+    if (r === null) return null;
+    out.push(r);
+  }
+  let body = out.join(' ');
+  if (alphaTok !== undefined) {
+    const a = _modernAlpha(alphaTok);
+    if (a === null) return null;
+    if (a !== '') body += ' / ' + a;
+  }
+  return body;
+};
+// hwb() computes to sRGB rgb()/rgba(): pure-hue sRGB scaled by whiteness/blackness.
+const _computeHwb = (inner) => {
+  const parts = _splitTopLevel(inner);
+  if (parts.length < 3 || parts.length > 4) return null;
+  const num = (tok, base) => {
+    if (String(tok).trim().toLowerCase() === 'none') return 0;   // missing component → 0
+    let v = _evalMath(tok, base, { angle: base === 0, lengths: true, nonFinite: true });
+    if (v === null) return null;
+    if (Number.isNaN(v)) v = 0;
+    return v;
+  };
+  const h = num(parts[0], 0);                 // angle (deg) — opts.angle on (base 0)
+  let w = num(parts[1], 100), bl = num(parts[2], 100);  // whiteness/blackness in [0,100]
+  if (h === null || w === null || bl === null) return null;
+  let a = 1;
+  if (parts.length === 4) { a = num(parts[3], 1); if (a === null) return null; }
+  w /= 100; bl /= 100;
+  let r, g, b;
+  if (w + bl >= 1) { const gray = w / (w + bl); r = g = b = gray * 255; }
+  else {
+    const pure = _hslToRgb(h, 1, 0.5);        // pure hue, 0-255
+    const f = (c) => ((c / 255) * (1 - w - bl) + w) * 255;
+    r = f(pure[0]); g = f(pure[1]); b = f(pure[2]);
+  }
+  // Snap away sub-µ float drift before _serColor's round-to-int, so an exact
+  // half-integer channel (e.g. 0.5·255 = 127.5, which `1·(1−0.3−0.5)+0.3` yields
+  // as 127.4999999…) rounds up to 128 rather than down to 127.
+  const snap = (x) => Math.round(x * 1e6) / 1e6;
+  return _serColor(snap(r), snap(g), snap(b), a);
+};
+// Compute the modern <color> functions whose computed value stays in their own
+// space (+ hwb→sRGB). Returns the serialized computed value, or null when `value`
+// isn't one of these functions or a channel can't resolve — the caller then falls
+// back to the legacy `_computeColor` (which handles named/hex/rgb/hsl).
+const _computeModernColor = (value) => {
+  if (!value) return null;
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  const lp = s.indexOf('(');
+  if (lp <= 0 || !s.endsWith(')')) return null;
+  const fname = _unescapeIdent(s.slice(0, lp)).toLowerCase();
+  const inner = s.slice(lp + 1, -1);
+  if (fname === 'hwb') return _computeHwb(inner);
+  if (fname === 'color') {
+    const parts = _splitTopLevel(inner);
+    if (parts.length < 4 || parts.length > 5) return null;
+    const space = _COLOR_FN_SPACES[parts[0].toLowerCase()];
+    if (!space) return null;
+    const specs = [{ base: 1, clamp: null }, { base: 1, clamp: null }, { base: 1, clamp: null }];
+    const body = _modernBody(parts.slice(1, 4), specs, parts.length === 5 ? parts[4] : undefined);
+    return body === null ? null : `color(${space} ${body})`;
+  }
+  const specs = _MODERN_LAB_FNS[fname];
+  if (!specs) return null;
+  const parts = _splitTopLevel(inner);
+  if (parts.length < 3 || parts.length > 4) return null;
+  const body = _modernBody(parts.slice(0, 3), specs, parts.length === 4 ? parts[3] : undefined);
+  return body === null ? null : `${fname}(${body})`;
 };
 // Computed `color` of an element, honouring inheritance and `currentColor`.
 // A missing/`inherit`/`currentcolor` value inherits the parent's color; the
@@ -7128,7 +7276,11 @@ const _normComputed = (el, kebab, v) => {
     if (String(v).trim().toLowerCase() === 'currentcolor') {
       return kebab === 'color' ? _computeColor(_initialOf('color')) : _computedColorOf(el);
     }
-    return _computeColor(v);
+    // Modern colour functions whose computed value stays in their own colour
+    // space (lab/lch/oklab/oklch, color()) or convert to sRGB (hwb); fall back to
+    // the legacy named/hex/rgb/hsl computation when not one of those.
+    const modern = _computeModernColor(v);
+    return modern !== null ? modern : _computeColor(v);
   }
   return v;
 };

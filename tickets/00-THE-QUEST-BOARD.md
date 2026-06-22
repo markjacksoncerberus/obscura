@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~75~~ | ✅ [The Spectral Verdict](75-the-spectral-verdict.md) | `css/css-color/parsing/color-computed-{lab,hwb,color-function}` (modern `<color>` computed serialization) | **112/120 · 54/56 · 466/468** | ⚔️⚔️ | **SECURED — +632.** Obscura's `_computeColor` kept every modern colour function verbatim → `color-computed-lab` 0/120, `-hwb` 0/56, `-color-function` 0/468 (the support check `CSS.supports('color', …)` failed AND the value wasn't resolved). Key insight: `lab`/`lch`/`oklab`/`oklch` and `color(<space> …)` compute in their **own** colour space — no cross-space conversion, just per-channel canonicalization; `hwb()` converts to sRGB. Fix (pure JS, no new Rust): new `_computeModernColor` resolves each channel (eval math, `%`→channel reference, `none` preserved, NaN→0, ±∞→bounds, per-channel clamp, hue→deg normalized [0,360) at 6 sig-figs, alpha clamped/≥1-dropped), `color(xyz)`→`xyz-d65`; `_computeHwb` does pure-hue·whiteness/blackness→rgb (6-decimal snap so 127.5 rounds up). Wired into the `_normComputed` colour branch only — the **specified path is untouched** (no `color-valid-*` regression). `_isValidColor` (CSS.supports) extended via `_computeModernColor`. lab 0→112, hwb 0→54, color-function 0→466. **Zero regressions** (color-computed 16, -rgb 95/99, -named 455, -hex 6, color-valid 17, -lab 54/150 & -color-function 81/340 UNCHANGED = specified untouched; gradient-interpolation 1398, gradient-position-computed 43, serialize-values 696/697, var-bg 10, createElement 147; obscura-dom 40/40). **Caps:** the 12 fails (8 lab + 2 hwb + 2 color-function) are ALL `2cqw` container-query units — unwinnable (no layout). **Next:** specified-path modern colour (`color-valid-{lab,hwb,color-function}` — needs calc()-preservation: keep `calc(…)` wrapper, leave a/b/C `%` unresolved); `color-mix()` (0/948) + relative-color (0/1169) need real cross-space conversion math (the giant prize, a bigger engine); `alpha(from …)` (0/32) relative-style alpha. |
 | ~~74~~ | ✅ [The Pointed Verdict](74-the-pointed-verdict.md) | `css/css-ui/parsing/cursor-{computed,valid}` (the `cursor` property — `<image>` items: gradients + `image-set()`) | **37/39 · 45/46** | ⚔️ | **SECURED — +4.** `cursor` was registered for computed defaults but not in `_GRADIENT_PROPS`, so its gradient items serialized verbatim (cursor-computed 36/39) and bare-string `image-set()` options weren't wrapped (cursor-valid 42/46). Fix (pure JS, no new Rust): (1) added `cursor` to `_GRADIENT_PROPS` → its `<image>` items route through the existing `_canonGradients`/`_canonUrls` engine (the trailing hotspot coords + cursor keyword pass through verbatim) — fixed the radial computed case; (2) new `_canonImageSet` balanced-paren-scans `image-set(`/`-webkit-image-set(` heads and wraps a leading bare `<string>` option in `url()` (`image-set("u" 1x)`→`image-set(url("u") 1x)`, incl. nested in `light-dark()`; `_splitCommaQuoted` so a `,` in a string is safe), wired into all `_GRADIENT_PROPS` paths after `_canonGradients`, fast-pathing out when no `image-set(`. **The 2 remaining cursor-computed fails are upstream WPT test bugs** — lines 52/54 have malformed expected values (the gradient's `)` is missing, the trailing keyword pulled inside; line 54 even expects `pointer` for a `crosshair` input). No correct browser passes them; our output is the correct serialization. Zero regressions (surgically scoped: cursor-only + image-set-only; gradient family 18/43/13/1398, color 17, position 32, content-valid 46 byte-identical; obscura-dom 40/40; serialize-values/background-image-valid/mask-image 404-flux but proven zero image-set/cursor refs). Caps: `calc(2 + 0)`→`calc(2)` integer-calc simplification (the last cursor-valid fail; serialize-values hot-path risk, own quest); `light-dark()` resolution; `resolve-relative-to-stylesheet`; valid-prop registry; fresh realm. |
 | ~~73~~ | ✅ [The Storied Verdict](73-the-storied-verdict.md) | `css/css-content/parsing/content-{computed,valid}` (the `content` property — content-list serialization) | **41/41 · 46/46** | ⚔️ | **SECURED — +49.** `content` was never registered for computed style → `getComputedStyle(el).content` returned `""`, failing every `content-computed` support check (0/41); the specified path stored values verbatim, never dropping the default `decimal` counter-style (`content-valid` 38/46). Fix (pure JS, no new Rust): (1) registered `content: 'normal'` in `_GCS_DEFAULTS`; (2) new `_canonContent` wired into `_parseStyleDecls`/`setProperty` (specified) + `_normComputed` (computed) — `_canonCounterFns` drops a default `decimal` `<counter-style>` from `counter()`/`counters()` (`counter(n, dECiMaL)`→`counter(n)`, case-insensitive; custom styles kept; escaped names like `counter(\})` byte-preserved), gradient items route through the existing `_canonGradients`, url()s absolutize via `_canonUrls`; (3) quote-aware `_splitCommaQuoted` (counters() string separators may contain `,`); (4) linear `to <side-or-corner>` reorder in `_canonGradientDirection` (`to top right`→`to right top`, CSSOM order — the one gradient content-item needing a new rule; radial `ellipse`-drop + conic `from <angle>` were already handled). content-computed 0→41, content-valid 38→46. Zero regressions (gradient family 1398/932/18/43/13/3, background-image 13, mask-image 47, serialize-values 696/697, color 17/16, position 32, var-bg 10, shorthand 7, cursor 36/42 unchanged, createElement 147; obscura-dom 40/40). Caps: `cursor` gradient + image-set canon (cursor-computed 36/39, near-free +3); `resolve-relative-to-stylesheet` (external-CSS loading); comprehensive valid-prop registry; fresh realm. |
 | ~~72~~ | ✅ [The Lowercased Verdict](72-the-lowercased-verdict.md) | `css/css-backgrounds/parsing/{background,border}-color-valid` (keyword-`<color>` canonicalization) | **9/9 · 7/7** | ⚔️ | **SECURED — +2.** CSSOM canonical serialization ASCII-lowercases a keyword ident, but #68's `_canonColorSpecified` kept `currentColor`/named/CSS-wide keywords verbatim → `background-color: currentColor` serialized `currentColor` not `currentcolor`. Fix (pure JS, no new Rust): (1) `_canonColorSpecified` returns the lowercased keyword for that branch (legacy hex/rgb/hsl still resolve; modern fns/`var()` still verbatim); (2) new `_canonColorShorthand` + `_COLOR_SHORTHAND_PROPS` (`border-color`/`border-block-color`/`border-inline-color`) splits a value into top-level `<color>` tokens via paren-aware `_splitTopLevel` (`rgb(0, 0, 255)` stays whole) and canonicalizes each, wired into `_parseStyleDecls` + `setProperty`. Zero regressions (serialize-values 695/697, color 17/16/95, gradient/position/image family unchanged; obscura-dom 40/40). Foundational: every 404'd `*-color-valid` longhand + border-color flow-relative shorthands get the `currentColor` green free once served. Caps: `resolve-relative-to-stylesheet` (external-CSS loading); comprehensive valid-prop registry; broaden `_canonUrls` to `cursor`/`content`/`@font-face src`; fresh realm. |
@@ -113,6 +114,52 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-22 (Quest #75 The Spectral Verdict — modern `<color>` computed
+serialization, +632):** A baseline sweep of the `css/css-color/parsing` realm
+surfaced the widest unopened tail of the whole frontier: every modern colour
+function computed `0/N` because `_computeColor` kept them verbatim AND the
+`test_computed_value` support check `CSS.supports('color', …)` (→ `_isValidColor`)
+rejected them. **Key insight:** `lab()`/`lch()`/`oklab()`/`oklch()` and
+`color(<space> …)` compute in their **own** colour space — no cross-space
+conversion, just per-channel canonicalization — and `hwb()` converts to sRGB.
+**Fix (pure JS, `bootstrap.js`, NO new Rust):** new **`_computeModernColor(value)`**
+parses the function, splits channels via `_splitTopLevel` (3 + optional alpha;
+`color()` peels the space first), and resolves each channel through
+**`_modernChannel`** — `_evalMath` the token, resolve `<percentage>` against the
+channel's reference range (lab L→100/a,b→125, oklab L→1/a,b→0.4, lch C→150, oklch
+C→0.4, `color()`→1), `none` preserved verbatim, `NaN`→0, `±∞`→clamp bounds,
+per-channel clamp (L lab/lch [0,100], ok* [0,1]; C ≥0; a/b & `color()` unclamped),
+hue→degrees normalized `[0,360)` at 6 sig-figs (`1.28rad`→`73.3386`) — and
+**`_modernAlpha`** (`%`→number, clamp [0,1], `≥1` drops the `/ a`, `none` kept).
+`color(xyz …)`→`color(xyz-d65 …)`, space lowercased. **`_computeHwb`** scales the
+pure-hue sRGB (`_hslToRgb(h,1,.5)`) by whiteness/blackness (`w+b≥1`→gray), snapping
+channels to 6 decimals so an exact half-integer (127.5) rounds **up** not down (the
+`1·(1−w−b)+w` float-drift bug: green came out `127.4999…`). Wired into the
+`_normComputed` colour branch ONLY (`_computeModernColor(v) ?? _computeColor(v)`) —
+the **specified path (`_canonColorSpecified`) is deliberately untouched** because
+the `*-valid-*` tests need a different serialization (calc()-preservation), so they
+must not regress. `_isValidColor` (CSS.supports) extended via the same helper.
+lab 0→112, hwb 0→54, color-function 0→466. **+632. ZERO regressions** —
+color-computed 16/16, -rgb 95/99 (4 pre-existing), -named 455/455, -hex 6/6,
+color-valid 17/17, color-valid-lab 54/150 & -color-function 81/340 **UNCHANGED**
+(the proof the specified path is untouched), gradient-interpolation-method-valid
+1398, gradient-position-computed 43, serialize-values 696/697 (pre-existing calc
+cap), variable-substitution-background-properties 10, createElement 147;
+`cargo test -p obscura-dom --lib` 40/40. **HONEST CAP — the 12 remaining fails (8
+lab + 2 hwb + 2 color-function) are ALL `sign(2cqw - 10px)` container-query-unit
+cases** — `2cqw` needs the container's resolved width; Obscura has no layout, so
+`_evalMath` fails on `cqw` → unwinnable. **NEXT LEVERAGE:** (1) **specified-path
+modern colour** (`color-valid-{lab,hwb,color-function}` ≈ 528 more) — the harder
+sibling: must PRESERVE `calc()` wrappers (`lab(calc(50*3) …)`→`lab(calc(150) …)`,
+NOT clamped) and leave a/b/C `%` UNRESOLVED (`calc(50%)` stays) while still
+resolving bare numbers/percentages — a specified-value engine distinct from this
+computed one. (2) **`color-mix()`** (0/948) + **relative-color** `rgb(from …)`
+(0/1169) — the giant prize, but both need real **cross-space conversion math**
+(sRGB↔Lab↔OKLab↔XYZ matrices, gamut, interpolation) — a much bigger engine. (3)
+**`alpha(from …)`** (0/32) — relative-style alpha replacement (`alpha` keyword in
+calc, origin-colour resolution). (4) fresh realm. Scroll
+`tickets/75-the-spectral-verdict.md`.
 
 **Session 2026-06-22 (Quest #74 The Pointed Verdict — `cursor` `<image>` items:
 gradients + `image-set()`, +4):** Took #73's named "next leverage (1)" — the
