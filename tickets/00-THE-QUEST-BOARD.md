@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~68~~ | ✅ [The Tinctured Verdict](68-the-tinctured-verdict.md) | `css/css-color/parsing/color-valid` (specified-value `<color>` serialization) | **17/17** | ⚔️ | **SECURED — +10.** Took #67's "next leverage" via a reachability sweep (the bigger `<image>`/`<url>` tails were wpt.live 404 this session). The inline-`style` specified path stored colours verbatim, so legacy sRGB forms never canonicalized. New `_canonColorSpecified` (pure JS, no new Rust) reuses the existing `_computeColor` for the hex/`rgb`/`hsl`→canonical `rgb()`/`rgba()` conversion (`#234`→`rgb(34, 51, 68)`, `hsl(120, 100%, 50%)`→`rgb(0, 255, 0)`, channel/`%` clamp, 4-arg/slash-alpha→rgba) but — UNLIKE the computed path — keeps named colours/`currentcolor`/`transparent`/CSS-wide/modern functions (`light-dark()`)/`var()` **verbatim** (they only resolve at computed time). Wired into `_parseStyleDecls` + `setProperty` for `_COLOR_PROPS`. The foundational specified-`<color>` primitive: every `*-color-valid` test (background/border/outline/caret/text-decoration-color — all 404 this session) canonicalizes for free once served. Zero regressions (serialize-values 695/697 — its colour list is all fixed points; color-computed 16/16; gradient/position/image family unchanged; obscura-dom 40/40). Caps: `image(<color>)` canon (`image-function` 12/13·1/3 — extend `_canonGradients` to the `image()` wrapper); `cross-fade()` (404); url absolutization; colour-invalid drop. |
 | ~~67~~ | ✅ [The Imaged Verdict](67-the-imaged-verdict.md) | `mask-image` / `background-image` / `list-style-image` / `border-image-source` `-computed` | **47/47 · 47/48 · 11/11 · 9/10** | ⚔️⚔️ | **SECURED — +76.** Took #66's "next leverage (1)". Registered `mask-image`/`list-style-image`/`border-image-source` in `_GRADIENT_PROPS` (+ `_GCS_DEFAULTS` initial `none`) and completed the #64–66 gradient computed canonicalizer (pure JS, no new Rust): radial size clamp-to-`0px` + drop `circle` on explicit length, conic `from <angle>` normalize/drop-default-`0deg`, conic stop angle units (`1turn`→`360deg`) + stop calc resolution, **two-position colour-stop split** (`black 0% 0.5em`→`black 0%, black 20px`), linear direction angle calc (`calc(90deg-45deg)`→`45deg`), mixed `%`+length stop calc kept as `calc()`, pure-`%` calc resolved, `lh` unit (`1lh`→`80px`), `currentcolor`→el `color`, angle 6-sig-fig serialization (`2rad`→`114.592deg`), and EOF auto-close for unclosed functions. mask 0→47, background 35→47, list-style 3→11, border-image 0→9. Zero regressions (whole `<position>`/gradient family byte-identical; serialize-values 695/697; obscura-dom 40/40). Caps: `light-dark()` (CSS Color 5), url absolutization (document base-URL), `cross-fade()` specified canon. |
 | ~~66~~ | ✅ [The Interpolated Verdict](66-the-interpolated-verdict.md) | `css/css-images/parsing/gradient-interpolation-method-{valid,computed}` | **1398/1398 · 932/932** | ⚔️⚔️ | **SECURED — +1439.** The widest unopened tail of the whole frontier. Gradients carry a `<color-interpolation-method>` (`in oklab`/`in lab`/`in hsl longer hue`) the #64/#65 canonicalizer never parsed. Extended it (pure JS, no new Rust): `_interpolationClause` finds the `in <space> [ <hue> hue ]?` clause; `_canonGradientConfig` splits it off, canonicalizes direction + method independently, and **recombines `<direction> in <space>`** (reorder — `in lab 30deg`→`30deg in lab`); `_canonInterpolationMethod` aliases `xyz`→`xyz-d65`, drops the default `shorter hue`, and **drops the clause when it equals the default space** (`srgb` if every stop is a legacy sRGB colour, `oklab` otherwise — `_isNonLegacyColorTok`/`isLegacy`). Plus radial-prelude fixes the test surfaced: `_canonRadialPrelude` drops the default `ellipse` when an explicit size is present (`ellipse 50% 40em`→`50% 40em`) and resolves lengths to px at computed time (`40em`→`640px`), and `_isGradientConfig` now detects a bare `<radial-size>` config so the size still resolves after `ellipse` is dropped. valid 585→1398 (+813), computed 306→932 (+626). Zero regressions (whole `<position>`/gradient family byte-identical; serialize-values 695/697). Caps: more `<image>` props (`mask-image`/`list-style-image`/`border-image-source` — same grammar, mostly registration); valid-property registry; fresh realm. |
 | ~~65~~ | ✅ [The Distilled Verdict](65-the-distilled-verdict.md) | `css/css-variables/variable-substitution-background-properties` (gradient default-token canonicalization + linear-gradient) | **10/10** | ⚔️ | **SECURED — +2.** #64's named "next leverage (1)" — gradient default-token canonicalization, distilling away tokens that compute to their defaults. Extended the #64 gradient canonicalizer (pure JS, no new Rust) to (a) **`linear-gradient`** (added to `_GRADIENT_HEAD`; direction config detected via `to`/`<angle>`; computed-time drop of the default `to bottom`) and (b) **radial default shape/size drop** (`_canonRadialPrelude` filters the default `ellipse` shape + `farthest-corner` size from the prelude at computed time, keeping `circle`/explicit sizes + the `at` clause). `_canonGradientInner`/`_canonGradientConfig`/`_isGradientConfig` made gradient-type-aware (linear vs radial/conic); colour stops already computed via `_computeColor`, comma-spacing normalized by the layer join. `linear-gradient(to bottom, rgb(30,87,0) 0%, …)`→`linear-gradient(rgb(30, 87, 0) 0%, …)`; `radial-gradient(ellipse farthest-corner at 25px 25px, black 10%, …)`→`radial-gradient(at 25px 25px, rgb(0, 0, 0) 10%, …)`. Zero regressions (gradient-position-valid 18, -computed 43 byte-identical; serialize-values 695 has no gradients). Caps: more `<image>` props (`mask-image`/`list-style-image`/`border-image-source`); broader linear/conic computed canon (angle normalization, interpolation hints); valid-property registry; fresh realm. |
@@ -107,6 +108,37 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-21 (Quest #68 The Tinctured Verdict — specified-value `<color>`
+serialization, +10):** Took #67's named "next leverage" but, via a reachability sweep,
+chose the widest *measurable* tail: wpt.live was 404ing the bigger `<image>`/`<url>`
+computed tests (`background-image-valid`, `image-set-*`, the `*-color-*` siblings — serving
+flux), while `color-valid` was reachable at **7/17**. The inline-`style` specified path
+stored colours verbatim (only `_canonStandardValue`'s numeric pass ran), so every legacy
+sRGB form that must canonicalize stayed unchanged. **Fix (pure JS, `bootstrap.js`, NO new
+Rust):** new **`_canonColorSpecified(value)`** placed after `_computeColor` — it
+short-circuits keywords/named-colours/CSS-wide values to verbatim, then delegates the
+legacy hex/`rgb`/`hsl`→canonical `rgb()`/`rgba()` conversion to the existing `_computeColor`
+(channel clamp, `%`→0-255, 4-arg/slash-alpha→rgba, `%` alpha→number), with an `out === s`
+guard returning the original bytes for modern functions/`var()`/unparseable. The KEY
+distinction from the computed path: at specified time, named colours, `currentcolor`,
+`transparent`, CSS-wide keywords, and modern functions (`light-dark()`/`color-mix()`/`lab()`/
+relative) are kept as written — they only resolve at computed-value time (so `red` stays
+`red`, not `rgb(255, 0, 0)`). Wired into `_parseStyleDecls` + `setProperty` for `_COLOR_PROPS`,
+alongside the `_POSITION_PROPS`/`_ORIGIN_PROPS`/`_GRADIENT_PROPS` branches. **7→17/17; +10.
+ZERO regressions** — `serialize-values` 695/697 (its `_COLOR_PROPS` list `['black','red',
+'rgb(50, 75, 100)','rgba(5, 7, 10, 0.5)']`+`transparent`+`inherit` is all fixed points),
+`color-computed` 16/16 (the computed path is idempotent on the canonical `rgb()` we now
+store), gradient-position valid/computed 18/43, image-function 12·1 (unchanged), var-
+substitution-background 10/10, css-color/inheritance 4, inherit-initial 4, Element-matches
+669, Document-createElement 147; `cargo test -p obscura-dom` 40/40. (3 pre-existing runtime
+unit failures — blob-url/document.write/iframe-lifecycle — proven present on baseline with
+the change stashed; unrelated to colour.) **Foundational:** every `*-color-valid` test
+canonicalizes for free once wpt.live serves them. **Next leverage:** (1) `image(<color>)`
+canon (`image-function` 12/13·1/3 — extend `_canonGradients` to the `image()` wrapper, reuse
+this helper); (2) `cross-fade()` specified canon (404 this session); (3) url absolutization
+(foundational across `<url>` computed); (4) colour-invalid drop; (5) valid-property registry.
+Scroll `tickets/68-the-tinctured-verdict.md`.
 
 **Session 2026-06-21 (Quest #67 The Imaged Verdict — `<image>`-prop computed
 serialization, +76):** Took #66's named "next leverage (1)" (more `<image>` props). A

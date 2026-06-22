@@ -549,6 +549,7 @@ const _parseStyleDecls = (text) => {
       if (_POSITION_PROPS.has(name)) value = _serializePositionSpecified(value);
       else if (_ORIGIN_PROPS.has(name)) value = _serializeOriginSpecified(name, value);
       else if (_GRADIENT_PROPS.has(name)) value = _canonGradients(value, null, false);
+      else if (_COLOR_PROPS.has(name)) value = _canonColorSpecified(value);
     }
     out.push({ name, value, important });
   }
@@ -570,6 +571,7 @@ class CSSStyleDeclaration {
     if (!custom && _POSITION_PROPS.has(name)) stored = _serializePositionSpecified(stored);
     else if (!custom && _ORIGIN_PROPS.has(name)) stored = _serializeOriginSpecified(name, stored);
     else if (!custom && _GRADIENT_PROPS.has(name)) stored = _canonGradients(stored, null, false);
+    else if (!custom && _COLOR_PROPS.has(name)) stored = _canonColorSpecified(stored);
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
     // iterates _props in insertion order) resolves shared longhands last-write-wins
@@ -5993,6 +5995,26 @@ const _computeColor = (value) => {
     }
   }
   return value;
+};
+// Serialize a <color> at SPECIFIED time (the CSSOM `el.style.color` getter, read by
+// every `*-color-valid` test). Legacy sRGB forms — hex, rgb()/rgba(), hsl()/hsla() —
+// canonicalize to rgb()/rgba() per CSS Color 4 "serializing sRGB values": channels
+// clamp to [0,255], `%` channels resolve to integers, a 4-arg / slash-alpha rgb → rgba,
+// `%` alpha → number (`#234`→`rgb(34, 51, 68)`, `hsl(120, 100%, 50%)`→`rgb(0, 255, 0)`,
+// `rgb(100, 200, 300)`→`rgb(100, 200, 255)`). UNLIKE _computeColor (the COMPUTED path),
+// named colours, `currentcolor`, `transparent`, CSS-wide keywords, and modern functions
+// (light-dark/color-mix/lab/relative `rgb(from …)`/var()) keep their specified bytes —
+// those only resolve at computed-value time.
+const _canonColorSpecified = (value) => {
+  if (!value) return value;
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  const low = s.toLowerCase();
+  if (low === 'transparent' || low === 'currentcolor' || _CSS_WIDE.has(low) || _CSS_NAMED_COLORS[low]) return value;
+  const out = _computeColor(s);
+  // _computeColor returns its argument unchanged for anything that isn't a legacy
+  // hex/rgb/hsl colour (modern functions, var(), unparseable) — keep the original
+  // bytes (incl. any comments _canonStandardValue preserved) in that case.
+  return out === s ? value : out;
 };
 // Is `value` a syntactically valid CSS <color>? Used by CSS.supports().
 const _isValidColor = (value) => {
