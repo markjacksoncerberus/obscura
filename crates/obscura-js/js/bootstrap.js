@@ -6218,6 +6218,14 @@ const _isValidColor = (value) => {
   const low = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim().toLowerCase();
   if (low === 'transparent' || low === 'currentcolor' || _CSS_NAMED_COLORS[low]) return true;
   if (/^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(low)) return true;
+  // color-mix() / relative colour syntax are valid <color>s when their structure
+  // resolves (el-independent: currentcolor falls back to black for validity). This
+  // MUST precede the legacy rgb/hsl branch below, since `rgb(from …)`/`hsl(from …)`
+  // share those function names but aren't legacy comma-list bodies.
+  // A var()-bearing value is syntactically valid for any property (substitution is
+  // a computed-time concern), so CSS.supports() accepts it without resolving.
+  if (low.startsWith('color-mix(') && (/var\(/i.test(low) || _colorMixStruct(value, null) !== null)) return true;
+  if (/^[a-z]+\(\s*from\s/i.test(low) && (/var\(/i.test(low) || _relativeStruct(value, null) !== null)) return true;
   const lp = low.indexOf('(');
   if (lp > 0 && low.endsWith(')')) {
     const fname = _unescapeIdent(low.slice(0, lp));
@@ -6519,6 +6527,545 @@ const _computeModernColor = (value) => {
   if (parts.length < 3 || parts.length > 4) return null;
   const body = _modernBody(parts.slice(0, 3), specs, parts.length === 4 ? parts[3] : undefined);
   return body === null ? null : `${fname}(${body})`;
+};
+
+// ── CSS Color 4/5 cross-space colour engine (computed color-mix() / relative) ──
+// The COMPUTED value of color-mix() and of relative colour syntax
+// (rgb(from …)/lab(from …)/color(from …)) needs real colour-space maths, unlike
+// the SPECIFIED path (which is pure syntax canon — see _canonColorMix /
+// _canonRelativeColor). Every case reduces to three primitives: parse a <color>
+// into a structured `{space, coords, alpha, none[4]}`, convert between colour
+// spaces through an XYZ-D65 hub, then serialize the result in the target space's
+// canonical computed form. The WPT `fuzzy_compare_colors` comparator tolerates
+// ε≈0.01–0.02 on the numbers but checks the non-numeric skeleton exactly, so we
+// must emit the right output FUNCTION/SPACE; ~6 significant figures on the
+// channels is ample. All matrices are the published CSS Color 4 reference values
+// (drafts.csswg.org/css-color-4 sample code), with XYZ→RGB derived by inversion.
+const _m3v = (m, v) => [
+  m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+  m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+  m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+];
+const _inv3 = (m) => {
+  const a = m[0][0], b = m[0][1], c = m[0][2];
+  const d = m[1][0], e = m[1][1], f = m[1][2];
+  const g = m[2][0], h = m[2][1], i = m[2][2];
+  const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+  const det = a * A + b * B + c * C;
+  return [
+    [A / det, -(b * i - c * h) / det, (b * f - c * e) / det],
+    [B / det, (a * i - c * g) / det, -(a * f - c * d) / det],
+    [C / det, -(a * h - b * g) / det, (a * e - b * d) / det],
+  ];
+};
+// Per-channel transfer functions (gamma-encoded ↔ linear-light), sign-preserving.
+const _sgn = (x) => (x < 0 ? -1 : 1);
+const _srgbLin = (c) => { const a = Math.abs(c); return a <= 0.04045 ? c / 12.92 : _sgn(c) * Math.pow((a + 0.055) / 1.055, 2.4); };
+const _srgbGam = (c) => { const a = Math.abs(c); return a <= 0.0031308 ? c * 12.92 : _sgn(c) * (1.055 * Math.pow(a, 1 / 2.4) - 0.055); };
+const _a98Lin = (c) => _sgn(c) * Math.pow(Math.abs(c), 563 / 256);
+const _a98Gam = (c) => _sgn(c) * Math.pow(Math.abs(c), 256 / 563);
+const _proLin = (c) => { const a = Math.abs(c); return a <= 16 / 512 ? c / 16 : _sgn(c) * Math.pow(a, 1.8); };
+const _proGam = (c) => { const a = Math.abs(c); return a >= 1 / 512 ? _sgn(c) * Math.pow(a, 1 / 1.8) : 16 * c; };
+const _R2020_A = 1.09929682680944, _R2020_B = 0.018053968510807;
+const _recLin = (c) => { const a = Math.abs(c); return a < _R2020_B * 4.5 ? c / 4.5 : _sgn(c) * Math.pow((a + _R2020_A - 1) / _R2020_A, 1 / 0.45); };
+const _recGam = (c) => { const a = Math.abs(c); return a >= _R2020_B ? _sgn(c) * (_R2020_A * Math.pow(a, 0.45) - (_R2020_A - 1)) : 4.5 * c; };
+const _I = (c) => c;            // identity (the -linear predefined spaces)
+// Forward linear-RGB → XYZ matrices (D65, except prophoto which is D50).
+const _M_SRGB = [
+  [0.41239079926595934, 0.357584339383878, 0.1804807884018343],
+  [0.21263900587151027, 0.715168678767756, 0.07219231536073371],
+  [0.01933081871559182, 0.11919477979462598, 0.9505321522496607],
+];
+const _M_P3 = [
+  [0.4865709486482162, 0.26566769316909306, 0.19821728523436247],
+  [0.2289745640697488, 0.6917385218365064, 0.079286914093745],
+  [0.0, 0.04511338185890264, 1.043944368900976],
+];
+const _M_A98 = [
+  [0.5766690429101305, 0.1855582379065463, 0.1882286462349947],
+  [0.29734497525053605, 0.6273635662554661, 0.07529145849399788],
+  [0.02703136138641234, 0.07068885253582723, 0.9913375368376388],
+];
+const _M_REC = [
+  [0.6369580483012914, 0.14461690358620832, 0.16888097516417205],
+  [0.2627002120112671, 0.6779980715188708, 0.05930171646986196],
+  [0.0, 0.028072693049087428, 1.060985057710791],
+];
+const _M_PRO = [
+  [0.7977604896723027, 0.13518583717574031, 0.0313493495815248],
+  [0.2880711282292934, 0.7118432178101014, 0.00008565396060525902],
+  [0.0, 0.0, 0.8251046025104601],
+];
+// Each predefined RGB colour space: forward matrix, transfer fns, D50 flag.
+const _RGB_SPACE = {
+  'srgb':              { mat: _M_SRGB, lin: _srgbLin, gam: _srgbGam },
+  'srgb-linear':       { mat: _M_SRGB, lin: _I, gam: _I },
+  'display-p3':        { mat: _M_P3, lin: _srgbLin, gam: _srgbGam },
+  'display-p3-linear': { mat: _M_P3, lin: _I, gam: _I },
+  'a98-rgb':           { mat: _M_A98, lin: _a98Lin, gam: _a98Gam },
+  'rec2020':           { mat: _M_REC, lin: _recLin, gam: _recGam },
+  'prophoto-rgb':      { mat: _M_PRO, lin: _proLin, gam: _proGam, d50: true },
+};
+for (const k in _RGB_SPACE) _RGB_SPACE[k].imat = _inv3(_RGB_SPACE[k].mat);
+// Bradford chromatic adaptation between the D65 and D50 reference whites.
+const _D65_TO_D50 = [
+  [1.0479298208405488, 0.022946793341019088, -0.05019222954313557],
+  [0.029627815688159344, 0.990434484573249, -0.01707382502938514],
+  [-0.009243058152591178, 0.015055144896577895, 0.7518742899580008],
+];
+const _D50_TO_D65 = [
+  [0.9554734527042182, -0.023098536874261423, 0.0632593086610217],
+  [-0.028369706963208136, 1.0099954580058226, 0.021041398966943008],
+  [0.012314001688319899, -0.020507696433477912, 1.3303659366080753],
+];
+// OKLab ↔ XYZ-D65 (via the cube-rooted LMS cone responses).
+const _XYZ_TO_LMS = [
+  [0.8190224379967030, 0.3619062600528904, -0.1288737815209879],
+  [0.0329836539323885, 0.9292868615863434, 0.0361446663506424],
+  [0.0481771893596242, 0.2642395317527308, 0.6335478284694309],
+];
+const _LMS_TO_OKLAB = [
+  [0.2104542683093140, 0.7936177747023054, -0.0040720430116193],
+  [1.9779985324311684, -2.4285922420485799, 0.4505937096174110],
+  [0.0259040424655478, 0.7827717124575296, -0.8086757549230774],
+];
+const _LMS_TO_XYZ = _inv3(_XYZ_TO_LMS);
+const _OKLAB_TO_LMS = _inv3(_LMS_TO_OKLAB);
+const _xyzToOklab = (xyz) => _m3v(_LMS_TO_OKLAB, _m3v(_XYZ_TO_LMS, xyz).map(Math.cbrt));
+const _oklabToXyz = (lab) => _m3v(_LMS_TO_XYZ, _m3v(_OKLAB_TO_LMS, lab).map((v) => v * v * v));
+// CIE Lab ↔ XYZ-D50 (Lab is always relative to the D50 white).
+const _LAB_D50 = [0.3457 / 0.3585, 1.0, (1.0 - 0.3457 - 0.3585) / 0.3585];
+const _LAB_E = 216 / 24389, _LAB_K = 24389 / 27;
+const _xyzD50ToLab = (xyz) => {
+  const f = (t) => (t > _LAB_E ? Math.cbrt(t) : (_LAB_K * t + 16) / 116);
+  const fx = f(xyz[0] / _LAB_D50[0]), fy = f(xyz[1] / _LAB_D50[1]), fz = f(xyz[2] / _LAB_D50[2]);
+  return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+};
+const _labToXyzD50 = (lab) => {
+  const fy = (lab[0] + 16) / 116, fx = lab[1] / 500 + fy, fz = fy - lab[2] / 200;
+  const x = fx ** 3 > _LAB_E ? fx ** 3 : (116 * fx - 16) / _LAB_K;
+  const y = lab[0] > _LAB_K * _LAB_E ? ((lab[0] + 16) / 116) ** 3 : lab[0] / _LAB_K;
+  const z = fz ** 3 > _LAB_E ? fz ** 3 : (116 * fz - 16) / _LAB_K;
+  return [x * _LAB_D50[0], y * _LAB_D50[1], z * _LAB_D50[2]];
+};
+// Rectangular ↔ polar (Lab↔LCH, OKLab↔OKLCH share the maths).
+const _labToLch = (lab) => {
+  const C = Math.hypot(lab[1], lab[2]);
+  let H = Math.atan2(lab[2], lab[1]) * 180 / Math.PI;
+  if (H < 0) H += 360;
+  return [lab[0], C, H];
+};
+const _lchToLab = (lch) => {
+  const H = lch[2] * Math.PI / 180;
+  return [lch[0], lch[1] * Math.cos(H), lch[1] * Math.sin(H)];
+};
+// HSL/HWB ↔ sRGB (coords carry s/l/w/b as 0–100, hue in degrees).
+const _hslToRgb01 = (h, s, l) => _hslToRgb(h, s, l).map((c) => c / 255);
+const _rgbToHsl = (r, g, b) => {
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  const l = (max + min) / 2;
+  let h = 0, s = 0;
+  // `d` below a small absolute floor is treated as achromatic — this absorbs the
+  // ~1e-7 round-trip drift a srgb→XYZ→srgb hop leaves on near-grey colours (e.g.
+  // white), which would otherwise make `s` (whose denominator → 0 at l = 0/1)
+  // blow up to a bogus huge saturation and defeat the powerless-hue rule.
+  if (d > 1e-6) {
+    const denom = 1 - Math.abs(2 * l - 1);
+    s = denom > 1e-9 ? Math.min(1, d / denom) : 0;
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60; if (h < 0) h += 360;
+  }
+  return [h, s * 100, l * 100];
+};
+const _hwbToRgb01 = (h, w, bl) => {
+  if (w + bl >= 1) { const grey = w / (w + bl); return [grey, grey, grey]; }
+  return _hslToRgb01(h, 1, 0.5).map((c) => c * (1 - w - bl) + w);
+};
+const _rgbToHwb = (r, g, b) => [_rgbToHsl(r, g, b)[0], Math.min(r, g, b) * 100, (1 - Math.max(r, g, b)) * 100];
+// A colour's coords (in its own space) → XYZ-D65, and back. The hub everything
+// converts through.
+const _toXYZ = (space, c) => {
+  if (_RGB_SPACE[space]) {
+    const sp = _RGB_SPACE[space];
+    let xyz = _m3v(sp.mat, [sp.lin(c[0]), sp.lin(c[1]), sp.lin(c[2])]);
+    return sp.d50 ? _m3v(_D50_TO_D65, xyz) : xyz;
+  }
+  if (space === 'xyz-d65') return c.slice();
+  if (space === 'xyz-d50') return _m3v(_D50_TO_D65, c);
+  if (space === 'lab') return _m3v(_D50_TO_D65, _labToXyzD50(c));
+  if (space === 'lch') return _m3v(_D50_TO_D65, _labToXyzD50(_lchToLab(c)));
+  if (space === 'oklab') return _oklabToXyz(c);
+  if (space === 'oklch') return _oklabToXyz(_lchToLab(c));
+  if (space === 'hsl') return _toXYZ('srgb', _hslToRgb01(c[0], c[1] / 100, c[2] / 100));
+  if (space === 'hwb') return _toXYZ('srgb', _hwbToRgb01(c[0], c[1] / 100, c[2] / 100));
+  return c.slice();
+};
+const _fromXYZ = (space, xyz) => {
+  if (_RGB_SPACE[space]) {
+    const sp = _RGB_SPACE[space];
+    const lin = _m3v(sp.imat, sp.d50 ? _m3v(_D65_TO_D50, xyz) : xyz);
+    return [sp.gam(lin[0]), sp.gam(lin[1]), sp.gam(lin[2])];
+  }
+  if (space === 'xyz-d65') return xyz.slice();
+  if (space === 'xyz-d50') return _m3v(_D65_TO_D50, xyz);
+  if (space === 'lab') return _xyzD50ToLab(_m3v(_D65_TO_D50, xyz));
+  if (space === 'lch') return _labToLch(_xyzD50ToLab(_m3v(_D65_TO_D50, xyz)));
+  if (space === 'oklab') return _xyzToOklab(xyz);
+  if (space === 'oklch') return _labToLch(_xyzToOklab(xyz));
+  if (space === 'hsl') { const r = _fromXYZ('srgb', xyz); return _rgbToHsl(r[0], r[1], r[2]); }
+  if (space === 'hwb') { const r = _fromXYZ('srgb', xyz); return _rgbToHwb(r[0], r[1], r[2]); }
+  return xyz.slice();
+};
+// Convert a structured colour to `targetSpace` (alpha + alpha-missing carried;
+// per-channel missing is dropped across a space change — it isn't analogous).
+const _csConvert = (col, targetSpace) => {
+  if (col.space === targetSpace) return { space: col.space, coords: col.coords.slice(), alpha: col.alpha, none: col.none.slice() };
+  const coords = _fromXYZ(targetSpace, _toXYZ(col.space, col.coords));
+  const none = [false, false, false, col.none[3]];
+  // A hue that EMERGES from a conversion into a polar space is "missing" when its
+  // chroma/saturation is ~0 — the hue is then meaningless (CSS Color 4's powerless
+  // → missing rule). A NATIVELY-specified polar colour keeps its explicit hue: that
+  // path returns above without conversion, so `lch(100 0 20deg)` interpolates its
+  // 20°, while `lab(50 0 0)` converted into lch yields a missing hue.
+  // Thresholds sit well above the ~1e-5 chroma the XYZ round-trip leaves on a
+  // genuinely-achromatic colour, yet far below any real chroma in the suite.
+  if (targetSpace === 'hsl' && Math.abs(coords[1]) < 1e-3) none[0] = true;
+  else if (targetSpace === 'hwb' && coords[1] + coords[2] >= 100 - 1e-3) none[0] = true;
+  else if (targetSpace === 'lch' && Math.abs(coords[1]) < 1e-3) none[2] = true;
+  else if (targetSpace === 'oklch' && Math.abs(coords[1]) < 1e-4) none[2] = true;
+  return { space: targetSpace, coords, alpha: col.alpha, none };
+};
+// Parse one channel token of a colour function. `base` = value of 100%; `hue`
+// marks an <angle> channel. Returns {v, none} or null on unresolvable maths.
+const _csChan = (tok, base, hue) => {
+  const t = String(tok).trim();
+  if (t.toLowerCase() === 'none') return { v: 0, none: true };
+  let v = _evalMath(t, base, { angle: !!hue, lengths: true, nonFinite: true });
+  if (v === null) return null;
+  if (Number.isNaN(v)) v = 0;
+  if (!isFinite(v)) v = v > 0 ? base || 1e6 : 0;
+  return { v, none: false };
+};
+// `<percentage>` bases for each space's three channels (matching _MODERN_LAB_FNS
+// + the legacy rgb/hsl ranges); hue channels carry an explicit base of 0.
+const _CS_BASE = {
+  'srgb': [255, 255, 255], 'srgb-linear': [1, 1, 1], 'display-p3': [1, 1, 1],
+  'display-p3-linear': [1, 1, 1], 'a98-rgb': [1, 1, 1], 'rec2020': [1, 1, 1],
+  'prophoto-rgb': [1, 1, 1], 'xyz-d65': [1, 1, 1], 'xyz-d50': [1, 1, 1],
+  'hsl': [0, 100, 100], 'hwb': [0, 100, 100],
+  'lab': [100, 125, 125], 'lch': [100, 150, 0],
+  'oklab': [1, 0.4, 0.4], 'oklch': [1, 0.4, 0],
+};
+const _CS_HUE = { 'hsl': 0, 'hwb': 0, 'lch': 2, 'oklch': 2 };  // hue channel index (or undefined)
+// Per-channel clamps applied at serialization (matching `_MODERN_LAB_FNS`): L is
+// bounded, chroma is non-negative; a/b and the rgb/xyz spaces stay unclamped.
+const _CS_CLAMP = {
+  'lab': [[0, 100], null, null], 'lch': [[0, 100], [0, Infinity], null],
+  'oklab': [[0, 1], null, null], 'oklch': [[0, 1], [0, Infinity], null],
+};
+// For an rgb()/hsl() origin, channels are stored in [0,1]/0-100 internally but
+// the keyword values seen by relative syntax use the function's own units (rgb
+// channels 0–255). `_CS_KW_SCALE` maps internal-coord → keyword value.
+const _CS_KW_SCALE = { 'srgb': [255, 255, 255] };
+// Parse any <color> string into a structured colour, or null. Named/hex/legacy
+// rgb/hsl resolve via `_computeColor`; modern functions parse their channels in
+// place. `none` is tracked per channel + alpha.
+const _csParse = (str) => {
+  let s = String(str).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  const low = s.toLowerCase();
+  if (low === 'transparent') return { space: 'srgb', coords: [0, 0, 0], alpha: 0, none: [false, false, false, false] };
+  const fromRgbString = (rgb) => {
+    const lp = rgb.indexOf('(');
+    const comps = _rgbComponents(rgb.slice(lp + 1, -1));
+    if (!comps) return null;
+    return { space: 'srgb', coords: [comps[0] / 255, comps[1] / 255, comps[2] / 255], alpha: comps[3], none: [false, false, false, false] };
+  };
+  if (_CSS_NAMED_COLORS[low] || /^#[0-9a-f]+$/i.test(s)) {
+    const c = _computeColor(s);
+    return /^rgb/i.test(c) ? fromRgbString(c) : null;
+  }
+  const lp = s.indexOf('(');
+  if (lp <= 0 || !s.endsWith(')')) return null;
+  const fname = _unescapeIdent(s.slice(0, lp)).toLowerCase();
+  const inner = s.slice(lp + 1, -1);
+  const parts = _splitTopLevel(inner);
+  const buildAlpha = (tok) => {
+    if (tok === undefined) return { v: 1, none: false };
+    const r = _csChan(tok, 1, false);
+    if (r && !r.none) r.v = Math.max(0, Math.min(1, r.v));   // alpha clamps to [0,1] at parse
+    return r;
+  };
+  if (fname === 'rgb' || fname === 'rgba') {
+    const c = _computeColor(s);
+    return /^rgb/i.test(c) ? fromRgbString(c) : null;
+  }
+  if (fname === 'hsl' || fname === 'hsla' || fname === 'hwb') {
+    if (parts.length < 3 || parts.length > 4) return null;
+    const space = fname === 'hwb' ? 'hwb' : 'hsl';
+    const h = _csChan(parts[0], 0, true), c1 = _csChan(parts[1], 100, false), c2 = _csChan(parts[2], 100, false);
+    const a = buildAlpha(parts[3]);
+    if (!h || !c1 || !c2 || !a) return null;
+    return { space, coords: [h.v, c1.v, c2.v], alpha: a.v, none: [h.none, c1.none, c2.none, a.none] };
+  }
+  if (fname === 'lab' || fname === 'lch' || fname === 'oklab' || fname === 'oklch') {
+    if (parts.length < 3 || parts.length > 4) return null;
+    const base = _CS_BASE[fname], hueIdx = _CS_HUE[fname];
+    const ch = [];
+    for (let i = 0; i < 3; i++) { const r = _csChan(parts[i], base[i], i === hueIdx); if (!r) return null; ch.push(r); }
+    const a = buildAlpha(parts[3]);
+    if (!a) return null;
+    return { space: fname, coords: [ch[0].v, ch[1].v, ch[2].v], alpha: a.v, none: [ch[0].none, ch[1].none, ch[2].none, a.none] };
+  }
+  if (fname === 'color') {
+    if (parts.length < 4 || parts.length > 5) return null;
+    const space = _COLOR_FN_SPACES[parts[0].toLowerCase()];
+    if (!space) return null;
+    const ch = [];
+    for (let i = 1; i <= 3; i++) { const r = _csChan(parts[i], 1, false); if (!r) return null; ch.push(r); }
+    const a = buildAlpha(parts[4]);
+    if (!a) return null;
+    return { space, coords: [ch[0].v, ch[1].v, ch[2].v], alpha: a.v, none: [ch[0].none, ch[1].none, ch[2].none, a.none] };
+  }
+  return null;
+};
+// Resolve a <color> (incl. currentcolor, nested color-mix / relative) into a
+// structured colour. `el` is the context element for currentcolor.
+const _resolveColorStruct = (str, el) => {
+  let s = String(str).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  const low = s.toLowerCase();
+  if (low === 'currentcolor') s = (el ? (_computedColorOf(el) || 'rgb(0, 0, 0)') : 'rgb(0, 0, 0)');
+  if (/^color-mix\(/i.test(s)) return _colorMixStruct(s, el);
+  if (/^[a-z]+\(\s*from\s/i.test(s)) return _relativeStruct(s, el);
+  return _csParse(s);
+};
+// CSS Color 4 §12.4 hue fixup: adjust two in-[0,360) hues for the chosen arc.
+const _adjustHue = (h1, h2, method) => {
+  h1 = ((h1 % 360) + 360) % 360; h2 = ((h2 % 360) + 360) % 360;
+  const d = h2 - h1;
+  if (method === 'longer') { if (d > 0 && d < 180) h1 += 360; else if (d > -180 && d <= 0) h2 += 360; }
+  else if (method === 'increasing') { if (h2 < h1) h2 += 360; }
+  else if (method === 'decreasing') { if (h1 < h2) h1 += 360; }
+  else { if (d > 180) h1 += 360; else if (d < -180) h2 += 360; }  // shorter (default)
+  return [h1, h2];
+};
+// Parse a color-mix() interpolation method `in <space> [<hue> hue]?`.
+const _parseMixMethod = (str) => {
+  const toks = _wsTokens(str.trim());
+  let space = (toks[1] || 'oklab').toLowerCase();
+  if (space === 'xyz') space = 'xyz-d65';
+  let hue = 'shorter';
+  if (toks.length >= 4 && toks[3].toLowerCase() === 'hue') hue = toks[2].toLowerCase();
+  return { space, hue };
+};
+// Split a color-mix() component into its <color> and optional <percentage>.
+const _splitMixComp = (str) => {
+  const toks = _wsTokens(str.trim());
+  const isPct = (t) => /^[-+]?(\d+\.?\d*|\.\d+)%$/.test(t) || /^calc\(/i.test(t);
+  let pct = null, colorToks = [];
+  for (const t of toks) {
+    if (pct === null && isPct(t) && !/^(rgb|hsl|hwb|lab|lch|oklab|oklch|color|color-mix)\(/i.test(t)) {
+      const v = _evalMath(t, 100, { lengths: true });   // lengths → resolvable sign()/calc()
+      if (v !== null) { pct = v; continue; }
+    }
+    colorToks.push(t);
+  }
+  return { color: colorToks.join(' '), pct };
+};
+// Computed color-mix(): resolve both operands, convert into the mix space,
+// premultiplied-interpolate (hue handled per the chosen arc), apply the
+// percentage-derived alpha multiplier. Returns a structured colour or null.
+const _colorMixStruct = (value, el) => {
+  const s = String(value).trim();
+  const lp = s.indexOf('(');
+  if (lp < 0 || !s.endsWith(')')) return null;
+  const parts = _commaSplitTop(s.slice(lp + 1, -1)).map((p) => p.trim()).filter((p) => p.length);
+  let mi = 0, method = { space: 'oklab', hue: 'shorter' };
+  if (parts[0] && /^in(\s|$)/i.test(parts[0])) { method = _parseMixMethod(parts[0]); mi = 1; }
+  if (!_CS_BASE[method.space]) return null;
+  const comps = parts.slice(mi).map(_splitMixComp);
+  if (comps.length < 1) return null;
+  const cols = comps.map((c) => { const s2 = _resolveColorStruct(c.color, el); return s2 ? _csConvert(s2, method.space) : null; });
+  if (cols.some((c) => !c)) return null;
+  // Percentage normalization (the N-ary rule, which subsumes the binary one): an
+  // omitted percentage splits the remaining (100% − sum-of-specified) equally among
+  // the omitted components. The alpha multiplier applies only when the sum is under
+  // 100% (a sum over 100% just renormalizes the weights, leaving alpha intact).
+  let sumSpec = 0, nOmit = 0;
+  for (const c of comps) { if (c.pct == null) nOmit++; else sumSpec += c.pct; }
+  const fill = nOmit > 0 ? Math.max(0, 100 - sumSpec) / nOmit : 0;
+  const pcts = comps.map((c) => (c.pct == null ? fill : c.pct));
+  const sum = pcts.reduce((a, b) => a + b, 0);
+  const aMult = sum > 0 ? Math.min(1, sum / 100) : 0;
+  const weights = pcts.map((p) => (sum > 0 ? p / sum : 1 / cols.length));
+  const hueIdx = _CS_HUE[method.space];
+  // The binary case carries the full hue-arc + per-channel `none` machinery; the
+  // 1-or-N-ary case uses straight weighted premultiplied interpolation (no test
+  // exercises a polar N-ary mix, and the binary path covers every polar pair).
+  if (cols.length !== 2) {
+    const At = cols.reduce((acc, c, i) => acc + (c.none[3] ? 1 : c.alpha) * weights[i], 0);
+    const coords = [0, 0, 0];
+    for (let ch = 0; ch < 3; ch++) {
+      if (ch === hueIdx) { coords[ch] = cols.reduce((acc, c, i) => acc + c.coords[ch] * weights[i], 0); continue; }
+      const pre = cols.reduce((acc, c, i) => acc + c.coords[ch] * (c.none[3] ? 1 : c.alpha) * weights[i], 0);
+      coords[ch] = At > 1e-9 ? pre / At : 0;
+    }
+    const aAllNone = cols.every((c) => c.none[3]);
+    return { space: method.space, coords, alpha: aAllNone ? 0 : Math.max(0, Math.min(1, At * aMult)), none: [false, false, false, aAllNone] };
+  }
+  const sa = cols[0], sb = cols[1];
+  const t1 = weights[0], t2 = weights[1];
+  let a1 = sa.none[3] ? null : sa.alpha, a2 = sb.none[3] ? null : sb.alpha;
+  let aNone = false;
+  if (a1 == null && a2 == null) aNone = true;
+  else { if (a1 == null) a1 = a2; if (a2 == null) a2 = a1; }
+  const Amix = aNone ? 0 : a1 * t1 + a2 * t2;
+  const coords = [0, 0, 0], noneOut = [false, false, false, aNone];
+  for (let i = 0; i < 3; i++) {
+    const n1 = sa.none[i], n2 = sb.none[i];
+    if (n1 && n2) { noneOut[i] = true; continue; }
+    const v1 = n1 ? sb.coords[i] : sa.coords[i];
+    const v2 = n2 ? sa.coords[i] : sb.coords[i];
+    if (i === hueIdx) {
+      const [g1, g2] = _adjustHue(v1, v2, method.hue);
+      coords[i] = g1 * t1 + g2 * t2;          // hue is never premultiplied
+    } else if (aNone) {
+      coords[i] = v1 * t1 + v2 * t2;          // no alpha to premultiply by
+    } else {
+      // Premultiplied-alpha interpolation: a zero total alpha collapses the
+      // channels to 0 (so a fully-transparent mix is `… 0 0 0 / 0`, not the raw
+      // average — that distinguishes a negative/0 colour alpha from a 0% weight).
+      const pre = v1 * a1 * t1 + v2 * a2 * t2;
+      coords[i] = Amix > 1e-9 ? pre / Amix : 0;
+    }
+  }
+  const alpha = aNone ? 0 : Math.max(0, Math.min(1, Amix * aMult));
+  return { space: method.space, coords, alpha, none: noneOut };
+};
+// Per-relative-function config: the function's colour space, channel keyword
+// names, and (for rgb) the internal-coord → keyword-value scale.
+const _REL_FN = {
+  rgb:   { space: 'srgb', keys: ['r', 'g', 'b'] },
+  rgba:  { space: 'srgb', keys: ['r', 'g', 'b'] },
+  hsl:   { space: 'hsl', keys: ['h', 's', 'l'] },
+  hsla:  { space: 'hsl', keys: ['h', 's', 'l'] },
+  hwb:   { space: 'hwb', keys: ['h', 'w', 'b'] },
+  lab:   { space: 'lab', keys: ['l', 'a', 'b'] },
+  lch:   { space: 'lch', keys: ['l', 'c', 'h'] },
+  oklab: { space: 'oklab', keys: ['l', 'a', 'b'] },
+  oklch: { space: 'oklch', keys: ['l', 'c', 'h'] },
+};
+// Substitute relative-colour channel keywords (r/g/b/alpha/…) in an expression
+// with their numeric values, parenthesized to preserve precedence inside calc().
+const _relSubst = (expr, env) => {
+  const keys = Object.keys(env).sort((a, b) => b.length - a.length);
+  let out = expr;
+  for (const k of keys) {
+    out = out.replace(new RegExp('\\b' + k + '\\b', 'gi'), '(' + env[k] + ')');
+  }
+  return out;
+};
+// Computed relative colour: resolve the origin into the function's space, expose
+// its channels as keyword values, evaluate each output channel, and assemble a
+// structured colour in the function's space. Returns null on any parse failure.
+const _relativeStruct = (value, el) => {
+  const s = String(value).trim();
+  const lp = s.indexOf('(');
+  if (lp <= 0 || !s.endsWith(')')) return null;
+  const fname = _unescapeIdent(s.slice(0, lp)).toLowerCase();
+  const cfg = _REL_FN[fname];
+  if (fname !== 'color' && !cfg) return null;
+  const toks = _wsTokens(s.slice(lp + 1, -1).trim());
+  if (!toks.length || toks[0].toLowerCase() !== 'from') return null;
+  const origin = _resolveColorStruct(toks[1], el);
+  if (!origin) return null;
+  let rest = toks.slice(2);
+  const si = rest.indexOf('/');
+  let alphaToks = null;
+  if (si >= 0) { alphaToks = rest.slice(si + 1); rest = rest.slice(0, si); }
+  // Determine the function's colour space + keyword names.
+  let space, keys;
+  if (fname === 'color') {
+    space = _COLOR_FN_SPACES[(rest[0] || '').toLowerCase()];
+    if (!space) return null;
+    rest = rest.slice(1);
+    keys = (space === 'xyz-d65' || space === 'xyz-d50') ? ['x', 'y', 'z'] : ['r', 'g', 'b'];
+  } else { space = cfg.space; keys = cfg.keys; }
+  if (rest.length !== 3) return null;
+  const o = _csConvert(origin, space);
+  // rgb()/rgba() channels are 0–255 (so a keyword/literal/% maps onto that range);
+  // color() channels and every other function are in their space's own units.
+  const isRgbFn = space === 'srgb' && fname !== 'color';
+  const scale = isRgbFn ? [255, 255, 255] : [1, 1, 1];
+  const base = fname === 'color' ? [1, 1, 1] : (isRgbFn ? [255, 255, 255] : _CS_BASE[space]);
+  const hueIdx = fname === 'color' ? undefined : _CS_HUE[space];
+  const env = { alpha: o.none[3] ? 0 : o.alpha };
+  for (let i = 0; i < 3; i++) env[keys[i]] = o.coords[i] * scale[i];
+  const coords = [0, 0, 0], noneOut = [false, false, false, false];
+  for (let i = 0; i < 3; i++) {
+    const tok = rest[i];
+    if (tok.toLowerCase() === 'none') { noneOut[i] = true; continue; }
+    const r = _csChan(_relSubst(tok, env), base[i] != null ? base[i] : 0, i === hueIdx);
+    if (!r) return null;
+    coords[i] = r.v / scale[i];
+  }
+  let alpha = o.alpha, aNone = false;
+  if (alphaToks) {
+    const at = alphaToks.join(' ');
+    if (at.toLowerCase() === 'none') aNone = true;
+    else { const r = _csChan(_relSubst(at, env), 1, false); if (!r) return null; alpha = Math.max(0, Math.min(1, r.v)); }
+  }
+  noneOut[3] = aNone;
+  return { space, coords, alpha, none: noneOut };
+};
+// Serialize a structured colour to its canonical COMPUTED form. hsl/hwb resolve
+// to sRGB → color(srgb …); the predefined RGB + xyz spaces → color(<space> …);
+// lab/lch/oklab/oklch keep their own function. `none` channels serialize as the
+// `none` keyword; alpha ≥ 1 (and not missing) is dropped.
+const _csSerialize = (col) => {
+  let { space, coords, alpha, none } = col;
+  none = (none || [false, false, false, false]).slice();
+  if (space === 'hsl' || space === 'hwb') {
+    // hsl/hwb resolve to sRGB for serialization. The channels aren't analogous
+    // to sRGB's, so a missing hsl/hwb component is NOT carried — it converts as 0
+    // (`hsl(none none none)` → `color(srgb 0 0 0)`); only alpha-missing survives.
+    coords = _fromXYZ('srgb', _toXYZ(space, coords));
+    space = 'srgb';
+    none[0] = none[1] = none[2] = false;
+  }
+  const hueIdx = _CS_HUE[space];
+  const clamp = _CS_CLAMP[space];   // per-channel [min,max] for lab/lch/oklab/oklch
+  const chan = (i) => {
+    if (none[i]) return 'none';
+    let v = coords[i];
+    // Hue serializes at 6 significant figures (matching the plain lab/lch/oklch
+    // computed serializer in `_modernChannel`) so the harness's exact round-trip
+    // re-serialization is byte-stable.
+    if (i === hueIdx) v = parseFloat((((v % 360) + 360) % 360).toPrecision(6));
+    else if (clamp && clamp[i]) v = Math.max(clamp[i][0], Math.min(clamp[i][1], v));
+    return _serNumber(v);
+  };
+  const body = [chan(0), chan(1), chan(2)];
+  let tail = '';
+  if (none[3]) tail = ' / none';
+  else { const a = Math.max(0, Math.min(1, alpha)); if (a < 1) tail = ' / ' + _serNumber(a); }
+  if (space === 'lab' || space === 'lch' || space === 'oklab' || space === 'oklch') {
+    return `${space}(${body.join(' ')}${tail})`;
+  }
+  return `color(${space} ${body.join(' ')}${tail})`;
+};
+// Top-level computed serialization for color-mix() / relative colour syntax;
+// null when `value` isn't one of those (the caller falls back to _computeColor).
+const _computeColorMixComputed = (value, el) => {
+  if (!/^color-mix\(/i.test(String(value).trim())) return null;
+  const st = _colorMixStruct(value, el);
+  return st ? _csSerialize(st) : null;
+};
+const _computeRelativeComputed = (value, el) => {
+  if (!/^[a-z]+\(\s*from\s/i.test(String(value).trim())) return null;
+  const st = _relativeStruct(value, el);
+  return st ? _csSerialize(st) : null;
 };
 // Computed `color` of an element, honouring inheritance and `currentColor`.
 // A missing/`inherit`/`currentcolor` value inherits the parent's color; the
@@ -7433,7 +7980,13 @@ const _normComputed = (el, kebab, v) => {
     // space (lab/lch/oklab/oklch, color()) or convert to sRGB (hwb); fall back to
     // the legacy named/hex/rgb/hsl computation when not one of those.
     const modern = _computeModernColor(v);
-    return modern !== null ? modern : _computeColor(v);
+    if (modern !== null) return modern;
+    // color-mix() / relative colour syntax need real cross-space colour maths.
+    const mixed = _computeColorMixComputed(v, el);
+    if (mixed !== null) return mixed;
+    const rel = _computeRelativeComputed(v, el);
+    if (rel !== null) return rel;
+    return _computeColor(v);
   }
   return v;
 };
