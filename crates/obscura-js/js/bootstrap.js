@@ -6056,15 +6056,15 @@ const _canonColorSpecified = (value) => {
   // nested math function) serialize at SPECIFIED time IDENTICALLY to their computed
   // value: resolve each `%` against the channel reference, clamp per channel,
   // normalize the hue into [0, 360), drop an alpha ≥ 1, and convert hwb() → sRGB
-  // rgb()/rgba(). We can therefore reuse `_computeModernColor` here — BUT only when
-  // the body has no nested `(`: a channel carrying a calc()/min()/… must PRESERVE
-  // the math expression at specified time (unclamped, with any `%` left symbolic,
-  // e.g. `lab(calc(50%) 50% 0.5)`→`lab(calc(50%) 62.5 0.5)`), which the computed
-  // helper would wrongly evaluate/clamp. Those calc-bearing forms stay verbatim
-  // (a Wave-2 specified-calc-serializer cap), so they're left untouched here.
+  // rgb()/rgba(). We reuse `_computeModernColor` in SPECIFIED mode (`specified`
+  // = true): a bare channel resolves+clamps exactly as computed, while a channel
+  // carrying a calc()/min()/… keeps its math expression — canonically serialized
+  // by `_canonMathExpr` but UNCLAMPED with `%` left symbolic (`lab(calc(50%) 50%
+  // 0.5)`→`lab(calc(50%) 62.5 0.5)`, `lab(calc(50*3) …)`→`lab(calc(150) …)`).
+  // Returns null (→ verbatim) for var()-bearing / unparseable shapes.
   const lp0 = s.indexOf('(');
-  if (lp0 > 0 && s.endsWith(')') && s.indexOf('(', lp0 + 1) === -1) {
-    const m = _computeModernColor(s);
+  if (lp0 > 0 && s.endsWith(')')) {
+    const m = _computeModernColor(s, true);
     if (m !== null) return m;
   }
   // color-mix() — canonicalize its SYNTAX at specified time (interpolation method,
@@ -6126,6 +6126,11 @@ const _canonRelativeColor = (value) => {
     const space = rest[0].toLowerCase();
     rest = [space === 'xyz' ? 'xyz-d65' : space, ...rest.slice(1)];
   }
+  // A calc()-bearing channel is canonicalized (operand reorder / constant fold,
+  // e.g. `calc(g * 2)`→`calc(2 * g)`, `calc(l - 20)`→`calc(-20 + l)`); the channel
+  // keywords stay symbolic. A bare keyword / `/` / replacement value has no `(`
+  // and is kept verbatim.
+  rest = rest.map((t) => (t.indexOf('(') !== -1 ? (_canonMathExpr(t) || t) : t));
   const outFn = fn === 'rgba' ? 'rgb' : fn === 'hsla' ? 'hsl' : fn;
   return outFn + '(from ' + origin + (rest.length ? ' ' + rest.join(' ') : '') + ')';
 };
@@ -6417,6 +6422,215 @@ const _serNumber = (x) => {
   if (Object.is(r, -0)) r = 0;
   return String(r);
 };
+// ── CSS Values 4 math-function serialization (`calc()` canon) ──────────────
+// Serialize a `calc()` (or other math function) to its canonical SPECIFIED-value
+// form, per CSS Values 4 §"Serialize a Calculation Tree". Unlike `_evalMath`
+// (which fully EVALUATES to a number), this PRESERVES symbolic terms — a
+// relative-colour channel keyword (r/g/b/h/s/l/w/c/x/y/z/alpha), a <percentage>
+// or <dimension>, and an unresolvable function like `sign(1em - 10px)` — while
+// folding constant sub-expressions and imposing the canonical ordering browsers
+// emit:
+//  • a fully-numeric sum/product of one unit folds to a single value, keeping its
+//    type: `calc(50 * 3)`→`calc(150)`, `calc(20deg * 2)`→`calc(40deg)`,
+//    `calc(50% * 3)`→`calc(150%)`, `calc(0.5 - 1)`→`calc(-0.5)`, `calc(0 / 0)`→
+//    `calc(NaN)`;
+//  • a product's numeric factors fold into ONE coefficient placed FIRST —
+//    `calc(g * 2)`→`calc(2 * g)`, `calc(a / 3)`→`calc(0.333333 * a)` (a numeric
+//    divisor becomes its reciprocal); a NON-numeric divisor stays a division
+//    (`calc(1 / l)` kept);
+//  • a sum's combined numeric constant moves FIRST — `calc(l - 20)`→
+//    `calc(-20 + l)`; the non-numeric terms keep their source order;
+//  • a product nested in a sum is parenthesized — `calc(g * .5 + g * .5)`→
+//    `calc((0.5 * g) + (0.5 * g))`.
+// A <percentage>/<dimension> stays symbolic (a % resolves against its channel
+// reference only at COMPUTED time, never here). This is wired ONLY into the
+// colour-channel canon (`_canonColorSpecified` modern path + `_canonRelativeColor`),
+// NOT the generic value path — so the `serialize-values` calc hot path is untouched.
+// Returns null when `str` isn't a parseable math function (caller keeps the bytes).
+const _CALC_CONSTS = { infinity: Infinity, '-infinity': -Infinity, nan: NaN, pi: Math.PI, e: Math.E };
+// Parse a math expression into a calculation tree. Node kinds:
+//   {k:'num', v, u}            numeric leaf (u='' | '%' | dimension like 'deg')
+//   {k:'sym', s}               opaque ident leaf (channel keyword / unknown)
+//   {k:'sum', terms:[{op,node}]}   op '+' | '-' (first term op '+')
+//   {k:'prod', facs:[{op,node}]}   op '*' | '/' (first factor op '*')
+//   {k:'fn', name, args:[node]}    a preserved function (sign/min/max/…)
+const _parseCalcTree = (str) => {
+  const s = String(str).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (s === '') return null;
+  const toks = [];
+  let i = 0; const n = s.length;
+  const isDigit = (c) => c >= '0' && c <= '9';
+  while (i < n) {
+    const c = s[i];
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f') { i++; continue; }
+    if (c === '(' || c === ')' || c === ',' || c === '+' || c === '-' || c === '*' || c === '/') { toks.push({ t: c }); i++; continue; }
+    if (isDigit(c) || (c === '.' && isDigit(s[i + 1]))) {
+      let j = i;
+      while (j < n && isDigit(s[j])) j++;
+      if (s[j] === '.') { j++; while (j < n && isDigit(s[j])) j++; }
+      if (s[j] === 'e' || s[j] === 'E') { let k = j + 1; if (s[k] === '+' || s[k] === '-') k++; if (isDigit(s[k])) { k++; while (k < n && isDigit(s[k])) k++; j = k; } }
+      let v = parseFloat(s.slice(i, j));
+      let u = '';
+      if (s[j] === '%') { u = '%'; j++; }
+      else if (j < n && /[a-zA-Z]/.test(s[j])) { let p = j; while (p < n && /[a-zA-Z]/.test(s[p])) p++; u = s.slice(j, p).toLowerCase(); j = p; }
+      // Canonicalize every <angle> unit to degrees so same-dimension arithmetic
+      // folds correctly: `50rad / 50deg` must cancel to a unitless <number> (the
+      // serialized form is re-evaluated by the computed colour engine, so a
+      // dropped unit-cancellation would corrupt the value — e.g. flip sin(l) into
+      // sin(l°)). No specified colour test carries a non-deg angle unit in calc.
+      if (_ANGLE_DEG[u] !== undefined) { v *= _ANGLE_DEG[u]; u = 'deg'; }
+      toks.push({ t: 'num', v, u }); i = j; continue;
+    }
+    if (/[a-zA-Z]/.test(c)) { let j = i; while (j < n && /[a-zA-Z0-9-]/.test(s[j])) j++; toks.push({ t: 'ident', v: s.slice(i, j).toLowerCase() }); i = j; continue; }
+    return null;
+  }
+  let p = 0, failed = false;
+  const fail = () => { failed = true; return { k: 'num', v: 0, u: '' }; };
+  const peek = () => toks[p];
+  const negate = (node) => node.k === 'num'
+    ? { k: 'num', v: -node.v, u: node.u }
+    : { k: 'prod', facs: [{ op: '*', node: { k: 'num', v: -1, u: '' } }, { op: '*', node }] };
+  const parseSum = () => {
+    let node = parseProduct();
+    const terms = [{ op: '+', node }];
+    while (!failed && peek() && (peek().t === '+' || peek().t === '-')) { const op = toks[p++].t; terms.push({ op, node: parseProduct() }); }
+    return terms.length === 1 ? node : { k: 'sum', terms };
+  };
+  const parseProduct = () => {
+    let node = parseFactor();
+    const facs = [{ op: '*', node }];
+    while (!failed && peek() && (peek().t === '*' || peek().t === '/')) { const op = toks[p++].t; facs.push({ op, node: parseFactor() }); }
+    return facs.length === 1 ? node : { k: 'prod', facs };
+  };
+  const parseFactor = () => {
+    const tok = peek();
+    if (!tok) return fail();
+    if (tok.t === '+') { p++; return parseFactor(); }
+    if (tok.t === '-') { p++; return negate(parseFactor()); }
+    if (tok.t === 'num') { p++; return { k: 'num', v: tok.v, u: tok.u }; }
+    if (tok.t === '(') { p++; const e = parseSum(); if (!peek() || peek().t !== ')') return fail(); p++; return e; }
+    if (tok.t === 'ident') {
+      const name = tok.v;
+      if (toks[p + 1] && toks[p + 1].t === '(') {
+        p += 2;
+        const args = [parseSum()];
+        while (!failed && peek() && peek().t === ',') { p++; args.push(parseSum()); }
+        if (!peek() || peek().t !== ')') return fail();
+        p++; return { k: 'fn', name, args };
+      }
+      p++;
+      if (Object.prototype.hasOwnProperty.call(_CALC_CONSTS, name)) return { k: 'num', v: _CALC_CONSTS[name], u: '' };
+      return { k: 'sym', s: name };
+    }
+    return fail();
+  };
+  const root = parseSum();
+  if (failed || p !== toks.length) return null;
+  return root;
+};
+// Multiply / divide two numeric units (only one side ever carries a unit in valid
+// CSS — number×dimension→dimension, dimension÷sameDimension→number).
+const _mulUnit = (a, b) => (a === '' ? b : (b === '' ? a : a));
+const _divUnit = (a, b) => (b === '' ? a : (a === b ? '' : a));
+// Simplify a calculation tree: fold numeric constants and impose canonical order.
+const _simpCalc = (node) => {
+  if (node.k === 'num' || node.k === 'sym') return node;
+  if (node.k === 'fn') {
+    if (node.name === 'calc' && node.args.length === 1) return _simpCalc(node.args[0]);
+    return { k: 'fn', name: node.name, args: node.args.map(_simpCalc) };
+  }
+  if (node.k === 'sum') {
+    const terms = node.terms.map((t) => ({ op: t.op, node: _simpCalc(t.node) }));
+    let numAcc = null, others = [];   // numAcc = {v, u} of the combined numeric constant
+    for (const t of terms) {
+      if (t.node.k === 'num') {
+        const val = t.op === '-' ? -t.node.v : t.node.v;
+        if (numAcc === null) numAcc = { v: val, u: t.node.u };
+        else if (numAcc.u === t.node.u) numAcc.v += val;
+        else others.push(t);            // mixed numeric units — keep verbatim
+      } else others.push(t);
+    }
+    if (others.length === 0) return { k: 'num', v: numAcc.v, u: numAcc.u };
+    const out = [];
+    if (numAcc !== null && !(numAcc.v === 0 && numAcc.u === '')) out.push({ op: '+', node: { k: 'num', v: numAcc.v, u: numAcc.u } });
+    for (const o of others) out.push(o);
+    if (out.length === 1 && out[0].op === '+') return out[0].node;
+    if (out[0].op === '-') out[0] = { op: '+', node: { k: 'num', v: -out[0].node.v, u: out[0].node.u } };
+    else out[0] = { op: '+', node: out[0].node };
+    return { k: 'sum', terms: out };
+  }
+  // product
+  const facs = node.facs.map((f) => ({ op: f.op, node: _simpCalc(f.node) }));
+  let coef = 1, cu = '', hasNum = false; const rest = [];
+  for (const f of facs) {
+    if (f.node.k === 'num') {
+      hasNum = true;
+      if (f.op === '*') { coef *= f.node.v; cu = _mulUnit(cu, f.node.u); }
+      else { coef /= f.node.v; cu = _divUnit(cu, f.node.u); }
+    } else rest.push(f);
+  }
+  if (rest.length === 0) return { k: 'num', v: coef, u: cu };
+  const out = [];
+  if (hasNum) out.push({ op: '*', node: { k: 'num', v: coef, u: cu } });
+  for (const r of rest) out.push(r);
+  out[0] = { op: '*', node: out[0].node };
+  if (out.length === 1) return out[0].node;
+  return { k: 'prod', facs: out };
+};
+// Serialize a numeric leaf (value + unit; non-finite → CSS keyword).
+const _serCalcNum = (node) => {
+  const v = node.v;
+  const s = Number.isNaN(v) ? 'NaN' : v === Infinity ? 'infinity' : v === -Infinity ? '-infinity' : _serNumber(v);
+  return s + node.u;
+};
+// Serialize a calculation tree; sum/product nodes always wrap in parentheses.
+const _serCalcTree = (node) => {
+  if (node.k === 'num') return _serCalcNum(node);
+  if (node.k === 'sym') return node.s;
+  if (node.k === 'fn') return node.name + '(' + node.args.map(_serCalcRoot).join(', ') + ')';
+  if (node.k === 'sum') {
+    let out = _serCalcTree(node.terms[0].node);
+    for (let i = 1; i < node.terms.length; i++) {
+      const t = node.terms[i];
+      if (t.op === '+' && t.node.k === 'num' && isFinite(t.node.v) && t.node.v < 0) out += ' - ' + _serCalcTree({ k: 'num', v: -t.node.v, u: t.node.u });
+      else out += (t.op === '+' ? ' + ' : ' - ') + _serCalcTree(t.node);
+    }
+    return '(' + out + ')';
+  }
+  // product
+  let out = _serCalcTree(node.facs[0].node);
+  for (let i = 1; i < node.facs.length; i++) out += (node.facs[i].op === '*' ? ' * ' : ' / ') + _serCalcTree(node.facs[i].node);
+  return '(' + out + ')';
+};
+// Serialize at "root" position — a top-level sum/product sheds its outer parens.
+const _serCalcRoot = (node) => {
+  const s = _serCalcTree(node);
+  return (node.k === 'sum' || node.k === 'prod') ? s.slice(1, -1) : s;
+};
+// Canonicalize a math function (`calc(…)`/`min(…)`/…) string. Returns the
+// canonical serialization, or null if `str` isn't a parseable math function.
+const _canonMathExpr = (str) => {
+  const s = String(str).trim();
+  if (!/^[a-zA-Z][a-zA-Z-]*\(/.test(s) || !s.endsWith(')')) return null;
+  const root = _parseCalcTree(s);
+  if (root === null) return null;
+  const simp = _simpCalc(root);
+  if (root.k === 'fn' && root.name === 'calc') return 'calc(' + _serCalcRoot(simp) + ')';
+  if (simp.k === 'fn') return _serCalcTree(simp);
+  return 'calc(' + _serCalcRoot(simp) + ')';
+};
+// At SPECIFIED time a math function reduces to a constant ONLY if it folds to a
+// single numeric leaf — i.e. it has no channel symbols, no preserved function
+// (sign/min/…), and no font/viewport-relative unit (`1em - 10px` stays a sum of
+// distinct units, so it does NOT fold). Returns {v, u} of the constant, else null
+// (→ the value must stay symbolic). NB unlike `_evalMath` this never invents a
+// pixels-per-em, so `sign(1em - 10px)` is correctly irreducible here.
+const _calcConstValue = (str) => {
+  const root = _parseCalcTree(str);
+  if (root === null) return null;
+  const simp = _simpCalc(root);
+  return simp.k === 'num' ? { v: simp.v, u: simp.u } : null;
+};
 // Computed value of `opacity`: a <number> or <percentage> (incl. math
 // functions), clamped to [0, 1]. Returns null if the value isn't numeric.
 const _computeOpacity = (value) => {
@@ -6455,8 +6669,14 @@ const _COLOR_FN_SPACES = {
 // Resolve one channel of a lab/lch/oklab/oklch/color() function to its computed
 // serialization. Returns the string (`'none'` or a serialized <number>), or null
 // if the math can't resolve (e.g. a container-relative unit like cqw — no layout).
-const _modernChannel = (tok, spec) => {
-  if (String(tok).trim().toLowerCase() === 'none') return 'none';
+const _modernChannel = (tok, spec, specified) => {
+  const t = String(tok).trim();
+  if (t.toLowerCase() === 'none') return 'none';
+  // SPECIFIED time: a math-function channel keeps its calc() wrapper, canonically
+  // serialized but NOT resolved/clamped (a % stays a %). Returns null if the calc
+  // can't be parsed → the whole colour falls back to verbatim. (At COMPUTED time
+  // `specified` is falsy and the math is resolved below, as before.)
+  if (specified && t.indexOf('(') !== -1) return _canonMathExpr(t);
   if (spec.hue) {
     let v = _evalMath(tok, 0, { angle: true, lengths: true, nonFinite: true });
     if (v === null) return null;
@@ -6484,8 +6704,12 @@ const _modernChannel = (tok, spec) => {
 //   'none'  → keep `/ none`
 //   '<num>' → keep `/ <num>` (a value in [0, 1))
 //   null    → the math couldn't resolve
-const _modernAlpha = (tok) => {
-  if (String(tok).trim().toLowerCase() === 'none') return 'none';
+const _modernAlpha = (tok, specified) => {
+  const t = String(tok).trim();
+  if (t.toLowerCase() === 'none') return 'none';
+  // SPECIFIED: a math-function alpha keeps its calc() wrapper (never dropped or
+  // clamped), canonically serialized; null if unparseable.
+  if (specified && t.indexOf('(') !== -1) return _canonMathExpr(t);
   let a = _evalMath(tok, 1, { lengths: true, nonFinite: true });
   if (a === null) return null;
   if (Number.isNaN(a)) a = 0;
@@ -6495,37 +6719,82 @@ const _modernAlpha = (tok) => {
 };
 // Serialize a channel list + optional alpha into the `c1 c2 c3[ / a]` body, or
 // null on any unresolvable channel/alpha.
-const _modernBody = (chanToks, specs, alphaTok) => {
+const _modernBody = (chanToks, specs, alphaTok, specified) => {
   const out = [];
   for (let i = 0; i < specs.length; i++) {
-    const r = _modernChannel(chanToks[i], specs[i]);
+    const r = _modernChannel(chanToks[i], specs[i], specified);
     if (r === null) return null;
     out.push(r);
   }
   let body = out.join(' ');
   if (alphaTok !== undefined) {
-    const a = _modernAlpha(alphaTok);
+    const a = _modernAlpha(alphaTok, specified);
     if (a === null) return null;
     if (a !== '') body += ' / ' + a;
   }
   return body;
 };
+// SPECIFIED serialization of an hwb() whose hue (or another channel) is an
+// unresolvable calc — keep `hwb(h w b[ / a])`: a math-function channel keeps its
+// canonical calc() wrapper, a <percentage> whiteness/blackness resolves to its
+// <number> (`30%`→`30`), the hue normalizes into [0, 360), and the alpha follows
+// the modern-alpha rule (drop ≥ 1, keep calc symbolic). Null if any piece is
+// genuinely unparseable → caller keeps the original bytes.
+const _hwbSpecified = (parts) => {
+  const comp = (tok, base, hue) => {
+    const t = String(tok).trim();
+    if (t.toLowerCase() === 'none') return 'none';
+    if (t.indexOf('(') !== -1) return _canonMathExpr(t);   // calc kept symbolic
+    let v = _evalMath(t, base, { angle: hue, lengths: true, nonFinite: true });
+    if (v === null) return null;
+    if (Number.isNaN(v)) v = 0;
+    if (hue) { if (!isFinite(v)) v = 0; v = ((v % 360) + 360) % 360; }
+    return _serNumber(v);
+  };
+  const h = comp(parts[0], 0, true), w = comp(parts[1], 100, false), bl = comp(parts[2], 100, false);
+  if (h === null || w === null || bl === null) return null;
+  let body = `hwb(${h} ${w} ${bl}`;
+  if (parts.length === 4) {
+    const a = _modernAlpha(parts[3], true);
+    if (a === null) return null;
+    if (a !== '') body += ' / ' + a;
+  }
+  return body + ')';
+};
 // hwb() computes to sRGB rgb()/rgba(): pure-hue sRGB scaled by whiteness/blackness.
-const _computeHwb = (inner) => {
+const _computeHwb = (inner, specified) => {
   const parts = _splitTopLevel(inner);
   if (parts.length < 3 || parts.length > 4) return null;
   const num = (tok, base) => {
-    if (String(tok).trim().toLowerCase() === 'none') return 0;   // missing component → 0
-    let v = _evalMath(tok, base, { angle: base === 0, lengths: true, nonFinite: true });
+    const t = String(tok).trim();
+    if (t.toLowerCase() === 'none') return 0;   // missing component → 0
+    // SPECIFIED: a calc channel resolves to rgb ONLY if it folds to a constant
+    // (`calc(infinity)`/`calc(0/0)`); a sign()/relative-unit calc stays symbolic
+    // → null makes the caller keep `hwb()`.
+    if (specified && t.indexOf('(') !== -1) {
+      const c = _calcConstValue(t);
+      if (c === null) return null;
+      if (c.u === '') return c.v;
+      if (c.u === '%') return (c.v / 100) * base;
+      const af = base === 0 ? _ANGLE_DEG[c.u] : undefined;
+      return af === undefined ? null : c.v * af;
+    }
+    let v = _evalMath(t, base, { angle: base === 0, lengths: true, nonFinite: true });
     if (v === null) return null;
     if (Number.isNaN(v)) v = 0;
     return v;
   };
-  const h = num(parts[0], 0);                 // angle (deg) — opts.angle on (base 0)
+  let h = num(parts[0], 0);                 // angle (deg) — opts.angle on (base 0)
   let w = num(parts[1], 100), bl = num(parts[2], 100);  // whiteness/blackness in [0,100]
-  if (h === null || w === null || bl === null) return null;
   let a = 1;
-  if (parts.length === 4) { a = num(parts[3], 1); if (a === null) return null; }
+  if (parts.length === 4) a = num(parts[3], 1);
+  // A channel that won't resolve (a relative-unit/sign() calc) makes the colour
+  // un-convertible to sRGB. At SPECIFIED time we keep `hwb()` with each channel
+  // canonically serialized (calc kept symbolic, % resolved to <number>); at
+  // computed time we bail so the caller leaves it verbatim.
+  if (h === null || w === null || bl === null || a === null) return specified ? _hwbSpecified(parts) : null;
+  if (!isFinite(h)) h = 0;                   // ±∞/NaN hue → 0 (powerless after the wrap)
+  a = Number.isNaN(a) ? 0 : a === Infinity ? 1 : a === -Infinity ? 0 : Math.max(0, Math.min(1, a));
   w /= 100; bl /= 100;
   let r, g, b;
   if (w + bl >= 1) { const gray = w / (w + bl); r = g = b = gray * 255; }
@@ -6544,28 +6813,28 @@ const _computeHwb = (inner) => {
 // space (+ hwb→sRGB). Returns the serialized computed value, or null when `value`
 // isn't one of these functions or a channel can't resolve — the caller then falls
 // back to the legacy `_computeColor` (which handles named/hex/rgb/hsl).
-const _computeModernColor = (value) => {
+const _computeModernColor = (value, specified) => {
   if (!value) return null;
   const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
   const lp = s.indexOf('(');
   if (lp <= 0 || !s.endsWith(')')) return null;
   const fname = _unescapeIdent(s.slice(0, lp)).toLowerCase();
   const inner = s.slice(lp + 1, -1);
-  if (fname === 'hwb') return _computeHwb(inner);
+  if (fname === 'hwb') return _computeHwb(inner, specified);
   if (fname === 'color') {
     const parts = _splitTopLevel(inner);
     if (parts.length < 4 || parts.length > 5) return null;
     const space = _COLOR_FN_SPACES[parts[0].toLowerCase()];
     if (!space) return null;
     const specs = [{ base: 1, clamp: null }, { base: 1, clamp: null }, { base: 1, clamp: null }];
-    const body = _modernBody(parts.slice(1, 4), specs, parts.length === 5 ? parts[4] : undefined);
+    const body = _modernBody(parts.slice(1, 4), specs, parts.length === 5 ? parts[4] : undefined, specified);
     return body === null ? null : `color(${space} ${body})`;
   }
   const specs = _MODERN_LAB_FNS[fname];
   if (!specs) return null;
   const parts = _splitTopLevel(inner);
   if (parts.length < 3 || parts.length > 4) return null;
-  const body = _modernBody(parts.slice(0, 3), specs, parts.length === 4 ? parts[3] : undefined);
+  const body = _modernBody(parts.slice(0, 3), specs, parts.length === 4 ? parts[3] : undefined, specified);
   return body === null ? null : `${fname}(${body})`;
 };
 
