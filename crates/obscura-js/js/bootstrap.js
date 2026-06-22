@@ -6042,6 +6042,22 @@ const _canonColorSpecified = (value) => {
   // `Red`→`red` — but otherwise keep their keyword form (they only resolve to an
   // rgb() at computed-value time, unlike the legacy hex/rgb/hsl forms below).
   if (low === 'transparent' || low === 'currentcolor' || _CSS_WIDE.has(low) || _CSS_NAMED_COLORS[low]) return low;
+  // Modern colour functions — lab()/lch()/oklab()/oklch()/color(<space> …) and
+  // hwb() — whose channels are all plain <number>/<percentage>/<angle>/none (no
+  // nested math function) serialize at SPECIFIED time IDENTICALLY to their computed
+  // value: resolve each `%` against the channel reference, clamp per channel,
+  // normalize the hue into [0, 360), drop an alpha ≥ 1, and convert hwb() → sRGB
+  // rgb()/rgba(). We can therefore reuse `_computeModernColor` here — BUT only when
+  // the body has no nested `(`: a channel carrying a calc()/min()/… must PRESERVE
+  // the math expression at specified time (unclamped, with any `%` left symbolic,
+  // e.g. `lab(calc(50%) 50% 0.5)`→`lab(calc(50%) 62.5 0.5)`), which the computed
+  // helper would wrongly evaluate/clamp. Those calc-bearing forms stay verbatim
+  // (a Wave-2 specified-calc-serializer cap), so they're left untouched here.
+  const lp0 = s.indexOf('(');
+  if (lp0 > 0 && s.endsWith(')') && s.indexOf('(', lp0 + 1) === -1) {
+    const m = _computeModernColor(s);
+    if (m !== null) return m;
+  }
   const out = _computeColor(s);
   // _computeColor returns its argument unchanged for anything that isn't a legacy
   // hex/rgb/hsl colour (modern functions, var(), unparseable) — keep the original
