@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #69).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-21 (Quest #70).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-values/urls/resolve-relative-to-base.sub.html` | 0/2 | **2/2** | ✅ 100% | **Quest #70 The Resolved Verdict.** Computed-time URL absolutization (pure JS, no new Rust). New `_canonUrls(value, el)` resolves each `url()` token to its absolute URL via `new URL(raw, el.baseURI).href`, serialized double-quoted (`url(images/test.png)`→`url("http://www.not-wpt.live/images/test.png")` against `<base href>`); handles both quoted and unquoted forms; idempotent/fail-safe on already-absolute or unparseable (`{{token}}`) urls. Wired into `_normComputed` after `_canonGradients` for `_GRADIENT_PROPS`. **+2.** |
 | `css/css-images/parsing/image-function-valid.html` | 12/13 | **13/13** | ✅ 100% | **Quest #69 The Composited Verdict.** Generalized `_canonGradients` from a gradient-only scan to an `<image>`-function scan (pure JS, no new Rust). New `_canonImageInner` canonicalizes `image(<color>)` — `image(rgb(0 128 255))`→`image(rgb(0, 128, 255))` (specified); named/`currentcolor`/modern functions stay verbatim. **+1.** |
 | `css/css-images/parsing/image-function-computed.html` | 1/3 | **3/3** | ✅ 100% | **Quest #69 The Composited Verdict.** Computed `image(<color>)` via `_computeColor` — `image(red)`→`image(rgb(255, 0, 0))`, `image(transparent)`→`image(rgba(0, 0, 0, 0))`. **+2.** |
 | `css/css-backgrounds/parsing/background-image-valid.html` | 9/13 | **13/13** | ✅ 100% | **Quest #69 The Composited Verdict.** New `_canonCrossFadeInner`/`_canonCfImage`: each `cross-fade()` `<cf-image>` is `<percentage>? && [<image>|<color>]` — serialize the image/colour first, percentage last, single-space (`cross-fade(50% url(…), …)`→`cross-fade(url(…) 50%, …)`, `cross-fade( 1% red, green)`→`cross-fade(red 1%, green)`); nested `<image>` functions recurse. **+4.** |

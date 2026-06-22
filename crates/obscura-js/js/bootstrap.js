@@ -6830,6 +6830,62 @@ const _canonGradients = (value, el, computed) => {
   }
   return out;
 };
+// Resolve every url() token in a computed <image>/<url> value to its absolute URL
+// against the element's document base URL (CSS Values "the computed value of a
+// <url> is the absolute URL" — drafts.csswg.org/css-values/#relative-urls),
+// serialized double-quoted. A url() whose target won't parse (e.g. an
+// unsubstituted {{token}}) — or one that is already absolute — round-trips
+// byte-identical, so this is idempotent on absolute values. Handles both the
+// quoted functional form url("a") and the unquoted url-token form url(a).
+const _canonUrls = (value, el) => {
+  const s = String(value);
+  if (!/url\(/i.test(s)) return s;
+  let base;
+  try { base = el && el.baseURI; } catch (e) {}
+  if (!base) { try { base = globalThis.document.baseURI; } catch (e) {} }
+  if (!base) return s;
+  let out = '', i = 0;
+  const re = /url\(/gi;
+  while (i < s.length) {
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (!m) { out += s.slice(i); break; }
+    const start = m.index;
+    const before = start > 0 ? s[start - 1] : '';
+    if (before && /[A-Za-z0-9_-]/.test(before)) {     // embedded in an ident (e.g. -webkit-url) → not a url() token
+      out += s.slice(i, start + 4); i = start + 4; continue;
+    }
+    let j = start + 4;                                // first char after "url("
+    while (j < s.length && /\s/.test(s[j])) j++;
+    let raw = '';
+    if (s[j] === '"' || s[j] === "'") {               // quoted functional form
+      const q = s[j]; j++;
+      while (j < s.length && s[j] !== q) {
+        if (s[j] === '\\') { j++; if (j < s.length) { raw += s[j]; j++; } continue; }
+        raw += s[j]; j++;
+      }
+      j = Math.min(s.length, j + 1);                  // past closing quote
+    } else {                                          // unquoted url-token (no trailing ws)
+      while (j < s.length && s[j] !== ')') {
+        if (s[j] === '\\') { j++; if (j < s.length) { raw += s[j]; j++; } continue; }
+        raw += s[j]; j++;
+      }
+      raw = raw.replace(/\s+$/, '');
+    }
+    while (j < s.length && /\s/.test(s[j])) j++;
+    if (s[j] === ')') {                               // a well-formed url() — resolve it
+      j++;
+      out += s.slice(i, start);
+      let abs = null;
+      try { abs = new URL(raw, base).href; } catch (e) {}
+      out += abs == null ? s.slice(start, j)          // unparseable → keep verbatim
+        : 'url("' + abs.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '")';
+      i = j; continue;
+    }
+    out += s.slice(i, start + 4); i = start + 4;      // malformed url( → leave head, flow on
+  }
+  return out;
+};
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
 const _FONT_SIZE_KEYWORDS = {
@@ -6842,7 +6898,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
-  if (_GRADIENT_PROPS.has(kebab)) return _canonGradients(v, el, true);
+  if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonGradients(v, el, true), el);
   if (kebab === 'font-size') {
     const k = String(v).trim().toLowerCase();
     if (k in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[k];

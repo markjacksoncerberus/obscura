@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~70~~ | ✅ [The Resolved Verdict](70-the-resolved-verdict.md) | `css/css-values/urls/resolve-relative-to-base.sub.html` (computed-time URL absolutization) | **2/2** | ⚔️ | **SECURED — +2.** Took #69's "next leverage (1)" — the foundational `<url>`-computed primitive (the `image-set`/`cross-fade` pointers turned out not to exist as WPT tests; the `<url>` family lives in `css/css-values/urls/`). A relative `url()` in an `<image>`/`<url>` property must compute to its absolute URL against the document base URL (`<base href>`), but Obscura stored it verbatim (non-variable `url(images/test.png)`, variable `url("images/test.png")`). New `_canonUrls(value, el)` (pure JS, no new Rust): scans for `url()` tokens (both quoted functional + unquoted url-token forms), resolves each via `new URL(raw, el.baseURI).href`, serializes double-quoted; idempotent/fail-safe — already-absolute or unparseable (`{{token}}`) urls round-trip byte-identical (empirically verified in-engine). Wired into `_normComputed` after `_canonGradients` for `_GRADIENT_PROPS` (also absolutizes `url()`s nested in `image()`/`cross-fade()`). Specified time untouched (relative stays as written). Zero regressions (mask-image-computed 47/47 — its `url("http://{{host}}/")` round-trips byte-identical, the key idempotency proof; gradient family 18/43/1398, color 17/16, serialize-values 695/697, background-position-computed 32, createElement 147; obscura-dom 40/40). Caps: `resolve-relative-to-stylesheet` (0/3, needs external-CSS loading w/ per-stylesheet base); broaden `_canonUrls` to `cursor`/`content`/`@font-face src`; `image-function-invalid` (per-prop validation). |
 | ~~69~~ | ✅ [The Composited Verdict](69-the-composited-verdict.md) | `image-function-valid`·`-computed` + `background-image-valid` (`<image>`-function canon: `image()` + `cross-fade()`) | **13/13 · 3/3 · 13/13** | ⚔️ | **SECURED — +7.** Took #68's "next leverage (1)+(2)". Generalized `_canonGradients` from a gradient-only scan to an `<image>`-function scan (pure JS, no new Rust): new `_IMAGE_FUNC_HEAD` adds `image`/`cross-fade` heads, dispatched per-head. `_canonImageInner` canonicalizes `image(<color>)` (specified `_canonColorSpecified` → `image(rgb(0 128 255))`→`image(rgb(0, 128, 255))`, names/modern fns verbatim; computed `_computeColor` → `image(red)`→`image(rgb(255, 0, 0))`, `image(transparent)`→`image(rgba(0, 0, 0, 0))`). `_canonCrossFadeInner`/`_canonCfImage` reorder each `cross-fade()` `<cf-image>` to `<image|colour> <percentage>` (`cross-fade(50% url(…), …)`→`cross-fade(url(…) 50%, …)`, `cross-fade( 1% red, green)`→`cross-fade(red 1%, green)`), nested `<image>` functions recurse. Already wired via `background-image` ∈ `_GRADIENT_PROPS`. image-valid 12→13, image-computed 1→3, background-image-valid 9→13. Zero regressions (gradient family 18/43/1398, color-valid 17/computed 16, serialize-values 695/697, background-position-computed 32, Element-matches 669, createElement 147; obscura-dom 40/40; composing cases `cross-fade(image(green), red)`/nested gradients byte-identical). Caps: url absolutization (document base-URL, foundational `<url>`-computed); `cross-fade()` computed (404 this session, code already in place); `image-set()` canon; valid-prop registry. |
 | ~~68~~ | ✅ [The Tinctured Verdict](68-the-tinctured-verdict.md) | `css/css-color/parsing/color-valid` (specified-value `<color>` serialization) | **17/17** | ⚔️ | **SECURED — +10.** Took #67's "next leverage" via a reachability sweep (the bigger `<image>`/`<url>` tails were wpt.live 404 this session). The inline-`style` specified path stored colours verbatim, so legacy sRGB forms never canonicalized. New `_canonColorSpecified` (pure JS, no new Rust) reuses the existing `_computeColor` for the hex/`rgb`/`hsl`→canonical `rgb()`/`rgba()` conversion (`#234`→`rgb(34, 51, 68)`, `hsl(120, 100%, 50%)`→`rgb(0, 255, 0)`, channel/`%` clamp, 4-arg/slash-alpha→rgba) but — UNLIKE the computed path — keeps named colours/`currentcolor`/`transparent`/CSS-wide/modern functions (`light-dark()`)/`var()` **verbatim** (they only resolve at computed time). Wired into `_parseStyleDecls` + `setProperty` for `_COLOR_PROPS`. The foundational specified-`<color>` primitive: every `*-color-valid` test (background/border/outline/caret/text-decoration-color — all 404 this session) canonicalizes for free once served. Zero regressions (serialize-values 695/697 — its colour list is all fixed points; color-computed 16/16; gradient/position/image family unchanged; obscura-dom 40/40). Caps: `image(<color>)` canon (`image-function` 12/13·1/3 — extend `_canonGradients` to the `image()` wrapper); `cross-fade()` (404); url absolutization; colour-invalid drop. |
 | ~~67~~ | ✅ [The Imaged Verdict](67-the-imaged-verdict.md) | `mask-image` / `background-image` / `list-style-image` / `border-image-source` `-computed` | **47/47 · 47/48 · 11/11 · 9/10** | ⚔️⚔️ | **SECURED — +76.** Took #66's "next leverage (1)". Registered `mask-image`/`list-style-image`/`border-image-source` in `_GRADIENT_PROPS` (+ `_GCS_DEFAULTS` initial `none`) and completed the #64–66 gradient computed canonicalizer (pure JS, no new Rust): radial size clamp-to-`0px` + drop `circle` on explicit length, conic `from <angle>` normalize/drop-default-`0deg`, conic stop angle units (`1turn`→`360deg`) + stop calc resolution, **two-position colour-stop split** (`black 0% 0.5em`→`black 0%, black 20px`), linear direction angle calc (`calc(90deg-45deg)`→`45deg`), mixed `%`+length stop calc kept as `calc()`, pure-`%` calc resolved, `lh` unit (`1lh`→`80px`), `currentcolor`→el `color`, angle 6-sig-fig serialization (`2rad`→`114.592deg`), and EOF auto-close for unclosed functions. mask 0→47, background 35→47, list-style 3→11, border-image 0→9. Zero regressions (whole `<position>`/gradient family byte-identical; serialize-values 695/697; obscura-dom 40/40). Caps: `light-dark()` (CSS Color 5), url absolutization (document base-URL), `cross-fade()` specified canon. |
@@ -109,6 +110,38 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-21 (Quest #70 The Resolved Verdict — computed-time URL
+absolutization, +2):** Took #69's named "next leverage (1)" (URL absolutization). A
+reachability sweep found the `image-set-*`/`cross-fade-*` pointers from #69's memory
+**do not exist** as WPT tests (confirmed via the GitHub contents API); the `<url>`
+family lives in `css/css-values/urls/`. Of the reachable fails, `resolve-relative-to-
+base.sub.html` (0/2) is the clean foundational primitive: a relative `url()` in an
+`<image>`/`<url>` property must compute to its absolute URL against the document base
+URL (`<base href="http://www.not-wpt.live">` → `url(images/test.png)` computes to
+`url("http://www.not-wpt.live/images/test.png")`). Obscura stored it verbatim — a bare
+`url()` is outside every `_IMAGE_FUNC_HEAD` function, so `_canonGradients`'s scan never
+touched it. **Fix (pure JS, `bootstrap.js`, NO new Rust):** new **`_canonUrls(value,
+el)`** scans for `url()` tokens (both the quoted functional `url("a")` and the unquoted
+url-token `url(a)` forms, trailing ws trimmed, escapes consumed), resolves each via
+`new URL(raw, el.baseURI).href` (base from `_documentBaseURL` → `<base href>`), and
+re-serializes double-quoted. **Idempotent / fail-safe:** an unparseable target (e.g. an
+unsubstituted `{{token}}`) or an already-absolute url round-trips byte-identical —
+verified in-engine that `new URL("http://{{host}}/", base).href === "http://{{host}}/"`.
+Wired into `_normComputed` *after* `_canonGradients` for `_GRADIENT_PROPS` (so `url()`s
+nested in `image()`/`cross-fade()` absolutize too); specified time untouched. 0→2/2.
+**+2. ZERO regressions** — mask-image-computed 47/47 (its `url("http://{{host}}/")`
+subtests round-trip byte-identical = the idempotency proof), background-image-computed
+47/48 (1 pre-existing `light-dark()` cap), image-function 13/3, gradient-position
+18/43, interpolation-method 1398, color 17/16, background-position-computed 32,
+serialize-values 695/697, createElement 147; obscura-dom 40/40. (`list-style-image-
+computed`/`Element-matches` came back wpt.live 404 this session — serving flux, NOT
+regressions.) **Caps / next:** (1) `resolve-relative-to-stylesheet` (0/3) needs external-
+CSS loading with per-stylesheet base URL (bigger); (2) broaden `_canonUrls` to non-image
+`<url>` props (`cursor`/`content`/`@font-face src`) once registered for computed
+serialization; (3) `image-function-invalid` / per-property value validation (valid-prop
+registry cap); (4) `cross-fade()` computed (404, code in place); (5) fresh realm. Scroll
+`tickets/70-the-resolved-verdict.md`.
 
 **Session 2026-06-21 (Quest #69 The Composited Verdict — `<image>`-function canon
 (`image()` + `cross-fade()`), +7):** Took #68's named "next leverage (1)+(2)". A
