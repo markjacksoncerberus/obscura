@@ -12,6 +12,15 @@ use crate::document::ResolvedDoc;
 use crate::fonts::bundled_font_context;
 use crate::net::ResourceProvider;
 
+/// UA stylesheet that collapses all CSS transitions and animations to their end
+/// state, so a static screenshot reflects the settled page rather than a frame
+/// captured at t=0. See the usage site in [`RenderEngine::layout`] for why this
+/// matters (async stylesheet loads turn `transition`s into wrong-colour paints).
+const ANIMATION_DISABLING_UA_CSS: &str = "*, ::before, ::after, ::backdrop { \
+     transition-duration: 0s !important; transition-delay: 0s !important; \
+     animation-duration: 0s !important; animation-delay: 0s !important; \
+}";
+
 /// Owns the expensive, reusable state for rendering — currently the bundled
 /// [`FontContext`](blitz_dom::FontContext). Build one per process and reuse it
 /// across every page and every render; each [`layout`](RenderEngine::layout)
@@ -52,6 +61,21 @@ impl RenderEngine {
         tracing::debug!(html_len = input.html.len(), "render: laying out snapshot");
 
         let mut doc = HtmlDocument::from_html(&input.html, config);
+
+        // Render the *settled* state, not a mid-transition frame. Blitz has no
+        // animation clock: a CSS `transition`/`animation` is evaluated at t=0,
+        // so a property still renders at its pre-transition value. This bites
+        // real sites hard — external stylesheets load asynchronously, and when
+        // they finally apply, any property under `transition` (e.g. a link's
+        // `color` going from the UA default to the author colour) animates from
+        // its old value. The screenshot then captures the *start* of that
+        // animation: e.g. Tailwind links with `transition-colors` paint in the
+        // UA default link blue instead of their real colour. Forcing zero
+        // duration/delay collapses every transition/animation to its end state.
+        // `!important` in the UA origin outranks even author `!important`, so it
+        // wins regardless of how the page declares its transitions. This is the
+        // same trick headless screenshotters (Playwright/Puppeteer) use.
+        doc.add_user_agent_stylesheet(ANIMATION_DISABLING_UA_CSS);
 
         // Resolve repeatedly: each pass applies bytes delivered since the last
         // one and may request further resources. Stop when the provider is idle
