@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~67~~ | ✅ [The Imaged Verdict](67-the-imaged-verdict.md) | `mask-image` / `background-image` / `list-style-image` / `border-image-source` `-computed` | **47/47 · 47/48 · 11/11 · 9/10** | ⚔️⚔️ | **SECURED — +76.** Took #66's "next leverage (1)". Registered `mask-image`/`list-style-image`/`border-image-source` in `_GRADIENT_PROPS` (+ `_GCS_DEFAULTS` initial `none`) and completed the #64–66 gradient computed canonicalizer (pure JS, no new Rust): radial size clamp-to-`0px` + drop `circle` on explicit length, conic `from <angle>` normalize/drop-default-`0deg`, conic stop angle units (`1turn`→`360deg`) + stop calc resolution, **two-position colour-stop split** (`black 0% 0.5em`→`black 0%, black 20px`), linear direction angle calc (`calc(90deg-45deg)`→`45deg`), mixed `%`+length stop calc kept as `calc()`, pure-`%` calc resolved, `lh` unit (`1lh`→`80px`), `currentcolor`→el `color`, angle 6-sig-fig serialization (`2rad`→`114.592deg`), and EOF auto-close for unclosed functions. mask 0→47, background 35→47, list-style 3→11, border-image 0→9. Zero regressions (whole `<position>`/gradient family byte-identical; serialize-values 695/697; obscura-dom 40/40). Caps: `light-dark()` (CSS Color 5), url absolutization (document base-URL), `cross-fade()` specified canon. |
 | ~~66~~ | ✅ [The Interpolated Verdict](66-the-interpolated-verdict.md) | `css/css-images/parsing/gradient-interpolation-method-{valid,computed}` | **1398/1398 · 932/932** | ⚔️⚔️ | **SECURED — +1439.** The widest unopened tail of the whole frontier. Gradients carry a `<color-interpolation-method>` (`in oklab`/`in lab`/`in hsl longer hue`) the #64/#65 canonicalizer never parsed. Extended it (pure JS, no new Rust): `_interpolationClause` finds the `in <space> [ <hue> hue ]?` clause; `_canonGradientConfig` splits it off, canonicalizes direction + method independently, and **recombines `<direction> in <space>`** (reorder — `in lab 30deg`→`30deg in lab`); `_canonInterpolationMethod` aliases `xyz`→`xyz-d65`, drops the default `shorter hue`, and **drops the clause when it equals the default space** (`srgb` if every stop is a legacy sRGB colour, `oklab` otherwise — `_isNonLegacyColorTok`/`isLegacy`). Plus radial-prelude fixes the test surfaced: `_canonRadialPrelude` drops the default `ellipse` when an explicit size is present (`ellipse 50% 40em`→`50% 40em`) and resolves lengths to px at computed time (`40em`→`640px`), and `_isGradientConfig` now detects a bare `<radial-size>` config so the size still resolves after `ellipse` is dropped. valid 585→1398 (+813), computed 306→932 (+626). Zero regressions (whole `<position>`/gradient family byte-identical; serialize-values 695/697). Caps: more `<image>` props (`mask-image`/`list-style-image`/`border-image-source` — same grammar, mostly registration); valid-property registry; fresh realm. |
 | ~~65~~ | ✅ [The Distilled Verdict](65-the-distilled-verdict.md) | `css/css-variables/variable-substitution-background-properties` (gradient default-token canonicalization + linear-gradient) | **10/10** | ⚔️ | **SECURED — +2.** #64's named "next leverage (1)" — gradient default-token canonicalization, distilling away tokens that compute to their defaults. Extended the #64 gradient canonicalizer (pure JS, no new Rust) to (a) **`linear-gradient`** (added to `_GRADIENT_HEAD`; direction config detected via `to`/`<angle>`; computed-time drop of the default `to bottom`) and (b) **radial default shape/size drop** (`_canonRadialPrelude` filters the default `ellipse` shape + `farthest-corner` size from the prelude at computed time, keeping `circle`/explicit sizes + the `at` clause). `_canonGradientInner`/`_canonGradientConfig`/`_isGradientConfig` made gradient-type-aware (linear vs radial/conic); colour stops already computed via `_computeColor`, comma-spacing normalized by the layer join. `linear-gradient(to bottom, rgb(30,87,0) 0%, …)`→`linear-gradient(rgb(30, 87, 0) 0%, …)`; `radial-gradient(ellipse farthest-corner at 25px 25px, black 10%, …)`→`radial-gradient(at 25px 25px, rgb(0, 0, 0) 10%, …)`. Zero regressions (gradient-position-valid 18, -computed 43 byte-identical; serialize-values 695 has no gradients). Caps: more `<image>` props (`mask-image`/`list-style-image`/`border-image-source`); broader linear/conic computed canon (angle normalization, interpolation hints); valid-property registry; fresh realm. |
 | ~~64~~ | ✅ [The Gradient Verdict](64-the-gradient-verdict.md) | `css/css-images/parsing/gradient-position-{valid,computed}` | **18/18 · 43/43** | ⚔️⚔️ | **SECURED — +47.** The standing widest unopened tail since #57: `radial-gradient`/`conic-gradient` carry an `[ at <position> ]?` clause sharing the #61 `<position>` grammar, but `background-image` was stored verbatim. New gradient canonicalizer (pure JS, no new Rust) scoped to `_GRADIENT_PROPS={background-image}` + radial/conic (incl. `repeating-`): `_canonGradients` balanced-paren-scans a value, transforming each gradient in place while leaving every other char verbatim (multi-image lists/`url()`/`none`/inter-layer commas survive); `_canonGradientInner` comma-splits args, detecting a config chunk (`at`/`from`/shape/size kw) vs colour stops; `_canonGradientConfig` reorders the `at <position>` clause (specified) or computes it + **drops a default `at center center`/`at 50% 50%`** (computed); `_canonGradientStop` computes each stop colour (`red`→`rgb(255, 0, 0)`). Wired into `setProperty`/`_parseStyleDecls` (specified) + `_normComputed` (computed) alongside the `_POSITION_PROPS` branches. Zero regressions. Caps: gradient default-token canon (drop `to bottom`/`ellipse farthest-corner` + whitespace-normalize substituted colours → `variable-substitution-background` 8/10 + opens linear-gradient); more `<image>` props (`mask-image`/`list-style-image`). |
@@ -106,6 +107,39 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-21 (Quest #67 The Imaged Verdict — `<image>`-prop computed
+serialization, +76):** Took #66's named "next leverage (1)" (more `<image>` props). A
+baseline sweep showed the `<image>` family was the widest *non-validation* tail:
+`mask-image-computed` 0/47 + `border-image-source-computed` 0/10 (unregistered),
+`background-image-computed` 35/48 + `list-style-image-computed` 3/11 (registered but the
+#64–66 gradient computed canonicalizer was incomplete). One root cause: complete the
+gradient computed serializer + register the remaining `<image>` props. **Fix (pure JS,
+`bootstrap.js`, NO new Rust):** added `mask-image`/`list-style-image`/`border-image-source`
+to `_GRADIENT_PROPS` (+ `mask-image`/`border-image-source` to `_GCS_DEFAULTS`, initial
+`none`); extended the canonicalizer — `_evalMath` gained opt-in `opts.angle` (angle units
+→ degrees) + `opts.lhPx` (`lh`); `_serAngle` (6-sig-fig angle serialization, `2rad`→
+`114.592deg`); `_canonStopPos` (per-stop-position computed: angle→deg, `%`-only→%, mixed
+`%`+length→`calc(P% ± Lpx)`, else length→px); `_canonGradientStop` (resolve `currentcolor`
+→ el `color`, **split a two-position colour stop** into two stops); `_canonConicPrelude`
+(`from <angle>` normalize + drop default `from 0deg`); `_canonRadialPrelude` (drop `circle`
+on explicit length + clamp negative px → `0px`); `_canonGradientDirection` (linear single-
+`<angle>` direction resolves to degrees, e.g. `calc(90deg-45deg)`→`45deg`); `_posComputeLen`
+(`%`-only calc → a single percentage, mixed `%`+length still kept as canonical `calc()` so
+the #61 round-trip invariant holds; threads `lhPx`); `_canonGradients` (treats EOF as the
+implicit `)` for an unclosed function). mask 0→47, background 35→47, list-style 3→11,
+border-image 0→9. **ZERO regressions** — whole `<position>`/gradient family byte-identical
+(gradient-position 18/43, interpolation 1398/932, background-position-computed 32,
+transform/perspective-origin 23/21, mask-position-valid 23, list-style/border-image-valid
+3/2), serialize-values 695/697, var-substitution-background 10 / -shorthands 51,
+color-computed 16, opacity 30, Element-matches 669, createElement 147; obscura-dom 40/40.
+(`object-position`/`offset-*` `-computed` are wpt.live HTTP 404 = serving flux, not
+regressions; identical position code proven safe by background-position 32/32.) **Caps:**
+`light-dark()` (CSS Color 5, 1 subtest), url absolutization (document base-URL, 1 subtest),
+`cross-fade()` specified canon (background-image-valid 9/13). **Next leverage:** (1)
+`cross-fade()` specified canon (+4); (2) url absolutization (foundational across `<url>`
+computed); (3) comprehensive valid-property registry (csstext unknown-prop drop —
+serialize-values hot-path risk); (4) fresh realm. Scroll `tickets/67-the-imaged-verdict.md`.
 
 **Session 2026-06-21 (Quest #66 The Interpolated Verdict — gradient
 `<color-interpolation-method>` serialization, +1439):** Took #65's named "next

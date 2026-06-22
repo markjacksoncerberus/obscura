@@ -5366,6 +5366,10 @@ const _GCS_DEFAULTS = {
   // css-images. image-orientation/image-rendering inherit; object-* do not.
   'image-orientation': 'from-image', 'image-rendering': 'auto', 'object-fit': 'fill',
   'object-position': '50% 50%',
+  // <image>-valued properties (none initial); their gradient values canonicalize
+  // via _canonGradients (see _GRADIENT_PROPS). mask-image/border-image-source do
+  // not inherit. list-style-image is registered above (css-lists, inherited).
+  'mask-image': 'none', 'border-image-source': 'none',
   // css-transforms. transform-origin/perspective-origin do not inherit; their
   // computed value resolves to absolute lengths (see _serializeOriginComputed).
   'transform-origin': '50% 50%', 'perspective-origin': '50% 50%',
@@ -5878,6 +5882,9 @@ const _LENGTH_PX = {
   px: 1, em: 16, rem: 16, ex: 8, ch: 8, ic: 16, cap: 16,
   in: 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 25.4 / 4, pt: 96 / 72, pc: 16,
 };
+// CSS <angle> units → degrees (for gradient <angle> directions/stops via _evalMath
+// `opts.angle`). 400 grad = 360 deg; 1 turn = 360 deg; rad via 180/π.
+const _ANGLE_DEG = { deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 };
 // Unescape a CSS identifier: `\67` (hex, optional trailing whitespace) and
 // `\g` (literal). Used so an escaped function name like `r\67 b`/`r\gb`
 // resolves to `rgb` before we match it.
@@ -6085,10 +6092,17 @@ const _evalMath = (input, percentBase, opts) => {
       p++;
       if (tok.pct) return (tok.v / 100) * percentBase;
       if (tok.unit) {
+        // Angle units (gradient <angle> directions/stops) → degrees; available even
+        // without `opts.lengths` since an angle context has no <length>.
+        if (opts.angle) {
+          const af = _ANGLE_DEG[tok.unit];
+          if (af !== undefined) return tok.v * af;
+        }
         if (!opts.lengths) return fail();
-        // `opts.emPx` overrides em against an element's computed font-size (the
-        // default table assumes em = 16px); rem stays root-relative.
+        // `opts.emPx`/`opts.lhPx` resolve em / lh against the element's computed
+        // font-size & line-height (the default table assumes em = 16px); rem stays root.
         if (opts.emPx && tok.unit === 'em') return tok.v * opts.emPx;
+        if (opts.lhPx && tok.unit === 'lh') return tok.v * opts.lhPx;
         const f = _LENGTH_PX[tok.unit];
         return f === undefined ? fail() : tok.v * f; // unresolvable unit (vw/cqw/…) → fail
       }
@@ -6301,7 +6315,7 @@ const _serializePositionSpecified = (value) => {
 // Computed serialization of a length-percentage: plain percentages and px pass
 // through; relative units / math expressions resolve to px against `emPx` (the
 // element's computed font-size). Unresolvable → returned canonicalized.
-const _posComputeLen = (tok, emPx) => {
+const _posComputeLen = (tok, emPx, lhPx) => {
   const s = String(tok).trim();
   if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(s)) return _canonStandardValue(s);
   if (/^[+-]?(?:\d+\.?\d*|\.\d+)px$/i.test(s)) return _serNumber(parseFloat(s)) + 'px';
@@ -6310,10 +6324,15 @@ const _posComputeLen = (tok, emPx) => {
   // percentage stays symbolic → canonical `calc(P% ± Lpx)` (e.g. `calc(20% - 5em)`
   // → `calc(20% - 200px)`). Falls back to verbatim canon if it isn't a flat sum.
   if (/%/.test(s)) {
-    const r = _resolvePctLengthCalc(s, emPx);
-    return r !== null ? r : _canonStandardValue(s);
+    const r = _resolvePctLengthCalc(s, emPx);          // mixed %+length → calc(P% ± Lpx)
+    if (r !== null) return r;
+    if (!_LEN_UNIT_RE.test(s)) {                        // %-only calc → a single percentage
+      const p = _evalMath(s, 100, {});
+      if (p !== null) return _serNumber(p) + '%';
+    }
+    return _canonStandardValue(s);
   }
-  const r = _evalMath(s, 0, { lengths: true, emPx });
+  const r = _evalMath(s, 0, { lengths: true, emPx, lhPx });
   return r === null ? _canonStandardValue(s) : _serNumber(r) + 'px';
 };
 // Split a calc() body into flat top-level additive terms `{sign, text}`, splitting
@@ -6361,19 +6380,19 @@ const _resolvePctLengthCalc = (s, emPx) => {
     (px < 0 ? '- ' + _serNumber(-px) : '+ ' + _serNumber(px)) + 'px)';
 };
 // Computed value of one axis component (keyword origins → percentages).
-const _posCompComputed = (c, emPx) => {
-  if (c.lp != null) return _posComputeLen(c.lp, emPx);
+const _posCompComputed = (c, emPx, lhPx) => {
+  if (c.lp != null) return _posComputeLen(c.lp, emPx, lhPx);
   if (c.kw === 'center') return '50%';
   const fromStart = (c.kw === 'left' || c.kw === 'top');
   if (c.off == null) return fromStart ? '0%' : '100%';
   const off = String(c.off).trim();
-  if (fromStart) return _posComputeLen(off, emPx);              // left/top: offset from origin
+  if (fromStart) return _posComputeLen(off, emPx, lhPx);        // left/top: offset from origin
   // right/bottom: measured from the far edge → 100% − offset.
   const pm = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(off);
   if (pm) return _serNumber(100 - parseFloat(pm[1])) + '%';
   // length offset measured from the far edge → 100% − offset, the offset resolved
   // to px (px stays px, em/rem/etc. → px), the sign folded into the calc operator.
-  const lpx = _evalMath(off, 0, { lengths: true, emPx });
+  const lpx = _evalMath(off, 0, { lengths: true, emPx, lhPx });
   if (lpx !== null) {
     return lpx < 0 ? 'calc(100% + ' + _serNumber(-lpx) + 'px)'
                    : 'calc(100% - ' + _serNumber(lpx) + 'px)';
@@ -6383,10 +6402,11 @@ const _posCompComputed = (c, emPx) => {
 const _serializePositionComputed = (el, value) => {
   const fs = el ? parseFloat(_computedPropOf(el, 'font-size', 0)) : 16;
   const emPx = fs > 0 ? fs : 16;
+  const lhPx = _lineHeightPx(el, emPx);
   const out = [];
   for (const layer of _commaSplitTop(value)) {
     const p = _parsePosition(layer);
-    out.push(p ? _posCompComputed(p.h, emPx) + ' ' + _posCompComputed(p.v, emPx) : layer.trim());
+    out.push(p ? _posCompComputed(p.h, emPx, lhPx) + ' ' + _posCompComputed(p.v, emPx, lhPx) : layer.trim());
   }
   return out.join(', ');
 };
@@ -6487,11 +6507,67 @@ const _serializeOriginComputed = (el, kebab, value) => {
 // `at center center` (→ `50% 50%`), and computes each colour stop. Non-gradient
 // text (url(), `none`, the commas between multiple background layers) passes
 // through verbatim, so a multi-image list is preserved.
-const _GRADIENT_PROPS = new Set(['background-image']);
+const _GRADIENT_PROPS = new Set(['background-image', 'mask-image', 'list-style-image', 'border-image-source']);
 const _GRADIENT_HEAD = /(?:repeating-)?(?:linear|radial|conic)-gradient\(/i;
 const _GRADIENT_RADIAL_SIZE = /^(?:closest|farthest)-(?:side|corner)$/;
 const _ANGLE_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:deg|grad|rad|turn)$/i;
+const _ANGLE_UNIT_RE = /(?:deg|grad|rad|turn)\b/i;
+const _LEN_UNIT_RE = /(?:px|r?em|ex|ch|ic|cap|lh|in|cm|mm|q|pt|pc|v[wh]|vmin|vmax)\b/i;
 const _isAngle = (t) => _ANGLE_RE.test(t) || /^calc\(/i.test(t);
+// Serialize a computed <angle> in degrees — to 6 significant figures, as browsers
+// do (`2rad` → `114.592deg`, not `114.591559deg`).
+const _serAngle = (deg) => _serNumber(parseFloat(deg.toPrecision(6))) + 'deg';
+// Resolve a CSS <angle> token (incl. a calc() of angles) to a canonical `<n>deg`.
+// `1turn`→`360deg`, `calc(360deg * 4 / 5)`→`288deg`. Returns null if not an angle.
+const _toDeg = (tok) => {
+  const r = _evalMath(String(tok).trim(), 0, { angle: true });
+  return r === null ? null : _serAngle(r);
+};
+// Clamp a negative px result to `0px` (radial gradient sizes are never negative).
+const _clampZeroPx = (s) => (/^-(?:\d+\.?\d*|\.\d+)px$/i.test(String(s)) ? '0px' : s);
+// The computed px of `1lh`: the used line-height (a <number> multiplies the
+// element's computed font-size; a px/% value resolves directly; `normal` ≈ 1.2em).
+const _lineHeightPx = (el, emPx) => {
+  const lh = el ? String(_computedPropOf(el, 'line-height', 'normal')).trim().toLowerCase() : 'normal';
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(lh)) return parseFloat(lh) * emPx;        // <number>
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+))(px|%)$/.exec(lh);
+  if (m) return m[2] === '%' ? (parseFloat(m[1]) / 100) * emPx : parseFloat(m[1]);
+  return 1.2 * emPx;                                                              // 'normal' (approx)
+};
+// Computed serialization of one gradient colour-stop position: a percentage
+// (incl. a `%`-only calc) stays a percentage; an <angle> (conic stops) resolves
+// to `<n>deg`; a <length> resolves to px (`0.5em`→`20px`). Unresolvable → canon.
+const _canonStopPos = (tok, emPx, lhPx) => {
+  const s = String(tok).trim();
+  if (_ANGLE_UNIT_RE.test(s)) {                       // <angle> / angle-calc → deg
+    const r = _evalMath(s, 0, { angle: true, emPx, lhPx });
+    return r === null ? _canonStandardValue(s) : _serAngle(r);
+  }
+  if (/%/.test(s)) {
+    if (_LEN_UNIT_RE.test(s)) {                        // mixed %+length → keep calc(P% ± Lpx)
+      const r = _resolvePctLengthCalc(s, emPx);
+      return r !== null ? r : _canonStandardValue(s);
+    }
+    const r = _evalMath(s, 100, {});                   // %-only (incl. calc) → %
+    return r === null ? _canonStandardValue(s) : _serNumber(r) + '%';
+  }
+  const r = _evalMath(s, 0, { lengths: true, emPx, lhPx });   // <length> → px
+  return r === null ? _canonStandardValue(s) : _serNumber(r) + 'px';
+};
+// Canonicalize a conic-gradient prelude (`from <angle>` before any `at`). At
+// computed time the angle resolves to degrees and a default `from 0deg` is dropped.
+const _canonConicPrelude = (toks, computed) => {
+  if (toks.length >= 2 && toks[0].toLowerCase() === 'from') {
+    let ang = toks[1];
+    if (computed) {
+      const d = _toDeg(ang);
+      if (d !== null) ang = d;
+      if (ang === '0deg') return toks.slice(2);       // default `from 0deg` omitted
+    }
+    return ['from', ang].concat(toks.slice(2));
+  }
+  return toks;
+};
 // The CSS <color-interpolation-method> color spaces, and the polar subset that
 // admits an optional <hue-interpolation-method>. A gradient may carry an
 // `in <color-space> [ <hue> hue ]?` clause (CSS Images 4 / CSS Color 4).
@@ -6565,12 +6641,14 @@ const _isGradientConfig = (arg, type) => {
 // to px (`40em` → `640px`), percentages stay symbolic.
 const _canonRadialPrelude = (toks, computed, emPx) => {
   const hasSize = toks.some((t) => _GRADIENT_RADIAL_SIZE.test(t.toLowerCase()) || _isPosLP(t));
+  const hasLen = toks.some((t) => _isPosLP(t));      // an explicit <length-percentage> radius
   const out = [];
   for (const t of toks) {
     const l = t.toLowerCase();
     if (l === 'farthest-corner') continue;           // default size, always omitted
     if (l === 'ellipse' && hasSize) continue;        // default shape, drop when a size is present
-    out.push(computed && _isPosLP(t) ? _posComputeLen(t, emPx) : t);
+    if (l === 'circle' && hasLen && computed) continue;  // single-length size implies circle
+    out.push(computed && _isPosLP(t) ? _clampZeroPx(_posComputeLen(t, emPx)) : t);
   }
   return out;
 };
@@ -6581,12 +6659,20 @@ const _canonRadialPrelude = (toks, computed, emPx) => {
 // `50% 50%` drops the whole `at` clause (bare prelude, possibly empty).
 const _canonGradientDirection = (toks, el, computed, type, emPx) => {
   if (type === 'linear') {
-    if (computed && toks.join(' ').toLowerCase() === 'to bottom') return '';
+    if (computed) {
+      if (toks.join(' ').toLowerCase() === 'to bottom') return '';
+      // A single <angle> direction (incl. calc) resolves to degrees.
+      if (toks.length === 1 && _isAngle(toks[0])) {
+        const r = _evalMath(toks[0], 0, { angle: true, emPx });
+        if (r !== null) return _serAngle(r);
+      }
+    }
     return toks.join(' ');
   }
   const atIdx = toks.findIndex((t) => t.toLowerCase() === 'at');
   let preToks = atIdx < 0 ? toks : toks.slice(0, atIdx);
   if (type === 'radial') preToks = _canonRadialPrelude(preToks, computed, emPx);
+  else if (type === 'conic') preToks = _canonConicPrelude(preToks, computed);
   const prelude = preToks.join(' ');
   if (atIdx < 0) return prelude;                     // no position clause to touch
   const posStr = toks.slice(atIdx + 1).join(' ');
@@ -6603,8 +6689,7 @@ const _canonGradientDirection = (toks, el, computed, type, emPx) => {
 // Canonicalize a gradient configuration chunk: split off the `in <color-space>`
 // interpolation clause (reordered to serialize AFTER the direction), canonicalize
 // each independently, then recombine `<direction> in <space>`.
-const _canonGradientConfig = (arg, el, computed, type, isLegacy) => {
-  const emPx = computed && el ? (parseFloat(_computedPropOf(el, 'font-size', 0)) || 16) : 16;
+const _canonGradientConfig = (arg, el, computed, type, isLegacy, emPx) => {
   let toks = _wsTokens(arg);
   let method = '';
   const ic = _interpolationClause(toks);
@@ -6618,11 +6703,21 @@ const _canonGradientConfig = (arg, el, computed, type, isLegacy) => {
 // Computed serialization of one colour stop: `<color> <length-percentage>{0,2}` →
 // the colour computed (`red`→`rgb(255, 0, 0)`), positions left as-is. A bare
 // transition hint (just a <length-percentage>) has no colour and passes through.
-const _canonGradientStop = (arg, el) => {
+const _canonGradientStop = (arg, el, type, emPx, lhPx) => {
   const toks = _wsTokens(String(arg).trim());
-  if (!toks.length || _isPosLP(toks[0])) return arg;
-  const col = _computeColor(toks[0]) || toks[0];
-  return toks.length > 1 ? col + ' ' + toks.slice(1).join(' ') : col;
+  if (!toks.length) return arg;
+  // A bare transition hint (a lone <length-percentage>/<angle>, no colour).
+  if (_isPosLP(toks[0]) || (type === 'conic' && _isAngle(toks[0]))) {
+    return toks.map((t) => _canonStopPos(t, emPx, lhPx)).join(' ');
+  }
+  // `currentcolor` resolves to the element's computed `color`.
+  const c0 = /^currentcolor$/i.test(toks[0]) && el
+    ? _computedPropOf(el, 'color', 'currentcolor') : toks[0];
+  const col = _computeColor(c0) || c0;
+  const pos = toks.slice(1).map((t) => _canonStopPos(t, emPx, lhPx));
+  // A two-position colour stop serializes as two single-position stops.
+  if (pos.length === 2) return col + ' ' + pos[0] + ', ' + col + ' ' + pos[1];
+  return pos.length ? col + ' ' + pos.join(' ') : col;
 };
 const _canonGradientInner = (inner, el, computed, type) => {
   const args = _commaSplitTop(inner).map((a) => a.trim());
@@ -6637,8 +6732,10 @@ const _canonGradientInner = (inner, el, computed, type) => {
     const tok = _wsTokens(args[k])[0];
     if (tok && _isNonLegacyColorTok(tok)) { isLegacy = false; break; }
   }
-  if (hasConfig) args[0] = _canonGradientConfig(args[0], el, computed, type, isLegacy);
-  if (computed) for (let k = start; k < args.length; k++) args[k] = _canonGradientStop(args[k], el);
+  const emPx = computed && el ? (parseFloat(_computedPropOf(el, 'font-size', 0)) || 16) : 16;
+  const lhPx = computed ? _lineHeightPx(el, emPx) : 0;
+  if (hasConfig) args[0] = _canonGradientConfig(args[0], el, computed, type, isLegacy, emPx);
+  if (computed) for (let k = start; k < args.length; k++) args[k] = _canonGradientStop(args[k], el, type, emPx, lhPx);
   return args.filter((a) => a !== '').join(', ');
 };
 // Walk a value, transforming each gradient function in place (balanced-paren
@@ -6661,11 +6758,14 @@ const _canonGradients = (value, el, computed) => {
       if (s[j] === '(') depth++;
       else if (s[j] === ')' && --depth === 0) break;
     }
-    if (j >= s.length) { out += s.slice(start); break; }   // unbalanced → leave as-is
+    // A function left unclosed at end-of-value is auto-closed by the CSS parser
+    // (`conic-gradient(black 1turn, white` is valid) → treat EOF as the implicit ')'.
+    const closed = j < s.length;
     const head = m[0].toLowerCase();
     const type = head.includes('linear') ? 'linear' : head.includes('radial') ? 'radial' : 'conic';
-    out += s.slice(i, start) + m[0] + _canonGradientInner(s.slice(open + 1, j), el, computed, type) + ')';
-    i = j + 1;
+    out += s.slice(i, start) + m[0] +
+      _canonGradientInner(s.slice(open + 1, closed ? j : s.length), el, computed, type) + ')';
+    i = closed ? j + 1 : s.length;
   }
   return out;
 };
