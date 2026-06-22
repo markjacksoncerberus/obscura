@@ -119,6 +119,37 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-22 (Quest #80 The Reckoned Verdict — `_evalMath` trigonometry +
+exponent extension, +13):** Took #79's named "next leverage (1)". The
+`color-computed-relative-color` test carried ~13 fails whose relative channels use
+math functions `_evalMath` didn't know (`sin`/`asin`/`pow`/`pi`), e.g.
+`hsl(from hsl(50 50 50) h s calc((sin(l) + 1) * 50))`,
+`hsl(... calc((sin(l * (50rad / (50deg * (180 / pi)))) + 1) * 50))`,
+`oklch(from green pow(l, 1) c h)`. An unknown function returned `null`, so even the
+`CSS.supports` support check failed. Extended `_evalMath` (pure JS, no new Rust)
+with `sin`/`cos`/`tan` (radians or `<angle>` arg → radians), `asin`/`acos`/`atan`/
+`atan2` (return an `<angle>` in degrees), `pow`/`sqrt`/`hypot`/`exp`/`log`. The
+crux is proper CSS `<angle>`-vs-`<number>` type tracking through the calc algebra
+(each parse fn now returns `[value, isAngle]`; `angle×number→angle`,
+`angle÷angle→number`) so `50rad / 50` is an angle while `50rad / (50deg *
+(180/pi))` is a number, and `sin(asin(sin(l)))` round-trips. Angle units are
+recognized inside a trig argument even without an angle context (`trigDepth`); an
+angle leaking into a non-angle context is rejected. **Zero hot-path risk by
+construction:** `isAngle` only becomes true under `opts.angle` or inside a trig
+arg, so every other call site (serialize-values calc, gradient stops, length
+channels) is byte-identical. `color-computed-relative-color` 1150→1163. **+13.
+ZERO regressions** — color-valid-relative-color 1127/1147, color-computed-color-mix
+919/948, gradient-interpolation 1398, gradient-position 43/18, image-function 13,
+color-valid 17, color-computed 16, color-computed-lab 112, color-valid-lab 116,
+color-computed-color-function 466/468, color-computed-rgb 95, createElement 147,
+getElementsByTagName 19; obscura-dom 40/40 (serialize-values wpt.live HTTP 404 —
+serving flux, provably inert). **Caps — the 6 residual, all distinct:** 2
+`light-dark()`-wrapping, 2 `var()` custom-property origins, 1 `sibling-index()`,
+~4 out-of-gamut hsl xyz round-trips at ε=0.0001. **Next:** (1) Wave-2 specified-
+`calc()` serializer (~127). (2) `alpha(from …)` (0/32). (3) `light-dark()`
+computed. (4) `var()` custom-property registration. Scroll
+`tickets/80-the-reckoned-verdict.md`.
+
 **Session 2026-06-22 (Quest #79 The Transmuted Verdict — COMPUTED `color-mix()` +
 relative-colour, the cross-space colour-maths engine, +2069):** Took the
 "next leverage (1)" pointer carried since #75 — the biggest standing prize of the

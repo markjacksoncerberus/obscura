@@ -6293,80 +6293,120 @@ const _evalMath = (input, percentBase, opts) => {
   }
   let p = 0;
   let failed = false;
+  // >0 while parsing a sin/cos/tan argument: an <angle>|<number> position where a
+  // bare angle unit must be recognized even without opts.angle (e.g. `50rad`
+  // inside an hsl lightness channel `sin(l * (50rad / 50))`). Outside this and
+  // outside opts.angle, no token is ever tagged as an angle, so number/length
+  // contexts evaluate byte-identically to before.
+  let trigDepth = 0;
   const peek = () => toks[p];
-  const fail = () => { failed = true; return 0; };
+  // Each parse fn returns [value, isAngle]; an angle's `value` is its canonical
+  // degrees (CSS Values 4 §10). isAngle propagates through the calc type algebra
+  // restricted to {number, angle}: ±/min/max/clamp keep the type, ×/÷ follow
+  // dimensional rules (angle×number → angle, angle÷angle → number).
+  const tfail = () => { failed = true; return [0, false]; };
   const parseExpr = () => {
-    let v = parseTerm();
+    let [v, a] = parseTerm();
     while (!failed && peek() && (peek().t === '+' || peek().t === '-')) {
       const op = toks[p++].t;
-      const r = parseTerm();
+      const [r, ra] = parseTerm();
       v = op === '+' ? v + r : v - r;
+      a = a || ra;
     }
-    return v;
+    return [v, a];
   };
   const parseTerm = () => {
-    let v = parseFactor();
+    let [v, a] = parseFactor();
     while (!failed && peek() && (peek().t === '*' || peek().t === '/')) {
       const op = toks[p++].t;
-      const r = parseFactor();
-      v = op === '*' ? v * r : v / r;
+      const [r, ra] = parseFactor();
+      if (op === '*') { v *= r; a = a || ra; }   // angle × number → angle
+      else { v /= r; a = a && !ra; }             // angle ÷ number → angle; angle ÷ angle → number
     }
-    return v;
+    return [v, a];
   };
   const parseFactor = () => {
     const tok = peek();
-    if (!tok) return fail();
+    if (!tok) return tfail();
     if (tok.t === '+') { p++; return parseFactor(); }
-    if (tok.t === '-') { p++; return -parseFactor(); }
+    if (tok.t === '-') { p++; const [v, a] = parseFactor(); return [-v, a]; }
     if (tok.t === 'num') {
       p++;
-      if (tok.pct) return (tok.v / 100) * percentBase;
+      if (tok.pct) return [(tok.v / 100) * percentBase, false];
       if (tok.unit) {
-        // Angle units (gradient <angle> directions/stops) → degrees; available even
-        // without `opts.lengths` since an angle context has no <length>.
-        if (opts.angle) {
+        // Angle units (gradient <angle> directions/stops, trig arguments) → degrees;
+        // available even without `opts.lengths` since an angle context has no <length>.
+        if (opts.angle || trigDepth > 0) {
           const af = _ANGLE_DEG[tok.unit];
-          if (af !== undefined) return tok.v * af;
+          if (af !== undefined) return [tok.v * af, true];
         }
-        if (!opts.lengths) return fail();
+        if (!opts.lengths) return tfail();
         // `opts.emPx`/`opts.lhPx` resolve em / lh against the element's computed
         // font-size & line-height (the default table assumes em = 16px); rem stays root.
-        if (opts.emPx && tok.unit === 'em') return tok.v * opts.emPx;
-        if (opts.lhPx && tok.unit === 'lh') return tok.v * opts.lhPx;
+        if (opts.emPx && tok.unit === 'em') return [tok.v * opts.emPx, false];
+        if (opts.lhPx && tok.unit === 'lh') return [tok.v * opts.lhPx, false];
         const f = _LENGTH_PX[tok.unit];
-        return f === undefined ? fail() : tok.v * f; // unresolvable unit (vw/cqw/…) → fail
+        return f === undefined ? tfail() : [tok.v * f, false]; // unresolvable unit (vw/cqw/…) → fail
       }
-      return tok.v;
+      return [tok.v, false];
     }
-    if (tok.t === '(') { p++; const v = parseExpr(); if (!peek() || peek().t !== ')') return fail(); p++; return v; }
+    if (tok.t === '(') { p++; const r = parseExpr(); if (!peek() || peek().t !== ')') return tfail(); p++; return r; }
     if (tok.t === 'ident') {
       const name = tok.v;
       if (toks[p + 1] && toks[p + 1].t === '(') {
         p += 2; // consume the function name and its '('
+        // sin/cos/tan take an <angle>|<number>: parse the argument with angle
+        // units enabled so a bare number reads as radians and an angle resolves.
+        const trig = name === 'sin' || name === 'cos' || name === 'tan';
+        if (trig) trigDepth++;
         const args = [parseExpr()];
         while (!failed && peek() && peek().t === ',') { p++; args.push(parseExpr()); }
-        if (!peek() || peek().t !== ')') return fail();
+        if (trig) trigDepth--;
+        if (!peek() || peek().t !== ')') return tfail();
         p++;
-        if (name === 'calc') return args.length === 1 ? args[0] : fail();
-        if (name === 'min') return Math.min(...args);
-        if (name === 'max') return Math.max(...args);
-        if (name === 'clamp') return args.length === 3 ? Math.max(args[0], Math.min(args[1], args[2])) : fail();
-        if (name === 'sign') return args.length === 1 ? Math.sign(args[0]) : fail();
-        if (name === 'abs') return args.length === 1 ? Math.abs(args[0]) : fail();
-        return fail();
+        const val = args.map((x) => x[0]);
+        const anyAngle = args.some((x) => x[1]);
+        if (name === 'calc') return args.length === 1 ? args[0] : tfail();
+        if (name === 'min') return [Math.min(...val), anyAngle];
+        if (name === 'max') return [Math.max(...val), anyAngle];
+        if (name === 'clamp') return args.length === 3 ? [Math.max(val[0], Math.min(val[1], val[2])), anyAngle] : tfail();
+        if (name === 'sign') return args.length === 1 ? [Math.sign(val[0]), false] : tfail();
+        if (name === 'abs') return args.length === 1 ? [Math.abs(val[0]), args[0][1]] : tfail();
+        // Trigonometry (CSS Values 4 §10): sin/cos/tan take radians (a bare
+        // number) or an <angle> (its degrees → radians) and return a <number>;
+        // the inverse functions return an <angle> whose canonical value is degrees.
+        const R2D = 180 / Math.PI;
+        if (trig && args.length === 1) {
+          const r = args[0][1] ? args[0][0] / R2D : args[0][0];
+          return [name === 'sin' ? Math.sin(r) : name === 'cos' ? Math.cos(r) : Math.tan(r), false];
+        }
+        if ((name === 'asin' || name === 'acos' || name === 'atan') && args.length === 1)
+          return [(name === 'asin' ? Math.asin(val[0]) : name === 'acos' ? Math.acos(val[0]) : Math.atan(val[0])) * R2D, true];
+        if (name === 'atan2' && args.length === 2) return [Math.atan2(val[0], val[1]) * R2D, true];
+        // Exponential / power (CSS Values 4 §11): all <number> → <number>.
+        if (name === 'pow') return args.length === 2 ? [Math.pow(val[0], val[1]), false] : tfail();
+        if (name === 'sqrt') return args.length === 1 ? [Math.sqrt(val[0]), false] : tfail();
+        if (name === 'hypot') return args.length ? [Math.hypot(...val), false] : tfail();
+        if (name === 'exp') return args.length === 1 ? [Math.exp(val[0]), false] : tfail();
+        if (name === 'log') return args.length === 1 ? [Math.log(val[0]), false] : args.length === 2 ? [Math.log(val[0]) / Math.log(val[1]), false] : tfail();
+        return tfail();
       }
       // Bare numeric constant (CSS calc keywords).
       p++;
-      if (name === 'infinity') return Infinity;
-      if (name === 'nan') return NaN;
-      if (name === 'pi') return Math.PI;
-      if (name === 'e') return Math.E;
-      return fail();
+      if (name === 'infinity') return [Infinity, false];
+      if (name === 'nan') return [NaN, false];
+      if (name === 'pi') return [Math.PI, false];
+      if (name === 'e') return [Math.E, false];
+      return tfail();
     }
-    return fail();
+    return tfail();
   };
-  const result = parseExpr();
+  const [result, resultAngle] = parseExpr();
   if (failed || p !== toks.length) return null;
+  // An <angle> leaking into a non-angle context (e.g. a stray asin() where a
+  // plain number is required) is a type error — reject, matching the prior
+  // behavior where an angle unit failed unless opts.angle was set.
+  if (resultAngle && !opts.angle) return null;
   if (!opts.nonFinite && !isFinite(result)) return null;
   return result;
 };
