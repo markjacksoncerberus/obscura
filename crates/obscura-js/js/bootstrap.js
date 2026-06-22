@@ -6042,6 +6042,15 @@ const _canonColorSpecified = (value) => {
   // `Red`→`red` — but otherwise keep their keyword form (they only resolve to an
   // rgb() at computed-value time, unlike the legacy hex/rgb/hsl forms below).
   if (low === 'transparent' || low === 'currentcolor' || _CSS_WIDE.has(low) || _CSS_NAMED_COLORS[low]) return low;
+  // Relative colour `<fn>(from <origin> <channels>)` (CSS Color 5) — canonicalize
+  // the function name + origin colour, channels kept symbolic. Dispatched before the
+  // modern/legacy branches below because the `from` keyword isn't a number/percentage
+  // (the channel constants `r`/`g`/`b`/`l`/… aren't a legacy colour `_computeColor`
+  // would touch). Falls through verbatim on any non-relative or var()-bearing shape.
+  if (/^(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(\s*from\s/i.test(low)) {
+    const rc = _canonRelativeColor(s);
+    if (rc !== null) return rc;
+  }
   // Modern colour functions — lab()/lch()/oklab()/oklch()/color(<space> …) and
   // hwb() — whose channels are all plain <number>/<percentage>/<angle>/none (no
   // nested math function) serialize at SPECIFIED time IDENTICALLY to their computed
@@ -6082,6 +6091,43 @@ const _canonColorShorthand = (value) => {
   const toks = _splitTopLevel(String(value));
   if (toks.length === 0) return value;
   return toks.map((t) => _canonColorSpecified(t)).join(' ');
+};
+// ---- Relative <color> SPECIFIED-value serialization (CSS Color 5 §serial-relative-color) ----
+// `<fn>(from <origin> <channels>)` — e.g. `rgb(from rebeccapurple r g b / alpha)`. At
+// specified time only the SYNTAX is canonicalized (the channel maths that produce the
+// computed value is a separate, much bigger primitive — left as a cap):
+//  • the function name is ASCII-lowercased and `rgba`/`hsla` fold to `rgb`/`hsl`
+//    (`RGBA(from …)`→`rgb(from …)`);
+//  • the <origin> colour runs through `_canonColorSpecified` (recursively, so nested
+//    relative colours canonicalize too): `rgb(20%, 40%, 60%, 80%)`→`rgba(51, 102, 153,
+//    0.8)`, `lab(25 20 50 / 40%)`→`lab(25 20 50 / 0.4)`, `hwb(120deg 20% 50% / .5)`→its
+//    sRGB rgba(); named colours/`currentcolor`/`color-mix()` stay symbolic;
+//  • for `color()` the colour-space token AFTER the origin aliases `xyz`→`xyz-d65`.
+// The channel keywords (`r`/`g`/`b`/`alpha`/`none`/replacement <number>/<percentage>) are
+// kept VERBATIM — the WPT comparator strips numbers and compares approximately, so no
+// number normalization is needed, and a `calc()` channel is left untouched (operand
+// reordering like `calc(g * 2)`→`calc(2 * g)` needs the Wave-2 specified-calc serializer,
+// a documented cap). A `var()` anywhere makes the whole value a pending-substitution token
+// stream the engine keeps byte-for-byte (case + calc order preserved), so we bail to null
+// → the caller leaves it verbatim. Returns null on any non-relative / malformed shape.
+const _REL_COLOR_FNS = new Set(['rgb', 'rgba', 'hsl', 'hsla', 'hwb', 'lab', 'lch', 'oklab', 'oklch', 'color']);
+const _canonRelativeColor = (value) => {
+  const s = String(value).trim();
+  const lp = s.indexOf('(');
+  if (lp <= 0 || !s.endsWith(')')) return null;
+  const fn = s.slice(0, lp).toLowerCase();
+  if (!_REL_COLOR_FNS.has(fn)) return null;
+  if (/\bvar\(/i.test(s)) return null;                    // pending-substitution → verbatim
+  const toks = _wsTokens(s.slice(lp + 1, -1).trim());
+  if (toks.length < 2 || toks[0].toLowerCase() !== 'from') return null;
+  const origin = _canonColorSpecified(toks[1]);
+  let rest = toks.slice(2);
+  if (fn === 'color' && rest.length) {                    // color(): alias the space token
+    const space = rest[0].toLowerCase();
+    rest = [space === 'xyz' ? 'xyz-d65' : space, ...rest.slice(1)];
+  }
+  const outFn = fn === 'rgba' ? 'rgb' : fn === 'hsla' ? 'hsl' : fn;
+  return outFn + '(from ' + origin + (rest.length ? ' ' + rest.join(' ') : '') + ')';
 };
 // ---- color-mix() SPECIFIED-value serialization (CSS Color 5 §serial-color-mix) ----
 // Canonicalize the SYNTAX only — the cross-space mixing MATH (the computed value)
