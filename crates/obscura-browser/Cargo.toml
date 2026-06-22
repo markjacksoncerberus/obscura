@@ -11,6 +11,9 @@ stealth = ["obscura-net/stealth"]
 # vello_cpu) and bumps the effective MSRV to 1.89. Even when on, rendering stays
 # off at runtime until `--render-mode on-demand|always`.
 render = ["dep:obscura-render"]
+# Opt-in AVIF image decoding (implies `render`). Pulls a C library via
+# obscura-render — see that crate's `avif` feature note.
+avif = ["render", "obscura-render/avif"]
 
 [dependencies]
 obscura-dom = { workspace = true }

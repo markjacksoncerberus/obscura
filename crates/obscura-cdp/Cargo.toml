@@ -8,6 +8,9 @@ default = []
 # Propagates the Blitz renderer down to obscura-browser so CDP screenshots
 # (Page.captureScreenshot) and real layout metrics work.
 render = ["obscura-browser/render"]
+# Opt-in AVIF image decoding (implies `render`). See obscura-render's `avif`
+# feature note — pulls the dav1d C library.
+avif = ["render", "obscura-browser/avif"]
 
 [dependencies]
 obscura-dom = { workspace = true }
