@@ -556,6 +556,8 @@ const _parseStyleDecls = (text) => {
         value = _canonColorSpecified(value);
       } else if (_COLOR_SHORTHAND_PROPS.has(name)) {
         value = _canonColorShorthand(value);
+      } else if (name === 'content') {
+        value = _canonContent(value, null, false);
       }
     }
     out.push({ name, value, important });
@@ -585,6 +587,8 @@ class CSSStyleDeclaration {
       stored = _canonColorSpecified(stored);
     } else if (!custom && _COLOR_SHORTHAND_PROPS.has(name)) {
       stored = _canonColorShorthand(stored);
+    } else if (!custom && name === 'content') {
+      stored = _canonContent(stored, null, false);
     }
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
@@ -5408,8 +5412,10 @@ const _GCS_DEFAULTS = {
   'grid-column-end': 'auto', 'grid-column-start': 'auto', 'grid-row-end': 'auto',
   'grid-row-start': 'auto', 'grid-template-areas': 'none', 'grid-template-columns': 'none',
   'grid-template-rows': 'none',
-  // css-content. quotes inherits; bookmark-* do not.
-  quotes: 'auto', 'bookmark-level': 'none', 'bookmark-state': 'open',
+  // css-content. quotes inherits; content/bookmark-* do not. content's computed
+  // value is the specified content-list canonicalized (see _canonContent):
+  // default `decimal` counter-style dropped, gradients/url() resolved.
+  content: 'normal', quotes: 'auto', 'bookmark-level': 'none', 'bookmark-state': 'open',
   // css-multicol — none inherit. column-rule-color is <color> with a currentColor
   // initial; column-rule-width's `medium` matches the test's mediumWidth reference.
   'column-count': 'auto', 'column-fill': 'balance', 'column-rule-color': 'currentColor',
@@ -6718,6 +6724,15 @@ const _canonRadialPrelude = (toks, computed, emPx) => {
 // `50% 50%` drops the whole `at` clause (bare prelude, possibly empty).
 const _canonGradientDirection = (toks, el, computed, type, emPx) => {
   if (type === 'linear') {
+    // `to <side-or-corner>` canonicalizes horizontal-side-first: `to top right`
+    // → `to right top` (CSSOM serialization order). A single side, an already-
+    // canonical corner, or a bare <angle> is left unchanged.
+    if (toks.length === 3 && toks[0].toLowerCase() === 'to') {
+      const a = toks[1].toLowerCase(), b = toks[2].toLowerCase();
+      const vert = (x) => x === 'top' || x === 'bottom';
+      const horiz = (x) => x === 'left' || x === 'right';
+      if (vert(a) && horiz(b)) toks = ['to', toks[2], toks[1]];
+    }
     if (computed) {
       if (toks.join(' ').toLowerCase() === 'to bottom') return '';
       // A single <angle> direction (incl. calc) resolves to degrees.
@@ -6977,6 +6992,80 @@ const _canonUrls = (value, el) => {
   }
   return out;
 };
+// Split on top-level commas, skipping commas that sit inside parens/brackets or
+// inside a quoted string (a counters() separator may legitimately contain a `,`,
+// e.g. `counters(n, ",")` — neither _commaSplitTop nor _splitTopLevel is
+// quote-aware). Backslash escapes inside a string are consumed.
+const _splitCommaQuoted = (s) => {
+  const out = []; let depth = 0, cur = '', q = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      cur += c;
+      if (c === '\\' && i + 1 < s.length) cur += s[++i];
+      else if (c === q) q = '';
+      continue;
+    }
+    if (c === '"' || c === "'") { q = c; cur += c; }
+    else if (c === '(' || c === '[' || c === '{') { depth++; cur += c; }
+    else if (c === ')' || c === ']' || c === '}') { depth--; cur += c; }
+    else if (c === ',' && depth === 0) { out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+};
+// css-content: the <counter-style> argument of counter()/counters() defaults to
+// `decimal`; an explicit `decimal` (ASCII-case-insensitively) is dropped from the
+// serialized value (`counter(n, dECiMaL)`→`counter(n)`, `counters(n, ".", DECIMAL)`
+// →`counters(n, ".")`). Any other named style (a custom-ident like `counter-style`)
+// is kept verbatim. Balanced-paren, token-boundary-aware scan; a call that isn't
+// rewritten is copied byte-for-byte (so escaped counter names like `counter(\})`
+// round-trip).
+const _canonCounterFns = (value) => {
+  const s = String(value);
+  if (!/counters?\(/i.test(s)) return s;
+  let out = '', i = 0;
+  while (i < s.length) {
+    const m = /counters?\(/i.exec(s.slice(i));
+    if (!m) { out += s.slice(i); break; }
+    const start = i + m.index;
+    const before = start > 0 ? s[start - 1] : '';
+    if (before && /[A-Za-z0-9_-]/.test(before)) {   // not a token boundary → skip head
+      out += s.slice(i, start + m[0].length); i = start + m[0].length; continue;
+    }
+    const isCounters = /^counters\(/i.test(m[0]);
+    const open = start + m[0].length - 1;           // index of the '('
+    let depth = 0, j = open;
+    for (; j < s.length; j++) {
+      if (s[j] === '(') depth++;
+      else if (s[j] === ')' && --depth === 0) break;
+    }
+    const closed = j < s.length;
+    const end = closed ? j + 1 : s.length;
+    const args = _splitCommaQuoted(s.slice(open + 1, closed ? j : s.length)).map((a) => a.trim());
+    const want = isCounters ? 3 : 2;               // name[, sep], <style>
+    if (closed && args.length === want && args[want - 1].toLowerCase() === 'decimal') {
+      out += s.slice(i, start) + (isCounters ? 'counters(' : 'counter(') +
+        args.slice(0, want - 1).join(', ') + ')';
+    } else {
+      out += s.slice(i, end);                        // keep verbatim
+    }
+    i = end;
+  }
+  return out;
+};
+// css-content: canonicalize a `content` value — a list of content-items (strings,
+// counter()/counters(), url()/<image>, open-quote/close-quote/…) plus an optional
+// `/ <alt-text>`. counter()/counters() drop a default `decimal` <counter-style>;
+// gradient/<image> items canonicalize via _canonGradients; at computed time every
+// url() absolutizes via _canonUrls. Keyword/string items pass through unchanged.
+const _canonContent = (value, el, computed) => {
+  let v = _canonCounterFns(String(value));
+  v = _canonGradients(v, el, computed);
+  if (computed) v = _canonUrls(v, el);
+  return v;
+};
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
 const _FONT_SIZE_KEYWORDS = {
@@ -6990,6 +7079,7 @@ const _normComputed = (el, kebab, v) => {
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonGradients(v, el, true), el);
+  if (kebab === 'content') return _canonContent(v, el, true);
   if (kebab === 'font-size') {
     const k = String(v).trim().toLowerCase();
     if (k in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[k];

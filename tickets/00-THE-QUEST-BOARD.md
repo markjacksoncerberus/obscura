@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~73~~ | ✅ [The Storied Verdict](73-the-storied-verdict.md) | `css/css-content/parsing/content-{computed,valid}` (the `content` property — content-list serialization) | **41/41 · 46/46** | ⚔️ | **SECURED — +49.** `content` was never registered for computed style → `getComputedStyle(el).content` returned `""`, failing every `content-computed` support check (0/41); the specified path stored values verbatim, never dropping the default `decimal` counter-style (`content-valid` 38/46). Fix (pure JS, no new Rust): (1) registered `content: 'normal'` in `_GCS_DEFAULTS`; (2) new `_canonContent` wired into `_parseStyleDecls`/`setProperty` (specified) + `_normComputed` (computed) — `_canonCounterFns` drops a default `decimal` `<counter-style>` from `counter()`/`counters()` (`counter(n, dECiMaL)`→`counter(n)`, case-insensitive; custom styles kept; escaped names like `counter(\})` byte-preserved), gradient items route through the existing `_canonGradients`, url()s absolutize via `_canonUrls`; (3) quote-aware `_splitCommaQuoted` (counters() string separators may contain `,`); (4) linear `to <side-or-corner>` reorder in `_canonGradientDirection` (`to top right`→`to right top`, CSSOM order — the one gradient content-item needing a new rule; radial `ellipse`-drop + conic `from <angle>` were already handled). content-computed 0→41, content-valid 38→46. Zero regressions (gradient family 1398/932/18/43/13/3, background-image 13, mask-image 47, serialize-values 696/697, color 17/16, position 32, var-bg 10, shorthand 7, cursor 36/42 unchanged, createElement 147; obscura-dom 40/40). Caps: `cursor` gradient + image-set canon (cursor-computed 36/39, near-free +3); `resolve-relative-to-stylesheet` (external-CSS loading); comprehensive valid-prop registry; fresh realm. |
 | ~~72~~ | ✅ [The Lowercased Verdict](72-the-lowercased-verdict.md) | `css/css-backgrounds/parsing/{background,border}-color-valid` (keyword-`<color>` canonicalization) | **9/9 · 7/7** | ⚔️ | **SECURED — +2.** CSSOM canonical serialization ASCII-lowercases a keyword ident, but #68's `_canonColorSpecified` kept `currentColor`/named/CSS-wide keywords verbatim → `background-color: currentColor` serialized `currentColor` not `currentcolor`. Fix (pure JS, no new Rust): (1) `_canonColorSpecified` returns the lowercased keyword for that branch (legacy hex/rgb/hsl still resolve; modern fns/`var()` still verbatim); (2) new `_canonColorShorthand` + `_COLOR_SHORTHAND_PROPS` (`border-color`/`border-block-color`/`border-inline-color`) splits a value into top-level `<color>` tokens via paren-aware `_splitTopLevel` (`rgb(0, 0, 255)` stays whole) and canonicalizes each, wired into `_parseStyleDecls` + `setProperty`. Zero regressions (serialize-values 695/697, color 17/16/95, gradient/position/image family unchanged; obscura-dom 40/40). Foundational: every 404'd `*-color-valid` longhand + border-color flow-relative shorthands get the `currentColor` green free once served. Caps: `resolve-relative-to-stylesheet` (external-CSS loading); comprehensive valid-prop registry; broaden `_canonUrls` to `cursor`/`content`/`@font-face src`; fresh realm. |
 | ~~70~~ | ✅ [The Resolved Verdict](70-the-resolved-verdict.md) | `css/css-values/urls/resolve-relative-to-base.sub.html` (computed-time URL absolutization) | **2/2** | ⚔️ | **SECURED — +2.** Took #69's "next leverage (1)" — the foundational `<url>`-computed primitive (the `image-set`/`cross-fade` pointers turned out not to exist as WPT tests; the `<url>` family lives in `css/css-values/urls/`). A relative `url()` in an `<image>`/`<url>` property must compute to its absolute URL against the document base URL (`<base href>`), but Obscura stored it verbatim (non-variable `url(images/test.png)`, variable `url("images/test.png")`). New `_canonUrls(value, el)` (pure JS, no new Rust): scans for `url()` tokens (both quoted functional + unquoted url-token forms), resolves each via `new URL(raw, el.baseURI).href`, serializes double-quoted; idempotent/fail-safe — already-absolute or unparseable (`{{token}}`) urls round-trip byte-identical (empirically verified in-engine). Wired into `_normComputed` after `_canonGradients` for `_GRADIENT_PROPS` (also absolutizes `url()`s nested in `image()`/`cross-fade()`). Specified time untouched (relative stays as written). Zero regressions (mask-image-computed 47/47 — its `url("http://{{host}}/")` round-trips byte-identical, the key idempotency proof; gradient family 18/43/1398, color 17/16, serialize-values 695/697, background-position-computed 32, createElement 147; obscura-dom 40/40). Caps: `resolve-relative-to-stylesheet` (0/3, needs external-CSS loading w/ per-stylesheet base); broaden `_canonUrls` to `cursor`/`content`/`@font-face src`; `image-function-invalid` (per-prop validation). |
 | ~~69~~ | ✅ [The Composited Verdict](69-the-composited-verdict.md) | `image-function-valid`·`-computed` + `background-image-valid` (`<image>`-function canon: `image()` + `cross-fade()`) | **13/13 · 3/3 · 13/13** | ⚔️ | **SECURED — +7.** Took #68's "next leverage (1)+(2)". Generalized `_canonGradients` from a gradient-only scan to an `<image>`-function scan (pure JS, no new Rust): new `_IMAGE_FUNC_HEAD` adds `image`/`cross-fade` heads, dispatched per-head. `_canonImageInner` canonicalizes `image(<color>)` (specified `_canonColorSpecified` → `image(rgb(0 128 255))`→`image(rgb(0, 128, 255))`, names/modern fns verbatim; computed `_computeColor` → `image(red)`→`image(rgb(255, 0, 0))`, `image(transparent)`→`image(rgba(0, 0, 0, 0))`). `_canonCrossFadeInner`/`_canonCfImage` reorder each `cross-fade()` `<cf-image>` to `<image|colour> <percentage>` (`cross-fade(50% url(…), …)`→`cross-fade(url(…) 50%, …)`, `cross-fade( 1% red, green)`→`cross-fade(red 1%, green)`), nested `<image>` functions recurse. Already wired via `background-image` ∈ `_GRADIENT_PROPS`. image-valid 12→13, image-computed 1→3, background-image-valid 9→13. Zero regressions (gradient family 18/43/1398, color-valid 17/computed 16, serialize-values 695/697, background-position-computed 32, Element-matches 669, createElement 147; obscura-dom 40/40; composing cases `cross-fade(image(green), red)`/nested gradients byte-identical). Caps: url absolutization (document base-URL, foundational `<url>`-computed); `cross-fade()` computed (404 this session, code already in place); `image-set()` canon; valid-prop registry. |
@@ -111,6 +112,46 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-22 (Quest #73 The Storied Verdict — the `content` property:
+content-list serialization, +49):** A baseline sweep of #72's named "next leverage"
+pointers found the widest clean tail in `css/css-content/parsing`: `content-computed`
+was **0/41** (the property was never registered for computed style, so
+`getComputedStyle(el).content` returned `""` and every subtest's support check
+failed) and `content-valid` **38/46** (the specified path stored values verbatim,
+never dropping the default `decimal` counter-style). **Fix (pure JS,
+`bootstrap.js`, NO new Rust):** (1) registered `content: 'normal'` in
+`_GCS_DEFAULTS` (clears the support check + the ~38 identity-serializing subtests:
+quotes/strings/url/counter with custom-or-no style/combinations); (2) new
+**`_canonContent(value, el, computed)`** wired into `_parseStyleDecls` + `setProperty`
+(specified) and `_normComputed` (computed) — **`_canonCounterFns`** balanced-paren-
+scans `counter(`/`counters(` heads and drops a trailing default `decimal`
+`<counter-style>` (ASCII-case-insensitive; custom-idents kept; a non-rewritten call
+copied byte-for-byte so escaped names `counter(\})` round-trip), then routes gradient
+content-items through the existing `_canonGradients` and absolutizes url()s via
+`_canonUrls` at computed time; (3) quote-aware **`_splitCommaQuoted`** (neither
+`_commaSplitTop` nor `_splitTopLevel` skips strings, and a counters() separator may
+contain a comma); (4) a linear-gradient **`to <side-or-corner>` reorder** in
+`_canonGradientDirection` (`to top right`→`to right top`, CSSOM order — the one
+gradient content-item needing a new rule; the radial `ellipse`-drop + conic
+`from 1.5708rad`→`from 90.0002deg` cases were already handled by the #64–67 engine).
+content-computed 0→41, content-valid 38→46. **+49. ZERO regressions** — the risky
+shared corner-reorder was swept across the whole gradient family
+(gradient-interpolation-method-valid 1398, -computed 932, gradient-position 18/43,
+image-function 13/3, background-image-valid 13, mask-image-computed 47), plus
+serialize-values 696/697 (≥ the standing 695; the 1 fail is the pre-existing `calc()`
+additive-ordering cap), background-position-computed 32, color-valid 17, color-computed
+16, var-substitution-background 10, shorthand-serialization 7, cursor-computed 36/39 +
+cursor-valid 42/46 (unchanged — cursor isn't a gradient prop), createElement 147;
+`cargo test -p obscura-dom --lib` 40/40. **CAPS / NEXT LEVERAGE:** (1) **`cursor`
+gradient + image-set canon** — cursor-computed 36/39, its 3 fails are gradient
+content-items; registering `cursor` in `_GRADIENT_PROPS` + `_GCS_DEFAULTS` (initial
+`auto`) is a near-free +3, and cursor-valid 42/46 wants `image-set("url" 1x)`→
+`image-set(url("url") 1x)` + `calc(2 + 0)`→`calc(2)` + `light-dark()` (separate
+primitives). (2) **`resolve-relative-to-stylesheet`** (0/3) — external-CSS loading +
+per-stylesheet base. (3) comprehensive valid-property registry (serialize-values
+hot-path risk). (4) fresh realm (`fetch/`, `html/dom/` reflection). Scroll
+`tickets/73-the-storied-verdict.md`.
 
 **Session 2026-06-22 (Quest #72 The Lowercased Verdict — keyword-`<color>`
 canonicalization, +2):** A reachability sweep of #71's named "next leverage"
