@@ -560,6 +560,9 @@ const _parseStyleDecls = (text) => {
       } else if (name === 'filter' || name === 'backdrop-filter') {
         if (!_isValidFilter(value)) continue;              // invalid <filter-value-list> → drop
         value = _canonFilter(value, null, false);
+      } else if (name === 'transform') {
+        if (!_isValidTransform(value)) continue;           // invalid <transform-list> → drop
+        value = _canonTransform(value, null, false);
       } else if (name === 'content') {
         value = _canonContent(value, null, false);
       }
@@ -595,6 +598,9 @@ class CSSStyleDeclaration {
     } else if (!custom && (name === 'filter' || name === 'backdrop-filter')) {
       if (!_isValidFilter(stored)) return;                 // invalid <filter-value-list> → ignore
       stored = _canonFilter(stored, null, false);
+    } else if (!custom && name === 'transform') {
+      if (!_isValidTransform(stored)) return;              // invalid <transform-list> → ignore
+      stored = _canonTransform(stored, null, false);
     } else if (!custom && name === 'content') {
       stored = _canonContent(stored, null, false);
     }
@@ -8684,6 +8690,208 @@ const _canonFilter = (value, el, computed) => {
   }
   return out.join(' ');
 };
+// ── CSS Transforms 1/2: the `transform` property `<transform-list>` ───────────
+// A transform value is `none` or a space-separated list of `<transform-function>`s.
+// Each function's argument grammar (n = allowed arg counts; t = per-arg type, an
+// array means positional). Types: number, np = <number-percentage>, len = <length>,
+// lp = <length-percentage>, angle = <angle>, persp = non-negative <length> | none.
+const _TF_FUNCS = {
+  matrix:      { n: [6],    t: 'number' },
+  matrix3d:    { n: [16],   t: 'number' },
+  translate:   { n: [1, 2], t: 'lp' },
+  translatex:  { n: [1],    t: 'lp' },
+  translatey:  { n: [1],    t: 'lp' },
+  translatez:  { n: [1],    t: 'len' },
+  translate3d: { n: [3],    t: ['lp', 'lp', 'len'] },
+  scale:       { n: [1, 2], t: 'np' },
+  scalex:      { n: [1],    t: 'np' },
+  scaley:      { n: [1],    t: 'np' },
+  scalez:      { n: [1],    t: 'np' },
+  scale3d:     { n: [3],    t: 'np' },
+  rotate:      { n: [1],    t: 'angle' },
+  rotatex:     { n: [1],    t: 'angle' },
+  rotatey:     { n: [1],    t: 'angle' },
+  rotatez:     { n: [1],    t: 'angle' },
+  rotate3d:    { n: [4],    t: ['number', 'number', 'number', 'angle'] },
+  skew:        { n: [1, 2], t: 'angle' },
+  skewx:       { n: [1],    t: 'angle' },
+  skewy:       { n: [1],    t: 'angle' },
+  perspective: { n: [1],    t: 'persp' },
+};
+// Canonical serialized spelling for functions whose case is NOT the lowercased
+// name: translate*/rotate* preserve camelCase X/Y/Z, while scale*/skew* lowercase
+// (a long-standing Blink/WebKit serialization quirk the WPT tests pin).
+const _TF_DISP = {
+  translatex: 'translateX', translatey: 'translateY', translatez: 'translateZ',
+  rotatex: 'rotateX', rotatey: 'rotateY', rotatez: 'rotateZ',
+};
+const _TF_VAR_RE = /\b(?:var|env)\(/i;
+// Split a transform-function's argument list on top-level commas (parens kept whole).
+const _splitTfArgs = (s) => {
+  s = s.trim();
+  if (s === '') return [];
+  const out = []; let depth = 0, cur = '';
+  for (const c of s) {
+    if (c === '(') { depth++; cur += c; }
+    else if (c === ')') { depth = Math.max(0, depth - 1); cur += c; }
+    else if (c === ',' && depth === 0) { out.push(cur.trim()); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur.trim());
+  return out;
+};
+// Parse a transform value → { none } | { items: [{ name, args[] }] } | null.
+const _parseTransform = (value) => {
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (s === '') return null;
+  if (s.toLowerCase() === 'none') return { none: true };
+  const items = [];
+  for (const tok of _splitFilterTokens(s)) {
+    const m = /^([a-z][a-z0-9]*)\((.*)\)$/is.exec(tok);
+    if (!m) return null;
+    const name = m[1].toLowerCase();
+    if (!(name in _TF_FUNCS)) return null;
+    items.push({ name, args: _splitTfArgs(m[2]) });
+  }
+  return items.length ? { items } : null;
+};
+const _tfIsLen = (t) => {
+  if (_isFilterZero(t) || _FILTER_MATH_RE.test(t)) return true;
+  const lm = _FILTER_LEN_RE.exec(t);
+  return !!(lm && (_LENGTH_PX[lm[2].toLowerCase()] !== undefined || /^(?:cq[whib]|cqmin|cqmax|v[wh]|vmin|vmax|vi|vb)$/i.test(lm[2])));
+};
+const _tfIsAngle = (t) => {
+  if (_isFilterZero(t) || _FILTER_MATH_RE.test(t)) return true;
+  const lm = _FILTER_LEN_RE.exec(t);
+  return !!(lm && _ANGLE_DEG[lm[2].toLowerCase()] !== undefined);
+};
+const _tfArgType = (spec, i) => (Array.isArray(spec.t) ? spec.t[i] : spec.t);
+const _tfArgValid = (t, type) => {
+  t = t.trim();
+  if (t === '') return false;
+  switch (type) {
+    case 'number': return _FILTER_NUM_RE.test(t) || _FILTER_MATH_RE.test(t);
+    case 'np':     return _FILTER_NUM_RE.test(t) || _FILTER_PCT_RE.test(t) || _FILTER_MATH_RE.test(t);
+    case 'len':    return _tfIsLen(t);
+    case 'lp':     return _tfIsLen(t) || _FILTER_PCT_RE.test(t);
+    case 'angle':  return _tfIsAngle(t);
+    case 'persp':  return t.toLowerCase() === 'none' || (_tfIsLen(t) && (_FILTER_MATH_RE.test(t) || parseFloat(t) >= 0));
+  }
+  return false;
+};
+const _isValidTransform = (value) => {
+  if (_TF_VAR_RE.test(value)) return true;                 // var()/env() resolved later
+  const p = _parseTransform(value);
+  if (!p) return false;
+  if (p.none) return true;
+  for (const it of p.items) {
+    const spec = _TF_FUNCS[it.name];
+    if (!spec.n.includes(it.args.length)) return false;
+    for (let i = 0; i < it.args.length; i++) {
+      if (!_tfArgValid(it.args[i], _tfArgType(spec, i))) return false;
+    }
+  }
+  return true;
+};
+// Canonicalize one specified argument: lowercase nothing here (the function name is
+// lowercased by the caller); fold `<percentage>`→number for scale, unitless 0→0deg
+// for angles, keep lengths/percentages and math verbatim.
+const _canonTfArg = (t, type) => {
+  t = t.trim();
+  if (_FILTER_MATH_RE.test(t)) return t;
+  switch (type) {
+    case 'number': return _FILTER_NUM_RE.test(t) ? _serNumber(parseFloat(t)) : t;
+    case 'np':
+      if (_FILTER_PCT_RE.test(t)) return _serNumber(parseFloat(t) / 100);
+      if (_FILTER_NUM_RE.test(t)) return _serNumber(parseFloat(t));
+      return t;
+    case 'angle': return _isFilterZero(t) ? '0deg' : t;
+    case 'persp': return t.toLowerCase() === 'none' ? 'none' : t;
+    default: return t;                                     // len/lp kept verbatim
+  }
+};
+// Resolve helpers for the COMPUTED matrix (null = unresolvable → caller falls back).
+const _tfNum = (t) => {
+  t = t.trim();
+  if (_FILTER_NUM_RE.test(t)) return parseFloat(t);
+  if (_FILTER_PCT_RE.test(t)) return parseFloat(t) / 100;
+  return _evalMath(t, 0, {});
+};
+const _tfLenPx = (t) => { t = t.trim(); return _isFilterZero(t) ? 0 : _evalMath(t, 0, { lengths: true }); };
+const _tfDeg = (t) => { t = t.trim(); return _isFilterZero(t) ? 0 : _evalMath(t, 0, { angle: true }); };
+// 4×4 matrix in matrix3d() column-major order (index = col*4 + row). Build each
+// function's matrix, accumulate by post-multiplication, serialize as matrix()/matrix3d().
+const _TF_ID = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+const _tfMul = (a, b) => {
+  const m = new Array(16).fill(0);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0;
+    for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+    m[c * 4 + r] = s;
+  }
+  return m;
+};
+const _tfMatrix = (item) => {
+  const a = item.args, m = _TF_ID();
+  const D = Math.PI / 180;
+  switch (item.name) {
+    case 'matrix': { const v = a.map(_tfNum); if (v.some((x) => x == null)) return null;
+      return [v[0], v[1], 0, 0, v[2], v[3], 0, 0, 0, 0, 1, 0, v[4], v[5], 0, 1]; }
+    case 'matrix3d': { const v = a.map(_tfNum); if (v.some((x) => x == null)) return null; return v; }
+    case 'translate': { const x = _tfLenPx(a[0]), y = a.length > 1 ? _tfLenPx(a[1]) : 0; if (x == null || y == null) return null; m[12] = x; m[13] = y; return m; }
+    case 'translatex': { const x = _tfLenPx(a[0]); if (x == null) return null; m[12] = x; return m; }
+    case 'translatey': { const y = _tfLenPx(a[0]); if (y == null) return null; m[13] = y; return m; }
+    case 'translatez': { const z = _tfLenPx(a[0]); if (z == null) return null; m[14] = z; return m; }
+    case 'translate3d': { const x = _tfLenPx(a[0]), y = _tfLenPx(a[1]), z = _tfLenPx(a[2]); if (x == null || y == null || z == null) return null; m[12] = x; m[13] = y; m[14] = z; return m; }
+    case 'scale': { const x = _tfNum(a[0]), y = a.length > 1 ? _tfNum(a[1]) : _tfNum(a[0]); if (x == null || y == null) return null; m[0] = x; m[5] = y; return m; }
+    case 'scalex': { const x = _tfNum(a[0]); if (x == null) return null; m[0] = x; return m; }
+    case 'scaley': { const y = _tfNum(a[0]); if (y == null) return null; m[5] = y; return m; }
+    case 'scalez': { const z = _tfNum(a[0]); if (z == null) return null; m[10] = z; return m; }
+    case 'scale3d': { const x = _tfNum(a[0]), y = _tfNum(a[1]), z = _tfNum(a[2]); if (x == null || y == null || z == null) return null; m[0] = x; m[5] = y; m[10] = z; return m; }
+    case 'rotate': case 'rotatez': { const d = _tfDeg(a[0]); if (d == null) return null; const r = d * D, c = Math.cos(r), s = Math.sin(r); return [c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]; }
+    case 'rotatex': { const d = _tfDeg(a[0]); if (d == null) return null; const r = d * D, c = Math.cos(r), s = Math.sin(r); m[5] = c; m[6] = s; m[9] = -s; m[10] = c; return m; }
+    case 'rotatey': { const d = _tfDeg(a[0]); if (d == null) return null; const r = d * D, c = Math.cos(r), s = Math.sin(r); m[0] = c; m[2] = -s; m[8] = s; m[10] = c; return m; }
+    case 'rotate3d': { let x = _tfNum(a[0]), y = _tfNum(a[1]), z = _tfNum(a[2]); const d = _tfDeg(a[3]); if ([x, y, z, d].some((v) => v == null)) return null;
+      const len = Math.hypot(x, y, z); if (len === 0) return m; x /= len; y /= len; z /= len;
+      const r = d * D, c = Math.cos(r), s = Math.sin(r), t = 1 - c;
+      m[0] = t * x * x + c; m[1] = t * x * y + s * z; m[2] = t * x * z - s * y;
+      m[4] = t * x * y - s * z; m[5] = t * y * y + c; m[6] = t * y * z + s * x;
+      m[8] = t * x * z + s * y; m[9] = t * y * z - s * x; m[10] = t * z * z + c; return m; }
+    case 'skew': { const ax = _tfDeg(a[0]), ay = a.length > 1 ? _tfDeg(a[1]) : 0; if (ax == null || ay == null) return null; m[4] = Math.tan(ax * D); m[1] = Math.tan(ay * D); return m; }
+    case 'skewx': { const ax = _tfDeg(a[0]); if (ax == null) return null; m[4] = Math.tan(ax * D); return m; }
+    case 'skewy': { const ay = _tfDeg(a[0]); if (ay == null) return null; m[1] = Math.tan(ay * D); return m; }
+    case 'perspective': { if (a[0].trim().toLowerCase() === 'none') return m; const d = _tfLenPx(a[0]); if (d == null) return null; m[11] = d === 0 ? 0 : -1 / d; return m; }
+  }
+  return null;
+};
+const _TF_2D_ZERO = [2, 3, 6, 7, 8, 9, 11, 14];
+const _serMatrix = (m) => {
+  const is2D = _TF_2D_ZERO.every((i) => Math.abs(m[i]) < 1e-6) && Math.abs(m[10] - 1) < 1e-6 && Math.abs(m[15] - 1) < 1e-6;
+  if (is2D) return 'matrix(' + [m[0], m[1], m[4], m[5], m[12], m[13]].map(_serNumber).join(', ') + ')';
+  return 'matrix3d(' + m.map(_serNumber).join(', ') + ')';
+};
+// Canonicalize a `transform` value. SPECIFIED keeps the function form (lowercasing
+// the name, folding scale `%`→number, unitless angle 0→0deg); COMPUTED resolves the
+// whole list to a single matrix()/matrix3d() (falling back to the specified form for
+// any layout-dependent value the matrix builder cannot resolve, e.g. `%` translate).
+const _canonTransform = (value, el, computed) => {
+  if (_TF_VAR_RE.test(value)) return value;                // unresolved var()/env()
+  const p = _parseTransform(value);
+  if (!p) return value;
+  if (p.none) return 'none';
+  if (computed) {
+    let M = _TF_ID();
+    for (const it of p.items) { const F = _tfMatrix(it); if (!F) return _canonTransform(value, el, false); M = _tfMul(M, F); }
+    return _serMatrix(M);
+  }
+  const out = [];
+  for (const it of p.items) {
+    const spec = _TF_FUNCS[it.name];
+    const parts = it.args.map((arg, i) => _canonTfArg(arg, _tfArgType(spec, i)));
+    out.push((_TF_DISP[it.name] || it.name) + '(' + parts.join(', ') + ')');
+  }
+  return out.join(' ');
+};
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
 const _FONT_SIZE_KEYWORDS = {
@@ -8698,6 +8906,7 @@ const _normComputed = (el, kebab, v) => {
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);
   if (kebab === 'filter' || kebab === 'backdrop-filter') return _canonFilter(v, el, true);
+  if (kebab === 'transform') return _canonTransform(v, el, true);
   if (kebab === 'content') return _canonContent(v, el, true);
   if (kebab === 'font-size') {
     const k = String(v).trim().toLowerCase();

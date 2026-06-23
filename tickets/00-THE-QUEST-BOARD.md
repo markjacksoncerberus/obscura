@@ -122,6 +122,45 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-23 (Quest #85 The Transmuted Matrix — the `transform`
+property, +45):** A fresh realm — the first slice of the wide
+`css-transforms/parsing` frontier (~+197 across `transform`/`rotate`/`scale`/
+`translate`/`transform-origin`/`perspective`). The `transform` property takes a
+`<transform-list>` (`none` or space-separated `<transform-function>`s —
+`matrix`/`matrix3d`, `translate`/`X`/`Y`/`Z`/`3d`, `scale`/…, `rotate`/…,
+`skew`/`X`/`Y`, `perspective`). Obscura had `transform` in `_GCS_DEFAULTS`
+(`none`) with identity computed serialization and **no validation** — the same
+three failure modes as #82/#83/#84: every malformed form accepted
+(`transform-invalid` 0/20), computed fell through to verbatim
+(`transform-computed` 0/3), several valid forms needed canon (`transform-valid`
+20/42). ALL THREE → **100%**. **Built (pure JS, NO new Rust)** on the #84 filter
+scaffolding (`_splitFilterTokens`, the `_FILTER_*` regexes, `_isFilterZero`,
+`_evalMath`, `_serNumber`): `_TF_FUNCS` (per-function arg-count + per-arg type
+grammar table); `_parseTransform` + `_splitTfArgs` (paren-aware comma split);
+`_isValidTransform` (the grammar gate, wired into both specified paths — invalid
+list dropped); `_canonTransform(value, el, computed)` (the shared serializer).
+**SPECIFIED** keeps the function form, canonicalizing — scale `%`→number
+(`scale(250%)`→`scale(2.5)`), unitless angle `0`→`0deg`, and the Blink/WebKit
+**name-case quirk** (`_TF_DISP`): `scaleX`/`skewX`→lowercase but
+`translateX`/`rotateX` keep camelCase. **COMPUTED** resolves the whole list to a
+single `matrix()`/`matrix3d()` — `_tfMatrix` builds each function's 4×4 matrix in
+matrix3d() column-major order (index = col*4 + row), `_tfMul` post-multiplies,
+`_serMatrix` collapses to 2D `matrix()` when possible (`perspective(10px)`→
+`matrix3d(…, -0.1, …)`, `matrix3d(<identity>)`→`matrix(1, 0, 0, 1, 0, 0)`); a
+layout-dependent value the builder can't resolve falls back to the specified
+canon. A `var()`/`env()` guard keeps unresolved custom props verbatim.
+transform-valid 20→42, transform-invalid 0→20, transform-computed 0→3. **+45.
+Every subtest green. ZERO caps. ZERO regressions** (serialize-values 696/697,
+transform-origin 16/16 + 23/23, filter-computed 83/83, filter-parsing-valid
+87/87, backdrop-filter-computed 28/28, color-computed-relative 1163/1169,
+color-valid 17/17, classlist 1420/1420; `cargo test -p obscura-dom --lib`
+40/40 — baseline-exact; purely additive, no shared primitive touched). **Next:**
+the individual `scale`/`rotate`/`translate` properties (~+142, but their computed
+forms keep the function rather than collapsing to a matrix → own per-property
+computed serializers, reusing `_isValidTransform`'s predicates + `_canonTfArg`);
+`transform-origin-invalid` 0/10; `perspective`/`transform-box`/
+`backface-visibility`. Scroll `tickets/85-the-transmuted-matrix.md`.
+
 **Session 2026-06-23 (Quest #84 The Filtered Verdict — the `filter` /
 `backdrop-filter` properties, +167):** A fresh realm. CSS Filter Effects 1's
 `filter`/`backdrop-filter` take a `<filter-value-list>` (space-separated
