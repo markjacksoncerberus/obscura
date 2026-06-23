@@ -122,6 +122,48 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-23 (Quest #84 The Filtered Verdict — the `filter` /
+`backdrop-filter` properties, +167):** A fresh realm. CSS Filter Effects 1's
+`filter`/`backdrop-filter` take a `<filter-value-list>` (space-separated
+`<filter-function>`s — `blur`/`brightness`/`contrast`/`drop-shadow`/`grayscale`/
+`hue-rotate`/`invert`/`opacity`/`saturate`/`sepia` — or a `url()` reference;
+`none` stands alone). Obscura had `filter` in `_GCS_DEFAULTS` with identity
+computed serialization and **no validation** — same three failure modes as
+alpha()/contrast-color(): computed fell through to verbatim
+(`filter-computed` 11/83, `backdrop-filter-computed` 0/28); the setter validated
+nothing, so every malformed form was accepted (both `-invalid` 0/25); and a few
+valid forms needed canon (`filter-parsing-valid` 78/87). **Built (pure JS, NO new
+Rust):** `_parseFilterValue` (paren-aware top-level token split); `_isValidFilter`/
+`_isValidFilterFn`/`_parseShadowArgs` (the grammar gate, wired into both specified
+paths — invalid list dropped); `_canonFilter(value, el, computed)` (the shared
+serializer). **The SPECIFIED↔COMPUTED fork:** SPECIFIED keeps the number/`%`/calc
+form and only canonicalizes (`blur(0)`→`blur(0px)`, `hue-rotate(0)`→
+`hue-rotate(0deg)`, `grayscale(300%)`→`grayscale(100%)`, `opacity(2)`→`opacity(1)`,
+drop-shadow colour-first reorder, `drop-shadow(0 0 0)`→`drop-shadow(0px 0px 0px)`);
+COMPUTED resolves everything — `<amount>` → bare `<number>` (`%`→fraction, fill
+default `1`, clamp [0,1] vs [0,∞)), `blur()`→`blur(0px)`, `hue-rotate()`→
+`hue-rotate(0deg)`, calc→px/deg, drop-shadow colour via `_computeColor`
+(`currentColor`=el colour), lengths→px, fill blur `0px`, order `<color> x y blur`.
+One shared primitive: `_evalMath` gained a **narrow gated `opts.cqZero`** flag (an
+unresolvable container/viewport unit → 0, passed ONLY by the four `_canonFilter`
+computed call-sites — the colour/serialize-values hot path is byte-identical by
+construction) so `sign(2cqw - 10px)` resolves (the tests gate every such unit
+inside `sign()`, where only the sign matters → -1). Registered `backdrop-filter`
+in `_GCS_DEFAULTS`. filter & backdrop-filter share the grammar → one serializer
+wins both. computed 11→83 + 0→28, invalid 0→25 + 0→25, valid 78→87 + 29→37.
+**+167. EVERY subtest green. ZERO caps. ZERO regressions** (color-computed-relative
+1163, computed-color-mix 919/948, valid-relative 1146, computed-color-function
+466/468, valid-color-function 340, valid-lab 150, gradient-interpolation-valid
+1398, cursor-valid 45, color-valid 17, color-computed 16, classlist 1420,
+createElement 147; `cargo test -p obscura-dom --lib` 40/40 — all baseline-exact.
+serialize-values was a wpt.live 404 this session, `bodyLen=42`, confirmed via
+`curl` — serving flux, not a regression; gated `opts.cqZero` makes it
+byte-identical regardless). **Next:** `light-dark()` computed; `var()`/
+`sibling-index()` computed; generalize `_canonMathExpr` (hot-path risk → own
+quest); a fresh realm (filter proved an untouched CSS module can be one serializer
+away from a flood — candidates: `transform` 20/42+0/3, the rest of filter-effects).
+Scroll `tickets/84-the-filtered-verdict.md`.
+
 **Session 2026-06-23 (Quest #83 The Contrasted Verdict — the `contrast-color()`
 function, +27):** The natural sibling of #82's `alpha()`. CSS Color 5's
 `contrast-color( <color> )` resolves at computed-value time to whichever of

@@ -557,6 +557,9 @@ const _parseStyleDecls = (text) => {
         value = _canonColorSpecified(value);
       } else if (_COLOR_SHORTHAND_PROPS.has(name)) {
         value = _canonColorShorthand(value);
+      } else if (name === 'filter' || name === 'backdrop-filter') {
+        if (!_isValidFilter(value)) continue;              // invalid <filter-value-list> → drop
+        value = _canonFilter(value, null, false);
       } else if (name === 'content') {
         value = _canonContent(value, null, false);
       }
@@ -589,6 +592,9 @@ class CSSStyleDeclaration {
       stored = _canonColorSpecified(stored);
     } else if (!custom && _COLOR_SHORTHAND_PROPS.has(name)) {
       stored = _canonColorShorthand(stored);
+    } else if (!custom && (name === 'filter' || name === 'backdrop-filter')) {
+      if (!_isValidFilter(stored)) return;                 // invalid <filter-value-list> → ignore
+      stored = _canonFilter(stored, null, false);
     } else if (!custom && name === 'content') {
       stored = _canonContent(stored, null, false);
     }
@@ -5336,7 +5342,7 @@ const _GCS_DEFAULTS = {
   'background-attachment': 'scroll', 'background-clip': 'border-box',
   'background-origin': 'padding-box', 'background-position': '0% 0%',
   'background-repeat': 'repeat', 'background-size': 'auto',
-  'background-image': 'none', filter: 'none',
+  'background-image': 'none', filter: 'none', 'backdrop-filter': 'none',
   // css-text properties (all inherited) — initial computed values per spec.
   // Computed serialization for these is identity (keyword / simple length),
   // so the #52 inheritance engine resolves initial/inherit/unset directly.
@@ -6500,7 +6506,13 @@ const _evalMath = (input, percentBase, opts) => {
         if (opts.emPx && tok.unit === 'em') return [tok.v * opts.emPx, false];
         if (opts.lhPx && tok.unit === 'lh') return [tok.v * opts.lhPx, false];
         const f = _LENGTH_PX[tok.unit];
-        return f === undefined ? tfail() : [tok.v * f, false]; // unresolvable unit (vw/cqw/…) → fail
+        if (f !== undefined) return [tok.v * f, false];
+        // `opts.cqZero` (filter computed only) treats a viewport/container-relative
+        // unit as 0 — the filter tests gate every such unit inside `sign(2cqw - 10px)`
+        // where only the sign matters (cqw resolves to 0 with no container). Gated on
+        // the flag so every other caller still fails on these units, byte-identically.
+        if (opts.cqZero) return [0, false];
+        return tfail(); // unresolvable unit (vw/cqw/…) → fail
       }
       return [tok.v, false];
     }
@@ -8504,6 +8516,174 @@ const _canonContent = (value, el, computed) => {
   if (computed) v = _canonUrls(v, el);
   return v;
 };
+// ── CSS Filter Effects 1: `filter` / `backdrop-filter` serialization ───────────
+// A `<filter-value-list>` is a space-separated list of <filter-function>s (or a
+// single `url()` reference); `none` stands alone. Each function canonicalizes
+// differently at SPECIFIED time (keep <percentage>/calc form, only fix obvious
+// canonicalizations) versus COMPUTED time (resolve calc, %→<number>, fill
+// defaults, clamp). filter and backdrop-filter share an identical grammar.
+const _FILTER_NUM_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
+const _FILTER_PCT_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?%$/i;
+const _FILTER_LEN_RE = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)([a-z]+)$/i;
+const _FILTER_MATH_RE = /\b(?:calc|min|max|clamp|var|env|sign|abs|round|mod|rem|sin|cos|tan|asin|acos|atan|atan2|pow|sqrt|hypot|exp|log)\(/i;
+const _isFilterZero = (t) => _FILTER_NUM_RE.test(t) && parseFloat(t) === 0; // a unitless zero is a valid <length>/<angle>
+// The seven <filter-function>s that take a <number-percentage>; the [0,1]-clamped
+// quartet (grayscale/invert/opacity/sepia) versus the unbounded-above trio
+// (brightness/contrast/saturate). Value is the upper clamp (Infinity = none).
+const _FILTER_AMOUNT = {
+  grayscale: 1, invert: 1, opacity: 1, sepia: 1,
+  brightness: Infinity, contrast: Infinity, saturate: Infinity,
+};
+// Split a filter value into top-level space-separated tokens (parens kept whole).
+const _splitFilterTokens = (s) => {
+  const out = [];
+  let depth = 0, cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(') { depth++; cur += c; }
+    else if (c === ')') { depth--; cur += c; }
+    else if (depth === 0 && /\s/.test(c)) { if (cur) { out.push(cur); cur = ''; } }
+    else cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+};
+// Parse a filter value into a list of items: { url } | { name, args } | null.
+const _parseFilterValue = (value) => {
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (s === '') return null;
+  if (s.toLowerCase() === 'none') return { none: true };
+  const items = [];
+  for (const tok of _splitFilterTokens(s)) {
+    const m = /^([a-z-]+)\((.*)\)$/is.exec(tok);
+    if (!m) return null;                                  // not a function form
+    const name = m[1].toLowerCase();
+    if (name === 'url') { items.push({ url: tok }); continue; }
+    items.push({ name, args: m[2].trim() });
+  }
+  return items.length ? { items } : null;
+};
+// Is a drop-shadow argument list valid, and what are its colour/lengths? A
+// drop-shadow is `<color>? && <length>{2,3}`: 2-3 length offsets (the 3rd is the
+// non-negative blur radius) plus an optional colour, in any order.
+const _parseShadowArgs = (args) => {
+  if (args === '') return null;
+  let color = null; const lens = [];
+  for (const t of _splitFilterTokens(args)) {
+    if (_isFilterZero(t)) { lens.push(t); continue; }
+    const lm = _FILTER_LEN_RE.exec(t);
+    if (lm && (_LENGTH_PX[lm[2].toLowerCase()] !== undefined || /^(?:cq[whib]|cqmin|cqmax|v[wh]|vmin|vmax|vi|vb)$/i.test(lm[2]))) { lens.push(t); continue; }
+    if (_FILTER_MATH_RE.test(t)) { lens.push(t); continue; }   // calc() offset
+    // anything else must be the (single) colour
+    if (color !== null || !_isValidColor(t)) return null;
+    color = t;
+  }
+  if (lens.length < 2 || lens.length > 3) return null;
+  return { color, lens };
+};
+// Validate one <filter-function> (sans `url()`, handled by the caller).
+const _isValidFilterFn = (name, args) => {
+  if (name === 'blur') {
+    if (args === '' || _FILTER_MATH_RE.test(args)) return true;
+    if (_isFilterZero(args)) return true;                 // unitless 0 = 0px
+    const lm = _FILTER_LEN_RE.exec(args);
+    return !!(lm && _LENGTH_PX[lm[2].toLowerCase()] !== undefined && parseFloat(lm[1]) >= 0);
+  }
+  if (name === 'hue-rotate') {
+    if (args === '' || _FILTER_MATH_RE.test(args)) return true;
+    if (_isFilterZero(args)) return true;                 // unitless 0 = 0deg
+    const lm = _FILTER_LEN_RE.exec(args);
+    return !!(lm && _ANGLE_DEG[lm[2].toLowerCase()] !== undefined);
+  }
+  if (name in _FILTER_AMOUNT) {
+    if (args === '' || _FILTER_MATH_RE.test(args)) return true;
+    if (_FILTER_NUM_RE.test(args) || _FILTER_PCT_RE.test(args)) return parseFloat(args) >= 0;
+    return false;                                         // a <length> etc. is invalid
+  }
+  if (name === 'drop-shadow') return _parseShadowArgs(args) !== null;
+  return false;                                           // unknown function
+};
+const _isValidFilter = (value) => {
+  const p = _parseFilterValue(value);
+  if (!p) return false;
+  if (p.none) return true;
+  for (const it of p.items) {
+    if (it.url) continue;
+    if (!_isValidFilterFn(it.name, it.args)) return false;
+  }
+  return true;
+};
+// Canonicalize a <number-percentage> filter amount. SPECIFIED keeps the
+// number/percentage form, only clamping into range; COMPUTED resolves to a bare
+// <number> (a `%` → its fraction), filling the omitted-argument default of 1.
+const _canonFilterAmount = (name, args, computed) => {
+  const hi = _FILTER_AMOUNT[name];
+  if (computed) {
+    if (args === '') return name + '(1)';
+    const n = _evalMath(args, 1, { lengths: true, cqZero: true });
+    if (n === null) return null;
+    return name + '(' + _serNumber(Math.max(0, Math.min(hi, n))) + ')';
+  }
+  // specified
+  if (args === '' || _FILTER_MATH_RE.test(args)) return name + '(' + args + ')';
+  if (_FILTER_PCT_RE.test(args)) {
+    const p = Math.max(0, Math.min(hi * 100, parseFloat(args)));
+    return name + '(' + _serNumber(p) + '%)';
+  }
+  const n = Math.max(0, Math.min(hi, parseFloat(args)));
+  return name + '(' + _serNumber(n) + ')';
+};
+// Canonicalize a drop-shadow. SPECIFIED reorders the colour first and keeps the
+// given offsets (unitless 0 → 0px); COMPUTED resolves each length to px, fills
+// the omitted blur radius with 0px and the omitted colour with `currentColor`.
+const _canonDropShadow = (args, el, computed) => {
+  const sh = _parseShadowArgs(args);
+  if (!sh) return null;
+  const canonLen = (t) => {
+    if (computed) { const v = _evalMath(t, 0, { lengths: true, cqZero: true }); return v === null ? null : _serNumber(v) + 'px'; }
+    return _isFilterZero(t) ? '0px' : t;                  // specified: unitless 0 → 0px, else verbatim
+  };
+  const lens = [];
+  for (const t of sh.lens) { const c = canonLen(t); if (c === null) return null; lens.push(c); }
+  if (computed && lens.length === 2) lens.push('0px');    // computed fills the blur radius
+  let color = sh.color;
+  if (computed) color = color === null ? (_computedColorOf(el) || 'rgb(0, 0, 0)') : _computeColor(color);
+  else if (color !== null) color = _canonColorSpecified(color);
+  const parts = (color !== null ? [color] : []).concat(lens);
+  return 'drop-shadow(' + parts.join(' ') + ')';
+};
+// Canonicalize a `filter`/`backdrop-filter` value (the shared serializer for the
+// specified `computed=false` and computed `computed=true` paths).
+const _canonFilter = (value, el, computed) => {
+  const p = _parseFilterValue(value);
+  if (!p) return value;                                   // unparseable → leave as-is
+  if (p.none) return 'none';
+  const out = [];
+  for (const it of p.items) {
+    if (it.url) { out.push(it.url); continue; }
+    const { name, args } = it;
+    let piece;
+    if (name === 'blur') {
+      if (args === '') piece = computed ? 'blur(0px)' : 'blur()';
+      else if (computed || _FILTER_MATH_RE.test(args)) {
+        if (computed) { const v = _evalMath(args, 0, { lengths: true, cqZero: true }); piece = v === null ? 'blur(' + args + ')' : 'blur(' + _serNumber(Math.max(0, v)) + 'px)'; }
+        else piece = 'blur(' + args + ')';                // specified calc → verbatim
+      } else piece = 'blur(' + (_isFilterZero(args) ? '0px' : args) + ')';
+    } else if (name === 'hue-rotate') {
+      if (args === '') piece = computed ? 'hue-rotate(0deg)' : 'hue-rotate()';
+      else if (computed || _FILTER_MATH_RE.test(args)) {
+        if (computed) { const v = _evalMath(args, 0, { lengths: true, cqZero: true, angle: true }); piece = v === null ? 'hue-rotate(' + args + ')' : 'hue-rotate(' + _serNumber(v) + 'deg)'; }
+        else piece = 'hue-rotate(' + args + ')';
+      } else piece = 'hue-rotate(' + (_isFilterZero(args) ? '0deg' : args) + ')';
+    } else if (name in _FILTER_AMOUNT) {
+      piece = _canonFilterAmount(name, args, computed);
+    } else if (name === 'drop-shadow') {
+      piece = _canonDropShadow(args, el, computed);
+    }
+    out.push(piece == null ? (name + '(' + args + ')') : piece);
+  }
+  return out.join(' ');
+};
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
 const _FONT_SIZE_KEYWORDS = {
@@ -8517,6 +8697,7 @@ const _normComputed = (el, kebab, v) => {
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);
+  if (kebab === 'filter' || kebab === 'backdrop-filter') return _canonFilter(v, el, true);
   if (kebab === 'content') return _canonContent(v, el, true);
   if (kebab === 'font-size') {
     const k = String(v).trim().toLowerCase();
