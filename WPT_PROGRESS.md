@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-23 (Quest #86).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-23 (Quest #87).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-transforms/parsing/transform-origin-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #87 The Warded Verdict.** Added the origin invalid-rejection gate `_isValidOrigin` (wired into both specified paths) + fixed the shared 2-value `<position>` reorder so a `<length-percentage>` pins H-then-V order — `1px left`/`top 1px` now rejected (were wrongly accepted via keyword-axis reorder). var()/CSS-wide exempt. Pure JS, no new Rust. **+10.** |
+| `css/css-transforms/parsing/perspective-origin-invalid.html` | 0/12 | **12/12** | ✅ 100% | **Quest #87 The Warded Verdict.** `_isValidOrigin` for `perspective-origin` (strict `<position>`): an explicit 3-token guard rejects the legacy 3-value form (`center left 1px`); `auto`, `1px 2px 3px`, `left right`, `bottom 10% top 20%` → dropped. **+12.** |
+| `css/css-transforms/parsing/perspective-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #87 The Warded Verdict.** `_isValidPerspective` (`none \| <length [0,∞]>`): rejects `1000` (no unit), `-1px` (negative), `80%` (percentage); var()/calc()/`none`/non-negative real length accepted. **+3.** |
+| `css/css-transforms/parsing/transform-box-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #87 The Warded Verdict.** `transform-box` keyword gate (`content-box \| border-box \| fill-box \| stroke-box \| view-box`): `margin-box`, `padding-box`, `fill-box view-box` → dropped. **+3.** |
+| `css/css-transforms/parsing/backface-visibility-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #87 The Warded Verdict.** `backface-visibility` keyword gate (`visible \| hidden`): `auto`, `visible hidden` → dropped. **+2.** |
+| `css/css-images/parsing/object-position-invalid.html` | 0/13 | **13/13** | ✅ 100% | **Quest #87 The Warded Verdict.** Spill-over of the same root-cause fix: `_isValidStrictPosition` gates `object-position` (strict `<position>`, no legacy 3-value form) — 3-token guard + the reorder fix reject `auto`, `1px 2px 3px`, `left right`, `bottom 10%`, `center left 1px`, … (background/mask-position left ungated — they keep `<bg-position>`). **+13.** |
 | `css/css-transforms/parsing/scale-parsing-valid.html` | 15/32 | **32/32** | ✅ 100% | **Quest #86 The Individuated Matrix.** SPECIFIED `scale` (CSS Transforms 2 `none \| [<number>\|<percentage>]{1,3}`) — `_canonScale`: `<percentage>`→number fraction (`100%`→`1`, `1%`→`0.01`), calc kept symbolic via `_canonMathExpr` (`calc(200%)`, `calc(4 * 100%)`→`calc(400%)`), and the trailing-component elision (drop z if `1`, then y if equal to x: `100 100 1`→`100`, but `100 100 2`→`100 100 2`). Pure JS, no new Rust. **+17.** |
 | `css/css-transforms/parsing/scale-parsing-computed.html` | 0/38 | **38/38** | ✅ 100% | **Quest #86 The Individuated Matrix.** COMPUTED `scale` — every component resolved to a `<number>` (`%`→fraction, calc→number incl. `sign(1em - 1px)`→1), same elision. Unclosed-paren auto-close (`_balanceParens`) mirrors the CSS tokenizer's EOF block-closing (`2 calc(300% * sign(1em - 1px)`→`2 3`). **+38.** |
 | `css/css-transforms/parsing/scale-parsing-invalid.html` | 0/8 | **8/8** | ✅ 100% | **Quest #86 The Individuated Matrix.** `_isValidScale` — each token a `<number>`/`<percentage>`/dimensionless calc (`_scaleCalcOk` strips `sign()` bodies then requires a unitless eval); `100px`, `calc(100px)`, `calc(1s) 2`, `calc(180deg) 2 3`, `>3` components, trailing junk → dropped. **+8.** |

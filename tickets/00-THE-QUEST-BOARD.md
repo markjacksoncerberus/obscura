@@ -122,6 +122,44 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-23 (Quest #87 The Warded Verdict — the transform-module +
+object-position invalid-rejection gates, +43):** Six grammar gates stood
+unguarded — `transform-origin-invalid`, `perspective-origin-invalid`,
+`perspective-invalid`, `transform-box-invalid`, `backface-visibility-invalid`
+(all 0%), plus the adjacent `object-position-invalid` (0/13). Every one of these
+properties already serialized its **valid** and **computed** forms correctly
+(transform-origin 16/23, perspective-origin 18/21, transform-box-valid 5/5,
+backface-visibility-valid 2/2, object-position 18/16) — the only gap was the
+**invalid-rejection gate**: an out-of-grammar value was stored verbatim instead of
+being dropped, so `test_invalid_value()` (which asserts the property comes back
+empty) failed across the board. **ALL SIX tests → 100%** (10/12/3/3/2/13).
+**Built (pure JS, NO new Rust).** Root-cause fix in the shared 2-value
+`<position>` parser (`_parsePosition` + its origin sibling `_parseOriginPos`):
+reordering to horizontal-first is admitted **only in the keyword-pair form**; once
+a `<length-percentage>` is present the order is fixed H-then-V, so `1px left` /
+`top 1px` (a length plus a wrong-axis keyword) are now rejected (they were wrongly
+accepted via keyword-axis reorder). Three gates layered on top: **`_isValidOrigin`**
+(var()/CSS-wide exempt; for `perspective-origin` an explicit 3-token guard rejects
+the legacy 3-value form `center left 1px` — strict `<position>` has no 3-value
+syntax); **`_isValidSimpleTransform`** (`transform-box` + `backface-visibility`
+keyword enums; `perspective` = `none | <length [0,∞]>` via `_isValidPerspective`,
+which rejects `1000`/`-1px`/`80%` — bare number, negative, percentage — using
+`_trLenUnit` + a non-negative check); **`_isValidStrictPosition`** (gates
+`object-position` only — `background`/`mask-position` keep the legacy `<bg-position>`
+3-value form, `offset-anchor`/`offset-position` left ungated for their `auto`/
+`normal` keywords). All wired into both specified paths (`_parseStyleDecls` +
+`setProperty`). **ZERO caps. ZERO regressions** — the shared `_parsePosition`
+change is semantics-preserving (only rejects already-invalid forms): every
+consumer verified clean — background-position-valid/computed 31/32,
+object-position-valid/computed 18/16, gradient-position-valid/computed 18/43,
+offset-anchor/position-valid 11/12 + computed 14/15, plus serialize-values 696/697,
+all transform valid/computed/invalid, color-computed-relative 1163/1169, classlist
+1420, createElement 147; `cargo test -p obscura-dom --lib` 40/40. **Next:**
+`background-position-invalid` 0/11 / `mask-position-invalid` (need a dedicated
+`<bg-position>` validator — legacy 3/4-value quirks); `offset-anchor`/`offset-position`
+invalid gates (reuse `_isValidStrictPosition` + keyword exemptions); the standing
+colour leverage; or a fresh realm. Scroll `tickets/87-the-warded-verdict.md`.
+
 **Session 2026-06-23 (Quest #86 The Individuated Matrix — the `scale`/`rotate`/
 `translate` properties, +142):** The sequel to #85 — the three **individual
 transform properties** (CSS Transforms 2 §individual-transform). Unlike the

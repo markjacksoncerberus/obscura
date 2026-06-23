@@ -546,8 +546,17 @@ const _parseStyleDecls = (text) => {
       value = value.trim();
       if (value === '') continue;
       value = _canonStandardValue(value);
-      if (_POSITION_PROPS.has(name)) value = _serializePositionSpecified(value);
-      else if (_ORIGIN_PROPS.has(name)) value = _serializeOriginSpecified(name, value);
+      if (_POSITION_PROPS.has(name)) {
+        if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(value)) continue; // invalid strict <position> → drop
+        value = _serializePositionSpecified(value);
+      }
+      else if (_ORIGIN_PROPS.has(name)) {
+        if (!_isValidOrigin(name, value)) continue;        // invalid origin → drop
+        value = _serializeOriginSpecified(name, value);
+      }
+      else if (_SIMPLE_TRANSFORM_PROPS.has(name)) {
+        if (!_isValidSimpleTransform(name, value)) continue; // invalid perspective/transform-box/backface → drop
+      }
       else if (_GRADIENT_PROPS.has(name)) {
         if (_imageFuncInvalid(value)) continue;            // invalid image() → drop declaration
         value = _canonImageSet(_canonGradients(value, null, false));
@@ -587,8 +596,17 @@ class CSSStyleDeclaration {
     if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
     let stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
     if (!custom && stored === '') { this.removeProperty(name); return; }
-    if (!custom && _POSITION_PROPS.has(name)) stored = _serializePositionSpecified(stored);
-    else if (!custom && _ORIGIN_PROPS.has(name)) stored = _serializeOriginSpecified(name, stored);
+    if (!custom && _POSITION_PROPS.has(name)) {
+      if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored)) return; // invalid strict <position> → ignore
+      stored = _serializePositionSpecified(stored);
+    }
+    else if (!custom && _ORIGIN_PROPS.has(name)) {
+      if (!_isValidOrigin(name, stored)) return;           // invalid origin → ignore (keep prior value)
+      stored = _serializeOriginSpecified(name, stored);
+    }
+    else if (!custom && _SIMPLE_TRANSFORM_PROPS.has(name)) {
+      if (!_isValidSimpleTransform(name, stored)) return;  // invalid perspective/transform-box/backface → ignore
+    }
     else if (!custom && _GRADIENT_PROPS.has(name)) {
       if (_imageFuncInvalid(stored)) return;               // invalid image() → ignore (keep prior value)
       stored = _canonImageSet(_canonGradients(stored, null, false));
@@ -7778,10 +7796,14 @@ const _parsePosition = (value) => {
     else return null;
   } else {
     const [c1, c2] = comps;
-    const c1V = c1.kw && _POS_V.has(c1.kw);
-    const c2H = c2.kw && _POS_H.has(c2.kw);
-    if (c1V || c2H) { h = c2; v = c1; } else { h = c1; v = c2; }   // reorder to H-first
-    if ((h.kw && _POS_V.has(h.kw)) || (v.kw && _POS_H.has(v.kw))) return null; // axis conflict
+    // Reordering (vertical-first like `top left`) is admitted ONLY in the keyword
+    // pair form; once a <length-percentage> is present the order is fixed H-then-V,
+    // so `1px left` / `top 1px` are invalid (CSS Values <position>). The axis-conflict
+    // guard below then rejects a wrong-axis keyword in either fixed slot.
+    if (c1.kw && c2.kw) {
+      if (_POS_V.has(c1.kw) || _POS_H.has(c2.kw)) { h = c2; v = c1; } else { h = c1; v = c2; }
+    } else { h = c1; v = c2; }
+    if ((h.kw && _POS_V.has(h.kw)) || (v.kw && _POS_H.has(v.kw))) return null; // axis conflict / wrong-axis kw
   }
   return { h, v };
 };
@@ -7939,10 +7961,12 @@ const _parseOriginPos = (value, allowZ) => {
     else { h = c; v = { kw: 'center' }; }                   // H keyword / center / length
   } else {
     const [c1, c2] = comps;
-    const c1V = c1.kw && _POS_V.has(c1.kw);
-    const c2H = c2.kw && _POS_H.has(c2.kw);
-    if (c1V || c2H) { h = c2; v = c1; } else { h = c1; v = c2; }   // reorder to H-first
-    if ((h.kw && _POS_V.has(h.kw)) || (v.kw && _POS_H.has(v.kw))) return null; // axis conflict
+    // Same fixed-order rule as <position>: keyword pairs may reorder, but a
+    // <length-percentage> pins H-then-V (`1px left` / `top 1px` are invalid).
+    if (c1.kw && c2.kw) {
+      if (_POS_V.has(c1.kw) || _POS_H.has(c2.kw)) { h = c2; v = c1; } else { h = c1; v = c2; }
+    } else { h = c1; v = c2; }
+    if ((h.kw && _POS_V.has(h.kw)) || (v.kw && _POS_H.has(v.kw))) return null; // axis conflict / wrong-axis kw
   }
   return { h, v, z };
 };
@@ -7952,6 +7976,30 @@ const _parseOriginPos = (value, allowZ) => {
 const _parseOrigin = (kebab, value) => {
   if (kebab === 'transform-origin') return _parseOriginPos(value, true);
   return _parsePosition(value);
+};
+// Validity gate for the origin properties (drop an invalid declaration). var() and
+// the CSS-wide keywords are exempt (resolved/handled later). `perspective-origin`
+// is strict <position>, which has NO 3-value form — `center left 1px` must be
+// rejected even though the lenient <position> parser tolerates it for legacy
+// bg-position; the explicit 3-token guard catches that.
+const _isValidOrigin = (kebab, value) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v)) return true;
+  if (_CSS_WIDE.has(v.toLowerCase())) return true;
+  if (kebab === 'perspective-origin' && _wsTokens(v).length === 3) return false;
+  return _parseOrigin(kebab, v) != null;
+};
+// `object-position` is strict <position> (unlike background/mask-position, which
+// keep the legacy 3-value <bg-position> form) — so a 3-token value is invalid and
+// the validity gate below drops it (offset-anchor/offset-position are left ungated:
+// they admit extra `auto`/`normal` keywords with no invalid-value test to satisfy).
+const _STRICT_POSITION_PROPS = new Set(['object-position']);
+const _isValidStrictPosition = (value) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v)) return true;
+  if (_CSS_WIDE.has(v.toLowerCase())) return true;
+  if (_wsTokens(v).length === 3) return false;             // strict <position> has no 3-value form
+  return _parsePosition(v) != null;
 };
 const _serializeOriginSpecified = (kebab, value) => {
   const p = _parseOrigin(kebab, value);
@@ -9089,6 +9137,31 @@ const _canonIndividualTransform = (name, value, el, computed) => {
   if (name === 'scale') return _canonScale(value, el, computed);
   if (name === 'rotate') return _canonRotate(value, el, computed);
   return _canonTranslate(value, el, computed);
+};
+// ── Simple transform-module grammar gates ───────────────────────────────────
+// `transform-box`/`backface-visibility` are single-keyword enums; `perspective`
+// is `none | <length [0,∞]>`. Their valid/computed forms already serialize
+// verbatim (canonical) — only the invalid-rejection gate was missing.
+const _TRANSFORM_BOX_KW = new Set(['content-box', 'border-box', 'fill-box', 'stroke-box', 'view-box']);
+const _BACKFACE_KW = new Set(['visible', 'hidden']);
+const _isValidPerspective = (value) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v)) return true;
+  const low = v.toLowerCase();
+  if (low === 'none') return true;
+  if (_FILTER_MATH_RE.test(v)) return true;            // calc()/min()/… resolved later
+  if (_isFilterZero(v)) return true;                   // unitless 0 is a valid <length>
+  const lm = _trLenUnit(v);                            // a real <length> unit (rejects %, bare number)
+  return !!(lm && parseFloat(lm[1]) >= 0);             // non-negative per `[0,∞]`
+};
+const _SIMPLE_TRANSFORM_PROPS = new Set(['perspective', 'transform-box', 'backface-visibility']);
+const _isValidSimpleTransform = (name, value) => {
+  if (_TF_VAR_RE.test(value)) return true;
+  const low = String(value).trim().toLowerCase();
+  if (_CSS_WIDE.has(low)) return true;
+  if (name === 'perspective') return _isValidPerspective(value);
+  if (name === 'transform-box') return _TRANSFORM_BOX_KW.has(low);
+  return _BACKFACE_KW.has(low);                         // backface-visibility: visible | hidden
 };
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
