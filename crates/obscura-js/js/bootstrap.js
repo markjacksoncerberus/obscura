@@ -553,7 +553,7 @@ const _parseStyleDecls = (text) => {
         value = _canonImageSet(_canonGradients(value, null, false));
       } else if (_COLOR_PROPS.has(name)) {
         if (_hasImageFunc(value)) continue;                // image() is not a <color> → drop
-        if (/^alpha\(/i.test(value.trim()) && !_isValidColor(value)) continue;  // invalid alpha() → drop
+        if (/^(?:alpha|contrast-color)\(/i.test(value.trim()) && !_isValidColor(value)) continue;  // invalid alpha()/contrast-color() → drop
         value = _canonColorSpecified(value);
       } else if (_COLOR_SHORTHAND_PROPS.has(name)) {
         value = _canonColorShorthand(value);
@@ -585,7 +585,7 @@ class CSSStyleDeclaration {
       stored = _canonImageSet(_canonGradients(stored, null, false));
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
-      if (/^alpha\(/i.test(stored.trim()) && !_isValidColor(stored)) return;  // invalid alpha() → ignore
+      if (/^(?:alpha|contrast-color)\(/i.test(stored.trim()) && !_isValidColor(stored)) return;  // invalid alpha()/contrast-color() → ignore
       stored = _canonColorSpecified(stored);
     } else if (!custom && _COLOR_SHORTHAND_PROPS.has(name)) {
       stored = _canonColorShorthand(stored);
@@ -6044,6 +6044,23 @@ const _SYSTEM_COLORS = new Set([
   'highlight', 'highlighttext', 'linktext', 'mark', 'marktext', 'selecteditem',
   'selecteditemtext', 'visitedtext',
 ]);
+// Approximate light-theme sRGB used values for the system colours (Chromium
+// defaults). We don't surface these as the computed value of a system-colour
+// keyword (that stays the lowercased ident, matching named keywords) — they exist
+// only so contrast-color(<system-color>) has a luminance to choose black/white
+// against. A keyword absent from this map falls back to a neutral mid grey.
+const _SYSTEM_COLOR_RGB = {
+  accentcolor: 'rgb(0, 117, 255)', accentcolortext: 'rgb(255, 255, 255)',
+  activetext: 'rgb(255, 0, 0)', buttonborder: 'rgb(118, 118, 118)',
+  buttonface: 'rgb(239, 239, 239)', buttontext: 'rgb(0, 0, 0)',
+  canvas: 'rgb(255, 255, 255)', canvastext: 'rgb(0, 0, 0)',
+  field: 'rgb(255, 255, 255)', fieldtext: 'rgb(0, 0, 0)',
+  graytext: 'rgb(128, 128, 128)', highlight: 'rgb(0, 117, 255)',
+  highlighttext: 'rgb(255, 255, 255)', linktext: 'rgb(0, 0, 238)',
+  mark: 'rgb(255, 255, 0)', marktext: 'rgb(0, 0, 0)',
+  selecteditem: 'rgb(0, 117, 255)', selecteditemtext: 'rgb(255, 255, 255)',
+  visitedtext: 'rgb(85, 26, 139)',
+};
 const _canonColorSpecified = (value) => {
   if (!value) return value;
   const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
@@ -6057,6 +6074,11 @@ const _canonColorSpecified = (value) => {
   if (/^alpha\(\s*from\s/i.test(low)) {
     const ac = _canonAlpha(s);
     if (ac !== null) return ac;
+  }
+  // contrast-color() function (CSS Color 5) — canonicalize the inner <color>.
+  if (low.startsWith('contrast-color(')) {
+    const cc = _canonContrastColor(s);
+    if (cc !== null) return cc;
   }
   // Relative colour `<fn>(from <origin> <channels>)` (CSS Color 5) — canonicalize
   // the function name + origin colour, channels kept symbolic. Dispatched before the
@@ -6220,6 +6242,42 @@ const _canonAlpha = (value) => {
   }
   return out + ')';
 };
+// ---- contrast-color() function (CSS Color 5 §contrast-color) ----
+// `contrast-color( <color> )` — resolves at computed-value time to whichever of
+// black/white contrasts more with the single <color> argument. Grammar parse,
+// shared by the validity, specified-canon and computed paths. Returns
+// `{ color }` (the raw inner token string) or null on a malformed shape: the
+// function name must be `contrast-color`, with a single non-empty argument. The
+// argument is ONE <color> — it may itself contain spaces/`/`/commas inside its
+// own parens (`color(srgb 1 0 1 / 0.5)`, `rgb(255, 0, 0)`), so we keep the whole
+// inner verbatim and let `_isValidColor` judge it (`white white`/`max white` →
+// not a single colour → invalid).
+const _parseContrastColor = (value) => {
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  const lp = s.indexOf('(');
+  if (lp <= 0 || !s.endsWith(')')) return null;
+  if (_unescapeIdent(s.slice(0, lp)).toLowerCase() !== 'contrast-color') return null;
+  const inner = s.slice(lp + 1, -1).trim();
+  if (!inner) return null;                                  // contrast-color() → invalid
+  return { color: inner };
+};
+// Is `value` a valid `contrast-color()` <color>? (used by _isValidColor / the
+// setter drop) — its single argument must be a valid <color> (a var() passes
+// without resolving).
+const _isValidContrastColor = (value) => {
+  const p = _parseContrastColor(value);
+  if (!p) return false;
+  if (/var\(/i.test(p.color)) return true;
+  return _isValidColor(p.color);
+};
+// SPECIFIED-value canon: canonicalize the inner <color> via _canonColorSpecified
+// (recursively). Returns null on a malformed / var()-bearing shape (→ verbatim).
+const _canonContrastColor = (value) => {
+  const p = _parseContrastColor(value);
+  if (!p) return null;
+  if (/var\(/i.test(p.color)) return null;
+  return 'contrast-color(' + _canonColorSpecified(p.color) + ')';
+};
 // ---- color-mix() SPECIFIED-value serialization (CSS Color 5 §serial-color-mix) ----
 // Canonicalize the SYNTAX only — the cross-space mixing MATH (the computed value)
 // is deliberately NOT done here (that needs full colour-space conversion and stays a
@@ -6312,6 +6370,8 @@ const _isValidColor = (value) => {
   // alpha() relative-alpha function (CSS Color 5) — valid when its grammar + origin
   // + <alpha-value> resolve (var()-bearing parts pass without resolving).
   if (low.startsWith('alpha(')) return _isValidAlpha(value);
+  // contrast-color() (CSS Color 5) — valid when its single <color> argument is.
+  if (low.startsWith('contrast-color(')) return _isValidContrastColor(value);
   // color-mix() / relative colour syntax are valid <color>s when their structure
   // resolves (el-independent: currentcolor falls back to black for validity). This
   // MUST precede the legacy rgb/hsl branch below, since `rgb(from …)`/`hsl(from …)`
@@ -7237,6 +7297,7 @@ const _resolveColorStruct = (str, el) => {
   if (low === 'currentcolor') s = (el ? (_computedColorOf(el) || 'rgb(0, 0, 0)') : 'rgb(0, 0, 0)');
   if (/^color-mix\(/i.test(s)) return _colorMixStruct(s, el);
   if (/^alpha\(\s*from\s/i.test(s)) return _alphaStruct(s, el);
+  if (/^contrast-color\(/i.test(s)) return _contrastStruct(s, el);
   if (/^[a-z]+\(\s*from\s/i.test(s)) return _relativeStruct(s, el);
   return _csParse(s);
 };
@@ -7522,6 +7583,40 @@ const _computeAlphaComputed = (value, el) => {
     return _serColor(o.coords[0] * 255, o.coords[1] * 255, o.coords[2] * 255, st.alpha);
   }
   return _csSerialize(st);
+};
+// Computed contrast-color(): resolve the inner <color> and pick black or white,
+// whichever maximizes the WCAG-2.1 contrast ratio against it. The colour's
+// relative luminance L is the Y of its XYZ-D65 form; contrast-with-white is
+// (1.05)/(L + 0.05), contrast-with-black is (L + 0.05)/0.05 — black wins iff its
+// ratio is the larger (i.e. L is high). The argument's alpha plays no part. The
+// WPT computed test accepts EITHER black or white for every case (the exact
+// algorithm isn't pinned), so this stays sound even at the L = 0.18 crossover.
+const _contrastStruct = (value, el) => {
+  const p = _parseContrastColor(value);
+  if (!p) return null;
+  let inner = _resolveColorStruct(p.color, el);
+  // A system-colour keyword has no structured form (its used value is UA-defined);
+  // resolve it to its approximate sRGB so we have a luminance to choose against.
+  if (!inner) {
+    const low = p.color.trim().toLowerCase();
+    if (_SYSTEM_COLORS.has(low)) inner = _csParse(_SYSTEM_COLOR_RGB[low] || 'rgb(128, 128, 128)');
+  }
+  if (!inner) return null;
+  const L = _csConvert(inner, 'xyz-d65').coords[1];
+  const useBlack = (L + 0.05) / 0.05 >= 1.05 / (L + 0.05);
+  const c = useBlack ? 0 : 1;
+  return { space: 'srgb', coords: [c, c, c], alpha: 1, none: [false, false, false, false] };
+};
+// Top-level computed serialization for contrast-color() — a sRGB black/white, so
+// it serializes in the legacy rgb() form when standalone (`contrast-color(white)`
+// → `rgb(0, 0, 0)`); nested inside color-mix()/relative colour it is resolved via
+// `_resolveColorStruct` and serialized in that context's own space instead.
+const _computeContrastColorComputed = (value, el) => {
+  const s = String(value).trim();
+  if (!/^contrast-color\(/i.test(s)) return null;
+  const st = _contrastStruct(s, el);
+  if (!st) return null;
+  return _serColor(st.coords[0] * 255, st.coords[1] * 255, st.coords[2] * 255, st.alpha);
 };
 // Computed `color` of an element, honouring inheritance and `currentColor`.
 // A missing/`inherit`/`currentcolor` value inherits the parent's color; the
@@ -8442,6 +8537,8 @@ const _normComputed = (el, kebab, v) => {
     if (mixed !== null) return mixed;
     const alphaC = _computeAlphaComputed(v, el);
     if (alphaC !== null) return alphaC;
+    const cc = _computeContrastColorComputed(v, el);
+    if (cc !== null) return cc;
     const rel = _computeRelativeComputed(v, el);
     if (rel !== null) return rel;
     return _computeColor(v);
