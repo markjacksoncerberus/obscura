@@ -563,6 +563,9 @@ const _parseStyleDecls = (text) => {
       } else if (name === 'transform') {
         if (!_isValidTransform(value)) continue;           // invalid <transform-list> → drop
         value = _canonTransform(value, null, false);
+      } else if (_INDIV_TRANSFORM.has(name)) {
+        if (!_isValidIndividualTransform(name, value)) continue;  // invalid scale/rotate/translate → drop
+        value = _canonIndividualTransform(name, value, null, false);
       } else if (name === 'content') {
         value = _canonContent(value, null, false);
       }
@@ -601,6 +604,9 @@ class CSSStyleDeclaration {
     } else if (!custom && name === 'transform') {
       if (!_isValidTransform(stored)) return;              // invalid <transform-list> → ignore
       stored = _canonTransform(stored, null, false);
+    } else if (!custom && _INDIV_TRANSFORM.has(name)) {
+      if (!_isValidIndividualTransform(name, stored)) return;  // invalid scale/rotate/translate → ignore
+      stored = _canonIndividualTransform(name, stored, null, false);
     } else if (!custom && name === 'content') {
       stored = _canonContent(stored, null, false);
     }
@@ -5321,6 +5327,7 @@ const _GCS_DEFAULTS = {
   display: 'block', visibility: 'visible', opacity: '1',
   position: 'static', overflow: 'visible',
   transform: 'none', transition: 'none', animation: 'none',
+  scale: 'none', rotate: 'none', translate: 'none',
   float: 'none', clear: 'none',
   width: 'auto', height: 'auto',
   top: 'auto', left: 'auto', right: 'auto', bottom: 'auto',
@@ -8892,6 +8899,197 @@ const _canonTransform = (value, el, computed) => {
   }
   return out.join(' ');
 };
+// ── Individual transform properties: `scale` / `rotate` / `translate` ───────
+// (CSS Transforms 2 §individual-transform-serialization). Unlike the `transform`
+// shorthand these do NOT collapse to a matrix — their computed value keeps the
+// keyword/number/angle form, only resolving units. Each has its own grammar and
+// its own trailing-component elision rule.
+const _emPxOf = (el) => (el ? (parseFloat(_computedPropOf(el, 'font-size', 0)) || 16) : 16);
+
+// ----- scale: none | [ <number> | <percentage> ]{1,3} -----
+// A scale component's math function must be dimensionless (a <number>/<percentage>):
+// strip any `sign()` body (it yields a <number> from arguments of any type — e.g.
+// `sign(1em - 1px)`) then require the remainder to evaluate with NO units present.
+const _scaleCalcOk = (t) => {
+  const stripped = t.replace(/\bsign\s*\((?:[^()]|\([^()]*\))*\)/gi, '1');
+  return _evalMath(stripped, 1, {}) !== null;
+};
+const _scaleCompValid = (t) => {
+  t = t.trim();
+  if (_FILTER_NUM_RE.test(t) || _FILTER_PCT_RE.test(t)) return true;
+  if (_FILTER_MATH_RE.test(t)) return _scaleCalcOk(t);
+  return false;
+};
+const _isValidScale = (value) => {
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (s === '') return false;
+  if (s.toLowerCase() === 'none') return true;
+  const toks = _splitFilterTokens(s);
+  if (toks.length < 1 || toks.length > 3) return false;
+  return toks.every(_scaleCompValid);
+};
+const _scaleComp = (t, el, computed) => {
+  t = t.trim();
+  if (_FILTER_MATH_RE.test(t)) {
+    if (computed) { const v = _evalMath(t, 1, { lengths: true, angle: true, emPx: _emPxOf(el) }); return v === null ? (_canonMathExpr(t) || t) : _serNumber(v); }
+    return _canonMathExpr(t) || t;
+  }
+  if (_FILTER_PCT_RE.test(t)) return _serNumber(parseFloat(t) / 100);
+  return _serNumber(parseFloat(t));
+};
+const _canonScale = (value, el, computed) => {
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (s.toLowerCase() === 'none') return 'none';
+  let c = _splitFilterTokens(s).map((t) => _scaleComp(t, el, computed));
+  // Elide a trailing z==1, then a trailing y equal to x (CSS Transforms 2).
+  if (c.length === 3 && c[2] === '1') c = c.slice(0, 2);
+  if (c.length === 2 && c[1] === c[0]) c = c.slice(0, 1);
+  return c.join(' ');
+};
+
+// ----- rotate: none | <angle> | [ x | y | z | <number>{3} ] && <angle> -----
+const _rotKind = (t) => {
+  const low = t.trim().toLowerCase();
+  if (low === 'x' || low === 'y' || low === 'z') return 'kw';
+  const lm = _FILTER_LEN_RE.exec(t);
+  if (lm && _ANGLE_DEG[lm[2].toLowerCase()] !== undefined) return 'angle';
+  if (_FILTER_MATH_RE.test(t)) return /\d*\.?\d+\s*(?:deg|grad|rad|turn)\b/i.test(t) ? 'angle' : 'num';
+  if (_FILTER_NUM_RE.test(t)) return 'num';
+  return 'bad';
+};
+const _rotParse = (value) => {
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (s === '') return null;
+  if (s.toLowerCase() === 'none') return { none: true };
+  let angle = null, kw = null, nums = [];
+  for (const tok of _splitFilterTokens(s)) {
+    const k = _rotKind(tok);
+    if (k === 'angle') { if (angle !== null) return null; angle = tok; }
+    else if (k === 'kw') { if (kw !== null || nums.length) return null; kw = tok.toLowerCase(); }
+    else if (k === 'num') { if (kw !== null) return null; nums.push(tok); }
+    else return null;
+  }
+  if (angle === null) return null;                            // an <angle> is required
+  if (kw === null && nums.length !== 0 && nums.length !== 3) return null;
+  return { angle, kw, nums };
+};
+const _isValidRotate = (value) => !!_rotParse(value);
+const _rotAxisVec = (p) => {
+  if (p.kw === 'x') return [1, 0, 0];
+  if (p.kw === 'y') return [0, 1, 0];
+  if (p.kw === 'z' || (p.kw === null && p.nums.length === 0)) return [0, 0, 1];
+  return p.nums.map(parseFloat);
+};
+const _rotSerAngle = (angTok, computed, negate) => {
+  angTok = angTok.trim();
+  if (_FILTER_MATH_RE.test(angTok)) {
+    if (computed) { let d = _evalMath(angTok, 0, { angle: true }); if (d === null) return _canonMathExpr(angTok) || angTok; if (negate) d = -d; return _serNumber(d) + 'deg'; }
+    return negate ? 'calc(-1 * (' + (_canonMathExpr(angTok) || angTok) + '))' : (_canonMathExpr(angTok) || angTok);
+  }
+  if (computed) { let d = _evalMath(angTok, 0, { angle: true }) || 0; if (negate) d = -d; return _serNumber(d) + 'deg'; }
+  const lm = _FILTER_LEN_RE.exec(angTok);
+  if (!lm) return angTok;
+  let num = parseFloat(lm[1]); if (negate) num = -num;
+  return _serNumber(num) + lm[2];
+};
+const _canonRotate = (value, el, computed) => {
+  const p = _rotParse(value);
+  if (!p) return value;
+  if (p.none) return 'none';
+  const [x, y, z] = _rotAxisVec(p);
+  const ang = (neg) => _rotSerAngle(p.angle, computed, neg);
+  if (x === 0 && y === 0 && z === 0) return '0 0 0 ' + ang(false);
+  if (x === 0 && y === 0) return ang(z < 0);                  // z axis → just <angle>
+  if (y === 0 && z === 0) return 'x ' + ang(x < 0);
+  if (x === 0 && z === 0) return 'y ' + ang(y < 0);
+  return [x, y, z].map(_serNumber).join(' ') + ' ' + ang(false);
+};
+
+// ----- translate: none | <length-percentage> [ <length-percentage> <length>? ]? -----
+// (x,y accept <length-percentage>; z is a pure <length> — no percentage.)
+const _trLenUnit = (t) => { const lm = _FILTER_LEN_RE.exec(t); return lm && (_LENGTH_PX[lm[2].toLowerCase()] !== undefined || /^(?:cq[whib]|cqmin|cqmax|v[whib]|vmin|vmax|sv[wh]|lv[wh]|dv[wh])$/i.test(lm[2])) ? lm : null; };
+const _trXYValid = (t) => {
+  t = t.trim();
+  if (_isFilterZero(t) || _FILTER_PCT_RE.test(t)) return true;
+  if (_FILTER_MATH_RE.test(t)) return _evalMath(t, 100, { lengths: true, emPx: 16 }) !== null;
+  return !!_trLenUnit(t);
+};
+const _trZValid = (t) => {
+  t = t.trim();
+  if (_isFilterZero(t)) return true;
+  if (_FILTER_PCT_RE.test(t)) return false;                   // z is a pure <length>
+  if (_FILTER_MATH_RE.test(t)) return /%/.test(t) ? false : _evalMath(t, 0, { lengths: true, emPx: 16 }) !== null;
+  return !!_trLenUnit(t);
+};
+const _isValidTranslate = (value) => {
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (s === '') return false;
+  if (s.toLowerCase() === 'none') return true;
+  const toks = _splitFilterTokens(s);
+  if (toks.length < 1 || toks.length > 3) return false;
+  if (!_trXYValid(toks[0])) return false;
+  if (toks.length >= 2 && !_trXYValid(toks[1])) return false;
+  if (toks.length === 3 && !_trZValid(toks[2])) return false;
+  return true;
+};
+// A component that is a zero <length> (and so elidable from the tail) — `0`, `0px`,
+// `0em`, … but never `0%` (a percentage is kept) nor a calc().
+const _trIsZeroLen = (t) => {
+  t = t.trim();
+  if (_isFilterZero(t)) return true;
+  if (_FILTER_PCT_RE.test(t) || _FILTER_MATH_RE.test(t)) return false;
+  const lm = _FILTER_LEN_RE.exec(t);
+  return !!(lm && parseFloat(lm[1]) === 0);
+};
+const _trComp = (t, el, computed) => {
+  t = t.trim();
+  if (_FILTER_MATH_RE.test(t)) {
+    if (/%/.test(t)) {                                        // mixed %+<length> → canonical calc(P% ± Lpx)
+      const mixed = _resolvePctLengthCalc(t, computed ? _emPxOf(el) : undefined);
+      return mixed !== null ? mixed : (_canonMathExpr(t) || t);
+    }
+    if (computed) { const v = _evalMath(t, 0, { lengths: true, emPx: _emPxOf(el) }); if (v !== null) return _serNumber(v) + 'px'; }
+    return _canonMathExpr(t) || t;
+  }
+  if (_FILTER_PCT_RE.test(t)) return _serNumber(parseFloat(t)) + '%';
+  if (_isFilterZero(t)) return computed ? '0px' : _serNumber(parseFloat(t)) + 'px';
+  if (computed) { const v = _evalMath(t, 0, { lengths: true, emPx: _emPxOf(el) }); if (v !== null) return _serNumber(v) + 'px'; }
+  const lm = _FILTER_LEN_RE.exec(t);                          // specified: keep the unit, canon the number
+  return lm ? _serNumber(parseFloat(lm[1])) + lm[2] : t;
+};
+const _canonTranslate = (value, el, computed) => {
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (s.toLowerCase() === 'none') return 'none';
+  const toks = _splitFilterTokens(s);
+  const comps = toks.map((t) => _trComp(t, el, computed));
+  let n = comps.length;
+  if (n === 3 && _trIsZeroLen(toks[2])) n = 2;
+  if (n === 2 && _trIsZeroLen(toks[1])) n = 1;
+  return comps.slice(0, n).join(' ');
+};
+const _INDIV_TRANSFORM = new Set(['scale', 'rotate', 'translate']);
+// The CSS tokenizer auto-closes any blocks/functions still open at EOF (Syntax 3
+// §"consume a component value"). A value like `calc(2 * sign(1em - 1px)` (one `)`
+// short) is therefore valid — append the missing close-parens to mirror that.
+const _balanceParens = (s) => {
+  let depth = 0;
+  for (const c of s) { if (c === '(') depth++; else if (c === ')') depth = Math.max(0, depth - 1); }
+  return depth > 0 ? s + ')'.repeat(depth) : s;
+};
+const _isValidIndividualTransform = (name, value) => {
+  if (_TF_VAR_RE.test(value)) return true;                    // var()/env() resolved later
+  value = _balanceParens(String(value));
+  if (name === 'scale') return _isValidScale(value);
+  if (name === 'rotate') return _isValidRotate(value);
+  return _isValidTranslate(value);
+};
+const _canonIndividualTransform = (name, value, el, computed) => {
+  if (_TF_VAR_RE.test(value)) return value;                   // unresolved var()/env()
+  value = _balanceParens(String(value));
+  if (name === 'scale') return _canonScale(value, el, computed);
+  if (name === 'rotate') return _canonRotate(value, el, computed);
+  return _canonTranslate(value, el, computed);
+};
 // Serialize a resolved specified value into its computed form (colour/opacity
 // normalization; every other property passes through unchanged).
 const _FONT_SIZE_KEYWORDS = {
@@ -8907,6 +9105,7 @@ const _normComputed = (el, kebab, v) => {
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);
   if (kebab === 'filter' || kebab === 'backdrop-filter') return _canonFilter(v, el, true);
   if (kebab === 'transform') return _canonTransform(v, el, true);
+  if (_INDIV_TRANSFORM.has(kebab)) return _canonIndividualTransform(kebab, v, el, true);
   if (kebab === 'content') return _canonContent(v, el, true);
   if (kebab === 'font-size') {
     const k = String(v).trim().toLowerCase();

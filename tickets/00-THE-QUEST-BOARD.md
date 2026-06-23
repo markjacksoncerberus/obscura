@@ -122,6 +122,47 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-23 (Quest #86 The Individuated Matrix — the `scale`/`rotate`/
+`translate` properties, +142):** The sequel to #85 — the three **individual
+transform properties** (CSS Transforms 2 §individual-transform). Unlike the
+`transform` shorthand they do NOT collapse to a matrix; their computed value
+keeps the keyword/number/angle form, only resolving units. Obscura had none of
+them registered — no `_GCS_DEFAULTS`, no validation, no canon — the same three
+failure modes ×3 properties. **ALL NINE tests → 100%** (scale 32/38/8, rotate
+23/23/9, translate 20/19/6; before 15/0/0, 7/0/0, 14/0/0). **Built (pure JS, NO
+new Rust)** on the #84/#85 scaffolding (`_splitFilterTokens`, the `_FILTER_*`
+regexes, `_isFilterZero`, `_LENGTH_PX`, `_ANGLE_DEG`, `_evalMath`, `_serNumber`,
+`_canonMathExpr`, `_resolvePctLengthCalc`): three independent serializers behind
+one dispatcher pair (`_isValidIndividualTransform`/`_canonIndividualTransform`,
+wired into both specified paths + `_normComputed`; `_INDIV_TRANSFORM` set; `scale`/
+`rotate`/`translate` → `none` in `_GCS_DEFAULTS`). **scale** (`none | [<number>|
+<percentage>]{1,3}`): `_isValidScale` (`_scaleCalcOk` strips `sign()` bodies then
+requires a unitless eval → `calc(100px)`/`calc(1s)`/`calc(180deg)` invalid but
+`calc(2 * sign(1em - 1px))` valid); `_canonScale` (`%`→fraction, SPECIFIED keeps
+calc symbolic / COMPUTED resolves to number, trailing elision: drop z==`1` then
+y==x — `100 100 1`→`100`, `100 100 2`→`100 100 2`). **rotate** (`none | <angle> |
+[x|y|z|<number>{3}] && <angle>`): `_rotParse` (exactly one angle + axis of
+nothing/one-keyword/three-numbers); `_canonRotate` (axis→`x`/`y` keyword or bare
+`<angle>` with sign-flip on reverse, `0 0 0` kept, arbitrary→`x y z <angle>`;
+angle last, SPECIFIED keeps unit / COMPUTED→deg). **translate** (`none |
+<length-percentage> [<length-percentage> <length>?]?`, z a pure `<length>`):
+`_isValidTranslate` (z rejects `%`); `_canonTranslate` (unitless `0`→`0px`,
+SPECIFIED keeps unit / COMPUTED→px, mixed %+length calc → `calc(P% ± Lpx)` via
+`_resolvePctLengthCalc` since `_canonMathExpr` doesn't reorder % before length,
+trailing zero-*length* elision but `0%` kept). **Two loop fixes:** the translate
+calc ordering (`calc(10px - 10%)`→`calc(-10% + 10px)`) and `_balanceParens`
+(CSS EOF auto-closes open functions → `2 calc(300% * sign(1em - 1px)` valid).
+**ZERO caps. ZERO regressions** — purely additive, no shared primitive touched
+(serialize-values 696/697, transform-valid/computed/invalid 42/3/20,
+transform-origin 16/23, perspective-origin 18/21, transform-box-valid 5/5,
+color-computed-relative 1163/1169, color-valid 17/17, classlist 1420/1420,
+createElement 147/147; `cargo test -p obscura-dom --lib` 40/40). The
+`filter-effects/parsing/*` dir 404'd on wpt.live during the sweep (including the
+untouched `filter-valid` — directory-wide upstream flux, not a regression).
+**Next:** `transform-origin-invalid` 0/10 (pure grammar gate); `perspective`/
+`transform-box`/`backface-visibility` invalid gates; or a fresh realm. Scroll
+`tickets/86-the-individuated-matrix.md`.
+
 **Session 2026-06-23 (Quest #85 The Transmuted Matrix — the `transform`
 property, +45):** A fresh realm — the first slice of the wide
 `css-transforms/parsing` frontier (~+197 across `transform`/`rotate`/`scale`/
