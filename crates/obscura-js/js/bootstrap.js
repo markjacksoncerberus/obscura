@@ -553,6 +553,7 @@ const _parseStyleDecls = (text) => {
         value = _canonImageSet(_canonGradients(value, null, false));
       } else if (_COLOR_PROPS.has(name)) {
         if (_hasImageFunc(value)) continue;                // image() is not a <color> → drop
+        if (/^alpha\(/i.test(value.trim()) && !_isValidColor(value)) continue;  // invalid alpha() → drop
         value = _canonColorSpecified(value);
       } else if (_COLOR_SHORTHAND_PROPS.has(name)) {
         value = _canonColorShorthand(value);
@@ -584,6 +585,7 @@ class CSSStyleDeclaration {
       stored = _canonImageSet(_canonGradients(stored, null, false));
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
+      if (/^alpha\(/i.test(stored.trim()) && !_isValidColor(stored)) return;  // invalid alpha() → ignore
       stored = _canonColorSpecified(stored);
     } else if (!custom && _COLOR_SHORTHAND_PROPS.has(name)) {
       stored = _canonColorShorthand(stored);
@@ -6033,15 +6035,29 @@ const _computeColor = (value) => {
 // named colours, `currentcolor`, `transparent`, CSS-wide keywords, and modern functions
 // (light-dark/color-mix/lab/relative `rgb(from …)`/var()) keep their specified bytes —
 // those only resolve at computed-value time.
+// CSS system colours (CSS Color 4 §System Colors) — valid <color> keywords that
+// serialize as the ASCII-lowercased ident (their used value is UA-defined; we don't
+// resolve them to an rgb() at computed time, matching how named keywords are kept).
+const _SYSTEM_COLORS = new Set([
+  'accentcolor', 'accentcolortext', 'activetext', 'buttonborder', 'buttonface',
+  'buttontext', 'canvas', 'canvastext', 'field', 'fieldtext', 'graytext',
+  'highlight', 'highlighttext', 'linktext', 'mark', 'marktext', 'selecteditem',
+  'selecteditemtext', 'visitedtext',
+]);
 const _canonColorSpecified = (value) => {
   if (!value) return value;
   const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
   const low = s.toLowerCase();
-  // Keyword colours (named/`transparent`/`currentcolor`) and CSS-wide keywords
-  // serialize as the ASCII-lowercased ident — `currentColor`→`currentcolor`,
-  // `Red`→`red` — but otherwise keep their keyword form (they only resolve to an
-  // rgb() at computed-value time, unlike the legacy hex/rgb/hsl forms below).
-  if (low === 'transparent' || low === 'currentcolor' || _CSS_WIDE.has(low) || _CSS_NAMED_COLORS[low]) return low;
+  // Keyword colours (named/`transparent`/`currentcolor`/system) and CSS-wide
+  // keywords serialize as the ASCII-lowercased ident — `currentColor`→`currentcolor`,
+  // `Red`→`red`, `ActiveText`→`activetext` — but otherwise keep their keyword form
+  // (they only resolve to an rgb() at computed-value time, unlike the hex/rgb/hsl forms).
+  if (low === 'transparent' || low === 'currentcolor' || _CSS_WIDE.has(low) || _CSS_NAMED_COLORS[low] || _SYSTEM_COLORS.has(low)) return low;
+  // alpha() relative-alpha function — canonicalize the origin + a calc() alpha.
+  if (/^alpha\(\s*from\s/i.test(low)) {
+    const ac = _canonAlpha(s);
+    if (ac !== null) return ac;
+  }
   // Relative colour `<fn>(from <origin> <channels>)` (CSS Color 5) — canonicalize
   // the function name + origin colour, channels kept symbolic. Dispatched before the
   // modern/legacy branches below because the `from` keyword isn't a number/percentage
@@ -6134,6 +6150,76 @@ const _canonRelativeColor = (value) => {
   const outFn = fn === 'rgba' ? 'rgb' : fn === 'hsla' ? 'hsl' : fn;
   return outFn + '(from ' + origin + (rest.length ? ' ' + rest.join(' ') : '') + ')';
 };
+// ---- alpha() relative-alpha function (CSS Color 5 §relative-alpha) ----
+// `alpha(from <origin> [ / <alpha-value> ])` — keeps the origin colour's channels
+// + colour space and replaces ONLY its alpha. The `alpha` keyword inside the
+// `<alpha-value>` reads the origin's alpha. Grammar parse, shared by the validity,
+// specified-canon and computed paths. Returns `{ origin, alpha }` (alpha = the raw
+// token string, or null when omitted), or null on any malformed shape:
+//  • must start `alpha( from <color>` (no `from` / empty / non-color origin → null);
+//  • at most one `/ <alpha-value>` (a single ws-token: number/%/none/alpha/var()/
+//    sibling-*()/calc()); extra tokens, commas, multiple slashes, channel keywords
+//    in the origin position → null.
+const _parseAlphaFn = (value) => {
+  const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  const lp = s.indexOf('(');
+  if (lp <= 0 || !s.endsWith(')')) return null;
+  if (_unescapeIdent(s.slice(0, lp)).toLowerCase() !== 'alpha') return null;
+  const inner = s.slice(lp + 1, -1);
+  if (_commaSplitTop(inner).length > 1) return null;       // comma syntax not allowed
+  const toks = _wsTokens(inner.trim());
+  if (toks.length < 2 || toks[0].toLowerCase() !== 'from') return null;
+  const origin = toks[1];
+  if (origin === '/') return null;                         // missing origin colour
+  const rest = toks.slice(2);
+  let alpha = null;
+  if (rest.length) {
+    if (rest[0] !== '/') return null;                      // extra tokens after origin
+    const aToks = rest.slice(1);
+    if (aToks.length !== 1 || aToks[0] === '/') return null;  // exactly one alpha token
+    alpha = aToks[0];
+  }
+  return { origin, alpha };
+};
+// Is `tok` a valid <alpha-value>? Only the `alpha` keyword may stand for a colour
+// channel — a colour channel keyword (`r`/`l`/…) or a bare colour ident is invalid.
+const _isValidAlphaValue = (tok) => {
+  const t = String(tok).trim(), low = t.toLowerCase();
+  if (low === 'none' || low === 'alpha') return true;
+  if (/^var\(/i.test(t)) return true;
+  if (/^sibling-(?:index|count)\(\s*\)$/i.test(t)) return true;
+  if (/^[-+]?(?:\d+\.?\d*|\.\d+)%?$/.test(t)) return true;
+  if (/^(?:calc|min|max|clamp|abs|sign|round|mod|rem|hypot)\(/i.test(t)) {
+    // Substitute the only legal symbols (alpha, sibling-*()) → a number, then the
+    // expression must evaluate; a leftover channel ident (`r`/`l`/…) leaves it null.
+    const e = t.replace(/\balpha\b/gi, '1').replace(/sibling-(?:index|count)\(\s*\)/gi, '1');
+    return _evalMath(e, 1, { nonFinite: true }) !== null;
+  }
+  return false;
+};
+// Is `value` a valid `alpha()` <color>? (used by CSS.supports / the setter drop)
+const _isValidAlpha = (value) => {
+  const p = _parseAlphaFn(value);
+  if (!p) return false;
+  if (!/var\(/i.test(p.origin) && !_isValidColor(p.origin)) return false;
+  if (p.alpha !== null && !/var\(/i.test(p.alpha) && !_isValidAlphaValue(p.alpha)) return false;
+  return true;
+};
+// SPECIFIED-value canon: canonicalize the origin via _canonColorSpecified
+// (recursively) and reorder a calc() alpha via _canonMathExpr; var()/sibling-*()/
+// the `alpha` keyword stay verbatim. Returns null on a malformed shape (→ verbatim).
+const _canonAlpha = (value) => {
+  const p = _parseAlphaFn(value);
+  if (!p) return null;
+  const origin = _canonColorSpecified(p.origin);
+  let out = 'alpha(from ' + origin;
+  if (p.alpha !== null) {
+    let a = p.alpha;
+    if (/^calc\(/i.test(a)) a = _canonMathExpr(a) || a;
+    out += ' / ' + a;
+  }
+  return out + ')';
+};
 // ---- color-mix() SPECIFIED-value serialization (CSS Color 5 §serial-color-mix) ----
 // Canonicalize the SYNTAX only — the cross-space mixing MATH (the computed value)
 // is deliberately NOT done here (that needs full colour-space conversion and stays a
@@ -6221,8 +6307,11 @@ const _canonColorMix = (value) => {
 const _isValidColor = (value) => {
   if (!value) return false;
   const low = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim().toLowerCase();
-  if (low === 'transparent' || low === 'currentcolor' || _CSS_NAMED_COLORS[low]) return true;
+  if (low === 'transparent' || low === 'currentcolor' || _CSS_NAMED_COLORS[low] || _SYSTEM_COLORS.has(low)) return true;
   if (/^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(low)) return true;
+  // alpha() relative-alpha function (CSS Color 5) — valid when its grammar + origin
+  // + <alpha-value> resolve (var()-bearing parts pass without resolving).
+  if (low.startsWith('alpha(')) return _isValidAlpha(value);
   // color-mix() / relative colour syntax are valid <color>s when their structure
   // resolves (el-independent: currentcolor falls back to black for validity). This
   // MUST precede the legacy rgb/hsl branch below, since `rgb(from …)`/`hsl(from …)`
@@ -6513,6 +6602,7 @@ const _parseCalcTree = (str) => {
       const name = tok.v;
       if (toks[p + 1] && toks[p + 1].t === '(') {
         p += 2;
+        if (peek() && peek().t === ')') { p++; return { k: 'fn', name, args: [] }; }  // zero-arg fn, e.g. sibling-index()
         const args = [parseSum()];
         while (!failed && peek() && peek().t === ',') { p++; args.push(parseSum()); }
         if (!peek() || peek().t !== ')') return fail();
@@ -7146,6 +7236,7 @@ const _resolveColorStruct = (str, el) => {
   const low = s.toLowerCase();
   if (low === 'currentcolor') s = (el ? (_computedColorOf(el) || 'rgb(0, 0, 0)') : 'rgb(0, 0, 0)');
   if (/^color-mix\(/i.test(s)) return _colorMixStruct(s, el);
+  if (/^alpha\(\s*from\s/i.test(s)) return _alphaStruct(s, el);
   if (/^[a-z]+\(\s*from\s/i.test(s)) return _relativeStruct(s, el);
   return _csParse(s);
 };
@@ -7328,6 +7419,28 @@ const _relativeStruct = (value, el) => {
   noneOut[3] = aNone;
   return { space, coords, alpha, none: noneOut };
 };
+// Computed alpha(): resolve the origin into a structured colour and replace its
+// alpha. The `alpha` keyword inside the <alpha-value> reads the origin's alpha
+// (a missing origin alpha reads as 0). The origin's space + channels are kept
+// verbatim — alpha() never converts colour spaces. Returns null on any failure.
+const _alphaStruct = (value, el) => {
+  const p = _parseAlphaFn(value);
+  if (!p) return null;
+  const origin = _resolveColorStruct(p.origin, el);
+  if (!origin) return null;
+  let alpha = origin.alpha, aNone = origin.none[3];
+  if (p.alpha !== null) {
+    if (p.alpha.toLowerCase() === 'none') { aNone = true; alpha = 0; }
+    else {
+      const r = _csChan(_relSubst(p.alpha, { alpha: origin.none[3] ? 0 : origin.alpha }), 1, false);
+      if (!r) return null;
+      if (r.none) { aNone = true; alpha = 0; }
+      else { aNone = false; alpha = Math.max(0, Math.min(1, r.v)); }
+    }
+  }
+  const none = origin.none.slice(); none[3] = aNone;
+  return { space: origin.space, coords: origin.coords.slice(), alpha, none };
+};
 // Serialize a structured colour to its canonical COMPUTED form. hsl/hwb resolve
 // to sRGB → color(srgb …); the predefined RGB + xyz spaces → color(<space> …);
 // lab/lch/oklab/oklch keep their own function. `none` channels serialize as the
@@ -7372,9 +7485,43 @@ const _computeColorMixComputed = (value, el) => {
   return st ? _csSerialize(st) : null;
 };
 const _computeRelativeComputed = (value, el) => {
-  if (!/^[a-z]+\(\s*from\s/i.test(String(value).trim())) return null;
+  const s = String(value).trim();
+  if (/^alpha\(\s*from\s/i.test(s) || !/^[a-z]+\(\s*from\s/i.test(s)) return null;
   const st = _relativeStruct(value, el);
   return st ? _csSerialize(st) : null;
+};
+// Does the alpha() origin serialize in the LEGACY sRGB form (rgb()/rgba())? True
+// for named/hex/transparent colours and the legacy sRGB functions rgb/hsl/hwb
+// (incl. their relative `<fn>(from …)` forms), and recursively for a nested
+// `alpha()` origin. `currentcolor`, `color()`, `color-mix()` and the lab/lch/ok*
+// functions are NON-legacy (serialize in their own / `color(srgb …)` form).
+const _isLegacyOrigin = (origin, el) => {
+  const s = String(origin).replace(/\/\*[\s\S]*?\*\//g, '').trim().toLowerCase();
+  if (s === 'transparent' || /^#[0-9a-f]+$/i.test(s) || _CSS_NAMED_COLORS[s]) return true;
+  if (s === 'currentcolor') return false;
+  const lp = s.indexOf('(');
+  if (lp <= 0) return false;
+  const fn = s.slice(0, lp);
+  if (fn === 'rgb' || fn === 'rgba' || fn === 'hsl' || fn === 'hsla' || fn === 'hwb') return true;
+  if (fn === 'alpha') { const p = _parseAlphaFn(s); return p ? _isLegacyOrigin(p.origin, el) : false; }
+  return false;
+};
+// Computed alpha(): a legacy-sRGB origin with a numeric (non-`none`) alpha
+// serializes as rgb()/rgba(); otherwise the structured colour serializes in its
+// own space's canonical computed form (a `none` alpha forces even a legacy origin
+// into `color(srgb … / none)`, since legacy syntax can't express a missing alpha).
+const _computeAlphaComputed = (value, el) => {
+  const s = String(value).trim();
+  if (!/^alpha\(\s*from\s/i.test(s)) return null;
+  const p = _parseAlphaFn(s);
+  if (!p) return null;
+  const st = _alphaStruct(s, el);
+  if (!st) return null;
+  if (!st.none[3] && _isLegacyOrigin(p.origin, el)) {
+    const o = st.space === 'srgb' ? st : _csConvert(st, 'srgb');
+    return _serColor(o.coords[0] * 255, o.coords[1] * 255, o.coords[2] * 255, st.alpha);
+  }
+  return _csSerialize(st);
 };
 // Computed `color` of an element, honouring inheritance and `currentColor`.
 // A missing/`inherit`/`currentcolor` value inherits the parent's color; the
@@ -8293,6 +8440,8 @@ const _normComputed = (el, kebab, v) => {
     // color-mix() / relative colour syntax need real cross-space colour maths.
     const mixed = _computeColorMixComputed(v, el);
     if (mixed !== null) return mixed;
+    const alphaC = _computeAlphaComputed(v, el);
+    if (alphaC !== null) return alphaC;
     const rel = _computeRelativeComputed(v, el);
     if (rel !== null) return rel;
     return _computeColor(v);
