@@ -122,6 +122,34 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-23 (Quest #88 The Cornered Verdict — the background / mask /
+offset position-invalid gates, +30):** The sequel to #87. Four position gates
+still stood open — `background-position` (0/11), `mask-position` (0/13),
+`offset-anchor` (0/3), `offset-position` (0/3) — each with a passing VALID test and
+an unguarded INVALID one. The quest closed all four and drew the precise line
+between the TWO position grammars. **Strict `<position>`** (CSS Values 4 — 4-value
+edge form `[[left|right]<lp>] && [[top|bottom]<lp>]` ONLY, no `center`, no 3-value
+form) governs `mask-position`/`offset-anchor`/`offset-position`; **lenient
+`<bg-position>`** (CSS Backgrounds 3 — `center` admitted, offsets optional, 3-value
+forms like `center top 8px` legal) governs `background-position`. **ALL FOUR → 100%**
+(11/13/3/3). **Built (pure JS, NO new Rust):** (1) root-cause fix to the shared
+`_isPosLP` — a unit'd token is a `<length-percentage>` only for a LENGTH unit (or
+`%`), so `30deg` (an angle) is no longer admitted as a position component; bare
+numbers + math fns still pass. (2) `_STRICT_POSITION_PROPS` became a
+`Map<prop, extraKeywordSet>` (`mask-position`→none, `offset-anchor`→`{auto}`,
+`offset-position`→`{auto, normal}`); `_isValidStrictPosition` made **comma-layer-aware**
+(mask admits `bottom left, right 20%`) + keyword-exempting, keeping the 3-token-invalid
+guard. (3) new `_isValidBgPosition` (lenient, per-layer `_parsePosition`, NO 3-token
+guard). All wired into both specified paths. **ZERO caps. ZERO regressions** — the
+shared `_isPosLP` change is semantics-preserving for every consumer: background/mask/
+offset/object valid all hold (31/23/11/12 + object 18/13/16), and the gradient
+consumers stay byte-identical (gradient-position-valid 18/18 + computed 43/43,
+gradient-interpolation 1398/1398), plus serialize-values 696/697,
+color-computed-relative 1163/1169, classlist 1420, createElement 147; obscura-dom
+40/40. **Next:** the `css-transforms/parsing` `*-computed` tail; `offset-rotate`/
+`offset-path` parsing; `background-position-x`/`-y` longhands; the standing colour
+leverage; or a fresh realm. Scroll `tickets/88-the-cornered-verdict.md`.
+
 **Session 2026-06-23 (Quest #87 The Warded Verdict — the transform-module +
 object-position invalid-rejection gates, +43):** Six grammar gates stood
 unguarded — `transform-origin-invalid`, `perspective-origin-invalid`,

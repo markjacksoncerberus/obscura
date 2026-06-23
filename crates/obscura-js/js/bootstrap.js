@@ -547,7 +547,8 @@ const _parseStyleDecls = (text) => {
       if (value === '') continue;
       value = _canonStandardValue(value);
       if (_POSITION_PROPS.has(name)) {
-        if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(value)) continue; // invalid strict <position> → drop
+        if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(value, _STRICT_POSITION_PROPS.get(name))) continue; // invalid strict <position> → drop
+        if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(value)) continue;      // invalid <bg-position> → drop
         value = _serializePositionSpecified(value);
       }
       else if (_ORIGIN_PROPS.has(name)) {
@@ -597,7 +598,8 @@ class CSSStyleDeclaration {
     let stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
     if (!custom && stored === '') { this.removeProperty(name); return; }
     if (!custom && _POSITION_PROPS.has(name)) {
-      if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored)) return; // invalid strict <position> → ignore
+      if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
+      if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
       stored = _serializePositionSpecified(stored);
     }
     else if (!custom && _ORIGIN_PROPS.has(name)) {
@@ -7751,11 +7753,18 @@ const _POSITION_PROPS = new Set(['object-position', 'background-position',
   'mask-position', 'offset-anchor', 'offset-position']);
 const _POS_H = new Set(['left', 'right']);
 const _POS_V = new Set(['top', 'bottom']);
-// A token is a <length-percentage> (number+unit/%, bare number, or a math fn).
+// A token is a <length-percentage> (a percentage, a bare number, a number with a
+// LENGTH unit, or a math fn). A dimension with a non-length unit (`30deg`, `2s`,
+// `5dpi`) is NOT a <length-percentage> and must be rejected — an angle/time in a
+// <position> slot is invalid (offset-anchor / offset-position `30deg`).
 const _isPosLP = (t) => {
   const s = String(t).toLowerCase();
   if (/^(?:calc|min|max|clamp)\(/.test(s)) return true;
-  return /\d/.test(t) && /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?(?:%|[a-z]+)?$/i.test(t);
+  const m = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?(%|[a-z]+)?$/i.exec(t);
+  if (!m) return false;
+  const unit = m[1] && m[1].toLowerCase();
+  if (!unit || unit === '%') return true;                  // bare number (incl 0) or percentage
+  return _LEN_UNIT_RE.test(unit) || /^(?:cq[whib]|cqmin|cqmax|sv[wh]|lv[wh]|dv[wh])$/.test(unit);
 };
 // Parse one <position> into { h, v } components (each { kw?, off?, lp? }), or null.
 const _parsePosition = (value) => {
@@ -7989,17 +7998,46 @@ const _isValidOrigin = (kebab, value) => {
   if (kebab === 'perspective-origin' && _wsTokens(v).length === 3) return false;
   return _parseOrigin(kebab, v) != null;
 };
-// `object-position` is strict <position> (unlike background/mask-position, which
-// keep the legacy 3-value <bg-position> form) — so a 3-token value is invalid and
-// the validity gate below drops it (offset-anchor/offset-position are left ungated:
-// they admit extra `auto`/`normal` keywords with no invalid-value test to satisfy).
-const _STRICT_POSITION_PROPS = new Set(['object-position']);
-const _isValidStrictPosition = (value) => {
+// The strict <position> (CSS Values 4) properties. Their multi-value branch is the
+// 4-value edge-offset form `[[left|right]<lp>] && [[top|bottom]<lp>]` ONLY — no
+// `center` in the edge form, offsets required on BOTH axes, hence NO 3-value form
+// (a 3-token value is always invalid). Distinct from `background-position`, which
+// keeps the legacy lenient `<bg-position>` (3-value center forms allowed).
+//   object-position : strict, no extra keywords.
+//   mask-position   : strict, comma-separated layers, no extra keywords (`auto` invalid).
+//   offset-anchor   : strict OR `auto`.
+//   offset-position : strict OR `auto` / `normal`.
+const _STRICT_POSITION_PROPS = new Map([
+  ['object-position', null],
+  ['mask-position', null],
+  ['offset-anchor', new Set(['auto'])],
+  ['offset-position', new Set(['auto', 'normal'])],
+]);
+const _isValidStrictPosition = (value, extraKw) => {
   const v = String(value).trim();
   if (_TF_VAR_RE.test(v)) return true;
   if (_CSS_WIDE.has(v.toLowerCase())) return true;
-  if (_wsTokens(v).length === 3) return false;             // strict <position> has no 3-value form
-  return _parsePosition(v) != null;
+  for (const layer of _commaSplitTop(v)) {
+    const s = layer.trim();
+    if (extraKw && extraKw.has(s.toLowerCase())) continue; // property-specific keyword (auto/normal)
+    if (_wsTokens(s).length === 3) return false;           // strict <position> has no 3-value form
+    if (_parsePosition(s) == null) return false;
+  }
+  return true;
+};
+// `background-position` is the lenient legacy `<bg-position>` — its edge-offset
+// branch DOES admit `center` and optional offsets, so 3-value forms like
+// `center top 8px` are valid. `_parsePosition` already implements that lenient
+// grammar; the gate just drops a layer it can't parse (no 3-token guard).
+const _BG_POSITION_PROPS = new Set(['background-position']);
+const _isValidBgPosition = (value) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v)) return true;
+  if (_CSS_WIDE.has(v.toLowerCase())) return true;
+  for (const layer of _commaSplitTop(v)) {
+    if (_parsePosition(layer.trim()) == null) return false;
+  }
+  return true;
 };
 const _serializeOriginSpecified = (kebab, value) => {
   const p = _parseOrigin(kebab, value);
