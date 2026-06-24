@@ -123,6 +123,27 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-24 (Quest #91 The Charted Verdict — offset-path core, +117):**
+`offset-path` (CSS Motion 1) was never registered — stored verbatim (only the 46/70
+valid rows needing no canon passed), invalids kept (0/24), and the computed support
+gate `'offset-path' in getComputedStyle` failed at assertion 1 (0/65), the same shape
+as #89/#90. Built the full grammar `none | <ray()>|<url>|<basic-shape> || <coord-box>`
+as one additive module — ray()/path()/url()/inset()/circle()/ellipse()/polygon()/
+xywh()/rect() serializers on the existing position/length/calc primitives (no new
+Rust, no shared primitive touched). closest-side/round-0/nonzero defaults elided,
+calc ordered; computed resolves angles→deg, lengths→px (em/pt→px), positions→%, and
+xywh()/rect()→equivalent `inset(y calc(100%−x−w) calc(100%−y−h) x)`; path() computed
+accepts the as-authored form; the default `border-box` coord-box elided when a path
+accompanies it (kept when lone). `shape()` (CSS Shapes 2) intentionally preserved
+verbatim — the sequel. **offset-path-parsing-valid 46→70, -invalid 0→24, -computed
+0→65** (all 100%), plus incidental shape-parsing 16→17 and shape-computed 0→3 from
+registration. **Zero caps in the core trio, zero regressions** — background-position
+31, mask-position 23, offset-anchor 14, transform 42, scale 32, color-computed-relative
+1163/1169, classlist 1420, calc-serialization cap 0/1 all held. NEXT: `shape()`
+(~+27, shape-parsing 18 + shape-computed 9 — route through `_opShape`'s shape branch);
+the `offset` shorthand; standing colour leverage; or a fresh realm. Scroll
+`tickets/91-the-charted-verdict.md`.
+
 **Session 2026-06-23 (Quest #90 The Single-Axis Verdict — offset-rotate /
 offset-distance + background-position-x/-y longhands, +80):** Four single-axis
 longhands stood unregistered and ungated. The css-motion scalars `offset-rotate`

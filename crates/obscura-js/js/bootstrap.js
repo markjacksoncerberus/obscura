@@ -584,6 +584,9 @@ const _parseStyleDecls = (text) => {
       } else if (name === 'offset-distance') {
         if (!_isValidOffsetDistance(value)) continue;      // invalid <length-percentage> → drop
         value = _canonOffsetDistance(value);
+      } else if (name === 'offset-path') {
+        if (!_isValidOffsetPath(value)) continue;          // invalid <offset-path> → drop
+        value = _canonOffsetPath(value);
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -644,6 +647,9 @@ class CSSStyleDeclaration {
     } else if (!custom && name === 'offset-distance') {
       if (!_isValidOffsetDistance(stored)) return;         // invalid <length-percentage> → ignore
       stored = _canonOffsetDistance(stored);
+    } else if (!custom && name === 'offset-path') {
+      if (!_isValidOffsetPath(stored)) return;             // invalid <offset-path> → ignore
+      stored = _canonOffsetPath(stored);
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
       if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
       stored = _canonBgAxis(stored, _BG_POSITION_AXIS.get(name));
@@ -5463,6 +5469,9 @@ const _GCS_DEFAULTS = {
   // offset-distance (`<length-percentage>`, computed em→px) likewise don't inherit.
   'offset-anchor': 'auto', 'offset-position': 'normal',
   'offset-rotate': 'auto', 'offset-distance': '0px',
+  // offset-path: none | <ray()>|<url>|<basic-shape> || <coord-box>. Does not inherit;
+  // computed resolves lengths→px, positions→%, xywh()/rect()→inset().
+  'offset-path': 'none',
   // css-backgrounds longhands — each a single-axis `<bg-position>` list (the x/y
   // halves of `background-position`). Computed initial is `0%`; not inherited.
   'background-position-x': '0%', 'background-position-y': '0%',
@@ -8330,6 +8339,347 @@ const _computeBgAxis = (el, value, axis) => {
   }).join(', ');
 };
 
+// ============================================================================
+// offset-path  (CSS Motion 1 §2 + CSS Shapes 1)
+//   offset-path = none | <offset-path> || <coord-box>
+//   <offset-path> = <ray()> | <url> | <basic-shape>
+// Specified serialization canonicalizes each function (closest-side/round-0/etc.
+// defaults elided, calc ordered); computed resolves lengths to px (em/pt→px),
+// positions to percentages, and the <basic-shape-rect> functions xywh()/rect() to
+// the equivalent inset(). The default <coord-box> is border-box, elided whenever a
+// path accompanies it; a lone coord-box is kept. shape() (CSS Shapes 2) is not yet
+// canonicalized — it is preserved verbatim (a dedicated sequel) so the cases that
+// need no normalization keep passing instead of regressing.
+// ============================================================================
+const _COORD_BOX = new Set(['content-box', 'padding-box', 'border-box', 'margin-box', 'fill-box', 'stroke-box', 'view-box']);
+const _RAY_SIZE = new Set(['closest-side', 'closest-corner', 'farthest-side', 'farthest-corner', 'sides']);
+const _SVG_ARGC = { m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, a: 7, z: 0 };
+
+// One <length-percentage>: specified keeps the symbolic form (0→0px, calc ordered),
+// computed resolves em/pt/…→px while % stays symbolic.
+const _opLp = (tok, computed, emPx, lhPx) =>
+  computed ? _posComputeLen(tok, emPx, lhPx) : _canonLPToken(tok);
+// A token whose numeric part is zero (`0`, `0px`, `0%`, `0.0em`) — used to elide a
+// `round 0` border-radius (its default).
+const _opIsZero = (t) => /^[+-]?(?:0+\.?0*|\.0+)(%|[a-z]+)?$/i.test(String(t).trim());
+// margin-style 1–4 value collapse over already-serialized strings.
+const _opCollapse4 = (arr) => {
+  const [t, r, b, l] = _boxEdges(arr);
+  if (l !== r) return [t, r, b, l].join(' ');
+  if (b !== t) return [t, r, b].join(' ');
+  if (r !== t) return [t, r].join(' ');
+  return t;
+};
+// <border-radius> = <lp>{1,4} [ / <lp>{1,4} ]?  → serialized, or null if malformed.
+const _opBorderRadius = (radToks, computed, emPx, lhPx) => {
+  const joined = radToks.join(' ');
+  const sl = joined.indexOf('/');
+  const hStr = sl < 0 ? joined : joined.slice(0, sl);
+  const vStr = sl < 0 ? null : joined.slice(sl + 1);
+  const hT = _wsTokens(hStr.trim());
+  const vT = vStr != null ? _wsTokens(vStr.trim()) : null;
+  if (hT.length < 1 || hT.length > 4) return null;
+  if (vT && (vT.length < 1 || vT.length > 4)) return null;
+  for (const t of hT) if (!_isPosLP(t)) return null;
+  if (vT) for (const t of vT) if (!_isPosLP(t)) return null;
+  const h = _opCollapse4(hT.map((t) => _opLp(t, computed, emPx, lhPx)));
+  if (!vT) return h;
+  const v = _opCollapse4(vT.map((t) => _opLp(t, computed, emPx, lhPx)));
+  return h === v ? h : h + ' / ' + v;
+};
+// A ` round <border-radius>` clause — empty string when omitted/all-zero (the
+// default), null when the `round` keyword carries a malformed value.
+const _opRoundClause = (radToks, computed, emPx, lhPx) => {
+  if (radToks == null) return '';
+  if (radToks.length === 0) return null;                 // `round` with no value → invalid
+  if (radToks.filter((t) => t !== '/').every(_opIsZero)) return '';  // round 0 → omit
+  const br = _opBorderRadius(radToks, computed, emPx, lhPx);
+  return br == null ? null : ' round ' + br;
+};
+// polygon()'s `round <length>` — a NON-NEGATIVE <length> (no %, no angle; calc ok).
+const _opLength = (t) => {
+  const s = String(t).trim();
+  if (/^(?:calc|min|max|clamp)\(/i.test(s)) return true;
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+))([a-z]+)?$/i.exec(s);
+  if (!m) return false;
+  if (parseFloat(m[1]) < 0) return false;
+  const u = m[2] && m[2].toLowerCase();
+  if (!u) return parseFloat(m[1]) === 0;                 // unitless allowed only for 0
+  return _LEN_UNIT_RE.test(u) || /^(?:cq[whib]|cqmin|cqmax|sv[wh]|lv[wh]|dv[wh])$/.test(u);
+};
+// Resolve a simple <length-percentage> to { pct, px } (xywh/rect offsets are single
+// tokens — no mixed calc). Returns null if unresolvable.
+const _opPctPx = (tok, emPx, lhPx) => {
+  const s = String(tok).trim();
+  const pm = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(s);
+  if (pm) return { pct: parseFloat(pm[1]), px: 0 };
+  const v = _evalMath(s, 0, { lengths: true, emPx, lhPx });
+  return v === null ? null : { pct: 0, px: v };
+};
+// Serialize a { pct, px } computed offset: a lone % or px, else calc(P% ± Lpx).
+const _opSerCalc100 = (pct, px) => {
+  if (Math.abs(px) < 1e-9) return _serNumber(pct) + '%';
+  if (Math.abs(pct) < 1e-9) return _serNumber(px) + 'px';
+  return 'calc(' + _serNumber(pct) + '% ' + (px < 0 ? '- ' + _serNumber(-px) : '+ ' + _serNumber(px)) + 'px)';
+};
+// 100% − <length-percentage> (the rect()/xywh() right & bottom edges → inset()).
+const _opSub100 = (tok, emPx, lhPx) => {
+  const c = _opPctPx(tok, emPx, lhPx);
+  return c == null ? null : _opSerCalc100(100 - c.pct, -c.px);
+};
+// Normalize an SVG <string> path: validate command arg-counts (arc needs 7),
+// reject the empty path, collapse whitespace, lowercase-z → Z, canon numbers.
+// Returns null when invalid. (Computed accepts this same specified form.)
+const _opSvgPath = (data) => {
+  const s = String(data);
+  const toks = [];
+  let i = 0; const n = s.length;
+  const isD = (c) => c >= '0' && c <= '9';
+  while (i < n) {
+    const c = s[i];
+    if (/\s/.test(c) || c === ',') { i++; continue; }
+    if (/[A-Za-z]/.test(c)) { toks.push({ cmd: c }); i++; continue; }
+    let j = i;
+    if (s[j] === '+' || s[j] === '-') j++;
+    let hd = false;
+    while (j < n && isD(s[j])) { j++; hd = true; }
+    if (s[j] === '.') { j++; while (j < n && isD(s[j])) { j++; hd = true; } }
+    if (hd && (s[j] === 'e' || s[j] === 'E')) {
+      let k = j + 1; if (s[k] === '+' || s[k] === '-') k++;
+      if (isD(s[k])) { k++; while (k < n && isD(s[k])) k++; j = k; }
+    }
+    if (!hd) return null;
+    toks.push({ num: s.slice(i, j) }); i = j;
+  }
+  if (!toks.length || toks[0].cmd === undefined) return null;
+  if (toks[0].cmd.toLowerCase() !== 'm') return null;    // a path must begin with moveto
+  const out = [];
+  let p = 0;
+  while (p < toks.length) {
+    const t = toks[p];
+    if (t.cmd === undefined) return null;                // stray number outside a command
+    const cl = t.cmd.toLowerCase();
+    if (!(cl in _SVG_ARGC)) return null;                 // unknown command letter
+    p++;
+    const nums = [];
+    while (p < toks.length && toks[p].num !== undefined) { nums.push(toks[p].num); p++; }
+    const argc = _SVG_ARGC[cl];
+    const letter = cl === 'z' ? 'Z' : t.cmd;             // only normalization: z → Z
+    if (argc === 0) { if (nums.length) return null; out.push(letter); }
+    else {
+      if (!nums.length || nums.length % argc !== 0) return null;
+      out.push(letter + ' ' + nums.map((x) => _serNumber(parseFloat(x))).join(' '));
+    }
+  }
+  return out.join(' ');
+};
+// Serialize one <offset-path> function (ray/path/url/basic-shape), or null if it
+// fails the grammar. `computed` selects specified vs computed serialization.
+const _opShape = (head, body, computed, el, emPx, lhPx) => {
+  const b = String(body).trim();
+  const serPos = (toks) => computed ? _serializePositionComputed(el, toks.join(' ')) : _serializePositionSpecified(toks.join(' '));
+  if (head === 'ray') {
+    // ray( <angle> && <ray-size>? && contain? && [at <position>]? ) — any order;
+    // canonical order is angle, ray-size (closest-side elided), contain, at position.
+    const toks = _wsTokens(b);
+    let angle = null, size = null, contain = false, posToks = null, i = 0;
+    const isPosTok = (t) => { const l = t.toLowerCase(); return l === 'center' || _POS_H.has(l) || _POS_V.has(l) || _isPosLP(t); };
+    while (i < toks.length) {
+      const t = toks[i], l = t.toLowerCase();
+      if (l === 'at') {
+        if (posToks != null) return null;
+        i++; posToks = [];
+        while (i < toks.length && isPosTok(toks[i])) { posToks.push(toks[i]); i++; }
+        if (!posToks.length) return null;
+        continue;
+      }
+      if (_RAY_SIZE.has(l)) { if (size != null) return null; size = l; i++; continue; }
+      if (l === 'contain') { if (contain) return null; contain = true; i++; continue; }
+      if (_ANGLE_RE.test(t) || /^(?:calc|min|max|clamp)\(/i.test(t)) { if (angle != null) return null; angle = t; i++; continue; }
+      return null;
+    }
+    if (angle == null) return null;                      // the <angle> is required
+    if (posToks && !_parsePosition(posToks.join(' '))) return null;
+    const parts = [];
+    if (computed) { const d = _evalMath(angle, 0, { angle: true }); parts.push(d === null ? angle : _serAngle(d)); }
+    else parts.push(/^(?:calc|min|max|clamp)\(/i.test(angle) ? _canonMathExpr(angle) : _canonStandardValue(angle));
+    if (size && size !== 'closest-side') parts.push(size);
+    if (contain) parts.push('contain');
+    if (posToks) parts.push('at ' + serPos(posToks));
+    return 'ray(' + parts.join(' ') + ')';
+  }
+  if (head === 'path') {
+    const m = /^(['"])([\s\S]*)\1$/.exec(b);             // a lone <string>; a fill-rule prefix is invalid
+    if (!m) return null;
+    const np = _opSvgPath(m[2]);
+    return np == null ? null : 'path("' + np + '")';
+  }
+  if (head === 'url') {
+    const m = /^(['"])([\s\S]*)\1$/.exec(b);
+    const inner = m ? m[2] : b;
+    return inner === '' ? null : 'url("' + inner + '")';
+  }
+  if (head === 'inset') {
+    const toks = _wsTokens(b);
+    const ri = toks.findIndex((t) => t.toLowerCase() === 'round');
+    const off = ri < 0 ? toks : toks.slice(0, ri);
+    const rad = ri < 0 ? null : toks.slice(ri + 1);
+    if (off.length < 1 || off.length > 4) return null;
+    for (const t of off) if (!_isPosLP(t)) return null;
+    const rc = _opRoundClause(rad, computed, emPx, lhPx);
+    if (rc == null) return null;
+    return 'inset(' + _opCollapse4(off.map((t) => _opLp(t, computed, emPx, lhPx))) + rc + ')';
+  }
+  if (head === 'circle') {
+    // circle( [ <lp> | closest-side | farthest-side ]? [ at <position> ]? )
+    const toks = _wsTokens(b);
+    const ai = toks.findIndex((t) => t.toLowerCase() === 'at');
+    const rad = ai < 0 ? toks : toks.slice(0, ai);
+    const posToks = ai < 0 ? null : toks.slice(ai + 1);
+    if (rad.length > 1) return null;
+    let radStr = '';
+    if (rad.length === 1) {
+      const l = rad[0].toLowerCase();
+      if (l === 'farthest-side') radStr = 'farthest-side';
+      else if (l === 'closest-side') radStr = '';        // default radius → omit
+      else if (_isPosLP(rad[0])) radStr = _opLp(rad[0], computed, emPx, lhPx);
+      else return null;
+    }
+    if (posToks && (!posToks.length || !_parsePosition(posToks.join(' ')))) return null;
+    const parts = [];
+    if (radStr) parts.push(radStr);
+    if (posToks) parts.push('at ' + serPos(posToks));
+    return 'circle(' + parts.join(' ') + ')';
+  }
+  if (head === 'ellipse') {
+    // ellipse( [ <radius>{2} ]? [ at <position> ]? ) — 0 or 2 radii.
+    const toks = _wsTokens(b);
+    const ai = toks.findIndex((t) => t.toLowerCase() === 'at');
+    const rad = ai < 0 ? toks : toks.slice(0, ai);
+    const posToks = ai < 0 ? null : toks.slice(ai + 1);
+    if (rad.length !== 0 && rad.length !== 2) return null;
+    const radCanon = (t) => {
+      const l = t.toLowerCase();
+      if (l === 'closest-side' || l === 'farthest-side') return l;
+      return _isPosLP(t) ? _opLp(t, computed, emPx, lhPx) : null;
+    };
+    let radStr = '';
+    if (rad.length === 2) {
+      const r0 = radCanon(rad[0]), r1 = radCanon(rad[1]);
+      if (r0 == null || r1 == null) return null;
+      if (!(rad[0].toLowerCase() === 'closest-side' && rad[1].toLowerCase() === 'closest-side'))
+        radStr = r0 + ' ' + r1;                          // both default → omit
+    }
+    if (posToks && (!posToks.length || !_parsePosition(posToks.join(' ')))) return null;
+    const parts = [];
+    if (radStr) parts.push(radStr);
+    if (posToks) parts.push('at ' + serPos(posToks));
+    return 'ellipse(' + parts.join(' ') + ')';
+  }
+  if (head === 'polygon') {
+    // polygon( [ <fill-rule> ]? [ round <length> ]? , [ <lp> <lp> ]# )
+    const segs = _commaSplitTop(b).map((s) => s.trim());
+    let fillRule = null, roundLen = null, pStart = 0;
+    const ft = _wsTokens(segs[0] || '');
+    const f0 = ft.length ? ft[0].toLowerCase() : '';
+    if (f0 === 'nonzero' || f0 === 'evenodd' || f0 === 'round') {
+      let pi = 0;
+      if (ft[pi].toLowerCase() === 'nonzero' || ft[pi].toLowerCase() === 'evenodd') { fillRule = ft[pi].toLowerCase(); pi++; }
+      if (pi < ft.length && ft[pi].toLowerCase() === 'round') {
+        pi++;
+        if (pi >= ft.length || !_opLength(ft[pi])) return null;
+        roundLen = ft[pi]; pi++;
+      }
+      if (pi !== ft.length) return null;                 // leftover prelude tokens → invalid
+      pStart = 1;
+    }
+    const points = [];
+    for (let s = pStart; s < segs.length; s++) {
+      const pt = _wsTokens(segs[s]);
+      if (pt.length !== 2 || !_isPosLP(pt[0]) || !_isPosLP(pt[1])) return null;
+      points.push(pt.map((t) => _opLp(t, computed, emPx, lhPx)).join(' '));
+    }
+    if (!points.length) return null;
+    let pre = '';
+    if (fillRule === 'evenodd') pre += 'evenodd';         // nonzero (default) elided
+    if (roundLen != null) { const rl = _opLp(roundLen, computed, emPx, lhPx); if (!_opIsZero(rl)) pre += (pre ? ' ' : '') + 'round ' + rl; }
+    const sections = pre ? [pre] : [];                    // the prelude is its own comma section
+    sections.push(...points);
+    return 'polygon(' + sections.join(', ') + ')';
+  }
+  if (head === 'xywh') {
+    // xywh( <lp>{4} [ round <border-radius> ]? ) — specified keeps the function;
+    // computed converts to inset(y, 100%−x−w, 100%−y−h, x).
+    const toks = _wsTokens(b);
+    const ri = toks.findIndex((t) => t.toLowerCase() === 'round');
+    const off = ri < 0 ? toks : toks.slice(0, ri);
+    const rad = ri < 0 ? null : toks.slice(ri + 1);
+    if (off.length !== 4) return null;
+    for (const t of off) if (!_isPosLP(t)) return null;
+    const rc = _opRoundClause(rad, computed, emPx, lhPx);
+    if (rc == null) return null;
+    if (!computed) return 'xywh(' + off.map((t) => _canonLPToken(t)).join(' ') + rc + ')';
+    const x = _opPctPx(off[0], emPx, lhPx), y = _opPctPx(off[1], emPx, lhPx);
+    const w = _opPctPx(off[2], emPx, lhPx), h = _opPctPx(off[3], emPx, lhPx);
+    if (!x || !y || !w || !h) return null;
+    const four = [
+      _posComputeLen(off[1], emPx, lhPx),                            // top = y
+      _opSerCalc100(100 - x.pct - w.pct, -(x.px + w.px)),            // right = 100% − x − w
+      _opSerCalc100(100 - y.pct - h.pct, -(y.px + h.px)),           // bottom = 100% − y − h
+      _posComputeLen(off[0], emPx, lhPx),                           // left = x
+    ];
+    return 'inset(' + _opCollapse4(four) + rc + ')';
+  }
+  if (head === 'rect') {
+    // rect( [ <lp> | auto ]{4} [ round <border-radius> ]? ) — specified keeps the
+    // function; computed converts to inset(t, 100%−r, 100%−b, l) (auto edges → box).
+    const toks = _wsTokens(b);
+    const ri = toks.findIndex((t) => t.toLowerCase() === 'round');
+    const off = ri < 0 ? toks : toks.slice(0, ri);
+    const rad = ri < 0 ? null : toks.slice(ri + 1);
+    if (off.length !== 4) return null;
+    for (const t of off) if (t.toLowerCase() !== 'auto' && !_isPosLP(t)) return null;
+    const rc = _opRoundClause(rad, computed, emPx, lhPx);
+    if (rc == null) return null;
+    if (!computed) return 'rect(' + off.map((t) => t.toLowerCase() === 'auto' ? 'auto' : _canonLPToken(t)).join(' ') + rc + ')';
+    const isAuto = (t) => t.toLowerCase() === 'auto';
+    const top = isAuto(off[0]) ? '0%' : _posComputeLen(off[0], emPx, lhPx);
+    const right = isAuto(off[1]) ? '0%' : _opSub100(off[1], emPx, lhPx);
+    const bottom = isAuto(off[2]) ? '0%' : _opSub100(off[2], emPx, lhPx);
+    const left = isAuto(off[3]) ? '0%' : _posComputeLen(off[3], emPx, lhPx);
+    if (right == null || bottom == null) return null;
+    return 'inset(' + _opCollapse4([top, right, bottom, left]) + rc + ')';
+  }
+  return null;                                            // shape() handled by the caller; anything else invalid
+};
+// offset-path top level: none | <offset-path> || <coord-box>.
+const _serOffsetPath = (value, computed, el) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  if (v.toLowerCase() === 'none') return 'none';
+  let box = null, fn = null;
+  for (const t of _wsTokens(v)) {
+    const l = t.toLowerCase();
+    if (_COORD_BOX.has(l)) { if (box != null) return null; box = l; continue; }
+    const m = /^([A-Za-z][A-Za-z-]*)\(([\s\S]*)\)$/.exec(t);
+    if (!m || fn != null) return null;
+    fn = { head: m[1].toLowerCase(), body: m[2] };
+  }
+  if (fn == null && box == null) return null;
+  if (fn && fn.head === 'shape') return v;               // shape() preserved verbatim (sequel)
+  const emPx = computed ? _emPxOf(el) : 16;
+  const lhPx = computed ? _lineHeightPx(el, emPx) : 0;
+  let shape = null;
+  if (fn) { shape = _opShape(fn.head, fn.body, computed, el, emPx, lhPx); if (shape == null) return null; }
+  const parts = [];
+  if (shape != null) parts.push(shape);
+  if (box != null && !(shape != null && box === 'border-box')) parts.push(box);  // border-box is the default coord-box
+  return parts.join(' ');
+};
+const _isValidOffsetPath = (value) => _serOffsetPath(value, false, null) != null;
+const _canonOffsetPath = (value) => { const r = _serOffsetPath(value, false, null); return r == null ? value : r; };
+const _computeOffsetPath = (el, value) => { const r = _serOffsetPath(value, true, el); return r == null ? value : r; };
+
 // Canonicalize a conic-gradient prelude (`from <angle>` before any `at`). At
 // computed time the angle resolves to degrees and a default `from 0deg` is dropped.
 const _canonConicPrelude = (toks, computed) => {
@@ -9420,6 +9770,7 @@ const _normComputed = (el, kebab, v) => {
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
   if (kebab === 'offset-rotate') return _computeOffsetRotate(v);
   if (kebab === 'offset-distance') return _computeOffsetDistance(el, v);
+  if (kebab === 'offset-path') return _computeOffsetPath(el, v);
   if (_BG_POSITION_AXIS.has(kebab)) return _computeBgAxis(el, v, _BG_POSITION_AXIS.get(kebab));
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);

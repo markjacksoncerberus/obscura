@@ -10,12 +10,17 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-23 (Quest #89).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #91).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/motion/parsing/offset-path-parsing-valid.html` | 46/70 | **70/70** | ✅ 100% | **Quest #91 The Charted Verdict.** Full `offset-path` grammar (`none \| <ray()>\|<url>\|<basic-shape> \|\| <coord-box>`): ray()/path()/url()/inset()/circle()/ellipse()/polygon()/xywh()/rect() serializers; closest-side/round-0/nonzero defaults elided, calc ordered. Pure JS, no new Rust. **+24.** |
+| `css/motion/parsing/offset-path-parsing-invalid.html` | 0/24 | **24/24** | ✅ 100% | **Quest #91 The Charted Verdict.** Grammar gate drops `ray(0 sides)`, `ray(closest-side)`, `path("")`, `path(nonzero, …)`, `xywh(0px 1%)`, `rect(0px 1% auto)`, `polygon(round 1%, …)`, `polygon(round 1px nonzero, …)`, … **+24.** |
+| `css/motion/parsing/offset-path-computed.html` | 0/65 | **65/65** | ✅ 100% | **Quest #91 The Charted Verdict.** Registered `offset-path` in `_GCS_DEFAULTS` (`none`, no inherit) → support gate passes; computed resolves angles→deg, lengths→px (em/pt→px), positions→%, and xywh()/rect()→equivalent `inset(y calc(100%−x−w) calc(100%−y−h) x)`. path() computed accepts the specified form. **+65.** |
+| `css/motion/parsing/offset-path-shape-parsing.html` | 16/35 | **17/35** | 🔶 49% | **Quest #91 The Charted Verdict.** Incidental: `shape()` (CSS Shapes 2) preserved verbatim — full `shape()` canon is the sequel. **+1.** |
+| `css/motion/parsing/offset-path-shape-computed.html` | 0/12 | **3/12** | 🔶 25% | **Quest #91 The Charted Verdict.** Incidental: registration makes computed return the verbatim `shape()` for the cases needing no normalization. Sequel: full `shape()` computed. **+3.** |
 | `css/motion/parsing/offset-rotate-parsing-valid.html` | 5/7 | **7/7** | ✅ 100% | **Quest #90 The Single-Axis Verdict.** `offset-rotate = [auto\|reverse] \|\| <angle>`: `_parseOffsetRotate` accepts keyword and/or angle in either order, `_canonOffsetRotate` serializes keyword-first (`5turn auto`→`auto 5turn`). Pure JS, no new Rust. **+2.** |
 | `css/motion/parsing/offset-rotate-parsing-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #90 The Single-Axis Verdict.** Grammar gate `_isValidOffsetRotate`: `none`, bare `0`, `auto reverse` (two keywords), `reverse 30deg auto` (3 tokens) → dropped. **+4.** |
 | `css/motion/parsing/offset-rotate-computed.html` | 0/5 | **5/5** | ✅ 100% | **Quest #90 The Single-Axis Verdict.** Registered `offset-rotate` in `_GCS_DEFAULTS` (`auto`, no inherit) → support gate passes; `_computeOffsetRotate` resolves angle→deg and `reverse`≡`auto`+180° (`reverse -50grad`→`auto 135deg`). **+5.** |
