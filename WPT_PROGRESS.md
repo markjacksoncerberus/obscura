@@ -10,12 +10,19 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #94).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #95).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-values/round-mod-rem-invalid.html` | 0/108 | **108/108** | ✅ 100% | **Quest #95 The Rejected Verdict.** Math grammar/type validator: arity + unit checks reject `round(0px)`, `round(1, nearest)`, `mod(1, 1%)`, `round(0px, 0s)`, … gated on `opacity`/`height`. **+108.** |
+| `css/css-values/sin-cos-tan-invalid.html` | 0/42 | **42/42** | ✅ 100% | **Quest #95 The Rejected Verdict.** `rotate(sin(…))` rejected — sin/cos/tan yield `<number>`, not the `<angle>` rotate() needs; `sin(90px)` wrong arg type. **+42.** |
+| `css/css-values/acos-asin-atan-atan2-invalid.html` | 0/63 | **62/63** | ⚠️ 98% | **Quest #95 The Rejected Verdict.** `asin(90px)`, `atan(45deg )`, arity all rejected. 1 cap: `atan2(…, + …)` (whitespace-sensitive `+`, shared tokenizer). **+62.** |
+| `css/css-values/exp-log-invalid.html` | 0/48 | **48/48** | ✅ 100% | **Quest #95 The Rejected Verdict.** `exp(0px)`/`log(1, 1%)` need unitless args; arity. Gated on `opacity`. **+48.** |
+| `css/css-values/hypot-pow-sqrt-invalid.html` | 0/49 | **49/49** | ✅ 100% | **Quest #95 The Rejected Verdict.** `pow(2px, 2)`, `hypot(2px, 3)` (mixed), `hypot(1, 2)` (number into length slot, `outline-offset`), arity. **+49.** |
+| `css/css-values/signs-abs-invalid.html` | 0/53 | **53/53** | ✅ 100% | **Quest #95 The Rejected Verdict.** `abs(1, 2)` arity, `abs(1%)`/`sign(10%)` (`%` not accepted by `font-weight`/`tab-size`), `sign(10px + 5rad)` incompatible sum. **+53.** |
+| `css/css-color/parsing/opacity-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #95 (bonus).** `opacity` non-math grammar gate rejects `auto`/`10px`/`0 1`. **+3.** |
 | `css/css-values/round-mod-rem-computed.html` | 0/243 | **160/243** | ⚠️ 66% | **Quest #94 The Stepped Verdict.** Added `round`/`mod`/`rem` to `_evalMath` (full ±0/±∞/NaN edge cases) + folding in `_simpCalc`. number-type (`scale`) & angle-type (`rotate`) win; length/time-type remain (no computed-length/-time resolver). **+160.** |
 | `css/css-values/round-mod-rem-serialize.html` | 0/24 | **21/24** | ⚠️ 88% | **Quest #94 The Stepped Verdict.** `opacity`/`scale(…)` specified fold to `calc(N)`; non-finite handled. 3 fails are length-type computed. **+21.** |
 | `css/css-values/sin-cos-tan-serialize.html` | 144/270 | **270/270** | ✅ 100% | **Quest #94 The Stepped Verdict.** Numeric folding (`cos(0)`→`calc(1)`) + scale non-finite (NaN→0). **+126.** |

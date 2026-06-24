@@ -669,8 +669,17 @@ class CSSStyleDeclaration {
         this._props[ln] = lh[ln]; this._priority[ln] = prio;
       }
       return;                                              // expanded into longhands; no `offset` key
-    } else if (!custom && name === 'opacity') {
-      stored = _canonOpacitySpecified(stored);
+    } else if (!custom && _MATH_GATE_PROPS[name]) {
+      const g = _MATH_GATE_PROPS[name];
+      if (_mathReject(stored, g.types, g.pct)) return;     // malformed/mistyped math function → ignore
+      if (name === 'opacity') {
+        // opacity is <number>|<percentage> (+ math, + CSS-wide) — reject a non-numeric
+        // value (`auto`, `10px`, `0 1`) the math gate above doesn't see.
+        const low = stored.toLowerCase();
+        if (!_MATHFN_NAME_RE.test(stored) && !_TF_VAR_RE.test(stored) && !_CSS_WIDE.has(low)
+            && !_FILTER_NUM_RE.test(stored) && !_FILTER_PCT_RE.test(stored)) return;
+        stored = _canonOpacitySpecified(stored);
+      }
     }
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
@@ -7009,6 +7018,177 @@ const _calcConstValue = (str) => {
   const simp = _simpCalc(root);
   return simp.k === 'num' ? { v: simp.v, u: simp.u } : null;
 };
+// ── CSS Values 4 math-function GRAMMAR VALIDATION (§10 type-checking) ──────────
+// A math function is invalid when its grammar is malformed (`sin( )`, `round(1,,2)`,
+// `pow(1 2)`), its arity is wrong (`pow(1)`, `sqrt(1, 2)`, `round(1, nearest)`), or
+// its operand TYPES don't satisfy the function and the property it's used in
+// (`sin(90px)` — length where an <angle>/<number> is required; `rotate(tan(1deg))` —
+// a <number> result where the property wants an <angle>; `1px * sign(1em + 10%)`).
+// This is a *type checker* over the `_parseCalcTree` AST: `_mt` resolves a node to
+// one of the base CSS numeric types ('number'/'percentage'→ctx/'length'/'angle'/
+// 'time'/'frequency'/'resolution'/'flex'), 'unknown' (a channel keyword / unknown
+// function — be conservative and accept), or null (a definite type error). The
+// caller compares the resolved type against the set the property accepts.
+//
+// A <percentage>'s type depends on the property: opacity/scale resolve `%`→<number>,
+// width/margin resolve `%`→<length>, and font-weight/tab-size/<angle> don't accept
+// `%` at all. `pctType` carries that context (null ⇒ `%` is a type error here).
+const _MATH_UNIT_TYPE = {
+  // <length> — absolute, font-relative, viewport-relative, container-relative
+  px: 'length', em: 'length', rem: 'length', ex: 'length', rex: 'length', ch: 'length', rch: 'length',
+  ic: 'length', ric: 'length', cap: 'length', rcap: 'length', lh: 'length', rlh: 'length',
+  in: 'length', cm: 'length', mm: 'length', q: 'length', pt: 'length', pc: 'length',
+  vw: 'length', vh: 'length', vmin: 'length', vmax: 'length', vi: 'length', vb: 'length',
+  svw: 'length', svh: 'length', svmin: 'length', svmax: 'length', svi: 'length', svb: 'length',
+  lvw: 'length', lvh: 'length', lvmin: 'length', lvmax: 'length', lvi: 'length', lvb: 'length',
+  dvw: 'length', dvh: 'length', dvmin: 'length', dvmax: 'length', dvi: 'length', dvb: 'length',
+  cqw: 'length', cqh: 'length', cqi: 'length', cqb: 'length', cqmin: 'length', cqmax: 'length',
+  // <angle> — `_parseCalcTree` canonicalizes grad/rad/turn → deg, but accept all
+  deg: 'angle', grad: 'angle', rad: 'angle', turn: 'angle',
+  s: 'time', ms: 'time',
+  hz: 'frequency', khz: 'frequency',
+  dpi: 'resolution', dpcm: 'resolution', dppx: 'resolution', x: 'resolution',
+  fr: 'flex',
+};
+const _MATH_FNS = new Set([
+  'calc', 'min', 'max', 'clamp', 'round', 'mod', 'rem', 'abs', 'sign',
+  'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2',
+  'pow', 'sqrt', 'hypot', 'exp', 'log',
+]);
+// The concrete dimensional types. A <percentage> unifies with any of these (the
+// "percent hint" — `10px + 5%` is a valid <length-percentage>) but NOT with a bare
+// <number> (`round(1, 1%)` is a type error even where the property resolves `%` to
+// a number, because the two operands themselves don't share a type).
+const _DIMENSIONS = new Set(['length', 'angle', 'time', 'frequency', 'resolution', 'flex']);
+const _unifyType = (a, b) => {
+  if (a === b) return a;
+  if (a === 'percentage' && _DIMENSIONS.has(b)) return b;
+  if (b === 'percentage' && _DIMENSIONS.has(a)) return a;
+  return null;                                             // number+percentage, length+angle, … → type error
+};
+const _unifyAll = (ats) => ats.slice(1).reduce((acc, t) => (acc === null ? null : _unifyType(acc, t)), ats[0]);
+// Resolve a calc-tree node to its CSS numeric type ('number'/'percentage'/'length'/
+// 'angle'/'time'/'frequency'/'resolution'/'flex'), 'unknown' (channel keyword /
+// unknown function — accept), or null (a type error). `pctType` = the type a bare
+// <percentage> resolves to in the current property context, or null if `%` isn't
+// accepted there at all (a `%` leaf is then an immediate type error).
+const _mt = (node, pctType) => {
+  if (node.k === 'num') {
+    if (node.u === '') return 'number';
+    if (node.u === '%') return pctType === null ? null : 'percentage';  // `%` distinct; rejected where unsupported
+    return _MATH_UNIT_TYPE[node.u] || null;                // unknown unit (`1dag`) → type error
+  }
+  if (node.k === 'sym') return 'unknown';                  // channel keyword / unknown ident → accept
+  if (node.k === 'sum') {
+    const ats = [];
+    for (const term of node.terms) {
+      const t = _mt(term.node, pctType);
+      if (t === null) return null;
+      if (t === 'unknown') return 'unknown';
+      ats.push(t);
+    }
+    return _unifyAll(ats);                                 // `length + angle` → null; `length + %` → length
+  }
+  if (node.k === 'prod') {
+    let dim = 'number';                                     // accumulated dimension ('number' = degree 0)
+    for (const fac of node.facs) {
+      const t = _mt(fac.node, pctType);
+      if (t === null) return null;
+      if (t === 'unknown') return 'unknown';
+      if (t === 'number') continue;                         // <number> is the multiplicative identity
+      if (fac.op === '*') {
+        if (dim === 'number') dim = t;
+        else return null;                                   // dimension × dimension → degree ≥2 (`1vmin * 10%`)
+      } else {                                              // '/'
+        if (dim === t) dim = 'number';                      // D / D → <number>
+        else return null;                                   // <number>/D (inverse) or D1/D2 — no property accepts it
+      }
+    }
+    return dim;
+  }
+  if (node.k === 'fn') return _mtFn(node, pctType);
+  return null;
+};
+// Type-check a math FUNCTION node: arity + per-argument types, returning the result
+// type (or 'unknown' / null). Mirrors `_foldMathFn`'s spec rules at the type level.
+const _mtFn = (node, pctType) => {
+  const name = node.name, args = node.args;
+  if (!_MATH_FNS.has(name)) return 'unknown';              // var()/env()/sibling-index()/… → accept
+  // round(): an optional leading rounding-strategy keyword, then exactly 2 operands
+  // of the same type (CSS Values 4 §10.3). The keyword is illegal anywhere else.
+  if (name === 'round') {
+    let a = args;
+    if (a[0] && a[0].k === 'sym' && _ROUND_STRAT[a[0].s]) a = a.slice(1);
+    if (a.length !== 2) return null;
+    for (const x of a) if (x.k === 'sym' && _ROUND_STRAT[x.s]) return null;  // strategy keyword in a numeric slot
+    const t0 = _mt(a[0], pctType), t1 = _mt(a[1], pctType);
+    if (t0 === null || t1 === null) return null;
+    if (t0 === 'unknown' || t1 === 'unknown') return 'unknown';
+    return _unifyType(t0, t1);                                                       // `round(1, 1%)` → null
+  }
+  const ats = args.map((a) => _mt(a, pctType));
+  if (ats.some((t) => t === null)) return null;
+  if (ats.some((t) => t === 'unknown')) return 'unknown';
+  if (name === 'calc') return args.length === 1 ? ats[0] : null;
+  if (name === 'min' || name === 'max') return args.length >= 1 ? _unifyAll(ats) : null;   // same type
+  if (name === 'clamp') return args.length === 3 ? _unifyAll(ats) : null;
+  if (name === 'hypot') return args.length >= 1 ? _unifyAll(ats) : null;                    // same type
+  if (name === 'mod' || name === 'rem') return args.length === 2 ? _unifyType(ats[0], ats[1]) : null;
+  if (name === 'abs') return args.length === 1 ? ats[0] : null;                    // type-preserving
+  if (name === 'sign') return args.length === 1 ? 'number' : null;                 // any type → <number>
+  if (name === 'sin' || name === 'cos' || name === 'tan')
+    return args.length === 1 && (ats[0] === 'number' || ats[0] === 'angle') ? 'number' : null;
+  if (name === 'asin' || name === 'acos' || name === 'atan')
+    return args.length === 1 && ats[0] === 'number' ? 'angle' : null;
+  if (name === 'atan2') return args.length === 2 && _unifyType(ats[0], ats[1]) !== null ? 'angle' : null;  // 2 same-type → <angle>
+  if (name === 'pow') return args.length === 2 && ats[0] === 'number' && ats[1] === 'number' ? 'number' : null;
+  if (name === 'sqrt' || name === 'exp') return args.length === 1 && ats[0] === 'number' ? 'number' : null;
+  if (name === 'log') {
+    if (ats[0] !== 'number') return null;
+    if (args.length === 1) return 'number';
+    return args.length === 2 && ats[1] === 'number' ? 'number' : null;
+  }
+  return null;
+};
+// Validate a math-expression string against the set of CSS numeric types the
+// property accepts. Returns false ONLY when confidently invalid; an unparseable
+// expression is invalid, but an expression carrying an unknown symbol/function is
+// accepted (we can't judge it). `types` is the accepted-type array, `pctType` the
+// percentage-resolution context (see `_mt`).
+const _mathValid = (str, types, pctType) => {
+  const root = _parseCalcTree(str);
+  if (root === null) return false;
+  let t = _mt(root, pctType);
+  if (t === null) return false;
+  if (t === 'unknown') return true;
+  if (t === 'percentage') t = pctType;                     // a pure-% result resolves to the property's % type
+  return types.includes(t);
+};
+// A value that CONTAINS a top-level math function (so a bare keyword/length/number
+// is never matched and keeps its current pass-through behaviour). var()/env() are
+// excluded — they're substituted later, so we can't validate them here.
+const _MATHFN_NAME_RE = /(?:^|[^\w-])(?:calc|min|max|clamp|round|mod|rem|sin|cos|tan|asin|acos|atan|atan2|pow|sqrt|hypot|exp|log|abs|sign)\(/i;
+// Should `setProperty` REJECT this value as a malformed/mistyped math function?
+// Only fires when the value actually contains a math function; var()/env() and
+// CSS-wide keywords are always accepted.
+const _mathReject = (value, types, pctType) => {
+  const s = String(value).trim();
+  if (!_MATHFN_NAME_RE.test(s)) return false;             // no math function → not our concern
+  if (_TF_VAR_RE.test(s)) return false;                   // var()/env() → resolved later, accept
+  if (_CSS_WIDE.has(s.toLowerCase())) return false;
+  return !_mathValid(s, types, pctType);
+};
+// Properties whose specified value is a math-bearing numeric grammar, with the
+// accepted base types and the `%`-resolution context. (opacity also canonicalizes
+// — see its branch in setProperty.)
+const _MATH_GATE_PROPS = {
+  'opacity':        { types: ['number'], pct: 'number' },           // <number>|<percentage>
+  'outline-offset': { types: ['length'], pct: null },              // <length>
+  'font-weight':    { types: ['number'], pct: null },              // <number>|<keyword>
+  'margin-left':    { types: ['length'], pct: 'length' },          // <length-percentage>
+  'tab-size':       { types: ['number', 'length'], pct: null },    // <number>|<length>
+  'height':         { types: ['length'], pct: 'length' },          // <length-percentage>|<keyword>
+};
 // Computed value of `opacity`: a <number> or <percentage> (incl. math
 // functions), clamped to [0, 1]. Returns null if the value isn't numeric.
 const _computeOpacity = (value) => {
@@ -9826,9 +10006,18 @@ const _tfIsAngle = (t) => {
   return !!(lm && _ANGLE_DEG[lm[2].toLowerCase()] !== undefined);
 };
 const _tfArgType = (spec, i) => (Array.isArray(spec.t) ? spec.t[i] : spec.t);
+// A transform-function argument's <type> → (accepted math types, `%`-context), so a
+// math function in the argument is grammar/type-checked rather than blindly accepted
+// (`rotate(sin(1deg))` — sin yields a <number>, not the <angle> rotate() needs).
+const _TF_MATH_TYPE = { number: ['number'], np: ['number'], len: ['length'], lp: ['length'], angle: ['angle'], persp: ['length'] };
+const _TF_MATH_PCT  = { number: null, np: 'number', len: null, lp: 'length', angle: null, persp: null };
 const _tfArgValid = (t, type) => {
   t = t.trim();
   if (t === '') return false;
+  if (_FILTER_MATH_RE.test(t)) {                           // a math function in this argument slot
+    if (_TF_VAR_RE.test(t)) return true;                   // var()/env() resolved later
+    return _mathValid(t, _TF_MATH_TYPE[type], _TF_MATH_PCT[type]);
+  }
   switch (type) {
     case 'number': return _FILTER_NUM_RE.test(t) || _FILTER_MATH_RE.test(t);
     case 'np':     return _FILTER_NUM_RE.test(t) || _FILTER_PCT_RE.test(t) || _FILTER_MATH_RE.test(t);
