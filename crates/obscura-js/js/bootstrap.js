@@ -590,6 +590,11 @@ const _parseStyleDecls = (text) => {
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
+      } else if (name === 'offset') {
+        const lh = _parseOffsetShorthand(value);
+        if (!lh) continue;                                 // invalid <offset> → drop declaration
+        for (const ln of _OFFSET_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+        continue;                                          // expanded into longhands; no `offset` key
       }
     }
     out.push({ name, value, important });
@@ -653,6 +658,15 @@ class CSSStyleDeclaration {
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
       if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
       stored = _canonBgAxis(stored, _BG_POSITION_AXIS.get(name));
+    } else if (!custom && name === 'offset') {
+      const lh = _parseOffsetShorthand(stored);
+      if (!lh) return;                                     // invalid <offset> → ignore
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      for (const ln of _OFFSET_LONGHANDS) {
+        if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+        this._props[ln] = lh[ln]; this._priority[ln] = prio;
+      }
+      return;                                              // expanded into longhands; no `offset` key
     }
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
@@ -664,12 +678,18 @@ class CSSStyleDeclaration {
   }
   removeProperty(name) {
     name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
+    if (key === 'offset') {                                // shorthand: clear its five longhands
+      const old = _serializeOffsetShorthand(this);
+      for (const ln of _OFFSET_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     return old || "";
   }
   getPropertyValue(name) {
     name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
+    if (key === 'offset') return _serializeOffsetShorthand(this);  // reconstruct from longhands
     return this._props[key] || "";
   }
   getPropertyPriority(name) {
@@ -8782,6 +8802,160 @@ const _isValidOffsetPath = (value) => _serOffsetPath(value, false, null) != null
 const _canonOffsetPath = (value) => { const r = _serOffsetPath(value, false, null); return r == null ? value : r; };
 const _computeOffsetPath = (el, value) => { const r = _serOffsetPath(value, true, el); return r == null ? value : r; };
 
+// ─── The `offset` shorthand (CSS Motion 1 §6) ───────────────────────────────
+//   offset = [ <'offset-position'>? [ <'offset-path'> [ <'offset-distance'> ||
+//              <'offset-rotate'> ]? ]? ]! [ / <'offset-anchor'> ]?
+// We EXPAND a `offset` declaration into its five longhands (so the CSSOM exposes
+// each longhand canonically — `el.style['offset-path']` — and `el.style.offset`
+// reconstructs the shorthand from them). Stored state is the five longhand keys
+// ONLY (never an `offset` key): clearing the five longhands removes exactly what
+// the shorthand added (the "should not set unrelated longhands" invariant), and
+// `getPropertyValue('offset')` recomposes on demand via _serializeOffsetShorthand.
+const _OFFSET_LONGHANDS = ['offset-position', 'offset-path', 'offset-distance', 'offset-rotate', 'offset-anchor'];
+const _OFFSET_INITIAL = { 'offset-position': 'normal', 'offset-path': 'none', 'offset-distance': '0px', 'offset-rotate': 'auto', 'offset-anchor': 'auto' };
+// A token that begins the <offset-path> region (everything before it is the
+// optional leading <offset-position>): `none`, a ray()/path()/url()/<basic-shape>
+// function, or a bare <coord-box> keyword.
+const _OFFSET_PATH_FN_RE = /^(?:ray|path|url|circle|ellipse|inset|polygon|xywh|rect|shape)\(/i;
+const _isOffsetPathStart = (tok) => {
+  const l = String(tok).toLowerCase();
+  return l === 'none' || _OFFSET_PATH_FN_RE.test(l) || _COORD_BOX.has(l);
+};
+// Split a value at top-level `/` (paren/bracket/quote aware). Returns the parts
+// (1 or 2), or null if more than one top-level slash is present.
+const _splitTopSlash = (s) => {
+  const parts = []; let depth = 0, cur = '', q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { cur += c; if (c === q && s[i - 1] !== '\\') q = null; continue; }
+    if (c === '"' || c === "'") { q = c; cur += c; continue; }
+    if (c === '(' || c === '[') { depth++; cur += c; continue; }
+    if (c === ')' || c === ']') { depth--; cur += c; continue; }
+    if (c === '/' && depth === 0) { parts.push(cur); cur = ''; if (parts.length > 1) return null; continue; }
+    cur += c;
+  }
+  parts.push(cur);
+  return parts;
+};
+// Parse the `[ <offset-distance> || <offset-rotate> ]?` tail that may follow the
+// <offset-path>. Either component, in either order, each at most once; an
+// offset-rotate is a maximal `[auto|reverse] || <angle>` (1–2 tokens). Returns
+// { dist, rot } (each a raw token string or null), or null if a token fits
+// neither slot or a slot repeats (e.g. `reverse 100px 30deg` interleaves rotate).
+const _parseOffsetDistRot = (toks) => {
+  const isAngleTok = (t) => _ANGLE_RE.test(t) || /^calc\(/i.test(t);
+  const isRotKw = (t) => { const l = t.toLowerCase(); return l === 'auto' || l === 'reverse'; };
+  let dist = null, rot = null, i = 0;
+  while (i < toks.length) {
+    if (dist == null && _isPosLP(toks[i])) { dist = toks[i]; i++; continue; }
+    if (rot == null && (isRotKw(toks[i]) || isAngleTok(toks[i]))) {
+      let consumed = 1;
+      if (i + 1 < toks.length) {                            // a complementary kw/angle joins
+        if (isRotKw(toks[i]) && isAngleTok(toks[i + 1])) consumed = 2;
+        else if (isAngleTok(toks[i]) && isRotKw(toks[i + 1])) consumed = 2;
+      }
+      rot = toks.slice(i, i + consumed).join(' '); i += consumed; continue;
+    }
+    return null;                                            // unconsumable token → invalid
+  }
+  return { dist, rot };
+};
+// Parse a specified `offset` value into canonical longhand values, or null if it
+// does not match the grammar. Side-effect-free.
+const _parseOffsetShorthand = (value) => {
+  const v = String(value).trim();
+  if (v === '') return null;
+  // CSS-wide keyword / var(): every longhand takes the value verbatim (CSSOM).
+  if (_CSS_WIDE.has(v.toLowerCase()) || _TF_VAR_RE.test(v)) {
+    const out = {}; for (const ln of _OFFSET_LONGHANDS) out[ln] = v; return out;
+  }
+  const slash = _splitTopSlash(v);
+  if (slash == null) return null;                           // >1 top-level slash
+  const before = slash[0].trim();
+  const anchorStr = slash.length === 2 ? slash[1].trim() : null;
+  if (anchorStr === '') return null;                        // `… /` with no anchor
+  if (before === '') return null;                           // `/ anchor` — the `!` group is empty
+  const res = Object.assign({}, _OFFSET_INITIAL);
+  // <offset-anchor>: `auto` or a strict <position>.
+  if (anchorStr != null) {
+    if (!_isValidStrictPosition(anchorStr, _STRICT_POSITION_PROPS.get('offset-anchor'))) return null;
+    res['offset-anchor'] = _serializePositionSpecified(anchorStr);
+  }
+  const toks = _wsTokens(before);
+  let pi = -1;
+  for (let i = 0; i < toks.length; i++) { if (_isOffsetPathStart(toks[i])) { pi = i; break; } }
+  if (pi < 0) {
+    // No <offset-path> token → the whole `before` is the <offset-position>.
+    if (!_isValidStrictPosition(before, _STRICT_POSITION_PROPS.get('offset-position'))) return null;
+    res['offset-position'] = _serializePositionSpecified(before);
+    return res;
+  }
+  if (pi > 0) {
+    const posStr = toks.slice(0, pi).join(' ');
+    if (!_isValidStrictPosition(posStr, _STRICT_POSITION_PROPS.get('offset-position'))) return null;
+    res['offset-position'] = _serializePositionSpecified(posStr);
+  }
+  // <offset-path>: `none` stands alone; otherwise a run of path-function /
+  // <coord-box> tokens (`<basic-shape> || <coord-box>`, either order).
+  let pe;
+  if (toks[pi].toLowerCase() === 'none') pe = pi + 1;
+  else { pe = pi; while (pe < toks.length && (_OFFSET_PATH_FN_RE.test(toks[pe]) || _COORD_BOX.has(toks[pe].toLowerCase()))) pe++; }
+  const pathStr = toks.slice(pi, pe).join(' ');
+  if (!_isValidOffsetPath(pathStr)) return null;
+  res['offset-path'] = _canonOffsetPath(pathStr);
+  // [ <offset-distance> || <offset-rotate> ]?
+  const dr = _parseOffsetDistRot(toks.slice(pe));
+  if (dr == null) return null;
+  if (dr.dist != null) { if (!_isValidOffsetDistance(dr.dist)) return null; res['offset-distance'] = _canonOffsetDistance(dr.dist); }
+  if (dr.rot != null) { if (!_isValidOffsetRotate(dr.rot)) return null; res['offset-rotate'] = _canonOffsetRotate(dr.rot); }
+  return res;
+};
+// offset-rotate is at its initial value `auto` (so it drops out of the shorthand
+// serialization) when it is `auto` with no angle, or `auto` with a zero angle
+// (`auto 0deg` / `auto 0rad`). A lone angle (`0deg`) or `reverse` is NOT initial.
+const _offsetRotateIsInitial = (canon) => {
+  const p = _parseOffsetRotate(canon);
+  if (!p || p.kw !== 'auto') return false;
+  if (p.angle == null) return true;
+  return _evalMath(p.angle, 0, { angle: true }) === 0;
+};
+// Reconstruct `offset` from the five longhand declarations (CSSOM "serialize a CSS
+// value"). Returns '' unless all five are present with consistent priority.
+const _serializeOffsetShorthand = (decl) => {
+  const vals = {};
+  let prio = null;
+  for (let k = 0; k < _OFFSET_LONGHANDS.length; k++) {
+    const ln = _OFFSET_LONGHANDS[k];
+    if (!(ln in decl._props)) return '';
+    const p = decl._priority[ln] || '';
+    if (k === 0) prio = p; else if (p !== prio) return '';
+    vals[ln] = decl._props[ln];
+  }
+  // All five identical AND a CSS-wide keyword / var() → that single keyword.
+  const allSame = _OFFSET_LONGHANDS.every((ln) => vals[ln] === vals['offset-position']);
+  if (allSame && (_CSS_WIDE.has(vals['offset-position'].toLowerCase()) || _TF_VAR_RE.test(vals['offset-position'])))
+    return vals['offset-position'];
+  if (_OFFSET_LONGHANDS.some((ln) => _TF_VAR_RE.test(vals[ln]))) return '';  // a stray var() can't recombine
+  const pos = vals['offset-position'], path = vals['offset-path'];
+  const dist = vals['offset-distance'], rot = vals['offset-rotate'], anchor = vals['offset-anchor'];
+  const posPresent = pos.toLowerCase() !== 'normal';
+  const distPresent = dist !== '0px';
+  const rotPresent = !_offsetRotateIsInitial(rot);
+  const anchorPresent = anchor.toLowerCase() !== 'auto';
+  const parts = [];
+  if (posPresent) parts.push(pos);
+  // The `[ <path> … ]!` group must yield a value: serialize <offset-path> when it
+  // is non-`none`, when a distance/rotate follows it, or when nothing precedes it.
+  if (path.toLowerCase() !== 'none' || distPresent || rotPresent || !posPresent) {
+    parts.push(path);
+    if (distPresent) parts.push(dist);
+    if (rotPresent) parts.push(rot);
+  }
+  let s = parts.join(' ');
+  if (anchorPresent) s += ' / ' + anchor;
+  return s;
+};
+
 // Canonicalize a conic-gradient prelude (`from <angle>` before any `at`). At
 // computed time the angle resolves to degrees and a default `from 0deg` is dropped.
 const _canonConicPrelude = (toks, computed) => {
@@ -10148,6 +10322,7 @@ const _CSS_KNOWN_PROPS = (() => {
   const add = (k) => { set.add(k); set.add(_toCamel(k)); };
   for (const k of Object.keys(_GCS_DEFAULTS)) add(k);
   for (const k of _COLOR_PROPS) add(k);
+  add('offset');                                           // the `offset` shorthand (expands to its 5 longhands)
   return set;
 })();
 globalThis.getComputedStyle = (el, _pseudo) => {
