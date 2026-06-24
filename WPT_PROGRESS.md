@@ -10,12 +10,27 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #96).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #97).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-sizing/parsing/max-width-computed.html` | 0/12 | **12/12** | ✅ 100% | **Quest #97 The Sized Verdict.** Registered `min/max-width/height` in `_GCS_DEFAULTS` (the `property in getComputedStyle` gate); `_computeSizeValue` keeps `%` symbolic, clamps negative→`0px`, resolves `fit-content()`'s arg. **+12.** |
+| `css/css-sizing/parsing/min-width-computed.html` | 0/11 | **11/11** | ✅ 100% | **Quest #97 The Sized Verdict.** **+11.** |
+| `css/css-sizing/parsing/max-height-computed.html` | 0/12 | **12/12** | ✅ 100% | **Quest #97 The Sized Verdict.** **+12.** |
+| `css/css-sizing/parsing/min-height-computed.html` | 0/11 | **11/11** | ✅ 100% | **Quest #97 The Sized Verdict.** **+11.** |
+| `css/css-position/parsing/inset-computed.html` | 0/20 | **20/20** | ✅ 100% | **Quest #97 The Sized Verdict.** Registered the 4 logical inset longhands + added to `_LENGTH_COMPUTED_PROPS` (em→px, `%` symbolic, negatives kept). **+20.** |
+| `css/css-logical/parsing/inset-block-inline-computed.html` | 0/12 | **12/12** | ✅ 100% | **Quest #97 The Sized Verdict.** Logical inset longhands + the 2-value `inset-block`/`inset-inline` shorthands (`_computeBoxShorthand` resolves + collapses edges). **+12.** |
+| `css/css-logical/parsing/margin-block-inline-computed.html` | 0/12 | **9/12** | ⚠️ 75% | **Quest #97 The Sized Verdict.** Logical margin longhands + shorthands. 3 cap: `%`→px (needs layout). **+9.** |
+| `css/css-logical/parsing/padding-block-inline-computed.html` | 0/16 | **11/16** | ⚠️ 69% | **Quest #97 The Sized Verdict.** Logical padding longhands (clamp negative→0) + shorthands. 5 cap: `%`→px (needs layout). **+11.** |
+| `css/css-logical/parsing/max-block-size-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #97 The Sized Verdict.** Logical max sizing via `_computeSizeValue`. **+8.** |
+| `css/css-logical/parsing/max-inline-size-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #97 The Sized Verdict.** **+8.** |
+| `css/css-logical/parsing/min-block-size-computed.html` | 1/9 | **8/9** | ⚠️ 89% | **Quest #97 The Sized Verdict.** `auto`→`0px`. 1 cap: `auto` in flex layout → `auto` (needs layout). **+7.** |
+| `css/css-logical/parsing/min-inline-size-computed.html` | 1/9 | **8/9** | ⚠️ 89% | **Quest #97 The Sized Verdict.** 1 cap: flex `auto`. **+7.** |
+| `css/css-logical/parsing/block-size-computed.html` | 0/7 | **3/7** | ⚠️ 43% | **Quest #97 The Sized Verdict.** Explicit lengths resolve; `auto`/`%`/`min-content` need layout (cap). **+3.** |
+| `css/css-logical/parsing/inline-size-computed.html` | 0/7 | **3/7** | ⚠️ 43% | **Quest #97 The Sized Verdict.** **+3.** |
+| `css/css-box/parsing/padding-computed.html` | 7/13 | **8/13** | ⚠️ 62% | **Quest #97 (bonus).** Physical padding now clamps a resolved negative `calc()`→`0px`. 5 cap: `%`. **+1.** |
 | `css/css-values/signs-abs-computed.html` | 31/233 | **163/233** | ⚠️ 70% | **Quest #96 The Resolved Verdict.** Computed length/integer resolver: `abs(10px)`→`10px`, `sign(1px)`→`1`, `abs(10em)`/`sign(1vw)` resolved. Remaining = `%` (needs layout). **+132.** |
 | `css/css-values/round-mod-rem-computed.html` | 160/243 | **225/243** | ⚠️ 93% | **Quest #96 The Resolved Verdict.** length-type (`margin-left`) + time-type (`transition-delay`, new `_evalMath` `opts.time`→seconds) folded & resolved; vw/vh resolved. Remaining = `%`. **+65.** |
 | `css/css-values/hypot-pow-sqrt-computed.html` | 4/52 | **43/52** | ⚠️ 83% | **Quest #96 The Resolved Verdict.** integer (`z-index`) & length folding. **+39.** |

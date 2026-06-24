@@ -5411,6 +5411,26 @@ const _GCS_DEFAULTS = {
   margin: '0px', padding: '0px',
   'margin-top': '0px', 'margin-right': '0px', 'margin-bottom': '0px', 'margin-left': '0px',
   'padding-top': '0px', 'padding-right': '0px', 'padding-bottom': '0px', 'padding-left': '0px',
+  // css-sizing + css-logical block/inline sizing. min/max-* computed keep `%`
+  // symbolic, clamp a resolved negative <length> to 0, and resolve fit-content()'s
+  // argument (see _computeSizeValue); min-* `auto` → 0px. block/inline-size resolve
+  // only explicit lengths (auto/%/min-content need layout). None inherit.
+  'min-width': 'auto', 'min-height': 'auto', 'max-width': 'none', 'max-height': 'none',
+  'block-size': 'auto', 'inline-size': 'auto',
+  'min-block-size': 'auto', 'min-inline-size': 'auto',
+  'max-block-size': 'none', 'max-inline-size': 'none',
+  // css-logical flow-relative box edges (computed like their physical siblings:
+  // length math folded, em→px, `%` symbolic; inset allows negatives, padding clamps
+  // to 0). Plus the 2-value block/inline shorthands (recomposed in _normComputed).
+  'inset-block-start': 'auto', 'inset-block-end': 'auto',
+  'inset-inline-start': 'auto', 'inset-inline-end': 'auto',
+  'inset-block': 'auto', 'inset-inline': 'auto', inset: 'auto',
+  'margin-block-start': '0px', 'margin-block-end': '0px',
+  'margin-inline-start': '0px', 'margin-inline-end': '0px',
+  'margin-block': '0px', 'margin-inline': '0px',
+  'padding-block-start': '0px', 'padding-block-end': '0px',
+  'padding-inline-start': '0px', 'padding-inline-end': '0px',
+  'padding-block': '0px', 'padding-inline': '0px',
   'font-size': '16px', 'line-height': 'normal', 'font-weight': '400',
   color: 'rgb(0, 0, 0)', 'background-color': 'rgba(0, 0, 0, 0)',
   'border-width': '0px', 'border-style': 'none', 'border-color': 'rgb(0, 0, 0)',
@@ -10408,12 +10428,71 @@ const _FONT_SIZE_KEYWORDS = {
 // shared <length-percentage> component resolver (it also serves translate()).
 const _LENGTH_COMPUTED_PROPS = new Set([
   'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+  'margin-block-start', 'margin-block-end', 'margin-inline-start', 'margin-inline-end',
   'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+  'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
   'top', 'right', 'bottom', 'left',
-  'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
+  'inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end',
+  'width', 'height',
   'flex-basis', 'text-indent', 'outline-offset',
   'letter-spacing', 'word-spacing',                      // <length> | normal (keyword passes through)
 ]);
+// Properties whose computed value clamps a resolved negative <length> to 0 (padding
+// can't be negative). `%`-bearing values that would need layout are left symbolic.
+const _CLAMP_NEG_PROPS = new Set([
+  'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+  'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
+]);
+const _clampNegPx = (r) => {
+  const m = /^(-?(?:\d+\.?\d*|\.\d+))px$/.exec(String(r));
+  return (m && parseFloat(m[1]) < 0) ? '0px' : r;
+};
+// The css-sizing min/max + block/inline sizing family. getComputedStyle returns the
+// computed value (not the used value): `%` and `calc(%…)` stay symbolic, keywords
+// (none/min-content/max-content/fit-content/stretch) pass through, fit-content()'s
+// <length-percentage> argument resolves, min-* `auto` → 0px (the used minimum), and
+// a resolved negative <length> clamps to 0. block/inline-size's auto/%/intrinsic
+// keywords would need layout (a cap) — only explicit lengths resolve.
+const _SIZE_COMPUTED_PROPS = new Set([
+  'min-width', 'min-height', 'max-width', 'max-height',
+  'min-block-size', 'min-inline-size', 'max-block-size', 'max-inline-size',
+  'block-size', 'inline-size',
+]);
+const _SIZE_KW_PASS = new Set(['none', 'min-content', 'max-content', 'fit-content', 'stretch', 'contain']);
+const _computeSizeValue = (kebab, v, el) => {
+  const s = String(v).trim();
+  const low = s.toLowerCase();
+  if (low === 'auto') return kebab.startsWith('min-') ? '0px' : 'auto';
+  if (_SIZE_KW_PASS.has(low)) return low;
+  const fc = /^fit-content\(\s*([\s\S]*?)\s*\)$/i.exec(s);
+  if (fc) return 'fit-content(' + _trComp(fc[1], el, true, _vpUnits()) + ')';
+  return _clampNegPx(_trComp(s, el, true, _vpUnits()));
+};
+// The 2-value flow-relative box shorthands (and the 4-value `inset`). getPropertyValue
+// reconstructs them from longhands; here we resolve each component as its longhand
+// type and collapse identical edges (per _serializeBoxValue).
+const _SH_COMPUTED = {
+  'inset-block': 'inset', 'inset-inline': 'inset', inset: 'inset',
+  'margin-block': 'margin', 'margin-inline': 'margin',
+  'padding-block': 'padding', 'padding-inline': 'padding',
+};
+const _computeBoxShorthand = (kebab, v, el) => {
+  const kind = _SH_COMPUTED[kebab];
+  const toks = _wsTokens(String(v).trim());
+  if (!toks.length) return v;
+  const vp = _vpUnits();
+  const resolve1 = (t) => {
+    const r = _trComp(t, el, true, vp);
+    return kind === 'padding' ? _clampNegPx(r) : r;
+  };
+  // Expand to the shorthand's full edge count (`inset` → 4; the flow-relative
+  // block/inline shorthands → 2) so a single value duplicates and _serializeBoxValue
+  // can collapse identical edges back to the shortest form.
+  let edges;
+  if (kebab === 'inset') edges = _boxEdges(toks).map(resolve1);
+  else { const a = resolve1(toks[0]); edges = [a, toks.length >= 2 ? resolve1(toks[1]) : a]; }
+  return _serializeBoxValue(kebab, edges);
+};
 const _INTEGER_COMPUTED_PROPS = new Set(['z-index', 'order']);
 const _TIME_COMPUTED_PROPS = new Set([
   'transition-delay', 'transition-duration', 'animation-delay', 'animation-duration',
@@ -10465,7 +10544,12 @@ const _normComputed = (el, kebab, v) => {
     if (k in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[k];
     return v;
   }
-  if (_LENGTH_COMPUTED_PROPS.has(kebab)) return _trComp(v, el, true, _vpUnits());
+  if (_SIZE_COMPUTED_PROPS.has(kebab)) return _computeSizeValue(kebab, v, el);
+  if (_SH_COMPUTED[kebab]) return _computeBoxShorthand(kebab, v, el);
+  if (_LENGTH_COMPUTED_PROPS.has(kebab)) {
+    const r = _trComp(v, el, true, _vpUnits());
+    return _CLAMP_NEG_PROPS.has(kebab) ? _clampNegPx(r) : r;
+  }
   if (_INTEGER_COMPUTED_PROPS.has(kebab)) { const r = _computeIntegerValue(el, v); return r === null ? v : r; }
   if (_TIME_COMPUTED_PROPS.has(kebab)) { const r = _computeTimeValue(v); return r === null ? v : r; }
   if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
