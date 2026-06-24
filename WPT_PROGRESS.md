@@ -10,12 +10,22 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #93).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #94).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-values/round-mod-rem-computed.html` | 0/243 | **160/243** | ⚠️ 66% | **Quest #94 The Stepped Verdict.** Added `round`/`mod`/`rem` to `_evalMath` (full ±0/±∞/NaN edge cases) + folding in `_simpCalc`. number-type (`scale`) & angle-type (`rotate`) win; length/time-type remain (no computed-length/-time resolver). **+160.** |
+| `css/css-values/round-mod-rem-serialize.html` | 0/24 | **21/24** | ⚠️ 88% | **Quest #94 The Stepped Verdict.** `opacity`/`scale(…)` specified fold to `calc(N)`; non-finite handled. 3 fails are length-type computed. **+21.** |
+| `css/css-values/sin-cos-tan-serialize.html` | 144/270 | **270/270** | ✅ 100% | **Quest #94 The Stepped Verdict.** Numeric folding (`cos(0)`→`calc(1)`) + scale non-finite (NaN→0). **+126.** |
+| `css/css-values/acos-asin-atan-atan2-serialize.html` | 0/62 | **52/62** | ⚠️ 84% | **Quest #94 The Stepped Verdict.** Inverse-trig fold to `calc(<deg>)`; non-finite dimension → `calc(NaN * 1deg)`. **+52.** |
+| `css/css-values/exp-log-serialize.html` | 8/19 | **19/19** | ✅ 100% | **Quest #94 The Stepped Verdict.** `exp`/`log` fold to `calc(N)`. **+11.** |
+| `css/css-values/hypot-pow-sqrt-serialize.html` | 13/25 | **25/25** | ✅ 100% | **Quest #94 The Stepped Verdict.** `hypot`/`pow`/`sqrt` fold. **+12.** |
+| `css/css-values/signs-abs-serialize.html` | 0/16 | **16/16** | ✅ 100% | **Quest #94 The Stepped Verdict.** `sign`→<number>, `abs` keeps unit; fold realm-wide. **+16.** |
+| `css/css-values/signs-abs-computed.html` | 28/233 | **31/233** | ⚠️ 13% | **Quest #94 The Stepped Verdict.** number-type scale NaN/∞ cases; the 202 length-type (`abs(10px)`) await the computed-length resolver. **+3.** |
+| `css/css-values/minmax-number-serialize.html` | 20/40 | **40/40** | ✅ 100% | **Quest #94 (bonus).** `min`/`max`/`clamp` of unitless numbers fold to `calc(N)` via `_simpCalc`. **+20.** |
+| `css/css-color/parsing/opacity-valid.html` | 5/30 | **30/30** | ✅ 100% | **Quest #94 (bonus).** `_canonOpacitySpecified`: bare `%`→number (`50%`→`0.5`), math folds with `%` symbolic (`min(50%,0%)`→`calc(0%)`). **+25.** |
 | `css/motion/parsing/offset-path-parsing-valid.html` | 46/70 | **70/70** | ✅ 100% | **Quest #91 The Charted Verdict.** Full `offset-path` grammar (`none \| <ray()>\|<url>\|<basic-shape> \|\| <coord-box>`): ray()/path()/url()/inset()/circle()/ellipse()/polygon()/xywh()/rect() serializers; closest-side/round-0/nonzero defaults elided, calc ordered. Pure JS, no new Rust. **+24.** |
 | `css/motion/parsing/offset-path-parsing-invalid.html` | 0/24 | **24/24** | ✅ 100% | **Quest #91 The Charted Verdict.** Grammar gate drops `ray(0 sides)`, `ray(closest-side)`, `path("")`, `path(nonzero, …)`, `xywh(0px 1%)`, `rect(0px 1% auto)`, `polygon(round 1%, …)`, `polygon(round 1px nonzero, …)`, … **+24.** |
 | `css/motion/parsing/offset-path-computed.html` | 0/65 | **65/65** | ✅ 100% | **Quest #91 The Charted Verdict.** Registered `offset-path` in `_GCS_DEFAULTS` (`none`, no inherit) → support gate passes; computed resolves angles→deg, lengths→px (em/pt→px), positions→%, and xywh()/rect()→equivalent `inset(y calc(100%−x−w) calc(100%−y−h) x)`. path() computed accepts the specified form. **+65.** |

@@ -595,6 +595,8 @@ const _parseStyleDecls = (text) => {
         if (!lh) continue;                                 // invalid <offset> → drop declaration
         for (const ln of _OFFSET_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
         continue;                                          // expanded into longhands; no `offset` key
+      } else if (name === 'opacity') {
+        value = _canonOpacitySpecified(value);
       }
     }
     out.push({ name, value, important });
@@ -667,6 +669,8 @@ class CSSStyleDeclaration {
         this._props[ln] = lh[ln]; this._priority[ln] = prio;
       }
       return;                                              // expanded into longhands; no `offset` key
+    } else if (!custom && name === 'opacity') {
+      stored = _canonOpacitySpecified(stored);
     }
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
@@ -6492,6 +6496,41 @@ const _isValidColor = (value) => {
   if (_computeModernColor(value) !== null) return true;
   return false;
 };
+// ── Stepped-value functions (CSS Values 4 §10.3): round()/mod()/rem() ──────────
+// Pure numeric ops shared by `_evalMath` (full evaluation) and `_simpCalc` (calc-
+// tree folding) so both pipelines agree byte-for-byte. All operate on the already-
+// resolved numeric magnitudes (angles in canonical degrees); the caller carries
+// the unit. Edge cases (±0/±∞/NaN) follow the spec's per-strategy tables exactly —
+// see css/css-values/round-mod-rem-computed.html for the authoritative cases.
+const _ROUND_STRAT = { nearest: 1, up: 1, down: 1, 'to-zero': 1 };
+const _roundOp = (strat, A, B) => {
+  if (B === 0 || (!isFinite(A) && !isFinite(B))) return NaN;   // B=0, or both infinite
+  if (!isFinite(A)) return A;                                  // A infinite, B finite → same infinity
+  if (!isFinite(B)) {                                          // A finite, B infinite
+    const negZero = Object.is(A, -0);
+    if (strat === 'up') return A > 0 ? Infinity : (A === 0 && !negZero ? 0 : -0);
+    if (strat === 'down') return A < 0 ? -Infinity : (negZero ? -0 : 0);
+    return (A < 0 || negZero) ? -0 : 0;                        // nearest, to-zero → 0 with A's sign
+  }
+  const q = A / B;
+  const lo = Math.min(Math.floor(q) * B, Math.ceil(q) * B);
+  const hi = Math.max(Math.floor(q) * B, Math.ceil(q) * B);
+  if (lo === hi) return lo;                                    // A is an exact multiple of B
+  if (strat === 'down') return lo;
+  if (strat === 'up') return hi;
+  if (strat === 'to-zero') return Math.abs(lo) <= Math.abs(hi) ? lo : hi;
+  return (A - lo) < (hi - A) ? lo : hi;                        // nearest; ties round toward +∞
+};
+const _modOp = (A, B) => {                                     // floored modulo — sign follows B
+  if (B === 0 || !isFinite(A)) return NaN;
+  if (!isFinite(B)) return ((A < 0 || Object.is(A, -0)) === (B < 0)) ? A : NaN;  // opposite sign → NaN
+  return A - B * Math.floor(A / B);
+};
+const _remOp = (A, B) => {                                     // truncated modulo — sign follows A
+  if (B === 0 || !isFinite(A)) return NaN;
+  if (!isFinite(B)) return A;
+  return A - B * Math.trunc(A / B);
+};
 // Evaluate a CSS math expression — calc()/min()/max()/clamp()/sign()/abs() plus
 // a raw <number>/<percentage>/<dimension> — down to a plain JS number.
 // `percentBase` is what 100% resolves to (1 for unitless contexts like
@@ -6611,6 +6650,20 @@ const _evalMath = (input, percentBase, opts) => {
       const name = tok.v;
       if (toks[p + 1] && toks[p + 1].t === '(') {
         p += 2; // consume the function name and its '('
+        // round() carries an optional leading rounding-strategy keyword (CSS Values
+        // 4 §10.3) — it can't be parsed as a numeric expression, so peel it first.
+        if (name === 'round') {
+          let strat = 'nearest';
+          const k = peek();
+          if (k && k.t === 'ident' && _ROUND_STRAT[k.v]) { strat = k.v; p++; if (!peek() || peek().t !== ',') return tfail(); p++; }
+          const rA = parseExpr();
+          if (!peek() || peek().t !== ',') return tfail();
+          p++;
+          const rB = parseExpr();
+          if (!peek() || peek().t !== ')') return tfail();
+          p++;
+          return [_roundOp(strat, rA[0], rB[0]), rA[1] || rB[1]];
+        }
         // sin/cos/tan take an <angle>|<number>: parse the argument with angle
         // units enabled so a bare number reads as radians and an angle resolves.
         const trig = name === 'sin' || name === 'cos' || name === 'tan';
@@ -6628,6 +6681,10 @@ const _evalMath = (input, percentBase, opts) => {
         if (name === 'clamp') return args.length === 3 ? [Math.max(val[0], Math.min(val[1], val[2])), anyAngle] : tfail();
         if (name === 'sign') return args.length === 1 ? [Math.sign(val[0]), false] : tfail();
         if (name === 'abs') return args.length === 1 ? [Math.abs(val[0]), args[0][1]] : tfail();
+        // Stepped-value mod()/rem() (round() handled above): two operands of the
+        // same type; the result keeps that type (so an angle stays an angle).
+        if (name === 'mod') return args.length === 2 ? [_modOp(val[0], val[1]), anyAngle] : tfail();
+        if (name === 'rem') return args.length === 2 ? [_remOp(val[0], val[1]), anyAngle] : tfail();
         // Trigonometry (CSS Values 4 §10): sin/cos/tan take radians (a bare
         // number) or an <angle> (its degrees → radians) and return a <number>;
         // the inverse functions return an <angle> whose canonical value is degrees.
@@ -6784,12 +6841,74 @@ const _parseCalcTree = (str) => {
 // CSS — number×dimension→dimension, dimension÷sameDimension→number).
 const _mulUnit = (a, b) => (a === '' ? b : (b === '' ? a : a));
 const _divUnit = (a, b) => (b === '' ? a : (a === b ? '' : a));
+// Fold a math function whose arguments have all simplified to numeric leaves into
+// a single numeric leaf (CSS Values 4 "simplify a calculation tree"). Returns the
+// folded `{k:'num',v,u}` or null when it can't fold — a non-numeric argument, a
+// wrong argument count, or operands of incompatible units (e.g. `min(1em, 2px)`,
+// kept symbolic until computed time resolves the units). Angle units are already
+// canonicalized to `deg` by `_parseCalcTree`, so same-dimension angles compare
+// directly. `sign()`→<number> (unit dropped); the inverse-trig and exp/pow/log
+// family require unitless operands and yield <number>/<angle> per spec.
+const _R2D = 180 / Math.PI;
+const _foldMathFn = (name, args) => {
+  if (name === 'round') {
+    let i = 0, strat = 'nearest';
+    if (args[0] && args[0].k === 'sym' && _ROUND_STRAT[args[0].s]) { strat = args[0].s; i = 1; }
+    const A = args[i], B = args[i + 1];
+    if (args.length - i !== 2 || !A || !B || A.k !== 'num' || B.k !== 'num' || A.u !== B.u) return null;
+    return { k: 'num', v: _roundOp(strat, A.v, B.v), u: A.u };
+  }
+  if (name === 'mod' || name === 'rem') {
+    if (args.length !== 2 || args[0].k !== 'num' || args[1].k !== 'num' || args[0].u !== args[1].u) return null;
+    return { k: 'num', v: (name === 'mod' ? _modOp : _remOp)(args[0].v, args[1].v), u: args[0].u };
+  }
+  if (!args.length || !args.every((a) => a.k === 'num')) return null;
+  if (name === 'min' || name === 'max' || name === 'clamp') {
+    if (name === 'clamp' && args.length !== 3) return null;
+    const u = args[0].u;
+    if (!args.every((a) => a.u === u)) return null;
+    const vs = args.map((a) => a.v);
+    const v = name === 'min' ? Math.min(...vs) : name === 'max' ? Math.max(...vs) : Math.max(vs[0], Math.min(vs[1], vs[2]));
+    return { k: 'num', v, u };
+  }
+  if (name === 'abs') return args.length === 1 ? { k: 'num', v: Math.abs(args[0].v), u: args[0].u } : null;
+  if (name === 'sign') return args.length === 1 ? { k: 'num', v: Math.sign(args[0].v), u: '' } : null;
+  if (name === 'sin' || name === 'cos' || name === 'tan') {
+    if (args.length !== 1) return null;
+    const a = args[0]; let r;
+    if (a.u === '') r = a.v; else if (a.u === 'deg') r = a.v / _R2D; else return null;
+    return { k: 'num', v: name === 'sin' ? Math.sin(r) : name === 'cos' ? Math.cos(r) : Math.tan(r), u: '' };
+  }
+  if (name === 'asin' || name === 'acos' || name === 'atan') {
+    if (args.length !== 1 || args[0].u !== '') return null;
+    const v = (name === 'asin' ? Math.asin(args[0].v) : name === 'acos' ? Math.acos(args[0].v) : Math.atan(args[0].v)) * _R2D;
+    return { k: 'num', v, u: 'deg' };
+  }
+  if (name === 'atan2') return args.length === 2 && args[0].u === args[1].u ? { k: 'num', v: Math.atan2(args[0].v, args[1].v) * _R2D, u: 'deg' } : null;
+  if (name === 'pow') return args.length === 2 && args[0].u === '' && args[1].u === '' ? { k: 'num', v: Math.pow(args[0].v, args[1].v), u: '' } : null;
+  if (name === 'sqrt') return args.length === 1 && args[0].u === '' ? { k: 'num', v: Math.sqrt(args[0].v), u: '' } : null;
+  if (name === 'exp') return args.length === 1 && args[0].u === '' ? { k: 'num', v: Math.exp(args[0].v), u: '' } : null;
+  if (name === 'log') {
+    if (args[0].u !== '') return null;
+    if (args.length === 1) return { k: 'num', v: Math.log(args[0].v), u: '' };
+    if (args.length === 2 && args[1].u === '') return { k: 'num', v: Math.log(args[0].v) / Math.log(args[1].v), u: '' };
+    return null;
+  }
+  if (name === 'hypot') {
+    const u = args[0].u;
+    if (!args.every((a) => a.u === u)) return null;
+    return { k: 'num', v: Math.hypot(...args.map((a) => a.v)), u };
+  }
+  return null;
+};
 // Simplify a calculation tree: fold numeric constants and impose canonical order.
 const _simpCalc = (node) => {
   if (node.k === 'num' || node.k === 'sym') return node;
   if (node.k === 'fn') {
     if (node.name === 'calc' && node.args.length === 1) return _simpCalc(node.args[0]);
-    return { k: 'fn', name: node.name, args: node.args.map(_simpCalc) };
+    const simpArgs = node.args.map(_simpCalc);
+    const folded = _foldMathFn(node.name, simpArgs);
+    return folded || { k: 'fn', name: node.name, args: simpArgs };
   }
   if (node.k === 'sum') {
     const terms = node.terms.map((t) => ({ op: t.op, node: _simpCalc(t.node) }));
@@ -6829,11 +6948,18 @@ const _simpCalc = (node) => {
   if (out.length === 1) return out[0].node;
   return { k: 'prod', facs: out };
 };
-// Serialize a numeric leaf (value + unit; non-finite → CSS keyword).
+// Serialize a numeric leaf (value + unit). A non-finite value carrying a unit
+// can't be written `NaNdeg` (the keyword glued to a unit isn't a valid token), so
+// per CSS Values 4 it serializes as the product `<keyword> * 1<unit>` — e.g.
+// `calc(NaN * 1deg)`, `calc(infinity * 1px)`. A unitless non-finite stays the bare
+// keyword.
 const _serCalcNum = (node) => {
   const v = node.v;
-  const s = Number.isNaN(v) ? 'NaN' : v === Infinity ? 'infinity' : v === -Infinity ? '-infinity' : _serNumber(v);
-  return s + node.u;
+  if (!isFinite(v)) {
+    const kw = Number.isNaN(v) ? 'NaN' : v > 0 ? 'infinity' : '-infinity';
+    return node.u ? kw + ' * 1' + node.u : kw;
+  }
+  return _serNumber(v) + node.u;
 };
 // Serialize a calculation tree; sum/product nodes always wrap in parentheses.
 const _serCalcTree = (node) => {
@@ -6886,9 +7012,23 @@ const _calcConstValue = (str) => {
 // Computed value of `opacity`: a <number> or <percentage> (incl. math
 // functions), clamped to [0, 1]. Returns null if the value isn't numeric.
 const _computeOpacity = (value) => {
-  const num = _evalMath(value, 1);
+  const num = _evalMath(value, 1, { nonFinite: true });
   if (num === null) return null;
-  return _serNumber(Math.max(0, Math.min(1, num)));
+  if (Number.isNaN(num)) return '0';                           // NaN → 0 (CSS Values 4 §"NaN and infinity")
+  return _serNumber(Math.max(0, Math.min(1, num)));            // ±∞ clamp to the [0,1] bounds
+};
+// SPECIFIED value of `opacity` (an <alpha-value> = <number>|<percentage>): a bare
+// <percentage> serializes as the equivalent unclamped <number> (`50%`→`0.5`,
+// `-100%`→`-1`), a bare <number> is canonicalized, and a math function folds via
+// the calc engine WITH `%` kept symbolic (`min(50%,0%)`→`calc(0%)`, `calc(1+1)`→
+// `calc(2)`). Anything else (a CSS-wide keyword, or — until the math grammar gate
+// lands — an invalid value) is kept verbatim.
+const _canonOpacitySpecified = (v) => {
+  const s = String(v).trim();
+  if (_FILTER_MATH_RE.test(s)) return _canonMathExpr(s) || s;
+  if (_FILTER_PCT_RE.test(s)) return _serNumber(parseFloat(s) / 100);
+  if (_FILTER_NUM_RE.test(s)) return _serNumber(parseFloat(s));
+  return s;
 };
 
 // ── Modern <color> computed-value serialization (CSS Color 4) ──────────────────
@@ -9719,7 +9859,7 @@ const _isValidTransform = (value) => {
 // for angles, keep lengths/percentages and math verbatim.
 const _canonTfArg = (t, type) => {
   t = t.trim();
-  if (_FILTER_MATH_RE.test(t)) return t;
+  if (_FILTER_MATH_RE.test(t)) return _canonMathExpr(t) || t;   // fold/canon the math (scale(abs(1))→scale(calc(1)))
   switch (type) {
     case 'number': return _FILTER_NUM_RE.test(t) ? _serNumber(parseFloat(t)) : t;
     case 'np':
@@ -9826,7 +9966,7 @@ const _emPxOf = (el) => (el ? (parseFloat(_computedPropOf(el, 'font-size', 0)) |
 // `sign(1em - 1px)`) then require the remainder to evaluate with NO units present.
 const _scaleCalcOk = (t) => {
   const stripped = t.replace(/\bsign\s*\((?:[^()]|\([^()]*\))*\)/gi, '1');
-  return _evalMath(stripped, 1, {}) !== null;
+  return _evalMath(stripped, 1, { nonFinite: true }) !== null;   // a dimensionless calc that resolves to NaN/∞ is still valid
 };
 const _scaleCompValid = (t) => {
   t = t.trim();
@@ -9845,7 +9985,13 @@ const _isValidScale = (value) => {
 const _scaleComp = (t, el, computed) => {
   t = t.trim();
   if (_FILTER_MATH_RE.test(t)) {
-    if (computed) { const v = _evalMath(t, 1, { lengths: true, angle: true, emPx: _emPxOf(el) }); return v === null ? (_canonMathExpr(t) || t) : _serNumber(v); }
+    if (computed) {
+      const v = _evalMath(t, 1, { lengths: true, angle: true, emPx: _emPxOf(el), nonFinite: true });
+      if (v === null) return _canonMathExpr(t) || t;
+      if (Number.isNaN(v)) return '0';                          // NaN scale factor → 0 (matches browsers)
+      if (!isFinite(v)) return _canonMathExpr(t) || t;          // ±∞ keeps its calc(infinity) form
+      return _serNumber(v);
+    }
     return _canonMathExpr(t) || t;
   }
   if (_FILTER_PCT_RE.test(t)) return _serNumber(parseFloat(t) / 100);
