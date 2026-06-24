@@ -578,6 +578,15 @@ const _parseStyleDecls = (text) => {
         value = _canonIndividualTransform(name, value, null, false);
       } else if (name === 'content') {
         value = _canonContent(value, null, false);
+      } else if (name === 'offset-rotate') {
+        if (!_isValidOffsetRotate(value)) continue;        // invalid [auto|reverse]||<angle> → drop
+        value = _canonOffsetRotate(value);
+      } else if (name === 'offset-distance') {
+        if (!_isValidOffsetDistance(value)) continue;      // invalid <length-percentage> → drop
+        value = _canonOffsetDistance(value);
+      } else if (_BG_POSITION_AXIS.has(name)) {
+        if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
+        value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
       }
     }
     out.push({ name, value, important });
@@ -629,6 +638,15 @@ class CSSStyleDeclaration {
       stored = _canonIndividualTransform(name, stored, null, false);
     } else if (!custom && name === 'content') {
       stored = _canonContent(stored, null, false);
+    } else if (!custom && name === 'offset-rotate') {
+      if (!_isValidOffsetRotate(stored)) return;           // invalid [auto|reverse]||<angle> → ignore
+      stored = _canonOffsetRotate(stored);
+    } else if (!custom && name === 'offset-distance') {
+      if (!_isValidOffsetDistance(stored)) return;         // invalid <length-percentage> → ignore
+      stored = _canonOffsetDistance(stored);
+    } else if (!custom && _BG_POSITION_AXIS.has(name)) {
+      if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
+      stored = _canonBgAxis(stored, _BG_POSITION_AXIS.get(name));
     }
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
@@ -5441,7 +5459,13 @@ const _GCS_DEFAULTS = {
   // css-motion. offset-anchor/offset-position are a full <position>; their computed
   // value resolves like object-position (keywords→%, far-edge/em offsets→px). They
   // do not inherit. `auto`/`normal` pass through verbatim (not a <position>).
+  // offset-rotate (`[auto|reverse]||<angle>`, computed `reverse`→`auto`+180°) and
+  // offset-distance (`<length-percentage>`, computed em→px) likewise don't inherit.
   'offset-anchor': 'auto', 'offset-position': 'normal',
+  'offset-rotate': 'auto', 'offset-distance': '0px',
+  // css-backgrounds longhands — each a single-axis `<bg-position>` list (the x/y
+  // halves of `background-position`). Computed initial is `0%`; not inherited.
+  'background-position-x': '0%', 'background-position-y': '0%',
   // css-tables. table-layout does not inherit; the rest do.
   'border-collapse': 'separate', 'border-spacing': '0px', 'caption-side': 'top',
   'empty-cells': 'show', 'table-layout': 'auto',
@@ -8133,6 +8157,179 @@ const _canonStopPos = (tok, emPx, lhPx) => {
   const r = _evalMath(s, 0, { lengths: true, emPx, lhPx });   // <length> → px
   return r === null ? _canonStandardValue(s) : _serNumber(r) + 'px';
 };
+
+// ─── css-motion / css-backgrounds single-axis longhands (Quest #90) ──────────
+// CSSOM serializes the terms of a `calc()` sum in a canonical order — numbers,
+// then the percentage, then dimensions alphabetically by unit (CSS Values 4
+// §10.13), e.g. `calc(10px - 0.5em)` → `calc(-0.5em + 10px)`. The shared
+// `_canonMathExpr` folds same-unit terms but does NOT reorder mixed units; this
+// sorts a FLAT sum of simple number/%/dimension terms into that order. Anything
+// richer (nested groups, products, functions) falls back to the unsorted canon.
+// Scoped to `_canonLPToken` so the shared calc hot path is untouched.
+const _canonSortedCalc = (value) => {
+  const canon = _canonMathExpr(value);
+  const m = /^calc\(([\s\S]*)\)$/i.exec(canon);
+  if (!m) return canon;
+  const terms = _splitSumTerms(m[1]);
+  if (!terms || terms.length < 2) return canon;
+  const parsed = [];
+  for (const t of terms) {
+    const mm = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(%|[a-z]+)?$/i.exec(t.text);
+    if (!mm) return canon;                              // a non-simple term → leave order to canon
+    const unit = mm[2] ? mm[2].toLowerCase() : '';
+    parsed.push({ coef: parseFloat(mm[1]) * t.sign, unit, rank: unit === '' ? 0 : unit === '%' ? 1 : 2 });
+  }
+  parsed.sort((a, b) => a.rank - b.rank || (a.unit < b.unit ? -1 : a.unit > b.unit ? 1 : 0));
+  let out = '';
+  parsed.forEach((p, i) => {
+    const tok = _serNumber(Math.abs(p.coef)) + p.unit;
+    out += i === 0 ? (p.coef < 0 ? '-' : '') + tok : (p.coef < 0 ? ' - ' : ' + ') + tok;
+  });
+  return 'calc(' + out + ')';
+};
+// Canonicalize one `<length-percentage>` token: a calc/math fn through the calc
+// serializer (with canonical term ordering), a bare number → `<n>px` (length
+// context), else verbatim canon.
+const _canonLPToken = (t) => {
+  const s = String(t).trim();
+  if (/^(?:calc|min|max|clamp)\(/i.test(s)) return _canonSortedCalc(s);
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(s)) return _serNumber(parseFloat(s)) + 'px';
+  return _canonStandardValue(s);
+};
+
+// offset-rotate = [ auto | reverse ] || <angle>  (CSS Motion 1 §4). The keyword and
+// the angle may appear in either order; the canonical serialization is keyword-first.
+// `none` / a bare number / two keywords / three tokens are invalid.
+const _parseOffsetRotate = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  let kw = null, angle = null;
+  for (const t of toks) {
+    const l = t.toLowerCase();
+    if (l === 'auto' || l === 'reverse') { if (kw != null) return null; kw = l; }
+    else if (_ANGLE_RE.test(t) || /^calc\(/i.test(t)) { if (angle != null) return null; angle = t; }
+    else return null;                       // `none`, bare `0`, … → not part of the grammar
+  }
+  return (kw == null && angle == null) ? null : { kw, angle };
+};
+const _isValidOffsetRotate = (value) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return true;
+  return _parseOffsetRotate(v) != null;
+};
+const _canonOffsetRotate = (value) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  const p = _parseOffsetRotate(v);
+  if (!p) return v;
+  const parts = [];
+  if (p.kw) parts.push(p.kw);
+  if (p.angle != null) parts.push(/^calc\(/i.test(p.angle) ? _canonMathExpr(p.angle) : _canonStandardValue(p.angle));
+  return parts.join(' ');
+};
+// Computed: the angle resolves to degrees and `reverse` ≡ `auto` + 180°. `auto`
+// alone → `auto 0deg`; a lone angle stays a bare `<n>deg`.
+const _computeOffsetRotate = (value) => {
+  const v = String(value).trim();
+  const p = _parseOffsetRotate(v);
+  if (!p) return v;
+  let deg = 0;
+  if (p.angle != null) { const r = _evalMath(p.angle, 0, { angle: true }); if (r === null) return v; deg = r; }
+  if (p.kw === 'reverse') return 'auto ' + _serAngle(deg + 180);
+  if (p.kw === 'auto') return 'auto ' + _serAngle(deg);
+  return _serAngle(deg);
+};
+
+// offset-distance = <length-percentage> (CSS Motion 1 §3). A single token; an angle
+// (`30deg`) or `none` is invalid. `0` → `0px`; computed resolves em→px (% kept).
+const _isValidOffsetDistance = (value) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return true;
+  const toks = _wsTokens(v);
+  return toks.length === 1 && _isPosLP(toks[0]);
+};
+const _canonOffsetDistance = (value) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  return _canonLPToken(v);
+};
+const _computeOffsetDistance = (el, value) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v)) return v;
+  const emPx = _emPxOf(el);
+  return _posComputeLen(v, emPx, _lineHeightPx(el, emPx));
+};
+
+// background-position-x / -y = [ center | [ [ <axis-start>|<axis-end> ]? <lp>? ]! ]#
+// (CSS Backgrounds 4). One comma layer per origin; the x axis takes left/right/
+// x-start/x-end, the y axis top/bottom/y-start/y-end. `center` takes no offset, the
+// keyword precedes any offset, and a wrong-axis keyword is invalid.
+const _BG_AXIS_KW = {
+  x: { left: 'start', right: 'end', 'x-start': 'start', 'x-end': 'end' },
+  y: { top: 'start', bottom: 'end', 'y-start': 'start', 'y-end': 'end' },
+};
+const _BG_POSITION_AXIS = new Map([
+  ['background-position-x', 'x'], ['background-position-y', 'y'],
+]);
+// Parse one layer → { kw?, edge?, off?, lp? } or null. The original keyword is kept
+// (so logical x-start/y-end survive specified serialization); `edge` is start|end.
+const _parseBgAxisLayer = (layer, axis) => {
+  const map = _BG_AXIS_KW[axis];
+  const toks = _wsTokens(String(layer).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  if (toks.length === 1) {
+    const l = toks[0].toLowerCase();
+    if (l === 'center') return { kw: 'center' };
+    if (l in map) return { kw: l, edge: map[l] };
+    if (_isPosLP(toks[0])) return { lp: toks[0] };
+    return null;
+  }
+  const l = toks[0].toLowerCase();                 // 2-token form: edge keyword THEN offset
+  if (!(l in map) || !_isPosLP(toks[1])) return null;
+  return { kw: l, edge: map[l], off: toks[1] };
+};
+const _isValidBgAxis = (value, axis) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return true;
+  for (const layer of _commaSplitTop(v)) if (_parseBgAxisLayer(layer, axis) == null) return false;
+  return true;
+};
+const _canonBgAxisComp = (c) => {
+  if (c.lp != null) return _canonLPToken(c.lp);
+  return c.off != null ? c.kw + ' ' + _canonLPToken(c.off) : c.kw;
+};
+const _canonBgAxis = (value, axis) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  return _commaSplitTop(v).map((layer) => {
+    const c = _parseBgAxisLayer(layer, axis);
+    return c ? _canonBgAxisComp(c) : layer.trim();
+  }).join(', ');
+};
+// Computed: physical keyword → 0%/50%/100%, offsets resolved (end edge → `100% −
+// off`, reusing the shared <position> component serializer). A logical keyword
+// (x-start/x-end/y-start/y-end) keeps its keyword ONLY when it is the lone layer
+// with no offset — matching the observed engine quirk — else it resolves too.
+const _bgAxisComputed = (c, emPx, lhPx, keepLogical) => {
+  if (c.lp != null) return _posComputeLen(c.lp, emPx, lhPx);
+  if (c.kw === 'center') return '50%';
+  const logical = c.kw === 'x-start' || c.kw === 'x-end' || c.kw === 'y-start' || c.kw === 'y-end';
+  if (logical && keepLogical && c.off == null) return c.kw;
+  return _posCompComputed({ kw: c.edge === 'start' ? 'left' : 'right', off: c.off }, emPx, lhPx);
+};
+const _computeBgAxis = (el, value, axis) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v)) return v;
+  const emPx = _emPxOf(el);
+  const lhPx = _lineHeightPx(el, emPx);
+  const layers = _commaSplitTop(v);
+  const single = layers.length === 1;
+  return layers.map((layer) => {
+    const c = _parseBgAxisLayer(layer, axis);
+    return c ? _bgAxisComputed(c, emPx, lhPx, single) : layer.trim();
+  }).join(', ');
+};
+
 // Canonicalize a conic-gradient prelude (`from <angle>` before any `at`). At
 // computed time the angle resolves to degrees and a default `from 0deg` is dropped.
 const _canonConicPrelude = (toks, computed) => {
@@ -9221,6 +9418,9 @@ const _FONT_SIZE_KEYWORDS = {
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
+  if (kebab === 'offset-rotate') return _computeOffsetRotate(v);
+  if (kebab === 'offset-distance') return _computeOffsetDistance(el, v);
+  if (_BG_POSITION_AXIS.has(kebab)) return _computeBgAxis(el, v, _BG_POSITION_AXIS.get(kebab));
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);
   if (kebab === 'filter' || kebab === 'backdrop-filter') return _canonFilter(v, el, true);

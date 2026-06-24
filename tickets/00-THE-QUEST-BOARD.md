@@ -123,6 +123,43 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-23 (Quest #90 The Single-Axis Verdict — offset-rotate /
+offset-distance + background-position-x/-y longhands, +80):** Four single-axis
+longhands stood unregistered and ungated. The css-motion scalars `offset-rotate`
+(`[auto|reverse] || <angle>`) and `offset-distance` (`<length-percentage>`), and the
+css-backgrounds halves `background-position-x`/`-y` (one axis of `<bg-position>`
+each), all had passing VALID rows but **0** on every computed test (never in
+`_GCS_DEFAULTS` → the `test_computed_value` support gate `property in
+getComputedStyle` failed at the first assertion, exactly like #89's transform-box)
+and unguarded invalid rows. Closed all **twelve** tests → 100%. **Pure JS, NO new
+Rust; the diff is purely additive (200 insertions, 0 deletions) — no shared
+primitive modified, so every existing consumer is byte-identical by construction.**
+Built: (1) registered the four in `_GCS_DEFAULTS` (`offset-rotate:auto`,
+`offset-distance:0px`, `background-position-x/-y:0%`; none inherited). (2)
+`offset-rotate` — `_parseOffsetRotate`/`_isValidOffsetRotate`/`_canonOffsetRotate`
+(keyword-first serialization, `5turn auto`→`auto 5turn`) + `_computeOffsetRotate`
+(angle→deg, `reverse`≡`auto`+180°, `reverse -50grad`→`auto 135deg`). (3)
+`offset-distance` — `_isValidOffsetDistance` (single `<length-percentage>` via
+`_isPosLP`, drops `none`/`30deg`) + `_canonOffsetDistance` (`0`→`0px`) + computed via
+`_posComputeLen`. (4) `background-position-x/-y` — `_parseBgAxisLayer` per comma
+layer (x: `left|right|x-start|x-end`, y: `top|bottom|y-start|y-end`; keyword precedes
+offset; wrong-axis/`center 10px`/`right left` dropped), `_isValidBgAxis`,
+`_canonBgAxis`, `_computeBgAxis` (keyword→%, offsets routed through the shared
+`_posCompComputed` so `right 10px`→`calc(100% - 10px)`; logical `x-start` kept only
+as the sole layer else physicalized — the recorded engine quirk). (5) `_canonSortedCalc`
+— a calc additive **unit-ordering** serializer (numbers → % → dimensions
+alphabetical-by-unit, `calc(10px - 0.5em)`→`calc(-0.5em + 10px)`) wired **only** into
+`_canonLPToken`, leaving the shared `_canonMathExpr` hot path (and its standing
+`calc-serialization.html` 0/1 cap) untouched. All gates wired into both specified
+paths + `_normComputed`. **ZERO caps, ZERO regressions** — background-position
+shorthand 31/32, object-position 18, mask-position 23, offset-anchor 11/14,
+offset-position 12, transform-valid 42, scale 32, gradient-position 18/43,
+color-computed-relative 1163/1169, classlist 1420, createElement 147, qsa 1975 all
+at held baselines. NEXT: `offset-path` (valid 46/70, invalid 0/24, computed 0/65 —
+needs `ray()`/basic-shape/`url()`/coord-box grammar, a dedicated quest); the `offset`
+shorthand (composes the longhands); standing colour leverage; or a fresh realm.
+Scroll `tickets/90-the-single-axis-verdict.md`.
+
 **Session 2026-06-23 (Quest #89 The Inherited Matrix — css-transforms computed-style
 registry + CSS-wide passthrough, +19):** The transform realm's serializers were
 done (#85–#88), but the *computed-style plumbing* still had blind spots. Two root
