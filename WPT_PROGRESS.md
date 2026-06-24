@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-23 (Quest #87).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-23 (Quest #89).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-transforms/parsing/transform-box-computed.html` | 0/5 | **5/5** | ✅ 100% | **Quest #89 The Inherited Matrix.** Registered `transform-box` in `_GCS_DEFAULTS` (initial `view-box`) so it joins `_CSS_KNOWN_PROPS` — `'transform-box' in getComputedStyle(el)` is now true (the `test_computed_value` support gate). Computed value is identity (keyword passes through `_normComputed`). Pure JS, no new Rust. **+5.** |
+| `css/css-transforms/parsing/backface-visibility-computed.html` | 0/2 | **2/2** | ✅ 100% | **Quest #89 The Inherited Matrix.** Registered `backface-visibility` in `_GCS_DEFAULTS` (initial `visible`). Same support-gate fix; computed identity. **+2.** |
+| `css/css-transforms/inheritance.html` | 8/20 | **20/20** | ✅ 100% | **Quest #89 The Inherited Matrix.** Two root causes: (1) registered `perspective` (`none`), `transform-box` (`view-box`), `backface-visibility` (`visible`), `transform-style` (`flat`) in `_GCS_DEFAULTS` (+ `transform-style` keyword gate in `_SIMPLE_TRANSFORM_PROPS`) so the support/initial checks pass and they don't inherit; (2) `_isValidTransform`/`_isValidIndividualTransform` (and `_canonIndividualTransform`) now short-circuit the CSS-wide keywords — `style.rotate = 'inherit'` etc. were being dropped by the grammar gate, so `transform`/`rotate`/`scale`/`translate` never observed an explicit `inherit`. **+12.** |
 | `css/css-backgrounds/parsing/background-position-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #88 The Cornered Verdict.** Lenient `<bg-position>` gate `_isValidBgPosition` (per comma-layer, valid ⇔ `_parsePosition` non-null, NO 3-token guard — `center top 8px` etc. are legal). Drops a bare `<length-percentage>` standing alone in the edge form (`1% center 2px`, `right 7% 50%`, `100% top 14%`). Pure JS, no new Rust. **+11.** |
 | `css/css-masking/parsing/mask-position-invalid.html` | 0/13 | **13/13** | ✅ 100% | **Quest #88 The Cornered Verdict.** Strict `<position>` gate (added `mask-position` to `_STRICT_POSITION_PROPS`), made `_isValidStrictPosition` comma-layer-aware (mask admits `bottom left, right 20%`). 3-token guard drops every 3-value form (`center top 2px`, `left 4px top`); `auto`/`1px 2px 3px`/wrong-axis pairs dropped too. **+13.** |
 | `css/motion/parsing/offset-anchor-parsing-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #88 The Cornered Verdict.** Strict `<position>` gate with `{auto}` keyword exemption; `none`/`left 10% top` dropped, and `30deg` now rejected via the tightened `_isPosLP` (an angle is not a `<length-percentage>`). **+3.** |

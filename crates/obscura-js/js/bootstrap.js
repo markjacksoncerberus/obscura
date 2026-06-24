@@ -5433,7 +5433,11 @@ const _GCS_DEFAULTS = {
   'mask-image': 'none', 'border-image-source': 'none',
   // css-transforms. transform-origin/perspective-origin do not inherit; their
   // computed value resolves to absolute lengths (see _serializeOriginComputed).
+  // perspective/transform-box/backface-visibility/transform-style do not inherit;
+  // their computed value is identity (keyword / length passes through unchanged).
   'transform-origin': '50% 50%', 'perspective-origin': '50% 50%',
+  perspective: 'none', 'transform-box': 'view-box',
+  'backface-visibility': 'visible', 'transform-style': 'flat',
   // css-motion. offset-anchor/offset-position are a full <position>; their computed
   // value resolves like object-position (keywords→%, far-edge/em offsets→px). They
   // do not inherit. `auto`/`normal` pass through verbatim (not a <position>).
@@ -8874,6 +8878,7 @@ const _tfArgValid = (t, type) => {
 };
 const _isValidTransform = (value) => {
   if (_TF_VAR_RE.test(value)) return true;                 // var()/env() resolved later
+  if (_CSS_WIDE.has(String(value).trim().toLowerCase())) return true; // inherit/initial/unset/revert
   const p = _parseTransform(value);
   if (!p) return false;
   if (p.none) return true;
@@ -9164,6 +9169,7 @@ const _balanceParens = (s) => {
 };
 const _isValidIndividualTransform = (name, value) => {
   if (_TF_VAR_RE.test(value)) return true;                    // var()/env() resolved later
+  if (_CSS_WIDE.has(String(value).trim().toLowerCase())) return true; // inherit/initial/unset/revert
   value = _balanceParens(String(value));
   if (name === 'scale') return _isValidScale(value);
   if (name === 'rotate') return _isValidRotate(value);
@@ -9171,6 +9177,7 @@ const _isValidIndividualTransform = (name, value) => {
 };
 const _canonIndividualTransform = (name, value, el, computed) => {
   if (_TF_VAR_RE.test(value)) return value;                   // unresolved var()/env()
+  if (_CSS_WIDE.has(String(value).trim().toLowerCase())) return value; // CSS-wide keyword stored verbatim
   value = _balanceParens(String(value));
   if (name === 'scale') return _canonScale(value, el, computed);
   if (name === 'rotate') return _canonRotate(value, el, computed);
@@ -9182,6 +9189,7 @@ const _canonIndividualTransform = (name, value, el, computed) => {
 // verbatim (canonical) — only the invalid-rejection gate was missing.
 const _TRANSFORM_BOX_KW = new Set(['content-box', 'border-box', 'fill-box', 'stroke-box', 'view-box']);
 const _BACKFACE_KW = new Set(['visible', 'hidden']);
+const _TRANSFORM_STYLE_KW = new Set(['flat', 'preserve-3d']);
 const _isValidPerspective = (value) => {
   const v = String(value).trim();
   if (_TF_VAR_RE.test(v)) return true;
@@ -9192,13 +9200,14 @@ const _isValidPerspective = (value) => {
   const lm = _trLenUnit(v);                            // a real <length> unit (rejects %, bare number)
   return !!(lm && parseFloat(lm[1]) >= 0);             // non-negative per `[0,∞]`
 };
-const _SIMPLE_TRANSFORM_PROPS = new Set(['perspective', 'transform-box', 'backface-visibility']);
+const _SIMPLE_TRANSFORM_PROPS = new Set(['perspective', 'transform-box', 'backface-visibility', 'transform-style']);
 const _isValidSimpleTransform = (name, value) => {
   if (_TF_VAR_RE.test(value)) return true;
   const low = String(value).trim().toLowerCase();
   if (_CSS_WIDE.has(low)) return true;
   if (name === 'perspective') return _isValidPerspective(value);
   if (name === 'transform-box') return _TRANSFORM_BOX_KW.has(low);
+  if (name === 'transform-style') return _TRANSFORM_STYLE_KW.has(low); // flat | preserve-3d
   return _BACKFACE_KW.has(low);                         // backface-visibility: visible | hidden
 };
 // Serialize a resolved specified value into its computed form (colour/opacity
