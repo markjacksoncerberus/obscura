@@ -6026,6 +6026,9 @@ const _LENGTH_PX = {
 // CSS <angle> units → degrees (for gradient <angle> directions/stops via _evalMath
 // `opts.angle`). 400 grad = 360 deg; 1 turn = 360 deg; rad via 180/π.
 const _ANGLE_DEG = { deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 };
+// CSS <time> units → seconds (transition-delay/-duration computed values via
+// _evalMath `opts.time`; getComputedStyle serializes computed <time> in seconds).
+const _TIME_S = { s: 1, ms: 0.001 };
 // Unescape a CSS identifier: `\67` (hex, optional trailing whitespace) and
 // `\g` (literal). Used so an escaped function name like `r\67 b`/`r\gb`
 // resolves to `rgb` before we match it.
@@ -6638,6 +6641,12 @@ const _evalMath = (input, percentBase, opts) => {
           const af = _ANGLE_DEG[tok.unit];
           if (af !== undefined) return [tok.v * af, true];
         }
+        // Time units (transition-delay/-duration, …) → seconds; available without
+        // opts.lengths since a <time> context admits no <length>.
+        if (opts.time) {
+          const sf = _TIME_S[tok.unit];
+          return sf !== undefined ? [tok.v * sf, false] : tfail();
+        }
         if (!opts.lengths) return tfail();
         // `opts.emPx`/`opts.lhPx` resolve em / lh against the element's computed
         // font-size & line-height (the default table assumes em = 16px); rem stays root.
@@ -6645,6 +6654,15 @@ const _evalMath = (input, percentBase, opts) => {
         if (opts.lhPx && tok.unit === 'lh') return [tok.v * opts.lhPx, false];
         const f = _LENGTH_PX[tok.unit];
         if (f !== undefined) return [tok.v * f, false];
+        // `opts.vw`/`opts.vh` (px per 1% of the viewport) resolve viewport-relative
+        // units; gated on the flag so non-length callers stay byte-identical. The
+        // small/large/dynamic variants collapse to the same axis (we model no UI chrome).
+        if (opts.vw !== undefined) {
+          const u = tok.unit, vmin = opts.vw < opts.vh ? opts.vw : opts.vh, vmax = opts.vw > opts.vh ? opts.vw : opts.vh;
+          const vf = /^[sld]?v[wi]$/.test(u) ? opts.vw : /^[sld]?v[hb]$/.test(u) ? opts.vh
+                   : /^[sld]?vmin$/.test(u) ? vmin : /^[sld]?vmax$/.test(u) ? vmax : undefined;
+          if (vf !== undefined) return [tok.v * vf, false];
+        }
         // `opts.cqZero` (filter computed only) treats a viewport/container-relative
         // unit as 0 — the filter tests gate every such unit inside `sign(2cqw - 10px)`
         // where only the sign matters (cqw resolves to 0 with no container). Gated on
@@ -10290,19 +10308,24 @@ const _trIsZeroLen = (t) => {
   const lm = _FILTER_LEN_RE.exec(t);
   return !!(lm && parseFloat(lm[1]) === 0);
 };
-const _trComp = (t, el, computed) => {
+// `vp` (optional) carries {vw,vh} px-per-1%-viewport so viewport-relative units
+// resolve at computed time. translate() callers omit it (byte-identical behavior);
+// the length-property resolver passes it so `min(1vh)`/`12vw` collapse to px.
+const _trComp = (t, el, computed, vp) => {
   t = t.trim();
+  const lenOpts = () => (vp ? { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh }
+                            : { lengths: true, emPx: _emPxOf(el) });
   if (_FILTER_MATH_RE.test(t)) {
     if (/%/.test(t)) {                                        // mixed %+<length> → canonical calc(P% ± Lpx)
       const mixed = _resolvePctLengthCalc(t, computed ? _emPxOf(el) : undefined);
       return mixed !== null ? mixed : (_canonMathExpr(t) || t);
     }
-    if (computed) { const v = _evalMath(t, 0, { lengths: true, emPx: _emPxOf(el) }); if (v !== null) return _serNumber(v) + 'px'; }
+    if (computed) { const v = _evalMath(t, 0, lenOpts()); if (v !== null) return _serNumber(v) + 'px'; }
     return _canonMathExpr(t) || t;
   }
   if (_FILTER_PCT_RE.test(t)) return _serNumber(parseFloat(t)) + '%';
   if (_isFilterZero(t)) return computed ? '0px' : _serNumber(parseFloat(t)) + 'px';
-  if (computed) { const v = _evalMath(t, 0, { lengths: true, emPx: _emPxOf(el) }); if (v !== null) return _serNumber(v) + 'px'; }
+  if (computed) { const v = _evalMath(t, 0, lenOpts()); if (v !== null) return _serNumber(v) + 'px'; }
   const lm = _FILTER_LEN_RE.exec(t);                          // specified: keep the unit, canon the number
   return lm ? _serNumber(parseFloat(lm[1])) + lm[2] : t;
 };
@@ -10376,6 +10399,54 @@ const _FONT_SIZE_KEYWORDS = {
   'xx-small': '10px', 'x-small': '12px', small: '13px', medium: '16px',
   large: '18px', 'x-large': '24px', 'xx-large': '32px', 'xxx-large': '48px',
 };
+// Generic computed-value resolution for the numeric length / integer / time
+// property families (CSS Values 4 — getComputedStyle returns the *resolved*
+// value, in canonical units). Length props fold math functions and resolve the
+// absolute + font-relative units to px (`%` is kept symbolic — resolving a used
+// `%` length needs layout we don't perform); integer props (`z-index`) fold to a
+// rounded integer; time props fold to seconds. `_trComp(v, el, true)` is the
+// shared <length-percentage> component resolver (it also serves translate()).
+const _LENGTH_COMPUTED_PROPS = new Set([
+  'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+  'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+  'top', 'right', 'bottom', 'left',
+  'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
+  'flex-basis', 'text-indent', 'outline-offset',
+  'letter-spacing', 'word-spacing',                      // <length> | normal (keyword passes through)
+]);
+const _INTEGER_COMPUTED_PROPS = new Set(['z-index', 'order']);
+const _TIME_COMPUTED_PROPS = new Set([
+  'transition-delay', 'transition-duration', 'animation-delay', 'animation-duration',
+]);
+// px per 1% of the viewport (vw/vh), for resolving viewport-relative units at
+// computed time. Consistent across the two sides of an equivalence test — that is
+// all these used-value comparisons require.
+const _vpUnits = () => ({
+  vw: (Number(globalThis.innerWidth) || 0) / 100,
+  vh: (Number(globalThis.innerHeight) || 0) / 100,
+});
+// Fold a math expression on an integer property to a rounded <integer> (CSS Values
+// 4 §10 — calc on <integer> rounds to nearest). Keywords (`auto`) and bare ints
+// pass through; an unresolvable/non-finite math node is left canonicalized.
+const _computeIntegerValue = (el, v) => {
+  const s = String(v).trim();
+  if (!/[\d(]/.test(s)) return null;                     // `auto` and friends → caller keeps v
+  // `lengths` lets `sign(1px)` / `sign(1em)` / `sign(1vw)` resolve their length
+  // argument to the <number> the function yields (the value stays a valid <integer>).
+  const vp = _vpUnits();
+  const n = _evalMath(s, 0, { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh });
+  if (n === null || !isFinite(n)) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
+  return String(Math.round(n));
+};
+// Fold a <time> value (incl. math) to canonical seconds. Mixed s/ms resolve
+// consistently (`round(10s,6000ms)` and `12s` both → `12s`).
+const _computeTimeValue = (v) => {
+  const s = String(v).trim();
+  if (_TF_VAR_RE.test(s) || !/[\d(]/.test(s)) return null;
+  const sec = _evalMath(s, 0, { time: true });
+  if (sec === null || !isFinite(sec)) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
+  return _serNumber(sec) + 's';
+};
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
@@ -10394,6 +10465,9 @@ const _normComputed = (el, kebab, v) => {
     if (k in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[k];
     return v;
   }
+  if (_LENGTH_COMPUTED_PROPS.has(kebab)) return _trComp(v, el, true, _vpUnits());
+  if (_INTEGER_COMPUTED_PROPS.has(kebab)) { const r = _computeIntegerValue(el, v); return r === null ? v : r; }
+  if (_TIME_COMPUTED_PROPS.has(kebab)) { const r = _computeTimeValue(v); return r === null ? v : r; }
   if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
     if (String(v).trim().toLowerCase() === 'currentcolor') {
       return kebab === 'color' ? _computeColor(_initialOf('color')) : _computedColorOf(el);

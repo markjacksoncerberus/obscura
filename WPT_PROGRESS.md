@@ -10,12 +10,25 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #95).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #96).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-values/signs-abs-computed.html` | 31/233 | **163/233** | ⚠️ 70% | **Quest #96 The Resolved Verdict.** Computed length/integer resolver: `abs(10px)`→`10px`, `sign(1px)`→`1`, `abs(10em)`/`sign(1vw)` resolved. Remaining = `%` (needs layout). **+132.** |
+| `css/css-values/round-mod-rem-computed.html` | 160/243 | **225/243** | ⚠️ 93% | **Quest #96 The Resolved Verdict.** length-type (`margin-left`) + time-type (`transition-delay`, new `_evalMath` `opts.time`→seconds) folded & resolved; vw/vh resolved. Remaining = `%`. **+65.** |
+| `css/css-values/hypot-pow-sqrt-computed.html` | 4/52 | **43/52** | ⚠️ 83% | **Quest #96 The Resolved Verdict.** integer (`z-index`) & length folding. **+39.** |
+| `css/css-values/minmax-length-computed.html` | 0/80 | **76/80** | ⚠️ 95% | **Quest #96 The Resolved Verdict.** `min/max` length on `margin-left` resolved to px (em/abs/rem/vw). 4 cap: unbalanced-paren auto-close. **+76.** |
+| `css/css-values/minmax-integer-computed.html` | 0/10 | **10/10** | ✅ 100% | **Quest #96 The Resolved Verdict.** `min/max` on `z-index` fold to integer. **+10.** |
+| `css/css-values/clamp-length-computed.html` | 0/24 | **17/24** | ⚠️ 71% | **Quest #96 The Resolved Verdict.** `clamp()` on `letter-spacing` resolved to px. 7 cap: `%`. **+17.** |
+| `css/css-values/clamp-integer-computed.html` | 0/6 | **1/6** | ⚠️ 17% | **Quest #96 The Resolved Verdict.** `clamp(10,20,30)`→`20`. 5 cap: `clamp(none, …)` ±∞ sentinel. **+1.** |
+| `css/css-values/getComputedStyle-calc-mixed-units-002.html` | 0/8 | **2/8** | ⚠️ 25% | **Quest #96 The Resolved Verdict.** abs+em folds; `%`/`lh` capped. **+2.** |
+| `css/css-values/getComputedStyle-calc-mixed-units-003.html` | 0/7 | **2/7** | ⚠️ 29% | **Quest #96 The Resolved Verdict.** **+2.** |
+| `css/css-flexbox/parsing/flex-basis-computed.html` | 8/12 | **11/12** | ⚠️ 92% | **Quest #96 (bonus).** `flex-basis` em/calc → px. **+3.** |
+| `css/css-text/parsing/word-spacing-computed.html` | 4/9 | **7/9** | ⚠️ 78% | **Quest #96 (bonus).** **+3.** |
+| `css/css-text/parsing/letter-spacing-computed.html` | 5/9 | **7/9** | ⚠️ 78% | **Quest #96 (bonus).** **+2.** |
+| `css/css-box/parsing/padding-computed.html` | 6/13 | **7/13** | ⚠️ 54% | **Quest #96 (bonus).** **+1.** |
 | `css/css-values/round-mod-rem-invalid.html` | 0/108 | **108/108** | ✅ 100% | **Quest #95 The Rejected Verdict.** Math grammar/type validator: arity + unit checks reject `round(0px)`, `round(1, nearest)`, `mod(1, 1%)`, `round(0px, 0s)`, … gated on `opacity`/`height`. **+108.** |
 | `css/css-values/sin-cos-tan-invalid.html` | 0/42 | **42/42** | ✅ 100% | **Quest #95 The Rejected Verdict.** `rotate(sin(…))` rejected — sin/cos/tan yield `<number>`, not the `<angle>` rotate() needs; `sin(90px)` wrong arg type. **+42.** |
 | `css/css-values/acos-asin-atan-atan2-invalid.html` | 0/63 | **62/63** | ⚠️ 98% | **Quest #95 The Rejected Verdict.** `asin(90px)`, `atan(45deg )`, arity all rejected. 1 cap: `atan2(…, + …)` (whitespace-sensitive `+`, shared tokenizer). **+62.** |
@@ -23,7 +36,6 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #95).
 | `css/css-values/hypot-pow-sqrt-invalid.html` | 0/49 | **49/49** | ✅ 100% | **Quest #95 The Rejected Verdict.** `pow(2px, 2)`, `hypot(2px, 3)` (mixed), `hypot(1, 2)` (number into length slot, `outline-offset`), arity. **+49.** |
 | `css/css-values/signs-abs-invalid.html` | 0/53 | **53/53** | ✅ 100% | **Quest #95 The Rejected Verdict.** `abs(1, 2)` arity, `abs(1%)`/`sign(10%)` (`%` not accepted by `font-weight`/`tab-size`), `sign(10px + 5rad)` incompatible sum. **+53.** |
 | `css/css-color/parsing/opacity-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #95 (bonus).** `opacity` non-math grammar gate rejects `auto`/`10px`/`0 1`. **+3.** |
-| `css/css-values/round-mod-rem-computed.html` | 0/243 | **160/243** | ⚠️ 66% | **Quest #94 The Stepped Verdict.** Added `round`/`mod`/`rem` to `_evalMath` (full ±0/±∞/NaN edge cases) + folding in `_simpCalc`. number-type (`scale`) & angle-type (`rotate`) win; length/time-type remain (no computed-length/-time resolver). **+160.** |
 | `css/css-values/round-mod-rem-serialize.html` | 0/24 | **21/24** | ⚠️ 88% | **Quest #94 The Stepped Verdict.** `opacity`/`scale(…)` specified fold to `calc(N)`; non-finite handled. 3 fails are length-type computed. **+21.** |
 | `css/css-values/sin-cos-tan-serialize.html` | 144/270 | **270/270** | ✅ 100% | **Quest #94 The Stepped Verdict.** Numeric folding (`cos(0)`→`calc(1)`) + scale non-finite (NaN→0). **+126.** |
 | `css/css-values/acos-asin-atan-atan2-serialize.html` | 0/62 | **52/62** | ⚠️ 84% | **Quest #94 The Stepped Verdict.** Inverse-trig fold to `calc(<deg>)`; non-finite dimension → `calc(NaN * 1deg)`. **+52.** |
