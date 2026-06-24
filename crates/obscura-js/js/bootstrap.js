@@ -8347,9 +8347,9 @@ const _computeBgAxis = (el, value, axis) => {
 // defaults elided, calc ordered); computed resolves lengths to px (em/pt→px),
 // positions to percentages, and the <basic-shape-rect> functions xywh()/rect() to
 // the equivalent inset(). The default <coord-box> is border-box, elided whenever a
-// path accompanies it; a lone coord-box is kept. shape() (CSS Shapes 2) is not yet
-// canonicalized — it is preserved verbatim (a dedicated sequel) so the cases that
-// need no normalization keep passing instead of regressing.
+// path accompanies it; a lone coord-box is kept. shape() (CSS Shapes 2) is a full
+// segment-list grammar (from + move/line/hline/vline/curve/smooth/arc/close commands)
+// handled in the _opShape shape branch.
 // ============================================================================
 const _COORD_BOX = new Set(['content-box', 'padding-box', 'border-box', 'margin-box', 'fill-box', 'stroke-box', 'view-box']);
 const _RAY_SIZE = new Set(['closest-side', 'closest-corner', 'farthest-side', 'farthest-corner', 'sides']);
@@ -8650,7 +8650,110 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
     if (right == null || bottom == null) return null;
     return 'inset(' + _opCollapse4([top, right, bottom, left]) + rc + ')';
   }
-  return null;                                            // shape() handled by the caller; anything else invalid
+  if (head === 'shape') {
+    // shape( <fill-rule>? from <coordinate-pair>, <shape-command># )  (CSS Shapes 2).
+    // A <coordinate-pair> is two <length-percentage>s; a `with` control-point is a
+    // full <position> (so `with 10rem center` is valid). Specified canonicalizes each
+    // command (default arc keywords `ccw`/`small`/`rotate 0deg` and the default
+    // `nonzero` fill-rule elided); computed resolves lengths to px while percentages
+    // stay symbolic. Every command is its own top-level comma section.
+    const segs = _commaSplitTop(b).map((s) => s.trim());
+    if (segs.length < 2) return null;                      // need `from …` + ≥1 command
+    const coordPair = (toks) => {
+      if (toks.length !== 2 || !_isPosLP(toks[0]) || !_isPosLP(toks[1])) return null;
+      return _opLp(toks[0], computed, emPx, lhPx) + ' ' + _opLp(toks[1], computed, emPx, lhPx);
+    };
+    const ctrlPoint = (toks) => {                          // a <position> (1–4 tokens)
+      const joined = toks.join(' ');
+      if (!toks.length || !_parsePosition(joined)) return null;
+      return computed ? _serializePositionComputed(el, joined) : _serializePositionSpecified(joined);
+    };
+    // First section: [ <fill-rule> ] from <coordinate-pair>.
+    let h0 = _wsTokens(segs[0]);
+    let fill = null;
+    const f0 = h0.length ? h0[0].toLowerCase() : '';
+    if (f0 === 'nonzero' || f0 === 'evenodd') { fill = f0; h0 = h0.slice(1); }
+    if (h0.length < 1 || h0[0].toLowerCase() !== 'from') return null;
+    const fromCp = coordPair(h0.slice(1));
+    if (fromCp == null) return null;
+    const outCmds = [];
+    for (let s = 1; s < segs.length; s++) {
+      const t = _wsTokens(segs[s]);
+      if (!t.length) return null;
+      const kw = t[0].toLowerCase(), rest = t.slice(1);
+      const bt = rest.length ? rest[0].toLowerCase() : '';
+      if (kw === 'close') { if (rest.length) return null; outCmds.push('close'); continue; }
+      if (kw === 'move' || kw === 'line') {               // <by|to> <coordinate-pair>
+        if (rest.length !== 3 || (bt !== 'by' && bt !== 'to')) return null;
+        const cp = coordPair(rest.slice(1));
+        if (cp == null) return null;
+        outCmds.push(kw + ' ' + bt + ' ' + cp); continue;
+      }
+      if (kw === 'hline' || kw === 'vline') {             // <by|to> <length-percentage>
+        if (rest.length !== 2 || (bt !== 'by' && bt !== 'to') || !_isPosLP(rest[1])) return null;
+        outCmds.push(kw + ' ' + bt + ' ' + _opLp(rest[1], computed, emPx, lhPx)); continue;
+      }
+      if (kw === 'curve' || kw === 'smooth') {            // <endpoint> [with <cp> [/ <cp>]?]
+        if (rest.length < 3 || (bt !== 'by' && bt !== 'to')) return null;
+        const cp = coordPair(rest.slice(1, 3));
+        if (cp == null) return null;
+        const after = rest.slice(3);
+        let withClause = '';
+        if (after.length) {
+          if (after[0].toLowerCase() !== 'with') return null;
+          const groups = [[]];                             // split control-points on a `/` token
+          for (const tk of after.slice(1)) { if (tk === '/') groups.push([]); else groups[groups.length - 1].push(tk); }
+          if (groups.length > 2) return null;              // at most two control points
+          const cps = [];
+          for (const g of groups) { const c = ctrlPoint(g); if (c == null) return null; cps.push(c); }
+          withClause = ' with ' + cps.join(' / ');
+        } else if (kw === 'curve') return null;            // `with` is required for curve
+        outCmds.push(kw + ' ' + bt + ' ' + cp + withClause); continue;
+      }
+      if (kw === 'arc') {
+        // <endpoint> [of <lp>{1,2}] <arc-sweep>? <arc-size>? [rotate <angle>]?
+        if (rest.length < 3 || (bt !== 'by' && bt !== 'to')) return null;
+        const cp = coordPair(rest.slice(1, 3));
+        if (cp == null) return null;
+        let i = 3, radii = null;
+        if (i < rest.length && rest[i].toLowerCase() === 'of') {
+          i++; const r = [];
+          while (i < rest.length && r.length < 2 && _isPosLP(rest[i])) { r.push(rest[i]); i++; }
+          if (!r.length) return null;
+          radii = r;
+        }
+        let sweep = null, size = null, rot = null;
+        let l = i < rest.length ? rest[i].toLowerCase() : '';
+        if (l === 'cw' || l === 'ccw') { sweep = l; i++; l = i < rest.length ? rest[i].toLowerCase() : ''; }
+        if (l === 'large' || l === 'small') { size = l; i++; l = i < rest.length ? rest[i].toLowerCase() : ''; }
+        if (l === 'rotate') {
+          i++;
+          if (i >= rest.length) return null;
+          rot = rest[i];
+          if (!_ANGLE_RE.test(rot) && !/^(?:calc|min|max|clamp)\(/i.test(rot)) return null;
+          i++;
+        }
+        if (i !== rest.length) return null;                // leftover tokens → invalid
+        let out = 'arc ' + bt + ' ' + cp;
+        if (radii) out += ' of ' + radii.map((t2) => _opLp(t2, computed, emPx, lhPx)).join(' ');
+        if (sweep && sweep !== 'ccw') out += ' ' + sweep;  // ccw default elided
+        if (size && size !== 'small') out += ' ' + size;   // small default elided
+        if (rot != null) {
+          const isCalc = /^(?:calc|min|max|clamp)\(/i.test(rot);
+          const deg = _evalMath(rot, 0, { angle: true });
+          const specAngle = isCalc ? _canonMathExpr(rot) : _canonStandardValue(rot);
+          if (deg === null) out += ' rotate ' + specAngle;          // unresolvable → keep verbatim
+          else if (Math.abs(deg) > 1e-9) out += ' rotate ' + (computed ? _serAngle(deg) : specAngle);
+          // rotate 0deg is the default → elided in both specified and computed
+        }
+        outCmds.push(out); continue;
+      }
+      return null;                                          // unknown command keyword
+    }
+    const headSeg = (fill === 'evenodd' ? 'evenodd ' : '') + 'from ' + fromCp;
+    return 'shape(' + [headSeg, ...outCmds].join(', ') + ')';
+  }
+  return null;                                            // anything else invalid
 };
 // offset-path top level: none | <offset-path> || <coord-box>.
 const _serOffsetPath = (value, computed, el) => {
@@ -8666,7 +8769,6 @@ const _serOffsetPath = (value, computed, el) => {
     fn = { head: m[1].toLowerCase(), body: m[2] };
   }
   if (fn == null && box == null) return null;
-  if (fn && fn.head === 'shape') return v;               // shape() preserved verbatim (sequel)
   const emPx = computed ? _emPxOf(el) : 16;
   const lhPx = computed ? _lineHeightPx(el, emPx) : 0;
   let shape = null;
