@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #98).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #99).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-values/calc-infinity-nan-serialize-length.html` | 0/41 | **41/41** | ✅ 100% | **Quest #99 The Serialized Verdict.** Non-finite math in a SPECIFIED `<length>` value → canonical form via the `_canonMathExpr`/`_simpCalc` calc serializer: operand reorder (`calc(1px * NaN)`→`calc(NaN * 1px)`), abs-unit canon (`1in`→`1px`, `_ABS_LEN_PX` in `_parseCalcTree` opt-in), `infinity`/`-infinity`/`NaN` keywords, NaN-collapse of min()/max() across same-type units, redundant `1 *`/`calc()` wrapper drop. Wired (gated on a non-finite keyword) into `setProperty`/`_parseStyleDecls`. **+41.** |
+| `css/css-values/calc-infinity-nan-serialize-time.html` | 0/29 | **29/29** | ✅ 100% | **Quest #99 The Serialized Verdict.** Same serializer, `<time>` family (`animation-duration`): `ms`→`s` canon (`1ms * NaN`→`calc(NaN * 1s)`), keywords + folding. **+29.** |
 | `css/css-values/calc-infinity-nan-computed.html` | 0/48 | **48/48** | ✅ 100% | **Quest #98 The Clamped Verdict.** Non-finite math clamped at computed time (`_nfClamp`: NaN→0, +∞→1e30, −∞→−1e30) across the length (`_trComp`, incl. the mixed-`%` collapse), time (`_computeTimeValue`), scale-number (`_scaleComp`) & rotate-angle→identity (`_tfDeg`) paths; registered the `animation-*` longhands; `_balanceParens` on the time eval. **+48.** |
 | `css/css-sizing/parsing/max-width-computed.html` | 0/12 | **12/12** | ✅ 100% | **Quest #97 The Sized Verdict.** Registered `min/max-width/height` in `_GCS_DEFAULTS` (the `property in getComputedStyle` gate); `_computeSizeValue` keeps `%` symbolic, clamps negative→`0px`, resolves `fit-content()`'s arg. **+12.** |
 | `css/css-sizing/parsing/min-width-computed.html` | 0/11 | **11/11** | ✅ 100% | **Quest #97 The Sized Verdict.** **+11.** |

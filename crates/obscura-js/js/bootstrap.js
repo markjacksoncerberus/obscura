@@ -598,6 +598,7 @@ const _parseStyleDecls = (text) => {
       } else if (name === 'opacity') {
         value = _canonOpacitySpecified(value);
       }
+      value = _canonNonFiniteMath(name, value);   // non-finite <length>/<time> calc → canonical form
     }
     out.push({ name, value, important });
   }
@@ -681,6 +682,7 @@ class CSSStyleDeclaration {
         stored = _canonOpacitySpecified(stored);
       }
     }
+    if (!custom) stored = _canonNonFiniteMath(name, stored);  // non-finite <length>/<time> calc → canonical form
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
     // iterates _props in insertion order) resolves shared longhands last-write-wins
@@ -6054,6 +6056,11 @@ const _ANGLE_DEG = { deg: 1, grad: 0.9, rad: 180 / Math.PI, turn: 360 };
 // CSS <time> units → seconds (transition-delay/-duration computed values via
 // _evalMath `opts.time`; getComputedStyle serializes computed <time> in seconds).
 const _TIME_S = { s: 1, ms: 0.001 };
+// Absolute <length> units → px (the canonical <length> unit) for SPECIFIED-value
+// calc() simplification — `calc(1in * NaN)` serializes as `calc(NaN * 1px)`. The
+// relative units (em/rem/vw/… in `_LENGTH_PX`) are deliberately NOT here: they stay
+// symbolic until computed time resolves them against the element/viewport.
+const _ABS_LEN_PX = { px: 1, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 25.4 / 4, pt: 96 / 72, pc: 16 };
 // Unescape a CSS identifier: `\67` (hex, optional trailing whitespace) and
 // `\g` (literal). Used so an escaped function name like `r\67 b`/`r\gb`
 // resolves to `rgb` before we match it.
@@ -6814,7 +6821,8 @@ const _CALC_CONSTS = { infinity: Infinity, '-infinity': -Infinity, nan: NaN, pi:
 //   {k:'sum', terms:[{op,node}]}   op '+' | '-' (first term op '+')
 //   {k:'prod', facs:[{op,node}]}   op '*' | '/' (first factor op '*')
 //   {k:'fn', name, args:[node]}    a preserved function (sign/min/max/…)
-const _parseCalcTree = (str) => {
+const _parseCalcTree = (str, opts) => {
+  opts = opts || {};
   const s = String(str).replace(/\/\*[\s\S]*?\*\//g, '').trim();
   if (s === '') return null;
   const toks = [];
@@ -6839,6 +6847,11 @@ const _parseCalcTree = (str) => {
       // dropped unit-cancellation would corrupt the value — e.g. flip sin(l) into
       // sin(l°)). No specified colour test carries a non-deg angle unit in calc.
       if (_ANGLE_DEG[u] !== undefined) { v *= _ANGLE_DEG[u]; u = 'deg'; }
+      // SPECIFIED-value length/time canonicalization (opt-in, off for the colour
+      // path): absolute lengths → px, times → s, so same-type arithmetic folds
+      // (`min(NaN*1pt, NaN*1cm)` → `calc(NaN * 1px)`; `1ms * NaN` → `calc(NaN * 1s)`).
+      else if (opts.canonLen && _ABS_LEN_PX[u] !== undefined) { v *= _ABS_LEN_PX[u]; u = 'px'; }
+      else if (opts.canonTime && _TIME_S[u] !== undefined) { v *= _TIME_S[u]; u = 's'; }
       toks.push({ t: 'num', v, u }); i = j; continue;
     }
     if (/[a-zA-Z]/.test(c)) { let j = i; while (j < n && /[a-zA-Z0-9-]/.test(s[j])) j++; toks.push({ t: 'ident', v: s.slice(i, j).toLowerCase() }); i = j; continue; }
@@ -6889,6 +6902,16 @@ const _parseCalcTree = (str) => {
   if (failed || p !== toks.length) return null;
   return root;
 };
+// Classify a numeric-leaf unit into its CSS numeric TYPE (for cross-unit folding).
+// `_parseCalcTree` already canonicalizes angles→deg and (opt-in) abs-lengths→px &
+// times→s, so the only same-type/different-unit pairs that survive are length px-vs-
+// relative (em/rem/vw/…). Returns 'other' for unknown units (→ never cross-fold).
+const _LEN_UNIT = new Set(['px', 'em', 'rem', 'ex', 'ch', 'ic', 'cap', 'lh', 'rlh',
+  'vw', 'vh', 'vi', 'vb', 'vmin', 'vmax', 'svw', 'svh', 'lvw', 'lvh', 'dvw', 'dvh',
+  'cqw', 'cqh', 'cqi', 'cqb', 'cqmin', 'cqmax', 'in', 'cm', 'mm', 'q', 'pt', 'pc']);
+const _unitType = (u) => u === '' ? 'number' : u === '%' ? 'percent' : u === 'deg' ? 'angle'
+  : u === 's' ? 'time' : _LEN_UNIT.has(u) ? 'length' : 'other';
+const _CANON_TYPE_UNIT = { number: '', percent: '%', angle: 'deg', time: 's', length: 'px' };
 // Multiply / divide two numeric units (only one side ever carries a unit in valid
 // CSS — number×dimension→dimension, dimension÷sameDimension→number).
 const _mulUnit = (a, b) => (a === '' ? b : (b === '' ? a : a));
@@ -6918,10 +6941,21 @@ const _foldMathFn = (name, args) => {
   if (name === 'min' || name === 'max' || name === 'clamp') {
     if (name === 'clamp' && args.length !== 3) return null;
     const u = args[0].u;
-    if (!args.every((a) => a.u === u)) return null;
-    const vs = args.map((a) => a.v);
-    const v = name === 'min' ? Math.min(...vs) : name === 'max' ? Math.max(...vs) : Math.max(vs[0], Math.min(vs[1], vs[2]));
-    return { k: 'num', v, u };
+    if (args.every((a) => a.u === u)) {
+      const vs = args.map((a) => a.v);
+      const v = name === 'min' ? Math.min(...vs) : name === 'max' ? Math.max(...vs) : Math.max(vs[0], Math.min(vs[1], vs[2]));
+      return { k: 'num', v, u };
+    }
+    // Mixed units of the same TYPE (length px-vs-em) stay symbolic until computed
+    // time — EXCEPT when a NaN is present in a min()/max(): the comparison is then
+    // indeterminate regardless of the unresolved units, so it collapses to NaN at the
+    // type's canonical unit (`min(NaN*2px, NaN*4em)` → `calc(NaN * 1px)`). clamp()
+    // never cross-folds (`clamp(NaN*2em, NaN*4px, NaN*8pt)` keeps its three args).
+    if (name !== 'clamp' && args.some((a) => Number.isNaN(a.v))) {
+      const t = _unitType(u);
+      if (t !== 'other' && args.every((a) => _unitType(a.u) === t)) return { k: 'num', v: NaN, u: _CANON_TYPE_UNIT[t] };
+    }
+    return null;
   }
   if (name === 'abs') return args.length === 1 ? { k: 'num', v: Math.abs(args[0].v), u: args[0].u } : null;
   if (name === 'sign') return args.length === 1 ? { k: 'num', v: Math.sign(args[0].v), u: '' } : null;
@@ -6994,7 +7028,10 @@ const _simpCalc = (node) => {
   }
   if (rest.length === 0) return { k: 'num', v: coef, u: cu };
   const out = [];
-  if (hasNum) out.push({ op: '*', node: { k: 'num', v: coef, u: cu } });
+  // Drop a redundant unitless `1 *` (multiplicative identity) so `calc(1 * clamp(…))`
+  // reduces to the bare `clamp(…)`. Only when the surviving first factor is a `*`
+  // (a leading `/` must keep its numerator — `calc(1 / l)` ≠ `calc(l)`).
+  if (hasNum && !(coef === 1 && cu === '' && rest[0].op === '*')) out.push({ op: '*', node: { k: 'num', v: coef, u: cu } });
   for (const r of rest) out.push(r);
   out[0] = { op: '*', node: out[0].node };
   if (out.length === 1) return out[0].node;
@@ -7039,14 +7076,18 @@ const _serCalcRoot = (node) => {
 };
 // Canonicalize a math function (`calc(…)`/`min(…)`/…) string. Returns the
 // canonical serialization, or null if `str` isn't a parseable math function.
-const _canonMathExpr = (str) => {
+const _canonMathExpr = (str, opts) => {
   const s = String(str).trim();
   if (!/^[a-zA-Z][a-zA-Z-]*\(/.test(s) || !s.endsWith(')')) return null;
-  const root = _parseCalcTree(s);
+  const root = _parseCalcTree(s, opts);
   if (root === null) return null;
   const simp = _simpCalc(root);
-  if (root.k === 'fn' && root.name === 'calc') return 'calc(' + _serCalcRoot(simp) + ')';
-  if (simp.k === 'fn') return _serCalcTree(simp);
+  // A top-level math function (min/max/clamp/…) serializes WITHOUT a redundant calc()
+  // wrapper. The generic colour path keeps its legacy rule (shed the wrapper only when
+  // the INPUT wasn't a calc()); the non-finite length/time path (canonLen/canonTime)
+  // always sheds it — `calc(1 * clamp(…))` → `clamp(…)`, per CSS Values 4 serialization.
+  const bare = !!(opts && (opts.canonLen || opts.canonTime));
+  if (simp.k === 'fn' && simp.name !== 'calc' && (bare || !(root.k === 'fn' && root.name === 'calc'))) return _serCalcTree(simp);
   return 'calc(' + _serCalcRoot(simp) + ')';
 };
 // At SPECIFIED time a math function reduces to a constant ONLY if it folds to a
@@ -7060,6 +7101,24 @@ const _calcConstValue = (str) => {
   if (root === null) return null;
   const simp = _simpCalc(root);
   return simp.k === 'num' ? { v: simp.v, u: simp.u } : null;
+};
+// SPECIFIED-value canonicalization of a NON-FINITE math function on a <length> or
+// <time> property (CSS Values 4 §calc-type-checking serialization): fold numeric
+// sub-expressions, move a product's number first, canonicalize absolute units
+// (in/cm/pt→px, ms→s), and emit the `infinity`/`-infinity`/`NaN` keywords —
+// `calc(1px * NaN)` → `calc(NaN * 1px)`, `calc(1s * infinity)` → `calc(infinity * 1s)`.
+// GATED on a non-finite keyword so every FINITE calc serializes byte-identically
+// through the plain `_canonStandardValue` path: the generic specified calc serializer
+// is deliberately left untouched (folding finite `calc(1px + 2px)`→`calc(3px)` is a
+// separate, broader change — see `_canonMathExpr`'s note). Returns `v` unchanged when
+// it isn't a non-finite math function on a known length/time property.
+const _NONFINITE_KW_RE = /\b(?:infinity|nan)\b/i;
+const _canonNonFiniteMath = (name, v) => {
+  if (!_NONFINITE_KW_RE.test(v) || !_MATHFN_NAME_RE.test(v)) return v;
+  const isLen = _LENGTH_COMPUTED_PROPS.has(name) || _SIZE_COMPUTED_PROPS.has(name);
+  const isTime = _TIME_COMPUTED_PROPS.has(name);
+  if (!isLen && !isTime) return v;
+  return _canonMathExpr(v, { canonLen: isLen, canonTime: isTime }) || v;
 };
 // ── CSS Values 4 math-function GRAMMAR VALIDATION (§10 type-checking) ──────────
 // A math function is invalid when its grammar is malformed (`sin( )`, `round(1,,2)`,
