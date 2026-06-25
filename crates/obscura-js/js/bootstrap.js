@@ -5567,6 +5567,11 @@ const _GCS_DEFAULTS = {
   // css-transitions — none inherit. (The `transition` shorthand default is above.)
   'transition-delay': '0s', 'transition-duration': '0s',
   'transition-property': 'all', 'transition-timing-function': 'ease',
+  // css-animations — none inherit. (The `animation` shorthand default is above.)
+  'animation-delay': '0s', 'animation-duration': '0s',
+  'animation-name': 'none', 'animation-timing-function': 'ease',
+  'animation-iteration-count': '1', 'animation-direction': 'normal',
+  'animation-fill-mode': 'none', 'animation-play-state': 'running',
   // css-will-change — does not inherit.
   'will-change': 'auto',
   // css-color-adjust — every property in this family inherits. color-adjust is a
@@ -10098,6 +10103,13 @@ const _canonTfArg = (t, type) => {
     default: return t;                                     // len/lp kept verbatim
   }
 };
+// CSS Values 4 §calc-type-checking: a non-finite math result is clamped at
+// computed-value time — NaN → 0, +∞ → the largest finite value the engine
+// represents, −∞ → the most negative. (A finite value passes through unchanged.)
+// `1e30` is comfortably finite yet far above any real layout magnitude, which is
+// all the conformance tests require (`isFinite` + `>= 1e6`).
+const _CALC_CLAMP = 1e30;
+const _nfClamp = (v) => Number.isNaN(v) ? 0 : v === Infinity ? _CALC_CLAMP : v === -Infinity ? -_CALC_CLAMP : v;
 // Resolve helpers for the COMPUTED matrix (null = unresolvable → caller falls back).
 const _tfNum = (t) => {
   t = t.trim();
@@ -10106,7 +10118,10 @@ const _tfNum = (t) => {
   return _evalMath(t, 0, {});
 };
 const _tfLenPx = (t) => { t = t.trim(); return _isFilterZero(t) ? 0 : _evalMath(t, 0, { lengths: true }); };
-const _tfDeg = (t) => { t = t.trim(); return _isFilterZero(t) ? 0 : _evalMath(t, 0, { angle: true }); };
+// A non-finite rotation angle (calc(infinity·1deg)/NaN·…) yields the identity
+// matrix — clamp it to 0deg so the built matrix stays finite (cos(±∞)/cos(NaN)
+// would otherwise poison it to NaN). null (unparseable) still falls back.
+const _tfDeg = (t) => { t = t.trim(); if (_isFilterZero(t)) return 0; const d = _evalMath(t, 0, { angle: true, nonFinite: true }); return d == null ? null : (isFinite(d) ? d : 0); };
 // 4×4 matrix in matrix3d() column-major order (index = col*4 + row). Build each
 // function's matrix, accumulate by post-multiplication, serialize as matrix()/matrix3d().
 const _TF_ID = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
@@ -10215,8 +10230,7 @@ const _scaleComp = (t, el, computed) => {
     if (computed) {
       const v = _evalMath(t, 1, { lengths: true, angle: true, emPx: _emPxOf(el), nonFinite: true });
       if (v === null) return _canonMathExpr(t) || t;
-      if (Number.isNaN(v)) return '0';                          // NaN scale factor → 0 (matches browsers)
-      if (!isFinite(v)) return _canonMathExpr(t) || t;          // ±∞ keeps its calc(infinity) form
+      if (!isFinite(v)) return _serNumber(_nfClamp(v));         // NaN → 0, ±∞ → clamped finite
       return _serNumber(v);
     }
     return _canonMathExpr(t) || t;
@@ -10333,19 +10347,23 @@ const _trIsZeroLen = (t) => {
 // the length-property resolver passes it so `min(1vh)`/`12vw` collapse to px.
 const _trComp = (t, el, computed, vp) => {
   t = t.trim();
-  const lenOpts = () => (vp ? { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh }
-                            : { lengths: true, emPx: _emPxOf(el) });
+  const lenOpts = () => (vp ? { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, nonFinite: true }
+                            : { lengths: true, emPx: _emPxOf(el), nonFinite: true });
   if (_FILTER_MATH_RE.test(t)) {
     if (/%/.test(t)) {                                        // mixed %+<length> → canonical calc(P% ± Lpx)
+      // A non-finite result (infinity/NaN coefficient) can no longer be kept as a
+      // symbolic calc(P% ± Lpx) — it collapses to a clamped <length>. Probe with a
+      // positive %-base so `infinity * 1%` → ∞ (a 0 base would give ∞·0 = NaN).
+      if (computed) { const pv = _evalMath(t, 1, lenOpts()); if (pv !== null && !isFinite(pv)) return _serNumber(_nfClamp(pv)) + 'px'; }
       const mixed = _resolvePctLengthCalc(t, computed ? _emPxOf(el) : undefined);
       return mixed !== null ? mixed : (_canonMathExpr(t) || t);
     }
-    if (computed) { const v = _evalMath(t, 0, lenOpts()); if (v !== null) return _serNumber(v) + 'px'; }
+    if (computed) { const v = _evalMath(t, 0, lenOpts()); if (v !== null) return _serNumber(_nfClamp(v)) + 'px'; }
     return _canonMathExpr(t) || t;
   }
   if (_FILTER_PCT_RE.test(t)) return _serNumber(parseFloat(t)) + '%';
   if (_isFilterZero(t)) return computed ? '0px' : _serNumber(parseFloat(t)) + 'px';
-  if (computed) { const v = _evalMath(t, 0, lenOpts()); if (v !== null) return _serNumber(v) + 'px'; }
+  if (computed) { const v = _evalMath(t, 0, lenOpts()); if (v !== null) return _serNumber(_nfClamp(v)) + 'px'; }
   const lm = _FILTER_LEN_RE.exec(t);                          // specified: keep the unit, canon the number
   return lm ? _serNumber(parseFloat(lm[1])) + lm[2] : t;
 };
@@ -10522,9 +10540,11 @@ const _computeIntegerValue = (el, v) => {
 const _computeTimeValue = (v) => {
   const s = String(v).trim();
   if (_TF_VAR_RE.test(s) || !/[\d(]/.test(s)) return null;
-  const sec = _evalMath(s, 0, { time: true });
-  if (sec === null || !isFinite(sec)) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
-  return _serNumber(sec) + 's';
+  // The CSS tokenizer auto-closes blocks left open at EOF (e.g. `calc(max(…, 10s)`,
+  // one `)` short) — mirror that before evaluating.
+  const sec = _evalMath(_balanceParens(s), 0, { time: true, nonFinite: true });
+  if (sec === null) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
+  return _serNumber(_nfClamp(sec)) + 's';
 };
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
