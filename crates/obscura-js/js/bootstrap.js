@@ -6723,6 +6723,25 @@ const _evalMath = (input, percentBase, opts) => {
           p++;
           return [_roundOp(strat, rA[0], rB[0]), rA[1] || rB[1]];
         }
+        // clamp() accepts the `none` keyword in its MIN/MAX slots (CSS Values 4
+        // §funcdef-clamp) — `none` removes that bound. Evaluating it as ∓∞ lets the
+        // existing `max(lo, min(val, hi))` collapse correctly: a `none` low → −∞
+        // (no floor), a `none` high → +∞ (no ceiling). Only clamp takes `none`, so we
+        // peel it here per-arg; without this the bare `none` ident would fail the eval
+        // and the computed value would fall back to the symbolic `calc(…)` form.
+        if (name === 'clamp') {
+          const ca = [];
+          for (let ai = 0; ai < 3; ai++) {
+            if (ai > 0) { if (!peek() || peek().t !== ',') return tfail(); p++; }
+            const nx = peek(), after = toks[p + 1];
+            if (nx && nx.t === 'ident' && nx.v === 'none' && (!after || after.t === ',' || after.t === ')')) {
+              p++; ca.push([ai === 2 ? Infinity : -Infinity, false]);
+            } else ca.push(parseExpr());
+          }
+          if (failed || !peek() || peek().t !== ')') return tfail();
+          p++;
+          return [Math.max(ca[0][0], Math.min(ca[1][0], ca[2][0])), ca.some((x) => x[1])];
+        }
         // sin/cos/tan take an <angle>|<number>: parse the argument with angle
         // units enabled so a bare number reads as radians and an angle resolves.
         const trig = name === 'sin' || name === 'cos' || name === 'tan';
@@ -6912,10 +6931,13 @@ const _LEN_UNIT = new Set(['px', 'em', 'rem', 'ex', 'ch', 'ic', 'cap', 'lh', 'rl
 const _unitType = (u) => u === '' ? 'number' : u === '%' ? 'percent' : u === 'deg' ? 'angle'
   : u === 's' ? 'time' : _LEN_UNIT.has(u) ? 'length' : 'other';
 const _CANON_TYPE_UNIT = { number: '', percent: '%', angle: 'deg', time: 's', length: 'px' };
-// Multiply / divide two numeric units (only one side ever carries a unit in valid
-// CSS — number×dimension→dimension, dimension÷sameDimension→number).
-const _mulUnit = (a, b) => (a === '' ? b : (b === '' ? a : a));
-const _divUnit = (a, b) => (b === '' ? a : (a === b ? '' : a));
+// Multiply / divide two numeric units. The clean cases fold: number×dimension→
+// dimension, dimension÷number→dimension, dimension÷sameDimension→number. Two
+// DIFFERENT non-empty units (e.g. px·em or px÷em) form a compound that can't reduce
+// to a single numeric leaf at specified time (a relative unit like em is unresolved)
+// — return `null` so the product fold keeps the expression symbolic.
+const _mulUnit = (a, b) => (a === '' ? b : (b === '' ? a : null));
+const _divUnit = (a, b) => (b === '' ? a : (a === b ? '' : null));
 // Fold a math function whose arguments have all simplified to numeric leaves into
 // a single numeric leaf (CSS Values 4 "simplify a calculation tree"). Returns the
 // folded `{k:'num',v,u}` or null when it can't fold — a non-numeric argument, a
@@ -7071,14 +7093,20 @@ const _simpCalc = (node, sort) => {
   }
   // product
   const facs = node.facs.map((f) => ({ op: f.op, node: _simpCalc(f.node, sort) }));
-  let coef = 1, cu = '', hasNum = false; const rest = [];
+  let coef = 1, cu = '', hasNum = false, badUnit = false; const rest = [];
   for (const f of facs) {
     if (f.node.k === 'num') {
+      const nu = f.op === '*' ? _mulUnit(cu, f.node.u) : _divUnit(cu, f.node.u);
+      if (nu === null) { badUnit = true; break; }   // compound units (px/em·px) — see _mulUnit/_divUnit
       hasNum = true;
-      if (f.op === '*') { coef *= f.node.v; cu = _mulUnit(cu, f.node.u); }
-      else { coef /= f.node.v; cu = _divUnit(cu, f.node.u); }
+      coef = f.op === '*' ? coef * f.node.v : coef / f.node.v;
+      cu = nu;
     } else rest.push(f);
   }
+  // A product mixing incompatible dimensional units (e.g. `1600px / 1em * 1px`) is
+  // dimensionally valid but can't reduce to one numeric leaf at specified time (em
+  // is unresolved). Keep it symbolic so the COMPUTED path resolves em and folds it.
+  if (badUnit) return { k: 'prod', facs };
   if (rest.length === 0) return { k: 'num', v: coef, u: cu };
   const out = [];
   // Drop a redundant unitless `1 *` (multiplicative identity) so `calc(1 * clamp(…))`

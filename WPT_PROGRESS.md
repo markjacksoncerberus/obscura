@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-25 (Quest #100).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-25 (Quest #101).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-values/clamp-integer-computed.html` | 1/6 | **6/6** | ✅ 100% | **Quest #101 The Boundless Verdict.** `clamp(none, …)` resolves at COMPUTED time: `_evalMath` now evaluates the `none` keyword in clamp's min/max slots as ∓∞ (a `none` low → −∞, a `none` high → +∞), so `clamp(none, 30, 33)` on `z-index` folds to the bare integer `30` instead of falling back to the symbolic `calc(30)`. **+5.** |
+| `css/css-values/clamp-length-computed.html` | 22/24 | **24/24** | ✅ 100% | **Quest #101 The Boundless Verdict.** Same `none` sentinel in `_evalMath` (length path via `_trComp`) PLUS a mixed-unit product fix: `_mulUnit`/`_divUnit` now return `null` for two different non-empty units (px·em, px/em) so the product fold keeps `1600px / 1em * 1px` symbolic at specified time (it can't reduce — em is unresolved) and the computed path resolves em→px later (`clamp(1600px/1em*1px, 1em/1rem*1px, none)`→`80px` at font-size 20px). **+2.** |
 | `css/css-values/clamp-length-serialize.html` | 4/50 | **50/50** | ✅ 100% | **Quest #100 The Folded Verdict.** Finite `<length>` math folds at specified time: `clamp(1px,2px,3px)`→`calc(2px)`, `clamp(none,33px,30px)`→`calc(30px)` (`none` sentinels in `_foldMathFn`), `calc(0px ± clamp(…))` arithmetic, nested `calc(calc(…))`. Lifted the non-finite gate (`_canonNonFiniteMath`→`_canonLengthTimeMath`) so all length/time math routes through `_canonMathExpr`. **+46.** |
 | `css/css-values/calc-dimension-serialization-order.html` | 0/44 | **44/44** | ✅ 100% | **Quest #100 The Folded Verdict.** Canonical sum-ordering (`_simpSumSorted`, CSS Values 4 §sort-a-calculations-children): a sum serializes number → percentage → dimensions alphabetical by unit (`calc(1px + 1em + 3%)`→`calc(3% + 1em + 1px)`). Gated behind the length/time `sort` path so the colour path keeps input order. **+44.** |
 | `css/css-values/minmax-length-serialize.html` | 13/24 | **23/24** | 🔶 96% | **Quest #100 The Folded Verdict.** `min(1px)`→`calc(1px)`, `min(1in)`→`calc(96px)`, `calc(1px + min(1in,100px))`→`calc(97px)`. Last fail: nested-product coefficient fold (`2*(0.2*X)`→`0.4*X`, needs product flattening). **+10.** |
