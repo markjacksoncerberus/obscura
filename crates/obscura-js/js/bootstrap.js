@@ -6681,7 +6681,12 @@ const _evalMath = (input, percentBase, opts) => {
         // opts.lengths since a <time> context admits no <length>.
         if (opts.time) {
           const sf = _TIME_S[tok.unit];
-          return sf !== undefined ? [tok.v * sf, false] : tfail();
+          if (sf !== undefined) return [tok.v * sf, false];
+          // Not a <time> unit. Time-only callers have no <length> context, so fail as
+          // before; only when `lengths` is ALSO enabled (atan2's same-typed args may be
+          // <length>s) do we fall through to the length branch below — byte-identical
+          // for every existing caller, none of which sets both flags.
+          if (!opts.lengths) return tfail();
         }
         if (!opts.lengths) return tfail();
         // `opts.emPx`/`opts.lhPx` resolve em / lh against the element's computed
@@ -10431,7 +10436,16 @@ const _rotKind = (t) => {
   if (low === 'x' || low === 'y' || low === 'z') return 'kw';
   const lm = _FILTER_LEN_RE.exec(t);
   if (lm && _ANGLE_DEG[lm[2].toLowerCase()] !== undefined) return 'angle';
-  if (_FILTER_MATH_RE.test(t)) return /\d*\.?\d+\s*(?:deg|grad|rad|turn)\b/i.test(t) ? 'angle' : 'num';
+  if (_FILTER_MATH_RE.test(t)) {
+    // A math function's <angle>-ness is its RESULT TYPE, not whether it textually
+    // mentions an angle unit: `acos(1)`/`atan2(1px,-1px)` yield an <angle> with no
+    // `deg` in sight, while `sin(45deg)` yields a <number> despite containing one.
+    // Type the calc tree (rotate accepts no `%`, so pctType=null); fall back to the
+    // literal heuristic only when the type is unknown (var()/sibling-index()/…).
+    const root = _parseCalcTree(t);
+    if (root) { const ty = _mt(root, null); if (ty === 'angle') return 'angle'; if (ty === 'number') return 'num'; }
+    return /\d*\.?\d+\s*(?:deg|grad|rad|turn)\b/i.test(t) ? 'angle' : 'num';
+  }
   if (_FILTER_NUM_RE.test(t)) return 'num';
   return 'bad';
 };
@@ -10458,13 +10472,19 @@ const _rotAxisVec = (p) => {
   if (p.kw === 'z' || (p.kw === null && p.nums.length === 0)) return [0, 0, 1];
   return p.nums.map(parseFloat);
 };
-const _rotSerAngle = (angTok, computed, negate) => {
+const _rotSerAngle = (angTok, computed, negate, el) => {
   angTok = angTok.trim();
+  // `lengths`/`time`/`emPx`/`vw`/`vh` let an angle-typed math fn whose arguments
+  // are <length>s / <time>s resolve — `atan2(1px,-1px)`, `atan2(1em,-1em)`,
+  // `atan2(1vh,-1vh)`, `atan2(1s,-1s)` all reduce to an <angle> (the like units
+  // cancel as a ratio). `angle` units win first; time then length.
+  const vp = _vpUnits();
+  const angOpts = { angle: true, lengths: true, time: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh };
   if (_FILTER_MATH_RE.test(angTok)) {
-    if (computed) { let d = _evalMath(angTok, 0, { angle: true }); if (d === null) return _canonMathExpr(angTok) || angTok; if (negate) d = -d; return _serNumber(d) + 'deg'; }
+    if (computed) { let d = _evalMath(angTok, 0, angOpts); if (d === null) return _canonMathExpr(angTok) || angTok; if (negate) d = -d; return _serNumber(d) + 'deg'; }
     return negate ? 'calc(-1 * (' + (_canonMathExpr(angTok) || angTok) + '))' : (_canonMathExpr(angTok) || angTok);
   }
-  if (computed) { let d = _evalMath(angTok, 0, { angle: true }) || 0; if (negate) d = -d; return _serNumber(d) + 'deg'; }
+  if (computed) { let d = _evalMath(angTok, 0, angOpts) || 0; if (negate) d = -d; return _serNumber(d) + 'deg'; }
   const lm = _FILTER_LEN_RE.exec(angTok);
   if (!lm) return angTok;
   let num = parseFloat(lm[1]); if (negate) num = -num;
@@ -10475,7 +10495,7 @@ const _canonRotate = (value, el, computed) => {
   if (!p) return value;
   if (p.none) return 'none';
   const [x, y, z] = _rotAxisVec(p);
-  const ang = (neg) => _rotSerAngle(p.angle, computed, neg);
+  const ang = (neg) => _rotSerAngle(p.angle, computed, neg, el);
   if (x === 0 && y === 0 && z === 0) return '0 0 0 ' + ang(false);
   if (x === 0 && y === 0) return ang(z < 0);                  // z axis → just <angle>
   if (y === 0 && z === 0) return 'x ' + ang(x < 0);

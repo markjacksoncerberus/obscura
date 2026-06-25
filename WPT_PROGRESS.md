@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-25 (Quest #102).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-25 (Quest #104).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-values/acos-asin-atan-atan2-computed.html` | 11/50 | **46/50** | 🔶 92% | **Quest #104 The Angled Verdict.** `rotate` now accepts angle-VALUED math fns with no literal angle unit: `_rotKind` classifies a math token by its calc-tree RESULT TYPE (`_parseCalcTree`→`_mt`) not by whether the text mentions `deg` — so `acos(1)`/`atan2(0,0)`/`calc(asin(sin(pi/2)))` are `<angle>`s and `sin(45deg)` is correctly a `<number>`. `_rotSerAngle` resolves `<length>`/`<time>`/viewport args (`atan2(1px,-1px)`, `atan2(1s,-1s)`, `atan2(1vh,-1vh)`→`135deg`). Cap: `sibling-index()` (4 fails). **+35.** |
+| `css/css-values/signs-abs-computed.html` | 164/233 | **167/233** | 🔶 72% | **Quest #104 The Angled Verdict (bonus).** Same rotate type-aware classification + mixed length/time eval lifted 3 more `abs()`/`sign()`-on-`rotate` rows. **+3.** |
 | `css/css-values/clamp-integer-computed.html` | 1/6 | **6/6** | ✅ 100% | **Quest #101 The Boundless Verdict.** `clamp(none, …)` resolves at COMPUTED time: `_evalMath` now evaluates the `none` keyword in clamp's min/max slots as ∓∞ (a `none` low → −∞, a `none` high → +∞), so `clamp(none, 30, 33)` on `z-index` folds to the bare integer `30` instead of falling back to the symbolic `calc(30)`. **+5.** |
 | `css/css-values/clamp-length-computed.html` | 22/24 | **24/24** | ✅ 100% | **Quest #101 The Boundless Verdict.** Same `none` sentinel in `_evalMath` (length path via `_trComp`) PLUS a mixed-unit product fix: `_mulUnit`/`_divUnit` now return `null` for two different non-empty units (px·em, px/em) so the product fold keeps `1600px / 1em * 1px` symbolic at specified time (it can't reduce — em is unresolved) and the computed path resolves em→px later (`clamp(1600px/1em*1px, 1em/1rem*1px, none)`→`80px` at font-size 20px). **+2.** |
 | `css/css-values/clamp-length-serialize.html` | 4/50 | **50/50** | ✅ 100% | **Quest #100 The Folded Verdict.** Finite `<length>` math folds at specified time: `clamp(1px,2px,3px)`→`calc(2px)`, `clamp(none,33px,30px)`→`calc(30px)` (`none` sentinels in `_foldMathFn`), `calc(0px ± clamp(…))` arithmetic, nested `calc(calc(…))`. Lifted the non-finite gate (`_canonNonFiniteMath`→`_canonLengthTimeMath`) so all length/time math routes through `_canonMathExpr`. **+46.** |

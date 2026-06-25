@@ -134,6 +134,32 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-25 (Quest #104 The Angled Verdict — inverse-trig angles in `rotate`, +38):**
+The named #103 "next leverage" #3 (the computed inverse-trig tail). `acos-asin-atan-atan2-computed`
+sat at 11/50: the `rotate` property REJECTED angle-valued math functions that carry no literal angle
+unit — `acos(1)`, `atan2(0,0)`, `calc(asin(sin(pi/2)))`, `atan2(1px,-1px)` — computing `none` (the
+default) instead of the `<angle>`. Root cause: `_rotKind` decided a math token's angle-ness by a
+LITERAL-TEXT heuristic (does the string contain `deg|grad|rad|turn`?), which both rejected unit-free
+angle results AND would mis-accept a number-valued `sin(45deg)`. THE FIX (pure JS, additive,
+`bootstrap.js`): (1) `_rotKind` now classifies a math token by its calc-tree RESULT TYPE
+(`_parseCalcTree`→`_mt`, the same lattice `_mathValid` uses, `pctType=null`) — `asin`/`acos`/`atan`
+:`<number>`→`<angle>`, `atan2`:two same-typed→`<angle>`, `sin`/`cos`/`tan`→`<number>`; the literal
+heuristic survives only as the fallback for an `unknown` type (`var()`/`sibling-index()`). (2)
+`_rotSerAngle` threads `el` and resolves `<length>`/`<time>`/viewport arguments
+(`angle:true, lengths:true, time:true, emPx, vw, vh`) so `atan2(1px,-1px)`/`atan2(1s,-1s)`/
+`atan2(1vh,-1vh)`→`135deg` (like units cancel as a ratio). (3) `_evalMath`'s `opts.time` branch now
+FALLS THROUGH to the length branch for a non-`<time>` unit — but ONLY when `opts.lengths` is also set
+(`if (!opts.lengths) return tfail()` guards it), so every existing time-only caller is byte-identical
+and only the new rotate-angle eval gains mixed length/time resolution. **acos-asin-atan-atan2-computed
+11→46 (+35); signs-abs-computed 164→167 (+3 bonus) = +38.** **ZERO regressions**: rotate/scale/
+translate-parsing-computed 23/38/19, rotate-parsing-valid 23, sin-cos-tan-computed 26, round-mod-rem-
+computed 227, calc-infinity-nan-computed 48, hypot-pow-sqrt-computed 43, signs-abs-serialize 16,
+classlist 1420, createElement 147 all held. **Caps / Next:** `sibling-index()` (CSS Values 5
+tree-counting) — the lone `acos…` tail (4 fails) and a RECURRING tail across the whole computed
+css-values realm; needs the element's 1-based sibling index plumbed into `_evalMath` (today a pure
+string evaluator with no DOM context). Then `%`→used-px (layout); `border`→longhand expansion. Scroll
+`tickets/104-the-angled-verdict.md`.
+
 **Session 2026-06-25 (Quest #103 The Bordered Verdict — calc-in-shorthand: line-width math in border/outline/column-rule, +1):**
 The named #102 "next leverage" #1 — the standing `calc-nesting` 6/8 cap. The `border` shorthand value
 `calc(calc(10px)) solid pink` echoed its nested calc verbatim instead of canonicalizing to
