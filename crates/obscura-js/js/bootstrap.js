@@ -7092,7 +7092,23 @@ const _simpCalc = (node, sort) => {
     return { k: 'sum', terms: out };
   }
   // product
-  const facs = node.facs.map((f) => ({ op: f.op, node: _simpCalc(f.node, sort) }));
+  let facs = node.facs.map((f) => ({ op: f.op, node: _simpCalc(f.node, sort) }));
+  // Flatten a nested product factor so its coefficient combines with this level's
+  // (`2 * (0.2 * min(1em,1px))` → `0.4 * min(1em,1px)`). A child product only survives
+  // simplification when it still holds a symbol/function (a fully-numeric one already
+  // folded to a single leaf above), so its numeric coefficient is stranded one level
+  // down until we inline it. Inner factor ops carry over under `*`; under `/` they
+  // invert (`x / (a*b)` = `x/a/b`, `x / (a/b)` = `x/a*b`). Gated on `sort` (the
+  // length/time canon path) so the colour path stays byte-identical.
+  if (sort && facs.some((f) => f.node.k === 'prod')) {
+    const flat = [];
+    for (const f of facs) {
+      if (f.node.k === 'prod') {
+        for (const inner of f.node.facs) flat.push({ op: f.op === '/' ? (inner.op === '*' ? '/' : '*') : inner.op, node: inner.node });
+      } else flat.push(f);
+    }
+    facs = flat;
+  }
   let coef = 1, cu = '', hasNum = false, badUnit = false; const rest = [];
   for (const f of facs) {
     if (f.node.k === 'num') {

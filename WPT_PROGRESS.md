@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-25 (Quest #101).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-25 (Quest #102).
 
 ## Scoreboard
 
@@ -20,7 +20,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-25 (Quest #101).
 | `css/css-values/clamp-length-computed.html` | 22/24 | **24/24** | ✅ 100% | **Quest #101 The Boundless Verdict.** Same `none` sentinel in `_evalMath` (length path via `_trComp`) PLUS a mixed-unit product fix: `_mulUnit`/`_divUnit` now return `null` for two different non-empty units (px·em, px/em) so the product fold keeps `1600px / 1em * 1px` symbolic at specified time (it can't reduce — em is unresolved) and the computed path resolves em→px later (`clamp(1600px/1em*1px, 1em/1rem*1px, none)`→`80px` at font-size 20px). **+2.** |
 | `css/css-values/clamp-length-serialize.html` | 4/50 | **50/50** | ✅ 100% | **Quest #100 The Folded Verdict.** Finite `<length>` math folds at specified time: `clamp(1px,2px,3px)`→`calc(2px)`, `clamp(none,33px,30px)`→`calc(30px)` (`none` sentinels in `_foldMathFn`), `calc(0px ± clamp(…))` arithmetic, nested `calc(calc(…))`. Lifted the non-finite gate (`_canonNonFiniteMath`→`_canonLengthTimeMath`) so all length/time math routes through `_canonMathExpr`. **+46.** |
 | `css/css-values/calc-dimension-serialization-order.html` | 0/44 | **44/44** | ✅ 100% | **Quest #100 The Folded Verdict.** Canonical sum-ordering (`_simpSumSorted`, CSS Values 4 §sort-a-calculations-children): a sum serializes number → percentage → dimensions alphabetical by unit (`calc(1px + 1em + 3%)`→`calc(3% + 1em + 1px)`). Gated behind the length/time `sort` path so the colour path keeps input order. **+44.** |
-| `css/css-values/minmax-length-serialize.html` | 13/24 | **23/24** | 🔶 96% | **Quest #100 The Folded Verdict.** `min(1px)`→`calc(1px)`, `min(1in)`→`calc(96px)`, `calc(1px + min(1in,100px))`→`calc(97px)`. Last fail: nested-product coefficient fold (`2*(0.2*X)`→`0.4*X`, needs product flattening). **+10.** |
+| `css/css-values/minmax-length-serialize.html` | 13/24 | **24/24** | ✅ 100% | **Quest #102 The Flattened Verdict.** Nested-product coefficient fold: `_simpCalc` flattens a child product into its parent so stranded coefficients combine (`calc(2 * (.2 * min(1em,1px)) + 1px)`→`calc(1px + (0.4 * min(1em,1px)))`). Inner factor ops carry over under `*`, invert under `/`. Gated behind the length/time `sort` path. **+1** (#100 had taken this to 23/24). |
 | `css/css-values/minmax-time-serialize.html` | 11/22 | **22/22** | ✅ 100% | **Quest #100 The Folded Verdict.** Same folding in the `<time>` family (`ms`→`s` canon). **+11.** |
 | `css/css-values/calc-nesting.html` | 0/8 | **6/8** | 🔶 75% | **Quest #100 The Folded Verdict.** `calc(20px + calc(80px))`→`calc(100px)`, `calc(calc(100px))`→`calc(100px)`, `calc(calc(2)*calc(50px))`→`calc(100px)`. Caps: calc-in-shorthand (`calc(calc(10px)) solid pink`), `%`→used-px (`calc(60% - 20px)`→`100px`, layout). **+6.** |
 | `css/css-values/clamp-none-whitespace.html` | 0/3 | **3/3** | ✅ 100% | **Quest #100 The Folded Verdict.** `clamp(none,5px,10px)` now accepted + folds deterministically (`min`/`max` of the surviving bound), so whitespace variants serialize identically. **+3.** |
