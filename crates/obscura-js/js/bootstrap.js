@@ -6718,6 +6718,19 @@ const _evalMath = (input, percentBase, opts) => {
       const name = tok.v;
       if (toks[p + 1] && toks[p + 1].t === '(') {
         p += 2; // consume the function name and its '('
+        // sibling-index()/sibling-count() (CSS Values 5 §tree-counting) are zero-arg
+        // <integer> functions substituted at computed-value time. The caller resolves
+        // the element's real DOM position into `opts.siblingIndex`/`siblingCount`; with
+        // no element (a pure grammar-validity probe) `opts.siblingValid` accepts them as
+        // any integer, and absent both they stay symbolic (tfail → calc(…)).
+        if (name === 'sibling-index' || name === 'sibling-count') {
+          if (!peek() || peek().t !== ')') return tfail();   // these take no arguments
+          p++;
+          const sv = name === 'sibling-index' ? opts.siblingIndex : opts.siblingCount;
+          if (typeof sv === 'number') return [sv, false];
+          if (opts.siblingValid) return [1, false];
+          return tfail();
+        }
         // round() carries an optional leading rounding-strategy keyword (CSS Values
         // 4 §10.3) — it can't be parsed as a numeric expression, so peel it first.
         if (name === 'round') {
@@ -7338,7 +7351,12 @@ const _mt = (node, pctType) => {
 // type (or 'unknown' / null). Mirrors `_foldMathFn`'s spec rules at the type level.
 const _mtFn = (node, pctType) => {
   const name = node.name, args = node.args;
-  if (!_MATH_FNS.has(name)) return 'unknown';              // var()/env()/sibling-index()/… → accept
+  // sibling-index()/sibling-count() (CSS Values 5) are <integer> functions — type
+  // them as <number> (our lattice has no <integer>) so they classify concretely:
+  // `atan2(1, sibling-index())` resolves to <angle>, not the conservative 'unknown'
+  // that would mis-reject it in `rotate`. Any argument is a grammar error.
+  if (name === 'sibling-index' || name === 'sibling-count') return args.length === 0 ? 'number' : null;
+  if (!_MATH_FNS.has(name)) return 'unknown';              // var()/env()/… → accept
   // round(): an optional leading rounding-strategy keyword, then exactly 2 operands
   // of the same type (CSS Values 4 §10.3). The keyword is illegal anywhere else.
   if (name === 'round') {
@@ -10384,13 +10402,31 @@ const _canonTransform = (value, el, computed) => {
 // its own trailing-component elision rule.
 const _emPxOf = (el) => (el ? (parseFloat(_computedPropOf(el, 'font-size', 0)) || 16) : 16);
 
+// CSS Values 5 §tree-counting: resolve `sibling-index()` (the element's 1-based
+// position among its element siblings) and `sibling-count()` (the total element-
+// sibling count) for `_evalMath`. Reads the real DOM via the parent's element
+// children; a parentless / detached element is its own sole sibling (index 1,
+// count 1). Returns the opts slice the computed paths spread in — `{}` (a no-op
+// spread) whenever there's no element OR the value carries no sibling-* function,
+// so the common computed path takes no extra DOM round-trip and stays byte-identical.
+const _SIBLING_FN_RE = /sibling-(?:index|count)\(/i;
+const _siblingOpts = (el, val) => {
+  if (!el || !el._nid || (val != null && !_SIBLING_FN_RE.test(String(val)))) return {};
+  const parent = el.parentNode;
+  if (!parent || !parent._nid) return { siblingIndex: 1, siblingCount: 1 };
+  const kids = _domParse('element_children', parent._nid) || [];
+  const idx = kids.indexOf(el._nid);
+  if (idx < 0) return { siblingIndex: 1, siblingCount: 1 };
+  return { siblingIndex: idx + 1, siblingCount: kids.length };
+};
+
 // ----- scale: none | [ <number> | <percentage> ]{1,3} -----
 // A scale component's math function must be dimensionless (a <number>/<percentage>):
 // strip any `sign()` body (it yields a <number> from arguments of any type — e.g.
 // `sign(1em - 1px)`) then require the remainder to evaluate with NO units present.
 const _scaleCalcOk = (t) => {
   const stripped = t.replace(/\bsign\s*\((?:[^()]|\([^()]*\))*\)/gi, '1');
-  return _evalMath(stripped, 1, { nonFinite: true }) !== null;   // a dimensionless calc that resolves to NaN/∞ is still valid
+  return _evalMath(stripped, 1, { nonFinite: true, siblingValid: true }) !== null;   // a dimensionless calc that resolves to NaN/∞ is still valid
 };
 const _scaleCompValid = (t) => {
   t = t.trim();
@@ -10410,7 +10446,7 @@ const _scaleComp = (t, el, computed) => {
   t = t.trim();
   if (_FILTER_MATH_RE.test(t)) {
     if (computed) {
-      const v = _evalMath(t, 1, { lengths: true, angle: true, emPx: _emPxOf(el), nonFinite: true });
+      const v = _evalMath(t, 1, { lengths: true, angle: true, emPx: _emPxOf(el), nonFinite: true, ..._siblingOpts(el, t) });
       if (v === null) return _canonMathExpr(t) || t;
       if (!isFinite(v)) return _serNumber(_nfClamp(v));         // NaN → 0, ±∞ → clamped finite
       return _serNumber(v);
@@ -10479,7 +10515,7 @@ const _rotSerAngle = (angTok, computed, negate, el) => {
   // `atan2(1vh,-1vh)`, `atan2(1s,-1s)` all reduce to an <angle> (the like units
   // cancel as a ratio). `angle` units win first; time then length.
   const vp = _vpUnits();
-  const angOpts = { angle: true, lengths: true, time: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh };
+  const angOpts = { angle: true, lengths: true, time: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, ..._siblingOpts(el, angTok) };
   if (_FILTER_MATH_RE.test(angTok)) {
     if (computed) { let d = _evalMath(angTok, 0, angOpts); if (d === null) return _canonMathExpr(angTok) || angTok; if (negate) d = -d; return _serNumber(d) + 'deg'; }
     return negate ? 'calc(-1 * (' + (_canonMathExpr(angTok) || angTok) + '))' : (_canonMathExpr(angTok) || angTok);
@@ -10544,8 +10580,8 @@ const _trIsZeroLen = (t) => {
 // the length-property resolver passes it so `min(1vh)`/`12vw` collapse to px.
 const _trComp = (t, el, computed, vp) => {
   t = t.trim();
-  const lenOpts = () => (vp ? { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, nonFinite: true }
-                            : { lengths: true, emPx: _emPxOf(el), nonFinite: true });
+  const lenOpts = () => (vp ? { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, nonFinite: true, ..._siblingOpts(el, t) }
+                            : { lengths: true, emPx: _emPxOf(el), nonFinite: true, ..._siblingOpts(el, t) });
   if (_FILTER_MATH_RE.test(t)) {
     if (/%/.test(t)) {                                        // mixed %+<length> → canonical calc(P% ± Lpx)
       // A non-finite result (infinity/NaN coefficient) can no longer be kept as a
@@ -10728,7 +10764,7 @@ const _computeIntegerValue = (el, v) => {
   // `lengths` lets `sign(1px)` / `sign(1em)` / `sign(1vw)` resolve their length
   // argument to the <number> the function yields (the value stays a valid <integer>).
   const vp = _vpUnits();
-  const n = _evalMath(s, 0, { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh });
+  const n = _evalMath(s, 0, { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, ..._siblingOpts(el, s) });
   if (n === null || !isFinite(n)) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
   return String(Math.round(n));
 };
