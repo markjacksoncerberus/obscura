@@ -134,6 +134,25 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-25 (Quest #103 The Bordered Verdict — calc-in-shorthand: line-width math in border/outline/column-rule, +1):**
+The named #102 "next leverage" #1 — the standing `calc-nesting` 6/8 cap. The `border` shorthand value
+`calc(calc(10px)) solid pink` echoed its nested calc verbatim instead of canonicalizing to
+`calc(10px) solid pink`: `border`/`outline`/`column-rule` aren't in the length tables, so
+`_canonLengthTimeMath` skips them and their embedded calc() never reached the math canon. THE FIX (pure
+JS, additive, `bootstrap.js`): a `_canonShorthandLenMath` helper + a `_BORDER_SH_PROPS` set
+(`border`(+top/right/bottom/left), `outline`, `column-rule`). The grammar is `<line-width> ||
+<line-style> || <color>`; only the width can be a TOP-LEVEL math function (a keyword/hex/colour-function
+never is), so each top-level component that IS one (`_MATHFN_NAME_RE`) routes through
+`_canonMathExpr(p, {canonLen:true})` — the same length math canon `left`/`width` already use. Gated on
+`_MATHFN_NAME_RE` over the whole value so a math-free border stays **byte-for-byte identical** (no
+whitespace reflow), and wired into both `setProperty` and `_parseStyleDecls`. **calc-nesting 6→7/8.**
+**ZERO regressions** — stash-proven: border-shorthand 0/36 + outline-shorthand 0/4 were ALREADY failing
+(pre-existing structural caps — `border` not expanding to longhands, invalid-value rejection — none
+contain a math fn so the gate leaves them untouched); colour 1146/1121, calc-infinity-nan 41/48,
+minmax-length-serialize 24, clamp-length-serialize 50/computed 24, minmax-time-serialize 22,
+calc-dim-order 44, signs-abs 16, serialize-values 696 all held. The lone calc-nesting fail left is the
+layout test (`calc(60% - 20px)`→`100px`, the `%`→used-px cap). Scroll `tickets/103-the-bordered-verdict.md`.
+
 **Session 2026-06-25 (Quest #102 The Flattened Verdict — nested-product coefficient fold in the SPECIFIED length/time serializer, +1):**
 The named #101 "next leverage" #1 and the last fail standing in `minmax-length-serialize`. `_simpCalc`
 folds all numeric leaves at *one* product level into a single coefficient, but a child product that still

@@ -597,6 +597,8 @@ const _parseStyleDecls = (text) => {
         continue;                                          // expanded into longhands; no `offset` key
       } else if (name === 'opacity') {
         value = _canonOpacitySpecified(value);
+      } else if (_BORDER_SH_PROPS.has(name)) {
+        value = _canonShorthandLenMath(value);       // line-width calc() in border/outline/column-rule shorthand
       }
       value = _canonLengthTimeMath(name, value);   // <length>/<time> math → canonical specified form
     }
@@ -681,6 +683,8 @@ class CSSStyleDeclaration {
             && !_FILTER_NUM_RE.test(stored) && !_FILTER_PCT_RE.test(stored)) return;
         stored = _canonOpacitySpecified(stored);
       }
+    } else if (!custom && _BORDER_SH_PROPS.has(name)) {
+      stored = _canonShorthandLenMath(stored);       // line-width calc() in border/outline/column-rule shorthand
     }
     if (!custom) stored = _canonLengthTimeMath(name, stored);  // <length>/<time> math → canonical specified form
     // Re-setting an existing property through the CSSOM makes it the latest-written
@@ -7214,6 +7218,25 @@ const _canonLengthTimeMath = (name, v) => {
   const isTime = _TIME_COMPUTED_PROPS.has(name);
   if (!isLen && !isTime) return v;
   return _canonMathExpr(v, { canonLen: isLen, canonTime: isTime }) || v;
+};
+// SPECIFIED-value canonicalization of the line-width (a <length>) embedded in a
+// border / outline / column-rule SHORTHAND. These shorthands aren't in the length
+// tables, so `_canonLengthTimeMath` skips them and their nested calc() was echoed
+// verbatim (`calc(calc(10px)) solid pink`). The grammar is `<line-width> ||
+// <line-style> || <color>`; only the width can be a TOP-LEVEL math function (a
+// keyword/hex/colour-function never is), so any top-level component that IS one is
+// the width → route it through the length math canon. Gated on `_MATHFN_NAME_RE`
+// so a math-free border value stays byte-for-byte identical (no whitespace reflow),
+// leaving every colour/keyword border untouched.
+const _BORDER_SH_PROPS = new Set([
+  'border', 'border-top', 'border-right', 'border-bottom', 'border-left',
+  'outline', 'column-rule',
+]);
+const _canonShorthandLenMath = (value) => {
+  if (!_MATHFN_NAME_RE.test(value)) return value;     // no math → byte-identical
+  return _splitTopLevel(value)
+    .map((p) => (_MATHFN_NAME_RE.test(p) ? (_canonMathExpr(p, { canonLen: true }) || p) : p))
+    .join(' ');
 };
 // ── CSS Values 4 math-function GRAMMAR VALIDATION (§10 type-checking) ──────────
 // A math function is invalid when its grammar is malformed (`sin( )`, `round(1,,2)`,
