@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-24 (Quest #99).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-25 (Quest #100).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-values/clamp-length-serialize.html` | 4/50 | **50/50** | ✅ 100% | **Quest #100 The Folded Verdict.** Finite `<length>` math folds at specified time: `clamp(1px,2px,3px)`→`calc(2px)`, `clamp(none,33px,30px)`→`calc(30px)` (`none` sentinels in `_foldMathFn`), `calc(0px ± clamp(…))` arithmetic, nested `calc(calc(…))`. Lifted the non-finite gate (`_canonNonFiniteMath`→`_canonLengthTimeMath`) so all length/time math routes through `_canonMathExpr`. **+46.** |
+| `css/css-values/calc-dimension-serialization-order.html` | 0/44 | **44/44** | ✅ 100% | **Quest #100 The Folded Verdict.** Canonical sum-ordering (`_simpSumSorted`, CSS Values 4 §sort-a-calculations-children): a sum serializes number → percentage → dimensions alphabetical by unit (`calc(1px + 1em + 3%)`→`calc(3% + 1em + 1px)`). Gated behind the length/time `sort` path so the colour path keeps input order. **+44.** |
+| `css/css-values/minmax-length-serialize.html` | 13/24 | **23/24** | 🔶 96% | **Quest #100 The Folded Verdict.** `min(1px)`→`calc(1px)`, `min(1in)`→`calc(96px)`, `calc(1px + min(1in,100px))`→`calc(97px)`. Last fail: nested-product coefficient fold (`2*(0.2*X)`→`0.4*X`, needs product flattening). **+10.** |
+| `css/css-values/minmax-time-serialize.html` | 11/22 | **22/22** | ✅ 100% | **Quest #100 The Folded Verdict.** Same folding in the `<time>` family (`ms`→`s` canon). **+11.** |
+| `css/css-values/calc-nesting.html` | 0/8 | **6/8** | 🔶 75% | **Quest #100 The Folded Verdict.** `calc(20px + calc(80px))`→`calc(100px)`, `calc(calc(100px))`→`calc(100px)`, `calc(calc(2)*calc(50px))`→`calc(100px)`. Caps: calc-in-shorthand (`calc(calc(10px)) solid pink`), `%`→used-px (`calc(60% - 20px)`→`100px`, layout). **+6.** |
+| `css/css-values/clamp-none-whitespace.html` | 0/3 | **3/3** | ✅ 100% | **Quest #100 The Folded Verdict.** `clamp(none,5px,10px)` now accepted + folds deterministically (`min`/`max` of the surviving bound), so whitespace variants serialize identically. **+3.** |
 | `css/css-values/calc-infinity-nan-serialize-length.html` | 0/41 | **41/41** | ✅ 100% | **Quest #99 The Serialized Verdict.** Non-finite math in a SPECIFIED `<length>` value → canonical form via the `_canonMathExpr`/`_simpCalc` calc serializer: operand reorder (`calc(1px * NaN)`→`calc(NaN * 1px)`), abs-unit canon (`1in`→`1px`, `_ABS_LEN_PX` in `_parseCalcTree` opt-in), `infinity`/`-infinity`/`NaN` keywords, NaN-collapse of min()/max() across same-type units, redundant `1 *`/`calc()` wrapper drop. Wired (gated on a non-finite keyword) into `setProperty`/`_parseStyleDecls`. **+41.** |
 | `css/css-values/calc-infinity-nan-serialize-time.html` | 0/29 | **29/29** | ✅ 100% | **Quest #99 The Serialized Verdict.** Same serializer, `<time>` family (`animation-duration`): `ms`→`s` canon (`1ms * NaN`→`calc(NaN * 1s)`), keywords + folding. **+29.** |
 | `css/css-values/calc-infinity-nan-computed.html` | 0/48 | **48/48** | ✅ 100% | **Quest #98 The Clamped Verdict.** Non-finite math clamped at computed time (`_nfClamp`: NaN→0, +∞→1e30, −∞→−1e30) across the length (`_trComp`, incl. the mixed-`%` collapse), time (`_computeTimeValue`), scale-number (`_scaleComp`) & rotate-angle→identity (`_tfDeg`) paths; registered the `animation-*` longhands; `_balanceParens` on the time eval. **+48.** |

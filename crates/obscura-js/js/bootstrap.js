@@ -598,7 +598,7 @@ const _parseStyleDecls = (text) => {
       } else if (name === 'opacity') {
         value = _canonOpacitySpecified(value);
       }
-      value = _canonNonFiniteMath(name, value);   // non-finite <length>/<time> calc → canonical form
+      value = _canonLengthTimeMath(name, value);   // <length>/<time> math → canonical specified form
     }
     out.push({ name, value, important });
   }
@@ -682,7 +682,7 @@ class CSSStyleDeclaration {
         stored = _canonOpacitySpecified(stored);
       }
     }
-    if (!custom) stored = _canonNonFiniteMath(name, stored);  // non-finite <length>/<time> calc → canonical form
+    if (!custom) stored = _canonLengthTimeMath(name, stored);  // <length>/<time> math → canonical specified form
     // Re-setting an existing property through the CSSOM makes it the latest-written
     // declaration: delete+reinsert so the live-decl cascade source (_buildCascade
     // iterates _props in insertion order) resolves shared longhands last-write-wins
@@ -6937,6 +6937,18 @@ const _foldMathFn = (name, args) => {
     if (args.length !== 2 || args[0].k !== 'num' || args[1].k !== 'num' || args[0].u !== args[1].u) return null;
     return { k: 'num', v: (name === 'mod' ? _modOp : _remOp)(args[0].v, args[1].v), u: args[0].u };
   }
+  // clamp() `none` sentinels (CSS Values 4 §funcdef-clamp): `none` removes that bound —
+  // clamp(none, V, H) ≡ min(V, H), clamp(L, V, none) ≡ max(L, V), clamp(none, V, none) ≡ V.
+  // Handled before the all-numeric guard since `none` is a symbol leaf, not a <number>.
+  // When the surviving min()/max() can't fold (mixed units), this returns null and the
+  // original clamp(none, …) node is kept verbatim.
+  if (name === 'clamp' && args.length === 3) {
+    const loNone = args[0].k === 'sym' && args[0].s === 'none';
+    const hiNone = args[2].k === 'sym' && args[2].s === 'none';
+    if (loNone && hiNone) return args[1];
+    if (loNone) return _foldMathFn('min', [args[1], args[2]]);
+    if (hiNone) return _foldMathFn('max', [args[0], args[1]]);
+  }
   if (!args.length || !args.every((a) => a.k === 'num')) return null;
   if (name === 'min' || name === 'max' || name === 'clamp') {
     if (name === 'clamp' && args.length !== 3) return null;
@@ -6987,17 +6999,58 @@ const _foldMathFn = (name, args) => {
   }
   return null;
 };
+// Canonical sum-ordering rank: <number> first, then <percentage>, then dimensions
+// (sorted alphabetically by unit, ASCII case-insensitive — units are already
+// lowercased by `_parseCalcTree`). CSS Values 4 §sort-a-calculations-children.
+const _SUM_UNIT_RANK = (u) => (u === '' ? 0 : u === '%' ? 1 : 2);
+// Canonical-order simplification of a sum's already-simplified terms (the `sort`
+// path, used only for the length/time SPECIFIED serializer — the colour path keeps
+// its input order). Folds numeric terms by unit into one leaf per unit, then orders
+// number → percentage → dimensions (alphabetical), with non-numeric terms
+// (functions/products/symbols) preserved in their original order after the numbers.
+const _simpSumSorted = (terms) => {
+  const numByUnit = new Map();   // unit -> summed value
+  const seen = [];               // distinct units in first-seen order
+  const others = [];             // non-numeric terms {op, node}
+  for (const t of terms) {
+    const nd = t.node;
+    if (nd.k === 'num') {
+      const val = t.op === '-' ? -nd.v : nd.v;
+      if (numByUnit.has(nd.u)) numByUnit.set(nd.u, numByUnit.get(nd.u) + val);
+      else { numByUnit.set(nd.u, val); seen.push(nd.u); }
+    } else others.push({ op: t.op, node: nd });
+  }
+  let nums = seen.map((u) => ({ u, v: numByUnit.get(u) }));
+  nums.sort((a, b) => {
+    const ra = _SUM_UNIT_RANK(a.u), rb = _SUM_UNIT_RANK(b.u);
+    if (ra !== rb) return ra - rb;
+    return a.u < b.u ? -1 : a.u > b.u ? 1 : 0;
+  });
+  // Drop a zero unitless term (additive identity) when other terms survive — mirrors
+  // the colour path; same-unit folding already collapses `0px + 5px` → `5px`.
+  if (nums.length + others.length > 1) nums = nums.filter((n) => !(n.v === 0 && n.u === ''));
+  const out = [];
+  for (const n of nums) out.push({ op: '+', node: { k: 'num', v: n.v, u: n.u } });
+  for (const o of others) out.push(o);
+  if (out.length === 0) return { k: 'num', v: 0, u: '' };
+  if (out.length === 1 && out[0].op === '+') return out[0].node;
+  out[0] = { op: '+', node: out[0].node };   // serializer renders terms[0] sign-bare
+  return { k: 'sum', terms: out };
+};
 // Simplify a calculation tree: fold numeric constants and impose canonical order.
-const _simpCalc = (node) => {
+// `sort` (length/time specified path) additionally reorders sum terms into the
+// CSS Values 4 canonical order; the colour path leaves `sort` falsy (input order).
+const _simpCalc = (node, sort) => {
   if (node.k === 'num' || node.k === 'sym') return node;
   if (node.k === 'fn') {
-    if (node.name === 'calc' && node.args.length === 1) return _simpCalc(node.args[0]);
-    const simpArgs = node.args.map(_simpCalc);
+    if (node.name === 'calc' && node.args.length === 1) return _simpCalc(node.args[0], sort);
+    const simpArgs = node.args.map((a) => _simpCalc(a, sort));
     const folded = _foldMathFn(node.name, simpArgs);
     return folded || { k: 'fn', name: node.name, args: simpArgs };
   }
   if (node.k === 'sum') {
-    const terms = node.terms.map((t) => ({ op: t.op, node: _simpCalc(t.node) }));
+    const terms = node.terms.map((t) => ({ op: t.op, node: _simpCalc(t.node, sort) }));
+    if (sort) return _simpSumSorted(terms);
     let numAcc = null, others = [];   // numAcc = {v, u} of the combined numeric constant
     for (const t of terms) {
       if (t.node.k === 'num') {
@@ -7017,7 +7070,7 @@ const _simpCalc = (node) => {
     return { k: 'sum', terms: out };
   }
   // product
-  const facs = node.facs.map((f) => ({ op: f.op, node: _simpCalc(f.node) }));
+  const facs = node.facs.map((f) => ({ op: f.op, node: _simpCalc(f.node, sort) }));
   let coef = 1, cu = '', hasNum = false; const rest = [];
   for (const f of facs) {
     if (f.node.k === 'num') {
@@ -7081,7 +7134,7 @@ const _canonMathExpr = (str, opts) => {
   if (!/^[a-zA-Z][a-zA-Z-]*\(/.test(s) || !s.endsWith(')')) return null;
   const root = _parseCalcTree(s, opts);
   if (root === null) return null;
-  const simp = _simpCalc(root);
+  const simp = _simpCalc(root, !!(opts && (opts.canonLen || opts.canonTime)));
   // A top-level math function (min/max/clamp/…) serializes WITHOUT a redundant calc()
   // wrapper. The generic colour path keeps its legacy rule (shed the wrapper only when
   // the INPUT wasn't a calc()); the non-finite length/time path (canonLen/canonTime)
@@ -7102,19 +7155,17 @@ const _calcConstValue = (str) => {
   const simp = _simpCalc(root);
   return simp.k === 'num' ? { v: simp.v, u: simp.u } : null;
 };
-// SPECIFIED-value canonicalization of a NON-FINITE math function on a <length> or
-// <time> property (CSS Values 4 §calc-type-checking serialization): fold numeric
-// sub-expressions, move a product's number first, canonicalize absolute units
-// (in/cm/pt→px, ms→s), and emit the `infinity`/`-infinity`/`NaN` keywords —
-// `calc(1px * NaN)` → `calc(NaN * 1px)`, `calc(1s * infinity)` → `calc(infinity * 1s)`.
-// GATED on a non-finite keyword so every FINITE calc serializes byte-identically
-// through the plain `_canonStandardValue` path: the generic specified calc serializer
-// is deliberately left untouched (folding finite `calc(1px + 2px)`→`calc(3px)` is a
-// separate, broader change — see `_canonMathExpr`'s note). Returns `v` unchanged when
-// it isn't a non-finite math function on a known length/time property.
-const _NONFINITE_KW_RE = /\b(?:infinity|nan)\b/i;
-const _canonNonFiniteMath = (name, v) => {
-  if (!_NONFINITE_KW_RE.test(v) || !_MATHFN_NAME_RE.test(v)) return v;
+// SPECIFIED-value canonicalization of a math function on a <length> or <time>
+// property (CSS Values 4 §calc serialization / §calc-type-checking): parse, fold
+// numeric sub-expressions (`clamp(1px,2px,3px)`→`calc(2px)`, `calc(20px + calc(80px))`
+// →`calc(100px)`), canonicalize absolute units (in/cm/pt→px, ms→s), order a sum's
+// children (number → percentage → dimensions alphabetical), shed redundant calc()/
+// `1 *` wrappers, and emit the `infinity`/`-infinity`/`NaN` keywords for non-finite
+// results. Only fires when the value actually CONTAINS a math function on a known
+// length/time property — a bare `10px`/keyword keeps its `_canonStandardValue`
+// serialization untouched. Returns `v` unchanged otherwise.
+const _canonLengthTimeMath = (name, v) => {
+  if (!_MATHFN_NAME_RE.test(v)) return v;
   const isLen = _LENGTH_COMPUTED_PROPS.has(name) || _SIZE_COMPUTED_PROPS.has(name);
   const isTime = _TIME_COMPUTED_PROPS.has(name);
   if (!isLen && !isTime) return v;
