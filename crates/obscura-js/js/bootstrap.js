@@ -14021,9 +14021,13 @@ function __obscura_nodeDocument(n) {
 
 // DOM "ensure pre-insertion validity" of `node` into `parent` before `child` —
 // the throw-only half (no mutation), so Range.insertNode can validate before it
-// splits text. Covers the parent/ancestor/reference checks plus the node-type
-// rules that reject inserting a Document, a misplaced doctype, or Text into a
-// Document. (Document-parent cardinality rules are handled by insertBefore.)
+// splits text or removes the node from its old parent. Covers the parent/ancestor/
+// reference checks plus the node-type rules, AND the full Document-parent cardinality
+// rules (one element child, doctype placement, no Text into a Document). The latter
+// must run HERE, before insertNode mutates: deferring them to insertBefore meant a
+// node bound for an invalid Document slot was already removed from its old parent
+// before the throw, leaving the DOM mutated (WPT Range-insertNode's document-rooted
+// ranges compare "DOM unchanged after a HierarchyRequestError").
 function __obscura_ensurePreInsertionValidity(node, parent, child) {
   const pt = parent.nodeType;
   if (pt !== 1 && pt !== 9 && pt !== 11)
@@ -14037,6 +14041,10 @@ function __obscura_ensurePreInsertionValidity(node, parent, child) {
     throw new DOMException("The node is not a valid child (e.g. a Document)", "HierarchyRequestError");
   if (((nt === 3 || nt === 4) && pt === 9) || (nt === 10 && pt !== 9))
     throw new DOMException("Invalid node/parent combination", "HierarchyRequestError");
+  // Document-parent cardinality (element/doctype/fragment rules) — same machinery
+  // insertBefore/appendChild use, but evaluated up-front so insertNode can't mutate
+  // before detecting an invalid Document insertion.
+  _checkInsertConstraints(parent, node, child);
 }
 
 globalThis.Range = class Range {
