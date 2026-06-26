@@ -10763,19 +10763,42 @@ const _trIsZeroLen = (t) => {
 // `vp` (optional) carries {vw,vh} px-per-1%-viewport so viewport-relative units
 // resolve at computed time. translate() callers omit it (byte-identical behavior);
 // the length-property resolver passes it so `min(1vh)`/`12vw` collapse to px.
-// CSS Values 4 §simplification: a min()/max() with a SINGLE argument reduces to
-// that argument at computed-value time (the comparison is trivial). The single
-// calculation is then serialized as calc() — so `min(1px + 1%)` computes to
-// `calc(1% + 1px)`, identical to bare `calc(1px + 1%)`. A `%` keeps it symbolic
-// (resolving it needs layout), which is exactly why the wrapper must collapse:
-// otherwise the function name (`min`) leaks into the computed serialization and
-// no longer matches the equivalent calc(). Multi-arg min/max (a real comparison)
-// is left untouched. Idempotent for non-min/max and for already-calc input.
+// CSS Values 4 §simplification: a min()/max()/hypot() with a SINGLE argument
+// reduces to that argument at computed-value time (the comparison/magnitude is
+// trivial). The single calculation is then serialized as calc() — so
+// `min(1px + 1%)` computes to `calc(1% + 1px)`, identical to bare
+// `calc(1px + 1%)`, and `hypot(0% + 772.333px)` to `calc(0% + 772.333px)`. A `%`
+// keeps it symbolic (resolving it needs layout), which is exactly why the wrapper
+// must collapse: otherwise the function name (`min`/`hypot`) leaks into the
+// computed serialization and no longer matches the equivalent calc(). Multi-arg
+// forms (a real comparison / a real sqrt-of-sum-of-squares) are left untouched.
+// Idempotent for non-min/max/hypot and for already-calc input.
 const _unwrapSingleMinMax = (t) => {
-  const m = /^(?:min|max)\(([\s\S]*)\)$/i.exec(String(t).trim());
+  const m = /^(?:min|max|hypot)\(([\s\S]*)\)$/i.exec(String(t).trim());
   if (!m) return t;
   const args = _commaSplitTop(m[1]);
   return args.length === 1 ? 'calc(' + args[0].trim() + ')' : t;
+};
+// A math function that can't be re-serialized as a linear `calc(P% ± Lpx)` —
+// hypot/round/mod/rem (and the trig/exp family) MUST collapse their arguments to
+// concrete numbers to fold. When every `%` literal in such an expression is `0%`,
+// the percentage contributes 0 *regardless of the containing block* (0% of any
+// reference is 0), so the fold needs NO layout: `hypot(0% + 3px, 0% + 4px)` → 5px,
+// `round(1px + 0%, 1px)` → 1px. A non-zero `%` (e.g. `mod(18px, 100%/15)`) still
+// needs the used containing-block width, so it stays symbolic. Note a plain
+// `calc(0% + Npx)` is NOT in this set — it's a valid symbolic computed value
+// (Chrome keeps it), so single-arg hypot is unwrapped to calc() *before* reaching
+// here and never folds.
+const _FORCE_EVAL_FN_RE = /\b(?:hypot|round|mod|rem|sin|cos|tan|asin|acos|atan|atan2|pow|sqrt|exp|log|sign|abs)\(/i;
+const _PCT_LITERAL_RE = /(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*%/g;
+const _allPctZero = (t) => {
+  _PCT_LITERAL_RE.lastIndex = 0;
+  let m, any = false;
+  while ((m = _PCT_LITERAL_RE.exec(t)) !== null) {
+    any = true;
+    if (parseFloat(m[1]) !== 0) return false;
+  }
+  return any;  // true only when there is at least one `%` and all are 0%
 };
 const _trComp = (t, el, computed, vp) => {
   t = t.trim();
@@ -10788,6 +10811,11 @@ const _trComp = (t, el, computed, vp) => {
       // symbolic calc(P% ± Lpx) — it collapses to a clamped <length>. Probe with a
       // positive %-base so `infinity * 1%` → ∞ (a 0 base would give ∞·0 = NaN).
       if (computed) { const pv = _evalMath(t, 1, lenOpts()); if (pv !== null && !isFinite(pv)) return _serNumber(_nfClamp(pv)) + 'px'; }
+      // All-`0%` inside a forcing function folds with no layout (0% = 0 always).
+      if (computed && _FORCE_EVAL_FN_RE.test(t) && _allPctZero(t)) {
+        const z = _evalMath(t, 0, lenOpts());
+        if (z !== null && isFinite(z)) return _serNumber(_nfClamp(z)) + 'px';
+      }
       const mixed = _resolvePctLengthCalc(t, computed ? _emPxOf(el) : undefined);
       return mixed !== null ? mixed : (_canonMathExpr(t) || t);
     }
