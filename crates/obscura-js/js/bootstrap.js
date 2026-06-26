@@ -108,8 +108,12 @@ DOMException._codes = {
   URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
   InvalidNodeTypeError: 24, DataCloneError: 25,
 };
-// Legacy numeric code constants live on the interface object.
-Object.assign(DOMException, {
+// Legacy numeric code constants. Per WebIDL these live on BOTH the interface
+// object AND the interface prototype object, enumerable — so `domException.
+// HIERARCHY_REQUEST_ERR` resolves (via the prototype) and a `for (var prop in
+// e)` walk finds them (WPT's dom/common.js getDomExceptionName relies on this:
+// it scans enumerable props for one matching /^[A-Z_]+_ERR$/ whose value == e.code).
+const _DOMEXCEPTION_CONSTANTS = {
   INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3,
   WRONG_DOCUMENT_ERR: 4, INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6,
   NO_MODIFICATION_ALLOWED_ERR: 7, NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9,
@@ -118,7 +122,9 @@ Object.assign(DOMException, {
   VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18, NETWORK_ERR: 19,
   ABORT_ERR: 20, URL_MISMATCH_ERR: 21, QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23,
   INVALID_NODE_TYPE_ERR: 24, DATA_CLONE_ERR: 25,
-});
+};
+Object.assign(DOMException, _DOMEXCEPTION_CONSTANTS);
+Object.assign(DOMException.prototype, _DOMEXCEPTION_CONSTANTS);
 globalThis.DOMException = _markNative(DOMException);
 
 // QuotaExceededError — the modern WHATWG interface (a DOMException subclass with
@@ -13970,7 +13976,8 @@ function __obscura_furthestAncestor(node) {
 function __obscura_nodeLength(node) {
   const t = node.nodeType;
   if (t === 10) return 0;                       // DocumentType
-  if (t === 3 || t === 8 || t === 7) return node.data.length; // CharacterData / PI
+  // CharacterData: Text(3), CDATASection(4), ProcessingInstruction(7), Comment(8).
+  if (t === 3 || t === 4 || t === 8 || t === 7) return node.data.length;
   return node.childNodes.length;
 }
 function __obscura_nodeIndex(node) {
@@ -13978,6 +13985,10 @@ function __obscura_nodeIndex(node) {
   for (let n = node.previousSibling; n; n = n.previousSibling) i++;
   return i;
 }
+// A Text node, per DOM: Text(3) and its subclass CDATASection(4).
+function __obscura_isText(n) { const t = n.nodeType; return t === 3 || t === 4; }
+// A CharacterData node: Text(3), CDATASection(4), ProcessingInstruction(7), Comment(8).
+function __obscura_isCharData(n) { const t = n.nodeType; return t === 3 || t === 4 || t === 7 || t === 8; }
 // True iff `a` follows `b` in tree order (preorder), within the same tree.
 function __obscura_isFollowing(a, b) {
   if (a === b) return false;
@@ -14187,7 +14198,7 @@ globalThis.Range = class Range {
     const frag = __obscura_nodeDocument(this._sc).createDocumentFragment();
     if (this.collapsed) return frag;
     const sc = this._sc, so = this._so, ec = this._ec, eo = this._eo;
-    if (sc === ec && (sc.nodeType === 3 || sc.nodeType === 8 || sc.nodeType === 7)) {
+    if (sc === ec && __obscura_isCharData(sc)) {
       const clone = sc.cloneNode(false);
       clone.data = sc.substringData(so, eo - so);
       frag.appendChild(clone);
@@ -14197,7 +14208,7 @@ globalThis.Range = class Range {
     const first = this._firstPartiallyContainedChild(common);
     const last = this._lastPartiallyContainedChild(common);
     const contained = this._containedChildren(common);
-    if (first && (first.nodeType === 3 || first.nodeType === 8 || first.nodeType === 7)) {
+    if (first && __obscura_isCharData(first)) {
       const clone = sc.cloneNode(false);
       clone.data = sc.substringData(so, __obscura_nodeLength(sc) - so);
       frag.appendChild(clone);
@@ -14208,7 +14219,7 @@ globalThis.Range = class Range {
       clone.appendChild(sub.cloneContents());
     }
     for (const child of contained) frag.appendChild(child.cloneNode(true));
-    if (last && (last.nodeType === 3 || last.nodeType === 8 || last.nodeType === 7)) {
+    if (last && __obscura_isCharData(last)) {
       const clone = ec.cloneNode(false);
       clone.data = ec.substringData(0, eo);
       frag.appendChild(clone);
@@ -14225,7 +14236,7 @@ globalThis.Range = class Range {
     const frag = __obscura_nodeDocument(this._sc).createDocumentFragment();
     if (this.collapsed) return frag;
     const sc = this._sc, so = this._so, ec = this._ec, eo = this._eo;
-    if (sc === ec && (sc.nodeType === 3 || sc.nodeType === 8 || sc.nodeType === 7)) {
+    if (sc === ec && __obscura_isCharData(sc)) {
       const clone = sc.cloneNode(false);
       clone.data = sc.substringData(so, eo - so);
       frag.appendChild(clone);
@@ -14244,7 +14255,7 @@ globalThis.Range = class Range {
       while (reference.parentNode && !__obscura_isInclusiveAncestor(reference.parentNode, ec)) reference = reference.parentNode;
       newNode = reference.parentNode; newOffset = __obscura_nodeIndex(reference) + 1;
     }
-    if (first && (first.nodeType === 3 || first.nodeType === 8 || first.nodeType === 7)) {
+    if (first && __obscura_isCharData(first)) {
       const clone = sc.cloneNode(false);
       clone.data = sc.substringData(so, __obscura_nodeLength(sc) - so);
       frag.appendChild(clone);
@@ -14256,7 +14267,7 @@ globalThis.Range = class Range {
       clone.appendChild(sub.extractContents());
     }
     for (const child of contained) frag.appendChild(child);
-    if (last && (last.nodeType === 3 || last.nodeType === 8 || last.nodeType === 7)) {
+    if (last && __obscura_isCharData(last)) {
       const clone = ec.cloneNode(false);
       clone.data = ec.substringData(0, eo);
       frag.appendChild(clone);
@@ -14274,7 +14285,7 @@ globalThis.Range = class Range {
   deleteContents() {
     if (this.collapsed) return;
     const sc = this._sc, so = this._so, ec = this._ec, eo = this._eo;
-    if (sc === ec && (sc.nodeType === 3 || sc.nodeType === 8 || sc.nodeType === 7)) {
+    if (sc === ec && __obscura_isCharData(sc)) {
       sc.deleteData(so, eo - so);
       return;
     }
@@ -14294,23 +14305,23 @@ globalThis.Range = class Range {
       while (reference.parentNode && !__obscura_isInclusiveAncestor(reference.parentNode, ec)) reference = reference.parentNode;
       newNode = reference.parentNode; newOffset = __obscura_nodeIndex(reference) + 1;
     }
-    if (sc.nodeType === 3 || sc.nodeType === 8 || sc.nodeType === 7) sc.deleteData(so, __obscura_nodeLength(sc) - so);
+    if (__obscura_isCharData(sc)) sc.deleteData(so, __obscura_nodeLength(sc) - so);
     for (const n of toRemove) n.parentNode && n.parentNode.removeChild(n);
-    if (ec.nodeType === 3 || ec.nodeType === 8 || ec.nodeType === 7) ec.deleteData(0, eo);
+    if (__obscura_isCharData(ec)) ec.deleteData(0, eo);
     this._sc = newNode; this._so = newOffset; this._ec = newNode; this._eo = newOffset;
   }
 
   insertNode(node) {
     const sc = this._sc;
-    if (sc.nodeType === 7 || sc.nodeType === 8 || (sc.nodeType === 3 && !sc.parentNode) || node === sc)
+    if (sc.nodeType === 7 || sc.nodeType === 8 || (__obscura_isText(sc) && !sc.parentNode) || node === sc)
       throw new DOMException("cannot insert at this boundary", "HierarchyRequestError");
-    let referenceNode = (sc.nodeType === 3) ? sc : (sc.childNodes[this._so] || null);
+    let referenceNode = __obscura_isText(sc) ? sc : (sc.childNodes[this._so] || null);
     const parent = referenceNode === null ? sc : referenceNode.parentNode;
     // Spec step: ensure pre-insertion validity BEFORE any mutation (the text split
     // below), so an invalid node (Document, misplaced doctype, ancestor, …) throws
     // with the DOM left untouched.
     __obscura_ensurePreInsertionValidity(node, parent, referenceNode);
-    if (sc.nodeType === 3) referenceNode = sc.splitText(this._so);
+    if (__obscura_isText(sc)) referenceNode = sc.splitText(this._so);
     if (node === referenceNode) referenceNode = node.nextSibling;
     if (node.parentNode) node.parentNode.removeChild(node);
     let newOffset = referenceNode === null ? __obscura_nodeLength(parent) : __obscura_nodeIndex(referenceNode);
@@ -14322,9 +14333,9 @@ globalThis.Range = class Range {
   surroundContents(newParent) {
     // No non-Text node may be partially contained.
     for (let n = this._sc; n && n !== this.commonAncestorContainer; n = n.parentNode)
-      if (this._partiallyContains(n) && n.nodeType !== 3) throw new DOMException("partially contained non-Text node", "InvalidStateError");
+      if (this._partiallyContains(n) && !__obscura_isText(n)) throw new DOMException("partially contained non-Text node", "InvalidStateError");
     for (let n = this._ec; n && n !== this.commonAncestorContainer; n = n.parentNode)
-      if (this._partiallyContains(n) && n.nodeType !== 3) throw new DOMException("partially contained non-Text node", "InvalidStateError");
+      if (this._partiallyContains(n) && !__obscura_isText(n)) throw new DOMException("partially contained non-Text node", "InvalidStateError");
     const t = newParent.nodeType;
     if (t === 9 || t === 10 || t === 11) throw new DOMException("invalid newParent", "InvalidNodeTypeError");
     const fragment = this.extractContents();

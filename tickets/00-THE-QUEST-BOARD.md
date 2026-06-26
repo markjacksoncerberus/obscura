@@ -137,6 +137,32 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-26 (Quest #111 The Sectioned Verdict — DOMException legacy `*_ERR` constants on the prototype + CDATASection as Text/CharacterData in Range ops, +632):**
+Pivoted out of the now-layout-capped CSS-math realm (Captain's Counsel) into the DOM Range realm — the biggest unmined
+frontier by far (`Range-surroundContents` 1308/1840 = **532 fails**). TWO root causes, both pure-JS in `bootstrap.js`.
+**(1) DOMException legacy constants only on the interface object.** WPT's `dom/common.js` `getDomExceptionName(e)` does
+`for (var prop in e)` over a DOMException **instance** looking for an `*_ERR` constant whose value `== e.code`; our
+`DOMException` defined `HIERARCHY_REQUEST_ERR` &c. only via `Object.assign(DOMException, …)` (the interface object), never
+on `DOMException.prototype`, so an instance `for…in` found none and the helper threw `"Exception seems to not be a
+DOMException?"`. Per WebIDL these constants live on BOTH the interface object and the interface prototype object,
+enumerable — so factored them into `_DOMEXCEPTION_CONSTANTS` and `Object.assign`'d onto both. **(2) CDATASection (nodeType
+4) not treated as Text/CharacterData in Range ops.** `paras[5]` (common.js) holds two `CDATASection` nodes; a range
+starting inside one (`setStart(cdata, 2)`) threw `IndexSizeError` because `__obscura_nodeLength` computed a CDATASection's
+length as its child count (0) — it special-cased only Text(3)/Comment(8)/PI(7). Per DOM, the length of ANY CharacterData
+(Text, **CDATASection**, PI, Comment) is its `data` length. Added `t===4` to `__obscura_nodeLength` + two helpers
+(`__obscura_isText` = 3|4, `__obscura_isCharData` = 3|4|7|8) wired through `cloneContents`/`extractContents`/`deleteContents`
+(CharacterData branches) + `insertNode` (split a CDATA start node like Text) + `surroundContents` (partially-contained
+non-Text guard); the WPT reference's own `isText` is `TEXT_NODE || CDATA_SECTION_NODE`. **surroundContents 1308→1840 (100%),
+insertNode 1700→1792, extractContents 163→168, deleteContents 103→106 = +632.** ZERO regressions (DOMException is a shared
+global — swept error-bearing realms): cloneContents 187, comparePoint 5580, qsa 1975, classlist 1420, Node-cloneNode 135,
+Node-properties 726, createElement 147, Node-appendChild 11, structured-clone 141, getRandomValues 39, mark 22; CSS math
+signs-abs 222, round-mod-rem 233, minmax-length-percent 30 byte-identical; extractContents/deleteContents IMPROVED and
+their remaining 19/19 stash-proven pre-existing. **CAPS / NEXT (ROI):** `Range-insertNode`'s remaining 48 = cross-document
+**adoption** (insert a node from a foreign doc → adopt into start node's document; we don't yet) + niche document-insertion
+validity (`HIERARCHY_REQUEST_ERR` for doctype/element when range start is `document`) — a scoped follow-on. The 19+19
+extract/delete fails are a separate range-collapse-offset correctness bug. `Node-insertBefore.html` is a pre-existing
+heavy test that hangs the server on baseline too (NOT a regression). Scroll `tickets/111-the-sectioned-verdict.md`.
+
 **Session 2026-06-26 (Quest #110 The Zeroed Verdict — all-`0%` args fold inside forcing math functions, +10):**
 The named #107–#109 "next leverage" no-layout `0%` sub-win. Probed the standing `%`→used-px tail first and confirmed
 it IS genuinely layout-capped: getComputedStyle returns `margin-left: 10%` unresolved, and our layout reports the

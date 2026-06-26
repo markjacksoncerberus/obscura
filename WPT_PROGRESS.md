@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-26 (Quest #109).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-26 (Quest #111).
 
 ## Scoreboard
 
@@ -391,11 +391,11 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-26 (Quest #109).
 | `dom/ranges/Range-stringifier.html` | 0/5 | **5/5** | ✅ 100% | Quest #10: Range.toString `828ee41` |
 | `dom/ranges/Range-{selectNode,collapse,cloneRange,commonAncestorContainer,constructor,attributes,detach}` | stub | **96–100%** | ⬆️ | Quest #10 `828ee41` |
 | `dom/nodes/Node-compareDocumentPosition.html` | n/a | **1444/1444** | ✅ 100% | Quest #10: real compareDocumentPosition + DOCUMENT_POSITION_* consts `828ee41` |
-| `dom/ranges/Range-insertNode.html` | 0/1840 | **1531/1840** | ⬆️ | Quest #12: real per-iframe JS realms + node-backed iframe doc; +200 spec pre-insertion-validity run BEFORE the text split; +422 from a **live `DetachedDocument.doctype`** getter (scan children, not a stale cache) so the test's appended doctype shows up in the tree comparison |
-| `dom/ranges/Range-surroundContents.html` | 0/1840 | **1247/1840** | ⬆️ | Quest #12 ″; +549 from the same live `doctype` getter |
-| `dom/ranges/Range-cloneContents.html` | 0/187 | **177/187** | ⬆️ | Quest #12 ″ |
-| `dom/ranges/Range-deleteContents.html` | 0/125 | **103/125** | ⬆️ | Quest #12 ″ |
-| `dom/ranges/Range-extractContents.html` | 0/187 | **159/187** | ⬆️ | Quest #12 ″ (+2046 content-op subtests total, from 0) |
+| `dom/ranges/Range-surroundContents.html` | 0/1840 | **1840/1840** | ✅ 100% | **Quest #111 The Sectioned Verdict.** 1308→1840 (+532). Two root causes: (1) DOMException legacy `*_ERR` constants now also live on `DOMException.prototype` (enumerable), so WPT's `dom/common.js` `getDomExceptionName` — which does `for (var prop in e)` over a **DOMException instance** — finds `HIERARCHY_REQUEST_ERR == e.code` instead of throwing "Exception seems to not be a DOMException?". (2) `CDATASection`(nodeType 4) treated as Text/CharacterData in Range ops (`__obscura_nodeLength` + `__obscura_isText`/`__obscura_isCharData` helpers) so a range starting inside the `paras[5]` CDATA node sets up without `IndexSizeError`. |
+| `dom/ranges/Range-insertNode.html` | 0/1840 | **1792/1840** | ⬆️ | **Quest #111** 1700→1792 (+92): same DOMException-constants + CDATASection-as-Text fixes (`insertNode` splits a CDATASection start node like a Text node; partially-contained CDATA no longer mis-rejected). Quest #12: real per-iframe JS realms + node-backed iframe doc; +200 spec pre-insertion-validity run BEFORE the text split; +422 from a **live `DetachedDocument.doctype`** getter. Remaining 48: cross-document adoption + niche document-insertion validity. |
+| `dom/ranges/Range-cloneContents.html` | 0/187 | **187/187** | ✅ 100% | Quest #12 ″ (held through Quest #111) |
+| `dom/ranges/Range-deleteContents.html` | 0/125 | **106/125** | ⬆️ | **Quest #111** 103→106 (+3): CDATASection counted as CharacterData in `deleteContents`. Quest #12 ″. Remaining 19: pre-existing range-collapse-offset correctness. |
+| `dom/ranges/Range-extractContents.html` | 0/187 | **168/187** | ⬆️ | **Quest #111** 163→168 (+5): CDATASection counted as CharacterData in `extractContents`. Quest #12 ″ (+2046 content-op subtests total, from 0). Remaining 19: pre-existing range-collapse-offset correctness. |
 | `url/url-setters.any.html` | 5/279 | **241/279** | ⬆️ | Setters' Sigil + Quest #04 Inc 1 (userinfo no-strip, hostname `:` reject, port whitespace) + Inc 2 (path `^`, opaque trailing-space) |
 | `url/url-setters-stripping.any.html` | 224/260 | **260/260** | ✅ 100% | **Quest #04 Increment 1.** userinfo (username/password) setters percent-encode tab/LF/CR (`%09`/`%0A`/`%0D`) instead of stripping — strip moved per-part into `apply_url_setter` |
 | `url/url-statics-parse.any.html` | 0/8 | **8/8** | ✅ 100% | **Quest #04 Increment 1.** `URL.parse`/`URL.canParse` statics (parse→URL\|null, never throws) |
