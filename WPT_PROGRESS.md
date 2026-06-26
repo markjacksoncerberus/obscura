@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-26 (Quest #106).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-26 (Quest #107).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-backgrounds/parsing/border-shorthand.html` | 0/36 | **36/36** | ✅ 100% | **Quest #107 The Bordered Expansion.** The `border` family now expands into — and is stored as — its specified longhands (the `offset` model): `el.style.border = "5px dotted blue"` makes `el.style.borderTopColor` read `"blue"`, and `border` also resets the five `border-image-*` longhands to initial (CSS Backgrounds 3 §border-shorthands). `_BORDER_EXPAND` table + `_expandBorderShorthand` (validates each `<line-width>‖<line-style>‖<color>` component — `color-mix(42deg)` rejected via `_isValidColor`) + `_serializeBorderShorthand` (reconstructs on read). var()-bearing values stay a single key for the cascade (Quest #58). `CSS.supports('border', …)` validates via `_expandBorderShorthand`. **+36.** |
+| `css/css-ui/parsing/outline-shorthand.html` | 0/4 | **4/4** | ✅ 100% | **Quest #107 The Bordered Expansion.** Same machinery for `outline` (`outline-style` also accepts `auto`): `outline: 3px ridge blue` → `outline-{width,style,color}`. **+4.** |
 | `css/css-values/acos-asin-atan-atan2-computed.html` | 46/50 | **50/50** | ✅ 100% | **Quest #105 The Counted Verdict.** `sibling-index()` (CSS Values 5 tree-counting) resolves at computed time: `_evalMath` reads the element's real 1-based element-sibling index (via `_siblingOpts`→`element_children`), and `_mtFn` types `sibling-index()`/`sibling-count()` as `<number>` so `atan2(1, sibling-index())`→`<angle>` (was the conservative 'unknown' that `_rotKind` mis-rejected). `calc(asin(sin(180deg * sibling-index())))`→`0deg`, etc. **+4.** Earlier (#104): `_rotKind` types a math token by its calc-tree RESULT TYPE so `acos(1)`/`atan2(1px,-1px)` are `<angle>`s. |
 | `css/css-values/sin-cos-tan-computed.html` | 26/32 | **32/32** | ✅ 100% | **Quest #105 The Counted Verdict.** `scale: calc(sin(pi * sibling-index()))` and friends now compute: `_scaleCalcOk` accepts `sibling-index()` as a valid `<number>` (a `siblingValid` grammar probe in `_evalMath`) and `_scaleComp` folds it with the element's real sibling index. **+6.** |
 | `css/css-values/hypot-pow-sqrt-computed.html` | 43/52 | **48/52** | 🔶 92% | **Quest #106 The Balanced Verdict.** `calc(1px * pow(2, sqrt(100))` (one `)` short) now computes `1024px`: `_parseCalcTree` auto-closes trailing open parens (CSS Syntax §"consume a simple block": EOF implicitly closes open blocks), so the validity gate + serializer accept the unbalanced form like the transform gates already do. **+1.** Earlier (#105): `sqrt(sibling-index())`→`2`, `hypot(3, sibling-index())`→`5` etc. (`#target` is the 4th element child → `sibling-index()`=4, REAL DOM). Remaining 4 fails are the `hypot(0% + …)` mixed-% rows (the standing `%`→used-px layout cap). |

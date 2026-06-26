@@ -619,6 +619,15 @@ class CSSStyleDeclaration {
     if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
     let stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
     if (!custom && stored === '') { this.removeProperty(name); return; }
+    if (!custom && _BORDER_EXPAND[name] && !/\bvar\(/i.test(stored)) {
+      // border/outline shorthand (no var()): expand into — and store as — its
+      // longhands so `el.style.borderTopColor` reads back. Invalid → ignore.
+      const lh = _expandBorderShorthand(name, stored);
+      if (!lh) return;
+      delete this._props[name]; delete this._priority[name];   // drop any prior var()-stored shorthand key
+      for (const ln of _BORDER_EXPAND[name]) this.setProperty(ln, lh[ln], priority);
+      return;                                                  // expanded; no shorthand key kept
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -702,6 +711,12 @@ class CSSStyleDeclaration {
       for (const ln of _OFFSET_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
       return old;
     }
+    if (_BORDER_EXPAND[key]) {                              // border/outline: clear its longhands
+      const old = this.getPropertyValue(key);
+      delete this._props[key]; delete this._priority[key];   // any var()-stored shorthand key
+      for (const ln of _BORDER_EXPAND[key]) { delete this._props[ln]; delete this._priority[ln]; }
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     return old || "";
@@ -709,6 +724,10 @@ class CSSStyleDeclaration {
   getPropertyValue(name) {
     name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
     if (key === 'offset') return _serializeOffsetShorthand(this);  // reconstruct from longhands
+    if (_BORDER_EXPAND[key]) {                              // border/outline shorthand
+      if (key in this._props) return this._props[key];     // var() kept as a single key
+      return _serializeBorderShorthand(this, key);         // reconstruct from longhands
+    }
     return this._props[key] || "";
   }
   getPropertyPriority(name) {
@@ -5687,6 +5706,155 @@ const _parseBorderSide = (value) => {
     style: style == null ? 'none' : style,
     color: color == null ? 'currentColor' : color,
   };
+};
+
+// ── The `border`/`outline` shorthand family: expand-at-specified-time ──────────
+// CSSOM stores these as their LONGHANDS, not a single key (like `offset`): setting
+// `el.style.border = "5px dotted blue"` must make `el.style.borderTopColor` read
+// "blue", and `el.style.length` count the longhands actually set. The `border`
+// shorthand also RESETS the five border-image longhands to their initial values
+// (CSS Backgrounds 3 §border-shorthands). A value containing var() can't be split,
+// so it stays a single shorthand key and the cascade's pending-substitution path
+// (Quest #58) handles it at computed time — the setter/remover/getter below all
+// gate on the absence of var().
+const _BORDER_IMAGE_INITIAL = {
+  'border-image-source': 'none',
+  'border-image-slice': '100%',
+  'border-image-width': '1',
+  'border-image-outset': '0',
+  'border-image-repeat': 'stretch',
+};
+// Canonicalize a <line-width> token, folding any calc()/math (matching the
+// pre-expansion `_canonShorthandLenMath` path so `calc(calc(10px))`→`calc(10px)`).
+const _canonLineWidth = (t) =>
+  _MATHFN_NAME_RE.test(t) ? (_canonMathExpr(t, { canonLen: true }) || t) : t;
+const _BORDER_EXPAND = {
+  'border': [
+    'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
+    'border-top-style', 'border-right-style', 'border-bottom-style', 'border-left-style',
+    'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color',
+    'border-image-source', 'border-image-slice', 'border-image-width', 'border-image-outset', 'border-image-repeat',
+  ],
+  'border-top': ['border-top-width', 'border-top-style', 'border-top-color'],
+  'border-right': ['border-right-width', 'border-right-style', 'border-right-color'],
+  'border-bottom': ['border-bottom-width', 'border-bottom-style', 'border-bottom-color'],
+  'border-left': ['border-left-width', 'border-left-style', 'border-left-color'],
+  'border-width': ['border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width'],
+  'border-style': ['border-top-style', 'border-right-style', 'border-bottom-style', 'border-left-style'],
+  'border-color': ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color'],
+  'outline': ['outline-width', 'outline-style', 'outline-color'],
+};
+// Parse `<line-width> || <line-style> || <color>` (border/outline side), VALIDATING
+// each token and rejecting duplicates / unclassifiable tokens (so `2px solid
+// color-mix(42deg)` — an invalid <color> — is rejected whole). `outline` also
+// accepts `auto` as a <line-style> (outline-style: auto). Returns the three
+// components (omitted ones defaulted) or null when the value is invalid.
+const _parseBorderSideStrict = (value, outlineStyle) => {
+  let width = null, style = null, color = null;
+  const toks = _wsTokens(String(value).trim());
+  if (!toks.length) return null;
+  for (const t of toks) {
+    const low = t.toLowerCase();
+    if (_LINE_STYLE_KW.has(low) || (outlineStyle && low === 'auto')) {
+      if (style != null) return null; style = low;
+    } else if (_LINE_WIDTH_KW.has(low) || _isLengthTok(t)) {
+      if (width != null) return null; width = _LINE_WIDTH_KW.has(low) ? low : _canonLineWidth(t);
+    } else if (_isValidColor(t)) {
+      if (color != null) return null; color = _canonColorSpecified(t);
+    } else return null;
+  }
+  return {
+    width: width == null ? 'medium' : width,
+    style: style == null ? 'none' : style,
+    color: color == null ? 'currentcolor' : color,
+  };
+};
+// Split a border/outline shorthand into its longhand pieces (already canonical),
+// or null if the value is invalid. `border` also resets the border-image longhands.
+const _expandBorderShorthand = (sh, value) => {
+  value = String(value).trim();
+  if (sh === 'border-width' || sh === 'border-style' || sh === 'border-color') {
+    const suf = sh.slice('border-'.length);
+    const toks = _wsTokens(value);
+    if (!toks.length || toks.length > 4) return null;
+    for (const t of toks) {
+      const low = t.toLowerCase();
+      if (suf === 'width') { if (!_LINE_WIDTH_KW.has(low) && !_isLengthTok(t)) return null; }
+      else if (suf === 'style') { if (!_LINE_STYLE_KW.has(low)) return null; }
+      else if (!_isValidColor(t)) return null;
+    }
+    const edges = _boxEdges(toks); if (!edges) return null;
+    const out = {};
+    ['top', 'right', 'bottom', 'left'].forEach((s, i) => {
+      out['border-' + s + '-' + suf] = suf === 'color' ? _canonColorSpecified(edges[i])
+        : suf === 'width' ? (_LINE_WIDTH_KW.has(edges[i].toLowerCase()) ? edges[i].toLowerCase() : _canonLineWidth(edges[i]))
+        : edges[i].toLowerCase();
+    });
+    return out;
+  }
+  if (sh === 'border-top' || sh === 'border-right' || sh === 'border-bottom' || sh === 'border-left') {
+    const p = _parseBorderSideStrict(value, false); if (!p) return null;
+    const side = sh.slice('border-'.length);
+    return { ['border-' + side + '-width']: p.width, ['border-' + side + '-style']: p.style, ['border-' + side + '-color']: p.color };
+  }
+  if (sh === 'outline') {
+    const p = _parseBorderSideStrict(value, true); if (!p) return null;
+    return { 'outline-width': p.width, 'outline-style': p.style, 'outline-color': p.color };
+  }
+  if (sh === 'border') {
+    const p = _parseBorderSideStrict(value, false); if (!p) return null;
+    const out = {};
+    for (const s of ['top', 'right', 'bottom', 'left']) {
+      out['border-' + s + '-width'] = p.width;
+      out['border-' + s + '-style'] = p.style;
+      out['border-' + s + '-color'] = p.color;
+    }
+    return Object.assign(out, _BORDER_IMAGE_INITIAL);
+  }
+  return null;
+};
+// Reconstruct a border/outline shorthand from the longhands present (CSSOM
+// "serialize a CSS value"), or '' when a longhand is absent / the four sides
+// disagree / border-image is not at its initial value.
+const _LW_INIT = 'medium', _LS_INIT = 'none', _LC_INIT = 'currentcolor';
+const _joinBorderSide = (w, s, c) => {
+  const parts = [];
+  if (w !== _LW_INIT) parts.push(w);
+  if (s !== _LS_INIT) parts.push(s);
+  if (c !== _LC_INIT) parts.push(c);
+  return parts.length ? parts.join(' ') : _LS_INIT;
+};
+const _serializeBorderShorthand = (decl, sh) => {
+  const p = decl._props;
+  if (sh === 'border-width' || sh === 'border-style' || sh === 'border-color') {
+    const suf = sh.slice('border-'.length);
+    const vals = ['top', 'right', 'bottom', 'left'].map((s) => p['border-' + s + '-' + suf]);
+    if (vals.some((v) => v == null)) return '';
+    return _serializeBoxValue(sh, vals);
+  }
+  if (sh === 'border-top' || sh === 'border-right' || sh === 'border-bottom' || sh === 'border-left') {
+    const side = sh.slice('border-'.length);
+    const w = p['border-' + side + '-width'], s = p['border-' + side + '-style'], c = p['border-' + side + '-color'];
+    if (w == null || s == null || c == null) return '';
+    return _joinBorderSide(w, s, c);
+  }
+  if (sh === 'outline') {
+    const w = p['outline-width'], s = p['outline-style'], c = p['outline-color'];
+    if (w == null || s == null || c == null) return '';
+    return _joinBorderSide(w, s, c);
+  }
+  if (sh === 'border') {
+    for (const comp of ['width', 'style', 'color']) {
+      const v = p['border-top-' + comp];
+      if (v == null) return '';
+      for (const s of ['right', 'bottom', 'left']) if (p['border-' + s + '-' + comp] !== v) return '';
+    }
+    for (const k in _BORDER_IMAGE_INITIAL) {
+      if (p[k] != null && p[k] !== _BORDER_IMAGE_INITIAL[k]) return '';
+    }
+    return _joinBorderSide(p['border-top-width'], p['border-top-style'], p['border-top-color']);
+  }
+  return '';
 };
 const _isTimeTok = (t) => /^[+-]?(\d*\.?\d+)(s|ms)$/i.test(t);
 const _isTimingFnTok = (t) => {
@@ -12963,6 +13131,10 @@ globalThis.CSS = {
       const name = String(prop).trim().toLowerCase();
       const val = String(value).trim();
       if (!val) return false;
+      if (_BORDER_EXPAND[name]) {                          // border/outline shorthand
+        if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
+        return _expandBorderShorthand(name, val) != null;  // else validate by expanding
+      }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);
       return true;

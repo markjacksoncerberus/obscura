@@ -135,6 +135,29 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-26 (Quest #107 The Bordered Expansion — `border`/`outline` shorthands expand into specified longhands, +40):**
+The named #103–#106 "next leverage #2". `border-shorthand` sat at **0/36** and `outline-shorthand`
+at **0/4** because `el.style.border = "5px dotted blue"` stored `border` as one opaque key, so the
+specified-value reads `el.style.borderTopColor` returned `""`. (This is the CSSOM `el.style` path —
+distinct from Quest #58's *computed*-time cascade expansion, which already passed
+`variable-substitution-shorthands` 51/51 via getComputedStyle.) THE FIX (pure JS, additive,
+`bootstrap.js`) mirrors the `offset` shorthand model: expand-on-write into longhands, store only the
+longhands, reconstruct on read. New `_BORDER_EXPAND` table (shorthand→longhands; `border` also lists
+the 5 `border-image-*` reset longhands per CSS Backgrounds 3 §border-shorthands), `_expandBorderShorthand`
+(validates each `<line-width> ‖ <line-style> ‖ <color>` component — `color-mix(42deg)` rejected via
+`_isValidColor`; line-width math folded via `_canonLineWidth` so `calc(calc(10px))`→`calc(10px)`),
+`_serializeBorderShorthand` (reconstruct: sides agree + border-image initial → join dropping
+medium/none/currentcolor). Wired into setProperty/removeProperty/getPropertyValue + `CSS.supports`,
+all gated on `!var()` so the cascade still owns `border: var(--x)`. The proxy needed no change.
+**border-shorthand 0→36, outline-shorthand 0→4 = +40** (bonus: `border-image-source-computed` 9→10).
+ZERO regressions across a full sweep — KEY: `variable-substitution-shorthands` 51/51 (var()-cascade),
+`calc-nesting` 7/8 (border calc subtest held via `_canonLineWidth`), `serialize-values` 695→696,
+`shorthand-serialization` 7/7, `border-color-valid` 7/7, `css-ui/inheritance` 28/28,
+`css-tables/inheritance` 10/10, classlist 1420, createElement 147, qsa 1975. **Caps / Next:** (1)
+`%`→used-px against the containing block (the standing layout cap, biggest length tail); (2) cssText
+recombination for `border` (currently serializes longhands individually — untested, not a regression);
+(3) signs-abs/round-mod-rem-computed em-relative tails (no layout). Scroll `tickets/107-the-bordered-expansion.md`.
+
 **Session 2026-06-26 (Quest #106 The Balanced Verdict — auto-close unbalanced calc parens, +1):**
 The named #105 "next leverage" #1 — the `pow`-length `margin-left` validity gap. `hypot-pow-sqrt-computed`
 sat at 47/52; one fail was `calc(1px * pow(2, sqrt(100))` → expected `1024px`, got the default `0px`.
