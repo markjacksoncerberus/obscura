@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-26 (Quest #108).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-26 (Quest #109).
 
 ## Scoreboard
 
@@ -52,6 +52,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-06-26 (Quest #108).
 | `css/css-values/round-mod-rem-computed.html` | 160/243 | **225/243** | ⚠️ 93% | **Quest #96 The Resolved Verdict.** length-type (`margin-left`) + time-type (`transition-delay`, new `_evalMath` `opts.time`→seconds) folded & resolved; vw/vh resolved. Remaining = `%`. **+65.** |
 | `css/css-values/hypot-pow-sqrt-computed.html` | 4/52 | **43/52** | ⚠️ 83% | **Quest #96 The Resolved Verdict.** integer (`z-index`) & length folding. **+39.** |
 | `css/css-values/minmax-length-computed.html` | 0/80 | **76/80** | ⚠️ 95% | **Quest #96 The Resolved Verdict.** `min/max` length on `margin-left` resolved to px (em/abs/rem/vw). 4 cap: unbalanced-paren auto-close. **+76.** |
+| `css/css-values/minmax-length-percent-computed.html` | 0/50 | **30/50** | ⚠️ 60% | **Quest #109 The Singular Verdict.** Single-arg `min()`/`max()` (e.g. `min(1em + 1%)`) collapses to `calc(1% + 20px)` at computed time (`_unwrapSingleMinMax` in `_trComp`), matching bare calc(). 20 cap: multi-arg `min(20px, 10%)`→`10px` comparisons need `%`→used-px layout. **+30.** |
 | `css/css-values/minmax-integer-computed.html` | 0/10 | **10/10** | ✅ 100% | **Quest #96 The Resolved Verdict.** `min/max` on `z-index` fold to integer. **+10.** |
 | `css/css-values/clamp-length-computed.html` | 0/24 | **17/24** | ⚠️ 71% | **Quest #96 The Resolved Verdict.** `clamp()` on `letter-spacing` resolved to px. 7 cap: `%`. **+17.** |
 | `css/css-values/clamp-integer-computed.html` | 0/6 | **1/6** | ⚠️ 17% | **Quest #96 The Resolved Verdict.** `clamp(10,20,30)`→`20`. 5 cap: `clamp(none, …)` ±∞ sentinel. **+1.** |

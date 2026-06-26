@@ -10763,8 +10763,23 @@ const _trIsZeroLen = (t) => {
 // `vp` (optional) carries {vw,vh} px-per-1%-viewport so viewport-relative units
 // resolve at computed time. translate() callers omit it (byte-identical behavior);
 // the length-property resolver passes it so `min(1vh)`/`12vw` collapse to px.
+// CSS Values 4 §simplification: a min()/max() with a SINGLE argument reduces to
+// that argument at computed-value time (the comparison is trivial). The single
+// calculation is then serialized as calc() — so `min(1px + 1%)` computes to
+// `calc(1% + 1px)`, identical to bare `calc(1px + 1%)`. A `%` keeps it symbolic
+// (resolving it needs layout), which is exactly why the wrapper must collapse:
+// otherwise the function name (`min`) leaks into the computed serialization and
+// no longer matches the equivalent calc(). Multi-arg min/max (a real comparison)
+// is left untouched. Idempotent for non-min/max and for already-calc input.
+const _unwrapSingleMinMax = (t) => {
+  const m = /^(?:min|max)\(([\s\S]*)\)$/i.exec(String(t).trim());
+  if (!m) return t;
+  const args = _commaSplitTop(m[1]);
+  return args.length === 1 ? 'calc(' + args[0].trim() + ')' : t;
+};
 const _trComp = (t, el, computed, vp) => {
   t = t.trim();
+  if (computed) t = _unwrapSingleMinMax(t);
   const lenOpts = () => (vp ? { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, nonFinite: true, ..._siblingOpts(el, t) }
                             : { lengths: true, emPx: _emPxOf(el), nonFinite: true, ..._siblingOpts(el, t) });
   if (_FILTER_MATH_RE.test(t)) {
