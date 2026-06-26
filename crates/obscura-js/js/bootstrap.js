@@ -6864,7 +6864,13 @@ const _CALC_CONSTS = { infinity: Infinity, '-infinity': -Infinity, nan: NaN, pi:
 //   {k:'fn', name, args:[node]}    a preserved function (sign/min/max/…)
 const _parseCalcTree = (str, opts) => {
   opts = opts || {};
-  const s = String(str).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  // CSS Syntax §"consume a simple block": a math expression that ends while
+  // blocks are still open implicitly closes them (no parse error). `calc(1px *
+  // pow(2, sqrt(100))` (one `)` short) is a valid `calc(1px * pow(2, sqrt(100)))`.
+  // Auto-close trailing open parens so the validity gate + serializer accept it;
+  // idempotent for already-balanced input (the common case), and the transform
+  // gates already balance the same way via `_balanceParens`.
+  const s = _balanceParens(String(str).replace(/\/\*[\s\S]*?\*\//g, '').trim());
   if (s === '') return null;
   const toks = [];
   let i = 0; const n = s.length;

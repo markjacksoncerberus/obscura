@@ -135,6 +135,35 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-26 (Quest #106 The Balanced Verdict — auto-close unbalanced calc parens, +1):**
+The named #105 "next leverage" #1 — the `pow`-length `margin-left` validity gap. `hypot-pow-sqrt-computed`
+sat at 47/52; one fail was `calc(1px * pow(2, sqrt(100))` → expected `1024px`, got the default `0px`.
+The test value is **one closing paren short** (`calc(` `pow(` `sqrt(` = 3 opens, `100))` = 2 closes).
+CSS Syntax §"consume a simple block" implicitly closes any blocks still open at end-of-input — so
+`calc(1px * pow(2, sqrt(100))` is a perfectly valid `calc(1px * pow(2, sqrt(100)))`, not a parse error.
+But the generic math parser `_parseCalcTree` (the chokepoint for the validity gate `_mathReject`→
+`_mathValid` AND the specified-value serializer `_canonMathExpr`) treated the unbalanced token stream as
+malformed and returned `null` → the gate rejected the value → `margin-left` fell back to its `0px`
+initial. (The `rotate`/`scale`/`translate` gates already auto-balance via `_balanceParens` —
+`_parseCalcTree` was simply missing the same step.) THE FIX (pure JS, additive, one line, `bootstrap.js`):
+wrap `_parseCalcTree`'s input in the existing `_balanceParens` (`String(str)…trim()` → append the missing
+`)`s). **Idempotent** for already-balanced input (the overwhelmingly common case — a no-op), so the colour
+path and every finite/non-finite calc stay byte-identical. With the tree now parsing, the validity gate
+types it `<length>` (pow→`<number>`, `1px × <number>`→`<length>`) and `_canonMathExpr` folds it to
+`calc(1024px)` (it already accepts values ending in `)`, which this one does after its trailing
+`sqrt(100))`). **hypot-pow-sqrt-computed 47→48 = +1.** Zero regressions across the full sweep — KEY: the
+`*-invalid` realm (the over-acceptance risk, since the gate now accepts MORE) held exactly: acos-invalid
+62/63 (the 1 is the pre-existing `atan2(…, + …)` cap #95), signs-abs-invalid 53, round-mod-rem-invalid
+108, sin-cos-tan-invalid 42, hypot-invalid 49 — unbalanced trailing parens are not an invalidity reason
+per spec, so no invalid test relies on rejecting them. Also held: signs-abs-computed 167,
+round-mod-rem-computed 227, calc-infinity-nan 48, minmax-length-computed 76, clamp-length-computed 24,
+minmax-length-serialize 24, clamp-length-serialize 50, signs-abs-serialize 16, calc-nesting 7/8,
+calc-dimension-serialization-order 44, minmax-time-serialize 22, hypot-pow-sqrt-serialize 25,
+rotate/scale/translate-parsing-computed 23/38/19, color-computed-relative-color 1121, color-valid 17,
+classlist 1420, createElement 147. **Caps / Next:** the remaining 4 hypot fails are all `hypot(0% + …)`
+mixed-percentage rows → the standing `%`→used-px layout cap (`minmax-length-percent` 0/50). Then
+`border`→12-longhand expansion (`border-shorthand` 0/36). Scroll `tickets/106-the-balanced-verdict.md`.
+
 **Session 2026-06-25 (Quest #105 The Counted Verdict — `sibling-index()` tree-counting, +14):**
 The named #104 "next leverage" #1. Three computed math-function tests shared a `sibling-index()` tail —
 `acos-asin-atan-atan2-computed` (46/50), `sin-cos-tan-computed` (26/32), `hypot-pow-sqrt-computed`
