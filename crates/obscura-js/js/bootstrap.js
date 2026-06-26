@@ -414,11 +414,14 @@ const _canonCustomValue = (value) => { const t = String(value).trim(); return t 
 // no unit) per CSSOM "serialize a <number>": a bare leading decimal point gains a
 // `0` (`.5` → `0.5`, `-.5` → `-0.5`), a leading `+` is dropped, and a negative
 // zero loses its sign (`-0` → `0`). Digits otherwise preserved verbatim.
-const _canonNumberLiteral = (numStr) => {
+const _canonNumberLiteral = (numStr, keepNegZero) => {
   let s = numStr;
   s = s.replace(/^([+-]?)\.(?=\d)/, '$10.');     // .5 → 0.5 ; -.5 → -0.5
   if (s[0] === '+') s = s.slice(1);              // +5 → 5
-  if (s[0] === '-' && parseFloat(s) === 0) s = s.slice(1); // -0 / -0px's number → 0
+  // A top-level negative zero loses its sign per CSSOM "serialize a <number>"
+  // (`-0` → `0`), but inside a math function `-0` is significant (`1 / sign(-0px)`
+  // = −∞ vs `1 / sign(0px)` = +∞), so the calc serializer must round-trip it.
+  if (!keepNegZero && s[0] === '-' && parseFloat(s) === 0) s = s.slice(1); // -0 / -0px's number → 0
   return s;
 };
 // Lightly canonicalize a standard-property specified value: rewrite each numeric
@@ -431,7 +434,7 @@ const _canonStandardValue = (value) => {
   const s = String(value);
   const n = s.length;
   if (n === 0) return s;
-  let out = '', i = 0;
+  let out = '', i = 0, depth = 0;   // depth = open parens (a math-function context)
   while (i < n) {
     const c = s[i];
     if (c === '/' && s[i + 1] === '*') {                  // comment — copy verbatim
@@ -485,7 +488,9 @@ const _canonStandardValue = (value) => {
       out += ident; continue;
     }
     const m = _NUM_AT.exec(s.slice(i));                    // numeric token
-    if (m && /\d/.test(m[0])) { out += _canonNumberLiteral(m[0]); i += m[0].length; continue; }
+    if (m && /\d/.test(m[0])) { out += _canonNumberLiteral(m[0], depth > 0); i += m[0].length; continue; }
+    if (c === '(') depth++;
+    else if (c === ')' && depth > 0) depth--;
     out += c; i++;
   }
   return out;
@@ -7341,6 +7346,12 @@ const _serCalcNum = (node) => {
     const kw = Number.isNaN(v) ? 'NaN' : v > 0 ? 'infinity' : '-infinity';
     return node.u ? kw + ' * 1' + node.u : kw;
   }
+  // Preserve negative zero: `-0` is observably distinct from `+0` (e.g. `1 / sign(-0px)`
+  // = −∞, clamped to −1), so the SPECIFIED serialization must round-trip the sign so the
+  // computed-value re-evaluation can recover it. `_serNumber` deliberately collapses −0→0
+  // for general numeric output, so we special-case the leaf here. (CSS Values 4 §calc keeps
+  // the sign of zero.)
+  if (Object.is(v, -0)) return '-0' + node.u;
   return _serNumber(v) + node.u;
 };
 // Serialize a calculation tree; sum/product nodes always wrap in parentheses.
@@ -10937,19 +10948,29 @@ const _computeIntegerValue = (el, v) => {
   if (!/[\d(]/.test(s)) return null;                     // `auto` and friends → caller keeps v
   // `lengths` lets `sign(1px)` / `sign(1em)` / `sign(1vw)` resolve their length
   // argument to the <number> the function yields (the value stays a valid <integer>).
+  // `angle`/`time` do the same for `sign(1deg)` / `sign(1s)`: the only way an angle or
+  // time unit appears in an integer value is inside sign/abs (which collapse it to a
+  // <number>), so resolving them folds `sign(1deg)` to the bare `1` instead of leaving
+  // the `calc(1)` fallback (`_evalMath` returned null on the unrecognized unit → caller
+  // canonicalized symbolically). Invalid mixed-type values are rejected at set time.
   const vp = _vpUnits();
-  const n = _evalMath(s, 0, { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, ..._siblingOpts(el, s) });
+  const n = _evalMath(s, 0, { lengths: true, angle: true, time: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, ..._siblingOpts(el, s) });
   if (n === null || !isFinite(n)) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
   return String(Math.round(n));
 };
 // Fold a <time> value (incl. math) to canonical seconds. Mixed s/ms resolve
 // consistently (`round(10s,6000ms)` and `12s` both → `12s`).
-const _computeTimeValue = (v) => {
+const _computeTimeValue = (v, el) => {
   const s = String(v).trim();
   if (_TF_VAR_RE.test(s) || !/[\d(]/.test(s)) return null;
   // The CSS tokenizer auto-closes blocks left open at EOF (e.g. `calc(max(…, 10s)`,
   // one `)` short) — mirror that before evaluating.
-  const sec = _evalMath(_balanceParens(s), 0, { time: true, nonFinite: true });
+  // `lengths`/`emPx` let a length sub-expression inside sign/abs collapse to the
+  // <number> that scales the time (`5s + 15s * sign(40px - 2em)` → `5s` when 2em=40px);
+  // with `time` also set, `_evalMath` resolves time units first and falls through to
+  // length only for the non-time units, so plain `<time>` values stay byte-identical.
+  const vp = _vpUnits();
+  const sec = _evalMath(_balanceParens(s), 0, { time: true, lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, nonFinite: true, ..._siblingOpts(el, s) });
   if (sec === null) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
   return _serNumber(_nfClamp(sec)) + 's';
 };
@@ -10978,7 +10999,7 @@ const _normComputed = (el, kebab, v) => {
     return _CLAMP_NEG_PROPS.has(kebab) ? _clampNegPx(r) : r;
   }
   if (_INTEGER_COMPUTED_PROPS.has(kebab)) { const r = _computeIntegerValue(el, v); return r === null ? v : r; }
-  if (_TIME_COMPUTED_PROPS.has(kebab)) { const r = _computeTimeValue(v); return r === null ? v : r; }
+  if (_TIME_COMPUTED_PROPS.has(kebab)) { const r = _computeTimeValue(v, el); return r === null ? v : r; }
   if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
     if (String(v).trim().toLowerCase() === 'currentcolor') {
       return kebab === 'color' ? _computeColor(_initialOf('color')) : _computedColorOf(el);

@@ -135,6 +135,37 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-26 (Quest #108 The Signed Zero — `sign()` of angle/time + negative-zero round-trip + time-path lengths, +55):**
+The named "next leverage #3" of #106–#107 — the no-layout `signs-abs-computed` tail (167/233). Three
+orthogonal root causes, all non-layout: **(A) `sign(<angle>)`/`sign(<time>)` serialized `calc(1)` not `1`.**
+The integer (z-index) computed path `_computeIntegerValue` called `_evalMath` with only `lengths:true`, so an
+angle/time unit inside `sign()`/`abs()` was unresolvable → `_evalMath` returned null → the caller fell back to
+the symbolic `_canonMathExpr` (`calc(1)`). Fix: enable `angle:true, time:true` (the only way an angle/time unit
+reaches a valid integer value is inside sign/abs, which collapse it to a `<number>`; invalid mixed-type values
+are rejected at set time). **+30.** **(B) Negative zero was being destroyed at specified-serialization time.**
+`el.style.zIndex = 'calc(sign(-0px))'` stored `calc(sign(0px))` — `_canonStandardValue` (the light token-level
+canon on EVERY standard-property set) ran `_canonNumberLiteral`, which strips `-0`→`0` per the CSSOM
+`<number>` serialization rule. But inside a math function `-0` is observably distinct (`1 / sign(-0px)` = −∞,
+clamped to −1; vs `+0`→+∞→+1). Fix: paren-depth tracking in `_canonStandardValue` preserves the sign of zero
+inside parens (`_serCalcNum` already special-cased to emit `-0`), while a bare top-level `-0` still collapses to
+`0`. The computed re-evaluation then recovers −1 (`_evalMath`'s unary-minus + `Math.sign(-0)`=−0 already
+correct). **+22.** **(C) The time path didn't resolve lengths inside sign().** `_computeTimeValue` lacked
+`lengths`/`emPx`, so `calc(5s + 15s * sign(40px - 2em))` stayed symbolic; threaded `el`+`emPx` so `sign(40px-2em)`
+(2em=40px at font-size 20px) → 0 → `5s`. **+3.** **signs-abs-computed 167→222 = +55.** ZERO regressions across
+the full sweep — KEY (the −0 change touches every standard-property set): all serialize realms held byte-for-byte
+(signs-abs-serialize 16, clamp-length-serialize 50, minmax-length/time-serialize 24/22,
+calc-dimension-serialization-order 44, hypot-pow-sqrt-serialize 25, calc-infinity-nan-serialize
+length/number/time/angle 41/31/29/30, serialize-values 696), all `*-invalid` realms held (signs-abs 53,
+round-mod-rem 108, sin-cos-tan 42, hypot-pow-sqrt 49), transforms rotate/scale/translate-parsing-computed
+23/38/19, colour color-valid 17 + color-computed-relative-color 1121, calc-nesting 7/8,
+variable-substitution-shorthands 51, classlist 1420, createElement 147, qsa 1975; sibling math realms held
+(round-mod-rem-computed 227, minmax-length-computed 76, clamp-length-computed 24, sin-cos-tan 32, acos 50,
+hypot-pow-sqrt 48, calc-infinity-nan 48). **Caps / Next:** the remaining 11 signs-abs fails are 5 `%`→used-px
+(the standing layout cap — `abs(10%)`→`10px`, `calc((1em+1px)*(sign(1em-10px-10%)+1))`→`21px`) + 3 `fr`-unit
+(grid-template-rows) + 3 `dpi` (image-resolution) niche computed paths. round-mod-rem-computed's 16 fails are
+ALL `%`/`0%`-mixed (layout); a narrow `0%`→0px-always sub-win (~6 there) is possible but touches the
+length-resolution layout boundary. Scroll `tickets/108-the-signed-zero.md`.
+
 **Session 2026-06-26 (Quest #107 The Bordered Expansion — `border`/`outline` shorthands expand into specified longhands, +40):**
 The named #103–#106 "next leverage #2". `border-shorthand` sat at **0/36** and `outline-shorthand`
 at **0/4** because `el.style.border = "5px dotted blue"` stored `border` as one opaque key, so the
