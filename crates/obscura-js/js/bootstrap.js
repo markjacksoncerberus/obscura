@@ -912,6 +912,11 @@ class Node {
       for (let i = 0; i < kids.length; i++) this.appendChild(kids[i]);
       return c;
     }
+    // Moving an existing child = DOM "remove" then "insert"; the remove's live-range
+    // steps run with the node's OLD parent/index, before the tree op repositions it.
+    const _oldParent = c.parentNode;
+    if (_oldParent && __obscura_liveRanges.length)
+      __obscura_adjustRangesForRemove(c, _oldParent, __obscura_nodeIndex(c));
     const _prev = __mutationObservers?.length ? +_dom("last_child", this._nid) : -1;
     _dom("append_child", this._nid, c._nid);
     // Insert §"adopt node into the parent's node document": when the node comes
@@ -945,6 +950,9 @@ class Node {
   removeChild(c) {
     if (!c) return c;
     __obscura_runNodeIteratorPreRemove(c);
+    // DOM "remove" live-range steps, before the node leaves the tree.
+    if (c.parentNode && __obscura_liveRanges.length)
+      __obscura_adjustRangesForRemove(c, this, __obscura_nodeIndex(c));
     let _prev = -1, _next = -1;
     if (__mutationObservers?.length) {
       _prev = +_dom("prev_sibling", c._nid);
@@ -1041,7 +1049,16 @@ class Node {
       for (let i = 0; i < kids.length; i++) this.insertBefore(kids[i], ref);
       return n;
     }
+    // Moving an existing child = DOM "remove" then "insert"; the remove's live-range
+    // steps run with the node's OLD parent/index, before the tree op repositions it.
+    const _oldParent = n.parentNode;
+    if (_oldParent && __obscura_liveRanges.length)
+      __obscura_adjustRangesForRemove(n, _oldParent, __obscura_nodeIndex(n));
     _dom("insert_before", n._nid, ref._nid);
+    // DOM "insert" live-range steps, with the node now at its new position (a
+    // non-null reference, so boundary points past it shift forward by one).
+    if (__obscura_liveRanges.length)
+      __obscura_adjustRangesForInsert(n, this, __obscura_nodeIndex(n));
     // Adopt deeply when crossing documents (see appendChild); cheap compare otherwise.
     const _adoptDoc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
     if (n.ownerDocument !== _adoptDoc) _setNodeDocumentDeep(n, _adoptDoc);
@@ -1343,17 +1360,31 @@ class Text extends CharacterData {
   splitText(offset) {
     offset = offset >>> 0; // WebIDL unsigned long
     const d = this.data;
-    // §splitText step 2: offset > length → IndexSizeError.
+    // §splitText (DOM "split") step 2: offset > length → IndexSizeError.
     if (offset > d.length) throw new DOMException("The index is not in the allowed range.", "IndexSizeError");
-    const tail = d.substring(offset);
-    this.data = d.substring(0, offset);
-    const newNid = +_dom("create_text_node", tail);
+    const count = d.length - offset;
+    const newNode = _wrap(+_dom("create_text_node", d.substring(offset)));
     const parent = this.parentNode;
     if (parent) {
-      const ref = this.nextSibling;
-      parent.insertBefore(_wrap(newNid), ref);
+      // Step 7.1: insert the new node after this one. Steps 7.2–7.5: shift the
+      // boundary points of every live range per the DOM "split" algorithm.
+      parent.insertBefore(newNode, this.nextSibling);
+      const index = __obscura_nodeIndex(this);
+      const list = __obscura_liveRanges;
+      for (let i = list.length - 1; i >= 0; i--) {
+        const r = list[i].deref();
+        if (!r) { list.splice(i, 1); continue; }
+        if (r._sc === this && r._so > offset) { r._sc = newNode; r._so -= offset; }
+        if (r._ec === this && r._eo > offset) { r._ec = newNode; r._eo -= offset; }
+        if (r._sc === parent && r._so === index + 1) r._so += 1;
+        if (r._ec === parent && r._eo === index + 1) r._eo += 1;
+      }
     }
-    return _wrap(newNid);
+    // Step 8: replace data (truncate this node). Routed through the "replace data"
+    // primitive so a detached node's own ranges (no parent → steps 7 skipped) still
+    // collapse correctly, matching the spec's final step.
+    __obscura_replaceData(this, offset, count, "");
+    return newNode;
   }
   cloneNode() { return document.createTextNode(this.data); }
 }
@@ -14080,6 +14111,38 @@ function __obscura_replaceData(node, offset, count, data) {
       if (r._eo > offset && r._eo <= end) r._eo = offset;
       else if (r._eo > end) r._eo += delta;
     }
+  }
+}
+
+// DOM "remove" range-adjustment steps (https://dom.spec.whatwg.org/#concept-node-remove,
+// steps for live ranges): when `node` is removed from `parent` (its old parent),
+// where `index` is `node`'s index among `parent`'s children, move the boundary
+// points of every live range per the spec. Must be called BEFORE the node leaves
+// the tree (the inclusive-descendant test and the index both need it in place).
+function __obscura_adjustRangesForRemove(node, parent, index) {
+  const list = __obscura_liveRanges;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const r = list[i].deref();
+    if (!r) { list.splice(i, 1); continue; }
+    // start/end node is an inclusive descendant of node → (parent, index).
+    if (__obscura_isInclusiveAncestor(node, r._sc)) { r._sc = parent; r._so = index; }
+    else if (r._sc === parent && r._so > index) r._so -= 1;
+    if (__obscura_isInclusiveAncestor(node, r._ec)) { r._ec = parent; r._eo = index; }
+    else if (r._ec === parent && r._eo > index) r._eo -= 1;
+  }
+}
+
+// DOM "insert" live-range steps (https://dom.spec.whatwg.org/#concept-node-insert
+// step 5): a single `node` has just been inserted into `parent` at `index` before
+// a non-null reference child (appends — null reference — do NOT adjust). Each
+// boundary point in `parent` past the insertion point shifts forward by one.
+function __obscura_adjustRangesForInsert(node, parent, index) {
+  const list = __obscura_liveRanges;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const r = list[i].deref();
+    if (!r) { list.splice(i, 1); continue; }
+    if (r._sc === parent && r._so > index) r._so += 1;
+    if (r._ec === parent && r._eo > index) r._eo += 1;
   }
 }
 

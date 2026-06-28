@@ -141,6 +141,25 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-28 (Quest #115 The Shifted Verdict — live-range adjustment in the DOM node-mutation hooks: remove, insert, split, +48):**
+Took the #112/#113/#114-named "next leverage" — wire the `__obscura_liveRanges` registry (from #113) into the *other* spec
+range-mutation hooks. The individual `dom/ranges/Range-mutations-*.html` harnesses exist (the un-suffixed `Range-mutations.html`
+is the 404 noted before). Baselined: removeChild 11/20, appendChild 56/70, splitText 95/116, replaceChild 56/60. Curling
+`Range-mutations.js` showed the reference model is the literal DOM spec: **remove** collapses a removed node's descendant
+boundaries to (parent, index) and decrements later parent boundaries; **insert** (non-null reference only — appends don't
+shift) increments parent boundaries past the insertion point; **split** moves boundaries past the split offset onto the new
+node and bumps the index+1 boundary. THE FIX (pure JS, additive, bootstrap.js): two helpers beside `__obscura_replaceData` —
+`__obscura_adjustRangesForRemove` (called in removeChild before the tree op, and in appendChild/insertBefore when the node has
+an old parent = the remove half of a move) and `__obscura_adjustRangesForInsert` (called in insertBefore only, after the tree
+op); `splitText` rewritten to the spec "split" order (insert new node → steps 8.2–8.5 → truncate via `__obscura_replaceData`,
+so detached-node ranges still collapse). `replaceChild` (= remove + insert) fell out for free, including the `replaceChild(x,x)`
+replace-with-self round trip that needs the insert shift to undo the remove decrement. All four call sites guard on
+`__obscura_liveRanges.length` so range-free page mutations pay nothing. **removeChild 11→20, appendChild 56→70, splitText
+95→116, replaceChild 56→60 — all 100%, +48.** ZERO regressions (the Range content-ops route through these and all held; see
+sweep). CAP: `Range-mutations-insertBefore.html` is a pre-existing heavy-test hang (no result on baseline either, >5 min) —
+same family as the `Node-insertBefore.html` hang from #111; its logic is covered by replaceChild's node moves. NEXT: registry
+now wired into replace-data + remove + insert + split; CSS `%`→used-px stays layout-capped. Scroll `tickets/115-the-shifted-verdict.md`.
+
 **Session 2026-06-28 (Quest #114 The Coerced Verdict — WebIDL `unsigned long` (ToUint32) coercion + required-arg-count on the CharacterData mutators, +30):**
 Took the #113-named "next leverage" `CharacterData-*` tail. Baselined the five mutators: `substringData` 14/28, `deleteData`
 12/18, `replaceData` 30/34, `insertData` 14/18, `appendData` 12/14. Curling the real WPT sources confirmed every failure was a
