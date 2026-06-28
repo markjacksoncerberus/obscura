@@ -1298,12 +1298,21 @@ class CharacterData extends Node {
   }
   get length() { return this.data.length; }
   substringData(offset, count) {
-    return this.data.substring(offset, offset + count);
+    // WebIDL: both args are required `unsigned long`. Missing args → TypeError;
+    // each value is coerced via ToUint32 (`>>> 0`), so -1 → 4294967295,
+    // 0x100000000+1 → 1, "test" → 0. Per DOM "substring data": offset > length
+    // throws IndexSizeError; offset+count past the end clamps to the tail.
+    if (arguments.length < 2) throw new TypeError("CharacterData.substringData requires 2 arguments");
+    offset = offset >>> 0; count = count >>> 0;
+    const data = this.data;
+    if (offset > data.length) throw new DOMException("offset out of bounds", "IndexSizeError");
+    if (offset + count > data.length) return data.slice(offset);
+    return data.slice(offset, offset + count);
   }
   // The DOM "replace data" primitive underlies all of these: it rewrites the
   // string AND adjusts every live range whose boundary falls in the affected
   // span (which is why `deleteContents()`/the WPT reference collapse for free).
-  appendData(s) { __obscura_replaceData(this, this.data.length, 0, String(s)); }
+  appendData(s) { if (arguments.length < 1) throw new TypeError("CharacterData.appendData requires 1 argument"); __obscura_replaceData(this, this.data.length, 0, String(s)); }
   insertData(offset, s) { __obscura_replaceData(this, offset, 0, String(s)); }
   deleteData(offset, count) { __obscura_replaceData(this, offset, count, ""); }
   replaceData(offset, count, s) { __obscura_replaceData(this, offset, count, String(s)); }
@@ -14049,6 +14058,11 @@ const __obscura_liveRanges = [];
 // `node`'s data, replacing `count` code units at `offset` with `data`, then move
 // each live range's boundary points per the spec's range-mutation steps.
 function __obscura_replaceData(node, offset, count, data) {
+  // WebIDL `unsigned long` coercion (ToUint32) on the offset/count from
+  // delete/insert/replaceData: -1 → 4294967295 (→ out-of-bounds throw or tail
+  // clamp), -0x100000000+2 → 2, etc. Internal Range callers pass plain
+  // in-bounds integers, for which `>>> 0` is the identity.
+  offset = offset >>> 0; count = count >>> 0;
   const old = node.data;
   if (offset > old.length) throw new DOMException("offset out of bounds", "IndexSizeError");
   if (offset + count > old.length) count = old.length - offset;
