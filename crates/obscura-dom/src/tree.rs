@@ -898,7 +898,36 @@ impl DomTree {
     }
 
     pub fn get_element_by_id(&self, id: &str) -> Option<NodeId> {
-        self.inner.borrow().id_index.get(id).copied()
+        // DOM §dom-document-getelementbyid: return the FIRST element, in tree
+        // order, among the document's descendants whose ID is `id`. An element's
+        // ID is its non-empty `id` attribute — so the empty string never matches.
+        //
+        // We walk the live tree (pre-order) rather than consulting a stored index:
+        // an index keyed by id can neither honour tree order across duplicate ids
+        // nor stay live across innerHTML/outerHTML/subtree mutations. Walking from
+        // the document root also gives connectedness for free — a detached element
+        // (appended to a fragment or another orphan, not to the document) is simply
+        // not reachable, so it is correctly excluded.
+        if id.is_empty() {
+            return None;
+        }
+        let inner = self.inner.borrow();
+        let mut stack: Vec<NodeId> = Vec::new();
+        push_children_rev(&inner, inner.document, &mut stack);
+        while let Some(cur) = stack.pop() {
+            if let Some(Some(node)) = inner.nodes.get(cur.index()) {
+                if let NodeData::Element { ref attrs, .. } = node.data {
+                    if attrs
+                        .iter()
+                        .any(|a| a.name.local.as_ref() == "id" && a.value.as_str() == id)
+                    {
+                        return Some(cur);
+                    }
+                }
+                push_children_rev(&inner, cur, &mut stack);
+            }
+        }
+        None
     }
 
     pub fn text_content(&self, node_id: NodeId) -> String {
@@ -1030,6 +1059,27 @@ impl DomTree {
             inner.id_index.insert(new.to_string(), node_id);
         }
     }
+}
+
+/// Push `parent`'s children onto `stack` in reverse document order, so that a
+/// `stack.pop()`-driven loop visits them left-to-right (a pre-order / tree-order
+/// traversal). Used by `get_element_by_id`.
+fn push_children_rev(inner: &DomTreeInner, parent: NodeId, stack: &mut Vec<NodeId>) {
+    let start = stack.len();
+    let mut child = inner
+        .nodes
+        .get(parent.index())
+        .and_then(|n| n.as_ref())
+        .and_then(|n| n.first_child);
+    while let Some(child_id) = child {
+        stack.push(child_id);
+        child = inner
+            .nodes
+            .get(child_id.index())
+            .and_then(|n| n.as_ref())
+            .and_then(|n| n.next_sibling);
+    }
+    stack[start..].reverse();
 }
 
 fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {

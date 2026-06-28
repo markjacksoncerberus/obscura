@@ -3055,8 +3055,15 @@ class Document extends Node {
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) {
-    if (this._standalone) return this.querySelector('#' + String(id).replace(/["\\]/g, '\\$&'));
-    return _wrapEl(+_dom("get_element_by_id", id));
+    // WebIDL: elementId is a (non-nullable) DOMString — undefined -> "undefined",
+    // null -> "null". The empty string is a valid argument but matches nothing
+    // (an element's ID is its NON-EMPTY id attribute).
+    const eid = String(id);
+    if (this._standalone) {
+      if (eid === "") return null;
+      return this.querySelector('#' + eid.replace(/["\\]/g, '\\$&'));
+    }
+    return _wrapEl(+_dom("get_element_by_id", eid));
   }
   querySelector(s) {
     _primeTarget(s, this);
@@ -3508,7 +3515,7 @@ class DetachedDocument extends Document {
     const ids = _qsIds(_dom("query_selector_all_scoped", this._nid, s), s);
     return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }
-  getElementById(id) { return this.querySelector('#' + String(id).replace(/["\\]/g, '\\$&')); }
+  getElementById(id) { const eid = String(id); if (eid === "") return null; return this.querySelector('#' + eid.replace(/["\\]/g, '\\$&')); }
   // getElementsByTagName/NS/ClassName inherited from Document (live HTMLCollections).
   // Factories: create real nodes via the main document's ops, then tag this doc
   // as their owner.

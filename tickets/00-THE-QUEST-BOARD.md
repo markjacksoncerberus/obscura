@@ -145,6 +145,24 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-28 (Quest #123 The Identified Verdict — getElementById tree-order/connectedness/liveness, +10):**
+After #122 exhausted the ARIA reflection realm bar shadow scoping, swept a fresh region and found a
+**broken core primitive**: `dom/nodes/Document-getElementById.html` at 8/18. `getElementById` underlies the
+cascade's form-owner resolution, ARIA element reflection and named-element access — yet `tree.rs::get_element_by_id`
+was a single-entry `HashMap<String, NodeId>` lookup: it could not honour **tree order** across duplicate ids
+(last-writer-wins), did not check **connectedness** (returned detached elements), went **stale** across
+innerHTML/outerHTML/subtree mutations, and indexed `id=""`. The JS side compounded it — the shared `_dom`
+helper's `String(a1 ?? "")` collapses `null`/`undefined`→`""`, breaking WebIDL `DOMString` coercion. **The fix:**
+replaced the index lookup with a **live pre-order tree walk** from the document root (new `push_children_rev`
+helper; first element in tree order whose live, non-empty `id` matches) — making tree order, connectedness
+(only document-reachable nodes are visited), liveness (tree read each call), and `id=""`→null all correct at
+once; and made JS `getElementById` coerce its argument (`String(id)`) before `_dom`, with standalone/Detached
+paths short-circuiting `""`→null. **8/18 → 18/18, +10.** Zero regressions (qsa 1975, classlist 1420, createElement
+147, Node-properties 726, aria-attribute 41, aria-element 22, getElementsByTagName 19, getElementsByClassName 1
+— all unchanged). **No cap** (realm 100%); the walk is O(n) worst-case but the only certainly-correct option —
+if ever hot, the right optimization is a `Vec<NodeId>` superset index re-validated at lookup, never a single-entry
+map. Scroll `tickets/123-the-identified-verdict.md`.
+
 **Session 2026-06-28 (Quest #122 The Associated Verdict — ARIAMixin element reflection, +17):**
 After #121 secured the ARIAMixin *string* family, took the sibling it named:
 `html/dom/aria-element-reflection.html` at 5/27. This is the **element** half of ARIA
