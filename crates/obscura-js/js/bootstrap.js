@@ -762,6 +762,9 @@ class CSSStyleDeclaration {
   }
   get length() { return Object.keys(this._props).length; }
   item(i) { return Object.keys(this._props)[i] || ""; }
+  // CSSStyleDeclaration is iterable over the property names it exposes through the
+  // indexed getter (CSSOM "supported property indices") — same order as item().
+  [Symbol.iterator]() { return Object.keys(this._props)[Symbol.iterator](); }
 }
 
 // Map a JS-side style property accessor to its canonical CSS property name (the
@@ -3120,7 +3123,17 @@ class Document extends Node {
       hasFeature() { return true; },
     };
   }
-  get styleSheets() { return []; }
+  get styleSheets() {
+    // A StyleSheetList over the document's <style> and stylesheet <link> elements.
+    // Each CSSStyleSheet is cached per node (stable identity), re-parsed on text
+    // change. External <link> sheets carry no rules (we don't fetch their CSS).
+    let els = [];
+    try { els = this.querySelectorAll('style, link[rel~="stylesheet"]'); } catch { els = []; }
+    const out = [];
+    for (const el of els) { try { out.push(_styleSheetForNode(el)); } catch (e) {} }
+    out.item = (i) => { i = i >>> 0; return i < out.length ? out[i] : null; };
+    return out;
+  }
   get forms() { return this.querySelectorAll("form"); }
   get images() { return this.querySelectorAll("img"); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
@@ -11409,6 +11422,27 @@ const _buildCascade = (el) => {
       const spec = parseInt(_dom('selector_match_specificity', String(nid), rule.selectorText), 10);
       if (spec >= 0) sources.push({ spec, order: order++, decls: rule.decls });
     }
+    // Adopted constructable stylesheets (document.adoptedStyleSheets) apply at
+    // author origin, ordered after the document's <style> rules (later source
+    // order → wins same-specificity ties). Gated on a non-empty list so ordinary
+    // pages keep the exact original cascade (zero-regression). Only top-level
+    // CSSStyleRules participate; nested @media/@supports matching needs media
+    // evaluation that is out of scope here. Disabled sheets contribute nothing.
+    let adopted = [];
+    try { adopted = doc && doc.adoptedStyleSheets; } catch { adopted = []; }
+    if (adopted && adopted.length) {
+      for (const sheet of adopted) {
+        if (!sheet || sheet.disabled) continue;
+        let arr = null;
+        try { arr = sheet.cssRules && sheet.cssRules._rules; } catch { arr = null; }
+        if (!arr) continue;
+        for (const r of arr) {
+          if (!r || r.type !== 1) continue;
+          const spec = parseInt(_dom('selector_match_specificity', String(nid), r.selectorText), 10);
+          if (spec >= 0) sources.push({ spec, order: order++, decls: r._cascadeDecls });
+        }
+      }
+    }
     // Inline style — highest author source at each importance level.
     let inlineText = '';
     try { inlineText = el.getAttribute && el.getAttribute('style'); } catch { inlineText = ''; }
@@ -11539,41 +11573,421 @@ globalThis.getSelection = _markNative(function getSelection() {
   };
 });
 
-globalThis.CSSStyleSheet = class CSSStyleSheet {
-  constructor(options) {
-    this.cssRules = [];
-    this.ownerRule = null;
-    this.disabled = false;
-    this._rules = [];
+// ── CSSOM rule tree (CSSStyleSheet / CSSRule / CSSRuleList / MediaList) ───────
+// A spec-shaped object model over the same CSS parser the cascade uses. Covers
+// constructable stylesheets (new CSSStyleSheet + replace/replaceSync), the
+// `<style>`.sheet / document.styleSheets surface, and the CSSStyleRule /
+// grouping-rule (`@media`/`@supports`) tree with live insertRule/deleteRule.
+// Serialization reuses the inline-style machinery (_parseStyleDecls /
+// _serializeDeclBlock) so a rule's cssText matches the heavily-tested specified
+// declaration-block form. Layout-dependent application stays out of scope; the
+// cascade reads adoptedStyleSheets (see _buildCascade) so getComputedStyle
+// honours adopted constructable sheets.
+
+// Recursive CSS rule-list parser: returns a tree of plain descriptors. Unlike
+// _cssSplitRules (which flattens top-level style rules for the cascade), this
+// preserves at-rules and their nested rule lists, tracking string and bracket
+// nesting so a `{`/`}`/`;` inside a value or selector doesn't end a rule early.
+const _cssParseRuleList = (cssText) => {
+  const css = String(cssText == null ? '' : cssText).replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [];
+  let i = 0; const n = css.length;
+  while (i < n) {
+    while (i < n && /\s/.test(css[i])) i++;
+    if (i >= n) break;
+    // Scan the prelude up to a top-level `{` (block rule) or `;` (statement rule).
+    let j = i, depth = 0, inStr = null;
+    while (j < n) {
+      const c = css[j];
+      if (inStr) { if (c === inStr && css[j - 1] !== '\\') inStr = null; j++; continue; }
+      if (c === '"' || c === "'") { inStr = c; j++; continue; }
+      if (c === '(' || c === '[') depth++;
+      else if (c === ')' || c === ']') { if (depth > 0) depth--; }
+      else if (depth === 0 && (c === '{' || c === ';')) break;
+      j++;
+    }
+    if (j >= n) break;                                   // dangling prelude, no block
+    if (css[j] === ';') {                                // statement at-rule (@import/@namespace/@charset)
+      const prelude = css.slice(i, j).trim();
+      i = j + 1;
+      if (prelude && prelude[0] === '@') {
+        const m = /^@([\w-]+)/.exec(prelude);
+        rules.push({ type: 'stmt', name: m ? m[1].toLowerCase() : '', prelude });
+      }
+      continue;
+    }
+    const prelude = css.slice(i, j).trim();
+    // Read the balanced { … } block.
+    let k = j + 1; const stack = ['{']; inStr = null;
+    while (k < n && stack.length > 0) {
+      const c = css[k];
+      if (inStr) { if (c === inStr && css[k - 1] !== '\\') inStr = null; k++; continue; }
+      if (c === '"' || c === "'") inStr = c;
+      else if (c === '{' || c === '(' || c === '[') stack.push(c);
+      else if (c === '}' || c === ')' || c === ']') {
+        const top = stack[stack.length - 1];
+        if ((c === '}' && top === '{') || (c === ')' && top === '(') || (c === ']' && top === '[')) stack.pop();
+      }
+      k++;
+    }
+    const body = css.slice(j + 1, k - 1);
+    i = k;
+    if (!prelude) continue;
+    if (prelude[0] === '@') {
+      const m = /^@([\w-]+)\s*/.exec(prelude);
+      const name = m ? m[1].toLowerCase() : '';
+      const condition = prelude.slice(m ? m[0].length : 1).trim();
+      if (name === 'media' || name === 'supports' || name === 'container' || name === 'document') {
+        rules.push({ type: 'group', name, condition, prelude, rules: _cssParseRuleList(body) });
+      } else if (name === 'keyframes' || name === '-webkit-keyframes') {
+        rules.push({ type: 'keyframes', name, condition, prelude, body });
+      } else {
+        rules.push({ type: 'at', name, condition, prelude, body });
+      }
+    } else {
+      rules.push({ type: 'style', selectorText: prelude, body });
+    }
   }
-  insertRule(rule, index) {
-    const idx = index ?? this._rules.length;
-    this._rules.splice(idx, 0, { cssText: rule, type: 1 });
-    this.cssRules = this._rules;
-    return idx;
+  return rules;
+};
+
+// MediaList — a minimal serializable list of media queries (CSSOM §MediaList).
+// Wrapped in a Proxy so the indexed getter (`media[0]`) reads the live item list.
+const _makeMediaList = (text) => {
+  const ml = {
+    _items: String(text == null ? '' : (typeof text === 'string' ? text : (text.mediaText || '')))
+      .split(',').map((s) => s.trim()).filter(Boolean),
+    get length() { return this._items.length; },
+    get mediaText() { return this._items.join(', '); },
+    set mediaText(v) { this._items = String(v == null ? '' : v).split(',').map((s) => s.trim()).filter(Boolean); },
+    item(i) { i = i >>> 0; return i < this._items.length ? this._items[i] : null; },
+    appendMedium(m) { m = String(m); if (!this._items.includes(m)) this._items.push(m); },
+    deleteMedium(m) {
+      const idx = this._items.indexOf(String(m));
+      if (idx < 0) throw new DOMException("Media query not in list.", "NotFoundError");
+      this._items.splice(idx, 1);
+    },
+    toString() { return this._items.join(', '); },
+  };
+  return new Proxy(ml, {
+    get(t, p) {
+      if (typeof p === 'string' && /^[0-9]+$/.test(p)) return t._items[+p];
+      return t[p];
+    },
+  });
+};
+
+// CSSRuleList — an array-like view over a backing _rules array. The backing array
+// is mutated in place (insert/delete/replace) so the list keeps a stable identity
+// (`rules === sheet.cssRules` after replace). Numeric index access is served by a
+// Proxy reading the live backing array.
+class CSSRuleList {
+  constructor() { this._rules = []; }
+  get length() { return this._rules.length; }
+  item(i) { i = i >>> 0; return i < this._rules.length ? this._rules[i] : null; }
+  [Symbol.iterator]() { return this._rules[Symbol.iterator](); }
+}
+globalThis.CSSRuleList = CSSRuleList;
+const _ruleListProxy = (rl) => new Proxy(rl, {
+  get(t, p) {
+    if (typeof p === 'string' && /^[0-9]+$/.test(p)) return t._rules[+p];
+    return t[p];
+  },
+  has(t, p) {
+    if (typeof p === 'string' && /^[0-9]+$/.test(p)) return +p < t._rules.length;
+    return p in t;
+  },
+});
+
+class CSSRule {
+  constructor() { this._parentRule = null; this._parentStyleSheet = null; }
+  // parentRule / parentStyleSheet / type / cssText are readonly IDL attributes —
+  // they must live on the prototype chain (assert_idl_attribute) and reject writes
+  // (assert_readonly). Backing fields are set through _makeRule.
+  get parentRule() { return this._parentRule; }
+  get parentStyleSheet() { return this._parentStyleSheet; }
+  get type() { return 0; }
+  get cssText() { return ''; }
+}
+// Rule-type constants (exposed on the interface and on instances per WebIDL).
+const _CSSRULE_CONSTS = {
+  STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5,
+  PAGE_RULE: 6, KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, MARGIN_RULE: 9,
+  NAMESPACE_RULE: 10, COUNTER_STYLE_RULE: 11, SUPPORTS_RULE: 12,
+};
+for (const [k, v] of Object.entries(_CSSRULE_CONSTS)) {
+  Object.defineProperty(CSSRule, k, { value: v, enumerable: true });
+  Object.defineProperty(CSSRule.prototype, k, { value: v, enumerable: true });
+}
+globalThis.CSSRule = CSSRule;
+
+class CSSStyleRule extends CSSRule {
+  constructor(selectorText, body) {
+    super();
+    this._selectorText = String(selectorText == null ? '' : selectorText).trim();
+    this._styleDecl = _styleProxy(new CSSStyleDeclaration());
+    if (body) this._styleDecl.cssText = body;          // specified-value serialization
+    this._cascadeDecls = _cssParseDecls(body || '');   // cascade-shape decls for getComputedStyle
+  }
+  get type() { return 1; }
+  get selectorText() { return this._selectorText; }
+  set selectorText(v) { this._selectorText = String(v).trim(); }
+  get style() { return this._styleDecl; }
+  set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
+  get cssText() {
+    const block = this._styleDecl.cssText;
+    return this._selectorText + ' { ' + (block ? block + ' ' : '') + '}';
+  }
+}
+globalThis.CSSStyleRule = CSSStyleRule;
+
+class CSSGroupingRule extends CSSRule {
+  constructor() { super(); this._ruleListObj = new CSSRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj); }
+  get cssRules() { return this._ruleList; }
+  insertRule(text, index) {
+    const arr = this._ruleListObj._rules;
+    index = index === undefined ? 0 : index >>> 0;
+    if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
+    const parsed = _cssParseRuleList(text);
+    if (parsed.length !== 1) throw new DOMException("insertRule expects exactly one rule.", "SyntaxError");
+    // @import / @namespace (statement at-rules) cannot live inside a grouping rule.
+    if (parsed[0].type === 'stmt') throw new DOMException("Cannot insert this rule type inside a grouping rule.", "HierarchyRequestError");
+    arr.splice(index, 0, _makeRule(parsed[0], this.parentStyleSheet, this));
+    return index;
   }
   deleteRule(index) {
-    this._rules.splice(index, 1);
-    this.cssRules = this._rules;
+    const arr = this._ruleListObj._rules;
+    index = index >>> 0;
+    if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
+    arr.splice(index, 1);
+  }
+}
+globalThis.CSSGroupingRule = CSSGroupingRule;
+
+class CSSConditionRule extends CSSGroupingRule {
+  get conditionText() { return this._conditionText || ''; }
+  set conditionText(v) { this._conditionText = String(v); }
+}
+globalThis.CSSConditionRule = CSSConditionRule;
+
+const _serializeGroupBlock = (rule) => {
+  const inner = rule._ruleListObj._rules.map((r) => '  ' + r.cssText).join('\n');
+  return inner ? ' {\n' + inner + '\n}' : ' { }';
+};
+class CSSMediaRule extends CSSConditionRule {
+  constructor(condition) { super(); this._media = _makeMediaList(condition); }
+  get type() { return 4; }
+  get media() { return this._media; }
+  set media(v) { this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
+  get conditionText() { return this._media.mediaText; }
+  get cssText() { return '@media ' + this._media.mediaText + _serializeGroupBlock(this); }
+}
+globalThis.CSSMediaRule = CSSMediaRule;
+
+class CSSSupportsRule extends CSSConditionRule {
+  constructor(condition) { super(); this._conditionText = String(condition || ''); }
+  get type() { return 12; }
+  get cssText() { return '@supports ' + this._conditionText + _serializeGroupBlock(this); }
+}
+globalThis.CSSSupportsRule = CSSSupportsRule;
+
+// Minimal carriers for at-rules we parse but don't fully model. They preserve a
+// faithful cssText round-trip and a type code; their declarations don't feed the
+// cascade (out of scope for the CSSOM object-model tests this serves).
+class CSSGenericRule extends CSSRule {
+  constructor(desc) { super(); this._desc = desc; }
+  get type() {
+    const n = this._desc.name;
+    return n === 'font-face' ? 5 : n === 'page' ? 6 : n === 'namespace' ? 10
+      : n === 'import' ? 3 : n === 'charset' ? 2 : 0;
+  }
+  get cssText() {
+    const d = this._desc;
+    if (d.type === 'stmt') return d.prelude.replace(/\s+$/, '') + ';';
+    return d.prelude + ' { ' + (d.body || '').trim() + ' }';
+  }
+}
+
+// @keyframes — CSSKeyframesRule (a name + a list of CSSKeyframeRule) with the
+// appendRule/findRule/deleteRule/indexed-getter surface, and CSSKeyframeRule
+// (a keyText + a declaration block). The name serializes as a CSS identifier
+// unless it is a CSS-wide keyword or `none`, which must be a string.
+const _KF_QUOTE_NAMES = new Set(['initial', 'inherit', 'unset', 'revert', 'revert-layer', 'default', 'none']);
+const _serializeKeyframesName = (n) =>
+  _KF_QUOTE_NAMES.has(String(n).toLowerCase()) ? JSON.stringify(String(n)) : String(n);
+class CSSKeyframeRule extends CSSRule {
+  constructor(keyText, body) {
+    super();
+    this._keyText = String(keyText == null ? '' : keyText).trim();
+    this._styleDecl = _styleProxy(new CSSStyleDeclaration());
+    if (body) this._styleDecl.cssText = body;
+  }
+  get type() { return 8; }
+  get keyText() { return this._keyText; }
+  set keyText(v) { this._keyText = String(v).trim(); }
+  get style() { return this._styleDecl; }
+  set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
+  get cssText() {
+    const b = this._styleDecl.cssText;
+    return this._keyText + ' { ' + (b ? b + ' ' : '') + '}';
+  }
+}
+globalThis.CSSKeyframeRule = CSSKeyframeRule;
+const _kfRule = (desc, parent) => {
+  const r = new CSSKeyframeRule(desc.selectorText, desc.body);
+  r._parentRule = parent;
+  return r;
+};
+class CSSKeyframesRule extends CSSRule {
+  constructor(desc) {
+    super();
+    this._name = String((desc && desc.condition) || '').trim();
+    this._ruleListObj = new CSSRuleList();
+    this._ruleList = _ruleListProxy(this._ruleListObj);
+    for (const d of _cssParseRuleList((desc && desc.body) || '')) {
+      if (d.type === 'style') this._ruleListObj._rules.push(_kfRule(d, this));
+    }
+  }
+  get type() { return 7; }
+  get name() { return this._name; }
+  set name(v) { this._name = String(v); }
+  get cssRules() { return this._ruleList; }
+  get length() { return this._ruleListObj._rules.length; }
+  appendRule(text) {
+    for (const d of _cssParseRuleList(text)) if (d.type === 'style') this._ruleListObj._rules.push(_kfRule(d, this));
+  }
+  findRule(select) {
+    const key = String(select).trim();
+    const arr = this._ruleListObj._rules;
+    for (let i = arr.length - 1; i >= 0; i--) if (arr[i]._keyText === key) return arr[i];   // last match wins
+    return null;
+  }
+  deleteRule(select) {
+    const key = String(select).trim();
+    const arr = this._ruleListObj._rules;
+    for (let i = arr.length - 1; i >= 0; i--) if (arr[i]._keyText === key) { arr.splice(i, 1); break; }
+  }
+  get cssText() {
+    const inner = this._ruleListObj._rules.map((r) => '  ' + r.cssText).join('\n');
+    return '@keyframes ' + _serializeKeyframesName(this._name) + (inner ? ' {\n' + inner + '\n}' : ' { }');
+  }
+}
+globalThis.CSSKeyframesRule = CSSKeyframesRule;
+// CSSKeyframesRule exposes an indexed getter over its keyframe rules.
+const _keyframesProxy = (kf) => new Proxy(kf, {
+  get(t, p) {
+    if (typeof p === 'string' && /^[0-9]+$/.test(p)) return t._ruleListObj._rules[+p];
+    return t[p];
+  },
+});
+
+const _makeRule = (desc, parentSheet, parentRule) => {
+  let rule;
+  if (desc.type === 'keyframes') {
+    rule = _keyframesProxy(new CSSKeyframesRule(desc));
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
+  if (desc.type === 'style') rule = new CSSStyleRule(desc.selectorText, desc.body);
+  else if (desc.type === 'group' && desc.name === 'supports') rule = new CSSSupportsRule(desc.condition);
+  else if (desc.type === 'group') rule = new CSSMediaRule(desc.condition);  // media/container/document → grouping
+  else rule = new CSSGenericRule(desc);                                     // keyframes/font-face/page/import/namespace
+  rule._parentStyleSheet = parentSheet || null;
+  rule._parentRule = parentRule || null;
+  if (rule instanceof CSSGroupingRule && Array.isArray(desc.rules)) {
+    for (const child of desc.rules) rule._ruleListObj._rules.push(_makeRule(child, parentSheet, rule));
+  }
+  return rule;
+};
+
+class CSSStyleSheet {
+  constructor(options) {
+    options = options || {};
+    this._ruleListObj = new CSSRuleList();
+    this._ruleList = _ruleListProxy(this._ruleListObj);
+    this.ownerRule = null;
+    this._ownerNode = null;
+    this._parentStyleSheet = null;
+    this._href = null;
+    this._title = null;                 // title/alternate aren't settable via the constructor
+    this._media = _makeMediaList(options.media);
+    this._disabled = !!options.disabled;
+    this._constructed = true;           // a constructable sheet (allows replace/replaceSync)
+    this._baseURL = options.baseURL || null;
+  }
+  get cssRules() { return this._ruleList; }
+  get rules() { return this._ruleList; }            // legacy alias
+  get media() { return this._media; }
+  get disabled() { return this._disabled; }
+  set disabled(v) { this._disabled = !!v; }
+  get title() { return this._title || null; }
+  get ownerNode() { return this._ownerNode; }
+  get parentStyleSheet() { return this._parentStyleSheet; }
+  get href() { return this._href; }
+  get type() { return 'text/css'; }
+  _setRules(text) {
+    const arr = this._ruleListObj._rules;
+    arr.length = 0;
+    for (const d of _cssParseRuleList(text)) arr.push(_makeRule(d, this, null));
+  }
+  insertRule(text, index) {
+    const arr = this._ruleListObj._rules;
+    index = index === undefined ? 0 : index >>> 0;
+    if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
+    const parsed = _cssParseRuleList(text);
+    if (parsed.length !== 1) throw new DOMException("insertRule expects exactly one rule.", "SyntaxError");
+    arr.splice(index, 0, _makeRule(parsed[0], this, null));
+    return index;
+  }
+  deleteRule(index) {
+    const arr = this._ruleListObj._rules;
+    index = index >>> 0;
+    if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
+    arr.splice(index, 1);
   }
   addRule(selector, style, index) {
-    return this.insertRule(selector + '{' + style + '}', index);
+    this.insertRule((selector || '') + ' { ' + (style || '') + ' }',
+      index === undefined ? this._ruleListObj._rules.length : index);
+    return -1;
   }
-  removeRule(index) { this.deleteRule(index); }
-  replace(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
-    return Promise.resolve(this);
-  }
+  removeRule(index) { this.deleteRule(index || 0); }
   replaceSync(text) {
-    this._rules = [{ cssText: text, type: 1 }];
-    this.cssRules = this._rules;
+    if (!this._constructed) throw new DOMException("replaceSync can only be called on a constructed style sheet.", "NotAllowedError");
+    this._setRules(String(text).replace(/@import[^;]*;/gi, ''));   // @import is ignored in replace()
   }
+  replace(text) {
+    if (!this._constructed) return Promise.reject(new DOMException("replace can only be called on a constructed style sheet.", "NotAllowedError"));
+    return Promise.resolve().then(() => { this._setRules(String(text).replace(/@import[^;]*;/gi, '')); return this; });
+  }
+}
+globalThis.CSSStyleSheet = CSSStyleSheet;
+globalThis.StyleSheet = class StyleSheet {};   // interface-presence only
+
+// A non-constructable CSSStyleSheet backing a connected <style> element, cached
+// per node and re-parsed when the element's text changes.
+const _nodeSheetMap = new WeakMap();
+const _styleSheetForNode = (node) => {
+  let text = '';
+  try { text = node.textContent || ''; } catch { text = ''; }
+  let sheet = _nodeSheetMap.get(node);
+  if (!sheet) {
+    sheet = new CSSStyleSheet();
+    sheet._constructed = false;
+    sheet._ownerNode = node;
+    sheet.__text = null;
+    _nodeSheetMap.set(node, sheet);
+  }
+  if (sheet.__text !== text) { sheet.__text = text; sheet._setRules(text); }
+  return sheet;
 };
 
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
-  get() { return this._adoptedStyleSheets || []; },
-  set(sheets) { this._adoptedStyleSheets = sheets; },
+  configurable: true,
+  // Return a stable, persistent array so in-place mutation (push/pop/splice) is
+  // observed by the cascade — `document.adoptedStyleSheets.push(sheet)` must apply.
+  get() { if (!this._adoptedStyleSheets) this._adoptedStyleSheets = []; return this._adoptedStyleSheets; },
+  set(sheets) { this._adoptedStyleSheets = sheets == null ? [] : Array.from(sheets); },
 });
 
 const __mutationObservers = [];
@@ -13475,6 +13889,19 @@ const _defIface = (name, base) => {
 ].forEach(n => _defIface(n));
 globalThis.HTMLAudioElement = class HTMLAudioElement extends globalThis.HTMLMediaElement {};
 globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMediaElement {};
+
+// HTMLStyleElement.sheet (and HTMLLinkElement.sheet): the associated CSSStyleSheet
+// for a connected element, lazily built/cached and re-parsed on text change. A
+// disconnected element has no associated sheet (returns null) per HTML §styling.
+for (const _iface of ['HTMLStyleElement', 'HTMLLinkElement']) {
+  Object.defineProperty(globalThis[_iface].prototype, 'sheet', {
+    configurable: true,
+    get() {
+      try { if (!this.isConnected) return null; } catch (e) { return null; }
+      try { return _styleSheetForNode(this); } catch (e) { return null; }
+    },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // The constraint validation API (HTML §form-control-infrastructure / §the-constraint-validation-api).

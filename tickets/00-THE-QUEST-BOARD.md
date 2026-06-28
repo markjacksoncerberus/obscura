@@ -143,6 +143,35 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-28 (Quest #119 The Sheeted Verdict — CSSOM rule tree, +38):**
+After #118 exhausted the MutationObserver childList tail, swept a fresh region:
+`css/cssom/`. Its serialization half was already conquered (`serialize-values`
+696/697) but the **rule tree** was a stub — `document.styleSheets` returned `[]`,
+`CSSStyleSheet` stored plain `{cssText,type}` objects, no `CSSRule`/`CSSRuleList`/
+`CSSStyleRule`/grouping/keyframes, and `CSSStyleDeclaration` wasn't iterable. Built
+a spec-shaped CSSOM object model in `bootstrap.js` over the **same CSS parser the
+cascade already uses** (so a rule's `cssText` reuses the heavily-tested
+`_serializeDeclBlock` for free): a recursive `_cssParseRuleList` (preserves nested
+at-rules), `CSSRuleList` (stable-identity array-like, Proxy index), `CSSRule` base
+with readonly prototype attrs + type constants, `CSSStyleRule`
+(`[PutForwards=cssText]`), grouping rules `CSSGroupingRule`/`CSSMediaRule`(+`MediaList`,
+`[PutForwards=mediaText]`)/`CSSSupportsRule` (insertRule rejects `@import`/`@namespace`
+with HierarchyRequestError), `CSSKeyframesRule`/`CSSKeyframeRule`, a real constructable
+`CSSStyleSheet` (replace/replaceSync/insertRule/deleteRule), `document.styleSheets` +
+`<style>/<link>.sheet` (cached per node in a WeakMap), and cascade integration so
+`getComputedStyle` honours `adoptedStyleSheets` (gated on a non-empty list →
+ordinary pages keep the exact original cascade; the getter now returns a persistent
+array so `.push()` applies). **CSSStyleRule 0→10, CSSGroupingRule-insertRule 0→7,
+constructable 1→6, Keyframes(Rule) 0→2 each, replace-cssRules 0→2, duplicate 0→2,
+insertRule-no-index 0→2, MediaList/CSSRuleList/iterator/grouping-cssRules/
+conditionText/constructable-cssRules 0→1 each. +38.** ZERO regressions
+(serialize-values 696/697, shorthand 7/7, qsa 1975, classlist 1420,
+getElementsByTagName 19, MO-attributes 42, MO-childList 38, Node-properties 726,
+getComputedStyle-pseudo 2/28 — all unchanged; cascade change stash-proved). **Next
+leverage:** shadow-DOM `adoptedStyleSheets` scoping (finishes constructable.html +
+duplicate) or the `css/cssom/` insertRule-*/constructable-* tail. Scroll
+`tickets/119-the-sheeted-verdict.md`.
+
 **Session 2026-06-28 (Quest #118 The Batched Verdict — MutationObserver atomic childList record batching, +20):**
 Took #117's named lead. A compound DOM op must emit ONE childList record (added ∪ removed) per DOM "queue a tree mutation
 record", but the Phase-0c Rust recorder pushes one per primitive. Built a **suppress-then-synthesize** mechanism: a Rust
