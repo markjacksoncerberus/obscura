@@ -1300,19 +1300,13 @@ class CharacterData extends Node {
   substringData(offset, count) {
     return this.data.substring(offset, offset + count);
   }
-  appendData(s) { this.data += s; }
-  insertData(offset, s) {
-    const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset);
-  }
-  deleteData(offset, count) {
-    const d = this.data;
-    this.data = d.slice(0, offset) + d.slice(offset + count);
-  }
-  replaceData(offset, count, s) {
-    const d = this.data;
-    this.data = d.slice(0, offset) + s + d.slice(offset + count);
-  }
+  // The DOM "replace data" primitive underlies all of these: it rewrites the
+  // string AND adjusts every live range whose boundary falls in the affected
+  // span (which is why `deleteContents()`/the WPT reference collapse for free).
+  appendData(s) { __obscura_replaceData(this, this.data.length, 0, String(s)); }
+  insertData(offset, s) { __obscura_replaceData(this, offset, 0, String(s)); }
+  deleteData(offset, count) { __obscura_replaceData(this, offset, count, ""); }
+  replaceData(offset, count, s) { __obscura_replaceData(this, offset, count, String(s)); }
 }
 
 class Text extends CharacterData {
@@ -14047,10 +14041,39 @@ function __obscura_ensurePreInsertionValidity(node, parent, child) {
   _checkInsertConstraints(parent, node, child);
 }
 
+// Live Range registry (WeakRefs, pruned lazily) for the DOM "replace data"
+// algorithm: mutating a CharacterData node's text must shift the boundary
+// points of every live range that lands inside the replaced span.
+const __obscura_liveRanges = [];
+// DOM "replace data" (https://dom.spec.whatwg.org/#concept-cd-replace): rewrite
+// `node`'s data, replacing `count` code units at `offset` with `data`, then move
+// each live range's boundary points per the spec's range-mutation steps.
+function __obscura_replaceData(node, offset, count, data) {
+  const old = node.data;
+  if (offset > old.length) throw new DOMException("offset out of bounds", "IndexSizeError");
+  if (offset + count > old.length) count = old.length - offset;
+  node.data = old.slice(0, offset) + data + old.slice(offset + count);
+  const dl = data.length, end = offset + count, delta = dl - count;
+  const list = __obscura_liveRanges;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const r = list[i].deref();
+    if (!r) { list.splice(i, 1); continue; }
+    if (r._sc === node) {
+      if (r._so > offset && r._so <= end) r._so = offset;
+      else if (r._so > end) r._so += delta;
+    }
+    if (r._ec === node) {
+      if (r._eo > offset && r._eo <= end) r._eo = offset;
+      else if (r._eo > end) r._eo += delta;
+    }
+  }
+}
+
 globalThis.Range = class Range {
   constructor() {
     this._sc = globalThis.document; this._so = 0;
     this._ec = globalThis.document; this._eo = 0;
+    __obscura_liveRanges.push(new WeakRef(this));
   }
   get startContainer() { return this._sc; }
   get startOffset() { return this._so; }
