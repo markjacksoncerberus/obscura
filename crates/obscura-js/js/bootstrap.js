@@ -850,7 +850,12 @@ class Node {
       if (_watching) __notifyMutation('characterData', this._nid, [], [], null, { oldValue: _old });
       return;
     }
+    // §replace all with a node: ONE childList record (removed = old children,
+    // added = the new text node), not one per primitive. Suppress the
+    // per-primitive records and synthesize the single batched record.
+    const _outer = _watching && __obscura_batchDepth === 0;
     const children = _domParse("child_nodes", this._nid) || [];
+    if (_watching) __obscura_enterBatch();
     for (const c of children) _dom("remove_child", c);
     let added = [];
     if (v != null && v !== "") {
@@ -858,7 +863,11 @@ class Node {
       _dom("append_child", this._nid, tn);
       added = [tn];
     }
-    if (_watching) __notifyMutation('childList', this._nid, added, children);
+    if (_watching) __obscura_exitBatch();
+    if (_outer && (added.length || children.length)) {
+      __obscura_recordChildList(this._nid, added, children, null, null);
+      __notifyMutation();
+    }
   }
   get nodeValue() {
     // nodeValue is the data for every CharacterData kind: Text(3), CDATASection(4),
@@ -906,10 +915,26 @@ class Node {
     // document element/doctype cardinality). Checked BEFORE fragment expansion
     // so a multi-element fragment into a document is rejected atomically.
     _checkInsertConstraints(this, c, null);
-    // A DocumentFragment is inserted by moving each of its children, leaving it empty.
+    // A DocumentFragment is inserted by moving each of its children, leaving it
+    // empty. Per DOM "insert", that is TWO atomic records: a removal record on
+    // the fragment (all its children) and an addition record on the parent (all
+    // those children, previousSibling = the parent's old last child for an
+    // append). Synthesize both as a unit, suppressing the per-child primitives.
     if (c.nodeType === 11) {
       const kids = Array.prototype.slice.call(c.childNodes);
+      if (kids.length === 0) return c; // DOM insert: count 0 → nothing happens.
+      const _watching = __mutationObservers?.length;
+      const _outer = _watching && __obscura_batchDepth === 0;
+      const _prev = _outer ? +_dom("last_child", this._nid) : -1;
+      if (_watching) __obscura_enterBatch();
       for (let i = 0; i < kids.length; i++) this.appendChild(kids[i]);
+      if (_watching) __obscura_exitBatch();
+      if (_outer) {
+        const kidNids = kids.map(k => k._nid);
+        __obscura_recordChildList(c._nid, [], kidNids, null, null);
+        __obscura_recordChildList(this._nid, kidNids, [], _prev >= 0 ? _prev : null, null);
+        __notifyMutation();
+      }
       return c;
     }
     // Moving an existing child = DOM "remove" then "insert"; the remove's live-range
@@ -1011,16 +1036,45 @@ class Node {
     // 7. referenceChild = child's next sibling, unless that is node (then node's next sibling).
     let ref = child.nextSibling;
     if (ref && ref._nid === node._nid) ref = node.nextSibling;
-    // Replace: remove child, then insert node (a fragment inserts its children).
-    this.removeChild(child);
-    // Removing child may already leave node correctly positioned (the
-    // replace-with-adjacent-sibling case); only (re)insert when it isn't.
-    const inParent = node.parentNode && node.parentNode._nid === this._nid;
-    const alreadyPlaced = inParent &&
-      (ref ? (node.nextSibling && node.nextSibling._nid === ref._nid) : node.nextSibling == null);
-    if (!alreadyPlaced) {
-      if (ref && ref.parentNode && ref.parentNode._nid === this._nid) this.insertBefore(node, ref);
-      else this.appendChild(node);
+    const _watching = __mutationObservers?.length;
+    if (!_watching) {
+      // Fast path (no observer): remove child, then insert node (a fragment
+      // inserts its children). Removing child may already leave node correctly
+      // positioned (the replace-with-adjacent-sibling case); only (re)insert when
+      // it isn't. Identical tree result to the observed path below.
+      this.removeChild(child);
+      const inParent = node.parentNode && node.parentNode._nid === this._nid;
+      const alreadyPlaced = inParent &&
+        (ref ? (node.nextSibling && node.nextSibling._nid === ref._nid) : node.nextSibling == null);
+      if (!alreadyPlaced) {
+        if (ref && ref.parentNode && ref.parentNode._nid === this._nid) this.insertBefore(node, ref);
+        else this.appendChild(node);
+      }
+      return child;
+    }
+    // Observed path — DOM "replace" produces records in this order:
+    //  (a) if `node` already has a parent, the insert below adopts it, which first
+    //      removes it from that old parent — a separate, visible record on the old
+    //      parent (e.g. replacing a child with one of its own later siblings). Done
+    //      BEFORE the batch so it is recorded, not suppressed.
+    //  (b) the replacement is then ONE record on this parent: removed = child (if
+    //      still a child), added = node (or, for a fragment, its children), with
+    //      previousSibling = child's previous sibling and nextSibling = referenceChild.
+    const _outer = __obscura_batchDepth === 0;
+    const _prevSib = child.previousSibling;
+    const addedNids = node.nodeType === 11
+      ? Array.prototype.slice.call(node.childNodes).map(k => k._nid)
+      : [node._nid];
+    if (node.parentNode) node.parentNode.removeChild(node); // (a)
+    __obscura_enterBatch();                                  // (b)
+    const removed = [];
+    if (child.parentNode && child.parentNode._nid === this._nid) { removed.push(child._nid); this.removeChild(child); }
+    if (ref && ref.parentNode && ref.parentNode._nid === this._nid) this.insertBefore(node, ref);
+    else this.appendChild(node);
+    __obscura_exitBatch();
+    if (_outer) {
+      __obscura_recordChildList(this._nid, addedNids, removed, _prevSib ? _prevSib._nid : null, ref ? ref._nid : null);
+      __notifyMutation();
     }
     return child;
   }
@@ -1043,10 +1097,25 @@ class Node {
     // §ensure-pre-insertion-validity steps 5–6 (see appendChild), before the
     // fragment is expanded so the whole fragment is validated as a unit.
     _checkInsertConstraints(this, n, ref);
-    // A DocumentFragment inserts each of its children before the reference, then empties.
+    // A DocumentFragment inserts each of its children before the reference, then
+    // empties. Two atomic records (see appendChild): a removal on the fragment and
+    // an addition on the parent (previousSibling = the node before the reference,
+    // nextSibling = the reference). Synthesize as a unit.
     if (n.nodeType === 11) {
       const kids = Array.prototype.slice.call(n.childNodes);
+      if (kids.length === 0) return n;
+      const _watching = __mutationObservers?.length;
+      const _outer = _watching && __obscura_batchDepth === 0;
+      const _prevSib = _outer ? ref.previousSibling : null;
+      if (_watching) __obscura_enterBatch();
       for (let i = 0; i < kids.length; i++) this.insertBefore(kids[i], ref);
+      if (_watching) __obscura_exitBatch();
+      if (_outer) {
+        const kidNids = kids.map(k => k._nid);
+        __obscura_recordChildList(n._nid, [], kidNids, null, null);
+        __obscura_recordChildList(this._nid, kidNids, [], _prevSib ? _prevSib._nid : null, ref._nid);
+        __notifyMutation();
+      }
       return n;
     }
     // Moving an existing child = DOM "remove" then "insert"; the remove's live-range
@@ -1918,6 +1987,27 @@ class Element extends Node {
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
+  // §dom-element-outerhtml setter: parse the value and replace THIS element with
+  // the parsed nodes within its parent. A detached element is a no-op; a document
+  // child throws. The replacement routes through replaceChild(fragment, this), so
+  // a MutationObserver sees ONE childList record (removed = this, added = the
+  // parsed nodes) per the atomic-batching path.
+  set outerHTML(v) {
+    const parent = this.parentNode;
+    if (!parent) return;
+    if (parent.nodeType === 9)
+      throw new DOMException("Failed to set the 'outerHTML' property on 'Element': This element has no parent node.", "NoModificationAllowedError");
+    const doc = this.ownerDocument || globalThis.document;
+    // Parse with the parent element as the fragment-parsing context.
+    const tmp = doc.createElement(parent.nodeType === 1 ? (parent.localName || 'div') : 'div');
+    // [LegacyNullToEmptyString]: null → "", every other value via ToString (so
+    // `outerHTML = undefined` parses the text "undefined", not "").
+    tmp.innerHTML = (v === null ? "" : String(v));
+    const frag = doc.createDocumentFragment();
+    const kids = Array.prototype.slice.call(tmp.childNodes);
+    for (const k of kids) frag.appendChild(k);
+    parent.replaceChild(frag, this);
+  }
   get innerText() { return this.textContent; }
   set innerText(v) { this.textContent = v; }
   get children() {
@@ -2617,8 +2707,32 @@ function _pnReplaceChildren(...nodes) {
   // existing element child is still present (validating after the removal would
   // see an empty document and wrongly succeed).
   _checkInsertConstraints(this, node, null);
+  const _watching = __mutationObservers?.length;
+  if (!_watching) {
+    while (this.firstChild) this.removeChild(this.firstChild);
+    this.appendChild(node);
+    return;
+  }
+  // Observed: §replace-all queues ONE childList record on this parent (removed =
+  // the old children, added = node's children for a fragment / the node itself).
+  // Any removal of `node` from an OLD parent is a SEPARATE, visible record there
+  // and must stay unsuppressed — it already happened during _convertNodesIntoNode
+  // for a multi-node fragment, and happens via step (a) for a lone node.
+  const _outer = __obscura_batchDepth === 0;
+  const removedNids = Array.prototype.slice.call(this.childNodes).map(c => c._nid);
+  const addedNids = node.nodeType === 11
+    ? Array.prototype.slice.call(node.childNodes).map(k => k._nid)
+    : [node._nid];
+  if (node.nodeType !== 11 && node.parentNode) node.parentNode.removeChild(node); // (a)
+  __obscura_enterBatch();
   while (this.firstChild) this.removeChild(this.firstChild);
   this.appendChild(node);
+  __obscura_exitBatch();
+  if (_outer) {
+    if (addedNids.length || removedNids.length)
+      __obscura_recordChildList(this._nid, addedNids, removedNids, null, null);
+    __notifyMutation();
+  }
 }
 // §dom-childnode-before / -after / -replacewith. The "viable" sibling is the
 // nearest sibling that is NOT itself one of the nodes being inserted (so
@@ -11590,6 +11704,31 @@ const __scheduleMutationDelivery = function() {
 // A JS DOM mutation happened (the Rust tree already recorded it); just schedule
 // a delivery tick, which drains the Rust queue. The (type, ...) args are kept
 // for call-site compatibility but no longer used — Rust is the record source.
+// Atomic childList batching (DOM "queue a tree mutation record"). A compound
+// method (replaceChild, a DocumentFragment insertion, a replace-all) must emit
+// ONE childList record for a parent (added ∪ removed), not one per low-level
+// primitive. The method opens a batch scope: the Rust recorder is told to
+// suppress its per-primitive childList records, and only the OUTERMOST scope
+// synthesizes the spec-shaped record(s) — so a compound op nested inside another
+// (e.g. outerHTML → replaceChild → fragment insert) collapses to the outer op's
+// single record rather than each level emitting its own. All of this is gated on
+// an active observer, so non-observed pages run the original fast paths untouched.
+let __obscura_batchDepth = 0;
+const __obscura_enterBatch = function() {
+  if (__mutationObservers.length) _dom("push_suppress_mutations");
+  __obscura_batchDepth++;
+};
+const __obscura_exitBatch = function() {
+  __obscura_batchDepth--;
+  if (__mutationObservers.length) _dom("pop_suppress_mutations");
+};
+// added/removed: arrays of node ids (numbers). prev/next: a node id or null.
+const __obscura_recordChildList = function(targetNid, added, removed, prev, next) {
+  const payload = (added || []).join(',') + "\0" + (removed || []).join(',') +
+    "\0" + (prev != null ? prev : '') + "\0" + (next != null ? next : '');
+  _dom("record_childlist", targetNid, payload);
+};
+
 const __notifyMutation = function() {
   if (!__mutationObservers.length) return;
   // Drain the Rust queue NOW, while each observer's target list still reflects the

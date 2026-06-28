@@ -378,14 +378,30 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "set_inner_html" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             let target = NodeId::new(nid);
-            let children = dom.children(target);
-            for child in children {
-                dom.detach(child);
+            // DOM "replace all with a node": emit ONE childList record (removed =
+            // the old children, added = the parsed new children) rather than one
+            // per detach/import. Suppress the per-primitive records around the
+            // work, then synthesize the single batched record. (Only matters while
+            // a MutationObserver is active; otherwise this is a no-op wrapper.)
+            let recording = dom.is_recording_mutations();
+            let removed = dom.children(target);
+            if recording {
+                dom.push_suppress_mutations();
+            }
+            for child in removed.iter() {
+                dom.detach(*child);
             }
             if !arg2.is_empty() {
                 let fragment = obscura_dom::parse_fragment(&arg2);
                 let import_root = fragment.find_body_or_root();
                 dom.import_children_from(target, &fragment, import_root);
+            }
+            if recording {
+                dom.pop_suppress_mutations();
+                let added = dom.children(target);
+                if !added.is_empty() || !removed.is_empty() {
+                    dom.record_childlist_mutation(target, added, removed, None, None);
+                }
             }
             "true".into()
         }
@@ -410,6 +426,39 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         // is active, then drains the Rust-authoritative queue each delivery tick.
         "set_mutation_recording" => {
             dom.set_mutation_recording(arg1 == "1");
+            "true".into()
+        }
+        // Atomic childList batching: open/close a suppression scope so a compound
+        // JS operation can emit ONE synthesized record instead of one per primitive.
+        "push_suppress_mutations" => {
+            dom.push_suppress_mutations();
+            "true".into()
+        }
+        "pop_suppress_mutations" => {
+            dom.pop_suppress_mutations();
+            "true".into()
+        }
+        // Synthesize one childList record. arg1 = target nid; arg2 =
+        // "<added_csv>\0<removed_csv>\0<prev>\0<next>" (csv = comma-separated nids,
+        // empty = none; prev/next empty = null sibling).
+        "record_childlist" => {
+            let target = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let parts: Vec<&str> = arg2.split('\0').collect();
+            let parse_list = |s: &str| -> Vec<NodeId> {
+                s.split(',')
+                    .filter(|p| !p.is_empty())
+                    .filter_map(|p| p.parse::<u32>().ok())
+                    .map(NodeId::new)
+                    .collect()
+            };
+            let parse_opt = |s: Option<&&str>| -> Option<NodeId> {
+                s.and_then(|p| p.parse::<u32>().ok()).map(NodeId::new)
+            };
+            let added = parts.first().map(|s| parse_list(s)).unwrap_or_default();
+            let removed = parts.get(1).map(|s| parse_list(s)).unwrap_or_default();
+            let prev = parse_opt(parts.get(2));
+            let next = parse_opt(parts.get(3));
+            dom.record_childlist_mutation(target, added, removed, prev, next);
             "true".into()
         }
         "drain_mutations" => {

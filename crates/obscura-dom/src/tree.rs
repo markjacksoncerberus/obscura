@@ -270,6 +270,16 @@ pub(crate) struct DomTreeInner {
     // the bridge switches over to draining this.
     pub(crate) mutations_enabled: bool,
     pub(crate) pending_mutations: Vec<MutationRecord>,
+    // Atomic childList batching (DOM "queue a tree mutation record"). A compound
+    // operation — `replaceChild`, a DocumentFragment insertion, `textContent` /
+    // `innerHTML` / `replaceChildren` replace-all — must emit ONE childList record
+    // for the parent (added ∪ removed), not one per low-level primitive. While
+    // `suppress_mutations > 0` the primitive recorders (append_child / insert_before
+    // / detach) skip pushing their per-step childList records; the JS high-level
+    // method then synthesizes the single spec-shaped record via
+    // `record_childlist_mutation`. A depth counter (not a bool) so nested compound
+    // ops compose. Attribute/characterData records are unaffected.
+    pub(crate) suppress_mutations: u32,
     // Phase 0b: dynamic element state that doesn't live in attributes. Kept in
     // side maps so we never touch the `Node` literal (constructed in many
     // places). `checked_state` overrides the `checked` attribute default once
@@ -320,6 +330,7 @@ impl DomTree {
                 id_index: HashMap::new(),
                 mutations_enabled: false,
                 pending_mutations: Vec::new(),
+                suppress_mutations: 0,
                 checked_state: HashMap::new(),
                 indeterminate_state: HashMap::new(),
                 focused: None,
@@ -491,6 +502,46 @@ impl DomTree {
         }
     }
 
+    /// Begin/end a childList-record suppression scope (see `suppress_mutations`).
+    /// While suppressed, `append_child`/`insert_before`/`detach` skip their
+    /// per-primitive childList records; the caller synthesizes the single
+    /// spec-shaped record via `record_childlist_mutation`. Nesting-safe.
+    pub fn push_suppress_mutations(&self) {
+        self.inner.borrow_mut().suppress_mutations += 1;
+    }
+    pub fn pop_suppress_mutations(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.suppress_mutations = inner.suppress_mutations.saturating_sub(1);
+    }
+
+    /// Push one synthesized childList mutation record for a compound operation
+    /// (the DOM "queue a tree mutation record" with the full added ∪ removed set).
+    /// Recorded regardless of the suppress depth — it IS the replacement for the
+    /// suppressed per-primitive records — but still only while recording is on.
+    pub fn record_childlist_mutation(
+        &self,
+        target: NodeId,
+        added: Vec<NodeId>,
+        removed: Vec<NodeId>,
+        prev_sibling: Option<NodeId>,
+        next_sibling: Option<NodeId>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.mutations_enabled {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::ChildList,
+                target,
+                added,
+                removed,
+                prev_sibling,
+                next_sibling,
+                attr_name: None,
+                attr_namespace: None,
+                old_value: None,
+            });
+        }
+    }
+
     pub fn new_node(&self, data: NodeData) -> NodeId {
         let mut inner = self.inner.borrow_mut();
         let id = if let Some(slot) = inner.free_list.pop() {
@@ -570,7 +621,7 @@ impl DomTree {
         }
 
         // Phase 0c: childList addition (appended after the previous last child).
-        if inner.mutations_enabled {
+        if inner.mutations_enabled && inner.suppress_mutations == 0 {
             inner.pending_mutations.push(MutationRecord {
                 kind: MutationKind::ChildList,
                 target: parent_id,
@@ -625,7 +676,7 @@ impl DomTree {
         }
 
         // Phase 0c: childList addition, inserted before `existing_id`.
-        if inner.mutations_enabled {
+        if inner.mutations_enabled && inner.suppress_mutations == 0 {
             inner.pending_mutations.push(MutationRecord {
                 kind: MutationKind::ChildList,
                 target: parent_id,
@@ -678,7 +729,7 @@ impl DomTree {
         // Phase 0c: a detach from a real parent is a childList removal. Siblings
         // were captured above, before the unlink. (Detaching an already-orphan
         // node returned early, so `parent_id` here means it had a parent.)
-        if inner.mutations_enabled {
+        if inner.mutations_enabled && inner.suppress_mutations == 0 {
             if let Some(parent) = parent_id {
                 inner.pending_mutations.push(MutationRecord {
                     kind: MutationKind::ChildList,
