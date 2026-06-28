@@ -2608,25 +2608,9 @@ class Element extends Node {
   // actionability polling. With a real layout we'd check display, visibility,
   // opacity and rect dimensions per spec.
   checkVisibility(opts) { return true; }
-  // ARIA reflection properties. Without an accessibility tree we expose the
-  // raw aria-* attributes so Playwright's getByRole / getByLabel locators can
-  // at least find elements that author them explicitly.
-  get role() { return this.getAttribute('role'); }
-  set role(v) { if (v == null) this.removeAttribute('role'); else this.setAttribute('role', String(v)); }
-  get ariaLabel() { return this.getAttribute('aria-label'); }
-  set ariaLabel(v) { if (v == null) this.removeAttribute('aria-label'); else this.setAttribute('aria-label', String(v)); }
-  get ariaRoleDescription() { return this.getAttribute('aria-roledescription'); }
-  set ariaRoleDescription(v) { if (v == null) this.removeAttribute('aria-roledescription'); else this.setAttribute('aria-roledescription', String(v)); }
-  get ariaChecked() { return this.getAttribute('aria-checked'); }
-  set ariaChecked(v) { if (v == null) this.removeAttribute('aria-checked'); else this.setAttribute('aria-checked', String(v)); }
-  get ariaDisabled() { return this.getAttribute('aria-disabled'); }
-  set ariaDisabled(v) { if (v == null) this.removeAttribute('aria-disabled'); else this.setAttribute('aria-disabled', String(v)); }
-  get ariaExpanded() { return this.getAttribute('aria-expanded'); }
-  set ariaExpanded(v) { if (v == null) this.removeAttribute('aria-expanded'); else this.setAttribute('aria-expanded', String(v)); }
-  get ariaHidden() { return this.getAttribute('aria-hidden'); }
-  set ariaHidden(v) { if (v == null) this.removeAttribute('aria-hidden'); else this.setAttribute('aria-hidden', String(v)); }
-  get ariaSelected() { return this.getAttribute('aria-selected'); }
-  set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
+  // ARIAMixin reflection properties are defined on Element.prototype just after
+  // this class (see __ariaReflectedAttrs) — a table-driven loop covers the full
+  // WAI-ARIA set rather than a handful of hand-written accessors.
   scrollIntoView() { __obscura_click_target = this; }
   animate(keyframes, options) {
     const duration = typeof options === 'number' ? options : (options?.duration || 0);
@@ -2650,6 +2634,73 @@ class Element extends Node {
   // remove() + the append/prepend/replaceChildren ParentNode methods are mixed
   // onto Element.prototype below (see the "_pn*/_cn*" assignments) so the whole
   // mutation family shares one spec-correct "convert nodes into a node" core.
+}
+
+// ── ARIAMixin reflection (WAI-ARIA / HTML §dom-aria) ─────────────────────────
+// Every ARIAMixin IDL attribute is a nullable DOMString that *reflects* a
+// content attribute: the getter returns the attribute value, or null when it is
+// absent; the setter removes the attribute for null/undefined, else writes
+// String(value). `role` maps to the bare `role` attribute; each `ariaXxx` maps
+// to its `aria-xxx` content attribute. Without a real accessibility tree we
+// still expose the full set so Playwright role/label locators resolve and pages
+// that read these properties back behave per spec. (Element-typed ARIA
+// relationship reflections like ariaActiveDescendantElement are not modelled.)
+const __ariaReflectedAttrs = {
+  role: 'role',
+  ariaAtomic: 'aria-atomic',
+  ariaAutoComplete: 'aria-autocomplete',
+  ariaBrailleLabel: 'aria-braillelabel',
+  ariaBrailleRoleDescription: 'aria-brailleroledescription',
+  ariaBusy: 'aria-busy',
+  ariaChecked: 'aria-checked',
+  ariaColCount: 'aria-colcount',
+  ariaColIndex: 'aria-colindex',
+  ariaColIndexText: 'aria-colindextext',
+  ariaColSpan: 'aria-colspan',
+  ariaCurrent: 'aria-current',
+  ariaDescription: 'aria-description',
+  ariaDisabled: 'aria-disabled',
+  ariaExpanded: 'aria-expanded',
+  ariaHasPopup: 'aria-haspopup',
+  ariaHidden: 'aria-hidden',
+  ariaInvalid: 'aria-invalid',
+  ariaKeyShortcuts: 'aria-keyshortcuts',
+  ariaLabel: 'aria-label',
+  ariaLevel: 'aria-level',
+  ariaLive: 'aria-live',
+  ariaModal: 'aria-modal',
+  ariaMultiLine: 'aria-multiline',
+  ariaMultiSelectable: 'aria-multiselectable',
+  ariaOrientation: 'aria-orientation',
+  ariaPlaceholder: 'aria-placeholder',
+  ariaPosInSet: 'aria-posinset',
+  ariaPressed: 'aria-pressed',
+  ariaReadOnly: 'aria-readonly',
+  ariaRelevant: 'aria-relevant',
+  ariaRequired: 'aria-required',
+  ariaRoleDescription: 'aria-roledescription',
+  ariaRowCount: 'aria-rowcount',
+  ariaRowIndex: 'aria-rowindex',
+  ariaRowIndexText: 'aria-rowindextext',
+  ariaRowSpan: 'aria-rowspan',
+  ariaSelected: 'aria-selected',
+  ariaSetSize: 'aria-setsize',
+  ariaSort: 'aria-sort',
+  ariaValueMax: 'aria-valuemax',
+  ariaValueMin: 'aria-valuemin',
+  ariaValueNow: 'aria-valuenow',
+  ariaValueText: 'aria-valuetext',
+};
+for (const __jsAttr in __ariaReflectedAttrs) {
+  const __contentAttr = __ariaReflectedAttrs[__jsAttr];
+  Object.defineProperty(Element.prototype, __jsAttr, {
+    configurable: true, enumerable: true,
+    get() { return this.getAttribute(__contentAttr); },
+    set(v) {
+      if (v == null) this.removeAttribute(__contentAttr);
+      else this.setAttribute(__contentAttr, String(v));
+    },
+  });
 }
 
 // DOM §concept-node-adopt: remove `node` from any parent, then — when the

@@ -144,6 +144,25 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-28 (Quest #121 The Reflected Verdict — ARIAMixin string reflection, +33):**
+After #120 exhausted the CSSOM serialization tail, swept fresh ground and found
+`html/dom/aria-attribute-reflection.html` at 8/41. The WAI-ARIA **`ARIAMixin`** is a
+family of IDL attributes (`role`, `ariaLabel`, `ariaChecked`, `ariaColCount`, …) that
+each reflect an ARIA content attribute as a **nullable `DOMString`** (getter → the
+attribute or `null`; setter → remove for null/undefined else `String(v)`). `bootstrap.js`
+carried only 8 hand-written accessors; every other `ariaXxx` was absent (read
+`undefined`). Replaced them with a **table-driven loop** (`__ariaReflectedAttrs`) that
+defines all 41 properties on `Element.prototype` with the uniform nullable-reflection
+getter/setter, handling the spec's irregular folds (`ariaAutoComplete`→`aria-autocomplete`,
+`ariaHasPopup`→`aria-haspopup`, `ariaPosInSet`→`aria-posinset`, …). **8→41, +33.** Zero
+regressions (qsa 1975, classlist 1420, createElement 147, Node-properties 726,
+getElementsByTagName 19, selectorSerialize 23 — all unchanged). **Cap / Next:** the
+sibling `html/dom/aria-element-reflection.html` (5/27) is a SEPARATE larger lift — the
+Element-typed / `FrozenArray<Element>` relationship reflections (aria-activedescendant,
+aria-labelledby/controls/describedby/flowto/owns) needing the "explicitly set
+attr-element" internals + ID-resolution, and it is shadow-DOM-heavy (58 refs → many
+shadow-scoping caps). Scroll `tickets/121-the-reflected-verdict.md`.
+
 **Session 2026-06-28 (Quest #120 The Canonical Verdict — CSSOM selector serialization, +96):**
 Took #119's named CSSOM tail. `CSSStyleRule.selectorText` was a stub — getter returned the
 raw authored prelude, setter just trimmed. Built a real recursive-descent **CSS selector
