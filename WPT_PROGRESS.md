@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-28 (Quest #119).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-28 (Quest #120).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/cssom/CSSStyleRule-set-selectorText.html` | 24/82 | **82/82** | ✅ 100% | **Quest #120 The Canonical Verdict.** Real selector parser+serializer (`bootstrap.js`): `set selectorText` validates (invalid → no-op, keeps old) + getter re-serializes to canonical CSSOM form; plus a dirty-gated cascade path so a CSSOM selectorText edit on a `<style>`-backed rule is honoured by getComputedStyle. **+58.** |
+| `css/cssom/serialize-namespaced-type-selectors.html` | 31/60 | **60/60** | ✅ 100% | **Quest #120 The Canonical Verdict.** Type/universal namespace serialization: `*\|` dropped without a default ns, kept with one; a named prefix that resolves to the default-namespace URL is omitted (`nsdefault\|e`→`e`); `\|e`/`*\|e`/`ns\|e` rules. Sheet namespace info from `@namespace` rules. **+29.** |
+| `css/cssom/selectorSerialize.html` | 14/23 | **23/23** | ✅ 100% | **Quest #120 The Canonical Verdict.** Identifier escaping (`\30 zonk`, `\@`, `\\`), An+B canonicalisation (`even`→`2n`, `1n - 0`→`n`), functional-pseudo whitespace (`:lang( ja )`→`:lang(ja)`, `:not( abc )`→`:not(abc)`), attribute-name escapes. **+9.** |
 | `css/cssom/CSSStyleRule.html` | 0/10 | **10/10** | ✅ 100% | **Quest #119 The Sheeted Verdict.** A real CSSOM rule tree (`bootstrap.js`): `CSSRule` (readonly prototype attrs `parentRule`/`parentStyleSheet`/`type`/`cssText` + rule-type constants), `CSSStyleRule` (selectorText/style/cssText, `[PutForwards=cssText]` style setter). cssText reuses the inline-style `_serializeDeclBlock` so a rule round-trips `div { margin: 10px; padding: 0px; }`. **+10.** |
 | `css/cssom/CSSGroupingRule-insertRule.html` | 0/7 | **7/7** | ✅ 100% | **Quest #119 The Sheeted Verdict.** `CSSGroupingRule`/`CSSMediaRule`/`CSSSupportsRule` with insertRule/deleteRule + nested `cssRules`; `@media`/`@supports` parsed by the new recursive `_cssParseRuleList`. insertRule rejects statement at-rules (`@import`/`@namespace`) with `HierarchyRequestError`. **+7.** |
 | `css/cssom/CSSStyleSheet-constructable.html` | 1/13 | **6/13** | ⚠️ 46% | **Quest #119 The Sheeted Verdict.** Real constructable `CSSStyleSheet`: cssRules (stable-identity `CSSRuleList`), insertRule(default idx 0)/deleteRule/replace/replaceSync, `MediaList` media, disabled/title/ownerRule/ownerNode. Residue (7) is shadow-DOM + cross-document scoping — a separate lift. **+5.** |

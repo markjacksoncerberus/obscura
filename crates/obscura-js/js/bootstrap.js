@@ -6323,6 +6323,19 @@ const _sheetRuleCache = new WeakMap(); // styleEl -> { text, rules }
 const _styleSheetRules = (styleEl) => {
   let text = '';
   try { text = styleEl.textContent || ''; } catch { text = ''; }
+  // If the live CSSOM sheet for this <style> has been mutated through the object
+  // model (e.g. `rule.selectorText = …`) and still reflects the element's text,
+  // serve the cascade from those live rules so a CSSOM edit is honoured by
+  // getComputedStyle. Gated on _cssomDirty so untouched pages keep the fast
+  // text-parse path byte-for-byte (zero regression).
+  try {
+    const sheet = _nodeSheetMap && _nodeSheetMap.get(styleEl);
+    if (sheet && sheet._cssomDirty && sheet.__text === text) {
+      return sheet._ruleListObj._rules
+        .filter((r) => r && r.type === 1)
+        .map((r) => ({ selectorText: r._selectorSource, decls: r._cascadeDecls }));
+    }
+  } catch (e) {}
   const cached = _sheetRuleCache.get(styleEl);
   if (cached && cached.text === text) return cached.rules;
   const rules = _cssSplitRules(text);
@@ -11438,7 +11451,7 @@ const _buildCascade = (el) => {
         if (!arr) continue;
         for (const r of arr) {
           if (!r || r.type !== 1) continue;
-          const spec = parseInt(_dom('selector_match_specificity', String(nid), r.selectorText), 10);
+          const spec = parseInt(_dom('selector_match_specificity', String(nid), r._selectorSource || r.selectorText), 10);
           if (spec >= 0) sources.push({ spec, order: order++, decls: r._cascadeDecls });
         }
       }
@@ -11699,6 +11712,374 @@ const _ruleListProxy = (rl) => new Proxy(rl, {
   },
 });
 
+// ── CSS Selector parser + serializer (CSSOM §serialize-a-group-of-selectors) ──
+// A small recursive-descent selector parser used by CSSStyleRule.selectorText to
+// (1) validate a selector when set (invalid → the setter is a no-op per spec) and
+// (2) re-serialize it into canonical form on read. The *matching* engine is the
+// real Servo `selectors` crate (via op_dom); this only handles syntax + the CSSOM
+// serialization rules (identifier escaping, An+B canonicalisation, namespace-prefix
+// omission, legacy `:before`→`::before`). Parse failure in the getter falls back to
+// the raw authored text, so it can never break a page.
+const _serIdent = (str) => {                 // CSSOM §serialize-an-identifier
+  let out = '';
+  const s = String(str);
+  for (let idx = 0; idx < s.length; idx++) {
+    const code = s.charCodeAt(idx);
+    const ch = s[idx];
+    if (code === 0) { out += '�'; continue; }
+    if ((code >= 0x1 && code <= 0x1F) || code === 0x7F) { out += '\\' + code.toString(16) + ' '; continue; }
+    if (idx === 0 && code >= 0x30 && code <= 0x39) { out += '\\' + code.toString(16) + ' '; continue; }
+    if (idx === 1 && code >= 0x30 && code <= 0x39 && s[0] === '-') { out += '\\' + code.toString(16) + ' '; continue; }
+    if (idx === 0 && code === 0x2D && s.length === 1) { out += '\\-'; continue; }
+    if (code >= 0x80 || code === 0x2D || code === 0x5F ||
+        (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5A) || (code >= 0x61 && code <= 0x7A)) {
+      out += ch; continue;
+    }
+    out += '\\' + ch;
+  }
+  return out;
+};
+const _serString = (str) => {                // CSSOM §serialize-a-string
+  let out = '"';
+  const s = String(str);
+  for (let idx = 0; idx < s.length; idx++) {
+    const code = s.charCodeAt(idx);
+    const ch = s[idx];
+    if (code === 0) { out += '�'; continue; }
+    if ((code >= 0x1 && code <= 0x1F) || code === 0x7F) { out += '\\' + code.toString(16) + ' '; continue; }
+    if (ch === '"' || ch === '\\') { out += '\\' + ch; continue; }
+    out += ch;
+  }
+  return out + '"';
+};
+const _SEL_IDENT_START = (c) => /[A-Za-z_]/.test(c) || c.charCodeAt(0) >= 0x80;
+const _SEL_IDENT_CHAR = (c) => /[A-Za-z0-9_-]/.test(c) || c.charCodeAt(0) >= 0x80;
+// Read one CSS escape at s[i] (s[i] === '\\'). Returns [char, nextIndex] or null.
+const _selReadEscape = (s, i) => {
+  i++;
+  if (i >= s.length) return null;
+  const c = s[i];
+  if (/[0-9a-fA-F]/.test(c)) {
+    let hex = '', j = i;
+    while (j < s.length && hex.length < 6 && /[0-9a-fA-F]/.test(s[j])) { hex += s[j]; j++; }
+    if (j < s.length && /[ \t\n\r\f]/.test(s[j])) j++;   // one trailing whitespace consumed
+    let cp = parseInt(hex, 16);
+    if (cp === 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+    return [String.fromCodePoint(cp), j];
+  }
+  if (c === '\n' || c === '\r' || c === '\f') return null;   // escaped newline is invalid
+  return [c, i + 1];
+};
+// Read a CSS identifier (with escapes) at s[i]. Returns [unescapedName, nextIndex] or null.
+const _selReadIdent = (s, i) => {
+  let name = '', j = i, first = true;
+  while (j < s.length) {
+    const c = s[j];
+    if (c === '\\') { const e = _selReadEscape(s, j); if (!e) break; name += e[0]; j = e[1]; first = false; continue; }
+    if (first) {
+      if (c === '-') { name += c; j++; first = false; continue; }
+      if (_SEL_IDENT_START(c)) { name += c; j++; first = false; continue; }
+      break;
+    }
+    if (_SEL_IDENT_CHAR(c)) { name += c; j++; continue; }
+    break;
+  }
+  if (name === '' || name === '-') return null;
+  return [name, j];
+};
+// Read a quoted string at s[i]. Returns [unescapedValue, nextIndex] or null.
+const _selReadString = (s, i) => {
+  const q = s[i]; let v = '', j = i + 1;
+  while (j < s.length) {
+    const c = s[j];
+    if (c === q) return [v, j + 1];
+    if (c === '\\') { const e = _selReadEscape(s, j); if (!e) { j++; continue; } v += e[0]; j = e[1]; continue; }
+    if (c === '\n') return null;
+    v += c; j++;
+  }
+  return null;   // unterminated
+};
+// Canonicalise an <an+b> microsyntax string. Returns serialized form or null.
+const _selSerAnB = (raw) => {
+  let t = String(raw).trim().toLowerCase();
+  if (t === 'even') return '2n';
+  if (t === 'odd') return '2n+1';
+  const flat = t.replace(/\s+/g, '');
+  if (/^[+-]?\d+$/.test(flat)) return String(parseInt(flat, 10));
+  const m = /^([+-]?\d*)n([+-]\d+)?$/.exec(flat);
+  if (!m) return null;
+  let a = m[1];
+  if (a === '' || a === '+') a = 1; else if (a === '-') a = -1; else a = parseInt(a, 10);
+  let b = m[2] ? parseInt(m[2], 10) : 0;
+  let part = a === 1 ? 'n' : a === -1 ? '-n' : a + 'n';
+  if (b === 0) return part;
+  return part + (b > 0 ? '+' + b : '-' + (-b));
+};
+// Known pseudo-classes / pseudo-elements. Unknown names make a *set* selectorText
+// invalid (the getter still falls back to raw, so reads never break).
+const _SEL_STATIC_PC = new Set(['hover','active','focus','focus-within','focus-visible','link','visited',
+  'any-link','local-link','target','target-within','scope','current','past','future','root','empty',
+  'enabled','disabled','checked','indeterminate','default','optional','required','valid','invalid',
+  'in-range','out-of-range','read-only','read-write','placeholder-shown','autofill','user-invalid',
+  'user-valid','first-child','last-child','only-child','first-of-type','last-of-type','only-of-type',
+  'defined','playing','paused','fullscreen','modal','picture-in-picture','popover-open','open','closed',
+  'first','left','right','blank','host']);
+const _SEL_FN_PC = new Set(['not','is','where','has','matches','-webkit-any','any','nth-child','nth-last-child',
+  'nth-of-type','nth-last-of-type','nth-col','nth-last-col','lang','dir','host','host-context','state']);
+const _SEL_NESTING_FN = new Set(['not','is','where','has','matches','-webkit-any','any','host','host-context']);
+const _SEL_NTH_FN = new Set(['nth-child','nth-last-child','nth-of-type','nth-last-of-type','nth-col','nth-last-col']);
+const _SEL_PE = new Set(['before','after','first-line','first-letter','marker','selection','placeholder',
+  'backdrop','file-selector-button','first-letter','grammar-error','spelling-error','target-text',
+  'cue','cue-region','part','slotted','highlight','view-transition','view-transition-group',
+  'view-transition-image-pair','view-transition-old','view-transition-new','details-content']);
+const _SEL_LEGACY_PE = new Set(['before','after','first-line','first-letter']);
+// Parse a group of selectors. Returns the AST (array of complex selectors) or null.
+const _parseSelectorList = (src) => {
+  const s = String(src);
+  const n = s.length;
+  let i = 0;
+  const ws = () => { while (i < n && /[ \t\n\r\f]/.test(s[i])) i++; };
+  const readFnArgs = () => {                 // s[i] === '(' → [rawInner, nextIndex] or null
+    let depth = 0, j = i, inStr = null, start = i + 1;
+    while (j < n) {
+      const c = s[j];
+      if (inStr) { if (c === '\\') { j += 2; continue; } if (c === inStr) inStr = null; j++; continue; }
+      if (c === '"' || c === "'") { inStr = c; j++; continue; }
+      if (c === '\\') { j += 2; continue; }
+      if (c === '(' || c === '[') depth++;
+      else if (c === ')' || c === ']') { depth--; if (depth === 0) { return [s.slice(start, j), j + 1]; } }
+      j++;
+    }
+    return null;
+  };
+  const parseTypeNs = () => {                // returns {prefix,name} | null (no type) | undefined (error)
+    if (s[i] === '*') {
+      if (s[i + 1] === '|') { i += 2; return readElementName('*'); }
+      i++; return { prefix: null, name: '*' };
+    }
+    if (s[i] === '|' && s[i + 1] !== '|') { i++; return readElementName(''); }
+    const id = _selReadIdent(s, i);
+    if (id && s[id[1]] === '|' && s[id[1] + 1] !== '|' && s[id[1] + 1] !== '=') {
+      i = id[1] + 1; return readElementName(id[0]);
+    }
+    if (id) { i = id[1]; return { prefix: null, name: id[0] }; }
+    return null;
+  };
+  function readElementName(prefix) {         // after a consumed prefix '|'
+    if (s[i] === '*') { i++; return { prefix, name: '*' }; }
+    const id = _selReadIdent(s, i);
+    if (id) { i = id[1]; return { prefix, name: id[0] }; }
+    return undefined;                         // prefix with no element name → invalid
+  }
+  const parseAttr = () => {
+    i++; ws();                                // past '['
+    let prefix = null;
+    if (s[i] === '*' && s[i + 1] === '|') { prefix = '*'; i += 2; }
+    else if (s[i] === '|') { prefix = ''; i++; }
+    else {
+      const id = _selReadIdent(s, i);
+      if (id && s[id[1]] === '|' && s[id[1] + 1] !== '=') { prefix = id[0]; i = id[1] + 1; }
+    }
+    const nameId = _selReadIdent(s, i);
+    if (!nameId) return null;
+    i = nameId[1]; const name = nameId[0]; ws();
+    if (s[i] === ']') { i++; return { kind: 'attr', prefix, name, op: null }; }
+    let op = null;
+    if ('~|^$*'.includes(s[i]) && s[i + 1] === '=') { op = s[i] + '='; i += 2; }
+    else if (s[i] === '=') { op = '='; i++; }
+    else return null;
+    ws();
+    let value, isStr;
+    if (s[i] === '"' || s[i] === "'") { const r = _selReadString(s, i); if (!r) return null; value = r[0]; i = r[1]; isStr = true; }
+    else { const r = _selReadIdent(s, i); if (!r) return null; value = r[0]; i = r[1]; isStr = false; }
+    ws();
+    let flag = null;
+    if (/[isIS]/.test(s[i]) && (s[i + 1] === ']' || /[ \t\n\r\f]/.test(s[i + 1]))) { flag = s[i].toLowerCase(); i++; ws(); }
+    if (s[i] !== ']') return null;
+    i++;
+    return { kind: 'attr', prefix, name, op, value, isStr, flag };
+  };
+  const parsePseudo = () => {
+    i++;                                      // past ':'
+    let dbl = false;
+    if (s[i] === ':') { dbl = true; i++; }
+    const id = _selReadIdent(s, i);
+    if (!id) return null;
+    i = id[1];
+    const lname = id[0].toLowerCase();
+    let args = null;
+    if (s[i] === '(') { const fn = readFnArgs(); if (!fn) return null; args = parsePseudoArgs(lname, fn[0]); if (args === null) return null; i = fn[1]; }
+    if (dbl) {
+      if (!_SEL_PE.has(lname)) return null;
+      return { kind: 'pe', name: lname, args };
+    }
+    if (_SEL_LEGACY_PE.has(lname) && !args) return { kind: 'pe', name: lname, args: null };
+    if (args) { if (!_SEL_FN_PC.has(lname)) return null; }
+    else if (!_SEL_STATIC_PC.has(lname)) return null;
+    return { kind: 'pc', name: lname, args };
+  };
+  function parsePseudoArgs(name, raw) {       // returns serialized-arg model or null
+    if (_SEL_NESTING_FN.has(name)) { const inner = _parseSelectorList(raw); return inner ? { sel: inner } : null; }
+    if (_SEL_NTH_FN.has(name)) {
+      const ofIdx = raw.search(/\sof\s/i);
+      if (ofIdx >= 0) {
+        const anb = _selSerAnB(raw.slice(0, ofIdx)); if (anb === null) return null;
+        const inner = _parseSelectorList(raw.slice(ofIdx + 4)); if (!inner) return null;
+        return { anb, of: inner };
+      }
+      const anb = _selSerAnB(raw); return anb === null ? null : { anb };
+    }
+    if (name === 'lang' || name === 'dir' || name === 'state') {
+      const parts = raw.split(',').map((p) => p.trim()).filter((p) => p.length);
+      if (!parts.length) return null;
+      const out = [];
+      for (const p of parts) {
+        if (p[0] === '"' || p[0] === "'") { const r = _selReadString(p, 0); if (!r || r[1] !== p.length) return null; out.push({ s: r[0], str: true }); }
+        else { const r = _selReadIdent(p, 0); if (!r || r[1] !== p.length) return null; out.push({ s: r[0], str: false }); }
+      }
+      return { args: out };
+    }
+    return { raw: raw.trim() };               // host()/host-context() inner selector kept raw
+  }
+  const parseCompound = () => {
+    const t = parseTypeNs();
+    if (t === undefined) return null;
+    const type = t || null;
+    const subs = [];
+    while (i < n) {
+      const c = s[i];
+      if (c === '.') { i++; const id = _selReadIdent(s, i); if (!id) return null; i = id[1]; subs.push({ kind: 'class', name: id[0] }); }
+      else if (c === '#') { i++; const id = _selReadIdent(s, i); if (!id) return null; i = id[1]; subs.push({ kind: 'id', name: id[0] }); }
+      else if (c === '[') { const a = parseAttr(); if (!a) return null; subs.push(a); }
+      else if (c === ':') { const p = parsePseudo(); if (!p) return null; subs.push(p); }
+      else break;
+    }
+    if (!type && subs.length === 0) return null;
+    return { type, subs };
+  };
+  const parseComplex = () => {
+    const first = parseCompound();
+    if (!first) return null;
+    const parts = [{ comb: '', compound: first }];
+    while (true) {
+      const save = i;
+      let sawWs = false;
+      while (i < n && /[ \t\n\r\f]/.test(s[i])) { i++; sawWs = true; }
+      if (i >= n) { i = save; break; }
+      let comb = null;
+      if ((s[i] === '+' || s[i] === '>' || (s[i] === '~' && s[i + 1] !== '='))) { comb = s[i]; i++; ws(); }
+      else if (s[i] === '|' && s[i + 1] === '|') { comb = '||'; i += 2; ws(); }
+      else if (s[i] === ',') { i = save; break; }
+      else if (sawWs) comb = ' ';
+      else { i = save; break; }
+      const next = parseCompound();
+      if (!next) { if (comb === ' ') { i = save; break; } return null; }
+      parts.push({ comb, compound: next });
+    }
+    return parts;
+  };
+  ws();
+  if (i >= n) return null;
+  const list = [];
+  while (true) {
+    const cx = parseComplex();
+    if (!cx) return null;
+    list.push(cx);
+    ws();
+    if (i >= n) break;
+    if (s[i] === ',') { i++; ws(); if (i >= n) return null; continue; }
+    return null;
+  }
+  return list;
+};
+// Serialize a parsed selector list. `nsi` is the owning sheet's namespace info
+// { defUrl, map } — a default namespace and prefix→URL map change how type/universal
+// heads serialize (a prefix mapping to the default namespace is omitted).
+const _serSelList = (list, nsi) => list.map((cx) => _serComplex(cx, nsi)).join(', ');
+function _serComplex(parts, nsi) {
+  let out = '';
+  for (const p of parts) {
+    if (p.comb === '') out += _serCompound(p.compound, nsi);
+    else if (p.comb === ' ') out += ' ' + _serCompound(p.compound, nsi);
+    else out += ' ' + p.comb + ' ' + _serCompound(p.compound, nsi);
+  }
+  return out;
+}
+const _serTypeNs = (prefix, nsi) => {
+  if (prefix == null) return '';
+  if (prefix === '') return '|';                         // explicit null namespace
+  if (prefix === '*') return nsi.defUrl != null ? '*|' : '';   // any namespace
+  // A named prefix that resolves to the default namespace is omitted entirely.
+  if (nsi.defUrl != null && nsi.map && nsi.map[prefix] !== undefined && nsi.map[prefix] === nsi.defUrl) return '';
+  return _serIdent(prefix) + '|';
+};
+function _serCompound(c, nsi) {
+  let out = '';
+  if (c.type) {
+    const ns = _serTypeNs(c.type.prefix, nsi);
+    if (c.type.name === '*') {
+      if (ns !== '') out += ns + '*';
+      else if (c.subs.length === 0) out += '*';
+      // universal with empty namespace head + following simple selectors → omitted
+    } else out += ns + _serIdent(c.type.name);
+  }
+  for (const sub of c.subs) out += _serSub(sub, nsi);
+  return out;
+}
+function _serSub(sub, nsi) {
+  if (sub.kind === 'class') return '.' + _serIdent(sub.name);
+  if (sub.kind === 'id') return '#' + _serIdent(sub.name);
+  if (sub.kind === 'attr') {
+    const ns = sub.prefix == null || sub.prefix === '' ? '' : sub.prefix === '*' ? '*|' : _serIdent(sub.prefix) + '|';
+    let out = '[' + ns + _serIdent(sub.name);
+    if (sub.op) out += sub.op + _serString(sub.value) + (sub.flag ? ' ' + sub.flag : '');
+    return out + ']';
+  }
+  const head = sub.kind === 'pe' ? '::' : ':';
+  if (!sub.args) return head + sub.name;
+  return head + sub.name + '(' + _serPseudoArgs(sub.name, sub.args, nsi) + ')';
+}
+function _serPseudoArgs(name, a, nsi) {
+  if (a.sel) return _serSelList(a.sel, nsi);
+  if (a.anb !== undefined) return a.anb + (a.of ? ' of ' + _serSelList(a.of, nsi) : '');
+  if (a.args) return a.args.map((x) => x.str ? _serString(x.s) : _serIdent(x.s)).join(', ');
+  return a.raw || '';
+}
+// Parse an `@namespace` prelude → { prefix: string|null, url: string }. The url is
+// reduced to its bare content (the bytes inside url()/quotes) for prefix-equality.
+const _parseNamespacePrelude = (prelude) => {
+  let t = String(prelude).replace(/^@namespace/i, '').trim();
+  if (!t) return null;
+  let prefix = null;
+  if (t[0] !== '"' && t[0] !== "'" && !/^url\(/i.test(t)) {
+    const id = _selReadIdent(t, 0);
+    if (!id) return null;
+    prefix = id[0];
+    t = t.slice(id[1]).trim();
+  }
+  let url = '';
+  if (t[0] === '"' || t[0] === "'") { const r = _selReadString(t, 0); url = r ? r[0] : t.slice(1); }
+  else { const m = /^url\(\s*(.*?)\s*\)/is.exec(t); if (m) { url = m[1]; if (/^["']/.test(url)) url = url.slice(1, -1); } else url = t; }
+  return { prefix, url };
+};
+// Collect a sheet's namespace info: the default-namespace URL (if any) + prefix→URL map.
+const _sheetNsInfo = (sheet) => {
+  const nsi = { defUrl: null, map: {} };
+  if (!sheet) return nsi;
+  let rules; try { rules = sheet._ruleListObj && sheet._ruleListObj._rules; } catch { return nsi; }
+  if (!rules) return nsi;
+  for (const r of rules) {
+    try {
+      if (!r || r.type !== 10 || !r._desc) continue;
+      const ns = _parseNamespacePrelude(r._desc.prelude);
+      if (!ns) continue;
+      if (ns.prefix == null) { if (nsi.defUrl == null) nsi.defUrl = ns.url; }
+      else nsi.map[ns.prefix] = ns.url;
+    } catch {}
+  }
+  return nsi;
+};
+
 class CSSRule {
   constructor() { this._parentRule = null; this._parentStyleSheet = null; }
   // parentRule / parentStyleSheet / type / cssText are readonly IDL attributes —
@@ -11724,19 +12105,34 @@ globalThis.CSSRule = CSSRule;
 class CSSStyleRule extends CSSRule {
   constructor(selectorText, body) {
     super();
-    this._selectorText = String(selectorText == null ? '' : selectorText).trim();
+    this._selectorSource = String(selectorText == null ? '' : selectorText).trim();   // raw authored selector
     this._styleDecl = _styleProxy(new CSSStyleDeclaration());
     if (body) this._styleDecl.cssText = body;          // specified-value serialization
     this._cascadeDecls = _cssParseDecls(body || '');   // cascade-shape decls for getComputedStyle
   }
   get type() { return 1; }
-  get selectorText() { return this._selectorText; }
-  set selectorText(v) { this._selectorText = String(v).trim(); }
+  // Serialize the selector into canonical CSSOM form on read; fall back to the raw
+  // authored text if it can't be parsed (so an exotic selector never breaks a page).
+  get selectorText() {
+    const ast = _parseSelectorList(this._selectorSource);
+    if (!ast) return this._selectorSource;
+    try { return _serSelList(ast, _sheetNsInfo(this._parentStyleSheet)); }
+    catch (e) { return this._selectorSource; }
+  }
+  // Per CSSOM: parse the value as a group of selectors; if it fails to parse, the
+  // setter does nothing (the old value is retained).
+  set selectorText(v) {
+    const val = String(v == null ? '' : v);
+    if (_parseSelectorList(val) === null) return;      // invalid → no-op
+    this._selectorSource = val.trim();
+    // Flag the owning sheet so getComputedStyle re-reads the live rule (CSSOM edit).
+    try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
+  }
   get style() { return this._styleDecl; }
   set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
   get cssText() {
     const block = this._styleDecl.cssText;
-    return this._selectorText + ' { ' + (block ? block + ' ' : '') + '}';
+    return this.selectorText + ' { ' + (block ? block + ' ' : '') + '}';
   }
 }
 globalThis.CSSStyleRule = CSSStyleRule;
@@ -11930,6 +12326,7 @@ class CSSStyleSheet {
     const arr = this._ruleListObj._rules;
     arr.length = 0;
     for (const d of _cssParseRuleList(text)) arr.push(_makeRule(d, this, null));
+    this._cssomDirty = false;   // rules rebuilt from source text — clear CSSOM-edit flag
   }
   insertRule(text, index) {
     const arr = this._ruleListObj._rules;
