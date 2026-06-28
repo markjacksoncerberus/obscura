@@ -11524,7 +11524,7 @@ globalThis.MutationObserver = class MutationObserver {
       previousSibling: rec.previousSibling,
       nextSibling: rec.nextSibling,
       attributeName: rec.type === 'attributes' ? rec.attributeName : null,
-      attributeNamespace: null,
+      attributeNamespace: rec.type === 'attributes' ? (rec.attributeNamespace ?? null) : null,
       oldValue: null,
     };
     if (rec.type === 'attributes' && o.attributeOldValue) out.oldValue = rec.oldValue ?? null;
@@ -11554,6 +11554,7 @@ const __drainMutations = function() {
       addedNodes: (m.addedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
       removedNodes: (m.removedNodes || []).map(nid => _wrap(nid)).filter(Boolean),
       attributeName: m.attributeName ?? null,
+      attributeNamespace: m.attributeNamespace ?? null,
       oldValue: m.oldValue ?? null,
       previousSibling: m.previousSibling != null ? _wrap(m.previousSibling) : null,
       nextSibling: m.nextSibling != null ? _wrap(m.nextSibling) : null,

@@ -248,6 +248,9 @@ pub struct MutationRecord {
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
     pub attr_name: Option<String>,
+    /// The mutated attribute's namespace (DOM `MutationRecord.attributeNamespace`).
+    /// `None` for null-namespace attributes and for non-attribute records.
+    pub attr_namespace: Option<String>,
     pub old_value: Option<String>,
 }
 
@@ -447,7 +450,13 @@ impl DomTree {
 
     /// Record an attribute mutation. Called from the op layer, which performs
     /// attribute writes via `with_node_mut` rather than a child-list method.
-    pub fn record_attribute_mutation(&self, target: NodeId, name: &str, old_value: Option<String>) {
+    pub fn record_attribute_mutation(
+        &self,
+        target: NodeId,
+        name: &str,
+        namespace: Option<String>,
+        old_value: Option<String>,
+    ) {
         let mut inner = self.inner.borrow_mut();
         if inner.mutations_enabled {
             inner.pending_mutations.push(MutationRecord {
@@ -458,6 +467,7 @@ impl DomTree {
                 prev_sibling: None,
                 next_sibling: None,
                 attr_name: Some(name.to_string()),
+                attr_namespace: namespace,
                 old_value,
             });
         }
@@ -475,6 +485,7 @@ impl DomTree {
                 prev_sibling: None,
                 next_sibling: None,
                 attr_name: None,
+                attr_namespace: None,
                 old_value,
             });
         }
@@ -568,6 +579,7 @@ impl DomTree {
                 prev_sibling: old_last,
                 next_sibling: None,
                 attr_name: None,
+                attr_namespace: None,
                 old_value: None,
             });
         }
@@ -622,6 +634,7 @@ impl DomTree {
                 prev_sibling: prev_id,
                 next_sibling: Some(existing_id),
                 attr_name: None,
+                attr_namespace: None,
                 old_value: None,
             });
         }
@@ -675,6 +688,7 @@ impl DomTree {
                     prev_sibling: prev_id,
                     next_sibling: next_id,
                     attr_name: None,
+                    attr_namespace: None,
                     old_value: None,
                 });
             }

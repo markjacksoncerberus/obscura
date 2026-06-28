@@ -281,7 +281,8 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 }
                 // Phase 0c: attribute mutation record (the op writes via
                 // with_node_mut, so it can't ride a child-list tree method).
-                dom.record_attribute_mutation(node_id, name, old);
+                // setAttribute always records (creation or change); null namespace.
+                dom.record_attribute_mutation(node_id, name, None, old);
             }
             "true".into()
         }
@@ -304,7 +305,10 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 if ns.is_empty() && local == "id" {
                     dom.update_id_index(node_id, old.as_deref(), Some(value));
                 }
-                dom.record_attribute_mutation(node_id, local, old);
+                // setAttributeNS always records; attributeNamespace is the
+                // attribute's namespace (null for the empty-string namespace).
+                let ns_opt = if ns.is_empty() { None } else { Some(ns.to_string()) };
+                dom.record_attribute_mutation(node_id, local, ns_opt, old);
             }
             "true".into()
         }
@@ -320,7 +324,13 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             if ns.is_empty() && local == "id" {
                 dom.update_id_index(node_id, old.as_deref(), None);
             }
-            dom.record_attribute_mutation(node_id, local, old);
+            // "Remove an attribute" only queues a record when the attribute
+            // actually existed (old is Some); removing an absent attribute is a
+            // no-op per DOM §"remove an attribute by namespace and local name".
+            if old.is_some() {
+                let ns_opt = if ns.is_empty() { None } else { Some(ns.to_string()) };
+                dom.record_attribute_mutation(node_id, local, ns_opt, old);
+            }
             "true".into()
         }
         "inner_html" => {
@@ -358,7 +368,11 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 dom.update_id_index(node_id, old.as_deref(), None);
             }
             dom.with_node_mut(node_id, |n| n.remove_attribute_qualified(&arg2));
-            dom.record_attribute_mutation(node_id, &arg2, old);
+            // Only record when the attribute existed (no-op removal queues
+            // nothing); null namespace for the non-namespaced remove.
+            if old.is_some() {
+                dom.record_attribute_mutation(node_id, &arg2, None, old);
+            }
             "true".into()
         }
         "set_inner_html" => {
@@ -415,6 +429,7 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                         "previousSibling": r.prev_sibling.map(|n| n.raw()),
                         "nextSibling": r.next_sibling.map(|n| n.raw()),
                         "attributeName": r.attr_name,
+                        "attributeNamespace": r.attr_namespace,
                         "oldValue": r.old_value,
                     })
                 })
