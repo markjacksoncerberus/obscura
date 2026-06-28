@@ -80,7 +80,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | ~~03~~ | ✅ [The ClassList Mutation-Echo](03-the-classlist-mutation-echo.md) | `dom/nodes/Element-classlist` | **1420/1420** | ⚔️⚔️ | **SECURED 100%** |
 | 04 | [The URL Swamps](04-the-url-swamps.md) | `url/url-constructor`, `url/url-setters` | ⚔️ stripping **260/260** + statics **8/8** DONE; constructor 847, setters 241 | ⚔️⚔️⚔️ | Inc 1–3: **+73** (userinfo no-strip, statics, hostname/port, path `^`, opaque-space, `///` slash-skip); remaining = rust-url-vs-WHATWG `file:`/empty-host/`/.` divergences (real WHATWG parser is the keystone) |
 | ~~05~~ | ✅ [The Element Forge](05-the-element-forge.md) | `dom/nodes/Document-createElement` | **147/147** | ⚔️⚔️⚔️ | **SECURED** |
-| 06 | [The Node-Smithing Vaults](06-the-node-smithing-vaults.md) | `dom/nodes/Node-*` | mixed | ⚔️⚔️ | ~150 |
+| 06 | [The Node-Smithing Vaults](116-the-self-same-verdict.md) | `dom/nodes/Node-*` | **near-100%** | ⚔️⚔️ | **Quest #116 +49** — isSameNode 9/9, contains 1482/1482, cloneNode-XMLDocument 1/1, cloneNode-doctype 3/3. Realm baselined far greener than the old ~150 est (compareDocumentPosition 1444, properties 726, textContent 81, lookupNamespaceURI 75 all 100%). Caps: Node-removeChild hang, querySelector-escapes lone-surrogate IDs (Rust UTF-8), replaceChildren atomic-replace MO record, parentNode iframe onload |
 | 07 | [The Event Amphitheater](07-the-event-amphitheater.md) | `dom/events/*` | ⚔️ spec dispatch **DONE**; core 100% | ⚔️⚔️ | +110 this session (capturing/bubbling, event classes, trusted); tails = heavy cloneNode fixtures + synthetic-click |
 | 08 | [The Encoding Cipher](08-the-encoding-cipher.md) | `encoding/*` | ⚔️ TextEncoder/Decoder + **legacy encodings DONE** (~7800) | ⚔️⚔️ | #08b: +3900 (all single-byte + gb18030/gbk/big5/euc/sjis/iso-2022-jp via `encoding_rs` op); tails = SAB, utf-16-truncated, iso-2022-jp fatal-stream state |
 | 09 | [The FileAPI Vault](09-the-fileapi-vault.md) | `FileAPI/*` | ⚔️ Blob/File/FileReader + **blob: URL store DONE** (~365) | ⚔️⚔️ | #09b: +34 (blob:{origin}/{uuid}, byte store, fetch/XHR/Request snapshot); tails = element-toString, SAB, url-reload/in-tags (navigation), FileList |
@@ -140,6 +140,29 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-06-28 (Quest #116 The Self-Same Verdict — Node-Smithing correctness: isSameNode, contains, XMLDocument/doctype cloneNode, +49):**
+Took the Captain's Counsel #1 lead (Node-Smithing Vaults 06) now that the Range frontier is exhausted. The realm baselined far
+greener than the board's "~150" estimate — compareDocumentPosition (1444), lookupNamespaceURI (75), textContent (81),
+properties (726), nodeName, appendChild, replaceChild, isEqualNode, the ChildNode/ParentNode families were already 100%. Four
+pockets of red, all pure-JS (`bootstrap.js`), all additive: **(1) `Node-isSameNode` 0→9** — `isSameNode(other){return other && …}`
+leaked the falsy arg (`null`) instead of a WebIDL `false`; fixed with `other != null && this._nid === other._nid`, plus `Attr`
+(not a Node subclass) gained its own `isSameNode(o){return o===this}`. **(2) `Node-contains` 1444→1482** — `contains(node)` on
+itself was false; DOM §4.4 wants the *inclusive* descendant (a node contains itself), so the `o._nid === this._nid` self case is
+folded into the method (the Rust `contains` op is strict-descendant only; the 4 internal callers already added their own
+self-check — the tell). **(3) `Node-cloneNode-XMLDocument` 0→1** — `DetachedDocument.cloneNode` hardcoded `new DetachedDocument`,
+giving an `XMLDocument` clone the wrong interface; branch `instanceof XMLDocument` (sibling `_IframeDocument` has a different
+ctor signature → not `this.constructor`). **(4) `Node-cloneNode-document-with-doctype` 2→3** — DOMParser HTML stripped
+`<!DOCTYPE>` and never re-created the DocumentType child; `parseFromString` now parses name/publicId/systemId and inserts a real
+`createDocumentType` node, scoped to DOMParser to spare the iframe Range harness child counts. **+49.** ZERO regressions
+(Node-cloneNode 135, Node-properties 726, isEqualNode 9, compareDocumentPosition 1444, qsa 1975, classlist 1420, createElement
+147, surroundContents 1840, insertNode 1840, extract 187, delete 125, disabled 7/7; stash-proved the `contains`-at-risk suspects
+pre-existed: MutationObserver-childList could-not-run on old code too, DOMParser-parseFromString-html was already 9/10 — its lone
+fail is `<noscript>` parsing). CAPS: `Node-removeChild` heavy-test hang (loads but never completes, like Node-insertBefore);
+`querySelector-escapes` 66/68 (lone-surrogate IDs — Rust UTF-8 can't hold them, coerced to U+FFFD); `replaceChildren` 25/29
+(atomic-replace MutationObserver record, needs a Rust suppress-observers flag); `Node-parentNode` 4/5 (iframe-realm `onload`
+`this`). NEXT: Node-Smithing ~exhausted of cheap wins; broaden to a fresh CSS region or the MutationObserver/iframe harness gates.
+Scroll `tickets/116-the-self-same-verdict.md`.
 
 **Session 2026-06-28 (Quest #115 The Shifted Verdict — live-range adjustment in the DOM node-mutation hooks: remove, insert, split, +48):**
 Took the #112/#113/#114-named "next leverage" — wire the `__obscura_liveRanges` registry (from #113) into the *other* spec

@@ -1071,7 +1071,11 @@ class Node {
     if (n instanceof Element) _connectResourceElement(n);
     return n;
   }
-  contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
+  // DOM §4.4: contains(other) is true iff other is an *inclusive* descendant of
+  // this — so a node contains itself. The Rust `contains` op tests strict
+  // descendant only (internal callers add their own self-check), so fold the
+  // node-is-itself case in here.
+  contains(o) { return o ? (o._nid === this._nid || _dom("contains", this._nid, o._nid) === "true") : false; }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   // _targetDoc (internal): the document the clone is created in. Defaults to the
   // source's ownerDocument; importNode passes the importing document so the
@@ -1218,7 +1222,10 @@ class Node {
     }
     return true;
   }
-  isSameNode(other) { return other && this._nid === other._nid; }
+  // DOM §4.4: isSameNode(otherNode) is true iff otherNode IS this — a reference
+  // comparison. `other && …` returned the falsy arg verbatim (null), but WebIDL
+  // boolean must coerce; an explicit `!= null` guard yields a real false.
+  isSameNode(other) { return other != null && this._nid === other._nid; }
   // DOM namespace resolution (§4.4). An empty-string prefix means the default
   // namespace (null prefix). See _locateNamespace / _locatePrefix below.
   lookupNamespaceURI(prefix) {
@@ -1524,6 +1531,10 @@ globalThis.Attr = class Attr {
   get firstChild() { return null; }
   get parentNode() { return null; }
   cloneNode() { return new Attr(this._ns, this._prefix, this._local, this.value); }
+  // Attr is not a Node subclass, so it needs its own isSameNode. Attr objects are
+  // identity-cached on their element (and held directly when detached), so a plain
+  // reference compare is the spec's "otherNode is this".
+  isSameNode(other) { return other === this; }
   // Attr is not a Node subclass here, so mirror the namespace-resolution API
   // (it resolves through the owner element — see _locateNamespace, nodeType 2).
   lookupNamespaceURI(prefix) { return _locateNamespace(this, (prefix == null || prefix === '') ? null : String(prefix)); }
@@ -3162,7 +3173,13 @@ class DetachedDocument extends Document {
   // §clone a node (document): a new document of the same kind carrying the same
   // encoding/content type/URL/mode; children are copied only for a deep clone.
   cloneNode(deep) {
-    const copy = new DetachedDocument(this._kind);
+    // §clone a node makes a node implementing the SAME interface, so an
+    // XMLDocument (createDocument's product) must clone to an XMLDocument, not a
+    // bare DetachedDocument. _IframeDocument is a sibling with a different ctor
+    // signature, so branch explicitly rather than via this.constructor.
+    const copy = (this instanceof XMLDocument)
+      ? new XMLDocument(this._kind)
+      : new DetachedDocument(this._kind);
     // A clone starts empty — drop the kind-'html' auto-built <html><head><body>.
     for (let c = copy.firstChild; c; ) { const n = c.nextSibling; copy.removeChild(c); c = n; }
     copy._contentType = this._contentType;
@@ -12385,6 +12402,25 @@ globalThis.DOMParser = class DOMParser {
       // page — a footgun: mutating the "parsed" doc mutated the real page).
       const doc = new _IframeDocument(str, 'about:blank', null, 'about:blank', 'html');
       doc._contentType = 'text/html';
+      // The HTML parse path strips `<!DOCTYPE …>` (it parses into a synthetic
+      // html/head/body scaffold), so a parsed document has no DocumentType child.
+      // Real parsers emit one — re-create it here so `doc.doctype`/childNodes are
+      // spec-correct. Scoped to DOMParser to avoid perturbing iframe-document
+      // child counts the Range harness depends on.
+      try {
+        const dtm = str.match(/<!DOCTYPE\s+([^\s>]+)([^>]*)>/i);
+        if (dtm && !doc.doctype && doc.documentElement) {
+          const name = _asciiLower(dtm[1]);
+          let publicId = '', systemId = '';
+          const rest = dtm[2] || '';
+          const pub = rest.match(/PUBLIC\s+("[^"]*"|'[^']*')(?:\s+("[^"]*"|'[^']*'))?/i);
+          const sys = rest.match(/SYSTEM\s+("[^"]*"|'[^']*')/i);
+          if (pub) { publicId = pub[1].slice(1, -1); if (pub[2]) systemId = pub[2].slice(1, -1); }
+          else if (sys) { systemId = sys[1].slice(1, -1); }
+          const dtNode = doc.implementation.createDocumentType(name, publicId, systemId);
+          doc.insertBefore(dtNode, doc.documentElement);
+        }
+      } catch (e) {}
       // Quirks: no-quirks (CSS1Compat) iff a `<!DOCTYPE html>` leads the input,
       // else quirks (BackCompat). (Full quirks-mode table is out of scope here.)
       doc._compatMode = /^[﻿\s]*<!doctype\s+html\s*>/i.test(str) ? 'CSS1Compat' : 'BackCompat';
