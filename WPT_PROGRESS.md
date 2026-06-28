@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-28 (Quest #120).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-28 (Quest #122).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/dom/aria-element-reflection.html` | 5/27 | **22/27** | ⚠️ 81% | **Quest #122 The Associated Verdict.** ARIAMixin *element* reflection (`bootstrap.js`): `ariaActiveDescendantElement` (single Element) + 7 `FrozenArray<Element>` attrs (`ariaControls/DescribedBy/Details/ErrorMessage/FlowTo/LabelledBy/OwnsElements`). Explicit IDL refs stash in `_explicitAria` and write `""` to the content attribute; setting the content attribute directly resets the explicit ref (hook in setAttribute/removeAttribute); getter computes from content via getElementById otherwise. Valid-scope = host+ref connected to the same document; FrozenArray getter caches by element-list identity. Setter type-checks (TypeError on non-Element / non-sequence). The 5 residual all need real shadow-tree scope discrimination (crossing-into-shadow vs shadow-inclusive-ancestor) — a cap. **+17.** |
 | `html/dom/aria-attribute-reflection.html` | 8/41 | **41/41** | ✅ 100% | **Quest #121 The Reflected Verdict.** Full `ARIAMixin` string reflection (`bootstrap.js`): a table-driven loop defines all 41 nullable-DOMString IDL attributes on `Element.prototype` (`role`→`role`; every `ariaXxx`→`aria-xxx`) — getter returns the content attribute or null, setter removes for null/undefined else writes `String(v)`. Replaced the prior 8 hand-written accessors. **+33.** |
 | `css/cssom/CSSStyleRule-set-selectorText.html` | 24/82 | **82/82** | ✅ 100% | **Quest #120 The Canonical Verdict.** Real selector parser+serializer (`bootstrap.js`): `set selectorText` validates (invalid → no-op, keeps old) + getter re-serializes to canonical CSSOM form; plus a dirty-gated cascade path so a CSSOM selectorText edit on a `<style>`-backed rule is honoured by getComputedStyle. **+58.** |
 | `css/cssom/serialize-namespaced-type-selectors.html` | 31/60 | **60/60** | ✅ 100% | **Quest #120 The Canonical Verdict.** Type/universal namespace serialization: `*\|` dropped without a default ns, kept with one; a named prefix that resolves to the default-namespace URL is omitted (`nsdefault\|e`→`e`); `\|e`/`*\|e`/`ns\|e` rules. Sheet namespace info from `@namespace` rules. **+29.** |

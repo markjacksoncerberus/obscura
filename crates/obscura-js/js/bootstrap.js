@@ -2112,6 +2112,9 @@ class Element extends Node {
     if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
     // An id'd element is reachable as a Window-named global.
     if (qname === 'id' && v) __defineNamedGlobal(String(v));
+    // Writing a reflected ARIA-element content attribute directly resets any
+    // explicit element association (so the getter recomputes from the attribute).
+    if (__ariaElementContentAttrs.has(qname)) __ariaResetExplicit(this, qname);
   }
   setAttributeNS(namespace, qname, v) {
     const { namespace: ns, prefix, local } = _validateAndExtract(namespace, qname);
@@ -2147,6 +2150,9 @@ class Element extends Node {
     if (qname === 'style' && this._style) this._style.cssText = '';
     // Removing srcdoc reprocesses: the frame falls back to src or about:blank.
     if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
+    // Removing a reflected ARIA-element content attribute drops the explicit
+    // element association too.
+    if (__ariaElementContentAttrs.has(qname)) __ariaResetExplicit(this, qname);
   }
   removeAttributeNS(ns, local) {
     ns = (ns === '' || ns == null) ? '' : String(ns); local = String(local);
@@ -2701,6 +2707,119 @@ for (const __jsAttr in __ariaReflectedAttrs) {
       else this.setAttribute(__contentAttr, String(v));
     },
   });
+}
+
+// ── ARIAMixin element reflection (HTML §reflecting-content-attributes — element)
+// A second ARIA reflection family reflects an *element reference* (or a frozen
+// array of them) rather than a string: `ariaActiveDescendantElement` ↔
+// aria-activedescendant, `ariaControlsElements` ↔ aria-controls, etc. Each has
+// two ways the association is established (per the "attr-associated elements"
+// algorithm):
+//   • EXPLICIT — assigned via the IDL setter. We stash the raw Element refs in
+//     `_explicitAria[contentAttr]` and write the EMPTY STRING to the content
+//     attribute (the spec never serialises the id back). An explicit association
+//     wins over the content attribute and survives id changes / reparenting.
+//   • COMPUTED — parsed from the content attribute's id token(s) via
+//     getElementById, first-in-tree-order. Used only when no explicit ref exists.
+// Setting (or removing) the content attribute directly RESETS any explicit
+// association (see __ariaResetExplicit, called from setAttribute/removeAttribute).
+// A reference is only *exposed* when it shares a valid scope with the host — here
+// modelled as "both connected to the same document" (full shadow-tree scoping is
+// a known cap). The FrozenArray getter caches its result and reuses the same
+// array object until the computed element list actually changes, satisfying the
+// IDL caching invariant.
+const __ariaElementReflectedAttrs = {
+  ariaActiveDescendantElement: { attr: 'aria-activedescendant', multiple: false },
+  ariaControlsElements:        { attr: 'aria-controls',         multiple: true },
+  ariaDescribedByElements:     { attr: 'aria-describedby',      multiple: true },
+  ariaDetailsElements:         { attr: 'aria-details',          multiple: true },
+  ariaErrorMessageElements:    { attr: 'aria-errormessage',     multiple: true },
+  ariaFlowToElements:          { attr: 'aria-flowto',           multiple: true },
+  ariaLabelledByElements:      { attr: 'aria-labelledby',       multiple: true },
+  ariaOwnsElements:            { attr: 'aria-owns',             multiple: true },
+};
+const __ariaElementContentAttrs = new Set(
+  Object.keys(__ariaElementReflectedAttrs).map(k => __ariaElementReflectedAttrs[k].attr));
+// A referenced element is in a valid scope (exposed) iff the host is connected
+// and the element is connected within the same document tree. This covers the
+// light-DOM, not-yet-inserted, and cross-document cases; crossing shadow-tree
+// boundaries is not distinguished (cap).
+function __ariaElemValid(self, el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (!self.isConnected) return false;
+  if (el.ownerDocument !== self.ownerDocument) return false;
+  return el.isConnected;
+}
+// Setting/removing one of the reflected content attributes drops the explicit
+// association and its cached array, so the getter recomputes from the attribute.
+function __ariaResetExplicit(el, attr) {
+  if (el._explicitAria) delete el._explicitAria[attr];
+  if (el._ariaElemCacheObj) delete el._ariaElemCacheObj[attr];
+}
+for (const __jsAttr in __ariaElementReflectedAttrs) {
+  const __d = __ariaElementReflectedAttrs[__jsAttr];
+  const __attr = __d.attr;
+  if (__d.multiple) {
+    Object.defineProperty(Element.prototype, __jsAttr, {
+      configurable: true, enumerable: true,
+      get() {
+        let list;
+        if (this._explicitAria && (__attr in this._explicitAria)) {
+          list = this._explicitAria[__attr].filter(el => __ariaElemValid(this, el));
+        } else if (this.hasAttribute(__attr)) {
+          list = [];
+          const seen = new Set();
+          const doc = this.ownerDocument;
+          for (const tok of this.getAttribute(__attr).split(/\s+/)) {
+            if (!tok) continue;
+            const el = doc.getElementById(tok);
+            if (el && !seen.has(el) && __ariaElemValid(this, el)) { seen.add(el); list.push(el); }
+          }
+        } else {
+          return null; // absent content attribute & no explicit set → null
+        }
+        // Caching invariant: reuse the prior frozen array when the element list
+        // is unchanged, so `el.x === el.x` holds until something actually moves.
+        const cache = this._ariaElemCacheObj || (this._ariaElemCacheObj = {});
+        const prev = cache[__attr];
+        if (prev && prev.length === list.length && list.every((e, i) => e === prev[i])) return prev;
+        return (cache[__attr] = Object.freeze(list));
+      },
+      set(v) {
+        if (v === null || v === undefined) { this.removeAttribute(__attr); return; }
+        if (typeof v === 'string' || v[Symbol.iterator] === undefined)
+          throw new TypeError("Failed to set the '" + __jsAttr + "' property on 'Element': The provided value is not a sequence of Element.");
+        const arr = [];
+        for (const item of v) {
+          if (!(item instanceof Element))
+            throw new TypeError("Failed to set the '" + __jsAttr + "' property on 'Element': The provided value is not of type 'Element'.");
+          arr.push(item);
+        }
+        this.setAttribute(__attr, ""); // resets explicit (via __ariaResetExplicit) + cache
+        (this._explicitAria || (this._explicitAria = {}))[__attr] = arr;
+      },
+    });
+  } else {
+    Object.defineProperty(Element.prototype, __jsAttr, {
+      configurable: true, enumerable: true,
+      get() {
+        if (this._explicitAria && (__attr in this._explicitAria)) {
+          const el = this._explicitAria[__attr];
+          return __ariaElemValid(this, el) ? el : null;
+        }
+        if (!this.hasAttribute(__attr)) return null;
+        const el = this.ownerDocument.getElementById(this.getAttribute(__attr));
+        return __ariaElemValid(this, el) ? el : null;
+      },
+      set(v) {
+        if (v === null || v === undefined) { this.removeAttribute(__attr); return; }
+        if (!(v instanceof Element))
+          throw new TypeError("Failed to set the '" + __jsAttr + "' property on 'Element': The provided value is not of type 'Element'.");
+        this.setAttribute(__attr, ""); // resets explicit (via __ariaResetExplicit) + cache
+        (this._explicitAria || (this._explicitAria = {}))[__attr] = v;
+      },
+    });
+  }
 }
 
 // DOM §concept-node-adopt: remove `node` from any parent, then — when the
