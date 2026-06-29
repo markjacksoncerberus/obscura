@@ -3977,12 +3977,27 @@ const _addListenerByKey = function(key, type, handler, opts) {
   // boolean (so e.g. addEventListener(t, fn, 2.3) captures).
   const o = (typeof opts === 'object' && opts !== null) ? opts : { capture: !!opts };
   const cap = !!o.capture, once = !!o.once, passive = !!o.passive;
+  const signal = o.signal;
+  // WebIDL: AddEventListenerOptions.signal is a non-nullable AbortSignal, so a
+  // *present* value that isn't one (notably `null`) fails interface conversion →
+  // TypeError. That coercion happens during argument processing, i.e. BEFORE the
+  // null-callback step below (so addEventListener("x", null, {signal:null}) throws).
+  if (signal !== undefined && !(signal instanceof globalThis.AbortSignal))
+    throw new TypeError("Failed to execute 'addEventListener': member signal is not of type AbortSignal.");
   if (handler == null) return; // a null callback is ignored (after flattening)
+  // §"add an event listener" step 2: if the signal is already aborted, don't add.
+  if (signal && signal.aborted) return;
   if (!_eventRegistry[key]) _eventRegistry[key] = {};
   if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
   const list = _eventRegistry[key][type];
   if (list.some(e => e.handler === handler && e.capture === cap)) return;
   list.push({ handler, capture: cap, once, passive });
+  // §"add an event listener" final step: when the signal aborts, remove this
+  // listener. Registered only after the listener is actually added (a duplicate or
+  // null-callback add returns above without arming an abort algorithm).
+  if (signal) signal.addEventListener('abort', function() {
+    _removeListenerByKey(key, type, handler, { capture: cap });
+  });
 };
 const _removeListenerByKey = function(key, type, handler, opts) {
   const cap = !!((typeof opts === 'object' && opts !== null) ? opts.capture : opts);
