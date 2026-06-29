@@ -2943,6 +2943,12 @@ const __reflectedEnumAttrs = {
   dir: { attr: 'dir', keywords: ['ltr', 'rtl', 'auto'] },
   inputMode: { attr: 'inputmode', keywords: ['none', 'text', 'tel', 'url', 'email', 'numeric', 'decimal', 'search'] },
   enterKeyHint: { attr: 'enterkeyhint', keywords: ['enter', 'done', 'go', 'next', 'previous', 'search', 'send'] },
+  // Element-specific enums (inert on elements that don't own them). `as` is
+  // <link>-only; `referrerPolicy` is shared by <a>/<area>/<img>/<iframe>/<link>/
+  // <script>. Both have "" as the missing AND invalid default (for referrerPolicy
+  // "" is itself a keyword), which the getter already returns on absent/no-match.
+  as: { attr: 'as', keywords: ['fetch', 'audio', 'document', 'embed', 'font', 'image', 'manifest', 'object', 'report', 'script', 'sharedworker', 'style', 'track', 'video', 'worker', 'xslt'] },
+  referrerPolicy: { attr: 'referrerpolicy', keywords: ['', 'no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin', 'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url'] },
 };
 for (const __jsAttr in __reflectedEnumAttrs) {
   const { attr: __contentAttr, keywords: __keywords } = __reflectedEnumAttrs[__jsAttr];
@@ -2998,6 +3004,12 @@ const __reflectedExtraStringAttrs = {
   integrity: 'integrity',  // <script> / <link>
   event: 'event',          // <script> (obsolete)
   charset: 'charset',      // <script> / <link> / <a> (obsolete)
+  media: 'media',          // <link> / <style> / <meta> / <source>
+  scheme: 'scheme',        // <meta> (obsolete)
+  target: 'target',        // <base> / <link> / <a> / <area> / <form>
+  rev: 'rev',              // <link> / <a> (obsolete)
+  hreflang: 'hreflang',    // <link> / <a>
+  nonce: 'nonce',          // HTMLElement / SVGElement (global)
 };
 for (const __jsAttr in __reflectedExtraStringAttrs) {
   const __contentAttr = __reflectedExtraStringAttrs[__jsAttr];
@@ -3041,6 +3053,26 @@ Object.defineProperty(Element.prototype, 'crossOrigin', {
   set(v) {
     if (v == null) this.removeAttribute('crossorigin');
     else this.setAttribute('crossorigin', String(v));
+  },
+});
+
+// `content` is overloaded: on <template> it is the (read-only) template-contents
+// DocumentFragment (HTMLTemplateElement), but on <meta> it is a plain DOMString
+// reflection of the `content` attribute. This single accessor replaces the
+// template-only getter that `class Element` defined, preserving its behaviour
+// and adding the meta reflection (inert string reflection on every other element).
+Object.defineProperty(Element.prototype, 'content', {
+  configurable: true, enumerable: true,
+  get() {
+    if (this.localName === 'template') {
+      if (!this._templateContent) this._templateContent = document.createDocumentFragment();
+      return this._templateContent;
+    }
+    return this.getAttribute('content') ?? '';
+  },
+  set(v) {
+    if (this.localName === 'template') return;   // template.content is read-only
+    this.setAttribute('content', String(v));
   },
 });
 

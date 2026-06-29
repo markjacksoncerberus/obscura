@@ -148,6 +148,26 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-29 (Quest #131 The Metadata Verdict — metadata-element reflectors, +712):**
+After #130 unlocked the global HTMLElement reflectors and a first batch of element-specifics on
+`Element.prototype`, the sibling `reflection-metadata` suite (`link`/`meta`/`base`/`style`/`script`)
+still sat at **2282/3110 (73.4%)** — its own element-specific content-attribute reflectors returned
+`undefined`. **The fix** (`bootstrap.js`, no Rust, all riding #130's table-driven machinery so each
+reflector is inert on non-owning elements): two enum reflectors added to `__reflectedEnumAttrs` —
+`as` (`<link>`-only) and `referrerPolicy` (with `""` itself a keyword AND the missing/invalid default);
+six DOMString reflectors added to `__reflectedExtraStringAttrs` — `media`/`scheme`/`target`/`rev`/
+`hreflang`/`nonce`; and a **`content` overload** (one `Object.defineProperty` on `Element.prototype`
+preserving `template.content`'s read-only `DocumentFragment` byte-for-byte while adding `meta`-style
+string reflection everywhere else). **2282/3110 → 2994/3110, +712** (stash-baseline confirmed).
+**Zero regressions** (qsa 1975, classlist 1420, createElement 147, Node-properties 726, aria-attribute
+41, aria-element 22/27, getElementsByTagName 19/19; the risky `content` overload stash-baselined against
+`template-content.html` — 108/216 BOTH with and without, the 108 fails a pre-existing
+template-via-`innerHTML` parsing gap). **CAP:** the residual 116 is dominated by the same URL-origin cap
+as #130 — `link.href` (~42) expects the origin-less harness's garbage `"undefined//undefined…"` while
+Obscura returns the correct resolved URL. **NEXT:** grouping (4797/5358) & sections (4890/5604) carry
+their own element-specific reflectors (table-cell/form-control/list) under the same additive style; then
+the standing shadow-scope / namespaced-cascade leads. Scroll `tickets/131-the-metadata-verdict.md`.
+
 **Session 2026-06-29 (Quest #130 The Global Verdict — global HTMLElement attribute reflection, +4146):**
 After #129 exhausted the `dom/events` AddEventListenerOptions fruit, a fresh sweep found the widest
 unimplemented tail on the board: `html/dom/reflection-misc.html` at **563/4877 (11.5%)** — 4314 failing
