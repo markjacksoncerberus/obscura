@@ -148,6 +148,28 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-29 (Quest #130 The Global Verdict — global HTMLElement attribute reflection, +4146):**
+After #129 exhausted the `dom/events` AddEventListenerOptions fruit, a fresh sweep found the widest
+unimplemented tail on the board: `html/dom/reflection-misc.html` at **563/4877 (11.5%)** — 4314 failing
+subtests. The failures clustered on the **global HTMLElement attributes**, which Obscura defined nowhere
+(`HTMLElement` is an empty subclass of `Element`): `dir` (816), `hidden` (468), `autofocus` (468), `title`
+(456), `lang` (456), `accessKey` (456), `tabIndex` (336), `inputMode` (120), `enterKeyHint` (114) — every
+`element.title`/`element.dir`/… returned `undefined`. **The fix** (`bootstrap.js`, no Rust): a table-driven
+block on `Element.prototype` right after `__ariaReflectedAttrs`, four reflector kinds matching the WPT
+`reflection.js` semantics — DOMString (return attr or `""`; set `String(v)`), enum (ASCII-only keyword
+match, missing/invalid default `""`), boolean (`hasAttribute` / set-`""`-or-remove), and long (`tabIndex`,
+HTML signed-int parse with `−0`→`+0`, default −1). Plus the winnable element-specifics: DOMString
+`version`/`dateTime`/`integrity`/`event`/`charset`, boolean `open`/`defer`/`noModule`/`compact`, and the
+nullable-enum `crossOrigin` (missing default `null`, invalid default `"anonymous"`). **563/4877 → 4709/4877,
++4146.** The same primitive lifts every other reflection suite (measured after, not scored: grouping
+4797/5358, sections 4890/5604, metadata 2282/3110). **Zero regressions** (qsa 1975, createElement 147,
+Node-properties 726, getElementById 18, attributes 67, aria-attribute 41, aria-element 22/27 unchanged,
+Event-dispatch 5/5, passive 5/5, signal 11/11, DOMTokenList-coverage 168/175 — the 7 are pre-existing
+`relList`/`htmlFor`/`sandbox`/`sizes` DOMTokenList gaps). **CAP:** URL-typed reflections `cite`/`src` (~130)
+resolve to a garbage expected value (`"undefined//undefined…"`) in the origin-less harness — unwinnable here;
+`reflection-text`/`-embedded`/`-tabular`/`-obsolete` are `meta timeout=long` files that could-not-run even at
+280 s. Scroll `130-the-global-verdict.md`.
+
 **Session 2026-06-29 (Quest #129 The Passive Verdict — `AddEventListenerOptions.passive` during dispatch, +3):**
 The sibling #128 flagged: `dom/events/AddEventListenerOptions-passive.any.html` at **2/5**. Obscura read
 `passive` from the options dict and stored it per-listener, but never honored it during dispatch — a
