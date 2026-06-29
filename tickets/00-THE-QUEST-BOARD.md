@@ -147,6 +147,31 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-29 (Quest #127 The Named Verdict — named access on the Document object, +64):**
+After #126 took `insertAdjacentHTML` to 100%, swept fresh ground past the saturated `dom/nodes` realm and
+found the widest unimplemented tail on the board: **named property access on the `document` object**
+(HTML §named-access-on-the-Document-object / "nameditem") — `document.foo`, `document['foo']`,
+`'foo' in document`, `Object.getOwnPropertyNames(document)`. Obscura had **none** of it (every
+`document.someName` returned `undefined`), so the whole `html/dom/documents/dom-tree-accessors/nameditem-*`
+cluster sat at **16/82**. **The fix** (all in `bootstrap.js`, no Rust): a set of helpers computing the
+spec's supported-property-names set (the `name` of every exposed `embed`/`form`/`iframe`/`img`/`object`;
+the `id` of every exposed `object`; the `id` of every `img` that has both id AND name), plus a **transparent
+Proxy over the document** whose `get`/`has`/`ownKeys`/`getOwnPropertyDescriptor`/`set` traps expose named
+elements — but only when the name isn't already a real property of the document or its prototype chain
+(interface members & expandos always win, per WebIDL legacy-platform-object semantics). A single match
+returns the element (or an iframe's `contentWindow`); multiple matches return a **live `HTMLCollection`**.
+The load-bearing detail: the Proxy is installed BOTH as `globalThis.document` AND in the wrapper cache
+(`_cache.set(_docNid, _docProxy)`), so node-identity (`document === node.ownerDocument === _wrap(docNid)`)
+stays intact. **16/82 → 80/82, +64.** Zero regressions (qsa 1975, classlist 1420, createElement 147,
+Node-properties 726, getElementById 18, attributes 67, aria-attribute-reflection 41, dataset-get 10,
+insert_adjacent_html 31, Document-createElementNS 596, Event-dispatch-bubbles-true 5,
+getElementsByName-newelements 27). **2 caps:** `nameditem-03` (applet, 0/1 — `applet.name` returns the
+attribute because Obscura's generic `name` getter is too broad; narrowing it is a regression-prone refactor
+for one obsolete element) and `nameditem-names` (15/16 — the "embed inside an embed" exposure edge hinges on
+void-element parsing + plugin semantics we don't model). `Document.currentScript` 0/18 TIMEOUT + `title-01`
+1/4 verified identical on the stashed baseline — pre-existing, not regressions. Scroll
+`tickets/127-the-named-verdict.md`.
+
 **Session 2026-06-28 (Quest #126 The Adjacent Verdict — `Element.insertAdjacentHTML` spec rewrite, +29):**
 After #125 fixed `Document.cloneNode`, swept a fresh region and found the widest single-file tail on the
 board: `domparsing/insert_adjacent_html.html` at **2/31**. `insertAdjacentHTML` was a buggy stub with four

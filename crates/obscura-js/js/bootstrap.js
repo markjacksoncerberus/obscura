@@ -1843,6 +1843,74 @@ const _gebTagNameNS = (nid, ns, local) => {
 const _gebClassName = (nid, names) =>
   _makeHTMLCollection(() => (_domParse("get_elements_by_class_name", nid, String(names)) || []).map(_wrapEl).filter(Boolean));
 
+// ---- Named access on the Document object (HTML §nameditem) ------------------
+// The supported property names of a Document are, in tree order:
+//  - the `name` of every exposed embed/form/iframe/img/object with a non-empty name;
+//  - the `id`   of every exposed object with a non-empty id;
+//  - the `id`   of every img with BOTH a non-empty id AND a non-empty name.
+// "exposed" (embed/object): simplified to "has no object element ancestor" — enough
+// for ordinary (non-plugin) content; nested <object><object> de-exposes the inner one.
+const _DOC_NAMED_TAGS = 'embed,form,iframe,img,object';
+const _docElemExposed = function(el) {
+  for (let p = el.parentNode; p; p = p.parentNode) {
+    if (p.nodeType === 1 && p.localName === 'object') return false;
+  }
+  return true;
+};
+// Does HTML-namespaced element `el` contribute the supported name `name`?
+const _docElemHasName = function(el, name) {
+  if (el.namespaceURI !== _HTML_NS) return false;
+  const ln = el.localName;
+  const nm = el.getAttribute('name');
+  const id = el.getAttribute('id');
+  if (nm && nm === name) {                       // name-exposed set
+    if (ln === 'form' || ln === 'iframe' || ln === 'img') return true;
+    if ((ln === 'embed' || ln === 'object') && _docElemExposed(el)) return true;
+  }
+  if (id && id === name) {                        // id-exposed set
+    if (ln === 'object' && _docElemExposed(el)) return true;
+    if (ln === 'img' && nm) return true;          // img id only counts if it also has a name
+  }
+  return false;
+};
+const _docNamedElements = function(doc, name) {
+  if (name === '') return [];
+  const out = [];
+  const cands = doc.querySelectorAll(_DOC_NAMED_TAGS);
+  for (let i = 0; i < cands.length; i++) {
+    if (_docElemHasName(cands[i], name)) out.push(cands[i]);
+  }
+  return out;
+};
+const _docSupportedNames = function(doc) {
+  const names = [], seen = new Set();
+  const cands = doc.querySelectorAll(_DOC_NAMED_TAGS);
+  for (let i = 0; i < cands.length; i++) {
+    const el = cands[i];
+    if (el.namespaceURI !== _HTML_NS) continue;
+    const ln = el.localName, nm = el.getAttribute('name'), id = el.getAttribute('id');
+    const exposed = (ln === 'embed' || ln === 'object') ? _docElemExposed(el) : true;
+    if (nm && exposed && !seen.has(nm)) { seen.add(nm); names.push(nm); }   // name first
+    if (id) {                                                               // then id
+      if (ln === 'object' && exposed) { if (!seen.has(id)) { seen.add(id); names.push(id); } }
+      else if (ln === 'img' && nm) { if (!seen.has(id)) { seen.add(id); names.push(id); } }
+    }
+  }
+  return names;
+};
+// The §nameditem value: undefined (no match), the element (one match, or its
+// contentWindow for a single iframe), or a live HTMLCollection (multiple matches).
+const _docNamedItem = function(doc, name) {
+  const els = _docNamedElements(doc, name);
+  if (els.length === 0) return undefined;
+  if (els.length === 1) {
+    const el = els[0];
+    if (el.localName === 'iframe') { const w = el.contentWindow; if (w) return w; }
+    return el;
+  }
+  return _makeHTMLCollection(() => _docNamedElements(doc, name));
+};
+
 // A token must be non-empty and contain no ASCII whitespace (DOM spec).
 const _validateToken = function(t) {
   t = String(t);
@@ -17015,6 +17083,48 @@ globalThis.__obscura_init = function() {
   // `document`. Without this the document node has two distinct wrappers and
   // node-identity checks like isInclusiveDescendant(node, document) break.
   _cache.set(_docNid, globalThis.document);
+
+  // Named access on the Document object (HTML §nameditem): wrap the document in a
+  // transparent Proxy whose get/has/ownKeys/getOwnPropertyDescriptor expose named
+  // elements (forms, images, named iframes/embeds/objects) as document properties —
+  // but ONLY when the name is not already a real property of the document or its
+  // prototype chain. Interface members and expandos always win (WebIDL legacy
+  // platform object semantics: named props are shadowed by everything real). The
+  // Proxy is installed BOTH as globalThis.document AND in the wrapper cache so
+  // node-identity (document === node.ownerDocument === _wrap(docNid)) stays intact.
+  {
+    const _rawDoc = globalThis.document;
+    const _docProxy = new Proxy(_rawDoc, {
+      get(t, p, r) {
+        if (typeof p === 'string' && !Reflect.has(t, p)) {
+          const v = _docNamedItem(t, p);
+          if (v !== undefined) return v;
+        }
+        return Reflect.get(t, p, r);
+      },
+      set(t, p, v) { return Reflect.set(t, p, v); },   // expandos land on the target, no receiver recursion
+      has(t, p) {
+        if (Reflect.has(t, p)) return true;
+        return typeof p === 'string' && _docNamedElements(t, p).length > 0;
+      },
+      getOwnPropertyDescriptor(t, p) {
+        const own = Reflect.getOwnPropertyDescriptor(t, p);
+        if (own) return own;
+        if (typeof p === 'string' && _docNamedElements(t, p).length > 0) {
+          return { value: _docNamedItem(t, p), writable: false, enumerable: true, configurable: true };
+        }
+        return undefined;
+      },
+      ownKeys(t) {
+        const keys = Reflect.ownKeys(t);
+        const have = new Set(keys.filter(k => typeof k === 'string'));
+        for (const nm of _docSupportedNames(t)) if (!have.has(nm)) keys.push(nm);
+        return keys;
+      },
+    });
+    globalThis.document = _docProxy;
+    _cache.set(_docNid, _docProxy);
+  }
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];
