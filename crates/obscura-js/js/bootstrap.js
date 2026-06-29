@@ -2282,21 +2282,53 @@ class Element extends Node {
     }
     return null;
   }
+  // §dom-element-insertadjacenthtml. `position` is ASCII case-insensitive; resolve
+  // the insertion "context" element per spec, throwing the right DOMExceptions BEFORE
+  // any parsing/insertion: an unknown position → SyntaxError; beforebegin/afterend
+  // with no parent or a Document parent → NoModificationAllowedError.
   insertAdjacentHTML(position, html) {
-    const parent = this.parentNode;
-    switch (position) {
+    const pos = String(position).replace(/[A-Z]/g, c => c.toLowerCase());
+    let context;
+    switch (pos) {
       case 'beforebegin':
-        if (parent) { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; for (let i = 0; i < children.length; i++) parent.insertBefore(children[i], this); }
+      case 'afterend': {
+        const parent = this.parentNode;
+        if (!parent || parent.nodeType === 9)
+          throw new DOMException("Failed to execute 'insertAdjacentHTML' on 'Element': The element has no parent.", "NoModificationAllowedError");
+        context = parent;
         break;
+      }
       case 'afterbegin':
-        { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; const first = this.firstChild; for (let i = children.length - 1; i >= 0; i--) this.insertBefore(children[i], first); }
-        break;
       case 'beforeend':
-        { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; for (let i = 0; i < children.length; i++) this.appendChild(children[i]); }
+        context = this;
         break;
-      case 'afterend':
-        if (parent) { const tmp = document.createElement('div'); tmp.innerHTML = html; const children = tmp.childNodes; const next = this.nextSibling; for (let i = 0; i < children.length; i++) parent.insertBefore(children[i], next); }
-        break;
+      default:
+        throw new DOMException("Failed to execute 'insertAdjacentHTML' on 'Element': The value provided ('" + position + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.", "SyntaxError");
+    }
+    // Fragment parsing with `context` as the context element (a throwaway element of
+    // the same local name, mirroring the outerHTML setter). The <html> context maps
+    // to <body> so the parser doesn't synthesize implied <head>/<body>.
+    const doc = this.ownerDocument || globalThis.document;
+    const ctxName = (context.nodeType === 1 && context.localName) ? context.localName : 'div';
+    const tmp = doc.createElement(ctxName === 'html' ? 'body' : ctxName);
+    tmp.innerHTML = String(html);
+    // Per HTML fragment parsing, parsed <script> elements carry the "already started"
+    // flag so they never execute when later inserted (the Quest #125 inertness flag).
+    (function flagScripts(n) {
+      for (let k = n.firstChild; k; k = k.nextSibling) {
+        if (k.nodeType === 1) { if (k.localName === 'script') k._scriptAlreadyStarted = true; flagScripts(k); }
+      }
+    })(tmp);
+    // Collect the parsed nodes into a fragment and insert them atomically — avoids the
+    // live-NodeList hazard of moving children one-by-one, and never merges text nodes.
+    const frag = doc.createDocumentFragment();
+    const kids = Array.prototype.slice.call(tmp.childNodes);
+    for (const k of kids) frag.appendChild(k);
+    switch (pos) {
+      case 'beforebegin': this.parentNode.insertBefore(frag, this); break;
+      case 'afterbegin': this.insertBefore(frag, this.firstChild); break;
+      case 'beforeend': this.appendChild(frag); break;
+      case 'afterend': this.parentNode.insertBefore(frag, this.nextSibling); break;
     }
   }
   // Shared placement for insertAdjacentElement/Text. Position is case-insensitive;
