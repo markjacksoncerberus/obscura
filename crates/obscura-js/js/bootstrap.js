@@ -1935,6 +1935,32 @@ const _reflectURL = function (el, attr) {
 const _URL_REFLECT_SRC = new Set(['img', 'script', 'iframe', 'audio', 'video', 'source', 'track', 'embed', 'input', 'frame']);
 const _URL_REFLECT_HREF = new Set(['a', 'area', 'link']);
 
+// HTMLOrForeignElement.dataset (HTML §the-element-dataset) — a live DOMStringMap
+// over an element's `data-*` content attributes. The interface object must exist
+// (the WPT suite does `dataset instanceof DOMStringMap`) and the map itself is a
+// Proxy whose [[Prototype]] is DOMStringMap.prototype so instanceof holds.
+//
+// Name conversions per spec:
+//   attr -> key:  strip "data-", reject any uppercase ASCII letter, then each
+//                 "-x" (x = a-z) folds to uppercase X.   data-foo-bar -> fooBar
+//   key  -> attr: reject a "-" immediately followed by a-z (SyntaxError on set),
+//                 then each uppercase letter U+0041..U+005A -> "-" + lowercase.
+//                 prefix "data-".                          fooBar -> data-foo-bar
+const DOMStringMap = class DOMStringMap {};
+globalThis.DOMStringMap = DOMStringMap;
+function __datasetAttrToKey(a) {
+  if (!a.startsWith("data-")) return null;
+  const rest = a.slice(5);
+  if (/[A-Z]/.test(rest)) return null;
+  return rest.replace(/-([a-z])/g, (_m, c) => c.toUpperCase());
+}
+function __datasetKeyToAttr(k) {
+  if (/-[a-z]/.test(k)) return null;
+  let out = "";
+  for (const c of k) out += (c >= 'A' && c <= 'Z') ? "-" + c.toLowerCase() : c;
+  return "data-" + out;
+}
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -2577,10 +2603,64 @@ class Element extends Node {
     this.dispatchEvent(new Event('reset', { bubbles: true }));
   }
   get dataset() {
+    // dataset is exposed only on HTMLElement/SVGElement/MathMLElement; a random-
+    // namespace element (createElementNS("test","test")) has no .dataset at all.
+    const ns = this.namespaceURI;
+    if (ns !== "http://www.w3.org/1999/xhtml" &&
+        ns !== "http://www.w3.org/2000/svg" &&
+        ns !== "http://www.w3.org/1998/Math/MathML") return undefined;
     const el = this;
-    return new Proxy({}, {
-      get(_, k) { if(typeof k!=="string")return undefined; return el.getAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase()); },
-      set(_, k, v) { el.setAttribute("data-"+k.replace(/([A-Z])/g,"-$1").toLowerCase(), v); return true; },
+    // Target carries DOMStringMap.prototype so `dataset instanceof DOMStringMap`.
+    const target = Object.create(DOMStringMap.prototype);
+    return new Proxy(target, {
+      get(_, k) {
+        if (typeof k === "string") {
+          for (const a of el.getAttributeNames()) {
+            if (__datasetAttrToKey(a) === k) return el.getAttribute(a);
+          }
+        }
+        // Not a data-* attribute: let prototype-chain props shine through
+        // (Object.prototype.toString, accessor properties on DOMStringMap.prototype).
+        return target[k];
+      },
+      has(_, k) {
+        if (typeof k === "string") {
+          for (const a of el.getAttributeNames()) {
+            if (__datasetAttrToKey(a) === k) return true;
+          }
+        }
+        return k in target;
+      },
+      set(_, k, v) {
+        if (typeof k !== "string") { target[k] = v; return true; }
+        const a = __datasetKeyToAttr(k);
+        if (a === null) throw new DOMException("'" + k + "' is not a valid dataset name", "SyntaxError");
+        el.setAttribute(a, String(v));
+        return true;
+      },
+      deleteProperty(_, k) {
+        if (typeof k !== "string") { delete target[k]; return true; }
+        const a = __datasetKeyToAttr(k);
+        if (a !== null) el.removeAttribute(a);
+        return true;
+      },
+      ownKeys() {
+        const out = [];
+        for (const a of el.getAttributeNames()) {
+          const k = __datasetAttrToKey(a);
+          if (k !== null) out.push(k);
+        }
+        return out;
+      },
+      getOwnPropertyDescriptor(_, k) {
+        if (typeof k !== "string") return Object.getOwnPropertyDescriptor(target, k);
+        for (const a of el.getAttributeNames()) {
+          if (__datasetAttrToKey(a) === k) {
+            return { value: el.getAttribute(a), writable: true, enumerable: true, configurable: true };
+          }
+        }
+        return undefined;
+      },
     });
   }
   get offsetWidth() { return 100; } get offsetHeight() { return 20; }

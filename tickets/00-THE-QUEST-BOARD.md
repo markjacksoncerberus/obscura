@@ -145,6 +145,28 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-28 (Quest #124 The Mapped Verdict — DOMStringMap / `element.dataset`, +25):**
+After #123 swept getElementById to 100%, swept a fresh region and found a stubbed ubiquitous API:
+`element.dataset` had no `DOMStringMap` interface at all (`DOMStringMap is not defined`), returned
+`null` (not `undefined`) for absent keys, lacked `has`/`ownKeys`/`getOwnPropertyDescriptor`/`delete`
+traps, and was handed to *every* element regardless of namespace. **The fix** (all additive in
+`bootstrap.js`, no Rust): a `DOMStringMap` interface global + a Proxy over
+`Object.create(DOMStringMap.prototype)` so `dataset instanceof DOMStringMap` holds; gated to the
+HTML/SVG/MathML namespaces (a random-namespace element gets `undefined`); spec `data-*` ↔ camelCase
+converters; `get`/`has` scan `getAttributeNames()` and **fall through to the prototype chain** on no
+match (so `Object.prototype.toString` and accessor properties on `DOMStringMap.prototype` shine
+through); `set` is the named-property setter (always writes the content attribute, never a prototype
+setter, `SyntaxError` on an invalid name); full `ownKeys`/`getOwnPropertyDescriptor`/`deleteProperty`.
+The whole cluster went **21/46 → 46/46 (+25)**: `dataset` 0→8, `dataset-delete` 1→9, `dataset-enumeration`
+0→2, `dataset-prototype` 0→2, `dataset-set` 10→11, `dataset-binding` 0→4 (`dataset-get` already 10/10).
+Zero regressions (qsa 1975, classlist 1420, createElement 147, Node-properties 726, aria-attribute 41,
+aria-element 22/27 cap, getElementsByTagName 19, getElementById 18, attributes 67, Element-matches 669
+— all unchanged). **No cap** (realm 100%). **NEXT:** a real `Document.cloneNode` — the main-page
+`Document.cloneNode(deep)` returns a DocumentFragment instead of a cloned Document (no documentElement/
+head/body), the next root-cause primitive; clone into a `DetachedDocument` instead. (The
+`Event-dispatch-bubbles-true` test that surfaced it reports an untrustworthy inflated subtest count —
+fix the primitive for its own sake, measure on real clone tests.) Scroll `tickets/124-the-mapped-verdict.md`.
+
 **Session 2026-06-28 (Quest #123 The Identified Verdict — getElementById tree-order/connectedness/liveness, +10):**
 After #122 exhausted the ARIA reflection realm bar shadow scoping, swept a fresh region and found a
 **broken core primitive**: `dom/nodes/Document-getElementById.html` at 8/18. `getElementById` underlies the
