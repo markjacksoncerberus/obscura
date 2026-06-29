@@ -955,7 +955,7 @@ class Node {
     if (c.ownerDocument !== _adoptDoc) _setNodeDocumentDeep(c, _adoptDoc);
     else c._ownerDoc = _adoptDoc;
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [c._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null });
-    if (c instanceof Element && c.tagName === 'SCRIPT') {
+    if (c instanceof Element && c.tagName === 'SCRIPT' && !c._scriptAlreadyStarted) {
       const scriptType = c.getAttribute('type') || '';
       if (scriptType && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
         return c;
@@ -1178,6 +1178,12 @@ class Node {
         if (a.namespaceURI != null) el._rawSetNS(a.namespaceURI, a.prefix, a.localName, a.value);
         else el.setAttribute(a.name, a.value);
       }
+      // DOM §clone copies a script's "already started" flag: a cloned <script>
+      // must NOT re-execute when its clone is later inserted. (Without this,
+      // deep-cloning a page that contains its own <script> — e.g. via
+      // document.cloneNode(true) — would re-run that script on insertion and
+      // recurse without bound.) appendChild's inline-script eval honours the flag.
+      if (this.localName === 'script') el._scriptAlreadyStarted = true;
       if (deep) {
         // Recurse over real children rather than parsing outerHTML into a <div>:
         // a <div>'s fragment parser DROPS <html>/<head>/<body> wrappers (they are
@@ -3134,6 +3140,30 @@ class Document extends Node {
   get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
+  // §clone a node, document branch. Node.cloneNode returns null for nodeType 9,
+  // so the page document (and a standalone `new Document()`) need their own clone:
+  // a clone of a document is itself a Document, never null. The result is a fresh
+  // DETACHED document of the same kind (the clone is never the active document):
+  // an HTML DetachedDocument for the page, a standalone `new Document()` (XML) for
+  // `new Document()`. Children are deep-cloned only for a deep clone; a shallow
+  // clone is an empty document (no documentElement/head/body), per spec.
+  cloneNode(deep) {
+    const copy = this._standalone ? new Document() : new DetachedDocument('html');
+    // A fresh DetachedDocument('html') auto-builds <html><head><body>; a document
+    // clone must start empty before the source's own children are copied in.
+    for (let c = copy.firstChild; c; ) { const n = c.nextSibling; copy.removeChild(c); c = n; }
+    copy._compatMode = this._compatMode || this.compatMode;
+    if (this._contentType) copy._contentType = this._contentType;
+    if (deep) for (const k of this.childNodes) {
+      // Clone each child INTO the copy so the cloned nodes' node document is the
+      // clone (createElement/createTextNode run on `copy`).
+      const c = (k && k.cloneNode) ? k.cloneNode(true, copy) : null;
+      if (!c) continue;
+      if (c.nodeType === 10) c._ownerDoc = copy;  // a doctype's node document = the clone
+      copy.appendChild(c);
+    }
+    return copy;
+  }
   getElementById(id) {
     // WebIDL: elementId is a (non-nullable) DOMString — undefined -> "undefined",
     // null -> "null". The empty string is a valid argument but matches nothing

@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-28 (Quest #124).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-28 (Quest #125).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `dom/events/Event-dispatch-bubbles-true.html` | broken (ERROR) | **5/5** | ✅ 100% | **Quest #125 The Cloned Verdict.** Real `Document.cloneNode(deep)` (`bootstrap.js`): `Node.cloneNode` returned `null` for nodeType 9, so `document.cloneNode(true)` → "Cannot read properties of null (reading 'documentElement')". Now the page document (and standalone `new Document()`) clone into a fresh **detached** document of the same kind (HTML `DetachedDocument` / XML `new Document()`), deep-cloning children into the clone. **Root-cause #2:** a cloned `<script>` now carries the "already started" flag (`_scriptAlreadyStarted`) so `appendChild`'s inline-script eval skips it — without this, deep-cloning a page that contains its own `<script>` re-executed it and recursed to OOM. (The pre-fix harness reported an inflated 2112/2705 ERROR — only 5 real `test()` blocks exist; the count is a known artifact, so no large "+N" is claimed.) **Harness ERROR→OK, +1 real subtest.** |
 | `html/dom/elements/global-attributes/dataset.html` | 0/8 | **8/8** | ✅ 100% | **Quest #124 The Mapped Verdict.** Real `DOMStringMap` for `element.dataset` (`bootstrap.js`): a `DOMStringMap` interface global + a Proxy over `Object.create(DOMStringMap.prototype)` (so `dataset instanceof DOMStringMap`), gated to HTML/SVG/MathML namespaces (random-namespace elements get `undefined`). Spec `data-*` ↔ camelCase conversion; `get`/`has` fall through to the prototype chain (Object.prototype shines through); `set` writes the content attribute (named-property setter wins); full `ownKeys`/`getOwnPropertyDescriptor`/`deleteProperty`. **+8.** |
 | `html/dom/elements/global-attributes/dataset-delete.html` | 1/9 | **9/9** | ✅ 100% | **Quest #124 The Mapped Verdict.** `deleteProperty` trap → `removeAttribute` of the mapped `data-*` attribute. **+8.** |
 | `html/dom/elements/global-attributes/dataset-enumeration.html` | 0/2 | **2/2** | ✅ 100% | **Quest #124 The Mapped Verdict.** `ownKeys`/`getOwnPropertyDescriptor` project the element's `data-*` attributes to enumerable keys. **+2.** |
