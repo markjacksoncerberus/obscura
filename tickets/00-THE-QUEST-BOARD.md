@@ -148,6 +148,24 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-06-29 (Quest #129 The Passive Verdict — `AddEventListenerOptions.passive` during dispatch, +3):**
+The sibling #128 flagged: `dom/events/AddEventListenerOptions-passive.any.html` at **2/5**. Obscura read
+`passive` from the options dict and stored it per-listener, but never honored it during dispatch — a
+`preventDefault()` (or legacy `returnValue = false`) from inside a passive listener still set the canceled
+flag, so `dispatchEvent` wrongly returned `false`. **The fix** (`bootstrap.js`, no Rust — the DOM "in passive
+listener flag"): `_invokeListeners` sets `event._inPassiveListener = !!e.passive` immediately before each
+listener call and clears it after; `Event.preventDefault()` and the `returnValue` setter now set the canceled
+flag only when that flag is unset. A passive listener's cancel is silently ignored; a following non-passive
+listener (or any post-dispatch code) can still cancel. The "Equivalence of option values" subtest also went
+green — `passive` was already correctly excluded from the dedup key (only type/callback/capture identify a
+listener), it had merely been blocked behind the dispatch failures. **2/5 → 5/5, +3.** Zero regressions
+(AddEventListenerOptions-signal 11/11, -once 4/4, EventListenerOptions-capture 4/4, Event-dispatch-bubbles-true
+5/5, Event-dispatch-order 1/1, EventTarget-add-remove 1/1, EventListener-handleEvent 6/6, abort/event.any
+15/16 [pre-existing], qsa 1975, classlist 1420). No cap (realm 100%). The `dom/events` low-hanging fruit is now
+exhausted; NEXT-BEST reverts to the standing leads — shadow-tree scope discrimination (aria-element 5 residual /
+constructable 6/13), namespaced cascade-match Rust lift (`crates/obscura-dom/src/selector.rs`,
+set-selectorText-namespace 0/5), or sweep a fresh DOM/HTML region. Scroll `129-the-passive-verdict.md`.
+
 **Session 2026-06-29 (Quest #128 The Aborted Verdict — `AddEventListenerOptions.signal`, +7):**
 After #127 took named-document-access to 80/82, swept the fresh `dom/events` ground that #127's
 next-leverage flagged as implementable. The widest tail there was

@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-06-29 (Quest #128).
+Branch: `engine-per-page-threads`. Last updated: 2026-06-29 (Quest #129).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `dom/events/AddEventListenerOptions-passive.any.html` | 2/5 | **5/5** | ✅ 100% | **Quest #129 The Passive Verdict.** Honor `AddEventListenerOptions.passive` during dispatch (the DOM "in passive listener flag"), in `bootstrap.js` (no Rust). `_invokeListeners` sets `event._inPassiveListener = !!e.passive` around each listener call (cleared after); `Event.preventDefault()` and the legacy `returnValue = false` setter only set the canceled flag when that flag is unset — so a `preventDefault()`/`returnValue=false` from a passive listener is ignored and `dispatchEvent` returns `true`. A following non-passive listener (or post-dispatch code) can still cancel. **+3.** |
 | `dom/events/AddEventListenerOptions-signal.any.html` | 4/11 | **11/11** | ✅ 100% | **Quest #128 The Aborted Verdict.** `AddEventListenerOptions.signal` — AbortSignal-driven listener removal, in `bootstrap.js` (no Rust). One edit to the central `_addListenerByKey`: a present-but-non-`AbortSignal` signal (notably `null`) throws `TypeError` BEFORE the null-callback step (WebIDL non-nullable-interface coercion); an already-aborted signal never adds; otherwise the listener is added and an `abort` algorithm registered on the signal removes it (via the existing `_removeListenerByKey`) when it fires. In-flight abort-from-a-listener works for free via the existing snapshot+live-recheck in `_invokeListeners`. **+7.** |
 | `html/dom/.../nameditem-01.html` (img id & name) | 0/7 | **7/7** | ✅ 100% | **Quest #127 The Named Verdict.** Named access on the Document object (HTML §nameditem) — implemented in `bootstrap.js` (no Rust). A transparent Proxy over the document exposes named elements (forms, images, named iframes/embeds/objects) as document properties, but only when the name isn't already a real property of the document or its prototype chain (interface members & expandos win, per WebIDL legacy-platform-object semantics). The Proxy is installed BOTH as `globalThis.document` AND in the wrapper cache, so node-identity (`document === node.ownerDocument === _wrap(docNid)`) stays intact. **+7.** |
 | `html/dom/.../nameditem-02.html` (iframes) | 2/12 | **12/12** | ✅ 100% | **Quest #127 The Named Verdict.** Single iframe match → its `contentWindow` (WindowProxy); multiple matches → a live `HTMLCollection`; an iframe with id-but-no-name is not exposed. **+10.** |

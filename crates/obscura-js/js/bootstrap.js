@@ -4052,6 +4052,11 @@ const _invokeListeners = function(target, event, phase) {
     if (phase === 'bubbling' && e.capture) continue;
     if (e.once) _removeListenerByKey(key, event.type, e.handler, { capture: e.capture });
     const h = e.handler;
+    // §2.9 inner invoke: set the event's "in passive listener flag" iff this
+    // listener is passive, so preventDefault()/returnValue=false from inside it
+    // are ignored (the canceled flag is never set). Cleared after the call so a
+    // following non-passive listener — or any post-dispatch code — can cancel.
+    event._inPassiveListener = !!e.passive;
     try {
       if (typeof h === 'function') {
         h.call(target, event);
@@ -4062,6 +4067,7 @@ const _invokeListeners = function(target, event, phase) {
         he.call(h, event);
       }
     } catch (err) { _reportError(err); }
+    event._inPassiveListener = false;
   }
 };
 // DOM §2.9 dispatch: build the propagation path (target -> ancestors -> document
@@ -13023,8 +13029,11 @@ globalThis.Event = class Event {
   get cancelBubble() { return this._propagationStopped; }
   set cancelBubble(v) { if (v) this._propagationStopped = true; }
   get returnValue() { return !this.defaultPrevented; }
-  set returnValue(v) { if (v === false && this.cancelable) this.defaultPrevented = true; }
-  preventDefault() { if (this.cancelable) this.defaultPrevented=true; }
+  // §preventDefault / legacy returnValue: a cancel is ignored while the "in
+  // passive listener flag" is set (a preventDefault() from a passive listener
+  // must NOT mark the event canceled).
+  set returnValue(v) { if (v === false && this.cancelable && !this._inPassiveListener) this.defaultPrevented = true; }
+  preventDefault() { if (this.cancelable && !this._inPassiveListener) this.defaultPrevented=true; }
   stopPropagation(){ this._propagationStopped=true; }
   stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) {
