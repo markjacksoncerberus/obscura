@@ -2463,6 +2463,12 @@ class Element extends Node {
     try { this.dispatchEvent(new Event('focusout', { bubbles: true })); } catch(e) {}
   }
   get value() {
+    // <li>.value reflects a `long` content attribute (default 0) — not a form value.
+    if (this.localName === 'li') {
+      const num = __parseHtmlSignedInt(this.getAttribute('value'));
+      if (num === null || num < -2147483648 || num > 2147483647) return 0;
+      return num || 0;
+    }
     if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
     const tag = this.localName;
     if (tag === 'textarea') return this.textContent;
@@ -2480,6 +2486,7 @@ class Element extends Node {
     return this.getAttribute("value") || "";
   }
   set value(v) {
+    if (this.localName === 'li') { this.setAttribute('value', String(v | 0)); return; }
     _formValues[this._nid] = String(v);
     const tag = this.localName;
     if (tag === 'textarea') {
@@ -3010,6 +3017,12 @@ const __reflectedExtraStringAttrs = {
   rev: 'rev',              // <link> / <a> (obsolete)
   hreflang: 'hreflang',    // <link> / <a>
   nonce: 'nonce',          // HTMLElement / SVGElement (global)
+  // Obsolete presentational DOMString reflectors. Each is DOMString wherever it
+  // is reflected, so a generic definition is correct (and inert on elements that
+  // don't own it — the harness only exercises each on its owning element):
+  align: 'align',          // <hN> / <p> / <div> / <hr> (and table/img/etc.)
+  color: 'color',          // <hr> / <font> / <basefont>
+  background: 'background', // <body> / <table>/<td>/<tr> (plain DOMString — null→"null")
 };
 for (const __jsAttr in __reflectedExtraStringAttrs) {
   const __contentAttr = __reflectedExtraStringAttrs[__jsAttr];
@@ -3025,6 +3038,8 @@ const __reflectedExtraBoolAttrs = {
   defer: 'defer',          // <script>
   noModule: 'nomodule',    // <script>
   compact: 'compact',      // <ol> / <ul> / <dl> / <menu> (obsolete)
+  reversed: 'reversed',    // <ol>
+  noShade: 'noshade',      // <hr> (obsolete)
 };
 for (const __jsAttr in __reflectedExtraBoolAttrs) {
   const __contentAttr = __reflectedExtraBoolAttrs[__jsAttr];
@@ -3074,6 +3089,64 @@ Object.defineProperty(Element.prototype, 'content', {
     if (this.localName === 'template') return;   // template.content is read-only
     this.setAttribute('content', String(v));
   },
+});
+
+// Obsolete <body> presentational colour attributes — [LegacyNullToEmptyString]
+// DOMString reflections gated to <body>, because `.text`/`.link`/`.bgColor` name
+// entirely different IDL members on other elements (e.g. HTMLScriptElement.text
+// is the script's text content, not the `text` attribute). LegacyNullToEmptyString
+// means the setter coerces null to "" rather than the DOMString default "null".
+const __bodyColorAttrs = { text: 'text', link: 'link', vLink: 'vlink', aLink: 'alink', bgColor: 'bgcolor' };
+for (const __jsAttr in __bodyColorAttrs) {
+  const __contentAttr = __bodyColorAttrs[__jsAttr];
+  Object.defineProperty(Element.prototype, __jsAttr, {
+    configurable: true, enumerable: true,
+    get() { return this.localName === 'body' ? (this.getAttribute(__contentAttr) ?? '') : undefined; },
+    set(v) { if (this.localName === 'body') this.setAttribute(__contentAttr, v === null ? '' : String(v)); },
+  });
+}
+
+// `width` is overloaded by element: a `long` on <pre> (default 0) but a DOMString
+// on <hr>. A single accessor dispatches on tag name; every other element keeps
+// `width` undefined (its current behaviour — img/canvas/etc. are not reflected here).
+Object.defineProperty(Element.prototype, 'width', {
+  configurable: true, enumerable: true,
+  get() {
+    const tag = this.localName;
+    if (tag === 'hr') return this.getAttribute('width') ?? '';
+    if (tag === 'pre') {
+      const num = __parseHtmlSignedInt(this.getAttribute('width'));
+      if (num === null || num < -2147483648 || num > 2147483647) return 0;
+      return num || 0;
+    }
+    return undefined;
+  },
+  set(v) {
+    const tag = this.localName;
+    if (tag === 'hr') this.setAttribute('width', String(v));
+    else if (tag === 'pre') this.setAttribute('width', String(v | 0));
+  },
+});
+
+// `size` is a DOMString on <hr>, but an `unsigned long` on form controls
+// (<input>/<select>) whose IDL we don't reflect here — gate to <hr> so those stay
+// untouched (currently undefined).
+Object.defineProperty(Element.prototype, 'size', {
+  configurable: true, enumerable: true,
+  get() { return this.localName === 'hr' ? (this.getAttribute('size') ?? '') : undefined; },
+  set(v) { if (this.localName === 'hr') this.setAttribute('size', String(v)); },
+});
+
+// <ol>.start reflects a `long` with a missing/invalid default of 1 (not 0).
+Object.defineProperty(Element.prototype, 'start', {
+  configurable: true, enumerable: true,
+  get() {
+    if (this.localName !== 'ol') return undefined;
+    const num = __parseHtmlSignedInt(this.getAttribute('start'));
+    if (num === null || num < -2147483648 || num > 2147483647) return 1;
+    return num || 0;
+  },
+  set(v) { if (this.localName === 'ol') this.setAttribute('start', String(v | 0)); },
 });
 
 // ── ARIAMixin element reflection (HTML §reflecting-content-attributes — element)
@@ -3373,6 +3446,30 @@ class Document extends Node {
   }
   get head() { return this.querySelector("head"); }
   get body() { return this.querySelector("body"); }
+  // document.dir reflects the `dir` content attribute of the document element
+  // (an enumerated attribute, keywords ltr/rtl/auto, missing/invalid default "").
+  get dir() {
+    const de = this.documentElement;
+    if (!de) return '';
+    const v = de.getAttribute('dir');
+    if (v == null) return '';
+    const lower = __asciiLower(v);
+    return (lower === 'ltr' || lower === 'rtl' || lower === 'auto') ? lower : '';
+  }
+  set dir(v) { const de = this.documentElement; if (de) de.setAttribute('dir', String(v)); }
+  // Obsolete Document colour members reflect [LegacyNullToEmptyString] DOMString
+  // attributes on the <body> element (fgColor→text, bgColor→bgcolor, …). With no
+  // body element the getter returns "" and the setter is a no-op.
+  get fgColor() { const b = this.body; return b ? (b.getAttribute('text') ?? '') : ''; }
+  set fgColor(v) { const b = this.body; if (b) b.setAttribute('text', v === null ? '' : String(v)); }
+  get linkColor() { const b = this.body; return b ? (b.getAttribute('link') ?? '') : ''; }
+  set linkColor(v) { const b = this.body; if (b) b.setAttribute('link', v === null ? '' : String(v)); }
+  get vlinkColor() { const b = this.body; return b ? (b.getAttribute('vlink') ?? '') : ''; }
+  set vlinkColor(v) { const b = this.body; if (b) b.setAttribute('vlink', v === null ? '' : String(v)); }
+  get alinkColor() { const b = this.body; return b ? (b.getAttribute('alink') ?? '') : ''; }
+  set alinkColor(v) { const b = this.body; if (b) b.setAttribute('alink', v === null ? '' : String(v)); }
+  get bgColor() { const b = this.body; return b ? (b.getAttribute('bgcolor') ?? '') : ''; }
+  set bgColor(v) { const b = this.body; if (b) b.setAttribute('bgcolor', v === null ? '' : String(v)); }
   get doctype() {
     // A standalone document reflects its actual doctype child live (the page document
     // keeps the cached fast path below).
