@@ -15411,6 +15411,326 @@ function _cvReflLong(proto, prop, attr) {
     get() { return this.textContent; },
     set(v) { this.textContent = v == null ? "" : String(v); },
   });
+
+  // ---- HTMLInputElement value model + text field selection API ----------------
+  // HTML §4.10.5: an input's `value` IDL attribute is in one of four *value modes*
+  // determined by its `type`, each with its own get/set/sanitization semantics; a
+  // *type change* re-flows the value between modes ("signal a type change"). A
+  // subset of types additionally expose the text-field selection API
+  // (selectionStart/End/Direction + setSelectionRange). All of it lives here so
+  // the shared Element `value` accessor stays untouched for textarea/select/<li>.
+  const _INPUT_KNOWN_TYPES = new Set(["hidden", "text", "search", "tel", "url",
+    "email", "password", "date", "month", "week", "time", "datetime-local",
+    "number", "range", "color", "checkbox", "radio", "file", "submit", "image",
+    "reset", "button"]);
+  // Types to which the text-field selection API applies (HTML "text field
+  // selection"): everything else reports null for selectionStart and throws on
+  // setSelectionRange. Note email/number are intentionally excluded.
+  const _INPUT_SELECTABLE = new Set(["text", "search", "tel", "url", "password"]);
+  // Per-element selection state, keyed by node id (wrappers may be recreated).
+  const _inputSel = {};
+  // The current-state keyword of an input's type: a valid known keyword lowercased,
+  // else the default "text". (The public `type` getter stays raw for compatibility;
+  // this canonical form drives the value-mode / sanitization / selection logic.)
+  function _inputType(el) {
+    const a = el.getAttribute("type");
+    if (a == null) return "text";
+    const t = __asciiLower(a);
+    return _INPUT_KNOWN_TYPES.has(t) ? t : "text";
+  }
+  function _inputValueMode(t) {
+    if (t === "checkbox" || t === "radio") return "default/on";
+    if (t === "button" || t === "submit" || t === "reset" || t === "image") return "default";
+    if (t === "file") return "filename";
+    return "value";
+  }
+  // Value sanitization algorithms (HTML §4.10.5.1). Only the branches reachable by
+  // the value/text-field types are meaningful; anything else is left verbatim.
+  const _stripNewlines = (s) => s.replace(/[\r\n]/g, "");
+  const _stripLTWS = (s) => s.replace(/^[\t\n\f\r ]+/, "").replace(/[\t\n\f\r ]+$/, "");
+  const _isValidFloatingPoint = (s) => s !== "" && /^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(s);
+  const _TEMPORAL_PATS = {
+    "date": /^\d{4,}-\d{2}-\d{2}$/,
+    "month": /^\d{4,}-\d{2}$/,
+    "week": /^\d{4,}-W\d{2}$/,
+    "time": /^\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?$/,
+    "datetime-local": /^\d{4,}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?$/,
+  };
+  function _sanitizeInputValue(el, t, v) {
+    switch (t) {
+      case "text": case "search": case "password": case "tel":
+        return _stripNewlines(v);
+      case "url": case "email":
+        // (Non-multiple email; the "multiple" comma-split path is not modelled.)
+        return _stripLTWS(_stripNewlines(v));
+      case "date": case "month": case "week": case "time": case "datetime-local": {
+        const p = _TEMPORAL_PATS[t];
+        return (p && p.test(v)) ? v : "";
+      }
+      case "number":
+        return _isValidFloatingPoint(v) ? v : "";
+      case "range": {
+        let min = parseFloat(el.getAttribute("min")); if (isNaN(min)) min = 0;
+        let max = parseFloat(el.getAttribute("max")); if (isNaN(max)) max = 100;
+        if (max < min) max = min;
+        const def = min + (max - min) / 2;
+        if (!_isValidFloatingPoint(v)) return String(def);
+        const n = parseFloat(v);
+        if (n < min) return String(min);
+        if (n > max) return String(max);
+        return v;
+      }
+      case "color":
+        return /^#[0-9a-fA-F]{6}$/.test(v) ? __asciiLower(v) : "#000000";
+      default: // hidden, and any other value-mode type: no sanitization
+        return v;
+    }
+  }
+  // "Signal a type change" (HTML §4.10.5.5): re-flow the value between the old and
+  // new value modes and reset the text-selection state where required.
+  function _signalInputTypeChange(el, oldT, newT) {
+    const oldMode = _inputValueMode(oldT);
+    const newMode = _inputValueMode(newT);
+    if (oldMode === "value" && newMode !== "value") {
+      // Leaving value mode: hand the non-empty value off to the content attribute
+      // when the new mode reads from it; then drop the dirty value.
+      const cur = _formValues[el._nid];
+      if ((newMode === "default" || newMode === "default/on") && cur !== undefined && cur !== "") {
+        el.setAttribute("value", cur);
+      }
+      delete _formValues[el._nid];
+    } else if (oldMode !== "value" && newMode === "value") {
+      // Entering value mode: seed the value from the content attribute, then
+      // sanitize it under the new type (dirty value flag conceptually cleared).
+      const attr = el.getAttribute("value");
+      _formValues[el._nid] = _sanitizeInputValue(el, newT, attr == null ? "" : attr);
+    } else if (oldMode === "value" && newMode === "value") {
+      // Staying in value mode: re-sanitize the current dirty value, if any.
+      if (_formValues[el._nid] !== undefined) {
+        _formValues[el._nid] = _sanitizeInputValue(el, newT, _formValues[el._nid]);
+      }
+    }
+    // Selection: a transition from non-selectable to selectable resets it to the
+    // start (0,0,"none"); staying selectable preserves it; leaving it hides it.
+    if (_INPUT_SELECTABLE.has(newT) && !_INPUT_SELECTABLE.has(oldT)) {
+      _inputSel[el._nid] = { start: 0, end: 0, dir: "none" };
+    }
+  }
+
+  Object.defineProperty(Input, "type", {
+    configurable: true,
+    // Raw reflection preserved (matches the prior shared accessor) so nothing that
+    // read a non-canonical type keyword regresses; canonicalisation is internal.
+    get() { return this.getAttribute("type") || "text"; },
+    set(v) {
+      const oldT = _inputType(this);
+      this.setAttribute("type", v == null ? "" : String(v));
+      const newT = _inputType(this);
+      if (oldT !== newT) _signalInputTypeChange(this, oldT, newT);
+    },
+  });
+
+  Object.defineProperty(Input, "value", {
+    configurable: true,
+    get() {
+      const t = _inputType(this);
+      const mode = _inputValueMode(t);
+      if (mode === "filename") return "";      // no selected files in this engine
+      if (mode === "default") return this.getAttribute("value") || "";
+      if (mode === "default/on") {
+        const a = this.getAttribute("value");
+        return a == null ? "on" : a;
+      }
+      // value mode: the dirty value if set, else the sanitized content attribute.
+      if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+      return _sanitizeInputValue(this, t, this.getAttribute("value") || "");
+    },
+    set(v) {
+      const t = _inputType(this);
+      const mode = _inputValueMode(t);
+      v = v == null ? "" : String(v);
+      if (mode === "filename") {
+        if (v !== "") throw new DOMException(
+          "Failed to set the 'value' property on 'HTMLInputElement': This input " +
+          "element accepts a filename, which may only be programmatically set to " +
+          "the empty string.", "InvalidStateError");
+        return; // setting to "" clears the (empty) file list — a no-op here
+      }
+      if (mode === "default" || mode === "default/on") { this.setAttribute("value", v); return; }
+      const oldVal = this.value;
+      _formValues[this._nid] = _sanitizeInputValue(this, t, v); // dirty value
+      // The text entry cursor moves to the end only when the value actually changes.
+      if (this.value !== oldVal) _selCursorToEnd(this);
+    },
+  });
+
+  // The text-field selection API applies to <textarea> unconditionally and to the
+  // subset of input types in _INPUT_SELECTABLE. select()'s applicability is broader
+  // (it never throws), so it is handled separately below.
+  const _selApplicable = (el) =>
+    el.localName === "textarea" || _INPUT_SELECTABLE.has(_inputType(el));
+  function _selState(el) {
+    let s = _inputSel[el._nid];
+    if (!s) s = _inputSel[el._nid] = { start: 0, end: 0, dir: "none" };
+    return s;
+  }
+  // Queue a trusted, bubbling, non-cancelable `select` event — HTML's "set the
+  // selection range" fires one whenever the selection's extent or direction is
+  // actually modified. It is an async element task (never synchronous), so tests
+  // that assert "not fired synchronously" then await a frame see it fire.
+  function _fireSelectEvent(el) {
+    setTimeout(() => {
+      let ev;
+      try { ev = new Event("select", { bubbles: true, cancelable: false }); }
+      catch (e) { return; }
+      ev.isTrusted = true; ev.target = el;
+      try { _dispatchSpec(el, ev); } catch (e) {}
+      const h = el.onselect; // GlobalEventHandlers content-attribute handler
+      if (typeof h === "function") { try { h.call(el, ev); } catch (e) {} }
+    }, 0);
+  }
+  // Set the selection range (HTML "set the selection range"): clamp end then start
+  // to the current value's length, normalising the direction to a valid keyword,
+  // and fire `select` iff the stored selection actually changed.
+  function _setSelRange(el, start, end, dir) {
+    const len = String(el.value).length;
+    end = end > len ? len : (end < 0 ? 0 : end);
+    start = start > end ? end : (start < 0 ? 0 : start);
+    const d = (dir === "backward" || dir === "forward") ? dir : "none";
+    const prev = _inputSel[el._nid] || { start: 0, end: 0, dir: "none" };
+    _inputSel[el._nid] = { start, end, dir: d };
+    if (prev.start !== start || prev.end !== end || prev.dir !== d) _fireSelectEvent(el);
+  }
+  // Move the text entry cursor to the end of the value (0-width selection). Called
+  // when the value IDL attribute is set on a selectable control.
+  function _selCursorToEnd(el) {
+    if (!_selApplicable(el)) return;
+    const L = String(el.value).length;
+    _inputSel[el._nid] = { start: L, end: L, dir: "none" };
+  }
+  const _selThrow = (el) => { throw new DOMException(
+    "Failed to read/set the selection: this form control does not support " +
+    "selection.", "InvalidStateError"); };
+
+  // The stored offsets can fall out of range when the value is later shortened by
+  // means other than the selection API (a type change that re-sanitizes, a
+  // <textarea>'s child text being edited, a form reset): the getters clamp to the
+  // current value length so the reported cursor never exceeds the text.
+  const _clampToValue = (el, n) => { const len = String(el.value).length; return n > len ? len : n; };
+  const _selectionAPI = {
+    selectionStart: {
+      configurable: true,
+      get() { return _selApplicable(this) ? _clampToValue(this, _selState(this).start) : null; },
+      set(v) {
+        if (!_selApplicable(this)) _selThrow(this);
+        // Per spec: if the current end is before the new start, push it out too.
+        const s = _selState(this); v = v >>> 0;
+        _setSelRange(this, v, v > s.end ? v : s.end, s.dir);
+      },
+    },
+    selectionEnd: {
+      configurable: true,
+      get() { return _selApplicable(this) ? _clampToValue(this, _selState(this).end) : null; },
+      set(v) {
+        if (!_selApplicable(this)) _selThrow(this);
+        const s = _selState(this);
+        _setSelRange(this, s.start, v >>> 0, s.dir);
+      },
+    },
+    selectionDirection: {
+      configurable: true,
+      get() { return _selApplicable(this) ? _selState(this).dir : null; },
+      set(v) {
+        if (!_selApplicable(this)) _selThrow(this);
+        const s = _selState(this);
+        _setSelRange(this, s.start, s.end, String(v));
+      },
+    },
+    setSelectionRange: {
+      configurable: true, writable: true,
+      value: function (start, end, direction) {
+        if (!_selApplicable(this)) _selThrow(this);
+        _setSelRange(this, arguments.length > 0 ? (start >>> 0) : 0,
+                           arguments.length > 1 ? (end >>> 0) : 0,
+                           direction === undefined ? "none" : String(direction));
+      },
+    },
+    setRangeText: {
+      configurable: true, writable: true,
+      // HTML "setRangeText()" — replace a range of the value with new text and
+      // update the selection according to selectMode (default "preserve").
+      value: function (replacement, start, end, selectMode) {
+        if (!_selApplicable(this)) _selThrow(this);
+        replacement = replacement === undefined ? "undefined" : String(replacement);
+        const val = String(this.value);
+        const len = val.length;
+        let s0, e0;
+        if (arguments.length < 2) {            // one-argument form: use the selection
+          const s = _selState(this); start = s.start; end = s.end;
+        } else {
+          start = start >>> 0; end = end >>> 0;
+          if (start > end) throw new DOMException(
+            "The index is not in the allowed range.", "IndexSizeError");
+        }
+        if (start > len) start = len;
+        if (end > len) end = len;
+        const sel = _selState(this);
+        let selStart = sel.start, selEnd = sel.end;
+        const newValue = val.slice(0, start) + replacement + val.slice(end);
+        _setTextControlRawValue(this, newValue);   // dirty value; no cursor move
+        const newEnd = start + replacement.length;
+        const mode = selectMode === undefined ? "preserve" : String(selectMode);
+        if (mode === "select") { selStart = start; selEnd = newEnd; }
+        else if (mode === "start") { selStart = selEnd = start; }
+        else if (mode === "end") { selStart = selEnd = newEnd; }
+        else { // "preserve": shift the old selection endpoints past the edit
+          const delta = replacement.length - (end - start);
+          if (selStart > end) selStart += delta; else if (selStart > start) selStart = start;
+          if (selEnd > end) selEnd += delta; else if (selEnd > start) selEnd = newEnd;
+        }
+        _setSelRange(this, selStart, selEnd, _selState(this).dir);
+      },
+    },
+    select: {
+      configurable: true, writable: true,
+      // select() never throws: on a control without a text selection it is a no-op.
+      value: function () {
+        if (!_selApplicable(this)) return;
+        _setSelRange(this, 0, String(this.value).length, "none");
+      },
+    },
+    // The `onselect` event-handler IDL attribute (defaults to null). Stored on the
+    // element; _fireSelectEvent invokes it alongside the addEventListener listeners.
+    onselect: {
+      configurable: true,
+      get() { return this._onselect || null; },
+      set(fn) { this._onselect = (typeof fn === "function") ? fn : null; },
+    },
+  };
+  Object.defineProperties(Input, _selectionAPI);
+  Object.defineProperties(Textarea, _selectionAPI);
+
+  // Set a text control's *raw/dirty value* without moving the cursor: input value
+  // mode stores it in _formValues; <textarea> mirrors the shared value setter.
+  function _setTextControlRawValue(el, v) {
+    _formValues[el._nid] = String(v);
+    if (el.localName === "textarea") el.textContent = String(v);
+  }
+  // Setting <textarea>.value stores a dirty value and moves the cursor to the end.
+  Object.defineProperty(Textarea, "value", {
+    configurable: true,
+    get() {
+      if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+      return this.textContent;
+    },
+    set(v) {
+      v = v == null ? "" : String(v);
+      const oldVal = this.value;
+      _formValues[this._nid] = v;
+      this.textContent = v;
+      if (v !== oldVal) _selCursorToEnd(this); // cursor to end only on real change
+    },
+  });
 }
 
 globalThis.SVGElement = Element;
