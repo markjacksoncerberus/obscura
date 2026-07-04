@@ -18052,6 +18052,123 @@ Object.defineProperty(Element.prototype, 'shadowRoot', {
 });
 
 // ---------------------------------------------------------------------------
+// getHTML() — HTML fragment serialization WITH shadow roots (HTML §"getHTML()"
+// + the serializing-HTML-fragments extension). `Element.getHTML(options)` and
+// `ShadowRoot.getHTML(options)` serialize the node's children like innerHTML,
+// but may additionally serialize shadow roots as `<template shadowrootmode>`
+// elements. A shadow root is serialized when it is listed in
+// `options.shadowRoots`, OR when `options.serializableShadowRoots` is true and
+// the shadow root is `serializable`. An element that hosts such a shadow emits
+// the shadow's `<template>` as the FIRST node of its content, before its light
+// children.
+//
+// Our shadow model lives in JS (`host._shadowRoot`), invisible to the Rust
+// serializer — so wherever a shadow must be injected we recurse in JS. But for
+// any subtree with NO to-be-serialized shadow we defer to the Rust serializer
+// (`outer_html`), which already implements HTML fragment serialization exactly
+// as innerHTML does. That keeps getHTML byte-identical to innerHTML whenever no
+// shadow is serialized (the default), and confines the JS path to the small
+// shadow-hosting spine.
+const _HTML_VOID_SER = new Set(
+  'area base br col embed hr img input link meta param source track wbr'.split(' '));
+
+// The shadow root of `el` that should be serialized under these options, else null.
+function _shadowToSerialize(el, forced, serializableFlag) {
+  const sh = el && el._shadowRoot;
+  if (!sh) return null;
+  if (forced && forced.indexOf(sh) >= 0) return sh;
+  if (serializableFlag && sh._serializable) return sh;
+  return null;
+}
+
+// True iff `node` or any descendant element hosts a shadow that would be
+// serialized under these options — i.e. the Rust serializer would be WRONG
+// (it can't see shadows) and we must recurse in JS. Works for elements,
+// document fragments and shadow roots alike (they all expose childNodes).
+function _subtreeHasSerializableShadow(node, forced, serializableFlag) {
+  if (node.nodeType === 1 && _shadowToSerialize(node, forced, serializableFlag)) return true;
+  const kids = node.childNodes;
+  for (let i = 0; i < kids.length; i++) {
+    const c = kids[i];
+    if (c.nodeType === 1 && _subtreeHasSerializableShadow(c, forced, serializableFlag)) return true;
+  }
+  return false;
+}
+
+// Serialize an element's attributes, matching the Rust escaper (escape_attr):
+// only `&` and `"` are escaped in attribute values.
+function _serializeAttrsForShadowHost(el) {
+  let s = "";
+  const attrs = el.attributes;
+  const n = attrs.length;
+  for (let i = 0; i < n; i++) {
+    const a = attrs[i];
+    s += " " + a.name + '="' +
+      String(a.value).replace(/&/g, "&amp;").replace(/"/g, "&quot;") + '"';
+  }
+  return s;
+}
+
+// Serialize a shadow root as its declarative `<template shadowrootmode>` element.
+// Attribute order follows the HTML serialization algorithm (and the WPT oracle):
+// mode, then delegatesfocus, serializable, clonable.
+function _serializeShadowTemplate(sh, forced, serializableFlag) {
+  let attrs = ' shadowrootmode="' + sh._shadowMode + '"';
+  if (sh._delegatesFocus) attrs += ' shadowrootdelegatesfocus=""';
+  if (sh._serializable) attrs += ' shadowrootserializable=""';
+  if (sh._clonable) attrs += ' shadowrootclonable=""';
+  return '<template' + attrs + '>' +
+    _serializeShadowInclusiveInner(sh, forced, serializableFlag) + '</template>';
+}
+
+// Inner (children) serialization of `node`, prepending node's own shadow
+// `<template>` when node hosts a to-be-serialized shadow.
+function _serializeShadowInclusiveInner(node, forced, serializableFlag) {
+  let out = "";
+  if (node.nodeType === 1) {
+    const sh = _shadowToSerialize(node, forced, serializableFlag);
+    if (sh) out += _serializeShadowTemplate(sh, forced, serializableFlag);
+  }
+  const kids = node.childNodes;
+  for (let i = 0; i < kids.length; i++) {
+    out += _serializeChildShadowInclusive(kids[i], forced, serializableFlag);
+  }
+  return out;
+}
+
+function _serializeChildShadowInclusive(child, forced, serializableFlag) {
+  // Non-elements never host shadows, and no element below a shadow-free subtree
+  // does either — defer to Rust (correct escaping, void/raw-text handling).
+  if (child.nodeType !== 1 ||
+      !_subtreeHasSerializableShadow(child, forced, serializableFlag)) {
+    return _domParse("outer_html", child._nid) ?? "";
+  }
+  const tag = child.localName;
+  let s = "<" + tag + _serializeAttrsForShadowHost(child) + ">";
+  if (_HTML_VOID_SER.has(tag)) return s;   // void: no content, no end tag
+  s += _serializeShadowInclusiveInner(child, forced, serializableFlag);
+  s += "</" + tag + ">";
+  return s;
+}
+
+// The public getHTML(options) shared by Element and ShadowRoot.
+function _getHTMLImpl(node, options) {
+  options = (options == null) ? {} : options;
+  const serializableFlag = !!options.serializableShadowRoots;
+  const forced = (options.shadowRoots != null) ? Array.from(options.shadowRoots) : null;
+  // Fast path: nothing to serialize as a shadow → byte-identical to innerHTML.
+  if (!_subtreeHasSerializableShadow(node, forced, serializableFlag)) {
+    return node.innerHTML;
+  }
+  return _serializeShadowInclusiveInner(node, forced, serializableFlag);
+}
+
+Element.prototype.getHTML = function getHTML(options) { return _getHTMLImpl(this, options); };
+_markNative(Element.prototype.getHTML);
+ShadowRoot.prototype.getHTML = function getHTML(options) { return _getHTMLImpl(this, options); };
+_markNative(ShadowRoot.prototype.getHTML);
+
+// ---------------------------------------------------------------------------
 // Declarative Shadow DOM (HTML §declarative-shadow-dom). A parsed
 // `<template shadowrootmode="open|closed">` becomes a shadow root on its parent,
 // with the template's content as the shadow tree — but ONLY in the opt-in
@@ -18928,9 +19045,18 @@ globalThis.__obscura_init = function() {
   // node-identity (document === node.ownerDocument === _wrap(docNid)) stays intact.
   {
     const _rawDoc = globalThis.document;
+    // WebIDL named properties expose author-facing names (id / name attribute
+    // values); an internal engine slot — every `_`-prefixed key — is NEVER a
+    // named property and must resolve as a real own/prototype property. Skipping
+    // the named-item path for `_`-keys also breaks a re-entrancy cycle: a named
+    // lookup runs `_docNamedElements` → `querySelectorAll`, whose selector-engine
+    // path reads `document._isHTMLDoc` back through this proxy — and if that read
+    // were routed to `_docNamedItem` it would recurse until the stack overflows
+    // (observed when connecting an <embed>/<form>/<iframe>/<img>/<object>).
+    const _isNamedKey = (p) => typeof p === 'string' && p.charCodeAt(0) !== 95;
     const _docProxy = new Proxy(_rawDoc, {
       get(t, p, r) {
-        if (typeof p === 'string' && !Reflect.has(t, p)) {
+        if (_isNamedKey(p) && !Reflect.has(t, p)) {
           const v = _docNamedItem(t, p);
           if (v !== undefined) return v;
         }
@@ -18939,12 +19065,12 @@ globalThis.__obscura_init = function() {
       set(t, p, v) { return Reflect.set(t, p, v); },   // expandos land on the target, no receiver recursion
       has(t, p) {
         if (Reflect.has(t, p)) return true;
-        return typeof p === 'string' && _docNamedElements(t, p).length > 0;
+        return _isNamedKey(p) && _docNamedElements(t, p).length > 0;
       },
       getOwnPropertyDescriptor(t, p) {
         const own = Reflect.getOwnPropertyDescriptor(t, p);
         if (own) return own;
-        if (typeof p === 'string' && _docNamedElements(t, p).length > 0) {
+        if (_isNamedKey(p) && _docNamedElements(t, p).length > 0) {
           return { value: _docNamedItem(t, p), writable: false, enumerable: true, configurable: true };
         }
         return undefined;

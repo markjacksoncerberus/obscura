@@ -10,11 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #141).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #142).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+| `shadow-dom/declarative/gethtml.html` | 0/6908 | **6908/6908** | ✅ 100% | **Quest #142 The Serialized Verdict.** `Element.getHTML()`/`ShadowRoot.getHTML()` — HTML fragment serialization with shadow roots (`<template shadowrootmode>` prepended for serializable/forced shadows); shadow-free subtrees defer to the Rust `outer_html` serializer so output stays byte-identical to `innerHTML`. Plus a pre-existing doc-proxy stack-overflow fix (internal `_`-keys are never named properties) that unblocked connecting `embed`/`form`/`iframe`/`img`/`object`. **+6908.** |
+| `shadow-dom/declarative/gethtml-ordering.html` | could-not-run | **3/3** | ✅ 100% | **Quest #142 The Serialized Verdict.** `getHTML()` shadow-serialization ordering. **+3.** |
+| `shadow-dom/declarative/declarative-shadow-dom-serialization.html` | 0/2 | **2/2** | ✅ 100% | **Quest #142 The Serialized Verdict.** Declarative shadow round-trips through `getHTML({serializableShadowRoots:true})`. **+2.** |
+| `shadow-dom/declarative/declarative-shadow-dom-slot-assignment-serialization.html` | 0/3 | **1/3** | 🟡 33% | **Quest #142 The Serialized Verdict.** `getHTML()` on a slotted shadow. **+1.** (Residual: `shadowrootslotassignment` round-trip on manual assignment.) |
 | `shadow-dom/declarative/declarative-shadow-dom-attachment.html` | 0/654 | **654/654** | ✅ 100% | **Quest #141 The Declared Verdict.** `<template shadowrootmode>` → real shadow root at parse time (JS conversion after a `allow_declarative_shadow_roots→false` sink) + `setHTMLUnsafe` + declarative-reattach in `attachShadow`. **+654.** |
 | `shadow-dom/declarative/declarative-shadow-dom-opt-in.html` | 0/117 | **111/117** | 🟡 95% | **Quest #141 The Declared Verdict.** `innerHTML` leaves `<template shadowrootmode>` intact (opt-in); only main-doc + `setHTMLUnsafe` convert. **+111.** (Residual: `createContextualFragment`, `document.write`, iframe.) |
 | `shadow-dom/declarative/declarative-shadow-dom-basic.html` | 1/22 | **18/22** | 🟡 82% | **Quest #141 The Declared Verdict.** Parse-time conversion + `HTMLTemplateElement` `shadowRootMode`/`shadowRootDelegatesFocus`/`shadowRootClonable` reflection. **+17.** (Residual: clonable-shadow clone propagation.) |

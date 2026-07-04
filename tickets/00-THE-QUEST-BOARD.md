@@ -153,6 +153,37 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-04 (Quest #142 The Serialized Verdict — `getHTML()` = HTML fragment serialization with shadow roots, +6914):**
+Took #141's #1 pointer (the `gethtml.html` 0/6908 elephant — the single largest red test
+in the suite). `Element.getHTML()`/`ShadowRoot.getHTML()` did not exist. **THE FIX (all
+`bootstrap.js`):** `getHTML(options)` serializes a node's children like `innerHTML`, but an
+element hosting a *to-be-serialized* shadow (listed in `options.shadowRoots`, or
+`serializableShadowRoots` && the shadow is `serializable`) prepends the shadow as a
+`<template shadowrootmode>` to its content. Our shadow model lives in JS (invisible to the
+Rust serializer), so we recurse in JS only along the shadow-hosting spine and hand every
+shadow-free subtree to the Rust `outer_html` serializer — keeping getHTML byte-identical to
+innerHTML by default and reusing Rust's escaping/void/raw-text handling. **SECOND FIX** (a
+pre-existing, orthogonal bug surfaced once getHTML existed): connecting an
+`embed`/`form`/`iframe`/`img`/`object` (`_DOC_NAMED_TAGS`) triggered a document named-
+property lookup whose `querySelectorAll` read `document._isHTMLDoc` back through the named-
+access Proxy, which routed the internal `_`-key to `_docNamedItem` again → infinite
+recursion (`Maximum call stack size exceeded`). Guard: internal `_`-prefixed keys are NEVER
+WebIDL named properties (doc-proxy `get`/`has`/`getOwnPropertyDescriptor` skip them) —
+breaking the cycle AND hardening the engine (`appendChild(createElement('img'))` can no
+longer stack-overflow). RESULTS (stash-verified): gethtml 0→6908, gethtml-ordering
+could-not-run→3, declarative-shadow-dom-serialization 0→2, slot-assignment-serialization
+0→1 = **+6914 across 4 tests**. ZERO regressions (stash-verified: qsa 1975, classlist 1420,
+createElement 147, Node-properties 726, cloneNode 135, getElementsByTagName 19,
+template-content 216, insert_adjacent_html 31, slots 26, event-inside-slotted-node 20,
+attachment 654, basic 18/22, opt-in 111/117, ShadowRoot-interface 8/12, reset-form 12/12,
+nameditem-01/02/05/07 100%, nameditem-names 15/16 — the whole named-access series identical).
+CAPS: clone-propagation of clonable shadows (basic 18/22 — needs `cloneNode`/`importNode`
+to clone shadow roots, now the biggest self-contained shadow residual); slot-assignment-
+serialization 1/3 (manual `shadowrootslotassignment` round-trip); `ElementInternals`; in-
+shadow focus (`ShadowRoot.activeElement`). NEXT: **clone-propagation** (cloneNode/importNode
+clone shadow roots → basic 4 + template-clone tail), then **`ElementInternals`**, then
+**in-shadow focus**. Scroll `tickets/142-the-serialized-verdict.md`.
+
 **Session 2026-07-04 (Quest #141 The Declared Verdict — Declarative Shadow DOM: `<template shadowrootmode>` → a real shadow root at parse time, +793):**
 Took #140's #2 pointer (declarative shadow DOM). The whole `shadow-dom/declarative/` realm
 was red (attachment 0/654, opt-in 0/117, basic 1/22) behind two blockers: `setHTMLUnsafe`
