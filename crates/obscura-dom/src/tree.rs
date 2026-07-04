@@ -374,6 +374,13 @@ impl DomTree {
         self.inner.borrow_mut().checked_state.insert(id, checked);
     }
 
+    /// Clear the dynamic checked override so `checked()` falls back to the
+    /// `checked` content attribute. This is the "dirty checkedness flag = false"
+    /// step of the form reset algorithm (HTML §4.10.21.4).
+    pub fn clear_checked(&self, id: NodeId) {
+        self.inner.borrow_mut().checked_state.remove(&id);
+    }
+
     /// Resolve an element's checked state: the JS-set state if present, else the
     /// `checked` attribute default. Used by `:checked` and the checked getter.
     pub fn checked(&self, id: NodeId) -> bool {

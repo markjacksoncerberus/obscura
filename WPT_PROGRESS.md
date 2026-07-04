@@ -10,11 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #135).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #136).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+| `html/semantics/forms/resetting-a-form/reset-form.html` | 0/12 | **12/12** | ✅ 100% | **Quest #136 The Reset Verdict.** The form reset algorithm — fire a trusted, cancelable `reset` event, then restore each control's default: input value/checkedness (drop the dirty value + dirty-checkedness override via a new `clear_checked` op), textarea raw value → child text, output → default value, select → per-option `selected` attribute. Reset-button `click()` now runs the reset activation behavior; `document.forms` is a real named-access `HTMLCollection`. **+12.** |
+| `html/semantics/forms/resetting-a-form/reset-form-2.html` | 0/1 | **1/1** | ✅ 100% | **Quest #136 The Reset Verdict.** Script-built form integration: `input.defaultValue`/`defaultChecked`, `textarea.defaultValue`, `option.defaultSelected` restore on reset; after reset (dirty flags cleared) the live value/checkedness follows the default. **+1.** |
+| `html/semantics/forms/resetting-a-form/reset-event.html` | 0/1 | **1/1** | ✅ 100% | **Quest #136 The Reset Verdict.** `form.reset()` fires a trusted, bubbling, cancelable `reset` event at the form; `onreset` handler invoked. **+1.** |
+| `html/semantics/forms/resetting-a-form/reset-form-event-realm.html` | 0/1 | **1/1** | ✅ 100% | **Quest #136 The Reset Verdict.** The `reset` event fires synchronously in the target form's realm. **+1.** |
+| `html/semantics/forms/the-textarea-element/value-defaultValue-textContent.html` | 6/12 | **7/12** | 🟡 58.3% | **Quest #136 The Reset Verdict.** Setting `textarea.value` no longer clobbers the child text (raw value ≠ default value), so `defaultValue` survives. **+1.** Residual 5 = child-text-content (not textContent) semantics + CRLF/NUL value normalization (separate work). |
 | `html/semantics/forms/the-select-element/selected-index.html` | 0/13 | **13/13** | ✅ 100% | **Quest #135 The Selectedness Verdict.** `HTMLSelectElement.selectedIndex`/`value` get+set + the selectedness setting algorithm (auto-select first non-disabled when a single-line select has none; `selectedIndex = -1` deliberately selects nothing), on `HTMLSelectElement.prototype` (no Rust). **+13.** |
 | `html/semantics/forms/the-option-element/option-label.html` | 0/12 | **12/12** | ✅ 100% | **Quest #135 The Selectedness Verdict.** `HTMLOptionElement.label` (falls back to the option's text unless a null-namespace `label` attribute is present). **+12.** |
 | `html/semantics/forms/the-option-element/option-element-constructor.html` | 0/11 | **11/11** | ✅ 100% | **Quest #135 The Selectedness Verdict.** The `Option(text, value, defaultSelected, selected)` legacy factory — 4th arg sets selectedness without dirtiness; `value`/`selected` content-attribute presence rules. **+11.** |

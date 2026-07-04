@@ -2438,6 +2438,10 @@ class Element extends Node {
         if (form && typeof form.submit === 'function') {
           form.submit(this);
         }
+      } else if (type === 'reset' && (this.localName === 'button' || this.localName === 'input')) {
+        // A reset button's activation behavior (HTML §4.10.6.1) resets its form owner.
+        const form = this.closest ? this.closest('form') : null;
+        if (form && typeof form.reset === 'function') form.reset();
       }
     }
   }
@@ -3799,7 +3803,8 @@ class Document extends Node {
     out.item = (i) => { i = i >>> 0; return i < out.length ? out[i] : null; };
     return out;
   }
-  get forms() { return this.querySelectorAll("form"); }
+  // document.forms is an HTMLCollection (named access by id/name), not a NodeList.
+  get forms() { const d = this; return _makeHTMLCollection(() => [...d.querySelectorAll("form")]); }
   get images() { return this.querySelectorAll("img"); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
@@ -15581,6 +15586,22 @@ function _cvReflLong(proto, prop, attr) {
     },
   });
 
+  // input.defaultValue reflects the `value` content attribute — the value the
+  // form-reset algorithm restores. input.defaultChecked reflects the `checked`
+  // content attribute (the default checkedness). Setting defaultChecked mutates
+  // only the content attribute; while there is no dirty checkedness override the
+  // Rust `checked()` follows it, so the live checkedness tracks it too.
+  Object.defineProperty(Input, "defaultValue", {
+    configurable: true,
+    get() { return this.getAttribute("value") || ""; },
+    set(v) { this.setAttribute("value", v == null ? "" : String(v)); },
+  });
+  Object.defineProperty(Input, "defaultChecked", {
+    configurable: true,
+    get() { return this.hasAttribute("checked"); },
+    set(v) { if (v) this.setAttribute("checked", ""); else this.removeAttribute("checked"); },
+  });
+
   // ---- valueAsNumber / valueAsDate / stepUp / stepDown (HTML §4.10.5.4) -------
   // The numeric projection of the value model. All the string→number machinery
   // (`_cvTyped`, `_cvStepInfo`, `_cvDefaultStepBase`, the per-type parsers) is the
@@ -15883,9 +15904,11 @@ function _cvReflLong(proto, prop, attr) {
 
   // Set a text control's *raw/dirty value* without moving the cursor: input value
   // mode stores it in _formValues; <textarea> mirrors the shared value setter.
+  // A <textarea>'s *raw value* (the API value) is distinct from its *default value*
+  // (the child text content, which `defaultValue` reflects and form reset restores),
+  // so setting `.value` stores the raw value WITHOUT mutating the child text.
   function _setTextControlRawValue(el, v) {
     _formValues[el._nid] = String(v);
-    if (el.localName === "textarea") el.textContent = String(v);
   }
   // Setting <textarea>.value stores a dirty value and moves the cursor to the end.
   Object.defineProperty(Textarea, "value", {
@@ -15898,7 +15921,6 @@ function _cvReflLong(proto, prop, attr) {
       v = v == null ? "" : String(v);
       const oldVal = this.value;
       _formValues[this._nid] = v;
-      this.textContent = v;
       if (v !== oldVal) _selCursorToEnd(this); // cursor to end only on real change
     },
   });
@@ -16225,17 +16247,65 @@ function _cvReflLong(proto, prop, attr) {
     get() { if (!this._dlOptionsColl) { const dl = this; this._dlOptionsColl = _makeHTMLCollection(() => [...dl.querySelectorAll("option")]); } return this._dlOptionsColl; },
   });
 
-  // Form reset (HTML "reset algorithm"): restore each option's selectedness from
-  // its `selected` content attribute, clear dirtiness, then re-run selectedness.
+  // ---- HTMLOutputElement value / defaultValue (HTML §4.10.12) ------------------
+  // An <output> holds a value-mode flag ("value" | "default") and a default value.
+  // `value` mirrors the descendant text; `defaultValue` reads/writes the default
+  // value (or the text while still in default mode). Reset returns to default mode
+  // and restores the text from the default value.
+  {
+    const Output = globalThis.HTMLOutputElement.prototype;
+    Object.defineProperty(Output, "value", {
+      configurable: true,
+      get() { return this.textContent; },
+      set(v) { this._outValueMode = true; this.textContent = v == null ? "" : String(v); },
+    });
+    Object.defineProperty(Output, "defaultValue", {
+      configurable: true,
+      get() { return this._outValueMode ? (this._outDefault || "") : this.textContent; },
+      set(v) {
+        v = v == null ? "" : String(v);
+        if (this._outValueMode) this._outDefault = v; else this.textContent = v;
+      },
+    });
+  }
+
+  // Form reset (HTML "reset algorithm" §4.10.21.4): fire a trusted, cancelable
+  // `reset` event; if not canceled, run each resettable control's reset algorithm.
   const _resetSelect = (sel) => {
     for (const o of _listOfOptions(sel)) { _ensureOpt(o); o._optSel = o.hasAttribute("selected"); o._optDirty = false; }
     sel._noAutoSelect = false; _runSelectedness(sel);
   };
-  globalThis.HTMLFormElement.prototype.reset = function () {
-    for (const f of this.elements) {
-      if (f.localName === "select") { _resetSelect(f); continue; }
-      if ("value" in f) f.value = "";
+  const _resetControl = (f) => {
+    const tag = f.localName;
+    if (tag === "select") { _resetSelect(f); return; }
+    if (tag === "textarea") { delete _formValues[f._nid]; return; } // → default (child text)
+    if (tag === "output") { f._outValueMode = false; if (f._outDefault !== undefined) f.textContent = f._outDefault; return; }
+    if (tag === "input") {
+      const t = (f.getAttribute("type") || "text").toLowerCase();
+      // Reset the checkedness of checkbox/radio to the `checked` content attribute
+      // by dropping the dirty override; reset the value to the content attribute by
+      // dropping the dirty value.
+      if (t === "checkbox" || t === "radio") _dom("clear_checked", f._nid, "");
+      delete _formValues[f._nid];
+      return;
     }
+  };
+  globalThis.HTMLFormElement.prototype.reset = function () {
+    let ev;
+    try { ev = new Event("reset", { bubbles: true, cancelable: true }); }
+    catch (e) { ev = null; }
+    if (ev) {
+      ev.isTrusted = true;
+      // Dispatch privately so the trusted flag survives (the public path clears it).
+      _dispatchSpec(this, ev);
+      // The `onreset` content-attribute handler is not auto-invoked by dispatch in
+      // this engine (mirrors the `onselect` path), so run it explicitly; it may
+      // still cancel the reset via preventDefault().
+      const h = this.onreset;
+      if (typeof h === "function") { try { h.call(this, ev); } catch (e) {} }
+      if (ev.defaultPrevented) return; // preventDefault() aborts the reset
+    }
+    for (const f of this.elements) _resetControl(f);
   };
 }
 

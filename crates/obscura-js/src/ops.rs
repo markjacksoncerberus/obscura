@@ -496,6 +496,13 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             let nid = arg1.parse::<u32>().unwrap_or(0);
             if dom.checked(NodeId::new(nid)) { "1".into() } else { "0".into() }
         }
+        // Form reset: drop the dirty checkedness override so `checked` follows the
+        // `checked` content attribute again.
+        "clear_checked" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.clear_checked(NodeId::new(nid));
+            "true".into()
+        }
         // Checkbox `indeterminate` IDL state (drives `:indeterminate`).
         "set_indeterminate" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
