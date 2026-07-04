@@ -44,7 +44,7 @@ impl DomTree {
                 buf.push_str(name);
                 buf.push('>');
             }
-            NodeData::Element { name, attrs, .. } => {
+            NodeData::Element { name, attrs, template_contents, .. } => {
                 let tag = name.local.as_ref();
                 if include_self {
                     buf.push('<');
@@ -66,7 +66,13 @@ impl DomTree {
                 }
 
                 if !is_void_element(tag) {
-                    self.serialize_children(node_id, emit_nids, buf);
+                    // HTML fragment-serialization: a <template>'s serialized body is
+                    // its template-contents children (a template has no direct
+                    // children — they all live in the separate content subtree).
+                    match template_contents {
+                        Some(tc) => self.serialize_children(*tc, emit_nids, buf),
+                        None => self.serialize_children(node_id, emit_nids, buf),
+                    }
                     if include_self {
                         buf.push_str("</");
                         buf.push_str(tag);

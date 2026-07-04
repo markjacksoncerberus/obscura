@@ -1195,6 +1195,20 @@ class Node {
           if (c) el.appendChild(c);
         }
       }
+      // The "cloning steps" for a <template> (HTML §the-template-element): its
+      // children live in the separate content fragment, not as direct children,
+      // so the childNodes loop above never sees them. Deep-clone the template
+      // contents into the clone's own (fresh) content fragment.
+      if (deep && this.localName === 'template') {
+        const src = this.content, dst = el.content;
+        if (src && dst) {
+          const ck = src.childNodes;
+          for (let i = 0; i < ck.length; i++) {
+            const c = (ck[i] && ck[i].cloneNode) ? ck[i].cloneNode(true, _targetDoc) : null;
+            if (c) dst.appendChild(c);
+          }
+        }
+      }
       return el;
     }
     if (t === 3) return (_targetDoc || document).createTextNode(this.textContent);
@@ -2129,8 +2143,7 @@ class Element extends Node {
   }
   get content() {
     if (this.localName !== 'template') return undefined;
-    if (!this._templateContent) this._templateContent = document.createDocumentFragment();
-    return this._templateContent;
+    return _templateContentFragment(this);
   }
   get childElementCount() { return this.children.length; }
   get firstElementChild() { return this.children[0] || null; }
@@ -2933,7 +2946,7 @@ for (const __jsAttr in __ariaReflectedAttrs) {
 //                 out of the signed-32-bit range); setter writes String(ToInt32).
 // SVG/foreign elements inherit these too; reading just yields "" / false / the
 // default when the attribute is absent, so the addition is inert for them.
-const __reflectedStringAttrs = { title: 'title', lang: 'lang', accessKey: 'accesskey' };
+const __reflectedStringAttrs = { title: 'title', lang: 'lang', accessKey: 'accesskey', slot: 'slot' };
 for (const __jsAttr in __reflectedStringAttrs) {
   const __contentAttr = __reflectedStringAttrs[__jsAttr];
   Object.defineProperty(Element.prototype, __jsAttr, {
@@ -3094,10 +3107,7 @@ Object.defineProperty(Element.prototype, 'crossOrigin', {
 Object.defineProperty(Element.prototype, 'content', {
   configurable: true, enumerable: true,
   get() {
-    if (this.localName === 'template') {
-      if (!this._templateContent) this._templateContent = document.createDocumentFragment();
-      return this._templateContent;
-    }
+    if (this.localName === 'template') return _templateContentFragment(this);
     return this.getAttribute('content') ?? '';
   },
   set(v) {
@@ -3897,6 +3907,23 @@ class DocumentFragment extends Node {
     if (deep) frag.innerHTML = this.innerHTML;
     return frag;
   }
+}
+
+// The DocumentFragment wrapping a <template>'s REAL template-contents node (the
+// separate subtree the HTML parser fills with the template's children). Wrapping
+// the live node — instead of a disconnected empty fragment — is what makes
+// `template.content`, `.content.querySelector`, and importNode(template.content)
+// see the parsed markup. Cached so identity is stable (the same fragment object
+// across repeated `.content` reads, and via parentNode from a content child).
+function _templateContentFragment(tpl) {
+  const cid = +_dom("template_content", tpl._nid);
+  if (cid < 0 || isNaN(cid)) {
+    if (!tpl._templateContent) tpl._templateContent = document.createDocumentFragment();
+    return tpl._templateContent;
+  }
+  const cached = _cache.get(cid);
+  if (cached && cached.nodeType === 11) return cached;
+  return new DocumentFragment(cid);   // constructor caches by nid (no new node created)
 }
 
 class DocumentType extends Node {
@@ -17837,6 +17864,125 @@ Object.defineProperty(Element.prototype, 'shadowRoot', {
   enumerable: true,
   get() { const s = this._shadowRoot; return (s && s._shadowMode === 'open') ? s : null; },
 });
+
+// ---------------------------------------------------------------------------
+// Slots & the slot-assignment algorithm (DOM §4.2.2 "Assigning slottables and
+// slots" + the Slottable mixin + HTMLSlotElement). Everything here is computed
+// LAZILY on every query — there is no imperative "assign slottables" pass and no
+// dirty tracking — so any DOM mutation is reflected the next time assignedNodes()
+// / assignedElements() / assignedSlot is read (which is exactly how the WPT
+// mutation tests probe it). Both named and manual (assign()) assignment modes
+// are modelled. slotchange is not fired here (no test in this suite needs it).
+// ---------------------------------------------------------------------------
+
+// Slottable = Element or Text (the two interfaces implementing the mixin).
+function _isSlottable(n) { const t = n && n.nodeType; return t === 1 || t === 3; }
+// A <slot> element (HTML namespace).
+function _isSlotEl(n) {
+  return !!n && n.nodeType === 1 && n.localName === 'slot' &&
+    (n.namespaceURI === _HTML_NS || n.namespaceURI == null);
+}
+// The name used to match a slottable to a slot: an element's `slot` attribute
+// value, or "" for a text node / an element without the attribute.
+function _slottableName(n) {
+  return (n.nodeType === 1) ? (n.getAttribute('slot') || '') : '';
+}
+// The topmost node reached by walking parentNode; if it is a ShadowRoot the slot
+// lives in a shadow tree (only then can it have assigned nodes).
+function _shadowRootContaining(n) {
+  let cur = n, p;
+  while ((p = cur.parentNode)) cur = p;
+  return (cur && cur._shadowHost !== undefined) ? cur : null;
+}
+// DOM "find a slot" for a slottable. openFlag: assignedSlot must not reveal a
+// slot that lives inside a CLOSED shadow tree.
+function _findSlotFor(slottable, openFlag) {
+  const parent = slottable.parentNode;
+  if (!parent) return null;
+  const shadow = parent._shadowRoot;          // slottable's parent must be a shadow host
+  if (!shadow) return null;
+  if (openFlag && shadow._shadowMode !== 'open') return null;
+  const slots = shadow.querySelectorAll('slot');   // shadow-tree order
+  if (shadow._slotAssignment === 'manual') {
+    for (const s of slots) {
+      const m = s._manuallyAssigned;
+      if (m && m.indexOf(slottable) >= 0) return s;
+    }
+    return null;
+  }
+  const name = _slottableName(slottable);
+  for (const s of slots) { if ((s.getAttribute('name') || '') === name) return s; }
+  return null;
+}
+// DOM "find slottables" of a slot: its shadow host's slottable children assigned
+// to it, in tree order.
+function _findSlottables(slot) {
+  const shadow = _shadowRootContaining(slot);
+  if (!shadow) return [];
+  const host = shadow._shadowHost;
+  const out = [], kids = host.childNodes;
+  for (let i = 0; i < kids.length; i++) {
+    const child = kids[i];
+    if (_isSlottable(child) && _findSlotFor(child, false) === slot) out.push(child);
+  }
+  return out;
+}
+// DOM "find flattened slottables": expand assigned slots recursively and fall
+// back to a slot's own slottable children when nothing is assigned to it.
+function _findFlattenedSlottables(slot) {
+  const shadow = _shadowRootContaining(slot);
+  if (!shadow) return [];
+  const slottables = _findSlottables(slot);
+  if (slottables.length === 0) {
+    const kids = slot.childNodes;                  // fallback content
+    for (let i = 0; i < kids.length; i++) if (_isSlottable(kids[i])) slottables.push(kids[i]);
+  }
+  const out = [];
+  for (const node of slottables) {
+    if (_isSlotEl(node) && _shadowRootContaining(node)) {
+      for (const x of _findFlattenedSlottables(node)) out.push(x);
+    } else {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
+// HTMLSlotElement.name reflects the `name` content attribute.
+Object.defineProperty(HTMLSlotElement.prototype, 'name', {
+  configurable: true, enumerable: true,
+  get() { return this.getAttribute('name') || ''; },
+  set(v) { this.setAttribute('name', String(v)); },
+});
+HTMLSlotElement.prototype.assignedNodes = function assignedNodes(options) {
+  return (options && options.flatten)
+    ? _findFlattenedSlottables(this) : _findSlottables(this);
+};
+HTMLSlotElement.prototype.assignedElements = function assignedElements(options) {
+  return this.assignedNodes(options).filter((n) => n.nodeType === 1);
+};
+// HTMLSlotElement.assign(...nodes): manual slot assignment (only takes effect in a
+// shadow tree whose slotAssignment is "manual").
+HTMLSlotElement.prototype.assign = function assign() {
+  const nodes = [];
+  for (let i = 0; i < arguments.length; i++) {
+    const n = arguments[i];
+    if (n && _isSlottable(n) && nodes.indexOf(n) < 0) nodes.push(n);
+  }
+  this._manuallyAssigned = nodes;
+};
+_markNative(HTMLSlotElement.prototype.assignedNodes);
+_markNative(HTMLSlotElement.prototype.assignedElements);
+_markNative(HTMLSlotElement.prototype.assign);
+
+// Slottable mixin: assignedSlot is defined on Element and Text (not Comment /
+// ProcessingInstruction — those extend CharacterData directly, not Text).
+for (const _proto of [Element.prototype, Text.prototype]) {
+  Object.defineProperty(_proto, 'assignedSlot', {
+    configurable: true, enumerable: true,
+    get() { return _findSlotFor(this, true); },
+  });
+}
 
 globalThis.AudioContext = class AudioContext {
   constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; }

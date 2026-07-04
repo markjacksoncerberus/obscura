@@ -562,6 +562,32 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "create_document_fragment" => {
             dom.new_node(NodeData::Document).index().to_string()
         }
+        // The <template>'s template-contents node (HTML §the-template-element).
+        // The parser stashes a template's children in a separate Document-backed
+        // node; expose its id so JS `template.content` can wrap the REAL parsed
+        // subtree instead of a disconnected empty fragment. Lazily creates the
+        // node for a programmatically-built template that has none yet. Returns
+        // "-1" if the target is not an element.
+        "template_content" => {
+            let nid = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            let existing = dom.get_node(nid).and_then(|n| match &n.data {
+                NodeData::Element { template_contents, .. } => Some(*template_contents),
+                _ => None,
+            });
+            match existing {
+                Some(Some(cid)) => cid.index().to_string(),
+                Some(None) => {
+                    let cid = dom.new_node(NodeData::Document);
+                    dom.with_node_mut(nid, |node| {
+                        if let NodeData::Element { template_contents, .. } = &mut node.data {
+                            *template_contents = Some(cid);
+                        }
+                    });
+                    cid.index().to_string()
+                }
+                None => "-1".into(),
+            }
+        }
         "create_element" => {
             dom.new_node(NodeData::Element {
                 name: html5ever::QualName::new(None, html5ever::ns!(html), html5ever::LocalName::from(arg1.as_str())),

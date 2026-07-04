@@ -10,11 +10,26 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #138).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #139).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+| `shadow-dom/slots.html` | 1/26 | **26/26** | ✅ 100% | **Quest #139 The Slotted Verdict.** The slot-assignment algorithm (find-a-slot / find-slottables / find-flattened-slottables), computed lazily on every query; named + manual modes; open-flag hides closed-tree slots. **+25.** |
+| `shadow-dom/slots-fallback.html` | 0/13 | **13/13** | ✅ 100% | **Quest #139 The Slotted Verdict.** Recursive flatten with fallback content (a slot's own slottable children when nothing is assigned). **+13.** |
+| `shadow-dom/HTMLSlotElement-interface.html` | 2/18 | **18/18** | ✅ 100% | **Quest #139 The Slotted Verdict.** `HTMLSlotElement` `name`/`assignedNodes({flatten})`/`assignedElements`. **+16.** |
+| `shadow-dom/Slottable-mixin.html` | 0/4 | **4/4** | ✅ 100% | **Quest #139 The Slotted Verdict.** `assignedSlot` on Element + Text only (not Comment/PI). **+4.** |
+| `shadow-dom/imperative-slot-api.html` | 1/16 | **7/16** | 🟡 44% | **Quest #139 The Slotted Verdict.** `slot.assign(...)` manual assignment. **+6.** Residual 9 = `slotchange` events (not fired). |
+| `shadow-dom/slots-fallback-in-document.html` | 0/2 | **2/2** | ✅ 100% | **Quest #139 The Slotted Verdict.** **+2.** |
+| `shadow-dom/slots-outside-shadow-dom.html` | 0/1 | **1/1** | ✅ 100% | **Quest #139 The Slotted Verdict.** A slot only distributes when its root is a shadow root. **+1.** |
+| `shadow-dom/imperative-slot-api-cross-shadow-root.html` | 0/2 | **1/2** | 🟡 50% | **Quest #139 The Slotted Verdict.** **+1.** |
+| `shadow-dom/assign-slottables-after-removing-shadow-tree-from-document.html` | 0/1 | **1/1** | ✅ 100% | **Quest #139 The Slotted Verdict.** **+1.** |
+| `html/semantics/scripting-1/the-template-element/template-element/template-content.html` | 108/216 | **216/216** | ✅ 100% | **Quest #139 The Slotted Verdict.** `<template>.content` wired to the real Rust `template_contents` node (new `template_content` op) + import/serialize/clone all carry template content. **+108.** |
+| `html/semantics/scripting-1/the-template-element/serializing-html-templates/outerhtml.html` | 0/3 | **3/3** | ✅ 100% | **Quest #139 The Slotted Verdict.** `serialize_node` emits a `<template>`'s content children. **+3.** |
+| `html/semantics/scripting-1/the-template-element/additions-to-the-steps-to-clone-a-node/templates-copy-document-owner.html` | 3/5 | **5/5** | ✅ 100% | **Quest #139 The Slotted Verdict.** `cloneNode` runs the template cloning step. **+2.** |
+| `html/semantics/scripting-1/the-template-element/additions-to-the-steps-to-clone-a-node/template-clone-children.html` | 2/3 | **3/3** | ✅ 100% | **Quest #139 The Slotted Verdict.** **+1.** |
+| `html/semantics/scripting-1/the-template-element/innerhtml-on-templates/innerhtml.html` | 3/4 | **4/4** | ✅ 100% | **Quest #139 The Slotted Verdict.** `import_node_from` rebuilds template content on `innerHTML`. **+1.** |
+| `dom/nodes/DocumentFragment-getElementById.html` | 4/5 | **5/5** | ✅ 100% | **Quest #139 The Slotted Verdict.** `<template>.content.getElementById` now scopes to a real backing node (was the #138 residual). **+1.** |
 | `shadow-dom/Element-interface-attachShadow.html` | 2/6 | **6/6** | ✅ 100% | **Quest #138 The Shadowed Verdict.** `attachShadow` rewritten to the DOM algorithm: required `mode` enum (missing/non-{open,closed} → TypeError), non-safelisted-host → NotSupportedError, already-hosts → NotSupportedError, returns a real `instanceof ShadowRoot`. **+4.** |
 | `shadow-dom/Element-interface-shadowRoot-attribute.html` | 0/3 | **3/3** | ✅ 100% | **Quest #138 The Shadowed Verdict.** `Element.prototype.shadowRoot` getter — the element's OPEN shadow root else null (closed → null); defined only on `Element.prototype`. **+3.** |
 | `dom/nodes/rootNode.html` | 1/5 | **5/5** | ✅ 100% | **Quest #138 The Shadowed Verdict.** `Node.getRootNode(options)` real: walk the `parent` chain to the topmost node (was a stub returning `document`); `composed:true` jumps from a shadow root to its host's tree. **+4.** |

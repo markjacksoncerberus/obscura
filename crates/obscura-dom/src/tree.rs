@@ -1027,19 +1027,45 @@ impl DomTree {
     }
 
     fn import_node_from(&self, parent_id: NodeId, source: &DomTree, source_node_id: NodeId) {
-        let node_data = {
+        let (mut node_data, source_template_contents) = {
             let source_inner = source.inner.borrow();
             match source_inner.nodes.get(source_node_id.index()) {
-                Some(Some(node)) => node.data.clone(),
+                Some(Some(node)) => {
+                    let tc = match &node.data {
+                        NodeData::Element { template_contents, .. } => *template_contents,
+                        _ => None,
+                    };
+                    (node.data.clone(), tc)
+                }
                 _ => return,
             }
         };
 
+        // A cloned <template> must NOT keep the source tree's content-node id (it
+        // would dangle into the discarded source tree). Reset it; if the source had
+        // template contents, rebuild a fresh content node in THIS tree and import
+        // the source's contents into it. A template's children live under its
+        // separate content subtree, not under the element itself, so importing
+        // `source.children(template)` alone would silently drop all its markup.
+        if let NodeData::Element { template_contents, .. } = &mut node_data {
+            *template_contents = None;
+        }
         let new_id = self.new_node(node_data);
         self.append_child(parent_id, new_id);
 
-        let children = source.children(source_node_id);
-        for child_id in children {
+        if let Some(src_tc) = source_template_contents {
+            let content_id = self.new_node(NodeData::Document);
+            self.with_node_mut(new_id, |node| {
+                if let NodeData::Element { template_contents, .. } = &mut node.data {
+                    *template_contents = Some(content_id);
+                }
+            });
+            for child_id in source.children(src_tc) {
+                self.import_node_from(content_id, source, child_id);
+            }
+        }
+
+        for child_id in source.children(source_node_id) {
             self.import_node_from(new_id, source, child_id);
         }
     }

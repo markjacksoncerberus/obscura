@@ -153,6 +153,28 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-04 (Quest #139 The Slotted Verdict — the slot-assignment algorithm + a real `<template>.content`, +185):**
+Followed #138's pointer into **slots**, and found a second, deeper prize underneath: `<template>` content was
+silently broken engine-wide. (1) **Slots** (all `bootstrap.js`, computed lazily on every query — no dirty
+tracking, no `slotchange`): `element.slot` reflection; `HTMLSlotElement` `name`/`assignedNodes`/`assignedElements`/
+`assign()`; `Slottable.assignedSlot` on Element+Text only; the DOM find-a-slot / find-slottables /
+find-flattened-slottables algorithms (open-flag hides slots in closed trees; named **and** manual modes; fallback
+content; recursive flatten). (2) **`<template>` content** was dropped by FOUR primitives at once — `template.content`
+returned a disconnected empty fragment (never wired to the real Rust `template_contents` node); `import_children_from`
+kept the source tree's dangling content id and imported the template's (empty) direct children; HTML serialization
+emitted `<template></template>`; and `cloneNode(deep)` never cloned the content fragment. THE FIX: new Rust op
+`template_content` (returns/creates the real content node) + `_templateContentFragment` wrapper; `import_node_from`
+rebuilds a fresh content node and imports the *source content's* children; `serialize_node` emits a template's
+content children (byte-identical for non-templates); `cloneNode` runs the template cloning step. RESULTS: Slottable-mixin
+0→4, HTMLSlotElement-interface 2→18, slots 1→26, slots-fallback 0→13, imperative-slot-api 1→7, imperative-slot-cross-shadow
+0→1, slots-outside-shadow-dom 0→1, slots-fallback-in-document 0→2, assign-slottables-after-removing 0→1, template-clone-children
+2→3, templates-copy-document-owner 3→5, serializing outerhtml 0→3, innerhtml-on-templates 3→4, **template-content 108→216
+(+108)**, DocumentFragment-getElementById 4→5 = **+185 across 15 tests**, ZERO regressions (stash-verified: qsa 1975,
+classlist 1420, cloneNode 135, Node-properties 726, Range-cloneContents 187, createElement 147, insert_adjacent_html 31,
+attachShadow 6/6, ShadowRoot-interface 8/12). CAPS: `slotchange` events (query-lazy model has no mutation bookkeeping —
+`slotchange*.html` hang, imperative-slot-api residual 9/16); composed events/retargeting; declarative shadow DOM. Scroll
+`tickets/139-the-slotted-verdict.md`.
+
 **Session 2026-07-04 (Quest #138 The Shadowed Verdict — a real `ShadowRoot` + `Node.getRootNode`, +21):**
 The standing shadow-tree lead — named since Quest #34 and deferred by a dozen quests since — falls. `attachShadow`
 returned a **fake object literal**, `ShadowRoot` was `class ShadowRoot {}` (empty, web-constructible, not
