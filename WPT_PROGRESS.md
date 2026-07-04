@@ -10,11 +10,17 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #140).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #141).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+| `shadow-dom/declarative/declarative-shadow-dom-attachment.html` | 0/654 | **654/654** | ✅ 100% | **Quest #141 The Declared Verdict.** `<template shadowrootmode>` → real shadow root at parse time (JS conversion after a `allow_declarative_shadow_roots→false` sink) + `setHTMLUnsafe` + declarative-reattach in `attachShadow`. **+654.** |
+| `shadow-dom/declarative/declarative-shadow-dom-opt-in.html` | 0/117 | **111/117** | 🟡 95% | **Quest #141 The Declared Verdict.** `innerHTML` leaves `<template shadowrootmode>` intact (opt-in); only main-doc + `setHTMLUnsafe` convert. **+111.** (Residual: `createContextualFragment`, `document.write`, iframe.) |
+| `shadow-dom/declarative/declarative-shadow-dom-basic.html` | 1/22 | **18/22** | 🟡 82% | **Quest #141 The Declared Verdict.** Parse-time conversion + `HTMLTemplateElement` `shadowRootMode`/`shadowRootDelegatesFocus`/`shadowRootClonable` reflection. **+17.** (Residual: clonable-shadow clone propagation.) |
+| `shadow-dom/declarative/declarative-shadow-dom-slot-assignment.html` | 0/8 | **7/8** | 🟡 88% | **Quest #141 The Declared Verdict.** `shadowRootSlotAssignment` reflection + `slotAssignment` carried into the declarative shadow. **+7.** |
+| `shadow-dom/declarative/declarative-shadow-dom-repeats.html` | 0/3 | **3/3** | ✅ 100% | **Quest #141 The Declared Verdict.** "Keep only the first" declarative root + matching-mode reattach preserving original options. **+3.** |
+| `shadow-dom/declarative/declarative-shadow-dom-repeats-2.html` | 0/1 | **1/1** | ✅ 100% | **Quest #141 The Declared Verdict.** **+1.** |
 | `shadow-dom/event-inside-slotted-node.html` | 0/20 | **20/20** | ✅ 100% | **Quest #140 The Retargeted Verdict.** Full DOM §2.9 event dispatch with retargeting — the event path crosses slots and shadow boundaries; `event.target` retargets per struct. **+20.** |
 | `shadow-dom/event-with-related-target.html` | 0/18 | **18/18** | ✅ 100% | **Quest #140 The Retargeted Verdict.** Per-struct `relatedTarget` retargeting + the "parent is (retargeted) related target" path-stop. **+18.** |
 | `shadow-dom/event-post-dispatch.html` | 3/16 | **16/16** | ✅ 100% | **Quest #140 The Retargeted Verdict.** clear-targets computed before listeners run; per-struct `window.event` (hidden in shadow trees). **+13.** |

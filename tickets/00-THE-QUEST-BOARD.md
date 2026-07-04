@@ -153,7 +153,38 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-04 (Quest #141 The Declared Verdict — Declarative Shadow DOM: `<template shadowrootmode>` → a real shadow root at parse time, +793):**
+Took #140's #2 pointer (declarative shadow DOM). The whole `shadow-dom/declarative/` realm
+was red (attachment 0/654, opt-in 0/117, basic 1/22) behind two blockers: `setHTMLUnsafe`
+missing, and a parser bug that DUMPED a declarative template's content into the light DOM.
+ROOT CAUSE: **html5ever 0.39 natively supports declarative shadow DOM** via two `TreeSink`
+hooks — `allow_declarative_shadow_roots` (default true) + `attach_declarative_shadow`
+(default false, no-op); our sink implemented neither, so the parser mis-handled the floating
+template. Since our shadow model lives in JS (`ShadowRoot`/`attachShadow`), the fix splits
+clean: **(1) Rust** — override `allow_declarative_shadow_roots → false` (parser now leaves
+every `<template shadowrootmode>` as an ordinary template, markup in `template_contents`);
+this ONE line took opt-in 0→110. **(2) JS** (`bootstrap.js`) — `_processDeclarativeShadowRoots`
+tree-walk converts templates → real shadow roots, but ONLY in the opt-in contexts (main-doc
+load + `setHTMLUnsafe`, never `innerHTML`); a `skipDirect` flag skips the fragment context's
+direct-child templates (topmost-element rule — also handles void hosts like `<area>`);
+`attachShadow` declarative-reattach (matching mode empties + returns, preserves ORIGINAL
+options per whatwg/dom#1246; else throws) + `disabledFeatures` check;
+`HTMLTemplateElement` reflection (`shadowRootMode`/`shadowRootDelegatesFocus`/
+`shadowRootClonable`/`shadowRootSerializable`/`shadowRootSlotAssignment`). **(3) page.rs** —
+the `<ready-state>` hook calls the walk before named-globals exposure. RESULTS
+(stash-verified): attachment 0→654, opt-in 0→111, basic 1→18, slot-assignment 0→7, repeats
+0→3, repeats-2 0→1 = **+793 across 6 tests**. ZERO regressions (stash-verified identical:
+qsa 1975, classlist 1/1, createElement 147, Node-properties 726, cloneNode 135, slots 26,
+slots-fallback 13, ShadowRoot-interface 8/12, attachShadow 6/6, event-inside-slotted-node 20,
+template-content 216, insert_adjacent_html 31, DOMParser-html 9/10). CAPS: clone-propagation
+of clonable shadows (basic 4/22, needs `cloneNode` shadow cloning); `getHTML()` serialization
+(**gethtml.html 0/6908** — the single largest remaining shadow tail); `ElementInternals`;
+streaming-parse ordering (disabled-shadow 1). NEXT: **`getHTML()` + shadow serialization**
+(6908-subtest elephant), then **clone-propagation** (cloneNode/importNode clone shadow roots),
+then `ElementInternals`. Scroll `tickets/141-the-declared-verdict.md`.
+
 **Session 2026-07-04 (Quest #140 The Retargeted Verdict — full DOM §2.9 event dispatch with shadow retargeting + `composedPath()`, +107):**
+Followed #139's pointer into **composed events / event retargeting** (`shadow-dom/event-*`) — the frontier stood at
 Followed #139's pointer into **composed events / event retargeting** (`shadow-dom/event-*`) — the frontier stood at
 ~14/110. Event dispatch built a flat `target → parentNode → document → window` path: `event.target` was set once and
 never retargeted, `composedPath()` returned that flat path (no closed-tree hiding, no slot/shadow crossing),

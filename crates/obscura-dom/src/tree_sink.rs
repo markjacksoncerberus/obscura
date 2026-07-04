@@ -230,6 +230,18 @@ impl TreeSink for DomTree {
         x == y
     }
 
+    // Declarative Shadow DOM (`<template shadowrootmode>`). html5ever natively
+    // converts these at parse time — but our shadow-root model lives in JS
+    // (`ShadowRoot`/`attachShadow`), not the Rust tree, so we can't build a real
+    // JS shadow from inside the sink. Returning `false` here makes the parser
+    // leave the `<template shadowrootmode>` as an ordinary template element (with
+    // its markup preserved in `template_contents`). The JS layer then performs the
+    // declarative-shadow conversion after parsing, but ONLY in the opt-in contexts
+    // (main-document load + `setHTMLUnsafe`), never for plain `innerHTML`.
+    fn allow_declarative_shadow_roots(&self, _intended_parent: &NodeId) -> bool {
+        false
+    }
+
     fn set_quirks_mode(&self, _mode: QuirksMode) {}
 
     fn is_mathml_annotation_xml_integration_point(&self, target: &NodeId) -> bool {

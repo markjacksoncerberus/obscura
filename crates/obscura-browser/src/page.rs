@@ -494,7 +494,7 @@ impl Page {
                 "<ready-state>",
                 // Also expose markup id'd elements as Window-named globals
                 // (<el id=foo> -> window.foo) before page scripts run.
-                &format!("globalThis.__documentReadyState__ = 'loading'; __exposeNamedGlobals(); __installBodyWindowHandlers();{}", nav_sizes_js),
+                &format!("globalThis.__documentReadyState__ = 'loading'; try {{ _processDeclarativeShadowRoots(document.documentElement); }} catch(e) {{}} __exposeNamedGlobals(); __installBodyWindowHandlers();{}", nav_sizes_js),
             );
         }
 

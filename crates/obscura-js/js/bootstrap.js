@@ -17999,8 +17999,32 @@ Element.prototype.attachShadow = function attachShadow(init) {
     throw new DOMException("Failed to execute 'attachShadow' on 'Element': This element does not " +
       "support attachShadow", "NotSupportedError");
   }
-  // "If element already hosts a shadow root, throw a NotSupportedError."
+  // A custom element whose definition lists "shadow" in disabledFeatures cannot be
+  // a shadow host (HTML "attach a shadow root" step 5).
+  const _def = globalThis.customElements && globalThis.customElements.get(local);
+  if (_def) {
+    let _df; try { _df = _def.disabledFeatures; } catch (e) {}
+    if (Array.isArray(_df) && _df.indexOf('shadow') >= 0) {
+      throw new DOMException("Failed to execute 'attachShadow' on 'Element': The element does not " +
+        "support shadow (disabledFeatures).", "NotSupportedError");
+    }
+  }
+  // "If element already hosts a shadow root …" — a DECLARATIVE shadow root
+  // (parser-created) of the SAME mode is emptied and returned instead of throwing
+  // (HTML "attach a shadow root": reattaching to a declarative shadow clears its
+  // `declarative` flag, empties it, and re-applies the init options). Any other
+  // case — a non-declarative shadow, or a mode mismatch — is a NotSupportedError.
   if (host._shadowRoot) {
+    const existing = host._shadowRoot;
+    // A matching-mode reattach to a declarative shadow empties it and clears the
+    // `declarative` flag but PRESERVES the shadow's original settings (delegatesFocus,
+    // clonable, serializable, slotAssignment) — the new init options are ignored
+    // (HTML "attach a shadow root", per whatwg/dom#1246).
+    if (existing._declarative && existing._shadowMode === mode) {
+      let c; while ((c = existing.firstChild)) existing.removeChild(c);
+      existing._declarative = false;
+      return existing;
+    }
     throw new DOMException("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be " +
       "created on a host which already hosts a shadow tree.", "NotSupportedError");
   }
@@ -18026,6 +18050,135 @@ Object.defineProperty(Element.prototype, 'shadowRoot', {
   enumerable: true,
   get() { const s = this._shadowRoot; return (s && s._shadowMode === 'open') ? s : null; },
 });
+
+// ---------------------------------------------------------------------------
+// Declarative Shadow DOM (HTML §declarative-shadow-dom). A parsed
+// `<template shadowrootmode="open|closed">` becomes a shadow root on its parent,
+// with the template's content as the shadow tree — but ONLY in the opt-in
+// contexts: main-document parsing and `setHTMLUnsafe`, never plain `innerHTML`.
+// Our Rust sink leaves every such template as an ordinary element
+// (`allow_declarative_shadow_roots` → false, since the shadow-root model lives
+// here in JS); this pass performs the conversion after parsing.
+
+// Enumerated `shadowrootmode` reflection: "open"/"closed" (ASCII case-insensitive),
+// anything else (including missing) → the empty string.
+const _validShadowRootMode = (v) => {
+  if (v === null || v === undefined) return '';
+  const s = String(v).toLowerCase();
+  return (s === 'open' || s === 'closed') ? s : '';
+};
+
+// Enumerated `shadowrootslotassignment`: "manual" (ASCII case-insensitive) else
+// "named" (the missing/invalid value default).
+const _slotAssignmentValue = (v) => {
+  if (v !== null && v !== undefined && String(v).toLowerCase() === 'manual') return 'manual';
+  return 'named';
+};
+
+// A parent is a valid declarative shadow host iff `attachShadow` would accept it:
+// an HTML-namespace element on the shadow-host safelist or a valid custom name.
+const _isDeclShadowHost = (host) => {
+  if (!host || host.nodeType !== 1) return false;
+  const ns = host.namespaceURI;
+  if (!(ns === _HTML_NS || ns === null || ns === undefined)) return false;
+  const local = host.localName;
+  return !!local && (_SHADOW_HOST_NAMES.has(local) || local.indexOf('-') >= 0);
+};
+
+// Convert one `<template>` (already known to carry a valid shadowrootmode) into a
+// shadow root on its parent. Returns true when converted (template removed), false
+// when it must stay (invalid host, or the host already hosts a shadow root — the
+// "multiple declarative roots" case leaves the duplicate template in the DOM).
+function _convertDeclarativeTemplate(tmpl, mode) {
+  const host = tmpl.parentNode;
+  if (!_isDeclShadowHost(host) || host._shadowRoot) return false;
+  let shadow;
+  try {
+    shadow = host.attachShadow({
+      mode,
+      delegatesFocus: tmpl.hasAttribute('shadowrootdelegatesfocus'),
+      clonable: tmpl.hasAttribute('shadowrootclonable'),
+      serializable: tmpl.hasAttribute('shadowrootserializable'),
+      slotAssignment: _slotAssignmentValue(tmpl.getAttribute('shadowrootslotassignment')),
+    });
+  } catch (e) { return false; }
+  shadow._declarative = true;
+  // Move the template's parsed content into the shadow tree, then drop the template.
+  const content = tmpl.content;
+  if (content) { let c; while ((c = content.firstChild)) shadow.appendChild(c); }
+  host.removeChild(tmpl);
+  return true;
+}
+
+// Walk a subtree in tree order, converting declarative-shadow templates and
+// descending into any shadow tree we create (so nested declarative shadows in the
+// shadow content are honoured). An unconverted `<template>` has no light children
+// to recurse into, so it is a harmless no-op. `skipDirect` skips conversion of
+// `node`'s DIRECT `<template>` children: in HTML fragment parsing the context
+// element is the topmost element in the stack of open elements, and a declarative
+// template directly inside it is NOT attached (only deeper ones are). This is also
+// what leaves a `<template shadowrootmode>` alone when its host is a void element
+// (e.g. `<area>`) — the parser makes it a sibling directly under the fragment root.
+function _processDeclarativeShadowRoots(node, skipDirect) {
+  if (!node) return;
+  let child = node.firstChild;
+  while (child) {
+    const next = child.nextSibling;           // captured before conversion mutates the tree
+    if (child.nodeType === 1) {
+      let converted = false;
+      if (child.localName === 'template' && !skipDirect) {
+        const mode = _validShadowRootMode(child.getAttribute('shadowrootmode'));
+        if (mode && _convertDeclarativeTemplate(child, mode)) {
+          _processDeclarativeShadowRoots(node._shadowRoot, false);  // host === node
+          converted = true;
+        }
+      }
+      if (!converted) _processDeclarativeShadowRoots(child, false);
+    }
+    child = next;
+  }
+}
+globalThis._processDeclarativeShadowRoots = _processDeclarativeShadowRoots;
+
+// setHTMLUnsafe (HTML §dom-element-sethtmlunsafe): parse `html` as this element's
+// contents AND process declarative shadow roots within them (the opt-in). The
+// element itself is the fragment context (topmost), so its direct-child
+// declarative templates are not converted — hence `skipDirect = true`. Defined on
+// Element and ShadowRoot.
+Element.prototype.setHTMLUnsafe = function setHTMLUnsafe(html) {
+  this.innerHTML = (html === null || html === undefined) ? '' : String(html);
+  _processDeclarativeShadowRoots(this, true);
+};
+_markNative(Element.prototype.setHTMLUnsafe);
+ShadowRoot.prototype.setHTMLUnsafe = function setHTMLUnsafe(html) {
+  this.innerHTML = (html === null || html === undefined) ? '' : String(html);
+  _processDeclarativeShadowRoots(this, true);
+};
+_markNative(ShadowRoot.prototype.setHTMLUnsafe);
+
+// HTMLTemplateElement IDL reflection for the declarative-shadow attributes. These
+// live on HTMLTemplateElement.prototype (feature-detected via hasOwnProperty).
+Object.defineProperty(HTMLTemplateElement.prototype, 'shadowRootMode', {
+  configurable: true, enumerable: true,
+  get() { return _validShadowRootMode(this.getAttribute('shadowrootmode')); },
+  set(v) { this.setAttribute('shadowrootmode', v == null ? '' : String(v)); },
+});
+Object.defineProperty(HTMLTemplateElement.prototype, 'shadowRootSlotAssignment', {
+  configurable: true, enumerable: true,
+  get() { return _slotAssignmentValue(this.getAttribute('shadowrootslotassignment')); },
+  set(v) { this.setAttribute('shadowrootslotassignment', v == null ? '' : String(v)); },
+});
+for (const [_idl, _attr] of [
+  ['shadowRootDelegatesFocus', 'shadowrootdelegatesfocus'],
+  ['shadowRootClonable', 'shadowrootclonable'],
+  ['shadowRootSerializable', 'shadowrootserializable'],
+]) {
+  Object.defineProperty(HTMLTemplateElement.prototype, _idl, {
+    configurable: true, enumerable: true,
+    get() { return this.hasAttribute(_attr); },
+    set(v) { if (v) this.setAttribute(_attr, ''); else this.removeAttribute(_attr); },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Slots & the slot-assignment algorithm (DOM §4.2.2 "Assigning slottables and
