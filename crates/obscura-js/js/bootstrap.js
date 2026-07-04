@@ -16257,7 +16257,12 @@ function _cvReflLong(proto, prop, attr) {
     Object.defineProperty(Output, "value", {
       configurable: true,
       get() { return this.textContent; },
-      set(v) { this._outValueMode = true; this.textContent = v == null ? "" : String(v); },
+      set(v) {
+        // Switching into "value" mode freezes the current text as the default
+        // value, so `defaultValue` keeps reading the pre-set text (HTML §4.10.12).
+        if (!this._outValueMode) { this._outDefault = this.textContent; this._outValueMode = true; }
+        this.textContent = v == null ? "" : String(v);
+      },
     });
     Object.defineProperty(Output, "defaultValue", {
       configurable: true,
@@ -16266,6 +16271,143 @@ function _cvReflLong(proto, prop, attr) {
         v = v == null ? "" : String(v);
         if (this._outValueMode) this._outDefault = v; else this.textContent = v;
       },
+    });
+  }
+
+  // ---- Form-element IDL: type reflection, fieldset.elements, labels ----------
+  // `button.type` is an enumerated attribute {submit, reset, button}; both the
+  // missing-value and invalid-value defaults are "submit" (HTML §4.10.6). It
+  // reflects the canonical keyword (case-insensitively matched, lowercased).
+  // `output.type`/`fieldset.type` are constants. Each shadows the generic
+  // Element `type` getter for its subclass.
+  Object.defineProperty(globalThis.HTMLButtonElement.prototype, "type", {
+    configurable: true,
+    get() {
+      const v = (this.getAttribute("type") || "").toLowerCase();
+      return (v === "reset" || v === "button") ? v : "submit";
+    },
+    set(v) { this.setAttribute("type", v == null ? "" : String(v)); },
+  });
+  Object.defineProperty(globalThis.HTMLOutputElement.prototype, "type", {
+    configurable: true, get() { return "output"; },
+  });
+  Object.defineProperty(globalThis.HTMLFieldSetElement.prototype, "type", {
+    configurable: true, get() { return "fieldset"; },
+  });
+
+  // `fieldset.elements` — the listed (form-associated) elements that are
+  // descendants, in tree order (HTML §4.10.15). Listed = button, fieldset,
+  // input, object, output, select, textarea; <progress>/<meter> are NOT listed.
+  Object.defineProperty(globalThis.HTMLFieldSetElement.prototype, "elements", {
+    configurable: true,
+    get() {
+      const root = this;
+      return _makeHTMLCollection(
+        () => [...root.querySelectorAll("button, fieldset, input, object, output, select, textarea")]);
+    },
+  });
+
+  // `labels` / `label.control` — the label associations (HTML §4.10.4). A <label>
+  // associates with its "labeled control": the element named by its `for`
+  // attribute (if labelable), else its first labelable descendant. Only labelable
+  // elements have a `labels` IDL attribute (others → undefined); a hidden input is
+  // not labelable so its `labels` is null. Labelable = button, input (not hidden),
+  // meter, output, progress, select, textarea.
+  const _LABELABLE = new Set(["button", "input", "meter", "output", "progress", "select", "textarea"]);
+  const _LABELABLE_SEL = "button, input, meter, output, progress, select, textarea";
+  const _isLabelable = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    const ln = el.localName;
+    if (ln === "input") return (el.getAttribute("type") || "").toLowerCase() !== "hidden";
+    return _LABELABLE.has(ln);
+  };
+  // The real root of a node (its tree). `getRootNode()` here is a stub that always
+  // returns document, so walk `parentNode` — a connected node reaches document, a
+  // detached one reaches the topmost detached ancestor. Label associations are
+  // scoped to a single tree (a detached label can't label a connected control, and
+  // vice-versa), so all lookups below use this root, not `ownerDocument`.
+  const _rootOf = (node) => { let n = node; for (;;) { const p = n.parentNode; if (!p) return n; n = p; } };
+  const _labelsInTree = (node) => {
+    const root = _rootOf(node), out = [];
+    if (root.nodeType === 1 && root.localName === "label") out.push(root); // root itself
+    if (root.querySelectorAll) for (const L of root.querySelectorAll("label")) out.push(L);
+    return out;
+  };
+  const _findLabelableById = (label, id) => {
+    if (id === "") return null;
+    const root = _rootOf(label);
+    let el = null;
+    if (root.getElementById) el = root.getElementById(id);
+    else if (root.nodeType === 1 && root.id === id) el = root;
+    else if (root.querySelector) { try { el = root.querySelector('#' + String(id).replace(/["\\]/g, "\\$&")); } catch (e) { el = null; } }
+    return _isLabelable(el) ? el : null;
+  };
+  const _labeledControl = (label) => {
+    const f = label.getAttribute("for");
+    if (f != null) return _findLabelableById(label, f);
+    for (const c of label.querySelectorAll(_LABELABLE_SEL)) if (_isLabelable(c)) return c;
+    return null;
+  };
+  const _labelItemsFor = (el) => {
+    const out = [];
+    for (const L of _labelsInTree(el)) {
+      const c = _labeledControl(L);
+      if (c && c._nid === el._nid) out.push(L);
+    }
+    return out;
+  };
+  // A [SameObject], live NodeList of a control's labels — recomputed on access so
+  // it tracks tree/type mutations (the retained reference the WPT test keeps must
+  // reflect a control becoming un-labelable), cached per element for identity.
+  const _labelsCache = new WeakMap();
+  const _makeLiveLabels = (el) => {
+    const target = new globalThis.NodeList();
+    const items = () => _labelItemsFor(el);
+    return new Proxy(target, {
+      get(t, p, r) {
+        if (p === "length") return items().length;
+        if (_nlIsIndex(p)) { const it = items(), i = +p; return i < it.length ? it[i] : undefined; }
+        return Reflect.get(t, p, r);
+      },
+      has(t, p) { if (_nlIsIndex(p)) return +p < items().length; return Reflect.has(t, p); },
+      ownKeys(t) {
+        const n = items().length, k = [];
+        for (let i = 0; i < n; i++) k.push(String(i));
+        for (const x of Reflect.ownKeys(t)) if (!k.includes(x)) k.push(x);
+        return k;
+      },
+      getOwnPropertyDescriptor(t, p) {
+        if (_nlIsIndex(p)) { const it = items(), i = +p; return i < it.length ? { value: it[i], writable: false, enumerable: true, configurable: true } : undefined; }
+        return Reflect.getOwnPropertyDescriptor(t, p);
+      },
+    });
+  };
+  const _labelsGetter = function () {
+    if (!_isLabelable(this)) return null;
+    let nl = _labelsCache.get(this);
+    if (!nl) { nl = _makeLiveLabels(this); _labelsCache.set(this, nl); }
+    return nl;
+  };
+  for (const nm of ["HTMLButtonElement", "HTMLInputElement", "HTMLMeterElement",
+                    "HTMLOutputElement", "HTMLProgressElement", "HTMLSelectElement",
+                    "HTMLTextAreaElement"]) {
+    const P = globalThis[nm] && globalThis[nm].prototype;
+    if (P) Object.defineProperty(P, "labels", { configurable: true, get: _labelsGetter });
+  }
+  if (globalThis.HTMLLabelElement) {
+    Object.defineProperty(globalThis.HTMLLabelElement.prototype, "control", {
+      configurable: true, get() { return _labeledControl(this); },
+    });
+    Object.defineProperty(globalThis.HTMLLabelElement.prototype, "htmlFor", {
+      configurable: true,
+      get() { return this.getAttribute("for") || ""; },
+      set(v) { this.setAttribute("for", v == null ? "" : String(v)); },
+    });
+    // label.form is the form owner of its labeled control (null if no control) —
+    // NOT the label's own ancestor form (HTML §4.10.4).
+    Object.defineProperty(globalThis.HTMLLabelElement.prototype, "form", {
+      configurable: true,
+      get() { const c = this.control; return c ? (c.form || null) : null; },
     });
   }
 

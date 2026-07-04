@@ -152,6 +152,40 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-04 (Quest #137 The Labeled Verdict — form-element IDL: `type`/`labels`/`control` + label association, +43):**
+Followed #136's "next leverage" into fresh `html/semantics/forms/*` element IDL. The button/output/fieldset
+elements returned `""` for `.type` (the generic `Element` getter), no element had a `labels` attribute, and
+`<label>` had no `control`/`htmlFor`/`form`. THE FIX (all `bootstrap.js`, NO Rust; a block after the
+`<output>` value model): (1) **`button.type`** — enumerated attribute {submit, reset, button}, both the
+missing- and invalid-value defaults are "submit", reflected as the lowercased canonical keyword (shadows the
+generic getter on `HTMLButtonElement.prototype`). **`output.type`**/**`fieldset.type`** = constants. (2)
+**`fieldset.elements`** — an `HTMLCollection` (`_makeHTMLCollection`) of the *listed* form-associated
+descendants (`button, fieldset, input, object, output, select, textarea`; `<progress>`/`<meter>` are NOT
+listed), tree order. (3) **`labels`** — only on labelable elements (button, input-not-hidden, meter, output,
+progress, select, textarea; others → `undefined`), a hidden input → `null`. It's a **[SameObject] live
+NodeList** (a `Proxy` over a real `NodeList`, recomputed on access, cached per element in a `WeakMap`) so the
+WPT test's retained reference reflects the control becoming un-labelable when its `type` flips to hidden and
+returns the *same object* when it flips back. (4) **`label.control`** = the labeled control: the element named
+by `for` (if labelable), else the label's first labelable descendant. **`label.htmlFor`** reflects `for`;
+**`label.form`** = the control's form owner (null if no control) — NOT the label's own ancestor form. (5)
+**Tree-scoped association**: `getRootNode()` here is a stub that always returns `document`, so I walk
+`parentNode` to the *real* root — a detached label can't label a connected control and vice-versa, and a
+label enumeration/`for`-id lookup is scoped to that root (including the root itself when it's a `<label>`).
+This is what makes the detached-subtree, cross-move-liveness, and duplicate-id cases correct.
+RESULTS (before→after): labelable-elements 12→26, label-attributes.sub 2→19, button-validation 3→6,
+button-type 0→2, button-type-enumerated-ascii-case-insensitive 0→2, button-labels 0→1, input-labels 0→1,
+output 0→1, HTMLFieldSetElement 1→3 = **+43 across 9 tests**. ZERO regressions (held: qsa 1975, classlist
+1420, createElement 147, Node-properties 726, type-change-state 380, reset-form 12, select-value 4/4,
+output-validity/button-validity/fieldset-validity 1/1; input-labels baseline STASH-verified 0/1 pre-change).
+CAPS: label-attributes.sub 19/20 — last needs shadow DOM (`attachShadow`/`ShadowRoot instanceof
+DocumentFragment`), the standing shadow-tree lead. HTMLFieldSetElement 3/4 — last needs form
+supported-property-name named access (`form[name]`), which would need Proxy-wrapping form elements (the engine
+deliberately doesn't Proxy elements — architectural, not worth 1 subtest). NEXT: the shadow-tree scope lead
+is now doubly-attractive (unlocks label-attributes 20/20 + aria-element 5 + CSSStyleSheet-constructable 6/13);
+or the textarea residual (value-defaultValue 7/12 — child-text-content default + CRLF/NUL value normalization);
+or namespaced cascade-match Rust lift (`crates/obscura-dom/src/selector.rs`, set-selectorText-namespace 0/5).
+Scroll `tickets/137-the-labeled-verdict.md`.
+
 **Session 2026-07-04 (Quest #136 The Reset Verdict — the form reset algorithm, +16):**
 Followed #135's "next leverage" pointer straight to form **reset**: the whole `resetting-a-form/` suite sat
 at **0/15**. `HTMLFormElement.prototype.reset()` crudely cleared every control to `""`, fired no event, and

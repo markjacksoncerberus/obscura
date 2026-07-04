@@ -10,11 +10,20 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #136).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #137).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+| `html/semantics/forms/the-label-element/labelable-elements.html` | 12/26 | **26/26** | ✅ 100% | **Quest #137 The Labeled Verdict.** `labels` on labelable elements (button/input-not-hidden/meter/output/progress/select/textarea) as a [SameObject] live NodeList; `label.control`; non-labelable elements have no `labels` (→ undefined). **+14.** |
+| `html/semantics/forms/the-label-element/label-attributes.sub.html` | 2/20 | **19/20** | 🟡 95% | **Quest #137 The Labeled Verdict.** Tree-scoped label association (walk `parentNode` to the real root since `getRootNode()` is a stub): detached labels/controls, cross-move liveness, `label.htmlFor`, `label.form` (= control's form owner, not the label's ancestor form). **+17.** Residual 1 = shadow DOM (`attachShadow`/`ShadowRoot instanceof DocumentFragment`) — standing lead. |
+| `html/semantics/forms/the-button-element/button-validation.html` | 3/6 | **6/6** | ✅ 100% | **Quest #137 The Labeled Verdict.** `button.type` enumerated {submit,reset,button}; missing/invalid → submit (was returning the raw attr / empty). **+3.** |
+| `html/semantics/forms/the-button-element/button-type.html` | 0/2 | **2/2** | ✅ 100% | **Quest #137 The Labeled Verdict.** `button.type` canonical keyword, lowercased. **+2.** |
+| `html/semantics/forms/the-button-element/button-type-enumerated-ascii-case-insensitive.html` | 0/2 | **2/2** | ✅ 100% | **Quest #137 The Labeled Verdict.** Case-insensitive keyword match on `button.type`. **+2.** |
+| `html/semantics/forms/the-button-element/button-labels.html` | 0/1 | **1/1** | ✅ 100% | **Quest #137 The Labeled Verdict.** `button.labels` (nested implicit labels). **+1.** |
+| `html/semantics/forms/the-input-element/input-labels.html` | 0/1 | **1/1** | ✅ 100% | **Quest #137 The Labeled Verdict.** `input.labels`. **+1.** |
+| `html/semantics/forms/the-output-element/output.html` | 0/1 | **1/1** | ✅ 100% | **Quest #137 The Labeled Verdict.** `output.type` = "output"; the value-mode switch now freezes the current text as the default value so `defaultValue` survives a `value=` write. **+1.** |
+| `html/semantics/forms/the-fieldset-element/HTMLFieldSetElement.html` | 1/4 | **3/4** | 🟡 75% | **Quest #137 The Labeled Verdict.** `fieldset.type` = "fieldset"; `fieldset.elements` (listed descendants, tree order, as an `HTMLCollection`). **+2.** Residual 1 = form supported-property-name named access (`form[name]`) — would need Proxy-wrapping form elements (architectural). |
 | `html/semantics/forms/resetting-a-form/reset-form.html` | 0/12 | **12/12** | ✅ 100% | **Quest #136 The Reset Verdict.** The form reset algorithm — fire a trusted, cancelable `reset` event, then restore each control's default: input value/checkedness (drop the dirty value + dirty-checkedness override via a new `clear_checked` op), textarea raw value → child text, output → default value, select → per-option `selected` attribute. Reset-button `click()` now runs the reset activation behavior; `document.forms` is a real named-access `HTMLCollection`. **+12.** |
 | `html/semantics/forms/resetting-a-form/reset-form-2.html` | 0/1 | **1/1** | ✅ 100% | **Quest #136 The Reset Verdict.** Script-built form integration: `input.defaultValue`/`defaultChecked`, `textarea.defaultValue`, `option.defaultSelected` restore on reset; after reset (dirty flags cleared) the live value/checkedness follows the default. **+1.** |
 | `html/semantics/forms/resetting-a-form/reset-event.html` | 0/1 | **1/1** | ✅ 100% | **Quest #136 The Reset Verdict.** `form.reset()` fires a trusted, bubbling, cancelable `reset` event at the form; `onreset` handler invoked. **+1.** |
