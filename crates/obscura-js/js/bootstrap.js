@@ -1215,7 +1215,18 @@ class Node {
     // Siblings/cousins: if this follows other in tree order, other PRECEDES this.
     return __obscura_isFollowing(this, other) ? 2 : 4;
   }
-  getRootNode() { return globalThis.document; }
+  // DOM §4.4 getRootNode(options): the topmost node reachable by walking the
+  // `parent` chain (a node with no parent is its own root). With `composed:true`
+  // the SHADOW-INCLUDING root is returned — if the plain root is a shadow root,
+  // continue the walk from its host. (Was a stub always returning `document`.)
+  getRootNode(options) {
+    let root = this;
+    for (;;) { const p = root.parentNode; if (!p) break; root = p; }
+    if (options && options.composed && root && root._shadowHost) {
+      return root._shadowHost.getRootNode({ composed: true });
+    }
+    return root;
+  }
   // DOM: baseURI returns the node document's document base URL, serialized. A
   // document node is its own node document.
   get baseURI() {
@@ -3870,7 +3881,15 @@ class DocumentFragment extends Node {
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
   get childElementCount() { return this.children.length; }
-  getElementById(id) { return null; }
+  // DOM §4.2.5 getElementById on a DocumentFragment: the first element in tree
+  // order (descendant of the fragment) whose id is `id`. An empty-string id never
+  // matches. Scoped to this fragment's backing node so it also serves ShadowRoot
+  // and <template>.content, and keeps working while detached.
+  getElementById(id) {
+    if (id === "" || id === null || id === undefined) return null;
+    const sel = '[id="' + String(id).replace(/(["\\])/g, "\\$1") + '"]';
+    try { return this.querySelector(sel); } catch (_) { return null; }
+  }
   // ParentNode append/prepend/replaceChildren are mixed onto the prototype below
   // (shared with Element/Document via the "_pn*" assignments).
   cloneNode(deep) {
@@ -13242,7 +13261,46 @@ const __notifyMutation = function() {
   __scheduleMutationDelivery();
 };
 
-globalThis.ShadowRoot = class ShadowRoot {};
+// A real ShadowRoot — a DocumentFragment-backed shadow tree (DOM §4.8). It owns a
+// genuine backing fragment node (so appendChild/innerHTML/querySelector/getElementById
+// and the `parent`-chain all flow through the Rust tree), reports its `host`/`mode`,
+// and is `instanceof DocumentFragment`. Not web-constructible: `new ShadowRoot()`
+// throws (only `Element.attachShadow` may build one, gated by `_allowShadowConstruct`).
+let _allowShadowConstruct = false;
+class ShadowRoot extends DocumentFragment {
+  constructor(nid, host, mode) {
+    if (!_allowShadowConstruct) throw new TypeError("Illegal constructor");
+    super(nid);
+    this._shadowHost = host;
+    this._shadowMode = mode;
+  }
+  get host() { return this._shadowHost; }
+  get mode() { return this._shadowMode; }
+  get delegatesFocus() { return !!this._delegatesFocus; }
+  get slotAssignment() { return this._slotAssignment || "named"; }
+  get clonable() { return !!this._clonable; }
+  get serializable() { return !!this._serializable; }
+  // We don't model focus inside shadow trees yet; no element is ever the shadow's
+  // active element. (The connected-focus case is a known gap.)
+  get activeElement() { return null; }
+  // styleSheets is connectedness-gated and our shadow trees never enter the render
+  // tree, so report an empty StyleSheetList (array-like with .item) rather than throw.
+  get styleSheets() {
+    const out = [];
+    out.item = (i) => { i = i >>> 0; return i < out.length ? out[i] : null; };
+    return out;
+  }
+  // getElementById is inherited from DocumentFragment (scoped to the backing node,
+  // so it keeps working after the host is detached).
+  // A shadow root is its own (non-composed) root; composed jumps to the host's tree.
+  getRootNode(options) {
+    if (options && options.composed && this._shadowHost) {
+      return this._shadowHost.getRootNode({ composed: true });
+    }
+    return this;
+  }
+}
+globalThis.ShadowRoot = ShadowRoot;
 globalThis.customElements = {
   _registry: new Map(),
   define(name, cls, opts) { this._registry.set(name, cls); },
@@ -17728,82 +17786,57 @@ _markNative(Element.prototype.getContext);
 _markNative(Element.prototype.toDataURL);
 _markNative(Element.prototype.toBlob);
 
-Element.prototype.attachShadow = function attachShadow(opts) {
+// DOM §4.9 "attach a shadow root". Elements that may host a shadow tree: a
+// safelisted HTML-namespace name, or a valid custom element name (contains "-").
+const _SHADOW_HOST_NAMES = new Set([
+  'article', 'aside', 'blockquote', 'body', 'div', 'footer', 'h1', 'h2', 'h3',
+  'h4', 'h5', 'h6', 'header', 'main', 'nav', 'p', 'section', 'span',
+]);
+Element.prototype.attachShadow = function attachShadow(init) {
   const host = this;
-  const children = [];
-  const shadow = {
-    mode: opts?.mode || 'open',
-    host: host,
-    get innerHTML() { return children.map(c => c.outerHTML || c.textContent || '').join(''); },
-    set innerHTML(v) {
-      children.length = 0;
-      if (v) {
-        const tmp = document.createElement('div');
-        tmp.innerHTML = v;
-        for (let i = 0; i < tmp.childNodes.length; i++) children.push(tmp.childNodes[i]);
-      }
-    },
-    get childNodes() { return children; },
-    get firstChild() { return children[0] || null; },
-    get lastChild() { return children[children.length - 1] || null; },
-    get firstElementChild() { return children.find(c => c.nodeType === 1) || null; },
-    get children() { return children.filter(c => c.nodeType === 1); },
-    appendChild(c) {
-      if (c) {
-        children.push(c);
-        try { c.parentNode = shadow; } catch (_) { /* parentNode is getter-only on Node, ignore */ }
-      }
-      return c;
-    },
-    insertBefore(n, ref) {
-      if (!n) return n;
-      if (!ref) { shadow.appendChild(n); return n; }
-      const idx = children.indexOf(ref);
-      if (idx >= 0) {
-        children.splice(idx, 0, n);
-        try { n.parentNode = shadow; } catch (_) {}
-      }
-      else shadow.appendChild(n);
-      return n;
-    },
-    removeChild(c) { const idx = children.indexOf(c); if (idx >= 0) children.splice(idx, 1); return c; },
-    replaceChild(n, o) {
-      const idx = children.indexOf(o);
-      if (idx >= 0) {
-        children[idx] = n;
-        try { n.parentNode = shadow; } catch (_) {}
-      }
-      return o;
-    },
-    querySelector(s) {
-      for (const c of children) {
-        if (c.matches && c.matches(s)) return c;
-        if (c.querySelector) { const r = c.querySelector(s); if (r) return r; }
-      }
-      return null;
-    },
-    querySelectorAll(s) {
-      const results = [];
-      for (const c of children) {
-        if (c.matches && c.matches(s)) results.push(c);
-        if (c.querySelectorAll) results.push(...c.querySelectorAll(s));
-      }
-      return results;
-    },
-    getElementById(id) { return shadow.querySelector('#' + id); },
-    contains(n) { return children.includes(n); },
-    getRootNode() { return shadow; },
-    get ownerDocument() { return document; },
-    get nodeType() { return 11; }, // DOCUMENT_FRAGMENT_NODE
-    get nodeName() { return '#document-fragment'; },
-    addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-    cloneNode() { return shadow; },
-  };
-  this.shadowRoot = shadow;
+  // ShadowRootInit.mode is a required WebIDL enum — a missing or non-{open,closed}
+  // value is a TypeError (thrown during dictionary conversion, before any DOM step).
+  const mode = (init === null || init === undefined) ? undefined : init.mode;
+  if (mode !== 'open' && mode !== 'closed') {
+    throw new TypeError("Failed to execute 'attachShadow' on 'Element': The provided value '" +
+      String(mode) + "' is not a valid enum value of type ShadowRootMode.");
+  }
+  // "If element is not a shadow host candidate, throw a NotSupportedError."
+  const local = host.localName;
+  const ns = host.namespaceURI;
+  const htmlNs = (ns === _HTML_NS || ns === null || ns === undefined);
+  const validHost = htmlNs && !!local && (_SHADOW_HOST_NAMES.has(local) || local.indexOf('-') >= 0);
+  if (!validHost) {
+    throw new DOMException("Failed to execute 'attachShadow' on 'Element': This element does not " +
+      "support attachShadow", "NotSupportedError");
+  }
+  // "If element already hosts a shadow root, throw a NotSupportedError."
+  if (host._shadowRoot) {
+    throw new DOMException("Failed to execute 'attachShadow' on 'Element': Shadow root cannot be " +
+      "created on a host which already hosts a shadow tree.", "NotSupportedError");
+  }
+  const nid = +_dom("create_document_fragment");
+  _allowShadowConstruct = true;
+  let shadow;
+  try { shadow = new ShadowRoot(nid, host, mode); } finally { _allowShadowConstruct = false; }
+  if (init && init.delegatesFocus) shadow._delegatesFocus = true;
+  if (init && init.slotAssignment === 'manual') shadow._slotAssignment = 'manual';
+  if (init && init.clonable) shadow._clonable = true;
+  if (init && init.serializable) shadow._serializable = true;
+  host._shadowRoot = shadow;
   return shadow;
 };
 
 _markNative(Element.prototype.attachShadow);
+
+// Element.shadowRoot (DOM §4.9): the element's OPEN shadow root, else null. A closed
+// shadow root is hidden from script. Defined only on Element.prototype (not Node /
+// Document / DocumentFragment), matching where attachShadow lives.
+Object.defineProperty(Element.prototype, 'shadowRoot', {
+  configurable: true,
+  enumerable: true,
+  get() { const s = this._shadowRoot; return (s && s._shadowMode === 'open') ? s : null; },
+});
 
 globalThis.AudioContext = class AudioContext {
   constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; }

@@ -10,13 +10,21 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #137).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #138).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+| `shadow-dom/Element-interface-attachShadow.html` | 2/6 | **6/6** | ✅ 100% | **Quest #138 The Shadowed Verdict.** `attachShadow` rewritten to the DOM algorithm: required `mode` enum (missing/non-{open,closed} → TypeError), non-safelisted-host → NotSupportedError, already-hosts → NotSupportedError, returns a real `instanceof ShadowRoot`. **+4.** |
+| `shadow-dom/Element-interface-shadowRoot-attribute.html` | 0/3 | **3/3** | ✅ 100% | **Quest #138 The Shadowed Verdict.** `Element.prototype.shadowRoot` getter — the element's OPEN shadow root else null (closed → null); defined only on `Element.prototype`. **+3.** |
+| `dom/nodes/rootNode.html` | 1/5 | **5/5** | ✅ 100% | **Quest #138 The Shadowed Verdict.** `Node.getRootNode(options)` real: walk the `parent` chain to the topmost node (was a stub returning `document`); `composed:true` jumps from a shadow root to its host's tree. **+4.** |
+| `shadow-dom/ShadowRoot-interface.html` | 6/12 | **8/12** | 🟡 67% | **Quest #138 The Shadowed Verdict.** `class ShadowRoot extends DocumentFragment` (real backing node, `instanceof DocumentFragment`), non-constructible (`new ShadowRoot()` throws), `host`/`mode`. **+2.** Residual 4 = `activeElement` (needs in-shadow focus tracking) + `styleSheets` (needs connected-shadow `style.sheet`). |
+| `shadow-dom/Element-interface-attachShadow-custom-element.html` | 1/6 | **4/6** | 🟡 67% | **Quest #138 The Shadowed Verdict.** Custom-element hosts (hyphenated names) may attach a shadow; mode/instanceof/already-hosts. **+3.** Residual 2 = custom-element upgrade/reactions. |
+| `shadow-dom/getElementById-dynamic-001.html` | 0/1 | **1/1** | ✅ 100% | **Quest #138 The Shadowed Verdict.** `ShadowRoot.getElementById` (inherited from `DocumentFragment`) scoped to the backing node — keeps working after the host is detached. **+1.** |
+| `dom/nodes/DocumentFragment-getElementById.html` | 3/5 | **4/5** | 🟡 80% | **Quest #138 The Shadowed Verdict.** `DocumentFragment.getElementById` real (first element in tree order, empty-string id never matches); was a `null` stub. **+1.** Residual 1 = `<template>.content` scoping. |
+| `html/dom/aria-element-reflection.html` | 22/27 | **24/27** | 🟡 89% | **Quest #138 The Shadowed Verdict.** Real `attachShadow`/`ShadowRoot instanceof DocumentFragment` unlocked 2 shadow-host reflection cases. **+2.** Residual 3 = shadow-inclusive-ancestor scope discrimination. |
 | `html/semantics/forms/the-label-element/labelable-elements.html` | 12/26 | **26/26** | ✅ 100% | **Quest #137 The Labeled Verdict.** `labels` on labelable elements (button/input-not-hidden/meter/output/progress/select/textarea) as a [SameObject] live NodeList; `label.control`; non-labelable elements have no `labels` (→ undefined). **+14.** |
-| `html/semantics/forms/the-label-element/label-attributes.sub.html` | 2/20 | **19/20** | 🟡 95% | **Quest #137 The Labeled Verdict.** Tree-scoped label association (walk `parentNode` to the real root since `getRootNode()` is a stub): detached labels/controls, cross-move liveness, `label.htmlFor`, `label.form` (= control's form owner, not the label's ancestor form). **+17.** Residual 1 = shadow DOM (`attachShadow`/`ShadowRoot instanceof DocumentFragment`) — standing lead. |
+| `html/semantics/forms/the-label-element/label-attributes.sub.html` | 2/20 | **20/20** | ✅ 100% | **Quest #137 → #138.** Tree-scoped label association (#137); the last residual (a `<label>` in a shadow tree) fell to **Quest #138 The Shadowed Verdict**'s real `attachShadow`/`ShadowRoot instanceof DocumentFragment`. **+18 total (#138: +1).** |
 | `html/semantics/forms/the-button-element/button-validation.html` | 3/6 | **6/6** | ✅ 100% | **Quest #137 The Labeled Verdict.** `button.type` enumerated {submit,reset,button}; missing/invalid → submit (was returning the raw attr / empty). **+3.** |
 | `html/semantics/forms/the-button-element/button-type.html` | 0/2 | **2/2** | ✅ 100% | **Quest #137 The Labeled Verdict.** `button.type` canonical keyword, lowercased. **+2.** |
 | `html/semantics/forms/the-button-element/button-type-enumerated-ascii-case-insensitive.html` | 0/2 | **2/2** | ✅ 100% | **Quest #137 The Labeled Verdict.** Case-insensitive keyword match on `button.type`. **+2.** |
