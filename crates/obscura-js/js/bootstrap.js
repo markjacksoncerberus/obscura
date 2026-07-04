@@ -15218,7 +15218,21 @@ function _cvCompute(el) {
       const files = el.files;
       flags.valueMissing = !files || files.length === 0;
     } else if (tag === "select") {
-      flags.valueMissing = el.value === "";
+      // Missing iff no option is selected, or the only selected one is the
+      // placeholder label option: the first option in the list, a direct child of
+      // the select (not in an optgroup) with an empty value, when the select is
+      // single-line (display size 1, not multiple). (HTML §the-select-element.)
+      const opts = el.options;
+      const n = opts.length;
+      let selCount = 0, firstSelected = null;
+      for (let i = 0; i < n; i++) { if (opts[i].selected) { selCount++; if (!firstSelected) firstSelected = opts[i]; } }
+      let ph = null;
+      const ds = el.size > 0 ? el.size : (el.multiple ? 4 : 1);
+      if (!el.multiple && ds === 1 && n > 0) {
+        const first = opts[0];
+        if (first.parentNode === el && first.value === "") ph = first;
+      }
+      flags.valueMissing = (selCount === 0) || (selCount === 1 && firstSelected === ph);
     } else if (tag === "input" && (_CV_TEXTLIKE.has(t) || _CV_TYPED.has(t)) || tag === "textarea") {
       flags.valueMissing = _cvIsMutable(el) && _cvValueEmpty(el);
     }
@@ -15888,6 +15902,341 @@ function _cvReflLong(proto, prop, attr) {
       if (v !== oldVal) _selCursorToEnd(this); // cursor to end only on real change
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// The <select> / <option> / <datalist> model + the selectedness algorithm.
+//   HTMLOptionsCollection · HTMLSelectElement (options/value/selectedIndex/
+//   selectedOptions/add/remove/item/namedItem/length/size) · HTMLOptionElement
+//   (value/label/text/index/selected/defaultSelected/form + Option()).
+// Installed on the subclass prototypes so they SHADOW the generic localName-gated
+// getters on Element.prototype (same idiom as the input value model above).
+//
+// Selectedness model (HTML §the-option-element / §the-select-element). Each option
+// carries two booleans — selectedness (_optSel) and dirtiness (_optDirty) — lazily
+// seeded from the `selected` content attribute. The IDL `selected` setter sets
+// dirtiness; content-attribute changes only touch selectedness while NOT dirty.
+// The "selectedness setting algorithm" (auto-select the first non-disabled option
+// when a single-line select has none selected; collapse a markup double-selection
+// to the last) runs at READ time — the spec runs it on parse/insert/remove/reset,
+// hooks we lack, so read-time reconciliation reproduces the same observable state.
+// The one thing read-time can't infer is a *deliberate* empty selection
+// (`selectedIndex = -1`), so the value/selectedIndex setters set `_noAutoSelect`
+// to suppress the auto-select-first step until the next selection-establishing act
+// (an option `selected` setter, an attribute change, or a form reset) clears it.
+// ---------------------------------------------------------------------------
+{
+  const HTML_NS = _HTML_NS;
+  // The list of options of a select (HTML "get the list of options"): a tree-order
+  // descendant walk collecting every <option>, descending through ordinary elements
+  // (so an <option> nested in a <div> counts) but never into an <option>'s subtree
+  // nor into an <optgroup> that itself has an <optgroup> ancestor.
+  const _listOfOptions = (sel) => {
+    const out = [];
+    const walk = (node, inOptgroup) => {
+      for (const c of node.children) {
+        const ln = c.localName;
+        if (ln === "option") out.push(c);              // append; don't descend
+        else if (ln === "optgroup") { if (!inOptgroup) walk(c, true); } // skip nested optgroups
+        else walk(c, inOptgroup);                       // descend into other elements
+      }
+    };
+    walk(sel, false);
+    return out;
+  };
+  // The <select> an option belongs to (through at most one <optgroup>), else null.
+  const _ownerSelect = (o) => {
+    const p = o.parentNode;
+    if (!p) return null;
+    if (p.localName === "select") return p;
+    if (p.localName === "optgroup") { const g = p.parentNode; if (g && g.localName === "select") return g; }
+    return null;
+  };
+  const _optDisabled = (o) => {
+    if (o.hasAttribute("disabled")) return true;
+    const p = o.parentNode;
+    return !!(p && p.localName === "optgroup" && p.hasAttribute("disabled"));
+  };
+  // display size = parsed non-negative `size`, else 4 if multiple else 1.
+  const _displaySize = (sel) => {
+    const s = sel.getAttribute("size");
+    if (s != null) { const m = /^[ \t\n\f\r]*([0-9]+)/.exec(s); if (m) return parseInt(m[1], 10); }
+    return sel.multiple ? 4 : 1;
+  };
+  const _ensureOpt = (o) => {
+    if (o._optInit === undefined) { o._optSel = o.hasAttribute("selected"); o._optDirty = false; o._optInit = true; }
+  };
+  // The "text of an option": strip-and-collapse ASCII whitespace over the data of
+  // all Text descendants in tree order, excluding descendants of <script>.
+  const _optText = (o) => {
+    let s = "";
+    const rec = (node) => {
+      for (const c of node.childNodes) {
+        const t = c.nodeType;
+        if (t === 3) s += c.data;
+        else if (t === 1) { if (c.localName === "script") continue; rec(c); }
+      }
+    };
+    rec(o);
+    return s.replace(/[ \t\n\f\r]+/g, " ").replace(/^[ \t\n\f\r]+|[ \t\n\f\r]+$/g, "");
+  };
+  // value/label fall back to the option's text unless the attribute is present in
+  // the NULL namespace (a namespaced `value`/`label` via setAttributeNS does not count).
+  const _optValue = (o) => { _ensureOpt(o); const v = o.getAttributeNS(null, "value"); return v !== null ? v : _optText(o); };
+
+  // The selectedness setting algorithm, run at read time (see header note).
+  const _runSelectedness = (sel) => {
+    if (!sel || sel.multiple) return;
+    const opts = _listOfOptions(sel);
+    let trueOnes = [];
+    for (const o of opts) { _ensureOpt(o); if (o._optSel) trueOnes.push(o); }
+    if (trueOnes.length >= 2) {
+      const keep = trueOnes[trueOnes.length - 1];
+      for (const o of trueOnes) if (o !== keep) o._optSel = false;
+      trueOnes = [keep];
+    }
+    if (trueOnes.length === 0 && !sel._noAutoSelect && _displaySize(sel) === 1) {
+      for (const o of opts) if (!_optDisabled(o)) { o._optSel = true; break; }
+    }
+  };
+  // Single-select invariant: when one option becomes selected, the rest go false.
+  const _deselectOthers = (sel, keep) => {
+    if (sel.multiple) return;
+    for (const other of _listOfOptions(sel)) if (other !== keep) { _ensureOpt(other); other._optSel = false; }
+  };
+
+  // Mirror the list of options onto the select's own numeric properties so the
+  // indexed getter `select[i]` works (elements aren't Proxy-wrapped). Refreshed
+  // from the length/options getters — which the tests read right before indexing.
+  const _syncIndices = (sel) => {
+    const opts = _listOfOptions(sel);
+    for (const k of Object.getOwnPropertyNames(sel))
+      if (/^(0|[1-9][0-9]*)$/.test(k) && (+k) >= opts.length) delete sel[k];
+    for (let i = 0; i < opts.length; i++)
+      Object.defineProperty(sel, String(i), { value: opts[i], writable: true, enumerable: false, configurable: true });
+  };
+  const _isAncestorOf = (anc, node) => { for (let p = node; p; p = p.parentNode) if (p === anc) return true; return false; };
+
+  // Shared add(element, before?) for HTMLSelectElement + HTMLOptionsCollection.
+  const _selectAdd = (sel, element, before) => {
+    if (!sel) return;
+    if (_isAncestorOf(element, sel))
+      throw new DOMException("The node to be inserted is an ancestor of the select element.", "HierarchyRequestError");
+    let reference = null;
+    if (before != null && typeof before === "object") {
+      if (before === element) return;
+      if (!_isAncestorOf(sel, before))
+        throw new DOMException("The reference node is not a descendant of the select element.", "NotFoundError");
+      reference = before;
+    } else if (typeof before === "number") {
+      const opts = _listOfOptions(sel); const bi = before | 0;
+      reference = (bi >= 0 && bi < opts.length) ? opts[bi] : null;
+    }
+    if (before === element) return;
+    const parent = reference ? reference.parentNode : sel;
+    parent.insertBefore(element, reference || null);
+    _syncIndices(sel);
+  };
+  const _selectRemoveIndex = (sel, index) => {
+    if (!sel) return;
+    const opts = _listOfOptions(sel); const i = index | 0;
+    if (i < 0 || i >= opts.length) return;
+    const o = opts[i]; if (o.parentNode) o.parentNode.removeChild(o);
+    _syncIndices(sel);
+  };
+  const _optionsSetLength = (sel, v) => {
+    if (!sel) return;
+    const n = v >>> 0, opts = _listOfOptions(sel), cur = opts.length;
+    if (n > cur) { for (let i = 0; i < n - cur; i++) sel.appendChild(globalThis.document.createElement("option")); }
+    else if (n < cur) { for (let i = cur - 1; i >= n; i--) { const o = opts[i]; if (o.parentNode) o.parentNode.removeChild(o); } }
+    _syncIndices(sel);
+  };
+  // HTMLOptionsCollection indexed setter: null removes; past-end pads with empty
+  // <option>s then places; in-range replaces (HTML "setter" steps).
+  const _optionsSetIndexed = (sel, index, opt) => {
+    if (!sel) return;
+    if (opt == null) { _selectRemoveIndex(sel, index); return; }
+    const opts = _listOfOptions(sel), length = opts.length, n = index - length;
+    if (n > 0) for (let i = 0; i < n; i++) sel.appendChild(globalThis.document.createElement("option"));
+    if (n >= 0) sel.appendChild(opt);
+    else { const ref = opts[index]; ref.parentNode.replaceChild(opt, ref); }
+    _syncIndices(sel);
+  };
+
+  // ---- HTMLOptionsCollection (a real interface: indexed get/set, settable length,
+  // add/remove/selectedIndex, named getter via namedItem, iterable) --------------
+  globalThis.HTMLOptionsCollection = class HTMLOptionsCollection extends globalThis.HTMLCollection {
+    get [Symbol.toStringTag]() { return "HTMLOptionsCollection"; }
+  };
+  const _OC = globalThis.HTMLOptionsCollection.prototype;
+  const _colSelect = new WeakMap(); // collection proxy -> its <select>
+  Object.defineProperty(_OC, "length", {
+    configurable: true, get() { return _hcItems(this).length; },
+    set(v) { _optionsSetLength(_colSelect.get(this) || null, v); },
+  });
+  Object.defineProperty(_OC, "selectedIndex", {
+    configurable: true,
+    get() { const s = _colSelect.get(this); return s ? s.selectedIndex : -1; },
+    set(v) { const s = _colSelect.get(this); if (s) s.selectedIndex = v; },
+  });
+  _OC.add = function (el, before) { _selectAdd(_colSelect.get(this) || null, el, before); };
+  _OC.remove = function (i) { _selectRemoveIndex(_colSelect.get(this) || null, i); };
+  const _makeOptionsCollection = (sel) => {
+    const refresh = () => _listOfOptions(sel);
+    const supportedNames = () => _hcSupportedNames(refresh());
+    const namedGet = (key) => _hcNamedItem(refresh(), key) ?? undefined;
+    const target = Object.create(_OC);
+    const proxy = new Proxy(target, {
+      get(t, p, r) {
+        if (_hcIsIndex(p)) { const it = refresh(), i = +p; return i < it.length ? it[i] : undefined; }
+        if (typeof p === "string" && !Reflect.has(t, p)) { const el = namedGet(p); if (el !== undefined) return el; }
+        return Reflect.get(t, p, r);
+      },
+      set(t, p, v) {
+        if (_hcIsIndex(p)) { _optionsSetIndexed(sel, +p, v); return true; }
+        if (p === "length") { _optionsSetLength(sel, v); return true; }
+        if (p === "selectedIndex") { sel.selectedIndex = v; return true; }
+        return Reflect.set(t, p, v);
+      },
+      has(t, p) {
+        if (_hcIsIndex(p)) return +p < refresh().length;
+        if (Reflect.has(t, p)) return true;
+        return typeof p === "string" && namedGet(p) !== undefined;
+      },
+      ownKeys(t) {
+        const keys = [], n = refresh().length;
+        for (let i = 0; i < n; i++) keys.push(String(i));
+        for (const nm of supportedNames()) if (!keys.includes(nm)) keys.push(nm);
+        for (const k of Reflect.ownKeys(t)) if (!keys.includes(k)) keys.push(k);
+        return keys;
+      },
+      getOwnPropertyDescriptor(t, p) {
+        if (_hcIsIndex(p)) {
+          const it = refresh(), i = +p;
+          if (i < it.length) return { value: it[i], writable: true, enumerable: true, configurable: true };
+          return undefined;
+        }
+        if (typeof p === "string" && !Reflect.getOwnPropertyDescriptor(t, p)) {
+          const el = namedGet(p);
+          if (el !== undefined) return { value: el, writable: false, enumerable: false, configurable: true };
+        }
+        return Reflect.getOwnPropertyDescriptor(t, p);
+      },
+    });
+    _hcRefresh.set(proxy, refresh);
+    _colSelect.set(proxy, sel);
+    return proxy;
+  };
+
+  // ---- HTMLOptionElement IDL ---------------------------------------------------
+  const _Opt = globalThis.HTMLOptionElement.prototype;
+  // The `selected` content-attribute change steps: while the option is not dirty,
+  // selectedness tracks the attribute; the change is also a selectedness trigger.
+  const _optSelAttrChanged = (o, present) => {
+    _ensureOpt(o);
+    if (o._optDirty) return;
+    o._optSel = present;
+    const s = _ownerSelect(o);
+    if (s) { s._noAutoSelect = false; if (present) _deselectOthers(s, o); }
+  };
+  const _ElSetAttr = Element.prototype.setAttribute;
+  const _ElRemoveAttr = Element.prototype.removeAttribute;
+  _Opt.setAttribute = function (name, value) {
+    _ElSetAttr.call(this, name, value);
+    if (String(name).toLowerCase() === "selected") _optSelAttrChanged(this, true);
+  };
+  _Opt.removeAttribute = function (name) {
+    _ElRemoveAttr.call(this, name);
+    if (String(name).toLowerCase() === "selected") _optSelAttrChanged(this, false);
+  };
+  Object.defineProperties(_Opt, {
+    value: { configurable: true, get() { return _optValue(this); }, set(v) { this.setAttribute("value", v == null ? "" : String(v)); } },
+    label: { configurable: true, get() { const v = this.getAttributeNS(null, "label"); return v !== null ? v : _optText(this); }, set(v) { this.setAttribute("label", v == null ? "" : String(v)); } },
+    text: { configurable: true, get() { return _optText(this); }, set(v) { this.textContent = v == null ? "" : String(v); } },
+    index: { configurable: true, get() { const s = _ownerSelect(this); if (!s) return 0; const i = _listOfOptions(s).indexOf(this); return i < 0 ? 0 : i; } },
+    defaultSelected: { configurable: true, get() { return this.hasAttribute("selected"); }, set(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); } },
+    selected: {
+      configurable: true,
+      get() { _ensureOpt(this); const s = _ownerSelect(this); if (s) _runSelectedness(s); return this._optSel; },
+      set(v) {
+        _ensureOpt(this); this._optDirty = true; const nv = !!v; this._optSel = nv;
+        const s = _ownerSelect(this);
+        if (s) { s._noAutoSelect = false; if (nv) _deselectOthers(s, this); }
+      },
+    },
+    form: { configurable: true, get() { const s = _ownerSelect(this); return s ? s.form : null; } },
+  });
+  // The Option() legacy factory function: new Option(text, value, defaultSelected, selected).
+  const _Option = function Option(text, value, defaultSelected, selected) {
+    const opt = globalThis.document.createElement("option");
+    if (text !== undefined && text !== "") opt.appendChild(globalThis.document.createTextNode(String(text)));
+    if (value !== undefined) _ElSetAttr.call(opt, "value", String(value));
+    if (defaultSelected) opt.setAttribute("selected", ""); // truthy -> content attr (change steps)
+    _ensureOpt(opt); opt._optSel = !!selected; opt._optDirty = false; // 4th arg wins; not dirty
+    return opt;
+  };
+  _Option.prototype = globalThis.HTMLOptionElement.prototype;
+  globalThis.Option = _Option;
+
+  // ---- HTMLSelectElement IDL ---------------------------------------------------
+  const _Sel = globalThis.HTMLSelectElement.prototype;
+  Object.defineProperties(_Sel, {
+    options: { configurable: true, get() { if (!this._optionsColl) this._optionsColl = _makeOptionsCollection(this); _syncIndices(this); return this._optionsColl; } },
+    length: { configurable: true, get() { _syncIndices(this); return _listOfOptions(this).length; }, set(v) { _optionsSetLength(this, v); } },
+    selectedOptions: {
+      configurable: true,
+      get() {
+        if (!this._selectedOptionsColl) {
+          const sel = this;
+          this._selectedOptionsColl = _makeHTMLCollection(() => { _runSelectedness(sel); return _listOfOptions(sel).filter((o) => { _ensureOpt(o); return o._optSel; }); });
+        }
+        return this._selectedOptionsColl;
+      },
+    },
+    selectedIndex: {
+      configurable: true,
+      get() { _runSelectedness(this); const opts = _listOfOptions(this); for (let i = 0; i < opts.length; i++) { _ensureOpt(opts[i]); if (opts[i]._optSel) return i; } return -1; },
+      set(v) {
+        const idx = v | 0, opts = _listOfOptions(this); let matched = false;
+        for (const o of opts) { _ensureOpt(o); o._optDirty = true; o._optSel = false; }
+        if (idx >= 0 && idx < opts.length) { opts[idx]._optSel = true; matched = true; }
+        this._noAutoSelect = !matched; _syncIndices(this);
+      },
+    },
+    value: {
+      configurable: true,
+      get() { _runSelectedness(this); const opts = _listOfOptions(this); for (const o of opts) { _ensureOpt(o); if (o._optSel) return _optValue(o); } return ""; },
+      set(v) {
+        const val = v == null ? "" : String(v), opts = _listOfOptions(this); let matched = false;
+        for (const o of opts) { _ensureOpt(o); o._optDirty = true; if (!matched && _optValue(o) === val) { o._optSel = true; matched = true; } else o._optSel = false; }
+        this._noAutoSelect = !matched; _syncIndices(this);
+      },
+    },
+    size: { configurable: true, get() { const s = this.getAttribute("size"); if (s == null) return 0; const n = parseInt(s, 10); return (isNaN(n) || n < 0) ? 0 : n; }, set(v) { this.setAttribute("size", String(v >>> 0)); } },
+    item: { configurable: true, writable: true, value: function (i) { const opts = _listOfOptions(this); i = i >>> 0; return i < opts.length ? opts[i] : null; } },
+    namedItem: { configurable: true, writable: true, value: function (name) { return _hcNamedItem(_listOfOptions(this), String(name)); } },
+    add: { configurable: true, writable: true, value: function (element, before) { _selectAdd(this, element, before === undefined ? null : before); } },
+    remove: { configurable: true, writable: true, value: function (index) { if (arguments.length === 0) { Element.prototype.remove.call(this); return; } _selectRemoveIndex(this, index); } },
+  });
+
+  // ---- HTMLDataListElement.options (live HTMLCollection of descendant options) --
+  Object.defineProperty(globalThis.HTMLDataListElement.prototype, "options", {
+    configurable: true,
+    get() { if (!this._dlOptionsColl) { const dl = this; this._dlOptionsColl = _makeHTMLCollection(() => [...dl.querySelectorAll("option")]); } return this._dlOptionsColl; },
+  });
+
+  // Form reset (HTML "reset algorithm"): restore each option's selectedness from
+  // its `selected` content attribute, clear dirtiness, then re-run selectedness.
+  const _resetSelect = (sel) => {
+    for (const o of _listOfOptions(sel)) { _ensureOpt(o); o._optSel = o.hasAttribute("selected"); o._optDirty = false; }
+    sel._noAutoSelect = false; _runSelectedness(sel);
+  };
+  globalThis.HTMLFormElement.prototype.reset = function () {
+    for (const f of this.elements) {
+      if (f.localName === "select") { _resetSelect(f); continue; }
+      if ("value" in f) f.value = "";
+    }
+  };
 }
 
 globalThis.SVGElement = Element;
