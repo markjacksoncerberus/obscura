@@ -153,6 +153,34 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-04 (Quest #140 The Retargeted Verdict — full DOM §2.9 event dispatch with shadow retargeting + `composedPath()`, +107):**
+Followed #139's pointer into **composed events / event retargeting** (`shadow-dom/event-*`) — the frontier stood at
+~14/110. Event dispatch built a flat `target → parentNode → document → window` path: `event.target` was set once and
+never retargeted, `composedPath()` returned that flat path (no closed-tree hiding, no slot/shadow crossing),
+`relatedTarget` was never retargeted. THE FIX (all `bootstrap.js`, no Rust): rewrote `_dispatchSpec`,
+`_invokeListeners`, and `composedPath()` to the DOM Standard §2.9 dispatch algorithm. New shadow-aware helpers
+(`_isSR`/`_nodeRoot`/`_shadowIncAncestor`/`_retarget`/`_assignedSlotOf`/`_getEventParent`) replace the old flat
+`_eventParent`. `_dispatchSpec` builds an **event path of structs** `{it, sat, rt, rct, sct}` via the spec's
+`while(parent)` walk (crossing assigned-slottable→slot and shadow-root→host, tracking the evolving target for the
+shadow-inclusive-ancestor branch, slot-in-closed-tree bookkeeping, and the step-5 skip gate); `event.target` per
+struct = last non-null shadow-adjusted target at-or-before. `_invokeListeners` sets `currentTarget`/`target`/
+`relatedTarget` per struct and manages **`window.event` per struct** (exposed only when the invocation target is NOT
+in a shadow tree). `composedPath()` reimplemented as the spec's closed-tree-visibility walk over the `rct`/`sct`
+flags. **clear-targets computed BEFORE listeners run** (a listener may move the target across a shadow boundary).
+Plus: `Element.click()` now fires its `MouseEvent` with `composed:true`. RESULTS (stash-verified): event-inside-slotted-node
+0→20, event-with-related-target 0→18, event-post-dispatch 3→16, Extensions-to-Event-Interface 8→16,
+event-composed-path-with-related-target 4→13, event-inside-shadow-tree 0→12, event-composed-path 1→11, event-composed
+5→9, capturing-and-bubbling-…-across-shadow-trees 1→5, event-post-dispatch-no-listeners 0→5,
+event-composed-path-after-dom-mutation 0→2, event-dispatch-order.tentative 0→1, event-global 4→5 = **+107 across 13
+tests**. ZERO regressions (qsa 1975, classlist 1420, Node-properties 726, cloneNode 135, createElement 147,
+getElementsByTagName 19, slots 26, slots-fallback 13, ShadowRoot-interface 8/12, type-change-state 380,
+EventTarget-dispatchEvent 25, Event-propagation 7 — all held; checkbox 1/6 + detached-input 4/12 identical
+before/after). CAPS: `focus-within-shadow` (in-shadow focus tracking), `slotchange` (query-lazy model, tests HANG),
+declarative shadow DOM, input-activation `input`/`change` events. NEXT: **`slotchange`** (needs a signal-a-slot-change
+queue + microtask flush; unlocks imperative-slot-api 9/16 residual), then **declarative shadow DOM**
+(`<template shadowrootmode>`), then in-shadow focus (`ShadowRoot.activeElement` → focus-within-shadow + the
+ShadowRoot-interface 4/12 residual). Scroll `tickets/140-the-retargeted-verdict.md`.
+
 **Session 2026-07-04 (Quest #139 The Slotted Verdict — the slot-assignment algorithm + a real `<template>.content`, +185):**
 Followed #138's pointer into **slots**, and found a second, deeper prize underneath: `<template>` content was
 silently broken engine-wide. (1) **Slots** (all `bootstrap.js`, computed lazily on every query — no dirty

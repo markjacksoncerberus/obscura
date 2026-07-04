@@ -2445,7 +2445,7 @@ class Element extends Node {
     let _preChecked = null;
     if (_ct === 'checkbox') { _preChecked = this.checked; this.checked = !this.checked; }
     else if (_ct === 'radio') { _preChecked = this.checked; this.checked = true; }
-    const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
+    const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true, composed: true}));
     if (cancelled && _preChecked !== null) this.checked = _preChecked;
     if (!cancelled) {
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
@@ -4354,49 +4354,115 @@ const _evtRegKey = function(t) {
   }
   return null;
 };
-// The parent in the event-propagation tree: a node's parentNode, a document's
-// browsing-context window (defaultView), and nothing above a window.
-const _eventParent = function(node) {
-  if (!node || node === globalThis) return null;
-  if (node.nodeType === 9) return node.defaultView || null;
-  if (typeof node.nodeType !== 'number') return null; // window-like target
+// ---- Shadow-tree event dispatch helpers (DOM §2.9 retargeting) ----
+// A ShadowRoot is the only fragment with a `_shadowHost`; that pointer is our
+// "this node is a shadow root" test throughout dispatch.
+const _isSR = (n) => !!(n && n._shadowHost);
+// A node's root: the topmost node reached by walking parentNode. A shadow tree's
+// nodes bottom out at their ShadowRoot (fragments have no parentNode), so this
+// returns the ShadowRoot for anything inside a shadow tree — exactly what the
+// spec's "node's root" means for retargeting.
+const _nodeRoot = (n) => {
+  let cur = n, p;
+  while (cur && (p = cur.parentNode)) cur = p;
+  return cur;
+};
+// Is `anc` a shadow-including inclusive ancestor of `node`? Walk node's parent
+// chain, jumping from a shadow root to its host so composition is crossed.
+const _shadowIncAncestor = (anc, node) => {
+  let cur = node;
+  while (cur) {
+    if (cur === anc) return true;
+    let p = cur.parentNode;
+    if (!p && _isSR(cur)) p = cur._shadowHost;
+    cur = p;
+  }
+  return false;
+};
+// DOM "retarget A against B": climb A out of each shadow tree (to that tree's
+// host) until A's root is no longer a shadow root, or B lives at/under A's root.
+// A non-node A (window, null, undefined) is returned unchanged.
+const _retarget = (A, B) => {
+  while (A != null && typeof A.nodeType === 'number') {
+    const r = _nodeRoot(A);
+    if (!_isSR(r)) break;
+    if (B != null && typeof B.nodeType === 'number' && _shadowIncAncestor(r, B)) break;
+    A = r._shadowHost;
+  }
+  return A;
+};
+// The slot a slottable node is assigned to (openFlag off — event dispatch sees
+// slots in closed shadow trees too); null for non-slottables and unassigned nodes.
+const _assignedSlotOf = (n) =>
+  (n && (n.nodeType === 1 || n.nodeType === 3)) ? _findSlotFor(n, false) : null;
+// DOM "get the parent" of an EventTarget for propagation, given the event and the
+// first struct's invocation target (needed for the non-composed shadow-root stop):
+// an assigned slottable's parent is its slot; a shadow root's parent is its host
+// (or null when the event isn't composed and we'd escape the origin shadow tree);
+// a document's parent is its window; a window has no parent.
+const _getEventParent = (node, event, firstIT) => {
+  const slot = _assignedSlotOf(node);
+  if (slot) return slot;
+  if (_isSR(node)) {
+    if (!event.composed && _nodeRoot(firstIT) === node) return null;
+    return node._shadowHost;
+  }
+  if (node && node.nodeType === 9) return node.defaultView || null;
+  if (!node || typeof node.nodeType !== 'number') return null; // window-like target
   return node.parentNode || null;
 };
 // DOM §2.9 "inner invoke" for one struct of the event path: run the target's
 // listeners that match the current phase, honoring once / stopImmediatePropagation
 // and re-checking removal against the live list.
-const _invokeListeners = function(target, event, phase) {
+const _invokeListeners = function(struct, event, phase) {
   // §2.9 invoke step: if propagation was stopped, this struct is skipped entirely.
   if (event._propagationStopped) return;
+  const target = struct.it;
   event.currentTarget = target;
+  // Retargeting: event.target is this struct's shadow-adjusted target and
+  // event.relatedTarget its per-struct retargeted relatedTarget. A base Event has
+  // no relatedTarget slot, so only mutate it when one already exists.
+  event.target = struct.et;
+  if ('relatedTarget' in event) event.relatedTarget = struct.rt;
   const key = _evtRegKey(target);
   const reg = _eventRegistry[key];
   if (!reg) return;
   const listeners = (reg[event.type] || []).slice();
-  for (const e of listeners) {
-    if (event._immediatePropagationStopped) break;
-    const live = (_eventRegistry[key] || {})[event.type];
-    if (!live || live.indexOf(e) === -1) continue; // removed since the snapshot
-    if (phase === 'capturing' && !e.capture) continue;
-    if (phase === 'bubbling' && e.capture) continue;
-    if (e.once) _removeListenerByKey(key, event.type, e.handler, { capture: e.capture });
-    const h = e.handler;
-    // §2.9 inner invoke: set the event's "in passive listener flag" iff this
-    // listener is passive, so preventDefault()/returnValue=false from inside it
-    // are ignored (the canceled flag is never set). Cleared after the call so a
-    // following non-passive listener — or any post-dispatch code — can cancel.
-    event._inPassiveListener = !!e.passive;
-    try {
-      if (typeof h === 'function') {
-        h.call(target, event);
-      } else {
-        const he = h && h.handleEvent;
-        if (typeof he !== 'function')
-          throw new TypeError("Failed to invoke event listener: 'handleEvent' is not a function");
-        he.call(h, event);
-      }
-    } catch (err) { _reportError(err); }
-    event._inPassiveListener = false;
+  // Legacy window.event: per HTML "inner invoke", the current event is exposed on
+  // the global ONLY while the invocation target is NOT in a shadow tree (so shadow
+  // internals don't leak through window.event). Saved and restored around this
+  // struct's listeners.
+  const _prevWinEvent = globalThis.event;
+  const _targetInShadow = _isSR(_nodeRoot(target));
+  if (!_targetInShadow) { try { globalThis.event = event; } catch (e) {} }
+  try {
+    for (const e of listeners) {
+      if (event._immediatePropagationStopped) break;
+      const live = (_eventRegistry[key] || {})[event.type];
+      if (!live || live.indexOf(e) === -1) continue; // removed since the snapshot
+      if (phase === 'capturing' && !e.capture) continue;
+      if (phase === 'bubbling' && e.capture) continue;
+      if (e.once) _removeListenerByKey(key, event.type, e.handler, { capture: e.capture });
+      const h = e.handler;
+      // §2.9 inner invoke: set the event's "in passive listener flag" iff this
+      // listener is passive, so preventDefault()/returnValue=false from inside it
+      // are ignored (the canceled flag is never set). Cleared after the call so a
+      // following non-passive listener — or any post-dispatch code — can cancel.
+      event._inPassiveListener = !!e.passive;
+      try {
+        if (typeof h === 'function') {
+          h.call(target, event);
+        } else {
+          const he = h && h.handleEvent;
+          if (typeof he !== 'function')
+            throw new TypeError("Failed to invoke event listener: 'handleEvent' is not a function");
+          he.call(h, event);
+        }
+      } catch (err) { _reportError(err); }
+      event._inPassiveListener = false;
+    }
+  } finally {
+    try { globalThis.event = _prevWinEvent; } catch (e) {}
   }
 };
 // DOM §2.9 dispatch: build the propagation path (target -> ancestors -> document
@@ -4416,28 +4482,83 @@ const _dispatchSpec = function(target, event, fromPublic) {
   if (fromPublic) event._isTrusted = false;
   event._dispatchFlag = true;
   if (!event.target) event.target = target;
-  // Legacy window.event: reflects the event currently being dispatched (some
-  // scripts read the global `event` instead of the listener parameter).
-  const _prevWindowEvent = globalThis.event;
-  try { globalThis.event = event; } catch (e) {}
 
-  const path = [];
-  for (let n = target; n; n = _eventParent(n)) path.push(n);
-  event._composedPath = path;
-
-  // Capturing pass: root -> target (inclusive). The target struct is AT_TARGET.
-  for (let i = path.length - 1; i >= 0; i--) {
-    const item = path[i];
-    event.eventPhase = (item === target) ? 2 : 1;
-    _invokeListeners(item, event, 'capturing');
+  // DOM §2.9 "dispatch": build the event path with retargeting. Each struct is
+  // {it: invocation target, sat: shadow-adjusted target (null on pass-through
+  // structs), rt: retargeted relatedTarget, rct: root-of-closed-tree,
+  // sct: slot-in-closed-tree}. The path is ordered target-first (outward).
+  const origTarget = target;
+  const _rootOfClosed = (n) => _isSR(n) && n._shadowMode === 'closed';
+  const _related0 = _retarget(event.relatedTarget, origTarget);
+  // §2.9 step 5 gate: skip dispatch entirely when the target retargets onto its own
+  // related target (e.g. a mouseover between two nodes of the same shadow tree that
+  // collapse to one host) — unless the related target IS the target verbatim.
+  const _skipDispatch = (origTarget === _related0 && origTarget !== event.relatedTarget);
+  const structs = [];
+  if (!_skipDispatch) {
+    let evTarget = origTarget;          // the spec's evolving `target` variable
+    let slottable = _assignedSlotOf(origTarget) ? origTarget : null;
+    let slotInClosed = false;
+    structs.push({
+      it: origTarget, sat: origTarget, rt: _related0,
+      rct: _rootOfClosed(origTarget), sct: false,
+    });
+    let parent = _getEventParent(origTarget, event, origTarget);
+    while (parent) {
+      if (slottable !== null) {                  // we just stepped onto parent, a slot
+        slottable = null;
+        const sr = _shadowRootContaining(parent);
+        if (sr && sr._shadowMode === 'closed') slotInClosed = true;
+      }
+      if (_assignedSlotOf(parent)) slottable = parent;
+      const prt = _retarget(event.relatedTarget, parent);
+      if (parent === globalThis ||
+          (typeof parent.nodeType === 'number' && _shadowIncAncestor(_nodeRoot(evTarget), parent))) {
+        // Same tree as the current target (or the window): a pass-through struct.
+        structs.push({ it: parent, sat: null, rt: prt, rct: _rootOfClosed(parent), sct: slotInClosed });
+      } else if (parent === prt) {
+        parent = null;                           // stop at the (retargeted) related target
+      } else {
+        evTarget = parent;                       // crossed a shadow boundary: new target
+        structs.push({ it: parent, sat: parent, rt: prt, rct: _rootOfClosed(parent), sct: slotInClosed });
+      }
+      if (parent) parent = _getEventParent(parent, event, origTarget);
+      slotInClosed = false;
+    }
   }
-  // Bubbling pass: target -> root. Non-target structs only when the event bubbles.
-  for (let i = 0; i < path.length; i++) {
-    const item = path[i];
-    if (item === target) event.eventPhase = 2;
+  // event.target during invoke = the shadow-adjusted target of the last struct at
+  // or before this one whose shadow-adjusted target is non-null.
+  let _lastSat = null;
+  for (const s of structs) { if (s.sat) _lastSat = s.sat; s.et = _lastSat; }
+  event._composedPath = structs;
+
+  // §2.9 clear-targets — computed NOW, before any listener runs (a listener may
+  // move the target across a shadow boundary; the decision must reflect the tree
+  // as it stood at dispatch): true if the outermost shadow-adjusted struct's target
+  // or related target is inside a shadow tree, so a closed tree isn't leaked to an
+  // outside reader on cleanup.
+  let _clearStruct = null;
+  for (const s of structs) if (s.sat) _clearStruct = s;
+  const _clearTargets = !!(_clearStruct && (
+    (_clearStruct.sat != null && typeof _clearStruct.sat.nodeType === 'number' && _isSR(_nodeRoot(_clearStruct.sat))) ||
+    (_clearStruct.rt != null && typeof _clearStruct.rt.nodeType === 'number' && _isSR(_nodeRoot(_clearStruct.rt)))
+  ));
+
+  // Capturing pass: outermost struct -> target. A struct with a shadow-adjusted
+  // target (the origin target and each shadow-host boundary) is AT_TARGET.
+  for (let i = structs.length - 1; i >= 0; i--) {
+    const s = structs[i];
+    event.eventPhase = s.sat ? 2 : 1;
+    _invokeListeners(s, event, 'capturing');
+  }
+  // Bubbling pass: target -> outermost. Pass-through structs run only if the event
+  // bubbles; AT_TARGET structs always run.
+  for (let i = 0; i < structs.length; i++) {
+    const s = structs[i];
+    if (s.sat) event.eventPhase = 2;
     else if (event.bubbles) event.eventPhase = 3;
     else continue;
-    _invokeListeners(item, event, 'bubbling');
+    _invokeListeners(s, event, 'bubbling');
   }
 
   // §2.9 clean-up: clear the stop-propagation flags so the event can be dispatched
@@ -4448,7 +4569,14 @@ const _dispatchSpec = function(target, event, fromPublic) {
   event._propagationStopped = false;
   event._immediatePropagationStopped = false;
   event._dispatchFlag = false;
-  try { globalThis.event = _prevWindowEvent; } catch (e) {}
+  // Post-dispatch target = the target retargeted to the outermost tree (the value
+  // an outside reader sees), unless clear-targets hides a shadow-tree node.
+  if (_clearTargets) {
+    event.target = null;
+    if ('relatedTarget' in event) event.relatedTarget = null;
+  } else if (structs.length) {
+    event.target = structs[structs.length - 1].et;
+  }
   return !event.defaultPrevented;
 };
 // The public EventTarget.dispatchEvent: §2.8 sets isTrusted to false, then runs
@@ -13391,8 +13519,42 @@ globalThis.Event = class Event {
   get isTrusted() { return this._isTrusted === true; }
   set isTrusted(v) { this._isTrusted = !!v; }
   get srcElement() { return this.target; } // legacy alias for target
-  // The frozen propagation path during dispatch; [] when not dispatching.
-  composedPath() { return (this.currentTarget && this._composedPath) ? this._composedPath.slice() : []; }
+  // DOM §2.9 composedPath(): the propagation path visible from the current target,
+  // hiding invocation targets inside closed shadow trees the current target can't
+  // see (tracked via the per-struct root-of-closed-tree / slot-in-closed-tree
+  // flags). [] when not dispatching.
+  composedPath() {
+    const out = [];
+    const path = this._composedPath;
+    if (!this.currentTarget || !path || path.length === 0) return out;
+    const ct = this.currentTarget;
+    out.push(ct);
+    // Locate the current target's struct and its closed-subtree nesting level.
+    let ctIndex = 0, ctHidden = 0;
+    let index = path.length - 1;
+    while (index >= 0) {
+      if (path[index].rct) ctHidden++;
+      if (path[index].it === ct) { ctIndex = index; break; }
+      if (path[index].sct) ctHidden--;
+      index--;
+    }
+    // Walk inward (toward the target), prepending structs no deeper in a closed
+    // tree than the current target.
+    let curHidden = ctHidden, maxHidden = ctHidden;
+    for (index = ctIndex - 1; index >= 0; index--) {
+      if (path[index].rct) curHidden++;
+      if (curHidden <= maxHidden) out.unshift(path[index].it);
+      if (path[index].sct) { curHidden--; if (curHidden < maxHidden) maxHidden = curHidden; }
+    }
+    // Walk outward (toward the root), appending under the same visibility rule.
+    curHidden = ctHidden; maxHidden = ctHidden;
+    for (index = ctIndex + 1; index < path.length; index++) {
+      if (path[index].sct) curHidden++;
+      if (curHidden <= maxHidden) out.push(path[index].it);
+      if (path[index].rct) { curHidden--; if (curHidden < maxHidden) maxHidden = curHidden; }
+    }
+    return out;
+  }
   // Legacy aliases backed by the stop-propagation / canceled state.
   get cancelBubble() { return this._propagationStopped; }
   set cancelBubble(v) { if (v) this._propagationStopped = true; }

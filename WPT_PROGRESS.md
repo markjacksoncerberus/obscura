@@ -10,11 +10,24 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #139).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #140).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+| `shadow-dom/event-inside-slotted-node.html` | 0/20 | **20/20** | ✅ 100% | **Quest #140 The Retargeted Verdict.** Full DOM §2.9 event dispatch with retargeting — the event path crosses slots and shadow boundaries; `event.target` retargets per struct. **+20.** |
+| `shadow-dom/event-with-related-target.html` | 0/18 | **18/18** | ✅ 100% | **Quest #140 The Retargeted Verdict.** Per-struct `relatedTarget` retargeting + the "parent is (retargeted) related target" path-stop. **+18.** |
+| `shadow-dom/event-post-dispatch.html` | 3/16 | **16/16** | ✅ 100% | **Quest #140 The Retargeted Verdict.** clear-targets computed before listeners run; per-struct `window.event` (hidden in shadow trees). **+13.** |
+| `shadow-dom/event-composed-path-with-related-target.html` | 4/13 | **13/13** | ✅ 100% | **Quest #140 The Retargeted Verdict.** `composedPath()` closed-tree visibility + relatedTarget retargeting. **+9.** |
+| `shadow-dom/event-inside-shadow-tree.html` | 0/12 | **12/12** | ✅ 100% | **Quest #140 The Retargeted Verdict.** Event path = [target, parent, shadow root, host, …] with retargeted `event.target`. **+12.** |
+| `shadow-dom/event-composed-path.html` | 1/11 | **11/11** | ✅ 100% | **Quest #140 The Retargeted Verdict.** `composedPath()` spec algorithm over per-struct root-of-closed-tree / slot-in-closed-tree flags. **+10.** |
+| `shadow-dom/event-composed.html` | 5/9 | **9/9** | ✅ 100% | **Quest #140 The Retargeted Verdict.** composed events escape shadow trees; UA `click()` now `composed:true`. **+4.** |
+| `shadow-dom/capturing-and-bubbling-event-listeners-across-shadow-trees.html` | 1/5 | **5/5** | ✅ 100% | **Quest #140 The Retargeted Verdict.** **+4.** |
+| `shadow-dom/event-post-dispatch-no-listeners.html` | 0/5 | **5/5** | ✅ 100% | **Quest #140 The Retargeted Verdict.** **+5.** |
+| `shadow-dom/event-dispatch-order.tentative.html` | 0/1 | **1/1** | ✅ 100% | **Quest #140 The Retargeted Verdict.** **+1.** |
+| `shadow-dom/Extensions-to-Event-Interface.html` | 8/16 | **16/16** | ✅ 100% | **Quest #140 The Retargeted Verdict.** `composedPath()` across shadow boundaries. **+8.** |
+| `shadow-dom/event-composed-path-after-dom-mutation.html` | 0/2 | **2/2** | ✅ 100% | **Quest #140 The Retargeted Verdict.** Path frozen at dispatch, unaffected by mid-dispatch DOM mutation. **+2.** |
+| `dom/events/event-global.html` | 4/8 | **5/8** | 🟡 63% | **Quest #140 The Retargeted Verdict.** Per-struct `window.event` (undefined when the target is in a shadow tree). **+1.** |
 | `shadow-dom/slots.html` | 1/26 | **26/26** | ✅ 100% | **Quest #139 The Slotted Verdict.** The slot-assignment algorithm (find-a-slot / find-slottables / find-flattened-slottables), computed lazily on every query; named + manual modes; open-flag hides closed-tree slots. **+25.** |
 | `shadow-dom/slots-fallback.html` | 0/13 | **13/13** | ✅ 100% | **Quest #139 The Slotted Verdict.** Recursive flatten with fallback content (a slot's own slottable children when nothing is assigned). **+13.** |
 | `shadow-dom/HTMLSlotElement-interface.html` | 2/18 | **18/18** | ✅ 100% | **Quest #139 The Slotted Verdict.** `HTMLSlotElement` `name`/`assignedNodes({flatten})`/`assignedElements`. **+16.** |
