@@ -150,6 +150,24 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-03 (Quest #134 The Numeric Verdict — valueAsNumber/valueAsDate/stepUp/stepDown + temporal normalization, +119):**
+Continuation of #133: the value model was in place but its *numeric* projection was not, so every
+`valueAsNumber`/`valueAsDate`/`stepUp`/`stepDown` test died on `is not a function`. **The fix**
+(`bootstrap.js`, no Rust, all on `HTMLInputElement.prototype`) rides the constraint-validation number
+machinery already present (`_cvTyped`/`_cvStepInfo`/`_cvDefaultStepBase` + leap-year-aware parsers) and
+adds only its inverses: number→string / string→Date / Date→string projections, `valueAsNumber` (TypeError
+on ±Infinity *before* the applies check; InvalidStateError off-type), `valueAsDate` (date/month/week/time
+only; TypeError on non-null non-Date), the full `stepUp/stepDown` step algorithm (allowed step,
+`step="any"`, step base, align-or-step, min/max grid clamp, overshoot guard), and temporal value-
+sanitization **normalization** (parse→re-serialize, dropping redundant `.010`/`:00`). One reverse-
+engineered browser divergence: the step overshoot guard is skipped when the field started empty
+(only case 2 of `input-stepdown-02` needs it; the other five are spec-literal). **input-stepup 0→53,
+input-valueasdate 4→30, input-seconds-leading-zeroes 4→12, input-stepdown 0→5, input-valueasnumber-stepping
+0→7, + 8 more = +119 across 13 tests.** ZERO regressions (#133 realm held exactly: type-change-state 380,
+select-event 270, setRangeText 80, setSelectionRange 49, …; core: qsa 1975, classlist 168/175, createElement
+147, Node-properties 726, reflection-misc 4709). CAP: `input-stepup-weekmonth` could-not-run (heavy/long).
+Scroll `tickets/134-the-numeric-verdict.md`.
+
 **Session 2026-07-03 (Quest #133 The Selected Verdict — text-field selection API + input value model, +1082):**
 After the reflection realm reached ~100% (bar the URL cap), swept fresh ground and found the widest
 untapped tail: `the-input-element/type-change-state.html` at **0/380**, every subtest blocked on one

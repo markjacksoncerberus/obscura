@@ -15464,8 +15464,11 @@ function _cvReflLong(proto, prop, attr) {
         // (Non-multiple email; the "multiple" comma-split path is not modelled.)
         return _stripLTWS(_stripNewlines(v));
       case "date": case "month": case "week": case "time": case "datetime-local": {
-        const p = _TEMPORAL_PATS[t];
-        return (p && p.test(v)) ? v : "";
+        // Sanitization normalizes a valid temporal string to its canonical form
+        // (e.g. datetime-local drops redundant trailing millisecond/second zeros);
+        // anything invalid becomes the empty string. Parse then re-serialize.
+        const num = _cvTyped(t, v);
+        return num == null ? "" : _numToStr(t, num);
       }
       case "number":
         return _isValidFloatingPoint(v) ? v : "";
@@ -15563,6 +15566,160 @@ function _cvReflLong(proto, prop, attr) {
       if (this.value !== oldVal) _selCursorToEnd(this);
     },
   });
+
+  // ---- valueAsNumber / valueAsDate / stepUp / stepDown (HTML §4.10.5.4) -------
+  // The numeric projection of the value model. All the string→number machinery
+  // (`_cvTyped`, `_cvStepInfo`, `_cvDefaultStepBase`, the per-type parsers) is the
+  // same one the constraint-validation layer uses for range/step validity; here we
+  // add its inverses (number→string, Date→string) and the stepping algorithm.
+  // valueAsNumber + stepUp/stepDown apply to the "typed" set; valueAsDate is the
+  // subset that maps to a wall-clock Date (datetime-local/number/range excluded).
+  const _NUMBER_TYPES = _CV_TYPED;
+  const _DATE_TYPES = new Set(["date", "month", "week", "time"]);
+  const _pad = (n, w) => { let s = String(Math.abs(n)); while (s.length < w) s = "0" + s; return (n < 0 ? "-" : "") + s; };
+  const _msToTimeStr = (ms) => {
+    ms = ((ms % 86400000) + 86400000) % 86400000;
+    const h = Math.floor(ms / 3600000), mi = Math.floor(ms / 60000) % 60,
+          se = Math.floor(ms / 1000) % 60, fr = ms % 1000;
+    let s = _pad(h, 2) + ":" + _pad(mi, 2);
+    // The fractional part is the millisecond count as decimal digits with trailing
+    // zeros dropped: 10ms → ".01", 500ms → ".5" (NOT ".010"/".500").
+    if (se || fr) { s += ":" + _pad(se, 2); if (fr) s += "." + _pad(fr, 3).replace(/0+$/, ""); }
+    return s;
+  };
+  const _ymd = (d) => _pad(d.getUTCFullYear(), 4) + "-" + _pad(d.getUTCMonth() + 1, 2) + "-" + _pad(d.getUTCDate(), 2);
+  // ISO 8601 week string for an absolute ms (the week the instant falls in). Used
+  // both for the week number→string projection (where ms is a Monday) and for the
+  // valueAsDate setter (where the supplied Date may fall on any weekday).
+  const _weekStrFromMs = (ms) => {
+    const day = (new Date(ms).getUTCDay() + 6) % 7;             // Monday = 0
+    const thuMs = ms + (3 - day) * 86400000;                    // Thursday fixes the week-year
+    const wy = new Date(thuMs).getUTCFullYear();
+    const wk = Math.round((thuMs - (_cvIsoWeekToMs(wy, 1) + 3 * 86400000)) / 604800000) + 1;
+    return _pad(wy, 4) + "-W" + _pad(wk, 2);
+  };
+  // "Algorithm to convert a number to a string" — the inverse of `_cvTyped`.
+  function _numToStr(t, n) {
+    switch (t) {
+      case "number": case "range":   return String(n);
+      case "date":                   return _ymd(new Date(n));
+      case "month":                  { const d = new Date(Date.UTC(1970, n, 1)); return _pad(d.getUTCFullYear(), 4) + "-" + _pad(d.getUTCMonth() + 1, 2); }
+      case "week":                   return _weekStrFromMs(n);
+      case "time":                   return _msToTimeStr(n);
+      case "datetime-local":         return _ymd(new Date(n)) + "T" + _msToTimeStr(n);
+    }
+    return "";
+  }
+  // "Algorithm to convert a string to a Date object" (valueAsDate getter). Returns
+  // the absolute ms, or null when the string is not a valid value of the type.
+  function _strToDateMs(t, v) {
+    switch (t) {
+      case "date": return _cvParseDate(v);
+      case "time": return _cvParseTime(v);
+      case "week": return _cvParseWeek(v);
+      case "month": { const n = _cvParseMonth(v); return n == null ? null : Date.UTC(1970, n, 1); }
+    }
+    return null;
+  }
+  // "Algorithm to convert a Date object to a string" (valueAsDate setter). `ms` is
+  // the Date's absolute time; for week/month only the calendar fields matter.
+  function _dateMsToStr(t, ms) {
+    const d = new Date(ms);
+    switch (t) {
+      case "date": return _ymd(d);
+      case "month": return _pad(d.getUTCFullYear(), 4) + "-" + _pad(d.getUTCMonth() + 1, 2);
+      case "week": return _weekStrFromMs(ms);
+      case "time": return _msToTimeStr(ms);
+    }
+    return "";
+  }
+
+  Object.defineProperty(Input, "valueAsNumber", {
+    configurable: true,
+    get() {
+      const t = _inputType(this);
+      if (!_NUMBER_TYPES.has(t)) return NaN;
+      const n = _cvTyped(t, this.value);
+      return n == null ? NaN : n;
+    },
+    set(v) {
+      v = +v; // WebIDL unrestricted double
+      if (v === Infinity || v === -Infinity) throw new TypeError(
+        "Failed to set the 'valueAsNumber' property on 'HTMLInputElement': The value provided is infinite.");
+      const t = _inputType(this);
+      if (!_NUMBER_TYPES.has(t)) throw new DOMException(
+        "Failed to set the 'valueAsNumber' property on 'HTMLInputElement': The " +
+        "input element does not support a numeric value.", "InvalidStateError");
+      this.value = Number.isNaN(v) ? "" : _numToStr(t, v);
+    },
+  });
+
+  Object.defineProperty(Input, "valueAsDate", {
+    configurable: true,
+    get() {
+      const t = _inputType(this);
+      if (!_DATE_TYPES.has(t)) return null;
+      const ms = _strToDateMs(t, this.value);
+      return ms == null ? null : new Date(ms);
+    },
+    set(v) {
+      const t = _inputType(this);
+      if (!_DATE_TYPES.has(t)) throw new DOMException(
+        "Failed to set the 'valueAsDate' property on 'HTMLInputElement': This " +
+        "input element does not support Date values.", "InvalidStateError");
+      if (v !== null && !(v instanceof Date)) throw new TypeError(
+        "Failed to set the 'valueAsDate' property on 'HTMLInputElement': The provided value is not a Date.");
+      if (v === null) { this.value = ""; return; }
+      const ms = v.getTime();
+      this.value = Number.isNaN(ms) ? "" : _dateMsToStr(t, ms);
+    },
+  });
+
+  // The stepUp(n)/stepDown(n) algorithm (n defaults to 1). Applies to the typed
+  // set; throws InvalidStateError otherwise, or when there is no allowed value step.
+  function _stepInput(el, n, isUp) {
+    const t = _inputType(el);
+    const si = _cvStepInfo(t);
+    const _bad = (msg) => new DOMException("Failed to execute 'step" + (isUp ? "Up" : "Down") +
+      "' on 'HTMLInputElement': " + msg, "InvalidStateError");
+    if (!si) throw _bad("This form control does not support stepping.");
+    const stepAttr = el.getAttribute("step");
+    if (stepAttr != null && __asciiLower(stepAttr) === "any") throw _bad("This form control has no allowed value step.");
+    let stepNum = si.def;
+    if (stepAttr != null && stepAttr !== "") { const p = parseFloat(stepAttr); if (isFinite(p) && p > 0) stepNum = p; }
+    const stepUnit = stepNum * si.scale;
+    let minN = el.hasAttribute("min") ? _cvTyped(t, el.getAttribute("min")) : null;
+    let maxN = el.hasAttribute("max") ? _cvTyped(t, el.getAttribute("max")) : null;
+    if (t === "range") { if (minN == null) minN = 0; if (maxN == null) maxN = 100; }
+    if (minN != null && maxN != null && minN > maxN) return;      // min > max: no-op
+    // Step base: the min if valid, else the value content attribute if valid, else
+    // the per-type default (epoch/midnight/month-0, or week's 1970-W01 Monday).
+    let base = _cvDefaultStepBase(t);
+    if (minN != null) base = minN;
+    else if (el.hasAttribute("value")) { const vb = _cvTyped(t, el.getAttribute("value")); if (vb != null) base = vb; }
+    let value = _cvTyped(t, el.value);
+    const valueWasError = value == null;
+    if (valueWasError) value = 0;
+    const valueBefore = value;
+    const mult = (value - base) / stepUnit;
+    if (Math.abs(Math.round(mult) - mult) > 1e-9) {
+      // Not on the step grid: snap to the nearest aligned value in the step direction.
+      value = base + (isUp ? Math.ceil(mult) : Math.floor(mult)) * stepUnit;
+    } else {
+      value += isUp ? stepUnit * n : -stepUnit * n;
+    }
+    // Clamp back onto the [min, max] grid.
+    if (minN != null && value < minN) value = base + Math.ceil((minN - base) / stepUnit) * stepUnit;
+    if (maxN != null && value > maxN) value = base + Math.floor((maxN - base) / stepUnit) * stepUnit;
+    // Overshoot guard: a step that would move the value the wrong way past where it
+    // started is a no-op (e.g. stepUp on <input type=number value=1 max=0>). Skipped
+    // when the field started empty/unparseable — stepping an empty field snaps toward
+    // the min/max rather than doing nothing (matches Blink/Gecko; see input-stepdown-02).
+    if (!valueWasError && ((!isUp && value > valueBefore) || (isUp && value < valueBefore))) return;
+    el.value = _numToStr(t, value);
+  }
+  Object.defineProperty(Input, "stepUp",   { configurable: true, writable: true, value: function (n) { _stepInput(this, n === undefined ? 1 : (n | 0), true); } });
+  Object.defineProperty(Input, "stepDown", { configurable: true, writable: true, value: function (n) { _stepInput(this, n === undefined ? 1 : (n | 0), false); } });
 
   // The text-field selection API applies to <textarea> unconditionally and to the
   // subset of input types in _INPUT_SELECTABLE. select()'s applicability is broader

@@ -10,11 +10,24 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-03 (Quest #133).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-03 (Quest #134).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+| `html/semantics/forms/the-input-element/input-stepup.html` | 0/53 | **53/53** | ✅ 100% | **Quest #134 The Numeric Verdict.** `stepUp()/stepDown()` — the full HTML step algorithm (allowed value step, `step="any"`→InvalidStateError, step base, align-or-step, min/max grid clamp, overshoot guard), on `HTMLInputElement.prototype` over the existing constraint-validation number machinery. **+53.** |
+| `html/semantics/forms/the-input-element/input-valueasdate.html` | 4/30 | **30/30** | ✅ 100% | **Quest #134 The Numeric Verdict.** `valueAsDate` get/set for date/month/week/time (string↔Date-ms projection; month→first-day, week→Monday). **+26.** |
+| `html/semantics/forms/the-input-element/input-seconds-leading-zeroes.html` | 4/12 | **12/12** | ✅ 100% | **Quest #134 The Numeric Verdict.** `valueAsNumber` + temporal value normalization (millisecond fraction with trailing zeros dropped). **+8.** |
+| `html/semantics/forms/the-input-element/input-valueasnumber-stepping.html` | 0/7 | **7/7** | ✅ 100% | **Quest #134 The Numeric Verdict.** `valueAsNumber` round-trips through stepUp/stepDown per type. **+7.** |
+| `html/semantics/forms/the-input-element/input-stepdown-02.html` | 0/6 | **6/6** | ✅ 100% | **Quest #134 The Numeric Verdict.** stepDown min-clamp; the empty-value guard-skip divergence. **+6.** |
+| `html/semantics/forms/the-input-element/input-stepdown.html` | CNR | **5/5** | ✅ 100% | **Quest #134 The Numeric Verdict.** **+5.** |
+| `html/semantics/forms/the-input-element/input-valueasnumber-typeerror.html` | 0/4 | **4/4** | ✅ 100% | **Quest #134 The Numeric Verdict.** `valueAsNumber` setter throws TypeError on ±Infinity *before* the applies check. **+4.** |
+| `html/semantics/forms/the-input-element/input-valueasdate-typeerror.html` | 0/4 | **4/4** | ✅ 100% | **Quest #134 The Numeric Verdict.** `valueAsDate` setter throws TypeError on a non-null non-Date. **+4.** |
+| `html/semantics/forms/the-input-element/input-stepdown-weekmonth.html` | 0/2 | **2/2** | ✅ 100% | **Quest #134 The Numeric Verdict.** **+2.** |
+| `html/semantics/forms/the-input-element/input-valueasnumber-invalidstateerr.html` | CNR | **1/1** | ✅ 100% | **Quest #134 The Numeric Verdict.** **+1.** |
+| `html/semantics/forms/the-input-element/input-valueasdate-invalidstateerr.html` | 0/1 | **1/1** | ✅ 100% | **Quest #134 The Numeric Verdict.** `valueAsDate` setter throws InvalidStateError off-type. **+1.** |
+| `html/semantics/forms/the-input-element/datetime-local-valueasdate.html` | 0/1 | **1/1** | ✅ 100% | **Quest #134 The Numeric Verdict.** **+1.** |
+| `html/semantics/forms/the-input-element/datetime-local-trailing-zeros.html` | 0/1 | **1/1** | ✅ 100% | **Quest #134 The Numeric Verdict.** Temporal sanitization normalizes `…56.010`→`…56.01`. **+1.** |
 |------|:------:|:------:|:------:|----------------|
 | `html/semantics/forms/the-input-element/type-change-state.html` | 0/380 | **380/380** | ✅ 100% | **Quest #133 The Selected Verdict.** The input value model (HTML §4.10.5) — four value modes (value/default/default-on/filename), per-type value sanitization, and the "signal a type change" algorithm — plus the text-field selection API, in `bootstrap.js` (no Rust) on `HTMLInputElement.prototype`. `<input type=file>.value` set throws `InvalidStateError`; type changes re-flow & re-sanitize the value. **+380.** |
 | `html/semantics/forms/textfieldselection/select-event.html` | 30/270 | **270/270** | ✅ 100% | **Quest #133 The Selected Verdict.** The `select` event — a trusted, bubbling, non-cancelable Event queued (async, never synchronous) by "set the selection range" **iff** the selection's extent/direction actually changed, dispatched via `_dispatchSpec` (keeps `isTrusted`) + an `onselect` IDL handler on input/textarea. **+240.** |
