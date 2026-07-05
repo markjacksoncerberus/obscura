@@ -309,6 +309,12 @@ pub(crate) struct DomTreeInner {
     // DocumentFragments, so this set is how `:root` tells "document element of a
     // document" from "root of a fragment". The main document (NodeId 0) is always real.
     pub(crate) real_documents: HashSet<NodeId>,
+    // Custom elements that are "defined" (custom element state "custom") — JS marks a
+    // node here when it is constructed or successfully upgraded. Read by the `:defined`
+    // pseudo-class for hyphenated HTML elements (built-ins are always defined without
+    // consulting this set). Definedness is monotonic per node, so this is set once, not
+    // pushed per-query.
+    pub(crate) ce_defined: HashSet<NodeId>,
 }
 
 impl DomTree {
@@ -338,6 +344,7 @@ impl DomTree {
                 validity_state: HashMap::new(),
                 design_mode: false,
                 real_documents: HashSet::new(),
+                ce_defined: HashSet::new(),
             }),
         }
     }
@@ -423,6 +430,16 @@ impl DomTree {
     /// constraint-validation pseudo-classes apply).
     pub fn validity_state(&self, id: NodeId) -> u8 {
         self.inner.borrow().validity_state.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Mark a custom element as "defined" (state "custom"), so `:defined` matches it.
+    pub fn set_ce_defined(&self, id: NodeId) {
+        self.inner.borrow_mut().ce_defined.insert(id);
+    }
+
+    /// Whether a node has been marked a defined custom element.
+    pub fn is_ce_defined(&self, id: NodeId) -> bool {
+        self.inner.borrow().ce_defined.contains(&id)
     }
 
     /// Set whether the document is in design mode (drives `:read-write`/`:read-only`).

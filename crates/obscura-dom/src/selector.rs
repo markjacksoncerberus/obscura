@@ -120,6 +120,56 @@ pub enum PseudoClass {
     Other(String),
 }
 
+/// HTML "valid custom element name": starts with [a-z], contains a '-', every code
+/// point is a PCENChar, and it is not one of the reserved hyphenated SVG/MathML names.
+/// Used by `:defined` to tell a would-be custom element from a built-in.
+fn is_valid_custom_element_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if matches!(
+        name,
+        "annotation-xml" | "color-profile" | "font-face" | "font-face-src"
+            | "font-face-uri" | "font-face-format" | "font-face-name" | "missing-glyph"
+    ) {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !('a'..='z').contains(&first) {
+        return false;
+    }
+    let mut has_hyphen = false;
+    for c in name.chars() {
+        let u = c as u32;
+        if c == '-' {
+            has_hyphen = true;
+            continue;
+        }
+        let ok = c == '.'
+            || ('0'..='9').contains(&c)
+            || c == '_'
+            || ('a'..='z').contains(&c)
+            || u == 0xB7
+            || (0xC0..=0xD6).contains(&u)
+            || (0xD8..=0xF6).contains(&u)
+            || (0xF8..=0x37D).contains(&u)
+            || (0x37F..=0x1FFF).contains(&u)
+            || (0x200C..=0x200D).contains(&u)
+            || (0x203F..=0x2040).contains(&u)
+            || (0x2070..=0x218F).contains(&u)
+            || (0x2C00..=0x2FEF).contains(&u)
+            || (0x3001..=0xD7FF).contains(&u)
+            || (0xF900..=0xFDCF).contains(&u)
+            || (0xFDF0..=0xFFFD).contains(&u)
+            || (0x10000..=0xEFFFF).contains(&u);
+        if !ok {
+            return false;
+        }
+    }
+    has_hyphen
+}
+
 /// Standard CSS pseudo-class names that are syntactically valid (so a selector
 /// using them must NOT throw), beyond the ones we actively match. Genuinely
 /// unknown names are rejected (-> SyntaxError) by the parser.
@@ -607,6 +657,32 @@ impl<'a> DomElement<'a> {
         self.tree
             .with_node(self.node_id, |n| n.as_element().map(|qn| qn.local.as_ref().to_string()))
             .flatten()
+    }
+
+    /// `:defined` — see the match arm. A hyphenated HTML element, or one carrying an
+    /// `is` attribute (a would-be customized built-in), is defined only after JS marks
+    /// it in the tree's `ce_defined` set; everything else is defined unconditionally.
+    fn match_defined(&self) -> bool {
+        let info = self
+            .tree
+            .with_node(self.node_id, |n| {
+                n.as_element()
+                    .map(|qn| (qn.local.as_ref().to_string(), qn.ns == ns!(html)))
+            })
+            .flatten();
+        let (local, is_html) = match info {
+            Some(v) => v,
+            None => return false,
+        };
+        let has_is = self
+            .tree
+            .with_node(self.node_id, |n| n.get_attribute("is").is_some())
+            .unwrap_or(false);
+        if has_is || (is_html && is_valid_custom_element_name(&local)) {
+            self.tree.is_ce_defined(self.node_id)
+        } else {
+            true
+        }
     }
 
     /// The lower-cased `type` of an `<input>` (missing/empty → `text`).
@@ -1172,6 +1248,10 @@ impl<'a> Element for DomElement<'a> {
                 // :default — a form's default submit button, a checkbox/radio with
                 // the `checked` attribute, or an option with the `selected` attribute.
                 "default" => self.match_default(),
+                // :defined — built-in elements are always defined; a hyphenated
+                // HTML-namespace element (or a customized built-in via `is`) is defined
+                // only once JS has constructed/upgraded it (marked in `ce_defined`).
+                "defined" => self.match_defined(),
                 // Other accepted-but-unimplemented standard pseudo-classes never match.
                 _ => false,
             },

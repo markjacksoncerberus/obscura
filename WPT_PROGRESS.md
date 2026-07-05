@@ -10,11 +10,22 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #143).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #144).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+|------|:------:|:------:|:------:|----------------|
+| `custom-elements/CustomElementRegistry.html` | 10/46 | **31/46** | 🟡 | **Quest #144 The Upgraded Verdict.** Real `CustomElementRegistry` (spec `define`/`get`/`getName`/`whenDefined`/`upgrade`). **+21.** |
+| `custom-elements/Document-createElement.html` | 0/36 | **12/36** | 🟡 | **Quest #144.** `createElement` consults the registry + synchronous construction in a browsing-context doc. **+12.** |
+| `custom-elements/HTMLElement-constructor.html` | 1/12 | **11/12** | 🟡 | **Quest #144.** Real HTML element constructor + construction-stack adoption (identity-preserving upgrade). **+10.** |
+| `custom-elements/upgrading.html` | 8/28 | **17/28** | 🟡 | **Quest #144.** Upgrade on define + on connect. **+9.** |
+| `custom-elements/connected-callbacks.html` | 8/40 | **24/40** | 🟡 | **Quest #144.** connectedCallback via insertion steps. **+16.** |
+| `custom-elements/disconnected-callbacks.html` | 8/40 | **24/40** | 🟡 | **Quest #144.** disconnectedCallback via removal steps. **+16.** |
+| `custom-elements/attribute-changed-callback.html` | 0/13 | **9/13** | 🟡 | **Quest #144.** attributeChangedCallback + observedAttributes on set/remove. **+9.** |
+| `custom-elements/pseudo-class-defined.html` | 10/35 | **27/35** | 🟡 | **Quest #144.** `:defined` — Rust `ce_defined` node-flag primitive. **+17.** |
+| `custom-elements/adopted-callback.html` | 0/71 | **20/71** | 🟡 | **Quest #144.** adoptedCallback via adopting steps. **+20.** |
+| `custom-elements/reaction-timing.html` | 0/3 | **1/3** | 🟡 | **Quest #144.** Synchronous reaction flush. **+1.** |
 | `shadow-dom/declarative/declarative-shadow-dom-basic.html` | 18/22 | **22/22** | ✅ 100% | **Quest #143 The Cloned Verdict.** Clone-propagation of *clonable* shadow roots: `_processDeclarativeShadowRoots` descends into `<template>` content (attaching declarative shadows there at parse time), `Node.cloneNode` runs the DOM clone shadow-host step, and `DocumentFragment.cloneNode` deep-clones REAL children instead of an innerHTML round-trip (which dropped shadows). **+4.** |
 | `shadow-dom/Node-prototype-cloneNode.html` | 2/4 | **4/4** | ✅ 100% | **Quest #143 The Cloned Verdict.** `ShadowRoot.cloneNode(...)` throws `NotSupportedError` (DOM §clone); non-clonable element shadows still not cloned. **+2.** |
 | `shadow-dom/Document-prototype-importNode.html` | 0/2 | **2/2** | ✅ 100% | **Quest #143 The Cloned Verdict.** `importNode(shadowRoot)` throws `NotSupportedError` (delegates to the throwing `ShadowRoot.cloneNode`). **+2.** |

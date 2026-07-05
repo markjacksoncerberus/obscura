@@ -952,7 +952,8 @@ class Node {
     // subtree (otherwise descendants keep their old ownerDocument). Same-document
     // appends — the overwhelmingly common case — skip the walk via a cheap compare.
     const _adoptDoc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
-    if (c.ownerDocument !== _adoptDoc) _setNodeDocumentDeep(c, _adoptDoc);
+    const _ceOldDoc = c.ownerDocument;
+    if (_ceOldDoc !== _adoptDoc) { _setNodeDocumentDeep(c, _adoptDoc); _ceAdoptedSteps(c, _ceOldDoc, _adoptDoc); }
     else c._ownerDoc = _adoptDoc;
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [c._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null });
     if (c instanceof Element && c.tagName === 'SCRIPT' && !c._scriptAlreadyStarted) {
@@ -973,6 +974,7 @@ class Node {
     if (c instanceof Element && c.localName === 'iframe') _connectIframe(c);
     if (c instanceof Element) _connectResourceElement(c);
     if (c instanceof Element && c.id) __defineNamedGlobal(c.id);
+    _ceInsertionSteps(c);
     return c;
   }
   removeChild(c) {
@@ -986,8 +988,10 @@ class Node {
       _prev = +_dom("prev_sibling", c._nid);
       _next = +_dom("next_sibling", c._nid);
     }
+    const _wasConnected = c.nodeType === 1 && c.isConnected;
     _dom("remove_child", c._nid);
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [], [c._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
+    if (_wasConnected) _ceRemovalSteps(c);
     return c;
   }
   // DOM "replace" (§4.2.3): replace `child` with `node`, returning `child`.
@@ -1133,7 +1137,8 @@ class Node {
       __obscura_adjustRangesForInsert(n, this, __obscura_nodeIndex(n));
     // Adopt deeply when crossing documents (see appendChild); cheap compare otherwise.
     const _adoptDoc = this.nodeType === 9 ? this : (this.ownerDocument || globalThis.document);
-    if (n.ownerDocument !== _adoptDoc) _setNodeDocumentDeep(n, _adoptDoc);
+    const _ceOldDoc = n.ownerDocument;
+    if (_ceOldDoc !== _adoptDoc) { _setNodeDocumentDeep(n, _adoptDoc); _ceAdoptedSteps(n, _ceOldDoc, _adoptDoc); }
     else n._ownerDoc = _adoptDoc;
     if (__mutationObservers?.length) {
       const _prev = +_dom("prev_sibling", n._nid);
@@ -1141,6 +1146,7 @@ class Node {
     }
     if (n instanceof Element && n.localName === 'iframe') _connectIframe(n);
     if (n instanceof Element) _connectResourceElement(n);
+    _ceInsertionSteps(n);
     return n;
   }
   // DOM §4.4: contains(other) is true iff other is an *inclusive* descendant of
@@ -2130,10 +2136,18 @@ class Element extends Node {
     }
     const _watching = __mutationObservers?.length;
     const _old = _watching ? (_domParse("child_nodes", this._nid) || []) : null;
+    // Custom element removal steps for the outgoing subtree (before the reparse
+    // discards it) when connected — fires disconnectedCallback.
+    const _ceLive = globalThis.customElements && globalThis.customElements._defs.size && this.isConnected;
+    if (_ceLive) { let c = this.firstChild; while (c) { _ceRemovalSteps(c); c = c.nextSibling; } }
     _dom("set_inner_html", this._nid, String(v ?? ""));
     if (_watching) {
       const _new = _domParse("child_nodes", this._nid) || [];
       __notifyMutation('childList', this._nid, _new, _old);
+    }
+    // Insertion steps for the freshly-parsed subtree — upgrade + connectedCallback.
+    if (globalThis.customElements && globalThis.customElements._defs.size) {
+      let c = this.firstChild; while (c) { _ceInsertionSteps(c); c = c.nextSibling; }
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
@@ -2247,8 +2261,10 @@ class Element extends Node {
     qname = String(qname);
     _validateAttrName(qname);
     if (this._htmlAttr) qname = _asciiLower(qname);
+    const _ceOld = this._ceState === "custom" ? _domParse("get_attribute", this._nid, qname) : undefined;
     _dom("set_attribute", this._nid, qname + "\0" + String(v));
     __notifyMutation();
+    if (_ceOld !== undefined) _ceAttributeChanged(this, qname, _ceOld, String(v), null);
     // The `style` content attribute reflects into the live CSSOM declaration so the
     // specified value is observable via el.style.getPropertyValue (HTML parsing and
     // setAttribute both land here; setting it replaces the declaration block).
@@ -2292,6 +2308,8 @@ class Element extends Node {
       this._attrNodes.delete((doomed._ns || '') + '|' + doomed._local);
     }
     __notifyMutation();
+    // A removed observed attribute reports newValue null (only if it was present).
+    if (val !== null && this._ceState === "custom") _ceAttributeChanged(this, qname, val, null, null);
     // Removing the `style` attribute empties the live CSSOM declaration.
     if (qname === 'style' && this._style) this._style.cssText = '';
     // Removing srcdoc reprocesses: the frame falls back to src or about:blank.
@@ -3323,7 +3341,7 @@ function _adoptNodeInto(node, doc) {
   const oldDoc = node.ownerDocument;
   const parent = node.parentNode;
   if (parent) parent.removeChild(node);
-  if (doc !== oldDoc) _setNodeDocumentDeep(node, doc);
+  if (doc !== oldDoc) { _setNodeDocumentDeep(node, doc); _ceAdoptedSteps(node, oldDoc, doc); }
 }
 
 // ---- ParentNode / ChildNode mutation mixins (DOM §parentnode, §childnode) ----
@@ -3631,6 +3649,23 @@ class Document extends Node {
       throw new DOMException("The string '" + name + "' is not a valid element name.", "InvalidCharacterError");
     }
     const local = _asciiLower(name);
+    // Custom element consultation (HTML "create an element"): in a document WITH a
+    // browsing context (the main document, defaultView === the window), a matching
+    // autonomous definition is constructed synchronously. Documents without a browsing
+    // context (createHTMLDocument/XML) skip this and yield an "undefined" element.
+    const reg = globalThis.customElements;
+    if (reg && reg._defs.size && this.defaultView === globalThis && _isValidCustomElementName(local)) {
+      const def = reg._defs.get(local);
+      if (def && def.name === def.localName) {
+        const cel = _ceConstruct(def);
+        if (cel) cel._ownerDoc = this;
+        return cel;
+      }
+      // Valid custom name, no definition yet → an "undefined" custom element.
+      const uel = _wrapEl(+_dom("create_element", local));
+      if (uel) { uel._ownerDoc = this; uel._ceState = "undefined"; }
+      return uel;
+    }
     const el = _wrapEl(+_dom("create_element", local));
     if (el && local === 'template') {
       el._templateContent = this.createDocumentFragment();
@@ -4163,7 +4198,11 @@ const _HTML_IFACE_BY_TAG = {
 const _htmlClassForLocal = function(local) {
   const ifaceName = _HTML_IFACE_BY_TAG[local];
   if (ifaceName) return globalThis[ifaceName] || globalThis.HTMLElement;
-  return _KNOWN_HTML_TAGS.has(local) ? globalThis.HTMLElement : globalThis.HTMLUnknownElement;
+  if (_KNOWN_HTML_TAGS.has(local)) return globalThis.HTMLElement;
+  // A valid custom element name (hyphenated) uses the HTMLElement interface even
+  // before/without a definition — an "undefined" custom element, NOT HTMLUnknownElement.
+  if (_isValidCustomElementName(local)) return globalThis.HTMLElement;
+  return globalThis.HTMLUnknownElement;
 };
 // Default wrap path (parsed elements + createElement): elements are HTML, so map
 // by their canonical (lowercased) tag name.
@@ -4225,6 +4264,206 @@ function _createElementXMLInto(doc, t, ns) {
     el._ownerDoc = doc;
   }
   return el;
+}
+
+// ===================== Custom Elements (DOM/HTML §4.13) ==========================
+// The realm's custom elements live in `globalThis.customElements`. State rides on
+// each element wrapper: `el._ceState` ∈ {undefined(=none / "uncustomized"),
+// "undefined" (a would-be custom element awaiting a definition), "failed", "custom"}
+// and `el._ceDefinition` points at the definition record. Everything is gated on
+// `customElements._defs.size` so a page with no `define()` pays ZERO cost — the
+// entire machinery is inert (no walks, no hooks fire) until the first definition.
+const _CE_RESERVED_NAMES = new Set(['annotation-xml', 'color-profile', 'font-face',
+  'font-face-src', 'font-face-uri', 'font-face-format', 'font-face-name', 'missing-glyph']);
+// HTML "valid custom element name": starts [a-z], contains a '-', all code points are
+// PCENChar, and it is not one of the reserved SVG/MathML hyphenated names.
+function _isValidCustomElementName(name) {
+  if (typeof name !== 'string' || name.length === 0) return false;
+  if (_CE_RESERVED_NAMES.has(name)) return false;
+  const first = name.codePointAt(0);
+  if (first < 0x61 || first > 0x7A) return false;           // must start with [a-z]
+  let hasHyphen = false;
+  for (let i = 0; i < name.length; i++) {
+    let c = name.codePointAt(i);
+    if (c > 0xFFFF) i++;                                     // advance past a surrogate pair
+    if (c === 0x2D) { hasHyphen = true; continue; }         // '-'
+    const ok = c === 0x2E || (c >= 0x30 && c <= 0x39) || c === 0x5F ||
+      (c >= 0x61 && c <= 0x7A) || c === 0xB7 ||
+      (c >= 0xC0 && c <= 0xD6) || (c >= 0xD8 && c <= 0xF6) || (c >= 0xF8 && c <= 0x37D) ||
+      (c >= 0x37F && c <= 0x1FFF) || (c >= 0x200C && c <= 0x200D) || (c >= 0x203F && c <= 0x2040) ||
+      (c >= 0x2070 && c <= 0x218F) || (c >= 0x2C00 && c <= 0x2FEF) || (c >= 0x3001 && c <= 0xD7FF) ||
+      (c >= 0xF900 && c <= 0xFDCF) || (c >= 0xFDF0 && c <= 0xFFFD) || (c >= 0x10000 && c <= 0xEFFFF);
+    if (!ok) return false;
+  }
+  return hasHyphen;
+}
+// IsConstructor(f): does f have a [[Construct]] slot? Reflect.construct throws a
+// TypeError if newTarget (3rd arg) is not a constructor — without ever running f.
+function _isConstructor(f) {
+  if (typeof f !== 'function') return false;
+  try { Reflect.construct(function () {}, [], f); return true; } catch (e) { return false; }
+}
+
+// The custom element reaction queue: a single FIFO of {el, cb, args}. Reactions are
+// flushed synchronously at the end of each mutating operation (append/remove/attr/…),
+// re-entrancy-guarded so a callback that itself mutates the tree appends to the SAME
+// drain rather than nesting — giving correct FIFO ordering without a full
+// backup-element-queue microtask model.
+const _ceQueue = [];
+let _ceInFlush = false;
+function _ceEnqueueReaction(el, name, args) {
+  const def = el && el._ceDefinition;
+  if (!def) return;
+  const cb = def.callbacks[name];
+  if (!cb) return;
+  _ceQueue.push({ el, cb, args: args || [] });
+}
+function _ceFlush() {
+  if (_ceInFlush) return;                 // a nested drain — the outer loop will pick these up
+  _ceInFlush = true;
+  try {
+    while (_ceQueue.length) {
+      const r = _ceQueue.shift();
+      try { r.cb.apply(r.el, r.args); }
+      catch (e) { _reportError(e); }       // a reaction's exception is reported, never thrown to script
+    }
+  } finally { _ceInFlush = false; }
+}
+
+// A sentinel replacing the construction-stack entry once its element has been adopted
+// by the HTMLElement constructor (DOM "already constructed marker").
+const _CE_MARKER = { _alreadyConstructed: true };
+
+// Fresh synchronous construction (the createElement / `new C()` path): run the
+// definition's constructor, which allocates its own backing node via the HTMLElement
+// constructor's empty-stack branch. On a thrown constructor, fall back to a bare
+// element in the "failed" state (HTML "create an element" step 6.1.3).
+function _ceConstruct(def) {
+  try {
+    return Reflect.construct(def.constructor, [], def.constructor);
+  } catch (e) {
+    _reportError(e);
+    const el = _wrapEl(+_dom("create_element", def.localName));
+    if (el) { el._ceState = "failed"; el._ceDefinition = def; }
+    return el;
+  }
+}
+
+// Upgrade an existing (parser/createElement-made) element in place: preserve its JS
+// identity (other code may hold the reference) by re-pointing its [[Prototype]] to the
+// definition's prototype, then run the constructor with the element on the
+// construction stack so the HTMLElement constructor ADOPTS it (returns it from super()
+// without allocating a new node). Then fire attributeChanged for pre-existing observed
+// attributes and connectedCallback if connected (HTML "upgrade an element").
+function _ceUpgrade(el, def) {
+  const st = el._ceState;
+  if (st === "custom" || st === "failed" || st === "precustomized") return;
+  el._ceDefinition = def;
+  el._ceState = "failed";                 // tentative; promoted to "custom" only on success
+  Object.setPrototypeOf(el, def.constructor.prototype);
+  const stack = def.constructionStack;
+  stack.push(el);
+  let ok = false;
+  try {
+    const result = Reflect.construct(def.constructor, [], def.constructor);
+    ok = (result === el);
+  } catch (e) {
+    _reportError(e);
+    ok = false;
+  } finally {
+    stack.pop();
+  }
+  if (!ok) { el._ceState = "failed"; return; }
+  el._ceState = "custom";
+  if (typeof el._nid === 'number') _dom("set_ce_defined", el._nid);
+  // Enqueue attributeChangedCallback for each observed attribute already present.
+  const oa = def.observedAttributes;
+  if (oa && oa.length) {
+    const attrs = el.attributes;
+    for (let i = 0; i < attrs.length; i++) {
+      const a = attrs[i];
+      if (oa.indexOf(a.name) !== -1)
+        _ceEnqueueReaction(el, 'attributeChangedCallback', [a.name, null, a.value, a.namespaceURI]);
+    }
+  }
+  if (el.isConnected) _ceEnqueueReaction(el, 'connectedCallback', []);
+}
+
+// Try to upgrade `el` if a matching autonomous definition now exists (HTML "try to
+// upgrade an element"). Autonomous only — customized built-ins are unsupported.
+function _ceTryUpgrade(el) {
+  if (!el || el.nodeType !== 1) return;
+  const st = el._ceState;
+  if (st === "custom" || st === "failed") return;
+  if (el._is) return;
+  if (el.namespaceURI !== _HTML_NS) return;
+  const reg = globalThis.customElements;
+  const def = reg._defs.get(el.localName);
+  if (!def || def.name !== def.localName) return;
+  _ceUpgrade(el, def);
+}
+
+// Insertion steps: walk an inserted subtree in tree order; upgrade would-be customs
+// and enqueue connectedCallback for connected ones. No-op unless something is defined.
+function _ceInsertionSteps(node) {
+  const reg = globalThis.customElements;
+  if (!reg || reg._defs.size === 0 || !node || node.nodeType > 11) return;
+  const connected = node.nodeType === 1 || node.nodeType === 11 ? node.isConnected : false;
+  const walk = (el) => {
+    if (el.nodeType === 1) {
+      if (el._ceState === "custom") {
+        if (connected) _ceEnqueueReaction(el, 'connectedCallback', []);
+      } else {
+        if (connected) _ceTryUpgrade(el);
+        else if (el.localName && el.localName.indexOf('-') !== -1 && el._ceState === undefined &&
+                 el.namespaceURI === _HTML_NS) el._ceState = "undefined";
+      }
+    }
+    let c = el.firstChild;
+    while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; }
+  };
+  if (node.nodeType === 1) walk(node);
+  else { let c = node.firstChild; while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; } }
+  _ceFlush();
+}
+// Removal steps: enqueue disconnectedCallback for every custom element in the removed
+// subtree (HTML "removing steps"). Called with the node's OLD subtree still intact.
+function _ceRemovalSteps(node) {
+  const reg = globalThis.customElements;
+  if (!reg || reg._defs.size === 0 || !node || node.nodeType > 11) return;
+  const walk = (el) => {
+    if (el.nodeType === 1 && el._ceState === "custom")
+      _ceEnqueueReaction(el, 'disconnectedCallback', []);
+    let c = el.firstChild;
+    while (c) { walk(c); c = c.nextSibling; }
+  };
+  if (node.nodeType === 1) walk(node);
+  else { let c = node.firstChild; while (c) walk(c), c = c.nextSibling; }
+  _ceFlush();
+}
+// Adopting steps: when a subtree moves to a different node document, enqueue
+// adoptedCallback(oldDocument, newDocument) for every custom element in it.
+function _ceAdoptedSteps(node, oldDoc, newDoc) {
+  const reg = globalThis.customElements;
+  if (!reg || reg._defs.size === 0 || oldDoc === newDoc || !node || node.nodeType > 11) return;
+  const walk = (el) => {
+    if (el.nodeType === 1 && el._ceState === "custom")
+      _ceEnqueueReaction(el, 'adoptedCallback', [oldDoc, newDoc]);
+    let c = el.firstChild;
+    while (c) { walk(c); c = c.nextSibling; }
+  };
+  walk(node);
+  _ceFlush();
+}
+// Attribute-change steps: enqueue attributeChangedCallback if the element is custom
+// and the (namespaced) attribute is observed.
+function _ceAttributeChanged(el, localName, oldValue, newValue, namespace) {
+  if (el._ceState !== "custom") return;
+  const def = el._ceDefinition;
+  if (!def || !def.callbacks.attributeChangedCallback) return;
+  if (def.observedAttributes.indexOf(localName) === -1) return;
+  _ceEnqueueReaction(el, 'attributeChangedCallback', [localName, oldValue, newValue, namespace ?? null]);
+  _ceFlush();
 }
 
 // _wrap / _cache are module-local (declared above); no need to expose them on
@@ -13497,13 +13736,126 @@ class ShadowRoot extends DocumentFragment {
   }
 }
 globalThis.ShadowRoot = ShadowRoot;
-globalThis.customElements = {
-  _registry: new Map(),
-  define(name, cls, opts) { this._registry.set(name, cls); },
-  get(name) { return this._registry.get(name); },
-  whenDefined(name) { return Promise.resolve(this._registry.get(name)); },
-  upgrade() {},
-};
+// CustomElementRegistry (HTML §4.13.4). Holds the realm's definitions, keyed by both
+// name and constructor, plus pending whenDefined() promises. `define()` follows the
+// spec: validate the name + constructor, extract the lifecycle callbacks /
+// observedAttributes / disabledFeatures / formAssociated off the constructor, then
+// upgrade every matching element already in the (main) document.
+class CustomElementRegistry {
+  constructor() {
+    this._defs = new Map();          // name -> definition record
+    this._byCtor = new Map();        // constructor -> definition record
+    this._whenDefined = new Map();   // name -> { promise, resolve }
+    this._defining = false;          // HTML "element definition is running" flag
+  }
+  define(name, constructor, options) {
+    if (!_isConstructor(constructor))
+      throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': parameter 2 is not a constructor.");
+    name = String(name);
+    if (!_isValidCustomElementName(name))
+      throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + name + "\" is not a valid custom element name", "SyntaxError");
+    if (this._defs.has(name))
+      throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the name \"" + name + "\" has already been used with this registry", "NotSupportedError");
+    if (this._byCtor.has(constructor))
+      throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': this constructor has already been used with this registry", "NotSupportedError");
+    let localName = name;
+    let extendsOpt = (options && options.extends != null) ? String(options.extends) : null;
+    if (extendsOpt !== null) {
+      if (_isValidCustomElementName(extendsOpt))
+        throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + extendsOpt + "\" is a valid custom element name", "NotSupportedError");
+      if (_htmlClassForLocal(extendsOpt) === globalThis.HTMLUnknownElement)
+        throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + extendsOpt + "\" is an unknown element", "NotSupportedError");
+      localName = extendsOpt;
+    }
+    if (this._defining)
+      throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': reentrant definition", "NotSupportedError");
+    this._defining = true;
+    let observedAttributes = [];
+    const callbacks = {};
+    let disableInternals = false, disableShadow = false, formAssociated = false;
+    try {
+      const proto = constructor.prototype;
+      if (proto === null || (typeof proto !== 'object' && typeof proto !== 'function'))
+        throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': constructor prototype is not an object");
+      const getCb = (n) => {
+        const v = proto[n];
+        if (v === undefined) return;
+        if (typeof v !== 'function')
+          throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': " + n + " is not a function");
+        callbacks[n] = v;
+      };
+      getCb('connectedCallback'); getCb('disconnectedCallback');
+      getCb('adoptedCallback'); getCb('attributeChangedCallback');
+      if (callbacks.attributeChangedCallback) {
+        const oa = constructor.observedAttributes;
+        if (oa !== undefined) observedAttributes = Array.from(oa, (x) => String(x));
+      }
+      let df = constructor.disabledFeatures;
+      if (df !== undefined) {
+        df = Array.from(df, (x) => String(x));
+        disableInternals = df.indexOf('internals') !== -1;
+        disableShadow = df.indexOf('shadow') !== -1;
+      }
+      formAssociated = Boolean(constructor.formAssociated);
+      if (formAssociated) {
+        getCb('formAssociatedCallback'); getCb('formResetCallback');
+        getCb('formDisabledCallback'); getCb('formStateRestoreCallback');
+      }
+    } finally {
+      this._defining = false;
+    }
+    const def = {
+      name, localName, constructor, observedAttributes, callbacks,
+      disableInternals, disableShadow, formAssociated, constructionStack: [],
+    };
+    this._defs.set(name, def);
+    this._byCtor.set(constructor, def);
+    // Upgrade candidates already in the main document (HTML define() steps 14–15).
+    if (def.name === def.localName && globalThis.document && globalThis.document.getElementsByTagName) {
+      const matches = globalThis.document.getElementsByTagName(localName);
+      const candidates = [];
+      for (let i = 0; i < matches.length; i++) {
+        const el = matches[i];
+        if (el.namespaceURI === _HTML_NS && !el._is &&
+            el._ceState !== "custom" && el._ceState !== "failed") candidates.push(el);
+      }
+      for (const el of candidates) _ceUpgrade(el, def);
+      _ceFlush();
+    }
+    // Resolve any pending whenDefined() promise for this name.
+    const w = this._whenDefined.get(name);
+    if (w && w.resolve) { w.resolve(constructor); w.resolve = null; }
+  }
+  get(name) { const d = this._defs.get(String(name)); return d ? d.constructor : undefined; }
+  getName(constructor) { const d = this._byCtor.get(constructor); return d ? d.name : null; }
+  whenDefined(name) {
+    name = String(name);
+    if (!_isValidCustomElementName(name))
+      return Promise.reject(new DOMException("Failed to execute 'whenDefined' on 'CustomElementRegistry': \"" + name + "\" is not a valid custom element name", "SyntaxError"));
+    const existing = this._defs.get(name);
+    if (existing) return Promise.resolve(existing.constructor);
+    let entry = this._whenDefined.get(name);
+    if (!entry) {
+      let resolve; const promise = new Promise((r) => { resolve = r; });
+      entry = { promise, resolve }; this._whenDefined.set(name, entry);
+    }
+    return entry.promise;
+  }
+  upgrade(root) {
+    if (root == null || typeof root !== 'object' || typeof root._nid !== 'number')
+      throw new TypeError("Failed to execute 'upgrade' on 'CustomElementRegistry': parameter 1 is not of type 'Node'.");
+    if (this._defs.size === 0) return;
+    const walk = (el) => {
+      if (el.nodeType === 1) _ceTryUpgrade(el);
+      let c = el.firstChild;
+      while (c) { walk(c); c = c.nextSibling; }
+    };
+    walk(root);
+    _ceFlush();
+  }
+}
+globalThis.CustomElementRegistry = CustomElementRegistry;
+globalThis.customElements = new CustomElementRegistry();
 globalThis.NodeFilter = {
   SHOW_ALL: 0xFFFFFFFF,
   SHOW_ELEMENT: 0x1,
@@ -15223,7 +15575,56 @@ globalThis.CSS = {
 
 // HTMLElement is a real subclass of Element: only elements in the HTML namespace
 // are HTMLElement instances (foreign / non-HTML elements stay plain Element).
-globalThis.HTMLElement = class HTMLElement extends Element {};
+//
+// The constructor doubles as the "HTML element constructor" (HTML §4.13.5) for
+// autonomous custom elements. Two call shapes reach it:
+//   • INTERNAL wrap — `new HTMLDivElement(nid)` from `_wrap`/`_wrapEl`, a numeric nid,
+//     new.target is a built-in interface class (never a registered custom ctor).
+//   • CUSTOM construction — `new MyEl()` (no nid); new.target is a registered custom
+//     element constructor. Either allocates a fresh backing node (empty construction
+//     stack) or ADOPTS the element on top of the definition's stack, returning it from
+//     super() WITHOUT allocating — preserving JS identity across an upgrade.
+globalThis.HTMLElement = class HTMLElement extends Element {
+  constructor(nid) {
+    // Internal wrap path: `_wrap`/`_wrapEl` always pass a numeric nid. (Custom
+    // construction — `new C()`, upgrade, createElement — never passes an argument, so
+    // a number unambiguously means "adopt this backing node".)
+    if (typeof nid === 'number') {
+      super(nid);
+      return;
+    }
+    const reg = globalThis.customElements;
+    const NT = new.target;
+    // "If NewTarget is equal to the active function object" — `new HTMLElement()`.
+    if (NT === globalThis.HTMLElement)
+      throw new TypeError("Illegal constructor");
+    const def = reg && reg._byCtor.get(NT);
+    if (!def)
+      throw new TypeError("Illegal constructor");
+    // Autonomous only. A customized built-in definition (localName ≠ name) has an
+    // active function object that is a built-in interface, never HTMLElement — which,
+    // in our shared-constructor model, we cannot be, so it always throws (matching the
+    // WPT customized-built-in "must throw" subtests). Autonomous elements proceed.
+    if (def.localName !== def.name)
+      throw new TypeError("Illegal constructor");
+    const stack = def.constructionStack;
+    if (stack.length > 0) {
+      const el = stack[stack.length - 1];
+      if (el === _CE_MARKER)
+        throw new DOMException("The result must not have children", "InvalidStateError");
+      stack[stack.length - 1] = _CE_MARKER;   // mark "already constructed"
+      return el;                               // adopt — no super(): super() rebinds `this` to el
+    }
+    // Fresh construction: allocate a backing node with the definition's local name.
+    const newNid = +_dom("create_element", def.localName);
+    super(newNid);
+    _cache.set(newNid, this);
+    this._ceDefinition = def;
+    this._ceState = "custom";
+    this._ownerDoc = globalThis.document;
+    _dom("set_ce_defined", newNid);
+  }
+};
 // Unknown / non-conforming HTML tag names (e.g. uppercase via createElementNS).
 globalThis.HTMLUnknownElement = class HTMLUnknownElement extends globalThis.HTMLElement {};
 globalThis.HTMLSpanElement = class HTMLSpanElement extends globalThis.HTMLElement {};

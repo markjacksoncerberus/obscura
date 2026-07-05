@@ -153,6 +153,33 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-05 (Quest #144 The Upgraded Verdict — custom element upgrade + reactions + `:defined`, +131):**
+Chased #143's pointer (`ElementInternals`) and found the elephant beneath it: the whole
+`custom-elements/` realm (~500+ subtests) was red behind a five-line STUB `customElements`
+(`define` just stored the class; no upgrade, no reactions, `createElement`/parser returned
+`HTMLUnknownElement`). Built the real thing (all `bootstrap.js` bar the `:defined` Rust
+primitive): (1) a real `CustomElementRegistry` — spec `define` (name/ctor validation, callback +
+`observedAttributes`/`disabledFeatures`/`formAssociated` extraction, candidate upgrade),
+`get`/`getName`/`whenDefined`/`upgrade`; (2) a real HTML element constructor with the
+**construction-stack adoption trick** — when upgrading, `super()` returns the existing wrapper
+WITHOUT allocating, so the user's `this` rebinds to it and JS identity survives; (3) custom
+element state + `_ceUpgrade` (re-point `[[Prototype]]`, run ctor, fire attrChanged + connected);
+(4) a re-entrancy-guarded reaction FIFO wired into insertion (`appendChild`/`insertBefore`/
+`innerHTML`), removal (`removeChild`), adoption (`_adoptNodeInto` + cross-doc branches), and
+attribute (`setAttribute`/`removeAttribute`) — ALL gated on `_defs.size` so non-custom pages pay
+zero cost; (5) `:defined` via a Rust `ce_defined` node flag (`set_ce_defined` op, `match_defined`,
+`is_valid_custom_element_name`). CustomElementRegistry 10→31, createElement 0→12, constructor
+1→11, upgrading 8→17, connected 8→24, disconnected 8→24, attribute-changed 0→9,
+pseudo-class-defined 10→27, adopted 0→20, reaction-timing 0→1 = **+131, ZERO regressions**
+(swept qsa 1975, classlist 1420, createElement 147, Node-properties 726, cloneNode 135,
+insert_adjacent_html 31, template-content 216, declarative-shadow-dom-basic 22, attachment 654,
+slots 26, event-inside-slotted-node 20, Document-adoptNode 4, attributes 67, Node-appendChild 11).
+CAPS: reaction-queue timing edge cases (custom-element-reaction-queue/enqueue-inside-callback/
+throw-on-dynamic-markup — need the full backup-queue microtask model); `ElementInternals-role`/
+`-accessibility` (118 subtests, gated on `test_driver.get_computed_role` = a CDP a11y backend we
+lack); shadow-including upgrade order + customized built-ins. NEXT: **`ElementInternals`/
+`attachInternals`** (now unblocked, ~47 winnable subtests). Scroll `tickets/144-the-upgraded-verdict.md`.
+
 **Session 2026-07-05 (Quest #143 The Cloned Verdict — clone-propagation of shadow roots, +8):**
 Took #142's #1 pointer (`declarative-shadow-dom-basic` 18/22 — clone a `<template>` whose
 content holds a `<template shadowrootmode=open shadowrootclonable>` and assert the clone's

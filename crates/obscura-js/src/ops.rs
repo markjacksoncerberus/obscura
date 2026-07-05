@@ -542,6 +542,14 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             dom.set_validity_state_bulk(&entries);
             "true".into()
         }
+        "set_ce_defined" => {
+            // arg1 = node id of a custom element that has become "defined" (constructed
+            // or successfully upgraded), so `:defined` matches it.
+            if let Ok(nid) = arg1.parse::<u32>() {
+                dom.set_ce_defined(NodeId::new(nid));
+            }
+            "true".into()
+        }
         "set_design_mode" => {
             // arg1 = "1" to enable design mode (every element editable → matches
             // :read-write), anything else disables it. Drives :read-write/:read-only.
