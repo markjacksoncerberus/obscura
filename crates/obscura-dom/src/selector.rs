@@ -115,6 +115,9 @@ pub enum PseudoClass {
     /// `:lang(en, fr, …)` — matched against the element's language (its nearest
     /// ancestor-or-self `lang` attribute), per the CSS prefix rule.
     Lang(Vec<String>),
+    /// `:state(ident)` — the custom-state pseudo-class. Matches a custom element whose
+    /// `ElementInternals.states` currently holds this (case-sensitive) identifier.
+    State(String),
     /// A standard CSS pseudo-class we accept as valid (so querySelector does not
     /// throw) but don't implement matching for — it never matches.
     Other(String),
@@ -230,6 +233,11 @@ impl ToCss for PseudoClass {
                 }
                 dest.write_str(")")
             }
+            PseudoClass::State(ident) => {
+                dest.write_str(":state(")?;
+                cssparser::serialize_identifier(ident, dest)?;
+                dest.write_str(")")
+            }
             PseudoClass::Other(name) => {
                 dest.write_str(":")?;
                 dest.write_str(name)
@@ -249,10 +257,22 @@ pub enum PseudoElement {
     // nodes inside a shadow tree, which we don't model), so a selector using it
     // parses successfully and selects nothing — what WPT expects (vs. throwing).
     Slotted(String),
+    // ::part(<ident>+) — a shadow-part pseudo-element. Like ::slotted we parse it
+    // (retaining the part-name list for round-tripping) but never match it, since
+    // matching needs cross-shadow part mapping we don't model. This keeps rules using
+    // ::part() in the CSSOM (so their cssText/selectorText serialize) rather than
+    // silently dropping them.
+    Part(String),
 }
 
 impl parser::PseudoElement for PseudoElement {
     type Impl = ObscuraSelector;
+
+    // ::part() accepts trailing state/user-action pseudo-classes (e.g.
+    // `::part(inner):state(foo)`, `::part(inner):hover`) — CSS Shadow Parts §3.1.
+    fn accepts_state_pseudo_classes(&self) -> bool {
+        matches!(self, PseudoElement::Part(_))
+    }
 }
 
 impl ToCss for PseudoElement {
@@ -264,6 +284,11 @@ impl ToCss for PseudoElement {
             PseudoElement::FirstLetter => dest.write_str("::first-letter"),
             PseudoElement::Slotted(arg) => {
                 dest.write_str("::slotted(")?;
+                dest.write_str(arg)?;
+                dest.write_str(")")
+            }
+            PseudoElement::Part(arg) => {
+                dest.write_str("::part(")?;
                 dest.write_str(arg)?;
                 dest.write_str(")")
             }
@@ -354,6 +379,22 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             let arg = arguments.slice_from(start).trim().to_string();
             return Ok(PseudoElement::Slotted(arg));
         }
+        if name.eq_ignore_ascii_case("part") {
+            // ::part(<ident>+) — a non-empty space-separated list of part names.
+            // We keep the serialized names for round-tripping but never match.
+            let mut parts = String::new();
+            loop {
+                let ident = arguments.expect_ident()?;
+                if !parts.is_empty() {
+                    parts.push(' ');
+                }
+                cssparser::serialize_identifier(ident.as_ref(), &mut parts).ok();
+                if arguments.is_exhausted() {
+                    break;
+                }
+            }
+            return Ok(PseudoElement::Part(parts));
+        }
         Err(arguments.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name)))
     }
 
@@ -376,6 +417,14 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             if !langs.is_empty() {
                 return Ok(PseudoClass::Lang(langs));
             }
+        }
+        if name.eq_ignore_ascii_case("state") {
+            // :state(<ident>) — a single CSS identifier, nothing else. A dimension
+            // (`16px`), `=`, `name=value`, whitespace-separated idents, or an empty
+            // argument all fail to parse (-> SyntaxError), which is what WPT expects.
+            let ident = parser.expect_ident()?.as_ref().to_owned();
+            parser.expect_exhausted()?;
+            return Ok(PseudoClass::State(ident));
         }
         Err(parser.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name)))
     }
@@ -1223,6 +1272,9 @@ impl<'a> Element for DomElement<'a> {
                     !r.is_empty() && (lang == r || lang.starts_with(&(r + "-")))
                 })
             }
+            // :state(ident) — matches iff the element's live CustomStateSet (pushed by
+            // JS on every add/delete/clear) currently holds this exact identifier.
+            PseudoClass::State(ident) => self.tree.has_ce_state(self.node_id, ident),
             PseudoClass::Other(name) => match name.as_str() {
                 // :required / :optional are pure tag + type + attribute state, so
                 // we evaluate them straight off the tree (no JS round-trip needed).

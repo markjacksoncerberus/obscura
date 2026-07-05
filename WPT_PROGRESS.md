@@ -10,12 +10,17 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #145).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #146).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `custom-elements/state/ElementInternals-states.html` | 0/4 | **4/4** | ✅ 100% | **Quest #146 The Stateful Verdict.** `CustomStateSet` + `ElementInternals.states`. **+4.** |
+| `custom-elements/state/state-css-selector.html` | 0/10 | **10/10** | ✅ 100% | **Quest #146.** `:state()` styling (live getComputedStyle re-match). **+10.** |
+| `custom-elements/state/state-pseudo-class.html` | 2/8 | **6/8** | 🟡 | **Quest #146.** `:state()` parse/match/serialize + `::part()` parse + escape-aware rule splitter. **+4.** (caps: `::part()`/`:host()` shadow styling) |
+| `custom-elements/state/state-css-selector-nth-of.html` | 0/3 | **1/3** | 🟡 | **Quest #146.** `:state()` matching. **+1.** (cap: `:nth-child(N of S)`) |
+| `custom-elements/state/custom-state-set-strong-ref.html` | 0/1 | **1/1** | ✅ 100% | **Quest #146.** CustomStateSet survives host detach + GC. **+1.** |
 | `custom-elements/HTMLElement-attachInternals.html` | 0/4 | **4/4** | ✅ 100% | **Quest #145 The Internal Verdict.** `attachInternals()` (spec NotSupportedError gating). **+4.** |
 | `custom-elements/element-internals-shadowroot.html` | 0/7 | **7/7** | ✅ 100% | **Quest #145.** `ElementInternals.shadowRoot` + availableToElementInternals flag. **+7.** |
 | `custom-elements/form-associated/ElementInternals-validation.html` | 0/14 | **11/14** | 🟡 | **Quest #145.** `willValidate`/`validity`/`setValidity`/`validationMessage`/`checkValidity`. **+11.** |

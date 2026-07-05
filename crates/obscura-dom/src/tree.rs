@@ -315,6 +315,11 @@ pub(crate) struct DomTreeInner {
     // consulting this set). Definedness is monotonic per node, so this is set once, not
     // pushed per-query.
     pub(crate) ce_defined: HashSet<NodeId>,
+    // A form-associated/autonomous custom element's `CustomStateSet` contents, keyed by
+    // node. JS pushes the full list whenever `ElementInternals.states` is mutated
+    // (add/delete/clear). Read by the `:state(ident)` pseudo-class. Unlike `ce_defined`
+    // this is NOT monotonic — states toggle — so an empty list drops the entry entirely.
+    pub(crate) ce_states: HashMap<NodeId, Vec<String>>,
 }
 
 impl DomTree {
@@ -345,6 +350,7 @@ impl DomTree {
                 design_mode: false,
                 real_documents: HashSet::new(),
                 ce_defined: HashSet::new(),
+                ce_states: HashMap::new(),
             }),
         }
     }
@@ -440,6 +446,26 @@ impl DomTree {
     /// Whether a node has been marked a defined custom element.
     pub fn is_ce_defined(&self, id: NodeId) -> bool {
         self.inner.borrow().ce_defined.contains(&id)
+    }
+
+    /// Replace a node's custom-state set (the `:state()` pseudo consults it). An empty
+    /// list removes the entry so nothing lingers after `states.clear()`.
+    pub fn set_ce_states(&self, id: NodeId, states: Vec<String>) {
+        let mut inner = self.inner.borrow_mut();
+        if states.is_empty() {
+            inner.ce_states.remove(&id);
+        } else {
+            inner.ce_states.insert(id, states);
+        }
+    }
+
+    /// Whether a node currently carries the given custom state (exact, case-sensitive).
+    pub fn has_ce_state(&self, id: NodeId, state: &str) -> bool {
+        self.inner
+            .borrow()
+            .ce_states
+            .get(&id)
+            .is_some_and(|v| v.iter().any(|s| s == state))
     }
 
     /// Set whether the document is in design mode (drives `:read-write`/`:read-only`).

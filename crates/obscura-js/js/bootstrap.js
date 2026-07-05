@@ -12751,6 +12751,9 @@ const _cssParseRuleList = (cssText) => {
     let j = i, depth = 0, inStr = null;
     while (j < n) {
       const c = css[j];
+      // A CSS backslash-escape (outside strings) shields the next code point — e.g.
+      // `:state(\(escaped\ state)` where the escaped `(` must NOT open a nesting level.
+      if (!inStr && c === '\\') { j += 2; continue; }
       if (inStr) { if (c === inStr && css[j - 1] !== '\\') inStr = null; j++; continue; }
       if (c === '"' || c === "'") { inStr = c; j++; continue; }
       if (c === '(' || c === '[') depth++;
@@ -12773,6 +12776,7 @@ const _cssParseRuleList = (cssText) => {
     let k = j + 1; const stack = ['{']; inStr = null;
     while (k < n && stack.length > 0) {
       const c = css[k];
+      if (!inStr && c === '\\') { k += 2; continue; }
       if (inStr) { if (c === inStr && css[k - 1] !== '\\') inStr = null; k++; continue; }
       if (c === '"' || c === "'") inStr = c;
       else if (c === '{' || c === '(' || c === '[') stack.push(c);
@@ -16122,6 +16126,38 @@ Object.defineProperty(_CEIValidityState.prototype, "valid", {
   configurable: true, enumerable: true, get() { return this._i._isValid(); },
 });
 
+// CustomStateSet — the set-like backing ElementInternals.states (HTML §custom-state).
+// A thin wrapper over a real Set<string>: insertion-ordered, deduping, with live
+// iteration semantics identical to Set (which is exactly what WPT checks). Any string
+// is accepted (the old <dashed-ident> restriction was dropped). On every mutation it
+// pushes the full list to the Rust tree so the `:state(ident)` selector can match, and
+// pushes the full list to the Rust tree so the `:state(ident)` selector can match.
+// No explicit style invalidation is needed: getComputedStyle re-runs the Rust matcher
+// live per call (_buildCascade → selector_match_specificity), reading the live states.
+globalThis.CustomStateSet = class CustomStateSet {
+  constructor(target) {
+    Object.defineProperty(this, "_set", { value: new Set() });
+    Object.defineProperty(this, "_target", { value: target });
+  }
+  _sync() {
+    const t = this._target;
+    if (t && typeof t._nid === "number") {
+      try { _dom("set_ce_states", t._nid, JSON.stringify([...this._set])); } catch (e) {}
+    }
+  }
+  get size() { return this._set.size; }
+  add(v) { this._set.add(String(v)); this._sync(); return this; }
+  delete(v) { const r = this._set.delete(String(v)); if (r) this._sync(); return r; }
+  clear() { const had = this._set.size > 0; this._set.clear(); if (had) this._sync(); }
+  has(v) { return this._set.has(String(v)); }
+  keys() { return this._set.keys(); }
+  values() { return this._set.values(); }
+  entries() { return this._set.entries(); }
+  forEach(cb, thisArg) { this._set.forEach((v) => cb.call(thisArg, v, v, this)); }
+  [Symbol.iterator]() { return this._set[Symbol.iterator](); }
+  get [Symbol.toStringTag]() { return "CustomStateSet"; }
+};
+
 globalThis.ElementInternals = class ElementInternals {
   constructor(target) {
     if (!(target instanceof Element)) throw new TypeError("Illegal constructor");
@@ -16131,6 +16167,13 @@ globalThis.ElementInternals = class ElementInternals {
     this._validityAnchor = null;
     this._submissionValue = null;
     this._state = null;
+    this._states = null;            // lazily-minted CustomStateSet
+  }
+  // [SameObject] — the CustomStateSet reflecting this element's custom states. Available
+  // regardless of form-association (unlike the form-* operations).
+  get states() {
+    if (!this._states) this._states = new globalThis.CustomStateSet(this._target);
+    return this._states;
   }
   get shadowRoot() {
     const sr = this._target._shadowRoot;
