@@ -153,6 +153,25 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-05 (Quest #145 The Internal Verdict — `ElementInternals` / `attachInternals`, +28):**
+Rode #144's fresh custom elements to the memory's original pointer. `HTMLElement.attachInternals()`
+(autonomous only; spec `NotSupportedError` gating on `is`/no-def/`disabledFeatures`/already-attached/
+state) + a full `ElementInternals`: `shadowRoot` (gated on a new `_availableToElementInternals` flag
+set in `attachShadow` when the host is already (pre)customized), and form-associated ops all guarded by
+`NotSupportedError` when the definition isn't `formAssociated` — `form` (owner via id-ref/ancestor),
+`setFormValue`, `setValidity`/`validity`/`validationMessage`/`willValidate`/`checkValidity`/
+`reportValidity`, `labels`. Made `_isLabelable` accept form-associated customs (so `label.control`
+resolves them) + `label.form` reads the internals' owner. `_ceUpgrade` now sets `"precustomized"`
+during the ctor so `this.attachInternals()` works mid-upgrade. attachInternals 0→4, shadowroot 0→7,
+validation 0→11, form 0→2, setFormValue-nullish 0→2, NotSupportedError 0→1, labels 0→1 = **+28,
+ZERO regressions** (labelable-elements 26, label-attributes.sub 20, ShadowRoot-interface 8,
+form-validation-valueMissing 78, declarative-shadow-dom-basic 22, connected 24, adopted 20).
+CAPS: form-validity integration (custom control → owner form `checkValidity`/`:valid`/`:invalid`,
+validation 11/14); `setFormValue.html` (CNR, needs FormData entry-list); `ElementInternals-role`/
+`-accessibility` (118, need `test_driver.get_computed_role` = a CDP a11y backend). NEXT:
+reaction-queue microtask model; form-validity integration; `CustomStateSet`/`:state()`. Scroll
+`tickets/145-the-internal-verdict.md`.
+
 **Session 2026-07-05 (Quest #144 The Upgraded Verdict — custom element upgrade + reactions + `:defined`, +131):**
 Chased #143's pointer (`ElementInternals`) and found the elephant beneath it: the whole
 `custom-elements/` realm (~500+ subtests) was red behind a five-line STUB `customElements`

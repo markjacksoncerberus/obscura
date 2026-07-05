@@ -10,12 +10,19 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #144).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #145).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `custom-elements/HTMLElement-attachInternals.html` | 0/4 | **4/4** | ✅ 100% | **Quest #145 The Internal Verdict.** `attachInternals()` (spec NotSupportedError gating). **+4.** |
+| `custom-elements/element-internals-shadowroot.html` | 0/7 | **7/7** | ✅ 100% | **Quest #145.** `ElementInternals.shadowRoot` + availableToElementInternals flag. **+7.** |
+| `custom-elements/form-associated/ElementInternals-validation.html` | 0/14 | **11/14** | 🟡 | **Quest #145.** `willValidate`/`validity`/`setValidity`/`validationMessage`/`checkValidity`. **+11.** |
+| `custom-elements/form-associated/ElementInternals-form.html` | 0/2 | **2/2** | ✅ 100% | **Quest #145.** `ElementInternals.form` (form owner). **+2.** |
+| `custom-elements/form-associated/ElementInternals-setFormValue-nullish-value.html` | 0/2 | **2/2** | ✅ 100% | **Quest #145.** `setFormValue`. **+2.** |
+| `custom-elements/form-associated/ElementInternals-NotSupportedError.html` | 0/1 | **1/1** | ✅ 100% | **Quest #145.** Non-form-associated ops throw NotSupportedError. **+1.** |
+| `custom-elements/form-associated/ElementInternals-labels.html` | 0/3 | **1/3** | 🟡 | **Quest #145.** `ElementInternals.labels` + form-associated customs are labelable. **+1.** |
 | `custom-elements/CustomElementRegistry.html` | 10/46 | **31/46** | 🟡 | **Quest #144 The Upgraded Verdict.** Real `CustomElementRegistry` (spec `define`/`get`/`getName`/`whenDefined`/`upgrade`). **+21.** |
 | `custom-elements/Document-createElement.html` | 0/36 | **12/36** | 🟡 | **Quest #144.** `createElement` consults the registry + synchronous construction in a browsing-context doc. **+12.** |
 | `custom-elements/HTMLElement-constructor.html` | 1/12 | **11/12** | 🟡 | **Quest #144.** Real HTML element constructor + construction-stack adoption (identity-preserving upgrade). **+10.** |

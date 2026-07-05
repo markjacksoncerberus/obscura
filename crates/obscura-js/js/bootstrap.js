@@ -4364,6 +4364,7 @@ function _ceUpgrade(el, def) {
   const stack = def.constructionStack;
   stack.push(el);
   let ok = false;
+  el._ceState = "precustomized";          // HTML upgrade step: state during the ctor (attachInternals allows it)
   try {
     const result = Reflect.construct(def.constructor, [], def.constructor);
     ok = (result === el);
@@ -16078,6 +16079,144 @@ Object.defineProperties(globalThis.HTMLFormElement.prototype, {
   reportValidity: { configurable: true, writable: true, value: function () { return this.checkValidity(); } },
 });
 
+// ===================== ElementInternals / attachInternals (HTML §4.13.6) =========
+// A form-associated custom element's form owner: the `form` content-attribute id-ref
+// (resolved in the element's tree, must point at a <form>), else the nearest ancestor
+// <form>. Autonomous (non-form-associated) internals never call this.
+function _ceiFormOwner(el) {
+  const fa = el.getAttribute ? el.getAttribute("form") : null;
+  if (fa != null) {
+    if (fa === "") return null;
+    let root = el; for (;;) { const p = root.parentNode; if (!p) break; root = p; }
+    let cand = null;
+    if (root.getElementById) cand = root.getElementById(fa);
+    else if (root.querySelector) { try { cand = root.querySelector('#' + String(fa).replace(/["\\]/g, "\\$&")); } catch (e) {} }
+    return (cand && cand.localName === "form") ? cand : null;
+  }
+  let p = el.parentNode;
+  while (p && p.nodeType === 1) { if (p.localName === "form") return p; p = p.parentNode; }
+  return null;
+}
+// willValidate for a form-associated custom element: barred by disabled, an ancestor
+// <datalist>, or a `readonly` content attribute (HTML §4.13.6).
+function _ceiWillValidate(el) {
+  if (_cvIsDisabled(el)) return false;
+  if (_cvHasDatalistAncestor(el)) return false;
+  if (el.hasAttribute && el.hasAttribute("readonly")) return false;
+  return true;
+}
+const _CEI_VALIDITY_KEYS = ["valueMissing", "typeMismatch", "patternMismatch", "tooLong",
+  "tooShort", "rangeUnderflow", "rangeOverflow", "stepMismatch", "badInput", "customError"];
+// ElementInternals' ValidityState reflects the flags last pushed via setValidity()
+// (unlike the built-in ValidityState which computes from an <input>'s attributes/value).
+class _CEIValidityState {
+  constructor(internals) { Object.defineProperty(this, "_i", { value: internals }); }
+  get [Symbol.toStringTag]() { return "ValidityState"; }
+}
+for (const k of _CEI_VALIDITY_KEYS) {
+  Object.defineProperty(_CEIValidityState.prototype, k, {
+    configurable: true, enumerable: true, get() { return !!this._i._validity[k]; },
+  });
+}
+Object.defineProperty(_CEIValidityState.prototype, "valid", {
+  configurable: true, enumerable: true, get() { return this._i._isValid(); },
+});
+
+globalThis.ElementInternals = class ElementInternals {
+  constructor(target) {
+    if (!(target instanceof Element)) throw new TypeError("Illegal constructor");
+    Object.defineProperty(this, "_target", { value: target });
+    this._validity = {};            // flags pushed by setValidity
+    this._validationMessage = "";
+    this._validityAnchor = null;
+    this._submissionValue = null;
+    this._state = null;
+  }
+  get shadowRoot() {
+    const sr = this._target._shadowRoot;
+    return (sr && sr._availableToElementInternals) ? sr : null;
+  }
+  // The form-associated operations throw NotSupportedError on a custom element whose
+  // definition is not form-associated (HTML: each is guarded by this check).
+  _requireFormAssociated() {
+    const def = this._target._ceDefinition;
+    if (!def || !def.formAssociated)
+      throw new DOMException("The target element is not a form-associated custom element.", "NotSupportedError");
+  }
+  _formOwner() { return _ceiFormOwner(this._target); }
+  _isValid() {
+    for (const k of _CEI_VALIDITY_KEYS) if (this._validity[k]) return false;
+    return true;
+  }
+  get form() { this._requireFormAssociated(); return _ceiFormOwner(this._target); }
+  setFormValue(value, state) {
+    this._requireFormAssociated();
+    this._submissionValue = value;
+    this._state = (state === undefined) ? value : state;
+  }
+  setValidity(flags, message, anchor) {
+    this._requireFormAssociated();
+    if (flags == null || typeof flags !== "object")
+      throw new TypeError("Failed to execute 'setValidity' on 'ElementInternals': The provided value is not of type 'ValidityStateFlags'.");
+    let anyInvalid = false;
+    for (const k of _CEI_VALIDITY_KEYS) if (flags[k]) anyInvalid = true;
+    if (anyInvalid && (message === undefined || message === null || String(message) === ""))
+      throw new TypeError("Failed to execute 'setValidity' on 'ElementInternals': The validity message must not be empty when the element is invalid.");
+    const next = {};
+    for (const k of _CEI_VALIDITY_KEYS) next[k] = !!flags[k];
+    this._validity = next;
+    this._validationMessage = anyInvalid ? String(message) : "";
+    this._validityAnchor = anyInvalid ? (anchor || null) : null;
+  }
+  get validity() {
+    this._requireFormAssociated();
+    if (!this._validityStateObj) this._validityStateObj = new _CEIValidityState(this);
+    return this._validityStateObj;
+  }
+  get validationMessage() { this._requireFormAssociated(); return this._isValid() ? "" : this._validationMessage; }
+  get willValidate() { this._requireFormAssociated(); return _ceiWillValidate(this._target); }
+  checkValidity() {
+    this._requireFormAssociated();
+    if (_ceiWillValidate(this._target) && !this._isValid()) {
+      this._target.dispatchEvent(new Event("invalid", { cancelable: true, bubbles: false }));
+      return false;
+    }
+    return true;
+  }
+  reportValidity() {
+    this._requireFormAssociated();
+    if (!_ceiWillValidate(this._target)) return true;
+    return this.checkValidity();
+  }
+  get labels() {
+    this._requireFormAssociated();
+    return globalThis.__ceiLabelsFor(this._target);
+  }
+  get [Symbol.toStringTag]() { return "ElementInternals"; }
+};
+
+// HTMLElement.attachInternals() (HTML §4.13.5). Autonomous elements only.
+Object.defineProperty(globalThis.HTMLElement.prototype, "attachInternals", {
+  configurable: true, writable: true,
+  value: function attachInternals() {
+    if (this._is)
+      throw new DOMException("Unable to attach ElementInternals to a customized built-in element.", "NotSupportedError");
+    const reg = globalThis.customElements;
+    const def = reg && reg._defs.get(this.localName);
+    if (!def || def.name !== def.localName)
+      throw new DOMException("The element is not a custom element.", "NotSupportedError");
+    if (def.disableInternals)
+      throw new DOMException("ElementInternals is disabled for this element (disabledFeatures).", "NotSupportedError");
+    if (this._ceInternals)
+      throw new DOMException("ElementInternals for the specified element was already attached.", "NotSupportedError");
+    if (this._ceState !== "precustomized" && this._ceState !== "custom")
+      throw new DOMException("The element is not fully upgraded yet.", "NotSupportedError");
+    const internals = new globalThis.ElementInternals(this);
+    this._ceInternals = internals;
+    return internals;
+  },
+});
+
 // --- reflected content attributes the constraint validation tests rely on --
 function _cvReflBool(proto, prop, attr) {
   Object.defineProperty(proto, prop, {
@@ -17006,6 +17145,8 @@ function _cvReflLong(proto, prop, attr) {
   const _LABELABLE_SEL = "button, input, meter, output, progress, select, textarea";
   const _isLabelable = (el) => {
     if (!el || el.nodeType !== 1) return false;
+    // A form-associated custom element is labelable (HTML §4.10.4).
+    if (el._ceDefinition && el._ceDefinition.formAssociated) return true;
     const ln = el.localName;
     if (ln === "input") return (el.getAttribute("type") || "").toLowerCase() !== "hidden";
     return _LABELABLE.has(ln);
@@ -17077,6 +17218,12 @@ function _cvReflLong(proto, prop, attr) {
     if (!nl) { nl = _makeLiveLabels(this); _labelsCache.set(this, nl); }
     return nl;
   };
+  // Exposed for ElementInternals.labels (a form-associated custom element's labels).
+  globalThis.__ceiLabelsFor = function (el) {
+    let nl = _labelsCache.get(el);
+    if (!nl) { nl = _makeLiveLabels(el); _labelsCache.set(el, nl); }
+    return nl;
+  };
   for (const nm of ["HTMLButtonElement", "HTMLInputElement", "HTMLMeterElement",
                     "HTMLOutputElement", "HTMLProgressElement", "HTMLSelectElement",
                     "HTMLTextAreaElement"]) {
@@ -17096,7 +17243,13 @@ function _cvReflLong(proto, prop, attr) {
     // NOT the label's own ancestor form (HTML §4.10.4).
     Object.defineProperty(globalThis.HTMLLabelElement.prototype, "form", {
       configurable: true,
-      get() { const c = this.control; return c ? (c.form || null) : null; },
+      get() {
+        const c = this.control;
+        if (!c) return null;
+        // A form-associated custom element's form owner lives on its internals.
+        if (c._ceInternals) return c._ceInternals._formOwner();
+        return c.form || null;
+      },
     });
   }
 
@@ -18478,6 +18631,12 @@ Element.prototype.attachShadow = function attachShadow(init) {
   if (init && init.slotAssignment === 'manual') shadow._slotAssignment = 'manual';
   if (init && init.clonable) shadow._clonable = true;
   if (init && init.serializable) shadow._serializable = true;
+  // DOM "attach a shadow root": the shadow is available to element internals iff the
+  // host is a custom element that's already been (pre)customized — so a shadow attached
+  // during/after upgrade is reachable via ElementInternals.shadowRoot, but one attached
+  // to a still-"undefined" host (before the constructor runs) is not.
+  if (host._ceState === "precustomized" || host._ceState === "custom")
+    shadow._availableToElementInternals = true;
   host._shadowRoot = shadow;
   return shadow;
 };
