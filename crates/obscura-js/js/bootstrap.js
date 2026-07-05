@@ -1209,6 +1209,28 @@ class Node {
           }
         }
       }
+      // DOM "clone a node" — the shadow-host step: if this element hosts a
+      // CLONABLE shadow root, the clone gets its own shadow root with the same
+      // settings, and the shadow tree is ALWAYS deep-cloned into it (independent
+      // of `deep`, per spec). This is what carries a declarative shadow through
+      // `template.content.cloneNode(true)` / `importNode()` — the
+      // `shadowrootclonable` case. Non-clonable shadows are not copied.
+      if (this._shadowRoot && this._shadowRoot._clonable) {
+        const srcSR = this._shadowRoot;
+        const newSR = el.attachShadow({
+          mode: srcSR._shadowMode,
+          delegatesFocus: !!srcSR._delegatesFocus,
+          slotAssignment: srcSR._slotAssignment || 'named',
+          clonable: true,
+          serializable: !!srcSR._serializable,
+        });
+        newSR._declarative = srcSR._declarative;
+        const sk = srcSR.childNodes;
+        for (let i = 0; i < sk.length; i++) {
+          const c = (sk[i] && sk[i].cloneNode) ? sk[i].cloneNode(true, _targetDoc) : null;
+          if (c) newSR.appendChild(c);
+        }
+      }
       return el;
     }
     if (t === 3) return (_targetDoc || document).createTextNode(this.textContent);
@@ -3902,9 +3924,21 @@ class DocumentFragment extends Node {
   }
   // ParentNode append/prepend/replaceChildren are mixed onto the prototype below
   // (shared with Element/Document via the "_pn*" assignments).
-  cloneNode(deep) {
-    const frag = document.createDocumentFragment();
-    if (deep) frag.innerHTML = this.innerHTML;
+  cloneNode(deep, _targetDoc) {
+    const doc = (_targetDoc && _targetDoc.createDocumentFragment) ? _targetDoc : document;
+    const frag = doc.createDocumentFragment();
+    // Deep-clone by recursing over the REAL children (not innerHTML round-trip):
+    // serialize+reparse would DROP shadow roots on child hosts (innerHTML never
+    // includes shadow trees) and re-parse without declarative-shadow processing,
+    // so `template.content.cloneNode(true)` / `importNode()` lost clonable shadows.
+    // Recursing lets the element clone step carry each clonable shadow across.
+    if (deep) {
+      const kids = this.childNodes;
+      for (let i = 0; i < kids.length; i++) {
+        const c = (kids[i] && kids[i].cloneNode) ? kids[i].cloneNode(true, _targetDoc) : null;
+        if (c) frag.appendChild(c);
+      }
+    }
     return frag;
   }
 }
@@ -13447,6 +13481,13 @@ class ShadowRoot extends DocumentFragment {
   }
   // getElementById is inherited from DocumentFragment (scoped to the backing node,
   // so it keeps working after the host is detached).
+  // DOM §4.4 clone: "If node is a shadow root, then throw a NotSupportedError."
+  // This also makes Document.importNode(shadowRoot) throw (it delegates to
+  // cloneNode). Overrides DocumentFragment.cloneNode, which would silently clone.
+  cloneNode() {
+    throw new DOMException("Failed to execute 'cloneNode' on 'Node': ShadowRoot nodes are not clonable.",
+      "NotSupportedError");
+  }
   // A shadow root is its own (non-composed) root; composed jumps to the host's tree.
   getRootNode(options) {
     if (options && options.composed && this._shadowHost) {
@@ -18250,7 +18291,20 @@ function _processDeclarativeShadowRoots(node, skipDirect) {
           converted = true;
         }
       }
-      if (!converted) _processDeclarativeShadowRoots(child, false);
+      if (!converted) {
+        _processDeclarativeShadowRoots(child, false);
+        // A `<template>` element's parsed markup lives in its SEPARATE content
+        // fragment, not as light children, so the walk above never reaches it.
+        // Declarative shadow roots inside template content ARE attached during
+        // document parsing (the content's direct children have the fragment as
+        // parent — never a valid host — so skipDirect is unnecessary here). This
+        // is exactly what `shadowrootclonable` + `template.content.cloneNode()`
+        // rely on: the inner host carries a clonable shadow that the clone copies.
+        if (child.localName === 'template') {
+          const content = child.content;
+          if (content) _processDeclarativeShadowRoots(content, false);
+        }
+      }
     }
     child = next;
   }

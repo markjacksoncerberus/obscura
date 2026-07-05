@@ -153,6 +153,29 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-05 (Quest #143 The Cloned Verdict — clone-propagation of shadow roots, +8):**
+Took #142's #1 pointer (`declarative-shadow-dom-basic` 18/22 — clone a `<template>` whose
+content holds a `<template shadowrootmode=open shadowrootclonable>` and assert the clone's
+inner host has a live shadow). CDP-probing pinned THREE `bootstrap.js` root causes: (1)
+`_processDeclarativeShadowRoots` never descended into `<template>` content (a template's
+markup lives in its separate content fragment, `firstChild` is null), so the inner
+declarative shadow was never attached at parse time; (2) `Node.cloneNode` skipped the DOM
+"clone a node" shadow-host step (a *clonable* shadow must be re-attached and deep-cloned onto
+the clone); (3) `DocumentFragment.cloneNode` cloned via an `innerHTML` round-trip, which DROPS
+shadow roots (innerHTML never serializes shadow trees) — so `template.content.cloneNode(true)`
+lost the shadow before the element clone step ran. FIX: descend into template content;
+`cloneNode` runs the shadow-host step gated on `_clonable` (imperative non-clonable shadows
+stay uncloned — the "should NOT clone" subtests already passed); fragment `cloneNode` recurses
+over REAL children forwarding `_targetDoc`; and `ShadowRoot.cloneNode` throws `NotSupportedError`
+(DOM §clone), which also makes `importNode(shadowRoot)` throw. basic 18→22, Node-prototype-cloneNode
+2→4, Document-prototype-importNode 0→2 = **+8, ZERO regressions** (Node-cloneNode 135,
+Range-cloneContents/extractContents 187 each, template-content 216, insert_adjacent_html 31,
+qsa 1975, classlist 1420, createElement 147, Node-properties 726, attachment 654, opt-in 111,
+slots 26, gethtml 6908 — all identical). CAPS: `declarative-after-attachshadow` 0/1 (parse-time
+MutationObserver interleaving, not clone); `slot-assignment-serialization` 1/3; `ElementInternals`;
+in-shadow focus. NEXT: **`ElementInternals`/`attachInternals`**, then in-shadow focus
+(`ShadowRoot.activeElement`). Scroll `tickets/143-the-cloned-verdict.md`.
+
 **Session 2026-07-04 (Quest #142 The Serialized Verdict — `getHTML()` = HTML fragment serialization with shadow roots, +6914):**
 Took #141's #1 pointer (the `gethtml.html` 0/6908 elephant — the single largest red test
 in the suite). `Element.getHTML()`/`ShadowRoot.getHTML()` did not exist. **THE FIX (all

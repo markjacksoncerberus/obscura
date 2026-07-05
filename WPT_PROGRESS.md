@@ -10,11 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-04 (Quest #142).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #143).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
+| `shadow-dom/declarative/declarative-shadow-dom-basic.html` | 18/22 | **22/22** | ✅ 100% | **Quest #143 The Cloned Verdict.** Clone-propagation of *clonable* shadow roots: `_processDeclarativeShadowRoots` descends into `<template>` content (attaching declarative shadows there at parse time), `Node.cloneNode` runs the DOM clone shadow-host step, and `DocumentFragment.cloneNode` deep-clones REAL children instead of an innerHTML round-trip (which dropped shadows). **+4.** |
+| `shadow-dom/Node-prototype-cloneNode.html` | 2/4 | **4/4** | ✅ 100% | **Quest #143 The Cloned Verdict.** `ShadowRoot.cloneNode(...)` throws `NotSupportedError` (DOM §clone); non-clonable element shadows still not cloned. **+2.** |
+| `shadow-dom/Document-prototype-importNode.html` | 0/2 | **2/2** | ✅ 100% | **Quest #143 The Cloned Verdict.** `importNode(shadowRoot)` throws `NotSupportedError` (delegates to the throwing `ShadowRoot.cloneNode`). **+2.** |
 | `shadow-dom/declarative/gethtml.html` | 0/6908 | **6908/6908** | ✅ 100% | **Quest #142 The Serialized Verdict.** `Element.getHTML()`/`ShadowRoot.getHTML()` — HTML fragment serialization with shadow roots (`<template shadowrootmode>` prepended for serializable/forced shadows); shadow-free subtrees defer to the Rust `outer_html` serializer so output stays byte-identical to `innerHTML`. Plus a pre-existing doc-proxy stack-overflow fix (internal `_`-keys are never named properties) that unblocked connecting `embed`/`form`/`iframe`/`img`/`object`. **+6908.** |
 | `shadow-dom/declarative/gethtml-ordering.html` | could-not-run | **3/3** | ✅ 100% | **Quest #142 The Serialized Verdict.** `getHTML()` shadow-serialization ordering. **+3.** |
 | `shadow-dom/declarative/declarative-shadow-dom-serialization.html` | 0/2 | **2/2** | ✅ 100% | **Quest #142 The Serialized Verdict.** Declarative shadow round-trips through `getHTML({serializableShadowRoots:true})`. **+2.** |
