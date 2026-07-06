@@ -10,12 +10,22 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #146).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #147).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `custom-elements/reactions/Element.html` | 38/47 | **47/47** | ✅ 100% | **Quest #147 The Reactive Verdict.** setAttributeNS/Node(NS)/removeAttributeNode + cross-doc disconnected. **+9.** |
+| `custom-elements/reactions/HTMLElement.html` | 12/22 | **20/22** | 🟡 91% | **Quest #147.** translate/draggable/spellcheck reflectors + innerText/outerText disconnected (popover capped). **+8.** |
+| `custom-elements/reactions/NamedNodeMap.html` | 8/14 | **14/14** | ✅ 100% | **Quest #147.** setNamedItem(NS)/removeNamedItem(NS) via `_rawSetNS`/`_rawRemoveNS`. **+6.** |
+| `custom-elements/reactions/Node.html` | 9/14 | **14/14** | ✅ 100% | **Quest #147.** Attr nodeValue/textContent + cross-doc disconnected. **+5.** |
+| `custom-elements/reactions/ChildNode.html` | 4/7 | **7/7** | ✅ 100% | **Quest #147.** before/after/replaceWith cross-doc disconnected. **+3.** |
+| `custom-elements/reactions/ParentNode.html` | 2/4 | **4/4** | ✅ 100% | **Quest #147.** append/prepend cross-doc disconnected. **+2.** |
+| `custom-elements/reactions/Range.html` | 8/10 | **10/10** | ✅ 100% | **Quest #147.** extractContents disconnected + `createContextualFragment`. **+2.** |
+| `custom-elements/reactions/Attr.html` | 1/2 | **2/2** | ✅ 100% | **Quest #147.** Attr.value setter attributeChanged. **+1.** |
+| `custom-elements/adopted-callback.html` | 20/71 | **32/71** | 🟡 45% | **Quest #147** (bonus). Cross-doc move now fires the full disconnected+adopted+connected. **+12.** |
+| `custom-elements/attribute-changed-callback.html` | 9/13 | **12/13** | 🟡 92% | **Quest #147** (bonus). setAttributeNS/Node paths now enqueue attributeChanged. **+3.** |
 | `custom-elements/state/ElementInternals-states.html` | 0/4 | **4/4** | ✅ 100% | **Quest #146 The Stateful Verdict.** `CustomStateSet` + `ElementInternals.states`. **+4.** |
 | `custom-elements/state/state-css-selector.html` | 0/10 | **10/10** | ✅ 100% | **Quest #146.** `:state()` styling (live getComputedStyle re-match). **+10.** |
 | `custom-elements/state/state-pseudo-class.html` | 2/8 | **6/8** | 🟡 | **Quest #146.** `:state()` parse/match/serialize + `::part()` parse + escape-aware rule splitter. **+4.** (caps: `::part()`/`:host()` shadow styling) |

@@ -154,6 +154,29 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-05 (Quest #147 The Reactive Verdict — CEReactions on the remaining DOM mutation entry points, +51):**
+Quest #144 wired reactions into the primary mutation paths; this filled in EVERY other
+`[CEReactions]` entry point the `custom-elements/reactions/` suite exercises. All `bootstrap.js`,
+all gated on `customElements._defs.size` so non-custom pages pay zero cost. **(1) Attribute
+funnel:** `setAttributeNS`/`setAttributeNode(NS)`/`NamedNodeMap.setNamedItem(NS)` and the
+`Attr.value`/`nodeValue`/`textContent` setters ALL funnel through `_rawSetNS` (removes through
+`_rawRemoveNS`), so ONE hook in each — read old value when `"custom"`, then
+`_ceAttributeChanged(local, old, new, ns)` — fixed Element attrs + Attr + NamedNodeMap + the
+Attr-node cases of Node at once. **(2) Moved connected nodes run removing steps** (DOM "adopt"
+step 2): `appendChild`/`insertBefore` now capture `_wasConnected` before the tree op and
+`_ceRemovalSteps(node)` after, so a cross-document move fires the leading `disconnected`;
+`replaceChild` + all before/after/replaceWith/remove/append/prepend delegate to these cores;
+`textContent`/`innerText`/`outerText` setters fire removal steps on detached children.
+**(3) HTMLElement reflectors:** `translate`/`draggable`/`spellcheck` (IDL bool → enumerated
+keyword content values) + a real `outerText` setter. **(4) `Range.createContextualFragment`:**
+fragment-parse in context, then upgrade the subtree. reactions/Element 38→47, HTMLElement 12→20
+(popover capped), NamedNodeMap 8→14, Node 9→14, ChildNode 4→7, ParentNode 2→4, Range 8→10,
+Attr 1→2, **+ bonus** adopted-callback 20→32, attribute-changed-callback 9→12 = **+51, ZERO
+regressions** (qsa 1975, classlist 1420, createElement 147, Range-surroundContents 1840,
+Range-cloneContents 187, connected 24, disconnected 24, upgrading 17, pseudo-class-defined 27,
+CustomElementRegistry 31). CAPS: per-document registries (reactions/Document 0/12, parser 1/10),
+reaction-queue microtask model, `popover`. Scroll `tickets/147-the-reactive-verdict.md`.
+
 **Session 2026-07-05 (Quest #146 The Stateful Verdict — `CustomStateSet` + `:state()`, +20):**
 Rode #145's fresh `ElementInternals` into the `custom-elements/state/` realm (all red).
 Two-part feature mirroring `:defined`: **(JS)** `CustomStateSet` — a thin wrapper over a real

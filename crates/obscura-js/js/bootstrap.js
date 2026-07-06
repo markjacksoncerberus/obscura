@@ -859,7 +859,14 @@ class Node {
     const _outer = _watching && __obscura_batchDepth === 0;
     const children = _domParse("child_nodes", this._nid) || [];
     if (_watching) __obscura_enterBatch();
-    for (const c of children) _dom("remove_child", c);
+    // Replacing children detaches the old subtree; when connected, its custom
+    // elements get disconnectedCallback (this is what innerText='' relies on).
+    const _ceReg = globalThis.customElements;
+    const _ceDisc = _ceReg && _ceReg._defs.size && this.isConnected;
+    for (const c of children) {
+      if (_ceDisc) _ceRemovalSteps(_wrap(c));
+      _dom("remove_child", c);
+    }
     let added = [];
     if (v != null && v !== "") {
       const tn = +_dom("create_text_node", String(v));
@@ -946,7 +953,14 @@ class Node {
     if (_oldParent && __obscura_liveRanges.length)
       __obscura_adjustRangesForRemove(c, _oldParent, __obscura_nodeIndex(c));
     const _prev = __mutationObservers?.length ? +_dom("last_child", this._nid) : -1;
+    // Moving a currently-CONNECTED node is DOM "adopt" step 2 ("remove node"),
+    // whose removing steps enqueue disconnectedCallback for every custom element
+    // in the moved subtree — BEFORE the adopted/connected reactions below. Gated
+    // on a live registry so non-custom pages skip the isConnected walk entirely.
+    const _ceRegA = globalThis.customElements;
+    const _wasConnected = (_ceRegA && _ceRegA._defs.size && (c.nodeType === 1 || c.nodeType === 11)) ? c.isConnected : false;
     _dom("append_child", this._nid, c._nid);
+    if (_wasConnected) _ceRemovalSteps(c);
     // Insert §"adopt node into the parent's node document": when the node comes
     // from a different document, retarget the node document of it AND its whole
     // subtree (otherwise descendants keep their old ownerDocument). Same-document
@@ -1130,7 +1144,12 @@ class Node {
     const _oldParent = n.parentNode;
     if (_oldParent && __obscura_liveRanges.length)
       __obscura_adjustRangesForRemove(n, _oldParent, __obscura_nodeIndex(n));
+    // Moving a connected node runs removing steps first (see appendChild) —
+    // disconnectedCallback precedes the adopted/connected reactions below.
+    const _ceRegI = globalThis.customElements;
+    const _wasConnectedI = (_ceRegI && _ceRegI._defs.size && (n.nodeType === 1 || n.nodeType === 11)) ? n.isConnected : false;
     _dom("insert_before", n._nid, ref._nid);
+    if (_wasConnectedI) _ceRemovalSteps(n);
     // DOM "insert" live-range steps, with the node now at its new position (a
     // non-null reference, so boundary points past it shift forward by one).
     if (__obscura_liveRanges.length)
@@ -2174,6 +2193,27 @@ class Element extends Node {
   }
   get innerText() { return this.textContent; }
   set innerText(v) { this.textContent = v; }
+  // outerText getter mirrors innerText (rendered text ≈ textContent for us). The
+  // setter replaces the element itself with a "rendered text fragment" (newlines
+  // become <br>); an empty value therefore just removes the element (which is
+  // what the CEReactions test relies on for its disconnectedCallback).
+  get outerText() { return this.textContent; }
+  set outerText(v) {
+    const parent = this.parentNode;
+    if (!parent)
+      throw new DOMException("Failed to set the 'outerText' property on 'HTMLElement': This element has no parent node.", "NoModificationAllowedError");
+    const doc = this.ownerDocument || globalThis.document;
+    const s = (v === null ? "" : String(v));
+    const frag = doc.createDocumentFragment();
+    if (s !== "") {
+      const parts = s.split(/\r\n|\r|\n/);
+      for (let i = 0; i < parts.length; i++) {
+        if (i) frag.appendChild(doc.createElement('br'));
+        frag.appendChild(doc.createTextNode(parts[i]));
+      }
+    }
+    parent.replaceChild(frag, this);
+  }
   get children() {
     return _makeHTMLCollection(() => (_domParse("element_children", this._nid) || []).map(_wrapEl).filter(Boolean));
   }
@@ -2221,12 +2261,25 @@ class Element extends Node {
   // Low-level namespace-keyed get/set/remove used by Attr nodes and the NS APIs.
   _rawGetNS(ns, local) { return _domParse("get_attribute_ns", this._nid, (ns || '') + "\0" + local); }
   _rawSetNS(ns, prefix, local, value) {
+    // Every namespaced / attr-node write funnels here — setAttributeNS,
+    // setAttributeNode(NS), NamedNodeMap.setNamedItem(NS), and the Attr.value /
+    // Attr.nodeValue / Attr.textContent setters — so this is the single spot to
+    // enqueue the custom-element attributeChanged reaction for all of them (the
+    // plain setAttribute path has its own hook against the `set_attribute` op).
+    const _ce = globalThis.customElements;
+    const _ceOld = (_ce && _ce._defs.size && this._ceState === "custom") ? this._rawGetNS(ns, local) : undefined;
     _dom("set_attribute_ns", this._nid, (ns || '') + "\0" + (prefix || '') + "\0" + local + "\0" + String(value));
     __notifyMutation();
+    if (_ceOld !== undefined) _ceAttributeChanged(this, local, _ceOld, String(value), ns || null);
   }
   _rawRemoveNS(ns, local) {
+    // Funnel for removeAttributeNS / removeAttributeNode / NamedNodeMap.removeNamedItem(NS):
+    // fire attributeChanged(local, oldValue, null, ns) only if the attribute was present.
+    const _ce = globalThis.customElements;
+    const _ceOld = (_ce && _ce._defs.size && this._ceState === "custom") ? this._rawGetNS(ns, local) : undefined;
     _dom("remove_attribute_ns", this._nid, (ns || '') + "\0" + local);
     __notifyMutation();
+    if (_ceOld != null) _ceAttributeChanged(this, local, _ceOld, null, ns || null);
   }
   // Reconcile the per-element Attr identity cache against the live attribute
   // list, minting wrappers for new attributes and detaching removed ones.
@@ -3036,6 +3089,34 @@ for (const __jsAttr in __reflectedEnumAttrs) {
       return __keywords.includes(lower) ? lower : '';
     },
     set(v) { this.setAttribute(__contentAttr, String(v)); },
+  });
+}
+
+// `translate` / `draggable` / `spellcheck` are IDL booleans that reflect to
+// ENUMERATED content attributes (keyword values, not the empty/absent form of a
+// plain boolean). translate ↔ yes/no (missing/invalid default: inherit, true at
+// the root); draggable ↔ true/false (default false); spellcheck ↔ true/false
+// (default: inherit, true-ish). The setter writes the keyword via setAttribute
+// so it participates in the custom-element attributeChanged reaction like any
+// other content-attribute write.
+const __reflectedBoolEnumAttrs = {
+  translate:  { attr: 'translate',  on: 'yes',  off: 'no',    dflt: true },
+  draggable:  { attr: 'draggable',  on: 'true', off: 'false', dflt: false },
+  spellcheck: { attr: 'spellcheck', on: 'true', off: 'false', dflt: true },
+};
+for (const __jsAttr in __reflectedBoolEnumAttrs) {
+  const { attr: __contentAttr, on: __on, off: __off, dflt: __dflt } = __reflectedBoolEnumAttrs[__jsAttr];
+  Object.defineProperty(Element.prototype, __jsAttr, {
+    configurable: true, enumerable: true,
+    get() {
+      const v = this.getAttribute(__contentAttr);
+      if (v == null) return __dflt;                 // missing → default (simplified: no inheritance walk)
+      const lower = __asciiLower(v);
+      if (lower === __on || (__on === 'yes' && v === '')) return true;   // translate: "" counts as yes
+      if (lower === __off) return false;
+      return __dflt;                                // invalid value → default
+    },
+    set(v) { this.setAttribute(__contentAttr, v ? __on : __off); },
   });
 }
 
@@ -18063,6 +18144,33 @@ globalThis.Range = class Range {
     this.insertNode(newParent);
     newParent.appendChild(fragment);
     this.selectNode(newParent);
+  }
+
+  // DOM §dom-range-createcontextualfragment: fragment-parse `markup` using the
+  // range's start node as the parsing context, returning a DocumentFragment.
+  // Custom elements in the markup are CONSTRUCTED (upgraded) even though the
+  // fragment is not connected — so an inline `<x-foo id>` logs constructed +
+  // attributeChanged before it is ever inserted.
+  createContextualFragment(markup) {
+    markup = String(markup);
+    const node = this._sc;
+    const doc = (node && node.nodeType === 9) ? node : ((node && node.ownerDocument) || globalThis.document);
+    let element = (node && node.nodeType === 1) ? node : null;
+    // A null context, or an <html> element in an HTML document, parses in a body context.
+    if (element && element.localName === 'html' && doc._isHTMLDoc !== false) element = null;
+    const tmp = doc.createElement(element ? (element.localName || 'body') : 'body');
+    tmp.innerHTML = markup;                        // fragment parsing algorithm (detached → no upgrade yet)
+    const frag = doc.createDocumentFragment();
+    while (tmp.firstChild) frag.appendChild(tmp.firstChild);
+    // Upgrade the whole parsed subtree in tree order (createContextualFragment
+    // runs in a browsing-context document, which synchronously constructs customs).
+    const reg = globalThis.customElements;
+    if (reg && reg._defs.size) {
+      const walk = (el) => { _ceTryUpgrade(el); let k = el.firstChild; while (k) { if (k.nodeType === 1) walk(k); k = k.nextSibling; } };
+      let c = frag.firstChild; while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; }
+      _ceFlush();
+    }
+    return frag;
   }
 
   getBoundingClientRect() { return new DOMRect(); }
