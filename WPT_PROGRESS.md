@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-05 (Quest #147).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-06 (Quest #148).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `custom-elements/reactions/Document.html` | 0/12 | **10/12** | 🟡 83% | **Quest #148 The Realmed Verdict.** Per-window registries: `test_with_window` defines in each frame's own registry (no collision); iframe `createElement`/`importNode`/`adoptNode` construct from it; `Document.body` setter + `document.write`/`open` clear semantics. (execCommand-delete + `title.text` capped.) **+10.** |
+| `custom-elements/parser/parser-uses-registry-of-owner-document.html` | 1/10 | **10/10** | ✅ 100% | **Quest #148.** Parsed customs upgrade via the owner document's registry, not the global one. **+9.** |
+| `custom-elements/upgrading.html` | 17/28 | **25/28** | 🟡 89% | **Quest #148** (bonus). Per-window `HTMLElement`/registry resolution across frames. **+8.** |
+| `html/dom/documents/dom-tree-accessors/Document.body.html` | 7/26 | **11/26** | 🟡 42% | **Quest #148.** New spec `Document.body` setter (WebIDL TypeError + HierarchyRequestError + replace/append). **+4.** |
+| `custom-elements/pseudo-class-defined.html` | 27/35 | **31/35** | 🟡 89% | **Quest #148** (bonus). `:defined` resolves per owner-document registry. **+4.** |
+| `custom-elements/custom-element-reaction-queue.html` | 0/6 | **1/6** | 🔴 17% | **Quest #148.** Per-window registry removes the `define() already used` collision (rest need the microtask reaction-queue model). **+1.** |
 | `custom-elements/reactions/Element.html` | 38/47 | **47/47** | ✅ 100% | **Quest #147 The Reactive Verdict.** setAttributeNS/Node(NS)/removeAttributeNode + cross-doc disconnected. **+9.** |
 | `custom-elements/reactions/HTMLElement.html` | 12/22 | **20/22** | 🟡 91% | **Quest #147.** translate/draggable/spellcheck reflectors + innerText/outerText disconnected (popover capped). **+8.** |
 | `custom-elements/reactions/NamedNodeMap.html` | 8/14 | **14/14** | ✅ 100% | **Quest #147.** setNamedItem(NS)/removeNamedItem(NS) via `_rawSetNS`/`_rawRemoveNS`. **+6.** |

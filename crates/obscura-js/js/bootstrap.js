@@ -861,8 +861,7 @@ class Node {
     if (_watching) __obscura_enterBatch();
     // Replacing children detaches the old subtree; when connected, its custom
     // elements get disconnectedCallback (this is what innerText='' relies on).
-    const _ceReg = globalThis.customElements;
-    const _ceDisc = _ceReg && _ceReg._defs.size && this.isConnected;
+    const _ceDisc = _ceGlobalDefCount > 0 && this.isConnected;
     for (const c of children) {
       if (_ceDisc) _ceRemovalSteps(_wrap(c));
       _dom("remove_child", c);
@@ -957,8 +956,7 @@ class Node {
     // whose removing steps enqueue disconnectedCallback for every custom element
     // in the moved subtree — BEFORE the adopted/connected reactions below. Gated
     // on a live registry so non-custom pages skip the isConnected walk entirely.
-    const _ceRegA = globalThis.customElements;
-    const _wasConnected = (_ceRegA && _ceRegA._defs.size && (c.nodeType === 1 || c.nodeType === 11)) ? c.isConnected : false;
+    const _wasConnected = (_ceGlobalDefCount > 0 && (c.nodeType === 1 || c.nodeType === 11)) ? c.isConnected : false;
     _dom("append_child", this._nid, c._nid);
     if (_wasConnected) _ceRemovalSteps(c);
     // Insert §"adopt node into the parent's node document": when the node comes
@@ -1146,8 +1144,7 @@ class Node {
       __obscura_adjustRangesForRemove(n, _oldParent, __obscura_nodeIndex(n));
     // Moving a connected node runs removing steps first (see appendChild) —
     // disconnectedCallback precedes the adopted/connected reactions below.
-    const _ceRegI = globalThis.customElements;
-    const _wasConnectedI = (_ceRegI && _ceRegI._defs.size && (n.nodeType === 1 || n.nodeType === 11)) ? n.isConnected : false;
+    const _wasConnectedI = (_ceGlobalDefCount > 0 && (n.nodeType === 1 || n.nodeType === 11)) ? n.isConnected : false;
     _dom("insert_before", n._nid, ref._nid);
     if (_wasConnectedI) _ceRemovalSteps(n);
     // DOM "insert" live-range steps, with the node now at its new position (a
@@ -2157,7 +2154,7 @@ class Element extends Node {
     const _old = _watching ? (_domParse("child_nodes", this._nid) || []) : null;
     // Custom element removal steps for the outgoing subtree (before the reparse
     // discards it) when connected — fires disconnectedCallback.
-    const _ceLive = globalThis.customElements && globalThis.customElements._defs.size && this.isConnected;
+    const _ceLive = _ceGlobalDefCount > 0 && this.isConnected;
     if (_ceLive) { let c = this.firstChild; while (c) { _ceRemovalSteps(c); c = c.nextSibling; } }
     _dom("set_inner_html", this._nid, String(v ?? ""));
     if (_watching) {
@@ -2165,7 +2162,15 @@ class Element extends Node {
       __notifyMutation('childList', this._nid, _new, _old);
     }
     // Insertion steps for the freshly-parsed subtree — upgrade + connectedCallback.
-    if (globalThis.customElements && globalThis.customElements._defs.size) {
+    if (_ceGlobalDefCount > 0) {
+      // Parsed nodes belong to the context element's node document (DOM "fragment
+      // parsing"): retag them so custom-element upgrade consults the RIGHT registry.
+      // Only for a non-main document (frame/detached) — main-document nodes already
+      // default to the main document, so the common case pays nothing.
+      const _ctxDoc = this.ownerDocument;
+      if (_ctxDoc && _ctxDoc !== globalThis.document) {
+        let c = this.firstChild; while (c) { _setNodeDocumentDeep(c, _ctxDoc); c = c.nextSibling; }
+      }
       let c = this.firstChild; while (c) { _ceInsertionSteps(c); c = c.nextSibling; }
     }
   }
@@ -2266,8 +2271,7 @@ class Element extends Node {
     // Attr.nodeValue / Attr.textContent setters — so this is the single spot to
     // enqueue the custom-element attributeChanged reaction for all of them (the
     // plain setAttribute path has its own hook against the `set_attribute` op).
-    const _ce = globalThis.customElements;
-    const _ceOld = (_ce && _ce._defs.size && this._ceState === "custom") ? this._rawGetNS(ns, local) : undefined;
+    const _ceOld = (_ceGlobalDefCount > 0 && this._ceState === "custom") ? this._rawGetNS(ns, local) : undefined;
     _dom("set_attribute_ns", this._nid, (ns || '') + "\0" + (prefix || '') + "\0" + local + "\0" + String(value));
     __notifyMutation();
     if (_ceOld !== undefined) _ceAttributeChanged(this, local, _ceOld, String(value), ns || null);
@@ -2275,8 +2279,7 @@ class Element extends Node {
   _rawRemoveNS(ns, local) {
     // Funnel for removeAttributeNS / removeAttributeNode / NamedNodeMap.removeNamedItem(NS):
     // fire attributeChanged(local, oldValue, null, ns) only if the attribute was present.
-    const _ce = globalThis.customElements;
-    const _ceOld = (_ce && _ce._defs.size && this._ceState === "custom") ? this._rawGetNS(ns, local) : undefined;
+    const _ceOld = (_ceGlobalDefCount > 0 && this._ceState === "custom") ? this._rawGetNS(ns, local) : undefined;
     _dom("remove_attribute_ns", this._nid, (ns || '') + "\0" + local);
     __notifyMutation();
     if (_ceOld != null) _ceAttributeChanged(this, local, _ceOld, null, ns || null);
@@ -3559,6 +3562,33 @@ function _checkInsertConstraints(parent, node, child) {
   }
 }
 
+// HTML §dom-document-body setter (shared by Document / DetachedDocument / _IframeDocument,
+// each of which overrides `get body()` and so must re-expose the setter). The new value
+// must be a <body>/<frameset>; it replaces the current body element (or is appended to the
+// document element if there is none). The replace/append run through replaceChild/
+// appendChild, so custom-element removal (disconnected) + insertion (connected) reactions
+// — and node-document adoption of the incoming subtree — fire for free.
+function _documentSetBody(doc, newBody) {
+  // WebIDL: `body` is `HTMLElement?` — a non-null value that isn't an element fails
+  // type conversion with a TypeError (e.g. assigning a string), BEFORE the algorithm.
+  if (newBody !== null && (typeof newBody !== 'object' || newBody === undefined || newBody.nodeType !== 1)) {
+    throw new TypeError("Failed to set the 'body' property on 'Document': The provided value is not of type 'HTMLElement'.");
+  }
+  // Algorithm step 1: the new value must be a <body> or <frameset> element (null too
+  // is rejected here, as it is neither).
+  if (!newBody || (newBody.localName !== 'body' && newBody.localName !== 'frameset')) {
+    throw new DOMException("Failed to set the 'body' property on 'Document': The new body element " +
+      "is of type '" + (newBody && newBody.nodeName ? newBody.nodeName : String(newBody)) +
+      "'. It must be either a 'BODY' or 'FRAMESET' element.", "HierarchyRequestError");
+  }
+  const oldBody = doc.body;
+  if (newBody === oldBody) return;
+  if (oldBody && oldBody.parentNode) { oldBody.parentNode.replaceChild(newBody, oldBody); return; }
+  const de = doc.documentElement;
+  if (!de) throw new DOMException("Failed to set the 'body' property on 'Document': No document element exists.", "HierarchyRequestError");
+  de.appendChild(newBody);
+}
+
 class Document extends Node {
   // `new Document(nid)` (numeric) wraps a real document node (the main document,
   // or a node-type-9 node from the tree). `new Document()` with NO id is the DOM
@@ -3592,6 +3622,7 @@ class Document extends Node {
   }
   get head() { return this.querySelector("head"); }
   get body() { return this.querySelector("body"); }
+  set body(v) { _documentSetBody(this, v); }
   // document.dir reflects the `dir` content attribute of the document element
   // (an enumerated attribute, keywords ltr/rtl/auto, missing/invalid default "").
   get dir() {
@@ -3730,12 +3761,13 @@ class Document extends Node {
       throw new DOMException("The string '" + name + "' is not a valid element name.", "InvalidCharacterError");
     }
     const local = _asciiLower(name);
-    // Custom element consultation (HTML "create an element"): in a document WITH a
-    // browsing context (the main document, defaultView === the window), a matching
-    // autonomous definition is constructed synchronously. Documents without a browsing
-    // context (createHTMLDocument/XML) skip this and yield an "undefined" element.
-    const reg = globalThis.customElements;
-    if (reg && reg._defs.size && this.defaultView === globalThis && _isValidCustomElementName(local)) {
+    // Custom element consultation (HTML "create an element"): a document WITH a
+    // browsing context (the main document OR an iframe document) consults ITS OWN
+    // registry and constructs a matching autonomous definition synchronously.
+    // Window-less documents (createHTMLDocument/new Document/XML) have no registry
+    // (`_ceRegistryForDoc` → null) and yield a plain element with no custom state.
+    const reg = _ceRegistryForDoc(this);
+    if (reg && reg._defs.size && _isValidCustomElementName(local)) {
       const def = reg._defs.get(local);
       if (def && def.name === def.localName) {
         const cel = _ceConstruct(def);
@@ -4197,6 +4229,7 @@ class DetachedDocument extends Document {
   }
   get head() { return this._kind === 'html' ? this.querySelector('head') : null; }
   get body() { return this._kind === 'html' ? this.querySelector('body') : null; }
+  set body(v) { _documentSetBody(this, v); }
   querySelector(s) { _primeTarget(s, this); _primeValidity(s, this); return _qsOne(_dom("query_selector_scoped", this._nid, s), s); }
   querySelectorAll(s) {
     _primeTarget(s, this);
@@ -4385,6 +4418,38 @@ function _isConstructor(f) {
   try { Reflect.construct(function () {}, [], f); return true; } catch (e) { return false; }
 }
 
+// Per-document custom-element registries (HTML: each Window has its own
+// CustomElementRegistry). Obscura's main document uses `globalThis.customElements`;
+// each iframe window mints its OWN registry (stored on the window as `.customElements`
+// and back-linked onto its document as `_ceRegistry`). Window-less documents
+// (createHTMLDocument / new Document / DOMParser / template contents) have NO browsing
+// context and therefore NO registry — custom elements are never constructed or
+// upgraded in them (HTML "look up a custom element definition" requires a registry).
+//
+// A single fast counter of ALL definitions across ALL registries keeps non-custom
+// pages at zero cost: every reaction gate checks `_ceGlobalDefCount === 0` first (the
+// entire machinery stays inert until the first define() anywhere), and only then pays
+// the per-node registry resolution. A global constructor→definition map lets the one
+// shared HTMLElement constructor resolve `new.target` regardless of which window's
+// registry defined the class.
+let _ceGlobalDefCount = 0;
+const _ceGlobalByCtor = new Map();
+// The registry associated with a document (its Window's registry). Main document →
+// the global registry; iframe documents → their own (`_ceRegistry`); window-less
+// documents → null (no construction/upgrade). `_ceRegistryForNode` resolves via the
+// node's node document, so every reaction targets the right realm's registry.
+function _ceRegistryForDoc(doc) {
+  if (!doc) return null;
+  if (doc._ceRegistry) return doc._ceRegistry;
+  if (doc === globalThis.document) return globalThis.customElements;
+  return null;
+}
+function _ceRegistryForNode(node) {
+  if (!node) return null;
+  const doc = node.nodeType === 9 ? node : node.ownerDocument;
+  return _ceRegistryForDoc(doc);
+}
+
 // The custom element reaction queue: a single FIFO of {el, cb, args}. Reactions are
 // flushed synchronously at the end of each mutating operation (append/remove/attr/…),
 // re-entrancy-guarded so a callback that itself mutates the tree appends to the SAME
@@ -4479,7 +4544,8 @@ function _ceTryUpgrade(el) {
   if (st === "custom" || st === "failed") return;
   if (el._is) return;
   if (el.namespaceURI !== _HTML_NS) return;
-  const reg = globalThis.customElements;
+  const reg = _ceRegistryForNode(el);       // the element's node-document registry
+  if (!reg) return;                          // window-less document → never upgrades
   const def = reg._defs.get(el.localName);
   if (!def || def.name !== def.localName) return;
   _ceUpgrade(el, def);
@@ -4488,8 +4554,7 @@ function _ceTryUpgrade(el) {
 // Insertion steps: walk an inserted subtree in tree order; upgrade would-be customs
 // and enqueue connectedCallback for connected ones. No-op unless something is defined.
 function _ceInsertionSteps(node) {
-  const reg = globalThis.customElements;
-  if (!reg || reg._defs.size === 0 || !node || node.nodeType > 11) return;
+  if (_ceGlobalDefCount === 0 || !node || node.nodeType > 11) return;  // inert until any define()
   const connected = node.nodeType === 1 || node.nodeType === 11 ? node.isConnected : false;
   const walk = (el) => {
     if (el.nodeType === 1) {
@@ -4511,8 +4576,7 @@ function _ceInsertionSteps(node) {
 // Removal steps: enqueue disconnectedCallback for every custom element in the removed
 // subtree (HTML "removing steps"). Called with the node's OLD subtree still intact.
 function _ceRemovalSteps(node) {
-  const reg = globalThis.customElements;
-  if (!reg || reg._defs.size === 0 || !node || node.nodeType > 11) return;
+  if (_ceGlobalDefCount === 0 || !node || node.nodeType > 11) return;
   const walk = (el) => {
     if (el.nodeType === 1 && el._ceState === "custom")
       _ceEnqueueReaction(el, 'disconnectedCallback', []);
@@ -4526,8 +4590,7 @@ function _ceRemovalSteps(node) {
 // Adopting steps: when a subtree moves to a different node document, enqueue
 // adoptedCallback(oldDocument, newDocument) for every custom element in it.
 function _ceAdoptedSteps(node, oldDoc, newDoc) {
-  const reg = globalThis.customElements;
-  if (!reg || reg._defs.size === 0 || oldDoc === newDoc || !node || node.nodeType > 11) return;
+  if (_ceGlobalDefCount === 0 || oldDoc === newDoc || !node || node.nodeType > 11) return;
   const walk = (el) => {
     if (el.nodeType === 1 && el._ceState === "custom")
       _ceEnqueueReaction(el, 'adoptedCallback', [oldDoc, newDoc]);
@@ -13828,11 +13891,12 @@ globalThis.ShadowRoot = ShadowRoot;
 // observedAttributes / disabledFeatures / formAssociated off the constructor, then
 // upgrade every matching element already in the (main) document.
 class CustomElementRegistry {
-  constructor() {
+  constructor(doc) {
     this._defs = new Map();          // name -> definition record
-    this._byCtor = new Map();        // constructor -> definition record
+    this._byCtor = new Map();        // constructor -> definition record (this registry only)
     this._whenDefined = new Map();   // name -> { promise, resolve }
     this._defining = false;          // HTML "element definition is running" flag
+    this._document = doc || null;    // the document this registry serves (null → main document)
   }
   define(name, constructor, options) {
     if (!_isConstructor(constructor))
@@ -13890,15 +13954,19 @@ class CustomElementRegistry {
     } finally {
       this._defining = false;
     }
+    const upgDoc = this._document || globalThis.document;   // this registry's document
     const def = {
       name, localName, constructor, observedAttributes, callbacks,
       disableInternals, disableShadow, formAssociated, constructionStack: [],
+      _document: upgDoc,
     };
     this._defs.set(name, def);
     this._byCtor.set(constructor, def);
-    // Upgrade candidates already in the main document (HTML define() steps 14–15).
-    if (def.name === def.localName && globalThis.document && globalThis.document.getElementsByTagName) {
-      const matches = globalThis.document.getElementsByTagName(localName);
+    _ceGlobalByCtor.set(constructor, def);   // global map for the shared HTMLElement ctor
+    _ceGlobalDefCount++;                      // fast gate: any definition in any registry
+    // Upgrade candidates already in THIS registry's document (HTML define() steps 14–15).
+    if (def.name === def.localName && upgDoc && upgDoc.getElementsByTagName) {
+      const matches = upgDoc.getElementsByTagName(localName);
       const candidates = [];
       for (let i = 0; i < matches.length; i++) {
         const el = matches[i];
@@ -15679,12 +15747,14 @@ globalThis.HTMLElement = class HTMLElement extends Element {
       super(nid);
       return;
     }
-    const reg = globalThis.customElements;
     const NT = new.target;
     // "If NewTarget is equal to the active function object" — `new HTMLElement()`.
     if (NT === globalThis.HTMLElement)
       throw new TypeError("Illegal constructor");
-    const def = reg && reg._byCtor.get(NT);
+    // One HTMLElement constructor is shared across every window/realm, so resolve the
+    // definition through the GLOBAL constructor→def map (a class can be defined in only
+    // one registry, so this is unambiguous) — the def carries its own construction stack.
+    const def = _ceGlobalByCtor.get(NT);
     if (!def)
       throw new TypeError("Illegal constructor");
     // Autonomous only. A customized built-in definition (localName ≠ name) has an
@@ -15707,7 +15777,9 @@ globalThis.HTMLElement = class HTMLElement extends Element {
     _cache.set(newNid, this);
     this._ceDefinition = def;
     this._ceState = "custom";
-    this._ownerDoc = globalThis.document;
+    // The element's node document is the registry's document (frame doc for an iframe
+    // registry, the main document otherwise). createElement overrides this afterward.
+    this._ownerDoc = def._document || globalThis.document;
     _dom("set_ce_defined", newNid);
   }
 };
@@ -16325,7 +16397,7 @@ Object.defineProperty(globalThis.HTMLElement.prototype, "attachInternals", {
   value: function attachInternals() {
     if (this._is)
       throw new DOMException("Unable to attach ElementInternals to a customized built-in element.", "NotSupportedError");
-    const reg = globalThis.customElements;
+    const reg = _ceRegistryForNode(this);
     const def = reg && reg._defs.get(this.localName);
     if (!def || def.name !== def.localName)
       throw new DOMException("The element is not a custom element.", "NotSupportedError");
@@ -18164,8 +18236,8 @@ globalThis.Range = class Range {
     while (tmp.firstChild) frag.appendChild(tmp.firstChild);
     // Upgrade the whole parsed subtree in tree order (createContextualFragment
     // runs in a browsing-context document, which synchronously constructs customs).
-    const reg = globalThis.customElements;
-    if (reg && reg._defs.size) {
+    // _ceTryUpgrade resolves each element's own node-document registry.
+    if (_ceGlobalDefCount > 0) {
       const walk = (el) => { _ceTryUpgrade(el); let k = el.firstChild; while (k) { if (k.nodeType === 1) walk(k); k = k.nextSibling; } };
       let c = frag.firstChild; while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; }
       _ceFlush();
@@ -18337,6 +18409,7 @@ class _IframeDocument extends DetachedDocument {
   }
   get head() { return this.querySelector('head'); }
   get body() { return this.querySelector('body'); }
+  set body(v) { _documentSetBody(this, v); }
   get title() { const t = this.querySelector('title'); return t ? t.textContent : ''; }
   set title(v) {
     let t = this.querySelector('title');
@@ -18375,15 +18448,37 @@ class _IframeDocument extends DetachedDocument {
     return _dispatchPublic(this, event);
   }
 
-  write(html) { const b = this.body; if (b) b.innerHTML += html; }
+  // HTML §dom-document-write / §dom-document-open. Calling write() on a fully-loaded
+  // document (no active parser / insertion point undefined) implicitly runs open()
+  // first, which EMPTIES the document — so `write('')` on a loaded frame removes the
+  // existing content (firing disconnectedCallback on any custom elements) and adds
+  // nothing. An explicit open() sets the "write session" flag so subsequent write()s
+  // append to the freshly-emptied body instead of re-clearing it.
+  write(html) {
+    if (!this._writeOpen) this.open();     // implicit open on a loaded document
+    const b = this.body;
+    if (!b) return;
+    // Append the parsed markup to the body WITHOUT re-parsing existing content, so
+    // only the newly-inserted subtree runs insertion steps (constructed + connected).
+    const tmp = this.createElement('body');
+    tmp.innerHTML = String(html);
+    while (tmp.firstChild) b.appendChild(tmp.firstChild);
+  }
   writeln(html) { this.write(html + '\n'); }
-  open() { const b = this.body; if (b) b.innerHTML = ''; }
-  close() {}
+  open() { const b = this.body; if (b) b.innerHTML = ''; this._writeOpen = true; return this; }
+  close() { this._writeOpen = false; }
 }
 
 class _IframeWindow {
   constructor(doc, url, originUrl) {
     this.document = doc;
+    // Each frame window owns its own CustomElementRegistry (HTML: a Window's registry
+    // is distinct from other windows'). Back-link it onto the frame document so that
+    // reactions on nodes in this document (`_ceRegistryForNode`) target THIS registry,
+    // not the global one — so `define('x')` in two frames no longer collides, and
+    // `contentDocument.createElement('x')` constructs from the frame's own definitions.
+    this.customElements = new CustomElementRegistry(doc);
+    if (doc) doc._ceRegistry = this.customElements;
     this._url = url;
     this.self = this;
     this.top = globalThis;
@@ -18747,7 +18842,8 @@ Element.prototype.attachShadow = function attachShadow(init) {
   }
   // A custom element whose definition lists "shadow" in disabledFeatures cannot be
   // a shadow host (HTML "attach a shadow root" step 5).
-  const _def = globalThis.customElements && globalThis.customElements.get(local);
+  const _ceReg = _ceRegistryForNode(host);
+  const _def = _ceReg && _ceReg.get(local);
   if (_def) {
     let _df; try { _df = _def.disabledFeatures; } catch (e) {}
     if (Array.isArray(_df) && _df.indexOf('shadow') >= 0) {

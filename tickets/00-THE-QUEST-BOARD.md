@@ -154,7 +154,35 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-06 (Quest #148 The Realmed Verdict — per-window `CustomElementRegistry`, +36):**
+Quests #144–#147 built the whole custom-elements realm behind ONE global registry, but HTML gives
+each Window its own. The shared WPT helper `test_with_window(f)` runs each test in a fresh iframe and
+does `contentWindow.customElements.define('custom-element', C)` — and because our iframe window's
+`customElements` fell through a Proxy to the global registry, the SECOND test's define collided
+(`the name "custom-element" has already been used with this registry`), pinning `reactions/Document`
+at 0/12 and `parser-uses-registry-of-owner-document` at 1/10. **The fix, all `bootstrap.js`:**
+**(1)** `_ceRegistryForDoc`/`_ceRegistryForNode` resolve the registry of a node's OWNER DOCUMENT —
+main doc → global registry, iframe doc → its own (`doc._ceRegistry`), window-less doc → null (never
+constructs). `_IframeWindow` mints `new CustomElementRegistry(doc)`; `define()` walks ITS document's
+upgrade candidates. **(2)** A single `_ceGlobalDefCount` (defs across ALL registries) replaces every
+`_defs.size` gate so non-custom pages stay provably inert; a global `_ceGlobalByCtor` map lets the one
+shared `HTMLElement` ctor resolve `new.target` across realms. **(3)** `createElement` dropped its
+`defaultView === globalThis` gate for `_ceRegistryForDoc(this)` — so iframe `createElement`/`importNode`
+(delegates to `cloneNode`→`createElement`)/`adoptNode` now construct from the frame registry; every
+reaction hook (`_ceTryUpgrade`, `attachInternals`, `attachShadow`, `createContextualFragment`) resolves
+per-node. **(4)** `innerHTML`-parsed nodes get `_setNodeDocumentDeep` retagged to the context element's
+document (gated to non-main docs) so `frameBody.innerHTML='<x>'` upgrades against the RIGHT registry.
+**(5)** New spec `Document.body` setter (WebIDL TypeError + HierarchyRequestError + replace/append, CE
+reactions free) and `_IframeDocument.write`/`open`/`writeln`/`close` clear semantics (write on a loaded
+doc implicitly opens→empties→disconnected, then appends the parsed markup). reactions/Document 0→10,
+parser 1→10, upgrading 17→25, pseudo-class-defined 27→31, Document.body 7→11, reaction-queue 0→1 =
+**+36, ZERO regressions** (qsa 1975, createElement 147, reactions/Element 47/HTMLElement 20/Node 14,
+adopted-callback 32, CustomElementRegistry 31, connected 24, disconnected 24, structured-clone 141).
+CAPS: reactions/Document last 2 = `execCommand('delete')` (editing) + `HTMLTitleElement.text`;
+reaction-queue rest = the microtask backup-element-queue model. Scroll `tickets/148-the-realmed-verdict.md`.
+
 **Session 2026-07-05 (Quest #147 The Reactive Verdict — CEReactions on the remaining DOM mutation entry points, +51):**
+Quest #144 wired reactions into the primary mutation paths; this filled in EVERY other
 Quest #144 wired reactions into the primary mutation paths; this filled in EVERY other
 `[CEReactions]` entry point the `custom-elements/reactions/` suite exercises. All `bootstrap.js`,
 all gated on `customElements._defs.size` so non-custom pages pay zero cost. **(1) Attribute
