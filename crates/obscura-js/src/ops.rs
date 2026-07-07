@@ -559,6 +559,14 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             }
             "true".into()
         }
+        "set_popover_open" => {
+            // arg1 = node id; arg2 = "1" if the popover is showing, else hidden.
+            // Drives the `:popover-open` pseudo-class.
+            if let Ok(nid) = arg1.parse::<u32>() {
+                dom.set_popover_open(NodeId::new(nid), arg2 == "1");
+            }
+            "true".into()
+        }
         "set_design_mode" => {
             // arg1 = "1" to enable design mode (every element editable → matches
             // :read-write), anything else disables it. Drives :read-write/:read-only.

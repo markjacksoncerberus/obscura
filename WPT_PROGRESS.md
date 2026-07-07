@@ -10,12 +10,28 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-07 (Quest #150).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-07 (Quest #152).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/popovers/popover-attribute-all-elements.html` | 0/1101 | **1101/1101** | ✅ 100% | **Quest #152 The Overlaid Verdict.** The whole popover API — every HTML element behaves as a popover; `showPopover({modal})`/`getBoundingClientRect` no-assert + `assertNotAPopover` + non-rendering elements. **+1101.** |
+| `html/semantics/popovers/popover-invoking-attribute.html` | 0/1402 | **1400/1402** | ✅ 99.9% | **Quest #152.** `popovertarget` invokers via real `.click()` across all button/input types × actions × `popoverTargetElement`/`popoverTargetAction` IDL (element ref reflection, limited-value action). **+1400.** |
+| `html/semantics/popovers/popover-invoking-attribute-hint.html` | 0/700 | **700/700** | ✅ 100% | **Quest #152.** Same invoker matrix for `popover=hint`. **+700.** |
+| `html/semantics/popovers/popover-attribute-basic.html` | 0/249 | **113/249** | 🟡 45% | **Quest #152.** `popover` reflection, show/hide/toggle, `:popover-open`, type-change closes open popovers, disconnected throws. CAP: 136 combinatorial fails end in a `test_driver` light-dismiss `clickOn` (harness bridge missing). **+113.** |
+| `html/semantics/popovers/toggleevent-interface.html` | 0/39 | **39/39** | ✅ 100% | **Quest #152.** `ToggleEvent` (oldState/newState ToString-coerced readonly, source Element?, no relatedTarget). **+39.** |
+| `html/semantics/popovers/button-type-popovertarget.html` | 0/15 | **11/15** | 🟡 73% | **Quest #152.** A button invokes its popover unless it does a form action (submit/reset with a form owner). CAP: 4 `-attr-form` need `form=` association. **+11.** |
+| `html/semantics/popovers/input-type-popovertarget.html` | 0/12 | **8/12** | 🟡 67% | **Quest #152.** Input invokers (button/submit/reset/image types). CAP: `form=` assoc + `type=image` submit. **+8.** |
+| `html/semantics/popovers/popover-toggle-source.html` | 0/7 | **6/7** | 🟡 86% | **Quest #152.** `ToggleEvent.source` = the `showPopover({source})` / invoker. CAP: 1 `command` API. **+6.** |
+| `html/semantics/popovers/popover-events.html` | 0/6 | **5/6** | 🟡 83% | **Quest #152.** beforetoggle (cancelable only opening) + async coalescing toggle; not fired on removal. CAP: focus/blur-during-removal. **+5.** |
+| `html/semantics/popovers/imperative-invokers.html` | 0/10 | **5/10** | 🟡 50% | **Quest #152.** CAP: command API. **+5.** |
+| `html/semantics/popovers/togglePopover.html` | 0/3 | **3/3** | ✅ 100% | **Quest #152.** force param + return value reflects end state + throw conditions. **+3.** |
+| `html/semantics/popovers/popover-nested-in-button.html` | 0/4 | **3/4** | 🟡 75% | **Quest #152.** **+3.** |
+| `html/semantics/popovers/popover-target-element-disabled.html` | 0/7 | **2/7** | 🟡 29% | **Quest #152.** **+2.** |
+| `html/semantics/popovers/popover-types.html` | 0/1 | **1/1** | ✅ 100% | **Quest #152.** Manuals don't close autos. **+1.** |
+| `html/semantics/popovers/popover-{self-invoke,invoker-reset,removal,beforetoggle-opening-event}.html`, `hide-other-popover-side-effects.html`, `popover-move-documents.html` | 0 | 1 each | 🟡 | **Quest #152.** **+7** total. |
+| `custom-elements/reactions/HTMLElement.html` | 20/22 | **22/22** | ✅ 100% | **Quest #152.** The `popover` reflector's `[CEReactions]` fire via setAttribute. **+2.** |
 | `html/semantics/tabular-data/the-table-element/caption-methods.html` | 0/18 | **18/18** | ✅ 100% | **Quest #150 The Tabulated Verdict.** `HTMLTableElement` `caption`/`createCaption`/`deleteCaption` (HTML-ns caption filter; WebIDL TypeError, HierarchyRequestError on cyclic insert). **+18.** |
 | `html/semantics/tabular-data/the-table-element/createTBody.html` | 0/15 | **15/15** | ✅ 100% | **Quest #150.** `createTBody()` inserts after the last direct tbody child (or at end). **+15.** |
 | `html/semantics/tabular-data/the-table-element/tHead.html` | 0/3 | **3/3** | ✅ 100% | **Quest #150.** `tHead` getter/setter + `createTHead`/`deleteTHead` (insert before first non-caption/non-colgroup child; section TypeError/HierarchyRequestError). **+3.** |

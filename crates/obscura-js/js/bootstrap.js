@@ -990,6 +990,8 @@ class Node {
     try {
     _dom("append_child", this._nid, c._nid);
     if (_wasConnected) _ceRemovalSteps(c);
+    // A showing popover moved into a disconnected subtree is hidden (no events).
+    if (_popoverShowingCount > 0 && !c.isConnected) globalThis._popoverRemovalSteps(c);
     // Insert §"adopt node into the parent's node document": when the node comes
     // from a different document, retarget the node document of it AND its whole
     // subtree (otherwise descendants keep their old ownerDocument). Same-document
@@ -1036,6 +1038,7 @@ class Node {
     _dom("remove_child", c._nid);
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [], [c._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
     if (_wasConnected) _ceRemovalSteps(c);
+    if (_popoverShowingCount > 0) globalThis._popoverRemovalSteps(c);
     return c;
   }
   // DOM "replace" (§4.2.3): replace `child` with `node`, returning `child`.
@@ -1182,6 +1185,7 @@ class Node {
     try {
     _dom("insert_before", n._nid, ref._nid);
     if (_wasConnectedI) _ceRemovalSteps(n);
+    if (_popoverShowingCount > 0 && !n.isConnected) globalThis._popoverRemovalSteps(n);
     // DOM "insert" live-range steps, with the node now at its new position (a
     // non-null reference, so boundary points past it shift forward by one).
     if (__obscura_liveRanges.length)
@@ -2398,6 +2402,9 @@ class Element extends Node {
     _validateAttrName(qname);
     if (this._htmlAttr) qname = _asciiLower(qname);
     const _ceOld = this._ceState === "custom" ? _domParse("get_attribute", this._nid, qname) : undefined;
+    // Capture the popover attribute's OLD value before the write — a type change
+    // while the popover is showing must hide it (popover attribute change steps).
+    const _popOld = qname === 'popover' ? _domParse("get_attribute", this._nid, qname) : undefined;
     _dom("set_attribute", this._nid, qname + "\0" + String(v));
     __notifyMutation();
     if (_ceOld !== undefined) _ceAttributeChanged(this, qname, _ceOld, String(v), null);
@@ -2416,6 +2423,8 @@ class Element extends Node {
     // Writing a reflected ARIA-element content attribute directly resets any
     // explicit element association (so the getter recomputes from the attribute).
     if (__ariaElementContentAttrs.has(qname)) __ariaResetExplicit(this, qname);
+    // Popover attribute change steps (marks the page as popover-using either way).
+    if (qname === 'popover') globalThis._runPopoverAttrChange(this, _popOld);
   }
   setAttributeNS(namespace, qname, v) {
     const { namespace: ns, prefix, local } = _validateAndExtract(namespace, qname);
@@ -2459,6 +2468,8 @@ class Element extends Node {
     // Removing a reflected ARIA-element content attribute drops the explicit
     // element association too.
     if (__ariaElementContentAttrs.has(qname)) __ariaResetExplicit(this, qname);
+    // Removing the popover attribute is a state change to "no popover" — hide it.
+    if (qname === 'popover' && val !== null) globalThis._runPopoverAttrChange(this, val);
   }
   removeAttributeNS(ns, local) {
     ns = (ns === '' || ns == null) ? '' : String(ns); local = String(local);
@@ -2630,6 +2641,26 @@ class Element extends Node {
     const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true, composed: true}));
     if (cancelled && _preChecked !== null) this.checked = _preChecked;
     if (!cancelled) {
+      // Popover invoker activation: a button/input with popovertarget toggles/shows/
+      // hides its referenced popover — UNLESS the control actually performs a form
+      // action (a submit/reset/image button that has a form owner), in which case the
+      // form action wins and the popover is left alone (per chromium issue 329118508).
+      if ((this.localName === 'button' || this.localName === 'input')
+          && (this.hasAttribute('popovertarget') || this._popoverTargetElement)) {
+        const _t = (this.getAttribute('type') || '').toLowerCase();
+        const _isInput = this.localName === 'input';
+        // <button> is always an invoker candidate; <input> only for its button types.
+        const _candidate = _isInput
+          ? (_t === 'button' || _t === 'submit' || _t === 'reset' || _t === 'image')
+          : true;
+        if (_candidate) {
+          const _formAction = _isInput
+            ? (_t === 'submit' || _t === 'reset' || _t === 'image')
+            : (_t !== 'button' && _t !== 'menu');
+          const _hasForm = _formAction && !!(this.form || (this.closest && this.closest('form')));
+          if (!_hasForm) globalThis._runPopoverInvoker(this);
+        }
+      }
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
         const href = link.getAttribute('href');
@@ -2986,7 +3017,8 @@ class Element extends Node {
       },
     });
   }
-  get offsetWidth() { return 100; } get offsetHeight() { return 20; }
+  get offsetWidth() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 100; }
+  get offsetHeight() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 20; }
   get offsetTop() { return 0; } get offsetLeft() { return 0; }
   get clientWidth() { return 100; } get clientHeight() { return 20; }
   get scrollWidth() { return 100; } get scrollHeight() { return 20; }
@@ -2994,6 +3026,11 @@ class Element extends Node {
   get scrollLeft() { return 0; } set scrollLeft(v) {}
   getBoundingClientRect() {
     __obscura_click_target = this;
+    // A display:none element (self or ancestor) generates no box: an all-zero rect.
+    // Gated on _popoverEverUsed so non-popover pages keep the deterministic grid.
+    if (_popoverBoxCheck(this) && !_renderedHasBox(this)) {
+      return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0, toJSON() { return this; } };
+    }
     // No layout engine, but Playwright's actionability polling needs each
     // element to occupy a stable, distinct rect so hit-testing can pick the
     // right one (issue #45). Synthesize a deterministic position from the
@@ -3012,7 +3049,7 @@ class Element extends Node {
       toJSON() { return this; },
     };
   }
-  getClientRects() { return [this.getBoundingClientRect()]; }
+  getClientRects() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? [] : [this.getBoundingClientRect()]; }
   // No layout engine: a stub that always returns true unblocks Playwright's
   // actionability polling. With a real layout we'd check display, visibility,
   // opacity and rect dimensions per spec.
@@ -4520,6 +4557,49 @@ function _isConstructor(f) {
 // registry defined the class.
 let _ceGlobalDefCount = 0;
 const _ceGlobalByCtor = new Map();
+// Popover support: a MONOTONIC flag flipped true the first time any element gets a
+// `popover` content attribute. Off-popover pages keep it false, so the UA-style
+// `display:none` computation and the display-aware offset/rect getters are skipped
+// entirely — zero cost until a page actually uses popovers.
+let _popoverEverUsed = false;
+// The ordered stack of currently-showing auto/hint popovers (the "auto popover
+// list") — light dismiss + auto-closing walk this. Manual popovers are showing but
+// never join the stack. Populated by the popover API block far below.
+const _popoverAutoStack = [];
+// How many popovers are currently showing (auto/hint/manual). When 0, the removal
+// steps below are a no-op, so nodes leaving the tree cost nothing off-popover.
+let _popoverShowingCount = 0;
+// A popover element currently in the HIDDEN state: has a valid popover attribute,
+// is not showing, and is not an open <dialog>. Such elements compute display:none
+// (HTML rendering §"[popover]:not(:popover-open):not(dialog[open]){display:none}").
+function _isHiddenPopover(el) {
+  if (!el || el.nodeType !== 1 || !el.hasAttribute || el._popoverShowing) return false;
+  if (!el.hasAttribute('popover')) return false;
+  if (el.localName === 'dialog' && el.hasAttribute('open')) return false;
+  return true;
+}
+// Offset/rect gate: true once the page is known to use popovers. Self-flips the
+// monotonic flag the first time an offset is read on a popover element, so markup
+// popovers (whose attribute came from the parser, never setAttribute) also get the
+// display:none-aware box. Off-popover pages keep returning false → the fast path.
+function _popoverBoxCheck(el) {
+  if (_popoverEverUsed) return true;
+  if (el && el.nodeType === 1 && el.hasAttribute && el.hasAttribute('popover')) {
+    _popoverEverUsed = true;
+    return true;
+  }
+  return false;
+}
+// Whether `el` generates a box: false if it or any ancestor computes display:none.
+// Consulted only by the offset/rect getters, and only on popover-using pages.
+function _renderedHasBox(el) {
+  let n = el, g = 0;
+  while (n && n.nodeType === 1 && g++ < 200) {
+    if (_computedPropOf(n, 'display', 0) === 'none') return false;
+    n = n.parentElement;
+  }
+  return true;
+}
 // The registry associated with a document (its Window's registry). Main document →
 // the global registry; iframe documents → their own (`_ceRegistry`); window-less
 // documents → null (no construction/upgrade). `_ceRegistryForNode` resolves via the
@@ -12713,6 +12793,12 @@ const _computedPropOf = (el, kebab, guard) => {
   guard = guard || 0;
   if (!el || guard > 200) return _normComputed(el, kebab, _initialOf(kebab));
   const spec = _specifiedDecl(el, kebab);
+  // UA stylesheet: a hidden popover computes display:none — but an explicit author
+  // `display` (any origin that reached the cascade/inline) still wins over the UA rule.
+  if (kebab === 'display' && _popoverEverUsed && !String(spec.value || '').trim()
+      && _isHiddenPopover(el)) {
+    return _normComputed(el, 'display', 'none');
+  }
   let v = String(spec.value || '').trim();
   const sh = spec.sh;
   const inheritFrom = () => (el.parentElement
@@ -14418,6 +14504,25 @@ globalThis.MessageEvent = class extends Event { constructor(t,o) { o = (o == nul
 globalThis.ClipboardEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.clipboardData=o.clipboardData??null; } };
 globalThis.SubmitEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.submitter=o.submitter??null; } };
 globalThis.ProgressEvent = class ProgressEvent extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.lengthComputable=!!o.lengthComputable; this.loaded=o.loaded??0; this.total=o.total??0; } };
+// ToggleEvent (HTML popover / <details>): oldState/newState are DOMStrings coerced
+// via ToString (so null→"null", []→"", numbers stringified); both readonly, default
+// "". `source` is an Element? default null. `relatedTarget` is deliberately NOT
+// exposed. The type argument is required and ToString-coerced (undefined→"undefined").
+globalThis.ToggleEvent = class ToggleEvent extends Event {
+  constructor(type, init) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'ToggleEvent': 1 argument required, but only 0 present.");
+    init = (init == null) ? {} : init;
+    super(String(type), init);
+    const os = init.oldState === undefined ? "" : String(init.oldState);
+    const ns = init.newState === undefined ? "" : String(init.newState);
+    const src = init.source === undefined ? null : init.source;
+    Object.defineProperty(this, 'oldState', { value: os, enumerable: true, configurable: true });
+    Object.defineProperty(this, 'newState', { value: ns, enumerable: true, configurable: true });
+    Object.defineProperty(this, 'source', { value: src, enumerable: true, configurable: true });
+  }
+};
+_markNative(ToggleEvent);
 
 const _abortError = function(name, msg) { if (typeof DOMException === 'function') return new DOMException(msg, name); const e = new Error(msg); e.name = name; return e; };
 globalThis.AbortSignal = class AbortSignal {
@@ -16037,6 +16142,310 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
     throw new DOMException("The value provided ('" + v + "') is not one of 'true', 'false', 'plaintext-only', or 'inherit'.", 'SyntaxError');
   },
 });
+
+// ===================== Popover API (HTML §popover) ==============================
+// The `popover` attribute turns any HTML element into a top-layer popover with
+// showPopover()/hidePopover()/togglePopover(), the `:popover-open` pseudo-class,
+// and beforetoggle/toggle (ToggleEvent) events. The showing/hidden bit lives on a
+// JS `_popoverShowing` flag mirrored to a Rust node flag (`set_popover_open`) so
+// the selector engine matches `:popover-open`. Layout/anchor positioning is out of
+// scope (no render engine); the UA `display:none` for hidden popovers is synthesized
+// in getComputedStyle + the offset/rect getters (both gated on `_popoverEverUsed`).
+{
+  // Map a raw popover content-attribute value to its state (auto/hint/manual) or
+  // null (no popover). "" and "auto" → auto; any invalid value → manual.
+  const _popoverStateFromRaw = (raw) => {
+    if (raw === null || raw === undefined) return null;
+    const low = String(raw).toLowerCase();
+    if (low === '' || low === 'auto') return 'auto';
+    if (low === 'hint') return 'hint';
+    if (low === 'manual') return 'manual';
+    return 'manual';
+  };
+  const _popoverState = (el) => (el && el.getAttribute)
+    ? _popoverStateFromRaw(el.getAttribute('popover')) : null;
+  globalThis._popoverStateFromRaw = _popoverStateFromRaw;
+
+  // Fire a ToggleEvent (beforetoggle/toggle) at el: dispatch to registered listeners
+  // then the `on<type>` handler. Returns false iff a cancelable event was canceled.
+  const _fireToggleEvent = (el, type, oldState, newState, cancelable, source) => {
+    let ev;
+    try { ev = new ToggleEvent(type, { oldState, newState, cancelable, bubbles: false, source: source || null }); }
+    catch (e) { return true; }
+    ev._isTrusted = true;
+    try { _dispatchSpec(el, ev); } catch (e) {}
+    const h = el['on' + type];
+    if (typeof h === 'function') { try { h.call(el, ev); } catch (e) {} }
+    return !ev.defaultPrevented;
+  };
+
+  // Queue the async `toggle` element task, coalescing with any already-queued one:
+  // the pending task keeps its ORIGINAL oldState and adopts the latest newState, and
+  // only fires once (the superseded timer finds a cleared tracker and no-ops).
+  const _queuePopoverToggle = (el, oldState, newState, source) => {
+    const prev = el._popoverToggleTask;
+    if (prev) oldState = prev.oldState;
+    el._popoverToggleTask = { oldState, newState, source: source || null };
+    setTimeout(() => {
+      const t = el._popoverToggleTask;
+      if (!t) return;
+      el._popoverToggleTask = null;
+      _fireToggleEvent(el, 'toggle', t.oldState, t.newState, false, t.source);
+    }, 0);
+  };
+
+  // HTML "check popover validity": popover attr present (else NotSupportedError),
+  // in the expected showing/hidden state (else silent no-op), connected (else
+  // InvalidStateError), and not an open <dialog>.
+  const _checkPopoverValidity = (el, expectedShowing, throwEx) => {
+    if (_popoverState(el) === null) {
+      if (throwEx) throw new DOMException(
+        "Not supported on elements that do not have a valid value for the popover attribute.",
+        "NotSupportedError");
+      return false;
+    }
+    if (!!el._popoverShowing !== expectedShowing) return false;
+    if (!el.isConnected) {
+      if (throwEx) throw new DOMException(
+        "Invalid on popover elements which aren't connected to a document.", "InvalidStateError");
+      return false;
+    }
+    if (expectedShowing === false && el.localName === 'dialog' && el.hasAttribute('open')) {
+      if (throwEx) throw new DOMException(
+        "Not supported on <dialog> elements that are open as a dialog.", "InvalidStateError");
+      return false;
+    }
+    return true;
+  };
+
+  // Hide one popover in place (no cascade): fire the (non-cancelable) closing
+  // beforetoggle if fireEvents, drop the showing flag + Rust `:popover-open` bit,
+  // then queue the async closing toggle. Re-entrancy-guarded.
+  const _hidePopoverInstance = (el, fireEvents, source) => {
+    if (!el._popoverShowing || el._popoverHiding) return;
+    el._popoverHiding = true;
+    try {
+      const idx = _popoverAutoStack.indexOf(el);
+      if (idx >= 0) _popoverAutoStack.splice(idx, 1);
+      if (fireEvents) _fireToggleEvent(el, 'beforetoggle', 'open', 'closed', false, source);
+      el._popoverShowing = false;
+      try { _dom("set_popover_open", el._nid, "0"); } catch (e) {}
+      _popoverShowingCount--;
+      if (fireEvents) _queuePopoverToggle(el, 'open', 'closed', source);
+    } finally { el._popoverHiding = false; }
+  };
+
+  // Close every showing auto/hint popover that is NOT an inclusive DOM ancestor of
+  // `el` (used when showing a new auto/hint popover), top of the stack first.
+  const _hidePopoversUnrelatedTo = (el) => {
+    const unrelated = _popoverAutoStack.filter(p => p !== el && !(p.contains && p.contains(el)));
+    for (let i = unrelated.length - 1; i >= 0; i--) _hidePopoverInstance(unrelated[i], true);
+  };
+
+  // HTML "hide popover": validate, then (for auto/hint) hide everything shown above
+  // `el` on the stack (nested descendants close first), then hide `el` itself.
+  const _hidePopover = (el, fireEvents, throwEx, source) => {
+    if (!_checkPopoverValidity(el, true, throwEx)) return;
+    const type = _popoverState(el);
+    if (type === 'auto' || type === 'hint') {
+      const idx = _popoverAutoStack.indexOf(el);
+      if (idx >= 0)
+        for (let i = _popoverAutoStack.length - 1; i > idx; i--)
+          _hidePopoverInstance(_popoverAutoStack[i], fireEvents);
+    }
+    _hidePopoverInstance(el, fireEvents, source);
+  };
+
+  // HTML "show popover": validate → fire cancelable opening beforetoggle → re-validate
+  // (the handler may have mutated el) → close unrelated auto popovers → re-validate →
+  // enter the top layer + queue the opening toggle. Re-checks the popover TYPE after
+  // each event-firing step (a handler that changed the type throws InvalidStateError).
+  const _showPopover = (el, throwEx, source) => {
+    if (!_checkPopoverValidity(el, false, throwEx)) return false;
+    const originalType = _popoverState(el);
+    const typeChanged = () => {
+      if (_popoverState(el) === originalType) return false;
+      if (throwEx) throw new DOMException(
+        "The popover's type changed while it was being shown.", "InvalidStateError");
+      return true;
+    };
+    if (!_fireToggleEvent(el, 'beforetoggle', 'closed', 'open', true, source)) return false;
+    if (!_checkPopoverValidity(el, false, throwEx) || typeChanged()) return false;
+    if (originalType === 'auto' || originalType === 'hint') {
+      _hidePopoversUnrelatedTo(el);
+      if (!_checkPopoverValidity(el, false, throwEx) || typeChanged()) return false;
+    }
+    el._popoverShowing = true;
+    _popoverShowingCount++;
+    if (originalType === 'auto' || originalType === 'hint') _popoverAutoStack.push(el);
+    try { _dom("set_popover_open", el._nid, "1"); } catch (e) {}
+    _queuePopoverToggle(el, 'closed', 'open', source);
+    return true;
+  };
+
+  // The popover attribute change steps: a type change while showing hides the popover
+  // (firing events). Called from setAttribute/removeAttribute with the OLD raw value.
+  globalThis._runPopoverAttrChange = (el, oldRaw) => {
+    _popoverEverUsed = true;
+    if (!el._popoverShowing) return;
+    if (_popoverStateFromRaw(oldRaw) !== _popoverState(el)) _hidePopover(el, true, false);
+  };
+
+  // Removal steps: a showing popover (or one nested in a removed subtree) is hidden
+  // WITHOUT firing events when it leaves the document. Gated on the showing count.
+  globalThis._popoverRemovalSteps = (node) => {
+    if (_popoverShowingCount === 0 || !node || node.nodeType > 11) return;
+    const doomed = [];
+    const visit = (n) => {
+      if (n.nodeType === 1) {
+        if (n._popoverShowing) doomed.push(n);
+        if (n.children) for (const ch of n.children) visit(ch);
+      }
+    };
+    visit(node);
+    for (const p of doomed) _hidePopoverInstance(p, false);
+  };
+
+  // HTML "popover target attribute activation behavior": a button/input with a
+  // popovertarget runs on activation (a real or scripted click that wasn't
+  // canceled). Resolves the target (the popoverTargetElement IDL association or the
+  // `popovertarget` id in the invoker's tree) and toggles/shows/hides it. The invoker
+  // path never throws (throwExceptions is false).
+  globalThis._runPopoverInvoker = (invoker) => {
+    if (invoker.disabled) return;
+    let target = invoker._popoverTargetElement || null;
+    if (target && (!target.isConnected || target._nid === undefined)) target = null;
+    if (!target) {
+      const id = invoker.getAttribute('popovertarget');
+      if (!id) return;
+      const root = invoker.getRootNode ? invoker.getRootNode() : document;
+      target = (root && root.getElementById) ? root.getElementById(id)
+        : (document.getElementById ? document.getElementById(id) : null);
+    }
+    if (!target || _popoverState(target) === null) return;
+    const action = String(invoker.getAttribute('popovertargetaction') || 'toggle').toLowerCase();
+    const wantAction = (action === 'show' || action === 'hide') ? action : 'toggle';
+    const showing = !!target._popoverShowing;
+    if (showing && (wantAction === 'toggle' || wantAction === 'hide')) _hidePopover(target, true, false, invoker);
+    else if (!showing && (wantAction === 'toggle' || wantAction === 'show')) _showPopover(target, false, invoker);
+  };
+
+  // Light dismiss: a pointerdown outside the open auto/hint popover stack closes it.
+  // `target` is the event target (our CDP input bridge hit-tests to <body> for
+  // out-of-popover coordinates, which is correctly "outside"). Closes every open
+  // auto/hint popover that is not the clicked popover or an ancestor of it; an
+  // invoker whose target is open counts as clicking that popover (so its own toggle
+  // isn't undone). Runs only when auto/hint popovers are actually open.
+  globalThis._popoverLightDismiss = (target) => {
+    if (_popoverAutoStack.length === 0 || !target) return;
+    // The clicked popover: the deepest open auto/hint popover containing the target.
+    let clicked = null;
+    for (const p of _popoverAutoStack) {
+      if (p === target || (p.contains && p.contains(target))) {
+        if (!clicked || (clicked.contains && clicked.contains(p))) clicked = p;
+      }
+    }
+    // An invoker for an open popover protects that popover from light dismiss.
+    if (!clicked) {
+      let n = target;
+      while (n && n.nodeType === 1) {
+        if ((n.localName === 'button' || n.localName === 'input') &&
+            (n.hasAttribute('popovertarget') || n._popoverTargetElement)) {
+          const id = n.getAttribute('popovertarget');
+          const root = n.getRootNode ? n.getRootNode() : document;
+          const tgt = n._popoverTargetElement ||
+            (id && root && root.getElementById ? root.getElementById(id) : null);
+          if (tgt && tgt._popoverShowing) { clicked = tgt; break; }
+        }
+        n = n.parentElement;
+      }
+    }
+    const snapshot = _popoverAutoStack.slice();
+    for (let i = snapshot.length - 1; i >= 0; i--) {
+      const p = snapshot[i];
+      if (clicked && (p === clicked || (p.contains && p.contains(clicked)))) continue;
+      _hidePopoverInstance(p, true);
+    }
+  };
+  try {
+    const _ld = (e) => { try { globalThis._popoverLightDismiss(e && e.target); } catch (x) {} };
+    document.addEventListener('pointerdown', _ld, true);
+    document.addEventListener('mousedown', _ld, true);
+  } catch (e) {}
+
+  const _defP = (name, fn) => Object.defineProperty(globalThis.HTMLElement.prototype, name, {
+    configurable: true, enumerable: true, writable: true, value: _markNative(fn),
+  });
+  const _optSource = (options) => (options && typeof options === 'object' && options.source) || null;
+  _defP('showPopover', function showPopover(options) { _showPopover(this, true, _optSource(options)); });
+  _defP('hidePopover', function hidePopover() { _hidePopover(this, true, true); });
+  _defP('togglePopover', function togglePopover(options) {
+    let force;
+    if (typeof options === 'boolean') force = options;
+    else if (options && typeof options === 'object' && 'force' in options) force = !!options.force;
+    const source = _optSource(options);
+    if (this._popoverShowing && force !== true) _hidePopover(this, true, true, source);
+    else if (!this._popoverShowing && force !== false) _showPopover(this, true, source);
+    else if (!_checkPopoverValidity(this, !!this._popoverShowing, true)) return false;
+    return !!this._popoverShowing;
+  });
+  // The `popover` IDL attribute reflects the enumerated content attribute: the getter
+  // returns the limited-to-known-values state (auto/hint/manual or null); the setter
+  // propagates the string verbatim, with null/undefined removing the attribute.
+  Object.defineProperty(globalThis.HTMLElement.prototype, 'popover', {
+    configurable: true, enumerable: true,
+    get() { return _popoverState(this); },
+    set(v) {
+      if (v === null || v === undefined) { this.removeAttribute('popover'); return; }
+      this.setAttribute('popover', String(v));
+    },
+  });
+
+  // The PopoverInvokerElement mixin — `popoverTargetElement` and `popoverTargetAction`
+  // on <button> and <input> (HTML §popover). popoverTargetElement reflects the
+  // `popovertarget` content attribute as an element reference: the setter stores an
+  // explicit association and blanks the content attribute; the getter returns the
+  // explicit element only while it shares this invoker's tree, else resolves the id.
+  // popoverTargetAction reflects `popovertargetaction`, limited to show/hide/toggle.
+  const _defInvokerIDL = (proto) => {
+    if (!proto) return;
+    Object.defineProperty(proto, 'popoverTargetElement', {
+      configurable: true, enumerable: true,
+      get() {
+        const explicit = this._popoverTargetElement;
+        if (explicit != null) {
+          try {
+            if (explicit._nid !== undefined && this.getRootNode() === explicit.getRootNode())
+              return explicit;
+          } catch (e) {}
+          return null;
+        }
+        const id = this.getAttribute('popovertarget');
+        if (!id) return null;
+        const root = this.getRootNode ? this.getRootNode() : document;
+        return (root && root.getElementById) ? root.getElementById(id) : null;
+      },
+      set(v) {
+        if (v !== null && !(v && v._nid !== undefined))
+          throw new TypeError("Failed to set the 'popoverTargetElement' property: The provided value is not of type 'Element'.");
+        this._popoverTargetElement = v || null;
+        this.setAttribute('popovertarget', '');
+      },
+    });
+    Object.defineProperty(proto, 'popoverTargetAction', {
+      configurable: true, enumerable: true,
+      get() {
+        const a = this.getAttribute('popovertargetaction');
+        if (a === null) return 'toggle';
+        const low = a.toLowerCase();
+        return (low === 'show' || low === 'hide') ? low : 'toggle';
+      },
+      set(v) { this.setAttribute('popovertargetaction', String(v)); },
+    });
+  };
+  _defInvokerIDL(globalThis.HTMLButtonElement && globalThis.HTMLButtonElement.prototype);
+  _defInvokerIDL(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype);
+}
 
 // ===================== Tabular data IDL (HTML §4.9) =============================
 // The table family (HTMLTableElement / HTMLTableSectionElement / HTMLTableRowElement)

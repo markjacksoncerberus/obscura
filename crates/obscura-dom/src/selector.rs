@@ -1300,6 +1300,9 @@ impl<'a> Element for DomElement<'a> {
                 // :default — a form's default submit button, a checkbox/radio with
                 // the `checked` attribute, or an option with the `selected` attribute.
                 "default" => self.match_default(),
+                // :popover-open — a popover element ([popover]) currently in the
+                // showing state (JS toggles the flag on showPopover/hidePopover).
+                "popover-open" => self.tree.is_popover_open(self.node_id),
                 // :defined — built-in elements are always defined; a hyphenated
                 // HTML-namespace element (or a customized built-in via `is`) is defined
                 // only once JS has constructed/upgraded it (marked in `ce_defined`).

@@ -320,6 +320,9 @@ pub(crate) struct DomTreeInner {
     // (add/delete/clear). Read by the `:state(ident)` pseudo-class. Unlike `ce_defined`
     // this is NOT monotonic — states toggle — so an empty list drops the entry entirely.
     pub(crate) ce_states: HashMap<NodeId, Vec<String>>,
+    // Popovers currently in the "showing" state (top layer). JS toggles membership on
+    // showPopover/hidePopover; read by the `:popover-open` pseudo-class. Non-monotonic.
+    pub(crate) popover_open: HashSet<NodeId>,
 }
 
 impl DomTree {
@@ -351,6 +354,7 @@ impl DomTree {
                 real_documents: HashSet::new(),
                 ce_defined: HashSet::new(),
                 ce_states: HashMap::new(),
+                popover_open: HashSet::new(),
             }),
         }
     }
@@ -466,6 +470,21 @@ impl DomTree {
             .ce_states
             .get(&id)
             .is_some_and(|v| v.iter().any(|s| s == state))
+    }
+
+    /// Toggle a popover's "showing" membership (drives `:popover-open`).
+    pub fn set_popover_open(&self, id: NodeId, open: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if open {
+            inner.popover_open.insert(id);
+        } else {
+            inner.popover_open.remove(&id);
+        }
+    }
+
+    /// Whether a node is a currently-showing popover.
+    pub fn is_popover_open(&self, id: NodeId) -> bool {
+        self.inner.borrow().popover_open.contains(&id)
     }
 
     /// Set whether the document is in design mode (drives `:read-write`/`:read-only`).
