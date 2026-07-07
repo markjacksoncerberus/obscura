@@ -10,12 +10,39 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-06 (Quest #149).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-07 (Quest #150).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/tabular-data/the-table-element/caption-methods.html` | 0/18 | **18/18** | ✅ 100% | **Quest #150 The Tabulated Verdict.** `HTMLTableElement` `caption`/`createCaption`/`deleteCaption` (HTML-ns caption filter; WebIDL TypeError, HierarchyRequestError on cyclic insert). **+18.** |
+| `html/semantics/tabular-data/the-table-element/createTBody.html` | 0/15 | **15/15** | ✅ 100% | **Quest #150.** `createTBody()` inserts after the last direct tbody child (or at end). **+15.** |
+| `html/semantics/tabular-data/the-table-element/tHead.html` | 0/3 | **3/3** | ✅ 100% | **Quest #150.** `tHead` getter/setter + `createTHead`/`deleteTHead` (insert before first non-caption/non-colgroup child; section TypeError/HierarchyRequestError). **+3.** |
+| `html/semantics/tabular-data/the-table-element/tFoot.html` | 0/2 | **2/2** | ✅ 100% | **Quest #150.** `tFoot` getter/setter + `createTFoot`/`deleteTFoot` (append at end). **+2.** |
+| `html/semantics/tabular-data/the-table-element/tBodies.html` | 0/1 | **1/1** | ✅ 100% | **Quest #150.** `tBodies` [SameObject] live HTMLCollection of direct tbody children. **+1.** |
+| `html/semantics/tabular-data/the-table-element/delete-caption.html` | 0/6 | **6/6** | ✅ 100% | **Quest #150.** **+6.** |
+| `html/semantics/tabular-data/the-table-element/table-rows.html` | 0/5 | **5/5** | ✅ 100% | **Quest #150.** `rows` collection ordering: thead rows, then direct-tr + tbody rows interleaved (tree order), then tfoot rows; named access + `ownKeys` from the existing HTMLCollection proxy. **+5.** |
+| `html/semantics/tabular-data/the-table-element/table-insertRow.html` | 0/3 | **3/3** | ✅ 100% | **Quest #150.** `insertRow` creates a tbody when rows is empty and no tbody exists. **+3.** |
+| `html/semantics/tabular-data/the-table-element/insertRow-method-01.html` | 0/1 | **1/1** | ✅ 100% | **Quest #150.** `insertRow` on a prefixed HTML `foo:table` yields a prefix-less `tr`/`tbody`. **+1.** |
+| `html/semantics/tabular-data/the-table-element/insertRow-method-02.html` | 0/3 | **3/3** | ✅ 100% | **Quest #150.** `insertRow(0)` on an empty table. **+3.** |
+| `html/semantics/tabular-data/the-table-element/insertRow-method-03.html` | 1/3 | **3/3** | ✅ 100% | **Quest #150.** `insertRow(1)` on a non-empty table. **+2.** |
+| `html/semantics/tabular-data/the-table-element/remove-row.html` | 0/6 | **6/6** | ✅ 100% | **Quest #150.** `deleteRow` (IndexSizeError bounds; `-1` removes last or no-ops on empty). **+6.** |
+| `html/semantics/tabular-data/the-tbody-element/insertRow.html` | 0/6 | **6/6** | ✅ 100% | **Quest #150.** `HTMLTableSectionElement.insertRow`. **+6.** |
+| `html/semantics/tabular-data/the-tbody-element/deleteRow.html` | 0/6 | **6/6** | ✅ 100% | **Quest #150.** `HTMLTableSectionElement.deleteRow`. **+6.** |
+| `html/semantics/tabular-data/the-tbody-element/rows.html` | 0/1 | **1/1** | ✅ 100% | **Quest #150.** section `rows` = live HTMLCollection of tr children. **+1.** |
+| `html/semantics/tabular-data/the-thead-element/rows.html` | 0/1 | **1/1** | ✅ 100% | **Quest #150.** **+1.** |
+| `html/semantics/tabular-data/the-tfoot-element/rows.html` | 0/1 | **1/1** | ✅ 100% | **Quest #150.** **+1.** |
+| `html/semantics/tabular-data/the-tr-element/cells.html` | 0/1 | **1/1** | ✅ 100% | **Quest #150.** `HTMLTableRowElement.cells` = live HTMLCollection of td/th children. **+1.** |
+| `html/semantics/tabular-data/the-tr-element/insertCell.html` | 0/7 | **7/7** | ✅ 100% | **Quest #150.** `insertCell` (IndexSizeError bounds; append at `-1`/length). **+7.** |
+| `html/semantics/tabular-data/the-tr-element/deleteCell.html` | 0/6 | **6/6** | ✅ 100% | **Quest #150.** `deleteCell`. **+6.** |
+| `html/semantics/tabular-data/the-tr-element/rowIndex.html` | 0/12 | **12/12** | ✅ 100% | **Quest #150.** `rowIndex` = index in the table's rows collection, −1 unless parent is an HTML table / HTML section under an HTML table. **+12.** |
+| `html/semantics/tabular-data/the-tr-element/sectionRowIndex.html` | 0/19 | **19/19** | ✅ 100% | **Quest #150.** `sectionRowIndex` = index among the tr children of the parent HTML table/section. **+19.** |
+| `html/semantics/tabular-data/the-caption-element/caption_001.html` | 0/5 | **5/5** | ✅ 100% | **Quest #150.** **+5.** |
+| `html/semantics/tabular-data/attributes-common-to-td-and-th-elements/cellIndex.html` | 0/6 | **6/6** | ✅ 100% | **Quest #150.** `HTMLTableCellElement.cellIndex` = index among td/th children of the parent HTML tr (non-cell siblings skipped), else −1. **+6.** |
+| `custom-elements/reactions/HTMLTableElement.html` | 0/10 | **7/10** | 🟡 70% | **Quest #150.** Table mutation methods route through appendChild/insertBefore/remove → `[CEReactions]` fire for free. **+7.** (cap: 3 need custom-element construction when setting `innerHTML` on a *detached* iframe-owned element — a #148-era innerHTML-upgrade gap.) |
+| `custom-elements/reactions/HTMLTableRowElement.html` | 0/1 | **1/1** | ✅ 100% | **Quest #150.** **+1.** |
+| `custom-elements/reactions/HTMLTableSectionElement.html` | 0/2 | **2/2** | ✅ 100% | **Quest #150.** **+2.** |
 | `custom-elements/reactions/CSSStyleDeclaration.html` | 0/30 | **22/30** | 🟡 73% | **Quest #149 The Reflected Verdict.** Inline-style CSSOM mutations (`setProperty`/`cssText`/`removeProperty`/camelCase) now reflect into the `style` content attribute through the reaction-firing `setAttribute` (gated on custom-element defs → inert + zero-cost otherwise); shorthand expansion batched to one reaction; `-webkit-filter` aliased to `filter`. **+22.** (cap: border-width/style/color shorthand serialization recombination.) |
 | `custom-elements/reactions/ElementContentEditable.html` | 0/2 | **2/2** | ✅ 100% | **Quest #149.** `contentEditable` enumerated reflector (`{true,false,plaintext-only}`, missing/invalid→`inherit`, `inherit`→remove, else SyntaxError). **+2.** |
 | `custom-elements/reactions/HTMLAnchorElement.html` | 0/1 | **1/1** | ✅ 100% | **Quest #149.** `HTMLAnchorElement.text` (alias of textContent; disconnected via removing steps). **+1.** |

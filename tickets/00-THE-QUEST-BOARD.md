@@ -154,6 +154,31 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-07 (Quest #150 The Tabulated Verdict — the whole tabular-data IDL, +146):**
+The table family (`HTMLTableElement`/`HTMLTableSectionElement`/`HTMLTableRowElement`/`HTMLTableCellElement`)
+were **empty subclasses** — `createElement("table")` was honestly an `HTMLTableElement`, but the entire
+tabular DOM API was absent, pinning `html/semantics/tabular-data/` at **1/131**. Built the whole layer in
+ONE `bootstrap.js` block (no Rust) over three enumeration helpers — `_tblKids(el, local)` (direct HTML-ns
+children by localName), `_tblCells(tr)`, and `_tableRows(table)` (thead rows → direct-tr+tbody rows
+interleaved in tree order → tfoot rows). Every enumeration is HTML-namespace + localName scoped, so a
+`<foo:caption>` or foreign-namespaced `<tbody>` is invisible, matching the spec's namespace filters and the
+`createElementNS("", …)` cases. **HTMLTableElement:** `caption`/`tHead`/`tFoot` getters+setters (WebIDL
+TypeError on wrong type, HierarchyRequestError on wrong-localName section / cyclic insert), `createCaption`/
+`createTHead`/`createTFoot`/`createTBody`, `deleteCaption`/`deleteTHead`/`deleteTFoot`, `tBodies`+`rows`
+([SameObject] live HTMLCollections), `insertRow`/`deleteRow` (IndexSizeError bounds; the empty-table
+create-a-tbody branch). **Section:** `rows`, `insertRow`/`deleteRow`. **tr:** `cells`, `insertCell`/
+`deleteCell`, `rowIndex` (index in the table's rows collection, −1 unless properly parented in an HTML
+table), `sectionRowIndex` (index among the parent's tr children — for a direct-table-child tr that's its
+position among the table's *direct* tr children, NOT the full rows collection). **td/th:** `cellIndex`.
+Named access (`table.rows.foo`), `namedItem`, and `Object.getOwnPropertyNames(rows)` all came free from the
+existing `_makeHTMLCollection` Proxy. **Reactions came free** — every mutation routes through
+appendChild/insertBefore/remove which already fire `[CEReactions]`. tabular-data element suite 1→131 (+130),
+cellIndex 0→6, reactions/HTMLTable{Element 0→7, RowElement 0→1, SectionElement 0→2} = **+146, ZERO
+regressions**. CAP: reactions/HTMLTableElement 7/10 — the 3 remaining need custom-element construction when
+setting `innerHTML` on a *detached iframe-owned* element (a #148-era innerHTML-upgrade gap, not table IDL).
+NEXT: reaction-queue microtask model (highest tail, highest risk), then `popover`. Scroll
+`tickets/150-the-tabulated-verdict.md`.
+
 **Session 2026-07-06 (Quest #149 The Reflected Verdict — CEReactions on CSSOM + reflectors, +26):**
 The `custom-elements/reactions/` suite had a cluster of untouched interfaces. The elephant was
 `CSSStyleDeclaration` (0/30): mutating `el.style.setProperty`/`cssText`/`removeProperty`/camelCase

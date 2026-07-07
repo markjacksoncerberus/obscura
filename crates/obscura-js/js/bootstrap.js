@@ -15946,6 +15946,251 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   },
 });
 
+// ===================== Tabular data IDL (HTML §4.9) =============================
+// The table family (HTMLTableElement / HTMLTableSectionElement / HTMLTableRowElement)
+// were empty subclasses; here are their spec attributes + methods. Everything mutates
+// the live tree via appendChild/insertBefore/remove, so [CEReactions] fire for FREE
+// (custom cells/rows run their connected/disconnected callbacks through those cores —
+// the custom-elements/reactions/HTMLTable* suite passes without extra plumbing).
+// Every enumeration is scoped to HTML-namespace children matched by localName, so a
+// `<foo:caption>` (HTML ns, colon in the name) or a foreign-namespaced <tbody> is
+// invisible to these — matching the spec's "in the HTML namespace" filters.
+{
+  const _tblKids = (el, local) => {                     // direct HTML-ns children named `local`
+    const out = [];
+    for (const c of el.children) if (c.namespaceURI === _HTML_NS && c.localName === local) out.push(c);
+    return out;
+  };
+  const _tblCells = (tr) => {                            // direct td/th children (HTML ns)
+    const out = [];
+    for (const c of tr.children)
+      if (c.namespaceURI === _HTML_NS && (c.localName === 'td' || c.localName === 'th')) out.push(c);
+    return out;
+  };
+  // A table's rows collection: thead rows (tree order), then the table's direct tr
+  // children interleaved with tbody rows (tree order), then tfoot rows.
+  const _tableRows = (table) => {
+    const kids = [];
+    for (const c of table.children) if (c.namespaceURI === _HTML_NS) kids.push(c);
+    const out = [];
+    for (const c of kids) if (c.localName === 'thead') for (const r of _tblKids(c, 'tr')) out.push(r);
+    for (const c of kids) {
+      if (c.localName === 'tr') out.push(c);
+      else if (c.localName === 'tbody') for (const r of _tblKids(c, 'tr')) out.push(r);
+    }
+    for (const c of kids) if (c.localName === 'tfoot') for (const r of _tblKids(c, 'tr')) out.push(r);
+    return out;
+  };
+  const _idxErr = (msg) => new DOMException(msg, 'IndexSizeError');
+
+  // ---- HTMLTableElement --------------------------------------------------------
+  const TE = globalThis.HTMLTableElement.prototype;
+  const _firstKid = (el, local) => _tblKids(el, local)[0] || null;
+  // Insert a thead: immediately before the first child element that is neither a
+  // caption nor a colgroup, or at the end of the table if there is none.
+  const _insertHead = (table, node) => {
+    let ref = null;
+    for (const c of table.children) {
+      if (c.namespaceURI === _HTML_NS && (c.localName === 'caption' || c.localName === 'colgroup')) continue;
+      ref = c; break;
+    }
+    table.insertBefore(node, ref);
+  };
+  Object.defineProperty(TE, 'caption', {
+    configurable: true, enumerable: true,
+    get() { return _firstKid(this, 'caption'); },
+    set(v) {
+      if (v !== null && !(v instanceof globalThis.HTMLTableCaptionElement))
+        throw new TypeError("Failed to set the 'caption' property on 'HTMLTableElement': The provided value is not of type 'HTMLTableCaptionElement'.");
+      const old = _firstKid(this, 'caption');
+      if (old) old.remove();
+      if (v !== null) this.insertBefore(v, this.firstChild);
+    },
+  });
+  TE.createCaption = function () {
+    let c = _firstKid(this, 'caption');
+    if (c) return c;
+    c = this.ownerDocument.createElement('caption');
+    this.insertBefore(c, this.firstChild);
+    return c;
+  };
+  TE.deleteCaption = function () { const c = _firstKid(this, 'caption'); if (c) c.remove(); };
+  // tHead / tFoot share a shape: a section getter/setter (WebIDL HTMLTableSectionElement?
+  // → TypeError; wrong-localName section → HierarchyRequestError) + create*/delete*.
+  const _defSection = (name, local, insert) => {
+    Object.defineProperty(TE, name, {
+      configurable: true, enumerable: true,
+      get() { return _firstKid(this, local); },
+      set(v) {
+        if (v !== null && !(v instanceof globalThis.HTMLTableSectionElement))
+          throw new TypeError("Failed to set the '" + name + "' property on 'HTMLTableElement': The provided value is not of type 'HTMLTableSectionElement'.");
+        if (v !== null && v.localName !== local)
+          throw new DOMException("The element provided is not a " + local + " element.", 'HierarchyRequestError');
+        const old = _firstKid(this, local);
+        if (old) old.remove();
+        if (v !== null) insert(this, v);
+      },
+    });
+  };
+  _defSection('tHead', 'thead', _insertHead);
+  _defSection('tFoot', 'tfoot', (table, node) => table.appendChild(node)); // tfoot goes at the end
+  TE.createTHead = function () {
+    let t = _firstKid(this, 'thead'); if (t) return t;
+    t = this.ownerDocument.createElement('thead'); _insertHead(this, t); return t;
+  };
+  TE.deleteTHead = function () { const t = _firstKid(this, 'thead'); if (t) t.remove(); };
+  TE.createTFoot = function () {
+    let t = _firstKid(this, 'tfoot'); if (t) return t;
+    t = this.ownerDocument.createElement('tfoot'); this.appendChild(t); return t;
+  };
+  TE.deleteTFoot = function () { const t = _firstKid(this, 'tfoot'); if (t) t.remove(); };
+  Object.defineProperty(TE, 'tBodies', {
+    configurable: true, enumerable: true,
+    get() {
+      if (!this._tBodiesColl) { const t = this; this._tBodiesColl = _makeHTMLCollection(() => _tblKids(t, 'tbody')); }
+      return this._tBodiesColl;
+    },
+  });
+  TE.createTBody = function () {
+    const t = this.ownerDocument.createElement('tbody');
+    const bodies = _tblKids(this, 'tbody');
+    const last = bodies.length ? bodies[bodies.length - 1] : null;
+    this.insertBefore(t, last ? last.nextSibling : null);
+    return t;
+  };
+  Object.defineProperty(TE, 'rows', {
+    configurable: true, enumerable: true,
+    get() {
+      if (!this._rowsColl) { const t = this; this._rowsColl = _makeHTMLCollection(() => _tableRows(t)); }
+      return this._rowsColl;
+    },
+  });
+  TE.insertRow = function (index) {
+    index = (index === undefined) ? -1 : (index | 0);
+    const rows = _tableRows(this);
+    if (index < -1 || index > rows.length)
+      throw _idxErr("The index provided (" + index + ") is greater than the number of rows in the table (" + rows.length + ").");
+    const tr = this.ownerDocument.createElement('tr');
+    const tbodies = _tblKids(this, 'tbody');
+    if (rows.length === 0 && tbodies.length === 0) {           // no rows, no tbody → new tbody
+      const tb = this.ownerDocument.createElement('tbody');
+      tb.appendChild(tr); this.appendChild(tb);
+    } else if (rows.length === 0) {                            // no rows → append to last tbody
+      tbodies[tbodies.length - 1].appendChild(tr);
+    } else if (index === -1 || index === rows.length) {        // append after the current last row
+      rows[rows.length - 1].parentNode.appendChild(tr);
+    } else {                                                   // insert before the index-th row
+      const ref = rows[index]; ref.parentNode.insertBefore(tr, ref);
+    }
+    return tr;
+  };
+  TE.deleteRow = function (index) {
+    index = index | 0;
+    const rows = _tableRows(this);
+    if (index < -1 || index >= rows.length)
+      throw _idxErr("The index provided (" + index + ") is greater than the number of rows in the table (" + rows.length + ").");
+    if (index === -1) { if (rows.length) rows[rows.length - 1].remove(); return; }
+    rows[index].remove();
+  };
+
+  // ---- HTMLTableSectionElement (thead / tbody / tfoot) -------------------------
+  const SE = globalThis.HTMLTableSectionElement.prototype;
+  Object.defineProperty(SE, 'rows', {
+    configurable: true, enumerable: true,
+    get() {
+      if (!this._secRowsColl) { const s = this; this._secRowsColl = _makeHTMLCollection(() => _tblKids(s, 'tr')); }
+      return this._secRowsColl;
+    },
+  });
+  SE.insertRow = function (index) {
+    index = (index === undefined) ? -1 : (index | 0);
+    const rows = _tblKids(this, 'tr');
+    if (index < -1 || index > rows.length)
+      throw _idxErr("The index provided (" + index + ") is greater than the number of rows (" + rows.length + ").");
+    const tr = this.ownerDocument.createElement('tr');
+    if (index === -1 || index === rows.length) this.appendChild(tr);
+    else this.insertBefore(tr, rows[index]);
+    return tr;
+  };
+  SE.deleteRow = function (index) {
+    index = index | 0;
+    const rows = _tblKids(this, 'tr');
+    if (index < -1 || index >= rows.length)
+      throw _idxErr("The index provided (" + index + ") is greater than the number of rows (" + rows.length + ").");
+    if (index === -1) { if (rows.length) rows[rows.length - 1].remove(); return; }
+    rows[index].remove();
+  };
+
+  // ---- HTMLTableRowElement (tr) ------------------------------------------------
+  const RE = globalThis.HTMLTableRowElement.prototype;
+  Object.defineProperty(RE, 'cells', {
+    configurable: true, enumerable: true,
+    get() {
+      if (!this._cellsColl) { const r = this; this._cellsColl = _makeHTMLCollection(() => _tblCells(r)); }
+      return this._cellsColl;
+    },
+  });
+  RE.insertCell = function (index) {
+    index = (index === undefined) ? -1 : (index | 0);
+    const cells = _tblCells(this);
+    if (index < -1 || index > cells.length)
+      throw _idxErr("The index provided (" + index + ") is greater than the number of cells (" + cells.length + ").");
+    const td = this.ownerDocument.createElement('td');
+    if (index === -1 || index === cells.length) this.appendChild(td);
+    else this.insertBefore(td, cells[index]);
+    return td;
+  };
+  RE.deleteCell = function (index) {
+    index = index | 0;
+    const cells = _tblCells(this);
+    if (index < -1 || index >= cells.length)
+      throw _idxErr("The index provided (" + index + ") is greater than the number of cells (" + cells.length + ").");
+    if (index === -1) { if (cells.length) cells[cells.length - 1].remove(); return; }
+    cells[index].remove();
+  };
+  // rowIndex: index of this tr in its table's rows collection, or −1 if the tr is not
+  // a row of an HTML table (parent must be an HTML table, or an HTML thead/tbody/tfoot
+  // whose parent is an HTML table).
+  Object.defineProperty(RE, 'rowIndex', {
+    configurable: true, enumerable: true,
+    get() {
+      const p = this.parentNode;
+      if (!p || p.nodeType !== 1 || p.namespaceURI !== _HTML_NS) return -1;
+      let table = null;
+      if (p.localName === 'table') table = p;
+      else if (p.localName === 'thead' || p.localName === 'tbody' || p.localName === 'tfoot') {
+        const gp = p.parentNode;
+        if (gp && gp.nodeType === 1 && gp.namespaceURI === _HTML_NS && gp.localName === 'table') table = gp;
+      }
+      return table ? _tableRows(table).indexOf(this) : -1;
+    },
+  });
+  // sectionRowIndex: index of this tr among the tr children of its parent section (or
+  // of the table directly), or −1 if the parent is not an HTML table/thead/tbody/tfoot.
+  Object.defineProperty(RE, 'sectionRowIndex', {
+    configurable: true, enumerable: true,
+    get() {
+      const p = this.parentNode;
+      if (!p || p.nodeType !== 1 || p.namespaceURI !== _HTML_NS) return -1;
+      const ln = p.localName;
+      if (ln !== 'table' && ln !== 'thead' && ln !== 'tbody' && ln !== 'tfoot') return -1;
+      return _tblKids(p, 'tr').indexOf(this);
+    },
+  });
+
+  // ---- HTMLTableCellElement (td / th) -----------------------------------------
+  // cellIndex: index of this cell among the td/th children of its parent tr (HTML
+  // ns; non-cell siblings are skipped), or −1 if the parent is not an HTML tr.
+  Object.defineProperty(globalThis.HTMLTableCellElement.prototype, 'cellIndex', {
+    configurable: true, enumerable: true,
+    get() {
+      const p = this.parentNode;
+      if (!p || p.nodeType !== 1 || p.namespaceURI !== _HTML_NS || p.localName !== 'tr') return -1;
+      return _tblCells(p).indexOf(this);
+    },
+  });
+}
+
 // HTMLStyleElement.sheet (and HTMLLinkElement.sheet): the associated CSSStyleSheet
 // for a connected element, lazily built/cached and re-parsed on text change. A
 // disconnected element has no associated sheet (returns null) per HTML §styling.
