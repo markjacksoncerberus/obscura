@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-06 (Quest #148).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-06 (Quest #149).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `custom-elements/reactions/CSSStyleDeclaration.html` | 0/30 | **22/30** | 🟡 73% | **Quest #149 The Reflected Verdict.** Inline-style CSSOM mutations (`setProperty`/`cssText`/`removeProperty`/camelCase) now reflect into the `style` content attribute through the reaction-firing `setAttribute` (gated on custom-element defs → inert + zero-cost otherwise); shorthand expansion batched to one reaction; `-webkit-filter` aliased to `filter`. **+22.** (cap: border-width/style/color shorthand serialization recombination.) |
+| `custom-elements/reactions/ElementContentEditable.html` | 0/2 | **2/2** | ✅ 100% | **Quest #149.** `contentEditable` enumerated reflector (`{true,false,plaintext-only}`, missing/invalid→`inherit`, `inherit`→remove, else SyntaxError). **+2.** |
+| `custom-elements/reactions/HTMLAnchorElement.html` | 0/1 | **1/1** | ✅ 100% | **Quest #149.** `HTMLAnchorElement.text` (alias of textContent; disconnected via removing steps). **+1.** |
+| `custom-elements/reactions/HTMLTitleElement.html` | 0/1 | **1/1** | ✅ 100% | **Quest #149.** `HTMLTitleElement.text` (child text content get / replace-all set). **+1.** |
 | `custom-elements/reactions/Document.html` | 0/12 | **10/12** | 🟡 83% | **Quest #148 The Realmed Verdict.** Per-window registries: `test_with_window` defines in each frame's own registry (no collision); iframe `createElement`/`importNode`/`adoptNode` construct from it; `Document.body` setter + `document.write`/`open` clear semantics. (execCommand-delete + `title.text` capped.) **+10.** |
 | `custom-elements/parser/parser-uses-registry-of-owner-document.html` | 1/10 | **10/10** | ✅ 100% | **Quest #148.** Parsed customs upgrade via the owner document's registry, not the global one. **+9.** |
 | `custom-elements/upgrading.html` | 17/28 | **25/28** | 🟡 89% | **Quest #148** (bonus). Per-window `HTMLElement`/registry resolution across frames. **+8.** |

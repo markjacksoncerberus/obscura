@@ -620,6 +620,11 @@ const _parseStyleDecls = (text) => {
 
 class CSSStyleDeclaration {
   constructor() { this._props = {}; this._priority = {}; }
+  // Fire the inline-style reflect hook, unless a shorthand expansion has opened a
+  // batch (_styleBatch > 0) — expanding one shorthand into its longhands must
+  // reflect as a SINGLE "update style attribute" (one attributeChanged reaction),
+  // not one per longhand. Standalone declarations have no _onChange → inert.
+  _notifyChange() { if (this._onChange && !this._styleBatch) this._onChange(); }
   setProperty(name, value, priority) {
     name = String(name);
     const custom = name.startsWith('--');
@@ -636,7 +641,10 @@ class CSSStyleDeclaration {
       const lh = _expandBorderShorthand(name, stored);
       if (!lh) return;
       delete this._props[name]; delete this._priority[name];   // drop any prior var()-stored shorthand key
-      for (const ln of _BORDER_EXPAND[name]) this.setProperty(ln, lh[ln], priority);
+      this._styleBatch = (this._styleBatch | 0) + 1;
+      try { for (const ln of _BORDER_EXPAND[name]) this.setProperty(ln, lh[ln], priority); }
+      finally { this._styleBatch--; }
+      this._notifyChange();                                    // one reflect for the whole shorthand
       return;                                                  // expanded; no shorthand key kept
     }
     if (!custom && _POSITION_PROPS.has(name)) {
@@ -691,6 +699,7 @@ class CSSStyleDeclaration {
         if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
         this._props[ln] = lh[ln]; this._priority[ln] = prio;
       }
+      this._notifyChange();
       return;                                              // expanded into longhands; no `offset` key
     } else if (!custom && _MATH_GATE_PROPS[name]) {
       const g = _MATH_GATE_PROPS[name];
@@ -714,22 +723,31 @@ class CSSStyleDeclaration {
     if (name in this._props) { delete this._props[name]; delete this._priority[name]; }
     this._props[name] = stored;
     this._priority[name] = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+    // A CSSOM mutation on an element's inline declaration must reflect back into
+    // its `style` content attribute ("update style attribute", CSSOM §6.4.2) —
+    // which is how getAttribute('style') stays live AND how [CEReactions] on the
+    // CSSStyleDeclaration setters fire an attributeChanged reaction. Standalone
+    // declarations (getComputedStyle, CSSRule.style) have no _onChange → inert.
+    this._notifyChange();
   }
   removeProperty(name) {
     name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
     if (key === 'offset') {                                // shorthand: clear its five longhands
       const old = _serializeOffsetShorthand(this);
       for (const ln of _OFFSET_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
       return old;
     }
     if (_BORDER_EXPAND[key]) {                              // border/outline: clear its longhands
       const old = this.getPropertyValue(key);
       delete this._props[key]; delete this._priority[key];   // any var()-stored shorthand key
       for (const ln of _BORDER_EXPAND[key]) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
       return old;
     }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
+    this._notifyChange();
     return old || "";
   }
   getPropertyValue(name) {
@@ -759,6 +777,7 @@ class CSSStyleDeclaration {
       this._props[d.name] = d.value;
       this._priority[d.name] = d.important ? 'important' : '';
     }
+    this._notifyChange();
   }
   get length() { return Object.keys(this._props).length; }
   item(i) { return Object.keys(this._props)[i] || ""; }
@@ -775,10 +794,15 @@ class CSSStyleDeclaration {
 // through unchanged. Keeping every access on one storage key means
 // `el.style.backgroundColor`, `el.style['background-color']`,
 // `setProperty('background-color', …)` and `setAttribute('style', …)` all agree.
+// Legacy vendor-prefixed CSSOM aliases: the prefixed IDL/property name resolves
+// to (and stores under) its unprefixed modern property, so `el.style.webkitFilter`
+// and `el.style['-webkit-filter']` serialize as `filter:`. Kept deliberately tiny.
+const _CSS_KEBAB_ALIAS = { 'webkit-filter': 'filter', '-webkit-filter': 'filter' };
 const _cssPropToKebab = (p) => {
   if (p.startsWith('--')) return p;
   if (p === 'cssFloat') return 'float';
-  return p.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+  const k = p.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+  return _CSS_KEBAB_ALIAS[k] || k;
 };
 const _styleProxy = (decl) => new Proxy(decl, {
   get(t, p) {
@@ -2107,7 +2131,38 @@ function __datasetKeyToAttr(k) {
 class Element extends Node {
   constructor(nid) {
     super(nid);
-    this._style = _styleProxy(new CSSStyleDeclaration());
+    // The inline-style declaration carries an _onChange back-reference so any
+    // CSSOM mutation reflects into the `style` content attribute (see
+    // _styleWriteback); standalone declarations never get one, staying inert.
+    const decl = new CSSStyleDeclaration();
+    const el = this;
+    decl._onChange = () => el._styleWriteback();
+    this._style = _styleProxy(decl);
+  }
+  // Reflect the live inline declaration back into the `style` content attribute
+  // (CSSOM "update style attribute"). Routing through setAttribute keeps the Rust
+  // tree / getAttribute('style') / serialization in sync AND fires the element's
+  // [CEReactions] attributeChanged reaction. Guarded so it (a) never re-enters via
+  // the setAttribute style-sync hook, and (b) never materializes an empty style=""
+  // for a rejected / no-op CSSOM write.
+  //
+  // GATED on there being a custom-element definition anywhere: the only spec-
+  // observable consequence of reflecting a per-property CSSOM mutation is a
+  // [CEReactions] attributeChanged, which only fires for custom elements. Keeping
+  // it inert otherwise (a) costs non-custom pages nothing and (b) avoids exposing
+  // our lenient CSSOM value storage — real browsers reject `width: -100px` /
+  // unknown properties at parse time; we store them, and an always-on writeback
+  // would leak those as spurious style attributes / mutation records. The whole-
+  // declaration `.style =`/`.cssText` attribute reflect stays unconditional below.
+  _styleWriteback() {
+    if (this._styleSyncing || _ceGlobalDefCount === 0) return;
+    const text = this._style.cssText;
+    const cur = this.getAttribute('style');
+    if (cur === text) return;                 // no change to reflect
+    if (cur === null && text === '') return;  // nothing to add
+    this._styleSyncing = true;
+    try { this.setAttribute('style', text); }
+    finally { this._styleSyncing = false; }
   }
   get tagName() {
     // createElementNS pins a case-preserved identity: the tagName is the qualified
@@ -2246,13 +2301,26 @@ class Element extends Node {
       this._styleSynced = true;
       let attr = null;
       try { attr = this.getAttribute('style'); } catch (e) {}
-      if (attr != null && attr !== '') this._style.cssText = String(attr);
+      // Populate the decl from the existing attribute WITHOUT reflecting back
+      // (the attribute is already the source of this value).
+      if (attr != null && attr !== '') {
+        this._styleSyncing = true;
+        try { this._style.cssText = String(attr); } finally { this._styleSyncing = false; }
+      }
     }
     return this._style;
   }
-  // [PutForwards=cssText]: also reflect to the `style` content attribute so it is
-  // observable via getAttribute/hasAttribute/toggleAttribute and rendered.
-  set style(v) { v = (v == null) ? "" : String(v); this._style.cssText = v; this.setAttribute("style", v); }
+  // [PutForwards=cssText]: assigning to .style forwards to cssText, then reflects
+  // to the `style` content attribute unconditionally (observable via
+  // getAttribute/hasAttribute and rendered; fires a [CEReactions] attributeChanged
+  // for custom elements). The _styleSyncing guard suppresses the per-property
+  // writeback so this is a single attribute write.
+  set style(v) {
+    v = (v == null) ? "" : String(v);
+    this._styleSyncing = true;
+    try { this._style.cssText = v; } finally { this._styleSyncing = false; }
+    this.setAttribute("style", v);
+  }
   // Should attribute names be ASCII-lowercased for this element? Only for an
   // element in the HTML namespace inside an HTML document. Cached (immutable).
   get _htmlAttr() {
@@ -2324,7 +2392,10 @@ class Element extends Node {
     // The `style` content attribute reflects into the live CSSOM declaration so the
     // specified value is observable via el.style.getPropertyValue (HTML parsing and
     // setAttribute both land here; setting it replaces the declaration block).
-    if (qname === 'style' && this._style) this._style.cssText = String(v);
+    if (qname === 'style' && this._style && !this._styleSyncing) {
+      this._styleSyncing = true;
+      try { this._style.cssText = String(v); } finally { this._styleSyncing = false; }
+    }
     // Changing srcdoc on an iframe reprocesses the frame (src goes through the
     // src property setter's own load path).
     if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
@@ -2367,7 +2438,10 @@ class Element extends Node {
     // A removed observed attribute reports newValue null (only if it was present).
     if (val !== null && this._ceState === "custom") _ceAttributeChanged(this, qname, val, null, null);
     // Removing the `style` attribute empties the live CSSOM declaration.
-    if (qname === 'style' && this._style) this._style.cssText = '';
+    if (qname === 'style' && this._style && !this._styleSyncing) {
+      this._styleSyncing = true;
+      try { this._style.cssText = ''; } finally { this._styleSyncing = false; }
+    }
     // Removing srcdoc reprocesses: the frame falls back to src or about:blank.
     if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
     // Removing a reflected ARIA-element content attribute drops the explicit
@@ -15827,6 +15901,50 @@ const _defIface = (name, base) => {
 ].forEach(n => _defIface(n));
 globalThis.HTMLAudioElement = class HTMLAudioElement extends globalThis.HTMLMediaElement {};
 globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMediaElement {};
+
+// HTMLAnchorElement.text (and HTMLAreaElement inherits none) — the `text` IDL
+// attribute is a plain alias of textContent (HTML §4.6.3). [CEReactions]: the
+// textContent setter already runs removing steps on detached custom children.
+Object.defineProperty(globalThis.HTMLAnchorElement.prototype, 'text', {
+  configurable: true, enumerable: true,
+  get() { return this.textContent; },
+  set(v) { this.textContent = v == null ? '' : String(v); },
+});
+// HTMLTitleElement.text — on getting, the element's *child text content* (direct
+// Text-node children only, not descendants); on setting, "string replace all"
+// (which detaches the old children, firing disconnectedCallback for customs).
+Object.defineProperty(globalThis.HTMLTitleElement.prototype, 'text', {
+  configurable: true, enumerable: true,
+  get() {
+    let s = '';
+    for (const c of this.childNodes) if (c.nodeType === 3) s += (c.nodeValue || '');
+    return s;
+  },
+  set(v) { this.textContent = v == null ? '' : String(v); },
+});
+// ElementContentEditable.contentEditable — an enumerated attribute reflecting
+// `contenteditable` (HTML §7.6.2): {true, false, plaintext-only}, missing/invalid
+// value default "inherit". The setter maps "inherit" → remove the attribute, a
+// known keyword → set it (canonical lowercase), anything else → SyntaxError; the
+// [CEReactions] attributeChanged fires through the normal setAttribute path.
+Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
+  configurable: true, enumerable: true,
+  get() {
+    const a = this.getAttribute('contenteditable');
+    if (a === null) return 'inherit';
+    const low = a.toLowerCase();
+    if (low === '' || low === 'true') return 'true';
+    if (low === 'false') return 'false';
+    if (low === 'plaintext-only') return 'plaintext-only';
+    return 'inherit';
+  },
+  set(v) {
+    const low = String(v).toLowerCase();
+    if (low === 'inherit') { this.removeAttribute('contenteditable'); return; }
+    if (low === 'true' || low === 'false' || low === 'plaintext-only') { this.setAttribute('contenteditable', low); return; }
+    throw new DOMException("The value provided ('" + v + "') is not one of 'true', 'false', 'plaintext-only', or 'inherit'.", 'SyntaxError');
+  },
+});
 
 // HTMLStyleElement.sheet (and HTMLLinkElement.sheet): the associated CSSStyleSheet
 // for a connected element, lazily built/cached and re-parsed on text change. A

@@ -154,6 +154,38 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-06 (Quest #149 The Reflected Verdict — CEReactions on CSSOM + reflectors, +26):**
+The `custom-elements/reactions/` suite had a cluster of untouched interfaces. The elephant was
+`CSSStyleDeclaration` (0/30): mutating `el.style.setProperty`/`cssText`/`removeProperty`/camelCase
+never wrote back to the `style` content attribute at all (`getAttribute('style')` returned stale/null),
+so no `attributeChanged` reaction could fire. **The root-cause fix (all `bootstrap.js`):** the element's
+inline `CSSStyleDeclaration` gets an `_onChange` back-reference; every mutation method fires it
+(`_notifyChange`, batched so a shorthand expansion like `border-width`→4 longhands reflects as ONE
+reaction), and `_styleWriteback` re-serializes the declaration and reflects it via `setAttribute('style', …)`
+— which keeps the Rust tree/`getAttribute`/serialization live AND fires the `[CEReactions]` attributeChanged.
+**Gated on `_ceGlobalDefCount > 0`:** the only spec-observable consequence of reflecting a *per-property*
+CSSOM mutation is a custom-element reaction, so the writeback stays inert (and zero-cost) on non-custom
+pages — which also avoids leaking our lenient CSSOM value storage (real browsers reject `width: -100px` /
+unknown properties at parse time; we store them, and an always-on writeback surfaced them as spurious
+attributes / mutation records — caught & fixed via a stash-compare that flagged 3 regressions:
+`cssstyledeclaration-setter-attr` 2→0, `mutationrecord-002`/`005` 1→0). The whole-declaration `.style =`
+setter keeps its unconditional raw reflect (baseline). Plus `-webkit-filter`→`filter` alias (in the central
+`_cssPropToKebab`). Then three reflectors: `HTMLAnchorElement.text` (textContent alias),
+`HTMLTitleElement.text` (child-text-content get / replace-all set — a documented #148 cap), and
+`contentEditable` (enumerated reflector on `HTMLElement.prototype`). CSSStyleDeclaration 0→22,
+ElementContentEditable 0→2, HTMLAnchorElement 0→1, HTMLTitleElement 0→1 = **+26, ZERO regressions**
+(qsa 1975, createElement 147, classlist, reactions/Element 47/HTMLElement 20/Node 14/NamedNodeMap 14,
+upgrading 25, pseudo-class-defined 31, adopted-callback 32; CSSOM csstext 7/11, modifications 2/4,
+mutationrecord suite, setter-attr 2/2 all held). CAPS: CSSStyleDeclaration 22/30 last 8 = border-width/
+style/color shorthand **serialization recombination** (we expand them to longhands but `_serializeDeclBlock`
+only recombines margin/padding — broad CSSOM-serialization change, deferred); the always-on getAttribute(
+'style') reflection for non-custom pages (needs stricter CSSOM value validation to not leak invalid values —
+this is why `mutationrecord-001`'s valid-value gain is forgone under the gate); HTMLSelectElement 3/5 (indexed
+setter); the whole table IDL (`HTMLTableElement`/`Section`/`Row` 0/13 — caption/tHead/tFoot/insertRow/rows/
+cells, a separate quest with a large `tabular-data` tail). NEXT: **the table IDL** (fresh primitive, broad
+tabular-data tail + the 13 reaction subtests), then **reaction-queue microtask model**, then `popover`.
+Scroll `tickets/149-the-reflected-verdict.md`.
+
 **Session 2026-07-06 (Quest #148 The Realmed Verdict — per-window `CustomElementRegistry`, +36):**
 Quests #144–#147 built the whole custom-elements realm behind ONE global registry, but HTML gives
 each Window its own. The shared WPT helper `test_with_window(f)` runs each test in a fresh iframe and
