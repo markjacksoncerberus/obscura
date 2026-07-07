@@ -154,6 +154,34 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-07 (Quest #151 The Queued Verdict — the custom element reactions STACK, +12):**
+Quests #144–#150 ran the whole custom-elements realm on a **single global FIFO** reaction queue
+drained by a re-entrancy-guarded flush at the end of each mutating op — correct for a flat
+mutation, wrong the moment a reaction callback itself mutates the DOM (the nested mutation's
+reactions flattened into the outer drain). Replaced it with HTML's **custom element reactions
+stack** (all `bootstrap.js`, no Rust): per-element reaction queues, a stack of element queues
+where each `[CEReactions]` boundary pushes/drains its own queue, plus a backup element queue +
+`queueMicrotask` safety net. **Upgrade became a queued reaction** — `_ceTryUpgrade`/`define()`/
+`upgrade()`/`createContextualFragment` now ENQUEUE an upgrade reaction (`_ceEnqueueUpgrade`)
+instead of upgrading synchronously; `_ceDoUpgrade` runs during invoke and enqueues
+attributeChanged (for the PRE-construction observed attributes) + connectedCallback (on the
+PRE-construction connected state) **before** running the constructor, so an attribute the ctor
+sets no longer spuriously fires attributeChanged and a `this.remove()` in the ctor no longer
+suppresses connectedCallback. `define()`'s candidate loop is one boundary → per-element
+`ctor, attrChanged, connected` ordering. The four step functions self-bound only as the
+top-level op; `appendChild`/`insertBefore` open ONE boundary spanning removing+adopting+
+inserting (gated on `_ceGlobalDefCount > 0`) so a reaction fired inside an `adoptedCallback`
+sees siblings' still-pending `connected` reactions. Everything stays behind `_ceGlobalDefCount`
+→ zero cost off custom elements. reaction-queue 1→6, reaction-timing 1→3, enqueue-inside-callback
+4→8 = **+12, ZERO regressions** (git-stash-verified: microtasks-and-constructors 1/5,
+range-and-constructors 0/2, connected/disconnected 24, Document 11, upgrading 25 all identical
+pre/post; whole reactions/ dir + qsa 1975 / classlist 1420 / createElement 147 held). CAPS:
+`throw-on-dynamic-markup-insertion-counter-{construct,reactions}` (0/11 each) need a real
+`document.write` parser + per-doc throw-on-dynamic counter + `document.open(URL)` navigation
+(subtest 3 hard-times-out, cascading notrun) — separate feature, navigation cap. NEXT: **`popover`**
+(reactions/HTMLElement 20/22 — the last 2; self-contained), then the detached-iframe innerHTML-
+upgrade gap (reactions/HTMLTableElement 7/10). Scroll `tickets/151-the-queued-verdict.md`.
+
 **Session 2026-07-07 (Quest #150 The Tabulated Verdict — the whole tabular-data IDL, +146):**
 The table family (`HTMLTableElement`/`HTMLTableSectionElement`/`HTMLTableRowElement`/`HTMLTableCellElement`)
 were **empty subclasses** — `createElement("table")` was honestly an `HTMLTableElement`, but the entire

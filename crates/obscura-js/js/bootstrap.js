@@ -981,6 +981,13 @@ class Node {
     // in the moved subtree — BEFORE the adopted/connected reactions below. Gated
     // on a live registry so non-custom pages skip the isConnected walk entirely.
     const _wasConnected = (_ceGlobalDefCount > 0 && (c.nodeType === 1 || c.nodeType === 11)) ? c.isConnected : false;
+    // appendChild is ONE [CEReactions] boundary: opening it here (only when a custom
+    // element is defined, so non-custom pages pay nothing) means the removing/adopted/
+    // inserting steps below all enqueue into a SINGLE element queue, invoked at _cePop —
+    // so a reaction fired during adoptedCallback sees the pending connected reactions.
+    const _ceBoundary = _ceGlobalDefCount > 0;
+    if (_ceBoundary) _cePush();
+    try {
     _dom("append_child", this._nid, c._nid);
     if (_wasConnected) _ceRemovalSteps(c);
     // Insert §"adopt node into the parent's node document": when the node comes
@@ -1011,6 +1018,7 @@ class Node {
     if (c instanceof Element) _connectResourceElement(c);
     if (c instanceof Element && c.id) __defineNamedGlobal(c.id);
     _ceInsertionSteps(c);
+    } finally { if (_ceBoundary) _cePop(); }
     return c;
   }
   removeChild(c) {
@@ -1169,6 +1177,9 @@ class Node {
     // Moving a connected node runs removing steps first (see appendChild) —
     // disconnectedCallback precedes the adopted/connected reactions below.
     const _wasConnectedI = (_ceGlobalDefCount > 0 && (n.nodeType === 1 || n.nodeType === 11)) ? n.isConnected : false;
+    const _ceBoundaryI = _ceGlobalDefCount > 0;   // one [CEReactions] boundary (see appendChild)
+    if (_ceBoundaryI) _cePush();
+    try {
     _dom("insert_before", n._nid, ref._nid);
     if (_wasConnectedI) _ceRemovalSteps(n);
     // DOM "insert" live-range steps, with the node now at its new position (a
@@ -1187,6 +1198,7 @@ class Node {
     if (n instanceof Element && n.localName === 'iframe') _connectIframe(n);
     if (n instanceof Element) _connectResourceElement(n);
     _ceInsertionSteps(n);
+    } finally { if (_ceBoundaryI) _cePop(); }
     return n;
   }
   // DOM §4.4: contains(other) is true iff other is an *inclusive* descendant of
@@ -4524,30 +4536,72 @@ function _ceRegistryForNode(node) {
   return _ceRegistryForDoc(doc);
 }
 
-// The custom element reaction queue: a single FIFO of {el, cb, args}. Reactions are
-// flushed synchronously at the end of each mutating operation (append/remove/attr/…),
-// re-entrancy-guarded so a callback that itself mutates the tree appends to the SAME
-// drain rather than nesting — giving correct FIFO ordering without a full
-// backup-element-queue microtask model.
-const _ceQueue = [];
-let _ceInFlush = false;
+// The custom element reactions stack (HTML §custom-element-reactions-stack). Each
+// [CEReactions] operation pushes a fresh ELEMENT QUEUE (an array of elements) onto
+// `_ceStack`, runs, then pops the queue and invokes its reactions. Every element
+// carries its OWN reaction queue (`el._ceReactionQueue` — a FIFO of {cb,args} callback
+// reactions or {up:def} upgrade reactions). This nesting is what makes a mutation
+// performed INSIDE a reaction callback (itself a [CEReactions] boundary) run its own
+// reactions to completion before the outer drain resumes — the single-FIFO model
+// flattened those and mis-ordered them. When a reaction is enqueued with an empty
+// stack (only reachable from within an invoke), the element goes to the backup element
+// queue, drained by a microtask — a spec-faithful safety net that is inert in practice
+// because every author-facing mutation is itself a boundary. All of this stays behind
+// `_ceGlobalDefCount === 0`, so a page with no define() never touches it.
+const _ceStack = [];              // stack of element queues (each an array of elements)
+const _ceBackup = [];             // the backup element queue
+let _ceBackupScheduled = false;
+function _cePush() { _ceStack.push([]); }
+function _cePop() { const q = _ceStack.pop(); if (q && q.length) _ceInvokeQueue(q); }
+function _ceEnqueueElement(el) {
+  if (_ceStack.length === 0) {
+    _ceBackup.push(el);
+    if (_ceBackupScheduled) return;
+    _ceBackupScheduled = true;
+    queueMicrotask(_ceProcessBackup);
+  } else {
+    _ceStack[_ceStack.length - 1].push(el);
+  }
+}
+function _ceProcessBackup() {
+  const q = _ceBackup;
+  // Elements enqueued during processing (stack still empty) append here and are drained
+  // in the same pass; their reaction queues are usually already empty (no-op).
+  for (let i = 0; i < q.length; i++) _ceInvokeElement(q[i]);
+  q.length = 0;
+  _ceBackupScheduled = false;
+}
+function _ceInvokeQueue(queue) {
+  for (let i = 0; i < queue.length; i++) _ceInvokeElement(queue[i]);
+}
+function _ceInvokeElement(el) {
+  const rq = el._ceReactionQueue;
+  if (!rq || !rq.length) return;
+  // Drain until empty: a reaction that enqueues MORE reactions on this same element
+  // (e.g. an upgrade reaction enqueues attributeChanged/connected) appends here and is
+  // picked up by this loop — giving per-element "constructor, attributeChanged,
+  // connected" ordering.
+  while (rq.length) {
+    const r = rq.shift();
+    try {
+      if (r.up) _ceDoUpgrade(el, r.up);
+      else r.cb.apply(el, r.args);
+    } catch (e) { _reportError(e); }       // a reaction's exception is reported, never thrown to script
+  }
+}
 function _ceEnqueueReaction(el, name, args) {
   const def = el && el._ceDefinition;
   if (!def) return;
   const cb = def.callbacks[name];
   if (!cb) return;
-  _ceQueue.push({ el, cb, args: args || [] });
+  (el._ceReactionQueue || (el._ceReactionQueue = [])).push({ cb, args: args || [] });
+  _ceEnqueueElement(el);
 }
-function _ceFlush() {
-  if (_ceInFlush) return;                 // a nested drain — the outer loop will pick these up
-  _ceInFlush = true;
-  try {
-    while (_ceQueue.length) {
-      const r = _ceQueue.shift();
-      try { r.cb.apply(r.el, r.args); }
-      catch (e) { _reportError(e); }       // a reaction's exception is reported, never thrown to script
-    }
-  } finally { _ceInFlush = false; }
+// Enqueue an "upgrade reaction" for `el` (HTML "enqueue a custom element upgrade
+// reaction"). The actual upgrade runs later, during invoke, via `_ceDoUpgrade`.
+function _ceEnqueueUpgrade(el, def) {
+  (el._ceReactionQueue || (el._ceReactionQueue = [])).push({ up: def });
+  _ceEnqueueElement(el);
 }
 
 // A sentinel replacing the construction-stack entry once its element has been adopted
@@ -4575,29 +4629,25 @@ function _ceConstruct(def) {
 // construction stack so the HTMLElement constructor ADOPTS it (returns it from super()
 // without allocating a new node). Then fire attributeChanged for pre-existing observed
 // attributes and connectedCallback if connected (HTML "upgrade an element").
-function _ceUpgrade(el, def) {
+// Perform the actual upgrade of `el` (HTML "upgrade an element"), run as an upgrade
+// reaction from `_ceInvokeElement`. Preserves JS identity by re-pointing [[Prototype]]
+// to the definition's prototype, then runs the constructor with the element on the
+// construction stack so the HTMLElement constructor ADOPTS it (returns it from super()
+// without allocating). CRITICAL ORDERING: attributeChanged (for pre-existing observed
+// attributes) and connectedCallback are ENQUEUED onto the element's own reaction queue
+// BEFORE the constructor runs (spec steps 6–7 precede step 8's construct). They capture
+// the pre-construction attribute list / connected state — so an attribute the ctor
+// itself sets does NOT get an attributeChanged, and a `this.remove()`/`appendChild(this)`
+// inside the ctor cannot change whether connectedCallback fires. The constructor logs
+// synchronously; the enqueued reactions drain immediately after (per-element FIFO),
+// giving "constructor, attributeChanged, connected".
+function _ceDoUpgrade(el, def) {
   const st = el._ceState;
   if (st === "custom" || st === "failed" || st === "precustomized") return;
   el._ceDefinition = def;
-  el._ceState = "failed";                 // tentative; promoted to "custom" only on success
   Object.setPrototypeOf(el, def.constructor.prototype);
-  const stack = def.constructionStack;
-  stack.push(el);
-  let ok = false;
-  el._ceState = "precustomized";          // HTML upgrade step: state during the ctor (attachInternals allows it)
-  try {
-    const result = Reflect.construct(def.constructor, [], def.constructor);
-    ok = (result === el);
-  } catch (e) {
-    _reportError(e);
-    ok = false;
-  } finally {
-    stack.pop();
-  }
-  if (!ok) { el._ceState = "failed"; return; }
-  el._ceState = "custom";
-  if (typeof el._nid === 'number') _dom("set_ce_defined", el._nid);
-  // Enqueue attributeChangedCallback for each observed attribute already present.
+  // Steps 6–7: enqueue reactions for the PRE-construction observed attributes + connected
+  // state, onto el's own reaction queue (drained in place by the invoke loop).
   const oa = def.observedAttributes;
   if (oa && oa.length) {
     const attrs = el.attributes;
@@ -4608,81 +4658,117 @@ function _ceUpgrade(el, def) {
     }
   }
   if (el.isConnected) _ceEnqueueReaction(el, 'connectedCallback', []);
+  el._ceState = "precustomized";          // state during the ctor (attachInternals allows it)
+  const stack = def.constructionStack;
+  stack.push(el);
+  let ok = false;
+  try {
+    const result = Reflect.construct(def.constructor, [], def.constructor);
+    ok = (result === el);
+  } catch (e) {
+    _reportError(e);
+    ok = false;
+  } finally {
+    stack.pop();
+  }
+  if (!ok) {
+    el._ceState = "failed";
+    // Construction failed: discard the attributeChanged/connected reactions we enqueued
+    // above (nothing else can be in this element's queue — the invoke loop just shifted
+    // the upgrade reaction off before calling here).
+    if (el._ceReactionQueue) el._ceReactionQueue.length = 0;
+    return;
+  }
+  el._ceState = "custom";
+  if (typeof el._nid === 'number') _dom("set_ce_defined", el._nid);
 }
 
 // Try to upgrade `el` if a matching autonomous definition now exists (HTML "try to
-// upgrade an element"). Autonomous only — customized built-ins are unsupported.
+// upgrade an element") by ENQUEUEING an upgrade reaction. Autonomous only — customized
+// built-ins are unsupported.
 function _ceTryUpgrade(el) {
   if (!el || el.nodeType !== 1) return;
   const st = el._ceState;
-  if (st === "custom" || st === "failed") return;
+  if (st === "custom" || st === "failed" || st === "precustomized") return;
   if (el._is) return;
   if (el.namespaceURI !== _HTML_NS) return;
   const reg = _ceRegistryForNode(el);       // the element's node-document registry
   if (!reg) return;                          // window-less document → never upgrades
   const def = reg._defs.get(el.localName);
   if (!def || def.name !== def.localName) return;
-  _ceUpgrade(el, def);
+  _ceEnqueueUpgrade(el, def);
 }
 
-// Insertion steps: walk an inserted subtree in tree order; upgrade would-be customs
-// and enqueue connectedCallback for connected ones. No-op unless something is defined.
+// Insertion steps: walk an inserted subtree in tree order; enqueue upgrade reactions for
+// would-be customs and connectedCallback for connected customs, then invoke this
+// operation's element queue. No-op unless something is defined.
 function _ceInsertionSteps(node) {
   if (_ceGlobalDefCount === 0 || !node || node.nodeType > 11) return;  // inert until any define()
   const connected = node.nodeType === 1 || node.nodeType === 11 ? node.isConnected : false;
-  const walk = (el) => {
-    if (el.nodeType === 1) {
-      if (el._ceState === "custom") {
-        if (connected) _ceEnqueueReaction(el, 'connectedCallback', []);
-      } else {
-        if (connected) _ceTryUpgrade(el);
-        else if (el.localName && el.localName.indexOf('-') !== -1 && el._ceState === undefined &&
-                 el.namespaceURI === _HTML_NS) el._ceState = "undefined";
+  const _own = _ceStack.length === 0;     // own the boundary only as the top-level op (a
+  if (_own) _cePush();                     // wrapping appendChild/insertBefore combines adopt+insert into ONE)
+  try {
+    const walk = (el) => {
+      if (el.nodeType === 1) {
+        if (el._ceState === "custom") {
+          if (connected) _ceEnqueueReaction(el, 'connectedCallback', []);
+        } else {
+          if (connected) _ceTryUpgrade(el);
+          else if (el.localName && el.localName.indexOf('-') !== -1 && el._ceState === undefined &&
+                   el.namespaceURI === _HTML_NS) el._ceState = "undefined";
+        }
       }
-    }
-    let c = el.firstChild;
-    while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; }
-  };
-  if (node.nodeType === 1) walk(node);
-  else { let c = node.firstChild; while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; } }
-  _ceFlush();
+      let c = el.firstChild;
+      while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; }
+    };
+    if (node.nodeType === 1) walk(node);
+    else { let c = node.firstChild; while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; } }
+  } finally { if (_own) _cePop(); }
 }
 // Removal steps: enqueue disconnectedCallback for every custom element in the removed
 // subtree (HTML "removing steps"). Called with the node's OLD subtree still intact.
 function _ceRemovalSteps(node) {
   if (_ceGlobalDefCount === 0 || !node || node.nodeType > 11) return;
-  const walk = (el) => {
-    if (el.nodeType === 1 && el._ceState === "custom")
-      _ceEnqueueReaction(el, 'disconnectedCallback', []);
-    let c = el.firstChild;
-    while (c) { walk(c); c = c.nextSibling; }
-  };
-  if (node.nodeType === 1) walk(node);
-  else { let c = node.firstChild; while (c) walk(c), c = c.nextSibling; }
-  _ceFlush();
+  const _own = _ceStack.length === 0;
+  if (_own) _cePush();
+  try {
+    const walk = (el) => {
+      if (el.nodeType === 1 && el._ceState === "custom")
+        _ceEnqueueReaction(el, 'disconnectedCallback', []);
+      let c = el.firstChild;
+      while (c) { walk(c); c = c.nextSibling; }
+    };
+    if (node.nodeType === 1) walk(node);
+    else { let c = node.firstChild; while (c) walk(c), c = c.nextSibling; }
+  } finally { if (_own) _cePop(); }
 }
 // Adopting steps: when a subtree moves to a different node document, enqueue
 // adoptedCallback(oldDocument, newDocument) for every custom element in it.
 function _ceAdoptedSteps(node, oldDoc, newDoc) {
   if (_ceGlobalDefCount === 0 || oldDoc === newDoc || !node || node.nodeType > 11) return;
-  const walk = (el) => {
-    if (el.nodeType === 1 && el._ceState === "custom")
-      _ceEnqueueReaction(el, 'adoptedCallback', [oldDoc, newDoc]);
-    let c = el.firstChild;
-    while (c) { walk(c); c = c.nextSibling; }
-  };
-  walk(node);
-  _ceFlush();
+  const _own = _ceStack.length === 0;
+  if (_own) _cePush();
+  try {
+    const walk = (el) => {
+      if (el.nodeType === 1 && el._ceState === "custom")
+        _ceEnqueueReaction(el, 'adoptedCallback', [oldDoc, newDoc]);
+      let c = el.firstChild;
+      while (c) { walk(c); c = c.nextSibling; }
+    };
+    walk(node);
+  } finally { if (_own) _cePop(); }
 }
 // Attribute-change steps: enqueue attributeChangedCallback if the element is custom
-// and the (namespaced) attribute is observed.
+// and the (namespaced) attribute is observed, invoking this operation's element queue.
 function _ceAttributeChanged(el, localName, oldValue, newValue, namespace) {
   if (el._ceState !== "custom") return;
   const def = el._ceDefinition;
   if (!def || !def.callbacks.attributeChangedCallback) return;
   if (def.observedAttributes.indexOf(localName) === -1) return;
-  _ceEnqueueReaction(el, 'attributeChangedCallback', [localName, oldValue, newValue, namespace ?? null]);
-  _ceFlush();
+  const _own = _ceStack.length === 0;
+  if (_own) _cePush();
+  try { _ceEnqueueReaction(el, 'attributeChangedCallback', [localName, oldValue, newValue, namespace ?? null]); }
+  finally { if (_own) _cePop(); }
 }
 
 // _wrap / _cache are module-local (declared above); no need to expose them on
@@ -14047,8 +14133,12 @@ class CustomElementRegistry {
         if (el.namespaceURI === _HTML_NS && !el._is &&
             el._ceState !== "custom" && el._ceState !== "failed") candidates.push(el);
       }
-      for (const el of candidates) _ceUpgrade(el, def);
-      _ceFlush();
+      // define() is a [CEReactions] boundary: enqueue an upgrade reaction per candidate
+      // into one element queue, then invoke — so each element's constructor +
+      // attributeChanged + connected fully run before the next element is upgraded.
+      _cePush();
+      try { for (const el of candidates) _ceEnqueueUpgrade(el, def); }
+      finally { _cePop(); }
     }
     // Resolve any pending whenDefined() promise for this name.
     const w = this._whenDefined.get(name);
@@ -14073,13 +14163,15 @@ class CustomElementRegistry {
     if (root == null || typeof root !== 'object' || typeof root._nid !== 'number')
       throw new TypeError("Failed to execute 'upgrade' on 'CustomElementRegistry': parameter 1 is not of type 'Node'.");
     if (this._defs.size === 0) return;
-    const walk = (el) => {
-      if (el.nodeType === 1) _ceTryUpgrade(el);
-      let c = el.firstChild;
-      while (c) { walk(c); c = c.nextSibling; }
-    };
-    walk(root);
-    _ceFlush();
+    _cePush();
+    try {
+      const walk = (el) => {
+        if (el.nodeType === 1) _ceTryUpgrade(el);
+        let c = el.firstChild;
+        while (c) { walk(c); c = c.nextSibling; }
+      };
+      walk(root);
+    } finally { _cePop(); }
   }
 }
 globalThis.CustomElementRegistry = CustomElementRegistry;
@@ -18601,9 +18693,11 @@ globalThis.Range = class Range {
     // runs in a browsing-context document, which synchronously constructs customs).
     // _ceTryUpgrade resolves each element's own node-document registry.
     if (_ceGlobalDefCount > 0) {
-      const walk = (el) => { _ceTryUpgrade(el); let k = el.firstChild; while (k) { if (k.nodeType === 1) walk(k); k = k.nextSibling; } };
-      let c = frag.firstChild; while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; }
-      _ceFlush();
+      _cePush();
+      try {
+        const walk = (el) => { _ceTryUpgrade(el); let k = el.firstChild; while (k) { if (k.nodeType === 1) walk(k); k = k.nextSibling; } };
+        let c = frag.firstChild; while (c) { if (c.nodeType === 1) walk(c); c = c.nextSibling; }
+      } finally { _cePop(); }
     }
     return frag;
   }
