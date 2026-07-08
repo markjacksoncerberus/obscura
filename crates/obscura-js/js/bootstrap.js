@@ -2435,6 +2435,8 @@ class Element extends Node {
     // element association (HTML element reflection: the getter recomputes from the
     // attribute value). The IDL setter re-establishes the explicit ref afterwards.
     if (qname === 'popovertarget') this._popoverTargetElement = null;
+    // Likewise `commandfor` (the command invoker element reflection, HTML §invokers).
+    if (qname === 'commandfor') this._commandForElement = null;
   }
   setAttributeNS(namespace, qname, v) {
     const { namespace: ns, prefix, local } = _validateAndExtract(namespace, qname);
@@ -2482,6 +2484,7 @@ class Element extends Node {
     if (qname === 'popover' && val !== null) globalThis._runPopoverAttrChange(this, val);
     // Removing `popovertarget` drops any explicit element association too.
     if (qname === 'popovertarget') this._popoverTargetElement = null;
+    if (qname === 'commandfor') this._commandForElement = null;
   }
   removeAttributeNS(ns, local) {
     ns = (ns === '' || ns == null) ? '' : String(ns); local = String(local);
@@ -2673,6 +2676,18 @@ class Element extends Node {
           if (!_hasForm) globalThis._runPopoverInvoker(this);
         }
       }
+      // Command invoker activation (HTML §invokers): a <button> whose commandfor names
+      // a target runs its command. Per the button activation behavior, when the button
+      // has a form owner the form action wins for the Submit / Reset / Auto states (the
+      // algorithm returns before the command steps); only the Button state — or having
+      // no form owner at all — reaches the command. `_runCommandInvoker` resolves the
+      // target and no-ops when there is none.
+      if (this.localName === 'button' && this.hasAttribute('commandfor')) {
+        const _ct2 = (this.getAttribute('type') || '').toLowerCase();
+        // The form owner honors the `form=` attribute association, not just ancestry.
+        const _hasForm2 = !!_ceiFormOwner(this);
+        if (!_hasForm2 || _ct2 === 'button') globalThis._runCommandInvoker(this);
+      }
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
         const href = link.getAttribute('href');
@@ -2682,14 +2697,21 @@ class Element extends Node {
         }
       }
       const type = (this.getAttribute('type') || '').toLowerCase();
-      if (type === 'submit' || (this.localName === 'button' && type !== 'button' && type !== 'reset')) {
-        const form = this.closest ? this.closest('form') : null;
+      // A <button> is a submit button in the Submit state, OR in the Auto state (missing
+      // /invalid type) only when it has NEITHER a command nor a commandfor attribute —
+      // a command invoker in the Auto state is not a submit button (HTML §invokers).
+      const _isSubmitBtn = type === 'submit' ||
+        (this.localName === 'button' && type !== 'button' && type !== 'reset'
+         && !this.hasAttribute('command') && !this.hasAttribute('commandfor'));
+      if (_isSubmitBtn) {
+        // Resolve the form owner via the `form=` attribute or ancestry (HTML §form owner).
+        const form = _ceiFormOwner(this) || (this.closest ? this.closest('form') : null);
         if (form && typeof form.submit === 'function') {
           form.submit(this);
         }
       } else if (type === 'reset' && (this.localName === 'button' || this.localName === 'input')) {
         // A reset button's activation behavior (HTML §4.10.6.1) resets its form owner.
-        const form = this.closest ? this.closest('form') : null;
+        const form = _ceiFormOwner(this) || (this.closest ? this.closest('form') : null);
         if (form && typeof form.reset === 'function') form.reset();
       }
     }
@@ -5101,6 +5123,8 @@ const _invokeListeners = function(struct, event, phase) {
   // no relatedTarget slot, so only mutate it when one already exists.
   event.target = struct.et;
   if ('relatedTarget' in event) event.relatedTarget = struct.rt;
+  // A CommandEvent carries its retargeting value in `source` (not relatedTarget).
+  if ('_cmdSource' in event) event._sourceLive = struct.rt;
   const key = _evtRegKey(target);
   const reg = _eventRegistry[key];
   if (!reg) return;
@@ -5166,11 +5190,15 @@ const _dispatchSpec = function(target, event, fromPublic) {
   // sct: slot-in-closed-tree}. The path is ordered target-first (outward).
   const origTarget = target;
   const _rootOfClosed = (n) => _isSR(n) && n._shadowMode === 'closed';
-  const _related0 = _retarget(event.relatedTarget, origTarget);
+  // The retargeting base: a MouseEvent-family event uses relatedTarget; a CommandEvent
+  // uses its `source`. Read the original (never the per-struct live value) since struct
+  // building runs before any listener can mutate it.
+  const _rtBase = ('_cmdSource' in event) ? event._cmdSource : event.relatedTarget;
+  const _related0 = _retarget(_rtBase, origTarget);
   // §2.9 step 5 gate: skip dispatch entirely when the target retargets onto its own
   // related target (e.g. a mouseover between two nodes of the same shadow tree that
   // collapse to one host) — unless the related target IS the target verbatim.
-  const _skipDispatch = (origTarget === _related0 && origTarget !== event.relatedTarget);
+  const _skipDispatch = (origTarget === _related0 && origTarget !== _rtBase);
   const structs = [];
   if (!_skipDispatch) {
     let evTarget = origTarget;          // the spec's evolving `target` variable
@@ -5188,7 +5216,7 @@ const _dispatchSpec = function(target, event, fromPublic) {
         if (sr && sr._shadowMode === 'closed') slotInClosed = true;
       }
       if (_assignedSlotOf(parent)) slottable = parent;
-      const prt = _retarget(event.relatedTarget, parent);
+      const prt = _retarget(_rtBase, parent);
       if (parent === globalThis ||
           (typeof parent.nodeType === 'number' && _shadowIncAncestor(_nodeRoot(evTarget), parent))) {
         // Same tree as the current target (or the window): a pass-through struct.
@@ -5251,6 +5279,7 @@ const _dispatchSpec = function(target, event, fromPublic) {
   if (_clearTargets) {
     event.target = null;
     if ('relatedTarget' in event) event.relatedTarget = null;
+    if ('_cmdSource' in event) event._sourceLive = null;
   } else if (structs.length) {
     event.target = structs[structs.length - 1].et;
   }
@@ -14543,6 +14572,38 @@ globalThis.ToggleEvent = class ToggleEvent extends Event {
 };
 _markNative(ToggleEvent);
 
+// CommandEvent (HTML invokers / command-and-commandfor): `command` is a DOMString
+// coerced via ToString (null→"null", []→"", {}→"[object Object]"), readonly, default
+// "". `source` is an Element? default null, and — unlike ToggleEvent's inert source —
+// it participates in event retargeting exactly like a MouseEvent's relatedTarget:
+// during dispatch it is retargeted per struct against the current target's tree, and
+// after dispatch it reads back the value retargeted to the outermost tree (or null
+// when a closed shadow tree would otherwise leak). The retargeting base is stashed in
+// `_cmdSource` (immutable) so struct-building always sees the original; the getter
+// reports `_sourceLive`, which the dispatch algorithm updates per struct. The type
+// argument is required and ToString-coerced.
+globalThis.CommandEvent = class CommandEvent extends Event {
+  constructor(type, init) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'CommandEvent': 1 argument required, but only 0 present.");
+    init = (init == null) ? {} : init;
+    super(String(type), init);
+    const cmd = init.command === undefined ? "" : String(init.command);
+    // `source` is an `Element?`: absent/undefined → null, null → null, any other
+    // non-Element value (a boolean, a plain object, a non-Element EventTarget like
+    // XMLHttpRequest) is a WebIDL conversion TypeError.
+    let src = init.source;
+    if (src === undefined) src = null;
+    else if (src !== null && !(src && src._nid !== undefined))
+      throw new TypeError("Failed to construct 'CommandEvent': Failed to read the 'source' property from 'CommandEventInit': The provided value is not of type 'Element'.");
+    Object.defineProperty(this, 'command', { value: cmd, enumerable: true, configurable: true });
+    this._cmdSource = src;    // immutable retargeting base (the source as constructed)
+    this._sourceLive = src;   // the value the `source` getter reports (retargeted during dispatch)
+  }
+  get source() { return this._sourceLive; }
+};
+_markNative(CommandEvent);
+
 const _abortError = function(name, msg) { if (typeof DOMException === 'function') return new DOMException(msg, name); const e = new Error(msg); e.name = name; return e; };
 globalThis.AbortSignal = class AbortSignal {
   constructor() { this.aborted = false; this.reason = undefined; this.onabort = null; this._listeners = []; }
@@ -16433,6 +16494,69 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
     else if (!showing && (wantAction === 'toggle' || wantAction === 'show')) _showPopover(target, false, invoker);
   };
 
+  // Command invoker activation (HTML §invokers): a <button>'s commandfor-associated
+  // target receives a `command` CommandEvent (cancelable, bubbling, composed; its
+  // `source` is the invoker), and — unless a listener calls preventDefault or removes
+  // the target — the named default action runs. The command value is captured BEFORE
+  // firing, so a handler that rewrites the `command` attribute cannot alter THIS
+  // invocation. The caller is responsible for the form-owner gate (a submit/reset/auto
+  // button with a form owner never reaches here); this runs the command steps only.
+  globalThis._runCommandInvoker = (invoker) => {
+    if (invoker.disabled) return;
+    // Resolve the commandfor-associated element (explicit ref while same-tree, else id).
+    let target = invoker._commandForElement || null;
+    if (target && (!target.isConnected || target._nid === undefined)) target = null;
+    if (!target) {
+      const id = invoker.getAttribute('commandfor');
+      if (!id) return;
+      const root = invoker.getRootNode ? invoker.getRootNode() : document;
+      target = (root && root.getElementById) ? root.getElementById(id)
+        : (document.getElementById ? document.getElementById(id) : null);
+    }
+    if (!target) return;
+    // The command getter returns '' for a missing/invalid command → no command to run.
+    const command = invoker.command;
+    if (command === '') return;
+    // Determining if a command is valid for a target (HTML §invokers) — decided BEFORE
+    // firing, so an unsupported command dispatches no event at all. A custom (--x)
+    // command is valid for any HTML element; the popover commands are valid for any HTML
+    // element (the default action later no-ops on a non-popover); show-modal / close are
+    // valid only for a <dialog>. A non-HTML-namespaced target supports nothing.
+    const _isHTMLEl = target._nid !== undefined && target.namespaceURI === _HTML_NS;
+    let _valid;
+    if (command.startsWith('--')) _valid = _isHTMLEl;
+    else if (command === 'toggle-popover' || command === 'show-popover' || command === 'hide-popover') _valid = _isHTMLEl;
+    else if (command === 'show-modal' || command === 'close') _valid = _isHTMLEl && target.localName === 'dialog';
+    else _valid = false;
+    if (!_valid) return;
+    // Fire the event; a canceled event (or one whose handler disconnects the target)
+    // suppresses the default action.
+    let notCanceled;
+    try {
+      notCanceled = target.dispatchEvent(new CommandEvent('command', {
+        command, source: invoker, cancelable: true, bubbles: true, composed: true,
+      }));
+    } catch (e) { return; }
+    if (!notCanceled) return;
+    if (!target.isConnected || target._nid === undefined) return;
+    // Custom (--x) commands have no UA default action.
+    if (command.startsWith('--')) return;
+    if (command === 'toggle-popover' || command === 'show-popover' || command === 'hide-popover') {
+      if (_popoverState(target) === null) return;
+      const showing = !!target._popoverShowing;
+      if ((command === 'toggle-popover' || command === 'hide-popover') && showing) _hidePopover(target, true, false, invoker);
+      else if ((command === 'toggle-popover' || command === 'show-popover') && !showing) _showPopover(target, false, invoker);
+    } else if (command === 'show-modal') {
+      if (target.localName === 'dialog' && typeof target.showModal === 'function' && !target.hasAttribute('open')) {
+        try { target.showModal(); } catch (e) {}
+      }
+    } else if (command === 'close') {
+      if (target.localName === 'dialog' && typeof target.close === 'function' && target.hasAttribute('open')) {
+        try { target.close(); } catch (e) {}
+      }
+    }
+  };
+
   // Light dismiss: a pointerdown outside the open auto/hint popover stack closes it.
   // `target` is the event target (our CDP input bridge hit-tests to <body> for
   // out-of-popover coordinates, which is correctly "outside"). Closes every open
@@ -16562,6 +16686,66 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   };
   _defInvokerIDL(globalThis.HTMLButtonElement && globalThis.HTMLButtonElement.prototype);
   _defInvokerIDL(globalThis.HTMLInputElement && globalThis.HTMLInputElement.prototype);
+
+  // The command invoker attributes (HTML §invokers) live on HTMLButtonElement ONLY —
+  // NOT on <input> (unlike popovertarget). `commandForElement` reflects `commandfor`
+  // as an element reference (identical machinery to popoverTargetElement). `command`
+  // reflects the enumerated `command` content attribute: the known keywords are ASCII
+  // case-insensitive and canonicalize to lowercase; a custom command (starting with
+  // "--") is valid and preserved verbatim (case-sensitive); anything else — and the
+  // missing attribute — reads back as the empty string. The setter is a plain string
+  // reflection (ToString coercion via setAttribute).
+  const _COMMAND_KEYWORDS = new Set(['toggle-popover', 'show-popover', 'hide-popover', 'show-modal', 'close']);
+  globalThis._commandKeywords = _COMMAND_KEYWORDS;
+  {
+    const proto = globalThis.HTMLButtonElement && globalThis.HTMLButtonElement.prototype;
+    if (proto) {
+      Object.defineProperty(proto, 'commandForElement', {
+        configurable: true, enumerable: true,
+        get() {
+          const explicit = this._commandForElement;
+          if (explicit != null) {
+            // Get the attr-associated element (HTML element reflection): an explicitly
+            // set element is exposed only while it is a descendant of one of this
+            // button's shadow-including ancestors — so a light-DOM target set from a
+            // shadow button is visible, but a target buried inside a shadow tree is not.
+            try {
+              if (explicit._nid !== undefined) {
+                let n = this;
+                while (n) {
+                  if (n.contains && n.contains(explicit)) return explicit;
+                  n = n.parentNode || (n.host && n.host !== n ? n.host : null);
+                }
+              }
+            } catch (e) {}
+            return null;
+          }
+          const id = this.getAttribute('commandfor');
+          if (!id) return null;
+          const root = this.getRootNode ? this.getRootNode() : document;
+          return (root && root.getElementById) ? root.getElementById(id) : null;
+        },
+        set(v) {
+          if (v !== null && !(v && v._nid !== undefined))
+            throw new TypeError("Failed to set the 'commandForElement' property: The provided value is not of type 'Element'.");
+          if (v == null) { this._commandForElement = null; this.removeAttribute('commandfor'); return; }
+          this.setAttribute('commandfor', '');
+          this._commandForElement = v;
+        },
+      });
+      Object.defineProperty(proto, 'command', {
+        configurable: true, enumerable: true,
+        get() {
+          const a = this.getAttribute('command');
+          if (a === null) return '';
+          if (a.startsWith('--')) return a;             // custom command: verbatim, case-sensitive
+          const low = a.toLowerCase();
+          return _COMMAND_KEYWORDS.has(low) ? low : ''; // known keyword canonicalized, else invalid
+        },
+        set(v) { this.setAttribute('command', v == null ? '' : String(v)); },
+      });
+    }
+  }
 }
 
 // ===================== Tabular data IDL (HTML §4.9) =============================
@@ -18289,7 +18473,12 @@ function _cvReflLong(proto, prop, attr) {
     configurable: true,
     get() {
       const v = (this.getAttribute("type") || "").toLowerCase();
-      return (v === "reset" || v === "button") ? v : "submit";
+      if (v === "reset" || v === "button" || v === "submit") return v;
+      // Missing / invalid value default is the Auto state (HTML §the-button-element).
+      // Auto resolves to "submit" only for a bona fide submit button — a button with
+      // NEITHER a command nor a commandfor attribute (and not a <select>'s button);
+      // otherwise (a command invoker) Auto reflects as the Button state.
+      return (this.hasAttribute("command") || this.hasAttribute("commandfor")) ? "button" : "submit";
     },
     set(v) { this.setAttribute("type", v == null ? "" : String(v)); },
   });

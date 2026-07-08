@@ -10,12 +10,21 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #153).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #154).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/the-button-element/command-and-commandfor/interface.html` | 1/11 | **11/11** | ✅ 100% | **Quest #154 The Commanded Verdict.** `commandForElement` element reflection (get-the-attr-associated-element: exposed while a descendant of a shadow-including ancestor; `{}`→TypeError) + `command` enumerated reflection. **+10.** |
+| `html/semantics/the-button-element/command-and-commandfor/command-reflection.html` | 8/16 | **16/16** | ✅ 100% | **Quest #154.** `command` known keywords case-fold to lowercase; `--custom` verbatim; invalid/missing → `""`. **+8.** |
+| `html/semantics/the-button-element/command-and-commandfor/event-interface.html` | 0/22 | **22/22** | ✅ 100% | **Quest #154.** `CommandEvent` (command ToString-coerced readonly, source `Element?` — non-Element throws TypeError). **+22.** |
+| `html/semantics/the-button-element/command-and-commandfor/button-type-behavior.html` | 8/23 | **23/23** | ✅ 100% | **Quest #154.** Activation: the form-owner gate (submit/reset/Auto return early only WITH a form owner; Button state or no form → command). `form=` association via `_ceiFormOwner`. **+15.** |
+| `html/semantics/the-button-element/command-and-commandfor/button-type-reflection.html` | 9/27 | **27/27** | ✅ 100% | **Quest #154.** `button.type` Auto-state resolution: Auto reflects `submit` only for a bona-fide submit button (no command/commandfor), else `button`. **+18.** |
+| `html/semantics/the-button-element/command-and-commandfor/on-popover-behavior.html` | 14/28 | **28/28** | ✅ 100% | **Quest #154.** `command` popover default actions (toggle/show/hide) over `CommandEvent`; command captured before firing; preventDefault suppresses. **+14.** |
+| `html/semantics/the-button-element/command-and-commandfor/on-popover-invalid-behavior.html` | 16/16 | **16/16** | ✅ 100% | **Quest #154.** Command-validity gate BEFORE firing (show-modal/close fire no event on a non-dialog). Held (regression caught + fixed). |
+| `html/semantics/the-button-element/command-and-commandfor/on-popover-disconnect.html` | 0/1 | **1/1** | ✅ 100% | **Quest #154.** Removing the target inside the command event → default action skipped, no error. **+1.** |
+| `html/semantics/the-button-element/command-and-commandfor/source-attribute-retargeting.html` | 0/3 | **3/3** | ✅ 100% | **Quest #154.** `CommandEvent.source` retargets through the shared dispatch path exactly like `relatedTarget`. **+3.** |
 | `html/semantics/popovers/popover-attribute-all-elements.html` | 0/1101 | **1101/1101** | ✅ 100% | **Quest #152 The Overlaid Verdict.** The whole popover API — every HTML element behaves as a popover; `showPopover({modal})`/`getBoundingClientRect` no-assert + `assertNotAPopover` + non-rendering elements. **+1101.** |
 | `html/semantics/popovers/popover-invoking-attribute.html` | 0/1402 | **1400/1402** | ✅ 99.9% | **Quest #152.** `popovertarget` invokers via real `.click()` across all button/input types × actions × `popoverTargetElement`/`popoverTargetAction` IDL (element ref reflection, limited-value action). **+1400.** |
 | `html/semantics/popovers/popover-invoking-attribute-hint.html` | 0/700 | **700/700** | ✅ 100% | **Quest #152.** Same invoker matrix for `popover=hint`. **+700.** |
@@ -23,7 +32,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #153).
 | `html/semantics/popovers/toggleevent-interface.html` | 0/39 | **39/39** | ✅ 100% | **Quest #152.** `ToggleEvent` (oldState/newState ToString-coerced readonly, source Element?, no relatedTarget). **+39.** |
 | `html/semantics/popovers/button-type-popovertarget.html` | 0/15 | **11/15** | 🟡 73% | **Quest #152.** A button invokes its popover unless it does a form action (submit/reset with a form owner). CAP: 4 `-attr-form` need `form=` association. **+11.** |
 | `html/semantics/popovers/input-type-popovertarget.html` | 0/12 | **8/12** | 🟡 67% | **Quest #152.** Input invokers (button/submit/reset/image types). CAP: `form=` assoc + `type=image` submit. **+8.** |
-| `html/semantics/popovers/popover-toggle-source.html` | 0/7 | **6/7** | 🟡 86% | **Quest #152.** `ToggleEvent.source` = the `showPopover({source})` / invoker. CAP: 1 `command` API. **+6.** |
+| `html/semantics/popovers/popover-toggle-source.html` | 0/7 | **7/7** | ✅ 100% | **Quest #152 → #154.** `ToggleEvent.source` = the `showPopover({source})` / invoker. The last subtest (a `command` invoker) closed by **Quest #154 The Commanded Verdict**. **+7.** |
 | `html/semantics/popovers/popover-events.html` | 0/6 | **5/6** | 🟡 83% | **Quest #152.** beforetoggle (cancelable only opening) + async coalescing toggle; not fired on removal. CAP: focus/blur-during-removal. **+5.** |
 | `html/semantics/popovers/imperative-invokers.html` | 0/10 | **10/10** | ✅ 100% | **Quest #153 The Hinted Verdict.** `_topmostPopoverAncestor` now honours the invoker `source` (a popover invoked from inside another is nested under it) + `{source:null}` throws TypeError. **+10** (was 5 in #152). |
 | `html/semantics/popovers/popover-types-with-hints.html` | 0/7 | **7/7** | ✅ 100% | **Quest #153.** The auto/hint two-list stacking model (showing a hint never closes autos; an auto opened inside a hint downgrades to hint; hiding an auto takes its nested hint stack with it) + `document.currentScript` (the test helper reads `currentScript.parentElement`). **+7.** |

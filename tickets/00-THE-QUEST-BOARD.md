@@ -156,6 +156,33 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-08 (Quest #154 The Commanded Verdict — the `command`/`commandfor` invoker API, +92):**
+Took the #152/#153-named "next leverage" — the `command`/`commandfor` invoker API, the event-driven sibling of `popovertarget`,
+found the `command-and-commandfor/` realm almost entirely red. All `bootstrap.js`, no new Rust. **(1) `CommandEvent`** (Event
+subclass like `ToggleEvent`): `command` ToString-coerced readonly; `source` an `Element?` where a present non-Element (bool, `{}`,
+`XMLHttpRequest`) throws WebIDL TypeError — and `source` **retargets through event dispatch exactly like `relatedTarget`**.
+**(2) Generalized the shared dispatch** (`_dispatchSpec`/`_invokeListeners`) with a single `_rtBase` = relatedTarget for a
+Mouse/Focus event OR the CommandEvent's original `source` (stashed immutable in `_cmdSource`; per-struct retarget written to
+`_sourceLive`); **guarded on `'_cmdSource' in event`** so for every existing event `_rtBase === relatedTarget` and the path is
+provably inert. **(3) `commandForElement`** element reflection (button-only): the getter exposes the explicit element while it's a
+**descendant of a shadow-including ancestor** of the button (the get-the-attr-associated-element algorithm — differs from
+popoverTargetElement's same-root check). **(4) `command`** enumerated reflection (known keywords case-fold; `--custom` verbatim;
+invalid/missing → `""`). **(5) `button.type` Auto-state**: Auto reflects `submit` only for a bona-fide submit button (no
+command/commandfor), else `button`. **(6) Activation** (`_runCommandInvoker` + `click()`): the form-owner gate returns early for
+Submit/Reset/Auto ONLY when the button has a form owner (honoring `form=` via `_ceiFormOwner`); command validity is decided
+BEFORE firing (popover cmds on any HTML element, show-modal/close only on `<dialog>`, unsupported → no event), the command value
+captured before the cancelable/bubbling/composed event, default action gated on not-canceled + still-connected.
+interface 1→11, command-reflection 8→16, event-interface 0→22, button-type-behavior 8→23, button-type-reflection 9→27,
+on-popover-behavior 14→28, on-popover-disconnect 0→1, source-attribute-retargeting 0→3, +bonus popover-toggle-source 6→7 =
+**+92, ZERO regressions** (a mid-quest `on-popover-invalid-behavior` regression — show-modal/close firing on a non-dialog — was
+caught by the sweep and fixed with the validity gate; shared-dispatch verified: event-with-related-target 18/18, composed-path
+11/11, dispatchEvent 25/25; popover held: all-elements 1101, invoking 1400/1402 [test_driver cap], -hint 700, toggleevent 39;
+qsa 1975, createElement 147). **CAP:** the dialog command tail (`on-dialog-behavior` 0/104, `-invalid` 1/40) is dialog-API-blocked
+— `dialog.showModal` doesn't exist yet; `_runCommandInvoker` already dispatches show-modal/close, so ~140 subtests light up the
+moment the `<dialog>` API lands. **NEXT: the `<dialog>` element API** (show/showModal/close/requestClose, `open` reflection,
+returnValue, cancel/close events, `:modal`, top-layer) — unlocks the dialog command tail PLUS the standalone dialog realm; then
+a `test_driver`→CDP input bridge for the light-dismiss/focus tail. Scroll `tickets/154-the-commanded-verdict.md`.
+
 **Session 2026-07-08 (Quest #153 The Hinted Verdict — the popover hint-stacking model + `document.currentScript`, +21):**
 Quest #152 landed the popover API on a **single merged auto/hint stack** whose "show closes
 unrelated popovers" step used pure DOM containment — correct for auto-only pages, wrong for
