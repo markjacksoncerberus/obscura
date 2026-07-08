@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-07 (Quest #152).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #153).
 
 ## Scoreboard
 
@@ -25,7 +25,12 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-07 (Quest #152).
 | `html/semantics/popovers/input-type-popovertarget.html` | 0/12 | **8/12** | 🟡 67% | **Quest #152.** Input invokers (button/submit/reset/image types). CAP: `form=` assoc + `type=image` submit. **+8.** |
 | `html/semantics/popovers/popover-toggle-source.html` | 0/7 | **6/7** | 🟡 86% | **Quest #152.** `ToggleEvent.source` = the `showPopover({source})` / invoker. CAP: 1 `command` API. **+6.** |
 | `html/semantics/popovers/popover-events.html` | 0/6 | **5/6** | 🟡 83% | **Quest #152.** beforetoggle (cancelable only opening) + async coalescing toggle; not fired on removal. CAP: focus/blur-during-removal. **+5.** |
-| `html/semantics/popovers/imperative-invokers.html` | 0/10 | **5/10** | 🟡 50% | **Quest #152.** CAP: command API. **+5.** |
+| `html/semantics/popovers/imperative-invokers.html` | 0/10 | **10/10** | ✅ 100% | **Quest #153 The Hinted Verdict.** `_topmostPopoverAncestor` now honours the invoker `source` (a popover invoked from inside another is nested under it) + `{source:null}` throws TypeError. **+10** (was 5 in #152). |
+| `html/semantics/popovers/popover-types-with-hints.html` | 0/7 | **7/7** | ✅ 100% | **Quest #153.** The auto/hint two-list stacking model (showing a hint never closes autos; an auto opened inside a hint downgrades to hint; hiding an auto takes its nested hint stack with it) + `document.currentScript` (the test helper reads `currentScript.parentElement`). **+7.** |
+| `html/semantics/popovers/popover-hint-hierarchy.html` | 0/5 | **3/5** | 🟡 60% | **Quest #153.** Same hint model. CAP: 2 need `test_driver` light-dismiss input. **+3.** |
+| `html/semantics/popovers/popover-open-in-beforetoggle.html` | 0/5 | **3/5** | 🟡 60% | **Quest #153.** Document `showing popover` / `hiding popover nesting count` reentrancy guards — `showPopover()` from inside a (closing) beforetoggle throws InvalidStateError. CAP: 1 `dialog.showModal`, 1 light-dismiss input. **+3** (was harness ERROR). |
+| `html/semantics/popovers/popovertarget-reflection.html` | 0/1 | **1/1** | ✅ 100% | **Quest #153.** `popoverTargetElement` element-reflection: `=null` removes the attribute; any `popovertarget` content-attribute write clears the explicit element ref. **+1.** |
+| `html/semantics/popovers/popover-top-layer-nesting-hints.html` | 3/20 | **5/20** | 🟡 25% | **Quest #153.** Hint model. CAP: rest need `dialog.showModal` / fullscreen / input. **+2.** |
 | `html/semantics/popovers/togglePopover.html` | 0/3 | **3/3** | ✅ 100% | **Quest #152.** force param + return value reflects end state + throw conditions. **+3.** |
 | `html/semantics/popovers/popover-nested-in-button.html` | 0/4 | **3/4** | 🟡 75% | **Quest #152.** **+3.** |
 | `html/semantics/popovers/popover-target-element-disabled.html` | 0/7 | **2/7** | 🟡 29% | **Quest #152.** **+2.** |

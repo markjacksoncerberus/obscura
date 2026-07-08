@@ -317,6 +317,7 @@ impl Page {
             is_defer: bool,
             is_async: bool,
             is_module: bool,
+            nid: u32,
         }
 
         let all_scripts = match &self.js {
@@ -354,6 +355,7 @@ impl Page {
                                     is_defer,
                                     is_async,
                                     is_module,
+                                    nid: sid.raw(),
                                 });
                             }
                         }
@@ -499,6 +501,14 @@ impl Page {
         }
 
         for (i, script) in all_to_execute.iter().enumerate() {
+            // Point document.currentScript at this classic <script> for the duration
+            // of its synchronous execution (cleared after the loop; modules run null).
+            if let Some(js) = &mut self.js {
+                let _ = js.execute_script(
+                    "<current-script>",
+                    &format!("globalThis.__currentScriptNid = {};", script.nid),
+                );
+            }
             if script.src.is_some() {
                 if let Some((url, code, resp, elapsed_ms)) = fetched.remove(&i) {
                     tracing::info!("Executing script ({} bytes): {}", code.len(), url);
@@ -532,6 +542,12 @@ impl Page {
                     }
                 }
             }
+        }
+
+        // Classic scripts done: document.currentScript is null during module
+        // evaluation and for the rest of the lifecycle.
+        if let Some(js) = &mut self.js {
+            let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid = -1;");
         }
 
         for module_script in &module_scripts {

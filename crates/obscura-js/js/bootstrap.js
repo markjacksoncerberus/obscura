@@ -1013,7 +1013,13 @@ class Node {
         _loadElementResource(c, src, 'script', { eval: true });
       } else {
         const code = c.textContent;
-        if (code) { try { (0, eval)(code); } catch(e) { console.error('Dynamic inline script error:', e.message); } }
+        if (code) {
+          const _prevCS = globalThis.__currentScriptNid;
+          globalThis.__currentScriptNid = c._nid;
+          try { (0, eval)(code); }
+          catch(e) { console.error('Dynamic inline script error:', e.message); }
+          finally { globalThis.__currentScriptNid = _prevCS; }
+        }
       }
     }
     if (c instanceof Element && c.localName === 'iframe') _connectIframe(c);
@@ -2425,6 +2431,10 @@ class Element extends Node {
     if (__ariaElementContentAttrs.has(qname)) __ariaResetExplicit(this, qname);
     // Popover attribute change steps (marks the page as popover-using either way).
     if (qname === 'popover') globalThis._runPopoverAttrChange(this, _popOld);
+    // Writing the `popovertarget` content attribute directly resets any explicit
+    // element association (HTML element reflection: the getter recomputes from the
+    // attribute value). The IDL setter re-establishes the explicit ref afterwards.
+    if (qname === 'popovertarget') this._popoverTargetElement = null;
   }
   setAttributeNS(namespace, qname, v) {
     const { namespace: ns, prefix, local } = _validateAndExtract(namespace, qname);
@@ -2470,6 +2480,8 @@ class Element extends Node {
     if (__ariaElementContentAttrs.has(qname)) __ariaResetExplicit(this, qname);
     // Removing the popover attribute is a state change to "no popover" — hide it.
     if (qname === 'popover' && val !== null) globalThis._runPopoverAttrChange(this, val);
+    // Removing `popovertarget` drops any explicit element association too.
+    if (qname === 'popovertarget') this._popoverTargetElement = null;
   }
   removeAttributeNS(ns, local) {
     ns = (ns === '' || ns == null) ? '' : String(ns); local = String(local);
@@ -4122,6 +4134,13 @@ class Document extends Node {
   get images() { return this.querySelectorAll("img"); }
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
+  // The <script> whose classic script is currently executing (null in modules,
+  // event handlers, or outside script execution). The running nid is set by the
+  // page-load script driver (Rust) and by the dynamic-insertion eval path.
+  get currentScript() {
+    const nid = globalThis.__currentScriptNid;
+    return (nid === undefined || nid === null || nid < 0) ? null : _wrap(nid);
+  }
   get cookie() {
     return Deno.core.ops.op_get_cookies();
   }
@@ -16218,6 +16237,25 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
     return true;
   };
 
+  // The EFFECTIVE popover type while showing: an `auto` opened inside a `hint` is
+  // "downgraded" to hint (an auto popover cannot be parented by a hint), stored on
+  // the element; otherwise it is the attribute state. `_popoverAutoStack` holds both
+  // auto and hint popovers in a single top-layer order; the two "showing … popover
+  // lists" the spec names are just this stack filtered by effective type.
+  const _popoverEffType = (el) =>
+    (el._popoverShowing && el._popoverEffectiveType) ? el._popoverEffectiveType : _popoverState(el);
+  const _autoSublist = () => _popoverAutoStack.filter(p => _popoverEffType(p) === 'auto');
+  const _hintSublist = () => _popoverAutoStack.filter(p => _popoverEffType(p) === 'hint');
+  // The auto popover the current hint stack hangs off of (its "hint stack parent"),
+  // or null for a top-level hint stack. Hiding that auto clears the whole hint stack.
+  let _popoverHintStackParent = null;
+  // HTML document-level reentrancy guards: `showing popover` is true across a show,
+  // `hiding popover nesting count` is >0 while a closing beforetoggle is firing. A
+  // showPopover() invoked while either is active (e.g. from inside a beforetoggle
+  // handler) throws InvalidStateError.
+  let _popoverShowingFlag = false;
+  let _popoverHidingCount = 0;
+
   // Hide one popover in place (no cascade): fire the (non-cancelable) closing
   // beforetoggle if fireEvents, drop the showing flag + Rust `:popover-open` bit,
   // then queue the async closing toggle. Re-entrancy-guarded.
@@ -16227,41 +16265,88 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
     try {
       const idx = _popoverAutoStack.indexOf(el);
       if (idx >= 0) _popoverAutoStack.splice(idx, 1);
-      if (fireEvents) _fireToggleEvent(el, 'beforetoggle', 'open', 'closed', false, source);
+      if (fireEvents) {
+        _popoverHidingCount++;
+        try { _fireToggleEvent(el, 'beforetoggle', 'open', 'closed', false, source); }
+        finally { _popoverHidingCount--; }
+      }
       el._popoverShowing = false;
+      el._popoverEffectiveType = null;
       try { _dom("set_popover_open", el._nid, "0"); } catch (e) {}
       _popoverShowingCount--;
+      // When the last hint closes, the hint stack no longer hangs off any auto.
+      if (_hintSublist().length === 0) _popoverHintStackParent = null;
       if (fireEvents) _queuePopoverToggle(el, 'open', 'closed', source);
     } finally { el._popoverHiding = false; }
   };
 
-  // Close every showing auto/hint popover that is NOT an inclusive DOM ancestor of
-  // `el` (used when showing a new auto/hint popover), top of the stack first.
-  const _hidePopoversUnrelatedTo = (el) => {
-    const unrelated = _popoverAutoStack.filter(p => p !== el && !(p.contains && p.contains(el)));
-    for (let i = unrelated.length - 1; i >= 0; i--) _hidePopoverInstance(unrelated[i], true);
+  // HTML "topmost popover ancestor": the open popover that is the nearest flat-tree
+  // ancestor of `newEl`, OR whose subtree contains the invoker `source`; whichever is
+  // LATER in top-layer order wins. Returns null if there is no such ancestor.
+  const _topmostPopoverAncestor = (newEl, source) => {
+    const combined = _popoverAutoStack;
+    let idx = -1;
+    for (let i = 0; i < combined.length; i++) {
+      const p = combined[i];
+      if (p !== newEl && p.contains && p.contains(newEl)) idx = i;
+    }
+    let sidx = -1;
+    if (source) for (let i = 0; i < combined.length; i++) {
+      const p = combined[i];
+      if (p !== newEl && (p === source || (p.contains && p.contains(source)))) sidx = i;
+    }
+    const a = Math.max(idx, sidx);
+    return a >= 0 ? combined[a] : null;
   };
 
-  // HTML "hide popover": validate, then (for auto/hint) hide everything shown above
-  // `el` on the stack (nested descendants close first), then hide `el` itself.
+  // HTML "hide popover stack until": hide, top-first, every popover of the given
+  // stack type (`auto`|`hint`) sitting ABOVE `endpoint` in that type's list (all of
+  // them if endpoint is null or not in the list). Recomputes each pass because a
+  // fired beforetoggle handler may itself have shown further popovers.
+  const _hideStackUntil = (endpoint, stackType, fireEvents) => {
+    for (let guard = 0; guard < 128; guard++) {
+      const list = _popoverAutoStack.filter(p => _popoverEffType(p) === stackType);
+      let lastHideIndex = 0;
+      if (endpoint) { const ei = list.indexOf(endpoint); lastHideIndex = ei >= 0 ? ei + 1 : 0; }
+      if (list.length <= lastHideIndex) break;
+      let hidAny = false;
+      for (let i = list.length - 1; i >= lastHideIndex; i--) {
+        if (list[i]._popoverShowing && !list[i]._popoverHiding) { _hidePopoverInstance(list[i], fireEvents); hidAny = true; }
+      }
+      if (!hidAny) break;
+    }
+  };
+
+  // HTML "hide popover": validate, then (for auto/hint) close the popovers stacked
+  // above `el` — hints above it first, then (if `el` anchors the hint stack) the WHOLE
+  // hint stack, then autos above it — and finally hide `el` itself. So hiding an auto
+  // takes its nested hint stack down with it, but leaves a sibling (non-nested) hint.
   const _hidePopover = (el, fireEvents, throwEx, source) => {
     if (!_checkPopoverValidity(el, true, throwEx)) return;
-    const type = _popoverState(el);
+    const type = _popoverEffType(el);
     if (type === 'auto' || type === 'hint') {
-      const idx = _popoverAutoStack.indexOf(el);
-      if (idx >= 0)
-        for (let i = _popoverAutoStack.length - 1; i > idx; i--)
-          _hidePopoverInstance(_popoverAutoStack[i], fireEvents);
+      if (_hintSublist().indexOf(el) >= 0) _hideStackUntil(el, 'hint', fireEvents);
+      if (el === _popoverHintStackParent) _hideStackUntil(null, 'hint', fireEvents);
+      if (_autoSublist().indexOf(el) >= 0) _hideStackUntil(el, 'auto', fireEvents);
     }
     _hidePopoverInstance(el, fireEvents, source);
   };
 
   // HTML "show popover": validate → fire cancelable opening beforetoggle → re-validate
-  // (the handler may have mutated el) → close unrelated auto popovers → re-validate →
-  // enter the top layer + queue the opening toggle. Re-checks the popover TYPE after
-  // each event-firing step (a handler that changed the type throws InvalidStateError).
+  // (the handler may have mutated el) → for auto/hint, compute the topmost popover
+  // ancestor and close everything this popover supersedes (hints ALWAYS, autos only
+  // when this popover itself resolves to `auto`) → re-validate → enter the top layer +
+  // queue the opening toggle. Re-checks the popover TYPE after each event-firing step
+  // (a handler that changed the type throws InvalidStateError).
   const _showPopover = (el, throwEx, source) => {
     if (!_checkPopoverValidity(el, false, throwEx)) return false;
+    // Reentrancy guard: a popover cannot be shown while another popover is mid show
+    // or hide (e.g. from within a beforetoggle handler) — throw InvalidStateError.
+    if (_popoverShowingFlag || _popoverHidingCount !== 0) {
+      if (throwEx) throw new DOMException(
+        "The popover cannot be shown while another popover is being shown or hidden.", "InvalidStateError");
+      return false;
+    }
     const originalType = _popoverState(el);
     const typeChanged = () => {
       if (_popoverState(el) === originalType) return false;
@@ -16269,18 +16354,36 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
         "The popover's type changed while it was being shown.", "InvalidStateError");
       return true;
     };
-    if (!_fireToggleEvent(el, 'beforetoggle', 'closed', 'open', true, source)) return false;
-    if (!_checkPopoverValidity(el, false, throwEx) || typeChanged()) return false;
-    if (originalType === 'auto' || originalType === 'hint') {
-      _hidePopoversUnrelatedTo(el);
+    _popoverShowingFlag = true;
+    try {
+      if (!_fireToggleEvent(el, 'beforetoggle', 'closed', 'open', true, source)) return false;
       if (!_checkPopoverValidity(el, false, throwEx) || typeChanged()) return false;
-    }
-    el._popoverShowing = true;
-    _popoverShowingCount++;
-    if (originalType === 'auto' || originalType === 'hint') _popoverAutoStack.push(el);
-    try { _dom("set_popover_open", el._nid, "1"); } catch (e) {}
-    _queuePopoverToggle(el, 'closed', 'open', source);
-    return true;
+      if (originalType === 'auto' || originalType === 'hint') {
+        const ancestor = _topmostPopoverAncestor(el, source);
+        // Downgrade: an auto whose nearest open ancestor is a hint becomes a hint.
+        let effType = originalType;
+        if (originalType === 'auto' && ancestor && _popoverEffType(ancestor) === 'hint') effType = 'hint';
+        // Hints always close first (down to the ancestor); autos close only if THIS is
+        // an auto — showing a hint must not disturb unrelated auto popovers.
+        _hideStackUntil(ancestor, 'hint', true);
+        if (effType === 'auto') _hideStackUntil(ancestor, 'auto', true);
+        if (!_checkPopoverValidity(el, false, throwEx) || typeChanged()) return false;
+        // A fresh hint stack records the auto (if any) that anchors it.
+        if (effType === 'hint' && _hintSublist().length === 0)
+          _popoverHintStackParent = (ancestor && _popoverEffType(ancestor) === 'auto') ? ancestor : null;
+        el._popoverEffectiveType = effType;
+        el._popoverInvokerSource = source || null;
+        el._popoverShowing = true;
+        _popoverShowingCount++;
+        _popoverAutoStack.push(el);
+      } else {
+        el._popoverShowing = true;
+        _popoverShowingCount++;
+      }
+      try { _dom("set_popover_open", el._nid, "1"); } catch (e) {}
+      _queuePopoverToggle(el, 'closed', 'open', source);
+      return true;
+    } finally { _popoverShowingFlag = false; }
   };
 
   // The popover attribute change steps: a type change while showing hides the popover
@@ -16376,7 +16479,18 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   const _defP = (name, fn) => Object.defineProperty(globalThis.HTMLElement.prototype, name, {
     configurable: true, enumerable: true, writable: true, value: _markNative(fn),
   });
-  const _optSource = (options) => (options && typeof options === 'object' && options.source) || null;
+  // Read the `source` member of a Show/TogglePopoverOptions dictionary. It is a
+  // non-nullable `Element`, so an absent/undefined member is "no source" (null) but
+  // an explicitly present non-Element value (including null) is a WebIDL conversion
+  // TypeError.
+  const _optSource = (options) => {
+    if (!options || typeof options !== 'object') return null;
+    const s = options.source;
+    if (s === undefined) return null;
+    if (!(s && s._nid !== undefined))
+      throw new TypeError("Failed to read the 'source' property from the options: The provided value is not of type 'Element'.");
+    return s;
+  };
   _defP('showPopover', function showPopover(options) { _showPopover(this, true, _optSource(options)); });
   _defP('hidePopover', function hidePopover() { _hidePopover(this, true, true); });
   _defP('togglePopover', function togglePopover(options) {
@@ -16428,8 +16542,11 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
       set(v) {
         if (v !== null && !(v && v._nid !== undefined))
           throw new TypeError("Failed to set the 'popoverTargetElement' property: The provided value is not of type 'Element'.");
-        this._popoverTargetElement = v || null;
+        if (v == null) { this._popoverTargetElement = null; this.removeAttribute('popovertarget'); return; }
+        // Set the content attribute (which clears the explicit ref) then record the
+        // explicit element, so the getter returns it while it shares this tree.
         this.setAttribute('popovertarget', '');
+        this._popoverTargetElement = v;
       },
     });
     Object.defineProperty(proto, 'popoverTargetAction', {
