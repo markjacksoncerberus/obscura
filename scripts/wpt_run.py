@@ -237,6 +237,8 @@ TESTDRIVER_BRIDGE_JS = r"""
       firePointer('pointerup', element, x, y, 0, 0);
       fireMouse('mouseup', element, x, y, 0, 0, 1);
       fireMouse('click', element, x, y, 0, 0, 1);
+      // A click is user activation (for the close-watcher grouping model etc.).
+      try { globalThis.__obscuraUserActivation && globalThis.__obscuraUserActivation(); } catch (e) {}
       return Promise.resolve();
     };
     impl.send_keys = function(element, keys) {
@@ -248,7 +250,13 @@ TESTDRIVER_BRIDGE_JS = r"""
       return Promise.resolve();
     };
     impl.action_sequence = function(actions) { dispatchCmds(resolveActions(actions)); return Promise.resolve(); };
-    impl.bless = function() { return Promise.resolve(); };
+    // bless() grants the page transient/history-action user activation (wptrunner
+    // implements it as a click on an element). NOT the Esc key, which is a close
+    // request, not activation.
+    impl.bless = function() {
+      try { globalThis.__obscuraUserActivation && globalThis.__obscuraUserActivation(); } catch (e) {}
+      return Promise.resolve();
+    };
   }
 
   // Obscura runs preload scripts *after* load, so testdriver.js has already set

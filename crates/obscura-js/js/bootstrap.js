@@ -4951,7 +4951,19 @@ globalThis.length = 0;
 // HTML spec exposes on* event handler IDL attributes on Window. Libraries like
 // jQuery feature-detect bubbling via `("on" + ev) in window` and fall back to
 // a legacy IE path that crashes on missing DOM APIs when the check returns
-// false. Initialising them to null makes the check match real browsers.
+// false. Beyond feature detection, real browsers make these ACCESSORS that
+// register a listener on the window when set, so `window.onkeydown = fn` (or
+// onresize/onpopstate/onhashchange/…) actually fires during dispatch — a bubbling
+// keydown that reaches the window, a popstate, etc. We install accessors that
+// register/unregister a listener via the shared window listener path (mirroring
+// the FileReader on-handler pattern). `_addListener`/`_removeListener` are `const`s
+// declared further down; the setter only references them at call time (long after
+// bootstrap), so the forward reference is safe.
+// EXCLUSIONS: `load` and `error` keep plain data-property semantics — the
+// load-event driver both calls `win.onload(...)` directly AND dispatches a `load`
+// event (registering a listener would double-fire), and `onerror` is invoked
+// manually with its bespoke (message, source, lineno, colno, error) signature.
+const _WINDOW_ONHANDLER_DATA = new Set(["load", "error"]);
 for (const _ev of [
   "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
   "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
@@ -4967,7 +4979,20 @@ for (const _ev of [
   "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
   "unload","volumechange","waiting","wheel",
 ]) {
-  if (!(("on" + _ev) in globalThis)) globalThis["on" + _ev] = null;
+  const _name = "on" + _ev;
+  if (_name in globalThis) continue;              // already defined elsewhere — leave it
+  if (_WINDOW_ONHANDLER_DATA.has(_ev)) { globalThis[_name] = null; continue; }
+  const _slot = "__winon_" + _ev, _type = _ev;
+  Object.defineProperty(globalThis, _name, {
+    configurable: true, enumerable: true,
+    get() { return this[_slot] || null; },
+    set(fn) {
+      const cur = this[_slot];
+      if (cur) _removeListener(globalThis, _type, cur);
+      this[_slot] = (typeof fn === "function") ? fn : null;
+      if (this[_slot]) _addListener(globalThis, _type, this[_slot]);
+    },
+  });
 }
 
 globalThis.Window = globalThis.Window || function Window() {};
@@ -14647,6 +14672,174 @@ globalThis.AbortController = class AbortController {
 _markNative(AbortSignal); _markNative(AbortSignal.abort); _markNative(AbortSignal.timeout); _markNative(AbortSignal.any);
 _markNative(AbortSignal.prototype.addEventListener); _markNative(AbortSignal.prototype.removeEventListener); _markNative(AbortSignal.prototype.dispatchEvent); _markNative(AbortSignal.prototype.throwIfAborted);
 _markNative(AbortController); _markNative(AbortController.prototype.abort);
+
+// ===== Close watchers (HTML §6.10 — the close-watcher infrastructure) =====
+// A per-Window "close watcher manager": a list of GROUPS, each group a list of
+// close watchers, plus an "allowed number of groups" and a "next user interaction
+// allows a new group" flag. This is the anti-abuse gate for close requests (the
+// Escape key / platform "close" gesture): close watchers created WITHOUT
+// intervening user activation pile into ONE group, so a single close request
+// closes them all; each user activation "banks" room for one more independent
+// group (allowed number of groups starts at 1 → without any activation everything
+// lands in the single first group). CloseWatcher objects register here; modal
+// dialogs and popovers keep their own top-layer close path for now, and
+// `_processCloseRequest` ranks the close-watcher group against them by the shared
+// monotonic `_topLayerSeq` stamp so the topmost element handles the request.
+const _cwManager = { groups: [], allowedGroups: 1, nextUAAllowsNewGroup: true, hasActivation: false };
+
+// "Notify the close watcher manager about user activation": if the next user
+// interaction is allowed to start a new group, increment the allowed number of
+// groups and clear the flag. Also grants the page the history-action activation a
+// close request consults. Called by the test_driver bridge's bless()/click (and any
+// real activating interaction) — NEVER for the Escape key itself, since a close
+// request does not itself count as user activation (see close-watcher/esc-key/
+// not-user-activation.html: an Esc-only interaction yields cancelable=false).
+globalThis.__obscuraUserActivation = function() {
+  if (_cwManager.nextUAAllowsNewGroup) { _cwManager.allowedGroups++; _cwManager.nextUAAllowsNewGroup = false; }
+  _cwManager.hasActivation = true;
+};
+
+// A close watcher is "active" iff it currently sits in some group.
+const _cwActive = (cw) => _cwManager.groups.some((g) => g.indexOf(cw) !== -1);
+
+// "Establish a close watcher": append it as its own new group if there is room
+// (groups' size < allowed number of groups), else onto the last group. Then set
+// "next user interaction allows a new group" back to true. Stamps `_topLayerSeq` so
+// `_processCloseRequest` can rank the group against popovers/dialogs.
+const _cwEstablish = (cancelAction, closeAction, getEnabledState) => {
+  const cw = { cancelAction, closeAction, getEnabledState, isRunningCancelAction: false };
+  if (_cwManager.groups.length < _cwManager.allowedGroups) _cwManager.groups.push([cw]);
+  else _cwManager.groups[_cwManager.groups.length - 1].push(cw);
+  _cwManager.nextUAAllowsNewGroup = true;
+  cw._topLayerSeq = (globalThis._topLayerSeq = (globalThis._topLayerSeq || 0) + 1);
+  return cw;
+};
+
+// "Destroy a close watcher": remove it from every group, then drop any emptied group.
+const _cwDestroy = (cw) => {
+  for (const g of _cwManager.groups) { const i = g.indexOf(cw); if (i !== -1) g.splice(i, 1); }
+  _cwManager.groups = _cwManager.groups.filter((g) => g.length > 0);
+};
+
+// "Close a close watcher": if still active and enabled, destroy it then run its
+// close action (which fires the `close` event synchronously).
+const _cwClose = (cw) => {
+  if (!_cwActive(cw)) return;
+  if (!cw.getEnabledState()) return;
+  _cwDestroy(cw);
+  cw.closeAction();
+};
+
+// "Request to close a close watcher" with a requireHistoryActionActivation boolean.
+// canPreventClose (whether the cancel event is cancelable) is true iff the request
+// does not require activation (the imperative requestClose()) OR there is room for a
+// new group AND the page has history-action activation. Returns false ONLY when a
+// cancelable cancel action was prevented — which also CONSUMES the activation, so a
+// second close request without intervening activation cannot be prevented.
+const _cwRequestClose = (cw, requireHAA) => {
+  if (!_cwActive(cw)) return true;
+  if (!cw.getEnabledState()) return true;
+  if (cw.isRunningCancelAction) return true;
+  const canPreventClose = !requireHAA ||
+    (_cwManager.groups.length < _cwManager.allowedGroups && _cwManager.hasActivation);
+  cw.isRunningCancelAction = true;
+  const shouldContinue = cw.cancelAction(canPreventClose);
+  cw.isRunningCancelAction = false;
+  if (!shouldContinue) { _cwManager.hasActivation = false; return false; }
+  _cwClose(cw);
+  return true;
+};
+
+// "Process close watchers": the close-request entry point. Runs the watchers in the
+// LAST group in reverse order, closing each until one prevents the request, then
+// decrements the allowed number of groups (down to a floor of 1). Returns whether
+// any enabled watcher was processed.
+globalThis._cwProcessCloseWatchers = () => {
+  let processed = false;
+  if (_cwManager.groups.length) {
+    const group = _cwManager.groups[_cwManager.groups.length - 1].slice();
+    for (let i = group.length - 1; i >= 0; i--) {
+      const cw = group[i];
+      if (cw.getEnabledState()) processed = true;
+      if (!_cwRequestClose(cw, true)) break;
+    }
+    if (_cwManager.allowedGroups > 1) _cwManager.allowedGroups--;
+  }
+  return processed;
+};
+
+// The `_topLayerSeq` rank of the topmost close watcher in the last group (or -1 if
+// there are none) — used by `_processCloseRequest` to order the group against the
+// popover/dialog top-layer stacks.
+globalThis._cwTopSeq = () => {
+  const g = _cwManager.groups[_cwManager.groups.length - 1];
+  if (!g || !g.length) return -1;
+  let s = -1;
+  for (const cw of g) if ((cw._topLayerSeq || 0) > s) s = cw._topLayerSeq || 0;
+  return s;
+};
+
+// Install an event-handler IDL attribute (oncancel/onclose) on the CloseWatcher
+// prototype: stores the current handler and, on first assignment, registers ONE
+// persistent listener that dispatches to whatever handler is currently stored (so
+// the handler's position among addEventListener listeners stays stable per spec).
+const _cwEventHandlerAttr = (proto, name, type) => {
+  const slot = '_' + name;
+  const installed = slot + '_installed';
+  Object.defineProperty(proto, name, {
+    configurable: true, enumerable: true,
+    get() { return this[slot] || null; },
+    set(fn) {
+      this[slot] = (typeof fn === 'function') ? fn : null;
+      if (!this[installed]) {
+        this[installed] = true;
+        _addListener(this, type, (ev) => { const h = this[slot]; if (typeof h === 'function') h.call(this, ev); });
+      }
+    },
+  });
+};
+
+// The CloseWatcher interface. Its cancel action fires a `cancel` event (cancelable
+// per canPreventClose) and reports whether it survived (not preventDefault'd); its
+// close action fires a `close` event; its enabled state is always true. Uses its own
+// EventTarget surface over the shared listener registry (it is not a Node).
+globalThis.CloseWatcher = class CloseWatcher {
+  constructor(options) {
+    // "If this's relevant global object's associated Document is not fully active,
+    // throw InvalidStateError." The top-level page document is always fully active
+    // when script runs here, so no throw path is reachable.
+    const self = this;
+    const cw = _cwEstablish(
+      (canPreventClose) => {
+        const ev = new Event('cancel', { cancelable: !!canPreventClose });
+        _dispatchPublic(self, ev);
+        return !ev.defaultPrevented;
+      },
+      () => { _dispatchPublic(self, new Event('close')); },
+      () => true,
+    );
+    Object.defineProperty(this, '_cw', { value: cw, enumerable: false, configurable: true });
+    // The `signal` option: aborting the AbortSignal destroys the watcher.
+    const signal = options && options.signal;
+    if (signal !== undefined && signal !== null) {
+      if (signal.aborted) _cwDestroy(cw);
+      else if (typeof signal.addEventListener === 'function')
+        signal.addEventListener('abort', () => _cwDestroy(cw));
+    }
+  }
+  requestClose() { _cwRequestClose(this._cw, false); }
+  close() { _cwClose(this._cw); }
+  destroy() { _cwDestroy(this._cw); }
+  addEventListener(type, handler, opts) { _addListener(this, String(type), handler, opts); }
+  removeEventListener(type, handler, opts) { _removeListener(this, String(type), handler, opts); }
+  dispatchEvent(event) { return _dispatchPublic(this, event); }
+};
+_cwEventHandlerAttr(CloseWatcher.prototype, 'oncancel', 'cancel');
+_cwEventHandlerAttr(CloseWatcher.prototype, 'onclose', 'close');
+_markNative(CloseWatcher);
+_markNative(CloseWatcher.prototype.requestClose); _markNative(CloseWatcher.prototype.close); _markNative(CloseWatcher.prototype.destroy);
+_markNative(CloseWatcher.prototype.addEventListener); _markNative(CloseWatcher.prototype.removeEventListener); _markNative(CloseWatcher.prototype.dispatchEvent);
+
 // Base64 over raw bytes (for FileReader.readAsDataURL).
 const _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const _b64FromBytes = function(b) {
@@ -16661,6 +16854,12 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
         best = d; bestSeq = d._topLayerSeq || 0;
       }
     }
+    // A close watcher group ranks by its topmost watcher's `_topLayerSeq`; if it
+    // sits above any showing popover/modal dialog (or there is none), the close
+    // request processes that group instead. No close watchers → cwSeq is -1 and the
+    // popover/dialog path below is untouched.
+    const cwSeq = (typeof globalThis._cwTopSeq === 'function') ? globalThis._cwTopSeq() : -1;
+    if (cwSeq > bestSeq) { try { globalThis._cwProcessCloseWatchers(); } catch (e) {} return; }
     if (!best) return;
     if (best.localName === 'dialog') {
       const rc = globalThis._dialogRequestClose;

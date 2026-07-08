@@ -10,12 +10,20 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #156).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #157).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `close-watcher/basic.html` | 0/7 | **7/7** | ✅ 100% | **Quest #157 The Watched Verdict.** The `CloseWatcher` API (`new CloseWatcher()`, `requestClose`/`close`/`destroy`, `cancel`/`close` events, `oncancel`/`onclose`, the `signal` option). **+7.** |
+| `close-watcher/event-properties.html` | 0/1 | **1/1** | ✅ 100% | **Quest #157.** `cancel`/`close` event properties (bubbles/cancelable). **+1.** |
+| `close-watcher/abortsignal.html` | 0/9 | **9/9** | ✅ 100% | **Quest #157.** Aborting the constructor `signal` destroys the watcher (pre-aborted and later-aborted). **+9.** |
+| `close-watcher/frame-removal.html` | 0/6 | **5/6** | 🟡 83% | **Quest #157.** Watchers destroyed on frame teardown. CAP: constructing a `CloseWatcher` in a detached iframe realm should throw `InvalidStateError` (needs a per-realm fully-active check; the class is shared on the top global). **+5.** |
+| `close-watcher/inside-event-listeners.html` | 0/12 | **12/12** | ✅ 100% | **Quest #157.** Establishing/closing watchers from within cancel/close handlers; group re-entrancy. **+12.** |
+| `close-watcher/esc-key/keydown.html` | 0/1 | **1/1** | ✅ 100% | **Quest #157.** A `window.onkeydown` `preventDefault()` suppresses the Esc close request — fixed by making Window `on*` handler IDL attributes **real listener-registering accessors** (they were inert `null` data props). **+1.** |
+| `close-watcher/esc-key/{keypress,keyup,not-user-activation,synthetic-keyboard-event}.html` | 0/4 | **4/4** | ✅ 100% | **Quest #157.** Esc close-request routed through the close-watcher manager; keypress/keyup are not close requests. **+4.** |
+| `close-watcher/user-activation/*.html` (28 files, CloseWatcher variant) | 2/37 | **28/37** | 🟡 76% | **Quest #157.** The activation-gated grouping model: watchers established without intervening user activation share one group closed by a single request; each activation banks room for a new group; a prevented cancel consumes the activation. Bridge `bless()`/click grant activation. CAP: the 9 `-dialog`/`-popover` variants need dialogs/popovers wired into the manager as close watchers (the group-close semantics). **+26.** |
 | `html/semantics/popovers/popover-attribute-basic.html` | 113/249 | **159/249** | 🟡 64% | **Quest #156 The Driven Verdict.** Bonus from a real `elementFromPoint` (hit-tests the synthetic per-node rects instead of always returning `<body>`), which fixes visibility/box-dependent subtests. **+46.** |
 | `html/semantics/popovers/popover-light-dismiss.html` | 8/33 | **15/33** | 🟡 45% | **Quest #156.** The in-page `test_driver` input bridge (click/Actions → real mousedown at hit-tested coords) drives light-dismiss; Escape close-request closes the topmost popover. CAP: Tab-focus navigation, coordinate-invoker activation, isTrusted-synthetic, pointerup-vs-pointerdown timing. **+7.** |
 | `html/semantics/popovers/popover-light-dismiss-hint.html` | 1/9 | **3/9** | 🟡 33% | **Quest #156.** Same click-driven light-dismiss for the hint stack. **+2.** |
