@@ -58,6 +58,11 @@ async fn do_navigate(
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
         let nav_body = params.get("__body").and_then(|v| v.as_str()).unwrap_or("");
+        // Hand the preload scripts to the page so it runs them right after creating the
+        // JS context and BEFORE the document's own scripts (proper "on new document"
+        // ordering) — otherwise a page whose scripts run to completion during navigation
+        // (e.g. a testharness page) never sees the preload in time.
+        page.set_pending_preloads(preload_scripts.clone());
         if nav_method == "POST" && !nav_body.is_empty() {
             page.navigate_with_wait_post(url, wait_until, nav_method, nav_body)
                 .await
@@ -66,12 +71,6 @@ async fn do_navigate(
             page.navigate_with_wait(url, wait_until)
                 .await
                 .map_err(|e| e.to_string())?;
-        }
-
-        for source in &preload_scripts {
-            if let Err(e) = page.execute_preload_script(source) {
-                tracing::debug!("Preload script error: {}", e);
-            }
         }
 
         let reached_network_idle = page.lifecycle.is_network_idle();

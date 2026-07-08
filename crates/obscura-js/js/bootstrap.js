@@ -16461,6 +16461,9 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
         el._popoverShowing = true;
         _popoverShowingCount++;
         _popoverAutoStack.push(el);
+        // Stamp the top-layer sequence so a close request can rank this popover
+        // against modal dialogs and other popovers (topmost = highest stamp).
+        el._topLayerSeq = (globalThis._topLayerSeq = (globalThis._topLayerSeq || 0) + 1);
       } else {
         el._popoverShowing = true;
         _popoverShowingCount++;
@@ -16638,6 +16641,34 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
     document.addEventListener('pointerdown', _ld, true);
     document.addEventListener('mousedown', _ld, true);
   } catch (e) {}
+
+  // Process a close request (the Escape key / platform "close" gesture). Invoked as
+  // the default action of a *trusted* Escape keydown by the CDP Input bridge — only
+  // when the keydown was not preventDefault'd, so a page (or a focused control, e.g. a
+  // text field) that cancels the keydown swallows the close request. Picks the single
+  // topmost top-layer element across BOTH the auto/hint popover stack AND the open
+  // modal dialogs, ranked by the monotonic `_topLayerSeq` stamp, and runs its close
+  // behavior: a popover is hidden (fires beforetoggle/toggle); a modal dialog gets a
+  // "request to close" (a cancelable `cancel`, then close unless the handler prevents).
+  globalThis._processCloseRequest = () => {
+    let best = null, bestSeq = -1;
+    for (const p of _popoverAutoStack) {
+      if (p._popoverShowing && (p._topLayerSeq || 0) > bestSeq) { best = p; bestSeq = p._topLayerSeq || 0; }
+    }
+    const modals = globalThis._modalDialogSet;
+    if (modals) for (const d of modals) {
+      if (d._isModal && d.hasAttribute && d.hasAttribute('open') && (d._topLayerSeq || 0) > bestSeq) {
+        best = d; bestSeq = d._topLayerSeq || 0;
+      }
+    }
+    if (!best) return;
+    if (best.localName === 'dialog') {
+      const rc = globalThis._dialogRequestClose;
+      if (typeof rc === 'function') rc(best, null, null);
+    } else {
+      _hidePopover(best, true, false);
+    }
+  };
 
   const _defP = (name, fn) => Object.defineProperty(globalThis.HTMLElement.prototype, name, {
     configurable: true, enumerable: true, writable: true, value: _markNative(fn),
@@ -16832,12 +16863,22 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
       };
 
       // Set/clear the is-modal state + the Rust `:modal` flag, keeping the counter honest.
+      // Also maintains the set of currently-open modal dialogs and stamps each with a
+      // monotonic top-layer sequence, so a close request (Escape) can find the single
+      // topmost element across BOTH modal dialogs and the auto/hint popover stack.
       const _setDialogModal = (el, modal) => {
         if (!!el._isModal === !!modal) return;
         el._isModal = !!modal;
         try { _dom('set_dialog_modal', el._nid, modal ? '1' : '0'); } catch (e) {}
         globalThis._dialogModalCount += modal ? 1 : -1;
         if (globalThis._dialogModalCount < 0) globalThis._dialogModalCount = 0;
+        const set = globalThis._modalDialogSet || (globalThis._modalDialogSet = new Set());
+        if (modal) {
+          set.add(el);
+          el._topLayerSeq = (globalThis._topLayerSeq = (globalThis._topLayerSeq || 0) + 1);
+        } else {
+          set.delete(el);
+        }
       };
 
       // Hide the popovers that opening this dialog must dismiss: "topmost popover
@@ -21247,25 +21288,47 @@ if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node, deep) { return node ? node.cloneNode(!!deep, this) : null; };
 }
 
-// Document.elementFromPoint / elementsFromPoint — no layout engine, so this is a stub:
-// in-viewport coords return <body> (or <html> as fallback), out-of-viewport returns null.
-// Wrong-but-non-throwing beats "undefined", which traps ad/analytics bootstraps in retry loops
-// (see issue #63).
+// Document.elementFromPoint / elementsFromPoint. Obscura has no real layout engine,
+// but getBoundingClientRect synthesizes a stable, distinct rect per element (a grid
+// keyed by node id). Hit-testing against those synthetic boxes is enough for the
+// common case that matters: automation (test_driver / Playwright) and page code
+// click an element at *its own* rect center, and this returns that same element —
+// which is what the WebDriver "element is pointer-interactable" gate and popover
+// light-dismiss containment checks need. Returns the topmost (deepest / latest in
+// tree order) element whose box contains the point; falls back to <body> for points
+// that hit no box (keeping the non-null contract that unblocks ad/analytics
+// bootstraps — issue #63). Out-of-viewport / non-finite coords return null/[].
 if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
-  Document.prototype.elementFromPoint = function(x, y) {
-    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
-      return null;
-    }
+  var _hitTestFromPoint = function(doc, x, y) {
+    if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) return null;
     var w = (typeof window !== 'undefined' && window.innerWidth) || 0;
     var h = (typeof window !== 'undefined' && window.innerHeight) || 0;
-    if (x < 0 || y < 0 || x > w || y > h) {
-      return null;
+    if (x < 0 || y < 0 || x > w || y > h) return null;
+    // getBoundingClientRect sets __obscura_click_target as a side effect; preserve it.
+    var saved = globalThis.__obscura_click_target;
+    var matches = [];
+    var all;
+    try { all = doc.querySelectorAll('*'); } catch (e) { all = []; }
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (!el || typeof el.getBoundingClientRect !== 'function') continue;
+      var r;
+      try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+      if (!r || (r.width === 0 && r.height === 0)) continue;  // no generated box
+      if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) matches.push(el);
     }
-    return this.body || this.documentElement || null;
+    globalThis.__obscura_click_target = saved;
+    matches.reverse();  // topmost first: later in tree order / deeper paints on top
+    return matches;
+  };
+  Document.prototype.elementFromPoint = function(x, y) {
+    var m = _hitTestFromPoint(this, x, y);
+    if (m === null) return null;
+    return m.length ? m[0] : (this.body || this.documentElement || null);
   };
   Document.prototype.elementsFromPoint = function(x, y) {
-    var el = this.elementFromPoint(x, y);
-    return el ? [el] : [];
+    var m = _hitTestFromPoint(this, x, y);
+    return m === null ? [] : m;
   };
 }
 if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {

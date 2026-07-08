@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #155).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #156).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/popovers/popover-attribute-basic.html` | 113/249 | **159/249** | 🟡 64% | **Quest #156 The Driven Verdict.** Bonus from a real `elementFromPoint` (hit-tests the synthetic per-node rects instead of always returning `<body>`), which fixes visibility/box-dependent subtests. **+46.** |
+| `html/semantics/popovers/popover-light-dismiss.html` | 8/33 | **15/33** | 🟡 45% | **Quest #156.** The in-page `test_driver` input bridge (click/Actions → real mousedown at hit-tested coords) drives light-dismiss; Escape close-request closes the topmost popover. CAP: Tab-focus navigation, coordinate-invoker activation, isTrusted-synthetic, pointerup-vs-pointerdown timing. **+7.** |
+| `html/semantics/popovers/popover-light-dismiss-hint.html` | 1/9 | **3/9** | 🟡 33% | **Quest #156.** Same click-driven light-dismiss for the hint stack. **+2.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-canceling.html` | 0/1 | **1/1** | ✅ 100% | **Quest #156.** The Escape close-request: a trusted (non-preventDefault'd) Escape keydown runs the UA algorithm — fires `cancel` on / closes the topmost modal dialog, ranked with popovers by a monotonic top-layer stamp. A focused text field that cancels the keydown swallows it. **+1.** |
 | `html/semantics/the-button-element/command-and-commandfor/on-dialog-behavior.html` | 0/104 (CNR) | **104/104** | ✅ 100% | **Quest #155 The Dialoged Verdict.** The `<dialog>` API (show/showModal/close/requestClose, `:modal`) lit up the command dialog tail; a detached-invoker gate (`getRootNode({composed:true})` connectedness) killed the leak cascade. **+104.** |
 | `html/semantics/the-button-element/command-and-commandfor/on-dialog-invalid-behavior.html` | 1/40 | **40/40** | ✅ 100% | **Quest #155.** Same dialog API + validity gate. **+39.** |
 | `html/semantics/interactive-elements/the-dialog-element/dialog-open.html` | 0 | **3/3** | ✅ 100% | **Quest #155.** `show()`/`showModal()` + `open` reflection + `:modal`. **+3.** |

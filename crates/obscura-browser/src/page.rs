@@ -141,6 +141,11 @@ pub struct Page {
     network_event_counter: u32,
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
+    /// CDP `Page.addScriptToEvaluateOnNewDocument` sources, run on every navigation
+    /// right after the JS context is created and BEFORE the document's own scripts —
+    /// the correct "on new document" ordering (Playwright's addInitScript relies on
+    /// it, e.g. to install a test_driver backend before testharness runs).
+    pending_preloads: Vec<String>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     /// The viewport this page lays out and paints against. Starts from the
     /// context's default; `Emulation.setDeviceMetricsOverride` mutates it.
@@ -212,6 +217,7 @@ impl Page {
             network_event_counter: 0,
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
+            pending_preloads: Vec::new(),
             intercept_tx: None,
             viewport,
             document_body_size: None,
@@ -924,10 +930,12 @@ impl Page {
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             self.init_js();
+            self.run_pending_preloads();
             return Ok(());
         }
 
         self.init_js();
+        self.run_pending_preloads();
 
         if !css_sources.is_empty() {
             if let Some(js) = &mut self.js {
@@ -1391,6 +1399,26 @@ Content-Location: {url}\r\n\
             js.execute_script("<preload>", source)
         } else {
             Err("No JS runtime".to_string())
+        }
+    }
+
+    /// Set the preload scripts (CDP `addScriptToEvaluateOnNewDocument` sources) to run
+    /// on the next navigation, before the document's own scripts.
+    pub fn set_pending_preloads(&mut self, preloads: Vec<String>) {
+        self.pending_preloads = preloads;
+    }
+
+    /// Run the pending preload scripts against the freshly-created JS context. Called
+    /// right after `init_js()` and before the document's `<script>`s execute.
+    fn run_pending_preloads(&mut self) {
+        if self.pending_preloads.is_empty() {
+            return;
+        }
+        let preloads = self.pending_preloads.clone();
+        for source in &preloads {
+            if let Err(e) = self.execute_preload_script(source) {
+                tracing::debug!("Preload script error: {}", e);
+            }
         }
     }
 

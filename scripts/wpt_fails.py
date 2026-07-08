@@ -33,6 +33,11 @@ async def main_async(args):
         browser = await p.chromium.connect_over_cdp(args.cdp)
         ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
         page = await ctx.new_page()
+        try:
+            from wpt_run import TESTDRIVER_BRIDGE_JS
+            await page.add_init_script(TESTDRIVER_BRIDGE_JS)
+        except Exception:  # noqa: BLE001
+            pass
         await page.goto(url, wait_until="load", timeout=args.timeout * 1000)
         data = {}
         for _ in range(max(2, int(args.timeout // 4) + 1)):
