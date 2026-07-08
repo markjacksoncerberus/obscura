@@ -992,6 +992,8 @@ class Node {
     if (_wasConnected) _ceRemovalSteps(c);
     // A showing popover moved into a disconnected subtree is hidden (no events).
     if (_popoverShowingCount > 0 && !c.isConnected) globalThis._popoverRemovalSteps(c);
+    // A modal dialog moved into a disconnected subtree loses its modal state.
+    if (globalThis._dialogModalCount > 0 && !c.isConnected) globalThis._dialogRemovalSteps(c);
     // Insert §"adopt node into the parent's node document": when the node comes
     // from a different document, retarget the node document of it AND its whole
     // subtree (otherwise descendants keep their old ownerDocument). Same-document
@@ -1045,6 +1047,7 @@ class Node {
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [], [c._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
     if (_wasConnected) _ceRemovalSteps(c);
     if (_popoverShowingCount > 0) globalThis._popoverRemovalSteps(c);
+    if (globalThis._dialogModalCount > 0) globalThis._dialogRemovalSteps(c);
     return c;
   }
   // DOM "replace" (§4.2.3): replace `child` with `node`, returning `child`.
@@ -1157,6 +1160,16 @@ class Node {
     // §ensure-pre-insertion-validity steps 5–6 (see appendChild), before the
     // fragment is expanded so the whole fragment is validated as a unit.
     _checkInsertConstraints(this, n, ref);
+    // DOM "pre-insert" step 3: if the reference child is the very node being inserted,
+    // advance the reference to that node's next sibling. Without this, insertBefore(x, x)
+    // — e.g. prepend()/insertBefore of a node that is already the first child — asks the
+    // tree to insert a node before ITSELF, which corrupts the sibling list into a
+    // self-cycle that hangs every later tree walk. When x is the last child its next
+    // sibling is null, so the move degrades to an append (leaving x in place).
+    if (ref._nid === n._nid) {
+      ref = n.nextSibling;
+      if (!ref) { this.appendChild(n); return n; }
+    }
     // A DocumentFragment inserts each of its children before the reference, then
     // empties. Two atomic records (see appendChild): a removal on the fragment and
     // an addition on the parent (previousSibling = the node before the reference,
@@ -1192,6 +1205,7 @@ class Node {
     _dom("insert_before", n._nid, ref._nid);
     if (_wasConnectedI) _ceRemovalSteps(n);
     if (_popoverShowingCount > 0 && !n.isConnected) globalThis._popoverRemovalSteps(n);
+    if (globalThis._dialogModalCount > 0 && !n.isConnected) globalThis._dialogRemovalSteps(n);
     // DOM "insert" live-range steps, with the node now at its new position (a
     // non-null reference, so boundary points past it shift forward by one).
     if (__obscura_liveRanges.length)
@@ -12847,6 +12861,16 @@ const _computedPropOf = (el, kebab, guard) => {
       && _isHiddenPopover(el)) {
     return _normComputed(el, 'display', 'none');
   }
+  // UA stylesheet: `dialog:not([open]) { display: none }`. A closed <dialog> computes
+  // display:none (an author `display` still wins). Open dialogs fall through to the
+  // default `block`. A <dialog popover> that is currently SHOWING as a popover is
+  // visible even without the `open` attribute (showPopover doesn't set `open`), so the
+  // showing-popover case must escape this rule. Cheap localName gate keeps non-dialog
+  // display queries fast.
+  if (kebab === 'display' && el.localName === 'dialog' && !String(spec.value || '').trim()
+      && el.hasAttribute && !el.hasAttribute('open') && !el._popoverShowing) {
+    return _normComputed(el, 'display', 'none');
+  }
   let v = String(spec.value || '').trim();
   const sh = spec.sh;
   const inheritFrom = () => (el.parentElement
@@ -16503,6 +16527,14 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   // button with a form owner never reaches here); this runs the command steps only.
   globalThis._runCommandInvoker = (invoker) => {
     if (invoker.disabled) return;
+    // A disconnected invoker performs no command — its activation behavior is inert
+    // (HTML §invokers gates the command steps on the invoker being connected). So a
+    // detached button whose commandForElement points at a live dialog does nothing.
+    // "Connected" is shadow-INCLUDING (a button inside a connected host's shadow tree
+    // still acts), so test the composed root for being a Document — `isConnected` alone
+    // stops at the shadow boundary.
+    { const _r = invoker.getRootNode ? invoker.getRootNode({ composed: true }) : null;
+      if (!_r || _r.nodeType !== 9) return; }
     // Resolve the commandfor-associated element (explicit ref while same-tree, else id).
     let target = invoker._commandForElement || null;
     if (target && (!target.isConnected || target._nid === undefined)) target = null;
@@ -16526,7 +16558,7 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
     let _valid;
     if (command.startsWith('--')) _valid = _isHTMLEl;
     else if (command === 'toggle-popover' || command === 'show-popover' || command === 'hide-popover') _valid = _isHTMLEl;
-    else if (command === 'show-modal' || command === 'close') _valid = _isHTMLEl && target.localName === 'dialog';
+    else if (command === 'show-modal' || command === 'close' || command === 'request-close') _valid = _isHTMLEl && target.localName === 'dialog';
     else _valid = false;
     if (!_valid) return;
     // Fire the event; a canceled event (or one whose handler disconnects the target)
@@ -16546,13 +16578,20 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
       const showing = !!target._popoverShowing;
       if ((command === 'toggle-popover' || command === 'hide-popover') && showing) _hidePopover(target, true, false, invoker);
       else if ((command === 'toggle-popover' || command === 'show-popover') && !showing) _showPopover(target, false, invoker);
-    } else if (command === 'show-modal') {
-      if (target.localName === 'dialog' && typeof target.showModal === 'function' && !target.hasAttribute('open')) {
-        try { target.showModal(); } catch (e) {}
-      }
-    } else if (command === 'close') {
-      if (target.localName === 'dialog' && typeof target.close === 'function' && target.hasAttribute('open')) {
-        try { target.close(); } catch (e) {}
+    } else if (command === 'show-modal' || command === 'close' || command === 'request-close') {
+      if (target.localName !== 'dialog') return;
+      // The invoker button's "optional value" — its `value` content attribute if
+      // present, else null (a missing value must NOT override the dialog returnValue).
+      const optVal = invoker.hasAttribute('value') ? invoker.getAttribute('value') : null;
+      if (command === 'show-modal') {
+        if (!target.hasAttribute('open') && globalThis._dialogShowModal)
+          try { globalThis._dialogShowModal(target, invoker); } catch (e) {}
+      } else if (command === 'close') {
+        if (target.hasAttribute('open') && globalThis._dialogClose)
+          try { globalThis._dialogClose(target, optVal, invoker); } catch (e) {}
+      } else { // request-close
+        if (target.hasAttribute('open') && globalThis._dialogRequestClose)
+          try { globalThis._dialogRequestClose(target, optVal, invoker); } catch (e) {}
       }
     }
   };
@@ -16695,7 +16734,7 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   // "--") is valid and preserved verbatim (case-sensitive); anything else — and the
   // missing attribute — reads back as the empty string. The setter is a plain string
   // reflection (ToString coercion via setAttribute).
-  const _COMMAND_KEYWORDS = new Set(['toggle-popover', 'show-popover', 'hide-popover', 'show-modal', 'close']);
+  const _COMMAND_KEYWORDS = new Set(['toggle-popover', 'show-popover', 'hide-popover', 'show-modal', 'close', 'request-close']);
   globalThis._commandKeywords = _COMMAND_KEYWORDS;
   {
     const proto = globalThis.HTMLButtonElement && globalThis.HTMLButtonElement.prototype;
@@ -16744,6 +16783,194 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
         },
         set(v) { this.setAttribute('command', v == null ? '' : String(v)); },
       });
+    }
+  }
+
+  // ===================== The <dialog> element (HTML §interactive-elements) ========
+  // show() / showModal() / close() / requestClose(), the `open` boolean reflection,
+  // the internal `returnValue`, the `closedBy` enumerated reflection, cancel/close
+  // events, beforetoggle/toggle (ToggleEvent), and the `:modal` pseudo-class (a Rust
+  // node flag mirrored via `set_dialog_modal`). Lives INSIDE the popover IIFE so it
+  // can reuse `_fireToggleEvent`, `_topmostPopoverAncestor`, `_hideStackUntil`, and the
+  // shared `_popoverAutoStack`. Top-layer painting, autofocus/focus restoration, and
+  // the Escape-key close request (a real close watcher) are out of scope without a
+  // render/input path; showModal() still flips `:modal` and drives the show/close state
+  // machine the script tests observe.
+  {
+    const DP = globalThis.HTMLDialogElement && globalThis.HTMLDialogElement.prototype;
+    if (DP) {
+      // Count of dialogs currently open as MODAL — gates the disconnection cleanup so
+      // pages with no modal dialog pay nothing in the hot removeChild/append paths.
+      globalThis._dialogModalCount = 0;
+
+      // Fire a simple (non-Toggle) event at el, mirroring _fireToggleEvent's dispatch:
+      // registered listeners via _dispatchSpec, then the `on<type>` handler. Returns
+      // false iff a cancelable event was canceled (preventDefault).
+      const _fireDialogEvent = (el, type, cancelable, bubbles) => {
+        let ev;
+        try { ev = new Event(type, { cancelable: !!cancelable, bubbles: !!bubbles }); }
+        catch (e) { return true; }
+        ev._isTrusted = true;
+        try { _dispatchSpec(el, ev); } catch (e) {}
+        const h = el['on' + type];
+        if (typeof h === 'function') { try { h.call(el, ev); } catch (e) {} }
+        return !ev.defaultPrevented;
+      };
+
+      // Queue the async dialog `toggle` element task, coalescing with any pending one:
+      // a superseding task keeps the ORIGINAL oldState and adopts the latest newState.
+      const _queueDialogToggle = (el, oldState, newState, source) => {
+        const prev = el._dialogToggleTask;
+        if (prev) oldState = prev.oldState;
+        el._dialogToggleTask = { oldState, newState, source: source || null };
+        setTimeout(() => {
+          const t = el._dialogToggleTask;
+          if (!t) return;
+          el._dialogToggleTask = null;
+          _fireToggleEvent(el, 'toggle', t.oldState, t.newState, false, t.source);
+        }, 0);
+      };
+
+      // Set/clear the is-modal state + the Rust `:modal` flag, keeping the counter honest.
+      const _setDialogModal = (el, modal) => {
+        if (!!el._isModal === !!modal) return;
+        el._isModal = !!modal;
+        try { _dom('set_dialog_modal', el._nid, modal ? '1' : '0'); } catch (e) {}
+        globalThis._dialogModalCount += modal ? 1 : -1;
+        if (globalThis._dialogModalCount < 0) globalThis._dialogModalCount = 0;
+      };
+
+      // Hide the popovers that opening this dialog must dismiss: "topmost popover
+      // ancestor" of the dialog, then hide-popovers-until that endpoint (both lists).
+      const _dialogHidePopovers = (el) => {
+        if (_popoverAutoStack.length === 0) return;
+        const endpoint = _topmostPopoverAncestor(el, null);
+        _hideStackUntil(endpoint, 'hint', true);
+        _hideStackUntil(endpoint, 'auto', true);
+      };
+
+      // HTML "close the dialog", given a dialog `el`, a result (null | string), and a
+      // source (null | Element). Fires the closing beforetoggle/toggle + the async,
+      // non-cancelable, non-bubbling, trusted `close` event, and drops the modal state.
+      const _closeTheDialog = (el, result, source) => {
+        if (!el.hasAttribute('open')) return;
+        _fireToggleEvent(el, 'beforetoggle', 'open', 'closed', false, source);
+        if (!el.hasAttribute('open')) return;
+        _queueDialogToggle(el, 'open', 'closed', source);
+        el.removeAttribute('open');
+        _setDialogModal(el, false);
+        if (result != null) el._returnValue = String(result);
+        el._requestCloseReturnValue = null;
+        el._requestCloseSource = null;
+        // The close event is queued on the user-interaction task source — never fired
+        // synchronously (dialog-close-event asserts the handler doesn't run inline).
+        setTimeout(() => { _fireDialogEvent(el, 'close', false, false); }, 0);
+      };
+      globalThis._dialogClose = _closeTheDialog;
+
+      // HTML "request to close" — fire a cancelable `cancel`; unless prevented, close.
+      const _requestCloseDialog = (el, result, source) => {
+        if (!el.hasAttribute('open')) return;
+        // "If subject is not connected or subject's node document is not fully active,
+        // then return." A standalone/inactive document (createHTMLDocument, detached
+        // frame) has no browsing context → its defaultView is null.
+        if (!el.isConnected) return;
+        const _doc = el.ownerDocument;
+        if (!_doc || _doc.defaultView == null) return;
+        el._requestCloseReturnValue = result;
+        el._requestCloseSource = source || null;
+        const notCanceled = _fireDialogEvent(el, 'cancel', true, false);
+        if (!notCanceled) { el._requestCloseReturnValue = null; el._requestCloseSource = null; return; }
+        _closeTheDialog(el, result, source);
+      };
+      globalThis._dialogRequestClose = _requestCloseDialog;
+
+      // HTML "show a modal dialog" given `el` and source.
+      const _showModalDialog = (el, source) => {
+        if (el.hasAttribute('open')) {
+          if (el._isModal) return;
+          throw new DOMException("The dialog is already open as a non-modal dialog, and therefore cannot be opened as a modal dialog.", "InvalidStateError");
+        }
+        if (!el.isConnected)
+          throw new DOMException("The element is not connected to a document.", "InvalidStateError");
+        if (el._popoverShowing)
+          throw new DOMException("The dialog is already open as a popover, and therefore cannot be opened as a modal dialog.", "InvalidStateError");
+        if (!_fireToggleEvent(el, 'beforetoggle', 'closed', 'open', true, source)) return;
+        if (el.hasAttribute('open')) return;
+        if (!el.isConnected) return;
+        if (el._popoverShowing) return;
+        _queueDialogToggle(el, 'closed', 'open', source);
+        el.setAttribute('open', '');
+        _setDialogModal(el, true);
+        _dialogHidePopovers(el);
+      };
+      globalThis._dialogShowModal = _showModalDialog;
+
+      DP.show = _markNative(function show() {
+        if (this.hasAttribute('open')) {
+          if (!this._isModal) return;                     // already showing non-modal → no-op
+          throw new DOMException("The dialog is already open as a modal dialog, and therefore cannot be opened as a non-modal dialog.", "InvalidStateError");
+        }
+        if (!_fireToggleEvent(this, 'beforetoggle', 'closed', 'open', true, null)) return;
+        if (this.hasAttribute('open')) return;
+        _queueDialogToggle(this, 'closed', 'open', null);
+        this.setAttribute('open', '');
+        _dialogHidePopovers(this);
+      });
+      DP.showModal = _markNative(function showModal() { _showModalDialog(this, null); });
+      DP.close = _markNative(function close(returnValue) {
+        _closeTheDialog(this, returnValue === undefined ? null : String(returnValue), null);
+      });
+      DP.requestClose = _markNative(function requestClose(returnValue) {
+        _requestCloseDialog(this, returnValue === undefined ? null : String(returnValue), null);
+      });
+
+      // `open` — boolean reflection of the `open` content attribute.
+      Object.defineProperty(DP, 'open', {
+        configurable: true, enumerable: true,
+        get() { return this.hasAttribute('open'); },
+        set(v) { if (v) this.setAttribute('open', ''); else this.removeAttribute('open'); },
+      });
+
+      // `returnValue` — an internal string slot (NOT a reflected content attribute),
+      // initially "". close()/showModal set it directly, so a JS setter shadowing this
+      // one on the prototype/instance is never invoked (dialog-close asserts this).
+      Object.defineProperty(DP, 'returnValue', {
+        configurable: true, enumerable: true,
+        get() { return this._returnValue == null ? '' : this._returnValue; },
+        set(v) { this._returnValue = v == null ? '' : String(v); },
+      });
+
+      // `closedBy` — enumerated reflection {any, closerequest, none}; the getter returns
+      // the COMPUTED closed-by state: a known keyword (case-folded), else the Auto default
+      // which behaves as "closerequest" for a modal dialog and "none" otherwise. The
+      // setter is a plain string reflection (ReflectSetter).
+      Object.defineProperty(DP, 'closedBy', {
+        configurable: true, enumerable: true,
+        get() {
+          const a = this.getAttribute('closedby');
+          if (a !== null) {
+            const low = a.toLowerCase();
+            if (low === 'any' || low === 'closerequest' || low === 'none') return low;
+          }
+          return this._isModal ? 'closerequest' : 'none';
+        },
+        set(v) { this.setAttribute('closedby', v == null ? '' : String(v)); },
+      });
+
+      // Disconnection cleanup: a modal dialog that leaves the tree loses its modal
+      // state (and the `:modal` flag). Gated on the modal counter so it is inert unless
+      // a modal dialog is actually open.
+      globalThis._dialogRemovalSteps = (node) => {
+        if (globalThis._dialogModalCount === 0 || !node || node.nodeType > 11) return;
+        const visit = (n) => {
+          if (n.nodeType === 1) {
+            if (n._isModal && n.localName === 'dialog') _setDialogModal(n, false);
+            if (n.children) for (const ch of n.children) visit(ch);
+          }
+        };
+        visit(node);
+      };
     }
   }
 }

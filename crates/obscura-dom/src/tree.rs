@@ -323,6 +323,9 @@ pub(crate) struct DomTreeInner {
     // Popovers currently in the "showing" state (top layer). JS toggles membership on
     // showPopover/hidePopover; read by the `:popover-open` pseudo-class. Non-monotonic.
     pub(crate) popover_open: HashSet<NodeId>,
+    // Dialogs currently showing as MODAL (via showModal()). JS toggles membership on
+    // showModal/close; read by the `:modal` pseudo-class. Non-monotonic.
+    pub(crate) dialog_modal: HashSet<NodeId>,
 }
 
 impl DomTree {
@@ -355,6 +358,7 @@ impl DomTree {
                 ce_defined: HashSet::new(),
                 ce_states: HashMap::new(),
                 popover_open: HashSet::new(),
+                dialog_modal: HashSet::new(),
             }),
         }
     }
@@ -485,6 +489,21 @@ impl DomTree {
     /// Whether a node is a currently-showing popover.
     pub fn is_popover_open(&self, id: NodeId) -> bool {
         self.inner.borrow().popover_open.contains(&id)
+    }
+
+    /// Toggle a dialog's "modal" membership (drives the `:modal` pseudo-class).
+    pub fn set_dialog_modal(&self, id: NodeId, modal: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if modal {
+            inner.dialog_modal.insert(id);
+        } else {
+            inner.dialog_modal.remove(&id);
+        }
+    }
+
+    /// Whether a node is a currently-open modal dialog.
+    pub fn is_dialog_modal(&self, id: NodeId) -> bool {
+        self.inner.borrow().dialog_modal.contains(&id)
     }
 
     /// Set whether the document is in design mode (drives `:read-write`/`:read-only`).
@@ -706,6 +725,23 @@ impl DomTree {
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
+        // A node can never be inserted before itself: doing so would wire the node's
+        // prev/next siblings to point at itself, turning the sibling list into a cycle
+        // that hangs every subsequent tree walk. (The DOM "pre-insert" algorithm avoids
+        // ever calling this by advancing the reference child to the node's next sibling,
+        // but guard here too so no caller can corrupt the tree.)
+        if existing_id == new_sibling_id {
+            return;
+        }
+        // Detach the moving node FIRST, then read the reference's parent/prev_sibling.
+        // Order matters: if `new_sibling_id` was `existing_id`'s previous sibling (i.e.
+        // moving a node to just before its own next sibling — a no-op move), detaching
+        // it rewires `existing_id.prev_sibling`. Reading prev BEFORE the detach would
+        // capture the moving node itself as the anchor, wiring it as its own previous
+        // sibling — a cycle that drops the rest of the list. Read AFTER detach so the
+        // anchor is the moving node's former predecessor.
+        self.detach(new_sibling_id);
+
         let (parent_id, prev_id) = {
             let inner = self.inner.borrow();
             let node = match inner
@@ -721,8 +757,6 @@ impl DomTree {
                 None => return,
             }
         };
-
-        self.detach(new_sibling_id);
 
         let mut inner = self.inner.borrow_mut();
 

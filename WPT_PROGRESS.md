@@ -10,12 +10,25 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #154).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #155).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/the-button-element/command-and-commandfor/on-dialog-behavior.html` | 0/104 (CNR) | **104/104** | ✅ 100% | **Quest #155 The Dialoged Verdict.** The `<dialog>` API (show/showModal/close/requestClose, `:modal`) lit up the command dialog tail; a detached-invoker gate (`getRootNode({composed:true})` connectedness) killed the leak cascade. **+104.** |
+| `html/semantics/the-button-element/command-and-commandfor/on-dialog-invalid-behavior.html` | 1/40 | **40/40** | ✅ 100% | **Quest #155.** Same dialog API + validity gate. **+39.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-open.html` | 0 | **3/3** | ✅ 100% | **Quest #155.** `show()`/`showModal()` + `open` reflection + `:modal`. **+3.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-close.html` | 0 | **5/5** | ✅ 100% | **Quest #155.** `close(returnValue)` drops `[open]`/modal, sets returnValue. **+5.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-close-event.html` | 0 | **1/1** | ✅ 100% | **Quest #155.** Trusted async non-bubbling `close` event. **+1.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-close-event-async.html` | 0 | **1/1** | ✅ 100% | **Quest #155.** `close` never fires synchronously (queued on setTimeout). **+1.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-requestclose-2.html` | 0 | **1/1** | ✅ 100% | **Quest #155.** `requestClose()` fires cancelable `cancel` then closes. **+1.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-requestclose-3.html` | 0 | **1/1** | ✅ 100% | **Quest #155.** `requestClose()` is a no-op in a not-fully-active document (`defaultView == null`). **+1.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-no-throw-requested-state.html` | 0 | **1/1** | ✅ 100% | **Quest #155.** State machine no-throw on requested state. **+1.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-enabled.html` | 0 | **1/1** | ✅ 100% | **Quest #155.** Dialog enabled/interaction. **+1.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-open-2.html` | 0 | **1/1** | ✅ 100% | **Quest #155.** Second `open` reflection case. **+1.** |
+| `html/semantics/interactive-elements/the-dialog-element/toggle-events.html` | 0 (CNR) | **5/12** | 🟡 42% | **Quest #155.** show/showModal beforetoggle+toggle. CAP: residual `showModal()` sub-tests fail on a testharness `step_timeout` ordering interaction (isolated primitives pass). **+5.** |
+| `dom/nodes/Node-insertBefore.html` | 38/40 | **39/40** | 🟡 98% | **Quest #155 (bonus).** Fixed a pre-existing Rust `insert_before` self-cycle bug (captured `prev_id` before detach) that dropped a sibling when moving a node before its own next sibling. **+1.** |
 | `html/semantics/the-button-element/command-and-commandfor/interface.html` | 1/11 | **11/11** | ✅ 100% | **Quest #154 The Commanded Verdict.** `commandForElement` element reflection (get-the-attr-associated-element: exposed while a descendant of a shadow-including ancestor; `{}`→TypeError) + `command` enumerated reflection. **+10.** |
 | `html/semantics/the-button-element/command-and-commandfor/command-reflection.html` | 8/16 | **16/16** | ✅ 100% | **Quest #154.** `command` known keywords case-fold to lowercase; `--custom` verbatim; invalid/missing → `""`. **+8.** |
 | `html/semantics/the-button-element/command-and-commandfor/event-interface.html` | 0/22 | **22/22** | ✅ 100% | **Quest #154.** `CommandEvent` (command ToString-coerced readonly, source `Element?` — non-Element throws TypeError). **+22.** |

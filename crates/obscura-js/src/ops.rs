@@ -567,6 +567,14 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             }
             "true".into()
         }
+        "set_dialog_modal" => {
+            // arg1 = node id; arg2 = "1" if the dialog is showing as modal, else not.
+            // Drives the `:modal` pseudo-class.
+            if let Ok(nid) = arg1.parse::<u32>() {
+                dom.set_dialog_modal(NodeId::new(nid), arg2 == "1");
+            }
+            "true".into()
+        }
         "set_design_mode" => {
             // arg1 = "1" to enable design mode (every element editable → matches
             // :read-write), anything else disables it. Drives :read-write/:read-only.
