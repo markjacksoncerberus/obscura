@@ -163,6 +163,31 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-09 (Quest #164 The Lit-Host Verdict — `:focus`/`:focus-within` on shadow hosts + focus-update-steps, +19):**
+Took Quest #163's named next lever: **`:focus`/`:focus-within`-on-shadow-host selector matching**. The
+shadow tree lives entirely in JS; in the Rust arena a shadow root is a *detached fragment* (its parent is
+null), so the selector engine can't walk from a focused shadow node to its host — a shadow input's focus
+never lit its host's `:focus`. **(1) The focus-host chain.** JS's `_focusShadowHosts(el)` walks the focused
+element's parent chain, jumping each shadow root to its `_shadowHost`, collecting the hosts crossed (slotted
+light-DOM content crosses none → its host stays dark, per spec). `_syncRustFocus` sends `[nid, host-nids]`
+to Rust via the existing `set_focus` op (arg2); Rust `:focus` matches `focused == self || focus_hosts
+∋ self`. A move that repositions the focused element (or a shadow-including ancestor) re-syncs the chain,
+gated on a JS-only ancestor check so unrelated DOM-building pays no bridge op. **(2) `:focus-within`** —
+was parsed-but-never-matched; now a real `PseudoClass::FocusWithin` matching the focused element's light-tree
+inclusive ancestors + every focus-host and its ancestors (`Tree::focus_within`). **(3) Focus update steps** —
+`_performFocus` now unfocuses the old element BEFORE its blur/focusout fire (activeElement reads `<body>`
+during them, spec-correct), aborts if a nested `focus()` in a handler took over, and bails if `el` became
+unfocusable — so focusing/removing a target from its own `focusout` leaves no stale `:focus-within`.
+`focus-pseudo-matches-on-shadow-host` 8→20 (+12), `focus-selector-delegatesFocus` 6→12 (+6),
+`focus-within-removal` 0→1 (+1) = **+19, ZERO regressions** (held: qsa 1975, classlist 1420, dispatchEvent 25,
+insertBefore 39/40, focus-method-delegatesFocus 15, -with 8, autofocus 5, blur 2, activeElement 6,
+ShadowRoot-delegatesFocus 3, delegatesFocus-tabindex-change 1, popover-focus 11/30 — all at baseline).
+**CAPS:** `focus-pseudo-on-shadow-host-1/2/3` are **reftests** (render comparison, unwinnable); `focus-tab-on-shadow-host`
+needs `:focus` render/send_keys; `focus-within-focus-move` needs **`onblur` content-attribute event-handler
+reflection** (GlobalEventHandlers) which fires nothing today — a separate quest. **NEXT: GlobalEventHandlers
+content-attribute reflection** (`on*=""` → compiled handler; unlocks focus-within-focus-move + broad event
+tail), then **popover-in-taborder** (still open from #161). Scroll `tickets/164-the-lit-host-verdict.md`.
+
 **Session 2026-07-09 (Quest #163 The Flattened Verdict — flat-tree scoped sequential focus navigation, +37):**
 Took Quest #162's named next lever: **shadow-DOM sequential focus navigation**. The core
 `_sequentialFocusNavigation` (Quest #159) gathered candidates from `document.querySelectorAll('*')`

@@ -102,6 +102,11 @@ pub enum PseudoClass {
     Hover,
     Active,
     Focus,
+    /// `:focus-within` — matches an element that is (or is a shadow-including
+    /// ancestor of) the focused element: the focused element itself, its inclusive
+    /// ancestors in the light tree, and any shadow host whose shadow tree contains
+    /// the focused element (plus that host's ancestors).
+    FocusWithin,
     Enabled,
     Disabled,
     Checked,
@@ -180,7 +185,7 @@ fn is_known_pseudo_class(name: &str) -> bool {
     matches!(
         name,
         "link" | "visited" | "any-link" | "local-link" | "target" | "target-within"
-            | "focus-within" | "focus-visible" | "indeterminate" | "default" | "required"
+            | "focus-visible" | "indeterminate" | "default" | "required"
             | "optional" | "valid" | "invalid" | "in-range" | "out-of-range" | "read-only"
             | "read-write" | "placeholder-shown" | "autofill" | "current" | "past" | "future"
             | "playing" | "paused" | "user-invalid" | "user-valid" | "blank" | "defined"
@@ -217,6 +222,7 @@ impl ToCss for PseudoClass {
             PseudoClass::Hover => dest.write_str(":hover"),
             PseudoClass::Active => dest.write_str(":active"),
             PseudoClass::Focus => dest.write_str(":focus"),
+            PseudoClass::FocusWithin => dest.write_str(":focus-within"),
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
@@ -325,6 +331,7 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "hover" => Ok(PseudoClass::Hover),
             "active" => Ok(PseudoClass::Active),
             "focus" => Ok(PseudoClass::Focus),
+            "focus-within" => Ok(PseudoClass::FocusWithin),
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
@@ -1199,8 +1206,17 @@ impl<'a> Element for DomElement<'a> {
         match pc {
             // No pointer state in a headless tree.
             PseudoClass::Hover | PseudoClass::Active => false,
-            // Phase 0b: live focus state.
-            PseudoClass::Focus => self.tree.focused() == Some(self.node_id),
+            // Phase 0b: live focus state. `:focus` matches the focused element, and
+            // — per HTML "has the focus" — any shadow host whose shadow tree contains
+            // the focused element (the host chain JS syncs alongside `focused`), so a
+            // host lights up while a descendant in its shadow tree holds focus.
+            PseudoClass::Focus => {
+                self.tree.focused() == Some(self.node_id) || self.tree.is_focus_host(self.node_id)
+            }
+            // `:focus-within` — this element is, or is a shadow-including ancestor of,
+            // the focused element (Selectors-4). Computed in the tree from the live
+            // focused node + its shadow-host chain.
+            PseudoClass::FocusWithin => self.tree.focus_within(self.node_id),
             // :disabled/:enabled = "actually disabled" per HTML (own attr, option's
             // optgroup, or a disabled <fieldset> ancestor); :checked from live state.
             PseudoClass::Disabled => self.is_actually_disabled(),
@@ -1831,6 +1847,43 @@ mod tests {
         assert_eq!(tree.query_selector_all(":focus").unwrap(), vec![c]);
         tree.set_focus(None);
         assert!(tree.query_selector_all(":focus").unwrap().is_empty());
+    }
+
+    #[test]
+    fn focus_within_and_shadow_host_focus() {
+        // `#inner` is the (light-tree) focused element; `#outer` its ancestor.
+        let tree = parse_html(
+            r#"<div id="outer"><div id="mid"><input id="inner"></div></div><div id="host"></div><input id="sib">"#,
+        );
+        let outer = tree.query_selector("#outer").unwrap().unwrap();
+        let mid = tree.query_selector("#mid").unwrap().unwrap();
+        let inner = tree.query_selector("#inner").unwrap().unwrap();
+        let host = tree.query_selector("#host").unwrap().unwrap();
+        let sib = tree.query_selector("#sib").unwrap().unwrap();
+
+        // Nothing focused → neither pseudo matches.
+        assert!(tree.query_selector_all(":focus").unwrap().is_empty());
+        assert!(tree.query_selector_all(":focus-within").unwrap().is_empty());
+
+        // Focus #inner: :focus is just #inner; :focus-within is #inner + ancestors.
+        tree.set_focus(Some(inner));
+        assert_eq!(tree.query_selector_all(":focus").unwrap(), vec![inner]);
+        let fw = tree.query_selector_all(":focus-within").unwrap();
+        assert!(fw.contains(&inner) && fw.contains(&mid) && fw.contains(&outer));
+        assert!(!fw.contains(&sib) && !fw.contains(&host));
+
+        // A shadow host containing the focused element matches BOTH :focus and
+        // :focus-within (the host chain the JS side syncs). Simulate: focus lives in
+        // #host's shadow tree, so #host is in the focus-host chain.
+        tree.set_focus(Some(inner));
+        tree.set_focus_hosts(vec![host]);
+        assert!(tree.query_selector_all(":focus").unwrap().contains(&host));
+        assert!(tree.query_selector_all(":focus-within").unwrap().contains(&host));
+
+        // Clearing focus drops the host chain too.
+        tree.set_focus(None);
+        assert!(tree.query_selector_all(":focus").unwrap().is_empty());
+        assert!(tree.query_selector_all(":focus-within").unwrap().is_empty());
     }
 
     #[test]

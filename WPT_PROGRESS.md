@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #163).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #164).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `shadow-dom/focus/focus-pseudo-matches-on-shadow-host.html` | 8/20 | **20/20** | ✅ 100% | **Quest #164 The Lit-Host Verdict.** `:focus` now matches a shadow host whose shadow tree contains the focused element (all open/closed × delegatesFocus modes, nested hosts, NOT via slots). JS syncs a **focus-host chain** to Rust alongside `set_focus`; a move that repositions the focused element re-syncs it (stale-state fix). **+12.** |
+| `shadow-dom/focus/focus-selector-delegatesFocus.html` | 6/12 | **12/12** | ✅ 100% | **Quest #164.** Same `:focus`-on-host rule, independent of `delegatesFocus`; a slotted light-DOM focused element does NOT light its host. **+6.** |
+| `css/selectors/focus-within-removal.html` | 0/1 | **1/1** | ✅ 100% | **Quest #164.** New `:focus-within` matching (light-tree ancestors + shadow-host chain) **plus** a focus-update-steps fix: the old element is unfocused BEFORE its blur/focusout fire, so removing the focus target from its own `focusout` handler leaves no stale `:focus-within`. **+1.** |
 | `shadow-dom/focus-navigation/focus-navigation.html` | 0/1 | **1/1** | ✅ 100% | **Quest #163 The Flattened Verdict.** `_sequentialFocusNavigation` rewritten to walk the **flat tree** and honour **focus navigation scopes** — Tab descends shadow trees and follows slot assignment, tabindex ordering is per-scope, a scope owner splices its scope in at its tabindex position. Reproduces the deeply-nested `[i0,j5,xbar,k1,k0,j1,j2,j3,j4,i1,i2,j0,j6]` ideal order. **+1.** |
 | `shadow-dom/focus-navigation/focus-navigation-with-delegatesFocus.html` | 4/16 | **16/16** | ✅ 100% | **Quest #163.** Full delegatesFocus × mode × tabindex Tab matrix: a `delegatesFocus` host is never itself a Tab stop (only its shadow contents); an *explicit* negative tabindex removes the whole shadow scope while an *omitted*-−1 leaves it navigable. **+12.** |
 | `shadow-dom/focus-navigation/` slot family (`-slots`, `-slot-fallback`, `-slot-fallback-default-tabindex`, `-slot-nested`, `-slot-nested-2levels`, `-slot-nested-delegatesFocus`, `-slot-nested-fallback`, `-slot-shadow-in-fallback`, `-slot-shadow-in-slot`, `-slot-with-tabindex`, `-web-component-radio`, `focus-reverse-unassigned-slot`) | 0/1 each | **1/1 each** | ✅ 100% | **Quest #163.** Flat-tree slot scopes: slotted elements sort by their own tabindex within the slot scope; fallback content navigates when nothing is assigned; nested slots/hosts descend correctly. **+12.** |

@@ -995,6 +995,12 @@ class Node {
     if (_ceBoundary) _cePush();
     try {
     _dom("append_child", this._nid, c._nid);
+    // A move that repositions the focused element (or a shadow-including ancestor of
+    // it) changes which shadow hosts contain it — re-sync the `:focus` host chain so
+    // a host no longer holding the focused element in its shadow tree stops matching.
+    // Gated on a JS-only ancestor check, so building DOM while an unrelated element is
+    // focused pays no bridge op.
+    if (__obscura_focused && _shadowIncAncestor(c, __obscura_focused)) globalThis._syncRustFocus(__obscura_focused);
     if (_wasConnected) _ceRemovalSteps(c);
     // A showing popover moved into a disconnected subtree is hidden (no events).
     if (_popoverShowingCount > 0 && !c.isConnected) globalThis._popoverRemovalSteps(c);
@@ -1213,6 +1219,9 @@ class Node {
     if (_ceBoundaryI) _cePush();
     try {
     _dom("insert_before", n._nid, ref._nid);
+    // Re-sync the `:focus` host chain if this move repositioned the focused element
+    // (or a shadow-including ancestor of it); see appendChild for the rationale.
+    if (__obscura_focused && _shadowIncAncestor(n, __obscura_focused)) globalThis._syncRustFocus(__obscura_focused);
     if (_wasConnectedI) _ceRemovalSteps(n);
     if (_popoverShowingCount > 0 && !n.isConnected) globalThis._popoverRemovalSteps(n);
     if (globalThis._dialogModalCount > 0 && !n.isConnected) globalThis._dialogRemovalSteps(n);
@@ -16517,18 +16526,57 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
 // The actual focus state change (blur the old, focus the new, fire blur/focusout on the
 // old and focus/focusin on the new, update the Rust `:focus` bit). Chosen deliberately
 // by the focusing steps, so it does NOT re-check focusability — the caller already did.
+// The chain of shadow HOST nids that contain `el` within their shadow tree — the
+// hosts crossed while walking `el`'s parent chain out of each nested shadow tree
+// (a shadow root's parentNode is null, so we jump to its `_shadowHost`). Slotted
+// light-DOM content yields NO hosts: its parent chain stays in the light tree, so
+// no shadow root is crossed. Per HTML "has the focus", each host here matches
+// `:focus`; syncing them to Rust lets `host.matches(':focus')` light up while a
+// descendant in its shadow tree holds focus (the Rust tree can't see the link).
+function _focusShadowHosts(el) {
+  const hosts = [];
+  let cur = el;
+  while (cur) {
+    let p = cur.parentNode;
+    if (!p && _isSR(cur)) {
+      const h = cur._shadowHost;
+      if (h && typeof h._nid === 'number') hosts.push(h._nid);
+      p = h;
+    }
+    cur = p;
+  }
+  return hosts;
+}
+// Sync the Rust `:focus` state for `el`: the focused nid plus its shadow-host chain.
+globalThis._syncRustFocus = function(el) {
+  try {
+    if (!el) { _dom("set_focus", "", ""); return; }
+    _dom("set_focus", el._nid, _focusShadowHosts(el).join(","));
+  } catch (e) {}
+};
 globalThis._performFocus = function(el) {
   // Any genuine focus move clears a pending sequential-focus starting point.
   __obscura_seqFocusStart = null;
   const prev = __obscura_focused;
   if (prev === el) return;
   if (prev) {
+    // Platform focus update steps: the old element loses focus BEFORE its blur/focusout
+    // fire, so `document.activeElement` reads as <body> (and `:focus`/`:focus-within`
+    // clear) during them. A handler may run a NESTED focus() or remove `el`; committing
+    // `el` blindly afterwards would leave stale state (whatwg/selectors #the-focus-within).
+    __obscura_focused = null;
+    __obscura_click_target = null;
+    globalThis._syncRustFocus(null);
     try { prev.dispatchEvent(new Event('blur', { bubbles: false })); } catch (e) {}
     try { prev.dispatchEvent(new Event('focusout', { bubbles: true })); } catch (e) {}
+    // A nested focusing operation during those events won — don't clobber its result.
+    if (__obscura_focused !== null) return;
+    // …or a handler made `el` unfocusable (e.g. removed it) — focus lands nowhere.
+    if (globalThis._isFocusableArea && !globalThis._isFocusableArea(el)) return;
   }
   __obscura_focused = el;
   __obscura_click_target = el;
-  try { _dom("set_focus", el._nid, ""); } catch (e) {}
+  globalThis._syncRustFocus(el);
   try { el.dispatchEvent(new Event('focus', { bubbles: false })); } catch (e) {}
   try { el.dispatchEvent(new Event('focusin', { bubbles: true })); } catch (e) {}
 };

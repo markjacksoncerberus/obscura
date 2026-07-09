@@ -515,9 +515,20 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         }
         "set_focus" => {
             if arg1.is_empty() {
+                // Clears both the focused node and the shadow-host focus chain.
                 dom.set_focus(None);
             } else {
                 dom.set_focus(Some(NodeId::new(arg1.parse::<u32>().unwrap_or(0))));
+                // arg2 = comma-separated shadow-host nids containing the focused
+                // element (empty when focus is not inside any shadow tree). These
+                // also match `:focus`.
+                let hosts: Vec<NodeId> = arg2
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<u32>().ok())
+                    .map(NodeId::new)
+                    .collect();
+                dom.set_focus_hosts(hosts);
             }
             "true".into()
         }

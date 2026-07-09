@@ -290,6 +290,13 @@ pub(crate) struct DomTreeInner {
     // entry means false. Read by `:indeterminate` for checkbox inputs.
     pub(crate) indeterminate_state: HashMap<NodeId, bool>,
     pub(crate) focused: Option<NodeId>,
+    // Shadow HOSTS that contain the focused element within their shadow tree (the
+    // hosts crossed walking the focused element's parent chain out of each nested
+    // shadow tree — NOT via slots). Per HTML "has the focus", each such host also
+    // matches `:focus`. JS syncs this alongside `focused` because the Rust tree
+    // does not model the host↔shadow-root link (a shadow root is a detached
+    // fragment here). Empty whenever nothing is focused.
+    pub(crate) focus_hosts: Vec<NodeId>,
     // The id named by the current document's URL fragment, for `:target`. JS sets
     // it from the queried document's URL right before a `:target` query.
     pub(crate) target_id: Option<String>,
@@ -351,6 +358,7 @@ impl DomTree {
                 checked_state: HashMap::new(),
                 indeterminate_state: HashMap::new(),
                 focused: None,
+                focus_hosts: Vec::new(),
                 target_id: None,
                 validity_state: HashMap::new(),
                 design_mode: false,
@@ -517,8 +525,55 @@ impl DomTree {
     }
 
     /// Phase 0b: the focused element (drives `:focus` and `document.activeElement`).
+    /// Clearing focus (`None`) also clears the shadow-host focus chain.
     pub fn set_focus(&self, id: Option<NodeId>) {
-        self.inner.borrow_mut().focused = id;
+        let mut inner = self.inner.borrow_mut();
+        inner.focused = id;
+        if id.is_none() {
+            inner.focus_hosts.clear();
+        }
+    }
+
+    /// The shadow hosts that contain the focused element (see `focus_hosts`). Each
+    /// also matches `:focus`. Set by JS whenever focus moves into a shadow tree.
+    pub fn set_focus_hosts(&self, ids: Vec<NodeId>) {
+        self.inner.borrow_mut().focus_hosts = ids;
+    }
+
+    /// Whether `id` is a shadow host containing the focused element (so `:focus`
+    /// matches it per HTML "has the focus").
+    pub fn is_focus_host(&self, id: NodeId) -> bool {
+        self.inner.borrow().focus_hosts.contains(&id)
+    }
+
+    /// Whether `id` matches `:focus-within`: it is, or is a light-tree ancestor of,
+    /// the focused element or any shadow host containing the focused element. The
+    /// host chain carries the cross-shadow reach (the Rust tree can't walk from a
+    /// shadow node to its host), so walking each host's light-tree ancestry here
+    /// covers the full shadow-including ancestor set.
+    pub fn focus_within(&self, id: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let is_inclusive_ancestor = |mut cur: Option<NodeId>| -> bool {
+            while let Some(c) = cur {
+                if c == id {
+                    return true;
+                }
+                cur = match inner.nodes.get(c.index()).and_then(|n| n.as_ref()) {
+                    Some(n) => n.parent,
+                    None => return false,
+                };
+            }
+            false
+        };
+        if let Some(f) = inner.focused {
+            if is_inclusive_ancestor(Some(f)) {
+                return true;
+            }
+        }
+        inner
+            .focus_hosts
+            .iter()
+            .any(|&h| is_inclusive_ancestor(Some(h)))
     }
 
     /// The id named by the current document's URL fragment, for `:target`. An
