@@ -3,11 +3,13 @@
 const __obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
-globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.preventDefault(); };
-
-globalThis.onerror = function(msg, src, line, col, error) {
-  __obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
-};
+// `window.onerror` / `window.onunhandledrejection` default to null per HTML (the
+// event-handler IDL attributes are null until a page assigns one). They used to be
+// seeded with internal reporter stubs, but that made them non-null — visible to
+// pages (e.g. the Window-reflecting-body-handler tests read `window.onerror` and
+// expect null). Uncaught-listener capture now lives in `_reportError` directly, and
+// a page-supplied `window.onerror` is still invoked there. Both names get their
+// null-default accessor/data-property below (the window on-handler installer).
 // The window is an EventTarget like any other: its listeners live in the shared
 // _eventRegistry (key 'window') and it dispatches through the unified spec path,
 // so a window listener participates in capturing/bubbling for events dispatched
@@ -22,6 +24,7 @@ globalThis.dispatchEvent = function(event) { return _dispatchPublic(globalThis, 
 // back to onerror(message, ...). Used by event dispatch per the DOM spec.
 const _reportError = function(err) {
   try { console.error(err); } catch (e) {}
+  try { __obscura_errors.push({ msg: (err && err.message) || String(err), src: "", line: 0, error: String(err) }); } catch (e) {}
   let ev;
   try {
     ev = (typeof ErrorEvent === 'function')
@@ -337,6 +340,58 @@ const _ehSetContentAttr = function(target, name, source) {
 };
 const _ehRemoveContentAttr = function(target, name) {
   target['__eh_' + name] = null; // deactivate the value; the installed listener no-ops
+};
+// HTML "Window-reflecting body element event handler set": on <body>/<frameset>,
+// these on* handlers do NOT act on the element — they act on the element's Window
+// (its node document's browsing-context Window). The set is
+// {blur,error,focus,load,resize,scroll} ∪ WindowEventHandlers. IDL get/set AND the
+// content attribute all forward to `window.on<name>` (so `document.body.onblur = f`
+// is `window.onblur = f`, and `<body onload=…>` is `window.onload`).
+const _BODY_WIN_REFLECT_SET = new Set(['onblur', 'onerror', 'onfocus', 'onload',
+  'onresize', 'onscroll', 'onafterprint', 'onbeforeprint', 'onbeforeunload',
+  'onhashchange', 'onlanguagechange', 'onmessage', 'onmessageerror', 'onoffline',
+  'ononline', 'onpagehide', 'onpagereveal', 'onpageshow', 'onpageswap', 'onpopstate',
+  'onrejectionhandled', 'onstorage', 'onunhandledrejection', 'onunload']);
+// The Window a body/frameset element reflects into: its node document's Window
+// (defaultView). A window-less document (template contents / DOMParser) has no
+// browsing context → null, and the reflection is inert (getter null, setter no-op),
+// matching HTML's "the element's node document's relevant global object" only
+// applying when that document has a browsing context.
+const _bodyReflectWin = function(el) {
+  try { const d = el && el.ownerDocument; return (d && d.defaultView) || null; }
+  catch (e) { return null; }
+};
+// Does `el` reflect `name` onto its Window? (body/frameset + a reflecting name).
+// instanceof only — no bridge crossing on the setAttribute hot path.
+const _isBodyWinReflect = function(el, name) {
+  if (!_BODY_WIN_REFLECT_SET.has(name)) return false;
+  return (globalThis.HTMLBodyElement && el instanceof globalThis.HTMLBodyElement) ||
+         (globalThis.HTMLFrameSetElement && el instanceof globalThis.HTMLFrameSetElement);
+};
+// Content-attribute reflection for a reflecting body/frameset handler: compile the
+// source eagerly and install it on the Window (whose on* accessor registers the
+// listener), so an event dispatched on the Window fires it.
+const _bodyWinSetContentAttr = function(el, name, source) {
+  const w = _bodyReflectWin(el);
+  if (!w) return;
+  let fn = null;
+  try { fn = new Function('event', source); } catch (e) { _reportError(e); fn = null; }
+  w[name] = fn;
+};
+const _bodyWinRemoveContentAttr = function(el, name) {
+  const w = _bodyReflectWin(el);
+  if (w) w[name] = null;
+};
+// Install the reflecting on* IDL accessors on HTMLBodyElement/HTMLFrameSetElement
+// prototypes (shadowing HTMLElement's element-scoped accessors for these names).
+const _installBodyWinReflectAccessors = function(proto) {
+  for (const name of _BODY_WIN_REFLECT_SET) {
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true,
+      get() { const w = _bodyReflectWin(this); return w ? (w[name] || null) : null; },
+      set(v) { const w = _bodyReflectWin(this); if (w) w[name] = v; },
+    });
+  }
 };
 // Install the on* IDL accessors on a prototype (HTMLElement / SVGElement / Document /
 // — for the names it is still missing — window). Skips a name already carrying its
@@ -2583,7 +2638,8 @@ class Element extends Node {
     if (__obscura_focused && globalThis._scheduleFocusFixup) globalThis._scheduleFocusFixup();
     // An on* event handler content attribute reflects into its event handler (compiled
     // lazily) and installs the handler listener at this — its first — registration point.
-    if (_EH_ATTR_SET.has(qname)) _ehSetContentAttr(this, qname, String(v));
+    if (_isBodyWinReflect(this, qname)) _bodyWinSetContentAttr(this, qname, String(v));
+    else if (_EH_ATTR_SET.has(qname)) _ehSetContentAttr(this, qname, String(v));
   }
   setAttributeNS(namespace, qname, v) {
     const { namespace: ns, prefix, local } = _validateAndExtract(namespace, qname);
@@ -2637,7 +2693,8 @@ class Element extends Node {
     if (__obscura_focused && globalThis._scheduleFocusFixup) globalThis._scheduleFocusFixup();
     // Removing an on* content attribute nulls its event handler (the installed
     // listener stays but no-ops).
-    if (_EH_ATTR_SET.has(qname)) _ehRemoveContentAttr(this, qname);
+    if (_isBodyWinReflect(this, qname)) _bodyWinRemoveContentAttr(this, qname);
+    else if (_EH_ATTR_SET.has(qname)) _ehRemoveContentAttr(this, qname);
   }
   removeAttributeNS(ns, local) {
     ns = (ns === '' || ns == null) ? '' : String(ns); local = String(local);
@@ -5148,14 +5205,15 @@ globalThis.length = 0;
 // manually with its bespoke (message, source, lineno, colno, error) signature.
 const _WINDOW_ONHANDLER_DATA = new Set(["load", "error"]);
 for (const _ev of [
-  "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
+  "abort","afterprint","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
   "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
   "dragenter","dragleave","dragover","dragstart","drop","durationchange","emptied",
   "ended","error","focus","focusin","focusout","formdata","gotpointercapture",
   "hashchange","input","invalid","keydown","keypress","keyup","languagechange",
   "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message",
-  "mousedown","mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup",
-  "offline","online","pagehide","pageshow","paste","pause","play","playing",
+  "messageerror","mousedown","mouseenter","mouseleave","mousemove","mouseout",
+  "mouseover","mouseup","offline","online","pagehide","pagereveal","pageshow",
+  "pageswap","paste","pause","play","playing",
   "pointercancel","pointerdown","pointerenter","pointerleave","pointermove",
   "pointerout","pointerover","pointerup","popstate","progress","ratechange",
   "rejectionhandled","reset","resize","scroll","seeked","seeking","select",
@@ -16586,6 +16644,12 @@ const _defIface = (name, base) => {
 ].forEach(n => _defIface(n));
 globalThis.HTMLAudioElement = class HTMLAudioElement extends globalThis.HTMLMediaElement {};
 globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMediaElement {};
+
+// The Window-reflecting body element event handler set (HTML): the reflecting on*
+// handlers on <body>/<frameset> forward get/set to the element's Window, not the
+// element. Installed here, now that both interfaces exist.
+_installBodyWinReflectAccessors(globalThis.HTMLBodyElement.prototype);
+_installBodyWinReflectAccessors(globalThis.HTMLFrameSetElement.prototype);
 
 // HTMLAnchorElement.text (and HTMLAreaElement inherits none) — the `text` IDL
 // attribute is a plain alias of textContent (HTML §4.6.3). [CEReactions]: the

@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #165).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #166).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/webappapis/scripting/events/event-handler-attributes-body-window.html` | 75/140 | **139/140** | 🟡 99% | **Quest #166 The Body-Window Verdict.** The Window-reflecting body element event handler set: `<body>`/`<frameset>` `on*` for `{blur,error,focus,load,resize,scroll}` ∪ WindowEventHandlers reflect get/set/content-attr onto the element's Window. Added `afterprint`/`messageerror`/`pagereveal`/`pageswap` to window on-handlers; `window.onerror`/`onunhandledrejection` now default null. **+64.** 1 cap: `load` fires as a data-prop (needs onload-as-listener). |
+| `html/webappapis/scripting/events/event-handler-attributes-windowless-body.html` | 152/236 | **236/236** | ✅ 100% | **Quest #166.** A windowless body/frameset (DOMParser / template contents, no browsing context) reflects NOWHERE — reflecting handlers read `null`, setter inert. **+84.** |
+| `html/webappapis/scripting/events/event-handler-attributes-body-alt.html` | 75/118 | **118/118** | ✅ 100% | **Quest #166.** Same reflection matrix from an alternative (detached) body. **+43.** |
+| `html/webappapis/scripting/events/event-handler-attributes-window.html` | 75/118 | **118/118** | ✅ 100% | **Quest #166.** Setting `window.on*` reflects back onto `document.body`/alt body for the reflecting set. **+43.** |
 | `html/webappapis/scripting/events/event-handler-all-global-events.html` | 0/375 | **375/375** | ✅ 100% | **Quest #165 The Handler Verdict.** GlobalEventHandlers `on*` IDL + content-attribute reflection: all 75 handler names are own accessors on HTMLElement/SVGElement/Document/window (NOT Element), a content attribute compiles lazily into its property, and `el[name]`/dispatch fire the handler. Needed a distinct `SVGElement` class. **+375.** |
 | `html/webappapis/scripting/events/event-handler-processing-algorithm.html` | 2/7 | **7/7** | ✅ 100% | **Quest #165.** An on-handler that returns `false` cancels a cancelable event (`onmouseover`/`onclick`/`onblur`/`ondblclick`), applied uniformly via the installed listener's return-value processing. **+5.** |
 | `html/webappapis/scripting/events/inline-event-handler-ordering.html` | 0/3 | **3/3** | ✅ 100% | **Quest #165.** The single handler listener installs at FIRST activation and holds its position; the value is compiled lazily each dispatch, so an invalid handler (compile fail → null) keeps its slot and a later valid re-set fires in the original order. **+3.** |
