@@ -2731,18 +2731,12 @@ class Element extends Node {
     }
   }
   focus() {
-    const prev = __obscura_focused;
-    if (prev === this) return;
-    if (prev) {
-      try { prev.dispatchEvent(new Event('blur', { bubbles: false })); } catch(e) {}
-      try { prev.dispatchEvent(new Event('focusout', { bubbles: true })); } catch(e) {}
-    }
-    __obscura_focused = this;
-    __obscura_click_target = this;
-    _dom("set_focus", this._nid, ""); // Phase 0b: Rust focus state for :focus
-    // focus/blur do not bubble; focusin/focusout do.
-    try { this.dispatchEvent(new Event('focus', { bubbles: false })); } catch(e) {}
-    try { this.dispatchEvent(new Event('focusin', { bubbles: true })); } catch(e) {}
+    if (__obscura_focused === this) return;
+    // A non-focusable element's focus() is a no-op (HTML: the focusing steps only move
+    // focus to a focusable area). `_performFocus` does the actual state change + events
+    // (blur/focusout on the old, focus/focusin on the new, Rust `:focus` bit).
+    if (globalThis._isFocusableArea && !globalThis._isFocusableArea(this)) return;
+    globalThis._performFocus(this);
   }
   blur() {
     if (__obscura_focused !== this) return;
@@ -16440,6 +16434,168 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   },
 });
 
+// ===================== Focus model (HTML §focus) ===============================
+// A small, layout-free focus model: `document.activeElement` tracks `__obscura_focused`
+// (set by the `focus()`/`blur()` methods on HTMLElement). This block adds the two pieces
+// the popover/dialog focus tests need: (1) a FOCUSABILITY predicate so `focus()` on a
+// non-focusable element is a no-op (HTML: only focusable areas take focus), and (2) the
+// AUTOFOCUS FOCUSING STEPS a popover/dialog runs when it opens (focus its autofocus
+// delegate, or — for a dialog — its first focusable descendant, or the dialog itself),
+// plus focus RESTORATION to the previously-focused element when it closes. There is no
+// render engine, so "rendered / not display:none" is approximated structurally (the
+// `hidden` attribute, an inline `display:none`, a closed `<dialog>`, or a non-showing
+// `[popover]` on the element or any ancestor renders a subtree unfocusable — which is
+// exactly what the WPT dialog/popover autofocus fixtures rely on to skip candidates).
+
+// The actual focus state change (blur the old, focus the new, fire blur/focusout on the
+// old and focus/focusin on the new, update the Rust `:focus` bit). Chosen deliberately
+// by the focusing steps, so it does NOT re-check focusability — the caller already did.
+globalThis._performFocus = function(el) {
+  const prev = __obscura_focused;
+  if (prev === el) return;
+  if (prev) {
+    try { prev.dispatchEvent(new Event('blur', { bubbles: false })); } catch (e) {}
+    try { prev.dispatchEvent(new Event('focusout', { bubbles: true })); } catch (e) {}
+  }
+  __obscura_focused = el;
+  __obscura_click_target = el;
+  try { _dom("set_focus", el._nid, ""); } catch (e) {}
+  try { el.dispatchEvent(new Event('focus', { bubbles: false })); } catch (e) {}
+  try { el.dispatchEvent(new Event('focusin', { bubbles: true })); } catch (e) {}
+};
+
+// Is `el` (or any ancestor) not rendered — display:none per the UA sheet / an author
+// `hidden`/`display:none` / a closed dialog / a non-showing popover? Such elements (and
+// their descendants) are never focusable.
+globalThis._isRenderedForFocus = function(el) {
+  let n = el;
+  while (n && n.nodeType === 1) {
+    if (n.hasAttribute('hidden')) return false;
+    const st = n.getAttribute('style');
+    if (st && /(^|;)\s*display\s*:\s*none(\s*;|\s*$|\s*!)/i.test(st)) return false;
+    // UA sheet: `dialog:not([open]) { display:none }` (unless it is showing as a popover).
+    if (n.localName === 'dialog' && !n.hasAttribute('open') && !n._popoverShowing) return false;
+    // UA sheet: a `[popover]` that is not currently showing is `display:none`.
+    if (n.hasAttribute('popover') && !n._popoverShowing) return false;
+    n = n.parentNode;
+  }
+  return true;
+};
+
+// Is `el` a focusable area (HTML "focusable area")? Explicit `tabindex`, the natively
+// focusable elements, an open/shown `<dialog>` (the dialog focusing-steps fallback), or a
+// `contenteditable` host — provided it is rendered and not a disabled form control.
+globalThis._isFocusableArea = function(el) {
+  if (!el || el.nodeType !== 1 || !el.isConnected) return false;
+  if (!globalThis._isRenderedForFocus(el)) return false;
+  const ln = el.localName;
+  if ((ln === 'button' || ln === 'input' || ln === 'select' || ln === 'textarea' ||
+       ln === 'optgroup' || ln === 'option' || ln === 'fieldset') && el.hasAttribute('disabled'))
+    return false;
+  const ti = el.getAttribute('tabindex');
+  if (ti !== null && __parseHtmlSignedInt(ti) !== null) return true;
+  if (ln === 'button' || ln === 'select' || ln === 'textarea') return true;
+  if (ln === 'input') return (el.getAttribute('type') || '').toLowerCase() !== 'hidden';
+  if ((ln === 'a' || ln === 'area') && el.hasAttribute('href')) return true;
+  if (ln === 'iframe' || ln === 'object' || ln === 'embed') return true;
+  if (ln === 'audio' || ln === 'video') return el.hasAttribute('controls');
+  if (ln === 'summary') {
+    const p = el.parentNode;
+    return !!(p && p.localName === 'details' && p.querySelector && p.querySelector('summary') === el);
+  }
+  if (ln === 'dialog') return el.hasAttribute('open') || !!el._popoverShowing;
+  if (el.hasAttribute('contenteditable')) {
+    const ce = (el.getAttribute('contenteditable') || '').toLowerCase();
+    if (ce === '' || ce === 'true' || ce === 'plaintext-only') return true;
+  }
+  return false;
+};
+
+// First descendant of `root` in tree order that has the `autofocus` attribute and is a
+// focusable area — the HTML "autofocus delegate".
+globalThis._autofocusDelegate = function(root) {
+  const walk = (node) => {
+    const kids = node.children;
+    if (!kids) return null;
+    for (const ch of kids) {
+      if (ch.hasAttribute('autofocus') && globalThis._isFocusableArea(ch)) return ch;
+      const inner = walk(ch);
+      if (inner) return inner;
+    }
+    return null;
+  };
+  return walk(root);
+};
+
+// First focusable-area descendant of `root` in tree order (the dialog "focus delegate"
+// fallback when there is no autofocus delegate).
+globalThis._firstFocusableDescendant = function(root) {
+  const walk = (node) => {
+    const kids = node.children;
+    if (!kids) return null;
+    for (const ch of kids) {
+      if (globalThis._isFocusableArea(ch)) return ch;
+      const inner = walk(ch);
+      if (inner) return inner;
+    }
+    return null;
+  };
+  return walk(root);
+};
+
+// HTML "popover focusing steps": if the popover has `autofocus` and is focusable, focus
+// it; else focus its autofocus delegate (if any). A `<dialog>` shown as a popover uses
+// the dialog focusing steps instead ("dialog initial focus algorithm").
+globalThis._popoverFocusingSteps = function(subject) {
+  if (subject.localName === 'dialog') { globalThis._dialogFocusingSteps(subject); return; }
+  let control = null;
+  if (subject.hasAttribute('autofocus') && globalThis._isFocusableArea(subject)) control = subject;
+  if (!control) control = globalThis._autofocusDelegate(subject);
+  if (control) globalThis._performFocus(control);
+};
+
+// HTML "dialog focusing steps": focus the dialog if it has `autofocus`; else its focus
+// delegate (autofocus delegate, else first focusable descendant); else the dialog itself.
+globalThis._dialogFocusingSteps = function(subject) {
+  let control = null;
+  if (subject.hasAttribute('autofocus') && globalThis._isFocusableArea(subject)) control = subject;
+  if (!control) control = globalThis._autofocusDelegate(subject) || globalThis._firstFocusableDescendant(subject);
+  if (!control) control = subject;   // fallback: the dialog itself (focusable as fallback)
+  // Only move focus if the control is actually a focusable area: a disconnected (or
+  // otherwise non-rendered) dialog's focusing steps must NOT change focus.
+  if (globalThis._isFocusableArea(control)) globalThis._performFocus(control);
+};
+
+// Restore focus to a top-layer element's stored "previously focused element" when it
+// closes — but only when focus is still inside (or on) the closing element, and the
+// stored element is still a focusable area (a removed prior-focus is not restored).
+globalThis._restorePreviousFocus = function(el) {
+  const prevEl = el._previouslyFocusedElement;
+  el._previouslyFocusedElement = null;
+  if (!prevEl) return;
+  const cur = __obscura_focused;
+  const within = cur === el || (el.contains && cur && el.contains(cur));
+  if (!within) return;
+  if (globalThis._isFocusableArea(prevEl)) globalThis._performFocus(prevEl);
+};
+
+// Document autofocus: after the document loads, "flush the autofocus candidates" —
+// focus the first focusable element in tree order that carries the `autofocus`
+// attribute (HTML §the-autofocus-attribute). Only when nothing has been focused yet
+// (a script that already moved focus wins), so it is inert for pages without an
+// unfocused autofocus candidate.
+try {
+  window.addEventListener('load', () => {
+    try {
+      if (__obscura_focused) return;
+      const root = document.documentElement || document.body;
+      if (!root) return;
+      const cand = globalThis._autofocusDelegate(root);
+      if (cand) globalThis._performFocus(cand);
+    } catch (e) {}
+  });
+} catch (e) {}
+
 // ===================== Popover API (HTML §popover) ==============================
 // The `popover` attribute turns any HTML element into a top-layer popover with
 // showPopover()/hidePopover()/togglePopover(), the `:popover-open` pseudo-class,
@@ -16537,7 +16693,7 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   // Hide one popover in place (no cascade): fire the (non-cancelable) closing
   // beforetoggle if fireEvents, drop the showing flag + Rust `:popover-open` bit,
   // then queue the async closing toggle. Re-entrancy-guarded.
-  const _hidePopoverInstance = (el, fireEvents, source) => {
+  const _hidePopoverInstance = (el, fireEvents, source, focusPrev) => {
     if (!el._popoverShowing || el._popoverHiding) return;
     el._popoverHiding = true;
     try {
@@ -16554,6 +16710,10 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
       _popoverShowingCount--;
       // When the last hint closes, the hint stack no longer hangs off any auto.
       if (_hintSublist().length === 0) _popoverHintStackParent = null;
+      // Focus model: restore focus to the previously-focused element (unless the caller
+      // opted out — removal and a modal dialog superseding the popover do not restore).
+      if (focusPrev !== false) { try { globalThis._restorePreviousFocus(el); } catch (e) {} }
+      else el._previouslyFocusedElement = null;
       if (fireEvents) _queuePopoverToggle(el, 'open', 'closed', source);
     } finally { el._popoverHiding = false; }
   };
@@ -16581,7 +16741,7 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   // stack type (`auto`|`hint`) sitting ABOVE `endpoint` in that type's list (all of
   // them if endpoint is null or not in the list). Recomputes each pass because a
   // fired beforetoggle handler may itself have shown further popovers.
-  const _hideStackUntil = (endpoint, stackType, fireEvents) => {
+  const _hideStackUntil = (endpoint, stackType, fireEvents, focusPrev) => {
     for (let guard = 0; guard < 128; guard++) {
       const list = _popoverAutoStack.filter(p => _popoverEffType(p) === stackType);
       let lastHideIndex = 0;
@@ -16589,7 +16749,7 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
       if (list.length <= lastHideIndex) break;
       let hidAny = false;
       for (let i = list.length - 1; i >= lastHideIndex; i--) {
-        if (list[i]._popoverShowing && !list[i]._popoverHiding) { _hidePopoverInstance(list[i], fireEvents); hidAny = true; }
+        if (list[i]._popoverShowing && !list[i]._popoverHiding) { _hidePopoverInstance(list[i], fireEvents, undefined, focusPrev); hidAny = true; }
       }
       if (!hidAny) break;
     }
@@ -16599,15 +16759,15 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   // above `el` — hints above it first, then (if `el` anchors the hint stack) the WHOLE
   // hint stack, then autos above it — and finally hide `el` itself. So hiding an auto
   // takes its nested hint stack down with it, but leaves a sibling (non-nested) hint.
-  const _hidePopover = (el, fireEvents, throwEx, source) => {
+  const _hidePopover = (el, fireEvents, throwEx, source, focusPrev) => {
     if (!_checkPopoverValidity(el, true, throwEx)) return;
     const type = _popoverEffType(el);
     if (type === 'auto' || type === 'hint') {
-      if (_hintSublist().indexOf(el) >= 0) _hideStackUntil(el, 'hint', fireEvents);
-      if (el === _popoverHintStackParent) _hideStackUntil(null, 'hint', fireEvents);
-      if (_autoSublist().indexOf(el) >= 0) _hideStackUntil(el, 'auto', fireEvents);
+      if (_hintSublist().indexOf(el) >= 0) _hideStackUntil(el, 'hint', fireEvents, focusPrev);
+      if (el === _popoverHintStackParent) _hideStackUntil(null, 'hint', fireEvents, focusPrev);
+      if (_autoSublist().indexOf(el) >= 0) _hideStackUntil(el, 'auto', fireEvents, focusPrev);
     }
-    _hidePopoverInstance(el, fireEvents, source);
+    _hidePopoverInstance(el, fireEvents, source, focusPrev);
   };
 
   // HTML "show popover": validate → fire cancelable opening beforetoggle → re-validate
@@ -16662,6 +16822,13 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
         _popoverShowingCount++;
       }
       try { _dom("set_popover_open", el._nid, "1"); } catch (e) {}
+      // Focus model: an auto/hint popover remembers the previously-focused element so it
+      // can be restored when it hides; a manual popover still moves focus on show but is
+      // never restored. Capture BEFORE the focusing steps move focus, then run the
+      // popover focusing steps (focus the popover's autofocus delegate, if any).
+      el._previouslyFocusedElement =
+        (el._popoverEffectiveType === 'auto' || el._popoverEffectiveType === 'hint') ? __obscura_focused : null;
+      try { globalThis._popoverFocusingSteps(el); } catch (e) {}
       _queuePopoverToggle(el, 'closed', 'open', source);
       return true;
     } finally { _popoverShowingFlag = false; }
@@ -16687,7 +16854,9 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
       }
     };
     visit(node);
-    for (const p of doomed) _hidePopoverInstance(p, false);
+    // Removal hides without firing events AND without restoring focus (focusPreviousElement
+    // is false when a popover is removed from the document).
+    for (const p of doomed) _hidePopoverInstance(p, false, undefined, false);
   };
 
   // HTML "popover target attribute activation behavior": a button/input with a
@@ -16844,14 +17013,14 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
   // behavior: a popover is hidden (fires beforetoggle/toggle); a modal dialog gets a
   // "request to close" (a cancelable `cancel`, then close unless the handler prevents).
   globalThis._processCloseRequest = () => {
-    let best = null, bestSeq = -1;
+    let best = null, bestSeq = -1, bestKind = null;
     for (const p of _popoverAutoStack) {
-      if (p._popoverShowing && (p._topLayerSeq || 0) > bestSeq) { best = p; bestSeq = p._topLayerSeq || 0; }
+      if (p._popoverShowing && (p._topLayerSeq || 0) > bestSeq) { best = p; bestSeq = p._topLayerSeq || 0; bestKind = 'popover'; }
     }
     const modals = globalThis._modalDialogSet;
     if (modals) for (const d of modals) {
       if (d._isModal && d.hasAttribute && d.hasAttribute('open') && (d._topLayerSeq || 0) > bestSeq) {
-        best = d; bestSeq = d._topLayerSeq || 0;
+        best = d; bestSeq = d._topLayerSeq || 0; bestKind = 'dialog';
       }
     }
     // A close watcher group ranks by its topmost watcher's `_topLayerSeq`; if it
@@ -16861,7 +17030,10 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
     const cwSeq = (typeof globalThis._cwTopSeq === 'function') ? globalThis._cwTopSeq() : -1;
     if (cwSeq > bestSeq) { try { globalThis._cwProcessCloseWatchers(); } catch (e) {} return; }
     if (!best) return;
-    if (best.localName === 'dialog') {
+    // A modal dialog gets a "request to close" (cancelable cancel, then close); a popover —
+    // INCLUDING a `<dialog>` shown as a popover (which has no `open` attribute and so is
+    // NOT a modal dialog) — is hidden (which restores its previously-focused element).
+    if (bestKind === 'dialog') {
       const rc = globalThis._dialogRequestClose;
       if (typeof rc === 'function') rc(best, null, null);
     } else {
@@ -17085,8 +17257,10 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
       const _dialogHidePopovers = (el) => {
         if (_popoverAutoStack.length === 0) return;
         const endpoint = _topmostPopoverAncestor(el, null);
-        _hideStackUntil(endpoint, 'hint', true);
-        _hideStackUntil(endpoint, 'auto', true);
+        // A modal dialog superseding popovers does not restore their previous focus — the
+        // dialog's own focusing steps take focus (focusPreviousElement is false).
+        _hideStackUntil(endpoint, 'hint', true, false);
+        _hideStackUntil(endpoint, 'auto', true, false);
       };
 
       // HTML "close the dialog", given a dialog `el`, a result (null | string), and a
@@ -17102,6 +17276,9 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
         if (result != null) el._returnValue = String(result);
         el._requestCloseReturnValue = null;
         el._requestCloseSource = null;
+        // Focus model: restore focus to the previously-focused element (only when focus is
+        // still inside the closing dialog and that element is still focusable).
+        try { globalThis._restorePreviousFocus(el); } catch (e) {}
         // The close event is queued on the user-interaction task source — never fired
         // synchronously (dialog-close-event asserts the handler doesn't run inline).
         setTimeout(() => { _fireDialogEvent(el, 'close', false, false); }, 0);
@@ -17142,7 +17319,11 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
         _queueDialogToggle(el, 'closed', 'open', source);
         el.setAttribute('open', '');
         _setDialogModal(el, true);
+        // Focus model: remember the previously-focused element (restored on close), hide
+        // any superseded popovers, then run the dialog focusing steps.
+        el._previouslyFocusedElement = __obscura_focused;
         _dialogHidePopovers(el);
+        try { globalThis._dialogFocusingSteps(el); } catch (e) {}
       };
       globalThis._dialogShowModal = _showModalDialog;
 
@@ -17155,7 +17336,11 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
         if (this.hasAttribute('open')) return;
         _queueDialogToggle(this, 'closed', 'open', null);
         this.setAttribute('open', '');
+        // Focus model: a non-modal dialog also remembers the previously-focused element and
+        // runs the dialog focusing steps (restored on close).
+        this._previouslyFocusedElement = __obscura_focused;
         _dialogHidePopovers(this);
+        try { globalThis._dialogFocusingSteps(this); } catch (e) {}
       });
       DP.showModal = _markNative(function showModal() { _showModalDialog(this, null); });
       DP.close = _markNative(function close(returnValue) {

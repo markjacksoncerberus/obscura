@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #157).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #158).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/popovers/popover-focus.html` | 1/30 | **11/30** | 🟡 37% | **Quest #158 The Focused Verdict.** A layout-free focus model: a FOCUSABILITY predicate (`focus()` on a non-focusable element is a no-op), the popover/dialog AUTOFOCUS FOCUSING STEPS on show, and focus RESTORATION to the previously-focused element on hide/Escape. Turns all 8 div-popover "Popover focus test" subtests green + both `<dialog popover>` variants (Escape on a dialog-shown-as-popover now takes the hide-popover path). CAP: the "button click"/"corner cases" families need coordinate-invoker activation + isTrusted-synthetic click-to-focus (Tab navigation too). **+10.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-autofocus.html` | 0/1 | **1/1** | ✅ 100% | **Quest #158.** Dialog focusing steps (skip disabled/hidden/nested-closed-dialog autofocus candidates) + document-load autofocus (unhangs `waitUntilLoadedAndAutofocused`). **+1.** |
+| `html/semantics/interactive-elements/the-dialog-element/show-modal-focusing-steps.html` | 0/1 | **1/1** | ✅ 100% | **Quest #158.** Dialog focus delegate: autofocus element → first focusable descendant → the dialog itself (as fallback). **+1.** |
+| `html/semantics/interactive-elements/the-dialog-element/dialog-autofocus-just-once.html` | 0/1 | **1/1** | ✅ 100% | **Quest #158.** Document-load autofocus fires once. **+1.** |
 | `close-watcher/basic.html` | 0/7 | **7/7** | ✅ 100% | **Quest #157 The Watched Verdict.** The `CloseWatcher` API (`new CloseWatcher()`, `requestClose`/`close`/`destroy`, `cancel`/`close` events, `oncancel`/`onclose`, the `signal` option). **+7.** |
 | `close-watcher/event-properties.html` | 0/1 | **1/1** | ✅ 100% | **Quest #157.** `cancel`/`close` event properties (bubbles/cancelable). **+1.** |
 | `close-watcher/abortsignal.html` | 0/9 | **9/9** | ✅ 100% | **Quest #157.** Aborting the constructor `signal` destroys the watcher (pre-aborted and later-aborted). **+9.** |
