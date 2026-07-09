@@ -153,6 +153,12 @@ globalThis.QuotaExceededError = _markNative(QuotaExceededError);
 // `window` (real browsers expose those).
 let __obscura_focused = null;
 let __obscura_click_target = null;
+// The HTML "sequential focus navigation starting point": set by the focus fixup
+// rule when the focused element stops being focusable (disabled/removed/hidden),
+// so a later Tab resumes from that element's position rather than the document
+// start. Cleared whenever focus actually moves (see `_performFocus`).
+let __obscura_seqFocusStart = null;
+let __obscura_focusFixupPending = false;
 
 // Rust<->JS eval bridge scratchpad / object registry. `__obscura_objects` is a
 // persistent map of CDP objectId -> live JS value (so callFunctionOn can re-
@@ -1048,6 +1054,10 @@ class Node {
     if (_wasConnected) _ceRemovalSteps(c);
     if (_popoverShowingCount > 0) globalThis._popoverRemovalSteps(c);
     if (globalThis._dialogModalCount > 0) globalThis._dialogRemovalSteps(c);
+    // Focus fixup rule: removing the focused element resets focus SYNCHRONOUSLY
+    // (HTML §focus-fixup-rule — removal is the one synchronous trigger).
+    if (__obscura_focused && !__obscura_focused.isConnected && globalThis._runFocusFixup)
+      globalThis._runFocusFixup();
     return c;
   }
   // DOM "replace" (§4.2.3): replace `child` with `node`, returning `child`.
@@ -2451,6 +2461,9 @@ class Element extends Node {
     if (qname === 'popovertarget') this._popoverTargetElement = null;
     // Likewise `commandfor` (the command invoker element reflection, HTML §invokers).
     if (qname === 'commandfor') this._commandForElement = null;
+    // Focus fixup rule: an attribute change (disabled/hidden/tabindex/…) may have made
+    // the focused element unfocusable. Cheap guard — only when something is focused.
+    if (__obscura_focused && globalThis._scheduleFocusFixup) globalThis._scheduleFocusFixup();
   }
   setAttributeNS(namespace, qname, v) {
     const { namespace: ns, prefix, local } = _validateAndExtract(namespace, qname);
@@ -2499,6 +2512,9 @@ class Element extends Node {
     // Removing `popovertarget` drops any explicit element association too.
     if (qname === 'popovertarget') this._popoverTargetElement = null;
     if (qname === 'commandfor') this._commandForElement = null;
+    // Focus fixup rule (see setAttribute): removing tabindex/contenteditable/… may
+    // have made the focused element unfocusable.
+    if (__obscura_focused && globalThis._scheduleFocusFixup) globalThis._scheduleFocusFixup();
   }
   removeAttributeNS(ns, local) {
     ns = (ns === '' || ns == null) ? '' : String(ns); local = String(local);
@@ -16472,6 +16488,8 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
 // old and focus/focusin on the new, update the Rust `:focus` bit). Chosen deliberately
 // by the focusing steps, so it does NOT re-check focusability — the caller already did.
 globalThis._performFocus = function(el) {
+  // Any genuine focus move clears a pending sequential-focus starting point.
+  __obscura_seqFocusStart = null;
   const prev = __obscura_focused;
   if (prev === el) return;
   if (prev) {
@@ -16483,6 +16501,38 @@ globalThis._performFocus = function(el) {
   try { _dom("set_focus", el._nid, ""); } catch (e) {}
   try { el.dispatchEvent(new Event('focus', { bubbles: false })); } catch (e) {}
   try { el.dispatchEvent(new Event('focusin', { bubbles: true })); } catch (e) {}
+};
+
+// HTML "focus fixup rule": when the currently focused element stops being a focusable
+// area (it was removed, disabled, hidden, lost its tabindex, …), unfocus it and move the
+// focused area to the viewport — `document.activeElement` becomes `<body>` (our getter
+// returns `body` when `__obscura_focused` is null). Also record the element as the
+// sequential focus navigation starting point so a subsequent Tab resumes from its
+// position in the focus order rather than the document start.
+globalThis._runFocusFixup = function() {
+  const el = __obscura_focused;
+  if (!el) return;
+  try { el.dispatchEvent(new Event('blur', { bubbles: false })); } catch (e) {}
+  try { el.dispatchEvent(new Event('focusout', { bubbles: true })); } catch (e) {}
+  __obscura_focused = null;
+  __obscura_click_target = null;
+  try { _dom("set_focus", "", ""); } catch (e) {}
+  __obscura_seqFocusStart = el;
+};
+
+// Schedule an asynchronous focus-fixup check. Attribute-driven unfocusability
+// (disabled/hidden/tabindex/…) fixes up on a later frame, not synchronously — the
+// callback re-checks focusability so an unrelated attribute change is a no-op. Deduped
+// to a single pending frame. (Removal is handled synchronously at the removal sites.)
+globalThis._scheduleFocusFixup = function() {
+  if (__obscura_focusFixupPending) return;
+  __obscura_focusFixupPending = true;
+  requestAnimationFrame(() => {
+    __obscura_focusFixupPending = false;
+    const el = __obscura_focused;
+    if (el && globalThis._isFocusableArea && !globalThis._isFocusableArea(el))
+      globalThis._runFocusFixup();
+  });
 };
 
 // Is `el` (or any ancestor) not rendered — display:none per the UA sheet / an author
@@ -16610,8 +16660,11 @@ globalThis._restorePreviousFocus = function(el) {
 globalThis._sequentialFocusNavigation = function(backward) {
   let all;
   try { all = document.querySelectorAll('*'); } catch (e) { return; }
+  const treeIndex = new Map();
+  let t = 0;
   const cands = [];
   for (const el of all) {
+    treeIndex.set(el, t++);
     // el.tabIndex yields the effective value (explicit, else the name-based default);
     // pair it with real focusability so a hidden input (default 0 but not focusable)
     // and a negative-tabindex element are both excluded.
@@ -16621,17 +16674,39 @@ globalThis._sequentialFocusNavigation = function(backward) {
   // `cands` is already in tree order (querySelectorAll order); a stable sort by
   // tabindex keeps ties in tree order. Positive group first, then the 0 group.
   const order = cands
-    .map((el, i) => ({ el, ti: el.tabIndex, i }))
+    .map((el) => ({ el, ti: el.tabIndex, i: treeIndex.get(el) }))
     .sort((a, b) => {
       const ka = a.ti > 0 ? a.ti : Infinity, kb = b.ti > 0 ? b.ti : Infinity;
       return ka !== kb ? ka - kb : a.i - b.i;
     })
     .map((r) => r.el);
   const cur = __obscura_focused;
-  const idx = cur ? order.indexOf(cur) : -1;
+  let idx = cur ? order.indexOf(cur) : -1;
   let target;
-  if (backward) target = idx <= 0 ? order[order.length - 1] : order[idx - 1];
-  else target = (idx === -1 || idx === order.length - 1) ? order[0] : order[idx + 1];
+  if (idx === -1 && __obscura_seqFocusStart && __obscura_seqFocusStart.isConnected &&
+      treeIndex.has(__obscura_seqFocusStart)) {
+    // The focused element was fixed up away (disabled/removed/…). Resume navigation
+    // from its recorded position: pick the first candidate whose (tabindex, tree-order)
+    // key falls after it (backward: the last one before it), wrapping at the ends.
+    const sp = __obscura_seqFocusStart;
+    const spTi = sp.tabIndex > 0 ? sp.tabIndex : Infinity;
+    const spTree = treeIndex.get(sp);
+    const after = (el) => {
+      const ti = el.tabIndex > 0 ? el.tabIndex : Infinity;
+      return ti !== spTi ? ti > spTi : treeIndex.get(el) > spTree;
+    };
+    if (backward) {
+      target = null;
+      for (const el of order) { if (after(el)) break; target = el; }
+      if (!target) target = order[order.length - 1];
+    } else {
+      target = order.find(after) || order[0];
+    }
+  } else if (backward) {
+    target = idx <= 0 ? order[order.length - 1] : order[idx - 1];
+  } else {
+    target = (idx === -1 || idx === order.length - 1) ? order[0] : order[idx + 1];
+  }
   if (target) globalThis._performFocus(target);
 };
 

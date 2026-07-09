@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #159).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #160).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/interaction/focus/sequential-focus-navigation-after-disabled.html` | 0/1 | **1/1** | ✅ 100% | **Quest #160 The Fixed-Up Verdict.** The focus fixup rule: when the focused element becomes `disabled` it is unfocused (`activeElement` → `<body>`) and recorded as the sequential-focus **starting point**, so a subsequent Tab resumes from its position (→ the next element after it), not the document start. **+1.** |
+| `html/interaction/focus/processing-model/focus-fixup-rule-one-no-dialogs.html` | 0/8 | **1/8** | 🟡 13% | **Quest #160.** Bonus: the async attribute-driven fixup (disabled/hidden/tabindex/contenteditable → `activeElement` → `<body>`) turns the div-remove-tabindex path green. CAP: the other 7 need exact "end of update the rendering" fixup timing (after rAF + ResizeObserver), ResizeObserver firing, and visibility:hidden / ancestor-`fieldset[disabled]` focusability predicates. **+1.** |
 | `html/interaction/focus/sequential-focus-navigation-and-the-tabindex-attribute/tabindex-getter.html` | 106/120 | **120/120** | ✅ 100% | **Quest #159 The Tabbed Verdict.** The `tabindex` default value is name-based (0 for a/area/button/frame/iframe/input/object/select/textarea + a details' summary, else −1) — ignoring disabled/hidden/href/type — per §dom-tabindex. Fixes all 14 zero-default rows. **+14.** |
 | `html/interaction/focus/sequential-focus-navigation-and-the-tabindex-attribute/focus-tabindex-order.html` | 0/1 | **1/1** | ✅ 100% | **Quest #159.** Sequential focus navigation (Tab): positive tabindex first (ascending, ties in tree order), then the 0 group in tree order; negatives skipped. Also made the bridge's `send_keys` ASYNC (microtask-deferred) so a focus handler's own `i++` runs before the next Tab — a synchronous dispatch recursed the handler and hung. **+1.** |
 | `html/interaction/focus/sequential-focus-navigation-and-the-tabindex-attribute/focus-tabindex-positive.html` | 0/1 | **1/1** | ✅ 100% | **Quest #159.** A positive-tabindex element is Tab-focused. **+1.** |
