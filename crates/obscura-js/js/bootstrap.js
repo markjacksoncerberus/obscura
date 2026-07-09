@@ -16747,50 +16747,116 @@ globalThis._restorePreviousFocus = function(el) {
   if (globalThis._isFocusableArea(prevEl)) globalThis._performFocus(prevEl);
 };
 
-// HTML "sequential focus navigation" — the Tab / Shift+Tab traversal. Collect the
-// focusable areas that participate in sequential navigation (a focusable area whose
-// effective tabindex is >= 0 — a negative tabindex is focusable but SKIPPED here),
-// order them (positive tabindex first, ascending, ties in tree order; then the
-// tabindex-0 group in tree order), and move focus to the element after (backward:
-// before) the currently focused one, wrapping at the ends. Layout-free: tree order
-// stands in for the rendered order, which is correct for the common in-flow case.
+// HTML "sequential focus navigation" — the Tab / Shift+Tab traversal, over the FLAT
+// TREE so it descends shadow trees and follows slot assignment. Focus navigation is
+// scoped: the document, each shadow tree, and each <slot> are "focus navigation
+// scopes". Within a scope the members are ordered by tabindex (positive ascending,
+// then the 0/auto group in flat-tree order); a scope owner (a shadow host or a slot)
+// splices its own scope's members in at the owner's tabindex position. Layout-free:
+// flat-tree order stands in for the rendered order (correct for the in-flow case).
+//
+// Builds the full flat-tree tab order once, then moves ±1 from the focused element.
 globalThis._sequentialFocusNavigation = function(backward) {
-  let all;
-  try { all = document.querySelectorAll('*'); } catch (e) { return; }
-  const treeIndex = new Map();
-  let t = 0;
-  const cands = [];
-  for (const el of all) {
-    treeIndex.set(el, t++);
-    // el.tabIndex yields the effective value (explicit, else the name-based default);
-    // pair it with real focusability so a hidden input (default 0 but not focusable)
-    // and a negative-tabindex element are both excluded.
-    if (el.tabIndex >= 0 && globalThis._isFocusableArea(el)) cands.push(el);
-  }
-  if (!cands.length) return;
-  // `cands` is already in tree order (querySelectorAll order); a stable sort by
-  // tabindex keeps ties in tree order. Positive group first, then the 0 group.
-  const order = cands
-    .map((el) => ({ el, ti: el.tabIndex, i: treeIndex.get(el) }))
-    .sort((a, b) => {
-      const ka = a.ti > 0 ? a.ti : Infinity, kb = b.ti > 0 ? b.ti : Infinity;
-      return ka !== kb ? ka - kb : a.i - b.i;
-    })
-    .map((r) => r.el);
+  // Flat-tree children of a scope node: a shadow host exposes its shadow root's
+  // children; a <slot> exposes its assigned slottables (its own fallback content when
+  // nothing is assigned); a shadow root or ordinary node exposes its child nodes.
+  const isShadowSlot = (n) => _isSlotEl(n) && !!_shadowRootContaining(n);
+  const flatChildren = (node) => {
+    if (node.nodeType === 9)
+      return document.documentElement ? [document.documentElement] : [];
+    if (node.nodeType === 1 && node._shadowRoot)          // shadow host
+      return Array.prototype.slice.call(node._shadowRoot.childNodes);
+    if (node._shadowHost !== undefined)                   // a shadow root
+      return Array.prototype.slice.call(node.childNodes);
+    if (isShadowSlot(node)) {                              // a slot in a shadow tree
+      let s = _findSlottables(node);
+      if (!s.length) {
+        s = [];
+        const kids = node.childNodes;                     // fallback content
+        for (let i = 0; i < kids.length; i++) if (_isSlottable(kids[i])) s.push(kids[i]);
+      }
+      return s;
+    }
+    return Array.prototype.slice.call(node.childNodes);
+  };
+
+  // Flat-preorder rank of every element visited (tie-break within a scope's 0-group,
+  // and the reference position for the fixup starting-point resume below).
+  const flatPos = new Map();
+  let posCounter = 0;
+  const seenScopes = new Set();   // guard against a pathological slot-assignment cycle
+
+  // Collect one focus navigation scope's members in flat-preorder. Each member is a
+  // focusable element and/or a nested scope owner (shadow host / slot).
+  const collect = (scopeNode, members) => {
+    const kids = flatChildren(scopeNode);
+    for (let i = 0; i < kids.length; i++) {
+      const child = kids[i];
+      if (!child || child.nodeType !== 1) continue;
+      if (!flatPos.has(child)) flatPos.set(child, posCounter++);
+      const root = child._shadowRoot;
+      if (root) {
+        // Shadow host = scope owner. An element with an EXPLICIT negative tabindex
+        // removes its whole shadow scope from sequential navigation; an OMITTED
+        // tabindex (default -1) leaves the shadow contents navigable.
+        const ti = child.tabIndex;
+        if (child.hasAttribute('tabindex') && ti < 0) continue;
+        // With delegatesFocus the host itself is never a sequential stop (only its
+        // shadow contents are); otherwise a focusable host (tabindex >= 0) is emitted
+        // before its scope.
+        const emit = !root._delegatesFocus && ti >= 0 && globalThis._isFocusableArea(child);
+        members.push({ node: child, focus: emit, ownerScope: root, ti });
+        // Do not descend the host's light children here — they reach the flat tree
+        // only through <slot>s inside the shadow tree.
+      } else if (isShadowSlot(child)) {
+        // Like a shadow host, a <slot> with an EXPLICIT negative tabindex removes its
+        // whole scope (its assigned/fallback slottables) from sequential navigation.
+        const ti = child.tabIndex;
+        if (child.hasAttribute('tabindex') && ti < 0) continue;
+        members.push({ node: child, focus: false, ownerScope: child, ti });
+      } else {
+        if (child.tabIndex >= 0 && globalThis._isFocusableArea(child))
+          members.push({ node: child, focus: true, ownerScope: null, ti: child.tabIndex });
+        collect(child, members);                          // same-scope descent
+      }
+    }
+  };
+
+  // Emit one scope's focusable areas into `out` in tab order.
+  const emitScope = (scopeNode, out) => {
+    if (seenScopes.has(scopeNode)) return;
+    seenScopes.add(scopeNode);
+    const members = [];
+    collect(scopeNode, members);
+    members
+      .map((m, i) => { m._i = i; return m; })
+      .sort((a, b) => {
+        const ka = a.ti > 0 ? a.ti : Infinity, kb = b.ti > 0 ? b.ti : Infinity;
+        return ka !== kb ? ka - kb : a._i - b._i;
+      })
+      .forEach((m) => {
+        if (m.focus) out.push(m.node);
+        if (m.ownerScope) emitScope(m.ownerScope, out);
+      });
+  };
+
+  const order = [];
+  try { emitScope(document, order); } catch (e) { return; }
+  if (!order.length) return;
   const cur = __obscura_focused;
   let idx = cur ? order.indexOf(cur) : -1;
   let target;
   if (idx === -1 && __obscura_seqFocusStart && __obscura_seqFocusStart.isConnected &&
-      treeIndex.has(__obscura_seqFocusStart)) {
+      flatPos.has(__obscura_seqFocusStart)) {
     // The focused element was fixed up away (disabled/removed/…). Resume navigation
-    // from its recorded position: pick the first candidate whose (tabindex, tree-order)
+    // from its recorded position: pick the first candidate whose (tabindex, flat-order)
     // key falls after it (backward: the last one before it), wrapping at the ends.
     const sp = __obscura_seqFocusStart;
     const spTi = sp.tabIndex > 0 ? sp.tabIndex : Infinity;
-    const spTree = treeIndex.get(sp);
+    const spTree = flatPos.get(sp);
     const after = (el) => {
       const ti = el.tabIndex > 0 ? el.tabIndex : Infinity;
-      return ti !== spTi ? ti > spTi : treeIndex.get(el) > spTree;
+      return ti !== spTi ? ti > spTi : (flatPos.get(el) || 0) > spTree;
     };
     if (backward) {
       target = null;

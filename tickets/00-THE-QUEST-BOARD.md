@@ -163,6 +163,37 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-09 (Quest #163 The Flattened Verdict — flat-tree scoped sequential focus navigation, +37):**
+Took Quest #162's named next lever: **shadow-DOM sequential focus navigation**. The core
+`_sequentialFocusNavigation` (Quest #159) gathered candidates from `document.querySelectorAll('*')`
+— the **light DOM only** — so Tab never descended shadow trees, never followed slot assignment, and
+mis-ordered across shadow/slot boundaries. Rewrote it to walk the **flat tree** and honour **focus
+navigation scopes** (the document, each shadow tree, each `<slot>`). All `bootstrap.js`, one function.
+**(1)** `flatChildren` — a scope node's flat-tree children: a shadow host exposes its shadow root's
+children; a `<slot>` exposes its assigned slottables (fallback content when none, reusing `_findSlottables`);
+a host's *light* children are reached only through its shadow `<slot>`s. **(2)** Per-scope member
+collection + tabindex ordering (positive ascending, then the 0/auto group in flat order); a scope owner
+(host/slot) is emitted at its own tabindex position and its inner scope spliced in there — so a slotted
+element sorts by *its own* tabindex within the slot scope, and a host's contents appear right where the
+host sits. **(3)** The scope rules the tests pin down: a `delegatesFocus` host is never itself a Tab stop
+(only its shadow contents); a host/slot with an *explicit* negative tabindex removes its whole scope while
+an *omitted*-−1 (whose `tabIndex` getter also reports −1) leaves the contents navigable — discriminator
+`hasAttribute('tabindex') && tabIndex < 0`. Reverse traversal = the reverse of the built order; the #160
+fixup starting-point resume is preserved (keyed on a flat-preorder map). Hand-traced the deeply-nested
+`focus-navigation.html` (document → x-foo shadow → x-bar shadow → two interleaved slots, tabindex scrambled
+across scopes) to the fixture's ideal order before measuring. `focus-navigation/`: focus-navigation 0→1,
+focus-navigation-with-delegatesFocus 4→16, the 11-test slot family 0→1 each, focus-reverse-unassigned-slot
+0→1, focus-with-negative-index 0→1 = **+26**; `focus/focus-tabindex-order-shadow-*` 11 tests 0→1 each =
+**+11**. **+37 total, ZERO regressions** (stash A/B on the shared rewrite: baseline binary measured with the
+change stashed, then popped + rebuilt + re-measured — qsa 1975, dispatchEvent 25, insertBefore 39/40, and
+every #159/#160/#162 focus test held). **Caps:** `focus-with-negative-index` subtest 2 (intra-excluded-scope
+navigation with a Chromium-specific exit order — needs the recursive scoped search, not a flattened list);
+`focus-tabindex-order-shadow-varying-tabindex-2`/`-3` (multi-host + forwarder ordering); `:focus`/`:focus-visible`
+on a shadow host (`focus-tab-on-shadow-host`, `focus-selector-delegatesFocus` 6/12, `focus-pseudo-*`,
+`delegatesFocus-highlight-sibling`) is a **selector/render** gap — navigation lands focus correctly, but
+these read `matches(':focus')` / computed style. **Next:** `:focus`/`:focus-within`-on-shadow-host selector
+matching, then popover-in-taborder. Scroll `tickets/163-the-flattened-verdict.md`.
+
 **Session 2026-07-09 (Quest #162 The Delegated Verdict — shadow-DOM focus retargeting + `delegatesFocus`, +28):**
 Took Quest #161's named next lever: **shadow-DOM focus retargeting**. The `shadow-dom/focus/`
 realm was mostly red — `document.activeElement` leaked shadow-internal nodes, `ShadowRoot.activeElement`

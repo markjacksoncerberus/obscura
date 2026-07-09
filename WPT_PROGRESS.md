@@ -10,12 +10,17 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #162).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #163).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `shadow-dom/focus-navigation/focus-navigation.html` | 0/1 | **1/1** | ✅ 100% | **Quest #163 The Flattened Verdict.** `_sequentialFocusNavigation` rewritten to walk the **flat tree** and honour **focus navigation scopes** — Tab descends shadow trees and follows slot assignment, tabindex ordering is per-scope, a scope owner splices its scope in at its tabindex position. Reproduces the deeply-nested `[i0,j5,xbar,k1,k0,j1,j2,j3,j4,i1,i2,j0,j6]` ideal order. **+1.** |
+| `shadow-dom/focus-navigation/focus-navigation-with-delegatesFocus.html` | 4/16 | **16/16** | ✅ 100% | **Quest #163.** Full delegatesFocus × mode × tabindex Tab matrix: a `delegatesFocus` host is never itself a Tab stop (only its shadow contents); an *explicit* negative tabindex removes the whole shadow scope while an *omitted*-−1 leaves it navigable. **+12.** |
+| `shadow-dom/focus-navigation/` slot family (`-slots`, `-slot-fallback`, `-slot-fallback-default-tabindex`, `-slot-nested`, `-slot-nested-2levels`, `-slot-nested-delegatesFocus`, `-slot-nested-fallback`, `-slot-shadow-in-fallback`, `-slot-shadow-in-slot`, `-slot-with-tabindex`, `-web-component-radio`, `focus-reverse-unassigned-slot`) | 0/1 each | **1/1 each** | ✅ 100% | **Quest #163.** Flat-tree slot scopes: slotted elements sort by their own tabindex within the slot scope; fallback content navigates when nothing is assigned; nested slots/hosts descend correctly. **+12.** |
+| `shadow-dom/focus-navigation/focus-with-negative-index.html` | 0/2 | **1/2** | 🟡 50% | **Quest #163.** A `<slot tabindex=-1>` excludes its scope (like a host). CAP: subtest 2 (navigating *within* an excluded scope focused directly, with a Chromium-specific exit order) needs the recursive scoped search, not a flattened list. **+1.** |
+| `shadow-dom/focus/focus-tabindex-order-shadow-*` (11 tests: `-zero`, `-zero-delegatesFocus`, `-zero-host-one`, `-zero-host-negative`, `-zero-host-not-set`, `-zero-host-not-set-scrollable`, `-zero-host-scrollable`, `-slot-one`, `-varying-tabindex`, `-varying-delegatesFocus`, `-negative-delegatesFocus`) | 0/1 each | **1/1 each** | ✅ 100% | **Quest #163.** Shadow-crossing Tab order with host/slot tabindex variations — stash-A/B verified these were red on the prior binary. CAP: `-varying-tabindex-2`/`-3` (multi-host + forwarder ordering) still 0/1. **+11.** |
 | `shadow-dom/focus/focus-method-delegatesFocus.html` | 1/15 | **15/15** | ✅ 100% | **Quest #162 The Delegated Verdict.** `host.focus()` on a `delegatesFocus` shadow host delegates to the first focusable area in the host's shadow **tree** (`_shadowFocusDelegate`; slotted light-DOM content is never a candidate, nested delegating hosts are descended into). Retargeting-based `activeElement` reports host / shadow-internal correctly. **+14.** |
 | `shadow-dom/focus/DocumentOrShadowRoot-activeElement.html` | 2/6 | **6/6** | ✅ 100% | **Quest #162.** `document.activeElement` = the focused element retargeted against the document (topmost shadow host); `ShadowRoot.activeElement` = the retargeting against that root, or null when focus lies outside it. Reuses the existing `_retarget`/`_nodeRoot` dispatch helpers. **+4.** |
 | `shadow-dom/focus/focus-method-with-delegatesFocus.html` | 4/8 | **8/8** | ✅ 100% | **Quest #162.** Delegated focus from `host.focus()` across slots + nested hosts. **+4.** |
