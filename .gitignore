@@ -4,4 +4,4 @@ target/
 shots/
 .claude/*
 !.claude/commands/
-out/
+out/__pycache__/

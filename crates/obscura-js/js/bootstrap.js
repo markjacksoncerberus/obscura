@@ -3301,14 +3301,35 @@ function __parseHtmlSignedInt(s) {
   if (i === start) return null;
   return sign * parseInt(s.slice(start, i), 10);
 }
-// tabIndex reflects a `long`. The WPT harness uses defaultVal:null ("too
-// complicated, skip the test"), so the absent/invalid default is never asserted;
-// a real UA returns 0 for focusable elements and -1 otherwise. We return -1.
+// The `tabindex` default value is 0 for elements that are focusable-by-default
+// per HTML §dom-tabindex, else −1. This is a purely ELEMENT-NAME-based table (it
+// ignores disabled/hidden/href/type — a `<button disabled>` and an
+// `<input type=hidden>` still default to 0), distinct from actual focusability
+// (`_isFocusableArea`, which does honour those). Plain `<a>` (no href) and SVG
+// `<a>` default to 0 even though they are not tab-focusable.
+globalThis._defaultTabIndexZero = function(el) {
+  const ln = el.localName;
+  switch (ln) {
+    case 'a': case 'area': case 'button': case 'frame': case 'iframe':
+    case 'input': case 'object': case 'select': case 'textarea':
+      return true;
+    case 'summary': {
+      const p = el.parentNode;
+      return !!(p && p.localName === 'details' && p.querySelector &&
+                p.querySelector('summary') === el);
+    }
+  }
+  return false;
+};
+
+// tabIndex reflects a `long`. When the content attribute is absent/invalid the
+// default is 0 for focusable-by-default element types, −1 otherwise (§dom-tabindex).
 Object.defineProperty(Element.prototype, 'tabIndex', {
   configurable: true, enumerable: true,
   get() {
     const num = __parseHtmlSignedInt(this.getAttribute('tabindex'));
-    if (num === null || num < -2147483648 || num > 2147483647) return -1;
+    if (num === null || num < -2147483648 || num > 2147483647)
+      return globalThis._defaultTabIndexZero(this) ? 0 : -1;
     return num || 0;   // normalise -0 → +0 (testharness distinguishes via 1/value)
   },
   set(v) { this.setAttribute('tabindex', String(v | 0)); },
@@ -16577,6 +16598,41 @@ globalThis._restorePreviousFocus = function(el) {
   const within = cur === el || (el.contains && cur && el.contains(cur));
   if (!within) return;
   if (globalThis._isFocusableArea(prevEl)) globalThis._performFocus(prevEl);
+};
+
+// HTML "sequential focus navigation" — the Tab / Shift+Tab traversal. Collect the
+// focusable areas that participate in sequential navigation (a focusable area whose
+// effective tabindex is >= 0 — a negative tabindex is focusable but SKIPPED here),
+// order them (positive tabindex first, ascending, ties in tree order; then the
+// tabindex-0 group in tree order), and move focus to the element after (backward:
+// before) the currently focused one, wrapping at the ends. Layout-free: tree order
+// stands in for the rendered order, which is correct for the common in-flow case.
+globalThis._sequentialFocusNavigation = function(backward) {
+  let all;
+  try { all = document.querySelectorAll('*'); } catch (e) { return; }
+  const cands = [];
+  for (const el of all) {
+    // el.tabIndex yields the effective value (explicit, else the name-based default);
+    // pair it with real focusability so a hidden input (default 0 but not focusable)
+    // and a negative-tabindex element are both excluded.
+    if (el.tabIndex >= 0 && globalThis._isFocusableArea(el)) cands.push(el);
+  }
+  if (!cands.length) return;
+  // `cands` is already in tree order (querySelectorAll order); a stable sort by
+  // tabindex keeps ties in tree order. Positive group first, then the 0 group.
+  const order = cands
+    .map((el, i) => ({ el, ti: el.tabIndex, i }))
+    .sort((a, b) => {
+      const ka = a.ti > 0 ? a.ti : Infinity, kb = b.ti > 0 ? b.ti : Infinity;
+      return ka !== kb ? ka - kb : a.i - b.i;
+    })
+    .map((r) => r.el);
+  const cur = __obscura_focused;
+  const idx = cur ? order.indexOf(cur) : -1;
+  let target;
+  if (backward) target = idx <= 0 ? order[order.length - 1] : order[idx - 1];
+  else target = (idx === -1 || idx === order.length - 1) ? order[0] : order[idx + 1];
+  if (target) globalThis._performFocus(target);
 };
 
 // Document autofocus: after the document loads, "flush the autofocus candidates" —

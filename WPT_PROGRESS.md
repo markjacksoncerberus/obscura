@@ -10,12 +10,19 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-08 (Quest #158).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #159).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/interaction/focus/sequential-focus-navigation-and-the-tabindex-attribute/tabindex-getter.html` | 106/120 | **120/120** | ✅ 100% | **Quest #159 The Tabbed Verdict.** The `tabindex` default value is name-based (0 for a/area/button/frame/iframe/input/object/select/textarea + a details' summary, else −1) — ignoring disabled/hidden/href/type — per §dom-tabindex. Fixes all 14 zero-default rows. **+14.** |
+| `html/interaction/focus/sequential-focus-navigation-and-the-tabindex-attribute/focus-tabindex-order.html` | 0/1 | **1/1** | ✅ 100% | **Quest #159.** Sequential focus navigation (Tab): positive tabindex first (ascending, ties in tree order), then the 0 group in tree order; negatives skipped. Also made the bridge's `send_keys` ASYNC (microtask-deferred) so a focus handler's own `i++` runs before the next Tab — a synchronous dispatch recursed the handler and hung. **+1.** |
+| `html/interaction/focus/sequential-focus-navigation-and-the-tabindex-attribute/focus-tabindex-positive.html` | 0/1 | **1/1** | ✅ 100% | **Quest #159.** A positive-tabindex element is Tab-focused. **+1.** |
+| `html/interaction/focus/sequential-focus-navigation-and-the-tabindex-attribute/focus-tabindex-zero.html` | 0/1 | **1/1** | ✅ 100% | **Quest #159.** A zero-tabindex element is Tab-focused. **+1.** |
+| `html/interaction/focus/sequential-focus-navigation-and-the-tabindex-attribute/focus-tabindex-negative.html` | 0/1 | **1/1** | ✅ 100% | **Quest #159.** A negative-tabindex element is skipped by Tab. **+1.** |
+| `html/interaction/focus/sequential-focus-navigation-and-the-tabindex-attribute/focus-tabindex-default-value.html` | 1/2 | **2/2** | ✅ 100% | **Quest #159.** `<button>` default `tabIndex` is 0 (name-based default). **+1.** |
+| `html/interaction/focus/tab-table-caption.html` | 0/6 | **6/6** | ✅ 100% | **Quest #159.** Sequential focus navigation Tabs through the (caption/table) focusable areas in order. **+6.** |
 | `html/semantics/popovers/popover-focus.html` | 1/30 | **11/30** | 🟡 37% | **Quest #158 The Focused Verdict.** A layout-free focus model: a FOCUSABILITY predicate (`focus()` on a non-focusable element is a no-op), the popover/dialog AUTOFOCUS FOCUSING STEPS on show, and focus RESTORATION to the previously-focused element on hide/Escape. Turns all 8 div-popover "Popover focus test" subtests green + both `<dialog popover>` variants (Escape on a dialog-shown-as-popover now takes the hide-popover path). CAP: the "button click"/"corner cases" families need coordinate-invoker activation + isTrusted-synthetic click-to-focus (Tab navigation too). **+10.** |
 | `html/semantics/interactive-elements/the-dialog-element/dialog-autofocus.html` | 0/1 | **1/1** | ✅ 100% | **Quest #158.** Dialog focusing steps (skip disabled/hidden/nested-closed-dialog autofocus candidates) + document-load autofocus (unhangs `waitUntilLoadedAndAutofocused`). **+1.** |
 | `html/semantics/interactive-elements/the-dialog-element/show-modal-focusing-steps.html` | 0/1 | **1/1** | ✅ 100% | **Quest #158.** Dialog focus delegate: autofocus element → first focusable descendant → the dialog itself (as fallback). **+1.** |

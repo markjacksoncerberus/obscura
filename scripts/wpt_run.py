@@ -96,6 +96,24 @@ TESTDRIVER_BRIDGE_JS = r"""
     else if (ch === ' ') return {key:' ', code:'Space', text:' '};
     return {key: ch, code: code, text: ch};
   }
+  // Legacy `keyCode`/`which` values many tests still assert (e.g. Tab === 9).
+  const KEYCODES = {
+    'Backspace':8, 'Tab':9, 'Enter':13, 'Shift':16, 'Control':17, 'Alt':18,
+    'Pause':19, 'Escape':27, ' ':32, 'PageUp':33, 'PageDown':34, 'End':35,
+    'Home':36, 'ArrowLeft':37, 'ArrowUp':38, 'ArrowRight':39, 'ArrowDown':40,
+    'Insert':45, 'Delete':46,
+  };
+  function legacyKeyCode(key) {
+    if (KEYCODES[key] != null) return KEYCODES[key];
+    if (key && key.length === 1) {
+      const c = key.toUpperCase().charCodeAt(0);
+      if ((c >= 65 && c <= 90) || (c >= 48 && c <= 57)) return c;
+    }
+    return 0;
+  }
+  // Modifier state tracked across a key command stream so Shift+Tab (and any
+  // modifier a test reads off the event) reflects held modifiers.
+  let _kbdMods = {shiftKey:false, ctrlKey:false, altKey:false, metaKey:false};
   const BTN = ['left', 'middle', 'right', 'back', 'forward'];
   const btnName = (b) => BTN[b] || 'left';
   const btnBit = (b) => { switch (b) { case 0: return 1; case 1: return 4; case 2: return 2;
@@ -182,16 +200,29 @@ TESTDRIVER_BRIDGE_JS = r"""
     var target = document.activeElement || document.body || document.documentElement;
     if (!target) return;
     var type = c.type === 'keyDown' ? 'keydown' : 'keyup';
+    // Track modifier key state so a subsequent Tab / other key carries it.
+    if (c.key === 'Shift') _kbdMods.shiftKey = (type === 'keydown');
+    else if (c.key === 'Control') _kbdMods.ctrlKey = (type === 'keydown');
+    else if (c.key === 'Alt') _kbdMods.altKey = (type === 'keydown');
+    else if (c.key === 'Meta') _kbdMods.metaKey = (type === 'keydown');
+    var kc = legacyKeyCode(c.key);
     var ev;
-    try { ev = new KeyboardEvent(type, {bubbles: true, cancelable: true, composed: true, key: c.key, code: c.code || ''}); }
+    try { ev = new KeyboardEvent(type, {bubbles: true, cancelable: true, composed: true,
+      key: c.key, code: c.code || '', keyCode: kc, which: kc,
+      shiftKey: _kbdMods.shiftKey, ctrlKey: _kbdMods.ctrlKey,
+      altKey: _kbdMods.altKey, metaKey: _kbdMods.metaKey}); }
     catch (e) { return; }
     var notPrevented = true;
     try { notPrevented = target.dispatchEvent(ev); } catch (e) {}
+    if (type !== 'keydown' || !notPrevented) return;
     // A trusted Escape keydown is a "close request": run the UA algorithm unless a
     // listener (e.g. a focused text field) cancels it. Mirrors the CDP Input path.
-    if (type === 'keydown' && c.key === 'Escape' && notPrevented &&
-        typeof globalThis._processCloseRequest === 'function') {
+    if (c.key === 'Escape' && typeof globalThis._processCloseRequest === 'function') {
       try { globalThis._processCloseRequest(); } catch (e) {}
+    }
+    // A Tab keydown that no listener cancelled runs sequential focus navigation.
+    else if (c.key === 'Tab' && typeof globalThis._sequentialFocusNavigation === 'function') {
+      try { globalThis._sequentialFocusNavigation(_kbdMods.shiftKey); } catch (e) {}
     }
   };
   const fireMouseCmd = (c) => {
@@ -242,12 +273,23 @@ TESTDRIVER_BRIDGE_JS = r"""
       return Promise.resolve();
     };
     impl.send_keys = function(element, keys) {
+      // Real test_driver.send_keys is ASYNCHRONOUS: it returns a promise and the
+      // key events fire on later ticks. Tests rely on this — a focus handler that
+      // calls send_keys for the *next* Tab expects its own synchronous work (e.g.
+      // an `i++` counter after the call) to run BEFORE the next key is processed.
+      // Dispatching synchronously would recurse the handler and skip that work, so
+      // defer each key's keydown/keyup through the microtask queue.
+      var p = Promise.resolve();
       for (var ch of String(keys)) {
-        var m = mapKey(ch);
-        fireKeyCmd({kind: 'key', type: 'keyDown', key: m.key, code: m.code || ''});
-        fireKeyCmd({kind: 'key', type: 'keyUp', key: m.key, code: m.code || ''});
+        (function (ch) {
+          p = p.then(function () {
+            var m = mapKey(ch);
+            fireKeyCmd({kind: 'key', type: 'keyDown', key: m.key, code: m.code || ''});
+            fireKeyCmd({kind: 'key', type: 'keyUp', key: m.key, code: m.code || ''});
+          });
+        })(ch);
       }
-      return Promise.resolve();
+      return p;
     };
     impl.action_sequence = function(actions) { dispatchCmds(resolveActions(actions)); return Promise.resolve(); };
     // bless() grants the page transient/history-action user activation (wptrunner
