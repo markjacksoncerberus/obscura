@@ -250,6 +250,114 @@ const _fp = function(key) { return _getFp()[key]; };
 const _eventRegistry = {};
 const _formValues = {};
 const _formChecked = {};
+
+// ===== GlobalEventHandlers: on* event handler IDL + content attributes ========
+// (HTML §event-handler-idl-attributes / §event-handler-content-attributes.)
+// Each on* name is an IDL attribute (`el.onclick`) and — on elements — a content
+// attribute (`<div onclick="…">`). Both reference ONE event handler whose value is
+// a function, null, or an "internal raw uncompiled handler" (a source string
+// compiled lazily on first get/dispatch). A single listener is installed at the
+// FIRST activation (first content-attr set OR first IDL set) and reads the current
+// value at each dispatch — so on-handlers keep their registration order relative to
+// addEventListener even when the value is later reassigned or a compile fails
+// (matches inline-event-handler-ordering.html). The listener slot is `__eh_<name>`,
+// the installed-once flag `__ehon_<name>`. These helpers are defined here (early,
+// before any bootstrap setAttribute could run); the on* IDL accessors are installed
+// on HTMLElement/SVGElement/Document prototypes far below, once those classes exist.
+const _EH_TYPE_OVERRIDE = {
+  onwebkitanimationend: 'webkitAnimationEnd',
+  onwebkitanimationiteration: 'webkitAnimationIteration',
+  onwebkitanimationstart: 'webkitAnimationStart',
+  onwebkittransitionend: 'webkitTransitionEnd',
+};
+// The GlobalEventHandlers on* set (mirrors interfaces/html.idl; onerror included —
+// on elements/documents it is an ordinary EventHandler, only the window/worker form
+// is the special OnErrorEventHandler, which keeps its own bespoke path).
+const _EH_HANDLER_NAMES = ('onabort onauxclick onbeforeinput onbeforematch ' +
+  'onbeforetoggle onblur oncancel oncanplay oncanplaythrough onchange onclick ' +
+  'onclose oncommand oncontextlost oncontextmenu oncontextrestored oncopy ' +
+  'oncuechange oncut ondblclick ondrag ondragend ondragenter ondragleave ' +
+  'ondragover ondragstart ondrop ondurationchange onemptied onended onerror ' +
+  'onfocus onformdata oninput oninvalid onkeydown onkeypress onkeyup onload ' +
+  'onloadeddata onloadedmetadata onloadstart onmousedown onmouseenter ' +
+  'onmouseleave onmousemove onmouseout onmouseover onmouseup onpaste onpause ' +
+  'onplay onplaying onprogress onratechange onreset onresize onscroll onscrollend ' +
+  'onsecuritypolicyviolation onseeked onseeking onselect onslotchange onstalled ' +
+  'onsubmit onsuspend ontimeupdate ontoggle onvolumechange onwaiting ' +
+  'onwebkitanimationend onwebkitanimationiteration onwebkitanimationstart ' +
+  'onwebkittransitionend onwheel').split(' ');
+const _EH_ATTR_SET = new Set(_EH_HANDLER_NAMES);
+const _EH_TYPE_FOR = (name) => _EH_TYPE_OVERRIDE[name] || name.slice(2);
+// A raw, not-yet-compiled content-attribute handler source.
+function _RawHandler(source) { this.source = source; }
+// HTML "compile a function body" for an event handler: most handlers take a single
+// `event` parameter (window.onerror's 5-arg form is handled by its own path). The
+// scope-chain refinement (element/form-owner/document in scope) is a follow-up.
+const _ehCompile = (target, name, source) => new Function('event', source);
+// "Get the current value of the event handler": compile a raw handler on first read,
+// reporting + nulling the value on a compile error WITHOUT deactivating the installed
+// listener (so a later valid re-set keeps its original ordering); else return the
+// stored function (or null for a null / non-callable value).
+const _ehCurrentValue = function(target, name) {
+  const slot = '__eh_' + name;
+  const v = target[slot];
+  if (v instanceof _RawHandler) {
+    let fn = null;
+    try { fn = _ehCompile(target, name, v.source); }
+    catch (e) { _reportError(e); fn = null; }
+    target[slot] = fn;
+    return fn;
+  }
+  return (typeof v === 'function') ? v : null;
+};
+// The single installed listener body for (target, name): read the current value each
+// dispatch and apply the HTML "process return value" cancel rule (a false return
+// cancels a cancelable event).
+const _ehInvoke = function(target, name, event) {
+  const fn = _ehCurrentValue(target, name);
+  if (typeof fn !== 'function') return;
+  let ret;
+  try { ret = fn.call(event.currentTarget, event); }
+  catch (e) { _reportError(e); return; }
+  if (ret === false) { try { event.preventDefault(); } catch (e) {} }
+};
+// Install the on-handler listener once (first activation); later value changes only
+// update the slot, so the handler keeps its original registration order.
+const _ehActivate = function(target, name) {
+  const flag = '__ehon_' + name;
+  if (target[flag]) return;
+  target[flag] = true;
+  const type = _EH_TYPE_FOR(name);
+  _addListener(target, type, (ev) => _ehInvoke(target, name, ev));
+};
+// Content-attribute reflection (called from setAttribute / removeAttribute).
+const _ehSetContentAttr = function(target, name, source) {
+  target['__eh_' + name] = new _RawHandler(source);
+  _ehActivate(target, name);
+};
+const _ehRemoveContentAttr = function(target, name) {
+  target['__eh_' + name] = null; // deactivate the value; the installed listener no-ops
+};
+// Install the on* IDL accessors on a prototype (HTMLElement / SVGElement / Document /
+// — for the names it is still missing — window). Skips a name already carrying its
+// own accessor so bespoke definitions (window's __winon_ set, CloseWatcher) win.
+const _ehDefineOnProto = function(proto) {
+  for (const name of _EH_HANDLER_NAMES) {
+    if (Object.getOwnPropertyDescriptor(proto, name)) continue;
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true,
+      get() { return _ehCurrentValue(this, name); },
+      set(v) {
+        if (typeof v === 'function' || (v !== null && typeof v === 'object')) {
+          this['__eh_' + name] = v;
+          _ehActivate(this, name);
+        } else {
+          this['__eh_' + name] = null;
+        }
+      },
+    });
+  }
+};
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
 // The selector ops return "ERR" for an invalid selector (vs "-1"/"[]" for no
 // match) so querySelector/All can throw SyntaxError per spec.
@@ -2473,6 +2581,9 @@ class Element extends Node {
     // Focus fixup rule: an attribute change (disabled/hidden/tabindex/…) may have made
     // the focused element unfocusable. Cheap guard — only when something is focused.
     if (__obscura_focused && globalThis._scheduleFocusFixup) globalThis._scheduleFocusFixup();
+    // An on* event handler content attribute reflects into its event handler (compiled
+    // lazily) and installs the handler listener at this — its first — registration point.
+    if (_EH_ATTR_SET.has(qname)) _ehSetContentAttr(this, qname, String(v));
   }
   setAttributeNS(namespace, qname, v) {
     const { namespace: ns, prefix, local } = _validateAndExtract(namespace, qname);
@@ -2524,6 +2635,9 @@ class Element extends Node {
     // Focus fixup rule (see setAttribute): removing tabindex/contenteditable/… may
     // have made the focused element unfocusable.
     if (__obscura_focused && globalThis._scheduleFocusFixup) globalThis._scheduleFocusFixup();
+    // Removing an on* content attribute nulls its event handler (the installed
+    // listener stays but no-ops).
+    if (_EH_ATTR_SET.has(qname)) _ehRemoveContentAttr(this, qname);
   }
   removeAttributeNS(ns, local) {
     ns = (ns === '' || ns == null) ? '' : String(ns); local = String(local);
@@ -4023,8 +4137,13 @@ class Document extends Node {
     const nid = +_dom("create_element_ns", (nsv || '') + "\0" + (prefix || '') + "\0" + local);
     if (nid < 0 || isNaN(nid)) return null;
     // Only HTML-namespace elements get an HTMLElement-based interface; the local
-    // name is matched case-sensitively (so "SPAN" → HTMLUnknownElement).
-    const C = (nsv === _HTML_NS) ? _htmlClassForLocal(local) : Element;
+    // name is matched case-sensitively (so "SPAN" → HTMLUnknownElement). SVG-namespace
+    // elements get the SVGElement interface (SVGSVGElement for the <svg> root) so the
+    // GlobalEventHandlers on* accessors reach them; everything else is plain Element.
+    const C = (nsv === _HTML_NS) ? _htmlClassForLocal(local)
+      : (nsv === 'http://www.w3.org/2000/svg')
+        ? (local === 'svg' ? globalThis.SVGSVGElement : globalThis.SVGElement)
+        : Element;
     let el = _cache.get(nid);
     if (!el) { el = new C(nid); _cache.set(nid, el); }
     el._ns = nsv; el._nsSet = true; el._prefix = prefix; el._localName = local;
@@ -5572,8 +5691,10 @@ const _fireIframeElementLoad = function(el) {
   ev.target = el;
   // Dispatch directly (not the public dispatchEvent, which would clear isTrusted).
   try { _dispatchSpec(el, ev); } catch (e) {}
-  if (typeof el.onload === 'function') { try { el.onload(ev); } catch (e) {} }
-  else { const a = el.getAttribute && el.getAttribute('onload'); if (a) { try { (0, eval)(a); } catch (e) {} } }
+  // An IDL/JS-set onload already fired as an installed listener during dispatch. A
+  // markup `onload` content attribute that was never activated as a listener still
+  // runs once here, via its source.
+  if (!el['__ehon_onload']) { const a = el.getAttribute && el.getAttribute('onload'); if (a) { try { (0, eval)(a); } catch (e) {} } }
 };
 
 // Fire a trusted `error` event on an element whose subresource failed to load.
@@ -5584,8 +5705,8 @@ const _fireElementError = function(el) {
   ev.isTrusted = true;
   ev.target = el;
   try { _dispatchSpec(el, ev); } catch (e) {}
-  if (typeof el.onerror === 'function') { try { el.onerror(ev); } catch (e) {} }
-  else { const a = el.getAttribute && el.getAttribute('onerror'); if (a) { try { (0, eval)(a); } catch (e) {} } }
+  // See _fireIframeElementLoad: an un-activated markup `onerror` still runs once.
+  if (!el['__ehon_onerror']) { const a = el.getAttribute && el.getAttribute('onerror'); if (a) { try { (0, eval)(a); } catch (e) {} } }
 };
 
 // Load a subresource referenced by an element (<img src>, <link href>,
@@ -16968,9 +17089,9 @@ try {
     try { ev = new ToggleEvent(type, { oldState, newState, cancelable, bubbles: false, source: source || null }); }
     catch (e) { return true; }
     ev._isTrusted = true;
+    // The on<type> content/IDL handler fires as an installed listener during dispatch
+    // (GlobalEventHandlers), so it must NOT be invoked again here.
     try { _dispatchSpec(el, ev); } catch (e) {}
-    const h = el['on' + type];
-    if (typeof h === 'function') { try { h.call(el, ev); } catch (e) {} }
     return !ev.defaultPrevented;
   };
 
@@ -17555,9 +17676,9 @@ try {
         try { ev = new Event(type, { cancelable: !!cancelable, bubbles: !!bubbles }); }
         catch (e) { return true; }
         ev._isTrusted = true;
+        // The on<type> handler fires as an installed listener during dispatch
+        // (GlobalEventHandlers), so it must NOT be invoked again here.
         try { _dispatchSpec(el, ev); } catch (e) {}
-        const h = el['on' + type];
-        if (typeof h === 'function') { try { h.call(el, ev); } catch (e) {} }
         return !ev.defaultPrevented;
       };
 
@@ -18959,9 +19080,8 @@ function _cvReflLong(proto, prop, attr) {
       try { ev = new Event("select", { bubbles: true, cancelable: false }); }
       catch (e) { return; }
       ev.isTrusted = true; ev.target = el;
+      // onselect fires as an installed GlobalEventHandlers listener during dispatch.
       try { _dispatchSpec(el, ev); } catch (e) {}
-      const h = el.onselect; // GlobalEventHandlers content-attribute handler
-      if (typeof h === "function") { try { h.call(el, ev); } catch (e) {} }
     }, 0);
   }
   // Set the selection range (HTML "set the selection range"): clamp end then start
@@ -19642,19 +19762,29 @@ function _cvReflLong(proto, prop, attr) {
       ev.isTrusted = true;
       // Dispatch privately so the trusted flag survives (the public path clears it).
       _dispatchSpec(this, ev);
-      // The `onreset` content-attribute handler is not auto-invoked by dispatch in
-      // this engine (mirrors the `onselect` path), so run it explicitly; it may
-      // still cancel the reset via preventDefault().
-      const h = this.onreset;
-      if (typeof h === "function") { try { h.call(this, ev); } catch (e) {} }
+      // onreset fires as an installed GlobalEventHandlers listener during dispatch;
+      // a `return false` / preventDefault() from it cancels the reset here.
       if (ev.defaultPrevented) return; // preventDefault() aborts the reset
     }
     for (const f of this.elements) _resetControl(f);
   };
 }
 
-globalThis.SVGElement = Element;
-globalThis.SVGSVGElement = Element;
+// SVGElement is a DISTINCT interface (not a bare `Element` alias) so its prototype
+// can carry the GlobalEventHandlers on* accessors WITHOUT them landing on
+// Element.prototype (the GlobalEventHandlers test asserts the handlers live on
+// HTMLElement/SVGElement/Document/window but NOT on Element). SVG-namespace elements
+// created via createElementNS are wrapped with this class (see createElementNS).
+globalThis.SVGElement = class SVGElement extends Element {};
+globalThis.SVGSVGElement = class SVGSVGElement extends globalThis.SVGElement {};
+_markNative(globalThis.SVGElement); _markNative(globalThis.SVGSVGElement);
+// Install the on* event handler IDL accessors (HTML GlobalEventHandlers) on the
+// element/document interfaces + the window names it is still missing. NOT on
+// Element.prototype (SVG/HTML elements reach them through their own prototypes).
+_ehDefineOnProto(globalThis.HTMLElement.prototype);
+_ehDefineOnProto(globalThis.SVGElement.prototype);
+_ehDefineOnProto(Document.prototype);
+_ehDefineOnProto(globalThis);
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;

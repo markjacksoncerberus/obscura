@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #164).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #165).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/webappapis/scripting/events/event-handler-all-global-events.html` | 0/375 | **375/375** | ✅ 100% | **Quest #165 The Handler Verdict.** GlobalEventHandlers `on*` IDL + content-attribute reflection: all 75 handler names are own accessors on HTMLElement/SVGElement/Document/window (NOT Element), a content attribute compiles lazily into its property, and `el[name]`/dispatch fire the handler. Needed a distinct `SVGElement` class. **+375.** |
+| `html/webappapis/scripting/events/event-handler-processing-algorithm.html` | 2/7 | **7/7** | ✅ 100% | **Quest #165.** An on-handler that returns `false` cancels a cancelable event (`onmouseover`/`onclick`/`onblur`/`ondblclick`), applied uniformly via the installed listener's return-value processing. **+5.** |
+| `html/webappapis/scripting/events/inline-event-handler-ordering.html` | 0/3 | **3/3** | ✅ 100% | **Quest #165.** The single handler listener installs at FIRST activation and holds its position; the value is compiled lazily each dispatch, so an invalid handler (compile fail → null) keeps its slot and a later valid re-set fires in the original order. **+3.** |
 | `shadow-dom/focus/focus-pseudo-matches-on-shadow-host.html` | 8/20 | **20/20** | ✅ 100% | **Quest #164 The Lit-Host Verdict.** `:focus` now matches a shadow host whose shadow tree contains the focused element (all open/closed × delegatesFocus modes, nested hosts, NOT via slots). JS syncs a **focus-host chain** to Rust alongside `set_focus`; a move that repositions the focused element re-syncs it (stale-state fix). **+12.** |
 | `shadow-dom/focus/focus-selector-delegatesFocus.html` | 6/12 | **12/12** | ✅ 100% | **Quest #164.** Same `:focus`-on-host rule, independent of `delegatesFocus`; a slotted light-DOM focused element does NOT light its host. **+6.** |
 | `css/selectors/focus-within-removal.html` | 0/1 | **1/1** | ✅ 100% | **Quest #164.** New `:focus-within` matching (light-tree ancestors + shadow-host chain) **plus** a focus-update-steps fix: the old element is unfocused BEFORE its blur/focusout fire, so removing the focus target from its own `focusout` handler leaves no stale `:focus-within`. **+1.** |
