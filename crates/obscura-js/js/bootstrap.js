@@ -3233,7 +3233,7 @@ for (const __jsAttr in __reflectedStringAttrs) {
   });
 }
 
-const __reflectedBoolAttrs = { hidden: 'hidden', autofocus: 'autofocus' };
+const __reflectedBoolAttrs = { hidden: 'hidden', autofocus: 'autofocus', inert: 'inert' };
 for (const __jsAttr in __reflectedBoolAttrs) {
   const __contentAttr = __reflectedBoolAttrs[__jsAttr];
   Object.defineProperty(Element.prototype, __jsAttr, {
@@ -16553,12 +16553,27 @@ globalThis._isRenderedForFocus = function(el) {
   return true;
 };
 
+// An element is "inert" (HTML §inert) if it or an inclusive ancestor carries the
+// `inert` content attribute. Inert nodes — and their whole subtree — are unfocusable,
+// uneditable, unselectable, and don't receive input events. (Modal-dialog / fullscreen
+// inertness, where everything OUTSIDE the top-layer element becomes inert, is not
+// modelled here yet — only the explicit `inert` attribute.)
+globalThis._isInert = function(el) {
+  let n = el;
+  while (n && n.nodeType === 1) {
+    if (n.hasAttribute('inert')) return true;
+    n = n.parentNode;
+  }
+  return false;
+};
+
 // Is `el` a focusable area (HTML "focusable area")? Explicit `tabindex`, the natively
 // focusable elements, an open/shown `<dialog>` (the dialog focusing-steps fallback), or a
-// `contenteditable` host — provided it is rendered and not a disabled form control.
+// `contenteditable` host — provided it is rendered, not inert, and not a disabled form control.
 globalThis._isFocusableArea = function(el) {
   if (!el || el.nodeType !== 1 || !el.isConnected) return false;
   if (!globalThis._isRenderedForFocus(el)) return false;
+  if (globalThis._isInert(el)) return false;
   const ln = el.localName;
   if ((ln === 'button' || ln === 'input' || ln === 'select' || ln === 'textarea' ||
        ln === 'optgroup' || ln === 'option' || ln === 'fieldset') && el.hasAttribute('disabled'))

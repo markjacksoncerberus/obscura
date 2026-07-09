@@ -163,6 +163,29 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-09 (Quest #161 The Inert Verdict — the `inert` model, +13):**
+Took Quest #160's named next lever: the **`inert` model** (HTML §inert). The `inert/`
+realm was mostly red — `el.inert` was `undefined`, inert elements were fully focusable,
+and turning an ancestor inert never fired the focus fixup. Three small `bootstrap.js`
+changes. **(1)** Added `inert` to `__reflectedBoolAttrs` → the `inert` IDL boolean
+reflection (getter reflects the element's *own* attribute, so a node inside an inert
+subtree with no attribute of its own still reports `.inert === false`). **(2)** `_isInert(el)`:
+walks self + inclusive ancestors for the `inert` attribute. **(3)** One line in
+`_isFocusableArea` — `if (_isInert(el)) return false` — makes every inert element a
+`focus()` no-op AND, because #160's fixup rule already re-checks `_isFocusableArea` on
+*any* attribute change while something is focused, automatically blurs a focused
+descendant when it (or an ancestor) turns inert — **no new fixup wiring needed**.
+inert-node-is-unfocusable 1→6, dynamic-inert-on-focused-element 0→6, nested-inert-unfocusable
+1→3 = **+13, ZERO regressions** (fresh-server sweep: qsa 1975, dispatchEvent 25, insertBefore
+39, dialog-open 3, dialog-close 5, popover-focus 11, popover-attribute-basic 159,
+tabindex-getter 120, focus-tabindex-order 1, tab-table-caption 6, after-disabled 1,
+focus-fixup-rule-one 1/8 — all held). **Caps:** the rest of `inert/` is gated on features
+*outside* the inert model — `getSelection().toString()` over a subtree (`inert-on-non-html`,
+`inert-with-modal-dialog-001/002`), `window.find` (`-003`), modal-dialog inertness,
+contenteditable typing (`-uneditable`), click activation (`-form-control`), and
+hittest/reftests. **Next:** popover-in-taborder, then shadow-DOM focus retargeting. Scroll
+`tickets/161-the-inert-verdict.md`.
+
 **Session 2026-07-09 (Quest #160 The Fixed-Up Verdict — the focus fixup rule, +2):**
 Took Quest #159's named "small, self-contained" next lever: the **focus fixup rule**
 (HTML §focus-fixup-rule). When the focused element stops being a focusable area
