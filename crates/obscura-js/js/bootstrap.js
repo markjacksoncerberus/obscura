@@ -5199,11 +5199,17 @@ globalThis.length = 0;
 // the FileReader on-handler pattern). `_addListener`/`_removeListener` are `const`s
 // declared further down; the setter only references them at call time (long after
 // bootstrap), so the forward reference is safe.
-// EXCLUSIONS: `load` and `error` keep plain data-property semantics — the
-// load-event driver both calls `win.onload(...)` directly AND dispatches a `load`
-// event (registering a listener would double-fire), and `onerror` is invoked
-// manually with its bespoke (message, source, lineno, colno, error) signature.
-const _WINDOW_ONHANDLER_DATA = new Set(["load", "error"]);
+// EXCLUSION: `error` keeps plain data-property semantics — `window.onerror` is
+// invoked manually with its bespoke (message, source, lineno, colno, error)
+// OnErrorEventHandler signature, so it is not a plain `error`-type listener.
+// `load` IS a real listener accessor: the main load-event driver dispatches a
+// trusted `load` at the window (page.rs `<load-event>`), which fires `window.onload`
+// through the normal listener path with `currentTarget === window` (HTML §"handler-
+// window-onload"). The driver no longer calls `window.onload()` directly (that path
+// passed no event arg, so `e.currentTarget` was undefined). This is also what lets a
+// body/frameset `onload` — which reflects to `window.onload` per the Window-reflecting
+// body element handler set — fire correctly at the window.
+const _WINDOW_ONHANDLER_DATA = new Set(["error"]);
 for (const _ev of [
   "abort","afterprint","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
   "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",

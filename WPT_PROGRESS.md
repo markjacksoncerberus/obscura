@@ -10,13 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #166).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #167).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
-| `html/webappapis/scripting/events/event-handler-attributes-body-window.html` | 75/140 | **139/140** | 🟡 99% | **Quest #166 The Body-Window Verdict.** The Window-reflecting body element event handler set: `<body>`/`<frameset>` `on*` for `{blur,error,focus,load,resize,scroll}` ∪ WindowEventHandlers reflect get/set/content-attr onto the element's Window. Added `afterprint`/`messageerror`/`pagereveal`/`pageswap` to window on-handlers; `window.onerror`/`onunhandledrejection` now default null. **+64.** 1 cap: `load` fires as a data-prop (needs onload-as-listener). |
+| `html/webappapis/scripting/events/event-handler-attributes-body-window.html` | 75/140 | **140/140** | ✅ 100% | **Quest #166 The Body-Window Verdict** (+64) + **Quest #167 The Onload Verdict** (+1, the final subtest). The Window-reflecting body element event handler set: `<body>`/`<frameset>` `on*` for `{blur,error,focus,load,resize,scroll}` ∪ WindowEventHandlers reflect get/set/content-attr onto the element's Window. #167 made `window.onload` a real `load`-listener accessor so `body.onload` fires *through dispatch* with `currentTarget === window` (was a data-prop). |
+| `html/webappapis/scripting/events/body-onload.html` | 0/1 | **1/1** | ✅ 100% | **Quest #167 The Onload Verdict.** `window.onload` is now a real `load`-listener accessor (removed from the window on-handler data-property exclusion set); the main load-event driver (`page.rs <load-event>`) no longer calls `window.onload()` directly — it dispatches a trusted `load` at the window, firing onload once, in listener order, with `currentTarget === window`. So a detached `body.onload` (which reflects to `window.onload`) fires correctly at the window. **+1.** |
 | `html/webappapis/scripting/events/event-handler-attributes-windowless-body.html` | 152/236 | **236/236** | ✅ 100% | **Quest #166.** A windowless body/frameset (DOMParser / template contents, no browsing context) reflects NOWHERE — reflecting handlers read `null`, setter inert. **+84.** |
 | `html/webappapis/scripting/events/event-handler-attributes-body-alt.html` | 75/118 | **118/118** | ✅ 100% | **Quest #166.** Same reflection matrix from an alternative (detached) body. **+43.** |
 | `html/webappapis/scripting/events/event-handler-attributes-window.html` | 75/118 | **118/118** | ✅ 100% | **Quest #166.** Setting `window.on*` reflects back onto `document.body`/alt body for the reflecting set. **+43.** |

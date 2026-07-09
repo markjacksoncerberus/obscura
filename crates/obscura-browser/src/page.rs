@@ -623,7 +623,6 @@ impl Page {
                 "globalThis.__documentReadyState__ = 'complete';\n\
                  try { if (typeof document.onreadystatechange === 'function') document.onreadystatechange(); } catch(e) {}\n\
                  try { var __rsc=new Event('readystatechange'); __rsc.isTrusted=true; _dispatchSpec(document, __rsc); } catch(e) {}\n\
-                 if (typeof window.onload === 'function') { try { window.onload(); } catch(e) {} }\n\
                  try { var __ld=new Event('load', {bubbles:false,cancelable:false}); __ld.isTrusted=true; _dispatchSpec(window, __ld); } catch(e) {}\n\
                  try { if (typeof __navTimingLoad === 'function') __navTimingLoad(); } catch(e) {}");
         }
