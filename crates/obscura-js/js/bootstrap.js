@@ -293,10 +293,69 @@ const _EH_ATTR_SET = new Set(_EH_HANDLER_NAMES);
 const _EH_TYPE_FOR = (name) => _EH_TYPE_OVERRIDE[name] || name.slice(2);
 // A raw, not-yet-compiled content-attribute handler source.
 function _RawHandler(source) { this.source = source; }
-// HTML "compile a function body" for an event handler: most handlers take a single
-// `event` parameter (window.onerror's 5-arg form is handled by its own path). The
-// scope-chain refinement (element/form-owner/document in scope) is a follow-up.
-const _ehCompile = (target, name, source) => new Function('event', source);
+// HTML "getting the current value of the event handler" — the lexical scope chain a
+// compiled inline handler runs in: innermost-first, the element, its form owner (if
+// any), then its node document; the global (window) is always the outermost fallback.
+// A Window's own handler (the window-reflecting body/frameset form) sees ONLY the
+// global. Native `with` establishes these scopes and honours Symbol.unscopables for
+// free, so an unscopable property on an in-scope object does not shadow the global.
+// The form owner of a form-associated element: read `.form` when the element exposes
+// it (input/button/select/textarea/output/fieldset/object); <img> and form-associated
+// custom elements have a form owner but no `.form` IDL, so resolve it structurally
+// (the form= referenced form, else the nearest ancestor form).
+const _FORM_ASSOCIATED_TAGS = new Set(['BUTTON', 'FIELDSET', 'INPUT', 'OBJECT', 'OUTPUT', 'SELECT', 'TEXTAREA', 'IMG']);
+const _ehFormOwner = function(el) {
+  if (!el || el.nodeType !== 1) return null;
+  // Only a form-associated element has a form owner (a bare `.form` getter that walks
+  // to an ancestor form is defined broadly, so gate on the element category first).
+  let associated = _FORM_ASSOCIATED_TAGS.has(el.tagName);
+  if (!associated) { const d = el._ceDefinition; if (d && d.formAssociated) associated = true; }
+  if (!associated) return null;
+  try { const f = el.form; if (f && f.nodeType === 1 && f.tagName === 'FORM') return f; } catch (e) {}
+  try {
+    const ref = el.getAttribute && el.getAttribute('form');
+    if (ref) { const f = el.ownerDocument.getElementById(ref); return (f && f.tagName === 'FORM') ? f : null; }
+    return el.closest ? el.closest('form') : null;
+  } catch (e) { return null; }
+};
+// The scope objects for an element/document handler, OUTERMOST-first (document …
+// element). A Window handler resolves only through the global, so [] here.
+const _ehScopeChain = function(target) {
+  const chain = [];
+  if (target && target.nodeType === 1) {
+    const doc = target.ownerDocument; if (doc) chain.push(doc);
+    const fo = _ehFormOwner(target); if (fo) chain.push(fo);
+    chain.push(target);
+  } else if (target && target.nodeType === 9) {
+    chain.push(target);
+  }
+  return chain;
+};
+// Is this handler an OnErrorEventHandler? (`onerror` on the Window, or on a
+// <body>/<frameset> element — the 5-argument callback signature).
+const _ehIsErrorTarget = function(target) {
+  return target === globalThis ||
+    (globalThis.HTMLBodyElement && target instanceof globalThis.HTMLBodyElement) ||
+    (globalThis.HTMLFrameSetElement && target instanceof globalThis.HTMLFrameSetElement);
+};
+// Build the compiled event-handler function: a function literally named `on<type>`
+// whose body is the raw source, so its `.toString()` is exactly
+// `function on<type>(<params>) {\n<source>\n}` (event-handler-sourcetext). The nested
+// `with` wrappers are captured by the returned closure at creation time, so free
+// identifiers in the body later resolve through the passed scope chain
+// (compile-event-handler-lexical-scopes / -symbol-unscopables). The factory is sloppy
+// (`with` needs it); the handler body may still opt into strict mode itself.
+const _ehMakeFn = function(name, isError, source, chain) {
+  const params = isError ? 'event, source, lineno, colno, error' : 'event';
+  const fnSrc = 'function ' + name + '(' + params + ') {\n' + source + '\n}';
+  let head = '', tail = ''; const argNames = [];
+  for (let i = 0; i < chain.length; i++) { head += 'with(__s' + i + '){'; tail += '}'; argNames.push('__s' + i); }
+  const factory = new Function(...argNames, head + 'return (' + fnSrc + ');' + tail);
+  return factory.apply(null, chain);
+};
+// HTML "compile a function body" for an element/document event handler.
+const _ehCompile = (target, name, source) =>
+  _ehMakeFn(name, (name === 'onerror') && _ehIsErrorTarget(target), source, _ehScopeChain(target));
 // "Get the current value of the event handler": compile a raw handler on first read,
 // reporting + nulling the value on a compile error WITHOUT deactivating the installed
 // listener (so a later valid re-set keeps its original ordering); else return the
@@ -375,7 +434,9 @@ const _bodyWinSetContentAttr = function(el, name, source) {
   const w = _bodyReflectWin(el);
   if (!w) return;
   let fn = null;
-  try { fn = new Function('event', source); } catch (e) { _reportError(e); fn = null; }
+  // The reflected handler is a Window's own handler → global-only scope; onerror is
+  // the 5-arg OnErrorEventHandler form (event-handler-sourcetext test 5).
+  try { fn = _ehMakeFn(name, name === 'onerror', source, []); } catch (e) { _reportError(e); fn = null; }
   w[name] = fn;
 };
 const _bodyWinRemoveContentAttr = function(el, name) {
@@ -4080,6 +4141,15 @@ class Document extends Node {
   }
   get URL() { return this._standalone ? "about:blank" : (_domParse("document_url") ?? ""); }
   get documentURI() { return this.URL; }
+  // The document's effective domain: its origin's host (empty for an opaque origin).
+  // Setting it is subject to same-origin restrictions we don't model, so the setter
+  // just stores the override (no page depends on the security semantics here yet).
+  get domain() {
+    if (this._domainOverride !== undefined) return this._domainOverride;
+    try { const u = this.URL; if (!u || u === "about:blank") return ""; return new URL(u).hostname || ""; }
+    catch (e) { return ""; }
+  }
+  set domain(v) { this._domainOverride = String(v); }
   get location() { return this._standalone ? null : globalThis.location; }
   set location(url) { if (this._standalone) return; Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return this._standalone ? null : globalThis; }
@@ -4742,6 +4812,25 @@ const _elementClassFor = function(nid) {
   const tag = _domParse("tag_name", nid);
   return tag ? _htmlClassForLocal(_asciiLower(tag)) : (globalThis.HTMLElement || Element);
 };
+// HTML "event handler content attributes": activate an element's parsed `on*`
+// content attributes as real event-handler listeners the FIRST time its wrapper is
+// constructed (before any script can addEventListener on it, so markup handlers keep
+// their spec ordering ahead of later listeners). One `on_handler_attrs` bridge call
+// per new element wrapper returns "" for the common handler-less element; only the
+// rare element carrying handlers pays the per-name getAttribute + install.
+const _activateMarkupHandlers = function(el) {
+  const names = _domParse("on_handler_attrs", el._nid);
+  if (!names) return;
+  for (const name of names.split(' ')) {
+    if (el['__ehon_' + name]) continue;
+    const reflect = _isBodyWinReflect(el, name);
+    if (!reflect && !_EH_ATTR_SET.has(name)) continue;
+    let src; try { src = el.getAttribute(name); } catch (e) { continue; }
+    if (src == null) continue;
+    if (reflect) _bodyWinSetContentAttr(el, name, src);
+    else _ehSetContentAttr(el, name, src);
+  }
+};
 const _wrap = function(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
@@ -4759,6 +4848,7 @@ const _wrap = function(nid) {
   }
   else n = new Node(nid);
   _cache.set(nid, n);
+  if (t === 1) _activateMarkupHandlers(n);
   return n;
 };
 const _wrapEl = function(nid) {
@@ -4767,6 +4857,7 @@ const _wrapEl = function(nid) {
   const C = _elementClassFor(nid);
   const n = new C(nid);
   _cache.set(nid, n);
+  _activateMarkupHandlers(n);
   return n;
 };
 // Create an element for an XML/XHTML document: case-PRESERVING local name (no ASCII
@@ -16610,8 +16701,26 @@ globalThis.HTMLElement = class HTMLElement extends Element {
 globalThis.HTMLUnknownElement = class HTMLUnknownElement extends globalThis.HTMLElement {};
 globalThis.HTMLSpanElement = class HTMLSpanElement extends globalThis.HTMLElement {};
 globalThis.HTMLFormElement = class HTMLFormElement extends globalThis.HTMLElement {
-  get elements() { return this.querySelectorAll("input, select, textarea, button, fieldset, output, object"); }
+  // A LIVE, cached HTMLFormControlsCollection: the same object every read (its
+  // contents recompute on access), so `form.elements === form.elements` and a value
+  // captured earlier stays identity-equal (compile-event-handler-lexical-scopes-form-owner).
+  get elements() {
+    if (!this._elementsColl)
+      this._elementsColl = _makeHTMLCollection(
+        () => Array.from(this.querySelectorAll(
+          "button, fieldset, input:not([type=image i]), object, output, select, textarea")));
+    return this._elementsColl;
+  }
   get length() { return this.elements.length; }
+  // enctype reflects the enumerated enctype attribute (default url-encoded); encoding
+  // is its HTML alias.
+  get enctype() {
+    const v = (this.getAttribute("enctype") || "").toLowerCase();
+    return (v === "multipart/form-data" || v === "text/plain") ? v : "application/x-www-form-urlencoded";
+  }
+  set enctype(v) { this.setAttribute("enctype", v); }
+  get encoding() { return this.enctype; }
+  set encoding(v) { this.enctype = v; }
   // Inherit submit() from Element.prototype: it dispatches the cancelable
   // 'submit' event and (if not prevented) builds form data and navigates.
   reset() { for (const f of this.elements) { if ('value' in f) f.value = ''; } }
@@ -19855,6 +19964,22 @@ _ehDefineOnProto(globalThis.HTMLElement.prototype);
 _ehDefineOnProto(globalThis.SVGElement.prototype);
 _ehDefineOnProto(Document.prototype);
 _ehDefineOnProto(globalThis);
+// Web IDL [Unscopable] members — the @@unscopables object each interface exposes so
+// its unscopable methods (the ParentNode/ChildNode DOM-manipulation set) don't shadow
+// like-named globals inside a `with` scope (used by compiled inline event handlers;
+// compile-event-handler-symbol-unscopables). A plain, extensible object per prototype:
+// pages may add keys (the test marks its own property unscopable at runtime).
+const _defineUnscopables = function(proto, names) {
+  const u = Object.create(null);
+  for (const n of names) u[n] = true;
+  Object.defineProperty(proto, Symbol.unscopables, { value: u, configurable: true, writable: false, enumerable: false });
+};
+// ParentNode + ChildNode unscopables live on Element; Document/DocumentFragment carry
+// only the ParentNode set. (HTMLElement/SVGElement inherit Element's.)
+_defineUnscopables(Element.prototype,
+  ['after', 'append', 'before', 'moveBefore', 'prepend', 'remove', 'replaceChildren', 'replaceWith']);
+_defineUnscopables(Document.prototype, ['append', 'prepend', 'replaceChildren']);
+_defineUnscopables(DocumentFragment.prototype, ['append', 'prepend', 'replaceChildren']);
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;

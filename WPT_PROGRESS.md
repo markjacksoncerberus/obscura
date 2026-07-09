@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #167).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #168).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/webappapis/scripting/events/event-handler-sourcetext.html` | 0/5 | **5/5** | ✅ 100% | **Quest #168 The Scope-Chain Verdict.** Compiled handler is a function literally named `on<type>` — 5-arg `(event, source, lineno, colno, error)` for onerror on Window/body/frameset, else `(event)` — so `.toString()` is exactly `function on<type>(<params>) {\n<src>\n}`. **+5.** |
+| `html/webappapis/scripting/events/compile-event-handler-symbol-unscopables.html` | 0/3 | **3/3** | ✅ 100% | **Quest #168.** Handler body runs inside nested `with(...)` which natively honours `Symbol.unscopables`; added extensible `@@unscopables` objects to Element/Document/DocumentFragment prototypes. **+3.** |
+| `html/webappapis/scripting/events/compile-event-handler-lexical-scopes-form-owner.html` | 0/4 | **4/4** | ✅ 100% | **Quest #168.** Form owner (gated on real form-association) placed in the handler's `with` scope chain; live cached `form.elements` gives identity-stable collection. **+4.** |
+| `html/webappapis/scripting/events/compile-event-handler-lexical-scopes.html` | 0/3 | **2/3** | 🟡 67% | **Quest #168.** Scope chain element→form-owner→document→window via nested `with`, captured at handler creation. **+2.** Cap: test 3 needs `window.onerror` to fire as an *ordered* `error` listener (onerror-as-listener, deferred). |
+| `html/semantics/forms/the-form-element/form-elements-matches.html` | 0/2 | **2/2** | ✅ 100% | **Quest #168** (bonus). `form.elements` is now a live cached HTMLFormControlsCollection (indexed/named/item/namedItem) excluding `input[type=image]`. **+2.** |
+| `html/semantics/forms/the-form-element/form-elements-nameditem-01.html` | 0/3 | **1/3** | 🟡 33% | **Quest #168** (bonus). Fieldset named access via the live `form.elements` collection. **+1.** Cap: RadioNodeList (missing global) for the same-name-inputs subtests. |
 | `html/webappapis/scripting/events/event-handler-attributes-body-window.html` | 75/140 | **140/140** | ✅ 100% | **Quest #166 The Body-Window Verdict** (+64) + **Quest #167 The Onload Verdict** (+1, the final subtest). The Window-reflecting body element event handler set: `<body>`/`<frameset>` `on*` for `{blur,error,focus,load,resize,scroll}` ∪ WindowEventHandlers reflect get/set/content-attr onto the element's Window. #167 made `window.onload` a real `load`-listener accessor so `body.onload` fires *through dispatch* with `currentTarget === window` (was a data-prop). |
 | `html/webappapis/scripting/events/body-onload.html` | 0/1 | **1/1** | ✅ 100% | **Quest #167 The Onload Verdict.** `window.onload` is now a real `load`-listener accessor (removed from the window on-handler data-property exclusion set); the main load-event driver (`page.rs <load-event>`) no longer calls `window.onload()` directly — it dispatches a trusted `load` at the window, firing onload once, in listener order, with `currentTarget === window`. So a detached `body.onload` (which reflects to `window.onload`) fires correctly at the window. **+1.** |
 | `html/webappapis/scripting/events/event-handler-attributes-windowless-body.html` | 152/236 | **236/236** | ✅ 100% | **Quest #166.** A windowless body/frameset (DOMParser / template contents, no browsing context) reflects NOWHERE — reflecting handlers read `null`, setter inert. **+84.** |

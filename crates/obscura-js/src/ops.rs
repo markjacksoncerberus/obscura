@@ -237,6 +237,35 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 .unwrap_or_default();
             serde_json::to_string(&names).unwrap_or("[]".into())
         }
+        // Space-joined list of an element's `on*` event-handler content-attribute
+        // names (e.g. "onclick onload"), or "" if none. Read once at wrapper
+        // construction so parsed markup handlers (`<div onclick=…>`) activate as real
+        // listeners; the common no-handler element returns "" from a single attr scan.
+        "on_handler_attrs" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let names: String = dom
+                .get_node(NodeId::new(nid))
+                .map(|n| {
+                    n.attrs()
+                        .map(|attrs| {
+                            attrs
+                                .iter()
+                                .filter_map(|a| {
+                                    let l = a.name.local.as_ref();
+                                    if l.len() > 2 && l.as_bytes()[0] == b'o' && l.as_bytes()[1] == b'n' {
+                                        Some(l.to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            serde_json::to_string(&names).unwrap_or("\"\"".into())
+        }
         // Ordered attribute list as [{ns,prefix,local,name,value}] for building
         // the JS Attr/NamedNodeMap wrappers. ns/prefix are null when absent.
         "attribute_list" => {
