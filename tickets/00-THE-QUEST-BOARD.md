@@ -163,6 +163,31 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-09 (Quest #162 The Delegated Verdict — shadow-DOM focus retargeting + `delegatesFocus`, +28):**
+Took Quest #161's named next lever: **shadow-DOM focus retargeting**. The `shadow-dom/focus/`
+realm was mostly red — `document.activeElement` leaked shadow-internal nodes, `ShadowRoot.activeElement`
+was a hard `return null`, and `delegatesFocus` did nothing (`host.focus()` never delegated). All
+`bootstrap.js`. **(1)** `activeElement` as a **retargeting** — reused the existing event-dispatch
+helpers `_retarget`/`_nodeRoot`/`_shadowIncAncestor`: `document.activeElement` = focused retargeted to
+the document (topmost shadow host); `ShadowRoot.activeElement` = the retarget against that root, or null
+when focus lies outside it. **(2)** The **focus delegate** `_shadowFocusDelegate(host)`: walk the host's
+shadow TREE in tree order (slotted light-DOM content is never a candidate — a `<slot>`'s children are its
+fallback, not its assigned nodes; nested delegating hosts descend, non-delegating ones are skipped),
+preferring the first `autofocus` candidate else the first focusable. `host.focus()` delegates to it (keeps
+focus if already inside; no-op if no delegate); `host.blur()` clears a shadow-tree delegation but not a
+slotted element focused through the host. **(3)** The latent blocker: `Node.isConnected` isn't
+shadow-including, so shadow-tree elements read `isConnected===false` and `_isFocusableArea` rejected them —
+added `_shadowConnected` (shadow-crossing) used ONLY in the focus path (tight scope; provably ≡ `isConnected`
+off-shadow). focus-method-delegatesFocus 1→15, activeElement 2→6, focus-method-with-delegatesFocus 4→8,
+focus-autofocus 1→5, blur-on-shadow-host-delegatesFocus 1→2, delegatesFocus-tabindex-change 0→1 = **+28,
+ZERO regressions** (same-session stash A/B: qsa 1975, dispatchEvent 25, insertBefore 39, event-composed 9,
+event-composed-path 11, attachShadow 6, popover-focus 11, dialog-open 3, ShadowRoot-delegatesFocus 3/3 —
+all identical). **Caps:** `:focus`/`:focus-within`-on-host matching (`focus-selector-delegatesFocus` 6/12,
+`focus-pseudo-on-shadow-host-*`) is a selector/render gap; `focus-navigation/*` needs shadow/slot-crossing
+sequential focus (flat-tree Tab order); root-cause `isConnected` shadow-inclusion deferred to its own quest.
+**Next:** shadow-DOM sequential focus navigation (flat-tree Tab across slots + delegating hosts), then
+`:focus`-on-host selector matching. Scroll `tickets/162-the-delegated-verdict.md`.
+
 **Session 2026-07-09 (Quest #161 The Inert Verdict — the `inert` model, +13):**
 Took Quest #160's named next lever: the **`inert` model** (HTML §inert). The `inert/`
 realm was mostly red — `el.inert` was `undefined`, inert elements were fully focusable,

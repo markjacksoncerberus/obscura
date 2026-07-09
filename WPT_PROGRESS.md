@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #161).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #162).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `shadow-dom/focus/focus-method-delegatesFocus.html` | 1/15 | **15/15** | ✅ 100% | **Quest #162 The Delegated Verdict.** `host.focus()` on a `delegatesFocus` shadow host delegates to the first focusable area in the host's shadow **tree** (`_shadowFocusDelegate`; slotted light-DOM content is never a candidate, nested delegating hosts are descended into). Retargeting-based `activeElement` reports host / shadow-internal correctly. **+14.** |
+| `shadow-dom/focus/DocumentOrShadowRoot-activeElement.html` | 2/6 | **6/6** | ✅ 100% | **Quest #162.** `document.activeElement` = the focused element retargeted against the document (topmost shadow host); `ShadowRoot.activeElement` = the retargeting against that root, or null when focus lies outside it. Reuses the existing `_retarget`/`_nodeRoot` dispatch helpers. **+4.** |
+| `shadow-dom/focus/focus-method-with-delegatesFocus.html` | 4/8 | **8/8** | ✅ 100% | **Quest #162.** Delegated focus from `host.focus()` across slots + nested hosts. **+4.** |
+| `shadow-dom/focus/focus-autofocus.html` | 1/5 | **5/5** | ✅ 100% | **Quest #162.** The focus delegate prefers an element with `autofocus` (first in shadow-tree order, across nested delegating hosts), else the first focusable — slotted `autofocus` content still never counts. **+4.** |
+| `shadow-dom/focus/blur-on-shadow-host-delegatesFocus.html` | 1/2 | **2/2** | ✅ 100% | **Quest #162.** `host.blur()` clears focus delegated into the host's shadow tree, but leaves a slotted light-DOM element focused through the host untouched (its root is the document, not the shadow root). **+1.** |
+| `shadow-dom/focus/delegatesFocus-tabindex-change.html` | 0/1 | **1/1** | ✅ 100% | **Quest #162.** Delegated focus survives a tabindex change on the host. **+1.** |
 | `inert/inert-node-is-unfocusable.html` | 1/6 | **6/6** | ✅ 100% | **Quest #161 The Inert Verdict.** The `inert` model: the `inert` IDL boolean reflection + `_isInert` (self-or-ancestor `inert` attribute) checked in `_isFocusableArea` → every inert element is a `focus()` no-op. **+5.** |
 | `inert/dynamic-inert-on-focused-element.html` | 0/6 | **6/6** | ✅ 100% | **Quest #161.** Turning a focused element (or its ancestor) inert now blurs it on the next frame — the #160 focus-fixup rule's general setAttribute chokepoint re-checks `_isFocusableArea`, which now rejects inert nodes, so no new wiring was needed. **+6.** |
 | `inert/nested-inert-unfocusable.html` | 1/3 | **3/3** | ✅ 100% | **Quest #161.** An input nested in inert subtrees stays unfocusable, and removing an *outer* inert while an inner remains keeps it inert (`_isInert` walks all inclusive ancestors). **+2.** |

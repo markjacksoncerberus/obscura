@@ -2748,6 +2748,18 @@ class Element extends Node {
   }
   focus() {
     if (__obscura_focused === this) return;
+    // Shadow host with delegatesFocus: focus() delegates to the first focusable area
+    // in the host's shadow tree (HTML "get the focus delegate"). If focus is already
+    // somewhere inside this host's shadow-including subtree, it stays put; if the
+    // shadow tree has no focusable delegate, focus() is a no-op (the host is not
+    // focused itself).
+    const sr = this._shadowRoot;
+    if (sr && sr._delegatesFocus) {
+      if (__obscura_focused && _shadowIncAncestor(this, __obscura_focused)) return;
+      const delegate = globalThis._shadowFocusDelegate(this);
+      if (delegate) globalThis._performFocus(delegate);
+      return;
+    }
     // A non-focusable element's focus() is a no-op (HTML: the focusing steps only move
     // focus to a focusable area). `_performFocus` does the actual state change + events
     // (blur/focusout on the old, focus/focusin on the new, Rust `:focus` bit).
@@ -2755,11 +2767,18 @@ class Element extends Node {
     globalThis._performFocus(this);
   }
   blur() {
-    if (__obscura_focused !== this) return;
+    // blur() clears focus when this element is focused, or — for a delegatesFocus
+    // shadow host — when focus was delegated into this host's SHADOW tree (a slotted
+    // light-DOM element focused through the host does NOT count: its root is the
+    // document, not the shadow root, so host.blur() leaves it alone).
+    const sr = this._shadowRoot;
+    const inShadow = sr && __obscura_focused && _shadowIncAncestor(sr, __obscura_focused);
+    if (__obscura_focused !== this && !inShadow) return;
+    const target = __obscura_focused;
     __obscura_focused = null;
     _dom("set_focus", "", ""); // Phase 0b: clear Rust focus state
-    try { this.dispatchEvent(new Event('blur', { bubbles: false })); } catch(e) {}
-    try { this.dispatchEvent(new Event('focusout', { bubbles: true })); } catch(e) {}
+    try { target.dispatchEvent(new Event('blur', { bubbles: false })); } catch(e) {}
+    try { target.dispatchEvent(new Event('focusout', { bubbles: true })); } catch(e) {}
   }
   get value() {
     // <li>.value reflects a `long` content attribute (default 0) — not a form value.
@@ -4099,7 +4118,12 @@ class Document extends Node {
     return new NodeIterator(root, __obscura_whatToShow(whatToShow), __obscura_nodeFilterArg(filter));
   }
   getSelection() { return globalThis.getSelection(); }
-  get activeElement() { return __obscura_focused || this.body; }
+  // DocumentOrShadowRoot.activeElement: the focused element retargeted against this
+  // document — when focus is inside a shadow tree, this is the topmost shadow host in
+  // the document tree (never a shadow-internal node). Falls back to <body>.
+  get activeElement() {
+    return __obscura_focused ? _retarget(__obscura_focused, this) : this.body;
+  }
   get implementation() {
     // The implementation is "associated" with the document it was read from
     // (`document.implementation` for the page, `doc.implementation` for a
@@ -14231,9 +14255,15 @@ class ShadowRoot extends DocumentFragment {
   get slotAssignment() { return this._slotAssignment || "named"; }
   get clonable() { return !!this._clonable; }
   get serializable() { return !!this._serializable; }
-  // We don't model focus inside shadow trees yet; no element is ever the shadow's
-  // active element. (The connected-focus case is a known gap.)
-  get activeElement() { return null; }
+  // DocumentOrShadowRoot.activeElement: retarget the focused element against this
+  // shadow root; it is this root's active element only when that retargeting lands a
+  // node whose root is this shadow root (i.e. focus is in this tree, or in a nested
+  // shadow tree whose host lives here). Otherwise null.
+  get activeElement() {
+    if (!__obscura_focused) return null;
+    const c = _retarget(__obscura_focused, this);
+    return (c && typeof c.nodeType === 'number' && _nodeRoot(c) === this) ? c : null;
+  }
   // styleSheets is connectedness-gated and our shadow trees never enter the render
   // tree, so report an empty StyleSheetList (array-like with .item) rather than throw.
   get styleSheets() {
@@ -16570,8 +16600,23 @@ globalThis._isInert = function(el) {
 // Is `el` a focusable area (HTML "focusable area")? Explicit `tabindex`, the natively
 // focusable elements, an open/shown `<dialog>` (the dialog focusing-steps fallback), or a
 // `contenteditable` host — provided it is rendered, not inert, and not a disabled form control.
+// Shadow-including connectedness: like `Node.isConnected` but crosses shadow
+// boundaries (jumps a shadow root to its host) so an element inside a connected
+// host's shadow tree counts as connected — which the plain `isConnected` getter
+// does not. Scoped to the focus path so it can't perturb any non-shadow page.
+globalThis._shadowConnected = function(el) {
+  let node = el;
+  while (node) {
+    if (node.nodeType === 9) return true;
+    let p = node.parentNode;
+    if (!p && _isSR(node)) p = node._shadowHost;
+    node = p;
+  }
+  return false;
+};
+
 globalThis._isFocusableArea = function(el) {
-  if (!el || el.nodeType !== 1 || !el.isConnected) return false;
+  if (!el || el.nodeType !== 1 || !globalThis._shadowConnected(el)) return false;
   if (!globalThis._isRenderedForFocus(el)) return false;
   if (globalThis._isInert(el)) return false;
   const ln = el.localName;
@@ -16595,6 +16640,43 @@ globalThis._isFocusableArea = function(el) {
     if (ce === '' || ce === 'true' || ce === 'plaintext-only') return true;
   }
   return false;
+};
+
+// HTML "get the focus delegate" for a shadow host with delegatesFocus: the first
+// focusable area in the host's shadow TREE in tree order (slotted light-DOM content
+// is NOT a candidate — only elements of the shadow tree itself). A nested shadow host
+// that also delegates focus is descended into (its own delegate is returned); a
+// non-delegating nested host and its light children are skipped. Returns null when the
+// shadow tree has no focusable delegate.
+globalThis._shadowFocusDelegate = function(host) {
+  const root = host && host._shadowRoot;
+  if (!root || !root._delegatesFocus) return null;
+  // Collect the delegate candidates in shadow-tree tree order. Each is the actual
+  // element that would be focused, tagged with whether it carries `autofocus` — a
+  // nested delegating host contributes its OWN resolved candidates spliced in at its
+  // position (so autofocus preference is decided globally, in tree order).
+  const collect = (node) => {
+    const out = [];
+    const kids = node.children;
+    for (let i = 0; i < kids.length; i++) {
+      const el = kids[i];
+      const csr = el._shadowRoot;
+      if (csr) {
+        // Nested shadow host: descend only if it delegates focus. Its light children
+        // are never independent candidates of this (outer) delegate walk.
+        if (csr._delegatesFocus) out.push.apply(out, collect(csr));
+        continue;
+      }
+      if (globalThis._isFocusableArea(el)) out.push({ el, af: el.hasAttribute('autofocus') });
+      out.push.apply(out, collect(el));   // <slot> children here are its fallback, not slotted content
+    }
+    return out;
+  };
+  const cands = collect(root);
+  // Autofocus wins (for non-"click" focus triggers, which is all we model), by first
+  // in tree order; otherwise the first focusable candidate.
+  for (const c of cands) if (c.af) return c.el;
+  return cands.length ? cands[0].el : null;
 };
 
 // First descendant of `root` in tree order that has the `autofocus` attribute and is a
