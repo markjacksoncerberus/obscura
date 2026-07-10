@@ -10,14 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #173).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #174).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/popovers/popover-shadow-dom.html` | 0/3 | **3/3** | ✅ 100% | **Quest #174 The Shadowed Verdict.** `showPopover()` inside a shadow tree no longer throws — the popover connectedness check is now shadow-INCLUDING (`_shadowConnected`, jumping each shadow root to its host) instead of the boundary-stopping `isConnected`. Same for the invoker's target-validity check. The "topmost popover ancestor" computation uses a shadow-including containment walk, so a popover nested inside a shadow-DOM ancestor popover is recognized as nested (not closed). **+3.** |
 | `html/semantics/popovers/popover-light-dismiss-command.html` | 4/14 | **8/14** | 🟡 57% | **Quest #173 The Invoked Verdict.** A *trusted* (harness/user) click now runs invoker activation. Extracted the popover + command invoker activation out of `.click()` into `_runInvokerActivation`, shared with a new document-level bubble-phase trusted-`click` listener (`_installInvokerActivation`, gated on `isTrusted \|\| __obscura_trusted_input`). Also: a `commandfor` command invoker pointing at a showing popover now protects it from light dismiss (parity with `popovertarget`), and a DISABLED invoker protects nothing (light-dismisses normally). **+4.** |
-| `html/semantics/popovers/popover-light-dismiss.html` | 20/33 | **23/33** | 🟡 70% | **Quest #173 The Invoked Verdict.** Harness clicks on `popovertarget`/`commandfor` invokers now open/toggle their popovers (trusted-click activation). **+3.** |
+| `html/semantics/popovers/popover-light-dismiss.html` | 20/33 | **25/33** | 🟡 76% | **Quest #173 → #174.** #173: harness clicks on `popovertarget`/`commandfor` invokers now open/toggle their popovers (trusted-click activation, +3). #174: popovers inside shadow trees can now be shown, so their light-dismiss subtests pass (+2). |
 | `html/semantics/popovers/popover-light-dismiss-input-button.html` | 5/14 | **8/14** | 🟡 57% | **Quest #173 The Invoked Verdict.** `<input type=button popovertarget>` invoker activation on trusted click. **+3.** |
 | `html/semantics/popovers/popover-light-dismiss-disabled-button.html` | 1/3 | **3/3** | ✅ 100% | **Quest #173 The Invoked Verdict.** A disabled popovertarget/commandfor invoker no longer protects its popover from light dismiss — clicking it is an ordinary outside click. **+2.** |
 | `html/semantics/popovers/popover-invoking-attribute.html` | 1400/1402 | **1402/1402** | ✅ 100% | **Quest #173 The Invoked Verdict.** Trusted-click invoker activation. **+2.** |

@@ -17384,7 +17384,11 @@ try {
       return false;
     }
     if (!!el._popoverShowing !== expectedShowing) return false;
-    if (!el.isConnected) {
+    // Connectedness is shadow-INCLUDING: a popover inside a connected host's shadow
+    // tree is "connected to a document" per spec, but Obscura's `isConnected` getter
+    // walks only `parentNode` and stops at the shadow boundary. `_shadowConnected`
+    // jumps each shadow root to its host, so `showPopover()` works inside shadow DOM.
+    if (!globalThis._shadowConnected(el)) {
       if (throwEx) throw new DOMException(
         "Invalid on popover elements which aren't connected to a document.", "InvalidStateError");
       return false;
@@ -17444,6 +17448,21 @@ try {
     } finally { el._popoverHiding = false; }
   };
 
+  // Shadow-INCLUDING containment: is `node` an inclusive descendant of `anc`,
+  // crossing shadow boundaries (a shadow root jumps to its host)? Plain `contains`
+  // stops at the shadow boundary, so a popover nested inside a shadow-DOM ancestor
+  // popover would look unrelated and wrongly close it. Mirrors `_shadowConnected`.
+  const _shadowIncludes = (anc, node) => {
+    let n = node;
+    while (n) {
+      if (n === anc) return true;
+      let p = n.parentNode;
+      if (!p && _isSR(n)) p = n._shadowHost;
+      n = p;
+    }
+    return false;
+  };
+
   // HTML "topmost popover ancestor": the open popover that is the nearest flat-tree
   // ancestor of `newEl`, OR whose subtree contains the invoker `source`; whichever is
   // LATER in top-layer order wins. Returns null if there is no such ancestor.
@@ -17452,12 +17471,12 @@ try {
     let idx = -1;
     for (let i = 0; i < combined.length; i++) {
       const p = combined[i];
-      if (p !== newEl && p.contains && p.contains(newEl)) idx = i;
+      if (p !== newEl && _shadowIncludes(p, newEl)) idx = i;
     }
     let sidx = -1;
     if (source) for (let i = 0; i < combined.length; i++) {
       const p = combined[i];
-      if (p !== newEl && (p === source || (p.contains && p.contains(source)))) sidx = i;
+      if (p !== newEl && (p === source || _shadowIncludes(p, source))) sidx = i;
     }
     const a = Math.max(idx, sidx);
     return a >= 0 ? combined[a] : null;
@@ -17656,7 +17675,9 @@ try {
   globalThis._runPopoverInvoker = (invoker) => {
     if (invoker.disabled) return;
     let target = invoker._popoverTargetElement || null;
-    if (target && (!target.isConnected || target._nid === undefined)) target = null;
+    // Shadow-including connectedness (see `_checkPopoverValidity`): a target inside a
+    // connected host's shadow tree is valid, but `isConnected` stops at the boundary.
+    if (target && (!globalThis._shadowConnected(target) || target._nid === undefined)) target = null;
     if (!target) {
       const id = invoker.getAttribute('popovertarget');
       if (!id) return;
