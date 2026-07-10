@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #175).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #178).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/forms/the-input-element/input-list.html` | 0/6 | **6/6** | ✅ 100% | **Quest #178 The Suggestions Verdict.** New `HTMLInputElement.list` getter — the *suggestions source element*: `getRootNode().getElementById(list attr)` and return it only if it's a `<datalist>` (so an earlier non-datalist with the same ID wins → null, per getElementById tree-order). Returns null for the input types the `list` attribute doesn't apply to. **+6.** |
+| `html/semantics/forms/the-input-element/maxlength.html` | 3/5 | **5/5** | ✅ 100% | **Quest #178 The Suggestions Verdict.** `maxLength`/`minLength` reflect a `long` "limited to only non-negative numbers": the setter ToInt32-converts (non-numeric → 0), throws `IndexSizeError` on a negative value; the getter maps a negative content attribute to the default (-1). **+2.** |
 | `html/semantics/popovers/popover-top-layer-combinations.html` | 0/5 | **5/5** | ✅ 100% | **Quest #175 The Fullscreen Verdict.** Two fixes: (1) `showPopover()` on a non-modal open `<dialog>` (opened via `show()`) no longer throws — the popover-validity gate now keys on the dialog's is-modal flag (`_isModal`), not the bare `open` attribute (per spec, only a `showModal()` dialog blocks). (2) A partial Fullscreen API: `Element.requestFullscreen()`/`Document.exitFullscreen()`/`fullscreenElement`, the `:fullscreen` pseudo (new Rust flag), and a fullscreen-flag popover-validity throw. **+5.** |
 | `html/semantics/popovers/popover-top-layer-interactions.html` | 4/9 | **9/9** | ✅ 100% | **Quest #175 The Fullscreen Verdict.** The Fullscreen API state machine: `requestFullscreen` pushes onto a fullscreen element stack (every element matches `:fullscreen`, topmost is `document.fullscreenElement`) and supersedes open popovers via the shared `_topLayerHidePopovers`, but leaves modal dialogs and other fullscreen elements alone. State-machine only (no real fullscreen render). **+5.** |
 | `html/semantics/popovers/popover-shadow-dom.html` | 0/3 | **3/3** | ✅ 100% | **Quest #174 The Shadowed Verdict.** `showPopover()` inside a shadow tree no longer throws — the popover connectedness check is now shadow-INCLUDING (`_shadowConnected`, jumping each shadow root to its host) instead of the boundary-stopping `isConnected`. Same for the invoker's target-validity check. The "topmost popover ancestor" computation uses a shadow-including containment walk, so a popover nested inside a shadow-DOM ancestor popover is recognized as nested (not closed). **+3.** |

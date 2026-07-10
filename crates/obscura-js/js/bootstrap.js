@@ -19221,11 +19221,20 @@ function _cvReflStr(proto, prop, attr) {
     set(v) { this.setAttribute(attr, v == null ? "" : String(v)); },
   });
 }
+// maxLength/minLength reflect a `long` "limited to only non-negative numbers":
+// the getter maps a missing/invalid/negative content attribute to the default
+// (-1); the setter converts the JS value to a `long` (Web IDL ToInt32, so a
+// non-numeric value becomes 0) and throws IndexSizeError for a negative result.
 function _cvReflLong(proto, prop, attr) {
   Object.defineProperty(proto, prop, {
     configurable: true,
-    get() { const a = this.getAttribute(attr); if (a == null) return -1; const n = parseInt(a, 10); return isNaN(n) ? -1 : n; },
-    set(v) { this.setAttribute(attr, String(v)); },
+    get() { const a = this.getAttribute(attr); if (a == null) return -1; const n = parseInt(a, 10); return (isNaN(n) || n < 0) ? -1 : n; },
+    set(v) {
+      let n = Number(v);
+      n = isFinite(n) ? (n | 0) : 0;
+      if (n < 0) throw new DOMException("The value provided (" + n + ") is negative.", "IndexSizeError");
+      this.setAttribute(attr, String(n));
+    },
   });
 }
 {
@@ -19240,6 +19249,29 @@ function _cvReflLong(proto, prop, attr) {
   _cvReflStr(Input, "min", "min");
   _cvReflStr(Input, "max", "max");
   _cvReflStr(Input, "step", "step");
+
+  // HTML §4.10.5: the `list` IDL attribute returns the input's *suggestions
+  // source element* — the first element in tree order whose ID matches the
+  // `list` content attribute, but only when that element is a <datalist>
+  // (getElementById semantics, so an earlier non-datalist with the same ID
+  // wins and yields null). The attribute does not apply to the button-like /
+  // opaque input types, for which it always returns null.
+  const _listNoApply = new Set(["hidden", "password", "checkbox", "radio",
+    "file", "submit", "image", "reset", "button"]);
+  Object.defineProperty(Input, "list", {
+    configurable: true,
+    get() {
+      const t = (this.getAttribute("type") || "text").toLowerCase();
+      if (_listNoApply.has(t)) return null;
+      const id = this.getAttribute("list");
+      if (id == null || id === "") return null;
+      const root = this.getRootNode();
+      const cand = (root && typeof root.getElementById === "function")
+        ? root.getElementById(id)
+        : (this.ownerDocument ? this.ownerDocument.getElementById(id) : null);
+      return (cand && cand.tagName === "DATALIST") ? cand : null;
+    },
+  });
   // <textarea> default value is its child text content; the (non-dirty) value
   // tracks it. Setting it programmatically is not a user edit.
   Object.defineProperty(Textarea, "defaultValue", {
