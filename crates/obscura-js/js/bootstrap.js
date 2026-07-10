@@ -17692,6 +17692,38 @@ try {
     } catch (e) {}
   };
 
+  // HTML "click focusing steps": a pointer press on a focusable element focuses it.
+  // Real browsers run the focusing steps on `mousedown`, targeting the nearest
+  // click-focusable inclusive ancestor of the press target (click focusability
+  // includes `tabindex=-1`, which `_isFocusableArea` already admits). We install a
+  // bubble-phase `mousedown` listener that, for a TRUSTED, non-canceled press, walks
+  // from the target up to the first focusable area and focuses it. Sequencing is what
+  // makes the popover cases fall out: the WPT input bridge fires
+  // mousedown → pointerup → click, so this focus lands BEFORE popover light dismiss
+  // (pointerup) and invoker activation (click) — a click on an invoker button focuses
+  // the button, then the activation toggles/hides the popover; if that hide moves
+  // focus (the pressed control sat inside the closing popover, now display:none), the
+  // hide's focus-restoration wins because the pressed control is no longer focusable.
+  // Gated on trust (`isTrusted || __obscura_trusted_input`) so the untrusted click the
+  // `.click()` METHOD dispatches — which carries no `mousedown` anyway — never shifts
+  // focus (the passing scripted-`showPopover` cases rely on focus NOT moving to the
+  // invoker). A press on non-focusable content is a no-op here: we do not blur the
+  // current focus, keeping the change scoped to the observable "click focuses control"
+  // behavior the tests assert (no fixture depends on click-empty-space clearing focus).
+  globalThis._installClickFocus = () => {
+    try {
+      document.addEventListener('mousedown', (e) => {
+        if (!e || !(e.isTrusted || globalThis.__obscura_trusted_input)) return;
+        if (e.defaultPrevented) return;
+        let n = e.target;
+        while (n && n.nodeType === 1) {
+          if (globalThis._isFocusableArea(n)) { globalThis._performFocus(n); return; }
+          n = n.parentNode;
+        }
+      }, false);
+    } catch (e) {}
+  };
+
   // HTML "popover target attribute activation behavior": a button/input with a
   // popovertarget runs on activation (a real or scripted click that wasn't
   // canceled). Resolves the target (the popoverTargetElement IDL association or the
@@ -22831,6 +22863,7 @@ globalThis.__obscura_init = function() {
   // bootstrap, where document is still null).
   try { globalThis._installPopoverLightDismiss && globalThis._installPopoverLightDismiss(); } catch (e) {}
   try { globalThis._installInvokerActivation && globalThis._installInvokerActivation(); } catch (e) {}
+  try { globalThis._installClickFocus && globalThis._installClickFocus(); } catch (e) {}
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];

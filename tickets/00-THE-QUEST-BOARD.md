@@ -170,6 +170,33 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-10 (Quest #176 The Click-Focus Verdict — trusted-mousedown click focusing steps, +10):**
+Took #175's named next lever's neighbor — the widest clearly-diagnosed tail on the board: `popover-focus.html`
+(20/30), whose last 10 fails (the *"Popover button click focus"* + *"corner cases"* families) all died on one
+assertion: after `await clickOn(button)`, `document.activeElement` should be the clicked button but stayed on
+`priorFocus`. ROOT CAUSE — Obscura had no **HTML "click focusing steps"**: a trusted pointer press focused
+nothing (the focus model only moved focus via `focus()`/autofocus paths). #158, which built the focus model,
+had literally named this cap. **FIX (`bootstrap.js`, one new installer):** `globalThis._installClickFocus()` —
+a bubble-phase `mousedown` listener (installed by `__obscura_init` next to the light-dismiss/invoker
+installers) that, for a **trusted, non-canceled** press, walks from `e.target` up to the first
+`_isFocusableArea` and `_performFocus`es it. The WPT bridge fires `mousedown → pointerup → click`, so this
+focus lands BEFORE popover light dismiss (pointerup) and invoker activation (click) — a click on an invoker
+focuses the button, THEN the toggle/dismiss runs; when the pressed control sat *inside* the closing popover it
+becomes `display:none` → unfocusable, so `_restorePreviousFocus` (already gated on "focus is inside the
+closing element") correctly returns focus to `priorFocus`. Two scoping choices: **trusted-only** (the scripted
+`.click()` METHOD dispatches an untrusted click with no `mousedown`, so it never shifts focus — the *passing*
+"Popover focus test" family relies on focus NOT moving to the invoker) and **focus-only, never blur** (a press
+on non-focusable content is a no-op; no fixture needs click-empty-space to clear focus, and blurring broadly
+is too wide a primitive to risk). `popover-focus` **20/30 → 30/30**. **Zero regressions** (fresh-server
+measured — two apparent dips, top-layer-combinations 3/5 and light-dismiss 24, were server degradation, cleared
+to 5/5 and 25 on restart): popover-attribute-basic 195, popover-invoking-attribute 1402, popover-light-dismiss
+25, popover-light-dismiss-command 8, popover-light-dismiss-hint 9, popover-shadow-dom 3, top-layer-combinations
+5/5, top-layer-interactions 9/9, qsa 1975, classlist 1420, createElement 147, dispatchEvent 25, Element-matches
+669, all-global-events 375, dialog-showModal 8/10 (pre-existing layout cap), dialog-close 5. **Caps:**
+click-focus is mousedown-scoped and focus-only — grep `_installClickFocus` before touching pointer→focus.
+**Next:** cross-document pointerdown/up pairing (`popover-light-dismiss` ~8 fails); scripting-errors exact
+error line/col. Scroll `tickets/176-the-click-focus-verdict.md`.
+
 **Session 2026-07-10 (Quest #175 The Fullscreen Verdict — dialog/fullscreen ↔ popover top-layer, +10):**
 Took #174's named #1 next lever: the dialog/fullscreen ↔ popover top-layer interaction tests. Two
 distinct root causes. **(1) The dialog gate:** `popover-top-layer-combinations` opens a `<dialog>`
