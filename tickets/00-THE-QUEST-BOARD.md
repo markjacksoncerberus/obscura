@@ -170,6 +170,30 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-10 (Quest #177 The Activation Verdict — input checkbox/radio activation behavior + radio-group exclusivity, +13):**
+Pivoted off the now-heavily-mined popover tail to a fresh wide primitive: the HTML **input-element activation
+behavior** for checkbox/radio. `checkbox.html` (2/6) and `radio.html` (3/12) shared one realm — the pre-activation
+toggle, the legacy-canceled-activation revert, the trusted `input`→`change` event pair, and (for radio) **radio
+button group mutual exclusion**. THREE fixes, all `bootstrap.js`: **(1)** the `checked` IDL setter now unchecks every
+other member of a radio's group when a radio's checkedness becomes true (group = same tree root + same non-empty
+`name` + same form owner via `_cvRadioGroup`; unchecks siblings with a direct `_dom("set_checked",…,"0")` so there's
+no re-entrancy) — this alone carries 8 of radio's 9 fails, which set `.checked` directly and never reach `.click()`.
+**(2)** `_cvRadioGroup` upgraded from the ancestor-only `_cvFormOwner` to the full `_ceiFormOwner` (honors the
+`form=` id-reference attribute) so radios associated to a form by id group correctly. **(3)** `.click()` gained the
+full activation behavior: a disabled checkbox/radio is a complete no-op; pre-activation clears `indeterminate` +
+toggles (checkbox) or remembers the group's prior checked member + sets checked (radio); canceled-activation (click
+`preventDefault`-ed) restores checkbox `checked`/`indeterminate` or re-checks the radio's remembered member; a
+non-canceled click fires a trusted, bubbling, non-cancelable `input` then `change` via the new
+`_fireInputThenChange` helper (dispatched through `_dispatchSpec` with `isTrusted=true`, so the events are trusted
+while the `.click()`-initiated click event stays untrusted — exactly what the tests assert). checkbox **2/6→6/6**,
+radio **3/12→12/12**. **Zero regressions:** form-validation-validity-valueMissing 78/78, select-validity 5/6
+(pre-existing cap), popover-invoking-attribute 1402, popover-light-dismiss 25, popover-focus 30/30,
+EventTarget-dispatchEvent 25, qsa 1975, DOMTokenList 6/6, Element-matches 669, createElement 147, type-change-state
+380/380. **Caps:** no name-change/form-owner-change re-evaluation of an already-checked radio (exclusivity runs on the
+checkedness→true setter, which covers every fixture); no parse-time group de-dup. Grep `set checked` / `_cvRadioGroup`
+before touching radio grouping. **Next:** cross-document pointerdown/up pairing (`popover-light-dismiss` ~8 fails);
+scripting-errors exact line/col. Scroll `tickets/177-the-activation-verdict.md`.
+
 **Session 2026-07-10 (Quest #176 The Click-Focus Verdict — trusted-mousedown click focusing steps, +10):**
 Took #175's named next lever's neighbor — the widest clearly-diagnosed tail on the board: `popover-focus.html`
 (20/30), whose last 10 fails (the *"Popover button click focus"* + *"corner cases"* families) all died on one

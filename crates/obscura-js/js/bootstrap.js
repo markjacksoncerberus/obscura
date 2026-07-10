@@ -2974,45 +2974,69 @@ class Element extends Node {
   insertAdjacentElement(position, element) { return this._insertAdjacentNode(position, element); }
   insertAdjacentText(position, text) { this._insertAdjacentNode(position, document.createTextNode(String(text))); }
   click() {
-    // Pre-click activation: a checkbox toggles its checkedness, a radio becomes
-    // checked. Reverted if the click event's default action is prevented.
     const _ct = this.localName === 'input' ? (this.getAttribute('type') || 'text').toLowerCase() : '';
-    let _preChecked = null;
-    if (_ct === 'checkbox') { _preChecked = this.checked; this.checked = !this.checked; }
-    else if (_ct === 'radio') { _preChecked = this.checked; this.checked = true; }
+    const _checkable = _ct === 'checkbox' || _ct === 'radio';
+    // A disabled checkbox/radio is non-mutable: its click() runs no activation and
+    // fires no events (the "run synthetic click activation steps" are inert for a
+    // disabled form control — HTML §the-input-element).
+    if (_checkable && _cvIsDisabled(this)) return;
+    // Legacy-pre-activation behavior: a checkbox toggles its checkedness and clears
+    // its indeterminate flag; a radio remembers the group's currently-checked member
+    // then becomes checked (which unchecks its group via the `checked` setter). The
+    // saved state drives legacy-canceled-activation if the click is preventDefault-ed.
+    let _restore = null;
+    if (_ct === 'checkbox') {
+      _restore = { checked: this.checked, indet: this.indeterminate, prev: null };
+      this.indeterminate = false;
+      this.checked = !this.checked;
+    } else if (_ct === 'radio') {
+      const _prev = _cvRadioGroup(this).find(r => r !== this && r.checked) || null;
+      _restore = { checked: this.checked, prev: _prev };
+      this.checked = true;
+    }
     const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true, composed: true}));
-    if (cancelled && _preChecked !== null) this.checked = _preChecked;
-    if (!cancelled) {
-      // Popover + command invoker activation. Shared with the document-level trusted-
-      // click activation path (`_installInvokerActivation`) so a real (trusted) click on
-      // an invoker — not just the scripted `.click()` method — runs its activation.
-      globalThis._runInvokerActivation(this);
-      const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
-      if (link) {
-        const href = link.getAttribute('href');
-        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-          location.assign(href);
-          return;
-        }
+    if (cancelled) {
+      // Legacy-canceled-activation behavior: restore the pre-activation state. For a
+      // radio, re-check the previously-checked group member (if any).
+      if (_ct === 'checkbox') { this.checked = _restore.checked; this.indeterminate = _restore.indet; }
+      else if (_ct === 'radio') { this.checked = false; if (_restore.prev) _restore.prev.checked = true; }
+      return;
+    }
+    if (_checkable) {
+      // Input-element activation behavior: fire a trusted, bubbling, non-cancelable
+      // `input` event, then a `change` event (HTML §the-input-element).
+      _fireInputThenChange(this);
+      return;
+    }
+    // Popover + command invoker activation. Shared with the document-level trusted-
+    // click activation path (`_installInvokerActivation`) so a real (trusted) click on
+    // an invoker — not just the scripted `.click()` method — runs its activation.
+    globalThis._runInvokerActivation(this);
+    const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
+    if (link) {
+      const href = link.getAttribute('href');
+      if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+        location.assign(href);
+        return;
       }
-      const type = (this.getAttribute('type') || '').toLowerCase();
-      // A <button> is a submit button in the Submit state, OR in the Auto state (missing
-      // /invalid type) only when it has NEITHER a command nor a commandfor attribute —
-      // a command invoker in the Auto state is not a submit button (HTML §invokers).
-      const _isSubmitBtn = type === 'submit' ||
-        (this.localName === 'button' && type !== 'button' && type !== 'reset'
-         && !this.hasAttribute('command') && !this.hasAttribute('commandfor'));
-      if (_isSubmitBtn) {
-        // Resolve the form owner via the `form=` attribute or ancestry (HTML §form owner).
-        const form = _ceiFormOwner(this) || (this.closest ? this.closest('form') : null);
-        if (form && typeof form.submit === 'function') {
-          form.submit(this);
-        }
-      } else if (type === 'reset' && (this.localName === 'button' || this.localName === 'input')) {
-        // A reset button's activation behavior (HTML §4.10.6.1) resets its form owner.
-        const form = _ceiFormOwner(this) || (this.closest ? this.closest('form') : null);
-        if (form && typeof form.reset === 'function') form.reset();
+    }
+    const type = (this.getAttribute('type') || '').toLowerCase();
+    // A <button> is a submit button in the Submit state, OR in the Auto state (missing
+    // /invalid type) only when it has NEITHER a command nor a commandfor attribute —
+    // a command invoker in the Auto state is not a submit button (HTML §invokers).
+    const _isSubmitBtn = type === 'submit' ||
+      (this.localName === 'button' && type !== 'button' && type !== 'reset'
+       && !this.hasAttribute('command') && !this.hasAttribute('commandfor'));
+    if (_isSubmitBtn) {
+      // Resolve the form owner via the `form=` attribute or ancestry (HTML §form owner).
+      const form = _ceiFormOwner(this) || (this.closest ? this.closest('form') : null);
+      if (form && typeof form.submit === 'function') {
+        form.submit(this);
       }
+    } else if (type === 'reset' && (this.localName === 'button' || this.localName === 'input')) {
+      // A reset button's activation behavior (HTML §4.10.6.1) resets its form owner.
+      const form = _ceiFormOwner(this) || (this.closest ? this.closest('form') : null);
+      if (form && typeof form.reset === 'function') form.reset();
     }
   }
   focus() {
@@ -3083,7 +3107,22 @@ class Element extends Node {
   // Phase 0b: checked state lives in the Rust DOM so it's visible to the
   // selector engine (:checked) and consistent across all access paths.
   get checked() { return _dom("get_checked", this._nid, "") === "1"; }
-  set checked(v) { _dom("set_checked", this._nid, v ? "1" : "0"); }
+  set checked(v) {
+    const on = !!v;
+    _dom("set_checked", this._nid, on ? "1" : "0");
+    // Radio button group exclusivity (HTML §radio-button-state): when a radio's
+    // checkedness becomes true, every OTHER radio in its group is unchecked. The
+    // group is the set of same-name radios sharing this element's tree and form
+    // owner (_cvRadioGroup). Unchecking others directly (not via this setter)
+    // avoids re-entrancy — setting checkedness to false never triggers exclusion.
+    if (on && this.localName === 'input' && (this.getAttribute('type') || '').toLowerCase() === 'radio') {
+      const grp = _cvRadioGroup(this);
+      for (let i = 0; i < grp.length; i++) {
+        const other = grp[i];
+        if (other !== this && other.checked) _dom("set_checked", other._nid, "0");
+      }
+    }
+  }
   // The `indeterminate` IDL flag lives in the Rust DOM so :indeterminate (which
   // the selector engine evaluates) reflects JS-set state across all access paths.
   get indeterminate() { return _dom("get_indeterminate", this._nid, "") === "1"; }
@@ -5947,6 +5986,19 @@ const _fireElementError = function(el) {
   // See _fireIframeElementLoad: an un-activated markup `onerror` still runs once.
   if (!el['__ehon_onerror']) { const a = el.getAttribute && el.getAttribute('onerror'); if (a) { try { (0, eval)(a); } catch (e) {} } }
 };
+
+// Fire the input-element activation events: a trusted, bubbling, non-cancelable
+// `input` event followed by a `change` event (HTML §the-input-element — the
+// activation behavior of a checkbox/radio after a non-canceled click). Dispatched
+// via _dispatchSpec so isTrusted stays true (the public dispatchEvent clears it).
+function _fireInputThenChange(el) {
+  for (const type of ['input', 'change']) {
+    const ev = new Event(type, { bubbles: true, cancelable: false });
+    ev.isTrusted = true;
+    ev.target = el;
+    try { _dispatchSpec(el, ev); } catch (e) {}
+  }
+}
 
 // Load a subresource referenced by an element (<img src>, <link href>,
 // <script src>, <object data>): fetch the bytes, record a
@@ -18719,11 +18771,14 @@ function _cvRadioGroup(el) {
   let list = null;
   try { if (root.querySelectorAll) list = root.querySelectorAll("input"); } catch (e) { list = null; }
   if (!list) return [el];
-  const owner = _cvFormOwner(el);
+  // Group membership uses the FULL form-owner algorithm (_ceiFormOwner honors the
+  // `form=` attribute, not just an ancestor <form>) so radios associated to a form
+  // by id reference group correctly (HTML §radio-button-group).
+  const owner = _ceiFormOwner(el);
   const group = [];
   for (const c of list) {
     if (c.localName === "input" && _cvInputType(c) === "radio" &&
-        (c.name || "") === name && _cvFormOwner(c) === owner) group.push(c);
+        (c.name || "") === name && _ceiFormOwner(c) === owner) group.push(c);
   }
   return group.length ? group : [el];
 }
