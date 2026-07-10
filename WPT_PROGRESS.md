@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #172).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #173).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/popovers/popover-light-dismiss-command.html` | 4/14 | **8/14** | 🟡 57% | **Quest #173 The Invoked Verdict.** A *trusted* (harness/user) click now runs invoker activation. Extracted the popover + command invoker activation out of `.click()` into `_runInvokerActivation`, shared with a new document-level bubble-phase trusted-`click` listener (`_installInvokerActivation`, gated on `isTrusted \|\| __obscura_trusted_input`). Also: a `commandfor` command invoker pointing at a showing popover now protects it from light dismiss (parity with `popovertarget`), and a DISABLED invoker protects nothing (light-dismisses normally). **+4.** |
+| `html/semantics/popovers/popover-light-dismiss.html` | 20/33 | **23/33** | 🟡 70% | **Quest #173 The Invoked Verdict.** Harness clicks on `popovertarget`/`commandfor` invokers now open/toggle their popovers (trusted-click activation). **+3.** |
+| `html/semantics/popovers/popover-light-dismiss-input-button.html` | 5/14 | **8/14** | 🟡 57% | **Quest #173 The Invoked Verdict.** `<input type=button popovertarget>` invoker activation on trusted click. **+3.** |
+| `html/semantics/popovers/popover-light-dismiss-disabled-button.html` | 1/3 | **3/3** | ✅ 100% | **Quest #173 The Invoked Verdict.** A disabled popovertarget/commandfor invoker no longer protects its popover from light dismiss — clicking it is an ordinary outside click. **+2.** |
+| `html/semantics/popovers/popover-invoking-attribute.html` | 1400/1402 | **1402/1402** | ✅ 100% | **Quest #173 The Invoked Verdict.** Trusted-click invoker activation. **+2.** |
+| `html/semantics/popovers/popover-hint-hierarchy.html` | 4/5 | **5/5** | ✅ 100% | **Quest #173 The Invoked Verdict.** Trusted-click invoker activation. **+1.** |
 | `html/webappapis/scripting/events/onerroreventhandler.html` | 0/3 | **3/3** | ✅ 100% | **Quest #171 The Framed-Error Verdict.** In-frame `document.body.outerHTML = "<body onerror=…></body>"` now replaces the body (Rust fragment parse uses the element's own tag as context — `html` context yields a real body) AND the reflected onerror fires: `_IframeDocument` masks raw-text (`<script>`) before its structural `<html>/<head>/<body>` strip (was corrupting the frame script's `"<body …>"` literal → empty), `_IframeWindow.onerror` is a real OnErrorEventHandler listener, frame element/window handlers resolve free idents against the frame window (where frame-script top-level `function`s are hoisted at program start). **+3.** |
 | `html/webappapis/scripting/events/event-handler-sourcetext.html` | 0/5 | **5/5** | ✅ 100% | **Quest #168 The Scope-Chain Verdict.** Compiled handler is a function literally named `on<type>` — 5-arg `(event, source, lineno, colno, error)` for onerror on Window/body/frameset, else `(event)` — so `.toString()` is exactly `function on<type>(<params>) {\n<src>\n}`. **+5.** |
 | `html/webappapis/scripting/events/compile-event-handler-symbol-unscopables.html` | 0/3 | **3/3** | ✅ 100% | **Quest #168.** Handler body runs inside nested `with(...)` which natively honours `Symbol.unscopables`; added extensible `@@unscopables` objects to Element/Document/DocumentFragment prototypes. **+3.** |

@@ -2983,38 +2983,10 @@ class Element extends Node {
     const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true, composed: true}));
     if (cancelled && _preChecked !== null) this.checked = _preChecked;
     if (!cancelled) {
-      // Popover invoker activation: a button/input with popovertarget toggles/shows/
-      // hides its referenced popover — UNLESS the control actually performs a form
-      // action (a submit/reset/image button that has a form owner), in which case the
-      // form action wins and the popover is left alone (per chromium issue 329118508).
-      if ((this.localName === 'button' || this.localName === 'input')
-          && (this.hasAttribute('popovertarget') || this._popoverTargetElement)) {
-        const _t = (this.getAttribute('type') || '').toLowerCase();
-        const _isInput = this.localName === 'input';
-        // <button> is always an invoker candidate; <input> only for its button types.
-        const _candidate = _isInput
-          ? (_t === 'button' || _t === 'submit' || _t === 'reset' || _t === 'image')
-          : true;
-        if (_candidate) {
-          const _formAction = _isInput
-            ? (_t === 'submit' || _t === 'reset' || _t === 'image')
-            : (_t !== 'button' && _t !== 'menu');
-          const _hasForm = _formAction && !!(this.form || (this.closest && this.closest('form')));
-          if (!_hasForm) globalThis._runPopoverInvoker(this);
-        }
-      }
-      // Command invoker activation (HTML §invokers): a <button> whose commandfor names
-      // a target runs its command. Per the button activation behavior, when the button
-      // has a form owner the form action wins for the Submit / Reset / Auto states (the
-      // algorithm returns before the command steps); only the Button state — or having
-      // no form owner at all — reaches the command. `_runCommandInvoker` resolves the
-      // target and no-ops when there is none.
-      if (this.localName === 'button' && this.hasAttribute('commandfor')) {
-        const _ct2 = (this.getAttribute('type') || '').toLowerCase();
-        // The form owner honors the `form=` attribute association, not just ancestry.
-        const _hasForm2 = !!_ceiFormOwner(this);
-        if (!_hasForm2 || _ct2 === 'button') globalThis._runCommandInvoker(this);
-      }
+      // Popover + command invoker activation. Shared with the document-level trusted-
+      // click activation path (`_installInvokerActivation`) so a real (trusted) click on
+      // an invoker — not just the scripted `.click()` method — runs its activation.
+      globalThis._runInvokerActivation(this);
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
         const href = link.getAttribute('href');
@@ -17613,6 +17585,69 @@ try {
     for (const p of doomed) _hidePopoverInstance(p, false, undefined, false);
   };
 
+  // The combined popover + command invoker activation behavior for one element, run
+  // when a non-canceled click reaches an activatable invoker (HTML "activation behavior"
+  // of a button/input). Shared by the `.click()` method and the document-level trusted-
+  // click path so a real click activates too. A control that actually performs a form
+  // action (a submit/reset/image button with a form owner) leaves its popover alone
+  // (chromium issue 329118508); the command path likewise defers to the form action for
+  // the Submit/Reset/Auto states, reaching the command only in the Button state or with
+  // no form owner at all.
+  globalThis._runInvokerActivation = (el) => {
+    if (!el || el.nodeType !== 1) return;
+    if ((el.localName === 'button' || el.localName === 'input')
+        && (el.hasAttribute('popovertarget') || el._popoverTargetElement)) {
+      const _t = (el.getAttribute('type') || '').toLowerCase();
+      const _isInput = el.localName === 'input';
+      // <button> is always an invoker candidate; <input> only for its button types.
+      const _candidate = _isInput
+        ? (_t === 'button' || _t === 'submit' || _t === 'reset' || _t === 'image')
+        : true;
+      if (_candidate) {
+        const _formAction = _isInput
+          ? (_t === 'submit' || _t === 'reset' || _t === 'image')
+          : (_t !== 'button' && _t !== 'menu');
+        const _hasForm = _formAction && !!(el.form || (el.closest && el.closest('form')));
+        if (!_hasForm) globalThis._runPopoverInvoker(el);
+      }
+    }
+    if (el.localName === 'button' && el.hasAttribute('commandfor')) {
+      const _ct2 = (el.getAttribute('type') || '').toLowerCase();
+      // The form owner honors the `form=` attribute association, not just ancestry.
+      const _hasForm2 = !!_ceiFormOwner(el);
+      if (!_hasForm2 || _ct2 === 'button') globalThis._runCommandInvoker(el);
+    }
+  };
+
+  // Document-level trusted-click activation. A dispatched click event carries NO
+  // activation behavior of its own — only the `.click()` method ran invoker activation,
+  // so a real (harness/user) click on a `popovertarget`/`commandfor` control never
+  // toggled its popover. This installs a bubble-phase document listener that, for a
+  // TRUSTED, non-canceled click, walks from the click target up to the nearest invoker
+  // ancestor and runs its activation. Gated on trust (`isTrusted || __obscura_trusted_input`,
+  // the same WPT-bridge flag the light dismiss uses) so a page's own
+  // `dispatchEvent(new MouseEvent('click'))` — which is untrusted — activates nothing, and
+  // the untrusted click that `.click()` itself dispatches (which already runs activation
+  // inline) does not double-fire here.
+  globalThis._installInvokerActivation = () => {
+    try {
+      document.addEventListener('click', (e) => {
+        if (!e || !(e.isTrusted || globalThis.__obscura_trusted_input)) return;
+        if (e.defaultPrevented) return;
+        let n = e.target;
+        while (n && n.nodeType === 1) {
+          if ((n.localName === 'button' || n.localName === 'input')
+              && (n.hasAttribute('popovertarget') || n._popoverTargetElement
+                  || n.hasAttribute('commandfor'))) {
+            globalThis._runInvokerActivation(n);
+            return;
+          }
+          n = n.parentNode;
+        }
+      }, false);
+    } catch (e) {}
+  };
+
   // HTML "popover target attribute activation behavior": a button/input with a
   // popovertarget runs on activation (a real or scripted click that wasn't
   // canceled). Resolves the target (the popoverTargetElement IDL association or the
@@ -17731,13 +17766,26 @@ try {
     if (!clicked) {
       let n = target;
       while (n && n.nodeType === 1) {
+        const root = n.getRootNode ? n.getRootNode() : document;
+        // A DISABLED invoker is inert — it activates nothing and protects nothing, so
+        // clicking it is just an ordinary outside click that light-dismisses normally.
+        if (n.disabled) { n = n.parentElement; continue; }
+        // A `popovertarget` invoker (button/input) protects the popover it controls.
         if ((n.localName === 'button' || n.localName === 'input') &&
             (n.hasAttribute('popovertarget') || n._popoverTargetElement)) {
           const id = n.getAttribute('popovertarget');
-          const root = n.getRootNode ? n.getRootNode() : document;
           const tgt = n._popoverTargetElement ||
             (id && root && root.getElementById ? root.getElementById(id) : null);
           if (tgt && tgt._popoverShowing) { clicked = tgt; break; }
+        }
+        // A command invoker (a <button> with `commandfor`) pointing at a showing
+        // popover likewise protects it — clicking the invoker again shouldn't
+        // light-dismiss the popover it controls (HTML light-dismiss ancestry).
+        if (n.localName === 'button' && (n.hasAttribute('commandfor') || n._commandForElement)) {
+          const cid = n.getAttribute('commandfor');
+          const ctgt = n._commandForElement ||
+            (cid && root && root.getElementById ? root.getElementById(cid) : null);
+          if (ctgt && ctgt._popoverShowing) { clicked = ctgt; break; }
         }
         n = n.parentElement;
       }
@@ -22655,6 +22703,7 @@ globalThis.__obscura_init = function() {
   // listeners on the live document (they cannot be registered at top-level
   // bootstrap, where document is still null).
   try { globalThis._installPopoverLightDismiss && globalThis._installPopoverLightDismiss(); } catch (e) {}
+  try { globalThis._installInvokerActivation && globalThis._installInvokerActivation(); } catch (e) {}
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];

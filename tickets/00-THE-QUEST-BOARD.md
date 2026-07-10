@@ -168,6 +168,26 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-10 (Quest #173 The Invoked Verdict — trusted-click invoker activation + command-invoker light-dismiss protection, +15):**
+Took #172's named next lever: a *trusted* `click` carried no activation behavior. Popover
+(`popovertarget`) and command (`commandfor`) invoker activation lived only inside the `.click()`
+**method**, so the harness clicking an invoker button never showed/toggled its popover — dozens of
+`clickOn(invoker)`-then-assert-open subtests failed at the first assertion. **FIX (`bootstrap.js`):
+(1)** extracted the two invoker blocks out of `.click()` into `_runInvokerActivation(el)` and shared
+it with a new document-level bubble-phase trusted-`click` listener (`_installInvokerActivation`,
+installed by `__obscura_init` after the doc is bound, gated on `isTrusted || __obscura_trusted_input` —
+so scripted `.click()`'s own untrusted dispatch and page-synthesized clicks never double-activate).
+**(2)** `_popoverClickedTarget` (light-dismiss "clicked node") now recognizes `commandfor` invokers
+too, protecting the showing popover they control from dismiss. **(3)** a `disabled` invoker protects
+nothing — an early `n.disabled` skip in the walk, which both killed a regression the commandfor branch
+would have caused and took `popover-light-dismiss-disabled-button` 1/3→3/3. **+15, ZERO regressions:**
+popover-light-dismiss-command 4→8, popover-light-dismiss 20→23, -input-button 5→8, -disabled-button
+1→3, popover-invoking-attribute 1400→1402, popover-hint-hierarchy 4→5. Swept clean: qsa 1975,
+createElement 147, DOMTokenList, dispatchEvent 25, all-global-events 375, and the whole popover realm.
+**NEXT:** shadow-DOM popover connectedness (`popover-shadow-dom` 0/3 — `showPopover()` throws inside a
+shadow tree; connectedness check must be shadow-inclusive); cross-document pointerdown/up pairing;
+popover Tab-focus (`popover-focus` 11/30). Scroll `tickets/173-the-invoked-verdict.md`.
+
 **Session 2026-07-10 (Quest #172 The Dismissed Verdict — popover light dismiss finally fires (live-document listener) + the pointerup/trusted-input spec model, +61):**
 Pivoted out of the scripting-errors realm into the widest untouched tail on the board: the popover
 family, where `popover-attribute-basic.html` alone sat at 159/249 with ~90 failing subtests all
