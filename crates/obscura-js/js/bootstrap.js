@@ -976,6 +976,13 @@ class CSSStyleDeclaration {
       const c = _canonCssUi(name, stored);
       if (c === null) return;
       stored = c;
+    } else if (!custom && _CSSTEXT_VALIDATED.has(name)) {
+      // css-text longhands + the text-wrap/white-space shorthands: validate +
+      // canonicalize the grammar (invalid → ignore). Precedes the length/_MATH_GATE
+      // branches (tab-size/word-spacing/letter-spacing are fully handled here).
+      const c = _canonCssText(name, stored);
+      if (c === null) return;
+      stored = c;
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
       if (/^(?:alpha|contrast-color)\(/i.test(stored.trim()) && !_isValidColor(stored)) return;  // invalid alpha()/contrast-color() → ignore
@@ -7822,6 +7829,9 @@ const _GCS_DEFAULTS = {
   'text-transform': 'none', 'text-wrap': 'wrap', 'text-wrap-mode': 'wrap',
   'text-wrap-style': 'auto', 'white-space': 'normal', 'white-space-collapse': 'collapse',
   'word-break': 'normal', 'word-spacing': '0px', 'word-wrap': 'normal',
+  'text-autospace': 'normal', 'text-spacing-trim': 'normal', 'text-group-align': 'none',
+  'word-space-transform': 'none', 'hyphenate-character': 'auto', 'hyphenate-limit-chars': 'auto',
+  'text-spacing': 'normal',
   // css-fonts properties (all inherited). font-size/font-weight/line-height
   // already modelled above. font-family has no fixed initial in the spec
   // (implementation-defined) so the test skips its initial assertion.
@@ -10850,6 +10860,8 @@ const _INHERITED_PROPS = new Set([
   'text-fit', 'text-indent', 'text-justify', 'text-transform', 'text-wrap',
   'text-wrap-mode', 'text-wrap-style', 'white-space', 'white-space-collapse',
   'word-break', 'word-spacing', 'word-wrap',
+  'text-autospace', 'text-spacing-trim', 'text-spacing', 'word-space-transform',
+  'hyphenate-character', 'hyphenate-limit-chars',       // (text-group-align does NOT inherit)
   // css-fonts: every property in this family inherits.
   'font-family', 'font-feature-settings', 'font-kerning', 'font-language-override',
   'font-optical-sizing', 'font-size-adjust', 'font-stretch', 'font-style',
@@ -11177,6 +11189,256 @@ const _canonCssUi = (name, value) => {
     if (_isZeroTok(t)) return '0px';
     if (_isLengthTok(t)) return _canonLineWidth(t);
     return null;
+  }
+  return s;
+};
+
+// ── CSS Text (css-text) value parsing ────────────────────────────────────────
+// These longhands (and the text-wrap/white-space shorthands) stored their value
+// RAW — no grammar check — so every `*-invalid` value was wrongly accepted and its
+// test scored 0/N. `_canonCssText` validates + canonicalizes each; a null return
+// means "invalid → ignore the declaration" (matching CSSOM). CSS-wide keywords and
+// var()/env() pass through untouched. Most css-text computed values equal the
+// specified serialization (keyword identity), so registration (in _GCS_DEFAULTS +
+// _INHERITED_PROPS) plus this specified-time canon is all that's needed; the length
+// longhands (word-spacing/letter-spacing/text-indent/tab-size) resolve through the
+// computed length machinery, and hyphenate-limit-chars rounds its calc() at computed
+// time (both handled in _normComputed).
+//
+// Enumerated longhands: value is EXACTLY one listed keyword (serialized lower-case);
+// no multi-value form (a 2nd token is always invalid).
+const _CSSTEXT_ENUM = {
+  'text-wrap-mode': new Set(['wrap', 'nowrap']),
+  'text-wrap-style': new Set(['auto', 'balance', 'stable', 'pretty']),
+  'white-space-collapse': new Set(['collapse', 'preserve', 'preserve-breaks', 'preserve-spaces', 'break-spaces']),
+  'word-break': new Set(['normal', 'keep-all', 'break-all', 'break-word', 'auto-phrase', 'manual']),
+  'line-break': new Set(['auto', 'loose', 'normal', 'strict', 'anywhere']),
+  'hyphens': new Set(['none', 'manual', 'auto']),
+  'text-justify': new Set(['auto', 'none', 'inter-word', 'inter-character', 'distribute']),
+  'text-align': new Set(['start', 'end', 'left', 'right', 'center', 'justify', 'match-parent', 'justify-all']),
+  'text-align-last': new Set(['auto', 'start', 'end', 'left', 'right', 'center', 'justify', 'match-parent']),
+  'text-align-all': new Set(['start', 'end', 'left', 'right', 'center', 'justify', 'match-parent']),
+  'overflow-wrap': new Set(['normal', 'break-word', 'anywhere']),
+  'word-wrap': new Set(['normal', 'break-word', 'anywhere']),
+  'text-spacing-trim': new Set(['normal', 'auto', 'space-all', 'trim-both', 'trim-all', 'trim-start', 'space-first']),
+  'text-group-align': new Set(['none', 'start', 'end', 'left', 'right', 'center']),
+};
+// `||`-combination longhands: each token belongs to exactly one ordered CATEGORY
+// (a Set), at most one token per category, unknown token → invalid. A `singletons`
+// keyword must stand alone. `requireCats` lists category indices of which ≥1 must be
+// present. When `preserveOrder`, tokens serialize in their specified order (the
+// property's canonical order IS the specified order); otherwise they serialize in
+// canonical category order. Returns the canonical string or null.
+const _ccOrderedCanon = (value, cats, opts) => {
+  opts = opts || {};
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length === 0) return null;
+  const lows = toks.map((t) => t.toLowerCase());
+  if (opts.singletons && lows.some((l) => opts.singletons.has(l)))
+    return (toks.length === 1 && opts.singletons.has(lows[0])) ? lows[0] : null;
+  const slot = new Array(cats.length).fill(null);
+  const order = [];
+  for (const l of lows) {
+    let ci = -1;
+    for (let i = 0; i < cats.length; i++) if (cats[i].has(l)) { ci = i; break; }
+    if (ci < 0 || slot[ci] !== null) return null;          // unknown keyword or duplicate category
+    slot[ci] = l; order.push(l);
+  }
+  if (opts.requireCats && !opts.requireCats.some((i) => slot[i] !== null)) return null;
+  return (opts.preserveOrder ? order : slot.filter((x) => x !== null)).join(' ');
+};
+const _CCSET = {
+  // text-transform: none | math-auto | [capitalize|uppercase|lowercase] || full-width || full-size-kana
+  'text-transform': { cats: [new Set(['capitalize', 'uppercase', 'lowercase']), new Set(['full-width']), new Set(['full-size-kana'])],
+    opts: { singletons: new Set(['none', 'math-auto']) } },
+  // text-autospace: normal|auto|no-autospace | [ideograph-alpha||ideograph-numeric||punctuation] || [insert|replace]
+  'text-autospace': { cats: [new Set(['ideograph-alpha']), new Set(['ideograph-numeric']), new Set(['punctuation']), new Set(['insert', 'replace'])],
+    opts: { singletons: new Set(['normal', 'auto', 'no-autospace']), requireCats: [0, 1, 2] } },
+  // word-space-transform: none | [space|ideographic-space] || auto-phrase (order preserved)
+  'word-space-transform': { cats: [new Set(['space', 'ideographic-space']), new Set(['auto-phrase'])],
+    opts: { singletons: new Set(['none']), requireCats: [0], preserveOrder: true } },
+  // hanging-punctuation: none | [first || [force-end|allow-end] || last] (order preserved)
+  'hanging-punctuation': { cats: [new Set(['first']), new Set(['force-end', 'allow-end']), new Set(['last'])],
+    opts: { singletons: new Set(['none']), preserveOrder: true } },
+};
+// A single <length-percentage> token → canonical form (or null if not one). Bare
+// non-zero numbers are invalid (unitless `0` is a valid zero <length> → `0px`);
+// calc()/math is folded via the length math canon (percentage-first reordering).
+const _canonLenPctSigned = (tok, allowPct) => {
+  const t = String(tok).trim();
+  if (_MATHFN_NAME_RE.test(t)) {
+    if (!allowPct && /%/.test(t)) return null;
+    return _canonMathExpr(t, { canonLen: true }) || t;
+  }
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(t)) return _isZeroTok(t) ? '0px' : null;
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(t)) return allowPct ? t.replace(/^\+/, '') : null;
+  if (_isLengthTok(t)) return _canonStandardValue(t);
+  return null;
+};
+// The css-text SHORTHANDS collapse (text-wrap-mode, text-wrap-style) / (white-space-
+// collapse, text-wrap-mode) into a SINGLE canonicalized keyword (we store them as one
+// key, not expanded longhands — lower risk to cssText round-trips; the parsing tests
+// only observe each shorthand's own serialization).
+const _canonTextWrap = (s) => {
+  const toks = _wsTokens(String(s).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  let mode = null, style = null;
+  for (const t of toks) {
+    const l = t.toLowerCase();
+    if (l === 'wrap' || l === 'nowrap') { if (mode) return null; mode = l; }
+    else if (l === 'auto' || l === 'balance' || l === 'stable' || l === 'pretty') { if (style) return null; style = l; }
+    else return null;
+  }
+  if (!mode && !style) return null;
+  mode = mode || 'wrap'; style = style || 'auto';
+  if (style === 'auto') return mode;                 // default style omitted → the mode keyword
+  if (mode === 'nowrap') return 'nowrap ' + style;   // non-default mode kept, style after
+  return style;                                      // default `wrap` mode omitted
+};
+const _WS_COLLAPSE = new Set(['collapse', 'preserve', 'preserve-breaks', 'break-spaces']);
+// (white-space-collapse | text-wrap-mode) → the legacy white-space keyword, if any.
+const _WS_LEGACY = {
+  'collapse|wrap': 'normal', 'collapse|nowrap': 'nowrap', 'preserve|wrap': 'pre-wrap',
+  'preserve|nowrap': 'pre', 'preserve-breaks|wrap': 'pre-line', 'break-spaces|wrap': 'break-spaces',
+};
+// A legacy white-space keyword → its (collapse, mode) pair.
+const _WS_KEYWORD = {
+  normal: ['collapse', 'wrap'], pre: ['preserve', 'nowrap'], nowrap: ['collapse', 'nowrap'],
+  'pre-wrap': ['preserve', 'wrap'], 'pre-line': ['preserve-breaks', 'wrap'], 'break-spaces': ['break-spaces', 'wrap'],
+};
+const _canonWhiteSpace = (s) => {
+  const toks = _wsTokens(String(s).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  let collapse = null, mode = null;
+  if (toks.length === 1) {
+    const l = toks[0].toLowerCase();
+    if (_WS_KEYWORD[l]) [collapse, mode] = _WS_KEYWORD[l];
+    else if (_WS_COLLAPSE.has(l)) { collapse = l; mode = 'wrap'; }
+    else if (l === 'wrap' || l === 'nowrap') { collapse = 'collapse'; mode = l; }
+    else return null;
+  } else {
+    for (const t of toks) {
+      const l = t.toLowerCase();
+      if (_WS_COLLAPSE.has(l)) { if (collapse) return null; collapse = l; }
+      else if (l === 'wrap' || l === 'nowrap') { if (mode) return null; mode = l; }
+      else return null;                              // a legacy keyword can't combine
+    }
+    collapse = collapse || 'collapse'; mode = mode || 'wrap';
+  }
+  return _WS_LEGACY[collapse + '|' + mode] || (collapse + ' ' + mode);
+};
+// text-spacing shorthand = <'text-spacing-trim'> || <'text-autospace'>, but only the
+// SIMPLE component values (the ideograph-* autospace forms aren't in the shorthand).
+// `none` = (space-all, no-autospace); `auto` = (auto, auto) — both stand alone.
+const _TSP_TRIM = new Set(['space-all', 'trim-both', 'trim-all', 'trim-start', 'space-first']);
+const _canonTextSpacing = (s) => {
+  const toks = _wsTokens(String(s).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  const lows = toks.map((t) => t.toLowerCase());
+  if (lows.some((l) => l === 'none' || l === 'auto'))          // magic singletons
+    return (toks.length === 1) ? lows[0] : null;
+  let trim = null, autospace = null;
+  for (const l of lows) {
+    if (_TSP_TRIM.has(l)) { if (trim) return null; trim = l; }
+    else if (l === 'no-autospace') { if (autospace) return null; autospace = l; }
+    else if (l !== 'normal') return null;                      // `normal` is the shared default
+  }
+  trim = trim || 'normal'; autospace = autospace || 'normal';
+  if (trim === 'space-all' && autospace === 'no-autospace') return 'none';
+  const parts = [];
+  if (trim !== 'normal') parts.push(trim);
+  if (autospace !== 'normal') parts.push(autospace);
+  return parts.length ? parts.join(' ') : 'normal';
+};
+// text-fit = none | [ [ grow | shrink ] [ consistent | per-line | per-line-all ]?
+// <percentage>? ]. Order is fixed (sizing, scope, percentage).
+const _TFIT_SCOPE = new Set(['consistent', 'per-line', 'per-line-all']);
+const _canonTextFit = (s) => {
+  const toks = _wsTokens(String(s).trim());
+  if (toks.length === 1 && toks[0].toLowerCase() === 'none') return 'none';
+  if (toks.length < 1 || toks.length > 3) return null;
+  const sizing = toks[0].toLowerCase();
+  if (sizing !== 'grow' && sizing !== 'shrink') return null;
+  let i = 1, scope = null, pct = null;
+  if (i < toks.length && _TFIT_SCOPE.has(toks[i].toLowerCase())) { scope = toks[i].toLowerCase(); i++; }
+  if (i < toks.length) {
+    if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(toks[i])) { pct = toks[i].replace(/^\+/, ''); i++; }
+    else return null;
+  }
+  if (i !== toks.length) return null;                          // leftover token (e.g. `grow 150% consistent`)
+  return [sizing, scope, pct].filter(Boolean).join(' ');
+};
+// Properties `_canonCssText` handles (dispatched from setProperty ahead of the
+// generic length/math branches).
+const _CSSTEXT_VALIDATED = new Set([
+  ...Object.keys(_CSSTEXT_ENUM), ...Object.keys(_CCSET),
+  'word-spacing', 'letter-spacing', 'tab-size', 'text-indent',
+  'hyphenate-character', 'hyphenate-limit-chars', 'text-wrap', 'white-space',
+  'text-spacing', 'text-fit',
+]);
+const _canonCssText = (name, value) => {
+  const s = String(value).trim();
+  const low = s.toLowerCase();
+  if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(s)) return s;   // CSS-wide / var()/env() → pass through
+  const enumSet = _CSSTEXT_ENUM[name];
+  if (enumSet) { const toks = _wsTokens(s); return (toks.length === 1 && enumSet.has(low)) ? low : null; }
+  if (_CCSET[name]) return _ccOrderedCanon(s, _CCSET[name].cats, _CCSET[name].opts);
+  if (name === 'text-wrap') return _canonTextWrap(s);
+  if (name === 'white-space') return _canonWhiteSpace(s);
+  if (name === 'text-spacing') return _canonTextSpacing(s);
+  if (name === 'text-fit') return _canonTextFit(s);
+  if (name === 'word-spacing' || name === 'letter-spacing') {
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;                     // `normal 10px` / `10% 10px` → invalid
+    return low === 'normal' ? 'normal' : _canonLenPctSigned(toks[0], true);
+  }
+  if (name === 'tab-size') {                                // <number [0,∞]> | <length [0,∞]> (no %)
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    if (_MATHFN_NAME_RE.test(t)) return /%/.test(t) ? null : (_canonMathExpr(t, { canonLen: true }) || t);
+    const numM = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)$/i.exec(t);
+    if (numM) return parseFloat(numM[1]) < 0 ? null : t.replace(/^\+/, '');
+    if (/%$/.test(t)) return null;
+    if (_isLengthTok(t)) return /^-/.test(t) ? null : _canonStandardValue(t);
+    return null;
+  }
+  if (name === 'text-indent') {                            // <length-percentage> && hanging? && each-line?
+    const toks = _wsTokens(s);
+    if (toks.length < 1 || toks.length > 3) return null;
+    let lenTok = null, hanging = false, eachLine = false;
+    for (const t of toks) {
+      const l = t.toLowerCase();
+      if (l === 'hanging') { if (hanging) return null; hanging = true; continue; }
+      if (l === 'each-line') { if (eachLine) return null; eachLine = true; continue; }
+      if (lenTok !== null) return null;                     // a second <length-percentage>
+      const c = _canonLenPctSigned(t, true);
+      if (c === null) return null;
+      lenTok = c;
+    }
+    if (lenTok === null) return null;                       // the <length-percentage> is required
+    return [lenTok, hanging ? 'hanging' : null, eachLine ? 'each-line' : null].filter(Boolean).join(' ');
+  }
+  if (name === 'hyphenate-character') {                     // auto | <string>
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    if (t.toLowerCase() === 'auto') return 'auto';
+    if (/^"(?:[^"\\]|\\.)*"$/.test(t) || /^'(?:[^'\\]|\\.)*'$/.test(t)) return _canonStandardValue(t);
+    return null;
+  }
+  if (name === 'hyphenate-limit-chars') {                   // [ auto | <integer [0,∞]> ]{1,3}
+    const toks = _wsTokens(s);
+    if (toks.length < 1 || toks.length > 3) return null;
+    const vals = [];
+    for (const t of toks) {
+      if (t.toLowerCase() === 'auto') { vals.push('auto'); continue; }
+      if (/^\+?\d+$/.test(t)) { vals.push(String(parseInt(t, 10))); continue; }
+      if (_MATHFN_NAME_RE.test(t)) { vals.push(_canonStandardValue(t)); continue; }  // calc kept; computed rounds
+      return null;                                          // 1.2 / normal / none → invalid
+    }
+    while (vals.length > 1 && vals[vals.length - 1] === vals[vals.length - 2]) vals.pop();  // collapse trailing dup
+    return vals.join(' ');
   }
   return s;
 };
@@ -13596,6 +13858,30 @@ const _computeTimeValue = (v, el) => {
 };
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  // css-text computed forms that differ from the specified serialization.
+  if (kebab === 'text-justify' && String(v).trim().toLowerCase() === 'distribute') return 'inter-character';
+  if (kebab === 'text-fit') {                              // computed drops the default `consistent` scope
+    const t = _wsTokens(String(v).trim());
+    return t.filter((x) => x.toLowerCase() !== 'consistent').join(' ') || v;
+  }
+  if (kebab === 'hyphenate-limit-chars') {                 // round each <integer> (calc → integer), then collapse
+    const toks = _wsTokens(String(v).trim());
+    const out = toks.map((t) => (t.toLowerCase() === 'auto' ? 'auto' : (_computeIntegerValue(el, t) || t)));
+    while (out.length > 1 && out[out.length - 1] === out[out.length - 2]) out.pop();
+    return out.join(' ');
+  }
+  if (kebab === 'tab-size') {                              // <number> stays; <length> resolves to px, clamps ≥0
+    const s = String(v).trim();
+    if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(s)) return s;
+    return _clampNegPx(_trComp(v, el, true, _vpUnits()));
+  }
+  if (kebab === 'text-indent') {                           // resolve the <length-percentage>, keep the trailing keywords
+    const toks = _wsTokens(String(v).trim());
+    const kws = toks.filter((t) => { const l = t.toLowerCase(); return l === 'hanging' || l === 'each-line'; });
+    const lenTok = toks.find((t) => { const l = t.toLowerCase(); return l !== 'hanging' && l !== 'each-line'; });
+    if (lenTok == null) return v;
+    return [_trComp(lenTok, el, true, _vpUnits()), ...kws].join(' ');
+  }
   if (_POSITION_PROPS.has(kebab)) return _serializePositionComputed(el, v);
   if (kebab === 'offset-rotate') return _computeOffsetRotate(v);
   if (kebab === 'offset-distance') return _computeOffsetDistance(el, v);
@@ -17106,6 +17392,10 @@ globalThis.CSS = {
       if (_CSSUI_VALIDATED.has(name)) {                  // box-sizing/resize/outline-*/caret-color/…
         if (/\bvar\(/i.test(val)) return true;
         return _canonCssUi(name, _canonStandardValue(val)) != null;
+      }
+      if (_CSSTEXT_VALIDATED.has(name)) {                // css-text longhands + text-wrap/white-space
+        if (/\bvar\(/i.test(val)) return true;
+        return _canonCssText(name, _canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);
