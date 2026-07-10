@@ -330,10 +330,29 @@ const _ehFormOwner = function(el) {
     return el.closest ? el.closest('form') : null;
   } catch (e) { return null; }
 };
-// The scope objects for an element/document handler, OUTERMOST-first (document …
-// element). A Window handler resolves only through the global, so [] here.
+// The Window a node belongs to, resolved from its TREE ROOT (robust to a
+// freshly-parsed frame node whose `ownerDocument` mis-resolves to the main document
+// because it isn't `_ownerDoc`-tagged). Returns the main window (globalThis) for a
+// main-document node, the frame window for an in-frame node, or null.
+const _windowForNode = function(node) {
+  try {
+    let r = node;
+    while (r && r.parentNode) r = r.parentNode;
+    const d = (r && r.nodeType === 9) ? r : (r && r.ownerDocument) || (node && node.ownerDocument);
+    return (d && d.defaultView) || null;
+  } catch (e) { return null; }
+};
+// The scope objects for an element/document handler, OUTERMOST-first (frame-window …
+// document … element). A Window handler resolves only through the global, so [] here.
+// For an in-FRAME element the frame window is prepended as the outermost user scope:
+// a frame's top-level `function foo(){}` lives on the frame window (Option C hoist),
+// not the realm global, so a `<span onclick='foo()'>` in that frame must see it.
 const _ehScopeChain = function(target) {
   const chain = [];
+  if (target && (target.nodeType === 1 || target.nodeType === 9)) {
+    const fw = _windowForNode(target);
+    if (fw && fw !== globalThis) chain.push(fw);
+  }
   if (target && target.nodeType === 1) {
     const doc = target.ownerDocument; if (doc) chain.push(doc);
     const fo = _ehFormOwner(target); if (fo) chain.push(fo);
@@ -428,10 +447,13 @@ const _BODY_WIN_REFLECT_SET = new Set(['onblur', 'onerror', 'onfocus', 'onload',
 // browsing context → null, and the reflection is inert (getter null, setter no-op),
 // matching HTML's "the element's node document's relevant global object" only
 // applying when that document has a browsing context.
-const _bodyReflectWin = function(el) {
-  try { const d = el && el.ownerDocument; return (d && d.defaultView) || null; }
-  catch (e) { return null; }
-};
+// Resolve the reflecting Window from the element's TREE ROOT (see _windowForNode),
+// not a bare `el.ownerDocument`: a body freshly parsed by `outerHTML`/`innerHTML`
+// into a frame document isn't `_ownerDoc`-tagged, so its `ownerDocument`
+// mis-resolves to the MAIN document — and a `<body onerror>` set through a frame's
+// `document.body.outerHTML` would then reflect onto the top window instead of the
+// frame's. Walking to the root recovers the correct frame Window.
+const _bodyReflectWin = function(el) { return _windowForNode(el); };
 // Does `el` reflect `name` onto its Window? (body/frameset + a reflecting name).
 // instanceof only — no bridge crossing on the setAttribute hot path.
 const _isBodyWinReflect = function(el, name) {
@@ -446,9 +468,15 @@ const _bodyWinSetContentAttr = function(el, name, source) {
   const w = _bodyReflectWin(el);
   if (!w) return;
   let fn = null;
-  // The reflected handler is a Window's own handler → global-only scope; onerror is
-  // the 5-arg OnErrorEventHandler form (event-handler-sourcetext test 5).
-  try { fn = _ehMakeFn(name, name === 'onerror', source, []); } catch (e) { _reportError(e); fn = null; }
+  // The reflected handler is a Window's own handler → its scope is that Window's
+  // global. For the MAIN window that IS globalThis (empty chain). For a FRAME window
+  // it's a plain object whose top-level frame-script decls hang off it (Option C
+  // `new Function` locals hoisted onto the frame window by _runFrameProgram), so wrap
+  // the handler in `with(frameWin)` — else a `<body onerror='check1(…)'>` set through
+  // a frame's document.body can't resolve the frame script's `check1`. onerror is the
+  // 5-arg OnErrorEventHandler form (event-handler-sourcetext test 5).
+  const chain = (w === globalThis) ? [] : [w];
+  try { fn = _ehMakeFn(name, name === 'onerror', source, chain); } catch (e) { _reportError(e); fn = null; }
   w[name] = fn;
 };
 const _bodyWinRemoveContentAttr = function(el, name) {
@@ -5799,10 +5827,11 @@ const _runFrameScript = function(code, win, url) {
 // reads off contentWindow, like run()/setupRangeTests, must be hoisted).
 const _scanTopLevelDecls = function(code) {
   const names = new Set();
-  const re = /(?:^|\n)[ \t]*(?:async[ \t]+)?(?:function[ \t]*\*?|var|let|const|class)[ \t]+([A-Za-z_$][\w$]*)/g;
+  const funcs = new Set();
+  const re = /(?:^|\n)[ \t]*(?:async[ \t]+)?(function[ \t]*\*?|var|let|const|class)[ \t]+([A-Za-z_$][\w$]*)/g;
   let m;
-  while ((m = re.exec(code))) names.add(m[1]);
-  return names;
+  while ((m = re.exec(code))) { names.add(m[2]); if (m[1].indexOf('function') === 0) funcs.add(m[2]); }
+  return { names, funcs };
 };
 
 // Run a frame's classic scripts as ONE concatenated program so they share a
@@ -5817,11 +5846,21 @@ const _scanTopLevelDecls = function(code) {
 const _runFrameProgram = function(parts, win, baseUrl) {
   if (!parts || !parts.length || !win) return;
   const names = new Set();
+  const funcs = new Set();
   let body = '';
   for (const p of parts) {
     body += '\n' + (p.code || '') + '\n//# sourceURL=' + (p.url || baseUrl || 'about:blank-frame') + '\n';
-    for (const n of _scanTopLevelDecls(p.code || '')) names.add(n);
+    const d = _scanTopLevelDecls(p.code || '');
+    for (const n of d.names) names.add(n);
+    for (const n of d.funcs) funcs.add(n);
   }
+  // Function declarations are hoisted to the top of the wrapper, so mirror them onto
+  // the frame window at the START of the body (not just the finally): a markup event
+  // handler that fires SYNCHRONOUSLY during the script — e.g. a `<body onerror>` set
+  // via document.body.outerHTML, then window.dispatchEvent — resolves the frame's
+  // top-level `function check1(){…}` only if it's already on the window at fire time.
+  let head = '';
+  for (const n of funcs) head += 'try{window[' + JSON.stringify(n) + ']=' + n + ';}catch(__e){}';
   let tail = '';
   for (const n of names) tail += 'try{window[' + JSON.stringify(n) + ']=' + n + ';}catch(__e){}';
   try {
@@ -5833,7 +5872,7 @@ const _runFrameProgram = function(parts, win, baseUrl) {
     const fn = new Function(
       'window', 'self', 'document', 'location', 'parent', 'top', 'frames',
       'frameElement', 'globalThis',
-      'try {\n' + body + '\n} finally {\n' + tail + '\n}'
+      'try {\n' + head + '\n' + body + '\n} finally {\n' + tail + '\n}'
     );
     fn.call(win, win, win, win.document, win.location, win.parent, win.top,
             win.frames, win.frameElement, win);
@@ -20917,14 +20956,28 @@ class _IframeDocument extends DetachedDocument {
       }
       return;
     }
+    // The strip below is a NAIVE regex over the whole markup, so it would also eat
+    // `<body>`/`<head>`/`<html>` tags that appear as literal TEXT inside a raw-text
+    // element (`<script>`/`<style>`/`<textarea>`/`<title>`) — e.g. a WPT frame whose
+    // script does `document.body.outerHTML = "<body onerror=…></body>"`. Mask each
+    // raw-text block to an opaque placeholder first, strip on the masked text, then
+    // restore, so structural tags are only removed from real document structure.
+    const _rawStash = [];
+    const _masked = String(html || '').replace(
+      /<(script|style|textarea|title)\b[^>]*>[\s\S]*?<\/\1\s*>/gi,
+      (m) => { _rawStash.push(m); return ' RAW' + (_rawStash.length - 1) + ' '; }
+    );
+    const _unmask = (s) => s.replace(/ RAW(\d+) /g, (m, i) => _rawStash[+i] ?? m);
     // The explicit <html>/<head>/<body> start tags get stripped below (we parse
     // into a synthetic scaffold), which would discard any attributes on them.
     // Real parsers merge those attributes onto the implicit html/head/body, and
     // WPT relies on it (e.g. <html id=html lang=en>, <body id=body>), so copy
     // them onto the scaffold elements first — reusing the real attribute parser.
+    // Match on the masked markup so a `<body …>` inside a script isn't mistaken
+    // for the document's real body start tag.
     const _copyStartTagAttrs = (tagName, target) => {
       if (!target) return;
-      const m = String(html || '').match(new RegExp('<' + tagName + '\\b([^>]*)>', 'i'));
+      const m = _masked.match(new RegExp('<' + tagName + '\\b([^>]*)>', 'i'));
       if (!m || !m[1] || !m[1].trim()) return;
       try {
         const tmp = globalThis.document.createElement('div');
@@ -20941,12 +20994,12 @@ class _IframeDocument extends DetachedDocument {
     // then lift the metadata elements into <head>, mirroring the parser's
     // implicit head construction. <script> is left in the tree and executed
     // later by _executeFrameScripts (innerHTML never runs scripts).
-    var inner = String(html || '')
+    var inner = _unmask(_masked
       .replace(/^﻿?\s*<!DOCTYPE[^>]*>/i, '')
       .replace(/<\/?html[^>]*>/gi, '')
       .replace(/<\/?head[^>]*>/gi, '')
       .replace(/<\/?body[^>]*>/gi, '')
-      .replace(/^\s+/, '');
+      .replace(/^\s+/, ''));
     // XHTML: trailing whitespace after </html> would otherwise land as a stray text
     // node in <body>, polluting documentElement.textContent (XML has no such node).
     if (kind === 'xhtml') inner = inner.replace(/\s+$/, '');
@@ -21085,6 +21138,30 @@ class _IframeWindow {
     if (originUrl) {
       try { this.location.origin = new URL(originUrl).origin; } catch(e) {}
     }
+    // This frame window's `onerror` is a real OnErrorEventHandler `error`-listener
+    // (mirroring the main window, Quest #169) rather than a plain data prop — so a
+    // <body onerror> reflected onto this window (via _bodyReflectWin) OR a direct
+    // `frameWin.onerror = fn` registers an ordered `error` listener that fires on
+    // `frameWin.dispatchEvent(errorEvent)`. Own null slots avoid the Proxy's
+    // globalThis fallback leaking the main window's onerror when this frame's is unset.
+    this.__winon_error = null;
+    this.__winon_error_w = null;
+    Object.defineProperty(this, 'onerror', {
+      configurable: true, enumerable: true,
+      get() { return this.__winon_error || null; },
+      set(fn) {
+        const curW = this.__winon_error_w;
+        if (curW) this.removeEventListener('error', curW);
+        this.__winon_error = (typeof fn === 'function') ? fn : null;
+        if (this.__winon_error) {
+          const wl = _makeOnErrorListener(this.__winon_error);
+          this.__winon_error_w = wl;
+          this.addEventListener('error', wl);
+        } else {
+          this.__winon_error_w = null;
+        }
+      },
+    });
     // Same-origin frames share the page's single JS realm, so anything the frame
     // window doesn't define itself (global constructors like DOMException/Node/
     // Event, etc.) falls through to globalThis. Frame-specific props (document,

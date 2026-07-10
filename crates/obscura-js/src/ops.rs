@@ -421,8 +421,16 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
                 dom.detach(*child);
             }
             if !arg2.is_empty() {
-                let fragment = obscura_dom::parse_fragment(&arg2);
-                let import_root = fragment.find_body_or_root();
+                // Per HTML §fragment parsing, the element itself is the context —
+                // markup parses differently under `table`/`tr`/`html` than under a
+                // hardcoded `body` (see parse_fragment_ctx). Fall back to `body` for
+                // a non-element target (e.g. a bare document root).
+                let ctx = dom
+                    .get_node(target)
+                    .and_then(|n| n.as_element().map(|name| name.local.as_ref().to_string()))
+                    .unwrap_or_else(|| "body".to_string());
+                let fragment = obscura_dom::parse_fragment_ctx(&arg2, &ctx);
+                let import_root = fragment.fragment_root();
                 dom.import_children_from(target, &fragment, import_root);
             }
             if recording {

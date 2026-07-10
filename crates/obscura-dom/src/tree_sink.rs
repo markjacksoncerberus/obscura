@@ -267,10 +267,26 @@ pub fn parse_html(html: &str) -> DomTree {
 }
 
 pub fn parse_fragment(html: &str) -> DomTree {
-    use html5ever::tendril::TendrilSink;
-    use html5ever::{parse_fragment, ParseOpts, QualName};
+    parse_fragment_ctx(html, "body")
+}
 
-    let context_name = QualName::new(None, ns!(html), local_name!("body"));
+/// Fragment-parse `html` using an HTML element named `context_local` as the
+/// fragment-parsing context element (HTML §html-fragment-parsing-algorithm).
+///
+/// The context element governs the parser's initial insertion mode, so the
+/// same markup parses differently under different contexts — e.g. a bare
+/// `<td>` survives under a `tr`/`table` context but is dropped under `body`,
+/// and a `<body onerror>` token yields a real `body` element only under an
+/// `html` context (under `body`/`div` it is a stray body start-tag and its
+/// attributes are dropped). `element.innerHTML` and the `outerHTML` setter
+/// therefore MUST parse with the real element as context, not a hardcoded
+/// `body` — otherwise `document.body.outerHTML = "<body …></body>"` (whose
+/// context per spec is the parent `<html>`) loses the new body entirely.
+pub fn parse_fragment_ctx(html: &str, context_local: &str) -> DomTree {
+    use html5ever::tendril::TendrilSink;
+    use html5ever::{parse_fragment, LocalName, ParseOpts, QualName};
+
+    let context_name = QualName::new(None, ns!(html), LocalName::from(context_local));
     let tree = DomTree::new();
     parse_fragment(tree, ParseOpts::default(), context_name, vec![])
         .from_utf8()
@@ -343,5 +359,27 @@ mod tests {
         let text = tree.text_content(tree.document());
         assert!(text.contains("Hello"));
         assert!(text.contains("World"));
+    }
+
+    #[test]
+    fn parse_fragment_ctx_html_yields_body() {
+        // <body …> is a stray body start-tag under `body`/`div` context (dropped),
+        // but under an `html` context it produces a real head+body pair — the
+        // behaviour `document.body.outerHTML = "<body …></body>"` depends on.
+        let elem_name = |tree: &DomTree, c: NodeId| -> Option<String> {
+            tree.get_node(c).and_then(|n| n.as_element().map(|q| q.local.as_ref().to_string()))
+        };
+        let dropped = parse_fragment_ctx("<body id=x></body>", "body");
+        assert!(dropped
+            .children(dropped.fragment_root())
+            .iter()
+            .all(|c| elem_name(&dropped, *c).as_deref() != Some("body")));
+        let kept = parse_fragment_ctx("<body id=x></body>", "html");
+        let names: Vec<String> = kept
+            .children(kept.fragment_root())
+            .iter()
+            .filter_map(|c| elem_name(&kept, *c))
+            .collect();
+        assert!(names.contains(&"body".to_string()), "html-context should yield a body, got {names:?}");
     }
 }

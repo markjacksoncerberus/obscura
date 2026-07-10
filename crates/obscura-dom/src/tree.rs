@@ -1144,6 +1144,28 @@ impl DomTree {
         self.append_child(parent_id, text_id);
     }
 
+    /// The root that holds a fragment's parsed nodes as its direct children.
+    ///
+    /// `parse_fragment[_ctx]` wraps parsed content in a synthetic `html`
+    /// element (the fragment-parsing "root"); its children ARE the fragment.
+    /// Unlike [`find_body_or_root`], this never descends into a `body` child —
+    /// crucial when the context element is `html`, where the fragment legitimately
+    /// contains `head`/`body` elements we want to import *as* nodes rather than
+    /// unwrapping. Returns the document itself if there is no element child.
+    pub fn fragment_root(&self) -> NodeId {
+        let doc = self.document();
+        for child in self.children(doc) {
+            if self
+                .get_node(child)
+                .map(|n| n.as_element().is_some())
+                .unwrap_or(false)
+            {
+                return child;
+            }
+        }
+        doc
+    }
+
     pub fn find_body_or_root(&self) -> NodeId {
         let doc = self.document();
         for child in self.children(doc) {
