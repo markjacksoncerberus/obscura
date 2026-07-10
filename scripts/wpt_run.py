@@ -180,7 +180,13 @@ TESTDRIVER_BRIDGE_JS = r"""
         clientX: x, clientY: y, screenX: x, screenY: y,
         button: button || 0, buttons: buttons || 0, detail: detail || 0});
     } catch (e) { return null; }
+    // Mark injected input as trusted for the dispatch's duration: real WebDriver
+    // actions produce isTrusted events, so UA behaviour gated on trust (e.g. popover
+    // light dismiss) must fire — while a page's own dispatchEvent(new MouseEvent(...))
+    // stays untrusted. Restored right after (synchronous dispatch).
+    var _pt = globalThis.__obscura_trusted_input; globalThis.__obscura_trusted_input = true;
     try { target.dispatchEvent(ev); } catch (e) {}
+    globalThis.__obscura_trusted_input = _pt;
     return ev;
   };
   const firePointer = (type, target, x, y, button, buttons) => {
@@ -194,7 +200,9 @@ TESTDRIVER_BRIDGE_JS = r"""
         : new MouseEvent(type, {bubbles: true, cancelable: true, composed: true,
             clientX: x, clientY: y, button: button < 0 ? 0 : button, buttons: buttons || 0});
     } catch (e) { return; }
+    var _pt = globalThis.__obscura_trusted_input; globalThis.__obscura_trusted_input = true;
     try { target.dispatchEvent(ev); } catch (e) {}
+    globalThis.__obscura_trusted_input = _pt;
   };
   const fireKeyCmd = (c) => {
     var target = document.activeElement || document.body || document.documentElement;

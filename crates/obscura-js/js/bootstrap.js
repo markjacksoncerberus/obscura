@@ -17715,22 +17715,19 @@ try {
     }
   };
 
-  // Light dismiss: a pointerdown outside the open auto/hint popover stack closes it.
-  // `target` is the event target (our CDP input bridge hit-tests to <body> for
-  // out-of-popover coordinates, which is correctly "outside"). Closes every open
-  // auto/hint popover that is not the clicked popover or an ancestor of it; an
-  // invoker whose target is open counts as clicking that popover (so its own toggle
-  // isn't undone). Runs only when auto/hint popovers are actually open.
-  globalThis._popoverLightDismiss = (target) => {
-    if (_popoverAutoStack.length === 0 || !target) return;
-    // The clicked popover: the deepest open auto/hint popover containing the target.
+  // Light dismiss (HTML §"light dismiss open popovers"). The clicked popover for a
+  // pointer target: the deepest open auto/hint popover containing the target, or —
+  // when the target is outside every popover — an open popover whose invoker the
+  // target is inside (so clicking an invoker doesn't undo its own toggle). null when
+  // the pointer landed fully outside the popover stack.
+  const _popoverClickedTarget = (target) => {
+    if (!target) return null;
     let clicked = null;
     for (const p of _popoverAutoStack) {
       if (p === target || (p.contains && p.contains(target))) {
         if (!clicked || (clicked.contains && clicked.contains(p))) clicked = p;
       }
     }
-    // An invoker for an open popover protects that popover from light dismiss.
     if (!clicked) {
       let n = target;
       while (n && n.nodeType === 1) {
@@ -17745,6 +17742,10 @@ try {
         n = n.parentElement;
       }
     }
+    return clicked;
+  };
+  // Hide every open auto/hint popover that is not `clicked` (or an ancestor of it).
+  const _popoverDismissExcept = (clicked) => {
     const snapshot = _popoverAutoStack.slice();
     for (let i = snapshot.length - 1; i >= 0; i--) {
       const p = snapshot[i];
@@ -17752,11 +17753,51 @@ try {
       _hidePopoverInstance(p, true);
     }
   };
-  try {
-    const _ld = (e) => { try { globalThis._popoverLightDismiss(e && e.target); } catch (x) {} };
-    document.addEventListener('pointerdown', _ld, true);
-    document.addEventListener('mousedown', _ld, true);
-  } catch (e) {}
+  // The spec light-dismisses on the pointer-UP: the popover that was under the
+  // pointer-DOWN is remembered, and on the matching pointer-up the popovers not
+  // related to that pointerdown target are hidden. This is what lets a drag that
+  // starts inside a popover and ends outside it leave the popover open, and makes a
+  // bare pointerdown (with no pointerup) NOT dismiss. `_popoverPdownSeen` guards the
+  // pointerup path so a stray pointerup (no preceding pointerdown) is inert.
+  let _popoverPdownClicked = null;
+  let _popoverPdownSeen = false;
+  globalThis._popoverLightDismissDown = (target) => {
+    if (_popoverAutoStack.length === 0) { _popoverPdownSeen = false; return; }
+    _popoverPdownSeen = true;
+    _popoverPdownClicked = _popoverClickedTarget(target);
+  };
+  globalThis._popoverLightDismissUp = (target) => {
+    if (!_popoverPdownSeen) return;
+    _popoverPdownSeen = false;
+    if (_popoverAutoStack.length === 0) { _popoverPdownClicked = null; return; }
+    const clicked = _popoverPdownClicked;
+    _popoverPdownClicked = null;
+    _popoverDismissExcept(clicked);
+  };
+  // Back-compat single-shot dismiss (compute + hide immediately for a target).
+  globalThis._popoverLightDismiss = (target) => {
+    if (_popoverAutoStack.length === 0 || !target) return;
+    _popoverDismissExcept(_popoverClickedTarget(target));
+  };
+  // Attach the light-dismiss listeners to the LIVE document. This popover block runs
+  // at top-level bootstrap, where `globalThis.document` is still null (it is bound
+  // later, in __obscura_init) — so registering here silently no-ops and light dismiss
+  // never fires. Expose an installer that __obscura_init calls once the document
+  // exists, so the pointer capture listeners land on the real document. Only TRUSTED
+  // pointer input (real user input; our automation bridge marks its injected events
+  // via `__obscura_trusted_input`) light-dismisses — a page's own `dispatchEvent(new
+  // PointerEvent(...))` must NOT close popovers.
+  globalThis._installPopoverLightDismiss = () => {
+    try {
+      const _trusted = (e) => !!(e && (e.isTrusted || globalThis.__obscura_trusted_input));
+      const _down = (e) => { if (_trusted(e)) try { globalThis._popoverLightDismissDown(e && e.target); } catch (x) {} };
+      const _up = (e) => { if (_trusted(e)) try { globalThis._popoverLightDismissUp(e && e.target); } catch (x) {} };
+      document.addEventListener('pointerdown', _down, true);
+      document.addEventListener('mousedown', _down, true);
+      document.addEventListener('pointerup', _up, true);
+      document.addEventListener('mouseup', _up, true);
+    } catch (e) {}
+  };
 
   // Process a close request (the Escape key / platform "close" gesture). Invoked as
   // the default action of a *trusted* Escape keydown by the CDP Input bridge — only
@@ -22609,6 +22650,11 @@ globalThis.__obscura_init = function() {
     globalThis.document = _docProxy;
     _cache.set(_docNid, _docProxy);
   }
+
+  // Now that `document` is bound, install the popover light-dismiss capture
+  // listeners on the live document (they cannot be registered at top-level
+  // bootstrap, where document is still null).
+  try { globalThis._installPopoverLightDismiss && globalThis._installPopoverLightDismiss(); } catch (e) {}
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];

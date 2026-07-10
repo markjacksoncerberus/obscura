@@ -168,7 +168,46 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-10 (Quest #172 The Dismissed Verdict — popover light dismiss finally fires (live-document listener) + the pointerup/trusted-input spec model, +61):**
+Pivoted out of the scripting-errors realm into the widest untouched tail on the board: the popover
+family, where `popover-attribute-basic.html` alone sat at 159/249 with ~90 failing subtests all
+ending in the same assertion — *"popover=auto should light-dismiss expected false got true"*. Root
+cause, found by narrowing to a same-origin `srcdoc`/`data:` repro driven over CDP: **light dismiss
+never fired at all.** The listener was registered at *top-level bootstrap* — `document.addEventListener
+('pointerdown', _ld, true)` — but `globalThis.document` is still `null` there (it is bound later, inside
+`__obscura_init`), so the call threw into a swallowing `try/catch` and no listener was ever installed on
+the live document. Proven directly: `_eventRegistry` had only a `window` key until a runtime
+`document.addEventListener` added the document's `_nid` key; a wrapped `_popoverLightDismiss` was never
+invoked by a real pointerdown, while the direct call and `elementFromPoint` both worked. **THE FIX (all
+`bootstrap.js` + a harness assist):** **(1)** deferred registration to a new `globalThis.
+_installPopoverLightDismiss()` that `__obscura_init` calls right after binding `globalThis.document`, so
+the pointer capture listeners land on the real document. That single fix took attribute-basic 159→195
+(+36). **(2)** Rewrote light dismiss to the spec model — **pointerdown records** the popover under the
+pointer, the **matching pointerup dismisses** the popovers not related to it (`_popoverClickedTarget` /
+`_popoverDismissExcept` / `_popoverLightDismissDown` / `_popoverLightDismissUp`). So a bare pointerdown,
+or a drag started inside a popover and released outside, no longer dismisses. **(3)** Gated dismissal on
+**trusted input** (`e.isTrusted || __obscura_trusted_input`): a page's own `dispatchEvent(new
+PointerEvent(...))` must not close popovers, while automation must. The WPT input bridge (`wpt_run.py`
+`firePointer`/`fireMouse`) sets `__obscura_trusted_input` for the duration of its synchronous dispatch —
+the faithful simulation of WebDriver's trusted events (there is no Rust CDP mouse-input path in the
+product, so this cannot regress real usage). **Results (+61, ZERO regressions):** attribute-basic
+159→195 (+36), light-dismiss 15→20 (+5), light-dismiss-hint 3→9 (+6, 100%), target-element-disabled
+2→7 (+5, 100%), top-layer-nesting-hints 5→11 (+6), hint-hierarchy 3→4 (+1), open-in-beforetoggle 3→5
+(+2, 100%). Swept hard: dispatchEvent 25/25, all-global-events 375/375, body-window 140/140,
+onerroreventhandler 3/3, qsa 1975/1975, classlist 6/6+1/1, createElement 147/147, form-elements-matches
+2/2, inline-event-handler-ordering 3/3, dialog-showModal 8/10 + frame-removal 5/6 (both pre-existing
+layout/windowless caps, unrelated). **CAPS / NEXT:** the remaining popover failures split into distinct
+primitives — (a) **coordinate-invoker activation**: a *trusted* `click` event runs no activation
+behavior (popover invoker / command invoker fire only inside the `.click()` *method*, not as a dispatched
+click's default action — `_dispatchSpec` has no activation step), which blocks the invoker cases in
+light-dismiss + shadow-DOM popovers; (b) **form-owner via the `form=` attribute** (button/input-type-
+popovertarget: a submit/reset button associated by `form=` should do the form action and NOT toggle its
+popover — `this.form`/`_hasForm` isn't honouring `form=`); (c) **Tab-focus navigation** into/out of
+popovers (popover-focus 11/30). Trusted-click activation behavior is the widest next lever (extends this
+same trusted-input mechanism). Scroll `tickets/172-the-dismissed-verdict.md`.
+
 **Session 2026-07-09 (Quest #171 The Framed-Error Verdict — in-frame `document.body.outerHTML` + the frame-window OnErrorEventHandler, +3):**
+Finally took the `document.body.outerHTML` body-replacement bug that #169 AND #170 both named
 Finally took the `document.body.outerHTML` body-replacement bug that #169 AND #170 both named
 and deferred — the last blocker on `onerroreventhandler.html` (0/3). It turned out to be FIVE
 bugs stacked, uncovered one at a time by narrowing from the failing test down to a faithful
