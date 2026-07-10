@@ -167,6 +167,44 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-09 (Quest #170 The Timer-Source Verdict — string-source timers + timer-callback error reporting, +8):**
+Took Quest #169's named next lever. The four `*-in-setTimeout` / `*-in-setInterval` tests
+(`html/webappapis/scripting/processing-model-2/`, all 0/2) use **string-source timers** —
+`setTimeout("undefined_variable;", 10)` / `setTimeout("{", 10)` — which were *silently
+ignored* (`setTimeout`/`setInterval` bailed on any non-function handler) and whose throw,
+even if run, was *swallowed* to `console.error`. A `TimerHandler` is `(Function or
+DOMString)`: a string must be **compiled as a classic script and run in global scope** at
+fire time, and its uncaught exception "reported" (fire `error` at the Window). **THE FIX,
+all `bootstrap.js`:** a shared `_runTimerHandler(fn, code, args)` does `code !== null ?
+(0, eval)(code) : fn(...args)` inside `try { … } catch (e) { _reportError(e); }`. The
+**indirect** `(0, eval)` gives exactly global-scope classic-script evaluation, so
+`"undefined_variable;"` throws a ReferenceError at run and `"{"` a SyntaxError at compile
+— both synchronously in the callback, caught and routed to `_reportError` (#169), which
+fires the ordered `error` listener path → `window.onerror(message, filename =
+location.href, lineno, colno, error)`. `setTimeout`/`setInterval` compute `code = (typeof
+fn === "function") ? null : String(fn)` once at schedule time and route every fire (and
+`setInterval` tick) through the helper; the function-callback path now reports its throws
+too (was `console.error`). The interval test's `window.onerror` `clearInterval`s on first
+report; `tick`'s post-run `_intervals.has(id)` guard stops the reschedule the same turn.
+The tests assert only `typeof lineno === 'number'` (not exact) and `filename ===
+location.href`, both already satisfied — so the #169 `lineno:0` cap doesn't block them.
+Results: compile-error-in-setTimeout **0→2/2**, compile-error-in-setInterval **0→2/2**,
+runtime-error-in-setTimeout **0→2/2**, runtime-error-in-setInterval **0→2/2**. **= +8,
+ZERO regressions** — swept hard on the risky function-throw→`_reportError` change:
+qsa 1975, classlist 1420, createElement 147, createElementNS 596, dispatchEvent 25,
+mark 22, measure-l3 3, getRandomValues 39, all-global-events 375, body-window 140,
+windowless-body 236, eventhandler-cancellation 14/15, processing-algorithm 7,
+lexical-scopes 3, the whole #169 scripting-errors realm, iframe-load 2/2, url-origin
+406/7, structured-clone 141/152 (last three's fails pre-exist). **CAPS:**
+`onerroreventhandler.html` 0/3 still blocked by the *separate* `document.body.outerHTML`
+body-replacement bug (after `document.body.outerHTML = "<body …></body>"` the body goes
+`null`; the `outerHTML` setter parses with an `<html>` context element that doesn't yield
+a findable body — mirror `insertAdjacentHTML`'s `html`→`body` context map); exact error
+line/col still 0 (runtime→Rust boundary); cross-origin/data-URL timer error tests are the
+muted-error / opaque-origin cap. **NEXT: the `document.body.outerHTML` body-replacement
+bug** (real DOM-primitive fix, unlocks onerroreventhandler + a broader outerHTML/body
+tail), then real error line/col tracking. Scroll `tickets/170-the-timer-source-verdict.md`.
+
 **Session 2026-07-09 (Quest #169 The Reported-Error Verdict — onerror-as-listener + "report the error" for uncaught classic-script errors, +16):**
 Took Quest #168's named last lever (`compile-event-handler-lexical-scopes` test 3 needed `window.onerror` to fire as
 an *ordered* `error` listener) — and it opened the whole **runtime-script-errors** realm. Two dark gaps: (a)

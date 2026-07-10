@@ -604,12 +604,28 @@ const _scheduleAfter = (delay, fn) => {
   else Deno.core.ops.op_sleep(d).then(fn);
 };
 
+// A `TimerHandler` is `(Function or DOMString)`: a non-function handler is compiled
+// as a classic script and run in global scope at fire time (§timer-initialisation-steps
+// "if handler is a string … the script … is the result of compiling"). A `(0, eval)`
+// indirect eval gives exactly that global-scope classic-script evaluation. A compile
+// error (`"{"`) or runtime error (`undefined_variable;`) inside the code is an uncaught
+// exception that HTML "reports the error" → fires `error` at the Window (so `window.onerror`
+// sees it with filename === location.href, numeric line/col). We route BOTH the string and
+// the function callback's uncaught exception through `_reportError` — a thrown timer
+// callback is a reportable error either way (previously the throw was swallowed to
+// console.error, so window.onerror never saw it).
+const _runTimerHandler = (fn, code, args) => {
+  try {
+    if (code !== null) (0, eval)(code); else fn(...args);
+  } catch (e) { _reportError(e); }
+};
+
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
-  if (typeof fn !== "function") return ++_tid;
+  const code = (typeof fn === "function") ? null : String(fn);
   const id = ++_tid;
   _scheduleAfter(delay, () => {
     if (_clearedTimers.has(id)) return;
-    try { fn(...args); } catch(e) { console.error("Timer error:", e); }
+    _runTimerHandler(fn, code, args);
   });
   return id;
 };
@@ -617,12 +633,12 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
 globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
-  if (typeof fn !== "function") return ++_tid;
+  const code = (typeof fn === "function") ? null : String(fn);
   const id = ++_tid;
   _intervals.add(id);
   const tick = () => {
     if (!_intervals.has(id)) return;
-    try { fn(...args); } catch(e) { console.error("Interval error:", e); }
+    _runTimerHandler(fn, code, args);
     if (!_intervals.has(id)) return;
     _scheduleAfter(delay, tick);
   };

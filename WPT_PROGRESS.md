@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #169).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #170).
 
 ## Scoreboard
 
@@ -30,6 +30,10 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-09 (Quest #169).
 | `html/webappapis/scripting/processing-model-2/window-onerror-runtime-error.html` | 0/1 | **2/3** | 🟡 67% | **Quest #169.** Uncaught `<script>` runtime error fires `window.onerror` with correct URL + call count. **+2.** Cap: exact `lineno === 36` (needs real line/col tracking; we report 0). |
 | `html/webappapis/scripting/processing-model-2/window-onerror-parse-error.html` | 0/1 | **2/3** | 🟡 67% | **Quest #169.** Parse error fires `window.onerror` with correct URL + count. **+2.** Cap: exact line number. |
 | `html/webappapis/scripting/processing-model-2/window-onerror-runtime-error-throw.html` | 0/1 | **2/3** | 🟡 67% | **Quest #169.** A thrown non-Error value fires `window.onerror`. **+2.** Cap: exact line number. |
+| `html/webappapis/scripting/processing-model-2/compile-error-in-setTimeout.html` | 0/2 | **2/2** | ✅ 100% | **Quest #170 The Timer-Source Verdict.** `setTimeout("{", 10)` — a string handler is now compiled & run as a classic script in global scope (indirect eval) at fire time; its compile error is reported via `_reportError` → `window.onerror` (message string, `filename === location.href`, numeric line/col). **+2.** |
+| `html/webappapis/scripting/processing-model-2/compile-error-in-setInterval.html` | 0/2 | **2/2** | ✅ 100% | **Quest #170.** `setInterval("{", 10)` string-source compile error reported to `window.onerror`. **+2.** |
+| `html/webappapis/scripting/processing-model-2/runtime-error-in-setTimeout.html` | 0/2 | **2/2** | ✅ 100% | **Quest #170.** `setTimeout("undefined_variable;", 10)` string-source runtime error (ReferenceError) reported to `window.onerror`. **+2.** |
+| `html/webappapis/scripting/processing-model-2/runtime-error-in-setInterval.html` | 0/2 | **2/2** | ✅ 100% | **Quest #170.** `setInterval("undefined_variable;", 10)` string-source runtime error reported to `window.onerror`; the handler `clearInterval`s to stop the repeat. **+2.** |
 | `html/semantics/forms/the-form-element/form-elements-matches.html` | 0/2 | **2/2** | ✅ 100% | **Quest #168** (bonus). `form.elements` is now a live cached HTMLFormControlsCollection (indexed/named/item/namedItem) excluding `input[type=image]`. **+2.** |
 | `html/semantics/forms/the-form-element/form-elements-nameditem-01.html` | 0/3 | **1/3** | 🟡 33% | **Quest #168** (bonus). Fieldset named access via the live `form.elements` collection. **+1.** Cap: RadioNodeList (missing global) for the same-name-inputs subtests. |
 | `html/webappapis/scripting/events/event-handler-attributes-body-window.html` | 75/140 | **140/140** | ✅ 100% | **Quest #166 The Body-Window Verdict** (+64) + **Quest #167 The Onload Verdict** (+1, the final subtest). The Window-reflecting body element event handler set: `<body>`/`<frameset>` `on*` for `{blur,error,focus,load,resize,scroll}` ∪ WindowEventHandlers reflect get/set/content-attr onto the element's Window. #167 made `window.onload` a real `load`-listener accessor so `body.onload` fires *through dispatch* with `currentTarget === window` (was a data-prop). |
