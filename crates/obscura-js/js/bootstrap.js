@@ -969,6 +969,13 @@ class CSSStyleDeclaration {
     else if (!custom && _GRADIENT_PROPS.has(name)) {
       if (_imageFuncInvalid(stored)) return;               // invalid image() → ignore (keep prior value)
       stored = _canonImageSet(_canonGradients(stored, null, false));
+    } else if (!custom && _CSSUI_VALIDATED.has(name)) {
+      // CSS Basic User Interface longhands (box-sizing/resize/outline-*/caret-color/…):
+      // validate + canonicalize the grammar (invalid → ignore). Must precede the
+      // _COLOR_PROPS branch for caret-color/outline-color (that branch skips validation).
+      const c = _canonCssUi(name, stored);
+      if (c === null) return;
+      stored = c;
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
       if (/^(?:alpha|contrast-color)\(/i.test(stored.trim()) && !_isValidColor(stored)) return;  // invalid alpha()/contrast-color() → ignore
@@ -7831,6 +7838,7 @@ const _GCS_DEFAULTS = {
   // the element's own computed colour. outline-width initial `medium` matches
   // the test's mediumWidth reference (a cascaded `border-top-width: medium`).
   appearance: 'none', 'caret-color': 'currentColor', 'caret-shape': 'auto',
+  'field-sizing': 'fixed', 'interactivity': 'auto',
   'nav-down': 'auto', 'nav-left': 'auto', 'nav-right': 'auto', 'nav-up': 'auto',
   'outline-color': 'currentColor', 'outline-offset': '0px', 'outline-style': 'none',
   'outline-width': 'medium', resize: 'none', 'user-select': 'auto',
@@ -10848,9 +10856,9 @@ const _INHERITED_PROPS = new Set([
   'font-synthesis', 'font-variant', 'font-variant-alternates', 'font-variant-caps',
   'font-variant-east-asian', 'font-variant-emoji', 'font-variant-ligatures',
   'font-variant-numeric', 'font-variant-position', 'font-variation-settings',
-  // css-ui: caret-color, caret-shape and cursor inherit (the outline-* and
-  // nav-* properties and appearance/resize/user-select do NOT).
-  'caret-color', 'caret-shape',
+  // css-ui: caret-color, caret-shape, cursor and interactivity inherit (the
+  // outline-* and nav-* properties and appearance/resize/user-select do NOT).
+  'caret-color', 'caret-shape', 'interactivity',
   // css-text-decor: text-emphasis-* / text-shadow / text-underline-position /
   // text-decoration-skip-ink inherit (text-decoration-* do NOT).
   'text-emphasis-color', 'text-emphasis-position', 'text-emphasis-style',
@@ -11081,6 +11089,98 @@ const _canonGapItem = (value) => {
     return _canonStandardValue(s);
   return null;                                                  // angle/time/etc. unit → invalid
 };
+// ── CSS Basic User Interface (css-ui) value parsing ──────────────────────────
+// These longhands stored their value RAW (no grammar check), so every invalid
+// value was wrongly accepted (`box-sizing: fill-box`, `caret-color: invert`, …).
+// `_canonCssUi` validates + canonicalizes each; a null return means "invalid →
+// ignore the declaration" (matching CSSOM). CSS-wide keywords and var()/env() are
+// passed through untouched (they're valid for every property).
+//
+// Enumerated-keyword longhands: the value must be exactly one listed keyword
+// (case-insensitive). `outline-style` is <outline-line-style> — like border's
+// <line-style> but WITHOUT `hidden`, and it additionally accepts `auto`.
+const _CSSUI_ENUM = {
+  'box-sizing': new Set(['content-box', 'border-box']),
+  'resize': new Set(['none', 'both', 'horizontal', 'vertical', 'block', 'inline']),
+  'user-select': new Set(['auto', 'text', 'none', 'contain', 'all']),
+  'field-sizing': new Set(['fixed', 'content']),
+  'interactivity': new Set(['auto', 'inert']),
+  'outline-style': new Set(['auto', 'none', 'dotted', 'dashed', 'solid', 'double', 'groove', 'ridge', 'inset', 'outset']),
+};
+// Properties `_canonCssUi` handles. caret-color/outline-color also live in
+// _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
+// branch does no <color> validation, so it wrongly accepts `invert`/`none`/`50%`).
+const _CSSUI_VALIDATED = new Set([
+  'box-sizing', 'resize', 'user-select', 'field-sizing', 'interactivity', 'outline-style',
+  'caret-color', 'outline-color', 'text-overflow', 'outline-width', 'outline-offset',
+]);
+// A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
+const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
+const _canonCssUi = (name, value) => {
+  const s = String(value).trim();
+  const low = s.toLowerCase();
+  if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(s)) return s;      // CSS-wide / var()/env() → pass through
+  const enumSet = _CSSUI_ENUM[name];
+  if (enumSet) return enumSet.has(low) ? low : null;
+  if (name === 'caret-color' || name === 'outline-color') {
+    // `[ auto | <color> ]` — caret-color takes one or two (the 2nd is the text
+    // colour overlapping a block caret); outline-color takes exactly one.
+    const toks = _wsTokens(s);
+    const max = name === 'caret-color' ? 2 : 1;
+    if (toks.length < 1 || toks.length > max) return null;
+    const out = [];
+    for (const t of toks) {
+      const tl = t.toLowerCase();
+      if (tl === 'auto') { out.push('auto'); continue; }
+      // outline-color also accepts the legacy `invert` keyword (CSS UI 3 + the
+      // CSSOM serialize-values test rely on it). css-ui-4 dropped `invert`, so
+      // outline-color-invalid's `invert` subtest is an accepted cap (a browser
+      // cannot satisfy both). caret-color never accepted `invert`.
+      if (name === 'outline-color' && tl === 'invert') { out.push('invert'); continue; }
+      if (_isValidColor(t)) { out.push(_canonColorSpecified(t)); continue; }
+      return null;                                             // `none`/`50%`/… → invalid
+    }
+    return out.join(' ');
+  }
+  if (name === 'text-overflow') {
+    // `[ clip | ellipsis | <string> ]{1,2}`.
+    const toks = _wsTokens(s);
+    if (toks.length < 1 || toks.length > 2) return null;
+    const out = [];
+    for (const t of toks) {
+      const tl = t.toLowerCase();
+      if (tl === 'clip' || tl === 'ellipsis') { out.push(tl); continue; }
+      if (/^"(?:[^"\\]|\\.)*"$/.test(t) || /^'(?:[^'\\]|\\.)*'$/.test(t)) { out.push(t); continue; }
+      return null;
+    }
+    return out.join(' ');
+  }
+  if (name === 'outline-width') {
+    // `<line-width>` = thin | medium | thick | <length [0,∞]>` (no percentage).
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0], tl = t.toLowerCase();
+    if (_LINE_WIDTH_KW.has(tl)) return tl;
+    if (_isZeroTok(t)) return '0px';
+    if (_isLengthTok(t)) {
+      if (/^-/.test(t) && !_MATHFN_NAME_RE.test(t)) return null; // literal negative → invalid
+      return _canonLineWidth(t);
+    }
+    return null;
+  }
+  if (name === 'outline-offset') {
+    // `<length> | inset` (negatives allowed; no percentage; no keyword but `inset`).
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    if (t.toLowerCase() === 'inset') return 'inset';
+    if (_isZeroTok(t)) return '0px';
+    if (_isLengthTok(t)) return _canonLineWidth(t);
+    return null;
+  }
+  return s;
+};
+
 // The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
 // `gap`/`grid-gap` map to row-gap/column-gap; `grid-row-gap`/`grid-column-gap` are
 // legacy single-longhand aliases handled separately (_GRID_GAP_ALIAS).
@@ -13520,6 +13620,25 @@ const _normComputed = (el, kebab, v) => {
   }
   if (_INTEGER_COMPUTED_PROPS.has(kebab)) { const r = _computeIntegerValue(el, v); return r === null ? v : r; }
   if (_TIME_COMPUTED_PROPS.has(kebab)) { const r = _computeTimeValue(v, el); return r === null ? v : r; }
+  if (kebab === 'caret-color') {
+    // `[ auto | <color> ]{1,2}`. Each value resolves as a colour (`auto` and
+    // `currentColor` → the element's own computed colour). The 2nd value is
+    // serialized only when present AND not `auto` (spec: an `auto`/absent 2nd
+    // value is dropped from the computed serialization).
+    const toks = _wsTokens(String(v).trim());
+    const one = (tok) => {
+      const l = String(tok).trim().toLowerCase();
+      if (l === 'auto' || l === 'currentcolor') return _computedColorOf(el);
+      const m = _computeModernColor(tok); if (m !== null) return m;
+      return _computeColor(tok);
+    };
+    if (toks.length === 1) return one(toks[0]);
+    if (toks.length === 2) {
+      const first = one(toks[0]);
+      return toks[1].trim().toLowerCase() === 'auto' ? first : first + ' ' + one(toks[1]);
+    }
+    return v;
+  }
   if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
     if (String(v).trim().toLowerCase() === 'currentcolor') {
       return kebab === 'color' ? _computeColor(_initialOf('color')) : _computedColorOf(el);
@@ -16983,6 +17102,10 @@ globalThis.CSS = {
       if (name === 'row-gap' || name === 'column-gap') {
         if (/\bvar\(/i.test(val)) return true;
         return _canonGapItem(_canonStandardValue(val)) != null;
+      }
+      if (_CSSUI_VALIDATED.has(name)) {                  // box-sizing/resize/outline-*/caret-color/…
+        if (/\bvar\(/i.test(val)) return true;
+        return _canonCssUi(name, _canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);
