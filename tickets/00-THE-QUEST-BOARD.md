@@ -174,6 +174,40 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-10 (Quest #182 The Snapped Verdict — CSS Scroll Snap parsing, +271):**
+Stayed on the #179/#180/#181 lever — another untouched `css/*/parsing/` dir, same root cause. The whole
+`css/css-scroll-snap/parsing/` dir (25 files) sat at **161/435**: the scroll-margin/scroll-padding/scroll-snap
+family stored values RAW in `CSSStyleDeclaration.setProperty` (no grammar check) → every `*-invalid` was 0/N
+(~120 subtests), every `*-shorthand` was 0/N (the shorthands never expanded, so `el.style.scrollMarginTop` read
+"" after `scrollMargin = …` and `.length` was wrong, ~76 subtests), and the length longhands never resolved at
+computed time. Built a self-contained **css-scroll-snap value engine** in `bootstrap.js` (inserted just before
+`_LENGTH_COMPUTED_PROPS`, where all the length/box helpers are already defined): **(1)** longhand validation +
+canon — `scroll-margin-*` `<length>` signed (`_canonScrollMargin`, reuses `_canonLenPctSigned`/`_canonMathExpr`,
+0→0px, no %), `scroll-padding-*` `auto|<length-percentage [0,∞]>` (`_canonScrollPadding`, reuses `_canonGapItem`
+for the order-preserving non-neg canon), `scroll-snap-align` `[none|start|end|center]{1,2}` (two-equal collapse),
+`scroll-snap-type` `none|[x|y|block|inline|both] [mandatory|proximity]?` (default `proximity` dropped),
+`scroll-snap-stop` `normal|always` — dispatched via `_SCROLL_LONGHANDS` in the setProperty else-if chain; **(2)**
+the `scroll-margin`/`scroll-padding` shorthands (physical 1–4 + logical block/inline 1–2) EXPAND into and store
+as their longhands (the border/offset model, NOT the raw-store `_BOX_SHORTHANDS` model — because the parsing
+tests read each `div.style[longhand]` and `.length`), via `_SCROLL_SH_LH`/`_expandScrollShorthand`, with
+reconstruction on the shorthand getter/`removeProperty`/`getComputedStyle` (`_serializeScrollShorthand` +
+`_serializeBoxValue`'s 1–4/1–2 edge collapse); **(3)** computed length resolution — the 16 longhands added to
+`_LENGTH_COMPUTED_PROPS`, the 8 scroll-padding to `_CLAMP_NEG_PROPS` (non-negative → resolved-negative clamps to
+0px), an `auto` passthrough in `_normComputed`; **(4)** registration (`_CSS_KNOWN_PROPS` gets the 6 shorthands;
+the longhands were already in `_GCS_DEFAULTS`) + a `CSS.supports` branch (validate longhands via `_canonScrollLong`,
+shorthands via `_expandScrollShorthand`). Realm **161/435 → 432/435** (+271). **ZERO regressions** (qsa 1975,
+classlist 1420, Element-matches 669, createElement 147, url-origin 406/413, css-align place/gap 15+12, css-ui
+caret-color-computed 12/12 + box-sizing-computed 2/2, css-text text-indent-valid 14/14, serialize-values 696/697,
+cssstyledeclaration-csstext 7/11 stash-proven pre-existing all held). **Caps (3):** `calc(auto)` on scroll-padding
+is wrongly accepted — a PRE-EXISTING engine-wide leniency, NOT scroll-specific: the shared math type-checker
+(`_mt`/`_mathValid`) treats the unknown symbol `auto` as `'unknown'` → valid (the var()/env() escape hatch), so
+`margin-left: calc(auto)` and `outline-offset: calc(auto)` are equally accepted. A correct fix belongs in `_mt`
+(reject bare non-constant identifiers) and would lift these 3 + the same latent bug across every length prop —
+deliberately left out of scope to keep this change tight and zero-regression. **Next:** the still-untouched
+`css/*/parsing/` dirs remain the widest tail — `css-fonts` (83), `css-grid` (61), `css-overflow` (35, more
+scattered across many small/experimental props) — same three-axis JS machinery. DEV NOTE: grep `_canonScrollLong`/
+`_SCROLL_SH_LH`/`_SCROLL_LONGHANDS`/`_expandScrollShorthand` before touching scroll-snap values.
+
 **Session 2026-07-10 (Quest #181 The Textual Verdict — CSS Text parsing, +404):**
 Stayed on the #179/#180 lever — the widest untouched `css/*/parsing/` dir, same root cause. The whole
 `css/css-text/parsing/` dir (86 files) sat at **341/754**: the entire css-text family stored values RAW in

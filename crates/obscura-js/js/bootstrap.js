@@ -954,6 +954,25 @@ class CSSStyleDeclaration {
       this._notifyChange();                                    // one reflect for the whole shorthand
       return;                                                  // expanded; no shorthand key kept
     }
+    if (!custom && _SCROLL_SH_LH[name] && !/\bvar\(/i.test(stored)) {
+      // scroll-margin/scroll-padding shorthand (physical 1–4 / logical block-inline
+      // 1–2): expand into — and store as — its longhands so `el.style.scrollMarginTop`
+      // reads back and `.length` counts them. Invalid → ignore the whole declaration.
+      // A CSS-wide keyword belongs to every longhand → skip to single-key storage below.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low)) {
+        const lh = _expandScrollShorthand(name, stored);
+        if (!lh) return;
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        delete this._props[name]; delete this._priority[name];   // drop any prior CSS-wide shorthand key
+        for (const ln of _SCROLL_SH_LH[name]) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                                 // expanded; no shorthand key kept
+      }
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1052,6 +1071,15 @@ class CSSStyleDeclaration {
         if (c === null) return;                      // invalid gap value → ignore
         stored = c;
       }
+    } else if (!custom && _SCROLL_LONGHANDS.has(name)) {
+      // scroll-margin-* / scroll-padding-* / scroll-snap-{align,type,stop}: validate +
+      // canonicalize the grammar. CSS-wide keywords and var()/env() pass through.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonScrollLong(name, stored);
+        if (c === null) return;                      // invalid scroll-snap value → ignore
+        stored = c;
+      }
     }
     if (!custom) stored = _canonLengthTimeMath(name, stored);  // <length>/<time> math → canonical specified form
     // Re-setting an existing property through the CSSOM makes it the latest-written
@@ -1091,6 +1119,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (_SCROLL_SH_LH[key]) {                               // scroll-margin/scroll-padding: clear its longhands
+      const old = (key in this._props) ? this._props[key] : _serializeScrollShorthand(this, key);
+      delete this._props[key]; delete this._priority[key];   // any CSS-wide shorthand key
+      for (const ln of _SCROLL_SH_LH[key]) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1107,6 +1142,10 @@ class CSSStyleDeclaration {
     if (_ALIGN_SHORTHAND_LH[key]) {                         // gap/place-* shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
       return _serializeAlignShorthand(this, key);          // reconstruct from longhands
+    }
+    if (_SCROLL_SH_LH[key]) {                               // scroll-margin/scroll-padding shorthand
+      if (key in this._props) return this._props[key];     // CSS-wide kept as a single key
+      return _serializeScrollShorthand(this, key);         // reconstruct from longhands
     }
     return this._props[key] || "";
   }
@@ -13735,6 +13774,128 @@ const _FONT_SIZE_KEYWORDS = {
   'xx-small': '10px', 'x-small': '12px', small: '13px', medium: '16px',
   large: '18px', 'x-large': '24px', 'xx-large': '32px', 'xxx-large': '48px',
 };
+// ── CSS Scroll Snap (css-scroll-snap) value parsing ──────────────────────────
+// These longhands stored their value RAW (no grammar check), so every `*-invalid`
+// value was wrongly accepted and the shorthands never expanded (`el.style.
+// scrollMarginTop` read "" after `scrollMargin = …`). This self-contained engine
+// validates + canonicalizes each; a null return means "invalid → ignore" (CSSOM).
+//   scroll-margin-*  : <length> (signed; no percentage; no keyword). 0 → 0px.
+//   scroll-padding-* : auto | <length-percentage [0,∞]>. 0 → 0px.
+//   scroll-snap-align: [ none | start | end | center ]{1,2} (two equal → one).
+//   scroll-snap-type : none | [ x | y | block | inline | both ] [ mandatory | proximity ]?
+//                      (proximity is the initial strictness → dropped from serialization).
+//   scroll-snap-stop : normal | always.
+const _SCROLL_MARGIN_LH = new Set([
+  'scroll-margin-top', 'scroll-margin-right', 'scroll-margin-bottom', 'scroll-margin-left',
+  'scroll-margin-block-start', 'scroll-margin-block-end',
+  'scroll-margin-inline-start', 'scroll-margin-inline-end',
+]);
+const _SCROLL_PADDING_LH = new Set([
+  'scroll-padding-top', 'scroll-padding-right', 'scroll-padding-bottom', 'scroll-padding-left',
+  'scroll-padding-block-start', 'scroll-padding-block-end',
+  'scroll-padding-inline-start', 'scroll-padding-inline-end',
+]);
+const _SNAP_ALIGN_KW = new Set(['none', 'start', 'end', 'center']);
+const _SNAP_AXIS_KW = new Set(['x', 'y', 'block', 'inline', 'both']);
+const _SNAP_STRICT_KW = new Set(['mandatory', 'proximity']);
+// scroll-margin longhand: a single <length> (signed; NO percentage, NO auto). 0 → 0px.
+const _canonScrollMargin = (v) => {
+  const toks = _wsTokens(String(v).trim());
+  if (toks.length !== 1) return null;                     // `1px 2px` etc. → invalid
+  const t = toks[0];
+  if (_MATHFN_NAME_RE.test(t)) {
+    if (/%/.test(t)) return null;                         // <length> only — a `%`-bearing calc is invalid
+    return _canonMathExpr(t, { canonLen: true });         // null (e.g. `calc(auto)`) → invalid — no raw fallback
+  }
+  return _canonLenPctSigned(t, false);
+};
+// scroll-padding longhand: auto | non-negative <length-percentage>.
+const _canonScrollPadding = (v) => {
+  const toks = _wsTokens(String(v).trim());
+  if (toks.length !== 1) return null;                     // `10px 20%` etc. → invalid
+  const t = toks[0], low = t.toLowerCase();
+  if (low === 'auto') return 'auto';
+  if (low === 'normal') return null;                      // _canonGapItem accepts `normal`; scroll-padding doesn't
+  // Gate math validity (`calc(auto)` → invalid) but keep _canonGapItem's ORDER-preserving
+  // canon so `calc(50% + 60px)` serializes as written (not reordered).
+  if (_MATHFN_NAME_RE.test(t) && _canonMathExpr(t, { canonLen: true }) == null) return null;
+  return _canonGapItem(t);                                // non-neg <length-percentage> (null → invalid)
+};
+const _canonSnapAlign = (v) => {
+  const toks = _wsTokens(String(v).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  const out = [];
+  for (const t of toks) { const l = t.toLowerCase(); if (!_SNAP_ALIGN_KW.has(l)) return null; out.push(l); }
+  if (out.length === 2 && out[0] === out[1]) return out[0];  // `start start` → `start`
+  return out.join(' ');
+};
+const _canonSnapType = (v) => {
+  const toks = _wsTokens(String(v).trim());
+  if (toks.length === 1 && toks[0].toLowerCase() === 'none') return 'none';
+  if (toks.length < 1 || toks.length > 2) return null;
+  const axis = toks[0].toLowerCase();
+  if (!_SNAP_AXIS_KW.has(axis)) return null;
+  if (toks.length === 1) return axis;
+  const strict = toks[1].toLowerCase();
+  if (!_SNAP_STRICT_KW.has(strict)) return null;
+  return strict === 'proximity' ? axis : axis + ' ' + strict;  // default `proximity` dropped
+};
+// Dispatch a single scroll-snap LONGHAND / keyword property → canonical value (null = invalid).
+const _canonScrollLong = (name, value) => {
+  if (_SCROLL_MARGIN_LH.has(name)) return _canonScrollMargin(value);
+  if (_SCROLL_PADDING_LH.has(name)) return _canonScrollPadding(value);
+  if (name === 'scroll-snap-align') return _canonSnapAlign(value);
+  if (name === 'scroll-snap-type') return _canonSnapType(value);
+  if (name === 'scroll-snap-stop') {
+    const l = String(value).trim().toLowerCase();
+    return (l === 'normal' || l === 'always') ? l : null;
+  }
+  return null;
+};
+const _SCROLL_LONGHANDS = new Set([
+  ..._SCROLL_MARGIN_LH, ..._SCROLL_PADDING_LH,
+  'scroll-snap-align', 'scroll-snap-type', 'scroll-snap-stop',
+]);
+// The scroll-margin/scroll-padding SHORTHANDS (physical 4-edge + logical block/inline
+// 2-edge), stored EXPANDED as their longhands (like border/offset) so
+// `el.style.scrollMarginTop` reads back and `.length` counts them. Reconstructed for
+// the shorthand getter / cssText / getComputedStyle.
+const _SCROLL_SH_LH = {
+  'scroll-margin': ['scroll-margin-top', 'scroll-margin-right', 'scroll-margin-bottom', 'scroll-margin-left'],
+  'scroll-padding': ['scroll-padding-top', 'scroll-padding-right', 'scroll-padding-bottom', 'scroll-padding-left'],
+  'scroll-margin-block': ['scroll-margin-block-start', 'scroll-margin-block-end'],
+  'scroll-margin-inline': ['scroll-margin-inline-start', 'scroll-margin-inline-end'],
+  'scroll-padding-block': ['scroll-padding-block-start', 'scroll-padding-block-end'],
+  'scroll-padding-inline': ['scroll-padding-inline-start', 'scroll-padding-inline-end'],
+};
+// Expand a scroll shorthand value into { longhand: canonical } (null → whole decl invalid).
+const _expandScrollShorthand = (name, value) => {
+  const lh = _SCROLL_SH_LH[name];
+  const canon1 = lh[0].startsWith('scroll-margin') ? _canonScrollMargin : _canonScrollPadding;
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > lh.length) return null;
+  const parts = toks.map((t) => canon1(t));
+  if (parts.some((p) => p === null)) return null;
+  const edges = lh.length === 4 ? _boxEdges(parts)
+    : (parts.length === 2 ? [parts[0], parts[1]] : [parts[0], parts[0]]);
+  const out = {};
+  lh.forEach((n, i) => { out[n] = edges[i]; });
+  return out;
+};
+// Reconstruct a scroll shorthand's SPECIFIED value from the stored longhands, or ''
+// if any is absent / they disagree on importance (matching CSSOM serialization).
+const _serializeScrollShorthand = (decl, name) => {
+  const vals = [];
+  let imp = null;
+  for (const ln of _SCROLL_SH_LH[name]) {
+    if (!(ln in decl._props)) return '';
+    const p = decl._priority[ln] === 'important';
+    if (imp === null) imp = p; else if (imp !== p) return '';
+    vals.push(decl._props[ln]);
+  }
+  return _serializeBoxValue(name, vals);
+};
+
 // Generic computed-value resolution for the numeric length / integer / time
 // property families (CSS Values 4 — getComputedStyle returns the *resolved*
 // value, in canonical units). Length props fold math functions and resolve the
@@ -13753,6 +13914,8 @@ const _LENGTH_COMPUTED_PROPS = new Set([
   'flex-basis', 'text-indent', 'outline-offset',
   'letter-spacing', 'word-spacing',                      // <length> | normal (keyword passes through)
   'row-gap', 'column-gap',                               // <length-percentage> | normal (non-negative)
+  ..._SCROLL_MARGIN_LH,                                  // scroll-margin-* : <length> (signed)
+  ..._SCROLL_PADDING_LH,                                 // scroll-padding-*: auto | <length-percentage [0,∞]>
 ]);
 // Properties whose computed value clamps a resolved negative <length> to 0 (padding
 // can't be negative). `%`-bearing values that would need layout are left symbolic.
@@ -13760,6 +13923,7 @@ const _CLAMP_NEG_PROPS = new Set([
   'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
   'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
   'row-gap', 'column-gap',                                // gap is non-negative (a resolved negative calc clamps to 0)
+  ..._SCROLL_PADDING_LH,                                  // scroll-padding is non-negative (resolved negative → 0)
 ]);
 const _clampNegPx = (r) => {
   const m = /^(-?(?:\d+\.?\d*|\.\d+))px$/.exec(String(r));
@@ -13900,6 +14064,7 @@ const _normComputed = (el, kebab, v) => {
   }
   if (_SIZE_COMPUTED_PROPS.has(kebab)) return _computeSizeValue(kebab, v, el);
   if (_SH_COMPUTED[kebab]) return _computeBoxShorthand(kebab, v, el);
+  if (_SCROLL_PADDING_LH.has(kebab) && String(v).trim().toLowerCase() === 'auto') return 'auto';
   if (_LENGTH_COMPUTED_PROPS.has(kebab)) {
     const r = _trComp(v, el, true, _vpUnits());
     return _CLAMP_NEG_PROPS.has(kebab) ? _clampNegPx(r) : r;
@@ -14227,6 +14392,7 @@ const _CSS_KNOWN_PROPS = (() => {
   for (const k of _COLOR_PROPS) add(k);
   add('offset');                                           // the `offset` shorthand (expands to its 5 longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
+  for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
   for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
   return set;
 })();
@@ -14248,6 +14414,13 @@ globalThis.getComputedStyle = (el, _pseudo) => {
       const av = resolve(a), bv = resolve(b);
       if (!av || !bv) return '';
       return av === bv ? av : av + ' ' + bv;
+    }
+    // scroll-margin/scroll-padding shorthands: reconstruct from the computed
+    // longhands, collapsing to the shortest 1–4 (or 1–2) edge form.
+    if (_SCROLL_SH_LH[kebab]) {
+      const vals = _SCROLL_SH_LH[kebab].map((ln) => resolve(ln));
+      if (vals.some((x) => !x)) return '';
+      return _serializeBoxValue(kebab, vals);
     }
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
@@ -17396,6 +17569,14 @@ globalThis.CSS = {
       if (_CSSTEXT_VALIDATED.has(name)) {                // css-text longhands + text-wrap/white-space
         if (/\bvar\(/i.test(val)) return true;
         return _canonCssText(name, _canonStandardValue(val)) != null;
+      }
+      if (_SCROLL_SH_LH[name]) {                         // scroll-margin/scroll-padding shorthands
+        if (/\bvar\(/i.test(val)) return true;
+        return _expandScrollShorthand(name, _canonStandardValue(val)) != null;
+      }
+      if (_SCROLL_LONGHANDS.has(name)) {                 // scroll-margin-*/scroll-padding-*/scroll-snap-*
+        if (/\bvar\(/i.test(val)) return true;
+        return _canonScrollLong(name, _canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);
