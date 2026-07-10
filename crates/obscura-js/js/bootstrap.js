@@ -921,6 +921,27 @@ class CSSStyleDeclaration {
     if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
     let stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
     if (!custom && stored === '') { this.removeProperty(name); return; }
+    if (!custom && _GRID_GAP_ALIAS[name]) name = _GRID_GAP_ALIAS[name];  // grid-row-gap→row-gap (legacy alias)
+    if (!custom && _ALIGN_SHORTHAND_LH[name] && !/\bvar\(/i.test(stored)) {
+      // gap/grid-gap/place-* shorthand (no var()): expand into — and store as — its
+      // two longhands so `el.style.rowGap`/`el.style.alignContent` read back. The
+      // whole declaration is dropped if it doesn't parse (invalid → ignore). CSS-wide
+      // keywords are not expanded (they belong to every longhand): skip to storage.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low)) {
+        const lh = (name === 'gap' || name === 'grid-gap')
+          ? _parseGapShorthand(stored) : _parsePlaceShorthand(name, stored);
+        if (!lh) return;
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        delete this._props[name]; delete this._priority[name];  // drop any prior var()-stored shorthand key
+        for (const ln of _ALIGN_SHORTHAND_LH[name]) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                                 // expanded; no shorthand key kept
+      }
+    }
     if (!custom && _BORDER_EXPAND[name] && !/\bvar\(/i.test(stored)) {
       // border/outline shorthand (no var()): expand into — and store as — its
       // longhands so `el.style.borderTopColor` reads back. Invalid → ignore.
@@ -1000,6 +1021,23 @@ class CSSStyleDeclaration {
       }
     } else if (!custom && _BORDER_SH_PROPS.has(name)) {
       stored = _canonShorthandLenMath(stored);       // line-width calc() in border/outline/column-rule shorthand
+    } else if (!custom && _ALIGN_PROPS[name]) {
+      // Box-alignment longhand (align-*/justify-*): validate + canonicalize the
+      // keyword grammar. CSS-wide keywords and var()/env() pass through untouched.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _alignCanonLonghand(name, stored);
+        if (c === null) return;                      // invalid alignment value → ignore
+        stored = c;
+      }
+    } else if (!custom && (name === 'row-gap' || name === 'column-gap')) {
+      // row-gap/column-gap: `normal | <length-percentage [0,∞]>`.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonGapItem(stored);
+        if (c === null) return;                      // invalid gap value → ignore
+        stored = c;
+      }
     }
     if (!custom) stored = _canonLengthTimeMath(name, stored);  // <length>/<time> math → canonical specified form
     // Re-setting an existing property through the CSSOM makes it the latest-written
@@ -1017,10 +1055,18 @@ class CSSStyleDeclaration {
     this._notifyChange();
   }
   removeProperty(name) {
-    name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
+    name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
+    if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     if (key === 'offset') {                                // shorthand: clear its five longhands
       const old = _serializeOffsetShorthand(this);
       for (const ln of _OFFSET_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (_ALIGN_SHORTHAND_LH[key]) {                         // gap/place-* shorthand: clear its longhands
+      const old = _serializeAlignShorthand(this, key);
+      delete this._props[key]; delete this._priority[key];   // any var()-stored shorthand key
+      for (const ln of _ALIGN_SHORTHAND_LH[key]) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -1037,16 +1083,22 @@ class CSSStyleDeclaration {
     return old || "";
   }
   getPropertyValue(name) {
-    name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
+    name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
+    if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     if (key === 'offset') return _serializeOffsetShorthand(this);  // reconstruct from longhands
     if (_BORDER_EXPAND[key]) {                              // border/outline shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
       return _serializeBorderShorthand(this, key);         // reconstruct from longhands
     }
+    if (_ALIGN_SHORTHAND_LH[key]) {                         // gap/place-* shorthand
+      if (key in this._props) return this._props[key];     // var() kept as a single key
+      return _serializeAlignShorthand(this, key);          // reconstruct from longhands
+    }
     return this._props[key] || "";
   }
   getPropertyPriority(name) {
-    name = String(name); const key = name.startsWith('--') ? name : name.toLowerCase();
+    name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
+    if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     return this._priority[key] || "";
   }
   get cssText() {
@@ -10943,6 +10995,146 @@ const _posComputeLen = (tok, emPx, lhPx) => {
   const r = _evalMath(s, 0, { lengths: true, emPx, lhPx });
   return r === null ? _canonStandardValue(s) : _serNumber(r) + 'px';
 };
+// ─── CSS Box Alignment value engine (css-align-3) ────────────────────────────
+// The align-*/justify-*/place-*/gap family had no value validation, canonical
+// serialization, or shorthand expansion — every value was stored raw, so invalid
+// values were wrongly accepted and canonical forms (`first baseline`→`baseline`,
+// `left legacy`→`legacy left`) were never produced. This block adds all three,
+// mirroring the per-property canon helpers above and the offset shorthand model.
+//
+// Keyword grammars (per the module's property definitions):
+//   <self-position>        = center|start|end|self-start|self-end|flex-start|flex-end
+//   <content-position>     = center|start|end|flex-start|flex-end
+//   <content-distribution> = space-between|space-around|space-evenly|stretch
+//   <overflow-position>    = safe|unsafe   (must PRECEDE its position)
+//   <baseline-position>    = [first|last]? baseline  (canonical drops a leading `first`)
+const _ALIGN_SELF_POS = new Set(['center', 'start', 'end', 'self-start', 'self-end', 'flex-start', 'flex-end']);
+const _ALIGN_CONTENT_POS = new Set(['center', 'start', 'end', 'flex-start', 'flex-end']);
+const _ALIGN_DIST = new Set(['space-between', 'space-around', 'space-evenly', 'stretch']);
+const _ALIGN_OVERFLOW = new Set(['safe', 'unsafe']);
+// Per-property capabilities. `pos` is the accepted <*-position> set; `dist` allows
+// the content-distribution keywords (content props); `stretchKw` allows a standalone
+// `stretch` (items/self props, where it's a keyword, not a distribution); `lr` adds
+// left|right; `auto` (self props) and `legacy` (justify-items) are the extras.
+const _ALIGN_PROPS = {
+  'align-content':   { normal: true, baseline: true,  dist: true,  pos: _ALIGN_CONTENT_POS, lr: false, auto: false, stretchKw: false, legacy: false },
+  'justify-content': { normal: true, baseline: false, dist: true,  pos: _ALIGN_CONTENT_POS, lr: true,  auto: false, stretchKw: false, legacy: false },
+  'align-items':     { normal: true, baseline: true,  dist: false, pos: _ALIGN_SELF_POS,    lr: false, auto: false, stretchKw: true,  legacy: false },
+  'justify-items':   { normal: true, baseline: true,  dist: false, pos: _ALIGN_SELF_POS,    lr: true,  auto: false, stretchKw: true,  legacy: true  },
+  'align-self':      { normal: true, baseline: true,  dist: false, pos: _ALIGN_SELF_POS,    lr: false, auto: true,  stretchKw: true,  legacy: false },
+  'justify-self':    { normal: true, baseline: true,  dist: false, pos: _ALIGN_SELF_POS,    lr: true,  auto: true,  stretchKw: true,  legacy: false },
+};
+// Validate + canonically serialize ONE align/justify longhand value; null if it
+// doesn't match the property's grammar. CSS-wide keywords / var() are the caller's
+// concern (never reach here). Keywords are ASCII case-insensitive → lowercased.
+const _alignCanonLonghand = (prop, value) => {
+  const cfg = _ALIGN_PROPS[prop];
+  if (!cfg) return null;
+  const toks = String(value).trim().toLowerCase().split(/\s+/);
+  const n = toks.length;
+  if (n === 1) {
+    const t = toks[0];
+    if (t === 'normal') return cfg.normal ? 'normal' : null;
+    if (t === 'auto') return cfg.auto ? 'auto' : null;
+    if (t === 'baseline') return cfg.baseline ? 'baseline' : null;
+    if (t === 'stretch') return (cfg.dist || cfg.stretchKw) ? 'stretch' : null;
+    if (t === 'legacy') return cfg.legacy ? 'legacy' : null;
+    if (cfg.dist && _ALIGN_DIST.has(t)) return t;
+    if (cfg.pos.has(t)) return t;
+    if (cfg.lr && (t === 'left' || t === 'right')) return t;
+    return null;
+  }
+  if (n === 2) {
+    const a = toks[0], b = toks[1];
+    // <baseline-position>: [first|last] baseline  (canonical drops `first`)
+    if (b === 'baseline' && (a === 'first' || a === 'last') && cfg.baseline)
+      return a === 'first' ? 'baseline' : 'last baseline';
+    // <overflow-position> <position>  (the overflow keyword MUST come first)
+    if (_ALIGN_OVERFLOW.has(a)) {
+      const posOk = cfg.pos.has(b) || (cfg.lr && (b === 'left' || b === 'right'));
+      return posOk ? a + ' ' + b : null;
+    }
+    // legacy && [left|right|center]  (either input order → canonical `legacy X`)
+    if (cfg.legacy) {
+      if (a === 'legacy' && (b === 'left' || b === 'right' || b === 'center')) return 'legacy ' + b;
+      if (b === 'legacy' && (a === 'left' || a === 'right' || a === 'center')) return 'legacy ' + a;
+    }
+    return null;
+  }
+  return null;   // >2 tokens is never a valid single alignment value
+};
+// row-gap / column-gap value: `normal | <length-percentage [0,∞]>`. Non-negative —
+// a literal negative length/percentage is invalid (a calc() may resolve negative, so
+// its sign is left to used-value time). Returns the canonical string, or null.
+const _canonGapItem = (value) => {
+  const s = String(value).trim();
+  if (/^normal$/i.test(s)) return 'normal';
+  if (_MATHFN_NAME_RE.test(s)) return _canonStandardValue(s);   // calc()/min()/… pass through
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(%|[a-z]+)?$/i.exec(s);
+  if (!m) return null;
+  const num = parseFloat(m[1]);
+  const unit = m[2] && m[2].toLowerCase();
+  if (num < 0) return null;                                     // negative → invalid
+  if (!unit) return num === 0 ? '0px' : null;                   // bare number: only 0 is a valid length
+  if (unit === '%') return _canonStandardValue(s);
+  if (_LEN_UNIT_RE.test(unit) || /^(?:cq[whib]|cqmin|cqmax|sv[wh]|lv[wh]|dv[wh])$/.test(unit))
+    return _canonStandardValue(s);
+  return null;                                                  // angle/time/etc. unit → invalid
+};
+// The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
+// `gap`/`grid-gap` map to row-gap/column-gap; `grid-row-gap`/`grid-column-gap` are
+// legacy single-longhand aliases handled separately (_GRID_GAP_ALIAS).
+const _ALIGN_SHORTHAND_LH = {
+  'gap': ['row-gap', 'column-gap'],
+  'grid-gap': ['row-gap', 'column-gap'],
+  'place-content': ['align-content', 'justify-content'],
+  'place-items': ['align-items', 'justify-items'],
+  'place-self': ['align-self', 'justify-self'],
+};
+const _GRID_GAP_ALIAS = { 'grid-row-gap': 'row-gap', 'grid-column-gap': 'column-gap' };
+// gap/grid-gap shorthand: `<'row-gap'> <'column-gap'>?` (omitted column copies row).
+const _parseGapShorthand = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  const row = _canonGapItem(toks[0]);
+  if (row === null) return null;
+  const col = toks.length === 2 ? _canonGapItem(toks[1]) : row;
+  if (col === null) return null;
+  return { 'row-gap': row, 'column-gap': col };
+};
+// place-content/place-items/place-self shorthand: `<align-lh> <justify-lh>?`. The
+// two halves are split by greedily consuming a valid align value (1 then 2 tokens)
+// off the front — unambiguous because no valid 2-token alignment value has a valid
+// 1-token prefix. An omitted justify half copies the align half, EXCEPT place-content
+// where a <baseline-position> align half maps to `start` (justify-content has no
+// baseline). Returns { <align-lh>: …, <justify-lh>: … } or null.
+const _parsePlaceShorthand = (name, value) => {
+  const [alignP, justifyP] = _ALIGN_SHORTHAND_LH[name];
+  const toks = _wsTokens(String(value).trim());
+  const n = toks.length;
+  if (n < 1 || n > 4) return null;
+  for (let k = 1; k <= 2 && k < n; k++) {                       // two-value form
+    const a = _alignCanonLonghand(alignP, toks.slice(0, k).join(' '));
+    if (a === null) continue;
+    const j = _alignCanonLonghand(justifyP, toks.slice(k).join(' '));
+    if (j === null) continue;
+    return { [alignP]: a, [justifyP]: j };
+  }
+  const a = _alignCanonLonghand(alignP, value);                 // single-value form → copy to both
+  if (a === null) return null;
+  let j;
+  if (name === 'place-content' && (a === 'baseline' || a === 'last baseline')) j = 'start';
+  else { j = _alignCanonLonghand(justifyP, value); if (j === null) return null; }
+  return { [alignP]: a, [justifyP]: j };
+};
+// Serialize a box-alignment shorthand from its longhands (CSSOM "serialize a CSS
+// value"): both halves must be present; equal halves collapse to a single value.
+const _serializeAlignShorthand = (decl, key) => {
+  const [a, b] = _ALIGN_SHORTHAND_LH[key];
+  const av = decl._props[a], bv = decl._props[b];
+  if (av == null || bv == null) return '';
+  return av === bv ? av : av + ' ' + bv;
+};
 // Split a calc() body into flat top-level additive terms `{sign, text}`, splitting
 // only on a `+`/`-` that sits at paren depth 0 and is whitespace-surrounded (the CSS
 // calc grammar requires that). Nested groups are kept whole inside a term.
@@ -13198,12 +13390,14 @@ const _LENGTH_COMPUTED_PROPS = new Set([
   'width', 'height',
   'flex-basis', 'text-indent', 'outline-offset',
   'letter-spacing', 'word-spacing',                      // <length> | normal (keyword passes through)
+  'row-gap', 'column-gap',                               // <length-percentage> | normal (non-negative)
 ]);
 // Properties whose computed value clamps a resolved negative <length> to 0 (padding
 // can't be negative). `%`-bearing values that would need layout are left symbolic.
 const _CLAMP_NEG_PROPS = new Set([
   'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
   'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
+  'row-gap', 'column-gap',                                // gap is non-negative (a resolved negative calc clamps to 0)
 ]);
 const _clampNegPx = (r) => {
   const m = /^(-?(?:\d+\.?\d*|\.\d+))px$/.exec(String(r));
@@ -13627,6 +13821,8 @@ const _CSS_KNOWN_PROPS = (() => {
   for (const k of Object.keys(_GCS_DEFAULTS)) add(k);
   for (const k of _COLOR_PROPS) add(k);
   add('offset');                                           // the `offset` shorthand (expands to its 5 longhands)
+  for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
+  for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
   return set;
 })();
 globalThis.getComputedStyle = (el, _pseudo) => {
@@ -13639,6 +13835,15 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // Custom properties (`--*`) inherit by default and resolve the CSS-wide
     // keywords through the dedicated engine (no var() substitution yet).
     if (kebab.startsWith('--')) return _computedCustomProp(el, kebab, 0);
+    // Box-alignment shorthands: reconstruct the computed value from the computed
+    // longhands (grid-*-gap are legacy aliases for a single longhand).
+    if (_GRID_GAP_ALIAS[kebab]) return resolve(_GRID_GAP_ALIAS[kebab]);
+    if (_ALIGN_SHORTHAND_LH[kebab]) {
+      const [a, b] = _ALIGN_SHORTHAND_LH[kebab];
+      const av = resolve(a), bv = resolve(b);
+      if (!av || !bv) return '';
+      return av === bv ? av : av + ' ' + bv;
+    }
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
     // Modelled standard properties resolve through the full computed-value
@@ -16763,6 +16968,21 @@ globalThis.CSS = {
       if (_BORDER_EXPAND[name]) {                          // border/outline shorthand
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
         return _expandBorderShorthand(name, val) != null;  // else validate by expanding
+      }
+      if (_ALIGN_SHORTHAND_LH[name] || _GRID_GAP_ALIAS[name]) {  // gap/grid-gap/place-*/grid-*-gap
+        if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
+        const canon = _canonStandardValue(val);
+        if (_GRID_GAP_ALIAS[name]) return _canonGapItem(canon) != null;   // grid-row-gap/grid-column-gap
+        return ((name === 'gap' || name === 'grid-gap')
+          ? _parseGapShorthand(canon) : _parsePlaceShorthand(name, canon)) != null;
+      }
+      if (_ALIGN_PROPS[name]) {                            // align-*/justify-* longhand
+        if (/\bvar\(/i.test(val)) return true;
+        return _alignCanonLonghand(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'row-gap' || name === 'column-gap') {
+        if (/\bvar\(/i.test(val)) return true;
+        return _canonGapItem(_canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);

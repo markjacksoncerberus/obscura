@@ -17,6 +17,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 |---|--------|-------|:----:|:----------:|:------:|
+| ~~179~~ | ✅ [The Alignment Verdict](179-the-alignment-verdict.md) | **CSS Box Alignment parsing** — the whole `css/css-align/parsing/` realm (50 files: `align-*`/`justify-*`/`place-*`/`gap`/`grid-*-gap`) | **+366 across ~44 files** | ⚔️⚔️⚔️ | **SECURED — +366, zero regressions.** A fresh WIDE realm (input-element thinned, popovers heavily mined). The family had NO value handling in `CSSStyleDeclaration`: raw storage → invalid values accepted (every `*-invalid` 0/N, ~171 subtests), no canonical serialization, no shorthand expansion, no computed resolution. Built a self-contained Box-Alignment value engine in `bootstrap.js`: keyword-grammar validate+canonicalize for the six align/justify longhands (`_alignCanonLonghand`/`_ALIGN_PROPS` — overflow-position ordering, `[first\|last]? baseline`, `legacy && [left\|right\|center]`), non-negative `<length-percentage>` `row-gap`/`column-gap`, `gap`/`place-*` shorthand→longhand expansion (`_parseGapShorthand`/`_parsePlaceShorthand`, greedy align/justify split, `place-content` baseline→`start`), `grid-*-gap` legacy aliases, `CSS.supports`/`_CSS_KNOWN_PROPS` registration, computed reconstruction of the shorthands, and `em`/`calc`→px (clamped ≥0) gap-length resolution. Realm **249/618 → 615/618**. **Cap:** `justify-items: legacy` computed-inheritance (3 fails). **Next:** the other untouched `css/*/parsing/` dirs (`css-text` 86, `css-fonts` 83, `css-grid` 61, `css-ui` 42, `css-overflow` 35) — same three-axis pattern, same JS machinery. |
 | ~~178~~ | ✅ [The Suggestions Verdict](178-the-suggestions-verdict.md) | **`HTMLInputElement` IDL primitives** — `input-list.html` (0/6), `maxlength.html` (3/5) | **+8 across 2 tests** | ⚔️ | **SECURED — +8, zero regressions.** Two small `bootstrap.js` IDL fixes in the input reflected-attribute block. **(1)** New `input.list` getter — the *suggestions source element*: `getRootNode().getElementById(list attr)`, returned only if it's a `<datalist>` (getElementById tree-order, so an earlier non-datalist with the same ID → null); null for input types the attribute doesn't apply to. **(2)** `maxLength`/`minLength` now reflect a `long` "limited to only non-negative numbers": setter ToInt32-converts (non-numeric → 0) and throws `IndexSizeError` on a negative value; getter maps a negative content attribute to the default (-1). `input-list` **0/6→6/6**, `maxlength` **3/5→5/5**. **Next:** cross-document pointer pairing (`popover-light-dismiss` ~8); scripting-errors line/col; or a fresh wide realm (input-element is now nearly all green). |
 | ~~175~~ | ✅ [The Fullscreen Verdict](175-the-fullscreen-verdict.md) | **Dialog/fullscreen ↔ popover top-layer interactions** — `popover-top-layer-combinations.html` (0/5), `popover-top-layer-interactions.html` (4/9) | **+10 across 2 tests** | ⚔️⚔️ | **SECURED — +10, zero regressions.** Two root causes. **(1)** `showPopover()` on a non-modal open `<dialog>` (opened via `show()`) wrongly threw — `_checkPopoverValidity`'s dialog gate keyed on the bare `open` attribute; per spec it gates on the **is-modal flag** (`_isModal`), so only a `showModal()` dialog (or a fullscreen element) blocks. **(2)** `requestFullscreen` didn't exist (a synchronous TypeError that escaped the tests' `await …then/catch`). Added a partial Fullscreen API — a top-layer STATE machine (no real render): `Element.requestFullscreen()`/`Document.exitFullscreen()`/`fullscreenElement`/`fullscreenEnabled`, a new Rust `:fullscreen` flag (mirrors `:modal`) matched by the selector engine, and a fullscreen-flag popover-validity throw. Entering fullscreen supersedes open popovers via the shared `_topLayerHidePopovers` but leaves modal dialogs and other fullscreen elements alone (they stay `:modal`/`:fullscreen`). `popover-top-layer-combinations` **0/5→5/5**, `popover-top-layer-interactions` **4/9→9/9**. **Next:** cross-document pointerdown/up pairing (`popover-light-dismiss`); popover Tab-focus (`popover-focus` 20/30); real error line/col in the scripting-errors realm. |
 | ~~174~~ | ✅ [The Shadowed Verdict](174-the-shadowed-verdict.md) | **Popovers inside shadow DOM** — `popover-shadow-dom.html` (`showPopover()` threw "not connected to a document" inside a shadow tree) | **+5 across 2 tests** | ⚔️ | **SECURED — +5, zero regressions.** The popover connectedness check was the boundary-stopping `isConnected`; a popover in a connected host's shadow tree read as disconnected. Swapped to the shadow-including `_shadowConnected` in `_checkPopoverValidity` (fixes the throw) and the invoker target-validity check, and added a shadow-including containment walk (`_shadowIncludes`) to "topmost popover ancestor" so a popover nested inside a shadow-DOM ancestor popover is recognized as nested (not closed). `popover-shadow-dom` **0/3→3/3**, `popover-light-dismiss` **23→25** (its two shadow subtests). Left `Node.isConnected` itself untouched (spec-should-be-shadow-inclusive, but too broad a primitive to risk here). **Next:** dialog+popover top-layer ordering (`popover-top-layer-combinations` 0/5, `-interactions` 4/9); cross-document pointer pairing; popover Tab-focus. |
@@ -170,6 +171,35 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-07-10 (Quest #179 The Alignment Verdict — CSS Box Alignment parsing, +366):**
+Pivoted to a fresh WIDE realm — the whole `css/css-align/parsing/` dir (50 files) sat at **249/618**
+(369 failing subtests). Root cause: the entire alignment family (`align-*`/`justify-*`/`place-*`/
+`gap`/`grid-*-gap`) had NO value handling in `CSSStyleDeclaration` — every value stored raw. That
+meant every `*-invalid.html` was 0/N (~171 subtests: no validation), the `*-valid` tails failed
+canonical serialization, `gap`/`place-*` shorthands weren't expanded, and computed values were empty.
+Built a self-contained **Box-Alignment value engine** in `bootstrap.js` (all in the CSS-value section
+after `_posComputeLen`): **(1)** `_alignCanonLonghand(prop, value)` — a per-property capability table
+(`_ALIGN_PROPS`) driving one keyword-grammar validator+canonicalizer over the six longhands (self- vs
+content-position sets, content-distribution, `<overflow-position>` ordering, `[first|last]? baseline`
+canonical-dropping `first`, `left|right`, `auto`, and `legacy && [left|right|center]` → canonical
+`legacy X`). **(2)** `_canonGapItem` — `normal | <length-percentage [0,∞]>` for row-gap/column-gap
+(rejects literal negatives + bare non-zero numbers; `0`→`0px`; `calc()` passes). **(3)** shorthand
+expansion into longhands like `offset`: `_parseGapShorthand` (gap/grid-gap) and `_parsePlaceShorthand`
+(place-content/items/self — greedy align-half/justify-half split, `place-content` baseline→`start`),
+with `getPropertyValue`/`removeProperty` reconstructing/clearing and equal halves collapsing;
+`grid-row-gap`/`grid-column-gap` as legacy single-longhand aliases (`_GRID_GAP_ALIAS`). **(4)**
+registered the shorthands in `_CSS_KNOWN_PROPS` + `CSS.supports` (validate-by-expansion), reconstructed
+the shorthands' computed values from computed longhands in `getComputedStyle`, and added
+`row-gap`/`column-gap` to `_LENGTH_COMPUTED_PROPS`+`_CLAMP_NEG_PROPS` so their computed value resolves
+`em`/`calc`→px and clamps negatives to `0px`. Realm **249/618 → 615/618** (+366). **ZERO regressions**
+(qsa 1975, classlist 1420, Element-matches 669, createElement 147, dispatchEvent 25, url-origin 406/413,
+mark 22/22, structured-clone 141/152, getRandomValues 39/39, popover-focus 30/30, color-valid 17/17,
+transform-valid 42/42, grid-auto-flow 4/7 all held; serialize-values 696/697, inline-style-001 4/5,
+style-sheet-interfaces 3/7 stash-proven identical pre/post). **Cap:** `justify-items: legacy`
+computed-inheritance (the only 3 remaining fails — needs a parent-computed walk, entangled with the
+existing `legacy center` initial-value hack). Grep `_alignCanonLonghand` / `_ALIGN_SHORTHAND_LH` /
+`_parsePlaceShorthand` / `_canonGapItem` / `_GRID_GAP_ALIAS`. Scroll `tickets/179-the-alignment-verdict.md`.
 
 **Session 2026-07-10 (Quest #178 The Suggestions Verdict — `HTMLInputElement.list` + non-negative `maxLength`/`minLength`, +8):**
 Cheap wide-ish follow-on to #177, staying in the input-element realm. Two small IDL fixes, both `bootstrap.js`.

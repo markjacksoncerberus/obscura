@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #178).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #179).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-align/parsing/` (whole realm, 50 files) | 249/618 | **615/618** | ✅ 99.5% | **Quest #179 The Alignment Verdict.** A self-contained Box-Alignment value engine in `bootstrap.js`: keyword-grammar validation + canonical serialization for the six `align-*`/`justify-*` longhands (`_alignCanonLonghand`/`_ALIGN_PROPS`), non-negative `<length-percentage>` `row-gap`/`column-gap`, `gap`/`place-*` shorthand expansion into longhands (`_parseGapShorthand`/`_parsePlaceShorthand`, greedy align/justify split; `place-content` baseline→`start`), `grid-*-gap` legacy aliases, `CSS.supports`/`_CSS_KNOWN_PROPS` registration, computed reconstruction of the shorthands, and `em`/`calc`→px (clamped ≥0) resolution of the gap longhands. Every `*-invalid` 0/N→N/N, every `*-valid`/`*-shorthand`/`*-computed` tail cleared. **+366.** Cap: `justify-items: legacy` computed-inheritance (3 fails). |
 | `html/semantics/forms/the-input-element/input-list.html` | 0/6 | **6/6** | ✅ 100% | **Quest #178 The Suggestions Verdict.** New `HTMLInputElement.list` getter — the *suggestions source element*: `getRootNode().getElementById(list attr)` and return it only if it's a `<datalist>` (so an earlier non-datalist with the same ID wins → null, per getElementById tree-order). Returns null for the input types the `list` attribute doesn't apply to. **+6.** |
 | `html/semantics/forms/the-input-element/maxlength.html` | 3/5 | **5/5** | ✅ 100% | **Quest #178 The Suggestions Verdict.** `maxLength`/`minLength` reflect a `long` "limited to only non-negative numbers": the setter ToInt32-converts (non-numeric → 0), throws `IndexSizeError` on a negative value; the getter maps a negative content attribute to the default (-1). **+2.** |
 | `html/semantics/popovers/popover-top-layer-combinations.html` | 0/5 | **5/5** | ✅ 100% | **Quest #175 The Fullscreen Verdict.** Two fixes: (1) `showPopover()` on a non-modal open `<dialog>` (opened via `show()`) no longer throws — the popover-validity gate now keys on the dialog's is-modal flag (`_isModal`), not the bare `open` attribute (per spec, only a `showModal()` dialog blocks). (2) A partial Fullscreen API: `Element.requestFullscreen()`/`Document.exitFullscreen()`/`fullscreenElement`, the `:fullscreen` pseudo (new Rust flag), and a fullscreen-flag popover-validity throw. **+5.** |
