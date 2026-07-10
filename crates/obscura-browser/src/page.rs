@@ -310,6 +310,22 @@ impl Page {
         self.js = Some(rt);
     }
 
+    /// HTML "report the error": an uncaught error from a classic script's evaluation
+    /// (parse or runtime) fires an `error` event on the Window (i.e. invokes
+    /// `window.onerror` and any `error` listeners). We swallowed these before — the
+    /// engine only logged them — so a page's own error handling never ran. Reconstruct
+    /// a carrier Error from the runtime's error string (its `.message` becomes the
+    /// ErrorEvent's message; `_reportError` supplies filename = document URL, line/col
+    /// 0). The whole report is defensively wrapped so a reporting failure can't cascade.
+    fn report_script_error(js: &mut ObscuraJsRuntime, err: &str) {
+        let msg = serde_json::to_string(err).unwrap_or_else(|_| "\"Script error.\"".to_string());
+        let code = format!(
+            "try {{ if (typeof _reportError === 'function') _reportError(new Error({})); }} catch (e) {{}}",
+            msg
+        );
+        let _ = js.execute_script("<report-error>", &code);
+    }
+
     async fn execute_scripts(&mut self) {
         tracing::info!(
             "execute_scripts called, js runtime exists: {}",
@@ -538,6 +554,7 @@ impl Page {
                         let _ = js.execute_script("<resource-timing>", &rt);
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
+                            Self::report_script_error(js, &e);
                         }
                     }
                 }
@@ -545,6 +562,7 @@ impl Page {
                 if let Some(js) = &mut self.js {
                     if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
                         tracing::warn!("Inline script error: {}", e);
+                        Self::report_script_error(js, &e);
                     }
                 }
             }

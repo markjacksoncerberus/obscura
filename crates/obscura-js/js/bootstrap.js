@@ -7,9 +7,12 @@ globalThis.addEventListener = globalThis.addEventListener || function(){};
 // event-handler IDL attributes are null until a page assigns one). They used to be
 // seeded with internal reporter stubs, but that made them non-null — visible to
 // pages (e.g. the Window-reflecting-body-handler tests read `window.onerror` and
-// expect null). Uncaught-listener capture now lives in `_reportError` directly, and
-// a page-supplied `window.onerror` is still invoked there. Both names get their
-// null-default accessor/data-property below (the window on-handler installer).
+// expect null). Uncaught-listener capture now lives in `_reportError` directly, which
+// fires the window's `error` listeners. `window.onerror` is one of them: it is a real
+// OnErrorEventHandler `error`-listener accessor (installed by the window on-handler
+// loop below), so a page-set onerror fires in listener order — before/after a page's
+// own addEventListener('error') — and gets the 5-arg (message, filename, lineno,
+// colno, error) splat when the event is an ErrorEvent. Both names still default null.
 // The window is an EventTarget like any other: its listeners live in the shared
 // _eventRegistry (key 'window') and it dispatches through the unified spec path,
 // so a window listener participates in capturing/bubbling for events dispatched
@@ -25,13 +28,22 @@ globalThis.dispatchEvent = function(event) { return _dispatchPublic(globalThis, 
 const _reportError = function(err) {
   try { console.error(err); } catch (e) {}
   try { __obscura_errors.push({ msg: (err && err.message) || String(err), src: "", line: 0, error: String(err) }); } catch (e) {}
+  // HTML "report an error": the ErrorEvent's filename is the URL of the responsible
+  // script — for a same-origin inline handler / script that is the document's URL. We
+  // don't track per-script URLs finely, so approximate with the document location
+  // (satisfies the OnErrorEventHandler `filename === location.href` assertion for
+  // inline-attribute compile/runtime errors); lineno/colno stay 0 (numbers).
+  let _fname = '';
+  try { _fname = (globalThis.location && globalThis.location.href) || ''; } catch (e) {}
   let ev;
   try {
     ev = (typeof ErrorEvent === 'function')
-      ? new ErrorEvent('error', { error: err, message: (err && err.message) || String(err), cancelable: true })
+      ? new ErrorEvent('error', { error: err, message: (err && err.message) || String(err),
+                                  filename: _fname, lineno: 0, colno: 0, cancelable: true })
       : null;
   } catch (e) { ev = null; }
   if (!ev) ev = { type: 'error', error: err, message: (err && err.message) || String(err),
+                  filename: _fname, lineno: 0, colno: 0,
                   defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
   try {
     // Deliver to the window's 'error' listeners directly (not via dispatchEvent —
@@ -44,10 +56,10 @@ const _reportError = function(err) {
       try { (typeof h === 'function' ? h : h && h.handleEvent).call(globalThis, ev); } catch (_) {}
     }
   } catch (e) {}
-  try {
-    if (typeof globalThis.onerror === 'function' && !ev.defaultPrevented)
-      globalThis.onerror(ev.message, '', 0, 0, err);
-  } catch (e) {}
+  // `window.onerror` is itself a registered `error` listener (an OnErrorEventHandler,
+  // installed as an accessor further down), so the loop above already invoked it in
+  // listener order with the 5-arg splat — no separate manual call here (that would
+  // double-fire, and out of order vs a page's addEventListener('error')).
 };
 
 // Generation counter bumped on every structural tree mutation. Live `childNodes`
@@ -5290,9 +5302,18 @@ globalThis.length = 0;
 // the FileReader on-handler pattern). `_addListener`/`_removeListener` are `const`s
 // declared further down; the setter only references them at call time (long after
 // bootstrap), so the forward reference is safe.
-// EXCLUSION: `error` keeps plain data-property semantics — `window.onerror` is
-// invoked manually with its bespoke (message, source, lineno, colno, error)
-// OnErrorEventHandler signature, so it is not a plain `error`-type listener.
+// `error` (window.onerror) is now ALSO a real `error`-type listener — but a special
+// one: an OnErrorEventHandler. Its accessor (below) registers a WRAPPER listener that
+// applies the HTML "event handler processing algorithm" special error handling: when
+// the dispatched event is an ErrorEvent on the Window, the underlying handler is
+// called with FIVE arguments (message, filename, lineno, colno, error) instead of the
+// event, and a `true` return (not `false`) cancels. Being a real listener means it
+// fires in registration order — a body-set onerror that reflects to window.onerror
+// (per the Window-reflecting body element handler set) fires before a later
+// window.addEventListener('error'), which the compile-event-handler-lexical-scopes and
+// onerroreventhandler tests rely on. `_reportError` (uncaught-exception path) and an
+// explicit window.dispatchEvent(errorEvent) both reach it through the shared error
+// listener list, each exactly once.
 // `load` IS a real listener accessor: the main load-event driver dispatches a
 // trusted `load` at the window (page.rs `<load-event>`), which fires `window.onload`
 // through the normal listener path with `currentTarget === window` (HTML §"handler-
@@ -5300,7 +5321,23 @@ globalThis.length = 0;
 // passed no event arg, so `e.currentTarget` was undefined). This is also what lets a
 // body/frameset `onload` — which reflects to `window.onload` per the Window-reflecting
 // body element handler set — fire correctly at the window.
-const _WINDOW_ONHANDLER_DATA = new Set(["error"]);
+// The OnErrorEventHandler wrapper: given the page's raw onerror function, return the
+// listener actually registered on the window's `error` type. It implements HTML's
+// "special error event handling" — 5-arg splat for an ErrorEvent, `return true`
+// cancels — so the underlying handler keeps its native `.length` (a body-compiled
+// onerror has 5 params) yet is fed the right arguments per event.
+const _makeOnErrorListener = function(fn) {
+  return function(event) {
+    let ret;
+    const special = (typeof ErrorEvent === 'function') && (event instanceof ErrorEvent) && event.type === 'error';
+    if (special) ret = fn.call(this, event.message, event.filename, event.lineno, event.colno, event.error);
+    else ret = fn.call(this, event);
+    // Process the return value: for special error handling a truthy `true` cancels;
+    // for an ordinary handler a `false` return cancels a cancelable event.
+    if (special ? (ret === true) : (ret === false)) { try { event.preventDefault(); } catch (e) {} }
+  };
+};
+const _WINDOW_ONHANDLER_DATA = new Set();
 for (const _ev of [
   "abort","afterprint","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
   "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
@@ -5320,6 +5357,26 @@ for (const _ev of [
   const _name = "on" + _ev;
   if (_name in globalThis) continue;              // already defined elsewhere — leave it
   if (_WINDOW_ONHANDLER_DATA.has(_ev)) { globalThis[_name] = null; continue; }
+  if (_ev === "error") {
+    // OnErrorEventHandler: register the 5-arg-aware wrapper (get returns the raw fn).
+    Object.defineProperty(globalThis, _name, {
+      configurable: true, enumerable: true,
+      get() { return this.__winon_error || null; },
+      set(fn) {
+        const curW = this.__winon_error_w;
+        if (curW) _removeListener(globalThis, "error", curW);
+        this.__winon_error = (typeof fn === "function") ? fn : null;
+        if (this.__winon_error) {
+          const w = _makeOnErrorListener(this.__winon_error);
+          this.__winon_error_w = w;
+          _addListener(globalThis, "error", w);
+        } else {
+          this.__winon_error_w = null;
+        }
+      },
+    });
+    continue;
+  }
   const _slot = "__winon_" + _ev, _type = _ev;
   Object.defineProperty(globalThis, _name, {
     configurable: true, enumerable: true,

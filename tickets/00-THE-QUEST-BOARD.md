@@ -167,6 +167,32 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-09 (Quest #169 The Reported-Error Verdict — onerror-as-listener + "report the error" for uncaught classic-script errors, +16):**
+Took Quest #168's named last lever (`compile-event-handler-lexical-scopes` test 3 needed `window.onerror` to fire as
+an *ordered* `error` listener) — and it opened the whole **runtime-script-errors** realm. Two dark gaps: (a)
+`window.onerror` was a plain data-property invoked manually at the *end* of `_reportError`, so a `body.setAttribute
+("onerror")` handler couldn't fire before a later `window.addEventListener("error")`, and an explicit
+`window.dispatchEvent(errorEvent)` never reached it; (b) an uncaught parse/runtime error in a classic `<script>` was
+*swallowed* (`page.rs` only `tracing::warn!`-logged it) — HTML's "report the error" (fire an `error` event at the
+Window) never happened. **THE FIX, `bootstrap.js` + `page.rs`.** **(1)** `window.onerror` is now a real
+OnErrorEventHandler `error`-listener accessor: removed `"error"` from `_WINDOW_ONHANDLER_DATA`, and the accessor
+registers a **wrapper** (`_makeOnErrorListener`) that applies the special error handling — 5-arg `(message, filename,
+lineno, colno, error)` splat when the event is an `ErrorEvent`, else the event; `true` (special) / `false` (ordinary)
+return cancels. `get` returns the raw fn (native `.length` intact), wrapper tracked in `__winon_error_w`.
+`_reportError` no longer hand-calls `globalThis.onerror` — the wrapper fires in listener order via the existing
+direct-fire loop, once. **(2)** `_reportError`'s ErrorEvent now carries `filename = location.href` + numeric
+line/col (0). **(3)** `Page::report_script_error` runs `_reportError(new Error(<msg>))` on any `execute_script_guarded`
+`Err` (src + inline paths). Results: lexical-scopes **2/3→3/3**, compile-error **0→2/2**, runtime-error **0→2/2**,
+compile-error-in-attribute **1→2/2**, runtime-error-in-attribute **1→2/2**, body-onerror-{compile,runtime}-error
+**1→2/2** each, runtime-error-in-body-onerror **0→1/1**, window-onerror-{runtime-error, parse-error,
+runtime-error-throw} **0→2/3** each. **= +16, ZERO regressions** (event-handler realm all held; url-origin 406/7 and
+structured-clone 141/10 stash-proven identical to baseline — their fails pre-exist). **CAPS:** exact error line/col
+(the runtime→Rust boundary drops the throw site → we report `lineno:0`; the three `window-onerror-*` remaining fails
+each assert an exact line); `onerroreventhandler.html` 0/3 blocked by a *separate* `document.body.outerHTML`→null
+body-replacement bug; `*-in-setTimeout/setInterval` need string-source timers. **NEXT: timer-callback error
+reporting** (`setTimeout`/`setInterval` `catch → _reportError`, with a hard regression sweep), then the
+`body.outerHTML` body-replacement bug, then real line/col tracking. Scroll `tickets/169-the-reported-error-verdict.md`.
+
 **Session 2026-07-09 (Quest #168 The Scope-Chain Verdict — scope-chain compilation + markup on-handler activation, +17):**
 Took Quest #167's named last lever: the event-handler realm's final structural gap. An inline handler was compiled
 by a bare `new Function('event', src)` — no scope chain, wrong `.toString()`, and (worse) parsed-markup `on*`
