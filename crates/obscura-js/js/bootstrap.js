@@ -17393,9 +17393,20 @@ try {
         "Invalid on popover elements which aren't connected to a document.", "InvalidStateError");
       return false;
     }
-    if (expectedShowing === false && el.localName === 'dialog' && el.hasAttribute('open')) {
+    // Spec "check popover validity" step: throw InvalidStateError if the element is a
+    // dialog opened as a MODAL dialog (its is-modal flag is true), OR the element's
+    // fullscreen flag is set. A dialog opened non-modally via show() (open attribute but
+    // not modal) can STILL be shown as a popover — so gate on `_isModal`, not the bare
+    // `open` attribute (popover-top-layer-combinations: showPopover after show() must not
+    // throw, but after showModal() must).
+    if (expectedShowing === false && el.localName === 'dialog' && el._isModal) {
       if (throwEx) throw new DOMException(
-        "Not supported on <dialog> elements that are open as a dialog.", "InvalidStateError");
+        "Not supported on <dialog> elements that are open as a modal dialog.", "InvalidStateError");
+      return false;
+    }
+    if (expectedShowing === false && el._fullscreenFlag) {
+      if (throwEx) throw new DOMException(
+        "Not supported on elements that are in fullscreen.", "InvalidStateError");
       return false;
     }
     return true;
@@ -17498,6 +17509,20 @@ try {
       }
       if (!hidAny) break;
     }
+  };
+
+  // A newly top-layered element (a modal dialog OR a fullscreen element) supersedes the
+  // popovers it isn't an ancestor of — "topmost popover ancestor" of `el`, then
+  // hide-popovers-until that endpoint (both hint and auto lists). Shared by the dialog
+  // show path (`_dialogHidePopovers`) and the Fullscreen API (`requestFullscreen`), so a
+  // fullscreen request closes any open auto/hint popovers (popover-top-layer-interactions:
+  // "A Fullscreen Element should close a Popover"). Exposed globally because the Fullscreen
+  // API is defined AFTER globalThis.Element exists, outside this block's scope.
+  globalThis._topLayerHidePopovers = (el) => {
+    if (_popoverAutoStack.length === 0) return;
+    const endpoint = _topmostPopoverAncestor(el, null);
+    _hideStackUntil(endpoint, 'hint', true, false);
+    _hideStackUntil(endpoint, 'auto', true, false);
   };
 
   // HTML "hide popover": validate, then (for auto/hint) close the popovers stacked
@@ -20218,6 +20243,87 @@ for (const k of Object.getOwnPropertyNames(Node)) {
 globalThis.Element = Element;
 globalThis.Document = Document;
 globalThis.EventTarget = Node;
+
+// ===================== Fullscreen API (partial) ================================
+// A JS-level model of the fullscreen element STACK — enough to drive the top-layer
+// state machine the popover/dialog interaction tests exercise (`:fullscreen`
+// matching, `document.fullscreenElement`, and "entering fullscreen closes open
+// popovers"). There is no real fullscreen rendering; requestFullscreen() flips the
+// Rust `:fullscreen` flag and updates the stack. Every element on the stack matches
+// `:fullscreen` (spec: the fullscreen element stack), while `document.fullscreenElement`
+// is the topmost. Entering fullscreen supersedes open popovers (like a modal dialog),
+// but does NOT close dialogs or other fullscreen elements.
+{
+  const _fsStack = () => (globalThis._fullscreenStack || (globalThis._fullscreenStack = []));
+  // Queue a bubbling+composed `fullscreenchange` at the element (bubbles to document).
+  const _fireFullscreenChange = (el) => {
+    setTimeout(() => {
+      try { el.dispatchEvent(new Event('fullscreenchange', { bubbles: true, composed: true })); }
+      catch (e) {}
+    }, 0);
+  };
+
+  globalThis.Element.prototype.requestFullscreen = _markNative(function requestFullscreen() {
+    const el = this;
+    return new Promise((resolve, reject) => {
+      // The element must be connected (shadow-including, matching the popover checks).
+      if (!globalThis._shadowConnected(el) || el._nid === undefined) {
+        reject(new TypeError("Fullscreen request failed: element is not connected."));
+        return;
+      }
+      // An element already showing as a popover occupies the top layer as a popover and
+      // cannot simultaneously be fullscreened — the request fails (a TypeError, per the
+      // popover-top-layer-combinations expectation).
+      if (el._popoverShowing) {
+        reject(new TypeError("Fullscreen request failed: element is an open popover."));
+        return;
+      }
+      // Already the topmost fullscreen element → no-op success.
+      const stack = _fsStack();
+      if (stack[stack.length - 1] === el) { resolve(undefined); return; }
+      // Entering fullscreen supersedes any open popovers (top-layer ordering).
+      try { globalThis._topLayerHidePopovers && globalThis._topLayerHidePopovers(el); } catch (e) {}
+      // Push onto the fullscreen stack (an element may appear once); flip the Rust flag.
+      const existing = stack.indexOf(el);
+      if (existing >= 0) stack.splice(existing, 1);
+      stack.push(el);
+      el._fullscreenFlag = true;
+      try { _dom('set_fullscreen', el._nid, '1'); } catch (e) {}
+      el._topLayerSeq = (globalThis._topLayerSeq = (globalThis._topLayerSeq || 0) + 1);
+      _fireFullscreenChange(el);
+      resolve(undefined);
+    });
+  });
+
+  globalThis.Document.prototype.exitFullscreen = _markNative(function exitFullscreen() {
+    return new Promise((resolve, reject) => {
+      const stack = _fsStack();
+      if (stack.length === 0) {
+        reject(new TypeError("Document not active or no element is fullscreen."));
+        return;
+      }
+      const el = stack.pop();
+      el._fullscreenFlag = false;
+      try { _dom('set_fullscreen', el._nid, '0'); } catch (e) {}
+      _fireFullscreenChange(el);
+      resolve(undefined);
+    });
+  });
+  // Legacy webkit alias — some pages/tests call the prefixed form.
+  globalThis.Document.prototype.webkitExitFullscreen =
+    globalThis.Document.prototype.exitFullscreen;
+
+  // `document.fullscreenElement` — the topmost element of the fullscreen stack, or null.
+  Object.defineProperty(globalThis.Document.prototype, 'fullscreenElement', {
+    configurable: true, enumerable: true,
+    get() { const s = globalThis._fullscreenStack; return (s && s.length) ? s[s.length - 1] : null; },
+  });
+  // `document.fullscreenEnabled` — fullscreen is available in this (top-level) document.
+  Object.defineProperty(globalThis.Document.prototype, 'fullscreenEnabled', {
+    configurable: true, enumerable: true,
+    get() { return true; },
+  });
+}
 // ---------------------------------------------------------------------------
 // Tree traversal primitives shared by NodeIterator + TreeWalker (DOM §6).
 // "following/preceding node within root" = standard tree-order step, bounded so

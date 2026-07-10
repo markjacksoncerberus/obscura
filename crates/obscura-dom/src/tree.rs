@@ -333,6 +333,10 @@ pub(crate) struct DomTreeInner {
     // Dialogs currently showing as MODAL (via showModal()). JS toggles membership on
     // showModal/close; read by the `:modal` pseudo-class. Non-monotonic.
     pub(crate) dialog_modal: HashSet<NodeId>,
+    // Elements currently in the fullscreen element stack (via requestFullscreen()). JS
+    // toggles membership on enter/exit; read by the `:fullscreen` pseudo-class. All
+    // elements on the stack match `:fullscreen` (not just the topmost). Non-monotonic.
+    pub(crate) fullscreen: HashSet<NodeId>,
 }
 
 impl DomTree {
@@ -367,6 +371,7 @@ impl DomTree {
                 ce_states: HashMap::new(),
                 popover_open: HashSet::new(),
                 dialog_modal: HashSet::new(),
+                fullscreen: HashSet::new(),
             }),
         }
     }
@@ -512,6 +517,21 @@ impl DomTree {
     /// Whether a node is a currently-open modal dialog.
     pub fn is_dialog_modal(&self, id: NodeId) -> bool {
         self.inner.borrow().dialog_modal.contains(&id)
+    }
+
+    /// Toggle an element's fullscreen membership (drives the `:fullscreen` pseudo-class).
+    pub fn set_fullscreen(&self, id: NodeId, on: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if on {
+            inner.fullscreen.insert(id);
+        } else {
+            inner.fullscreen.remove(&id);
+        }
+    }
+
+    /// Whether a node is currently in the fullscreen element stack.
+    pub fn is_fullscreen(&self, id: NodeId) -> bool {
+        self.inner.borrow().fullscreen.contains(&id)
     }
 
     /// Set whether the document is in design mode (drives `:read-write`/`:read-only`).

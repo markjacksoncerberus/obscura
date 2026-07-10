@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #174).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-10 (Quest #175).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `html/semantics/popovers/popover-top-layer-combinations.html` | 0/5 | **5/5** | ✅ 100% | **Quest #175 The Fullscreen Verdict.** Two fixes: (1) `showPopover()` on a non-modal open `<dialog>` (opened via `show()`) no longer throws — the popover-validity gate now keys on the dialog's is-modal flag (`_isModal`), not the bare `open` attribute (per spec, only a `showModal()` dialog blocks). (2) A partial Fullscreen API: `Element.requestFullscreen()`/`Document.exitFullscreen()`/`fullscreenElement`, the `:fullscreen` pseudo (new Rust flag), and a fullscreen-flag popover-validity throw. **+5.** |
+| `html/semantics/popovers/popover-top-layer-interactions.html` | 4/9 | **9/9** | ✅ 100% | **Quest #175 The Fullscreen Verdict.** The Fullscreen API state machine: `requestFullscreen` pushes onto a fullscreen element stack (every element matches `:fullscreen`, topmost is `document.fullscreenElement`) and supersedes open popovers via the shared `_topLayerHidePopovers`, but leaves modal dialogs and other fullscreen elements alone. State-machine only (no real fullscreen render). **+5.** |
 | `html/semantics/popovers/popover-shadow-dom.html` | 0/3 | **3/3** | ✅ 100% | **Quest #174 The Shadowed Verdict.** `showPopover()` inside a shadow tree no longer throws — the popover connectedness check is now shadow-INCLUDING (`_shadowConnected`, jumping each shadow root to its host) instead of the boundary-stopping `isConnected`. Same for the invoker's target-validity check. The "topmost popover ancestor" computation uses a shadow-including containment walk, so a popover nested inside a shadow-DOM ancestor popover is recognized as nested (not closed). **+3.** |
 | `html/semantics/popovers/popover-light-dismiss-command.html` | 4/14 | **8/14** | 🟡 57% | **Quest #173 The Invoked Verdict.** A *trusted* (harness/user) click now runs invoker activation. Extracted the popover + command invoker activation out of `.click()` into `_runInvokerActivation`, shared with a new document-level bubble-phase trusted-`click` listener (`_installInvokerActivation`, gated on `isTrusted \|\| __obscura_trusted_input`). Also: a `commandfor` command invoker pointing at a showing popover now protects it from light dismiss (parity with `popovertarget`), and a DISABLED invoker protects nothing (light-dismisses normally). **+4.** |
 | `html/semantics/popovers/popover-light-dismiss.html` | 20/33 | **25/33** | 🟡 76% | **Quest #173 → #174.** #173: harness clicks on `popovertarget`/`commandfor` invokers now open/toggle their popovers (trusted-click activation, +3). #174: popovers inside shadow trees can now be shown, so their light-dismiss subtests pass (+2). |

@@ -623,6 +623,14 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             }
             "true".into()
         }
+        "set_fullscreen" => {
+            // arg1 = node id; arg2 = "1" if the element is in the fullscreen stack.
+            // Drives the `:fullscreen` pseudo-class.
+            if let Ok(nid) = arg1.parse::<u32>() {
+                dom.set_fullscreen(NodeId::new(nid), arg2 == "1");
+            }
+            "true".into()
+        }
         "set_design_mode" => {
             // arg1 = "1" to enable design mode (every element editable → matches
             // :read-write), anything else disables it. Drives :read-write/:read-only.
