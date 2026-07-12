@@ -10,12 +10,25 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-12 (Quest #191).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-12 (Quest #192).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-color/parsing/color-invalid-named-color.html` | 1/184 | **153/184** | ⬆️ | **Quest #192 The Color Verdict.** Gated every `_COLOR_PROPS` setProperty on the (already-robust) `_isValidColor` — unknown idents like `redd` now rejected. **+152.** |
+| `css/css-color/parsing/color-invalid-relative-color.html` | 0/161 | **132/161** | ⬆️ | **Quest #192.** Relative-colour syntax structure validated via the gate. **+132.** |
+| `css/css-color/parsing/color-invalid-color-layers-function.html` | 0/93 | **93/93** | ✅ 100% | **Quest #192.** **+93.** |
+| `css/css-color/parsing/color-invalid-color-function.html` | 0/124 | **90/124** | ⬆️ | **Quest #192.** `color(<space> …)` channel/space validation. **+90.** |
+| `css/css-color/parsing/color-invalid-color-mix-function.html` | 0/141 | **33/141** | ⬆️ | **Quest #192.** `color-mix()` gate (loose branch still passes some — see cap). **+33.** |
+| `css/css-color/parsing/color-invalid-rgb.html` | 0/30 | **15/30** | ⬆️ | **Quest #192.** `_rgbComponents` gate. **+15.** |
+| `css/css-color/parsing/color-invalid-lab.html` | 0/18 | **12/18** | ⬆️ | **Quest #192.** **+12.** |
+| `css/css-color/parsing/color-invalid-hex-color.html` | 0/10 | **10/10** | ✅ 100% | **Quest #192.** `#12`/`#123456789`/odd-length hex rejected. **+10.** |
+| `css/css-color/parsing/color-invalid.html` | 0/11 | **8/11** | ⬆️ | **Quest #192.** `auto`/`123`/`rgb(1)`/malformed rejected. **+8.** |
+| `css/css-color/parsing/color-invalid-hsl.html` | 0/23 | **8/23** | ⬆️ | **Quest #192.** **+8.** |
+| `css/css-color/parsing/color-invalid-hwb.html` | 0/6 | **2/6** | ⬆️ | **Quest #192.** **+2.** |
+| `css/css-backgrounds/parsing/background-color-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #192.** `none`/`black white`/`black, white` rejected (cross-realm via the shared gate). **+3.** |
+| `css/css-multicol/parsing/column-rule-color-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #192.** Cross-realm via the shared gate. **+2.** |
 | `css/css-grid/parsing/grid-shorthand-valid.html` | 32/49 | **49/49** | ✅ 100% | **Quest #191 The Grid Verdict.** `grid` shorthand (`_parseGridShort`/`_serGridShort`): Form 1 `<'grid-template'>`, Form 2/3 auto-flow forms (`<rows> / auto-flow [dense] <auto-columns>` etc.) over all six grid-template-*/grid-auto-* longhands. **+17.** |
 | `css/css-grid/parsing/grid-shorthand-invalid.html` | 0/34 | **34/34** | ✅ 100% | **Quest #191.** auto-flow on both/neither side rejected, one top-level `/`, invalid track-size/`none`-mixing rejected; `_serGridShort` returns `''` unless all six longhands set. **+34.** |
 | `css/css-grid/parsing/grid-template-areas-valid.html` | 6/9 | **9/9** | ✅ 100% | **Quest #190 The Template Verdict.** `grid-template-areas` = `none \| <string>+` (`_canonGridTemplateAreas`): §7.3 cell tokenizer (dot-run→one null cell), filled-rectangle validation, whitespace-collapse. **+3.** |

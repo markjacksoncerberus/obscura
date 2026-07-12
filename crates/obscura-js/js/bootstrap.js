@@ -1163,7 +1163,13 @@ class CSSStyleDeclaration {
       }
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
-      if (/^(?:alpha|contrast-color)\(/i.test(stored.trim()) && !_isValidColor(stored)) return;  // invalid alpha()/contrast-color() → ignore
+      // Gate on the full <color> grammar (invalid → ignore, keep prior value). A
+      // CSS-wide keyword and a var()/env()-bearing value pass through (substitution is
+      // computed-time). caret-color additionally accepts `auto`.
+      const _clow = stored.toLowerCase();
+      if (!_CSS_WIDE.has(_clow) && !_TF_VAR_RE.test(stored)
+          && !(name === 'caret-color' && _clow === 'auto')
+          && !_isValidColor(stored)) return;               // invalid <color> → ignore
       stored = _canonColorSpecified(stored);
     } else if (!custom && _COLOR_SHORTHAND_PROPS.has(name)) {
       stored = _canonColorShorthand(stored);
@@ -9324,6 +9330,21 @@ const _isValidColor = (value) => {
   if (low.startsWith('alpha(')) return _isValidAlpha(value);
   // contrast-color() (CSS Color 5) — valid when its single <color> argument is.
   if (low.startsWith('contrast-color(')) return _isValidContrastColor(value);
+  // light-dark(<color>, <color>) (CSS Color 5) — valid when both args are colours.
+  if (low.startsWith('light-dark(') && low.endsWith(')')) {
+    if (/var\(/i.test(low)) return true;                   // var() substitution is computed-time
+    const inner = value.slice(value.indexOf('(') + 1, value.lastIndexOf(')'));
+    const parts = []; let depth = 0, cur = '';
+    for (let i = 0; i < inner.length; i++) {
+      const ch = inner[i];
+      if (ch === '(') { depth++; cur += ch; }
+      else if (ch === ')') { depth = Math.max(0, depth - 1); cur += ch; }
+      else if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; }
+      else cur += ch;
+    }
+    parts.push(cur);
+    return parts.length === 2 && parts.every((p) => _isValidColor(p.trim()));
+  }
   // color-mix() / relative colour syntax are valid <color>s when their structure
   // resolves (el-independent: currentcolor falls back to black for validity). This
   // MUST precede the legacy rgb/hsl branch below, since `rgb(from …)`/`hsl(from …)`
@@ -9345,7 +9366,11 @@ const _isValidColor = (value) => {
   // Modern colour functions whose computed value we can resolve — lab/lch/oklab/
   // oklch, color(<space> …), hwb — are valid <color>s. (`_computeModernColor`
   // returns null for a non-match or an unresolvable channel, e.g. a container unit.)
-  if (_computeModernColor(value) !== null) return true;
+  // Validity check runs in SPECIFIED mode: a math-function channel (e.g.
+  // `calc(infinity)` for an unclamped lab a/b or color() component) is a valid
+  // <color> even though it has no finite computed form — specified mode keeps it
+  // symbolic (via `_canonMathExpr`) instead of bailing on the non-finite result.
+  if (_computeModernColor(value, true) !== null) return true;
   return false;
 };
 // ── Stepped-value functions (CSS Values 4 §10.3): round()/mod()/rem() ──────────
