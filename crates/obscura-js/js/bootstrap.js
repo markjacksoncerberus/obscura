@@ -993,6 +993,23 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept (unless system/CSS-wide)
     }
+    if (!custom && name === 'font-variant' && !/\bvar\(/i.test(stored)) {
+      // `font-variant` shorthand (no var()): expand into — and store as — its six
+      // font-variant-* longhands; a CSS-wide keyword is kept as a single key.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const clear = () => {
+        delete this._props['font-variant']; delete this._priority['font-variant'];
+        for (const ln of _FONT_VARIANT_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      };
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low)) { clear(); this._props['font-variant'] = low; this._priority['font-variant'] = prio; this._notifyChange(); return; }
+      const parsed = _parseFontVariantShorthand(stored);
+      if (!parsed) return;                                      // invalid → keep prior value
+      clear();
+      for (const ln of _FONT_VARIANT_SH_LH) { this._props[ln] = parsed[ln]; this._priority[ln] = prio; }
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1163,6 +1180,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'font-variant') {                           // font-variant shorthand: clear its longhands + single key
+      const old = _serializeFontVariantShorthand(this);
+      delete this._props['font-variant']; delete this._priority['font-variant'];
+      for (const ln of _FONT_VARIANT_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1185,6 +1209,7 @@ class CSSStyleDeclaration {
       return _serializeScrollShorthand(this, key);         // reconstruct from longhands
     }
     if (key === 'font') return _serializeFontShorthand(this);  // system/CSS-wide key or reconstruct from longhands
+    if (key === 'font-variant') return _serializeFontVariantShorthand(this);  // CSS-wide key or reconstruct from longhands
     return this._props[key] || "";
   }
   getPropertyPriority(name) {
@@ -13973,6 +13998,7 @@ const _FONT_ENUM = {
   'font-optical-sizing': new Set(['auto', 'none']),
   'font-variant-caps': new Set(['normal', 'small-caps', 'all-small-caps', 'petite-caps', 'all-petite-caps', 'unicase', 'titling-caps']),
   'font-variant-emoji': new Set(['normal', 'text', 'emoji', 'unicode']),
+  'font-variant-position': new Set(['normal', 'sub', 'super']),
   'font-synthesis-weight': new Set(['auto', 'none']),
   'font-synthesis-style': new Set(['auto', 'none', 'oblique-only']),
   'font-synthesis-small-caps': new Set(['auto', 'none']),
@@ -14116,6 +14142,9 @@ const _canonFont = (name, value) => {
   if (name === 'font-size-adjust') return _canonFontSizeAdjust(value);
   if (name === 'font-family') return _canonFontFamily(value);
   if (name === 'font-synthesis') return _ccOrderedCanon(value, _FONT_SYNTH_CATS, { singletons: new Set(['none']) });
+  if (_FV_CC[name]) return _ccOrderedCanon(value, _FV_CC[name].cats, _FV_CC[name].opts);
+  if (name === 'font-variant-alternates') return _canonFontVariantAlternates(value);
+  if (name === 'font-feature-settings') return _canonFontFeatureSettings(value);
   const en = _FONT_ENUM[name];
   if (en) {
     const s = String(value).trim(), l = s.toLowerCase();
@@ -14125,7 +14154,9 @@ const _canonFont = (name, value) => {
 };
 const _FONT_VALIDATED = new Set([
   'font-style', 'font-weight', 'font-width', 'font-stretch', 'font-size',
-  'font-size-adjust', 'font-family', 'font-synthesis', ...Object.keys(_FONT_ENUM),
+  'font-size-adjust', 'font-family', 'font-synthesis', 'font-feature-settings',
+  'font-variant-ligatures', 'font-variant-numeric', 'font-variant-east-asian',
+  'font-variant-alternates', ...Object.keys(_FONT_ENUM),
 ]);
 // The parent element's computed font-size in px (font-relative `em`/`%` on the
 // font-size property itself resolve against the PARENT's size, not the element's).
@@ -14243,6 +14274,12 @@ const _fontFromLonghands = (get, computed) => {
   const family = String(get('font-family') || '');
   if (!size || !family) return '';
   if (variant !== 'normal' && variant !== 'small-caps') return '';   // only <font-variant-css2>
+  // `font` resets every font-variant longhand to normal and can only represent the
+  // CSS2 caps subset above — any other non-initial font-variant longhand → not expressible.
+  for (const fvl of ['font-variant-ligatures', 'font-variant-numeric', 'font-variant-east-asian', 'font-variant-alternates', 'font-variant-position']) {
+    const fv = String(get(fvl) || 'normal');
+    if (fv !== '' && fv !== 'normal') return '';
+  }
   let stretchKw = stretch;
   if (stretch !== 'normal') {
     if (_FONT_STRETCH_KW.has(stretch)) stretchKw = stretch;
@@ -14270,6 +14307,204 @@ const _serializeFontShorthand = (decl) => {
     if (imp === null) imp = p; else if (imp !== p) return '';
   }
   return _fontFromLonghands((ln) => decl._props[ln], false);
+};
+
+// ── font-variant longhands + the `font-variant` shorthand (css-fonts §4) ──────
+// The `||`-combination longhands (ligatures/numeric/east-asian) stored RAW, so every
+// `*-invalid` value was wrongly accepted and combinations never reordered to canonical
+// category order. Reuse `_ccOrderedCanon` (each token belongs to one ordered category,
+// at most one per category, `normal`/`none` singletons). font-variant-alternates and
+// font-feature-settings need their own functional-grammar parsers below.
+const _FV_CC = {
+  // normal | none | [ <common-lig> || <discretionary-lig> || <historical-lig> || <contextual-alt> ]
+  'font-variant-ligatures': { cats: [
+      new Set(['common-ligatures', 'no-common-ligatures']),
+      new Set(['discretionary-ligatures', 'no-discretionary-ligatures']),
+      new Set(['historical-ligatures', 'no-historical-ligatures']),
+      new Set(['contextual', 'no-contextual'])],
+    opts: { singletons: new Set(['normal', 'none']) } },
+  // normal | [ <figure> || <spacing> || <fraction> || ordinal || slashed-zero ]
+  'font-variant-numeric': { cats: [
+      new Set(['lining-nums', 'oldstyle-nums']),
+      new Set(['proportional-nums', 'tabular-nums']),
+      new Set(['diagonal-fractions', 'stacked-fractions']),
+      new Set(['ordinal']), new Set(['slashed-zero'])],
+    opts: { singletons: new Set(['normal']) } },
+  // normal | [ <east-asian-variant> || <east-asian-width> || ruby ]
+  'font-variant-east-asian': { cats: [
+      new Set(['jis78', 'jis83', 'jis90', 'jis04', 'simplified', 'traditional']),
+      new Set(['full-width', 'proportional-width']), new Set(['ruby'])],
+    opts: { singletons: new Set(['normal']) } },
+};
+// font-variant-alternates: normal | [ stylistic(<fvn>) || historical-forms ||
+// styleset(<fvn>#) || character-variant(<fvn>#) || swash(<fvn>) || ornaments(<fvn>) ||
+// annotation(<fvn>) ] — a `||` of functional notations, canonical order below.
+const _FVA_SINGLE = new Set(['stylistic', 'swash', 'ornaments', 'annotation']);  // one <feature-value-name>
+const _FVA_LIST = new Set(['styleset', 'character-variant']);                     // <feature-value-name>#
+const _FVA_ORDER = { stylistic: 0, 'historical-forms': 1, styleset: 2, 'character-variant': 3, swash: 4, ornaments: 5, annotation: 6 };
+// A <feature-value-name> is a <custom-ident> (not a CSS-wide keyword / `default`).
+const _isFvn = (t) => t !== '' && _isFamilyIdent(t) && !_CSS_WIDE.has(t.toLowerCase()) && t.toLowerCase() !== 'default';
+const _canonFontVariantAlternates = (v) => {
+  const s = String(v).trim();
+  if (s.toLowerCase() === 'normal') return 'normal';
+  const toks = _fontTokens(s);
+  if (toks.length === 0) return null;
+  const slots = {};
+  for (const tok of toks) {
+    const lt = tok.toLowerCase();
+    if (lt === 'historical-forms') { if ('historical-forms' in slots) return null; slots['historical-forms'] = 'historical-forms'; continue; }
+    const m = /^([a-zA-Z-]+)\(([\s\S]*)\)$/.exec(tok);
+    if (!m) return null;                                       // bare keyword / unbalanced parens → invalid
+    const fn = m[1].toLowerCase(), argsRaw = m[2].trim();
+    if (fn in slots) return null;                              // one per category
+    if (_FVA_SINGLE.has(fn)) {
+      if (!_isFvn(argsRaw)) return null;                       // exactly one feature-value-name
+      slots[fn] = fn + '(' + argsRaw + ')';
+    } else if (_FVA_LIST.has(fn)) {
+      const parts = argsRaw.split(',').map((p) => p.trim());
+      if (parts.length === 0 || !parts.every(_isFvn)) return null;
+      slots[fn] = fn + '(' + parts.join(', ') + ')';
+    } else return null;                                        // unknown function
+  }
+  return Object.keys(slots).sort((a, b) => _FVA_ORDER[a] - _FVA_ORDER[b]).map((k) => slots[k]).join(' ');
+};
+// font-feature-settings: normal | <feature-tag-value># where <feature-tag-value> =
+// <opentype-tag> [ <integer [0,∞]> | on | off ]?, <opentype-tag> a <string> of exactly
+// four 0x20–0x7E characters. Serialize the tag as a CSSOM string (escape "/\ + controls);
+// value 1/on omitted, off→0, other integer kept.
+const _serCssString = (s) => {
+  let out = '"';
+  for (const ch of String(s)) {
+    const cp = ch.codePointAt(0);
+    if (cp === 0) out += '�';
+    else if ((cp >= 0x1 && cp <= 0x1F) || cp === 0x7F) out += '\\' + cp.toString(16) + ' ';
+    else if (ch === '"' || ch === '\\') out += '\\' + ch;
+    else out += ch;
+  }
+  return out + '"';
+};
+// Split a value at top-level commas, respecting quoted strings (and \-escapes in them).
+const _commaSplitQuoted = (s) => {
+  const out = []; let cur = '', q = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { cur += c; if (c === '\\' && i + 1 < s.length) { cur += s[++i]; } else if (c === q) q = ''; continue; }
+    if (c === '"' || c === "'") { q = c; cur += c; continue; }
+    if (c === ',') { out.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  out.push(cur);
+  return out;
+};
+// Parse one <feature-tag-value> → { tag, val } (val a number, or a calc string), or null.
+const _parseFeatureTag = (part) => {
+  const s = String(part).trim();
+  const m = /^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')([\s\S]*)$/.exec(s);
+  if (!m) return null;
+  const content = _unescapeIdent(m[1].slice(1, -1));
+  if (content.length !== 4) return null;
+  for (const ch of content) { const cp = ch.codePointAt(0); if (cp < 0x20 || cp > 0x7E) return null; }
+  const rest = m[2].trim();
+  let val = 1;
+  if (rest !== '') {
+    const rl = rest.toLowerCase();
+    if (rl === 'on') val = 1;
+    else if (rl === 'off') val = 0;
+    else if (/^[0-9]+$/.test(rest)) val = parseInt(rest, 10);
+    else if (_MATHFN_NAME_RE.test(rest)) val = rest;           // calc → keep (folded at computed time)
+    else return null;
+  }
+  return { tag: content, val };
+};
+const _canonFontFeatureSettings = (v) => {
+  const s = String(v).trim();
+  if (s.toLowerCase() === 'normal') return 'normal';
+  const out = [];
+  for (const part of _commaSplitQuoted(s)) {
+    const p = _parseFeatureTag(part);
+    if (p === null) return null;
+    const tail = (typeof p.val === 'number') ? (p.val === 1 ? '' : ' ' + p.val)
+                                             : ' ' + (_canonMathExpr(String(p.val)) || String(p.val));
+    out.push(_serCssString(p.tag) + tail);
+  }
+  return out.length ? out.join(', ') : null;
+};
+// COMPUTED font-feature-settings: fold each calc integer, dedup by tag (last wins),
+// sort tags in codepoint order.
+const _computeFontFeatureSettings = (el, v) => {
+  const s = String(v).trim();
+  if (s.toLowerCase() === 'normal') return 'normal';
+  const map = new Map();
+  for (const part of _commaSplitQuoted(s)) {
+    const p = _parseFeatureTag(part);
+    if (p === null) return v;
+    let val = p.val;
+    if (typeof val !== 'number') { const n = _evalMath(String(val), 0, { lengths: true, cqZero: true }); val = n === null ? 1 : Math.round(n); }
+    map.set(p.tag, val);
+  }
+  return [...map.keys()].sort().map((k) => { const val = map.get(k); return _serCssString(k) + (val === 1 ? '' : ' ' + val); }).join(', ');
+};
+
+// The `font-variant` shorthand expands into (and stores as) its six longhands, like
+// `font`. `normal` → all normal; `none` → font-variant-ligatures:none, rest normal.
+// Otherwise route each token to its longhand by keyword membership, then canonicalize
+// each longhand's tokens together (so within-longhand `||` duplicate rules apply).
+const _FONT_VARIANT_SH_LH = ['font-variant-ligatures', 'font-variant-caps', 'font-variant-alternates', 'font-variant-numeric', 'font-variant-east-asian', 'font-variant-position'];
+const _FV_LIG_KW = _FV_CC['font-variant-ligatures'].cats.reduce((a, c) => { for (const k of c) a.add(k); return a; }, new Set());
+const _FV_NUM_KW = _FV_CC['font-variant-numeric'].cats.reduce((a, c) => { for (const k of c) a.add(k); return a; }, new Set());
+const _FV_EA_KW = _FV_CC['font-variant-east-asian'].cats.reduce((a, c) => { for (const k of c) a.add(k); return a; }, new Set());
+const _FV_CAPS_KW = new Set([...(_FONT_ENUM['font-variant-caps'])].filter((k) => k !== 'normal'));
+const _FV_POS_KW = new Set(['sub', 'super']);
+const _parseFontVariantShorthand = (value) => {
+  const s = String(value).trim(), l = s.toLowerCase();
+  const out = { 'font-variant-ligatures': 'normal', 'font-variant-caps': 'normal', 'font-variant-alternates': 'normal', 'font-variant-numeric': 'normal', 'font-variant-east-asian': 'normal', 'font-variant-position': 'normal' };
+  if (l === 'normal') return out;
+  if (l === 'none') { out['font-variant-ligatures'] = 'none'; return out; }
+  const toks = _fontTokens(s);
+  if (toks.length === 0) return null;
+  const buckets = { lig: [], caps: [], alt: [], num: [], ea: [], pos: [] };
+  for (const tok of toks) {
+    const lt = tok.toLowerCase();
+    if (lt === 'normal' || lt === 'none') return null;         // singletons can't combine
+    if (_FV_LIG_KW.has(lt)) buckets.lig.push(tok);
+    else if (_FV_NUM_KW.has(lt)) buckets.num.push(tok);
+    else if (_FV_EA_KW.has(lt)) buckets.ea.push(tok);
+    else if (_FV_CAPS_KW.has(lt)) buckets.caps.push(tok);
+    else if (_FV_POS_KW.has(lt)) buckets.pos.push(tok);
+    else if (lt === 'historical-forms' || /\(/.test(tok)) buckets.alt.push(tok);
+    else return null;                                          // unknown keyword
+  }
+  if (buckets.caps.length > 1 || buckets.pos.length > 1) return null;
+  if (buckets.caps.length === 1) out['font-variant-caps'] = buckets.caps[0].toLowerCase();
+  if (buckets.pos.length === 1) out['font-variant-position'] = buckets.pos[0].toLowerCase();
+  for (const [b, name] of [['lig', 'font-variant-ligatures'], ['num', 'font-variant-numeric'], ['ea', 'font-variant-east-asian']]) {
+    if (buckets[b].length) { const c = _ccOrderedCanon(buckets[b].join(' '), _FV_CC[name].cats, _FV_CC[name].opts); if (c === null) return null; out[name] = c; }
+  }
+  if (buckets.alt.length) { const c = _canonFontVariantAlternates(buckets.alt.join(' ')); if (c === null) return null; out['font-variant-alternates'] = c; }
+  return out;
+};
+// Reconstruct the `font-variant` serialization from a longhand getter (absent → the
+// initial `normal`). Returns '' when the longhands can't be represented (ligatures:none
+// alongside another non-initial longhand).
+const _fontVariantFromLonghands = (get) => {
+  const g = (n) => { const x = String(get(n) || ''); return x === '' ? 'normal' : x; };
+  const lig = g('font-variant-ligatures'), caps = g('font-variant-caps'), alt = g('font-variant-alternates');
+  const num = g('font-variant-numeric'), ea = g('font-variant-east-asian'), pos = g('font-variant-position');
+  const rest = caps === 'normal' && alt === 'normal' && num === 'normal' && ea === 'normal' && pos === 'normal';
+  if (lig === 'none') return rest ? 'none' : '';
+  const parts = [];
+  if (lig !== 'normal') parts.push(lig);
+  if (caps !== 'normal') parts.push(caps);
+  if (alt !== 'normal') parts.push(alt);
+  if (num !== 'normal') parts.push(num);
+  if (ea !== 'normal') parts.push(ea);
+  if (pos !== 'normal') parts.push(pos);
+  return parts.length ? parts.join(' ') : 'normal';
+};
+const _serializeFontVariantShorthand = (decl) => {
+  if ('font-variant' in decl._props) return decl._props['font-variant'];  // var()/CSS-wide single key
+  if (!_FONT_VARIANT_SH_LH.some((ln) => ln in decl._props)) return '';     // no longhand present → empty
+  return _fontVariantFromLonghands((ln) => decl._props[ln]);
 };
 
 // Generic computed-value resolution for the numeric length / integer / time
@@ -14482,6 +14717,7 @@ const _normComputed = (el, kebab, v) => {
     if (toks.length === 2) return toks[0] + ' ' + foldNum(toks[1]);
     return v;
   }
+  if (kebab === 'font-feature-settings') return _computeFontFeatureSettings(el, v);
   if (_SIZE_COMPUTED_PROPS.has(kebab)) return _computeSizeValue(kebab, v, el);
   if (_SH_COMPUTED[kebab]) return _computeBoxShorthand(kebab, v, el);
   if (_SCROLL_PADDING_LH.has(kebab) && String(v).trim().toLowerCase() === 'auto') return 'auto';
@@ -14850,6 +15086,8 @@ globalThis.getComputedStyle = (el, _pseudo) => {
       if (sfont && (_FONT_SYSTEM.has(sfont) || _CSS_WIDE.has(sfont))) return sfont;
       return _fontFromLonghands((ln) => resolve(ln), true);
     }
+    // `font-variant` shorthand: reconstruct from the computed longhands.
+    if (kebab === 'font-variant') return _fontVariantFromLonghands((ln) => resolve(ln));
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
     // Modelled standard properties resolve through the full computed-value
