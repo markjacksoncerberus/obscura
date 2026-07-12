@@ -1002,6 +1002,16 @@ class CSSStyleDeclaration {
       const c = _canonCssText(name, stored);
       if (c === null) return;
       stored = c;
+    } else if (!custom && _FONT_VALIDATED.has(name)) {
+      // css-fonts longhands (font-style/-weight/-width/-stretch/-size/-size-adjust/
+      // -family/-synthesis + the enum longhands): validate + canonicalize the grammar
+      // (invalid → ignore). CSS-wide keywords and var()/env() pass through untouched.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonFont(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
       if (/^(?:alpha|contrast-color)\(/i.test(stored.trim()) && !_isValidColor(stored)) return;  // invalid alpha()/contrast-color() → ignore
@@ -7876,8 +7886,10 @@ const _GCS_DEFAULTS = {
   // (implementation-defined) so the test skips its initial assertion.
   'font-family': '', 'font-feature-settings': 'normal', 'font-kerning': 'auto',
   'font-language-override': 'normal', 'font-optical-sizing': 'auto',
-  'font-size-adjust': 'none', 'font-stretch': '100%', 'font-style': 'normal',
+  'font-size-adjust': 'none', 'font-stretch': '100%', 'font-width': '100%', 'font-style': 'normal',
   'font-synthesis': 'weight style small-caps position', 'font-variant': 'normal',
+  'font-synthesis-weight': 'auto', 'font-synthesis-style': 'auto',
+  'font-synthesis-small-caps': 'auto', 'font-synthesis-position': 'auto',
   'font-variant-alternates': 'normal', 'font-variant-caps': 'normal',
   'font-variant-east-asian': 'normal', 'font-variant-emoji': 'normal',
   'font-variant-ligatures': 'normal', 'font-variant-numeric': 'normal',
@@ -10004,7 +10016,6 @@ const _mathReject = (value, types, pctType) => {
 const _MATH_GATE_PROPS = {
   'opacity':        { types: ['number'], pct: 'number' },           // <number>|<percentage>
   'outline-offset': { types: ['length'], pct: null },              // <length>
-  'font-weight':    { types: ['number'], pct: null },              // <number>|<keyword>
   'margin-left':    { types: ['length'], pct: 'length' },          // <length-percentage>
   'tab-size':       { types: ['number', 'length'], pct: null },    // <number>|<length>
   'height':         { types: ['length'], pct: 'length' },          // <length-percentage>|<keyword>
@@ -10903,8 +10914,10 @@ const _INHERITED_PROPS = new Set([
   'hyphenate-character', 'hyphenate-limit-chars',       // (text-group-align does NOT inherit)
   // css-fonts: every property in this family inherits.
   'font-family', 'font-feature-settings', 'font-kerning', 'font-language-override',
-  'font-optical-sizing', 'font-size-adjust', 'font-stretch', 'font-style',
-  'font-synthesis', 'font-variant', 'font-variant-alternates', 'font-variant-caps',
+  'font-optical-sizing', 'font-size-adjust', 'font-stretch', 'font-width', 'font-style',
+  'font-synthesis', 'font-synthesis-weight', 'font-synthesis-style',
+  'font-synthesis-small-caps', 'font-synthesis-position',
+  'font-variant', 'font-variant-alternates', 'font-variant-caps',
   'font-variant-east-asian', 'font-variant-emoji', 'font-variant-ligatures',
   'font-variant-numeric', 'font-variant-position', 'font-variation-settings',
   // css-ui: caret-color, caret-shape, cursor and interactivity inherit (the
@@ -13896,6 +13909,205 @@ const _serializeScrollShorthand = (decl, name) => {
   return _serializeBoxValue(name, vals);
 };
 
+// ── CSS Fonts (css-fonts) value parsing ──────────────────────────────────────
+// These longhands stored their value RAW (no grammar check), so every `*-invalid`
+// value was wrongly accepted, the keyword→canonical rewrites never happened, and
+// the computed forms (keyword→px/%, oblique→deg, bolder/lighter, calc folding) were
+// missing. This self-contained engine validates + canonicalizes each longhand; a
+// null return means "invalid → ignore" (CSSOM). Dispatched from setProperty via
+// `_FONT_VALIDATED` (ahead of the length/_MATH_GATE branches); the matching computed
+// forms live in `_normComputed`. The `font` shorthand + font-variant/-feature-settings
+// (complex combinatorial grammars) are intentionally out of this pass.
+
+// font-weight bolder/lighter: resolve against the inherited computed weight (CSS
+// Fonts 4 §font-weight, the continuous variable-font algorithm the tests encode).
+const _fontBolder = (w) => w < 350 ? 400 : w < 550 ? 700 : w < 900 ? 900 : w;
+const _fontLighter = (w) => w < 100 ? w : w < 550 ? 100 : w < 750 ? 400 : 700;
+// font-width / font-stretch keyword → computed <percentage>.
+const _FONT_WIDTH_KW = {
+  'ultra-condensed': '50%', 'extra-condensed': '62.5%', 'condensed': '75%',
+  'semi-condensed': '87.5%', 'normal': '100%', 'semi-expanded': '112.5%',
+  'expanded': '125%', 'extra-expanded': '150%', 'ultra-expanded': '200%',
+};
+const _FONT_ABS_SIZE = new Set(['xx-small', 'x-small', 'small', 'medium', 'large', 'x-large', 'xx-large', 'xxx-large']);
+const _FONT_REL_SIZE = new Set(['larger', 'smaller']);
+const _FONT_GENERIC = new Set([
+  'serif', 'sans-serif', 'cursive', 'fantasy', 'monospace', 'system-ui',
+  'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded', 'math', 'emoji', 'fangsong',
+]);
+// font-synthesis = none | [ weight || style/oblique-only || small-caps || position ].
+const _FONT_SYNTH_CATS = [
+  new Set(['weight']), new Set(['style', 'oblique-only']),
+  new Set(['small-caps']), new Set(['position']),
+];
+const _FONT_ENUM = {
+  'font-kerning': new Set(['auto', 'normal', 'none']),
+  'font-optical-sizing': new Set(['auto', 'none']),
+  'font-variant-caps': new Set(['normal', 'small-caps', 'all-small-caps', 'petite-caps', 'all-petite-caps', 'unicase', 'titling-caps']),
+  'font-variant-emoji': new Set(['normal', 'text', 'emoji', 'unicode']),
+  'font-synthesis-weight': new Set(['auto', 'none']),
+  'font-synthesis-style': new Set(['auto', 'none', 'oblique-only']),
+  'font-synthesis-small-caps': new Set(['auto', 'none']),
+  'font-synthesis-position': new Set(['auto', 'none']),
+};
+// A plain <angle> token → its value in degrees (no calc), or null.
+const _angleToDegNum = (tok) => {
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(deg|grad|rad|turn)$/i.exec(String(tok).trim());
+  if (!m) return null;
+  const nnn = parseFloat(m[1]), u = m[2].toLowerCase();
+  return u === 'deg' ? nnn : u === 'grad' ? nnn * 0.9 : u === 'rad' ? nnn * 180 / Math.PI : nnn * 360;
+};
+// font-style: normal | italic | oblique <angle [-90deg,90deg]>? — a literal 0 angle
+// serializes as `normal`; grad/rad/turn kept verbatim at specified time; calc kept.
+const _canonFontStyle = (v) => {
+  const toks = _wsTokens(String(v).trim());
+  if (toks.length === 1) {
+    const l = toks[0].toLowerCase();
+    return (l === 'normal' || l === 'italic' || l === 'oblique') ? l : null;
+  }
+  if (toks.length === 2 && toks[0].toLowerCase() === 'oblique') {
+    const a = toks[1];
+    if (_MATHFN_NAME_RE.test(a)) {
+      const c = _canonMathExpr(a);
+      return c === null ? null : 'oblique ' + c;
+    }
+    const deg = _angleToDegNum(a);
+    if (deg === null || deg < -90 || deg > 90) return null;
+    if (deg === 0) return 'normal';
+    return 'oblique ' + _canonStandardValue(a);
+  }
+  return null;
+};
+// font-weight: normal | bold | bolder | lighter | <number [1,1000]> (+ calc, whose
+// out-of-range value is clamped only at computed time).
+const _canonFontWeight = (v) => {
+  const toks = _wsTokens(String(v).trim());
+  if (toks.length !== 1) return null;
+  const t = toks[0], l = t.toLowerCase();
+  if (l === 'normal' || l === 'bold' || l === 'bolder' || l === 'lighter') return l;
+  if (_MATHFN_NAME_RE.test(t)) return _canonMathExpr(t);
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(t)) {
+    const nnn = parseFloat(t);
+    return (nnn >= 1 && nnn <= 1000) ? _serNumber(nnn) : null;
+  }
+  return null;
+};
+// font-width / font-stretch: normal|<keyword> | <percentage [0,∞]> (+ calc).
+const _canonFontWidth = (v) => {
+  const toks = _wsTokens(String(v).trim());
+  if (toks.length !== 1) return null;
+  const t = toks[0], l = t.toLowerCase();
+  if (l in _FONT_WIDTH_KW) return l;
+  if (_MATHFN_NAME_RE.test(t)) return /%/.test(t) ? _canonMathExpr(t) : null;
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(t);
+  if (m) { const nnn = parseFloat(m[1]); return nnn < 0 ? null : _serNumber(nnn) + '%'; }
+  return null;
+};
+// font-size: <absolute-size> | <relative-size> | <length-percentage [0,∞]> (+ calc).
+const _canonFontSize = (v) => {
+  const toks = _wsTokens(String(v).trim());
+  if (toks.length !== 1) return null;
+  const t = toks[0], l = t.toLowerCase();
+  if (_FONT_ABS_SIZE.has(l) || _FONT_REL_SIZE.has(l)) return l;
+  if (_MATHFN_NAME_RE.test(t)) return _canonMathExpr(t, { canonLen: true });
+  const c = _canonLenPctSigned(t, true);
+  if (c === null || /^-/.test(c)) return null;               // no bare-negative <length-percentage>
+  return c;
+};
+// A font-size-adjust <number [0,∞]> (or calc, whose negative value is kept).
+const _canonFsaNumber = (t) => {
+  if (_MATHFN_NAME_RE.test(t)) return /%/.test(t) ? null : _canonMathExpr(t);
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(t)) {
+    const nnn = parseFloat(t);
+    return nnn < 0 ? null : _serNumber(nnn);
+  }
+  return null;
+};
+const _FSA_BASIS = new Set(['ex-height', 'cap-height', 'ch-width', 'ic-width', 'ic-height']);
+// font-size-adjust: none | [ ex-height|cap-height|ch-width|ic-width|ic-height ]?
+// [ from-font | <number> ]. The default basis `ex-height` is omitted from serialization.
+const _canonFontSizeAdjust = (v) => {
+  const toks = _wsTokens(String(v).trim());
+  if (toks.length === 1) {
+    const l = toks[0].toLowerCase();
+    if (l === 'none' || l === 'from-font') return l;
+    return _canonFsaNumber(toks[0]);
+  }
+  if (toks.length === 2) {
+    const basis = toks[0].toLowerCase();
+    if (!_FSA_BASIS.has(basis)) return null;
+    const val = toks[1].toLowerCase() === 'from-font' ? 'from-font' : _canonFsaNumber(toks[1]);
+    if (val === null) return null;
+    return basis === 'ex-height' ? val : basis + ' ' + val;
+  }
+  return null;
+};
+// A single unquoted <family-name> ident token (CSS identifier grammar).
+const _isFamilyIdent = (t) => /^-?(?:[_a-zA-Z\u00A0-\uFFFF]|\\.)(?:[-_a-zA-Z0-9\u00A0-\uFFFF]|\\.)*$/.test(t);
+const _familyReserved = (l) => _FONT_GENERIC.has(l) || _CSS_WIDE.has(l) || l === 'default';
+// A quoted <family-name> string → its serialization: reduce to an unquoted custom-ident
+// sequence when it is one (and not a reserved keyword), else re-quote with double quotes.
+const _serFamilyString = (content) => {
+  const toks = content.split(/\s+/).filter(Boolean);
+  if (toks.length && content === toks.join(' ') && toks.every(_isFamilyIdent)
+      && !toks.some((t) => _familyReserved(t.toLowerCase())))
+    return toks.join(' ');
+  return '"' + content.replace(/["\\]/g, '\\$&') + '"';
+};
+// One comma-separated <family-name> | <generic-family> → canonical, or null.
+const _canonOneFamily = (p) => {
+  const sm = /^"((?:[^"\\]|\\.)*)"$/.exec(p) || /^'((?:[^'\\]|\\.)*)'$/.exec(p);
+  if (sm) return _serFamilyString(sm[1]);
+  const toks = _wsTokens(p);
+  if (toks.length === 0) return null;
+  const lows = toks.map((t) => t.toLowerCase());
+  if (toks.length === 1 && _FONT_GENERIC.has(lows[0])) return lows[0];  // generic → lowercased
+  if (!toks.every(_isFamilyIdent)) return null;
+  if (lows.some(_familyReserved)) return null;               // a reserved keyword can't be an unquoted family
+  return toks.join(' ');
+};
+// font-family: [ <family-name> | <generic-family> ]#.
+const _canonFontFamily = (v) => {
+  const parts = _splitCommaQuoted(String(v).trim());
+  const out = [];
+  for (const raw of parts) {
+    const p = raw.trim();
+    if (p === '') return null;
+    const c = _canonOneFamily(p);
+    if (c === null) return null;
+    out.push(c);
+  }
+  return out.join(', ');
+};
+// Dispatch a css-fonts longhand → canonical specified value (null = invalid → ignore).
+const _canonFont = (name, value) => {
+  if (name === 'font-style') return _canonFontStyle(value);
+  if (name === 'font-weight') return _canonFontWeight(value);
+  if (name === 'font-width' || name === 'font-stretch') return _canonFontWidth(value);
+  if (name === 'font-size') return _canonFontSize(value);
+  if (name === 'font-size-adjust') return _canonFontSizeAdjust(value);
+  if (name === 'font-family') return _canonFontFamily(value);
+  if (name === 'font-synthesis') return _ccOrderedCanon(value, _FONT_SYNTH_CATS, { singletons: new Set(['none']) });
+  const en = _FONT_ENUM[name];
+  if (en) {
+    const s = String(value).trim(), l = s.toLowerCase();
+    return (_wsTokens(s).length === 1 && en.has(l)) ? l : null;
+  }
+  return null;
+};
+const _FONT_VALIDATED = new Set([
+  'font-style', 'font-weight', 'font-width', 'font-stretch', 'font-size',
+  'font-size-adjust', 'font-family', 'font-synthesis', ...Object.keys(_FONT_ENUM),
+]);
+// The parent element's computed font-size in px (font-relative `em`/`%` on the
+// font-size property itself resolve against the PARENT's size, not the element's).
+const _parentFontSizePx = (el) => {
+  const p = el && el.parentElement;
+  if (!p) return 16;
+  const m = /^(-?(?:\d+\.?\d*|\.\d+))px$/.exec(String(_computedPropOf(p, 'font-size')).trim());
+  return m ? parseFloat(m[1]) : 16;
+};
+
 // Generic computed-value resolution for the numeric length / integer / time
 // property families (CSS Values 4 — getComputedStyle returns the *resolved*
 // value, in canonical units). Length props fold math functions and resolve the
@@ -14057,9 +14269,53 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'transform') return _canonTransform(v, el, true);
   if (_INDIV_TRANSFORM.has(kebab)) return _canonIndividualTransform(kebab, v, el, true);
   if (kebab === 'content') return _canonContent(v, el, true);
+  if (kebab === 'font-style') {
+    const toks = _wsTokens(String(v).trim());
+    if (toks.length !== 2) return v;                        // normal | italic | oblique
+    const r = _evalMath(toks[1], 0, { angle: true, lengths: true, cqZero: true });
+    if (r === null) return v;
+    const d = Math.max(-90, Math.min(90, r));               // clamp to [-90deg, 90deg]
+    return d === 0 ? 'normal' : 'oblique ' + _serAngle(d);
+  }
+  if (kebab === 'font-weight') {
+    const l = String(v).trim().toLowerCase();
+    if (l === 'normal') return '400';
+    if (l === 'bold') return '700';
+    if (l === 'bolder' || l === 'lighter') {
+      const pw = el && el.parentElement ? parseFloat(_computedPropOf(el.parentElement, 'font-weight')) : 400;
+      const base = isFinite(pw) ? pw : 400;
+      return String(l === 'bolder' ? _fontBolder(base) : _fontLighter(base));
+    }
+    const nnn = _evalMath(String(v), 1, { lengths: true, cqZero: true });
+    return nnn === null ? v : _serNumber(Math.max(1, Math.min(1000, nnn)));
+  }
+  if (kebab === 'font-width' || kebab === 'font-stretch') {
+    const l = String(v).trim().toLowerCase();
+    if (l in _FONT_WIDTH_KW) return _FONT_WIDTH_KW[l];
+    const nnn = _evalMath(String(v), 100, { lengths: true, cqZero: true });
+    return nnn === null ? v : _serNumber(Math.max(0, nnn)) + '%';
+  }
   if (kebab === 'font-size') {
-    const k = String(v).trim().toLowerCase();
-    if (k in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[k];
+    const l = String(v).trim().toLowerCase();
+    if (l in _FONT_SIZE_KEYWORDS) return _FONT_SIZE_KEYWORDS[l];
+    if (l === 'larger' || l === 'smaller') {
+      const base = _parentFontSizePx(el);
+      return _serNumber(l === 'larger' ? base * 1.2 : base / 1.2) + 'px';
+    }
+    if (_FONT_REL_SIZE.has(l) || _FONT_ABS_SIZE.has(l)) return v;
+    const base = _parentFontSizePx(el);
+    const nnn = _evalMath(String(v), base, Object.assign({ lengths: true, cqZero: true, emPx: base }, _vpUnits()));
+    return nnn === null ? v : _serNumber(Math.max(0, nnn)) + 'px';
+  }
+  if (kebab === 'font-size-adjust') {
+    const toks = _wsTokens(String(v).trim());
+    const foldNum = (t) => {
+      if (!_MATHFN_NAME_RE.test(t)) return t;                // number / from-font pass through
+      const nnn = _evalMath(t, 1, { lengths: true, cqZero: true });
+      return nnn === null ? t : _serNumber(Math.max(0, nnn)); // computed clamps to [0,∞]
+    };
+    if (toks.length === 1) return foldNum(toks[0]);
+    if (toks.length === 2) return toks[0] + ' ' + foldNum(toks[1]);
     return v;
   }
   if (_SIZE_COMPUTED_PROPS.has(kebab)) return _computeSizeValue(kebab, v, el);
