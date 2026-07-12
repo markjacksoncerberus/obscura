@@ -1010,6 +1010,24 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
+    if (!custom && name === 'overflow' && !/\bvar\(/i.test(stored)) {
+      // `overflow` shorthand: expand into — and store as — overflow-x/overflow-y so
+      // `el.style.overflowX` reads back. A CSS-wide keyword goes to both longhands.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const low = stored.toLowerCase();
+      let x, y;
+      if (_CSS_WIDE.has(low)) { x = y = low; }
+      else {
+        const lh = _parseOverflowShorthand(stored);
+        if (!lh) return;                                        // invalid → keep prior value
+        x = lh['overflow-x']; y = lh['overflow-y'];
+      }
+      delete this._props['overflow']; delete this._priority['overflow'];  // never keep a shorthand key
+      this._props['overflow-x'] = x; this._priority['overflow-x'] = prio;
+      this._props['overflow-y'] = y; this._priority['overflow-y'] = prio;
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1046,6 +1064,16 @@ class CSSStyleDeclaration {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
         const c = _canonFont(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
+    } else if (!custom && _OVERFLOW_VALIDATED.has(name)) {
+      // css-overflow longhands (overflow-x/-y/-block/-inline, scrollbar-gutter,
+      // block-ellipsis, overflow-clip-margin): validate + canonicalize the grammar
+      // (invalid → ignore). CSS-wide keywords and var()/env() pass through untouched.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonCssOverflow(name, stored);
         if (c === null) return;
         stored = c;
       }
@@ -1187,6 +1215,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'overflow') {                               // overflow shorthand: clear overflow-x/-y (+ any raw key)
+      const old = (key in this._props) ? this._props[key] : _serializeOverflowShorthand((n) => this._props[n] || '');
+      delete this._props['overflow']; delete this._priority['overflow'];
+      for (const ln of _OVERFLOW_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1210,6 +1245,10 @@ class CSSStyleDeclaration {
     }
     if (key === 'font') return _serializeFontShorthand(this);  // system/CSS-wide key or reconstruct from longhands
     if (key === 'font-variant') return _serializeFontVariantShorthand(this);  // CSS-wide key or reconstruct from longhands
+    if (key === 'overflow') {                              // shorthand
+      if (key in this._props) return this._props[key];     // raw key (set via style attribute / cssText)
+      return _serializeOverflowShorthand((n) => this._props[n] || '');  // reconstruct from overflow-x/-y
+    }
     return this._props[key] || "";
   }
   getPropertyPriority(name) {
@@ -7972,6 +8011,7 @@ const _GCS_DEFAULTS = {
   'block-ellipsis': 'no-ellipsis', continue: 'normal', 'max-lines': 'auto',
   'overflow-block': 'visible', 'overflow-inline': 'visible', 'overflow-x': 'visible',
   'overflow-y': 'visible', 'text-overflow': 'clip', 'scrollbar-gutter': 'auto',
+  'overflow-clip-margin': '0px', '-webkit-line-clamp': 'none',
   // css-break. orphans/widows inherit; the break-* and box-decoration-break do not.
   'box-decoration-break': 'slice', 'break-after': 'auto', 'break-before': 'auto',
   'break-inside': 'auto', orphans: '2', widows: '2',
@@ -8101,10 +8141,16 @@ const _expandDeclInto = (out, name, value, important) => {
 // Split a CSS value into top-level whitespace-separated tokens, keeping bracketed
 // groups (rgb(…), calc(…), …) intact.
 const _wsTokens = (s) => {
-  const out = []; let depth = 0, cur = '';
+  const out = []; let depth = 0, cur = '', q = 0;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if (c === '(' || c === '[' || c === '{') { depth++; cur += c; }
+    if (q) {                                                   // inside a "…"/'…' string: whitespace never splits
+      cur += c;
+      if (c === '\\' && i + 1 < s.length) { cur += s[++i]; }   // keep the escaped char verbatim
+      else if (c === q) q = 0;
+    }
+    else if (c === '"' || c === "'") { q = c; cur += c; }
+    else if (c === '(' || c === '[' || c === '{') { depth++; cur += c; }
     else if (c === ')' || c === ']' || c === '}') { depth--; cur += c; }
     else if (/\s/.test(c) && depth === 0) { if (cur) { out.push(cur); cur = ''; } }
     else cur += c;
@@ -11548,6 +11594,134 @@ const _canonCssText = (name, value) => {
   return s;
 };
 
+// ── CSS Overflow (css-overflow-3/4) value parsing ─────────────────────────────
+// The overflow longhands (overflow-x/-y/-block/-inline), scrollbar-gutter,
+// block-ellipsis and overflow-clip-margin stored their value RAW in setProperty
+// (no grammar check) → every `*-invalid` value was wrongly accepted (0/N) and
+// combinations/units never canonicalized. `_canonCssOverflow` validates +
+// canonicalizes each; a null return means "invalid → ignore the declaration"
+// (matching CSSOM). CSS-wide keywords and var()/env() pass through untouched
+// (gated at dispatch). The `overflow` SHORTHAND expands into overflow-x/-y (see
+// _parseOverflowShorthand); its visible↔auto computed coupling lives in
+// _normComputed.
+const _OVERFLOW_KW = new Set(['visible', 'hidden', 'clip', 'scroll', 'auto']);
+const _OVERFLOW_ENUM = new Set(['overflow-x', 'overflow-y', 'overflow-block', 'overflow-inline']);
+const _OCM_BOX = new Set(['content-box', 'padding-box', 'border-box']);
+const _CONTINUE_KW = new Set(['normal', 'discard', 'collapse', '-webkit-legacy']);
+// Serialize overflow-clip-margin from a resolved (box, length) pair per the CSSOM
+// rule: the box is dropped when it is the default `padding-box`; the length is
+// dropped when it is a literal zero AND a (non-default) box is present. When the
+// box is default/absent the length is always shown (as `0px` when absent). `zero`
+// flags that the (already-canonicalized) length string is a literal 0.
+const _serOverflowClipMargin = (box, lenStr, hasLen, zero) => {
+  const boxStr = (box && box !== 'padding-box') ? box : '';
+  let ls;
+  if (!hasLen) ls = boxStr ? '' : '0px';           // absent length shown only when box is default/absent
+  else ls = (boxStr && zero) ? '' : lenStr;         // present length dropped when a box is shown AND it is 0
+  return [boxStr, ls].filter(Boolean).join(' ') || '0px';
+};
+// Canonicalize an overflow-clip-margin <length [0,∞]> token (no percentage). A
+// calc() keeps its symbolic form; a literal must be non-negative. Returns
+// {str, zero} or null when invalid.
+const _canonOCMLength = (t) => {
+  if (_MATHFN_NAME_RE.test(t)) {
+    if (/%/.test(t)) return null;                    // percentages are not allowed
+    const c = _canonMathExpr(t, { canonLen: true });
+    return c === null ? null : { str: c, zero: false };  // calc kept symbolic → never a literal zero
+  }
+  if (/%$/.test(t)) return null;
+  if (_isZeroTok(t)) return { str: '0px', zero: true };       // unitless 0 → 0px
+  if (_isLengthTok(t)) {
+    if (/^-/.test(t)) return null;                            // literal negative → invalid
+    const cs = _canonStandardValue(t);
+    return { str: cs, zero: parseFloat(cs) === 0 };           // a literal-zero length (0px/0em) drops when a box is present
+  }
+  return null;
+};
+const _canonCssOverflow = (name, value) => {
+  const s = String(value).trim();
+  const low = s.toLowerCase();
+  if (_OVERFLOW_ENUM.has(name)) {                    // overflow-x/-y/-block/-inline: one keyword
+    const toks = _wsTokens(s);
+    return (toks.length === 1 && _OVERFLOW_KW.has(low)) ? low : null;
+  }
+  if (name === 'scrollbar-gutter') {                 // auto | stable && both-edges?
+    const toks = _wsTokens(s).map((t) => t.toLowerCase());
+    if (toks.length === 1) return (toks[0] === 'auto' || toks[0] === 'stable') ? toks[0] : null;
+    if (toks.length === 2 && toks.indexOf('stable') !== -1 && toks.indexOf('both-edges') !== -1) return 'stable both-edges';
+    return null;
+  }
+  if (name === 'block-ellipsis') {                   // no-ellipsis | ellipsis | <string>
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0], tl = t.toLowerCase();
+    if (tl === 'no-ellipsis' || tl === 'ellipsis') return tl;
+    if (/^"(?:[^"\\]|\\.)*"$/.test(t) || /^'(?:[^'\\]|\\.)*'$/.test(t)) return _canonStandardValue(t);
+    return null;
+  }
+  if (name === 'continue') return (_wsTokens(s).length === 1 && _CONTINUE_KW.has(low)) ? low : null;  // normal|discard|collapse|-webkit-legacy
+  if (name === 'max-lines') {                        // auto || <integer [1,∞]> (integer serialized first)
+    const toks = _wsTokens(s);
+    if (toks.length < 1 || toks.length > 2) return null;
+    let auto = false, intv = null;
+    for (const t of toks) {
+      if (t.toLowerCase() === 'auto') { if (auto) return null; auto = true; continue; }
+      if (intv !== null || !/^\+?\d+$/.test(t)) return null;
+      const n = parseInt(t, 10);
+      if (n < 1) return null;
+      intv = String(n);
+    }
+    return [intv, auto ? 'auto' : null].filter(Boolean).join(' ');
+  }
+  if (name === '-webkit-line-clamp') {               // none | <integer [1,∞]>
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    if (low === 'none') return 'none';
+    if (!/^\+?\d+$/.test(toks[0])) return null;
+    const n = parseInt(toks[0], 10);
+    return n >= 1 ? String(n) : null;
+  }
+  if (name === 'overflow-clip-margin') {             // <visual-box> || <length [0,∞]>
+    const toks = _wsTokens(s);
+    if (toks.length < 1 || toks.length > 2) return null;
+    let box = null, len = null;
+    for (const t of toks) {
+      const tl = t.toLowerCase();
+      if (_OCM_BOX.has(tl)) { if (box !== null) return null; box = tl; continue; }
+      if (len !== null) return null;                 // a second length
+      const c = _canonOCMLength(t);
+      if (c === null) return null;
+      len = c;
+    }
+    return _serOverflowClipMargin(box, len ? len.str : '', len !== null, len ? len.zero : false);
+  }
+  return s;
+};
+const _OVERFLOW_VALIDATED = new Set([
+  ...(_OVERFLOW_ENUM), 'scrollbar-gutter', 'block-ellipsis', 'overflow-clip-margin',
+  'continue', 'max-lines', '-webkit-line-clamp',
+]);
+// The `overflow` shorthand `[ visible | hidden | clip | scroll | auto ]{1,2}`
+// expands into overflow-x (first value) and overflow-y (second, or a copy of the
+// first). Returns {'overflow-x','overflow-y'} or null when invalid.
+const _OVERFLOW_SH_LH = ['overflow-x', 'overflow-y'];
+const _parseOverflowShorthand = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  const x = toks[0].toLowerCase();
+  const y = toks.length === 2 ? toks[1].toLowerCase() : x;
+  if (!_OVERFLOW_KW.has(x) || !_OVERFLOW_KW.has(y)) return null;
+  return { 'overflow-x': x, 'overflow-y': y };
+};
+// Serialize the `overflow` shorthand from its two longhands (get(name)→value),
+// collapsing to a single value when both axes are equal (CSSOM "serialize a CSS
+// value"). Returns '' when either longhand is missing.
+const _serializeOverflowShorthand = (get) => {
+  const x = get('overflow-x'), y = get('overflow-y');
+  if (!x || !y) return '';
+  return x === y ? x : x + ' ' + y;
+};
+
 // The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
 // `gap`/`grid-gap` map to row-gap/column-gap; `grid-row-gap`/`grid-column-gap` are
 // legacy single-longhand aliases handled separately (_GRID_GAP_ALIAS).
@@ -14633,6 +14807,29 @@ const _computeTimeValue = (v, el) => {
 };
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  if (kebab === 'overflow-x' || kebab === 'overflow-y') {
+    // css-overflow computed coupling: a `visible` axis computes to `auto` when the
+    // OTHER axis is a scrolling keyword (hidden/scroll/auto); `clip` and the
+    // scrolling keywords are unchanged. Read the counterpart's SPECIFIED keyword
+    // (pre-coupling — it can never itself be `visible` while this axis is), so no
+    // recursion into _normComputed.
+    const self = String(v).trim().toLowerCase();
+    if (self !== 'visible') return self;
+    const other = kebab === 'overflow-x' ? 'overflow-y' : 'overflow-x';
+    let ok = String((_specifiedDecl(el, other) || {}).value || '').trim().toLowerCase();
+    if (!ok || _CSS_WIDE.has(ok)) ok = 'visible';    // absent/CSS-wide → initial (visible, non-inherited)
+    return (ok === 'hidden' || ok === 'scroll' || ok === 'auto') ? 'auto' : 'visible';
+  }
+  if (kebab === 'overflow-clip-margin') {
+    // <visual-box> || <length [0,∞]>: resolve the length to absolute px (calc folded,
+    // clamped ≥0), then serialize by the same box-drop / zero-length-drop rule.
+    const toks = _wsTokens(String(v).trim());
+    let box = null, lenTok = null;
+    for (const t of toks) { if (_OCM_BOX.has(t.toLowerCase())) box = t.toLowerCase(); else lenTok = t; }
+    if (lenTok === null) return _serOverflowClipMargin(box, '', false, false);
+    const lenStr = _clampNegPx(_trComp(lenTok, el, true, _vpUnits()));
+    return _serOverflowClipMargin(box, lenStr, true, parseFloat(lenStr) === 0);
+  }
   // css-text computed forms that differ from the specified serialization.
   if (kebab === 'text-justify' && String(v).trim().toLowerCase() === 'distribute') return 'inter-character';
   if (kebab === 'text-fit') {                              // computed drops the default `consistent` scope
@@ -15048,6 +15245,7 @@ const _CSS_KNOWN_PROPS = (() => {
   for (const k of _COLOR_PROPS) add(k);
   add('offset');                                           // the `offset` shorthand (expands to its 5 longhands)
   add('font');                                             // the `font` shorthand (expands to its 7 longhands)
+  add('overflow');                                         // the `overflow` shorthand (expands to overflow-x/-y)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
   for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
@@ -15088,6 +15286,13 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     }
     // `font-variant` shorthand: reconstruct from the computed longhands.
     if (kebab === 'font-variant') return _fontVariantFromLonghands((ln) => resolve(ln));
+    // `overflow` shorthand: reconstruct from the computed overflow-x/overflow-y
+    // (which carry the visible↔auto coupling), collapsing equal axes to one value.
+    if (kebab === 'overflow') {
+      const xv = resolve('overflow-x'), yv = resolve('overflow-y');
+      if (!xv || !yv) return '';
+      return xv === yv ? xv : xv + ' ' + yv;
+    }
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
     // Modelled standard properties resolve through the full computed-value
@@ -18235,6 +18440,15 @@ globalThis.CSS = {
       if (_CSSTEXT_VALIDATED.has(name)) {                // css-text longhands + text-wrap/white-space
         if (/\bvar\(/i.test(val)) return true;
         return _canonCssText(name, _canonStandardValue(val)) != null;
+      }
+      if (_OVERFLOW_VALIDATED.has(name)) {               // css-overflow longhands (+ overflow-clip-margin)
+        if (/\bvar\(/i.test(val)) return true;
+        return _canonCssOverflow(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'overflow') {                         // the `overflow` shorthand
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _parseOverflowShorthand(c) != null;
       }
       if (_SCROLL_SH_LH[name]) {                         // scroll-margin/scroll-padding shorthands
         if (/\bvar\(/i.test(val)) return true;

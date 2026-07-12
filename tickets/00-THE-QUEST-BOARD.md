@@ -177,6 +177,42 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-11 (Quest #186 The Overflow Verdict — CSS Overflow value-parsing props, +120):**
+Pivoted off the finished css-fonts realm to the untouched `css/css-overflow/parsing/` dir — SAME root cause as
+#179→#185: the css-overflow longhands stored their value RAW in setProperty (no grammar check), so every
+`*-invalid` was 0/N, combinations were never reordered, and the computed forms were missing. Built a
+self-contained css-overflow value engine in `bootstrap.js` (`_canonCssOverflow`, dispatched via
+`_OVERFLOW_VALIDATED` in setProperty + `CSS.supports`): overflow-x/-y/-block/-inline `visible|hidden|clip|scroll|
+auto`; `scrollbar-gutter` `auto | stable && both-edges?` (both-edges reordered after stable); `block-ellipsis`
+`no-ellipsis|ellipsis|<string>`; `overflow-clip-margin` `<visual-box> || <length [0,∞]>` (box dropped when default
+`padding-box`, length dropped when literal-0 & a box is shown, calc-fold, no `%`) via `_canonOCMLength`/
+`_serOverflowClipMargin`; `continue` `normal|discard|collapse|-webkit-legacy`; `max-lines` `auto || <integer
+[1,∞]>` (integer serialized first); `-webkit-line-clamp` `none|<integer [1,∞]>`. The `overflow` **shorthand**
+`[visible|hidden|clip|scroll|auto]{1,2}` EXPANDS into and stores as overflow-x/-y (`_parseOverflowShorthand`; the
+getter/removeProperty check a raw `overflow` key first — the style-attribute path stores it un-expanded — then
+reconstruct via `_serializeOverflowShorthand`, collapsing equal axes). Computed (`_normComputed`): the overflow
+visible↔auto coupling (a `visible` axis computes to `auto` when the OTHER axis is a scrolling keyword; `clip`
+never changes) via the counterpart's SPECIFIED value (no recursion), `getComputedStyle().overflow` reconstruction,
+and overflow-clip-margin length→absolute-px (`_trComp`, clamp ≥0, em=16px). Also made the SHARED `_wsTokens`
+quote-aware so a `<string>` with an internal space (`text-overflow: "marker string"`) tokenizes as ONE token —
+fixed text-overflow-valid/-computed too. Registered `overflow-clip-margin`(0px)/`-webkit-line-clamp`(none) in
+`_GCS_DEFAULTS`, `overflow` in `_CSS_KNOWN_PROPS`. **Every `*-invalid` 0/N→N/N (scrollbar-gutter-invalid 1→26,
+block-ellipsis-invalid 0→11, continue-invalid 0→9, max-lines-invalid 0→8, webkit-line-clamp-invalid 0→7,
+overflow-invalid 0→6), overflow-clip-margin 7→25 + computed 0→20, overflow-computed 25→34, overflow-valid 15→18
+(+120). Realm value-parsing props 76/196 → 196/196. ZERO regressions** (qsa 1975, classlist 1420, Element-matches
+669, createElement 147, url-origin 406/413, serialize-values 696/697 — caught + fixed a mid-dev regression where
+the `overflow` getter ignored the style-attribute raw key, restoring the 5 `overflow:` subtests — css-fonts
+font-valid 315/315 + font-computed 315/315 + font-variant-invalid 21/21 + font-feature-settings 10/5/10, css-text
+text-indent 14/14 + word-spacing 9/9, css-ui caret-color 12/12+15/15, css-align place-content 23/23, css-scroll-snap
+scroll-margin-shorthand 20/20, css-content content-valid 46/46 all held). **Caps / Next:** the `line-clamp`
+shorthand (12/18 valid, 0/7 invalid — a 3-longhand expansion into max-lines/block-ellipsis/continue whose ellipsis
+component `auto|ellipsis|no-ellipsis|<string>` serializes DIFFERENTLY from block-ellipsis, `ellipsis`→`auto`;
+deferred as the messiest grammar); the untouched CSS-Overflow-5 carousel vein `scroll-buttons` (0/37!),
+`scroll-axis-lock` (invalid/computed 0/15), `scroll-target-group`, `getComputedStyle-scroll-button` (0/5) — the
+next in-realm target, SAME machinery; and the `display: -webkit-box`→`flow-root` blockification rule
+(webkit-box-computed, a display-computed feature we lack). grep `_canonCssOverflow`/`_OVERFLOW_VALIDATED`/
+`_parseOverflowShorthand`/`_serOverflowClipMargin`/`_canonOCMLength`. Scroll `tickets/186-the-overflow-verdict.md`.
+
 **Session 2026-07-11 (Quest #185 The Variant Verdict — the `font-variant` shorthand + longhands + `font-feature-settings`, +82):**
 Closed the last combinatorial tail of the css-fonts realm. The `||`-combination font-variant longhands
 (ligatures/numeric/east-asian) + the `font-variant` shorthand stored their values RAW (every `*-invalid`
