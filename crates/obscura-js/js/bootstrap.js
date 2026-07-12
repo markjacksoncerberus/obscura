@@ -1028,6 +1028,37 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
+    if (!custom && (name === 'grid-column' || name === 'grid-row') && !/\bvar\(/i.test(stored)) {
+      // grid-column / grid-row shorthand: expand into — and store as — its two
+      // <grid-line> longhands (grid-<axis>-start/-end) so `el.style.gridColumnStart`
+      // reads back. A CSS-wide keyword goes to both. Invalid → keep prior value.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const axis = name === 'grid-column' ? 'column' : 'row';
+      const low = stored.toLowerCase();
+      let s, e;
+      if (_CSS_WIDE.has(low)) { s = e = low; }
+      else { const lh = _parseGridColumnRow(stored); if (!lh) return; s = lh.start; e = lh.end; }
+      delete this._props[name]; delete this._priority[name];    // never keep a shorthand key
+      this._props['grid-' + axis + '-start'] = s; this._priority['grid-' + axis + '-start'] = prio;
+      this._props['grid-' + axis + '-end'] = e; this._priority['grid-' + axis + '-end'] = prio;
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
+    if (!custom && name === 'grid-area' && !/\bvar\(/i.test(stored)) {
+      // grid-area shorthand: expand into — and store as — its four <grid-line>
+      // longhands (row/column start/end). A CSS-wide keyword goes to all four.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const low = stored.toLowerCase();
+      let lh;
+      if (_CSS_WIDE.has(low)) lh = { 'grid-row-start': low, 'grid-column-start': low, 'grid-row-end': low, 'grid-column-end': low };
+      else { lh = _parseGridArea(stored); if (!lh) return; }
+      delete this._props[name]; delete this._priority[name];    // never keep a shorthand key
+      for (const ln of ['grid-row-start', 'grid-column-start', 'grid-row-end', 'grid-column-end']) {
+        this._props[ln] = lh[ln]; this._priority[ln] = prio;
+      }
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1086,6 +1117,15 @@ class CSSStyleDeclaration {
         const c = _canonGrid(name, stored);
         if (c === null) return;
         stored = c;
+      }
+    } else if (!custom && _GRID_LINE_LH.has(name)) {
+      // grid-row/-column-start/-end: validate + canonicalize a single <grid-line>
+      // (invalid → ignore). CSS-wide keywords and var()/env() pass through.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const g = _canonGridLine(stored);
+        if (g === null) return;
+        stored = g.s;
       }
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
@@ -1232,6 +1272,18 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'grid-column' || key === 'grid-row' || key === 'grid-area') {  // placement shorthand: clear its longhands
+      const axis = key === 'grid-column' ? 'column' : 'row';
+      const old = (key in this._props) ? this._props[key]
+        : (key === 'grid-area' ? _serGridArea((n) => this._props[n] || '') : _serGridColumnRow((n) => this._props[n] || '', axis));
+      delete this._props[key]; delete this._priority[key];    // any var()-stored shorthand key
+      const lhs = key === 'grid-area'
+        ? ['grid-row-start', 'grid-column-start', 'grid-row-end', 'grid-column-end']
+        : ['grid-' + axis + '-start', 'grid-' + axis + '-end'];
+      for (const ln of lhs) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1258,6 +1310,14 @@ class CSSStyleDeclaration {
     if (key === 'overflow') {                              // shorthand
       if (key in this._props) return this._props[key];     // raw key (set via style attribute / cssText)
       return _serializeOverflowShorthand((n) => this._props[n] || '');  // reconstruct from overflow-x/-y
+    }
+    if (key === 'grid-column' || key === 'grid-row') {     // placement shorthand
+      if (key in this._props) return this._props[key];     // var() kept as a single key
+      return _serGridColumnRow((n) => this._props[n] || '', key === 'grid-column' ? 'column' : 'row');
+    }
+    if (key === 'grid-area') {                             // placement shorthand
+      if (key in this._props) return this._props[key];     // var() kept as a single key
+      return _serGridArea((n) => this._props[n] || '');    // reconstruct from the four longhands
     }
     return this._props[key] || "";
   }
@@ -12097,6 +12157,206 @@ const _computeGridTemplate = (v, el) => {
     .filter((x) => x !== '').join(' ');
 };
 
+// ── CSS Grid placement: grid-row/-column-start/-end longhands + the ──────────
+// grid-row / grid-column / grid-area SHORTHANDS ──────────────────────────────
+// A <grid-line> (CSS Grid §8.3) is one of:
+//   auto | <custom-ident>
+//   | [ <integer [-∞,-1]> | <integer [1,∞]> ] && <custom-ident>?     (integer ≠ 0)
+//   | [ span && [ <integer [1,∞]> || <custom-ident> ] ]              (bare `span` invalid)
+// where a line-name <custom-ident> excludes `span`, `auto`, the CSS-wide keywords
+// and `default`. These longhands stored their value RAW → every `*-invalid` test
+// accepted junk (0/N) and canonicalisation (`az 2`→`2 az`, `span 1 i`→`span i`,
+// sign/`auto` casing) never happened. `_canonGridLine` returns { s, ci } — `ci` is
+// the ident when the line is a lone <custom-ident> (drives the omitted-value copy
+// rule), else null — or null when the value is not a valid <grid-line>.
+const _GRID_LINE_RESERVED = new Set(['span', 'auto', 'initial', 'inherit', 'unset', 'revert', 'revert-layer', 'default']);
+// Split a <grid-line> into tokens on top-level whitespace, keeping `\`-escapes
+// intact (a `\`+hex escape may embed a terminating space that is NOT a separator,
+// e.g. `\31 st`) and function parens whole (`min(-1, 6)`). `[`/`]` (a line-name
+// group, not allowed in a <grid-line>) → null. Returns null on unbalanced parens.
+const _gridLineTokens = (s) => {
+  const out = []; const n = s.length; let i = 0;
+  while (i < n) {
+    const c = s[i];
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f') { i++; continue; }
+    if (c === '[' || c === ']') return null;
+    let j = i, depth = 0, buf = '';
+    while (j < n) {
+      const cj = s[j];
+      if (cj === '\\') {                                          // escape: `\`+hex(+one ws) | `\`+char
+        const m = /^\\[0-9a-fA-F]{1,6}[ \t\n\r\f]?/.exec(s.slice(j));
+        if (m) { buf += m[0]; j += m[0].length; } else { buf += s.slice(j, j + 2); j += 2; }
+        continue;
+      }
+      if (cj === '(') { depth++; buf += cj; j++; continue; }
+      if (cj === ')') { if (depth === 0) return null; depth--; buf += cj; j++; continue; }
+      if (depth === 0 && (cj === ' ' || cj === '\t' || cj === '\n' || cj === '\r' || cj === '\f' || cj === '[' || cj === ']')) break;
+      buf += cj; j++;
+    }
+    if (depth !== 0) return null;
+    out.push(buf); i = j;
+  }
+  return out;
+};
+// Unescape a CSS ident token to raw code points (CSS Syntax §consume-escaped):
+// `\`+1-6 hex(+one trailing whitespace) → that code point; `\`+other → that char.
+const _unescapeCssIdent = (t) => {
+  let out = '';
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] !== '\\') { out += t[i]; continue; }
+    const m = /^\\([0-9a-fA-F]{1,6})[ \t\n\r\f]?/.exec(t.slice(i));
+    if (m) { out += String.fromCodePoint(parseInt(m[1], 16) || 0xFFFD); i += m[0].length - 1; }
+    else { out += t[i + 1] || ''; i += 1; }
+  }
+  return out;
+};
+// Serialize a raw ident string per CSSOM serialize-an-identifier: hex-escape a
+// leading digit / `-`+digit / control chars; pass through letters, digits, `-`,
+// `_`, and non-ASCII (incl. surrogates >=U+0080) verbatim; backslash-escape the rest.
+const _serializeCssIdent = (s) => {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0) { out += '�'; continue; }
+    if ((c >= 0x1 && c <= 0x1F) || c === 0x7F) { out += '\\' + c.toString(16) + ' '; continue; }
+    if (i === 0 && c >= 0x30 && c <= 0x39) { out += '\\' + c.toString(16) + ' '; continue; }
+    if (i === 1 && s.charCodeAt(0) === 0x2D && c >= 0x30 && c <= 0x39) { out += '\\' + c.toString(16) + ' '; continue; }
+    if (i === 0 && c === 0x2D && s.length === 1) { out += '\\-'; continue; }
+    if (c >= 0x80 || c === 0x2D || c === 0x5F || (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)) { out += s[i]; continue; }
+    out += '\\' + s[i];
+  }
+  return out;
+};
+// A grid-line <custom-ident>: a CSS ident (non-ASCII + `\`-escapes incl. hex, and
+// the `--` prefix) that is not a reserved line name. `_ESC_IDENT_RE` covers both a
+// `\`+hex escape (with its optional terminating whitespace) and a `\`+char escape.
+const _ESC_IDENT_RE = '(?:\\\\[0-9a-fA-F]{1,6}[ \\t\\n\\r\\f]?|\\\\[^\\n])';
+const _GRID_CI_RE = new RegExp('^(?:--(?:[-_a-zA-Z0-9\\u00A0-\\uFFFF]|' + _ESC_IDENT_RE + ')*|-?(?:[_a-zA-Z\\u00A0-\\uFFFF]|'
+  + _ESC_IDENT_RE + ')(?:[-_a-zA-Z0-9\\u00A0-\\uFFFF]|' + _ESC_IDENT_RE + ')*)$');
+const _isGridCustomIdent = (t) => _GRID_CI_RE.test(t) && !_GRID_LINE_RESERVED.has(_unescapeCssIdent(t).toLowerCase());
+// Canonicalize a <custom-ident> line name: unescape then CSSOM-serialize so
+// `\31st` and `\31 st` both → `\31 st` (and compare equal for the copy rule).
+const _canonGridIdent = (t) => _serializeCssIdent(_unescapeCssIdent(t));
+const _isGridIntLiteral = (t) => /^[+-]?\d+$/.test(t);
+// A <grid-line> integer: a literal non-zero integer (span form: >=1), or a math
+// function folded to a canonical integer calc() (clamped at used time). String | null.
+const _canonGridLineInt = (t, span) => {
+  if (_isGridIntLiteral(t)) {
+    const n = parseInt(t, 10);
+    if (span) { if (n < 1) return null; } else if (n === 0) return null;
+    return String(n);
+  }
+  return _MATHFN_NAME_RE.test(t) ? _canonMathExpr(t) : null;   // calc()/min()/... integer, folded
+};
+const _canonGridLine = (v) => {
+  const toks = _gridLineTokens(String(v).trim());
+  if (toks === null || toks.length === 0) return null;
+  const lows = toks.map((t) => t.toLowerCase());
+  if (lows.indexOf('auto') !== -1)
+    return toks.length === 1 ? { s: 'auto', ci: null } : null;        // `auto` must stand alone
+  const spanPos = lows.indexOf('span');
+  if (spanPos !== -1) {
+    // span && [ <integer> || <custom-ident> ] — canonical order `span <int> <ident>`.
+    if (toks.length > 3 || lows.filter((x) => x === 'span').length > 1) return null;
+    let iv = null, ident = null;
+    for (let i = 0; i < toks.length; i++) {
+      if (i === spanPos) continue;
+      const t = toks[i];
+      if (iv === null && (_isGridIntLiteral(t) || _MATHFN_NAME_RE.test(t))) {
+        iv = _canonGridLineInt(t, true); if (iv === null) return null;
+      } else if (ident === null && _isGridCustomIdent(t)) { ident = _canonGridIdent(t); }
+      else return null;
+    }
+    if (iv === null && ident === null) return null;                  // bare `span`
+    const parts = ['span'];
+    if (iv !== null && !(iv === '1' && ident !== null)) parts.push(iv);  // `span 1 foo` → `span foo`
+    if (ident !== null) parts.push(ident);
+    return { s: parts.join(' '), ci: null };
+  }
+  if (toks.length === 1) {
+    const t = toks[0];
+    if (_isGridIntLiteral(t) || _MATHFN_NAME_RE.test(t)) {
+      const iv = _canonGridLineInt(t, false); return iv === null ? null : { s: iv, ci: null };
+    }
+    if (!_isGridCustomIdent(t)) return null;
+    const ci = _canonGridIdent(t); return { s: ci, ci };             // a lone <custom-ident>
+  }
+  if (toks.length === 2) {                                            // <integer> && <custom-ident> (either order)
+    let intTok = null, ident = null;
+    for (const t of toks) {
+      if (intTok === null && (_isGridIntLiteral(t) || _MATHFN_NAME_RE.test(t))) intTok = t;
+      else if (ident === null && _isGridCustomIdent(t)) ident = _canonGridIdent(t);
+      else return null;
+    }
+    if (intTok === null || ident === null) return null;
+    const iv = _canonGridLineInt(intTok, false); if (iv === null) return null;
+    return { s: iv + ' ' + ident, ci: null };                        // canonical: integer first
+  }
+  return null;
+};
+// The omitted-value default for a grid-line whose paired line was elided: the
+// (already-canonical) start value if it is a lone <custom-ident>, else `auto`.
+const _gridLineDefault = (startVal) => {
+  const p = _canonGridLine(startVal);
+  return p && p.ci !== null ? startVal : 'auto';
+};
+// Split a placement shorthand at top-level `/` (respecting ()/[] nesting).
+const _gridSlashParts = (value) => {
+  const s = String(value); const out = []; let depth = 0, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') depth--;
+    else if (c === '/' && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
+  }
+  out.push(s.slice(start));
+  return out;
+};
+// grid-column / grid-row = <grid-line> [ / <grid-line> ]? → { start, end } | null.
+// An omitted second line copies the first when it is a lone <custom-ident>, else `auto`.
+const _parseGridColumnRow = (value) => {
+  const parts = _gridSlashParts(value);
+  if (parts.length < 1 || parts.length > 2) return null;
+  const a = _canonGridLine(parts[0]); if (!a) return null;
+  let endS;
+  if (parts.length === 2) { const b = _canonGridLine(parts[1]); if (!b) return null; endS = b.s; }
+  else endS = a.ci !== null ? a.ci : 'auto';
+  return { start: a.s, end: endS };
+};
+// grid-area = <grid-line> [ / <grid-line> ]{0,3} → the four placement longhands | null.
+// Elided lines copy: column-start←row-start, row-end←row-start, column-end←column-start.
+const _parseGridArea = (value) => {
+  const parts = _gridSlashParts(value);
+  if (parts.length < 1 || parts.length > 4) return null;
+  const lines = parts.map(_canonGridLine);
+  if (lines.some((x) => !x)) return null;
+  const rs = lines[0];
+  const cs = lines[1] || { s: rs.ci !== null ? rs.ci : 'auto', ci: rs.ci };
+  const re = lines[2] || { s: rs.ci !== null ? rs.ci : 'auto' };
+  const ce = lines[3] || { s: cs.ci !== null ? cs.ci : 'auto' };
+  return { 'grid-row-start': rs.s, 'grid-column-start': cs.s, 'grid-row-end': re.s, 'grid-column-end': ce.s };
+};
+// Reconstruct grid-column / grid-row from its two longhands (drop a redundant end).
+const _serGridColumnRow = (get, axis) => {
+  const s = get('grid-' + axis + '-start'), e = get('grid-' + axis + '-end');
+  if (!s || !e) return '';
+  return e === _gridLineDefault(s) ? s : s + ' / ' + e;
+};
+// Reconstruct grid-area from its four longhands, dropping redundant trailing lines
+// (column-end, then row-end, then column-start) that equal their omitted defaults.
+const _serGridArea = (get) => {
+  const rs = get('grid-row-start'), cs = get('grid-column-start'),
+        re = get('grid-row-end'), ce = get('grid-column-end');
+  if (!rs || !cs || !re || !ce) return '';
+  const vals = [rs, cs, re, ce];
+  if (ce !== _gridLineDefault(cs)) return vals.join(' / ');
+  if (re !== _gridLineDefault(rs)) return vals.slice(0, 3).join(' / ');
+  if (cs !== _gridLineDefault(rs)) return vals.slice(0, 2).join(' / ');
+  return rs;
+};
+// The single-<grid-line> placement longhands, validated in setProperty.
+const _GRID_LINE_LH = new Set(['grid-row-start', 'grid-row-end', 'grid-column-start', 'grid-column-end']);
+
 // The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
 // `gap`/`grid-gap` map to row-gap/column-gap; `grid-row-gap`/`grid-column-gap` are
 // legacy single-longhand aliases handled separately (_GRID_GAP_ALIAS).
@@ -18845,6 +19105,21 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         if (_CSS_WIDE.has(val.toLowerCase())) return true;
         return _canonGrid(name, _canonStandardValue(val)) != null;
+      }
+      if (_GRID_LINE_LH.has(name)) {                     // grid-row/-column-start/-end longhands
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _canonGridLine(_canonStandardValue(val)) != null;
+      }
+      if (name === 'grid-column' || name === 'grid-row') {  // placement shorthands
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _parseGridColumnRow(_canonStandardValue(val)) != null;
+      }
+      if (name === 'grid-area') {
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _parseGridArea(_canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);

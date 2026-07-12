@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-12 (Quest #188).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-12 (Quest #189).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-grid/parsing/grid-column-shorthand.html` | 0/48 | **48/48** | ✅ 100% | **Quest #189 The Placement Verdict.** `<grid-line>` engine (`_canonGridLine`/`_gridLineTokens`): `auto \| <custom-ident> \| <integer> && <custom-ident>? \| span && [<integer> \|\| <custom-ident>]`; `grid-column` shorthand expands into grid-column-start/-end (omitted end copies a lone custom-ident else `auto`). **+48.** |
+| `css/css-grid/parsing/grid-row-shorthand.html` | 0/48 | **48/48** | ✅ 100% | **Quest #189.** Same engine, row axis. **+48.** |
+| `css/css-grid/parsing/grid-area-valid.html` | 31/60 | **60/60** | ✅ 100% | **Quest #189.** `grid-area` = `<grid-line> [ / <grid-line> ]{0,3}` → 4 longhands; canonical int-before-ident (`az 2`→`2 az`), `span 1 i`→`span i`, calc fold (`min(-1,6)`→`calc(-1)`), CSSOM ident serialize (`\31st`≡`\31 st`), redundant-trailing-line collapse. **+29.** |
+| `css/css-grid/parsing/grid-area-invalid.html` | 0/25 | **25/25** | ✅ 100% | **Quest #189.** Rejects zero/`1.0`/`+-3`/bare `span`/`auto`+token/`"1st"`/CSS-wide-in-multi/too-many-slashes. **+25.** |
 | `css/css-grid/parsing/grid-template-columns-invalid.html` | 0/42 | **42/42** | ✅ 100% | **Quest #188 The Track Verdict.** Grid track-sizing value engine (`_GRID_VALIDATED`/`_canonGrid`/`_gridTokens`): `<track-list>`/`<auto-track-list>` grammar — ≤1 auto-repeat, other components must be `<fixed-size>`/`<fixed-repeat>`, line names exclude `span`/`auto`. **+42.** |
 | `css/css-grid/parsing/grid-template-rows-invalid.html` | 0/42 | **42/42** | ✅ 100% | **Quest #188 The Track Verdict.** Same `_canonGridTemplate` engine, rows axis. **+42.** |
 | `css/css-grid/parsing/grid-template-columns-valid.html` | 32/34 | **34/34** | ✅ 100% | **Quest #188.** Canonicalization: `auto /**/`→`auto`, empty `[]` groups dropped, `<fixed-repeat>` alongside `<auto-repeat>` accepted. **+2.** |
