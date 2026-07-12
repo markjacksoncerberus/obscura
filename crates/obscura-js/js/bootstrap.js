@@ -1072,6 +1072,19 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
+    if (!custom && name === 'grid' && !/\bvar\(/i.test(stored)) {
+      // grid shorthand: expand into — and store as — all six grid-template-*/
+      // grid-auto-* longhands. A CSS-wide keyword goes to all six. Invalid → keep.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const low = stored.toLowerCase();
+      let lh;
+      if (_CSS_WIDE.has(low)) { lh = {}; for (const ln of _GRID_SH_LH) lh[ln] = low; }
+      else { lh = _parseGridShort(stored); if (!lh) return; }
+      delete this._props[name]; delete this._priority[name];    // never keep a shorthand key
+      for (const ln of _GRID_SH_LH) { this._props[ln] = lh[ln]; this._priority[ln] = prio; }
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1312,6 +1325,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'grid') {                                    // full grid shorthand: clear all six longhands
+      const old = (key in this._props) ? this._props[key] : _serGridShort((n) => this._props[n] || '');
+      delete this._props[key]; delete this._priority[key];    // any var()-stored shorthand key
+      for (const ln of _GRID_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1350,6 +1370,10 @@ class CSSStyleDeclaration {
     if (key === 'grid-template') {                         // rows/columns/areas shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
       return _serGridTemplate((n) => this._props[n] || '');
+    }
+    if (key === 'grid') {                                  // full grid shorthand
+      if (key in this._props) return this._props[key];     // var() kept as a single key
+      return _serGridShort((n) => this._props[n] || '');
     }
     return this._props[key] || "";
   }
@@ -12580,6 +12604,74 @@ const _serGridTemplate = (get) => {
 };
 const _GRID_TEMPLATE_LH = ['grid-template-rows', 'grid-template-columns', 'grid-template-areas'];
 
+// ── The `grid` shorthand (all six grid-template-*/grid-auto-* longhands) ──────
+//   grid = <'grid-template'>
+//        | <'grid-template-rows'> / [ auto-flow && dense? ] <'grid-auto-columns'>?
+//        | [ auto-flow && dense? ] <'grid-auto-rows'>? / <'grid-template-columns'>
+// A <'grid-template'> value leaves grid-auto-* at their initials; an auto-flow
+// form sets grid-auto-flow/-rows/-columns and forces the rest to their initials.
+const _GRID_SH_LH = ['grid-template-rows', 'grid-template-columns', 'grid-template-areas', 'grid-auto-flow', 'grid-auto-rows', 'grid-auto-columns'];
+// Parse the `[ auto-flow && dense? ]` prefix of an auto-flow side; returns
+// { dense, rest } (rest = the remaining <grid-auto-rows/columns> tokens) or null
+// when `auto-flow` is absent or a stray keyword precedes the track list.
+const _parseAutoFlowSide = (toks) => {
+  let af = false, dense = false, i = 0;
+  while (i < toks.length) {
+    const low = toks[i].toLowerCase();
+    if (low === 'auto-flow' && !af) { af = true; i++; }
+    else if (low === 'dense' && !dense) { dense = true; i++; }
+    else break;
+  }
+  return af ? { dense, rest: toks.slice(i) } : null;
+};
+const _parseGridShort = (value) => {
+  const s = String(value).trim();
+  const toks = _gridTemplateTokens(s);
+  if (toks === null) return null;
+  if (!toks.some((t) => t.toLowerCase() === 'auto-flow')) {
+    const t = _parseGridTemplate(s);                              // Form 1: <'grid-template'>
+    return t ? Object.assign({}, t, { 'grid-auto-flow': 'row', 'grid-auto-rows': 'auto', 'grid-auto-columns': 'auto' }) : null;
+  }
+  // auto-flow form: exactly one top-level `/`, auto-flow on exactly one side.
+  if (toks.filter((t) => t === '/').length !== 1) return null;
+  const si = toks.indexOf('/');
+  const leftToks = toks.slice(0, si), rightToks = toks.slice(si + 1);
+  const leftAF = leftToks.some((t) => t.toLowerCase() === 'auto-flow');
+  const rightAF = rightToks.some((t) => t.toLowerCase() === 'auto-flow');
+  if (leftAF === rightAF) return null;                            // both sides / neither → invalid
+  if (leftAF) {
+    // Form 3: [ auto-flow && dense? ] <'grid-auto-rows'>? / <'grid-template-columns'>
+    const af = _parseAutoFlowSide(leftToks); if (!af) return null;
+    const ar = af.rest.length ? _canonGrid('grid-auto-rows', af.rest.join(' ')) : 'auto';
+    const tc = _canonGrid('grid-template-columns', rightToks.join(' '));
+    if (ar === null || tc === null) return null;
+    return { 'grid-template-rows': 'none', 'grid-template-columns': tc, 'grid-template-areas': 'none',
+      'grid-auto-flow': af.dense ? 'dense' : 'row', 'grid-auto-rows': ar, 'grid-auto-columns': 'auto' };
+  }
+  // Form 2: <'grid-template-rows'> / [ auto-flow && dense? ] <'grid-auto-columns'>?
+  const af = _parseAutoFlowSide(rightToks); if (!af) return null;
+  const ac = af.rest.length ? _canonGrid('grid-auto-columns', af.rest.join(' ')) : 'auto';
+  const tr = _canonGrid('grid-template-columns', leftToks.join(' '));   // a <'grid-template-rows'> value
+  if (ac === null || tr === null) return null;
+  return { 'grid-template-rows': tr, 'grid-template-columns': 'none', 'grid-template-areas': 'none',
+    'grid-auto-flow': af.dense ? 'column dense' : 'column', 'grid-auto-rows': 'auto', 'grid-auto-columns': ac };
+};
+// Reconstruct the `grid` shorthand from its six longhands (CSS Grid §7.8).
+const _serGridShort = (get) => {
+  const tr = get('grid-template-rows'), tc = get('grid-template-columns'), ta = get('grid-template-areas'),
+        af = get('grid-auto-flow'), ar = get('grid-auto-rows'), ac = get('grid-auto-columns');
+  if (!tr || !tc || !ta || !af || !ar || !ac) return '';
+  const flowInitial = af === 'row' && ar === 'auto' && ac === 'auto';
+  if (ta !== 'none' || flowInitial) return flowInitial ? _serGridTemplate(get) : '';  // template form (else inexpressible)
+  const dense = /\bdense\b/.test(af);
+  if (/\bcolumn\b/.test(af)) {                                    // Form 2: rows / auto-flow …
+    if (tc !== 'none') return '';
+    return tr + ' / auto-flow' + (dense ? ' dense' : '') + (ac !== 'auto' ? ' ' + ac : '');
+  }
+  if (tr !== 'none') return '';                                   // Form 3: auto-flow … / columns
+  return 'auto-flow' + (dense ? ' dense' : '') + (ar !== 'auto' ? ' ' + ar : '') + ' / ' + tc;
+};
+
 // The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
 // `gap`/`grid-gap` map to row-gap/column-gap; `grid-row-gap`/`grid-column-gap` are
 // legacy single-longhand aliases handled separately (_GRID_GAP_ALIAS).
@@ -19353,6 +19445,11 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         if (_CSS_WIDE.has(val.toLowerCase())) return true;
         return _parseGridTemplate(_canonStandardValue(val)) != null;
+      }
+      if (name === 'grid') {
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _parseGridShort(_canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);

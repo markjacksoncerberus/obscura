@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-12 (Quest #190).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-12 (Quest #191).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-grid/parsing/grid-shorthand-valid.html` | 32/49 | **49/49** | ✅ 100% | **Quest #191 The Grid Verdict.** `grid` shorthand (`_parseGridShort`/`_serGridShort`): Form 1 `<'grid-template'>`, Form 2/3 auto-flow forms (`<rows> / auto-flow [dense] <auto-columns>` etc.) over all six grid-template-*/grid-auto-* longhands. **+17.** |
+| `css/css-grid/parsing/grid-shorthand-invalid.html` | 0/34 | **34/34** | ✅ 100% | **Quest #191.** auto-flow on both/neither side rejected, one top-level `/`, invalid track-size/`none`-mixing rejected; `_serGridShort` returns `''` unless all six longhands set. **+34.** |
 | `css/css-grid/parsing/grid-template-areas-valid.html` | 6/9 | **9/9** | ✅ 100% | **Quest #190 The Template Verdict.** `grid-template-areas` = `none \| <string>+` (`_canonGridTemplateAreas`): §7.3 cell tokenizer (dot-run→one null cell), filled-rectangle validation, whitespace-collapse. **+3.** |
 | `css/css-grid/parsing/grid-template-areas-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #190.** Rejects `auto`/`none`-mixed/`""`/whitespace-only/non-rectangular strings. **+11.** |
 | `css/css-grid/parsing/grid-template-shorthand-valid.html` | 24/40 | **40/40** | ✅ 100% | **Quest #190.** `grid-template` shorthand (`_parseGridTemplate`/`_serGridTemplate`): `none`, Form A `<rows> / <cols>`, Form B ascii-art `[<line-names>? <string> <track-size>? <line-names>?]+ [/ <explicit-track-list>]?` → 3 longhands + reconstruction. **+16.** |
