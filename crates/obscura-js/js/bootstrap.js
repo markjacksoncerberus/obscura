@@ -1077,6 +1077,16 @@ class CSSStyleDeclaration {
         if (c === null) return;
         stored = c;
       }
+    } else if (!custom && _GRID_VALIDATED.has(name)) {
+      // grid-template-columns/-rows, grid-auto-columns/-rows, grid-auto-flow:
+      // validate + canonicalize the <track-list>/<track-size>/flow grammar
+      // (invalid → ignore). CSS-wide keywords and var()/env() pass through.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonGrid(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
       if (/^(?:alpha|contrast-color)\(/i.test(stored.trim()) && !_isValidColor(stored)) return;  // invalid alpha()/contrast-color() → ignore
@@ -11735,6 +11745,358 @@ const _serializeOverflowShorthand = (get) => {
   return x === y ? x : x + ' ' + y;
 };
 
+// ── CSS Grid track sizing value parsing (grid-template-columns/-rows, ────────
+// grid-auto-columns/-rows, grid-auto-flow) ──────────────────────────────────
+// These longhands stored their value RAW, so every `*-invalid` test failed
+// (junk track lists were accepted) and `*-computed` couldn't fold calc lengths.
+// `_canonGrid(name, value)` validates + canonicalizes the grammar; null → the
+// declaration is invalid and dropped (CSSOM). CSS-wide keywords / var() are
+// handled by the setProperty gate before this is reached.
+//
+// Grammar (CSS Grid §7): a <track-size> is one of
+//   <track-breadth> | minmax( <inflexible-breadth> , <track-breadth> )
+//                    | fit-content( <length-percentage [0,∞]> )
+//   <track-breadth>      = <length-percentage [0,∞]> | <flex> | min-content | max-content | auto
+//   <inflexible-breadth> = <length-percentage [0,∞]> | min-content | max-content | auto   (no <flex>)
+//   <fixed-breadth>      = <length-percentage [0,∞]>                                       (no keywords/flex)
+// A <fixed-size> is a track-size that pins a definite length: a <fixed-breadth>,
+// or a minmax() with a <fixed-breadth> in either slot.
+
+// Split a grid value into top-level tokens: line-name groups `[ … ]` are kept
+// whole (incl. brackets), functions keep their balanced parens, comments are
+// stripped. Returns null on unbalanced brackets/parens (→ invalid value).
+const _gridTokens = (s) => {
+  const out = []; const n = s.length; let i = 0;
+  while (i < n) {
+    const c = s[i];
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f') { i++; continue; }
+    if (c === '/' && s[i + 1] === '*') { const e = s.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; continue; }
+    if (c === '[') { const j = s.indexOf(']', i); if (j < 0) return null; out.push(s.slice(i, j + 1)); i = j + 1; continue; }
+    if (c === ']') return null;
+    let j = i, depth = 0;
+    while (j < n) {
+      const cj = s[j];
+      if (cj === '(') depth++;
+      else if (cj === ')') { if (depth === 0) return null; depth--; }
+      else if (depth === 0 && (cj === '[' || cj === ']' || cj === ' ' || cj === '\t' || cj === '\n' || cj === '\r' || cj === '\f')) break;
+      j++;
+    }
+    if (depth !== 0) return null;
+    out.push(s.slice(i, j)); i = j;
+  }
+  return out;
+};
+const _isGridLineNames = (t) => t.charCodeAt(0) === 91 /* [ */;
+// A reserved line-name (excluded from <custom-ident> in line-name context).
+const _GRID_RESERVED_LINE_NAME = new Set(['span', 'auto']);
+const _isGridIdent = (t) => /^-?[a-zA-Z_][a-zA-Z0-9_-]*$/.test(t)
+  && !_GRID_RESERVED_LINE_NAME.has(t.toLowerCase());
+// Canonicalize a `[ … ]` line-name group → normalized `[a b]` (single-spaced),
+// or `[]` when empty. Returns null when any name is not a valid line-name ident.
+const _canonGridLineNames = (t) => {
+  const inner = t.slice(1, -1).trim();
+  if (inner === '') return '[]';
+  const names = inner.split(/\s+/);
+  for (const nm of names) if (!_isGridIdent(nm)) return null;
+  return '[' + names.join(' ') + ']';
+};
+// A <flex> is `<number [0,∞]>fr`. Returns canonical `Nfr` or null.
+const _canonGridFlex = (t) => {
+  const m = /^(\+?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)fr$/i.exec(t);
+  if (!m) return null;
+  const num = parseFloat(m[1]);
+  return num >= 0 ? _serNumber(num) + 'fr' : null;
+};
+// A non-negative <length-percentage> (incl. calc()). Returns canonical string or null.
+const _canonGridLP = (t) => {
+  if (_MATHFN_NAME_RE.test(t)) return _canonStandardValue(t);   // calc()/min()/… pass through
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(%|[a-z]+)?$/i.exec(t);
+  if (!m) return null;
+  const num = parseFloat(m[1]);
+  const unit = m[2] && m[2].toLowerCase();
+  if (num < 0) return null;
+  if (!unit) return num === 0 ? '0px' : null;                   // bare number: only 0 is a valid length
+  if (unit === '%') return _serNumber(num) + '%';
+  if (_LEN_UNIT_RE.test(unit) || /^(?:cq[whib]|cqmin|cqmax|sv[wh]|lv[wh]|dv[wh])$/.test(unit))
+    return _serNumber(num) + unit;
+  return null;
+};
+const _GRID_INTRINSIC_KW = new Set(['min-content', 'max-content', 'auto']);
+// <track-breadth>: LP | flex | min/max-content | auto → canonical string | null.
+const _canonGridTrackBreadth = (t) => {
+  const low = t.toLowerCase();
+  if (_GRID_INTRINSIC_KW.has(low)) return low;
+  const f = _canonGridFlex(t); if (f !== null) return f;
+  return _canonGridLP(t);
+};
+// <inflexible-breadth>: like track-breadth but no <flex>.
+const _canonGridInflexBreadth = (t) => {
+  const low = t.toLowerCase();
+  if (_GRID_INTRINSIC_KW.has(low)) return low;
+  return _canonGridLP(t);
+};
+// Extract the balanced argument list of a `name( … )` function; returns the
+// inner string or null when `t` isn't that function.
+const _gridFnArgs = (t, name) => {
+  const re = new RegExp('^' + name + '\\(([\\s\\S]*)\\)$', 'i');
+  const m = re.exec(t.trim());
+  return m ? m[1] : null;
+};
+// Split a function argument string at top-level commas (respecting nested parens).
+const _gridSplitArgs = (s) => {
+  const out = []; let depth = 0, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(') depth++;
+    else if (c === ')') depth--;
+    else if (c === ',' && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
+  }
+  out.push(s.slice(start));
+  return out;
+};
+// Parse a single <track-size>. Returns { canon, fixed } or null. `fixed` marks a
+// <fixed-size> (usable inside an auto-repeat / alongside one).
+const _canonGridTrackSize = (t) => {
+  const mm = _gridFnArgs(t, 'minmax');
+  if (mm !== null) {
+    const args = _gridSplitArgs(mm);
+    if (args.length !== 2) return null;
+    const a = _canonGridInflexBreadth(args[0].trim());
+    const b = _canonGridTrackBreadth(args[1].trim());
+    if (a === null || b === null) return null;
+    // fixed-size iff either slot is a <fixed-breadth> (a non-negative LP).
+    const aFixed = _canonGridLP(args[0].trim()) !== null;
+    const bFixed = _canonGridLP(args[1].trim()) !== null;
+    return { canon: 'minmax(' + a + ', ' + b + ')', fixed: aFixed || bFixed };
+  }
+  const fc = _gridFnArgs(t, 'fit-content');
+  if (fc !== null) {
+    const args = _gridSplitArgs(fc);
+    if (args.length !== 1) return null;
+    const lp = _canonGridLP(args[0].trim());
+    if (lp === null) return null;
+    return { canon: 'fit-content(' + lp + ')', fixed: false };   // fit-content() is not a <fixed-size>
+  }
+  const tb = _canonGridTrackBreadth(t);
+  if (tb === null) return null;
+  return { canon: tb, fixed: _canonGridLP(t) !== null };
+};
+// Parse an inner track list `[ <line-names>? <track-size> ]+ <line-names>?`
+// (the body of a repeat(), or a full <track-list> when norepeat). `opts.fixed`
+// requires every track to be a <fixed-size> (auto-repeat body). Returns
+// { canon, tracks } or null. `norepeat` forbids nested repeat().
+const _canonGridTrackSeq = (toks, opts) => {
+  opts = opts || {};
+  const parts = []; let tracks = 0; let prevLineNames = false; let allFixed = true;
+  for (const tok of toks) {
+    if (_isGridLineNames(tok)) {
+      if (prevLineNames) return null;                            // two adjacent line-name groups
+      const ln = _canonGridLineNames(tok);
+      if (ln === null) return null;
+      if (ln !== '[]') parts.push(ln);                           // drop empty groups from the serialization
+      prevLineNames = true;
+      continue;
+    }
+    prevLineNames = false;
+    const ts = _canonGridTrackSize(tok);
+    if (ts === null) return null;
+    if (opts.fixed && !ts.fixed) return null;
+    if (!ts.fixed) allFixed = false;
+    parts.push(ts.canon); tracks++;
+  }
+  if (tracks < 1) return null;
+  return { canon: parts.join(' '), tracks, allFixed };
+};
+
+// Parse a repeat() at the top level of a <track-list>. Returns
+// { canon, auto, tracks } or null. auto ⇒ auto-fill/auto-fit (its body must be
+// all <fixed-size>); otherwise a numeric <integer [1,∞]> count.
+const _canonGridRepeat = (t) => {
+  const inner = _gridFnArgs(t, 'repeat');
+  if (inner === null) return null;
+  const comma = _gridSplitArgs(inner);
+  if (comma.length < 2) return null;
+  const arg1 = comma[0].trim();
+  const body = comma.slice(1).join(',');                         // the rest is the track body
+  const bodyToks = _gridTokens(body);
+  if (bodyToks === null) return null;
+  const a1low = arg1.toLowerCase();
+  if (a1low === 'auto-fill' || a1low === 'auto-fit') {
+    const seq = _canonGridTrackSeq(bodyToks, { fixed: true });
+    if (seq === null) return null;
+    return { canon: 'repeat(' + a1low + ', ' + seq.canon + ')', auto: true, tracks: seq.tracks };
+  }
+  // <integer [1,∞]> count — a plain integer, or a math function (calc()/…) that
+  // resolves to one (the value is clamped ≥1 at used time; kept symbolic here).
+  let countStr;
+  if (/^\+?\d+$/.test(arg1)) { if (parseInt(arg1, 10) < 1) return null; countStr = String(parseInt(arg1, 10)); }
+  else if (_MATHFN_NAME_RE.test(arg1)) countStr = _canonStandardValue(arg1);
+  else return null;
+  const seq = _canonGridTrackSeq(bodyToks, {});
+  if (seq === null) return null;
+  // A <fixed-repeat> (all inner tracks are <fixed-size>) may sit alongside an
+  // <auto-repeat> in an <auto-track-list>; a non-fixed normal repeat may not.
+  return { canon: 'repeat(' + countStr + ', ' + seq.canon + ')', auto: false, tracks: seq.tracks, fixed: seq.allFixed };
+};
+
+// Validate + canonicalize a full grid-template-columns/-rows <track-list> (the
+// non-`none` case). Returns the canonical string or null.
+const _canonGridTemplate = (toks) => {
+  const parts = []; let tracks = 0, autoRepeats = 0;
+  let prevLineNames = false;
+  const nonAutoFixed = [];                                       // fixedness of each non-auto track/repeat
+  for (const tok of toks) {
+    if (_isGridLineNames(tok)) {
+      if (prevLineNames) return null;
+      const ln = _canonGridLineNames(tok);
+      if (ln === null) return null;
+      if (ln !== '[]') parts.push(ln);
+      prevLineNames = true;
+      continue;
+    }
+    prevLineNames = false;
+    if (/^repeat\(/i.test(tok)) {
+      const r = _canonGridRepeat(tok);
+      if (r === null) return null;
+      if (r.auto) autoRepeats++; else nonAutoFixed.push(r.fixed);
+      parts.push(r.canon); tracks++;
+      continue;
+    }
+    const ts = _canonGridTrackSize(tok);
+    if (ts === null) return null;
+    parts.push(ts.canon); tracks++;
+    nonAutoFixed.push(ts.fixed);
+  }
+  if (tracks < 1) return null;
+  if (autoRepeats > 1) return null;                              // at most one <auto-repeat>
+  if (autoRepeats === 1) {
+    // <auto-track-list>: every other component must be a <fixed-size> or <fixed-repeat>.
+    for (const f of nonAutoFixed) if (!f) return null;
+  }
+  return parts.join(' ');
+};
+
+const _GRID_AUTO_FLOW_DIR = new Set(['row', 'column']);
+// grid-auto-flow: `[ row | column ] || dense`. Canonical form drops the default
+// `row` direction (kept only when alone), orders direction before `dense`.
+const _canonGridAutoFlow = (toks) => {
+  let dir = null, dense = false;
+  for (const t of toks) {
+    const low = t.toLowerCase();
+    if (_GRID_AUTO_FLOW_DIR.has(low)) { if (dir !== null) return null; dir = low; }
+    else if (low === 'dense') { if (dense) return null; dense = true; }
+    else return null;
+  }
+  if (dir === null && !dense) return null;
+  const parts = [];
+  if (dir === 'column') parts.push('column');
+  else if (dir === 'row' && !dense) parts.push('row');
+  if (dense) parts.push('dense');
+  return parts.join(' ');
+};
+
+// The grid track/flow longhands routed through `_canonGrid`.
+const _GRID_VALIDATED = new Set([
+  'grid-template-columns', 'grid-template-rows',
+  'grid-auto-columns', 'grid-auto-rows', 'grid-auto-flow',
+]);
+const _canonGrid = (name, value) => {
+  const s = String(value).trim();
+  const low = s.toLowerCase();
+  if (name === 'grid-auto-flow') {
+    const toks = _gridTokens(s);
+    return toks === null ? null : _canonGridAutoFlow(toks);
+  }
+  if (name === 'grid-auto-columns' || name === 'grid-auto-rows') {
+    // <track-size>+ : a bare space-separated list — no line names, no repeat().
+    const toks = _gridTokens(s);
+    if (toks === null || toks.length < 1) return null;
+    const out = [];
+    for (const t of toks) {
+      if (_isGridLineNames(t) || /^repeat\(/i.test(t)) return null;
+      const ts = _canonGridTrackSize(t);
+      if (ts === null) return null;
+      out.push(ts.canon);
+    }
+    return out.join(' ');
+  }
+  // grid-template-columns / grid-template-rows: none | <track-list> | <auto-track-list>
+  if (low === 'none') return 'none';
+  const toks = _gridTokens(s);
+  if (toks === null) return null;
+  return _canonGridTemplate(toks);
+};
+// Resolve a <track-size>'s computed form: fold each <length-percentage> to px
+// (calc collapsed, `%` kept symbolic), keywords/flex unchanged.
+const _computeGridTrackSize = (t, el, vp) => {
+  const mm = _gridFnArgs(t, 'minmax');
+  if (mm !== null) {
+    const args = _gridSplitArgs(mm).map((a) => _computeGridBreadth(a.trim(), el, vp));
+    return 'minmax(' + args[0] + ', ' + args[1] + ')';
+  }
+  const fc = _gridFnArgs(t, 'fit-content');
+  if (fc !== null) return 'fit-content(' + _computeGridBreadth(fc.trim(), el, vp) + ')';
+  return _computeGridBreadth(t, el, vp);
+};
+const _computeGridBreadth = (t, el, vp) => {
+  const low = t.trim().toLowerCase();
+  if (_GRID_INTRINSIC_KW.has(low)) return low;
+  if (/fr$/i.test(low) && _canonGridFlex(t.trim()) !== null) return _canonGridFlex(t.trim());
+  return _clampNegPx(_trComp(t.trim(), el, true, vp));           // <length-percentage> → px (% stays; ≥0)
+};
+// Computed value of grid-auto-columns/-rows: fold calc lengths in each track.
+const _computeGridAutoTracks = (v, el) => {
+  const toks = _gridTokens(String(v).trim());
+  if (toks === null) return v;
+  const vp = _vpUnits();
+  return toks.map((t) => _computeGridTrackSize(t, el, vp)).join(' ');
+};
+// Computed value of grid-template-columns/-rows (§7.2.6 "Resolved Value of a
+// Track Listing"). The full resolved value is the USED track sizes, which needs
+// the grid track-sizing algorithm (real layout). We resolve only the
+// layout-INDEPENDENT subset — purely fixed <length> tracks (no `%`, no <flex>,
+// no intrinsic keyword, no minmax()/fit-content(), no auto-repeat), where each
+// used size equals the specified length and a normal repeat(<int>) expands
+// deterministically (with adjacent line-name groups merged at the seams). Any
+// value needing layout is returned as its specified serialization (a cap, not a
+// wrong value).
+const _computeGridTemplate = (v, el) => {
+  const s = String(v).trim();
+  if (s.toLowerCase() === 'none') return 'none';
+  if (/auto-fill|auto-fit/i.test(s)) return v;                   // auto-repeat count needs layout
+  if (/%/.test(s)) return v;                                     // % track resolves against used size
+  if (/[\d.]\s*fr\b/i.test(s)) return v;                         // <flex> track needs layout
+  if (/\bminmax\s*\(|\bfit-content\s*\(/i.test(s)) return v;     // range/fit-content need layout
+  if (/\b(auto|min-content|max-content)\b/i.test(s)) return v;   // intrinsic track needs layout
+  const toks = _gridTokens(s);
+  if (toks === null) return v;
+  const vp = _vpUnits();
+  const items = [];                                              // { names:[…] } | { track:'2px' }
+  const pushNames = (t) => { const inr = t.slice(1, -1).trim(); items.push({ names: inr ? inr.split(/\s+/) : [] }); };
+  const pushTrack = (t) => items.push({ track: _clampNegPx(_trComp(t.trim(), el, true, vp)) });
+  for (const tok of toks) {
+    if (_isGridLineNames(tok)) { pushNames(tok); continue; }
+    if (/^repeat\(/i.test(tok)) {
+      const comma = _gridSplitArgs(_gridFnArgs(tok, 'repeat'));
+      let count = parseInt(comma[0].trim(), 10);
+      if (!isFinite(count)) { const r = _computeIntegerValue(el, comma[0].trim()); count = r === null ? 1 : parseInt(r, 10); }
+      count = Math.max(1, count);                                // used count clamps ≥1
+      const bToks = _gridTokens(comma.slice(1).join(',')) || [];
+      for (let k = 0; k < count; k++) for (const bt of bToks) (_isGridLineNames(bt) ? pushNames : pushTrack)(bt);
+      continue;
+    }
+    pushTrack(tok);
+  }
+  const merged = [];                                             // merge adjacent line-name groups
+  for (const it of items) {
+    const last = merged[merged.length - 1];
+    if (it.names && last && last.names) last.names = last.names.concat(it.names);
+    else merged.push({ names: it.names, track: it.track });
+  }
+  return merged.map((it) => (it.names ? (it.names.length ? '[' + it.names.join(' ') + ']' : '') : it.track))
+    .filter((x) => x !== '').join(' ');
+};
+
 // The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
 // `gap`/`grid-gap` map to row-gap/column-gap; `grid-row-gap`/`grid-column-gap` are
 // legacy single-longhand aliases handled separately (_GRID_GAP_ALIAS).
@@ -14927,6 +15289,8 @@ const _normComputed = (el, kebab, v) => {
     if (toks.length === 2) return toks[0] + ' ' + foldNum(toks[1]);
     return v;
   }
+  if (kebab === 'grid-auto-columns' || kebab === 'grid-auto-rows') return _computeGridAutoTracks(v, el);
+  if (kebab === 'grid-template-columns' || kebab === 'grid-template-rows') return _computeGridTemplate(v, el);
   if (kebab === 'font-feature-settings') return _computeFontFeatureSettings(el, v);
   if (_SIZE_COMPUTED_PROPS.has(kebab)) return _computeSizeValue(kebab, v, el);
   if (_SH_COMPUTED[kebab]) return _computeBoxShorthand(kebab, v, el);
@@ -18476,6 +18840,11 @@ globalThis.CSS = {
       if (_SCROLL_LONGHANDS.has(name)) {                 // scroll-margin-*/scroll-padding-*/scroll-snap-*
         if (/\bvar\(/i.test(val)) return true;
         return _canonScrollLong(name, _canonStandardValue(val)) != null;
+      }
+      if (_GRID_VALIDATED.has(name)) {                   // grid-template/-auto-columns/-rows, grid-auto-flow
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _canonGrid(name, _canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);
