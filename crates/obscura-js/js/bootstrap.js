@@ -973,6 +973,26 @@ class CSSStyleDeclaration {
         return;                                                 // expanded; no shorthand key kept
       }
     }
+    if (!custom && name === 'font' && !/\bvar\(/i.test(stored)) {
+      // `font` shorthand (no var()): expand a full value into — and store as — its
+      // longhands (font-style/-variant-caps/-weight/-stretch/-size, line-height,
+      // font-family) so `el.style.fontSize` reads back; keep a system-font or CSS-wide
+      // keyword as a single `font` key. Invalid → ignore the whole declaration.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const clear = () => {
+        delete this._props['font']; delete this._priority['font'];
+        for (const ln of _FONT_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      };
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low)) { clear(); this._props['font'] = low; this._priority['font'] = prio; this._notifyChange(); return; }
+      const parsed = _parseFontShorthand(stored);
+      if (!parsed) return;                                      // invalid → keep prior value
+      clear();
+      if (parsed.system) { this._props['font'] = parsed.system; this._priority['font'] = prio; }
+      else for (const ln of _FONT_SH_LH) { this._props[ln] = parsed[ln]; this._priority[ln] = prio; }
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept (unless system/CSS-wide)
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1136,6 +1156,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'font') {                                   // font shorthand: clear its longhands + single key
+      const old = _serializeFontShorthand(this);
+      delete this._props['font']; delete this._priority['font'];
+      for (const ln of _FONT_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1157,6 +1184,7 @@ class CSSStyleDeclaration {
       if (key in this._props) return this._props[key];     // CSS-wide kept as a single key
       return _serializeScrollShorthand(this, key);         // reconstruct from longhands
     }
+    if (key === 'font') return _serializeFontShorthand(this);  // system/CSS-wide key or reconstruct from longhands
     return this._props[key] || "";
   }
   getPropertyPriority(name) {
@@ -14108,6 +14136,142 @@ const _parentFontSizePx = (el) => {
   return m ? parseFloat(m[1]) : 16;
 };
 
+// ── The `font` shorthand (css-fonts §font-prop) ──────────────────────────────
+// Grammar: [ [ <'font-style'> || <font-variant-css2> || <'font-weight'> ||
+// <font-stretch-css3> ]? <'font-size'> [ / <'line-height'> ]? <'font-family'> ]
+//   | caption | icon | menu | message-box | small-caption | status-bar
+// Like the other shorthands (scroll/align/border), a valid value EXPANDS into —
+// and is stored as — its longhands, and the shorthand getter / getComputedStyle
+// reconstruct it. A system-font keyword (or CSS-wide keyword / var()) is kept as a
+// single `font` key. Reuses the css-fonts longhand canonicalizers above.
+const _FONT_SH_LH = ['font-style', 'font-variant-caps', 'font-weight', 'font-stretch', 'font-size', 'line-height', 'font-family'];
+const _FONT_SYSTEM = new Set(['caption', 'icon', 'menu', 'message-box', 'small-caption', 'status-bar']);
+// <font-stretch-css3>: the named keywords only (no <percentage> in the shorthand).
+const _FONT_STRETCH_KW = new Set(Object.keys(_FONT_WIDTH_KW));
+// Reverse map (computed <percentage> → css3 keyword) so a computed font-stretch
+// serializes back to its keyword inside `font` (which can't express a percentage).
+const _FONT_WIDTH_KW_REV = {};
+for (const _k in _FONT_WIDTH_KW) _FONT_WIDTH_KW_REV[_FONT_WIDTH_KW[_k]] = _k;
+// Tokenize a `font` value: whitespace-separated at top level, isolating a top-level
+// `/` as its own token, keeping parens (calc) and quoted strings intact.
+const _fontTokens = (s) => {
+  const out = []; let depth = 0, cur = '', q = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { cur += c; if (c === q) q = ''; continue; }
+    if (c === '"' || c === "'") { q = c; cur += c; continue; }
+    if (c === '(' || c === '[' || c === '{') { depth++; cur += c; }
+    else if (c === ')' || c === ']' || c === '}') { depth--; cur += c; }
+    else if (depth === 0 && /\s/.test(c)) { if (cur) { out.push(cur); cur = ''; } }
+    else if (depth === 0 && c === '/') { if (cur) { out.push(cur); cur = ''; } out.push('/'); }
+    else cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+};
+// <'line-height'> as it appears in `font`: normal | <number [0,∞]> | <length-percentage [0,∞]> (+ calc).
+const _canonFontLineHeight = (t) => {
+  const l = String(t).toLowerCase();
+  if (l === 'normal') return 'normal';
+  if (_MATHFN_NAME_RE.test(t)) return _canonMathExpr(t, { canonLen: true });
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(t)) {
+    const n = parseFloat(t); return n < 0 ? null : _serNumber(n);
+  }
+  const c = _canonLenPctSigned(t, true);
+  if (c === null || /^-/.test(c)) return null;
+  return c;
+};
+// Parse a `font` value → { system } | { <longhand>: canon, … } | null (invalid).
+const _parseFontShorthand = (value) => {
+  const v = String(value).trim();
+  if (_FONT_SYSTEM.has(v.toLowerCase())) return { system: v.toLowerCase() };
+  const toks = _fontTokens(v);
+  if (toks.length < 2) return null;
+  let i = 0, style = null, variant = null, weight = null, stretch = null;
+  // Prefix: <style> || <variant-css2> || <weight> || <stretch-css3>, each ≤ once,
+  // `normal` a filler for any of them. Stops at the first non-prefix token (the size).
+  while (i < toks.length) {
+    const t = toks[i], l = t.toLowerCase();
+    if (l === '/') return null;                              // slash before font-size → invalid
+    if (l === 'normal') { i++; continue; }
+    if (l === 'italic' || l === 'oblique') {
+      if (style !== null) return null;
+      if (l === 'oblique' && i + 1 < toks.length && _angleToDegNum(toks[i + 1]) !== null) {
+        const c = _canonFontStyle('oblique ' + toks[i + 1]);
+        if (c === null) return null;
+        style = c; i += 2; continue;
+      }
+      style = l; i++; continue;
+    }
+    if (l === 'small-caps') { if (variant !== null) return null; variant = 'small-caps'; i++; continue; }
+    if (l === 'bold' || l === 'bolder' || l === 'lighter') { if (weight !== null) return null; weight = l; i++; continue; }
+    if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(t) && !/%$/.test(t)) {  // bare <number> → weight
+      if (weight !== null) return null;
+      const n = parseFloat(t);
+      if (n >= 1 && n <= 1000) { weight = _serNumber(n); i++; continue; }
+      return null;                                          // out-of-range number can't be a font-size either
+    }
+    if (l !== 'normal' && _FONT_STRETCH_KW.has(l)) { if (stretch !== null) return null; stretch = l; i++; continue; }
+    break;                                                  // → font-size
+  }
+  if (i >= toks.length || toks[i] === '/') return null;     // font-size is mandatory
+  const size = _canonFontSize(toks[i]); if (size === null) return null; i++;
+  let lineHeight = 'normal';
+  if (i < toks.length && toks[i] === '/') {
+    i++;
+    if (i >= toks.length || toks[i] === '/') return null;
+    lineHeight = _canonFontLineHeight(toks[i]); if (lineHeight === null) return null; i++;
+  }
+  if (i >= toks.length) return null;                        // font-family is mandatory
+  const family = _canonFontFamily(toks.slice(i).join(' ')); if (family === null) return null;
+  return {
+    'font-style': style || 'normal', 'font-variant-caps': variant || 'normal',
+    'font-weight': weight || 'normal', 'font-stretch': stretch || 'normal',
+    'font-size': size, 'line-height': lineHeight, 'font-family': family,
+  };
+};
+// Reconstruct the `font` serialization from a longhand getter. `computed` picks the
+// computed omissions (weight 400, stretch %→keyword) vs. the specified ones. Returns
+// '' when the longhands can't be represented by the shorthand (CSSOM serialization).
+const _fontFromLonghands = (get, computed) => {
+  const style = String(get('font-style') || '');
+  const variant = String(get('font-variant-caps') || '');
+  const weight = String(get('font-weight') || '');
+  const stretch = String(get('font-stretch') || '');
+  const size = String(get('font-size') || '');
+  const lh = String(get('line-height') || '');
+  const family = String(get('font-family') || '');
+  if (!size || !family) return '';
+  if (variant !== 'normal' && variant !== 'small-caps') return '';   // only <font-variant-css2>
+  let stretchKw = stretch;
+  if (stretch !== 'normal') {
+    if (_FONT_STRETCH_KW.has(stretch)) stretchKw = stretch;
+    else if (stretch in _FONT_WIDTH_KW_REV) stretchKw = _FONT_WIDTH_KW_REV[stretch];
+    else return '';                                         // a <percentage> stretch isn't expressible in `font`
+  }
+  const parts = [];
+  if (style !== 'normal' && style !== '') parts.push(style);
+  if (variant === 'small-caps') parts.push(variant);
+  if (computed) { if (weight !== '400' && weight !== '') parts.push(weight); }
+  else if (weight !== 'normal' && weight !== '') parts.push(weight);
+  if (stretchKw !== 'normal') parts.push(stretchKw);
+  parts.push(lh && lh !== 'normal' ? size + ' / ' + lh : size);
+  parts.push(family);
+  return parts.join(' ');
+};
+// The `font` SPECIFIED serialization from the stored longhands (or the single-key
+// system/CSS-wide value). '' unless every longhand is present at one importance.
+const _serializeFontShorthand = (decl) => {
+  if ('font' in decl._props) return decl._props['font'];
+  let imp = null;
+  for (const ln of _FONT_SH_LH) {
+    if (!(ln in decl._props)) return '';
+    const p = decl._priority[ln] === 'important';
+    if (imp === null) imp = p; else if (imp !== p) return '';
+  }
+  return _fontFromLonghands((ln) => decl._props[ln], false);
+};
+
 // Generic computed-value resolution for the numeric length / integer / time
 // property families (CSS Values 4 — getComputedStyle returns the *resolved*
 // value, in canonical units). Length props fold math functions and resolve the
@@ -14647,6 +14811,7 @@ const _CSS_KNOWN_PROPS = (() => {
   for (const k of Object.keys(_GCS_DEFAULTS)) add(k);
   for (const k of _COLOR_PROPS) add(k);
   add('offset');                                           // the `offset` shorthand (expands to its 5 longhands)
+  add('font');                                             // the `font` shorthand (expands to its 7 longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
   for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
@@ -14677,6 +14842,13 @@ globalThis.getComputedStyle = (el, _pseudo) => {
       const vals = _SCROLL_SH_LH[kebab].map((ln) => resolve(ln));
       if (vals.some((x) => !x)) return '';
       return _serializeBoxValue(kebab, vals);
+    }
+    // `font` shorthand: a system-font / CSS-wide keyword set inline serializes as
+    // supplied; otherwise reconstruct from the computed longhands.
+    if (kebab === 'font') {
+      const sfont = el && el.style && el.style._props && el.style._props['font'];
+      if (sfont && (_FONT_SYSTEM.has(sfont) || _CSS_WIDE.has(sfont))) return sfont;
+      return _fontFromLonghands((ln) => resolve(ln), true);
     }
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
@@ -17829,6 +18001,11 @@ globalThis.CSS = {
       if (_SCROLL_SH_LH[name]) {                         // scroll-margin/scroll-padding shorthands
         if (/\bvar\(/i.test(val)) return true;
         return _expandScrollShorthand(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'font') {                             // the `font` shorthand
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _parseFontShorthand(c) != null;
       }
       if (_SCROLL_LONGHANDS.has(name)) {                 // scroll-margin-*/scroll-padding-*/scroll-snap-*
         if (/\bvar\(/i.test(val)) return true;
