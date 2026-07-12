@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-12 (Quest #189).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-12 (Quest #190).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-grid/parsing/grid-template-areas-valid.html` | 6/9 | **9/9** | ✅ 100% | **Quest #190 The Template Verdict.** `grid-template-areas` = `none \| <string>+` (`_canonGridTemplateAreas`): §7.3 cell tokenizer (dot-run→one null cell), filled-rectangle validation, whitespace-collapse. **+3.** |
+| `css/css-grid/parsing/grid-template-areas-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #190.** Rejects `auto`/`none`-mixed/`""`/whitespace-only/non-rectangular strings. **+11.** |
+| `css/css-grid/parsing/grid-template-shorthand-valid.html` | 24/40 | **40/40** | ✅ 100% | **Quest #190.** `grid-template` shorthand (`_parseGridTemplate`/`_serGridTemplate`): `none`, Form A `<rows> / <cols>`, Form B ascii-art `[<line-names>? <string> <track-size>? <line-names>?]+ [/ <explicit-track-list>]?` → 3 longhands + reconstruction. **+16.** |
+| `css/css-grid/parsing/grid-template-shorthand-invalid.html` | 0/66 | **66/66** | ✅ 100% | **Quest #190.** Line-name-group count ≤1 at edges / ≤2 between strings; no repeat as row size; `none`/`"a"` mixing rejected; `_serGridTemplate` returns `''` unless all 3 longhands set. **+66.** |
 | `css/css-grid/parsing/grid-column-shorthand.html` | 0/48 | **48/48** | ✅ 100% | **Quest #189 The Placement Verdict.** `<grid-line>` engine (`_canonGridLine`/`_gridLineTokens`): `auto \| <custom-ident> \| <integer> && <custom-ident>? \| span && [<integer> \|\| <custom-ident>]`; `grid-column` shorthand expands into grid-column-start/-end (omitted end copies a lone custom-ident else `auto`). **+48.** |
 | `css/css-grid/parsing/grid-row-shorthand.html` | 0/48 | **48/48** | ✅ 100% | **Quest #189.** Same engine, row axis. **+48.** |
 | `css/css-grid/parsing/grid-area-valid.html` | 31/60 | **60/60** | ✅ 100% | **Quest #189.** `grid-area` = `<grid-line> [ / <grid-line> ]{0,3}` → 4 longhands; canonical int-before-ident (`az 2`→`2 az`), `span 1 i`→`span i`, calc fold (`min(-1,6)`→`calc(-1)`), CSSOM ident serialize (`\31st`≡`\31 st`), redundant-trailing-line collapse. **+29.** |

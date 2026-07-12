@@ -1059,6 +1059,19 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
+    if (!custom && name === 'grid-template' && !/\bvar\(/i.test(stored)) {
+      // grid-template shorthand: expand into — and store as — grid-template-rows/
+      // -columns/-areas. A CSS-wide keyword goes to all three. Invalid → keep prior.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const low = stored.toLowerCase();
+      let lh;
+      if (_CSS_WIDE.has(low)) lh = { 'grid-template-rows': low, 'grid-template-columns': low, 'grid-template-areas': low };
+      else { lh = _parseGridTemplate(stored); if (!lh) return; }
+      delete this._props[name]; delete this._priority[name];    // never keep a shorthand key
+      for (const ln of _GRID_TEMPLATE_LH) { this._props[ln] = lh[ln]; this._priority[ln] = prio; }
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1126,6 +1139,14 @@ class CSSStyleDeclaration {
         const g = _canonGridLine(stored);
         if (g === null) return;
         stored = g.s;
+      }
+    } else if (!custom && name === 'grid-template-areas') {
+      // grid-template-areas: none | <string>+ (rectangular). Invalid → ignore.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonGridTemplateAreas(stored);
+        if (c === null) return;
+        stored = c;
       }
     } else if (!custom && _COLOR_PROPS.has(name)) {
       if (_hasImageFunc(stored)) return;                   // image() is not a <color> → ignore
@@ -1284,6 +1305,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'grid-template') {                           // rows/columns/areas shorthand: clear all three
+      const old = (key in this._props) ? this._props[key] : _serGridTemplate((n) => this._props[n] || '');
+      delete this._props[key]; delete this._priority[key];    // any var()-stored shorthand key
+      for (const ln of _GRID_TEMPLATE_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1318,6 +1346,10 @@ class CSSStyleDeclaration {
     if (key === 'grid-area') {                             // placement shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
       return _serGridArea((n) => this._props[n] || '');    // reconstruct from the four longhands
+    }
+    if (key === 'grid-template') {                         // rows/columns/areas shorthand
+      if (key in this._props) return this._props[key];     // var() kept as a single key
+      return _serGridTemplate((n) => this._props[n] || '');
     }
     return this._props[key] || "";
   }
@@ -12357,6 +12389,197 @@ const _serGridArea = (get) => {
 // The single-<grid-line> placement longhands, validated in setProperty.
 const _GRID_LINE_LH = new Set(['grid-row-start', 'grid-row-end', 'grid-column-start', 'grid-column-end']);
 
+// ── CSS Grid template shorthands: grid-template-areas + grid-template ────────
+// (and, later, `grid`). These set grid-template-rows/-columns/-areas. Both were
+// unmodelled → `grid-template-areas` accepted junk (invalid 0/N) and the
+// `grid-template` shorthand fell through to single-key storage (invalid 0/N,
+// no canon). Reuses #188's `<track-size>`/`_canonGridTemplate` and #189's tokens.
+
+// Tokenize a grid-template value: `"…"`/`'…'` strings and `[ … ]` line-name
+// groups and function parens kept whole, a top-level `/` its own token, comments
+// stripped. Null on unbalanced brackets/parens or an unterminated string.
+const _gridTemplateTokens = (s) => {
+  const out = []; const n = s.length; let i = 0;
+  const WS = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f';
+  while (i < n) {
+    const c = s[i];
+    if (WS(c)) { i++; continue; }
+    if (c === '/' && s[i + 1] === '*') { const e = s.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; continue; }
+    if (c === '"' || c === "'") { let j = i + 1; while (j < n && s[j] !== c) { if (s[j] === '\\') j++; j++; } if (j >= n) return null; out.push(s.slice(i, j + 1)); i = j + 1; continue; }
+    if (c === '[') { const j = s.indexOf(']', i); if (j < 0) return null; out.push(s.slice(i, j + 1)); i = j + 1; continue; }
+    if (c === ']') return null;
+    if (c === '/') { out.push('/'); i++; continue; }
+    let j = i, depth = 0;
+    while (j < n) {
+      const cj = s[j];
+      if (cj === '(') depth++;
+      else if (cj === ')') { if (depth === 0) return null; depth--; }
+      else if (depth === 0 && (cj === '[' || cj === ']' || cj === '"' || cj === "'" || cj === '/' || WS(cj))) break;
+      j++;
+    }
+    if (depth !== 0) return null;
+    out.push(s.slice(i, j)); i = j;
+  }
+  return out;
+};
+const _isGtString = (t) => t.charCodeAt(0) === 34 /* " */ || t.charCodeAt(0) === 39 /* ' */;
+// Split a template string's interior into cells (CSS Grid §7.3): a run of `.` is
+// one null cell (serialized `.`); a run of any other non-whitespace chars is one
+// named cell. Returns the array of cell tokens (['.'] for null).
+const _gridAreaCells = (inner) => {
+  const cells = []; const n = inner.length; let i = 0;
+  const WS = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f';
+  while (i < n) {
+    const c = inner[i];
+    if (WS(c)) { i++; continue; }
+    if (c === '.') { let j = i; while (j < n && inner[j] === '.') j++; cells.push('.'); i = j; }
+    else { let j = i; while (j < n && !WS(inner[j]) && inner[j] !== '.') j++; cells.push(inner.slice(i, j)); i = j; }
+  }
+  return cells;
+};
+// Validate a list of area rows (each an array of cell names, '.' for null): every
+// row same non-zero column count, and every named area forms a filled rectangle.
+const _gridAreasRectangular = (grid) => {
+  if (grid.length === 0) return false;
+  const cols = grid[0].length;
+  if (cols === 0) return false;
+  for (const r of grid) if (r.length !== cols) return false;
+  const box = {};                                                // name → {r0,r1,c0,c1,count}
+  for (let r = 0; r < grid.length; r++) for (let c = 0; c < cols; c++) {
+    const nm = grid[r][c];
+    if (nm === '.') continue;
+    const b = box[nm] || (box[nm] = { r0: r, r1: r, c0: c, c1: c, count: 0 });
+    b.r0 = Math.min(b.r0, r); b.r1 = Math.max(b.r1, r);
+    b.c0 = Math.min(b.c0, c); b.c1 = Math.max(b.c1, c); b.count++;
+  }
+  for (const nm in box) {
+    const b = box[nm];
+    if (b.count !== (b.r1 - b.r0 + 1) * (b.c1 - b.c0 + 1)) return false;  // not a filled rectangle
+    for (let r = b.r0; r <= b.r1; r++) for (let c = b.c0; c <= b.c1; c++) if (grid[r][c] !== nm) return false;
+  }
+  return true;
+};
+// grid-template-areas = none | <string>+. Returns the canonical serialization
+// (`"a b" "c d"`, whitespace-collapsed, dot-runs → `.`) or null.
+const _canonGridTemplateAreas = (value) => {
+  const s = String(value).trim();
+  if (s.toLowerCase() === 'none') return 'none';
+  const toks = _gridTemplateTokens(s);
+  if (toks === null || toks.length === 0) return null;
+  const grid = [], rows = [];
+  for (const tok of toks) {
+    if (!_isGtString(tok)) return null;                          // only <string>s allowed
+    const cells = _gridAreaCells(tok.slice(1, -1));
+    if (cells.length === 0) return null;                         // empty / whitespace-only string
+    grid.push(cells); rows.push(cells.join(' '));
+  }
+  if (!_gridAreasRectangular(grid)) return null;
+  return rows.map((r) => '"' + r + '"').join(' ');
+};
+
+// Parse a grid-template value into its three longhands. Returns
+// { 'grid-template-rows', 'grid-template-columns', 'grid-template-areas' } | null.
+//   none | <'grid-template-rows'> / <'grid-template-columns'>
+//        | [ <line-names>? <string> <track-size>? <line-names>? ]+ [ / <explicit-track-list> ]?
+const _parseGridTemplate = (value) => {
+  const s = String(value).trim();
+  if (s.toLowerCase() === 'none') return { 'grid-template-rows': 'none', 'grid-template-columns': 'none', 'grid-template-areas': 'none' };
+  const toks = _gridTemplateTokens(s);
+  if (toks === null || toks.length === 0) return null;
+  const hasString = toks.some(_isGtString);
+  const slashes = toks.reduce((a, t) => a + (t === '/' ? 1 : 0), 0);
+  if (!hasString) {
+    // Form A: <'grid-template-rows'> / <'grid-template-columns'> (needs exactly one `/`).
+    if (slashes !== 1) return null;
+    const si = toks.indexOf('/');
+    const left = _canonGrid('grid-template-columns', toks.slice(0, si).join(' '));
+    const right = _canonGrid('grid-template-columns', toks.slice(si + 1).join(' '));
+    if (left === null || right === null) return null;
+    return { 'grid-template-rows': left, 'grid-template-columns': right, 'grid-template-areas': 'none' };
+  }
+  // Form B (ascii-art). One optional top-level `/` splits rows from an explicit-track-list.
+  if (slashes > 1) return null;
+  const si = toks.indexOf('/');
+  const rowToks = si < 0 ? toks : toks.slice(0, si);
+  const colToks = si < 0 ? null : toks.slice(si + 1);
+  const names = []; const gcounts = []; const strs = []; const sizes = []; let cur = []; let gc = 0;
+  const flush = () => { names.push(cur); gcounts.push(gc); cur = []; gc = 0; };
+  let i = 0;
+  while (i < rowToks.length) {
+    const t = rowToks[i];
+    if (_isGridLineNames(t)) {
+      const ln = _canonGridLineNames(t); if (ln === null) return null;
+      gc++;                                                       // each `[ … ]` group (even empty) counts
+      if (ln !== '[]') for (const nm of ln.slice(1, -1).split(' ')) if (nm) cur.push(nm);
+      i++; continue;
+    }
+    if (_isGtString(t)) {
+      flush();
+      const cells = _gridAreaCells(t.slice(1, -1));
+      if (cells.length === 0) return null;
+      strs.push(cells.join(' ')); i++;
+      if (i < rowToks.length && !_isGtString(rowToks[i]) && !_isGridLineNames(rowToks[i])) {
+        if (/^repeat\(/i.test(rowToks[i])) return null;          // no repeat() as a row size
+        const ts = _canonGridTrackSize(rowToks[i]); if (ts === null) return null;
+        sizes.push(ts.canon); i++;
+      } else sizes.push('auto');
+      continue;
+    }
+    return null;                                                  // a track where a string/names was expected
+  }
+  flush();
+  if (strs.length === 0) return null;
+  // Line-name groups: at most one before the first string and one after the last
+  // (a single row's leading/trailing `<line-names>?`); up to two between strings
+  // (trailing of one row + leading of the next). `[] [] "a"`, `"a" [a] [a]` invalid.
+  if (gcounts[0] > 1 || gcounts[strs.length] > 1) return null;
+  for (let k = 1; k < strs.length; k++) if (gcounts[k] > 2) return null;
+  // Validate the areas as a rectangle grid.
+  const grid = strs.map((r) => r.split(' '));
+  if (!_gridAreasRectangular(grid)) return null;
+  // Build grid-template-rows: [names0]? size1 [names1]? … sizeN [namesN]? (auto kept).
+  const rowParts = [];
+  for (let k = 0; k < strs.length; k++) { if (names[k].length) rowParts.push('[' + names[k].join(' ') + ']'); rowParts.push(sizes[k]); }
+  if (names[strs.length].length) rowParts.push('[' + names[strs.length].join(' ') + ']');
+  let cols = 'none';
+  if (colToks) {
+    const cseq = _canonGridTrackSeq(colToks, {});                // explicit-track-list (no repeat/auto-repeat)
+    if (cseq === null) return null;
+    for (const t of colToks) if (/^repeat\(/i.test(t)) return null;
+    cols = cseq.canon;
+  }
+  return { 'grid-template-rows': rowParts.join(' '), 'grid-template-columns': cols, 'grid-template-areas': strs.map((r) => '"' + r + '"').join(' ') };
+};
+// Reconstruct the grid-template shorthand from its three longhands.
+const _serGridTemplate = (get) => {
+  const rows = get('grid-template-rows'), cols = get('grid-template-columns'), areas = get('grid-template-areas');
+  if (!rows || !cols || !areas) return '';                       // not all longhands set → no shorthand
+  if (areas === 'none') {
+    if (rows === 'none' && cols === 'none') return 'none';
+    return rows + ' / ' + cols;                                   // Form A
+  }
+  // Form B: interleave the row track-list with the area strings.
+  const rt = _gridTemplateTokens(rows) || [];
+  const bnames = [[]]; const sizes = [];
+  for (const t of rt) {
+    if (_isGridLineNames(t)) { const inr = t.slice(1, -1).trim(); if (inr) for (const nm of inr.split(/\s+/)) bnames[bnames.length - 1].push(nm); }
+    else { sizes.push(t); bnames.push([]); }
+  }
+  const strs = (_gridTemplateTokens(areas) || []).map((t) => t.slice(1, -1));
+  if (strs.length !== sizes.length) return rows + ' / ' + cols; // inconsistent (defensive)
+  const parts = [];
+  for (let k = 0; k < sizes.length; k++) {
+    if (bnames[k].length) parts.push('[' + bnames[k].join(' ') + ']');
+    parts.push('"' + strs[k] + '"');
+    if (sizes[k] !== 'auto') parts.push(sizes[k]);
+  }
+  if (bnames[sizes.length].length) parts.push('[' + bnames[sizes.length].join(' ') + ']');
+  let out = parts.join(' ');
+  if (cols !== 'none') out += ' / ' + cols;
+  return out;
+};
+const _GRID_TEMPLATE_LH = ['grid-template-rows', 'grid-template-columns', 'grid-template-areas'];
+
 // The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
 // `gap`/`grid-gap` map to row-gap/column-gap; `grid-row-gap`/`grid-column-gap` are
 // legacy single-longhand aliases handled separately (_GRID_GAP_ALIAS).
@@ -19120,6 +19343,16 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         if (_CSS_WIDE.has(val.toLowerCase())) return true;
         return _parseGridArea(_canonStandardValue(val)) != null;
+      }
+      if (name === 'grid-template-areas') {
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _canonGridTemplateAreas(_canonStandardValue(val)) != null;
+      }
+      if (name === 'grid-template') {
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _parseGridTemplate(_canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);
