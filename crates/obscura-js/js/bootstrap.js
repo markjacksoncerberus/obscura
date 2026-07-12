@@ -8012,6 +8012,8 @@ const _GCS_DEFAULTS = {
   'overflow-block': 'visible', 'overflow-inline': 'visible', 'overflow-x': 'visible',
   'overflow-y': 'visible', 'text-overflow': 'clip', 'scrollbar-gutter': 'auto',
   'overflow-clip-margin': '0px', '-webkit-line-clamp': 'none',
+  // css-overflow-5 carousel props (none inherit): simple keyword enums.
+  'scroll-marker-group': 'none', 'scroll-target-group': 'none', 'scroll-axis-lock': 'auto',
   // css-break. orphans/widows inherit; the break-* and box-decoration-break do not.
   'box-decoration-break': 'slice', 'break-after': 'auto', 'break-before': 'auto',
   'break-inside': 'auto', orphans: '2', widows: '2',
@@ -11608,6 +11610,15 @@ const _OVERFLOW_KW = new Set(['visible', 'hidden', 'clip', 'scroll', 'auto']);
 const _OVERFLOW_ENUM = new Set(['overflow-x', 'overflow-y', 'overflow-block', 'overflow-inline']);
 const _OCM_BOX = new Set(['content-box', 'padding-box', 'border-box']);
 const _CONTINUE_KW = new Set(['normal', 'discard', 'collapse', '-webkit-legacy']);
+// css-overflow-5 carousel props: each value is EXACTLY one listed keyword (no
+// multi-value form — a 2nd token, comma list, number, or unknown keyword is invalid).
+// Computed value is keyword identity, so registration in _GCS_DEFAULTS is all the
+// computed/enumeration tests need on top of this specified-time validation.
+const _CAROUSEL_ENUM = {
+  'scroll-marker-group': new Set(['none', 'before', 'after']),
+  'scroll-target-group': new Set(['none', 'auto']),
+  'scroll-axis-lock': new Set(['auto', 'none']),
+};
 // Serialize overflow-clip-margin from a resolved (box, length) pair per the CSSOM
 // rule: the box is dropped when it is the default `padding-box`; the length is
 // dropped when it is a literal zero AND a (non-default) box is present. When the
@@ -11645,6 +11656,8 @@ const _canonCssOverflow = (name, value) => {
     const toks = _wsTokens(s);
     return (toks.length === 1 && _OVERFLOW_KW.has(low)) ? low : null;
   }
+  const carousel = _CAROUSEL_ENUM[name];             // scroll-marker-group/-target-group/-axis-lock: one keyword
+  if (carousel) { const toks = _wsTokens(s); return (toks.length === 1 && carousel.has(low)) ? low : null; }
   if (name === 'scrollbar-gutter') {                 // auto | stable && both-edges?
     const toks = _wsTokens(s).map((t) => t.toLowerCase());
     if (toks.length === 1) return (toks[0] === 'auto' || toks[0] === 'stable') ? toks[0] : null;
@@ -11699,7 +11712,7 @@ const _canonCssOverflow = (name, value) => {
 };
 const _OVERFLOW_VALIDATED = new Set([
   ...(_OVERFLOW_ENUM), 'scrollbar-gutter', 'block-ellipsis', 'overflow-clip-margin',
-  'continue', 'max-lines', '-webkit-line-clamp',
+  'continue', 'max-lines', '-webkit-line-clamp', ...Object.keys(_CAROUSEL_ENUM),
 ]);
 // The `overflow` shorthand `[ visible | hidden | clip | scroll | auto ]{1,2}`
 // expands into overflow-x (first value) and overflow-y (second, or a copy of the
@@ -18443,6 +18456,7 @@ globalThis.CSS = {
       }
       if (_OVERFLOW_VALIDATED.has(name)) {               // css-overflow longhands (+ overflow-clip-margin)
         if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;   // CSS-wide keywords valid for every property
         return _canonCssOverflow(name, _canonStandardValue(val)) != null;
       }
       if (name === 'overflow') {                         // the `overflow` shorthand
