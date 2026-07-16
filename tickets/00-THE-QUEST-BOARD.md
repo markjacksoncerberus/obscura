@@ -184,6 +184,35 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-16 (Quest #197 The Shape Verdict — a `css-shapes` value engine reusing the
+offset-path/clip-path `<basic-shape>` engine, +81, ZERO regressions):** Took the #196 outgoing
+knight's option: the NEW untouched `css/css-shapes/parsing/` dir (pure raw-store — shape-outside/
+shape-margin/shape-image-threshold stored verbatim → every `*-invalid` 0/N). `shape-outside =
+none | [<basic-shape> || <shape-box>] | <image>` reuses the same `_opShape` engine as clip-path
+(#196) and offset-path, differing in only two ways: the box set excludes fill/stroke/view-box, and
+the DEFAULT box is `margin-box` (elided beside a shape) not border-box. Built `_serShapeOutside`
+(thin wrapper, modelled on `_serClipPath`) + `_serShapeMargin` (`<length-percentage [0,∞]>`, `0`→
+`0px`, calc-neg→`0px`) + `_serShapeThreshold` (`<number>|<percentage>`, `%`→number, computed clamps
+`[0,1]`). NEW `_opSvgPathAbsolute` (relative→absolute SVG resolver) for computed `path()`
+(`h 80 v 80`→`H 90 V 90`), specified keeps commands verbatim. TWO shared `_opShape` fixes (correct
+for offset-path + clip-path too, ZERO regressions): (a) `_parseShapePos` rejects the legacy 3-value
+`<position>` (`center left 1px`, csswg #2140) at every `_opShape` position check — the whole
+shape-outside-invalid-position win, and it does NOT touch background-position (own path, 31/31 held);
+(b) shape() `to <position>` end-point (`smooth to center 20%`→`smooth to 50% 20%`) vs `by
+<coordinate-pair>`. WINS: shape-outside-shape-invalid 0→9, -shape-valid 11→12, -path-invalid 0→7,
+-path-valid 1→9, -invalid-position 0→10, -valid-position 10→20, -computed 8→29; shape-margin-invalid
+0→2, -valid 3→4, -computed 1→3; shape-image-threshold-invalid 0→2, -valid 2→5, -computed 1→6.
+**+81, ZERO regressions** (offset-path-parsing-invalid 24/24, -parsing-valid 70/70, -shape-parsing
+35/35, -shape-computed 12/12, -computed 65/65, offset-shorthand 18/18; clip-path-invalid 48/48,
+-valid 54/54, -shape-parsing 43/44, -computed 19/21 — both pre-existing caps; mask-invalid 13/13,
+mask-computed 32/32, background-valid 45/46, background-position-valid 31/31, serialize-values
+696/697, qsa 1975). **CAPS (3, all shape-outside-computed, all pre-existing classes):** symbolic
+`calc(%−%)` rect edge, `sign(1em−1px)` em-in-position, `sibling-index()` tree fn. **NEXT LEVERAGE:**
+`css-shapes/parsing/` now CLOSED (13/13 files). Pivot to another `css/*/parsing/` dir — `css-scroll-snap`
+remainder, `css-contain` (`contain`/`container-*`), `css-will-change`, or `css-overflow`/`css-ui`
+remainder. Baseline a sample first (`*-invalid` 0/N = raw-store tell). grep `_serShapeOutside`/
+`_opSvgPathAbsolute`/`_parseShapePos`. Scroll `tickets/197-the-shape-verdict.md`.
+
 **Session 2026-07-16 (Quest #196 The Clip-Path Verdict — a `clip-path` `<basic-shape>` value engine
 reusing the offset-path `_opShape`, +121, ZERO regressions):** Took the #195 outgoing knight's option:
 the `clip-path` `<basic-shape>` sub-vein of `css-masking/parsing/` (pure raw-store — clip-path/clip/

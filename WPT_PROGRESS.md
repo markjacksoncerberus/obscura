@@ -10,12 +10,25 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #196).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #197).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-shapes/parsing/shape-outside-shape-invalid.html` | 0/9 | **9/9** | ✅ 100% | **Quest #197 The Shape Verdict.** `shape-outside` `shape()` delegated to `_opShape` (CSS Shapes 2) via `_serShapeOutside`. **+9.** |
+| `css/css-shapes/parsing/shape-outside-shape-valid.html` | 11/12 | **12/12** | ✅ 100% | **Quest #197.** `shape() to <position>` end-point (`smooth to center 20%`). **+1.** |
+| `css/css-shapes/parsing/shape-outside-path-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #197.** `path()` via `_clipPathPathFn` (empty/bad-fill-rule/trailing-token rejected). **+7.** |
+| `css/css-shapes/parsing/shape-outside-path-valid.html` | 1/9 | **9/9** | ✅ 100% | **Quest #197.** `path(<fill-rule>?, <string>)` specified (relative commands kept, whitespace/number normalized). **+8.** |
+| `css/css-shapes/parsing/shape-outside-invalid-position.html` | 0/10 | **10/10** | ✅ 100% | **Quest #197.** 3-value `<position>` rejected in `_opShape` (`_parseShapePos`, csswg #2140) — shared, offset-path/clip-path held. **+10.** |
+| `css/css-shapes/parsing/shape-outside-valid-position.html` | 10/20 | **20/20** | ✅ 100% | **Quest #197.** Full `<position>` canon inside `circle()`/`ellipse()` `at`. **+10.** |
+| `css/css-shapes/parsing/shape-outside-computed.html` | 8/32 | **29/32** | ⚠️ 91% | **Quest #197.** `_computeShapeOutside`: lengths→px, positions→%, rect()/xywh()→inset(), path()→absolute (`_opSvgPathAbsolute`), margin-box default. Caps: 3 (symbolic `calc(%−%)`, `sign(1em−1px)` em, `sibling-index()`). **+21.** |
+| `css/css-shapes/parsing/shape-margin-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #197.** `shape-margin` = `<length-percentage [0,∞]>` (`none`/unitless-`10` rejected). **+2.** |
+| `css/css-shapes/parsing/shape-margin-valid.html` | 3/4 | **4/4** | ✅ 100% | **Quest #197.** `0`→`0px`. **+1.** |
+| `css/css-shapes/parsing/shape-margin-computed.html` | 1/3 | **3/3** | ✅ 100% | **Quest #197.** `calc(10px+0.5em)`→`30px` (font-size 40px), negative calc clamps to `0px`. **+2.** |
+| `css/css-shapes/parsing/shape-image-threshold-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #197.** `<number>|<percentage>` only (`auto`/`10px` rejected). **+2.** |
+| `css/css-shapes/parsing/shape-image-threshold-valid.html` | 2/5 | **5/5** | ✅ 100% | **Quest #197.** `%`→number (`50%`→`0.5`, `-100%`→`-1`), no specified clamp. **+3.** |
+| `css/css-shapes/parsing/shape-image-threshold-computed.html` | 1/6 | **6/6** | ✅ 100% | **Quest #197.** Computed clamps to `[0,1]` (`-7`→`0`, `12.5`→`1`, `300%`→`1`). **+5.** |
 | `css/css-masking/parsing/clip-path-invalid.html` | 0/48 | **48/48** | ✅ 100% | **Quest #196 The Clip-Path Verdict.** `_serClipPath` gate: `auto`/`ray()`/unitless-nonzero radii (`circle(123)`)/negative radii (`circle(-10px)`)/bad `path()` prefix all rejected; `_opShape` tightened via `_isShapeLP`/`_isNonNegShapeLP`. **+48.** |
 | `css/css-masking/parsing/clip-path-valid.html` | 36/54 | **54/54** | ✅ 100% | **Quest #196.** `<basic-shape> || <geometry-box>` canon (border-box elided beside a shape), `url()` clip-source, `path(<fill-rule>?, <string>)` (quote-aware, nonzero elided). **+18.** |
 | `css/css-masking/parsing/clip-path-shape-parsing.html` | 19/44 | **43/44** | ⚠️ 98% | **Quest #196.** `shape()` delegated to `_opShape` (CSS Shapes 2). Cap: 1 `0Px`→`0px` unit-lowercasing (`_canonLPToken`, shared/low-ROI). **+24.** |

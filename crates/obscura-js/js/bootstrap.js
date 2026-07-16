@@ -893,6 +893,15 @@ const _parseStyleDecls = (text) => {
       } else if (name === 'clip') {
         if (!_isValidClip(value)) continue;                // invalid legacy clip → drop
         value = _canonClip(value);
+      } else if (name === 'shape-outside') {
+        if (!_isValidShapeOutside(value)) continue;        // invalid <shape-outside> → drop
+        value = _canonShapeOutside(value);
+      } else if (name === 'shape-margin') {
+        if (!_isValidShapeMargin(value)) continue;         // invalid <length-percentage [0,∞]> → drop
+        value = _canonShapeMargin(value);
+      } else if (name === 'shape-image-threshold') {
+        if (!_isValidShapeThreshold(value)) continue;      // invalid <number>|<percentage> → drop
+        value = _canonShapeThreshold(value);
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1288,6 +1297,15 @@ class CSSStyleDeclaration {
     } else if (!custom && name === 'clip') {
       if (!_isValidClip(stored)) return;                   // invalid legacy clip → ignore
       stored = _canonClip(stored);
+    } else if (!custom && name === 'shape-outside') {
+      if (!_isValidShapeOutside(stored)) return;           // invalid <shape-outside> → ignore
+      stored = _canonShapeOutside(stored);
+    } else if (!custom && name === 'shape-margin') {
+      if (!_isValidShapeMargin(stored)) return;            // invalid <length-percentage [0,∞]> → ignore
+      stored = _canonShapeMargin(stored);
+    } else if (!custom && name === 'shape-image-threshold') {
+      if (!_isValidShapeThreshold(stored)) return;         // invalid <number>|<percentage> → ignore
+      stored = _canonShapeThreshold(stored);
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
       if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
       stored = _canonBgAxis(stored, _BG_POSITION_AXIS.get(name));
@@ -14106,6 +14124,16 @@ const _opSvgPath = (data) => {
   }
   return out.join(' ');
 };
+// A <position> as it appears inside a <basic-shape> (`at <position>`, a shape()
+// control point / `to` end-point). Identical to the general <position> grammar
+// EXCEPT a 3-component form is invalid (CSS Values 4 / csswg-drafts #2140 removed
+// the legacy 3-value <position>: `left 1px center`, `center top 2px`, …). Only
+// 1-, 2-, and 4-token positions are valid. Not applied to background-position,
+// which keeps its own <bg-position> grammar path.
+const _parseShapePos = (joined) => {
+  if (!_parsePosition(joined)) return null;
+  return _wsTokens(joined).length === 3 ? null : true;
+};
 // Serialize one <offset-path> function (ray/path/url/basic-shape), or null if it
 // fails the grammar. `computed` selects specified vs computed serialization.
 const _opShape = (head, body, computed, el, emPx, lhPx) => {
@@ -14132,7 +14160,7 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
       return null;
     }
     if (angle == null) return null;                      // the <angle> is required
-    if (posToks && !_parsePosition(posToks.join(' '))) return null;
+    if (posToks && !_parseShapePos(posToks.join(' '))) return null;
     const parts = [];
     if (computed) { const d = _evalMath(angle, 0, { angle: true }); parts.push(d === null ? angle : _serAngle(d)); }
     else parts.push(/^(?:calc|min|max|clamp)\(/i.test(angle) ? _canonMathExpr(angle) : _canonStandardValue(angle));
@@ -14178,7 +14206,7 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
       else if (_isNonNegShapeLP(rad[0])) radStr = _opClampRadius(_opLp(rad[0], computed, emPx, lhPx));
       else return null;
     }
-    if (posToks && (!posToks.length || !_parsePosition(posToks.join(' ')))) return null;
+    if (posToks && (!posToks.length || !_parseShapePos(posToks.join(' ')))) return null;
     const parts = [];
     if (radStr) parts.push(radStr);
     if (posToks) parts.push('at ' + serPos(posToks));
@@ -14203,7 +14231,7 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
       if (!(rad[0].toLowerCase() === 'closest-side' && rad[1].toLowerCase() === 'closest-side'))
         radStr = r0 + ' ' + r1;                          // both default → omit
     }
-    if (posToks && (!posToks.length || !_parsePosition(posToks.join(' ')))) return null;
+    if (posToks && (!posToks.length || !_parseShapePos(posToks.join(' ')))) return null;
     const parts = [];
     if (radStr) parts.push(radStr);
     if (posToks) parts.push('at ' + serPos(posToks));
@@ -14296,11 +14324,14 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
       if (toks.length !== 2 || !_isPosLP(toks[0]) || !_isPosLP(toks[1])) return null;
       return _opLp(toks[0], computed, emPx, lhPx) + ' ' + _opLp(toks[1], computed, emPx, lhPx);
     };
-    const ctrlPoint = (toks) => {                          // a <position> (1–4 tokens)
+    const ctrlPoint = (toks) => {                          // a <position> (1/2/4 tokens)
       const joined = toks.join(' ');
-      if (!toks.length || !_parsePosition(joined)) return null;
+      if (!toks.length || !_parseShapePos(joined)) return null;
       return computed ? _serializePositionComputed(el, joined) : _serializePositionSpecified(joined);
     };
+    // A command <end-point>: `by <coordinate-pair>` (relative, two <lp>) or
+    // `to <position>` (absolute — so `smooth to center 20%` → `to 50% 20%`).
+    const endPoint = (toks, bt) => bt === 'by' ? coordPair(toks) : ctrlPoint(toks);
     // First section: [ <fill-rule> ] from <coordinate-pair>.
     let h0 = _wsTokens(segs[0]);
     let fill = null;
@@ -14316,9 +14347,9 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
       const kw = t[0].toLowerCase(), rest = t.slice(1);
       const bt = rest.length ? rest[0].toLowerCase() : '';
       if (kw === 'close') { if (rest.length) return null; outCmds.push('close'); continue; }
-      if (kw === 'move' || kw === 'line') {               // <by|to> <coordinate-pair>
-        if (rest.length !== 3 || (bt !== 'by' && bt !== 'to')) return null;
-        const cp = coordPair(rest.slice(1));
+      if (kw === 'move' || kw === 'line') {               // <by|to> <end-point>
+        if (rest.length < 2 || (bt !== 'by' && bt !== 'to')) return null;
+        const cp = endPoint(rest.slice(1), bt);
         if (cp == null) return null;
         outCmds.push(kw + ' ' + bt + ' ' + cp); continue;
       }
@@ -14326,11 +14357,13 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
         if (rest.length !== 2 || (bt !== 'by' && bt !== 'to') || !_isPosLP(rest[1])) return null;
         outCmds.push(kw + ' ' + bt + ' ' + _opLp(rest[1], computed, emPx, lhPx)); continue;
       }
-      if (kw === 'curve' || kw === 'smooth') {            // <endpoint> [with <cp> [/ <cp>]?]
-        if (rest.length < 3 || (bt !== 'by' && bt !== 'to')) return null;
-        const cp = coordPair(rest.slice(1, 3));
+      if (kw === 'curve' || kw === 'smooth') {            // <end-point> [with <cp> [/ <cp>]?]
+        if (rest.length < 2 || (bt !== 'by' && bt !== 'to')) return null;
+        let wi = -1;                                       // the endpoint runs up to a `with` token
+        for (let k = 1; k < rest.length; k++) { if (rest[k].toLowerCase() === 'with') { wi = k; break; } }
+        const cp = endPoint(rest.slice(1, wi < 0 ? rest.length : wi), bt);
         if (cp == null) return null;
-        const after = rest.slice(3);
+        const after = wi < 0 ? [] : rest.slice(wi);
         let withClause = '';
         if (after.length) {
           if (after[0].toLowerCase() !== 'with') return null;
@@ -14344,9 +14377,9 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
         outCmds.push(kw + ' ' + bt + ' ' + cp + withClause); continue;
       }
       if (kw === 'arc') {
-        // <endpoint> [of <lp>{1,2}] <arc-sweep>? <arc-size>? [rotate <angle>]?
+        // <end-point> [of <lp>{1,2}] <arc-sweep>? <arc-size>? [rotate <angle>]?
         if (rest.length < 3 || (bt !== 'by' && bt !== 'to')) return null;
-        const cp = coordPair(rest.slice(1, 3));
+        const cp = endPoint(rest.slice(1, 3), bt);
         if (cp == null) return null;
         let i = 3, radii = null;
         if (i < rest.length && rest[i].toLowerCase() === 'of') {
@@ -14521,6 +14554,182 @@ const _serClip = (value, computed, el) => {
 const _isValidClip = (value) => _serClip(value, false, null) != null;
 const _canonClip = (value) => { const r = _serClip(value, false, null); return r == null ? value : r; };
 const _computeClip = (el, value) => { const r = _serClip(value, true, el); return r == null ? value : r; };
+
+// ============================================================================
+// CSS Shapes 1/2: shape-outside / shape-margin / shape-image-threshold
+//   shape-outside = none | [ <basic-shape> || <shape-box> ] | <image>
+//   <shape-box>   = <visual-box> | margin-box   (= content/padding/border/margin-box)
+// shape-outside reuses the offset-path/clip-path <basic-shape> engine (_opShape)
+// with clip-path's two deviations (ray() forbidden; path() carries an optional
+// leading <fill-rule> via _clipPathPathFn). It differs from clip-path in only two
+// ways: (a) the box set excludes fill/stroke/view-box; (b) the DEFAULT <shape-box>
+// is margin-box (elided beside a shape), where clip-path's default is border-box.
+// A standalone <image> (url/gradient/image-set) is the third top-level alternative.
+// Computed resolves lengths→px, positions→%, xywh()/rect()→inset(), and — unlike
+// specified, which keeps a path() verbatim (relative commands preserved) — computed
+// normalizes path() data to ABSOLUTE form via _opSvgPathAbsolute.
+// ============================================================================
+const _SHAPE_BOX = new Set(['content-box', 'padding-box', 'border-box', 'margin-box']);
+// Resolve an SVG path data string to its ABSOLUTE, normalized form: relative
+// commands (m/l/h/v/c/s/q/t/a) folded against the running point, z→Z, numbers
+// re-serialized, implicit moveto-linetos kept as L. Returns null on the same
+// malformed input _opSvgPath rejects. Used at computed time for shape-outside path().
+const _opSvgPathAbsolute = (data) => {
+  const s = String(data);
+  const toks = [];
+  let i = 0; const n = s.length;
+  const isD = (c) => c >= '0' && c <= '9';
+  while (i < n) {
+    const c = s[i];
+    if (/\s/.test(c) || c === ',') { i++; continue; }
+    if (/[A-Za-z]/.test(c)) { toks.push({ cmd: c }); i++; continue; }
+    let j = i;
+    if (s[j] === '+' || s[j] === '-') j++;
+    let hd = false;
+    while (j < n && isD(s[j])) { j++; hd = true; }
+    if (s[j] === '.') { j++; while (j < n && isD(s[j])) { j++; hd = true; } }
+    if (hd && (s[j] === 'e' || s[j] === 'E')) {
+      let k = j + 1; if (s[k] === '+' || s[k] === '-') k++;
+      if (isD(s[k])) { k++; while (k < n && isD(s[k])) k++; j = k; }
+    }
+    if (!hd) return null;
+    toks.push({ num: parseFloat(s.slice(i, j)) }); i = j;
+  }
+  if (!toks.length || toks[0].cmd === undefined) return null;
+  if (toks[0].cmd.toLowerCase() !== 'm') return null;      // a path must begin with moveto
+  const out = [];
+  let cx = 0, cy = 0, sx = 0, sy = 0, p = 0;
+  const num = (x) => _serNumber(x);
+  while (p < toks.length) {
+    const t = toks[p];
+    if (t.cmd === undefined) return null;                  // stray number outside a command
+    const cl = t.cmd.toLowerCase();
+    if (!(cl in _SVG_ARGC)) return null;                   // unknown command letter
+    const rel = t.cmd === cl && cl !== 'z';                // lowercase (relative); z carries no coords
+    p++;
+    const nums = [];
+    while (p < toks.length && toks[p].num !== undefined) { nums.push(toks[p].num); p++; }
+    const argc = _SVG_ARGC[cl];
+    if (argc === 0) { if (nums.length) return null; out.push('Z'); cx = sx; cy = sy; continue; }
+    if (!nums.length || nums.length % argc !== 0) return null;
+    for (let g = 0; g < nums.length; g += argc) {
+      const a = nums.slice(g, g + argc);
+      const cmd = cl.toUpperCase();
+      if (cl === 'm') {
+        const x = rel ? cx + a[0] : a[0], y = rel ? cy + a[1] : a[1];
+        out.push((g === 0 ? 'M ' : 'L ') + num(x) + ' ' + num(y));  // extra pairs are implicit linetos
+        if (g === 0) { sx = x; sy = y; }
+        cx = x; cy = y;
+      } else if (cl === 'l' || cl === 't') {
+        const x = rel ? cx + a[0] : a[0], y = rel ? cy + a[1] : a[1];
+        cx = x; cy = y; out.push(cmd + ' ' + num(x) + ' ' + num(y));
+      } else if (cl === 'h') {
+        const x = rel ? cx + a[0] : a[0]; cx = x; out.push('H ' + num(x));
+      } else if (cl === 'v') {
+        const y = rel ? cy + a[0] : a[0]; cy = y; out.push('V ' + num(y));
+      } else if (cl === 'c') {
+        const x1 = rel ? cx + a[0] : a[0], y1 = rel ? cy + a[1] : a[1];
+        const x2 = rel ? cx + a[2] : a[2], y2 = rel ? cy + a[3] : a[3];
+        const x = rel ? cx + a[4] : a[4], y = rel ? cy + a[5] : a[5];
+        cx = x; cy = y; out.push('C ' + [x1, y1, x2, y2, x, y].map(num).join(' '));
+      } else if (cl === 's' || cl === 'q') {
+        const x1 = rel ? cx + a[0] : a[0], y1 = rel ? cy + a[1] : a[1];
+        const x = rel ? cx + a[2] : a[2], y = rel ? cy + a[3] : a[3];
+        cx = x; cy = y; out.push(cmd + ' ' + [x1, y1, x, y].map(num).join(' '));
+      } else if (cl === 'a') {
+        const x = rel ? cx + a[5] : a[5], y = rel ? cy + a[6] : a[6];
+        cx = x; cy = y; out.push('A ' + [a[0], a[1], a[2], a[3], a[4], x, y].map(num).join(' '));
+      }
+    }
+  }
+  return out.join(' ');
+};
+// clip-path's path() at COMPUTED time: same shape as _clipPathPathFn but the SVG
+// data is resolved to absolute form.
+const _clipPathPathComputed = (body) => {
+  let b = String(body).trim();
+  let fill = null;
+  const fm = /^(nonzero|evenodd)\s*,\s*([\s\S]*)$/i.exec(b);
+  if (fm) { fill = fm[1].toLowerCase(); b = fm[2].trim(); }
+  const m = /^(['"])([\s\S]*)\1$/.exec(b);
+  if (!m) return null;
+  const np = _opSvgPathAbsolute(m[2]);
+  if (np == null) return null;
+  return 'path(' + (fill === 'evenodd' ? 'evenodd, ' : '') + '"' + np + '")';
+};
+const _serShapeOutside = (value, computed, el) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  if (v.toLowerCase() === 'none') return 'none';
+  let box = null, fn = null;
+  for (const t of _wsTokens(v)) {
+    const l = t.toLowerCase();
+    if (_SHAPE_BOX.has(l)) { if (box != null) return null; box = l; continue; }
+    const m = /^([A-Za-z][A-Za-z-]*)\(([\s\S]*)\)$/.exec(t);
+    if (!m || fn != null) return null;                     // a bare non-box word, or a second function
+    fn = { head: m[1].toLowerCase(), body: m[2] };
+  }
+  if (fn == null && box == null) return null;
+  // A standalone <image> (url/gradient/image-set/…) — no accompanying <shape-box>.
+  if (fn && _BG_IMAGE_FN_RE.test(fn.head + '(')) {
+    if (box != null) return null;
+    const canon = _canonImageSet(_canonGradients(v, computed ? el : null, !!computed));
+    return computed ? _canonUrls(canon, el) : canon;
+  }
+  const emPx = computed ? _emPxOf(el) : 16;
+  const lhPx = computed ? _lineHeightPx(el, emPx) : 0;
+  let shape = null;
+  if (fn) {
+    if (fn.head === 'ray') return null;                    // ray() is offset-path-only, not a <basic-shape>
+    shape = fn.head === 'path'
+      ? (computed ? _clipPathPathComputed(fn.body) : _clipPathPathFn(fn.body))
+      : _opShape(fn.head, fn.body, computed, el, emPx, lhPx);
+    if (shape == null) return null;
+  }
+  const parts = [];
+  if (shape != null) parts.push(shape);
+  // shape-outside's default <shape-box> is margin-box → elided beside a shape.
+  if (box != null && !(shape != null && box === 'margin-box')) parts.push(box);
+  return parts.join(' ');
+};
+const _isValidShapeOutside = (value) => _serShapeOutside(value, false, null) != null;
+const _canonShapeOutside = (value) => { const r = _serShapeOutside(value, false, null); return r == null ? value : r; };
+const _computeShapeOutside = (el, value) => { const r = _serShapeOutside(value, true, el); return r == null ? value : r; };
+
+// shape-margin = <length-percentage [0,∞]>. `0`→`0px`; a bare non-zero number,
+// `none`, or a negative plain dimension is invalid. Computed folds em/…→px (% stays
+// symbolic) and clamps a math result that resolves negative to 0px.
+const _serShapeMargin = (value, computed, el) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  if (!_isNonNegShapeLP(v)) return null;
+  if (!computed) return _canonLPToken(v);
+  const emPx = _emPxOf(el), lhPx = _lineHeightPx(el, emPx);
+  const out = _posComputeLen(v, emPx, lhPx);
+  return /^-\d*\.?\d+px$/.test(out) ? '0px' : out;         // a calc that went negative clamps to 0px
+};
+const _isValidShapeMargin = (value) => _serShapeMargin(value, false, null) != null;
+const _canonShapeMargin = (value) => { const r = _serShapeMargin(value, false, null); return r == null ? value : r; };
+const _computeShapeMargin = (el, value) => { const r = _serShapeMargin(value, true, el); return r == null ? value : r; };
+
+// shape-image-threshold = <opacity-value> = <number> | <percentage>. Specified keeps
+// a number verbatim and converts a percentage to its number (÷100), with NO clamp;
+// computed additionally clamps to [0,1]. `auto` / a <length> are invalid.
+const _NUM_RE_SHAPE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
+const _serShapeThreshold = (value, computed) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  let num;
+  const pm = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)%$/i.exec(v);
+  if (pm) num = parseFloat(pm[1]) / 100;
+  else if (_NUM_RE_SHAPE.test(v)) num = parseFloat(v);
+  else return null;
+  if (computed) num = Math.min(1, Math.max(0, num));
+  return _serNumber(num);
+};
+const _isValidShapeThreshold = (value) => _serShapeThreshold(value, false) != null;
+const _canonShapeThreshold = (value) => { const r = _serShapeThreshold(value, false); return r == null ? value : r; };
+const _computeShapeThreshold = (value) => { const r = _serShapeThreshold(value, true); return r == null ? value : r; };
 
 // ─── The `offset` shorthand (CSS Motion 1 §6) ───────────────────────────────
 //   offset = [ <'offset-position'>? [ <'offset-path'> [ <'offset-distance'> ||
@@ -16716,6 +16925,9 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'offset-path') return _computeOffsetPath(el, v);
   if (kebab === 'clip-path') return _computeClipPath(el, v);
   if (kebab === 'clip') return _computeClip(el, v);
+  if (kebab === 'shape-outside') return _computeShapeOutside(el, v);
+  if (kebab === 'shape-margin') return _computeShapeMargin(el, v);
+  if (kebab === 'shape-image-threshold') return _computeShapeThreshold(v);
   if (_BG_POSITION_AXIS.has(kebab)) return _computeBgAxis(el, v, _BG_POSITION_AXIS.get(kebab));
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);
@@ -20412,6 +20624,21 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         if (_CSS_WIDE.has(val.toLowerCase())) return true;
         return _isValidClip(val);
+      }
+      if (name === 'shape-outside') {                     // none | [<basic-shape> || <shape-box>] | <image>
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _isValidShapeOutside(val);
+      }
+      if (name === 'shape-margin') {                      // <length-percentage [0,∞]>
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _isValidShapeMargin(val);
+      }
+      if (name === 'shape-image-threshold') {             // <number> | <percentage>
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _isValidShapeThreshold(val);
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);
