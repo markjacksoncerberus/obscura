@@ -10,12 +10,24 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #194).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #195).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-masking/parsing/mask-computed.html` | 0/32 | **32/32** | ✅ 100% | **Quest #195 The Mask Verdict.** The `mask` shorthand reconstructed from the COMPUTED longhands (`_serMaskShort` via getComputedStyle's resolve), gradient colours→rgb, box §serialization. **+32.** |
+| `css/css-masking/parsing/mask-invalid.html` | 0/13 | **13/13** | ✅ 100% | **Quest #195.** `_parseMaskShort` rejects double-image/double-mode/3-box/`margin-box`/2-slash/`repeat-y repeat-x`/`add intersect`. **+13.** |
+| `css/css-masking/parsing/mask-composite-invalid.html` | 0/14 | **14/14** | ✅ 100% | **Quest #195.** `mask-composite` = `[add\|subtract\|intersect\|exclude]#` (rejects `auto`/`source-over`/`xor`/…). **+14.** |
+| `css/css-masking/parsing/mask-repeat-computed.html` | 0/22 | **22/22** | ✅ 100% | **Quest #195.** `mask-repeat` canon (`repeat no-repeat`→`repeat-x`, equal pair→one) feeds the echo computed path. **+22.** |
+| `css/css-masking/parsing/mask-repeat-valid.html` | 16/22 | **22/22** | ✅ 100% | **Quest #195.** Two-token `<repeat-style>` collapse to the single-keyword forms. **+6.** |
+| `css/css-masking/parsing/mask-repeat-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #195.** `auto`/`repeat-z`/`repeat undefined` rejected. **+5.** |
+| `css/css-masking/parsing/mask-size-computed.html` | 0/16 | **14/16** | ⚠️ 88% | **Quest #195.** `mask-size` = background-size grammar; single→two-value, `auto auto`→`auto`. Cap: 2 `calc(px+em)`→px rows (font-size resolution=layout). **+14.** |
+| `css/css-masking/parsing/mask-size-valid.html` | 7/9 | **9/9** | ✅ 100% | **Quest #195.** `1px`→`1px auto`, `auto auto`→`auto`, comma layers. **+2.** |
+| `css/css-masking/parsing/mask-size-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #195.** `-1px`/`2% -3%`/3-value rejected. **+3.** |
+| `css/css-masking/parsing/mask-composite-computed.html` | 0/4 | **4/4** | ✅ 100% | **Quest #195.** Keyword-identity echo (add/subtract/intersect/exclude). **+4.** |
+| `css/css-masking/parsing/mask-type-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #195.** `mask-type` = `luminance\|alpha` single (no comma list; `auto`/pairs rejected). **+3.** |
+| `css/css-masking/parsing/mask-type-computed.html` | 0/2 | **2/2** | ✅ 100% | **Quest #195.** alpha/luminance echo. **+2.** |
 | `css/css-backgrounds/parsing/border-image-shorthand.sub.html` | 0/30 | **30/30** | ✅ 100% | **Quest #194 The Border-Image Verdict.** The `border-image` shorthand (`_parseBorderImageShort`/`_serBorderImage`): `<source> \|\| <slice> [/ <width>? [/ <outset>]?]? \|\| <repeat>`, expands into the 5 longhands. **+30.** |
 | `css/css-backgrounds/parsing/border-image-valid.html` | 28/30 | **30/30** | ✅ 100% | **Quest #194.** Full shorthand grammar + canon (`fill` reordered last, slash-group). **+2.** |
 | `css/css-backgrounds/parsing/border-image-invalid.html` | 0/17 | **17/17** | ✅ 100% | **Quest #194.** `auto`/`fill`/5-value/negatives/`1% fill 2%`/malformed slash-groups rejected. **+17.** |

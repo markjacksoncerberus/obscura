@@ -1111,6 +1111,19 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
+    if (!custom && name === 'mask' && !/\bvar\(/i.test(stored)) {
+      // mask shorthand: expand into — and store as — its eight longhands.
+      // A CSS-wide keyword goes to all eight. Invalid → keep the prior value.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const low = stored.toLowerCase();
+      let lh;
+      if (_CSS_WIDE.has(low)) { lh = {}; for (const ln of _MASK_SH_LH) lh[ln] = low; }
+      else { lh = _parseMaskShort(stored); if (!lh) return; }
+      delete this._props[name]; delete this._priority[name];    // never keep a shorthand key
+      for (const ln of _MASK_SH_LH) { this._props[ln] = lh[ln]; this._priority[ln] = prio; }
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1204,6 +1217,24 @@ class CSSStyleDeclaration {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
         const c = _canonBg(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
+    } else if (!custom && _MASK_VALIDATED.has(name)) {
+      // mask-repeat/-size/-composite/-mode/-origin/-clip: validate + canonicalize
+      // the per-layer `<type>#` grammar (invalid → ignore). CSS-wide keywords and
+      // var()/env() pass through untouched.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonMask(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
+    } else if (!custom && name === 'mask-type') {
+      // mask-type: a single `luminance | alpha` keyword (no comma list).
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonMaskType(stored);
         if (c === null) return;
         stored = c;
       }
@@ -1398,6 +1429,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'mask') {                                     // mask shorthand: clear all eight longhands
+      const old = (key in this._props) ? this._props[key] : _serMaskShort((n) => this._props[n] || '');
+      delete this._props[key]; delete this._priority[key];    // any var()-stored shorthand key
+      for (const ln of _MASK_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1448,6 +1486,10 @@ class CSSStyleDeclaration {
     if (key === 'border-image') {                           // border-image shorthand
       if (key in this._props) return this._props[key];     // var()/CSS-wide kept as a single key
       return _serBorderImage((n) => this._props[n] || '');
+    }
+    if (key === 'mask') {                                   // mask shorthand
+      if (key in this._props) return this._props[key];     // var()/CSS-wide kept as a single key
+      return _serMaskShort((n) => this._props[n] || '');
     }
     return this._props[key] || "";
   }
@@ -8224,6 +8266,12 @@ const _GCS_DEFAULTS = {
   // via _canonGradients (see _GRADIENT_PROPS). mask-image/border-image-source do
   // not inherit. list-style-image is registered above (css-lists, inherited).
   'mask-image': 'none', 'border-image-source': 'none',
+  // css-masking mask longhands (none inherit). mask-image/mask-position are
+  // registered elsewhere (_GRADIENT_PROPS / _POSITION_PROPS); these are the
+  // raw-store longhands now validated via _MASK_VALIDATED / _canonMaskType.
+  'mask-position': '0% 0%', 'mask-size': 'auto', 'mask-repeat': 'repeat',
+  'mask-origin': 'border-box', 'mask-clip': 'border-box', 'mask-composite': 'add',
+  'mask-mode': 'match-source', 'mask-type': 'luminance',
   // css-transforms. transform-origin/perspective-origin do not inherit; their
   // computed value resolves to absolute lengths (see _serializeOriginComputed).
   // perspective/transform-box/backface-visibility/transform-style do not inherit;
@@ -13168,6 +13216,219 @@ const _serBorderImage = (get) => {
   return parts.length ? parts.join(' ') : 'none';
 };
 
+// ── The `mask` shorthand + its raw-store longhands (CSS Masking 1) ─────────────
+// mask-image (in _GRADIENT_PROPS) and mask-position (in _POSITION_PROPS) already
+// validate/compute; the rest stored RAW → every *-invalid 0/N, no canon. Build a
+// per-layer value engine mirroring the `background` shorthand (#193): longhands via
+// _MASK_VALIDATED (_canonMask) + mask-type; the `mask` shorthand via
+// _parseMaskShort / _serMaskShort. All JS — no Rust.
+const _MASK_COMPOSITE_KW = new Set(['add', 'subtract', 'intersect', 'exclude']);
+const _MASK_MODE_KW = new Set(['alpha', 'luminance', 'match-source']);
+// <coord-box> for mask-origin (and, with `no-clip`, mask-clip). NOTE: `margin-box`
+// is NOT accepted by mask (`test_invalid_value('mask', 'margin-box')`).
+const _MASK_GEOM_KW = new Set(['content-box', 'padding-box', 'border-box', 'fill-box', 'stroke-box', 'view-box']);
+// mask-repeat two-token → single-keyword canonical form (the <repeat-style>
+// serialization): `repeat no-repeat`→`repeat-x`, `no-repeat repeat`→`repeat-y`,
+// an equal pair → one keyword. (Differs from background-repeat, which keeps the pair.)
+const _canonMaskRepeat2 = (a, b) => {
+  if (a === b) return a;
+  if (a === 'repeat' && b === 'no-repeat') return 'repeat-x';
+  if (a === 'no-repeat' && b === 'repeat') return 'repeat-y';
+  return a + ' ' + b;
+};
+const _canonMaskLayer = (name, layer) => {
+  const toks = _splitTopLevel(layer);
+  if (!toks.length) return null;
+  if (name === 'mask-composite') {
+    if (toks.length !== 1) return null;
+    const t = toks[0].toLowerCase();
+    return _MASK_COMPOSITE_KW.has(t) ? t : null;
+  }
+  if (name === 'mask-mode') {
+    if (toks.length !== 1) return null;
+    const t = toks[0].toLowerCase();
+    return _MASK_MODE_KW.has(t) ? t : null;
+  }
+  if (name === 'mask-origin') {
+    if (toks.length !== 1) return null;
+    const t = toks[0].toLowerCase();
+    return _MASK_GEOM_KW.has(t) ? t : null;
+  }
+  if (name === 'mask-clip') {
+    if (toks.length !== 1) return null;
+    const t = toks[0].toLowerCase();
+    return (_MASK_GEOM_KW.has(t) || t === 'no-clip') ? t : null;
+  }
+  if (name === 'mask-repeat') {
+    // <repeat-style> = repeat-x | repeat-y | [repeat|space|round|no-repeat]{1,2}
+    if (toks.length === 1) { const t = toks[0].toLowerCase(); return _BG_REPEAT1_KW.has(t) ? t : null; }
+    if (toks.length === 2) {
+      const a = toks[0].toLowerCase(), b = toks[1].toLowerCase();
+      return (_BG_REPEAT2_KW.has(a) && _BG_REPEAT2_KW.has(b)) ? _canonMaskRepeat2(a, b) : null;
+    }
+    return null;
+  }
+  // mask-size: identical grammar to background-size.
+  return _canonBgLayer('background-size', layer);
+};
+const _canonMask = (name, value) => {
+  const layers = _commaSplitTop(value).map((s) => s.trim());
+  if (!layers.length) return null;
+  const out = [];
+  for (const layer of layers) {
+    if (!layer) return null;                          // empty layer (`a,,b` / trailing comma) → invalid
+    const c = _canonMaskLayer(name, layer);
+    if (c === null) return null;
+    out.push(c);
+  }
+  return out.join(', ');
+};
+// mask-type is NOT a per-layer property (it is an SVG presentation attribute on the
+// <mask> element): a single `luminance | alpha` keyword, no comma list.
+const _canonMaskType = (value) => {
+  const t = value.trim().toLowerCase();
+  return (t === 'luminance' || t === 'alpha') ? t : null;
+};
+const _MASK_VALIDATED = new Set(['mask-repeat', 'mask-size', 'mask-composite', 'mask-mode', 'mask-origin', 'mask-clip']);
+
+// Resolve a layer's box tokens → { origin, clip }. The grammar is
+// `<geometry-box> || [ <geometry-box> | no-clip ]` (order-independent): 0 boxes →
+// both initial (border-box); 1 box → both that box (a lone `no-clip` sets clip only,
+// origin stays border-box); 2 boxes → the <geometry-box> is origin and the other
+// (geometry-box or no-clip) is clip — since `no-clip` is only ever the clip member,
+// `no-clip stroke-box` and `stroke-box no-clip` both mean origin=stroke-box,
+// clip=no-clip. Two geometry-boxes → first origin, second clip. >2 (or two no-clip,
+// which can't fill the single clip member twice) → null (invalid).
+const _maskResolveBox = (boxToks) => {
+  if (!boxToks.length) return { origin: 'border-box', clip: 'border-box' };
+  if (boxToks.length === 1) {
+    const b = boxToks[0];
+    return b === 'no-clip' ? { origin: 'border-box', clip: 'no-clip' } : { origin: b, clip: b };
+  }
+  if (boxToks.length === 2) {
+    const ncN = boxToks.filter((b) => b === 'no-clip').length;
+    if (ncN === 2) return null;                        // no-clip fills the clip member only once
+    if (ncN === 1) return { origin: boxToks.find((b) => b !== 'no-clip'), clip: 'no-clip' };
+    return { origin: boxToks[0], clip: boxToks[1] };   // two geometry-boxes → origin, clip
+  }
+  return null;
+};
+const _MASK_SH_LH = ['mask-image', 'mask-position', 'mask-size', 'mask-repeat',
+  'mask-origin', 'mask-clip', 'mask-composite', 'mask-mode'];
+const _parseMaskShort = (value) => {
+  const rawLayers = _commaSplitTop(value).map((s) => s.trim());
+  if (!rawLayers.length) return null;
+  const imgs = [], poss = [], sizes = [], reps = [], oris = [], clips = [], comps = [], modes = [];
+  for (let li = 0; li < rawLayers.length; li++) {
+    const layer = rawLayers[li];
+    if (!layer) return null;                                     // empty layer (`a,,b` / trailing comma)
+    const toks = _bgLayerToks(layer);
+    if (!toks.length) return null;
+    let image = null, position = null, size = null, repeat = null, composite = null, mode = null;
+    const boxToks = [];
+    let i = 0;
+    while (i < toks.length) {
+      const t = toks[i], l = t.toLowerCase();
+      if (t === '/') return null;                               // `/` not directly after a <position>
+      // <mask-reference> first: a gradient token can embed a math function (e.g.
+      // `linear-gradient(calc(…), …)`), which would otherwise be mis-sniffed as a
+      // <position> component (the math-name regex matches anywhere in the token).
+      if (_isBgImageTok(t)) {                                    // <mask-reference> = none | <image> | url(...)
+        if (image !== null) return null;
+        if (l === 'none') image = 'none';
+        else { if (_imageFuncInvalid(t)) return null; image = _canonImageSet(_canonGradients(t, null, false)); }
+        i++; continue;
+      }
+      if (position === null && _isBgPosTok(t)) {
+        const run = [];
+        while (i < toks.length && toks[i] !== '/' && _isBgPosTok(toks[i])) { run.push(toks[i]); i++; }
+        if (_parsePosition(run.join(' ')) == null) return null;
+        position = _serializePositionSpecified(run.join(' '));
+        if (i < toks.length && toks[i] === '/') {                // optional `/ <bg-size>`
+          i++;
+          const srun = [];
+          while (i < toks.length && srun.length < 2 && _isBgSizeTok(toks[i])) { srun.push(toks[i]); i++; }
+          if (!srun.length) return null;
+          const sc = _canonBgLayer('background-size', srun.join(' '));
+          if (sc === null) return null;
+          size = sc;
+        }
+        continue;
+      }
+      if (_BG_REPEAT1_KW.has(l)) {                               // <repeat-style> (contiguous 1-2 tokens)
+        if (repeat !== null) return null;
+        const run = [];
+        while (i < toks.length && _BG_REPEAT1_KW.has(toks[i].toLowerCase())) { run.push(toks[i]); i++; }
+        const rc = _canonMaskLayer('mask-repeat', run.join(' '));
+        if (rc === null) return null;
+        repeat = rc; continue;
+      }
+      if (_MASK_COMPOSITE_KW.has(l)) { if (composite !== null) return null; composite = l; i++; continue; }
+      if (_MASK_MODE_KW.has(l)) { if (mode !== null) return null; mode = l; i++; continue; }
+      if (_MASK_GEOM_KW.has(l) || l === 'no-clip') { boxToks.push(l); i++; continue; }
+      return null;                                              // unrecognized token → invalid layer
+    }
+    const box = _maskResolveBox(boxToks);
+    if (box === null) return null;
+    imgs.push(image !== null ? image : 'none');
+    poss.push(position !== null ? position : '0% 0%');
+    sizes.push(size !== null ? size : 'auto');
+    reps.push(repeat !== null ? repeat : 'repeat');
+    oris.push(box.origin);
+    clips.push(box.clip);
+    comps.push(composite !== null ? composite : 'add');
+    modes.push(mode !== null ? mode : 'match-source');
+  }
+  return {
+    'mask-image': imgs.join(', '),
+    'mask-position': poss.join(', '),
+    'mask-size': sizes.join(', '),
+    'mask-repeat': reps.join(', '),
+    'mask-origin': oris.join(', '),
+    'mask-clip': clips.join(', '),
+    'mask-composite': comps.join(', '),
+    'mask-mode': modes.join(', '),
+  };
+};
+// Reconstruct the `mask` shorthand from its eight longhands. Per-layer order:
+// `<image> <position>[/<size>] <repeat> <origin/clip> <composite> <mode>`, each
+// component omitted when it holds its initial value; an all-initial layer → `none`.
+// `''` if a longhand is missing or the per-layer counts disagree (inexpressible).
+const _serMaskShort = (get) => {
+  const img = get('mask-image');
+  // All eight longhands set to the same CSS-wide keyword → that keyword.
+  if (img && _CSS_WIDE.has(img.toLowerCase()) && _MASK_SH_LH.every((ln) => get(ln) === img)) return img;
+  const lists = {};
+  for (const ln of _MASK_SH_LH) { const v = get(ln); if (!v) return ''; lists[ln] = _commaSplitTop(v).map((s) => s.trim()); }
+  const n = lists['mask-image'].length;
+  for (const ln of _MASK_SH_LH) if (lists[ln].length !== n) return '';
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const image = lists['mask-image'][i], pos = lists['mask-position'][i], size = lists['mask-size'][i];
+    const repeat = lists['mask-repeat'][i], origin = lists['mask-origin'][i], clip = lists['mask-clip'][i];
+    const composite = lists['mask-composite'][i], mode = lists['mask-mode'][i];
+    // <geometry-box> serialization: origin==clip → one box (omit if the initial
+    // border-box). When they differ, `origin clip` — except the origin is dropped
+    // when it holds its initial (border-box) AND the clip is `no-clip` (so
+    // `border-box no-clip`→`no-clip`, but `stroke-box no-clip`→`stroke-box no-clip`).
+    let boxOut = '';
+    if (origin === clip) boxOut = (origin === 'border-box') ? '' : origin;
+    else if (clip === 'no-clip') boxOut = (origin === 'border-box') ? 'no-clip' : (origin + ' no-clip');
+    else boxOut = origin + ' ' + clip;
+    const parts = [];
+    if (image.toLowerCase() !== 'none') parts.push(image);
+    if (pos !== '0% 0%' || size.toLowerCase() !== 'auto') {
+      parts.push(size.toLowerCase() !== 'auto' ? pos + ' / ' + size : pos);
+    }
+    if (repeat.toLowerCase() !== 'repeat') parts.push(repeat);
+    if (boxOut) parts.push(boxOut);
+    if (composite.toLowerCase() !== 'add') parts.push(composite);
+    if (mode.toLowerCase() !== 'match-source') parts.push(mode);
+    out.push(parts.length ? parts.join(' ') : 'none');
+  }
+  return out.join(', ');
+};
+
 // The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
 // `gap`/`grid-gap` map to row-gap/column-gap; `grid-row-gap`/`grid-column-gap` are
 // legacy single-longhand aliases handled separately (_GRID_GAP_ALIAS).
@@ -16694,6 +16955,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('offset');                                           // the `offset` shorthand (expands to its 5 longhands)
   add('font');                                             // the `font` shorthand (expands to its 7 longhands)
   add('overflow');                                         // the `overflow` shorthand (expands to overflow-x/-y)
+  add('mask');                                             // the `mask` shorthand (expands to its 8 longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
   for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
@@ -16741,6 +17003,9 @@ globalThis.getComputedStyle = (el, _pseudo) => {
       if (!xv || !yv) return '';
       return xv === yv ? xv : xv + ' ' + yv;
     }
+    // `mask` shorthand: reconstruct from the COMPUTED longhands (so gradient colours
+    // resolve to rgb(), lengths to px, etc.) rather than echoing the specified value.
+    if (kebab === 'mask') return _serMaskShort((ln) => resolve(ln));
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
     // Modelled standard properties resolve through the full computed-value
@@ -19966,6 +20231,21 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         if (_CSS_WIDE.has(val.toLowerCase())) return true;
         return _parseBorderImageShort(_canonStandardValue(val)) != null;
+      }
+      if (_MASK_VALIDATED.has(name)) {                    // mask-repeat/-size/-composite/-mode/-origin/-clip
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _canonMask(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'mask-type') {                         // mask-type: luminance | alpha
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _canonMaskType(_canonStandardValue(val)) != null;
+      }
+      if (name === 'mask') {                              // the `mask` shorthand
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _parseMaskShort(_canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);

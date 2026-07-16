@@ -184,6 +184,34 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-16 (Quest #195 The Mask Verdict — the `mask` shorthand + its raw-store longhands,
++120):** Took the #194 outgoing knight's option (B): a NEW untouched `css/*/parsing/` dir. `css-masking`
+was pure raw-store — no `mask` handling existed in `bootstrap.js` at all (only `mask-image` via
+`_GRADIENT_PROPS` and `mask-position` via `_POSITION_PROPS` were green). Same #179→#194 lever. Two gaps:
+(1) `mask-repeat`/`-size`/`-composite`/`-mode`/`-origin`/`-clip`/`-type` stored RAW (every `*-invalid`
+0/N, every `*-computed` 0/N); (2) the `mask` shorthand was UNMODELLED (mask-invalid 0/13, mask-computed
+0/32). Built (all JS): `_canonMaskLayer`/`_canonMask`/`_MASK_VALIDATED` (per-layer `<type>#`; mask-size
+reuses `_canonBgLayer('background-size')`; mask-repeat has its own two-token→single-keyword collapse
+`repeat no-repeat`→`repeat-x`) + `_canonMaskType` (single `luminance|alpha`, no comma). The `mask`
+shorthand `_parseMaskShort`/`_serMaskShort`/`_maskResolveBox` — grammar `<mask-reference> || <position>
+[/ <bg-size>]? || <repeat-style> || <geometry-box> || [<geometry-box>|no-clip] || <compositing-operator>
+|| <masking-mode>`, expands into the 8 longhands. Two subtleties that cost the last few greens:
+(a) the `<mask-reference>` check MUST precede the `<position>` check — `_MATHFN_NAME_RE` matches a `calc(`
+anywhere, so a calc-bearing gradient (`linear-gradient(calc(90deg-45deg), …)`) was mis-sniffed as a
+position and rejected; (b) the box §serialization is order-independent for input (`no-clip stroke-box`≡
+`stroke-box no-clip`→origin=stroke-box, clip=no-clip) and for output drops the origin only when it is the
+initial border-box AND clip is `no-clip` (`border-box no-clip`→`no-clip`, but `stroke-box no-clip`→both).
+Computed: a `kebab==='mask'` branch in getComputedStyle's `resolve()` reconstructs from the COMPUTED
+longhands (colours→rgb, lengths→px); the 8 longhands + mask-type registered in `_GCS_DEFAULTS`. Wired
+exactly like the `background` shorthand (#193). WINS: mask-invalid 0→13, mask-computed 0→32,
+mask-repeat 0/16→22/22+5/5, mask-size 0→14+9/9+3/3, mask-composite 0→18, mask-type 0→3+2/2, mask-repeat-
+computed 0→22, mask-composite-computed 0→4. **+120, ZERO regressions** (held: qsa 1975, classlist 1420,
+serialize-values 696/697, color-valid 17/17, grid-shorthand-valid 49, all background/border-image suites
+at baseline). CAP: mask-size-computed 14/16 (2 `calc(px+em)`→px rows need font-size resolution=layout,
+same cap as background-size-computed). NEXT: the `clip-path` sub-vein of `css-masking/parsing/` — a
+`<basic-shape>` value engine (`clip-path-invalid` 0/48, `clip-path-valid` 36/54; + legacy `clip: rect()`),
+then `css-shapes` (`shape-outside` shares `<basic-shape>`). Scroll `tickets/195-the-mask-verdict.md`.
+
 **Session 2026-07-16 (Quest #194 The Border-Image Verdict — the `border-image` shorthand + its five
 raw-store longhands, +71):** Took the #193 outgoing knight's option (A) and closed the LAST raw-store
 vein of `css/css-backgrounds/parsing/`. Two gaps, same #179→#193 lever (CSS value parsing in JS
