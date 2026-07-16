@@ -884,6 +884,15 @@ const _parseStyleDecls = (text) => {
       } else if (name === 'offset-path') {
         if (!_isValidOffsetPath(value)) continue;          // invalid <offset-path> → drop
         value = _canonOffsetPath(value);
+      } else if (name === 'clip-path') {
+        if (!_isValidClipPath(value)) continue;            // invalid <clip-path> → drop
+        value = _canonClipPath(value);
+      } else if (name === 'clip-rule') {
+        const c = _canonClipRule(value); if (c == null) continue;  // nonzero | evenodd
+        value = c;
+      } else if (name === 'clip') {
+        if (!_isValidClip(value)) continue;                // invalid legacy clip → drop
+        value = _canonClip(value);
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1270,6 +1279,15 @@ class CSSStyleDeclaration {
     } else if (!custom && name === 'offset-path') {
       if (!_isValidOffsetPath(stored)) return;             // invalid <offset-path> → ignore
       stored = _canonOffsetPath(stored);
+    } else if (!custom && name === 'clip-path') {
+      if (!_isValidClipPath(stored)) return;               // invalid <clip-path> → ignore
+      stored = _canonClipPath(stored);
+    } else if (!custom && name === 'clip-rule') {
+      const c = _canonClipRule(stored); if (c == null) return;  // nonzero | evenodd
+      stored = c;
+    } else if (!custom && name === 'clip') {
+      if (!_isValidClip(stored)) return;                   // invalid legacy clip → ignore
+      stored = _canonClip(stored);
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
       if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
       stored = _canonBgAxis(stored, _BG_POSITION_AXIS.get(name));
@@ -8289,6 +8307,10 @@ const _GCS_DEFAULTS = {
   // offset-path: none | <ray()>|<url>|<basic-shape> || <coord-box>. Does not inherit;
   // computed resolves lengths→px, positions→%, xywh()/rect()→inset().
   'offset-path': 'none',
+  // css-masking: clip-path (none|<clip-source>|<basic-shape>||<geometry-box>, does
+  // not inherit), clip-rule (nonzero|evenodd, inherited), and the legacy CSS2 `clip`
+  // (auto|rect(), does not inherit). Computed clip-path/clip resolve lengths→px.
+  'clip-path': 'none', 'clip-rule': 'nonzero', 'clip': 'auto',
   // css-backgrounds longhands — each a single-axis `<bg-position>` list (the x/y
   // halves of `background-position`). Computed initial is `0%`; not inherited.
   'background-position-x': '0%', 'background-position-y': '0%',
@@ -13950,6 +13972,26 @@ const _SVG_ARGC = { m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, a: 7, z: 0 }
 // computed resolves em/pt/…→px while % stays symbolic.
 const _opLp = (tok, computed, emPx, lhPx) =>
   computed ? _posComputeLen(tok, emPx, lhPx) : _canonLPToken(tok);
+// Within a <basic-shape> a <length-percentage> is a percentage, a length-with-unit,
+// unitless 0, or a math fn — a bare NON-ZERO number (`123`) is NOT a length and so is
+// rejected (unlike the looser <position> rule in _isPosLP). _isNonNegShapeLP further
+// rejects a negative plain dimension (shape radii / border-radius are non-negative;
+// a math fn's sign is unknown until computed, where it clamps).
+const _SHAPE_UNITLESS_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
+const _isShapeLP = (t) => {
+  if (!_isPosLP(t)) return false;
+  const s = String(t).trim();
+  return _SHAPE_UNITLESS_RE.test(s) ? parseFloat(s) === 0 : true;   // unitless allowed only for 0
+};
+const _isNonNegShapeLP = (t) => {
+  if (!_isShapeLP(t)) return false;
+  const s = String(t).trim();
+  if (/^(?:calc|min|max|clamp)\(/i.test(s)) return true;             // math sign unknown at parse
+  return parseFloat(s) >= 0;                                         // plain dimension/percentage: no negatives
+};
+// Clamp a computed radius that resolved to a negative <length> to 0px (spec: shape
+// radii are clamped to be non-negative). Percentages/positives pass through.
+const _opClampRadius = (s) => (/^-\d*\.?\d+px$/.test(String(s)) ? '0px' : s);
 // A token whose numeric part is zero (`0`, `0px`, `0%`, `0.0em`) — used to elide a
 // `round 0` border-radius (its default).
 const _opIsZero = (t) => /^[+-]?(?:0+\.?0*|\.0+)(%|[a-z]+)?$/i.test(String(t).trim());
@@ -13971,8 +14013,8 @@ const _opBorderRadius = (radToks, computed, emPx, lhPx) => {
   const vT = vStr != null ? _wsTokens(vStr.trim()) : null;
   if (hT.length < 1 || hT.length > 4) return null;
   if (vT && (vT.length < 1 || vT.length > 4)) return null;
-  for (const t of hT) if (!_isPosLP(t)) return null;
-  if (vT) for (const t of vT) if (!_isPosLP(t)) return null;
+  for (const t of hT) if (!_isNonNegShapeLP(t)) return null;   // border-radius is a non-negative <lp>
+  if (vT) for (const t of vT) if (!_isNonNegShapeLP(t)) return null;
   const h = _opCollapse4(hT.map((t) => _opLp(t, computed, emPx, lhPx)));
   if (!vT) return h;
   const v = _opCollapse4(vT.map((t) => _opLp(t, computed, emPx, lhPx)));
@@ -14116,7 +14158,7 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
     const off = ri < 0 ? toks : toks.slice(0, ri);
     const rad = ri < 0 ? null : toks.slice(ri + 1);
     if (off.length < 1 || off.length > 4) return null;
-    for (const t of off) if (!_isPosLP(t)) return null;
+    for (const t of off) if (!_isShapeLP(t)) return null;       // inset offsets: <lp> (may be negative), not a bare number
     const rc = _opRoundClause(rad, computed, emPx, lhPx);
     if (rc == null) return null;
     return 'inset(' + _opCollapse4(off.map((t) => _opLp(t, computed, emPx, lhPx))) + rc + ')';
@@ -14133,7 +14175,7 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
       const l = rad[0].toLowerCase();
       if (l === 'farthest-side') radStr = 'farthest-side';
       else if (l === 'closest-side') radStr = '';        // default radius → omit
-      else if (_isPosLP(rad[0])) radStr = _opLp(rad[0], computed, emPx, lhPx);
+      else if (_isNonNegShapeLP(rad[0])) radStr = _opClampRadius(_opLp(rad[0], computed, emPx, lhPx));
       else return null;
     }
     if (posToks && (!posToks.length || !_parsePosition(posToks.join(' ')))) return null;
@@ -14152,7 +14194,7 @@ const _opShape = (head, body, computed, el, emPx, lhPx) => {
     const radCanon = (t) => {
       const l = t.toLowerCase();
       if (l === 'closest-side' || l === 'farthest-side') return l;
-      return _isPosLP(t) ? _opLp(t, computed, emPx, lhPx) : null;
+      return _isNonNegShapeLP(t) ? _opClampRadius(_opLp(t, computed, emPx, lhPx)) : null;
     };
     let radStr = '';
     if (rad.length === 2) {
@@ -14372,6 +14414,113 @@ const _serOffsetPath = (value, computed, el) => {
 const _isValidOffsetPath = (value) => _serOffsetPath(value, false, null) != null;
 const _canonOffsetPath = (value) => { const r = _serOffsetPath(value, false, null); return r == null ? value : r; };
 const _computeOffsetPath = (el, value) => { const r = _serOffsetPath(value, true, el); return r == null ? value : r; };
+
+// ============================================================================
+// clip-path  (CSS Masking 1 §6)  = none | <clip-source> | [ <basic-shape> || <geometry-box> ]
+//   <clip-source>  = <url>            (a reference; stands alone — no geometry-box)
+//   <geometry-box> = <shape-box> | fill-box | stroke-box | view-box
+//   <shape-box>    = <visual-box> | margin-box   (= content/padding/border/margin-box)
+//   <basic-shape>  = inset()|circle()|ellipse()|polygon()|path()|rect()|xywh()|shape()
+// The <basic-shape> functions reuse the offset-path `_opShape` engine verbatim (same
+// canonicalization + computed resolution: default keywords elided, xywh()/rect()→
+// inset(), em/pt→px), with two clip-path-specific deviations: ray() is forbidden
+// (it is motion-only) and clip-path's path() carries an optional leading <fill-rule>
+// (offset-path's does not). The default <geometry-box> is border-box, elided
+// whenever a shape accompanies it; a lone geometry-box is kept.
+// ============================================================================
+const _CLIP_GEOMETRY_BOX = _COORD_BOX;   // content/padding/border/margin/fill/stroke/view-box
+// clip-path's path(): `path( <fill-rule>? , <string> )` — nonzero (default) elided,
+// the SVG data validated + canonicalized via _opSvgPath. Returns null if malformed.
+const _clipPathPathFn = (body) => {
+  let b = String(body).trim();
+  let fill = null;
+  // Optional leading `<fill-rule> ,` — matched quote-agnostically so a comma inside
+  // the SVG <string> (`"M20,20…"`) is not mistaken for the fill-rule separator.
+  const fm = /^(nonzero|evenodd)\s*,\s*([\s\S]*)$/i.exec(b);
+  if (fm) { fill = fm[1].toLowerCase(); b = fm[2].trim(); }
+  const m = /^(['"])([\s\S]*)\1$/.exec(b);
+  if (!m) return null;                                       // a bare (unquoted) or trailing-token path is invalid
+  const np = _opSvgPath(m[2]);
+  if (np == null) return null;
+  return 'path(' + (fill === 'evenodd' ? 'evenodd, ' : '') + '"' + np + '")';
+};
+const _serClipPath = (value, computed, el) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  if (v.toLowerCase() === 'none') return 'none';
+  let box = null, fn = null;
+  for (const t of _wsTokens(v)) {
+    const l = t.toLowerCase();
+    if (_CLIP_GEOMETRY_BOX.has(l)) { if (box != null) return null; box = l; continue; }
+    const m = /^([A-Za-z][A-Za-z-]*)\(([\s\S]*)\)$/.exec(t);
+    if (!m || fn != null) return null;                       // a bare non-box word, or a second function
+    fn = { head: m[1].toLowerCase(), body: m[2] };
+  }
+  if (fn == null && box == null) return null;
+  // <clip-source> = <url>: stands alone (no accompanying geometry-box).
+  if (fn && fn.head === 'url') {
+    if (box != null) return null;
+    const mm = /^(['"])([\s\S]*)\1$/.exec(fn.body.trim());
+    const inner = mm ? mm[2] : fn.body.trim();
+    return inner === '' ? null : 'url("' + inner + '")';
+  }
+  const emPx = computed ? _emPxOf(el) : 16;
+  const lhPx = computed ? _lineHeightPx(el, emPx) : 0;
+  let shape = null;
+  if (fn) {
+    if (fn.head === 'ray') return null;                      // ray() is offset-path-only, not a <basic-shape>
+    shape = fn.head === 'path' ? _clipPathPathFn(fn.body) : _opShape(fn.head, fn.body, computed, el, emPx, lhPx);
+    if (shape == null) return null;
+  }
+  const parts = [];
+  if (shape != null) parts.push(shape);
+  if (box != null && !(shape != null && box === 'border-box')) parts.push(box);  // border-box default elided beside a shape
+  return parts.join(' ');
+};
+const _isValidClipPath = (value) => _serClipPath(value, false, null) != null;
+const _canonClipPath = (value) => { const r = _serClipPath(value, false, null); return r == null ? value : r; };
+const _computeClipPath = (el, value) => { const r = _serClipPath(value, true, el); return r == null ? value : r; };
+
+// clip-rule (CSS Masking / SVG): nonzero | evenodd. Inherited; computed = identity.
+const _canonClipRule = (value) => {
+  const l = String(value).trim().toLowerCase();
+  return (l === 'nonzero' || l === 'evenodd') ? l : null;
+};
+
+// The legacy `clip` property (CSS2 §11.1.2): `auto | rect(<t>, <r>, <b>, <l>)`, each
+// edge a signed <length> | auto (NO percentages), COMMA-separated (space-separated
+// rect() is invalid for `clip`). Serialized with `, ` separators. Computed resolves
+// em/…→px (percentages don't occur). A signed <length> (no %); `0` may be unitless.
+const _isClipLen = (t) => {
+  const s = String(t).trim();
+  if (/^(?:calc|min|max|clamp)\(/i.test(s)) return true;     // math resolved at computed time
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+))([a-z]+)?$/i.exec(s);
+  if (!m) return false;
+  const u = m[2] && m[2].toLowerCase();
+  if (!u) return parseFloat(m[1]) === 0;                     // unitless allowed only for 0
+  return _LEN_UNIT_RE.test(u);
+};
+const _serClip = (value, computed, el) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  if (v.toLowerCase() === 'auto') return 'auto';
+  const m = /^rect\(([\s\S]*)\)$/i.exec(v);
+  if (!m) return null;
+  const edges = _commaSplitTop(m[1]).map((s) => s.trim());
+  if (edges.length !== 4) return null;
+  const emPx = computed ? _emPxOf(el) : 16;
+  const lhPx = computed ? _lineHeightPx(el, emPx) : 0;
+  const out = [];
+  for (const e of edges) {
+    if (e.toLowerCase() === 'auto') { out.push('auto'); continue; }
+    if (!_isClipLen(e)) return null;
+    out.push(computed ? _posComputeLen(e, emPx, lhPx) : _canonLPToken(e));
+  }
+  return 'rect(' + out.join(', ') + ')';
+};
+const _isValidClip = (value) => _serClip(value, false, null) != null;
+const _canonClip = (value) => { const r = _serClip(value, false, null); return r == null ? value : r; };
+const _computeClip = (el, value) => { const r = _serClip(value, true, el); return r == null ? value : r; };
 
 // ─── The `offset` shorthand (CSS Motion 1 §6) ───────────────────────────────
 //   offset = [ <'offset-position'>? [ <'offset-path'> [ <'offset-distance'> ||
@@ -16565,6 +16714,8 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'offset-rotate') return _computeOffsetRotate(v);
   if (kebab === 'offset-distance') return _computeOffsetDistance(el, v);
   if (kebab === 'offset-path') return _computeOffsetPath(el, v);
+  if (kebab === 'clip-path') return _computeClipPath(el, v);
+  if (kebab === 'clip') return _computeClip(el, v);
   if (_BG_POSITION_AXIS.has(kebab)) return _computeBgAxis(el, v, _BG_POSITION_AXIS.get(kebab));
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);
@@ -20246,6 +20397,21 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         if (_CSS_WIDE.has(val.toLowerCase())) return true;
         return _parseMaskShort(_canonStandardValue(val)) != null;
+      }
+      if (name === 'clip-path') {                         // none|<clip-source>|<basic-shape>||<geometry-box>
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _isValidClipPath(val);
+      }
+      if (name === 'clip-rule') {                         // nonzero | evenodd
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _canonClipRule(val) != null;
+      }
+      if (name === 'clip') {                              // legacy auto | rect(<t>,<r>,<b>,<l>)
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _isValidClip(val);
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);

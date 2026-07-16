@@ -184,6 +184,36 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-16 (Quest #196 The Clip-Path Verdict — a `clip-path` `<basic-shape>` value engine
+reusing the offset-path `_opShape`, +121, ZERO regressions):** Took the #195 outgoing knight's option:
+the `clip-path` `<basic-shape>` sub-vein of `css-masking/parsing/` (pure raw-store — clip-path/clip/
+clip-rule stored verbatim → every `*-invalid`/`*-computed` 0/N). The big discovery: the entire
+`<basic-shape>` engine (`_opShape`: inset/circle/ellipse/polygon/path/rect/xywh/shape) ALREADY existed
+for `offset-path`. Built a thin `clip-path` wrapper `_serClipPath` (grammar `none | <clip-source> |
+[<basic-shape> || <geometry-box>]`) that delegates the shapes to `_opShape` with two clip-path-specific
+deviations: `ray()` forbidden (motion-only) and `path()` carries an optional leading `<fill-rule>`
+(`_clipPathPathFn`, quote-aware split so a comma inside the SVG string isn't the fill-rule separator).
+`url()` = a standalone `<clip-source>` (no geometry-box). Default `<geometry-box>` = border-box, elided
+beside a shape; a lone box kept. Also added `_canonClipRule` (`nonzero|evenodd`) and legacy `_serClip`
+(`auto | rect(<t>,<r>,<b>,<l>)`, comma-only, signed `<length>|auto` NO `%`, em→px computed). Fixed a
+GENUINE `_opShape` bug (shared with offset-path, made it stricter with ZERO regressions): unitless
+non-zero (`123`) was accepted as a length and negative radii/border-radius were accepted — added
+`_isShapeLP` (rejects bare non-zero numbers) + `_isNonNegShapeLP` (also rejects negatives) applied to
+inset offsets / border-radius / circle+ellipse radii, plus `_opClampRadius` (computed negative radius→
+0px). WINS: clip-path-invalid 0→48, -valid 36→54, -shape-parsing 19→43, -computed 0→19, clip-invalid
+0→4, clip-computed 0→4, clip-rule-invalid 0→2, clip-rule-computed 0→2. **+121, ZERO regressions**
+(offset-path-invalid 24/24, -valid 70/70, -computed 65/65, offset 13/13+29/29 all held; qsa 1975,
+serialize-values 696/697, mask-invalid 13/13, mask-computed 32/32, grid-shorthand-valid 49/49,
+background-valid 45/46). **CAPS (3, all pre-existing/shared, NOT clip-path parsing):** (1) 2 mixed-
+`calc(%+px)` xywh/rect computed rows need symbolic calc arithmetic (`100%−(2%+2px)`=`98%−2px`; same class
+as background-size-computed's calc cap); (2) 1 `0Px`→`0px` unit-lowercasing in `_canonLPToken` (shared
+broadly, low ROI). **NEXT LEVERAGE:** `css-masking/parsing/` is now effectively CLOSED (mask #195 +
+clip-path #196). Pivot to a NEW untouched `css/*/parsing/` dir: `css-shapes` (`shape-outside`/`shape-
+margin` — `shape-outside` shares `<basic-shape>` so it can REUSE `_serClipPath`'s pattern almost
+verbatim), or the `css-scroll-snap` remainder, or `css-contain`/`css-will-change`. Baseline a sample
+first (`*-invalid` 0/N is the raw-store tell). grep `_serClipPath`/`_clipPathPathFn`/`_isShapeLP`/
+`_isNonNegShapeLP`/`_serClip`/`_canonClipRule`. Scroll `tickets/196-the-clip-path-verdict.md`.
+
 **Session 2026-07-16 (Quest #195 The Mask Verdict — the `mask` shorthand + its raw-store longhands,
 +120):** Took the #194 outgoing knight's option (B): a NEW untouched `css/*/parsing/` dir. `css-masking`
 was pure raw-store — no `mask` handling existed in `bootstrap.js` at all (only `mask-image` via

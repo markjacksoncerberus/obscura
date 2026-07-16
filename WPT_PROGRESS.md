@@ -10,12 +10,20 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #195).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #196).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-masking/parsing/clip-path-invalid.html` | 0/48 | **48/48** | ✅ 100% | **Quest #196 The Clip-Path Verdict.** `_serClipPath` gate: `auto`/`ray()`/unitless-nonzero radii (`circle(123)`)/negative radii (`circle(-10px)`)/bad `path()` prefix all rejected; `_opShape` tightened via `_isShapeLP`/`_isNonNegShapeLP`. **+48.** |
+| `css/css-masking/parsing/clip-path-valid.html` | 36/54 | **54/54** | ✅ 100% | **Quest #196.** `<basic-shape> || <geometry-box>` canon (border-box elided beside a shape), `url()` clip-source, `path(<fill-rule>?, <string>)` (quote-aware, nonzero elided). **+18.** |
+| `css/css-masking/parsing/clip-path-shape-parsing.html` | 19/44 | **43/44** | ⚠️ 98% | **Quest #196.** `shape()` delegated to `_opShape` (CSS Shapes 2). Cap: 1 `0Px`→`0px` unit-lowercasing (`_canonLPToken`, shared/low-ROI). **+24.** |
+| `css/css-masking/parsing/clip-path-computed.html` | 0/21 | **19/21** | ⚠️ 90% | **Quest #196.** `_computeClipPath`: lengths→px, xywh()/rect()→inset(), negative radius clamps to 0px. Cap: 2 mixed-`calc(%+px)` xywh/rect rows (symbolic calc arithmetic, same class as background-size cap). **+19.** |
+| `css/css-masking/parsing/clip-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #196.** Legacy `clip`: `none`/3-edge/`%`/space-separated `rect()` rejected via `_serClip`. **+4.** |
+| `css/css-masking/parsing/clip-computed.html` | 0/4 | **4/4** | ✅ 100% | **Quest #196.** `rect(<t>,<r>,<b>,<l>)` em→px (`calc(-1em + 10px)`→`-30px`). **+4.** |
+| `css/css-masking/parsing/clip-rule-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #196.** `clip-rule` = `nonzero\|evenodd` (`auto`/`1` rejected). **+2.** |
+| `css/css-masking/parsing/clip-rule-computed.html` | 0/2 | **2/2** | ✅ 100% | **Quest #196.** nonzero/evenodd keyword echo + `_GCS_DEFAULTS`. **+2.** |
 | `css/css-masking/parsing/mask-computed.html` | 0/32 | **32/32** | ✅ 100% | **Quest #195 The Mask Verdict.** The `mask` shorthand reconstructed from the COMPUTED longhands (`_serMaskShort` via getComputedStyle's resolve), gradient colours→rgb, box §serialization. **+32.** |
 | `css/css-masking/parsing/mask-invalid.html` | 0/13 | **13/13** | ✅ 100% | **Quest #195.** `_parseMaskShort` rejects double-image/double-mode/3-box/`margin-box`/2-slash/`repeat-y repeat-x`/`add intersect`. **+13.** |
 | `css/css-masking/parsing/mask-composite-invalid.html` | 0/14 | **14/14** | ✅ 100% | **Quest #195.** `mask-composite` = `[add\|subtract\|intersect\|exclude]#` (rejects `auto`/`source-over`/`xor`/…). **+14.** |
