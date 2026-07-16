@@ -1098,6 +1098,19 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
+    if (!custom && name === 'border-image' && !/\bvar\(/i.test(stored)) {
+      // border-image shorthand: expand into — and store as — its five longhands.
+      // A CSS-wide keyword goes to all five. Invalid → keep the prior value.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const low = stored.toLowerCase();
+      let lh;
+      if (_CSS_WIDE.has(low)) { lh = {}; for (const ln of _BI_SH_LH) lh[ln] = low; }
+      else { lh = _parseBorderImageShort(stored); if (!lh) return; }
+      delete this._props[name]; delete this._priority[name];    // never keep a shorthand key
+      for (const ln of _BI_SH_LH) { this._props[ln] = lh[ln]; this._priority[ln] = prio; }
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1110,7 +1123,17 @@ class CSSStyleDeclaration {
     else if (!custom && _SIMPLE_TRANSFORM_PROPS.has(name)) {
       if (!_isValidSimpleTransform(name, stored)) return;  // invalid perspective/transform-box/backface → ignore
     }
-    else if (!custom && _GRADIENT_PROPS.has(name)) {
+    else if (!custom && _BI_VALIDATED.has(name)) {
+      // border-image-source/-slice/-width/-outset/-repeat: validate + canonicalize
+      // the grammar (invalid → ignore). Must precede _GRADIENT_PROPS (which also
+      // holds border-image-source but would accept `auto`/a comma layer list).
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonBorderImage(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
+    } else if (!custom && _GRADIENT_PROPS.has(name)) {
       if (_imageFuncInvalid(stored)) return;               // invalid image() → ignore (keep prior value)
       stored = _canonImageSet(_canonGradients(stored, null, false));
     } else if (!custom && _CSSUI_VALIDATED.has(name)) {
@@ -1368,6 +1391,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'border-image') {                             // border-image shorthand: clear all five longhands
+      const old = (key in this._props) ? this._props[key] : _serBorderImage((n) => this._props[n] || '');
+      delete this._props[key]; delete this._priority[key];    // any var()-stored shorthand key
+      for (const ln of _BI_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1414,6 +1444,10 @@ class CSSStyleDeclaration {
     if (key === 'background') {                             // background shorthand
       if (key in this._props) return this._props[key];     // var()/CSS-wide kept as a single key
       return _serBackgroundShort((n) => this._props[n] || '');
+    }
+    if (key === 'border-image') {                           // border-image shorthand
+      if (key in this._props) return this._props[key];     // var()/CSS-wide kept as a single key
+      return _serBorderImage((n) => this._props[n] || '');
     }
     return this._props[key] || "";
   }
@@ -12973,6 +13007,167 @@ const _serBackgroundShort = (get) => {
   return out.join(', ');
 };
 
+// ── The `border-image` shorthand + its five longhands (CSS Backgrounds 3) ──────
+// Shorthand grammar: <'border-image-source'> || <'border-image-slice'>
+//   [ / <'border-image-width'> | / <'border-image-width'>? / <'border-image-outset'> ]?
+//   || <'border-image-repeat'>.  The five longhands stored RAW (every *-invalid 0/N,
+// no canon) and the shorthand was UNMODELLED (single-key store → 0/30). Same
+// expand/reconstruct pattern as the `background`/`grid` shorthands. All JS.
+const _BI_SH_LH = ['border-image-source', 'border-image-slice', 'border-image-width',
+  'border-image-outset', 'border-image-repeat'];
+const _BI_VALIDATED = new Set(_BI_SH_LH);
+const _BI_REPEAT_KW = new Set(['stretch', 'repeat', 'round', 'space']);
+// A single non-negative <number> / <percentage> / <length> token (no sign → the
+// leading `-` that would make it negative is simply not matched).
+const _biNum = (t) => /^\+?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(t);
+const _biPct = (t) => /^\+?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?%$/i.test(t);
+const _biLen = (t) => /^\+?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?[a-z]+$/i.test(t);
+// Collapse 1–4 box values margin-style (`1 1 1 1`→`1`, `1 2% 3 4%` stays).
+const _biCollapse = (toks) => {
+  const e = _boxEdges(toks); if (!e) return null;
+  const out = [e[0], e[1], e[2], e[3]];
+  if (e[3] === e[1]) { out.pop(); if (e[2] === e[0]) { out.pop(); if (e[1] === e[0]) out.pop(); } }
+  return out.join(' ');
+};
+// border-image-slice: [<number [0,∞]> | <percentage [0,∞]>]{1,4} && fill?  (`fill`
+// contiguous with — before or after — the number run, serialized LAST).
+const _canonBiSlice = (value) => {
+  const toks = _wsTokens(value);
+  if (!toks.length) return null;
+  let fillPos = -1;
+  for (let i = 0; i < toks.length; i++) {
+    if (toks[i].toLowerCase() === 'fill') { if (fillPos !== -1) return null; fillPos = i; }
+  }
+  if (fillPos !== -1 && fillPos !== 0 && fillPos !== toks.length - 1) return null;   // fill must be an end
+  const nums = toks.filter((t) => t.toLowerCase() !== 'fill');
+  if (nums.length < 1 || nums.length > 4) return null;
+  for (const t of nums) if (!_biNum(t) && !_biPct(t)) return null;
+  const c = _biCollapse(nums); if (c === null) return null;
+  return fillPos !== -1 ? c + ' fill' : c;
+};
+// border-image-width: [<length-percentage [0,∞]> | <number [0,∞]> | auto]{1,4}.
+const _canonBiWidth = (value) => {
+  const toks = _wsTokens(value);
+  if (toks.length < 1 || toks.length > 4) return null;
+  const canon = [];
+  for (const t of toks) {
+    const l = t.toLowerCase();
+    if (l === 'auto') canon.push('auto');
+    else if (_biNum(t) || _biPct(t) || _biLen(t)) canon.push(t);
+    else return null;
+  }
+  return _biCollapse(canon);
+};
+// border-image-outset: [<length [0,∞]> | <number [0,∞]>]{1,4}  (no percentage, no auto).
+const _canonBiOutset = (value) => {
+  const toks = _wsTokens(value);
+  if (toks.length < 1 || toks.length > 4) return null;
+  for (const t of toks) if (!_biNum(t) && !_biLen(t)) return null;
+  return _biCollapse(toks);
+};
+// border-image-repeat: [stretch | repeat | round | space]{1,2}  (two equal → one).
+const _canonBiRepeat = (value) => {
+  const low = _wsTokens(value).map((t) => t.toLowerCase());
+  if (low.length < 1 || low.length > 2) return null;
+  for (const t of low) if (!_BI_REPEAT_KW.has(t)) return null;
+  return (low.length === 2 && low[0] === low[1]) ? low[0] : low.join(' ');
+};
+// border-image-source: none | <image>  (a single image — no comma layer list).
+const _canonBiSource = (value) => {
+  const v = value.trim();
+  if (v.toLowerCase() === 'none') return 'none';
+  if (_commaSplitTop(v).length !== 1) return null;
+  if (!_isBgImageTok(v) || _imageFuncInvalid(v)) return null;
+  return _canonImageSet(_canonGradients(v, null, false));
+};
+const _canonBorderImage = (name, value) => {
+  if (name === 'border-image-source') return _canonBiSource(value);
+  if (name === 'border-image-slice') return _canonBiSlice(value);
+  if (name === 'border-image-width') return _canonBiWidth(value);
+  if (name === 'border-image-outset') return _canonBiOutset(value);
+  if (name === 'border-image-repeat') return _canonBiRepeat(value);
+  return null;
+};
+// Parse the `border-image` shorthand → the five longhands (already canonical) or
+// null. The three `||` members (source / slice-group / repeat) come in any order;
+// the slashes bind to the slice-group (`slice [/ width [/ outset]]`).
+const _parseBorderImageShort = (value) => {
+  if (_commaSplitTop(value).length > 1) return null;               // no comma layer list
+  const toks = _bgLayerToks(value);                                // functions whole, top-level `/` its own token
+  if (!toks.length) return null;
+  let source = null, slice = null, width = null, outset = null, repeat = null, sawSlice = false;
+  let i = 0;
+  while (i < toks.length) {
+    const t = toks[i], l = t.toLowerCase();
+    if (t === '/') return null;                                    // a `/` not immediately after the slice run
+    if (_isBgImageTok(t)) {                                        // <source>
+      if (source !== null) return null;
+      source = _canonBiSource(t); if (source === null) return null;
+      i++; continue;
+    }
+    if (_BI_REPEAT_KW.has(l)) {                                    // <repeat> run (1–2 keywords)
+      if (repeat !== null) return null;
+      const run = [];
+      while (i < toks.length && _BI_REPEAT_KW.has(toks[i].toLowerCase())) { run.push(toks[i]); i++; }
+      repeat = _canonBiRepeat(run.join(' ')); if (repeat === null) return null;
+      continue;
+    }
+    if (l === 'fill' || _biNum(t) || _biPct(t)) {                  // <slice> [ / <width>? [ / <outset> ]? ]
+      if (sawSlice) return null;
+      sawSlice = true;
+      const srun = [];
+      while (i < toks.length && toks[i] !== '/' &&
+             (toks[i].toLowerCase() === 'fill' || _biNum(toks[i]) || _biPct(toks[i]))) { srun.push(toks[i]); i++; }
+      slice = _canonBiSlice(srun.join(' ')); if (slice === null) return null;
+      if (i < toks.length && toks[i] === '/') {                    // optional `/ <width>`
+        i++;
+        const wrun = [];
+        while (i < toks.length && toks[i] !== '/' &&
+               (toks[i].toLowerCase() === 'auto' || _biNum(toks[i]) || _biPct(toks[i]) || _biLen(toks[i]))) { wrun.push(toks[i]); i++; }
+        if (wrun.length) { width = _canonBiWidth(wrun.join(' ')); if (width === null) return null; }
+        if (i < toks.length && toks[i] === '/') {                  // optional `/ <outset>`
+          i++;
+          const orun = [];
+          while (i < toks.length && (_biNum(toks[i]) || _biLen(toks[i]))) { orun.push(toks[i]); i++; }
+          if (!orun.length) return null;
+          outset = _canonBiOutset(orun.join(' ')); if (outset === null) return null;
+        } else if (!wrun.length) return null;                      // a lone trailing `/` with no width
+      }
+      continue;
+    }
+    return null;                                                   // unclassifiable token
+  }
+  if (source === null && slice === null && repeat === null) return null;
+  return {
+    'border-image-source': source == null ? 'none' : source,
+    'border-image-slice': slice == null ? '100%' : slice,
+    'border-image-width': width == null ? '1' : width,
+    'border-image-outset': outset == null ? '0' : outset,
+    'border-image-repeat': repeat == null ? 'stretch' : repeat,
+  };
+};
+// Reconstruct `border-image` from its longhands (defaults omitted; `/ <width>` shown
+// when width or outset is non-default, `/ / <outset>` when outset alone is non-default).
+const _BI_INIT = { s: 'none', sl: '100%', w: '1', o: '0', r: 'stretch' };
+const _serBorderImage = (get) => {
+  const s = get('border-image-source'), sl = get('border-image-slice'),
+        w = get('border-image-width'), o = get('border-image-outset'), r = get('border-image-repeat');
+  if (!s || !sl || !w || !o || !r) return '';
+  if (_CSS_WIDE.has(s.toLowerCase()) && [sl, w, o, r].every((v) => v === s)) return s;   // all-CSS-wide
+  const parts = [];
+  if (s !== _BI_INIT.s) parts.push(s);
+  if (sl !== _BI_INIT.sl || w !== _BI_INIT.w || o !== _BI_INIT.o) {
+    parts.push(sl);
+    if (w !== _BI_INIT.w || o !== _BI_INIT.o) {
+      parts.push('/');
+      if (o !== _BI_INIT.o) { if (w !== _BI_INIT.w) parts.push(w); parts.push('/'); parts.push(o); }
+      else parts.push(w);
+    }
+  }
+  if (r !== _BI_INIT.r) parts.push(r);
+  return parts.length ? parts.join(' ') : 'none';
+};
+
 // The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
 // `gap`/`grid-gap` map to row-gap/column-gap; `grid-row-gap`/`grid-column-gap` are
 // legacy single-longhand aliases handled separately (_GRID_GAP_ALIAS).
@@ -19761,6 +19956,16 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         if (_CSS_WIDE.has(val.toLowerCase())) return true;
         return _parseBackgroundShort(_canonStandardValue(val)) != null;
+      }
+      if (_BI_VALIDATED.has(name)) {                      // border-image-source/-slice/-width/-outset/-repeat
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _canonBorderImage(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'border-image') {                      // the `border-image` shorthand
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _parseBorderImageShort(_canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);

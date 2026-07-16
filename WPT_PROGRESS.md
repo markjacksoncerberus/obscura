@@ -10,12 +10,22 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #193).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #194).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-backgrounds/parsing/border-image-shorthand.sub.html` | 0/30 | **30/30** | ✅ 100% | **Quest #194 The Border-Image Verdict.** The `border-image` shorthand (`_parseBorderImageShort`/`_serBorderImage`): `<source> \|\| <slice> [/ <width>? [/ <outset>]?]? \|\| <repeat>`, expands into the 5 longhands. **+30.** |
+| `css/css-backgrounds/parsing/border-image-valid.html` | 28/30 | **30/30** | ✅ 100% | **Quest #194.** Full shorthand grammar + canon (`fill` reordered last, slash-group). **+2.** |
+| `css/css-backgrounds/parsing/border-image-invalid.html` | 0/17 | **17/17** | ✅ 100% | **Quest #194.** `auto`/`fill`/5-value/negatives/`1% fill 2%`/malformed slash-groups rejected. **+17.** |
+| `css/css-backgrounds/parsing/border-image-slice-valid.html` | 3/4 | **4/4** | ✅ 100% | **Quest #194.** `fill 1 2% 3 4%` → `1 2% 3 4% fill`. **+1.** |
+| `css/css-backgrounds/parsing/border-image-slice-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #194.** `_canonBiSlice` (`fill` contiguous+end, non-neg num/pct, ≤4). **+6.** |
+| `css/css-backgrounds/parsing/border-image-width-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #194.** `none`/negatives/5-value rejected (`[<lp[0,∞]>\|<num>\|auto]{1,4}`). **+5.** |
+| `css/css-backgrounds/parsing/border-image-outset-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #194.** `auto`/`1%`/negatives/5-value rejected (`[<len[0,∞]>\|<num>]{1,4}`, no pct/auto). **+5.** |
+| `css/css-backgrounds/parsing/border-image-repeat-valid.html` | 2/3 | **3/3** | ✅ 100% | **Quest #194.** `space space` → `space` (two-equal collapse). **+1.** |
+| `css/css-backgrounds/parsing/border-image-repeat-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #194.** `auto`/3-token rejected (`[stretch\|repeat\|round\|space]{1,2}`). **+2.** |
+| `css/css-backgrounds/parsing/border-image-source-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #194.** `auto` + `none, url(…)` (comma layer list) rejected (`none \| <image>`). **+2.** |
 | `css/css-backgrounds/parsing/background-valid.html` | 1/46 | **45/46** | ⬆️ | **Quest #193 The Background Verdict.** The `background` shorthand (`_parseBackgroundShort`/`_serBackgroundShort`): order-independent `<bg-image> \|\| <bg-position>[/<bg-size>] \|\| <repeat-style> \|\| <attachment> \|\| <bg-clip> \|\| <visual-box>` per layer, expands into the 8 longhands. **+44** (1 cap: `none`→color quirk). |
 | `css/css-backgrounds/parsing/background-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #193.** `red, green` (color in non-final layer) + `black 0 url(…) / cover` (`/` not after `<bg-position>`) rejected. **+2.** |
 | `css/css-backgrounds/parsing/background-repeat-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #193.** `_canonBg` gates `<repeat-style>#` (`repeat repeat-x`/`repeat-y round`/3-token rejected). **+3.** |

@@ -184,6 +184,35 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-16 (Quest #194 The Border-Image Verdict — the `border-image` shorthand + its five
+raw-store longhands, +71):** Took the #193 outgoing knight's option (A) and closed the LAST raw-store
+vein of `css/css-backgrounds/parsing/`. Two gaps, same #179→#193 lever (CSS value parsing in JS
+`setProperty`): (1) `border-image-source`/`-slice`/`-width`/`-outset`/`-repeat` stored RAW (every
+`*-invalid` 0/N; no canon: `fill 1 2% 3 4%`→`1 2% 3 4% fill`, `space space`→`space` missing);
+(2) the `border-image` shorthand was UNMODELLED (`style.borderImage=…` fell through to single-key
+storage → shorthand test 0/30, valid 28/30). Built (all JS in `bootstrap.js`): `_canonBorderImage`
+dispatching five per-longhand canon fns (`_canonBiSlice` `[<num>|<pct>]{1,4} && fill?` with fill
+contiguous+serialized-last + margin-style `_biCollapse`; `_canonBiWidth` adds `auto`+`<len>`+`<pct>`;
+`_canonBiOutset` `[<len>|<num>]{1,4}` no pct/auto; `_canonBiRepeat` `[stretch|repeat|round|space]{1,2}`
+two-equal→one; `_canonBiSource` `none | <image>` rejecting `auto`+comma layer lists), routed via a new
+`_BI_VALIDATED` branch placed BEFORE `_GRADIENT_PROPS` (which also holds border-image-source but would
+accept `auto`). The `border-image` shorthand `_parseBorderImageShort` (the three `||` members
+source/slice-group/repeat in any order; slashes bind to the slice-group `slice [/ width [/ outset]]`;
+`_bgLayerToks` makes a top-level `/` its own token so `1 / -2px`/`1 / / auto`/`1 / none / 1px` are
+rejected) expands into + stores the five longhands; `_serBorderImage` reconstructs (defaults omitted,
+`/ / <outset>` when outset alone non-default, all-default→`none`). Wired EXACTLY like the `background`
+shorthand (#193): setProperty expand gated on `!var()`, removeProperty/getPropertyValue clear/reconstruct,
+CSS.supports branches, `_BI_SH_LH` the 5-longhand list. WINS: border-image-shorthand 0→30, -invalid 0→17,
+-valid 28→30, -slice-valid 3→4, -slice-invalid 0→6, -width-invalid 0→5, -outset-invalid 0→5, -repeat-valid
+2→3, -repeat-invalid 0→2, -source-invalid 0→2. **+71, ZERO regressions** (qsa 1975, serialize-values
+696/697, color-valid 17/17, color-invalid 8/11, border-color-valid 7/7, grid-shorthand-valid 49,
+background-valid 45/46, background-computed 39/39, bg-position-valid 31 all held; border-image-source-valid
+2/2 + -source-computed 10/10 unchanged). **CAP (pre-existing, NOT parsing):** border-image-`-width`/`-outset`/
+`-slice`/`-repeat`-computed are 0/N because those four longhands aren't registered in the getComputedStyle
+machinery ("doesn't seem to be supported in the computed style") — a separate computed-style-registration
+task, untouched by this specified-value change (border-image-source-computed passes: source IS registered).
+Scroll `tickets/194-the-border-image-verdict.md`.
+
 **Session 2026-07-16 (Quest #193 The Background Verdict — the `background` shorthand + its five
 raw-store sub-property longhands, +72):** Took the outgoing knight's option (A) and pivoted to the
 last raw-store vein of `css/css-backgrounds/parsing/`. Two gaps, same #179→#192 lever (CSS value
