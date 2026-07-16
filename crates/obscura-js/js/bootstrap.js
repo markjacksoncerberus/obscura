@@ -1085,6 +1085,19 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
+    if (!custom && name === 'background' && !/\bvar\(/i.test(stored)) {
+      // background shorthand: expand into — and store as — its eight longhands.
+      // A CSS-wide keyword goes to all eight. Invalid → keep the prior value.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const low = stored.toLowerCase();
+      let lh;
+      if (_CSS_WIDE.has(low)) { lh = {}; for (const ln of _BG_SH_LH) lh[ln] = low; }
+      else { lh = _parseBackgroundShort(stored); if (!lh) return; }
+      delete this._props[name]; delete this._priority[name];    // never keep a shorthand key
+      for (const ln of _BG_SH_LH) { this._props[ln] = lh[ln]; this._priority[ln] = prio; }
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && _POSITION_PROPS.has(name)) {
       if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(stored, _STRICT_POSITION_PROPS.get(name))) return; // invalid strict <position> → ignore
       if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(stored)) return;        // invalid <bg-position> → ignore
@@ -1158,6 +1171,16 @@ class CSSStyleDeclaration {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
         const c = _canonGridTemplateAreas(stored);
+        if (c === null) return;
+        stored = c;
+      }
+    } else if (!custom && _BG_VALIDATED.has(name)) {
+      // background-repeat/-attachment/-clip/-origin/-size: validate + canonicalize
+      // the per-layer `<type>#` grammar (invalid → ignore). CSS-wide keywords and
+      // var()/env() pass through untouched.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonBg(name, stored);
         if (c === null) return;
         stored = c;
       }
@@ -1338,6 +1361,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'background') {                               // background shorthand: clear all eight longhands
+      const old = (key in this._props) ? this._props[key] : _serBackgroundShort((n) => this._props[n] || '');
+      delete this._props[key]; delete this._priority[key];    // any var()-stored shorthand key
+      for (const ln of _BG_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     const old = this._props[key];
     delete this._props[key]; delete this._priority[key];
     this._notifyChange();
@@ -1380,6 +1410,10 @@ class CSSStyleDeclaration {
     if (key === 'grid') {                                  // full grid shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
       return _serGridShort((n) => this._props[n] || '');
+    }
+    if (key === 'background') {                             // background shorthand
+      if (key in this._props) return this._props[key];     // var()/CSS-wide kept as a single key
+      return _serBackgroundShort((n) => this._props[n] || '');
     }
     return this._props[key] || "";
   }
@@ -11405,6 +11439,86 @@ const _canonGapItem = (value) => {
     return _canonStandardValue(s);
   return null;                                                  // angle/time/etc. unit → invalid
 };
+// ── CSS Backgrounds sub-property longhands (background-repeat/-attachment/
+// -clip/-origin/-size) ───────────────────────────────────────────────────────
+// Each is a comma-separated per-layer list (`<type>#`). These stored RAW before,
+// so every invalid value was wrongly accepted (`background-attachment: auto`,
+// `background-clip: margin-box`, `background-size: -1px`). `_canonBg` validates +
+// canonicalizes; a null return means "invalid → ignore the declaration" (matching
+// CSSOM). CSS-wide keywords and var()/env() are dispatched away before this runs.
+const _BG_ATTACHMENT_KW = new Set(['scroll', 'fixed', 'local']);
+const _BG_REPEAT1_KW = new Set(['repeat-x', 'repeat-y', 'repeat', 'space', 'round', 'no-repeat']);
+const _BG_REPEAT2_KW = new Set(['repeat', 'space', 'round', 'no-repeat']);
+const _BG_ORIGIN_KW = new Set(['border-box', 'padding-box', 'content-box']);
+const _BG_CLIP1_KW = new Set(['border-box', 'padding-box', 'content-box', 'border-area', 'text']);
+// A single background-size value component: `auto | <length-percentage [0,∞]>`.
+const _bgSizeVal = (t) => {
+  if (/^auto$/i.test(t)) return 'auto';
+  if (/^normal$/i.test(t)) return null;   // _canonGapItem accepts `normal`; bg-size doesn't
+  return _canonGapItem(t);                // non-neg <length-percentage>|calc (null → invalid)
+};
+const _canonBgLayer = (name, layer) => {
+  const toks = _splitTopLevel(layer);
+  if (!toks.length) return null;
+  if (name === 'background-attachment') {
+    if (toks.length !== 1) return null;
+    const t = toks[0].toLowerCase();
+    return _BG_ATTACHMENT_KW.has(t) ? t : null;
+  }
+  if (name === 'background-origin') {
+    if (toks.length !== 1) return null;
+    const t = toks[0].toLowerCase();
+    return _BG_ORIGIN_KW.has(t) ? t : null;
+  }
+  if (name === 'background-repeat') {
+    // <repeat-style> = repeat-x | repeat-y | [repeat|space|round|no-repeat]{1,2}
+    if (toks.length === 1) { const t = toks[0].toLowerCase(); return _BG_REPEAT1_KW.has(t) ? t : null; }
+    if (toks.length === 2) {
+      const a = toks[0].toLowerCase(), b = toks[1].toLowerCase();
+      return (_BG_REPEAT2_KW.has(a) && _BG_REPEAT2_KW.has(b)) ? a + ' ' + b : null;
+    }
+    return null;
+  }
+  if (name === 'background-clip') {
+    // <bg-clip> = <visual-box> | border-area | text; the two-token form is the
+    // `[ border-area || text ]` pair, canonically ordered `border-area text`.
+    if (toks.length === 1) { const t = toks[0].toLowerCase(); return _BG_CLIP1_KW.has(t) ? t : null; }
+    if (toks.length === 2) {
+      const set = new Set([toks[0].toLowerCase(), toks[1].toLowerCase()]);
+      return (set.size === 2 && set.has('border-area') && set.has('text')) ? 'border-area text' : null;
+    }
+    return null;
+  }
+  // background-size: [ [ <lp [0,∞]> | auto ]{1,2} | cover | contain ]
+  if (toks.length === 1) {
+    const t = toks[0].toLowerCase();
+    if (t === 'cover' || t === 'contain') return t;
+    const v = _bgSizeVal(toks[0]);
+    if (v === null) return null;
+    return v === 'auto' ? 'auto' : v + ' auto';     // canonical two-value form (`1px` → `1px auto`)
+  }
+  if (toks.length === 2) {
+    const v1 = _bgSizeVal(toks[0]), v2 = _bgSizeVal(toks[1]);
+    if (v1 === null || v2 === null) return null;
+    return (v1 === 'auto' && v2 === 'auto') ? 'auto' : v1 + ' ' + v2;   // `auto auto` → `auto`
+  }
+  return null;
+};
+const _canonBg = (name, value) => {
+  const layers = _commaSplitTop(value).map((s) => s.trim());
+  if (!layers.length) return null;
+  const out = [];
+  for (const layer of layers) {
+    if (!layer) return null;                          // empty layer (`a,,b` / trailing comma) → invalid
+    const c = _canonBgLayer(name, layer);
+    if (c === null) return null;
+    out.push(c);
+  }
+  return out.join(', ');
+};
+const _BG_VALIDATED = new Set([
+  'background-repeat', 'background-attachment', 'background-clip', 'background-origin', 'background-size',
+]);
 // ── CSS Basic User Interface (css-ui) value parsing ──────────────────────────
 // These longhands stored their value RAW (no grammar check), so every invalid
 // value was wrongly accepted (`box-sizing: fill-box`, `caret-color: invert`, …).
@@ -12695,6 +12809,168 @@ const _serGridShort = (get) => {
   }
   if (tr !== 'none') return '';                                   // Form 3: auto-flow … / columns
   return 'auto-flow' + (dense ? ' dense' : '') + (ar !== 'auto' ? ' ' + ar : '') + ' / ' + tc;
+};
+
+// ── CSS Backgrounds `background` SHORTHAND ───────────────────────────────────
+// `background = <bg-layer># , <final-bg-layer>` where each layer is the
+// order-independent `<bg-image> || <bg-position> [ / <bg-size> ]? || <repeat-style>
+// || <attachment> || <bg-clip> || <visual-box>` (final adds `<'background-color'>`).
+// Was UNMODELLED (single-key store → every invalid value accepted, valid 1/46).
+// `_parseBackgroundShort` expands into the eight longhands (or null → ignore);
+// `_serBackgroundShort` reconstructs. All JS — no Rust.
+const _BG_IMAGE_FN_RE = /^(?:url|src|(?:-webkit-|-moz-|-o-|-ms-)?(?:repeating-)?(?:linear|radial|conic)-gradient|(?:-webkit-)?(?:image-set|cross-fade|gradient)|image|paint|element)\(/i;
+const _isBgImageTok = (t) => t.toLowerCase() === 'none' || _BG_IMAGE_FN_RE.test(t);
+const _BG_POS_KW = new Set(['left', 'right', 'top', 'bottom', 'center']);
+// A single <length-percentage>|<number>|math token (used to sniff position/size
+// components; the run is then validated by _parsePosition / _canonBgLayer).
+const _isLPTok = (t) => _MATHFN_NAME_RE.test(t)
+  || /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?(?:%|[a-z]+)?$/i.test(t);
+const _isBgPosTok = (t) => _BG_POS_KW.has(t.toLowerCase()) || _isLPTok(t);
+const _isBgSizeTok = (t) => { const l = t.toLowerCase(); return l === 'auto' || l === 'cover' || l === 'contain' || _isLPTok(t); };
+// Split a layer into whitespace tokens, keeping functions/brackets whole and
+// making a top-level `/` (the position/size separator) its own token.
+const _bgLayerToks = (s) => {
+  const out = []; let depth = 0, cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(' || c === '[') { depth++; cur += c; }
+    else if (c === ')' || c === ']') { depth = Math.max(0, depth - 1); cur += c; }
+    else if (depth === 0 && /\s/.test(c)) { if (cur) out.push(cur); cur = ''; }
+    else if (depth === 0 && c === '/') { if (cur) out.push(cur); cur = ''; out.push('/'); }
+    else cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+};
+// Resolve a layer's box keywords → { origin, clip } (§2.12 box rule): one <visual-box>
+// sets both; a clip-only keyword (border-area/text) sets clip + origin→border-box; two
+// <visual-box> → first origin, second clip. Returns null if the box set is malformed.
+const _BG_VISUAL_BOX = new Set(['border-box', 'padding-box', 'content-box']);
+const _bgResolveBox = (boxToks) => {
+  if (!boxToks.length) return { origin: 'padding-box', clip: 'border-box' };   // both initial
+  const visuals = boxToks.filter((t) => _BG_VISUAL_BOX.has(t));
+  const hasBA = boxToks.includes('border-area'), hasText = boxToks.includes('text');
+  const baN = boxToks.filter((t) => t === 'border-area').length;
+  const textN = boxToks.filter((t) => t === 'text').length;
+  if (baN > 1 || textN > 1) return null;                        // duplicate clip-only keyword
+  if (hasBA || hasText) {                                        // a value only valid in background-clip
+    if (visuals.length > 1) return null;
+    const clip = (hasBA && hasText) ? 'border-area text' : (hasBA ? 'border-area' : 'text');
+    return { origin: visuals.length === 1 ? visuals[0] : 'border-box', clip };
+  }
+  if (visuals.length === 1) return { origin: visuals[0], clip: visuals[0] };
+  if (visuals.length === 2) return { origin: visuals[0], clip: visuals[1] };
+  return null;                                                   // 0 handled above; >2 → invalid
+};
+const _parseBackgroundShort = (value) => {
+  const rawLayers = _commaSplitTop(value).map((s) => s.trim());
+  if (!rawLayers.length) return null;
+  const imgs = [], poss = [], sizes = [], reps = [], atts = [], oris = [], clips = [];
+  let color = 'transparent';
+  for (let li = 0; li < rawLayers.length; li++) {
+    const isFinal = li === rawLayers.length - 1;
+    const layer = rawLayers[li];
+    if (!layer) return null;                                     // empty layer (`a,,b` / trailing comma)
+    const toks = _bgLayerToks(layer);
+    if (!toks.length) return null;
+    let image = null, position = null, size = null, repeat = null, attachment = null, layerColor = null;
+    const boxToks = [];
+    let i = 0;
+    while (i < toks.length) {
+      const t = toks[i], l = t.toLowerCase();
+      if (t === '/') return null;                               // `/` not directly after a <bg-position>
+      if (position === null && _isBgPosTok(t)) {
+        const run = [];
+        while (i < toks.length && toks[i] !== '/' && _isBgPosTok(toks[i])) { run.push(toks[i]); i++; }
+        if (_parsePosition(run.join(' ')) == null) return null;
+        position = _serializePositionSpecified(run.join(' '));
+        if (i < toks.length && toks[i] === '/') {                // optional `/ <bg-size>`
+          i++;
+          const srun = [];
+          while (i < toks.length && srun.length < 2 && _isBgSizeTok(toks[i])) { srun.push(toks[i]); i++; }
+          if (!srun.length) return null;
+          const sc = _canonBgLayer('background-size', srun.join(' '));
+          if (sc === null) return null;
+          size = sc;
+        }
+        continue;
+      }
+      if (_isBgImageTok(t)) {
+        if (image !== null) return null;
+        if (l === 'none') image = 'none';
+        else { if (_imageFuncInvalid(t)) return null; image = _canonImageSet(_canonGradients(t, null, false)); }
+        i++; continue;
+      }
+      if (_BG_REPEAT1_KW.has(l)) {                               // <repeat-style> (contiguous 1-2 tokens)
+        if (repeat !== null) return null;
+        const run = [];
+        while (i < toks.length && _BG_REPEAT1_KW.has(toks[i].toLowerCase())) { run.push(toks[i]); i++; }
+        const rc = _canonBgLayer('background-repeat', run.join(' '));
+        if (rc === null) return null;
+        repeat = rc; continue;
+      }
+      if (_BG_ATTACHMENT_KW.has(l)) {
+        if (attachment !== null) return null;
+        attachment = l; i++; continue;
+      }
+      if (_BG_CLIP1_KW.has(l)) { boxToks.push(l); i++; continue; }   // <bg-clip> / <visual-box> keyword
+      if (isFinal && layerColor === null && _isValidColor(t)) {      // <'background-color'> (final layer only)
+        layerColor = _canonColorSpecified(t); i++; continue;
+      }
+      return null;                                              // unrecognized token → invalid layer
+    }
+    const box = _bgResolveBox(boxToks);
+    if (box === null) return null;
+    imgs.push(image !== null ? image : 'none');
+    poss.push(position !== null ? position : '0% 0%');
+    sizes.push(size !== null ? size : 'auto');
+    reps.push(repeat !== null ? repeat : 'repeat');
+    atts.push(attachment !== null ? attachment : 'scroll');
+    oris.push(box.origin);
+    clips.push(box.clip);
+    if (isFinal && layerColor !== null) color = layerColor;
+  }
+  return {
+    'background-image': imgs.join(', '),
+    'background-position': poss.join(', '),
+    'background-size': sizes.join(', '),
+    'background-repeat': reps.join(', '),
+    'background-attachment': atts.join(', '),
+    'background-origin': oris.join(', '),
+    'background-clip': clips.join(', '),
+    'background-color': color,
+  };
+};
+const _BG_SH_LH = ['background-image', 'background-position', 'background-size', 'background-repeat',
+  'background-attachment', 'background-origin', 'background-clip', 'background-color'];
+// Reconstruct the `background` shorthand from its longhands (spec/WebKit order:
+// `[<color> on final] <image> <position>[/<size>] <repeat> <attachment> <origin> <clip>`).
+// `''` if a longhand is missing or the per-layer counts disagree (inexpressible).
+const _serBackgroundShort = (get) => {
+  const color = get('background-color');
+  // All eight longhands set to the same CSS-wide keyword → that keyword.
+  if (color && _CSS_WIDE.has(color.toLowerCase()) && _BG_SH_LH.every((ln) => get(ln) === color)) return color;
+  const lists = {};
+  for (const ln of _BG_SH_LH) { if (ln === 'background-color') continue; const v = get(ln); if (!v) return ''; lists[ln] = _commaSplitTop(v).map((s) => s.trim()); }
+  if (!color) return '';
+  const n = lists['background-image'].length;
+  for (const ln of Object.keys(lists)) if (lists[ln].length !== n) return '';
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const final = i === n - 1;
+    const parts = [];
+    if (final && color.toLowerCase() !== 'transparent') parts.push(color);
+    parts.push(lists['background-image'][i]);
+    let pp = lists['background-position'][i];
+    if (lists['background-size'][i].toLowerCase() !== 'auto') pp += ' / ' + lists['background-size'][i];
+    parts.push(pp);
+    if (lists['background-repeat'][i].toLowerCase() !== 'repeat') parts.push(lists['background-repeat'][i]);
+    if (lists['background-attachment'][i].toLowerCase() !== 'scroll') parts.push(lists['background-attachment'][i]);
+    const ori = lists['background-origin'][i], clip = lists['background-clip'][i];
+    if (ori !== 'padding-box' || clip !== 'border-box') { parts.push(ori); parts.push(clip); }
+    out.push(parts.join(' '));
+  }
+  return out.join(', ');
 };
 
 // The box-alignment SHORTHANDS and their two longhands (align-half, justify-half).
@@ -19475,6 +19751,16 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         if (_CSS_WIDE.has(val.toLowerCase())) return true;
         return _parseGridShort(_canonStandardValue(val)) != null;
+      }
+      if (_BG_VALIDATED.has(name)) {                     // background-repeat/-attachment/-clip/-origin/-size
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _canonBg(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'background') {                        // the `background` shorthand
+        if (/\bvar\(/i.test(val)) return true;
+        if (_CSS_WIDE.has(val.toLowerCase())) return true;
+        return _parseBackgroundShort(_canonStandardValue(val)) != null;
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);

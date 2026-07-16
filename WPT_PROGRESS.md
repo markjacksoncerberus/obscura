@@ -10,12 +10,23 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-12 (Quest #192).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #193).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-backgrounds/parsing/background-valid.html` | 1/46 | **45/46** | ⬆️ | **Quest #193 The Background Verdict.** The `background` shorthand (`_parseBackgroundShort`/`_serBackgroundShort`): order-independent `<bg-image> \|\| <bg-position>[/<bg-size>] \|\| <repeat-style> \|\| <attachment> \|\| <bg-clip> \|\| <visual-box>` per layer, expands into the 8 longhands. **+44** (1 cap: `none`→color quirk). |
+| `css/css-backgrounds/parsing/background-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #193.** `red, green` (color in non-final layer) + `black 0 url(…) / cover` (`/` not after `<bg-position>`) rejected. **+2.** |
+| `css/css-backgrounds/parsing/background-repeat-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #193.** `_canonBg` gates `<repeat-style>#` (`repeat repeat-x`/`repeat-y round`/3-token rejected). **+3.** |
+| `css/css-backgrounds/parsing/background-attachment-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #193.** `auto`/`local, none` rejected. **+2.** |
+| `css/css-backgrounds/parsing/background-clip-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #193.** `fill-box`/`margin-box`/`stroke-box`/`view-box`/`border` rejected. **+5.** |
+| `css/css-backgrounds/parsing/background-clip-valid.html` | 8/9 | **9/9** | ✅ 100% | **Quest #193.** `text border-area` → `border-area text` canonical order. **+1.** |
+| `css/css-backgrounds/parsing/background-origin-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #193.** `<visual-box>#` only (fill-box/margin-box/stroke-box/view-box rejected). **+4.** |
+| `css/css-backgrounds/parsing/background-size-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #193.** `-1px`/`2% -3%`/`1px 2px 3px` rejected (non-neg `<lp>`, ≤2 tokens). **+3.** |
+| `css/css-backgrounds/parsing/background-size-valid.html` | 7/9 | **9/9** | ✅ 100% | **Quest #193.** `1px` → `1px auto`, `auto auto` → `auto` canonicalization. **+2.** |
+| `css/css-backgrounds/parsing/background-size-computed.html` | 10/16 | **14/16** | ⬆️ | **Quest #193** (bonus — the longhand canon feeds the computed path). **+4** (2 caps: `calc(…+0.5em)` needs layout). |
+| `css/css-backgrounds/parsing/background-computed.html` | 37/39 | **39/39** | ✅ 100% | **Quest #193** (bonus — shorthand expansion feeds computed). **+2.** |
 | `css/css-color/parsing/color-invalid-named-color.html` | 1/184 | **153/184** | ⬆️ | **Quest #192 The Color Verdict.** Gated every `_COLOR_PROPS` setProperty on the (already-robust) `_isValidColor` — unknown idents like `redd` now rejected. **+152.** |
 | `css/css-color/parsing/color-invalid-relative-color.html` | 0/161 | **132/161** | ⬆️ | **Quest #192.** Relative-colour syntax structure validated via the gate. **+132.** |
 | `css/css-color/parsing/color-invalid-color-layers-function.html` | 0/93 | **93/93** | ✅ 100% | **Quest #192.** **+93.** |
