@@ -953,6 +953,29 @@ const _parseStyleDecls = (text) => {
           const c = _canonFontLangOverride(value); if (c == null) continue;  // invalid → drop
           value = c;                                        // canonical (trailing spaces stripped)
         }
+      } else if (name === 'transition-duration' || name === 'transition-delay') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_MATHFN_NAME_RE.test(value)) {
+          if (!_isValidTransitionTime(value, name === 'transition-duration')) continue;  // invalid <time># → drop
+        }
+      } else if (name === 'transition-property') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonTransitionProperty(value); if (c == null) continue;   // invalid → drop
+          value = c;
+        }
+      } else if (name === 'transition-timing-function') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_MATHFN_NAME_RE.test(value)) {
+          const c = _canonTimingFunction(value); if (c == null) continue;       // invalid <easing-function># → drop
+          value = c;
+        }
+      } else if (name === 'transition') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_MATHFN_NAME_RE.test(value)) {
+          const c = _canonTransitionShorthand(value); if (c == null) continue;  // invalid <single-transition># → drop
+          value = c;
+        }
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1403,6 +1426,29 @@ class CSSStyleDeclaration {
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
         const c = _canonFontLangOverride(stored); if (c == null) return;  // invalid → ignore
         stored = c;                                        // canonical (trailing spaces stripped)
+      }
+    } else if (!custom && (name === 'transition-duration' || name === 'transition-delay')) {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
+        if (!_isValidTransitionTime(stored, name === 'transition-duration')) return;  // invalid <time># → ignore
+      }
+    } else if (!custom && name === 'transition-property') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonTransitionProperty(stored); if (c == null) return;   // invalid → ignore
+        stored = c;
+      }
+    } else if (!custom && name === 'transition-timing-function') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
+        const c = _canonTimingFunction(stored); if (c == null) return;       // invalid <easing-function># → ignore
+        stored = c;
+      }
+    } else if (!custom && name === 'transition') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
+        const c = _canonTransitionShorthand(stored); if (c == null) return;  // invalid <single-transition># → ignore
+        stored = c;
       }
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
       if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
@@ -15067,6 +15113,196 @@ const _canonFontLangOverride = (value) => {
     if (cp < 0x20 || cp > 0x7e) return null;             // non-printable-ASCII → reject
   }
   return _serCssString(inner.replace(/ +$/, ''));        // drop trailing spaces
+};
+
+// ── CSS Transitions 1 — the four longhands + the `transition` shorthand ───────
+// Each longhand is a comma-separated list; a single bad item invalidates the
+// whole declaration (per the CSSOM "parse a comma-separated list of component
+// values" rule). CSS-wide keywords and var()/env() are excluded by the caller;
+// values with a math function defer to `_canonLengthTimeMath` (so a calc() <time>
+// is never mis-rejected here).
+const _TRANS_NUM_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+const _TRANS_PCT_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?%$/;
+
+// transition-duration = <time [0s,∞]>#  /  transition-delay = <time>#. A pure
+// rejection gate: exactly one <time> per comma item (duration additionally
+// non-negative). The accepted value is kept byte-identical — the -valid files
+// (`0s`, `500ms`, `1s, 2s`, `-1s, -2s`) already serialize via raw-store.
+const _isValidTransitionTime = (value, nonNeg) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!items.length) return false;
+  for (const it of items) {
+    const toks = _wsTokens(it);
+    if (toks.length !== 1 || !_isTimeTok(toks[0])) return false;  // exactly one <time>
+    if (nonNeg && parseFloat(toks[0]) < 0) return false;          // <time [0s,∞]>
+  }
+  return true;
+};
+
+// A single <single-transition-property> = all | <custom-ident>, where the
+// <custom-ident> excludes `none` (and the always-excluded CSS-wide keywords +
+// `default`). Returns the canonical token (`all` lowercased; a custom-ident kept
+// verbatim), or null. `none` is handled by the list wrapper (valid only alone).
+const _TRANS_PROP_RESERVED = new Set(
+  ['none', 'default', 'initial', 'inherit', 'unset', 'revert', 'revert-layer']);
+const _canonSingleTransProp = (tok) => {
+  const low = tok.toLowerCase();
+  if (low === 'all') return 'all';                 // keyword → canonical lowercase
+  if (_TRANS_PROP_RESERVED.has(low)) return null;  // none/default/CSS-wide in a list
+  if (!_GRID_CI_RE.test(tok)) return null;         // must be a <custom-ident>
+  return tok;                                       // custom-ident keeps its case
+};
+// transition-property = none | <single-transition-property>#. Returns the
+// canonical serialization (items joined `, `; `all`/`none` lowercased) or null.
+const _canonTransitionProperty = (value) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (items.length === 1 && items[0].toLowerCase() === 'none') return 'none';
+  if (!items.length) return null;
+  const out = [];
+  for (const it of items) {
+    const toks = _wsTokens(it);
+    if (toks.length !== 1) return null;            // `one two three`
+    const c = _canonSingleTransProp(toks[0]);
+    if (c === null) return null;                   // `1` / `none` / `initial` / …
+    out.push(c);
+  }
+  return out.join(', ');
+};
+
+// A cubic-bezier() easing: four <number>s, with the two x-coordinates (P1x, P2x)
+// in [0,1]. Serialized `cubic-bezier(a, b, c, d)` (number tokens kept verbatim).
+const _canonCubicBezier = (inner) => {
+  const args = _commaSplitTop(inner).map((s) => s.trim());
+  if (args.length !== 4 || args.some((a) => !_TRANS_NUM_RE.test(a))) return null;
+  const x1 = parseFloat(args[0]), x2 = parseFloat(args[2]);
+  if (x1 < 0 || x1 > 1 || x2 < 0 || x2 > 1) return null;
+  return 'cubic-bezier(' + args.join(', ') + ')';
+};
+// A steps() easing: steps( <integer [1,∞]> [, <step-position>]? ), where the
+// count may also be an integer-valued function (`sibling-index()`). Canonical
+// serialization drops the default position (`end`/`jump-end`); `jump-none`
+// requires count ≥ 2.
+const _STEP_POSITIONS = new Set(
+  ['start', 'end', 'jump-start', 'jump-end', 'jump-both', 'jump-none']);
+const _canonSteps = (inner) => {
+  const args = _commaSplitTop(inner).map((s) => s.trim());
+  if (args.length < 1 || args.length > 2) return null;
+  const isSibling = /^sibling-index\(\s*\)$/i.test(args[0]);
+  let n = null;
+  if (!isSibling) {
+    if (!/^[+-]?\d+$/.test(args[0])) return null;  // <integer> only (`3.3`/`foobar` → reject)
+    n = parseInt(args[0], 10);
+    if (n < 1) return null;                        // <integer [1,∞]>
+  }
+  let pos = 'end';
+  if (args.length === 2) {
+    pos = args[1].toLowerCase();
+    if (!_STEP_POSITIONS.has(pos)) return null;    // `top` / `()start` / `()` → reject
+  }
+  if (pos === 'jump-none' && !isSibling && n < 2) return null;  // needs ≥ 2 steps
+  const cnt = isSibling ? 'sibling-index()' : String(n);
+  if (pos === 'end' || pos === 'jump-end') return 'steps(' + cnt + ')';  // default → omit
+  if (pos === 'start') return 'steps(' + cnt + ', start)';               // legacy keyword kept
+  return 'steps(' + cnt + ', ' + pos + ')';
+};
+// A linear() easing: linear( <linear-stop># ), <linear-stop> = <number>
+// <percentage>{0,2}. Validated and re-emitted in canonical spacing.
+const _canonLinearEasing = (inner) => {
+  const stops = _commaSplitTop(inner).map((s) => s.trim());
+  if (!stops.length) return null;
+  const out = [];
+  for (const st of stops) {
+    const toks = _wsTokens(st);
+    if (toks.length < 1 || toks.length > 3 || !_TRANS_NUM_RE.test(toks[0])) return null;
+    for (let i = 1; i < toks.length; i++) if (!_TRANS_PCT_RE.test(toks[i])) return null;
+    out.push(toks.join(' '));
+  }
+  return 'linear(' + out.join(', ') + ')';
+};
+// A single <easing-function> (keyword or function). Returns the canonical
+// serialization, or null when the token is not a valid easing.
+const _EASING_KW = new Set(['linear', 'ease', 'ease-in', 'ease-out', 'ease-in-out']);
+const _canonEasing = (str) => {
+  const s = str.trim();
+  const low = s.toLowerCase();
+  if (_EASING_KW.has(low)) return low;
+  if (low === 'step-start') return 'steps(1, start)';
+  if (low === 'step-end') return 'steps(1)';
+  const m = /^([a-zA-Z-]+)\(([\s\S]*)\)$/.exec(s);   // a single function wrapping the whole token
+  if (!m) return null;
+  const fn = m[1].toLowerCase(), body = m[2];
+  if (fn === 'cubic-bezier') return _canonCubicBezier(body);
+  if (fn === 'steps') return _canonSteps(body);
+  if (fn === 'linear') return _canonLinearEasing(body);
+  return null;
+};
+// transition-timing-function = <easing-function>#.
+const _canonTimingFunction = (value) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!items.length) return null;
+  const out = [];
+  for (const it of items) {
+    const c = _canonEasing(it);
+    if (c === null) return null;                   // `auto`, `ease-in ease-out`, bad fn args
+    out.push(c);
+  }
+  return out.join(', ');
+};
+
+// A single <single-transition> layer =
+//   [ none | <single-transition-property> ] || <time> || <easing-function> || <time>
+// (first <time> = duration [0s,∞], second = delay). Returns canonical component
+// parts { prop, dur, tf, delay } or null.
+const _canonSingleTransPropOrNone = (tok) => {
+  if (tok.toLowerCase() === 'none') return 'none';
+  return _canonSingleTransProp(tok);
+};
+const _parseSingleTransition = (layer) => {
+  const toks = _wsTokens(layer.trim());
+  if (!toks.length) return null;
+  let prop = null, dur = null, tf = null, delay = null, times = 0;
+  for (const t of toks) {
+    if (_isTimeTok(t)) {
+      if (times === 0) { if (parseFloat(t) < 0) return null; dur = t; }  // duration ≥ 0s
+      else if (times === 1) delay = t;
+      else return null;                            // a third <time> → invalid
+      times++;
+      continue;
+    }
+    const e = _canonEasing(t);                     // <easing-function> wins over <custom-ident>
+    if (e !== null) {
+      if (tf !== null) return null;                // two easing functions
+      tf = e;
+      continue;
+    }
+    if (prop !== null) return null;                // two properties (`none top`)
+    const p = _canonSingleTransPropOrNone(t);
+    if (p === null) return null;                   // `initial` / a bad property
+    prop = p;
+  }
+  return { prop: prop == null ? 'all' : prop, dur: dur == null ? '0s' : dur,
+    tf: tf == null ? 'ease' : tf, delay: delay == null ? '0s' : delay };
+};
+const _serSingleTransition = (c) => {
+  const parts = [];
+  if (c.prop !== 'all') parts.push(c.prop);                 // `all` is the default → omit
+  if (c.dur !== '0s' || c.delay !== '0s') parts.push(c.dur);  // duration precedes any delay
+  if (c.tf !== 'ease') parts.push(c.tf);
+  if (c.delay !== '0s') parts.push(c.delay);
+  return parts.length ? parts.join(' ') : 'all';           // all-default layer → `all`
+};
+// transition = <single-transition>#. Returns the canonical shorthand or null.
+const _canonTransitionShorthand = (value) => {
+  const layers = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!layers.length) return null;
+  const out = [];
+  for (const l of layers) {
+    if (!l) return null;                           // empty layer (stray comma)
+    const c = _parseSingleTransition(l);
+    if (c === null) return null;
+    out.push(_serSingleTransition(c));
+  }
+  return out.join(', ');
 };
 
 // line-clamp = none | [ <integer [1,∞]> || <'block-ellipsis'> ] -webkit-legacy?

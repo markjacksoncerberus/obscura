@@ -10,12 +10,22 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #208).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #209).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-transitions/parsing/transition-timing-function-invalid.html` | 0/25 | **25/25** | ✅ 100% | **Quest #209 The Transition Verdict.** The whole `css-transitions/parsing/` dir was pure raw-store. `_canonTimingFunction` (`<easing-function>#`) dispatches to `_canonCubicBezier` (x-coords ∈ [0,1]), `_canonSteps` (`steps(<int [1,∞]> [,pos]?)`, `jump-none`≥2, malformed `steps(2,()start)` family rejected), `_canonLinearEasing`; `step-start`→`steps(1, start)`. **+25.** |
+| `css/css-transitions/parsing/transition-property-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #209.** `_canonTransitionProperty` — `none \| <single-transition-property>#` (`all \| <custom-ident>`), excluded set none/default/CSS-wide. Rejects `one two three`, `1, 2, 3`, `none, one`, `initial, top`, `revert-layer, top`. **+15.** |
+| `css/css-transitions/parsing/transition-delay-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #209.** `_isValidTransitionTime` (pure gate) — `<time>#`, one `<time>` per comma item. Rejects `infinite`, `0`, `500ms 0.5s`, `-3s, initial`. **+5.** |
+| `css/css-transitions/parsing/transition-duration-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #209.** Same gate with `nonNeg` — `<time [0s,∞]>#`. Rejects `-500ms`, `infinite`, `1s 2s`, `1s, initial`. **+5.** |
+| `css/css-transitions/parsing/transition-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #209.** `_canonTransitionShorthand` — `<single-transition>#`. Rejects `1s 2s 3s` (3 times), `-1s -2s` (negative duration), `steps(1) steps(2)` (2 easings), `none top` (2 props), `initial 1s`. **+5.** |
+| `css/css-transitions/parsing/transition-valid.html` | 7/10 | **10/10** | ✅ 100% | **Quest #209.** Shorthand canonical order property·duration·timing·delay: `1s -3s cubic-bezier(0, -2, 1, 3) top`→`top 1s cubic-bezier(0, -2, 1, 3) -3s`, `all 1s`→`1s`. **+3.** |
+| `css/css-transitions/parsing/transition-timing-function-valid.html` | 18/22 | **22/22** | ✅ 100% | **Quest #209.** Steps canon: `steps(2, end)`→`steps(2)`, `steps(2, jump-end)`→`steps(2)`, `step-start`→`steps(1, start)`, `step-end`→`steps(1)`. **+4.** |
+| `css/css-transitions/parsing/transition-property-valid.html` | 6/7 | **7/7** | ✅ 100% | **Quest #209.** `ALL, INVALID, SYNTAX, SRC`→`all, INVALID, SYNTAX, SRC` (keyword lowercased, custom-idents kept). **+1.** |
+| `css/css-transitions/parsing/transition-delay-valid.html` | 4/4 | **4/4** | ✅ 100% | **Quest #209.** Held — pure gate keeps `0s`/`500ms`/`1s, 2s`/`-1s, -2s` byte-identical. |
+| `css/css-transitions/parsing/transition-duration-valid.html` | 3/3 | **3/3** | ✅ 100% | **Quest #209.** Held — pure gate keeps `0s`/`500ms`/`1s, 2s` byte-identical. |
 | `css/css-fonts/parsing/font-palette-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #208 The Palette & Language Verdict.** `font-palette = normal \| light \| dark \| <dashed-ident>` was pure raw-store — every value stored verbatim, so the invalid file all-failed while `-valid` 5/5 passed byte-for-byte. A pure REJECTION gate `_isValidFontPalette` (value kept byte-identical): empty / comma list / >1 token → reject; a single token valid iff `normal\|light\|dark` or `--`-prefixed. Rejects `normal none`/`none, light`/`A`/`none`. Wired into both setProperty paths, var()/CSS-wide deferred. **+4.** |
 | `css/css-fonts/parsing/font-palette-valid.html` | 5/5 | **5/5** | ✅ 100% | **Quest #208.** Held — the pure gate keeps valid values (`normal`, `--pitchfork`, `--`, …) verbatim. |
 | `css/css-fonts/parsing/font-language-override-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #208.** `font-language-override = normal \| <string>` (an OpenType language-system tag) was raw-store — `auto`/`normal "ksw"`/`"turkish"`/`"xøx"`/`""`/`"ENG  "` all accepted. `_canonFontLangOverride` gates: a lone `<string>` of 1–4 printable-ASCII chars (or `normal`), rejecting a >4/empty tag, a non-ASCII char, a two-token value, and non-string keywords. **+6.** |
