@@ -1008,6 +1008,18 @@ const _parseStyleDecls = (text) => {
           const c = _canonAnimationShorthand(value); if (c == null) continue;   // invalid <single-animation># → drop
           value = c;
         }
+      } else if (name === 'animation-range-start' || name === 'animation-range-end') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonAnimRange(value, name === 'animation-range-end'); if (c == null) continue;  // invalid <timeline-range># → drop
+          value = c;
+        }
+      } else if (name === 'animation-range') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonAnimRangeShorthand(value); if (c == null) continue;  // invalid <single-timeline-range># → drop
+          value = c;
+        }
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1518,6 +1530,18 @@ class CSSStyleDeclaration {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
         const c = _canonAnimationShorthand(stored); if (c == null) return;   // invalid <single-animation># → ignore
+        stored = c;
+      }
+    } else if (!custom && (name === 'animation-range-start' || name === 'animation-range-end')) {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonAnimRange(stored, name === 'animation-range-end'); if (c == null) return;  // invalid <timeline-range># → ignore
+        stored = c;
+      }
+    } else if (!custom && name === 'animation-range') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonAnimRangeShorthand(stored); if (c == null) return;  // invalid <single-timeline-range># → ignore
         stored = c;
       }
     } else if (!custom && _ANIM_KEYWORD_LISTS.has(name)) {
@@ -15559,6 +15583,106 @@ const _canonAnimationShorthand = (value) => {
     const c = _parseSingleAnimation(l);
     if (c === null) return null;
     out.push(_serSingleAnimation(c));
+  }
+  return out.join(', ');
+};
+
+// animation-range-start / animation-range-end (Scroll Animations 1 §5.2). Each is
+//   [ normal | <length-percentage> | <timeline-range-name> <length-percentage>? ]#
+// where <timeline-range-name> = cover | contain | entry | exit | entry-crossing
+// | exit-crossing. The name (when present) comes FIRST; a bare `<length-percentage>`
+// or `normal` stands alone. Canonical serialization drops a `<name>`'s offset when
+// it equals that name's DEFAULT position — 0% for `-start`, 100% for `-end` — so
+// `cover 0%`→`cover` (start) and `cover 100%`→`cover` (end); a length `0px` or any
+// other offset is kept. Offsets canonicalize through `_canonLPToken` (bare `0`→`0px`,
+// calc sums reordered %-before-length). Returns the canonical string, or null for an
+// invalid value; CSS-wide keywords and var()/env() are handled by the caller.
+const _TIMELINE_RANGE_NAMES = new Set(['cover', 'contain', 'entry', 'exit', 'entry-crossing', 'exit-crossing']);
+// A single `<length-percentage>`: a length token (valid unit or calc/min/max/clamp),
+// a percentage, or the unitless zero (the only unitless length CSS permits).
+const _isLenPctTok = (t) => _isLengthTok(t)
+  || /^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(t)
+  || /^[+-]?0(?:\.0+)?$/.test(t);
+const _canonAnimRangeItem = (item, isEnd) => {
+  const toks = _wsTokens(item);
+  if (toks.length === 1) {
+    const low = toks[0].toLowerCase();
+    if (low === 'normal') return 'normal';
+    if (_TIMELINE_RANGE_NAMES.has(low)) return low;               // bare <timeline-range-name>
+    if (_isLenPctTok(toks[0])) return _canonLPToken(toks[0]);     // bare <length-percentage>
+    return null;
+  }
+  if (toks.length === 2) {
+    const low = toks[0].toLowerCase();
+    if (!_TIMELINE_RANGE_NAMES.has(low)) return null;             // name must lead the pair
+    if (!_isLenPctTok(toks[1])) return null;
+    const off = _canonLPToken(toks[1]);
+    if (off === (isEnd ? '100%' : '0%')) return low;              // default offset → drop it
+    return low + ' ' + off;
+  }
+  return null;                                                    // empty or ≥3 tokens → invalid
+};
+const _canonAnimRange = (value, isEnd) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!items.length) return null;
+  const out = [];
+  for (const it of items) {
+    if (!it) return null;                                         // empty item (stray comma)
+    const c = _canonAnimRangeItem(it, isEnd);
+    if (c == null) return null;
+    out.push(c);
+  }
+  return out.join(', ');
+};
+
+// animation-range = [ <'animation-range-start'> <'animation-range-end'>? ]#
+// (Scroll Animations 1 §5.3). Each comma item is a start side optionally followed
+// by an end side; a side is `normal`, a bare `<length-percentage>`, or a
+// `<timeline-range-name>` with an optional `<length-percentage>` offset. The end is
+// omitted from the canonical serialization when it is redundant with the start:
+//   • the end canonicalizes identically to the start (`entry 0% entry 100%`→`entry`,
+//     both collapse to the bare name), OR
+//   • the start carries no range-name and the end is its far-end default —
+//     `normal` or `100%` (`100px normal`→`100px`, `0% 100%`→`0%`).
+// A start with a range-name keeps an explicit `normal` end (`entry normal` stays),
+// and a calc offset never collapses to the bare name (`entry calc(0%)` is kept).
+// Returns the canonical string, or null; CSS-wide/var()/env() handled by the caller.
+const _splitAnimRangeSide = (toks, i) => {                          // → [sideToks, nextIdx] | null
+  if (i >= toks.length) return null;
+  const low = toks[i].toLowerCase();
+  if (low === 'normal') return [[toks[i]], i + 1];
+  if (_TIMELINE_RANGE_NAMES.has(low)) {
+    if (i + 1 < toks.length && _isLenPctTok(toks[i + 1])) return [[toks[i], toks[i + 1]], i + 2];
+    return [[toks[i]], i + 1];                                     // bare name (offset defaults)
+  }
+  if (_isLenPctTok(toks[i])) return [[toks[i]], i + 1];            // bare <length-percentage>
+  return null;
+};
+const _canonAnimRangeShorthandItem = (item) => {
+  const toks = _wsTokens(item);
+  const s = _splitAnimRangeSide(toks, 0);
+  if (!s) return null;
+  const startC = _canonAnimRangeItem(s[0].join(' '), false);
+  if (startC == null) return null;
+  const startHasName = _TIMELINE_RANGE_NAMES.has(s[0][0].toLowerCase());
+  if (s[1] === toks.length) return startC;                         // no end side given
+  const e = _splitAnimRangeSide(toks, s[1]);
+  if (!e || e[1] !== toks.length) return null;                     // malformed / leftover tokens
+  const endC = _canonAnimRangeItem(e[0].join(' '), true);
+  if (endC == null) return null;
+  const omit = endC === startC
+    || (!startHasName && (endC === 'normal' || endC === '100%'));  // start's far-end default
+  return omit ? startC : startC + ' ' + endC;
+};
+const _canonAnimRangeShorthand = (value) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!items.length) return null;
+  const out = [];
+  for (const it of items) {
+    if (!it) return null;                                          // empty item (stray comma)
+    const c = _canonAnimRangeShorthandItem(it);
+    if (c == null) return null;
+    out.push(c);
   }
   return out.join(', ');
 };
