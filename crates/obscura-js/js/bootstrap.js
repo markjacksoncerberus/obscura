@@ -942,6 +942,17 @@ const _parseStyleDecls = (text) => {
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
           if (!_isValidImageResolution(value)) continue;   // invalid image-resolution → drop (value kept verbatim)
         }
+      } else if (name === 'font-palette') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          if (!_isValidFontPalette(value)) continue;       // invalid font-palette → drop (value kept verbatim)
+        }
+      } else if (name === 'font-language-override') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonFontLangOverride(value); if (c == null) continue;  // invalid → drop
+          value = c;                                        // canonical (trailing spaces stripped)
+        }
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1381,6 +1392,17 @@ class CSSStyleDeclaration {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
         if (!_isValidImageResolution(stored)) return;      // invalid image-resolution → ignore (kept verbatim)
+      }
+    } else if (!custom && name === 'font-palette') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        if (!_isValidFontPalette(stored)) return;          // invalid font-palette → ignore (kept verbatim)
+      }
+    } else if (!custom && name === 'font-language-override') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonFontLangOverride(stored); if (c == null) return;  // invalid → ignore
+        stored = c;                                        // canonical (trailing spaces stripped)
       }
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
       if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
@@ -15007,6 +15029,44 @@ const _isValidImageResolution = (value) => {
     else return false;                                         // auto / 100% / 2 / …
   }
   return fromImage <= 1 && res <= 1 && (fromImage + res) >= 1;
+};
+
+// font-palette = normal | light | dark | <palette-identifier>  (CSS Fonts 4 §6.1),
+// where <palette-identifier> is a <dashed-ident>. Nothing reorders or reserializes
+// these, so the -valid file passes verbatim via raw-store; we add only a pure
+// REJECTION gate for the leniently-accepted forms: a two-keyword value
+// (`normal none`), a comma list (`none, light`), a non-dashed ident (`A`), and the
+// bare non-keyword `none`. Value kept byte-identical when accepted.
+const _FONT_PALETTE_KW = new Set(['normal', 'light', 'dark']);
+const _isValidFontPalette = (value) => {
+  const v = String(value).trim();
+  if (v === '' || v.indexOf(',') !== -1) return false;   // empty / comma list
+  const toks = _wsTokens(v);
+  if (toks.length !== 1) return false;                    // a single value only
+  const t = toks[0];
+  if (_FONT_PALETTE_KW.has(t.toLowerCase())) return true;
+  return /^--/.test(t);                                   // <dashed-ident>
+};
+
+// font-language-override = normal | <string>  (CSS Fonts 4 §6.6). The <string> is an
+// OpenType language-system tag: 1–4 printable-ASCII characters. Serialization strips
+// only TRAILING spaces (`"ENG "` → `"ENG"`, `" en "` → `" en"`), keeping interior and
+// leading ones (`"1 %"` unchanged). Returns the canonical value, or null if invalid
+// (`auto`, `normal "ksw"`, a >4-char / empty / non-ASCII tag). _serCssString and
+// _unescapeIdent are defined later but resolve at call time (setProperty runtime).
+const _FONT_LANG_STR_RE = /^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')$/;
+const _canonFontLangOverride = (value) => {
+  const v = String(value).trim();
+  if (v.toLowerCase() === 'normal') return 'normal';
+  const m = _FONT_LANG_STR_RE.exec(v);
+  if (!m) return null;                                   // not `normal`, not a lone <string>
+  const inner = _unescapeIdent(m[1].slice(1, -1));
+  if (inner.length < 1 || inner.length > 4) return null; // OpenType tag is 1–4 chars
+  for (let i = 0; i < inner.length; i++) {
+    const cp = inner.charCodeAt(i);
+    if (cp < 0x20 || cp > 0x7e) return null;             // non-printable-ASCII → reject
+  }
+  return _serCssString(inner.replace(/ +$/, ''));        // drop trailing spaces
 };
 
 // line-clamp = none | [ <integer [1,∞]> || <'block-ellipsis'> ] -webkit-legacy?
