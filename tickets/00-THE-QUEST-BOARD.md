@@ -184,6 +184,25 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-16 (Quest #198 The Will-Change Verdict — a `will-change` validator, +127,
+ZERO regressions):** Took the #197 outgoing knight's next-leverage: the NEW untouched
+`css/css-will-change/parsing/` dir. Baseline showed a single lopsided file — `will-change-invalid`
+0/127 while `will-change-valid` 20/20 and `will-change-computed` 23/23 already passed (raw-store
+echoes valid values case-preserved and computed == specified). So the whole gap was invalid-value
+rejection. Built `_isValidWillChange` for the grammar `auto | <animateable-feature>#`: `auto` is a
+standalone alternative (never a list item — `auto, transform`/`contents, auto` are invalid); a list
+is comma-separated `<animateable-feature>` = scroll-position | contents | `<custom-ident>`, each a
+single ident token (reusing `_GRID_CI_RE` + `_commaSplitTop`); the `<custom-ident>` excludes the
+CSS-wide keywords plus `default`, `will-change`, `none`, `all`, `auto` (case-insensitive). Wired as
+an identity-canon branch in BOTH setProperty paths (inline-parse + API), guarded by `_CSS_WIDE`/
+`_TF_VAR_RE` so `will-change: inherit`/`var(...)` pass through. No `_computedPropOf`/`_GCS_DEFAULTS`
+change (`will-change: auto` default + computed==specified already present). **CLOSES
+`css/css-will-change/parsing/` (170/170).** ZERO regressions (offset-path 70/24/65, clip-path-invalid
+48, mask-invalid 13, shape-outside-shape-invalid 9, scroll-snap-type-invalid 14, background-valid
+45/46, serialize-values 696/697, qsa 1975 — all held). NEXT: `css-contain` (contain-invalid 0/14,
+contain-valid 9/13) or `css-ui` (cursor-invalid 0/10) — same raw-store→validate pattern. Scroll
+`tickets/198-the-will-change-verdict.md`.
+
 **Session 2026-07-16 (Quest #197 The Shape Verdict — a `css-shapes` value engine reusing the
 offset-path/clip-path `<basic-shape>` engine, +81, ZERO regressions):** Took the #196 outgoing
 knight's option: the NEW untouched `css/css-shapes/parsing/` dir (pure raw-store — shape-outside/

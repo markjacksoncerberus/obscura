@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #197).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #198).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-will-change/parsing/will-change-invalid.html` | 0/127 | **127/127** | ✅ 100% | **Quest #198 The Will-Change Verdict.** `will-change = auto \| <animateable-feature>#` validator (`_isValidWillChange`): `auto` standalone-only, comma-list of single `<custom-ident>` tokens excluding CSS-wide + `default`/`will-change`/`none`/`all`/`auto`. **+127.** |
+| `css/css-will-change/parsing/will-change-valid.html` | 20/20 | **20/20** | ✅ 100% | **Quest #198.** Held (identity canon — case preserved, `TRANSFORM`/`--var`). |
+| `css/css-will-change/parsing/will-change-computed.html` | 23/23 | **23/23** | ✅ 100% | **Quest #198.** Held (computed == specified). |
 | `css/css-shapes/parsing/shape-outside-shape-invalid.html` | 0/9 | **9/9** | ✅ 100% | **Quest #197 The Shape Verdict.** `shape-outside` `shape()` delegated to `_opShape` (CSS Shapes 2) via `_serShapeOutside`. **+9.** |
 | `css/css-shapes/parsing/shape-outside-shape-valid.html` | 11/12 | **12/12** | ✅ 100% | **Quest #197.** `shape() to <position>` end-point (`smooth to center 20%`). **+1.** |
 | `css/css-shapes/parsing/shape-outside-path-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #197.** `path()` via `_clipPathPathFn` (empty/bad-fill-rule/trailing-token rejected). **+7.** |

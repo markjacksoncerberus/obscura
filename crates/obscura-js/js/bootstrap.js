@@ -902,6 +902,9 @@ const _parseStyleDecls = (text) => {
       } else if (name === 'shape-image-threshold') {
         if (!_isValidShapeThreshold(value)) continue;      // invalid <number>|<percentage> → drop
         value = _canonShapeThreshold(value);
+      } else if (name === 'will-change') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_isValidWillChange(value)) continue; // invalid → drop
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1306,6 +1309,9 @@ class CSSStyleDeclaration {
     } else if (!custom && name === 'shape-image-threshold') {
       if (!_isValidShapeThreshold(stored)) return;         // invalid <number>|<percentage> → ignore
       stored = _canonShapeThreshold(stored);
+    } else if (!custom && name === 'will-change') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_isValidWillChange(stored)) return; // invalid → ignore
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
       if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
       stored = _canonBgAxis(stored, _BG_POSITION_AXIS.get(name));
@@ -14730,6 +14736,32 @@ const _serShapeThreshold = (value, computed) => {
 const _isValidShapeThreshold = (value) => _serShapeThreshold(value, false) != null;
 const _canonShapeThreshold = (value) => { const r = _serShapeThreshold(value, false); return r == null ? value : r; };
 const _computeShapeThreshold = (value) => { const r = _serShapeThreshold(value, true); return r == null ? value : r; };
+
+// will-change = auto | <animateable-feature># (CSS Will Change §2). `auto` is a
+// standalone alternative (never a list item); a list is comma-separated
+// <animateable-feature> = scroll-position | contents | <custom-ident>, each a
+// single ident token. The <custom-ident> excludes the CSS-wide keywords plus
+// `default`, and additionally `will-change`, `none`, `all`, `auto` — all
+// case-insensitively. Computed value == specified (identity, case preserved),
+// so we only validate; a valid value is kept exactly as _canonStandardValue
+// left it. CSS-wide keywords and var()/env() are handled by the caller's guard.
+const _WILL_CHANGE_EXCLUDED = new Set([
+  'initial', 'inherit', 'unset', 'revert', 'revert-layer', 'revert-rule', 'default',
+  'will-change', 'none', 'all', 'auto',
+]);
+const _isValidWillChange = (value) => {
+  const s = String(value).trim();
+  if (s === '') return false;
+  if (s.toLowerCase() === 'auto') return true;         // standalone `auto`
+  const parts = _commaSplitTop(s);
+  if (!parts.length) return false;
+  for (let p of parts) {
+    p = p.trim();
+    if (p === '' || !_GRID_CI_RE.test(p)) return false;          // one <custom-ident> token per item
+    if (_WILL_CHANGE_EXCLUDED.has(p.toLowerCase())) return false; // excluded keyword
+  }
+  return true;
+};
 
 // ─── The `offset` shorthand (CSS Motion 1 §6) ───────────────────────────────
 //   offset = [ <'offset-position'>? [ <'offset-path'> [ <'offset-distance'> ||
