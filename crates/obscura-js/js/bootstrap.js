@@ -937,6 +937,11 @@ const _parseStyleDecls = (text) => {
           const c = _serObjectFit(value); if (c == null) continue;   // invalid <object-fit> → drop
           value = c;
         }
+      } else if (name === 'image-resolution') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          if (!_isValidImageResolution(value)) continue;   // invalid image-resolution → drop (value kept verbatim)
+        }
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1371,6 +1376,11 @@ class CSSStyleDeclaration {
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
         const c = _serObjectFit(stored); if (c == null) return;      // invalid <object-fit> → ignore
         stored = c;
+      }
+    } else if (!custom && name === 'image-resolution') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        if (!_isValidImageResolution(stored)) return;      // invalid image-resolution → ignore (kept verbatim)
       }
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
       if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
@@ -14961,6 +14971,42 @@ const _serObjectFit = (value) => {
   if (!fit && !scaleDown) return null;
   if (scaleDown) return fit === 'cover' ? 'cover scale-down' : 'scale-down';
   return fit;                                            // contain or cover alone
+};
+
+// image-resolution = [ from-image || <resolution> ] && snap?  (CSS Images 4 §7).
+// A pure REJECTION gate — no browser ships this property, so WPT's -valid file
+// expects author order preserved (verbatim), which our raw-store already does and
+// which passes 12/12; we must NOT reorder. The -invalid file was all-fail only
+// because nothing rejected `auto`/`100%`/`2` (missing the required group) or a
+// `snap` split into the middle of the group (`3dpi snap from-image`). So we keep
+// the stored value byte-identical and merely validate the grammar:
+//   • the [from-image || <resolution>] group is required, each part at most once;
+//   • `snap` is optional, appears at most once, and — being on the OTHER side of the
+//     `&&` from the group — may sit only before or after it, never interior.
+const _RESOLUTION_UNITS = new Set(['dpi', 'dpcm', 'dppx', 'x']);
+const _isResolutionTok = (t) => {
+  const m = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?([a-z]+)$/.exec(String(t).toLowerCase());
+  return !!m && _RESOLUTION_UNITS.has(m[1]);
+};
+const _isValidImageResolution = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 3) return false;
+  const snaps = toks.filter(t => t.toLowerCase() === 'snap');
+  if (snaps.length > 1) return false;
+  let group = toks;
+  if (snaps.length === 1) {
+    const idx = toks.findIndex(t => t.toLowerCase() === 'snap');
+    if (idx !== 0 && idx !== toks.length - 1) return false;   // snap split into the group
+    group = toks.filter(t => t.toLowerCase() !== 'snap');
+  }
+  if (group.length < 1 || group.length > 2) return false;      // group is required
+  let fromImage = 0, res = 0;
+  for (const t of group) {
+    if (t.toLowerCase() === 'from-image') fromImage++;
+    else if (_isResolutionTok(t)) res++;
+    else return false;                                         // auto / 100% / 2 / …
+  }
+  return fromImage <= 1 && res <= 1 && (fromImage + res) >= 1;
 };
 
 // line-clamp = none | [ <integer [1,∞]> || <'block-ellipsis'> ] -webkit-legacy?
