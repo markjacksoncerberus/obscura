@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #201).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #202).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-images/parsing/gradient-interpolation-method-invalid.html` | 0/292 | **292/292** | ✅ 100% | **Quest #202 The Gradient Interpolation Verdict.** `_gradientInvalid` rejection gate (parallel to `_imageFuncInvalid`) for `<color-interpolation-method>` = `in <color-space> [ <hue> hue ]?`: `in` must be immediately followed by a colour space, no interpolation-ish token may sit outside a valid `in` clause (`lab lab`/`hsl hue`/`in 45deg`/`in to right`/`90deg in hsl longer`), no bare colour-space keyword may begin a colour stop (`red, blue, lab`), no empty argument. **+292.** |
+| `css/css-images/parsing/gradient-interpolation-method-valid.html` | 1398/1398 | **1398/1398** | ✅ 100% | **Quest #202.** Held — the existing `_canonGradients`/`_canonInterpolationMethod` already canonicalizes all valid forms; the gate only adds rejection. |
+| `css/css-images/parsing/gradient-interpolation-method-computed.html` | 932/932 | **932/932** | ✅ 100% | **Quest #202.** Held. |
 | `css/css-overflow/parsing/line-clamp-invalid.html` | 0/8 | **8/8** | ✅ 100% | **Quest #201 The Line-Clamp Verdict.** `line-clamp = none \| [ <integer [1,∞]> \|\| <'block-ellipsis'> ] -webkit-legacy?` engine (`_serLineClamp`): rejects `0`/`-5` (int must be ≥1), `none <x>` combos, bare `-webkit-legacy`, 3-token groups. **+8.** |
 | `css/css-overflow/parsing/line-clamp-valid.html` | 10/18 | **18/18** | ✅ 100% | **Quest #201.** Canonical `<max-lines> <block-ellipsis>? -webkit-legacy?`: reorder int-first (`no-ellipsis 10`→`10 no-ellipsis`), `ellipsis`→default elided (`8 ellipsis`→`8`, `ellipsis`→`auto`), string prepends `auto` placeholder (`" x "`→`auto " x "`), legacy renders omitted max-lines as `auto`. **+8.** |
 | `css/css-ui/parsing/cursor-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #200 The Cursor Verdict.** `cursor = [ <cursor-image> [<x> <y>]? , ]* <keyword>` engine (`_serCursor`): url/image-set/light-dark images ONLY (generated images rejected), hotspot `<x> <y>` are `<number>` (lengths/`%` invalid), final item a bare cursor keyword. **+10.** |

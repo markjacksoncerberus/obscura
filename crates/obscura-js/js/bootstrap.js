@@ -861,6 +861,7 @@ const _parseStyleDecls = (text) => {
       }
       else if (_GRADIENT_PROPS.has(name)) {
         if (_imageFuncInvalid(value)) continue;            // invalid image() → drop declaration
+        if (_gradientInvalid(value)) continue;             // malformed gradient interpolation method → drop
         value = _canonImageSet(_canonGradients(value, null, false));
       } else if (_COLOR_PROPS.has(name)) {
         if (_hasImageFunc(value)) continue;                // image() is not a <color> → drop
@@ -1185,6 +1186,7 @@ class CSSStyleDeclaration {
       }
     } else if (!custom && _GRADIENT_PROPS.has(name)) {
       if (_imageFuncInvalid(stored)) return;               // invalid image() → ignore (keep prior value)
+      if (_gradientInvalid(stored)) return;                // malformed gradient interpolation method → ignore
       stored = _canonImageSet(_canonGradients(stored, null, false));
     } else if (!custom && _CSSUI_VALIDATED.has(name)) {
       // CSS Basic User Interface longhands (box-sizing/resize/outline-*/caret-color/…):
@@ -15352,6 +15354,76 @@ const _imageFuncInvalid = (value) => {
     const parts = _commaSplitTop(inner).map((p) => p.trim());
     if (parts.length !== 1 || !_isColorish(parts[0])) return true;
     re.lastIndex = j < s.length ? j + 1 : s.length;          // resume past this image()
+  }
+  return false;
+};
+// CSS Images 4 §gradients: reject a gradient whose color-interpolation-method is
+// malformed. The lenient _canonGradients accepts any first-argument (unrecognized
+// configs pass through as if colour stops); this predicate is the rejection gate
+// for _GRADIENT_PROPS (parallel to _imageFuncInvalid). It validates ONLY the
+// interpolation-method grammar `in <color-space> [ <hue> hue ]?` and its placement
+// — the direction/prelude/stops stay permissive — so every valid gradient
+// (including the 1398 accepted interpolation forms) is untouched. A token is
+// "interpolation-ish" when it can only ever appear as part of an `in` clause: the
+// `in` keyword, a colour-space keyword, a hue-interpolation method, or `hue`.
+const _interpIsh = (t) => {
+  const l = t.toLowerCase();
+  return l === 'in' || l === 'hue' || _HUE_METHODS.has(l) || _GRADIENT_COLOR_SPACES.has(l);
+};
+// Is a gradient's FIRST argument (its configuration) ill-formed w.r.t. the
+// interpolation method? An `in` token must be immediately followed by a valid
+// colour space (and, for a polar space, an optional well-formed `<hue> hue`);
+// once that clause is removed, no interpolation-ish keyword may remain among the
+// residual direction/prelude tokens (`in 45deg`, `in to right`, `lab lab`,
+// `hsl hue`, `hsl shorter`, `shorter hue hsl`, `90deg in hsl longer` all fail).
+const _gradientConfigInvalid = (toks) => {
+  const inIdx = toks.findIndex((t) => t.toLowerCase() === 'in');
+  let residual = toks;
+  if (inIdx >= 0) {
+    const sp = toks[inIdx + 1] && toks[inIdx + 1].toLowerCase();
+    if (!sp || !_GRADIENT_COLOR_SPACES.has(sp)) return true;   // `in` without a colour space
+    let len = 2;
+    if (_GRADIENT_POLAR_SPACES.has(sp)
+        && toks[inIdx + 2] && _HUE_METHODS.has(toks[inIdx + 2].toLowerCase())
+        && toks[inIdx + 3] && toks[inIdx + 3].toLowerCase() === 'hue') len = 4;
+    residual = toks.slice(0, inIdx).concat(toks.slice(inIdx + len));
+  }
+  return residual.some(_interpIsh);                            // stray colour-space/hue token
+};
+// Validate one gradient function's inner argument list. An empty top-level
+// argument (leading/double/trailing comma) is invalid; the first argument is the
+// configuration (checked above); every later argument is a colour stop, which can
+// never begin with a bare colour-space keyword (`red, blue, lab` / `…, hsl … hue`).
+const _gradientInnerInvalid = (inner) => {
+  const args = _commaSplitTop(inner).map((a) => a.trim());
+  for (let k = 0; k < args.length; k++) {
+    if (args[k] === '') return true;
+    const toks = _wsTokens(args[k]);
+    if (!toks.length) return true;
+    if (k === 0) { if (_gradientConfigInvalid(toks)) return true; }
+    else if (_GRADIENT_COLOR_SPACES.has(toks[0].toLowerCase())) return true;
+  }
+  return false;
+};
+// Walk every gradient function head (balanced-paren, token-boundary scan) and
+// return true for the first ill-formed one, so the declaration is dropped. Only
+// gradient heads are examined; image()/cross-fade() are validated elsewhere.
+const _gradientInvalid = (value) => {
+  const s = String(value);
+  if (!/gradient\(/i.test(s)) return false;                    // fast path: no gradient
+  if (/var\(|env\(/i.test(s)) return false;                    // substitution pending → defer, never reject
+  const re = /(?:repeating-)?(?:linear|radial|conic)-gradient\(/gi;
+  let m;
+  while ((m = re.exec(s))) {
+    const start = m.index;
+    const before = start > 0 ? s[start - 1] : '';
+    if (before && /[A-Za-z0-9_-]/.test(before)) continue;      // embedded ident → not a head
+    const open = start + m[0].length - 1;                      // index of the '('
+    let depth = 0, j = open;
+    for (; j < s.length; j++) { if (s[j] === '(') depth++; else if (s[j] === ')' && --depth === 0) break; }
+    const inner = s.slice(open + 1, j < s.length ? j : s.length);
+    if (_gradientInnerInvalid(inner)) return true;
+    re.lastIndex = j < s.length ? j + 1 : s.length;            // resume past this gradient
   }
   return false;
 };
