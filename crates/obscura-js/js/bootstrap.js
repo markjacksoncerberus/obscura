@@ -15437,6 +15437,19 @@ const _interpIsh = (t) => {
 // once that clause is removed, no interpolation-ish keyword may remain among the
 // residual direction/prelude tokens (`in 45deg`, `in to right`, `lab lab`,
 // `hsl hue`, `hsl shorter`, `shorter hue hsl`, `90deg in hsl longer` all fail).
+// A radial/conic gradient's `at <position>` clause uses the STRICT CSS Values
+// <position> grammar, which — unlike the <bg-position> grammar of the
+// `background-position` property — has NO 3-value form and no `center`/optional-
+// offset variant of the edge-offset (`&&`) form. _parsePosition implements the
+// looser <bg-position> (correct for background-position), so here we additionally
+// reject the 3-token forms (`at center left 1px`, `at bottom right 8%`, …). A
+// missing position (`at` with nothing after) and anything _parsePosition itself
+// rejects (`at top 0px` — a lone vertical keyword can't lead a value) are invalid.
+const _gradientPosInvalid = (posToks) => {
+  if (!posToks.length) return true;                           // `at` with no <position>
+  if (posToks.length === 3) return true;                      // strict <position> has no 3-value form
+  return _parsePosition(posToks.join(' ')) === null;
+};
 const _gradientConfigInvalid = (toks) => {
   const inIdx = toks.findIndex((t) => t.toLowerCase() === 'in');
   let residual = toks;
@@ -15449,6 +15462,8 @@ const _gradientConfigInvalid = (toks) => {
         && toks[inIdx + 3] && toks[inIdx + 3].toLowerCase() === 'hue') len = 4;
     residual = toks.slice(0, inIdx).concat(toks.slice(inIdx + len));
   }
+  const atIdx = residual.findIndex((t) => t.toLowerCase() === 'at');
+  if (atIdx >= 0 && _gradientPosInvalid(residual.slice(atIdx + 1))) return true;  // malformed `at <position>`
   return residual.some(_interpIsh);                            // stray colour-space/hue token
 };
 // Validate one gradient function's inner argument list. An empty top-level

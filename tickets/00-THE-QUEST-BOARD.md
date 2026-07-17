@@ -187,6 +187,31 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-17 (Quest #204 The Gradient Position Verdict — a strict `<position>` gate for gradient `at` clauses, +9, ZERO regressions):**
+Took #203's next-leverage: `gradient-position-invalid` **0/9** in `css/css-images/parsing/`. A radial/conic gradient's
+`at <position>` clause uses the **strict CSS Values `<position>` grammar** — which, unlike the `<bg-position>` grammar
+of the `background-position` property, has **NO 3-value form** and no `center`/optional-offset variant of the
+edge-offset (`&&`) form (all 4 tokens `[edge <lp>] && [edge <lp>]` mandatory). Our `_parsePosition` implements the
+looser `<bg-position>` (correct for `background-position`, held 31/31 valid + 11/11 invalid), so it round-tripped the
+3-value positions gradients must drop (`at center left 1px`, `at bottom right 8%`) plus `at top 0px` (which it already
+rejected, but `_serializePositionSpecified` kept verbatim). Fix followed the #202 pattern — a **parallel rejection
+gate, canonicalizer untouched**: new `_gradientPosInvalid(posToks)` (empty → invalid; **exactly 3 tokens → invalid**;
+else defer to `_parsePosition(...) === null`), called from `_gradientConfigInvalid` after the `in`-clause removal (find
+`at` in the residual config tokens, validate everything after it — `at` precedes `in` in the grammar, so the residual
+tail is exactly the `<position>`). Wired via the existing `_gradientInvalid` gate — already in BOTH setProperty paths
+→ ZERO new wiring. Fully isolated: 1 helper + 2 lines. **The whole `<bg-position>`-vs-`<position>` delta reduces to
+"3-token is invalid"** — `_parsePosition` already rejects the 2-token bad case, and every 4-token parse it accepts is
+necessarily two `edge <lp>` components. **WINS:** gradient-position-invalid 0→9. **+9, ZERO regressions.** Sweep held:
+gradient-position-valid 18/18, gradient-interpolation-method-invalid 292/292 + -valid 1398/1398 + -computed 932/932,
+image-function-valid 13/13, image-function-invalid 6/6, object-position-valid 18/18, background-image-valid 13/13,
+background-position-valid 31/31, background-position-invalid 11/11, background-valid 45/46 (pre-existing cap),
+background-computed 39/39, mask-computed 32/32, object-fit-invalid 5/5, image-orientation-invalid 12/12,
+line-clamp-valid 18/18, cursor-invalid 10/10, qsa 1975/1975. **NEXT LEVERAGE (same dir):**
+`conic-gradient-calc-angle-percentage-invalid` 0/4 + `-valid` 1/6 (paired — the invalid half is a `calc()` type-check
+rejection, the valid half needs the harder calc-term-reordering serialization `calc(0deg + 100%)`→`calc(100% + 0deg)`),
+OR `background-image-invalid` 0/12 (in `css-backgrounds/parsing/` — negative radial radii + `cross-fade()` %), OR a NEW
+`css/*/parsing/` dir. Scroll `tickets/204-the-gradient-position-verdict.md`.
+
 **Session 2026-07-17 (Quest #203 The Enum Longhand Verdict — three plain-enum `css-images` longhands, +22, ZERO regressions):**
 Took #202's next-leverage: the raw-store enum longhands in the same `css/css-images/parsing/` dir. Baseline:
 `image-orientation-invalid` **0/12**, `object-fit-invalid` **0/5**, `object-fit-valid` **6/9**,

@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #203).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #204).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-images/parsing/gradient-position-invalid.html` | 0/9 | **9/9** | ✅ 100% | **Quest #204 The Gradient Position Verdict.** Gradient `at <position>` uses the strict CSS Values `<position>` grammar (NO 3-value form; edge-offset `&&` needs all 4 tokens) — narrower than `background-position`'s `<bg-position>`. `_gradientPosInvalid` (wired into the existing `_gradientInvalid` gate via `_gradientConfigInvalid`) rejects the 3-token forms (`at center left 1px`, `at bottom right 8%`) + `at top 0px` (lone V-keyword can't lead). `_parsePosition`/`background-position` (31/31 + 11/11) untouched. **+9.** |
+| `css/css-images/parsing/gradient-position-valid.html` | 18/18 | **18/18** | ✅ 100% | **Quest #204.** Held — only rejection added; the lenient `_parsePosition` path canonicalizes every valid 1/2/4-value position unchanged. |
 | `css/css-images/parsing/image-orientation-invalid.html` | 0/12 | **12/12** | ✅ 100% | **Quest #203 The Enum Longhand Verdict.** `image-orientation = from-image \| none` (Images 3) — a single-keyword enum; rejects `auto`/`0`/`30deg`/`flip` and every multi-token combo (`0 flip`, `flip from-image`, older `<angle>? flip` grammar). **+12.** |
 | `css/css-images/parsing/image-orientation-valid.html` | 2/2 | **2/2** | ✅ 100% | **Quest #203.** Held (identity — `from-image`/`none`). |
 | `css/css-images/parsing/object-fit-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #203.** `object-fit = fill \| none \| [contain\|cover] \|\| scale-down` (Images 4) engine (`_serObjectFit`): rejects `auto`, `contain cover` (fit twice), `fill scale-down`/`contain fill`/`cover none` (standalone keyword in a list). **+5.** |
