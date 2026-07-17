@@ -922,6 +922,19 @@ const _parseStyleDecls = (text) => {
           const c = _serLineClamp(value); if (c == null) continue;   // invalid <line-clamp> → drop
           value = c;
         }
+      } else if (name === 'image-orientation' || name === 'image-rendering') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const set = name === 'image-orientation' ? _IMAGE_ORIENTATION_KW : _IMAGE_RENDERING_KW;
+          if (!set.has(low)) continue;                   // invalid enum keyword → drop
+          value = low;                                   // canonical lowercase keyword
+        }
+      } else if (name === 'object-fit') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _serObjectFit(value); if (c == null) continue;   // invalid <object-fit> → drop
+          value = c;
+        }
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1340,6 +1353,19 @@ class CSSStyleDeclaration {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
         const c = _serLineClamp(stored); if (c == null) return;      // invalid <line-clamp> → ignore
+        stored = c;
+      }
+    } else if (!custom && (name === 'image-orientation' || name === 'image-rendering')) {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const set = name === 'image-orientation' ? _IMAGE_ORIENTATION_KW : _IMAGE_RENDERING_KW;
+        if (!set.has(low)) return;                       // invalid enum keyword → ignore
+        stored = low;                                    // canonical lowercase keyword
+      }
+    } else if (!custom && name === 'object-fit') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _serObjectFit(stored); if (c == null) return;      // invalid <object-fit> → ignore
         stored = c;
       }
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
@@ -14896,6 +14922,41 @@ const _serContain = (value, computed) => {
   if (style) parts.push('style');
   if (paint) parts.push('paint');
   return parts.join(' ');
+};
+
+// css-images enum longhands. image-orientation = from-image | none (Images 3);
+// image-rendering = auto | smooth | high-quality | crisp-edges | pixelated
+// (Images 3). Both are single-keyword grammars, so a value is valid iff it is
+// exactly one of these keywords — any multi-token value (`0 flip`, `flip
+// from-image`) or foreign keyword (`auto` for image-orientation, `none` for
+// image-rendering, an <angle> like `30deg`) is rejected. CSS-wide keywords and
+// var()/env() are handled by the caller's guard.
+const _IMAGE_ORIENTATION_KW = new Set(['from-image', 'none']);
+const _IMAGE_RENDERING_KW = new Set(['auto', 'smooth', 'high-quality', 'crisp-edges', 'pixelated']);
+
+// object-fit = fill | none | [ contain | cover ] || scale-down (CSS Images 4
+// §5.5). `fill`/`none` are standalone; the `||` combination pairs an optional
+// `[contain|cover]` fit keyword (mutually exclusive) with an optional
+// `scale-down`, in either input order but at most one of each. Canonical
+// serialization: the fit keyword precedes `scale-down`, EXCEPT that `contain`
+// beside `scale-down` collapses to just `scale-down` (scale-down already fits
+// as contain would, so the contain is redundant) — hence `contain scale-down`
+// and `scale-down contain` both serialize to `scale-down`, while `cover
+// scale-down` / `scale-down cover` keep both as `cover scale-down`. Returns the
+// canonical string, or null for an invalid value.
+const _serObjectFit = (value) => {
+  const low = String(value).trim().toLowerCase();
+  if (low === '') return null;
+  if (low === 'fill' || low === 'none') return low;
+  let fit = null, scaleDown = false;
+  for (const t of _wsTokens(low)) {
+    if (t === 'contain' || t === 'cover') { if (fit) return null; fit = t; }
+    else if (t === 'scale-down') { if (scaleDown) return null; scaleDown = true; }
+    else return null;                                    // unknown / fill|none in a list
+  }
+  if (!fit && !scaleDown) return null;
+  if (scaleDown) return fit === 'cover' ? 'cover scale-down' : 'scale-down';
+  return fit;                                            // contain or cover alone
 };
 
 // line-clamp = none | [ <integer [1,∞]> || <'block-ellipsis'> ] -webkit-legacy?

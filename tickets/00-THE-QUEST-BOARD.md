@@ -187,6 +187,28 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-17 (Quest #203 The Enum Longhand Verdict — three plain-enum `css-images` longhands, +22, ZERO regressions):**
+Took #202's next-leverage: the raw-store enum longhands in the same `css/css-images/parsing/` dir. Baseline:
+`image-orientation-invalid` **0/12**, `object-fit-invalid` **0/5**, `object-fit-valid` **6/9**,
+`image-rendering-invalid` **0/2**. All three properties were registered in `_GCS_DEFAULTS`/inherit lists but had NO
+value validation — garbage stored raw, canonical reorders never applied. `image-orientation` (`from-image | none`) and
+`image-rendering` (`auto | smooth | high-quality | crisp-edges | pixelated`) are single-keyword enums → valid iff the
+value is exactly one keyword; any multi-token value (`0 flip`, `flip from-image`, `high-quality crisp-edges`) or
+foreign keyword (`auto`/`30deg`/`none`) is rejected by a plain `Set.has(low)`. `object-fit`
+(`fill | none | [contain|cover] || scale-down`) got a fold fn `_serObjectFit`: the `||` serializes the fit keyword
+before `scale-down`, EXCEPT `contain` collapses beside `scale-down` (`contain scale-down`/`scale-down contain`→
+`scale-down`; `cover scale-down`/`scale-down cover`→`cover scale-down`). Two keyword sets + one fn next to
+`_serContain`, wired identity-guarded (`_CSS_WIDE`/`_TF_VAR_RE`) as branches in BOTH setProperty paths. No computed
+branch needed — computed tests use only already-canonical inputs, and the specified value is canonicalized on store.
+Reused `_wsTokens` unmodified → fully isolated. **WINS:** image-orientation-invalid 0→12, object-fit-invalid 0→5,
+object-fit-valid 6→9, image-rendering-invalid 0→2. **+22, ZERO regressions.** Sweep held:
+gradient-interpolation-method-invalid 292/292 + -valid 1398/1398, image-function-valid 13/13,
+image-function-invalid 6/6, object-position-valid 18/18, image-resolution-valid 12/12, cursor-invalid 10/10,
+contain-invalid 14/14, will-change-invalid 127/127, line-clamp-valid 18/18, qsa 1975. **NEXT LEVERAGE (same dir):**
+`gradient-position-invalid` 0/9 (lenient `_canonGradientDirection` → add rejection, like #202's `_gradientInvalid`),
+`conic-gradient-calc-angle-percentage-invalid` 0/4 (+`-valid` 1/6), or `background-image-invalid` 0/12 (in
+`css-backgrounds/parsing/` — negative radial radii + `cross-fade()` %). Scroll `tickets/203-the-enum-longhand-verdict.md`.
+
 **Session 2026-07-17 (Quest #202 The Gradient Interpolation Verdict — a `<color-interpolation-method>` rejection gate, +292, ZERO regressions):**
 Took #201's next-leverage (the gradient-grammar-validator branch), routed into the biggest single-file tail on the
 board. Baseline in `css/css-images/parsing/`: `gradient-interpolation-method-invalid` **0/292**, while `-valid`

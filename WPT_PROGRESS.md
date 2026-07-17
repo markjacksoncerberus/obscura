@@ -10,12 +10,19 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #202).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #203).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-images/parsing/image-orientation-invalid.html` | 0/12 | **12/12** | ✅ 100% | **Quest #203 The Enum Longhand Verdict.** `image-orientation = from-image \| none` (Images 3) — a single-keyword enum; rejects `auto`/`0`/`30deg`/`flip` and every multi-token combo (`0 flip`, `flip from-image`, older `<angle>? flip` grammar). **+12.** |
+| `css/css-images/parsing/image-orientation-valid.html` | 2/2 | **2/2** | ✅ 100% | **Quest #203.** Held (identity — `from-image`/`none`). |
+| `css/css-images/parsing/object-fit-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #203.** `object-fit = fill \| none \| [contain\|cover] \|\| scale-down` (Images 4) engine (`_serObjectFit`): rejects `auto`, `contain cover` (fit twice), `fill scale-down`/`contain fill`/`cover none` (standalone keyword in a list). **+5.** |
+| `css/css-images/parsing/object-fit-valid.html` | 6/9 | **9/9** | ✅ 100% | **Quest #203.** Canonical fold: fit precedes `scale-down`, but `contain` beside `scale-down` collapses to just `scale-down` (`contain scale-down`/`scale-down contain`→`scale-down`), `cover scale-down`/`scale-down cover`→`cover scale-down`. **+3.** |
+| `css/css-images/parsing/object-fit-computed.html` | 6/6 | **6/6** | ✅ 100% | **Quest #203.** Held (canonical inputs unchanged). |
+| `css/css-images/parsing/image-rendering-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #203.** `image-rendering = auto \| smooth \| high-quality \| crisp-edges \| pixelated` (Images 3) — single-keyword enum; rejects `none` and `high-quality crisp-edges`. **+2.** |
+| `css/css-images/parsing/image-rendering-valid.html` | 5/5 | **5/5** | ✅ 100% | **Quest #203.** Held (identity — 5 keywords). |
 | `css/css-images/parsing/gradient-interpolation-method-invalid.html` | 0/292 | **292/292** | ✅ 100% | **Quest #202 The Gradient Interpolation Verdict.** `_gradientInvalid` rejection gate (parallel to `_imageFuncInvalid`) for `<color-interpolation-method>` = `in <color-space> [ <hue> hue ]?`: `in` must be immediately followed by a colour space, no interpolation-ish token may sit outside a valid `in` clause (`lab lab`/`hsl hue`/`in 45deg`/`in to right`/`90deg in hsl longer`), no bare colour-space keyword may begin a colour stop (`red, blue, lab`), no empty argument. **+292.** |
 | `css/css-images/parsing/gradient-interpolation-method-valid.html` | 1398/1398 | **1398/1398** | ✅ 100% | **Quest #202.** Held — the existing `_canonGradients`/`_canonInterpolationMethod` already canonicalizes all valid forms; the gate only adds rejection. |
 | `css/css-images/parsing/gradient-interpolation-method-computed.html` | 932/932 | **932/932** | ✅ 100% | **Quest #202.** Held. |
