@@ -185,6 +185,37 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-16 (Quest #200 The Cursor Verdict — a `cursor` value engine, +10 net):**
+Took #199's next-leverage: `css-ui`. Baseline: `cursor-invalid` 0/10, `cursor-valid` 45/46,
+`cursor-computed` 37/39 (the sibling `caret-color`/`resize`/`field-sizing`/`text-overflow` `-invalid`
+already passed). `cursor` was mis-registered in `_GRADIENT_PROPS` — treated as a plain `<image>`
+property, so the WHOLE `cursor` grammar was unchecked (any garbage accepted; gradients wrongly
+accepted). Grammar `cursor = [ <cursor-image> [<x> <y>]? , ]* <cursor-keyword>`: a comma-list of
+url/image-set/light-dark images (each with an optional `<x> <y>` hotspot), ending in a mandatory bare
+cursor keyword. Built `_serCursor(value, computed, el)` (+ `_cursorCanonImage` / `_cursorHotspotNum`
+/ `_CURSOR_KEYWORDS`): `_commaSplitTop` the value → last item must be a keyword; each earlier item is
+`<image>` or `<image> <x> <y>` (`_wsTokens`, exactly 1 or 3 tokens). Images validate by FUNCTION HEAD
+(url/image-set/light-dark ONLY — generated images gradient/`image()`/`element()`/`paint()` reject;
+light-dark recurses on its two args), so a url() whose target text contains `gradient(` is never
+misjudged. Hotspots are `<number>` (calc folded via `_canonMathExpr`, `calc(2 + 0)`→`calc(2)`);
+lengths/`%` reject (`1px 2px`/`3% 4%`). Removed `cursor` from `_GRADIENT_PROPS`; wired via
+`_CSSUI_VALIDATED` + a `name === 'cursor'` branch in the inline parser + a `kebab === 'cursor'`
+computed branch (CSS-wide guarded). Reused `_commaSplitTop`/`_wsTokens`/`_canonImageSet`/`_canonUrls`/
+`_canonMathExpr` unmodified. **WINS:** cursor-invalid 0→10, cursor-valid 45→46. **CAP (−1, inherent):**
+cursor-computed 37→36 — its 3 gradient computed rows DIRECTLY CONTRADICT cursor-invalid (which mandates
+gradient rejection; all 4 of its gradient cases use single-stop `gradient(red)`, and we have NO gradient
+well-formedness validator — `background-image-invalid` is itself 0/12 — so "accept well-formed, reject
+malformed" isn't achievable). No browser passes both files; the other 2 gradient rows already failed on
+malformed expected strings (missing `)`, input `crosshair` vs expected `pointer`). **+10 net.** Sweep
+held: caret-color-invalid 12/12, will-change-invalid 127/127, contain-invalid 14/14, clip-path-invalid
+48/48, background-image-valid 13/13, mask-computed 32/32, list-style-image-valid 3/3, background-valid
+45/46 (pre-existing cap), qsa 1975. **NEXT LEVERAGE:** the newer `css-overflow` cluster — `line-clamp`
+(a shorthand, `line-clamp-invalid` 0/8 + `-valid` 10/18, grammar `none | <integer [1,∞]> || <ellipsis>
+|| -webkit-legacy` expanding into max-lines/block-ellipsis/continue/-webkit-line-clamp, tricky canonical
+reorder), `scroll-buttons-invalid` 1/8, `webkit-box-computed` 14/20. OR a real gradient grammar validator
+(fixes `background-image-invalid` 0/12 AND recovers the cursor radial-gradient computed row). grep
+`_serCursor`. Scroll `tickets/200-the-cursor-verdict.md`.
+
 **Session 2026-07-16 (Quest #199 The Contain Verdict — a `contain` value engine, +34,
 ZERO regressions):** Took the #198 outgoing knight's next-leverage: the NEW untouched
 `css/css-contain/parsing/` dir. Baseline: `contain-invalid` 0/14, `contain-valid` 9/13,

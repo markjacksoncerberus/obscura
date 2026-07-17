@@ -855,6 +855,10 @@ const _parseStyleDecls = (text) => {
       else if (_SIMPLE_TRANSFORM_PROPS.has(name)) {
         if (!_isValidSimpleTransform(name, value)) continue; // invalid perspective/transform-box/backface → drop
       }
+      else if (name === 'cursor') {
+        const c = _canonCssUi('cursor', value); if (c === null) continue; // invalid <cursor> → drop
+        value = c;
+      }
       else if (_GRADIENT_PROPS.has(name)) {
         if (_imageFuncInvalid(value)) continue;            // invalid image() → drop declaration
         value = _canonImageSet(_canonGradients(value, null, false));
@@ -11684,10 +11688,78 @@ const _CSSUI_ENUM = {
 // branch does no <color> validation, so it wrongly accepts `invert`/`none`/`50%`).
 const _CSSUI_VALIDATED = new Set([
   'box-sizing', 'resize', 'user-select', 'field-sizing', 'interactivity', 'outline-style',
-  'caret-color', 'outline-color', 'text-overflow', 'outline-width', 'outline-offset',
+  'caret-color', 'outline-color', 'text-overflow', 'outline-width', 'outline-offset', 'cursor',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
+// ── cursor (css-ui): `[ <cursor-image> [<x> <y>]? , ]* <cursor-keyword>` ──────
+// The optional leading comma-list carries URL cursor images (each with an optional
+// `<x> <y>` hotspot); the final comma-item is a mandatory bare cursor keyword.
+// <cursor-image> is url()/image-set()/light-dark() of those ONLY — generated images
+// (gradients, cross-fade(), image(), element(), paint()) are NOT valid for cursor
+// (css-ui-4 restricts it to <url>/<url-set>; the cursor-invalid WPT enforces this,
+// incl. gradients nested inside light-dark()).
+const _CURSOR_KEYWORDS = new Set([
+  'auto', 'default', 'none', 'context-menu', 'help', 'pointer', 'progress', 'wait',
+  'cell', 'crosshair', 'text', 'vertical-text', 'alias', 'copy', 'move', 'no-drop',
+  'not-allowed', 'grab', 'grabbing', 'e-resize', 'n-resize', 'ne-resize', 'nw-resize',
+  's-resize', 'se-resize', 'sw-resize', 'w-resize', 'ew-resize', 'ns-resize',
+  'nesw-resize', 'nwse-resize', 'col-resize', 'row-resize', 'all-scroll',
+  'zoom-in', 'zoom-out',
+]);
+// Canonicalize one <cursor-image> (url / image-set / light-dark of those). Returns
+// the canonical string, or null if it is not a valid cursor image. Dispatch is by
+// FUNCTION HEAD (not a regex scan) so a url() whose target text happens to contain
+// `gradient(`/`image(` is never misjudged; a gradient/image()/element()/paint() head
+// — or a bare keyword like `none` — simply matches none of the accepted heads → null.
+const _cursorCanonImage = (tok, computed, el) => {
+  const t = String(tok).trim();
+  const low = t.toLowerCase();
+  if (!t.endsWith(')')) return null;
+  if (low.startsWith('light-dark(')) {
+    const args = _commaSplitTop(t.slice(t.indexOf('(') + 1, -1)).map((a) => a.trim());
+    if (args.length !== 2) return null;
+    const a = _cursorCanonImage(args[0], computed, el);
+    const b = _cursorCanonImage(args[1], computed, el);
+    if (a == null || b == null) return null;
+    return 'light-dark(' + a + ', ' + b + ')';
+  }
+  if (low.startsWith('url(') || low.startsWith('image-set(') || low.startsWith('-webkit-image-set(')) {
+    let c = _canonImageSet(t);
+    if (computed) c = _canonUrls(c, el);
+    return c;
+  }
+  return null;                                             // gradient / image() / keyword / … → invalid
+};
+// A hotspot coordinate: a bare <number> (calc() folded, `calc(2 + 0)`→`calc(2)`).
+// Lengths and percentages are NOT numbers → `1px 2px` / `3% 4%` reject.
+const _cursorHotspotNum = (tok) => {
+  const t = String(tok).trim();
+  if (_MATHFN_NAME_RE.test(t)) return _canonMathExpr(t) || null;
+  return /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(t) ? t : null;
+};
+const _serCursor = (value, computed, el) => {
+  const parts = _commaSplitTop(String(value)).map((p) => p.trim());
+  if (!parts.length) return null;
+  const kw = parts[parts.length - 1].toLowerCase();
+  if (!_CURSOR_KEYWORDS.has(kw)) return null;              // final comma-item must be a keyword
+  const out = [];
+  for (let i = 0; i < parts.length - 1; i++) {
+    const toks = _wsTokens(parts[i]);
+    if (toks.length !== 1 && toks.length !== 3) return null; // <image> | <image> <x> <y>
+    const img = _cursorCanonImage(toks[0], computed, el);
+    if (img == null) return null;
+    let seg = img;
+    if (toks.length === 3) {
+      const x = _cursorHotspotNum(toks[1]), y = _cursorHotspotNum(toks[2]);
+      if (x == null || y == null) return null;
+      seg += ' ' + x + ' ' + y;
+    }
+    out.push(seg);
+  }
+  out.push(kw);
+  return out.join(', ');
+};
 const _canonCssUi = (name, value) => {
   const s = String(value).trim();
   const low = s.toLowerCase();
@@ -11750,6 +11822,7 @@ const _canonCssUi = (name, value) => {
     if (_isLengthTok(t)) return _canonLineWidth(t);
     return null;
   }
+  if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;
 };
 
@@ -13770,7 +13843,7 @@ const _serializeOriginComputed = (el, kebab, value) => {
 // `at center center` (→ `50% 50%`), and computes each colour stop. Non-gradient
 // text (url(), `none`, the commas between multiple background layers) passes
 // through verbatim, so a multi-image list is preserved.
-const _GRADIENT_PROPS = new Set(['background-image', 'mask-image', 'list-style-image', 'border-image-source', 'cursor']);
+const _GRADIENT_PROPS = new Set(['background-image', 'mask-image', 'list-style-image', 'border-image-source']);
 const _GRADIENT_HEAD = /(?:repeating-)?(?:linear|radial|conic)-gradient\(/i;
 const _GRADIENT_RADIAL_SIZE = /^(?:closest|farthest)-(?:side|corner)$/;
 const _ANGLE_RE = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:deg|grad|rad|turn)$/i;
@@ -17011,6 +17084,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'contain') { const l = String(v).trim().toLowerCase(); if (_CSS_WIDE.has(l)) return v; const r = _serContain(v, true); return r == null ? v : r; }
   if (_BG_POSITION_AXIS.has(kebab)) return _computeBgAxis(el, v, _BG_POSITION_AXIS.get(kebab));
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
+  if (kebab === 'cursor') { const l = String(v).trim().toLowerCase(); if (_CSS_WIDE.has(l)) return v; const r = _serCursor(v, true, el); return r == null ? v : r; }
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);
   if (kebab === 'filter' || kebab === 'backdrop-filter') return _canonFilter(v, el, true);
   if (kebab === 'transform') return _canonTransform(v, el, true);
