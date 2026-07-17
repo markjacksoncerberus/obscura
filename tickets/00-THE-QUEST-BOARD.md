@@ -187,6 +187,30 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-17 (Quest #206 The Angle-Percentage Verdict — a calc() dimensional type-check + specified-value reorder for conic gradient stops, +9, ZERO regressions):**
+Took #205's next-leverage: the PAIRED `conic-gradient-calc-angle-percentage-{invalid 0/4, valid 1/6}` in `css/css-images/parsing/`.
+A gradient colour-stop/hint position is `<length-percentage>` (linear/radial) or `<angle-percentage>` (conic); a conic `from` is a
+pure `<angle>`. `_evalMath` numerically SUMS a calc() but never type-checks (`50% + 30deg` evaluates fine), so both halves were new
+work. **Invalid half (+4) — a focused calc type-checker (`_gradientCalcBad`/`_calcSumKind`/`_dimKindOfTok`):** classify ONLY a flat
+`calc()` sum of simple number/dimension/percentage terms (a term with a product `*`/`/` or nested group → `'other'` → DEFER, never
+reject); `'bad'` when the sum mixes types that can't add (a `<number>` with a dimension/%, or a `<length>` with an `<angle>`); else a
+kind (`len`/`ang`/`pct`/`len-pct`/`ang-pct`). Rejected per context: `lp` rejects angle-bearing (`linear/radial-gradient(red
+calc(50% + 30deg))`), `ap` rejects length-bearing, `angle` rejects %/length (`conic-gradient(from calc(50% + 30deg))`); `'bad'`
+everywhere (`conic-gradient(red calc(50% + 0))` — number+%). Wired via the EXISTING `_gradientInvalid`: `from`-angle check inside
+`_gradientConfigInvalid` (conic), stop-calc check in `_gradientInnerInvalid` — the unconditional `_gradientConfigInvalid` call on
+`args[0]` KEPT (so the 292 interp rejections are untouched), the stop-calc check added on non-config args only (gated by
+`_isGradientConfig` so a real `from …`/`at …` config isn't stop-typed and mis-rejected). **Valid half (+5) — specified-value calc
+reorder:** specified-mode stops passed VERBATIM (only computed canonicalized them), so `calc(0deg + 100%)` never reordered. New
+`_canonGradientStopSpecified` maps each stop token, canonicalizing ONLY a `calc(` token via the existing `_canonSortedCalc` (CSS
+Values 4 mixed-unit ordering: number, then %, then dimension) — `calc(0deg + 100%)`→`calc(100% + 0deg)`, `calc(90deg + 50%)`→
+`calc(50% + 90deg)`, `calc(90deg + 0%)`→`calc(0% + 90deg)` (zero % preserved), `calc(100% - 45deg)` unchanged, repeating-conic too;
+colours + plain positions stay byte-identical. **WINS:** conic-gradient-calc-angle-percentage-invalid 0→4, -valid 1→6. **+9, ZERO
+regressions.** Sweep held: gradient-interpolation-method-valid 1398/1398 + -invalid 292/292 + -computed 932/932, gradient-position-valid
+18/18 + -invalid 9/9, image-function-valid 13/13 + -invalid 6/6, object-position-valid 18/18, object-fit-invalid 5/5 + -valid 9/9,
+image-orientation-invalid 12/12, image-rendering-invalid 2/2, image-resolution-valid 12/12, background-image-valid 13/13 + -invalid
+12/12, background-valid 45/46 (pre-existing cap), background-computed 39/39, mask-image-computed 47/47, cursor-invalid 10/10,
+line-clamp-valid 18/18, qsa 1975. **CAP:** none in these files. Scroll `tickets/206-the-angle-percentage-verdict.md`.
+
 **Session 2026-07-17 (Quest #205 The Background-Image Verdict — three parallel rejection gates for `background-image-invalid`, +12, ZERO regressions):**
 Took #204's next-leverage: `background-image-invalid` **0/12** in `css/css-backgrounds/parsing/` (NOT `css-images` — that dir has
 no `background-image-*` files). The 12 failures were three clean groups of *pure rejections* (no serialization change), each a

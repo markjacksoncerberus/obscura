@@ -15352,6 +15352,17 @@ const _canonGradientStop = (arg, el, type, emPx, lhPx) => {
   if (pos.length === 2) return col + ' ' + pos[0] + ', ' + col + ' ' + pos[1];
   return pos.length ? col + ' ' + pos.join(' ') : col;
 };
+// Specified-value canonicalization of one colour stop / hint: leave the colour and
+// every plain position token verbatim, but canonicalize a `calc()` position with
+// the CSS Values 4 mixed-unit term ordering (number, then %, then dimension) —
+// `calc(0deg + 100%)` → `calc(100% + 0deg)`. Only `calc(` tokens are touched (a
+// colour never is; min()/max()/nested math defer), so the specified serialization
+// of every non-calc stop is byte-identical to before.
+const _canonGradientStopSpecified = (arg) => {
+  const toks = _wsTokens(String(arg).trim());
+  if (!toks.length) return arg;
+  return toks.map((t) => (/^calc\(/i.test(t) ? _canonSortedCalc(t) : t)).join(' ');
+};
 const _canonGradientInner = (inner, el, computed, type) => {
   const args = _commaSplitTop(inner).map((a) => a.trim());
   if (!args.length) return inner;
@@ -15369,6 +15380,7 @@ const _canonGradientInner = (inner, el, computed, type) => {
   const lhPx = computed ? _lineHeightPx(el, emPx) : 0;
   if (hasConfig) args[0] = _canonGradientConfig(args[0], el, computed, type, isLegacy, emPx);
   if (computed) for (let k = start; k < args.length; k++) args[k] = _canonGradientStop(args[k], el, type, emPx, lhPx);
+  else for (let k = start; k < args.length; k++) args[k] = _canonGradientStopSpecified(args[k]);
   return args.filter((a) => a !== '').join(', ');
 };
 // Canonicalize the argument of an `image()` <image> function. These tests use
@@ -15454,6 +15466,62 @@ const _gradientPosInvalid = (posToks) => {
   if (posToks.length === 3) return true;                      // strict <position> has no 3-value form
   return _parsePosition(posToks.join(' ')) === null;
 };
+// ── CSS Values 4 calc() dimensional type-check for gradient positions ────────
+// A gradient colour-stop/hint position is <length-percentage> (linear/radial) or
+// <angle-percentage> (conic); a conic `from` is a pure <angle>. A calc() there
+// must not mix incompatible types. We classify ONLY a flat sum of simple
+// number/dimension/percentage terms — a term carrying a product (`*`/`/`) or a
+// nested group is too rich to type here and DEFERS (never rejects). Kinds:
+// 'num' | 'len' | 'ang' | 'pct' | 'len-pct' | 'ang-pct' | 'bad' | 'other'.
+const _dimKindOfTok = (t) => {
+  const s = String(t).trim();
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?%$/i.test(s)) return 'pct';
+  const m = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?([a-z]+)$/i.exec(s);
+  if (m) {
+    const u = m[1].toLowerCase();
+    if (_ANGLE_DEG[u] !== undefined) return 'ang';
+    if (_LENGTH_PX[u] !== undefined) return 'len';
+    return 'other';                                    // vw/cqw/unknown unit → defer
+  }
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(s)) return 'num';   // bare <number>
+  return 'other';
+};
+// Dimensional kind of a flat calc() sum body: 'other' if any term is a product,
+// a nested group, or an unclassifiable token (→ caller defers); 'bad' if the sum
+// mixes types that can NEVER add — a <number> with a dimension/percentage, or a
+// <length> with an <angle>.
+const _calcSumKind = (body) => {
+  const terms = _splitSumTerms(body);
+  if (!terms) return 'other';
+  let len = false, ang = false, pct = false, num = false;
+  for (const t of terms) {
+    if (/[*/()]/.test(t.text)) return 'other';         // product / nested group → defer
+    const k = _dimKindOfTok(t.text);
+    if (k === 'other') return 'other';
+    if (k === 'len') len = true; else if (k === 'ang') ang = true;
+    else if (k === 'pct') pct = true; else num = true;
+  }
+  if (num && (len || ang || pct)) return 'bad';        // <number> + dimension/% is a type error
+  if (len && ang) return 'bad';                        // <length> + <angle> never add
+  if (len) return pct ? 'len-pct' : 'len';
+  if (ang) return pct ? 'ang-pct' : 'ang';
+  return pct ? 'pct' : 'num';
+};
+// Is the token `tok` a type-invalid calc() for gradient position context `ctx` ∈
+// 'lp' (<length-percentage>) | 'ap' (<angle-percentage>) | 'angle' (pure <angle>)?
+// Only a bare `calc( <flat sum> )` is judged; min()/max()/clamp()/nested forms and
+// every non-math token DEFER (return false). A 'bad' (internally inconsistent) sum
+// is rejected in every context.
+const _gradientCalcBad = (tok, ctx) => {
+  const m = /^calc\(([\s\S]*)\)$/i.exec(String(tok).trim());
+  if (!m) return false;                                // not a bare calc() → defer
+  const k = _calcSumKind(m[1]);
+  if (k === 'bad') return true;
+  if (ctx === 'lp') return k === 'ang' || k === 'ang-pct';
+  if (ctx === 'ap') return k === 'len' || k === 'len-pct';
+  if (ctx === 'angle') return k === 'pct' || k === 'ang-pct' || k === 'len' || k === 'len-pct';
+  return false;
+};
 const _gradientConfigInvalid = (toks, type) => {
   const inIdx = toks.findIndex((t) => t.toLowerCase() === 'in');
   let residual = toks;
@@ -15477,6 +15545,12 @@ const _gradientConfigInvalid = (toks, type) => {
     const prelude = atIdx >= 0 ? residual.slice(0, atIdx) : residual;
     if (prelude.some((t) => _isPosLP(t) && parseFloat(t) < 0)) return true;
   }
+  // A conic `from <angle>` takes a pure <angle> — NOT <angle-percentage> — so a
+  // calc() mixing a percentage (or a length) into it is a type error.
+  if (type === 'conic') {
+    const fromIdx = toks.findIndex((t) => t.toLowerCase() === 'from');
+    if (fromIdx >= 0 && _gradientCalcBad(toks[fromIdx + 1] || '', 'angle')) return true;
+  }
   return residual.some(_interpIsh);                            // stray colour-space/hue token
 };
 // Validate one gradient function's inner argument list. An empty top-level
@@ -15485,12 +15559,19 @@ const _gradientConfigInvalid = (toks, type) => {
 // never begin with a bare colour-space keyword (`red, blue, lab` / `…, hsl … hue`).
 const _gradientInnerInvalid = (inner, type) => {
   const args = _commaSplitTop(inner).map((a) => a.trim());
+  // A colour-stop/hint position is <length-percentage> (linear/radial) or
+  // <angle-percentage> (conic); reject a type-invalid calc() in one.
+  const stopCtx = type === 'conic' ? 'ap' : 'lp';
   for (let k = 0; k < args.length; k++) {
     if (args[k] === '') return true;
     const toks = _wsTokens(args[k]);
     if (!toks.length) return true;
-    if (k === 0) { if (_gradientConfigInvalid(toks, type)) return true; }
-    else if (_GRADIENT_COLOR_SPACES.has(toks[0].toLowerCase())) return true;
+    if (k === 0) {
+      if (_gradientConfigInvalid(toks, type)) return true;
+      if (_isGradientConfig(args[k], type)) continue;         // a real config → not a colour stop
+    } else if (_GRADIENT_COLOR_SPACES.has(toks[0].toLowerCase())) return true;
+    // colour stop / hint (incl. args[0] when it is NOT a configuration)
+    if (toks.some((t) => _gradientCalcBad(t, stopCtx))) return true;
   }
   return false;
 };
