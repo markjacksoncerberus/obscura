@@ -905,6 +905,12 @@ const _parseStyleDecls = (text) => {
       } else if (name === 'will-change') {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_isValidWillChange(value)) continue; // invalid → drop
+      } else if (name === 'contain') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _serContain(value, false); if (c == null) continue; // invalid <contain> → drop
+          value = c;
+        }
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1312,6 +1318,12 @@ class CSSStyleDeclaration {
     } else if (!custom && name === 'will-change') {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_isValidWillChange(stored)) return; // invalid → ignore
+    } else if (!custom && name === 'contain') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _serContain(stored, false); if (c == null) return; // invalid <contain> → ignore
+        stored = c;
+      }
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
       if (!_isValidBgAxis(stored, _BG_POSITION_AXIS.get(name))) return; // invalid single-axis <bg-position> → ignore
       stored = _canonBgAxis(stored, _BG_POSITION_AXIS.get(name));
@@ -8384,6 +8396,8 @@ const _GCS_DEFAULTS = {
   'animation-fill-mode': 'none', 'animation-play-state': 'running',
   // css-will-change — does not inherit.
   'will-change': 'auto',
+  // css-contain — does not inherit.
+  'contain': 'none',
   // css-color-adjust — every property in this family inherits. color-adjust is a
   // legacy alias for print-color-adjust (initial `economy`).
   'color-scheme': 'normal', 'color-adjust': 'economy',
@@ -14763,6 +14777,40 @@ const _isValidWillChange = (value) => {
   return true;
 };
 
+// contain = none | strict | content | [ [ size | inline-size ] || layout || style
+//           || paint ]  (CSS Containment 3 §2). The multi-keyword alternative is an
+// unordered set (no repeats; size and inline-size are mutually exclusive), and
+// serializes in the canonical order size/inline-size, layout, style, paint. The
+// SPECIFIED value keeps the expanded keyword list; only the COMPUTED value folds the
+// two shorthand-equivalent sets: `layout style paint` → `content`, and
+// `size layout style paint` → `strict` (note inline-size does NOT fold — strict
+// implies full `size`). CSS-wide keywords and var()/env() are handled by the
+// caller's guard. Returns the serialized string, or null for an invalid value.
+const _serContain = (value, computed) => {
+  const low = String(value).trim().toLowerCase();
+  if (low === '') return null;
+  if (low === 'none' || low === 'strict' || low === 'content') return low;
+  let sizeKw = null, layout = false, style = false, paint = false;
+  for (const t of _wsTokens(low)) {
+    if (t === 'size' || t === 'inline-size') { if (sizeKw) return null; sizeKw = t; }
+    else if (t === 'layout') { if (layout) return null; layout = true; }
+    else if (t === 'style') { if (style) return null; style = true; }
+    else if (t === 'paint') { if (paint) return null; paint = true; }
+    else return null;                                    // unknown / none|strict|content in a list
+  }
+  if (!sizeKw && !layout && !style && !paint) return null;
+  if (computed) {
+    if (sizeKw === 'size' && layout && style && paint) return 'strict';
+    if (!sizeKw && layout && style && paint) return 'content';
+  }
+  const parts = [];
+  if (sizeKw) parts.push(sizeKw);
+  if (layout) parts.push('layout');
+  if (style) parts.push('style');
+  if (paint) parts.push('paint');
+  return parts.join(' ');
+};
+
 // ─── The `offset` shorthand (CSS Motion 1 §6) ───────────────────────────────
 //   offset = [ <'offset-position'>? [ <'offset-path'> [ <'offset-distance'> ||
 //              <'offset-rotate'> ]? ]? ]! [ / <'offset-anchor'> ]?
@@ -16960,6 +17008,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'shape-outside') return _computeShapeOutside(el, v);
   if (kebab === 'shape-margin') return _computeShapeMargin(el, v);
   if (kebab === 'shape-image-threshold') return _computeShapeThreshold(v);
+  if (kebab === 'contain') { const l = String(v).trim().toLowerCase(); if (_CSS_WIDE.has(l)) return v; const r = _serContain(v, true); return r == null ? v : r; }
   if (_BG_POSITION_AXIS.has(kebab)) return _computeBgAxis(el, v, _BG_POSITION_AXIS.get(kebab));
   if (_ORIGIN_PROPS.has(kebab)) return _serializeOriginComputed(el, kebab, v);
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);

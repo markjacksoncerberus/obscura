@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #198).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #199).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-contain/parsing/contain-invalid.html` | 0/14 | **14/14** | ✅ 100% | **Quest #199 The Contain Verdict.** `contain = none \| strict \| content \| [ [size\|inline-size] \|\| layout \|\| style \|\| paint ]` engine (`_serContain`): unordered set, no repeats, size/inline-size exclusive. **+14.** |
+| `css/css-contain/parsing/contain-valid.html` | 9/13 | **13/13** | ✅ 100% | **Quest #199.** Canonical order size/inline-size, layout, style, paint. **+4.** |
+| `css/css-contain/parsing/contain-computed.html` | 0/15 | **15/15** | ✅ 100% | **Quest #199.** Registered `contain: none` default + computed fold `layout style paint`→`content`, `size layout style paint`→`strict`. **+15.** |
+| `css/css-contain/parsing/contain-computed-children.html` | 0/1 | **1/1** | ✅ 100% | **Quest #199.** Child computed `contain` == `none` (does not inherit). **+1.** |
 | `css/css-will-change/parsing/will-change-invalid.html` | 0/127 | **127/127** | ✅ 100% | **Quest #198 The Will-Change Verdict.** `will-change = auto \| <animateable-feature>#` validator (`_isValidWillChange`): `auto` standalone-only, comma-list of single `<custom-ident>` tokens excluding CSS-wide + `default`/`will-change`/`none`/`all`/`auto`. **+127.** |
 | `css/css-will-change/parsing/will-change-valid.html` | 20/20 | **20/20** | ✅ 100% | **Quest #198.** Held (identity canon — case preserved, `TRANSFORM`/`--var`). |
 | `css/css-will-change/parsing/will-change-computed.html` | 23/23 | **23/23** | ✅ 100% | **Quest #198.** Held (computed == specified). |
