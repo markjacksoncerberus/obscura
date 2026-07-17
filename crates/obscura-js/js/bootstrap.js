@@ -8620,6 +8620,8 @@ const _GCS_DEFAULTS = {
   'animation-name': 'none', 'animation-timing-function': 'ease',
   'animation-iteration-count': '1', 'animation-direction': 'normal',
   'animation-fill-mode': 'none', 'animation-play-state': 'running',
+  // css-animations-2 scroll-driven ranges — none inherit; initial `normal`.
+  'animation-range-start': 'normal', 'animation-range-end': 'normal',
   // css-will-change — does not inherit.
   'will-change': 'auto',
   // css-contain — does not inherit.
@@ -18123,8 +18125,33 @@ const _computeTimeValue = (v, el) => {
   if (sec === null) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
   return _serNumber(_nfClamp(sec)) + 's';
 };
+// Computed value of an animation-range-{start,end} value. The specified value is
+// already canonicalized (names lowercased, default offsets dropped) by setProperty;
+// computing it additionally resolves each offset `<length-percentage>` through the
+// length machinery (`_trComp`: em→px against the element font-size, calc folded,
+// percentages kept) and re-applies the default-offset drop, since folding can now
+// surface the default (`entry calc(41% - 41%)` → `entry`). Names/`normal` pass through.
+const _computeAnimRange = (v, el, isEnd) => {
+  const dflt = isEnd ? '100%' : '0%';
+  return _commaSplitTop(String(v)).map((s) => s.trim()).map((it) => {
+    const toks = _wsTokens(it);
+    if (toks.length === 1) {
+      const low = toks[0].toLowerCase();
+      if (low === 'normal' || _TIMELINE_RANGE_NAMES.has(low)) return low;
+      return _trComp(toks[0], el, true, _vpUnits());              // bare <length-percentage>
+    }
+    if (toks.length === 2) {
+      const off = _trComp(toks[1], el, true, _vpUnits());
+      return off === dflt ? toks[0].toLowerCase() : toks[0].toLowerCase() + ' ' + off;
+    }
+    return it;
+  }).join(', ');
+};
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  if (kebab === 'animation-range-start' || kebab === 'animation-range-end') {
+    return _computeAnimRange(v, el, kebab === 'animation-range-end');
+  }
   if (kebab === 'overflow-x' || kebab === 'overflow-y') {
     // css-overflow computed coupling: a `visible` axis computes to `auto` when the
     // OTHER axis is a scrolling keyword (hidden/scroll/auto); `clip` and the
