@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #204).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #205).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-backgrounds/parsing/background-image-invalid.html` | 0/12 | **12/12** | ✅ 100% | **Quest #205 The Background-Image Verdict.** Three parallel rejection gates (canonicalizers untouched): (1) negative radial radii — a radial `<radial-size>` is `<length-percentage>` radii which must be NON-negative (`circle -10px`, `ellipse -20px 30px`, `-20% 30%`, `20px -30px`); checked in `_gradientConfigInvalid` (now type-aware) over the prelude before any `at`. (2) `cross-fade()` percentage grammar `<percentage [0,100]>? && [<image>\|<color>]` — new `_crossFadeInvalid` rejects `auto blue`/`1px red` (non-% → two rest toks), `calc(1% + 1px) red` (mixed-type calc → one non-% tok), `-1%`/`101%` (out of range). (3) a `none, auto` bad `<bg-image>` layer — new `_bgImageLayersInvalid` (name-guarded to background-image; accepts `none`/`<image>` head/`light-dark()`; defers on var()/env()). **+12.** |
+| `css/css-backgrounds/parsing/background-image-valid.html` | 13/13 | **13/13** | ✅ 100% | **Quest #205.** Held — `light-dark()` layers explicitly allowed by `_bgImageLayersInvalid`; every valid `<image>`/`cross-fade()`/radial form passes the gates untouched. |
 | `css/css-images/parsing/gradient-position-invalid.html` | 0/9 | **9/9** | ✅ 100% | **Quest #204 The Gradient Position Verdict.** Gradient `at <position>` uses the strict CSS Values `<position>` grammar (NO 3-value form; edge-offset `&&` needs all 4 tokens) — narrower than `background-position`'s `<bg-position>`. `_gradientPosInvalid` (wired into the existing `_gradientInvalid` gate via `_gradientConfigInvalid`) rejects the 3-token forms (`at center left 1px`, `at bottom right 8%`) + `at top 0px` (lone V-keyword can't lead). `_parsePosition`/`background-position` (31/31 + 11/11) untouched. **+9.** |
 | `css/css-images/parsing/gradient-position-valid.html` | 18/18 | **18/18** | ✅ 100% | **Quest #204.** Held — only rejection added; the lenient `_parsePosition` path canonicalizes every valid 1/2/4-value position unchanged. |
 | `css/css-images/parsing/image-orientation-invalid.html` | 0/12 | **12/12** | ✅ 100% | **Quest #203 The Enum Longhand Verdict.** `image-orientation = from-image \| none` (Images 3) — a single-keyword enum; rejects `auto`/`0`/`30deg`/`flip` and every multi-token combo (`0 flip`, `flip from-image`, older `<angle>? flip` grammar). **+12.** |

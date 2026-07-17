@@ -862,6 +862,8 @@ const _parseStyleDecls = (text) => {
       else if (_GRADIENT_PROPS.has(name)) {
         if (_imageFuncInvalid(value)) continue;            // invalid image() → drop declaration
         if (_gradientInvalid(value)) continue;             // malformed gradient interpolation method → drop
+        if (_crossFadeInvalid(value)) continue;            // malformed cross-fade() percentage → drop
+        if (name === 'background-image' && _bgImageLayersInvalid(value)) continue;  // bad <bg-image> layer → drop
         value = _canonImageSet(_canonGradients(value, null, false));
       } else if (_COLOR_PROPS.has(name)) {
         if (_hasImageFunc(value)) continue;                // image() is not a <color> → drop
@@ -1200,6 +1202,8 @@ class CSSStyleDeclaration {
     } else if (!custom && _GRADIENT_PROPS.has(name)) {
       if (_imageFuncInvalid(stored)) return;               // invalid image() → ignore (keep prior value)
       if (_gradientInvalid(stored)) return;                // malformed gradient interpolation method → ignore
+      if (_crossFadeInvalid(stored)) return;               // malformed cross-fade() percentage → ignore
+      if (name === 'background-image' && _bgImageLayersInvalid(stored)) return;  // bad <bg-image> layer → ignore
       stored = _canonImageSet(_canonGradients(stored, null, false));
     } else if (!custom && _CSSUI_VALIDATED.has(name)) {
       // CSS Basic User Interface longhands (box-sizing/resize/outline-*/caret-color/…):
@@ -15450,7 +15454,7 @@ const _gradientPosInvalid = (posToks) => {
   if (posToks.length === 3) return true;                      // strict <position> has no 3-value form
   return _parsePosition(posToks.join(' ')) === null;
 };
-const _gradientConfigInvalid = (toks) => {
+const _gradientConfigInvalid = (toks, type) => {
   const inIdx = toks.findIndex((t) => t.toLowerCase() === 'in');
   let residual = toks;
   if (inIdx >= 0) {
@@ -15464,19 +15468,28 @@ const _gradientConfigInvalid = (toks) => {
   }
   const atIdx = residual.findIndex((t) => t.toLowerCase() === 'at');
   if (atIdx >= 0 && _gradientPosInvalid(residual.slice(atIdx + 1))) return true;  // malformed `at <position>`
+  // A radial <radial-size> is one or two <length-percentage> radii which must be
+  // NON-NEGATIVE (`circle -10px`, `ellipse -20px 30px`, `-20% 30%`, `20px -30px`
+  // are all invalid). The size tokens are the prelude before any `at`; a negative
+  // literal length/percentage among them rejects the gradient. (Radial only —
+  // linear/conic preludes carry angles, where a negative value is valid.)
+  if (type === 'radial') {
+    const prelude = atIdx >= 0 ? residual.slice(0, atIdx) : residual;
+    if (prelude.some((t) => _isPosLP(t) && parseFloat(t) < 0)) return true;
+  }
   return residual.some(_interpIsh);                            // stray colour-space/hue token
 };
 // Validate one gradient function's inner argument list. An empty top-level
 // argument (leading/double/trailing comma) is invalid; the first argument is the
 // configuration (checked above); every later argument is a colour stop, which can
 // never begin with a bare colour-space keyword (`red, blue, lab` / `…, hsl … hue`).
-const _gradientInnerInvalid = (inner) => {
+const _gradientInnerInvalid = (inner, type) => {
   const args = _commaSplitTop(inner).map((a) => a.trim());
   for (let k = 0; k < args.length; k++) {
     if (args[k] === '') return true;
     const toks = _wsTokens(args[k]);
     if (!toks.length) return true;
-    if (k === 0) { if (_gradientConfigInvalid(toks)) return true; }
+    if (k === 0) { if (_gradientConfigInvalid(toks, type)) return true; }
     else if (_GRADIENT_COLOR_SPACES.has(toks[0].toLowerCase())) return true;
   }
   return false;
@@ -15498,8 +15511,69 @@ const _gradientInvalid = (value) => {
     let depth = 0, j = open;
     for (; j < s.length; j++) { if (s[j] === '(') depth++; else if (s[j] === ')' && --depth === 0) break; }
     const inner = s.slice(open + 1, j < s.length ? j : s.length);
-    if (_gradientInnerInvalid(inner)) return true;
+    const head = m[0].toLowerCase();
+    const type = head.includes('linear') ? 'linear' : head.includes('radial') ? 'radial' : 'conic';
+    if (_gradientInnerInvalid(inner, type)) return true;
     re.lastIndex = j < s.length ? j + 1 : s.length;            // resume past this gradient
+  }
+  return false;
+};
+// CSS Images 4 cross-fade(): each comma-separated <cf-image> is
+// `<percentage [0,100]>? && [ <image> | <color> ]`. The lenient _canonCrossFade
+// accepts any token soup; this parallel rejection gate enforces the grammar —
+// AT MOST one percentage (a plain <percentage>, not a length/`auto`/mixed calc),
+// which must lie in [0,100], and EXACTLY one <image>|<color> beside it. Rejects
+// `auto blue` (two non-% tokens), `1px red` (length not %), `calc(1% + 1px) red`
+// (mixed-type calc is one non-% token → two rest), `-1% red`/`101% red` (out of
+// range). Valid forms (`50% url(…)`, `red 33%`, `blue`, a nested cross-fade) all
+// leave exactly one rest token with an in-range (or absent) percentage.
+const _crossFadeInnerInvalid = (inner) => {
+  const args = _commaSplitTop(inner).map((a) => a.trim());
+  for (const arg of args) {
+    if (arg === '') return true;                               // empty <cf-image>
+    const pct = [], rest = [];
+    for (const t of _wsTokens(arg)) {
+      if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(t)) pct.push(t); else rest.push(t);
+    }
+    if (pct.length > 1) return true;                           // at most one <percentage>
+    if (rest.length !== 1) return true;                        // exactly one <image>|<color>
+    if (pct.length === 1) { const v = parseFloat(pct[0]); if (v < 0 || v > 100) return true; }
+  }
+  return false;
+};
+// Walk every cross-fade() head (balanced-paren scan, parallel to _gradientInvalid)
+// and reject the first ill-formed one. Defers on var()/env() (substitution pending).
+const _crossFadeInvalid = (value) => {
+  const s = String(value);
+  if (!/cross-fade\(/i.test(s)) return false;                  // fast path: no cross-fade()
+  if (/var\(|env\(/i.test(s)) return false;                    // substitution pending → defer
+  const re = /(?:-webkit-)?cross-fade\(/gi;
+  let m;
+  while ((m = re.exec(s))) {
+    const start = m.index;
+    const before = start > 0 ? s[start - 1] : '';
+    if (before && /[A-Za-z0-9_-]/.test(before)) continue;      // embedded ident → not a head
+    const open = start + m[0].length - 1;                      // index of the '('
+    let depth = 0, j = open;
+    for (; j < s.length; j++) { if (s[j] === '(') depth++; else if (s[j] === ')' && --depth === 0) break; }
+    const inner = s.slice(open + 1, j < s.length ? j : s.length);
+    if (_crossFadeInnerInvalid(inner)) return true;
+    re.lastIndex = j < s.length ? j + 1 : s.length;            // resume past this cross-fade()
+  }
+  return false;
+};
+// background-image is a comma list of `<bg-image> = none | <image>` layers. Each
+// layer must be a single token that is `none`, an <image> function/url() head, or
+// a `light-dark()` (which resolves to an <image> here); anything else (`none, auto`
+// — `auto` is neither) is invalid. Defers on var()/env() (a substitution may expand
+// to a valid <image>).
+const _bgImageLayersInvalid = (value) => {
+  const s = String(value);
+  if (/var\(|env\(/i.test(s)) return false;                    // substitution pending → defer
+  for (const layer of _commaSplitTop(s)) {
+    const toks = _wsTokens(layer.trim());
+    if (toks.length !== 1) return true;
+    if (!_isBgImageTok(toks[0]) && !/^light-dark\(/i.test(toks[0])) return true;
   }
   return false;
 };

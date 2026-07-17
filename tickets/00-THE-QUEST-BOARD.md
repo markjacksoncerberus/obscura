@@ -187,6 +187,30 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-17 (Quest #205 The Background-Image Verdict — three parallel rejection gates for `background-image-invalid`, +12, ZERO regressions):**
+Took #204's next-leverage: `background-image-invalid` **0/12** in `css/css-backgrounds/parsing/` (NOT `css-images` — that dir has
+no `background-image-*` files). The 12 failures were three clean groups of *pure rejections* (no serialization change), each a
+small parallel gate leaving the `_canonGradients`/`_canonCrossFade` engines untouched: **(1) negative radial radii (6)** —
+a radial `<radial-size>` is one/two `<length-percentage>` radii which MUST be non-negative (`radial-gradient(circle -10px …)`,
+`ellipse -20px 30px`, `-20% 30%`, `20px -30px`); made `_gradientConfigInvalid` type-aware (threaded `type` from `_gradientInvalid`
+→ `_gradientInnerInvalid`) and, for `type==='radial'`, reject any prelude token (before `at`) that is a literal negative
+`<length-percentage>` (`_isPosLP(t) && parseFloat(t) < 0`). RADIAL-only — linear/conic preludes carry angles, where negative is
+valid. **(2) `cross-fade()` percentages (5)** — cross-fade was CANONICALIZED but never VALIDATED; new `_crossFadeInvalid`
+(balanced-paren scan, parallel to `_gradientInvalid`) enforces `<cf-image> = <percentage [0,100]>? && [<image>|<color>]`: partition
+each cf-image's tokens into plain-`%` vs rest; AT MOST one `%`, EXACTLY one rest token, `%` in `[0,100]`. Rejects `auto blue`/`1px red`
+(two rest toks), `calc(1% + 1px) red` (mixed-type calc is one non-% token → two rest), `-1%`/`101%` (range). Valid `50% url(…)`,
+`red 33%`, `blue`, nested cross-fade all leave exactly one rest + in-range %. **(3) `none, auto` bad layer (1)** — new
+`_bgImageLayersInvalid` (name-guarded to `background-image`): each comma layer must be a single token that is `none`, an `<image>`
+function/url() head (`_isBgImageTok`), or `light-dark()`; `auto` is none of these. Defers on var()/env(). Both new gates wired into
+BOTH setProperty paths (inline ~864, API ~1204) beside the existing `_imageFuncInvalid`/`_gradientInvalid`. **Regression caught &
+fixed mid-flight:** the first `_bgImageLayersInvalid` rejected `light-dark(url(…), url(…))` (a valid bg-image layer not in
+`_BG_IMAGE_FN_RE`) → dropped background-image-valid 13→10; added the explicit `light-dark(` allowance → restored 13/13. **WINS:**
+background-image-invalid 0→12. **+12, ZERO regressions.** Sweep held: background-image-valid 13/13, background-valid 45/46
+(pre-existing cap), background-computed 39/39, gradient-position-invalid 9/9 + -valid 18/18, gradient-interpolation-method-invalid
+292/292 + -valid 1398/1398, image-function-valid 13/13 + -invalid 6/6, object-fit-invalid 5/5, object-position-valid 18/18,
+image-orientation-invalid 12/12, mask-image-computed 47/47, line-clamp-valid 18/18, cursor-invalid 10/10, qsa 1975. **CAP:** none in
+this file. Scroll `tickets/205-the-background-image-verdict.md`.
+
 **Session 2026-07-17 (Quest #204 The Gradient Position Verdict — a strict `<position>` gate for gradient `at` clauses, +9, ZERO regressions):**
 Took #203's next-leverage: `gradient-position-invalid` **0/9** in `css/css-images/parsing/`. A radial/conic gradient's
 `at <position>` clause uses the **strict CSS Values `<position>` grammar** — which, unlike the `<bg-position>` grammar
