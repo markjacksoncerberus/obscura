@@ -915,6 +915,12 @@ const _parseStyleDecls = (text) => {
           const c = _serContain(value, false); if (c == null) continue; // invalid <contain> → drop
           value = c;
         }
+      } else if (name === 'line-clamp') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _serLineClamp(value); if (c == null) continue;   // invalid <line-clamp> → drop
+          value = c;
+        }
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1326,6 +1332,12 @@ class CSSStyleDeclaration {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
         const c = _serContain(stored, false); if (c == null) return; // invalid <contain> → ignore
+        stored = c;
+      }
+    } else if (!custom && name === 'line-clamp') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _serLineClamp(stored); if (c == null) return;      // invalid <line-clamp> → ignore
         stored = c;
       }
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
@@ -14881,6 +14893,67 @@ const _serContain = (value, computed) => {
   if (layout) parts.push('layout');
   if (style) parts.push('style');
   if (paint) parts.push('paint');
+  return parts.join(' ');
+};
+
+// line-clamp = none | [ <integer [1,∞]> || <'block-ellipsis'> ] -webkit-legacy?
+// (CSS Overflow 4 §5.1). A shorthand for max-lines / block-ellipsis / continue,
+// but only its own specified-value serialization is exercised by the parsing
+// tests, so we canonicalize the string directly rather than expand into longhands.
+// Canonical form:  <max-lines> <block-ellipsis>? -webkit-legacy?  where
+//   • <max-lines> is the integer, or the keyword `auto` when the integer is omitted
+//     (the max-lines slot is always serialized), and
+//   • the <block-ellipsis> token is emitted only when it is not the default:
+//       `auto`      → kept ONLY beside an integer ("8 auto"→"8 auto"; standalone→just "auto")
+//       `ellipsis`  → the pre-standard alias for the default auto ellipsis; elided
+//                     ("8 ellipsis"→"8", "ellipsis"→"auto")
+//       omitted     → default; elided
+//       `no-ellipsis` / <string> → emitted verbatim.
+// A leading `auto` beside another block-ellipsis token (e.g. "auto no-ellipsis",
+// the canonical output of "no-ellipsis") is read as the max-lines placeholder so
+// canonical values round-trip. Returns the canonical string, or null for an
+// invalid value; CSS-wide keywords and var()/env() are handled by the caller.
+const _serLineClamp = (value) => {
+  const raw = String(value).trim();
+  if (raw === '') return null;
+  if (raw.toLowerCase() === 'none') return 'none';
+  let toks = _wsTokens(raw);
+  if (!toks.length) return null;
+  let legacy = false;
+  if (toks[toks.length - 1].toLowerCase() === '-webkit-legacy') {
+    legacy = true; toks = toks.slice(0, -1);
+    if (!toks.length) return null;                       // `-webkit-legacy` alone → invalid
+  }
+  if (toks.length > 2) return null;                      // the [<int> || <B>] group is 1–2 tokens
+  let intVal = null; const ells = [];                    // ells: auto|ellipsis|no-ellipsis|<string>
+  for (const t of toks) {
+    const lt = t.toLowerCase();
+    if (/^[-+]?\d+$/.test(t)) {                          // an <integer>
+      if (intVal !== null) return null;                  // two integers
+      const n = parseInt(t, 10);
+      if (!(n >= 1)) return null;                        // <integer [1,∞]> — zero/negative invalid
+      intVal = n;
+    } else if (lt === 'auto' || lt === 'ellipsis' || lt === 'no-ellipsis') {
+      ells.push(lt);
+    } else if (t[0] === '"' || t[0] === "'") {           // a <string>
+      if (t.length < 2 || t[t.length - 1] !== t[0]) return null;  // unterminated string
+      ells.push(t);                                      // preserve verbatim
+    } else return null;                                  // unknown token (e.g. `none` in a list)
+  }
+  let ell = null;
+  if (ells.length === 1) ell = ells[0];
+  else if (ells.length === 2) {                          // e.g. "auto no-ellipsis": one `auto` = placeholder
+    const ai = ells.indexOf('auto');
+    if (ai === -1 || intVal !== null) return null;       // two real block-ellipsis, or int+2 ellipsis
+    ell = ells[1 - ai];                                  // the non-placeholder component (or `auto`)
+  } else if (ells.length > 2) return null;
+  const hasInt = intVal !== null;
+  const parts = [hasInt ? String(intVal) : 'auto'];      // <max-lines> slot
+  if (ell === 'auto') { if (hasInt) parts.push('auto'); }// explicit auto kept only beside an integer
+  else if (ell === 'no-ellipsis') parts.push('no-ellipsis');
+  else if (ell !== null && ell !== 'ellipsis') parts.push(ell);  // a <string>
+  // ell === 'ellipsis' or null → the default ellipsis, elided
+  if (legacy) parts.push('-webkit-legacy');
   return parts.join(' ');
 };
 

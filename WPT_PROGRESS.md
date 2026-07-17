@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-16 (Quest #200).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #201).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-overflow/parsing/line-clamp-invalid.html` | 0/8 | **8/8** | ✅ 100% | **Quest #201 The Line-Clamp Verdict.** `line-clamp = none \| [ <integer [1,∞]> \|\| <'block-ellipsis'> ] -webkit-legacy?` engine (`_serLineClamp`): rejects `0`/`-5` (int must be ≥1), `none <x>` combos, bare `-webkit-legacy`, 3-token groups. **+8.** |
+| `css/css-overflow/parsing/line-clamp-valid.html` | 10/18 | **18/18** | ✅ 100% | **Quest #201.** Canonical `<max-lines> <block-ellipsis>? -webkit-legacy?`: reorder int-first (`no-ellipsis 10`→`10 no-ellipsis`), `ellipsis`→default elided (`8 ellipsis`→`8`, `ellipsis`→`auto`), string prepends `auto` placeholder (`" x "`→`auto " x "`), legacy renders omitted max-lines as `auto`. **+8.** |
 | `css/css-ui/parsing/cursor-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #200 The Cursor Verdict.** `cursor = [ <cursor-image> [<x> <y>]? , ]* <keyword>` engine (`_serCursor`): url/image-set/light-dark images ONLY (generated images rejected), hotspot `<x> <y>` are `<number>` (lengths/`%` invalid), final item a bare cursor keyword. **+10.** |
 | `css/css-ui/parsing/cursor-valid.html` | 45/46 | **46/46** | ✅ 100% | **Quest #200.** Hotspot calc folded (`calc(2 + 0)`→`calc(2)`). **+1.** |
 | `css/css-ui/parsing/cursor-computed.html` | 37/39 | 36/39 | ⚠️ 92% | **Quest #200.** −1 inherent cap: the 3 gradient computed rows contradict cursor-invalid (which requires gradient rejection); no browser passes both, and 2 already failed on malformed expected strings (missing `)`, `crosshair`→`pointer` typo). |
