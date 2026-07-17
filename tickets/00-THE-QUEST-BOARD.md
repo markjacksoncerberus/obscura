@@ -190,6 +190,28 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-17 (Quest #211 The Animation Shorthand Verdict — the `animation` shorthand in `css-animations/parsing/`, +13, ZERO regressions):**
+Took #210's next-leverage (the `animation` shorthand): baselined `animation-invalid` 0/8, `animation-valid` 9/12, `animation-computed`
+12/15 — pure raw-store, the shorthand had no value handling. Mirrored the #209 transition template with three new helpers beside
+`_canonAnimName`, both setProperty paths wired (var()/env()/math/CSS-wide deferred): **`_parseSingleAnimation`** parses one
+`<single-animation>` layer — the first `<time>` fills duration (≥0s), the second fills delay; `auto` fills duration; a bare keyword is
+matched against the components in grammar order (duration/easing/iteration-count/direction/fill-mode/play-state) BEFORE falling back to a
+`<keyframes-name>`, so `reverse` reads as a direction not a name, and `none` is assigned to animation-name (its reset value). Rejects a
+third `<time>` (`1s 2s 3s`), a negative duration (`-1s -2s`), two easings (`steps(1) steps(2)`), two numbers (`1 2`), and any repeated
+component (three directions/fill-modes/play-states/names). **`_serSingleAnimation`** lists non-default components in canonical order
+duration·timing·delay·iter·direction·fill·play·name (duration kept whenever a delay prints, so the two `<time>`s stay unambiguous);
+an all-default layer serializes as `none`. **`_canonAnimationShorthand`** maps `<single-animation>#` over the top-level comma list. Also
+extracted `_canonAnimNameTok` from `_canonAnimName` (shared single-token `<keyframes-name>` canon; `_canonAnimName` refactored to use it,
+byte-identical). **WINS:** invalid 0→8, valid 9→12, computed 12→14 (+2 bonus — canonical specified serialization fed the computed path).
+`anim paused both reverse 4 1s -3s cubic-bezier(0, -2, 1, 3)`→`1s cubic-bezier(0, -2, 1, 3) -3s 4 reverse both paused anim`;
+`cubic-bezier( 0, -2, 1, 3 )`→`cubic-bezier(0, -2, 1, 3)`. **+13, ZERO regressions.** Sweep held: qsa 1975, classlist 1420, whole
+css-transitions/parsing dir 101/101, every animation longhand at its #210 baseline (name-valid 27/27, name-computed 26/27,
+duration-computed 11/15, delay-computed 3/4). **CAP:** `animation-computed` 14/15 — the last fail (`delay but no duration`→`0s 1s`) is a
+getComputedStyle shorthand-reconstruction gap, not the specified-value path (`animation-composition-invalid` is a 404, not in this dir).
+**NEXT LEVERAGE:** scroll-driven `animation-range-{start,end}` (invalid 11+14, a NEW grammar `[normal | <length-percentage> |
+<timeline-range-name> <length-percentage>?]#`) and `animation-timeline` OR a NEW `css/*/parsing/` dir (baseline `*-invalid` 0/N first).
+Scroll `tickets/211-the-animation-shorthand-verdict.md`.
+
 **Session 2026-07-17 (Quest #210 The Animation Longhand Verdict — the `css-animations/parsing/` longhands, +55, ZERO regressions):**
 Took #209's next-leverage (`css/css-animations/parsing/`): baselined the dir — every `animation-*` longhand `*-invalid` file was at
 0/N (delay 0/5, duration 0/6, timing-function 0/7, direction 0/4, fill-mode 0/4, play-state 0/4, composition 0/4, iteration-count

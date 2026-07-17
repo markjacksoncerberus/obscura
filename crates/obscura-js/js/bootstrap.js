@@ -1002,6 +1002,12 @@ const _parseStyleDecls = (text) => {
           const c = _canonAnimName(value); if (c == null) continue;             // invalid <keyframes-name># → drop
           value = c;
         }
+      } else if (name === 'animation') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_MATHFN_NAME_RE.test(value)) {
+          const c = _canonAnimationShorthand(value); if (c == null) continue;   // invalid <single-animation># → drop
+          value = c;
+        }
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1506,6 +1512,12 @@ class CSSStyleDeclaration {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
         const c = _canonAnimName(stored); if (c == null) return;             // invalid <keyframes-name># → ignore
+        stored = c;
+      }
+    } else if (!custom && name === 'animation') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
+        const c = _canonAnimationShorthand(stored); if (c == null) return;   // invalid <single-animation># → ignore
         stored = c;
       }
     } else if (!custom && _ANIM_KEYWORD_LISTS.has(name)) {
@@ -15446,6 +15458,22 @@ const _canonAnimIterationCount = (value) => {
 // keyword lowercased); the reserved idents are excluded from a list <custom-ident>.
 const _ANIM_NAME_RESERVED = new Set(
   ['none', 'default', 'initial', 'inherit', 'unset', 'revert', 'revert-layer']);
+// Canonicalize a single <keyframes-name> token (custom-ident | string | `none`), or
+// null. Shared by animation-name and the `animation` shorthand's name component.
+const _canonAnimNameTok = (tok) => {
+  if (tok[0] === '"' || tok[0] === "'") {          // a <string> keyframes-name
+    if (tok.length < 2 || tok[tok.length - 1] !== tok[0]) return null;  // unterminated
+    const inner = _unescapeIdent(tok.slice(1, -1));
+    if (inner.length === 0) return null;           // `""`
+    return _ANIM_NAME_RESERVED.has(inner.toLowerCase())
+      ? _serCssString(inner) : _serIdent(inner);
+  }
+  const low = tok.toLowerCase();
+  if (low === 'none') return 'none';               // keyword → canonical lowercase
+  if (_ANIM_NAME_RESERVED.has(low)) return null;   // CSS-wide / `default` bare → reject
+  if (!_GRID_CI_RE.test(tok)) return null;         // `12` is not a <custom-ident>
+  return tok;                                       // custom-ident kept verbatim
+};
 const _canonAnimName = (value) => {
   const items = _commaSplitTop(String(value)).map((s) => s.trim());
   if (!items.length) return null;
@@ -15453,20 +15481,84 @@ const _canonAnimName = (value) => {
   for (const it of items) {
     const toks = _wsTokens(it);
     if (toks.length !== 1) return null;            // `one two`
-    const tok = toks[0];
-    if (tok[0] === '"' || tok[0] === "'") {        // a <string> keyframes-name
-      if (tok.length < 2 || tok[tok.length - 1] !== tok[0]) return null;  // unterminated
-      const inner = _unescapeIdent(tok.slice(1, -1));
-      if (inner.length === 0) return null;         // `""`
-      out.push(_ANIM_NAME_RESERVED.has(inner.toLowerCase())
-        ? _serCssString(inner) : _serIdent(inner));
+    const c = _canonAnimNameTok(toks[0]);
+    if (c === null) return null;                   // `12` / `""` / bare CSS-wide
+    out.push(c);
+  }
+  return out.join(', ');
+};
+
+// animation = <single-animation># (CSS Animations 1 §3). A layer is an
+// order-independent (||) combination of the eight longhand components. The first
+// <time> fills animation-duration ([0s,∞]), the second fills animation-delay; a bare
+// keyword is matched against the components in grammar order (duration `auto`,
+// easing, iteration-count, direction, fill-mode, play-state) before falling back to
+// a <keyframes-name>, so e.g. `reverse` reads as a direction, not a name. `none` is
+// assigned to animation-name (its reset value). Returns component parts, or null.
+const _parseSingleAnimation = (layer) => {
+  const toks = _wsTokens(layer.trim());
+  if (!toks.length) return null;
+  let dur = null, tf = null, delay = null, iter = null,
+    dir = null, fill = null, play = null, name = null;
+  for (const t of toks) {
+    const low = t.toLowerCase();
+    if (_isTimeTok(t)) {                            // <time>: duration first, delay second
+      if (dur === null) { if (parseFloat(t) < 0) return null; dur = t; }  // duration ≥ 0s
+      else if (delay === null) delay = t;
+      else return null;                            // a third <time>
       continue;
     }
-    const low = tok.toLowerCase();
-    if (low === 'none') { out.push('none'); continue; }  // keyword → canonical lowercase
-    if (_ANIM_NAME_RESERVED.has(low)) return null;       // CSS-wide / `default` bare → reject
-    if (!_GRID_CI_RE.test(tok)) return null;             // `12` is not a <custom-ident>
-    out.push(tok);                                       // custom-ident kept verbatim
+    if (low === 'auto') {                          // animation-duration = auto | <time>
+      if (dur !== null) return null;
+      dur = 'auto';
+      continue;
+    }
+    const e = _canonEasing(t);                     // <easing-function> beats a <custom-ident>
+    if (e !== null) { if (tf !== null) return null; tf = e; continue; }
+    if (low === 'infinite') { if (iter !== null) return null; iter = 'infinite'; continue; }
+    if (_TRANS_NUM_RE.test(t)) {                    // <number [0,∞]> iteration count
+      if (iter !== null || parseFloat(t) < 0) return null;
+      iter = t; continue;
+    }
+    if (low === 'none') { if (name !== null) return null; name = 'none'; continue; }  // → name
+    if (_ANIM_DIRECTION_KW.has(low)) { if (dir !== null) return null; dir = low; continue; }
+    if (low !== 'none' && _ANIM_FILL_MODE_KW.has(low)) { if (fill !== null) return null; fill = low; continue; }
+    if (_ANIM_PLAY_STATE_KW.has(low)) { if (play !== null) return null; play = low; continue; }
+    const n = _canonAnimNameTok(t);                // else a <keyframes-name>
+    if (n === null || name !== null) return null;  // not a name, or a second name
+    name = n;
+  }
+  return { dur: dur == null ? 'auto' : dur, tf: tf == null ? 'ease' : tf,
+    delay: delay == null ? '0s' : delay, iter: iter == null ? '1' : iter,
+    dir: dir == null ? 'normal' : dir, fill: fill == null ? 'none' : fill,
+    play: play == null ? 'running' : play, name: name == null ? 'none' : name };
+};
+// Serialize a layer's components in canonical order — duration, timing, delay,
+// iteration-count, direction, fill-mode, play-state, name — omitting any at its
+// initial value (duration is kept whenever a delay prints, so the two <time>s stay
+// positionally unambiguous). An all-default layer serializes as `none`.
+const _serSingleAnimation = (c) => {
+  const parts = [];
+  if (c.dur !== 'auto' || c.delay !== '0s') parts.push(c.dur);  // duration precedes any delay
+  if (c.tf !== 'ease') parts.push(c.tf);
+  if (c.delay !== '0s') parts.push(c.delay);
+  if (c.iter !== '1') parts.push(c.iter);
+  if (c.dir !== 'normal') parts.push(c.dir);
+  if (c.fill !== 'none') parts.push(c.fill);
+  if (c.play !== 'running') parts.push(c.play);
+  if (c.name !== 'none') parts.push(c.name);
+  return parts.length ? parts.join(' ') : 'none';  // all-default layer → `none`
+};
+// animation = <single-animation>#. Returns the canonical shorthand or null.
+const _canonAnimationShorthand = (value) => {
+  const layers = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!layers.length) return null;
+  const out = [];
+  for (const l of layers) {
+    if (!l) return null;                           // empty layer (stray comma)
+    const c = _parseSingleAnimation(l);
+    if (c === null) return null;
+    out.push(_serSingleAnimation(c));
   }
   return out.join(', ');
 };

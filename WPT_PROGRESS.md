@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #210).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #211).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-animations/parsing/animation-invalid.html` | 0/8 | **8/8** | ✅ 100% | **Quest #211 The Animation Shorthand Verdict.** The `animation` shorthand was pure raw-store. `_canonAnimationShorthand` — `<single-animation>#` via `_parseSingleAnimation`/`_serSingleAnimation`. First `<time>` = duration ([0s,∞]), second = delay; bare keywords matched in grammar order before falling to a `<keyframes-name>`. Rejects `1s 2s 3s`, `-1s -2s`, `steps(1) steps(2)`, `1 2`, three directions/fill-modes/play-states, three names. **+8.** |
+| `css/css-animations/parsing/animation-valid.html` | 9/12 | **12/12** | ✅ 100% | **Quest #211.** Canonical layer order duration·timing·delay·iter·direction·fill·play·name, defaults omitted (`none` fallback for all-default). `anim paused both reverse 4 1s -3s cubic-bezier(0, -2, 1, 3)`→`1s cubic-bezier(0, -2, 1, 3) -3s 4 reverse both paused anim`; whitespace-normalizes `cubic-bezier( 0, -2, 1, 3 )`. **+3.** |
+| `css/css-animations/parsing/animation-computed.html` | 12/15 | **14/15** | 🟡 93% | **Quest #211 (bonus).** Canonical specified serialization fed the computed path +2. Remaining fail (`delay but no duration`→`0s 1s`) is a getComputedStyle reconstruction gap, not the specified path. **+2.** |
 | `css/css-animations/parsing/animation-name-invalid.html` | 0/9 | **9/9** | ✅ 100% | **Quest #210 The Animation Longhand Verdict.** The `css-animations/parsing/` longhands were pure raw-store. `_canonAnimName` — `[none \| <keyframes-name>]#`, `<keyframes-name> = <custom-ident> \| <string>`. Rejects `12`, `one two`, CSS-wide/`default`/`revert`/`revert-layer` bare in a list, `""`. **+9.** |
 | `css/css-animations/parsing/animation-timing-function-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #210.** Reuses `_canonTimingFunction` (`<easing-function>#`) — the malformed `steps(2,()start)` family. **+7.** |
 | `css/css-animations/parsing/animation-duration-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #210.** `_isValidAnimDuration` — `auto \| <time [0s,∞]>#` (auto admitted for scroll timelines). Rejects `-3s`, `0`, `infinite`, `1s 2s`, `1s, initial`. **+6.** |
