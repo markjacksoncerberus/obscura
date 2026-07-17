@@ -976,6 +976,38 @@ const _parseStyleDecls = (text) => {
           const c = _canonTransitionShorthand(value); if (c == null) continue;  // invalid <single-transition># → drop
           value = c;
         }
+      } else if (name === 'animation-duration' || name === 'animation-delay') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_MATHFN_NAME_RE.test(value)) {
+          const ok = name === 'animation-duration'
+            ? _isValidAnimDuration(value)          // auto | <time [0s,∞]>#
+            : _isValidTransitionTime(value, false);  // animation-delay = <time>#
+          if (!ok) continue;                       // invalid → drop
+        }
+      } else if (name === 'animation-timing-function') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_MATHFN_NAME_RE.test(value)) {
+          const c = _canonTimingFunction(value); if (c == null) continue;       // invalid <easing-function># → drop
+          value = c;
+        }
+      } else if (name === 'animation-iteration-count') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_MATHFN_NAME_RE.test(value)) {
+          const c = _canonAnimIterationCount(value); if (c == null) continue;   // invalid <number [0,∞]># → drop
+          value = c;
+        }
+      } else if (name === 'animation-name') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonAnimName(value); if (c == null) continue;             // invalid <keyframes-name># → drop
+          value = c;
+        }
+      } else if (_ANIM_KEYWORD_LISTS.has(name)) {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonAnimKeywordList(value, _ANIM_KEYWORD_LISTS.get(name)); if (c == null) continue;  // invalid <keyword># → drop
+          value = c;
+        }
       } else if (_BG_POSITION_AXIS.has(name)) {
         if (!_isValidBgAxis(value, _BG_POSITION_AXIS.get(name))) continue; // invalid single-axis <bg-position> → drop
         value = _canonBgAxis(value, _BG_POSITION_AXIS.get(name));
@@ -1448,6 +1480,38 @@ class CSSStyleDeclaration {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
         const c = _canonTransitionShorthand(stored); if (c == null) return;  // invalid <single-transition># → ignore
+        stored = c;
+      }
+    } else if (!custom && (name === 'animation-duration' || name === 'animation-delay')) {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
+        const ok = name === 'animation-duration'
+          ? _isValidAnimDuration(stored)           // auto | <time [0s,∞]>#
+          : _isValidTransitionTime(stored, false);   // animation-delay = <time>#
+        if (!ok) return;                           // invalid → ignore
+      }
+    } else if (!custom && name === 'animation-timing-function') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
+        const c = _canonTimingFunction(stored); if (c == null) return;       // invalid <easing-function># → ignore
+        stored = c;
+      }
+    } else if (!custom && name === 'animation-iteration-count') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
+        const c = _canonAnimIterationCount(stored); if (c == null) return;   // invalid <number [0,∞]># → ignore
+        stored = c;
+      }
+    } else if (!custom && name === 'animation-name') {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonAnimName(stored); if (c == null) return;             // invalid <keyframes-name># → ignore
+        stored = c;
+      }
+    } else if (!custom && _ANIM_KEYWORD_LISTS.has(name)) {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonAnimKeywordList(stored, _ANIM_KEYWORD_LISTS.get(name)); if (c == null) return;  // invalid <keyword># → ignore
         stored = c;
       }
     } else if (!custom && _BG_POSITION_AXIS.has(name)) {
@@ -15301,6 +15365,108 @@ const _canonTransitionShorthand = (value) => {
     const c = _parseSingleTransition(l);
     if (c === null) return null;
     out.push(_serSingleTransition(c));
+  }
+  return out.join(', ');
+};
+
+// ── animation-* longhands (CSS Animations 1 §3) ──────────────────────────────
+// animation-duration / animation-delay reuse `_isValidTransitionTime` (duration is
+// <time [0s,∞]>#, delay is <time>#) and animation-timing-function reuses
+// `_canonTimingFunction` (<easing-function>#) — the grammars are identical to the
+// matching transition-* longhands, so those helpers are wired directly at the call
+// sites. The remaining longhands need their own small gates:
+
+// animation-duration = <single-animation-duration>#, <single-animation-duration> =
+// auto | <time [0s,∞]> (CSS Animations 2 — `auto` binds the duration to a timeline).
+// `_isValidTransitionTime` covers only the <time># half, so animation-duration needs
+// its own gate that also admits `auto`. Value kept byte-identical when valid (the
+// raw-store serialization is already canonical; computed resolution happens later).
+const _isValidAnimDuration = (value) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!items.length) return false;
+  for (const it of items) {
+    const toks = _wsTokens(it);
+    if (toks.length !== 1) return false;           // `1s 2s`
+    if (toks[0].toLowerCase() === 'auto') continue;
+    if (!_isTimeTok(toks[0]) || parseFloat(toks[0]) < 0) return false;  // `-3s`/`0`/`infinite`
+  }
+  return true;
+};
+
+// animation-direction / -fill-mode / -play-state / -composition are each a
+// <keyword>#: every comma item is exactly one keyword from the property's set
+// (case-insensitive → lowercased). Multi-token items and CSS-wide keywords in a
+// list are rejected (not a single token / not in the set).
+const _ANIM_DIRECTION_KW = new Set(['normal', 'reverse', 'alternate', 'alternate-reverse']);
+const _ANIM_FILL_MODE_KW = new Set(['none', 'forwards', 'backwards', 'both']);
+const _ANIM_PLAY_STATE_KW = new Set(['running', 'paused']);
+const _ANIM_COMPOSITION_KW = new Set(['replace', 'add', 'accumulate']);
+const _ANIM_KEYWORD_LISTS = new Map([
+  ['animation-direction', _ANIM_DIRECTION_KW],
+  ['animation-fill-mode', _ANIM_FILL_MODE_KW],
+  ['animation-play-state', _ANIM_PLAY_STATE_KW],
+  ['animation-composition', _ANIM_COMPOSITION_KW],
+]);
+const _canonAnimKeywordList = (value, kwSet) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!items.length) return null;
+  const out = [];
+  for (const it of items) {
+    const toks = _wsTokens(it);
+    if (toks.length !== 1) return null;            // `normal reverse`
+    const low = toks[0].toLowerCase();
+    if (!kwSet.has(low)) return null;              // `auto` / `initial` in a list
+    out.push(low);
+  }
+  return out.join(', ');
+};
+
+// animation-iteration-count = <single-animation-iteration-count>#,
+//   <single-animation-iteration-count> = infinite | <number [0,∞]>
+// (numbers kept verbatim; `infinite` lowercased). Rejects `-2`/`3 4`/`auto`.
+const _canonAnimIterationCount = (value) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!items.length) return null;
+  const out = [];
+  for (const it of items) {
+    const toks = _wsTokens(it);
+    if (toks.length !== 1) return null;            // `3 4`
+    const tok = toks[0], low = tok.toLowerCase();
+    if (low === 'infinite') { out.push('infinite'); continue; }
+    if (!_TRANS_NUM_RE.test(tok) || parseFloat(tok) < 0) return null;  // `-2`/`auto`/`initial`
+    out.push(tok);                                 // <number> kept verbatim
+  }
+  return out.join(', ');
+};
+
+// animation-name = [ none | <keyframes-name> ]#, <keyframes-name> = <custom-ident>
+// | <string> (§3.1). A <string> is re-serialized as a <custom-ident> UNLESS its
+// value collides with `none` / a CSS-wide keyword / `default` — those stay quoted so
+// the meaning can't shift. A bare <custom-ident> is kept verbatim (only the `none`
+// keyword lowercased); the reserved idents are excluded from a list <custom-ident>.
+const _ANIM_NAME_RESERVED = new Set(
+  ['none', 'default', 'initial', 'inherit', 'unset', 'revert', 'revert-layer']);
+const _canonAnimName = (value) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!items.length) return null;
+  const out = [];
+  for (const it of items) {
+    const toks = _wsTokens(it);
+    if (toks.length !== 1) return null;            // `one two`
+    const tok = toks[0];
+    if (tok[0] === '"' || tok[0] === "'") {        // a <string> keyframes-name
+      if (tok.length < 2 || tok[tok.length - 1] !== tok[0]) return null;  // unterminated
+      const inner = _unescapeIdent(tok.slice(1, -1));
+      if (inner.length === 0) return null;         // `""`
+      out.push(_ANIM_NAME_RESERVED.has(inner.toLowerCase())
+        ? _serCssString(inner) : _serIdent(inner));
+      continue;
+    }
+    const low = tok.toLowerCase();
+    if (low === 'none') { out.push('none'); continue; }  // keyword → canonical lowercase
+    if (_ANIM_NAME_RESERVED.has(low)) return null;       // CSS-wide / `default` bare → reject
+    if (!_GRID_CI_RE.test(tok)) return null;             // `12` is not a <custom-ident>
+    out.push(tok);                                       // custom-ident kept verbatim
   }
   return out.join(', ');
 };

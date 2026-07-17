@@ -190,6 +190,30 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+**Session 2026-07-17 (Quest #210 The Animation Longhand Verdict — the `css-animations/parsing/` longhands, +55, ZERO regressions):**
+Took #209's next-leverage (`css/css-animations/parsing/`): baselined the dir — every `animation-*` longhand `*-invalid` file was at
+0/N (delay 0/5, duration 0/6, timing-function 0/7, direction 0/4, fill-mode 0/4, play-state 0/4, composition 0/4, iteration-count
+0/5, name 0/9 = 48), pure raw-store. The longhands share the transition grammar, so two helpers were **reused directly** at the call
+sites — `_isValidTransitionTime(v, false)` for `animation-delay` (`<time>#`) and `_canonTimingFunction` for `animation-timing-function`
+(`<easing-function>#`, the malformed `steps(2,()start)` family). Four new small helpers beside `_canonTransitionShorthand`, both
+setProperty paths wired, var()/env()/math/CSS-wide deferred: **`_isValidAnimDuration`** — `auto | <time [0s,∞]>#` (a dedicated gate,
+NOT `_isValidTransitionTime`, because animation-duration also admits `auto` for scroll timelines — rejecting it regressed
+`animation-duration-computed` 11→7, caught by the stash-baseline; restoring `auto` fixed it); rejects `-3s`/`0`/`infinite`/`1s 2s`.
+**`_canonAnimKeywordList(value, kwSet)`** — a `<keyword>#` gate shared by direction/fill-mode/play-state/composition (one keyword per
+comma item from the property's set, lowercased); rejects `auto`/`normal reverse`/`reverse, initial`. **`_canonAnimIterationCount`** —
+`infinite | <number [0,∞]>#` (numbers verbatim); rejects `auto`/`-2`/`3 4`/`initial, 4`. **`_canonAnimName`** —
+`[none | <keyframes-name>]#`, `<keyframes-name> = <custom-ident> | <string>`: a `<string>` re-serialized as a `<custom-ident>` via
+`_serIdent` (`"something"`→`something`, `"multi word string"`→`multi\ word\ string`, `"---\22---"`→`---\"---`) UNLESS its value
+collides with `none`/CSS-wide/`default` (then kept quoted via `_serCssString`, e.g. `"NoNe"`/`"initial"`); bare `none`→lowercased,
+bare CSS-wide/`default` rejected, `12`/`""` rejected. **WINS:** invalid 0→48 (9 files), animation-name-valid 23→27 (+4),
+animation-name-computed 23→26 (+3, bonus). **+55, ZERO regressions.** Sweep held: qsa 1975, classlist 1420, the whole
+`css-transitions/parsing/` dir (timing-function-invalid 25/25, -valid 22/22, property-invalid 15/15, transition-valid 10/10 — the
+reused helpers untouched), image-resolution-invalid 5/5, font-palette-invalid 4/4, background-image-invalid 12/12, and every
+animation longhand `-valid`/`-computed` file (delay-computed 3/4, duration-computed 11/15 — both at baseline). **CAP:** the
+`animation` shorthand (`animation-invalid` 8, `animation-valid` 3) and the scroll-driven `animation-range-{start,end}` (11+14) +
+`animation-composition-computed`/`-iteration-count-computed`/`-duration-computed` computed-resolution gaps remain — separate quests.
+Scroll `tickets/210-the-animation-longhand-verdict.md`.
+
 **Session 2026-07-17 (Quest #209 The Transition Verdict — the whole `css-transitions/parsing/` dir, +63, ZERO regressions):**
 Took #208's next-leverage (a NEW `css/*/parsing/` dir): baselined `css-scroll-snap`, `css-shapes`, `css-transitions`,
 `css-will-change`. The first three came back near/fully green; **`css-transitions` was pure raw-store** — all five `*-invalid`

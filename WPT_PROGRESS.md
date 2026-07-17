@@ -10,12 +10,23 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #209).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #210).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-animations/parsing/animation-name-invalid.html` | 0/9 | **9/9** | ✅ 100% | **Quest #210 The Animation Longhand Verdict.** The `css-animations/parsing/` longhands were pure raw-store. `_canonAnimName` — `[none \| <keyframes-name>]#`, `<keyframes-name> = <custom-ident> \| <string>`. Rejects `12`, `one two`, CSS-wide/`default`/`revert`/`revert-layer` bare in a list, `""`. **+9.** |
+| `css/css-animations/parsing/animation-timing-function-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #210.** Reuses `_canonTimingFunction` (`<easing-function>#`) — the malformed `steps(2,()start)` family. **+7.** |
+| `css/css-animations/parsing/animation-duration-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #210.** `_isValidAnimDuration` — `auto \| <time [0s,∞]>#` (auto admitted for scroll timelines). Rejects `-3s`, `0`, `infinite`, `1s 2s`, `1s, initial`. **+6.** |
+| `css/css-animations/parsing/animation-delay-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #210.** Reuses `_isValidTransitionTime(v, false)` — `<time>#`. Rejects `infinite`, `0`, `1s 2s 3s`, `initial, -3s`. **+5.** |
+| `css/css-animations/parsing/animation-iteration-count-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #210.** `_canonAnimIterationCount` — `infinite \| <number [0,∞]>#`. Rejects `auto`, `-2`, `3 4`, `initial, 4`. **+5.** |
+| `css/css-animations/parsing/animation-direction-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #210.** `_canonAnimKeywordList` — each item one keyword of `{normal, reverse, alternate, alternate-reverse}`. Rejects `auto`, `normal reverse`, `reverse, initial`. **+4.** |
+| `css/css-animations/parsing/animation-fill-mode-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #210.** Same gate, `{none, forwards, backwards, both}`. Rejects `auto`, `forwards backwards`, `both, initial`. **+4.** |
+| `css/css-animations/parsing/animation-play-state-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #210.** Same gate, `{running, paused}`. Rejects `auto`, `paused running`, `paused, initial`. **+4.** |
+| `css/css-animations/parsing/animation-composition-invalid.tentative.html` | 0/4 | **4/4** | ✅ 100% | **Quest #210.** Same gate, `{replace, add, accumulate}`. Rejects `auto`, `add replace`, `add, initial`. **+4.** |
+| `css/css-animations/parsing/animation-name-valid.html` | 23/27 | **27/27** | ✅ 100% | **Quest #210.** `_canonAnimName` serialization: `NONE`→`none`; a `<string>` → `<custom-ident>` (`"something"`→`something`, `"multi word string"`→`multi\ word\ string`, `"---\22---"`→`---\"---`) unless it collides with `none`/CSS-wide/`default` (then kept quoted, e.g. `"NoNe"`, `"initial"`). **+4.** |
+| `css/css-animations/parsing/animation-name-computed.html` | 23/27 | **26/27** | ✅ 96% | **Quest #210.** Same canonicalization flows through the computed path (bonus). **+3.** |
 | `css/css-transitions/parsing/transition-timing-function-invalid.html` | 0/25 | **25/25** | ✅ 100% | **Quest #209 The Transition Verdict.** The whole `css-transitions/parsing/` dir was pure raw-store. `_canonTimingFunction` (`<easing-function>#`) dispatches to `_canonCubicBezier` (x-coords ∈ [0,1]), `_canonSteps` (`steps(<int [1,∞]> [,pos]?)`, `jump-none`≥2, malformed `steps(2,()start)` family rejected), `_canonLinearEasing`; `step-start`→`steps(1, start)`. **+25.** |
 | `css/css-transitions/parsing/transition-property-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #209.** `_canonTransitionProperty` — `none \| <single-transition-property>#` (`all \| <custom-ident>`), excluded set none/default/CSS-wide. Rejects `one two three`, `1, 2, 3`, `none, one`, `initial, top`, `revert-layer, top`. **+15.** |
 | `css/css-transitions/parsing/transition-delay-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #209.** `_isValidTransitionTime` (pure gate) — `<time>#`, one `<time>` per comma item. Rejects `infinite`, `0`, `500ms 0.5s`, `-3s, initial`. **+5.** |
