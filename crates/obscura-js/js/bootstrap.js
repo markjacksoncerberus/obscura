@@ -18551,9 +18551,23 @@ const _normComputed = (el, kebab, v) => {
     while (out.length > 1 && out[out.length - 1] === out[out.length - 2]) out.pop();
     return out.join(' ');
   }
-  if (kebab === 'tab-size') {                              // <number> stays; <length> resolves to px, clamps ≥0
+  if (kebab === 'tab-size') {                              // <number [0,∞]> stays; <length> resolves to px, clamps ≥0
     const s = String(v).trim();
     if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(s)) return s;
+    // A math function is number-typed OR length-typed; classify it via `_mt` so the
+    // result serializes with the right unit. `cqZero` folds a container unit inside a
+    // `sign(2cqw - 10px)` gate to its sign (no container ⇒ cqw = 0), so
+    // `calc(10 + sign(2cqw - 10px) * 5)`→`5` (number) and its `* 5px` twin →`5px`.
+    if (_MATHFN_NAME_RE.test(s)) {
+      const root = _parseCalcTree(s);
+      const nv = _evalMath(s, 0, Object.assign(
+        { lengths: true, cqZero: true, emPx: _emPxOf(el), nonFinite: true }, _vpUnits(), _siblingOpts(el, s)));
+      if (root !== null && nv !== null) {
+        const ty = _mt(root, null);
+        if (ty === 'number') return _serNumber(_nfClamp(Math.max(0, nv)));
+        if (ty === 'length') return _clampNegPx(_serNumber(_nfClamp(nv)) + 'px');
+      }
+    }
     return _clampNegPx(_trComp(v, el, true, _vpUnits()));
   }
   if (kebab === 'text-indent') {                           // resolve the <length-percentage>, keep the trailing keywords

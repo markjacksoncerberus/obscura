@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #219).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #220).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-text/parsing/tab-size-computed.html` | 8/10 | **10/10** | ✅ 100% | **Quest #220 The Tab-Size Sign Verdict.** Closed the #181 cap (container-query `sign(2cqw…)` in tab-size). `tab-size` computed accepts `<number>` OR `<length>`; a math function was routed through `_trComp` whose length-opts lack `cqZero`, so `sign(2cqw - 10px)` stayed symbolic. Added a math branch that classifies the calc via `_mt` (number vs length) and folds with `cqZero`: `calc(10 + (sign(2cqw - 10px) * 5))`→`5` (number, cqw→0 ⇒ sign(-10px)=-1), `calc(10px + (sign(2cqw - 10px) * 5px))`→`5px` (length, clamps ≥0). **+2.** |
 | `css/css-transitions/parsing/transition-delay-computed.html` | 0/1 | **1/1** | ✅ 100% | **Quest #219 The Time-Computed Verdict.** `_computeTimeValue` folded only the FIRST comma layer of a `<time>#` list, so `-500ms, calc(2 * 3s)` stayed verbatim instead of `-0.5s, 6s`. Made it comma-aware (`_commaSplitTop`, resolve each layer, rejoin). **+1.** |
 | `css/css-animations/parsing/animation-delay-computed.html` | 3/4 | **4/4** | ✅ 100% | **Quest #219.** Added `cqZero: true` to the `_computeTimeValue` math opts so an unresolved container unit collapses to 0 — `calc(10s + (sign(2cqw - 10px) * 5s))` folds to `5s` (cqw→0 with no container ⇒ `sign(-10px)` = -1). **+1.** |
 | `css/css-animations/parsing/animation-duration-computed.html` | 11/15 | **15/15** | ✅ 100% | **Quest #219.** Comma-split (`20s, 10s` was truncated to `20s`) + the cqw-`sign()` fold + the `auto` coupling: `animation-duration: auto` computes to `0s` only when `animation-timeline` is the initial single `auto` (a document/time-driven timeline); a timeline LIST or scroll timeline (`--t`, `none`, `scroll()`, `view()`) keeps `auto`. **+4.** |
