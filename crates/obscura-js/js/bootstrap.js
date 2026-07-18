@@ -1004,9 +1004,13 @@ const _parseStyleDecls = (text) => {
         }
       } else if (name === 'animation') {
         const low = value.toLowerCase();
-        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_MATHFN_NAME_RE.test(value)) {
-          const c = _canonAnimationShorthand(value); if (c == null) continue;   // invalid <single-animation># → drop
-          value = c;
+        if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(value) || _MATHFN_NAME_RE.test(value)) {
+          // CSS-wide keyword / var()/env() / math-fn: kept as one `animation` blob key
+          // (the getter/computed echo it); do NOT expand into longhands.
+        } else {
+          const lh = _expandAnimation(value); if (!lh) continue;  // invalid <single-animation># → drop
+          for (const ln in lh) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `animation` key
         }
       } else if (name === 'animation-range-start' || name === 'animation-range-end') {
         const low = value.toLowerCase();
@@ -1532,9 +1536,20 @@ class CSSStyleDeclaration {
       }
     } else if (!custom && name === 'animation') {
       const low = stored.toLowerCase();
-      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
-        const c = _canonAnimationShorthand(stored); if (c == null) return;   // invalid <single-animation># → ignore
-        stored = c;
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored) || _MATHFN_NAME_RE.test(stored)) {
+        // CSS-wide / var()/env() / math-fn: kept as one `animation` blob key (the
+        // getter/computed echo it); clear any expanded longhands, then store below.
+        for (const ln of _ALL_ANIMATION_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandAnimation(stored); if (!lh) return;   // invalid <single-animation># → ignore
+        if ('animation' in this._props) { delete this._props['animation']; delete this._priority['animation']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln in lh) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `animation` key
       }
     } else if (!custom && (name === 'animation-range-start' || name === 'animation-range-end')) {
       const low = stored.toLowerCase();
@@ -1647,6 +1662,14 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'animation') {                             // shorthand: clear its eleven longhands
+      const old = (key in this._props) ? this._props[key]
+        : _serAnimationFromLonghands((ln) => this._props[ln]);
+      delete this._props['animation']; delete this._priority['animation'];  // any CSS-wide/var blob key
+      for (const ln of _ALL_ANIMATION_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     if (_ALIGN_SHORTHAND_LH[key]) {                         // gap/place-* shorthand: clear its longhands
       const old = _serializeAlignShorthand(this, key);
       delete this._props[key]; delete this._priority[key];   // any var()-stored shorthand key
@@ -1745,6 +1768,10 @@ class CSSStyleDeclaration {
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     if (key === 'offset') return _serializeOffsetShorthand(this);  // reconstruct from longhands
+    if (key === 'animation') {                                // reconstruct from its eleven longhands
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      return _serAnimationFromLonghands((ln) => this._props[ln]);
+    }
     if (key === 'animation-range') {                          // reconstruct from its two longhands
       if (key in this._props) return this._props[key];        // (never stored; guard for safety)
       return _serAnimRangeFromLonghands(this._props['animation-range-start'], this._props['animation-range-end']);
@@ -15621,10 +15648,14 @@ const _parseSingleAnimation = (layer) => {
 // Serialize a layer's components in canonical order — duration, timing, delay,
 // iteration-count, direction, fill-mode, play-state, name — omitting any at its
 // initial value (duration is kept whenever a delay prints, so the two <time>s stay
-// positionally unambiguous). An all-default layer serializes as `none`.
-const _serSingleAnimation = (c) => {
+// positionally unambiguous). An all-default layer serializes as `none`. The specified
+// initial duration is `auto`; at COMPUTED time it resolves to `0s`, and a specified
+// `auto` reads as that same initial — so when `computed`, both `auto` and `0s` are
+// the omittable default (`animation: none` → computed `none`, not `0s`).
+const _serSingleAnimation = (c, computed) => {
+  const durIsInitial = computed ? (c.dur === 'auto' || c.dur === '0s') : (c.dur === 'auto');
   const parts = [];
-  if (c.dur !== 'auto' || c.delay !== '0s') parts.push(c.dur);  // duration precedes any delay
+  if (!durIsInitial || c.delay !== '0s') parts.push(c.dur);  // duration precedes any delay
   if (c.tf !== 'ease') parts.push(c.tf);
   if (c.delay !== '0s') parts.push(c.delay);
   if (c.iter !== '1') parts.push(c.iter);
@@ -15644,6 +15675,60 @@ const _canonAnimationShorthand = (value) => {
     const c = _parseSingleAnimation(l);
     if (c === null) return null;
     out.push(_serSingleAnimation(c));
+  }
+  return out.join(', ');
+};
+
+// The `animation` shorthand expands into eight per-layer longhands, and additionally
+// RESETS three reset-only longhands (animation-timeline, animation-range-start/-end)
+// to their initial value (a single value, not a per-layer list — the shorthand takes
+// no values for them). setProperty stores all eleven so `el.style.animationDelay`
+// reads back; the shorthand getter + getComputedStyle reconstruct from them.
+const _ANIMATION_LONGHANDS = [                      // the eight per-layer longhands (parse order)
+  'animation-duration', 'animation-timing-function', 'animation-delay',
+  'animation-iteration-count', 'animation-direction', 'animation-fill-mode',
+  'animation-play-state', 'animation-name',
+];
+const _ANIMATION_RESET_LH = {                       // reset-only longhands → initial value
+  'animation-timeline': 'auto', 'animation-range-start': 'normal', 'animation-range-end': 'normal',
+};
+const _ALL_ANIMATION_LH = _ANIMATION_LONGHANDS.concat(Object.keys(_ANIMATION_RESET_LH));
+// Split the shorthand into its eleven longhand values. Returns a { longhand: value }
+// map (the eight per-layer ones as comma lists), or null for an invalid value.
+const _expandAnimation = (value) => {
+  const layers = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!layers.length) return null;
+  const cols = [[], [], [], [], [], [], [], []];   // dur, tf, delay, iter, dir, fill, play, name
+  for (const l of layers) {
+    if (!l) return null;                           // empty layer (stray comma)
+    const c = _parseSingleAnimation(l);
+    if (c === null) return null;
+    cols[0].push(c.dur); cols[1].push(c.tf); cols[2].push(c.delay); cols[3].push(c.iter);
+    cols[4].push(c.dir); cols[5].push(c.fill); cols[6].push(c.play); cols[7].push(c.name);
+  }
+  const out = {};
+  _ANIMATION_LONGHANDS.forEach((ln, i) => { out[ln] = cols[i].join(', '); });
+  for (const k in _ANIMATION_RESET_LH) out[k] = _ANIMATION_RESET_LH[k];
+  return out;
+};
+// Reconstruct the `animation` shorthand from its longhands, read via `get(longhand)`
+// (the specified `_props` for the getter, `resolve()` for getComputedStyle). Returns
+// '' when the eight per-layer longhands disagree on layer count or any is missing, or
+// when a reset-only longhand is not at its initial value — the shorthand then cannot
+// represent the declaration. Otherwise serializes each layer via `_serSingleAnimation`.
+const _serAnimationFromLonghands = (get, computed) => {
+  const lists = _ANIMATION_LONGHANDS.map((ln) => _commaSplitTop(String(get(ln) || '')).map((s) => s.trim()));
+  const n = lists[0].length;
+  if (!n || lists.some((a) => a.length !== n || a.some((x) => !x))) return '';
+  for (const k in _ANIMATION_RESET_LH) {
+    if (String(get(k) || _ANIMATION_RESET_LH[k]).trim() !== _ANIMATION_RESET_LH[k]) return '';
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push(_serSingleAnimation({
+      dur: lists[0][i], tf: lists[1][i], delay: lists[2][i], iter: lists[3][i],
+      dir: lists[4][i], fill: lists[5][i], play: lists[6][i], name: lists[7][i],
+    }, computed));
   }
   return out.join(', ');
 };
@@ -18779,6 +18864,15 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     if (kebab === 'animation-range') {
       const sv = resolve('animation-range-start'), ev = resolve('animation-range-end');
       return _serAnimRangeFromLonghands(sv, ev);
+    }
+    // `animation` shorthand: reconstruct from the COMPUTED longhands. This also gives
+    // the right answer when a CSS-wide `animation` blob (e.g. `initial`) was stored
+    // inline and a longhand was then overridden — the blob does not shadow the
+    // per-longhand computed values. An empty reconstruction (unrepresentable) falls
+    // through to the standard engine (→ the `none` initial).
+    if (kebab === 'animation') {
+      const s = _serAnimationFromLonghands((ln) => resolve(ln), true);
+      if (s !== '') return s;
     }
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
