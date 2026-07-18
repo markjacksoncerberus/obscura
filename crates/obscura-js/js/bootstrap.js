@@ -1032,6 +1032,26 @@ const _parseStyleDecls = (text) => {
         }
         for (const ln of _ANIM_RANGE_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
         continue;                                            // expanded into longhands; no `animation-range` key
+      } else if (name === 'flex-grow' || name === 'flex-shrink') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonFlexGrowShrink(value); if (c == null) continue;  // invalid <number [0,∞]> → drop
+          value = c;
+        }
+      } else if (name === 'flex') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandFlex(value); if (!lh) continue;  // invalid <flex> → drop
+          for (const ln of _FLEX_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `flex` key
+        }
+      } else if (name === 'flex-flow') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandFlexFlow(value); if (!lh) continue;  // invalid <flex-flow> → drop
+          for (const ln of _FLEX_FLOW_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `flex-flow` key
+        }
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1587,6 +1607,43 @@ class CSSStyleDeclaration {
       }
       this._notifyChange();
       return;                                                // expanded into longhands; no `animation-range` key
+    } else if (!custom && (name === 'flex-grow' || name === 'flex-shrink')) {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonFlexGrowShrink(stored); if (c == null) return;  // invalid <number [0,∞]> → ignore
+        stored = c;
+      }
+    } else if (!custom && name === 'flex') {
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
+        // CSS-wide / var(): kept as one `flex` blob key; clear any expanded longhands.
+        for (const ln of _FLEX_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandFlex(stored); if (!lh) return;    // invalid <flex> → ignore
+        if ('flex' in this._props) { delete this._props['flex']; delete this._priority['flex']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln of _FLEX_LONGHANDS) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `flex` key
+      }
+    } else if (!custom && name === 'flex-flow') {
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
+        for (const ln of _FLEX_FLOW_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandFlexFlow(stored); if (!lh) return;  // invalid <flex-flow> → ignore
+        if ('flex-flow' in this._props) { delete this._props['flex-flow']; delete this._priority['flex-flow']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln of _FLEX_FLOW_LONGHANDS) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `flex-flow` key
+      }
     } else if (!custom && _ANIM_KEYWORD_LISTS.has(name)) {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
@@ -1674,6 +1731,22 @@ class CSSStyleDeclaration {
       const old = _serAnimRangeFromLonghands(this._props['animation-range-start'], this._props['animation-range-end']);
       delete this._props['animation-range']; delete this._priority['animation-range'];  // any legacy blob key
       for (const ln of _ANIM_RANGE_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'flex') {                                  // shorthand: clear its three longhands
+      const old = (key in this._props) ? this._props[key]
+        : _serFlexFromLonghands((ln) => this._props[ln]);
+      delete this._props['flex']; delete this._priority['flex'];  // any CSS-wide/var blob key
+      for (const ln of _FLEX_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'flex-flow') {                             // shorthand: clear flex-direction/flex-wrap
+      const old = (key in this._props) ? this._props[key]
+        : _serFlexFlow(this._props['flex-direction'], this._props['flex-wrap']);
+      delete this._props['flex-flow']; delete this._priority['flex-flow'];  // any CSS-wide/var blob key
+      for (const ln of _FLEX_FLOW_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -1802,6 +1875,14 @@ class CSSStyleDeclaration {
     if (key === 'animation-range') {                          // reconstruct from its two longhands
       if (key in this._props) return this._props[key];        // (never stored; guard for safety)
       return _serAnimRangeFromLonghands(this._props['animation-range-start'], this._props['animation-range-end']);
+    }
+    if (key === 'flex') {                                     // reconstruct from its three longhands
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      return _serFlexFromLonghands((ln) => this._props[ln]);
+    }
+    if (key === 'flex-flow') {                                // reconstruct from flex-direction/flex-wrap
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      return _serFlexFlow(this._props['flex-direction'], this._props['flex-wrap']);
     }
     if (_BORDER_EXPAND[key]) {                              // border/outline shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
@@ -8699,6 +8780,7 @@ const _GCS_DEFAULTS = {
   'animation-name': 'none', 'animation-timing-function': 'ease',
   'animation-iteration-count': '1', 'animation-direction': 'normal',
   'animation-fill-mode': 'none', 'animation-play-state': 'running',
+  'animation-composition': 'replace',                    // css-animations-2; initial `replace`, not inherited
   // css-animations-2 scroll-driven ranges — none inherit; initial `normal`.
   'animation-range-start': 'normal', 'animation-range-end': 'normal',
   // css-will-change — does not inherit.
@@ -15817,6 +15899,113 @@ const _serAnimationFromLonghands = (get, computed) => {
   return out.join(', ');
 };
 
+// ── css-flexbox: `flex` / `flex-flow` shorthands + flex-grow/-shrink longhands ──
+// flex = none | [ <'flex-grow'> <'flex-shrink'>? || <'flex-basis'> ] (CSS Flexbox 1
+// §7). The shorthand always serializes to the 3-value `<grow> <shrink> <basis>` form
+// (`none`→`0 0 auto`); an omitted grow/shrink defaults to 1 and an omitted basis to
+// `0%`. flex-flow = <flex-direction> || <flex-wrap> (§5.1).
+const _FLEX_NUM_RE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;  // strict <number> (rejects `1.`/`2e3.4`)
+const _FLEX_BASIS_KW = new Set(['auto', 'content', 'min-content', 'max-content', 'fit-content']);
+const _FLEX_DIRECTION_KW = new Set(['row', 'row-reverse', 'column', 'column-reverse']);
+const _FLEX_WRAP_KW = new Set(['nowrap', 'wrap', 'wrap-reverse']);
+const _FLEX_LONGHANDS = ['flex-grow', 'flex-shrink', 'flex-basis'];
+const _FLEX_FLOW_LONGHANDS = ['flex-direction', 'flex-wrap'];
+// A single <number> flex factor (grow/shrink): a plain <number [0,∞]> (canon via
+// _serNumber — `.0`→`0`, `23.4e5`→`2340000`) or a <number>-typed math function
+// (`calc(-1)` is valid — clamped at used-value time — and is reordered/folded). A
+// length/percentage-typed calc (`calc(3px)`) → null (that is a flex-basis).
+const _canonFlexFactor = (tok) => {
+  if (_FLEX_NUM_RE.test(tok)) { const n = parseFloat(tok); return n < 0 ? null : _serNumber(n); }
+  if (_MATHFN_NAME_RE.test(tok)) {
+    const root = _parseCalcTree(tok);
+    if (root === null || _mt(root, null) !== 'number') return null;   // must be <number>-typed
+    return _canonMathExpr(tok) || tok;
+  }
+  return null;
+};
+// A single <'flex-basis'> = content | <'width'>: a basis keyword, or a
+// <length-percentage> (bare unitless 0 → 0px). A math function must be
+// length/percentage-typed — a unitless calc (`calc(0)`, `calc(3 - 3)`) is invalid.
+const _canonFlexBasisTok = (tok) => {
+  const l = tok.toLowerCase();
+  if (_FLEX_BASIS_KW.has(l)) return l;
+  if (_MATHFN_NAME_RE.test(tok)) {
+    const root = _parseCalcTree(tok);
+    if (root === null || _mt(root, 'length') === 'number') return null;  // unitless calc → not a basis
+    return _canonLPToken(tok);
+  }
+  if (_isLenPctTok(tok)) return _canonLPToken(tok);
+  return null;
+};
+// Longhand flex-grow / flex-shrink: a single <number [0,∞]> (or number calc). Returns
+// the canonical value or null; CSS-wide keywords / var() handled by the caller.
+const _canonFlexGrowShrink = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length !== 1) return null;                     // `6 7`
+  return _canonFlexFactor(toks[0]);
+};
+// Expand the `flex` shorthand into its three longhands, or null if invalid.
+const _expandFlex = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 3) return null;
+  if (toks.length === 1 && toks[0].toLowerCase() === 'none') {
+    return { 'flex-grow': '0', 'flex-shrink': '0', 'flex-basis': 'auto' };
+  }
+  const factors = [];
+  let basis = null, factorsBeforeBasis = 0, factorsAfterBasis = 0, basisSeen = false;
+  for (const tok of toks) {
+    const numC = _canonFlexFactor(tok);
+    const basisC = _canonFlexBasisTok(tok);
+    // A unitless zero matches both grammars: it is a flex factor UNLESS two factors
+    // already preceded it (CSS Flexbox §7 note), in which case it is the flex-basis.
+    const asFactor = numC !== null && (basisC === null || factors.length < 2);
+    if (asFactor) {
+      if (factors.length >= 2) return null;               // a third flex factor
+      factors.push(numC);
+      if (basisSeen) factorsAfterBasis++; else factorsBeforeBasis++;
+    } else if (basisC !== null) {
+      if (basis !== null) return null;                    // a second flex-basis
+      basis = basisC; basisSeen = true;
+    } else {
+      return null;                                        // token is neither factor nor basis
+    }
+  }
+  if (factorsBeforeBasis > 0 && factorsAfterBasis > 0) return null;  // split factor run: `4 6px 5`
+  return {
+    'flex-grow': factors.length >= 1 ? factors[0] : '1',
+    'flex-shrink': factors.length >= 2 ? factors[1] : '1',
+    'flex-basis': basis !== null ? basis : '0%',
+  };
+};
+// Reconstruct the `flex` shorthand from its three longhands (always the 3-value form).
+const _serFlexFromLonghands = (get) => {
+  const g = get('flex-grow'), s = get('flex-shrink'), b = get('flex-basis');
+  if (!g || !s || !b) return '';
+  return g + ' ' + s + ' ' + b;
+};
+// Expand `flex-flow` into flex-direction + flex-wrap, or null if invalid.
+const _expandFlexFlow = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  let dir = null, wrap = null;
+  for (const tok of toks) {
+    const l = tok.toLowerCase();
+    if (_FLEX_DIRECTION_KW.has(l)) { if (dir !== null) return null; dir = l; }
+    else if (_FLEX_WRAP_KW.has(l)) { if (wrap !== null) return null; wrap = l; }
+    else return null;
+  }
+  return { 'flex-direction': dir !== null ? dir : 'row', 'flex-wrap': wrap !== null ? wrap : 'nowrap' };
+};
+// Serialize `flex-flow` from its longhands, dropping each at its initial (row / nowrap)
+// but keeping at least `row` when both are default (`row nowrap`→`row`, `row wrap`→`wrap`).
+const _serFlexFlow = (dir, wrap) => {
+  if (!dir || !wrap) return '';
+  const parts = [];
+  if (dir !== 'row') parts.push(dir);
+  if (wrap !== 'nowrap') parts.push(wrap);
+  return parts.length ? parts.join(' ') : 'row';
+};
+
 // animation-range-start / animation-range-end (Scroll Animations 1 §5.2). Each is
 //   [ normal | <length-percentage> | <timeline-range-name> <length-percentage>? ]#
 // where <timeline-range-name> = cover | contain | entry | exit | entry-crossing
@@ -18370,6 +18559,7 @@ const _CLAMP_NEG_PROPS = new Set([
   'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
   'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
   'row-gap', 'column-gap',                                // gap is non-negative (a resolved negative calc clamps to 0)
+  'flex-basis',                                           // flex-basis is <'width'> — non-negative (resolved negative → 0)
   ..._SCROLL_PADDING_LH,                                  // scroll-padding is non-negative (resolved negative → 0)
 ]);
 const _clampNegPx = (r) => {
@@ -18570,6 +18760,18 @@ const _normComputed = (el, kebab, v) => {
     }
     return _clampNegPx(_trComp(v, el, true, _vpUnits()));
   }
+  if (kebab === 'flex-grow' || kebab === 'flex-shrink') {
+    // <number [0,∞]>: fold a math function (cqw→0 in a `sign(2cqw…)` gate, so
+    // `calc(10 + sign(20cqw - 10px) * 5)`→`5`), clamp the result ≥0 (`calc(-1)`→`0`).
+    const s = String(v).trim();
+    if (_FLEX_NUM_RE.test(s)) return _serNumber(Math.max(0, parseFloat(s)));
+    if (_MATHFN_NAME_RE.test(s)) {
+      const nv = _evalMath(s, 0, Object.assign(
+        { lengths: true, cqZero: true, emPx: _emPxOf(el), nonFinite: true }, _vpUnits(), _siblingOpts(el, s)));
+      if (nv !== null) return _serNumber(_nfClamp(Math.max(0, nv)));
+    }
+    return s;
+  }
   if (kebab === 'text-indent') {                           // resolve the <length-percentage>, keep the trailing keywords
     const toks = _wsTokens(String(v).trim());
     const kws = toks.filter((t) => { const l = t.toLowerCase(); return l === 'hanging' || l === 'each-line'; });
@@ -18663,6 +18865,19 @@ const _normComputed = (el, kebab, v) => {
     // CSS Text 3: word-spacing computes to an absolute <length>; `normal` → `0px`.
     if (String(v).trim().toLowerCase() === 'normal') return '0px';
     return _trComp(v, el, true, _vpUnits());
+  }
+  if (kebab === 'flex-basis' && _MATHFN_NAME_RE.test(String(v)) && /cq(?:w|h|i|b|min|max)/i.test(String(v))) {
+    // A pure-<length> flex-basis calc carrying a container-query unit inside a
+    // `sign(20cqw - 10px)` gate: the generic `_trComp` path can't resolve cqw, so fold
+    // it here with `cqZero` (no container ⇒ cqw = 0) → `calc(10px + sign(20cqw-10px)*5px)`
+    // → `5px`. A `%`-bearing calc (`_mt` ≠ 'length') falls through to the generic path.
+    const s = String(v).trim();
+    const root = _parseCalcTree(s);
+    if (root !== null && _mt(root, null) === 'length') {
+      const nv = _evalMath(s, 0, Object.assign(
+        { lengths: true, cqZero: true, emPx: _emPxOf(el), nonFinite: true }, _vpUnits(), _siblingOpts(el, s)));
+      if (nv !== null) return _clampNegPx(_serNumber(_nfClamp(nv)) + 'px');
+    }
   }
   if (_LENGTH_COMPUTED_PROPS.has(kebab)) {
     const r = _trComp(v, el, true, _vpUnits());
@@ -18994,6 +19209,8 @@ const _CSS_KNOWN_PROPS = (() => {
   add('overflow');                                         // the `overflow` shorthand (expands to overflow-x/-y)
   add('mask');                                             // the `mask` shorthand (expands to its 8 longhands)
   add('animation-range');                                  // the `animation-range` shorthand (computed reconstructed from its stored value)
+  add('flex');                                             // the `flex` shorthand (reconstructed from flex-grow/-shrink/-basis)
+  add('flex-flow');                                        // the `flex-flow` shorthand (reconstructed from flex-direction/-wrap)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
   for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
@@ -19051,6 +19268,15 @@ globalThis.getComputedStyle = (el, _pseudo) => {
       const sv = resolve('animation-range-start'), ev = resolve('animation-range-end');
       return _serAnimRangeFromLonghands(sv, ev);
     }
+    // `flex` shorthand: reconstruct the 3-value `<grow> <shrink> <basis>` form from the
+    // COMPUTED longhands (grow/shrink fold their number-calc + clamp ≥0, basis resolves
+    // to px). Falls through to the standard engine only if a longhand is unresolvable.
+    if (kebab === 'flex') {
+      const g = resolve('flex-grow'), s = resolve('flex-shrink'), b = resolve('flex-basis');
+      if (g && s && b) return g + ' ' + s + ' ' + b;
+    }
+    // `flex-flow` shorthand: reconstruct from the computed flex-direction/flex-wrap.
+    if (kebab === 'flex-flow') return _serFlexFlow(resolve('flex-direction'), resolve('flex-wrap'));
     // `animation` shorthand: reconstruct from the COMPUTED longhands. This also gives
     // the right answer when a CSS-wide `animation` blob (e.g. `initial`) was stored
     // inline and a longhand was then overridden — the blob does not shadow the
