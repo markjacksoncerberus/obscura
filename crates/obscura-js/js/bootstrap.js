@@ -13149,6 +13149,30 @@ const _serGridArea = (get) => {
   if (cs !== _gridLineDefault(rs)) return vals.slice(0, 2).join(' / ');
   return rs;
 };
+// Computed value of a single <grid-line> longhand. The specified value is already
+// canonical (from _canonGridLine); computing additionally FOLDS any <integer> math
+// function to a plain rounded integer (`calc(1.1) -a-`→`1 -a-`; `cqZero` collapses an
+// unresolved container unit inside a `sign(2cqw…)` gate, so `calc(10 + sign(2cqw -
+// 10px)*5)`→`5`). A `span` integer clamps to ≥1 (`span calc(-1)`→`span 1`). Literal
+// integers, line-name <custom-ident>s, `span`, and `auto` pass through unchanged.
+const _computeGridLine = (el, v) => {
+  const s = String(v).trim();
+  if (s.toLowerCase() === 'auto') return 'auto';
+  const toks = _gridLineTokens(s);
+  if (toks === null) return s;
+  const span = toks.some((t) => t.toLowerCase() === 'span');
+  const vp = _vpUnits();
+  const out = toks.map((t) => {
+    if (t.toLowerCase() === 'span' || _isGridIntLiteral(t) || !_MATHFN_NAME_RE.test(t)) return t;
+    const n = _evalMath(t, 0, Object.assign(
+      { lengths: true, angle: true, time: true, cqZero: true, emPx: _emPxOf(el), nonFinite: true }, vp, _siblingOpts(el, t)));
+    if (n === null || !isFinite(n)) return t;                // unresolvable → keep symbolic
+    let r = Math.round(n);
+    if (span && r < 1) r = 1;
+    return String(r);
+  });
+  return out.join(' ');
+};
 // The single-<grid-line> placement longhands, validated in setProperty.
 const _GRID_LINE_LH = new Set(['grid-row-start', 'grid-row-end', 'grid-column-start', 'grid-column-end']);
 
@@ -18703,6 +18727,7 @@ const _computeAnimRange = (v, el, isEnd) => {
 };
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  if (_GRID_LINE_LH.has(kebab)) return _computeGridLine(el, v);
   if (kebab === 'animation-range-start' || kebab === 'animation-range-end') {
     return _computeAnimRange(v, el, kebab === 'animation-range-end');
   }
@@ -19211,6 +19236,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('animation-range');                                  // the `animation-range` shorthand (computed reconstructed from its stored value)
   add('flex');                                             // the `flex` shorthand (reconstructed from flex-grow/-shrink/-basis)
   add('flex-flow');                                        // the `flex-flow` shorthand (reconstructed from flex-direction/-wrap)
+  add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
   for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
@@ -19277,6 +19303,12 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     }
     // `flex-flow` shorthand: reconstruct from the computed flex-direction/flex-wrap.
     if (kebab === 'flex-flow') return _serFlexFlow(resolve('flex-direction'), resolve('flex-wrap'));
+    // grid placement shorthands: reconstruct from the COMPUTED <grid-line> longhands
+    // (integer math folded to plain integers), re-dropping redundant elided lines.
+    if (kebab === 'grid-column' || kebab === 'grid-row') {
+      return _serGridColumnRow((ln) => resolve(ln), kebab === 'grid-column' ? 'column' : 'row');
+    }
+    if (kebab === 'grid-area') return _serGridArea((ln) => resolve(ln));
     // `animation` shorthand: reconstruct from the COMPUTED longhands. This also gives
     // the right answer when a CSS-wide `animation` blob (e.g. `initial`) was stored
     // inline and a longhand was then overridden — the blob does not shadow the

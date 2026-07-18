@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #222).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #223).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-grid/parsing/grid-area-computed.html` | 16/35 | **35/35** | ✅ 100% | **Quest #223 The Grid-Placement Computed Verdict.** The `grid-area`/`grid-row`/`grid-column` placement shorthands were unregistered in computed style (*"doesn't seem to be supported in the computed style"*), and the `grid-*-start`/`-end` longhands never folded a `<grid-line>` integer math function. Registered the three shorthands in `_CSS_KNOWN_PROPS` + resolve() branches reconstructing them from the COMPUTED longhands (via `_serGridColumnRow`/`_serGridArea`, re-dropping redundant elided lines). New `_computeGridLine` folds an integer calc to a plain rounded integer (`cqZero` collapses a `sign(2cqw…)` gate), clamping a `span` integer ≥1: `calc(1.1) -a-`→`1 -a-`, `calc(10 + (sign(2cqw - 10px)*5)) -a-`→`5 -a-`, `span calc(-1)`→`span 1`, `span calc(sibling-index() - 2)`→`span 1`. **+19.** |
 | `css/css-flexbox/parsing/flex-computed.html` | 0/14 | **14/14** | ✅ 100% | **Quest #222 The Flex Shorthand Verdict.** The `flex` shorthand was raw-store (unregistered in computed style → *"not supported in the computed style"*). Now expands into flex-grow/-shrink/-basis; computed reconstructs the `<grow> <shrink> <basis>` form from the COMPUTED longhands (grow/shrink fold their number-calc + clamp ≥0, basis resolves to px). `none`→`0 0 auto`, `calc(10px + 0.5em)`→`1 1 30px`, `calc(-1) calc(-1) 0`→`0 0 0px`, `calc(10 + (sign(20cqw - 10px) * 5)) … 1px`→`5 5 1px`. **+14.** |
 | `css/css-flexbox/parsing/flex-valid.html` | 4/16 | **16/16** | ✅ 100% | **Quest #222.** `flex = none \| [ <'flex-grow'> <'flex-shrink'>? \|\| <'flex-basis'> ]`. `_expandFlex` classifies each token as a `<number>` flex factor or a `<'flex-basis'>` (a unitless zero is a factor unless two factors already preceded it), canonicalizes to the always-3-value form: omitted grow/shrink→1, omitted basis→`0%`. `1`→`1 1 0%`, `6px 4 5`→`4 5 6px`, `7% 8`→`8 1 7%`, `calc(1) calc(2 + 1) calc(3px)`→`calc(1) calc(3) calc(3px)`. **+12.** |
 | `css/css-flexbox/parsing/flex-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #222.** Rejects `none 1`/`9 none` (none can't combine), `2 3 4` (a third flex factor), `5px 7%` (two basis components), `1 2 calc(0)`/`1 2 calc(3 - 3)` (a unitless calc is number-typed → a third factor, not a basis). **+6.** |
