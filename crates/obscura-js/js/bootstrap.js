@@ -1295,6 +1295,8 @@ class CSSStyleDeclaration {
       else { lh = _parseMaskShort(stored); if (!lh) return; }
       delete this._props[name]; delete this._priority[name];    // never keep a shorthand key
       for (const ln of _MASK_SH_LH) { this._props[ln] = lh[ln]; this._priority[ln] = prio; }
+      const wide = _CSS_WIDE.has(low);                          // mask also resets the mask-border family
+      for (const bn of _MASK_BORDER_NAMES) { this._props[bn] = wide ? low : _MASK_BORDER_LH[bn]; this._priority[bn] = prio; }
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
@@ -1852,6 +1854,7 @@ class CSSStyleDeclaration {
       const old = (key in this._props) ? this._props[key] : _serMaskShort((n) => this._props[n] || '');
       delete this._props[key]; delete this._priority[key];    // any var()-stored shorthand key
       for (const ln of _MASK_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      for (const bn of _MASK_BORDER_NAMES) { delete this._props[bn]; delete this._priority[bn]; }
       this._notifyChange();
       return old;
     }
@@ -13857,6 +13860,18 @@ const _maskResolveBox = (boxToks) => {
 };
 const _MASK_SH_LH = ['mask-image', 'mask-position', 'mask-size', 'mask-repeat',
   'mask-origin', 'mask-clip', 'mask-composite', 'mask-mode'];
+// The `mask` shorthand also RESETS the mask-border family to their initial
+// values (CSS Masking §1: `mask` is a shorthand for both the mask-image layer
+// longhands AND the mask-border longhands). No `mask` syntax sets a border, so
+// they always land on the initial — or a CSS-wide keyword for `mask: inherit`.
+const _MASK_BORDER_LH = {
+  'mask-border-source': 'none',
+  'mask-border-slice': '0',
+  'mask-border-width': 'auto',
+  'mask-border-outset': '0',
+  'mask-border-repeat': 'stretch',
+};
+const _MASK_BORDER_NAMES = Object.keys(_MASK_BORDER_LH);
 const _parseMaskShort = (value) => {
   const rawLayers = _commaSplitTop(value).map((s) => s.trim());
   if (!rawLayers.length) return null;
@@ -18725,8 +18740,19 @@ const _computeAnimRange = (v, el, isEnd) => {
     return it;
   }).join(', ');
 };
+// mask-size computed value: the `<bg-size>#` list is already canonicalized to its
+// two-value form (`1px` → `1px auto`) upstream, so per component we only fold a
+// length/calc to absolute px (em/vp resolved, clamped ≥0) — `auto`/`contain`/
+// `cover` keywords and bare `%` pass through `_trComp` untouched.
+const _computeMaskSize = (el, v) => {
+  const vp = _vpUnits();
+  return _commaSplitTop(String(v)).map((layer) =>
+    _wsTokens(layer.trim()).map((tok) => _clampNegPx(_trComp(tok, el, true, vp))).join(' ')
+  ).join(', ');
+};
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  if (kebab === 'mask-size') return _computeMaskSize(el, v);
   if (_GRID_LINE_LH.has(kebab)) return _computeGridLine(el, v);
   if (kebab === 'animation-range-start' || kebab === 'animation-range-end') {
     return _computeAnimRange(v, el, kebab === 'animation-range-end');
