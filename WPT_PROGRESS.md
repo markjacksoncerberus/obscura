@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #220).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #221).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-text/parsing/letter-spacing-computed.html` | 8/9 | **9/9** | ✅ 100% | **Quest #221 The Spacing-Normal Verdict.** letter-spacing routed straight through the generic `_LENGTH_COMPUTED_PROPS` branch, so a computed zero stayed `0px`. Added a kebab-guarded computed branch: `normal`→`normal`, and a resolved `<length>` of zero (`0px`/`-0px`/calc→0) → `normal`; `%` stays symbolic. **+1.** |
+| `css/css-text/parsing/word-spacing-computed.html` | 8/9 | **9/9** | ✅ 100% | **Quest #221.** word-spacing computes to an absolute `<length>`; the `normal` keyword was passed through verbatim. Added a branch mapping `normal`→`0px` (opposite of letter-spacing). **+1.** |
 | `css/css-text/parsing/tab-size-computed.html` | 8/10 | **10/10** | ✅ 100% | **Quest #220 The Tab-Size Sign Verdict.** Closed the #181 cap (container-query `sign(2cqw…)` in tab-size). `tab-size` computed accepts `<number>` OR `<length>`; a math function was routed through `_trComp` whose length-opts lack `cqZero`, so `sign(2cqw - 10px)` stayed symbolic. Added a math branch that classifies the calc via `_mt` (number vs length) and folds with `cqZero`: `calc(10 + (sign(2cqw - 10px) * 5))`→`5` (number, cqw→0 ⇒ sign(-10px)=-1), `calc(10px + (sign(2cqw - 10px) * 5px))`→`5px` (length, clamps ≥0). **+2.** |
 | `css/css-transitions/parsing/transition-delay-computed.html` | 0/1 | **1/1** | ✅ 100% | **Quest #219 The Time-Computed Verdict.** `_computeTimeValue` folded only the FIRST comma layer of a `<time>#` list, so `-500ms, calc(2 * 3s)` stayed verbatim instead of `-0.5s, 6s`. Made it comma-aware (`_commaSplitTop`, resolve each layer, rejoin). **+1.** |
 | `css/css-animations/parsing/animation-delay-computed.html` | 3/4 | **4/4** | ✅ 100% | **Quest #219.** Added `cqZero: true` to the `_computeTimeValue` math opts so an unresolved container unit collapses to 0 — `calc(10s + (sign(2cqw - 10px) * 5s))` folds to `5s` (cqw→0 with no container ⇒ `sign(-10px)` = -1). **+1.** |

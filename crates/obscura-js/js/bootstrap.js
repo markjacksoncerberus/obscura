@@ -18651,6 +18651,19 @@ const _normComputed = (el, kebab, v) => {
   if (_SIZE_COMPUTED_PROPS.has(kebab)) return _computeSizeValue(kebab, v, el);
   if (_SH_COMPUTED[kebab]) return _computeBoxShorthand(kebab, v, el);
   if (_SCROLL_PADDING_LH.has(kebab) && String(v).trim().toLowerCase() === 'auto') return 'auto';
+  if (kebab === 'letter-spacing') {
+    // CSS Text 3: `normal` stays `normal`, but a computed <length> of zero is
+    // *also* serialized as `normal` (letter-spacing:0px → normal).
+    if (String(v).trim().toLowerCase() === 'normal') return 'normal';
+    const r = _trComp(v, el, true, _vpUnits());
+    const m = /^(-?(?:\d+\.?\d*|\.\d+))px$/.exec(String(r));
+    return (m && parseFloat(m[1]) === 0) ? 'normal' : r;
+  }
+  if (kebab === 'word-spacing') {
+    // CSS Text 3: word-spacing computes to an absolute <length>; `normal` → `0px`.
+    if (String(v).trim().toLowerCase() === 'normal') return '0px';
+    return _trComp(v, el, true, _vpUnits());
+  }
   if (_LENGTH_COMPUTED_PROPS.has(kebab)) {
     const r = _trComp(v, el, true, _vpUnits());
     return _CLAMP_NEG_PROPS.has(kebab) ? _clampNegPx(r) : r;
