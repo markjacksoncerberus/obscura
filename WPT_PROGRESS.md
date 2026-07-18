@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-17 (Quest #213).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #214).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-animations/parsing/keyframes-name-invalid.html` | 0/20 | **20/20** | ✅ 100% | **Quest #214 The Keyframes-Name Verdict.** `@keyframes NAME {}` at-rule name parsing was raw-store — invalid names were accepted (`sheet.cssRules.length` = 1 where 0 expected). Added `_isValidKeyframesName` (reuses the animation-name token grammar `_canonAnimNameTok`, then additionally rejects bare `none`) gating the `keyframes` push in `_cssParseRuleList` — an invalid `<keyframes-name>` drops the whole at-rule. Rejects bare `none`/CSS-wide/`default`, `12`/`-12`/`12foo`, `foo.bar`, `one two`, `one, two` comma lists, `""`. **+20.** |
+| `css/css-animations/parsing/keyframes-name-valid.html` | 39/39 | **39/39** | ✅ 100% | **Quest #214 (held).** Valid `<custom-ident>` (incl. ` foo `, `-foo`, `not`/`and`/`auto`/`normal`) and `<string>` (incl. `"none"`, `"one two"`, `"initial"`) names still accepted — stash-proved unchanged. |
 | `css/css-animations/parsing/animation-range-start-computed.html` | 0/30 | **30/30** | ✅ 100% | **Quest #213 The Animation-Range Computed Verdict.** Registered `animation-range-start: normal` in `_GCS_DEFAULTS` (→ `_CSS_KNOWN_PROPS`/`_initialOf`) + a computed serializer `_computeAnimRange` resolving each offset via `_trComp` (em→px, calc folded, % kept) then re-dropping the default 0% offset. `entry 1em`→`entry 10px`, `exit calc(41% + 1%)`→`exit 42%`, `contain calc(10% + 10px)` kept symbolic. **+30.** |
 | `css/css-animations/parsing/animation-range-end-computed.html` | 0/29 | **29/29** | ✅ 100% | **Quest #213.** Same registration + resolver, `isEnd` variant (default offset 100%). `initial`→`normal`. **+29.** |
 | `css/css-animations/parsing/animation-range-start-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #212 The Animation-Range Verdict.** Scroll-driven `animation-range-start` was pure raw-store. `_canonAnimRangeItem` — `[normal \| <length-percentage> \| <timeline-range-name> <length-percentage>?]#`. Rejects a name-second pair (`50% contain`), unknown names (`peek 50%`, `50% enter`), bare `none`, `normal 10px`, ≥3-token items. **+11.** |

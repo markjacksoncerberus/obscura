@@ -15500,6 +15500,22 @@ const _canonAnimNameTok = (tok) => {
   if (!_GRID_CI_RE.test(tok)) return null;         // `12` is not a <custom-ident>
   return tok;                                       // custom-ident kept verbatim
 };
+// @keyframes prelude <keyframes-name> = <custom-ident> | <string> (CSS Animations 1 §2).
+// Unlike animation-name, the bare `none` keyword is NOT a valid @keyframes name (it is the
+// property's reset value, reserved), and neither are the CSS-wide keywords / `default`. A
+// <string> may hold any text (even `"none"`/`"initial"`) but must be non-empty (`""` invalid),
+// and only a SINGLE name is allowed (no comma list). Reuses the animation-name token grammar,
+// then additionally excludes bare `none`. Returns true iff the whole prelude is one valid name.
+const _isValidKeyframesName = (raw) => {
+  const s = String(raw).trim();
+  if (!s) return false;
+  const toks = _wsTokens(s);
+  if (toks.length !== 1) return false;             // `one two`, `one, two`
+  const tok = toks[0];
+  const quoted = tok[0] === '"' || tok[0] === "'";
+  if (!quoted && tok.toLowerCase() === 'none') return false;  // bare `none` reserved here
+  return _canonAnimNameTok(tok) !== null;          // <custom-ident> | non-empty <string>
+};
 const _canonAnimName = (value) => {
   const items = _commaSplitTop(String(value)).map((s) => s.trim());
   if (!items.length) return null;
@@ -18771,7 +18787,8 @@ const _cssParseRuleList = (cssText) => {
       if (name === 'media' || name === 'supports' || name === 'container' || name === 'document') {
         rules.push({ type: 'group', name, condition, prelude, rules: _cssParseRuleList(body) });
       } else if (name === 'keyframes' || name === '-webkit-keyframes') {
-        rules.push({ type: 'keyframes', name, condition, prelude, body });
+        // An invalid <keyframes-name> makes the whole at-rule invalid → drop it (CSSOM).
+        if (_isValidKeyframesName(condition)) rules.push({ type: 'keyframes', name, condition, prelude, body });
       } else {
         rules.push({ type: 'at', name, condition, prelude, body });
       }
