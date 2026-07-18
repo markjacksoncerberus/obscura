@@ -1016,10 +1016,14 @@ const _parseStyleDecls = (text) => {
         }
       } else if (name === 'animation-range') {
         const low = value.toLowerCase();
-        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
-          const c = _canonAnimRangeShorthand(value); if (c == null) continue;  // invalid <single-timeline-range># → drop
-          value = c;
+        let lh;
+        if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(value)) {
+          lh = { 'animation-range-start': value, 'animation-range-end': value };  // keyword/var → each longhand
+        } else {
+          lh = _expandAnimRange(value); if (!lh) continue;   // invalid <single-timeline-range># → drop
         }
+        for (const ln of _ANIM_RANGE_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+        continue;                                            // expanded into longhands; no `animation-range` key
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1540,10 +1544,19 @@ class CSSStyleDeclaration {
       }
     } else if (!custom && name === 'animation-range') {
       const low = stored.toLowerCase();
-      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
-        const c = _canonAnimRangeShorthand(stored); if (c == null) return;  // invalid <single-timeline-range># → ignore
-        stored = c;
+      let lh;
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
+        lh = { 'animation-range-start': stored, 'animation-range-end': stored };  // keyword/var → each longhand
+      } else {
+        lh = _expandAnimRange(stored); if (!lh) return;      // invalid <single-timeline-range># → ignore
       }
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      for (const ln of _ANIM_RANGE_LONGHANDS) {
+        if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+        this._props[ln] = lh[ln]; this._priority[ln] = prio;
+      }
+      this._notifyChange();
+      return;                                                // expanded into longhands; no `animation-range` key
     } else if (!custom && _ANIM_KEYWORD_LISTS.has(name)) {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
@@ -1624,6 +1637,13 @@ class CSSStyleDeclaration {
     if (key === 'offset') {                                // shorthand: clear its five longhands
       const old = _serializeOffsetShorthand(this);
       for (const ln of _OFFSET_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'animation-range') {                       // shorthand: clear its two range longhands
+      const old = _serAnimRangeFromLonghands(this._props['animation-range-start'], this._props['animation-range-end']);
+      delete this._props['animation-range']; delete this._priority['animation-range'];  // any legacy blob key
+      for (const ln of _ANIM_RANGE_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -1725,6 +1745,10 @@ class CSSStyleDeclaration {
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     if (key === 'offset') return _serializeOffsetShorthand(this);  // reconstruct from longhands
+    if (key === 'animation-range') {                          // reconstruct from its two longhands
+      if (key in this._props) return this._props[key];        // (never stored; guard for safety)
+      return _serAnimRangeFromLonghands(this._props['animation-range-start'], this._props['animation-range-end']);
+    }
     if (_BORDER_EXPAND[key]) {                              // border/outline shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
       return _serializeBorderShorthand(this, key);         // reconstruct from longhands
@@ -13875,6 +13899,25 @@ const _resolvePctLengthCalc = (s, emPx) => {
   for (const t of terms) {
     const pm = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(t.text);
     if (pm) { pct += t.sign * parseFloat(pm[1]); havePct = true; continue; }
+    // A single sum-term can mix a percentage with a unitless coefficient
+    // (`10% * sign(1em - 1px)`) or a constant length (a nested `calc(10% + 5px)`).
+    // When such a term is LINEAR in the %-base b — value(b) = slope·b + const — split
+    // it into a percentage part (slope·100%) and a length part (const px). Only do so
+    // when there is no value-kink function (min/max/clamp/abs) whose output bends
+    // between probe points, and confirm linearity with three %-base probes; otherwise
+    // fall through to the length-only path (unchanged behaviour, kept approximate).
+    if (/%/.test(t.text) && !/\b(?:min|max|clamp|abs)\(/i.test(t.text)) {
+      const v0 = _evalMath(t.text, 0, { lengths: true, emPx });
+      const v1 = _evalMath(t.text, 1, { lengths: true, emPx });
+      const v2 = _evalMath(t.text, 2, { lengths: true, emPx });
+      if (v0 !== null && v1 !== null && v2 !== null && isFinite(v0) && isFinite(v1) && isFinite(v2)
+          && Math.abs((v2 - v1) - (v1 - v0)) < 1e-6) {          // linear in the %-base
+        pct += t.sign * (v1 - v0) * 100;
+        px += t.sign * v0;
+        havePct = true;
+        continue;
+      }
+    }
     const v = _evalMath(t.text, 0, { lengths: true, emPx });
     if (v === null) return null;
     px += t.sign * v;
@@ -15703,6 +15746,68 @@ const _canonAnimRangeShorthand = (value) => {
     out.push(c);
   }
   return out.join(', ');
+};
+
+// The `animation-range` shorthand expands into its two range longhands (like
+// `offset`/`background`): setProperty stores `animation-range-start` /
+// `animation-range-end` so `el.style.animationRangeStart` reads back, and the
+// shorthand getter + getComputedStyle reconstruct from them. (This supersedes
+// #212's direct blob storage; the specified serialization is byte-identical.)
+const _ANIM_RANGE_LONGHANDS = ['animation-range-start', 'animation-range-end'];
+// Split the shorthand into its two longhand comma-lists. Each layer is a start side
+// + optional end side; an omitted end defaults to the SAME <timeline-range-name> as
+// the start (serializing bare, i.e. that name at 100%), or to `normal` when the
+// start carries no range name. Returns { start, end } (keyed by longhand), or null.
+const _expandAnimRange = (value) => {
+  const items = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!items.length) return null;
+  const starts = [], ends = [];
+  for (const it of items) {
+    if (!it) return null;                                          // empty item (stray comma)
+    const toks = _wsTokens(it);
+    const s = _splitAnimRangeSide(toks, 0);
+    if (!s) return null;
+    const startC = _canonAnimRangeItem(s[0].join(' '), false);
+    if (startC == null) return null;
+    const startName = _TIMELINE_RANGE_NAMES.has(s[0][0].toLowerCase()) ? s[0][0].toLowerCase() : null;
+    let endC;
+    if (s[1] === toks.length) {
+      endC = startName || 'normal';                                // omitted end side
+    } else {
+      const e = _splitAnimRangeSide(toks, s[1]);
+      if (!e || e[1] !== toks.length) return null;                 // malformed / leftover tokens
+      endC = _canonAnimRangeItem(e[0].join(' '), true);
+      if (endC == null) return null;
+    }
+    starts.push(startC); ends.push(endC);
+  }
+  return { 'animation-range-start': starts.join(', '), 'animation-range-end': ends.join(', ') };
+};
+// Combine one already-canonical start side + end side back into a shorthand layer,
+// omitting the end when redundant with the start (identical, or — for a nameless
+// start — its far-end default `normal`/`100%`). The same rule as the direct
+// shorthand serializer, but on already-canon sides (no re-canonicalization, so it
+// is safe for COMPUTED sides where offsets are resolved to px).
+const _combineAnimRangeSides = (startC, endC) => {
+  const startName = _TIMELINE_RANGE_NAMES.has(_wsTokens(startC)[0].toLowerCase())
+    ? _wsTokens(startC)[0].toLowerCase() : null;
+  // Omit the end when it is redundant: identical to the start; the start's own
+  // range-name default (`cover 50%` → end `cover`, the name at 100%); or — for a
+  // nameless start — its far-end default `normal`/`100%` (`0% 100%` → `0%`).
+  const omit = endC === startC
+    || (startName ? endC === startName : (endC === 'normal' || endC === '100%'));
+  return omit ? startC : startC + ' ' + endC;
+};
+// Reconstruct the `animation-range` shorthand from its two longhand values (each a
+// comma list of canon sides). Returns '' when the layer counts differ or a longhand
+// is missing/empty — the shorthand then cannot represent the declaration. Shared by
+// the specified getter (canon sides) and getComputedStyle (computed sides).
+const _serAnimRangeFromLonghands = (startVal, endVal) => {
+  const starts = _commaSplitTop(String(startVal || '')).map((s) => s.trim());
+  const ends = _commaSplitTop(String(endVal || '')).map((s) => s.trim());
+  if (!starts.length || starts.length !== ends.length) return '';
+  if (starts.some((x) => !x) || ends.some((x) => !x)) return '';
+  return starts.map((s, i) => _combineAnimRangeSides(s, ends[i])).join(', ');
 };
 
 // line-clamp = none | [ <integer [1,∞]> || <'block-ellipsis'> ] -webkit-legacy?
@@ -18617,6 +18722,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('font');                                             // the `font` shorthand (expands to its 7 longhands)
   add('overflow');                                         // the `overflow` shorthand (expands to overflow-x/-y)
   add('mask');                                             // the `mask` shorthand (expands to its 8 longhands)
+  add('animation-range');                                  // the `animation-range` shorthand (computed reconstructed from its stored value)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
   for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
@@ -18667,6 +18773,13 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // `mask` shorthand: reconstruct from the COMPUTED longhands (so gradient colours
     // resolve to rgb(), lengths to px, etc.) rather than echoing the specified value.
     if (kebab === 'mask') return _serMaskShort((ln) => resolve(ln));
+    // `animation-range` shorthand: reconstruct the computed value from the two
+    // COMPUTED range longhands (offsets resolved to px, default offsets re-dropped),
+    // then re-omit the redundant end. Empty (unset) longhands compute to `normal`.
+    if (kebab === 'animation-range') {
+      const sv = resolve('animation-range-start'), ev = resolve('animation-range-end');
+      return _serAnimRangeFromLonghands(sv, ev);
+    }
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).
     // Modelled standard properties resolve through the full computed-value
