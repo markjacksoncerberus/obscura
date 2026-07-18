@@ -40,6 +40,64 @@ struct Args {
     /// Applied once at startup before any isolate is created.
     #[arg(long, value_name = "FLAGS", allow_hyphen_values = true)]
     v8_flags: Option<String>,
+
+    /// When to render pages: `never` (default), `on-demand`, or `always`.
+    /// Rendering powers screenshots and real layout geometry. Requires the
+    /// binary to be built with `--features render`; otherwise only `never`
+    /// works.
+    #[arg(long, global = true, value_name = "MODE", default_value = "never")]
+    render_mode: String,
+
+    /// Default layout viewport for rendering, as `WIDTHxHEIGHT` CSS pixels
+    /// (default `1280x720`). Overridden per-page by Emulation.
+    #[arg(long, global = true, value_name = "WxH")]
+    window_size: Option<String>,
+
+    /// Device pixel ratio for rendering (default `1.0`).
+    #[arg(long, global = true, value_name = "FACTOR")]
+    device_scale_factor: Option<f64>,
+}
+
+/// Parse the global render flags into [`RenderSettings`], failing loudly on bad
+/// input or when an enabled mode is requested from a binary built without the
+/// `render` feature.
+fn render_settings_from_args(args: &Args) -> anyhow::Result<obscura_browser::RenderSettings> {
+    use obscura_browser::{RenderMode, RenderSettings, ViewportConfig};
+
+    let mode: RenderMode = args
+        .render_mode
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if mode.is_enabled() && !cfg!(feature = "render") {
+        anyhow::bail!(
+            "--render-mode {mode} requires a build with rendering enabled. \
+             Rebuild with `cargo build --features render` (or use --render-mode never)."
+        );
+    }
+
+    let mut viewport = ViewportConfig::default();
+    if let Some(spec) = &args.window_size {
+        let (w, h) = spec
+            .split_once(['x', 'X'])
+            .ok_or_else(|| anyhow::anyhow!("--window-size must look like 1280x720"))?;
+        viewport.width = w
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid --window-size width '{w}'"))?;
+        viewport.height = h
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid --window-size height '{h}'"))?;
+    }
+    if let Some(dsf) = args.device_scale_factor {
+        if dsf <= 0.0 {
+            anyhow::bail!("--device-scale-factor must be positive");
+        }
+        viewport.device_scale_factor = dsf;
+    }
+
+    Ok(RenderSettings { mode, viewport })
 }
 
 #[derive(Subcommand)]
@@ -113,6 +171,16 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
+
+        /// Write a PNG/JPEG screenshot of the rendered page to this path.
+        /// Implies `--render-mode on-demand` and requires a `--features render`
+        /// build. The format is chosen from the file extension (default PNG).
+        #[arg(long, value_name = "PATH")]
+        screenshot: Option<std::path::PathBuf>,
+
+        /// Capture the full scrollable page height instead of just the viewport.
+        #[arg(long)]
+        full_page: bool,
     },
 
     Scrape {
@@ -150,9 +218,7 @@ enum Command {
         #[arg(long)]
         stealth: bool,
     },
-
 }
-
 
 #[derive(Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum DumpFormat {
@@ -173,7 +239,8 @@ enum DumpFormat {
 }
 
 fn print_banner(port: u16) {
-    println!(r#"
+    println!(
+        r#"
    ____  _                              
   / __ \| |                             
  | |  | | |__  ___  ___ _   _ _ __ __ _ 
@@ -183,7 +250,9 @@ fn print_banner(port: u16) {
                    
   Headless Browser v0.1.5
   CDP server: ws://127.0.0.1:{}/devtools/browser
-"#, port);
+"#,
+        port
+    );
 }
 
 fn select_log_filter(verbose: bool, quiet: bool) -> &'static str {
@@ -259,9 +328,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let global_proxy = args.proxy.clone();
+    let render_settings = render_settings_from_args(&args)?;
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, stealth, workers, allow_file_access, storage_dir }) => {
+        Some(Command::Serve {
+            port,
+            host,
+            proxy,
+            user_agent,
+            stealth,
+            workers,
+            allow_file_access,
+            storage_dir,
+        }) => {
             let proxy = merge_proxy(global_proxy.clone(), proxy);
             reject_stealth_with_socks5(proxy.as_deref(), stealth)?;
             print_banner(port);
@@ -283,23 +362,96 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Stealth mode enabled (tracker blocking)");
             }
 
+            if render_settings.mode.is_enabled() {
+                tracing::info!(
+                    "Rendering: {} ({}x{} @ {}x)",
+                    render_settings.mode,
+                    render_settings.viewport.width,
+                    render_settings.viewport.height,
+                    render_settings.viewport.device_scale_factor,
+                );
+            }
+
             if workers > 1 {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_host_and_security(
-                    port, &host, proxy, stealth, user_agent, allow_file_access, storage_dir,
-                ).await?;
+                obscura_cdp::start_with_host_security_storage_and_render(
+                    port,
+                    &host,
+                    proxy,
+                    stealth,
+                    user_agent,
+                    allow_file_access,
+                    storage_dir,
+                    render_settings,
+                )
+                .await?;
             }
         }
-        Some(Command::Fetch { url, dump, selector, wait, timeout, wait_until, user_agent, stealth, eval, output, quiet, storage_dir }) => {
+        Some(Command::Fetch {
+            url,
+            dump,
+            selector,
+            wait,
+            timeout,
+            wait_until,
+            user_agent,
+            stealth,
+            eval,
+            output,
+            quiet,
+            storage_dir,
+            screenshot,
+            full_page,
+        }) => {
             reject_stealth_with_socks5(global_proxy.as_deref(), stealth)?;
-            run_fetch(&url, dump, selector, wait, timeout, &wait_until, user_agent, stealth, eval, output, quiet, global_proxy, storage_dir).await?;
+            run_fetch(
+                &url,
+                dump,
+                selector,
+                wait,
+                timeout,
+                &wait_until,
+                user_agent,
+                stealth,
+                eval,
+                output,
+                quiet,
+                global_proxy,
+                storage_dir,
+                render_settings,
+                screenshot,
+                full_page,
+            )
+            .await?;
         }
-        Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
-            run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
+        Some(Command::Scrape {
+            urls,
+            eval,
+            concurrency,
+            format,
+            timeout,
+            quiet,
+        }) => {
+            run_parallel_scrape(
+                urls,
+                eval,
+                concurrency.get(),
+                &format,
+                timeout,
+                quiet,
+                global_proxy,
+            )
+            .await?;
         }
-        Some(Command::Mcp { http, port, proxy, user_agent, stealth }) => {
+        Some(Command::Mcp {
+            http,
+            port,
+            proxy,
+            user_agent,
+            stealth,
+        }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy.clone());
             reject_stealth_with_socks5(mcp_proxy.as_deref(), stealth)?;
             if http {
@@ -327,8 +479,8 @@ async fn run_multi_worker_serve(
     stealth: bool,
     user_agent: Option<String>,
 ) -> anyhow::Result<()> {
-    use tokio::net::TcpListener;
     use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
 
     let exe = std::env::current_exe()?;
     let mut children = Vec::new();
@@ -402,11 +554,8 @@ async fn run_multi_worker_serve(
                                     return;
                                 }
                             };
-                            let _ = tokio::io::copy_bidirectional(
-                                &mut client,
-                                &mut worker_stream,
-                            )
-                            .await;
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream)
+                                .await;
                         });
                     }
                     Err(e) => {
@@ -414,9 +563,7 @@ async fn run_multi_worker_serve(
                         tokio::spawn(async move {
                             let mut s = client_stream;
                             let _ = s
-                                .write_all(
-                                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n",
-                                )
+                                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
                                 .await;
                             let _ = s.shutdown().await;
                         });
@@ -431,8 +578,7 @@ async fn run_multi_worker_serve(
             match tokio::net::TcpStream::connect(&worker_addr).await {
                 Ok(mut worker_stream) => {
                     let mut client = client_stream;
-                    let _ =
-                        tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut worker_stream).await;
                 }
                 Err(e) => {
                     tracing::warn!("worker {} unreachable: {}", worker_addr, e);
@@ -461,30 +607,36 @@ async fn run_fetch(
     quiet: bool,
     proxy: Option<String>,
     storage_dir: Option<std::path::PathBuf>,
+    render: obscura_browser::RenderSettings,
+    screenshot: Option<std::path::PathBuf>,
+    full_page: bool,
 ) -> anyhow::Result<()> {
     // --dump original short-circuits the browser stack entirely: fetch the raw
     // response body via HTTP and stream the bytes verbatim. Useful for binary
     // payloads (images, fonts, …) and any non-HTML resource where parsing the
     // body through the DOM/JS layer would corrupt or discard data.
     if dump == DumpFormat::Original {
-        let bytes = fetch_original_bytes(
-            url_str,
-            proxy,
-            user_agent.clone(),
-            timeout_secs,
-        )
-        .await?;
+        let bytes = fetch_original_bytes(url_str, proxy, user_agent.clone(), timeout_secs).await?;
         write_or_print_bytes(&bytes, output.as_ref()).await?;
         return Ok(());
     }
 
-    let context = Arc::new(BrowserContext::with_storage_full(
+    let mut render = render;
+    // A screenshot implies rendering; turn it on if the user didn't.
+    if screenshot.is_some() && !render.mode.is_enabled() {
+        render.mode = obscura_browser::RenderMode::OnDemand;
+    }
+
+    let mut ctx = BrowserContext::with_storage_full(
         "fetch".to_string(),
         proxy,
         stealth,
         user_agent.clone(),
         storage_dir.clone(),
-    ));
+    );
+    ctx.render_mode = render.mode;
+    ctx.default_viewport = render.viewport;
+    let context = Arc::new(ctx);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
 
     if let Some(ref ua) = user_agent {
@@ -497,8 +649,15 @@ async fn run_fetch(
         eprintln!("Fetching {}...", url_str);
     }
 
-    match timeout(Duration::from_secs(timeout_secs), page.navigate_with_wait(url_str, wait_condition)).await {
-        Ok(result) => result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?,
+    match timeout(
+        Duration::from_secs(timeout_secs),
+        page.navigate_with_wait(url_str, wait_condition),
+    )
+    .await
+    {
+        Ok(result) => {
+            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?
+        }
         Err(_) => anyhow::bail!(
             "Timed out navigating to {} after {}s",
             url_str,
@@ -514,6 +673,33 @@ async fn run_fetch(
         let found = wait_for_selector(&mut page, sel, wait_secs).await;
         if !found {
             eprintln!("Warning: selector '{}' not found after {}s", sel, wait_secs);
+        }
+    }
+
+    if let Some(ref path) = screenshot {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        // JPEG for .jpg/.jpeg, PNG otherwise. Capture the full page height.
+        let format = match path.extension().and_then(|e| e.to_str()) {
+            Some(ext) if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") => {
+                "jpeg"
+            }
+            _ => "png",
+        };
+        let b64 = page
+            .capture_screenshot_base64(Some(format), None, None, full_page)
+            .map_err(|e| anyhow::anyhow!("screenshot failed: {e}"))?;
+        let bytes = BASE64
+            .decode(b64)
+            .map_err(|e| anyhow::anyhow!("decoding screenshot: {e}"))?;
+        tokio::fs::write(path, &bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("writing screenshot to {}: {e}", path.display()))?;
+        if !quiet {
+            eprintln!(
+                "Screenshot written to {} ({} bytes)",
+                path.display(),
+                bytes.len()
+            );
         }
     }
 
@@ -572,7 +758,10 @@ async fn fetch_original_bytes(
     Ok(response.body)
 }
 
-async fn write_or_print(content: String, output: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+async fn write_or_print(
+    content: String,
+    output: Option<&std::path::PathBuf>,
+) -> anyhow::Result<()> {
     if let Some(path) = output {
         tokio::fs::write(path, content)
             .await
@@ -610,9 +799,9 @@ async fn write_or_print_bytes(
 async fn wait_for_selector(page: &mut Page, selector: &str, timeout_secs: u64) -> bool {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
     loop {
-        let found = page.with_dom(|dom| {
-            dom.query_selector(selector).ok().flatten().is_some()
-        }).unwrap_or(false);
+        let found = page
+            .with_dom(|dom| dom.query_selector(selector).ok().flatten().is_some())
+            .unwrap_or(false);
 
         if found {
             return true;
@@ -635,7 +824,8 @@ fn dump_html(page: &Page) -> String {
             let doc = dom.document();
             dom.inner_html(doc)
         }
-    }).unwrap_or_default()
+    })
+    .unwrap_or_default()
 }
 
 fn dump_text(page: &mut Page) -> String {
@@ -646,7 +836,8 @@ fn dump_text(page: &mut Page) -> String {
         } else {
             String::new()
         }
-    }).unwrap_or_default()
+    })
+    .unwrap_or_default()
 }
 
 fn dump_markdown(page: &mut Page) -> String {
@@ -674,12 +865,38 @@ fn extract_readable_text(dom: &obscura_dom::DomTree, node_id: obscura_dom::NodeI
             let tag = name.local.as_ref();
             let is_block = matches!(
                 tag,
-                "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                    | "li" | "tr" | "br" | "hr" | "blockquote" | "pre"
-                    | "section" | "article" | "header" | "footer" | "nav"
-                    | "main" | "aside" | "figure" | "figcaption" | "table"
-                    | "thead" | "tbody" | "tfoot" | "dl" | "dt" | "dd"
-                    | "ul" | "ol"
+                "div"
+                    | "p"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "li"
+                    | "tr"
+                    | "br"
+                    | "hr"
+                    | "blockquote"
+                    | "pre"
+                    | "section"
+                    | "article"
+                    | "header"
+                    | "footer"
+                    | "nav"
+                    | "main"
+                    | "aside"
+                    | "figure"
+                    | "figcaption"
+                    | "table"
+                    | "thead"
+                    | "tbody"
+                    | "tfoot"
+                    | "dl"
+                    | "dt"
+                    | "dd"
+                    | "ul"
+                    | "ol"
             );
 
             // Boilerplate elements rarely contain content the user wants to
@@ -737,7 +954,11 @@ async fn run_parallel_scrape(
         );
     }
 
-    let worker_name = if cfg!(windows) { "obscura-worker.exe" } else { "obscura-worker" };
+    let worker_name = if cfg!(windows) {
+        "obscura-worker.exe"
+    } else {
+        "obscura-worker"
+    };
     let worker_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(worker_name)))
@@ -810,44 +1031,10 @@ async fn run_parallel_scrape(
             };
             let mut reader = BufReader::new(stdout);
 
-            let worker_result: Result<serde_json::Value, String> = match timeout(worker_timeout, async {
-                let nav_cmd = serde_json::json!({"cmd": "navigate", "url": url});
-                let mut line = serde_json::to_string(&nav_cmd).unwrap();
-                line.push('\n');
-                if stdin.write_all(line.as_bytes()).await.is_err() {
-                    return Err("Write failed".to_string());
-                }
-                if stdin.flush().await.is_err() {
-                    return Err("Write failed".to_string());
-                }
-
-                let mut resp_line = String::new();
-                match timeout(read_timeout, reader.read_line(&mut resp_line)).await {
-                    Ok(Ok(bytes)) if bytes > 0 => {}
-                    Ok(Ok(_)) | Ok(Err(_)) => return Err("Read failed".to_string()),
-                    Err(_) => return Err("timeout".to_string()),
-                };
-
-                let nav_resp: serde_json::Value =
-                    serde_json::from_str(resp_line.trim()).unwrap_or(serde_json::json!({"ok": false}));
-
-                if !nav_resp["ok"].as_bool().unwrap_or(false) {
-                    return Err(
-                        nav_resp["error"]
-                            .as_str()
-                            .unwrap_or("navigate failed")
-                            .to_string(),
-                    );
-                }
-
-                let title = nav_resp["result"]["title"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-
-                let eval_result = if let Some(ref expr) = *eval {
-                    let eval_cmd = serde_json::json!({"cmd": "evaluate", "expression": expr});
-                    let mut line = serde_json::to_string(&eval_cmd).unwrap();
+            let worker_result: Result<serde_json::Value, String> =
+                match timeout(worker_timeout, async {
+                    let nav_cmd = serde_json::json!({"cmd": "navigate", "url": url});
+                    let mut line = serde_json::to_string(&nav_cmd).unwrap();
                     line.push('\n');
                     if stdin.write_all(line.as_bytes()).await.is_err() {
                         return Err("Write failed".to_string());
@@ -858,38 +1045,72 @@ async fn run_parallel_scrape(
 
                     let mut resp_line = String::new();
                     match timeout(read_timeout, reader.read_line(&mut resp_line)).await {
-                        Ok(Ok(bytes)) if bytes > 0 => {
-                            let resp: serde_json::Value = serde_json::from_str(resp_line.trim())
-                                .unwrap_or(serde_json::json!({"ok": false}));
-                            resp["result"].clone()
-                        }
+                        Ok(Ok(bytes)) if bytes > 0 => {}
                         Ok(Ok(_)) | Ok(Err(_)) => return Err("Read failed".to_string()),
                         Err(_) => return Err("timeout".to_string()),
+                    };
+
+                    let nav_resp: serde_json::Value = serde_json::from_str(resp_line.trim())
+                        .unwrap_or(serde_json::json!({"ok": false}));
+
+                    if !nav_resp["ok"].as_bool().unwrap_or(false) {
+                        return Err(nav_resp["error"]
+                            .as_str()
+                            .unwrap_or("navigate failed")
+                            .to_string());
                     }
-                } else {
-                    serde_json::Value::Null
+
+                    let title = nav_resp["result"]["title"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+
+                    let eval_result = if let Some(ref expr) = *eval {
+                        let eval_cmd = serde_json::json!({"cmd": "evaluate", "expression": expr});
+                        let mut line = serde_json::to_string(&eval_cmd).unwrap();
+                        line.push('\n');
+                        if stdin.write_all(line.as_bytes()).await.is_err() {
+                            return Err("Write failed".to_string());
+                        }
+                        if stdin.flush().await.is_err() {
+                            return Err("Write failed".to_string());
+                        }
+
+                        let mut resp_line = String::new();
+                        match timeout(read_timeout, reader.read_line(&mut resp_line)).await {
+                            Ok(Ok(bytes)) if bytes > 0 => {
+                                let resp: serde_json::Value =
+                                    serde_json::from_str(resp_line.trim())
+                                        .unwrap_or(serde_json::json!({"ok": false}));
+                                resp["result"].clone()
+                            }
+                            Ok(Ok(_)) | Ok(Err(_)) => return Err("Read failed".to_string()),
+                            Err(_) => return Err("timeout".to_string()),
+                        }
+                    } else {
+                        serde_json::Value::Null
+                    };
+
+                    let shutdown_cmd = serde_json::json!({"cmd": "shutdown"});
+                    let mut line = serde_json::to_string(&shutdown_cmd).unwrap();
+                    line.push('\n');
+                    let _ = stdin.write_all(line.as_bytes()).await;
+                    let _ = stdin.flush().await;
+                    let _ = timeout(shutdown_timeout, child.wait()).await;
+
+                    Ok(serde_json::json!({
+                        "url": url,
+                        "title": title,
+                        "eval": eval_result,
+                        "time_ms": task_start.elapsed().as_millis(),
+                        "worker": i,
+                    }))
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("timeout".to_string()),
                 };
-
-                let shutdown_cmd = serde_json::json!({"cmd": "shutdown"});
-                let mut line = serde_json::to_string(&shutdown_cmd).unwrap();
-                line.push('\n');
-                let _ = stdin.write_all(line.as_bytes()).await;
-                let _ = stdin.flush().await;
-                let _ = timeout(shutdown_timeout, child.wait()).await;
-
-                Ok(serde_json::json!({
-                    "url": url,
-                    "title": title,
-                    "eval": eval_result,
-                    "time_ms": task_start.elapsed().as_millis(),
-                    "worker": i,
-                }))
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err("timeout".to_string()),
-            };
 
             match worker_result {
                 Ok(result) => result,
@@ -965,7 +1186,9 @@ fn dump_links(page: &Page) -> String {
                 let full_url = if href.starts_with("http://") || href.starts_with("https://") {
                     href.clone()
                 } else if let Some(ref base) = base_url {
-                    base.join(&href).map(|u| u.to_string()).unwrap_or(href.clone())
+                    base.join(&href)
+                        .map(|u| u.to_string())
+                        .unwrap_or(href.clone())
                 } else {
                     href.clone()
                 };
@@ -980,7 +1203,8 @@ fn dump_links(page: &Page) -> String {
             }
         }
         rendered.join("\n")
-    }).unwrap_or_default()
+    })
+    .unwrap_or_default()
 }
 
 /// Selectors paired with the attribute whose URL we extract and the
@@ -1003,7 +1227,13 @@ const ASSET_SELECTORS: &[(&str, &str, &str)] = &[
 /// Unknown / missing `rel` falls back to a generic "link" so the
 /// caller still sees the URL.
 fn link_kind_from_rel(rel: &str) -> &'static str {
-    match rel.split_ascii_whitespace().next().unwrap_or("").to_ascii_lowercase().as_str() {
+    match rel
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "stylesheet" => "stylesheet",
         "icon" | "shortcut" => "icon",
         "manifest" => "manifest",
@@ -1044,9 +1274,13 @@ fn extract_assets(dom: &obscura_dom::DomTree, base_url: Option<&url::Url>) -> St
     for (selector, attr, default_kind) in ASSET_SELECTORS {
         let nodes = dom.query_selector_all(selector).unwrap_or_default();
         for node_id in nodes {
-            let Some(node) = dom.get_node(node_id) else { continue };
+            let Some(node) = dom.get_node(node_id) else {
+                continue;
+            };
             let raw = node.get_attribute(attr).unwrap_or_default().to_string();
-            let Some(url) = resolve_asset_url(&raw, base_url) else { continue };
+            let Some(url) = resolve_asset_url(&raw, base_url) else {
+                continue;
+            };
 
             let kind = if *default_kind == "link" {
                 let rel = node.get_attribute("rel").unwrap_or_default().to_string();
@@ -1067,7 +1301,8 @@ fn extract_assets(dom: &obscura_dom::DomTree, base_url: Option<&url::Url>) -> St
 
 fn dump_assets(page: &Page) -> String {
     let base_url = page.url.clone();
-    page.with_dom(|dom| extract_assets(dom, base_url.as_ref())).unwrap_or_default()
+    page.with_dom(|dom| extract_assets(dom, base_url.as_ref()))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1075,8 +1310,8 @@ mod tests {
     use super::{
         extract_assets, extract_readable_text, fetch_original_bytes, is_quiet_command,
         link_kind_from_rel, merge_proxy, normalize_v8_flags, reject_stealth_with_socks5,
-        resolve_asset_url, select_log_filter, write_or_print, write_or_print_bytes, Args,
-        Command, DumpFormat,
+        resolve_asset_url, select_log_filter, write_or_print, write_or_print_bytes, Args, Command,
+        DumpFormat,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
@@ -1138,7 +1373,10 @@ mod tests {
 
         let _ = tokio::fs::remove_file(&path).await;
 
-        assert_eq!(bytes, PNG_BYTES, "raw response body must match the file byte-for-byte");
+        assert_eq!(
+            bytes, PNG_BYTES,
+            "raw response body must match the file byte-for-byte"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1161,7 +1399,10 @@ mod tests {
         let read_back = tokio::fs::read(&path).await.expect("read back");
         let _ = tokio::fs::remove_file(&path).await;
 
-        assert_eq!(read_back, payload, "file bytes must match the payload exactly");
+        assert_eq!(
+            read_back, payload,
+            "file bytes must match the payload exactly"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1206,13 +1447,8 @@ mod tests {
 
     #[test]
     fn parsed_fetch_with_quiet_flag_is_detected() {
-        let args = Args::try_parse_from([
-            "obscura",
-            "fetch",
-            "--quiet",
-            "https://example.com",
-        ])
-        .expect("clap should accept --quiet on fetch");
+        let args = Args::try_parse_from(["obscura", "fetch", "--quiet", "https://example.com"])
+            .expect("clap should accept --quiet on fetch");
         assert!(is_quiet_command(&args.command));
     }
 
@@ -1225,8 +1461,7 @@ mod tests {
 
     #[test]
     fn parsed_serve_command_is_not_quiet() {
-        let args = Args::try_parse_from(["obscura", "serve"])
-            .expect("clap should accept serve");
+        let args = Args::try_parse_from(["obscura", "serve"]).expect("clap should accept serve");
         assert!(!is_quiet_command(&args.command));
     }
 
@@ -1288,14 +1523,9 @@ mod tests {
 
     #[test]
     fn parsed_v8_flags_empty_string_is_accepted() {
-        let args = Args::try_parse_from([
-            "obscura",
-            "--v8-flags",
-            "",
-            "fetch",
-            "https://example.com",
-        ])
-        .expect("clap should accept empty --v8-flags value");
+        let args =
+            Args::try_parse_from(["obscura", "--v8-flags", "", "fetch", "https://example.com"])
+                .expect("clap should accept empty --v8-flags value");
         assert_eq!(args.v8_flags.as_deref(), Some(""));
     }
 
@@ -1362,13 +1592,8 @@ mod tests {
 
     #[test]
     fn parsed_fetch_quiet_resolves_to_off_filter() {
-        let args = Args::try_parse_from([
-            "obscura",
-            "fetch",
-            "--quiet",
-            "https://example.com",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["obscura", "fetch", "--quiet", "https://example.com"]).unwrap();
         let filter = select_log_filter(args.verbose, is_quiet_command(&args.command));
         assert_eq!(filter, "off");
     }
@@ -1388,6 +1613,8 @@ mod tests {
             quiet: true,
             output: None,
             storage_dir: None,
+            screenshot: None,
+            full_page: false,
         });
         assert!(is_quiet_command(&cmd));
     }
@@ -1399,7 +1626,10 @@ mod tests {
             .ok()
             .flatten()
             .expect("body must exist");
-        extract_readable_text(&dom, body).split_whitespace().collect::<Vec<_>>().join(" ")
+        extract_readable_text(&dom, body)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[test]
@@ -1626,5 +1856,4 @@ mod tests {
         assert!(lines[0].contains("\"https://example.test/ok.html\""));
         assert!(lines[0].contains("\"iframe\""));
     }
-
 }

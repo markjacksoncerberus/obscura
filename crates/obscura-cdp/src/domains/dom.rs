@@ -8,6 +8,21 @@ use crate::dispatch::CdpContext;
 /// and `objectId` in that order. Playwright commonly passes only `objectId`
 /// (returned by a prior `DOM.resolveNode`); without this fallback those
 /// requests silently default to node 0 and click the wrong element.
+/// A CDP quad `[x1,y1, x2,y2, x3,y3, x4,y4]` (TL, TR, BR, BL) from an
+/// `(x, y, width, height)` box in CSS pixels.
+fn box_quad(x: f64, y: f64, w: f64, h: f64) -> Vec<Value> {
+    vec![
+        json!(x),
+        json!(y),
+        json!(x + w),
+        json!(y),
+        json!(x + w),
+        json!(y + h),
+        json!(x),
+        json!(y + h),
+    ]
+}
+
 fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
     if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64()) {
         return Ok(nid);
@@ -17,7 +32,7 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
     }
     if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
         let code = format!(
-            "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects['{}']; \
+            "(function() {{ var o = __obscura_objects && __obscura_objects['{}']; \
              return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
             oid.replace('\'', "\\'")
         );
@@ -45,48 +60,68 @@ pub async fn handle(
             page.with_dom(|dom| {
                 let node = serialize_node(dom, dom.document(), depth as u32, 0);
                 json!({ "root": node })
-            }).ok_or_else(|| "No DOM loaded".to_string())
+            })
+            .ok_or_else(|| "No DOM loaded".to_string())
         }
         "querySelector" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
-            let result = page.with_dom(|dom| {
-                dom.query_selector(selector).ok().flatten().map(|id| id.index()).unwrap_or(0)
-            }).unwrap_or(0);
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or("selector required")?;
+            let result = page
+                .with_dom(|dom| {
+                    dom.query_selector(selector)
+                        .ok()
+                        .flatten()
+                        .map(|id| id.index())
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
             Ok(json!({ "nodeId": result }))
         }
         "querySelectorAll" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let selector = params.get("selector").and_then(|v| v.as_str()).ok_or("selector required")?;
-            let ids = page.with_dom(|dom| {
-                dom.query_selector_all(selector).ok()
-                    .map(|ids| ids.iter().map(|id| id.index() as u64).collect::<Vec<_>>())
-                    .unwrap_or_default()
-            }).unwrap_or_default();
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or("selector required")?;
+            let ids = page
+                .with_dom(|dom| {
+                    dom.query_selector_all(selector)
+                        .ok()
+                        .map(|ids| ids.iter().map(|id| id.index() as u64).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
             Ok(json!({ "nodeIds": ids }))
         }
         "getOuterHTML" => {
             let page = ctx.get_session_page(session_id).ok_or("No page")?;
-            let node_id = params.get("nodeId").and_then(|v| v.as_u64())
+            let node_id = params
+                .get("nodeId")
+                .and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
                 .ok_or("nodeId required")?;
-            let html = page.with_dom(|dom| {
-                dom.outer_html(NodeId::new(node_id as u32))
-            }).unwrap_or_default();
+            let html = page
+                .with_dom(|dom| dom.outer_html(NodeId::new(node_id as u32)))
+                .unwrap_or_default();
             Ok(json!({ "outerHTML": html }))
         }
         "describeNode" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let depth = params.get("depth").and_then(|v| v.as_i64()).unwrap_or(0);
 
-            let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
+            let node_id = if let Some(nid) = params
+                .get("nodeId")
+                .and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
             {
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
                 let escaped_oid = oid.replace('\\', "\\\\").replace('\'', "\\'");
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    "(function() {{ var o = __obscura_objects['{}']; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
                     escaped_oid
                 );
                 let result = page.evaluate(&code);
@@ -95,20 +130,22 @@ pub async fn handle(
                 return Err("nodeId or objectId required".to_string());
             };
 
-            let node = page.with_dom(|dom| {
-                serialize_node(dom, NodeId::new(node_id as u32), depth as u32, 0)
-            }).unwrap_or(json!(null));
+            let node = page
+                .with_dom(|dom| serialize_node(dom, NodeId::new(node_id as u32), depth as u32, 0))
+                .unwrap_or(json!(null));
             Ok(json!({ "node": node }))
         }
         "resolveNode" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-            let node_id = if let Some(nid) = params.get("nodeId").and_then(|v| v.as_u64())
+            let node_id = if let Some(nid) = params
+                .get("nodeId")
+                .and_then(|v| v.as_u64())
                 .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
             {
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    "(function() {{ var o = __obscura_objects['{}']; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
                     oid
                 );
                 let result = page.evaluate(&code);
@@ -168,6 +205,19 @@ pub async fn handle(
         "getBoxModel" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let node_id = resolve_node_id(page, params)?;
+            // Prefer real geometry from the renderer when it's available.
+            if let Some((x, y, w, h)) = page.render_node_rect(node_id) {
+                let quad = box_quad(x, y, w, h);
+                return Ok(json!({
+                    "model": {
+                        "content": quad.clone(),
+                        "padding": quad.clone(),
+                        "border": quad.clone(),
+                        "margin": quad,
+                        "width": w, "height": h,
+                    }
+                }));
+            }
             let code = format!(
                 "(function() {{\
                     var el = globalThis._wrap && globalThis._wrap({0});\
@@ -185,10 +235,36 @@ pub async fn handle(
                     let q: Vec<Value> = nums[..8].iter().map(|n| json!(n)).collect();
                     (q, nums[8], nums[9])
                 } else {
-                    (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+                    (
+                        vec![
+                            json!(8),
+                            json!(8),
+                            json!(108),
+                            json!(8),
+                            json!(108),
+                            json!(28),
+                            json!(8),
+                            json!(28),
+                        ],
+                        100.0,
+                        20.0,
+                    )
                 }
             } else {
-                (vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)], 100.0, 20.0)
+                (
+                    vec![
+                        json!(8),
+                        json!(8),
+                        json!(108),
+                        json!(8),
+                        json!(108),
+                        json!(28),
+                        json!(8),
+                        json!(28),
+                    ],
+                    100.0,
+                    20.0,
+                )
             };
             Ok(json!({
                 "model": {
@@ -203,6 +279,9 @@ pub async fn handle(
         "getContentQuads" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let node_id = resolve_node_id(page, params)?;
+            if let Some((x, y, w, h)) = page.render_node_rect(node_id) {
+                return Ok(json!({ "quads": [box_quad(x, y, w, h)] }));
+            }
             let code = format!(
                 "(function() {{\
                     var el = globalThis._wrap && globalThis._wrap({0});\
@@ -215,10 +294,31 @@ pub async fn handle(
             let val = page.evaluate(&code);
             let quad = if let Some(arr) = val.as_array() {
                 let nums: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                if nums.len() == 8 { nums.iter().map(|n| json!(n)).collect::<Vec<_>>() }
-                else { vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)] }
+                if nums.len() == 8 {
+                    nums.iter().map(|n| json!(n)).collect::<Vec<_>>()
+                } else {
+                    vec![
+                        json!(8),
+                        json!(8),
+                        json!(108),
+                        json!(8),
+                        json!(108),
+                        json!(28),
+                        json!(8),
+                        json!(28),
+                    ]
+                }
             } else {
-                vec![json!(8),json!(8),json!(108),json!(8),json!(108),json!(28),json!(8),json!(28)]
+                vec![
+                    json!(8),
+                    json!(8),
+                    json!(108),
+                    json!(8),
+                    json!(108),
+                    json!(28),
+                    json!(8),
+                    json!(28),
+                ]
             };
             Ok(json!({ "quads": [quad] }))
         }
@@ -237,41 +337,62 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
 
     match &node.data {
         NodeData::Document => {
-            result["nodeType"] = json!(9); result["nodeName"] = json!("#document");
-            result["localName"] = json!(""); result["nodeValue"] = json!("");
-            result["documentURL"] = json!(""); result["baseURL"] = json!(""); result["xmlVersion"] = json!("");
+            result["nodeType"] = json!(9);
+            result["nodeName"] = json!("#document");
+            result["localName"] = json!("");
+            result["nodeValue"] = json!("");
+            result["documentURL"] = json!("");
+            result["baseURL"] = json!("");
+            result["xmlVersion"] = json!("");
         }
-        NodeData::Doctype { name, public_id, system_id } => {
-            result["nodeType"] = json!(10); result["nodeName"] = json!(name);
-            result["localName"] = json!(""); result["nodeValue"] = json!("");
-            result["publicId"] = json!(public_id); result["systemId"] = json!(system_id);
+        NodeData::Doctype {
+            name,
+            public_id,
+            system_id,
+        } => {
+            result["nodeType"] = json!(10);
+            result["nodeName"] = json!(name);
+            result["localName"] = json!("");
+            result["nodeValue"] = json!("");
+            result["publicId"] = json!(public_id);
+            result["systemId"] = json!(system_id);
         }
         NodeData::Element { name, attrs, .. } => {
             result["nodeType"] = json!(1);
             result["nodeName"] = json!(name.local.as_ref().to_ascii_uppercase());
             result["localName"] = json!(name.local.as_ref());
             result["nodeValue"] = json!("");
-            let cdp_attrs: Vec<String> = attrs.iter()
-                .flat_map(|a| vec![a.name.local.to_string(), a.value.clone()]).collect();
+            let cdp_attrs: Vec<String> = attrs
+                .iter()
+                .flat_map(|a| vec![a.name.local.to_string(), a.value.clone()])
+                .collect();
             result["attributes"] = json!(cdp_attrs);
         }
         NodeData::Text { contents } => {
-            result["nodeType"] = json!(3); result["nodeName"] = json!("#text");
-            result["localName"] = json!(""); result["nodeValue"] = json!(contents);
+            result["nodeType"] = json!(3);
+            result["nodeName"] = json!("#text");
+            result["localName"] = json!("");
+            result["nodeValue"] = json!(contents);
         }
         NodeData::Comment { contents } => {
-            result["nodeType"] = json!(8); result["nodeName"] = json!("#comment");
-            result["localName"] = json!(""); result["nodeValue"] = json!(contents);
+            result["nodeType"] = json!(8);
+            result["nodeName"] = json!("#comment");
+            result["localName"] = json!("");
+            result["nodeValue"] = json!(contents);
         }
         NodeData::ProcessingInstruction { target, data } => {
-            result["nodeType"] = json!(7); result["nodeName"] = json!(target);
-            result["localName"] = json!(""); result["nodeValue"] = json!(data);
+            result["nodeType"] = json!(7);
+            result["nodeName"] = json!(target);
+            result["localName"] = json!("");
+            result["nodeValue"] = json!(data);
         }
     }
 
     if current_depth < max_depth && !children_ids.is_empty() {
-        let children: Vec<Value> = children_ids.iter()
-            .map(|&cid| serialize_node(dom, cid, max_depth, current_depth + 1)).collect();
+        let children: Vec<Value> = children_ids
+            .iter()
+            .map(|&cid| serialize_node(dom, cid, max_depth, current_depth + 1))
+            .collect();
         result["children"] = json!(children);
     }
     result

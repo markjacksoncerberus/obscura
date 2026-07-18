@@ -1,6 +1,6 @@
-use html5ever::{LocalName, Namespace, QualName};
+use html5ever::{LocalName, Namespace, Prefix, QualName};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +30,17 @@ impl fmt::Display for NodeId {
 pub struct Attribute {
     pub name: QualName,
     pub value: String,
+}
+
+impl Attribute {
+    /// The attribute's qualified name: `prefix:local` when a prefix is present,
+    /// otherwise just the local name. This is the DOM `Attr.name` / `nodeName`.
+    pub fn qualified_name(&self) -> String {
+        match &self.name.prefix {
+            Some(p) => format!("{}:{}", p.as_ref(), self.name.local.as_ref()),
+            None => self.name.local.as_ref().to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -126,12 +137,121 @@ impl Node {
         }
     }
 
+    // --- Namespace- and qualified-name-aware attribute access (DOM Attr model).
+    // The Rust `Attribute` already carries a full `QualName` (ns/prefix/local);
+    // these methods key on it so an element can hold several attributes that
+    // share a local name but differ in namespace (per the DOM spec). The plain
+    // `get_attribute`/`set_attribute` above stay keyed by local name for the
+    // selector engine and serializer, which only ever look up bare locals.
+
+    /// First attribute whose qualified name (`prefix:local` or `local`) equals
+    /// `qname`. This is what `Element.getAttribute(qualifiedName)` resolves to.
+    pub fn get_attribute_qualified(&self, qname: &str) -> Option<&str> {
+        self.attrs()?
+            .iter()
+            .find(|a| a.qualified_name() == qname)
+            .map(|a| a.value.as_str())
+    }
+
+    /// Set the value of the first attribute matching `qname`, or append a new
+    /// null-namespace attribute whose local name is the whole `qname`.
+    pub fn set_attribute_qualified(&mut self, qname: &str, value: String) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            if let Some(attr) = attrs.iter_mut().find(|a| a.qualified_name() == qname) {
+                attr.value = value;
+            } else {
+                attrs.push(Attribute {
+                    name: QualName::new(None, Namespace::default(), LocalName::from(qname)),
+                    value,
+                });
+            }
+        }
+    }
+
+    /// Remove the first attribute matching the qualified name `qname`.
+    pub fn remove_attribute_qualified(&mut self, qname: &str) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            if let Some(pos) = attrs.iter().position(|a| a.qualified_name() == qname) {
+                attrs.remove(pos);
+            }
+        }
+    }
+
+    /// First attribute matching (namespace, local name). The empty string for
+    /// `ns` denotes the null namespace. Matching is case-sensitive.
+    pub fn get_attribute_ns(&self, ns: &str, local: &str) -> Option<&str> {
+        self.attrs()?
+            .iter()
+            .find(|a| a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
+            .map(|a| a.value.as_str())
+    }
+
+    /// Set the (namespace, local) attribute, replacing the value of an existing
+    /// match (keeping its prefix, per spec) or appending a new attribute.
+    pub fn set_attribute_ns(&mut self, ns: &str, prefix: Option<&str>, local: &str, value: String) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            if let Some(attr) = attrs
+                .iter_mut()
+                .find(|a| a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
+            {
+                attr.value = value;
+            } else {
+                attrs.push(Attribute {
+                    name: QualName::new(
+                        prefix.map(Prefix::from),
+                        Namespace::from(ns),
+                        LocalName::from(local),
+                    ),
+                    value,
+                });
+            }
+        }
+    }
+
+    /// Remove the first attribute matching (namespace, local name).
+    pub fn remove_attribute_ns(&mut self, ns: &str, local: &str) {
+        if let NodeData::Element { attrs, .. } = &mut self.data {
+            if let Some(pos) = attrs
+                .iter()
+                .position(|a| a.name.ns.as_ref() == ns && a.name.local.as_ref() == local)
+            {
+                attrs.remove(pos);
+            }
+        }
+    }
+
     pub fn text_content_of_text_node(&self) -> Option<&str> {
         match &self.data {
             NodeData::Text { contents } => Some(contents),
             _ => None,
         }
     }
+}
+
+/// The shape of a DOM mutation, mirroring the parts of a DOM `MutationRecord`
+/// the JS bridge needs. Phase 0c: the Rust tree is the authoritative source of
+/// mutations, so `MutationObserver` fires regardless of whether a mutation came
+/// from a JS wrapper method or directly from a Rust/CDP code path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationKind {
+    ChildList,
+    Attributes,
+    CharacterData,
+}
+
+#[derive(Clone, Debug)]
+pub struct MutationRecord {
+    pub kind: MutationKind,
+    pub target: NodeId,
+    pub added: Vec<NodeId>,
+    pub removed: Vec<NodeId>,
+    pub prev_sibling: Option<NodeId>,
+    pub next_sibling: Option<NodeId>,
+    pub attr_name: Option<String>,
+    /// The mutated attribute's namespace (DOM `MutationRecord.attributeNamespace`).
+    /// `None` for null-namespace attributes and for non-attribute records.
+    pub attr_namespace: Option<String>,
+    pub old_value: Option<String>,
 }
 
 pub struct DomTree {
@@ -143,6 +263,80 @@ pub(crate) struct DomTreeInner {
     pub(crate) free_list: Vec<u32>,
     pub(crate) document: NodeId,
     pub(crate) id_index: HashMap<String, NodeId>,
+    // Phase 0c: Rust-side mutation queue. Gated by `mutations_enabled` (off by
+    // default) so the queue only grows while a consumer — a registered JS
+    // MutationObserver, via the bridge — is draining it. Avoids both a memory
+    // leak and double-firing alongside the legacy JS-instrumented path until
+    // the bridge switches over to draining this.
+    pub(crate) mutations_enabled: bool,
+    pub(crate) pending_mutations: Vec<MutationRecord>,
+    // Atomic childList batching (DOM "queue a tree mutation record"). A compound
+    // operation — `replaceChild`, a DocumentFragment insertion, `textContent` /
+    // `innerHTML` / `replaceChildren` replace-all — must emit ONE childList record
+    // for the parent (added ∪ removed), not one per low-level primitive. While
+    // `suppress_mutations > 0` the primitive recorders (append_child / insert_before
+    // / detach) skip pushing their per-step childList records; the JS high-level
+    // method then synthesizes the single spec-shaped record via
+    // `record_childlist_mutation`. A depth counter (not a bool) so nested compound
+    // ops compose. Attribute/characterData records are unaffected.
+    pub(crate) suppress_mutations: u32,
+    // Phase 0b: dynamic element state that doesn't live in attributes. Kept in
+    // side maps so we never touch the `Node` literal (constructed in many
+    // places). `checked_state` overrides the `checked` attribute default once
+    // JS sets `el.checked`; `focused` is the single focused element.
+    pub(crate) checked_state: HashMap<NodeId, bool>,
+    // The `indeterminate` IDL state of checkboxes (set by JS `el.indeterminate =
+    // …`). Unlike `checked`, it has no content-attribute default, so a missing
+    // entry means false. Read by `:indeterminate` for checkbox inputs.
+    pub(crate) indeterminate_state: HashMap<NodeId, bool>,
+    pub(crate) focused: Option<NodeId>,
+    // Shadow HOSTS that contain the focused element within their shadow tree (the
+    // hosts crossed walking the focused element's parent chain out of each nested
+    // shadow tree — NOT via slots). Per HTML "has the focus", each such host also
+    // matches `:focus`. JS syncs this alongside `focused` because the Rust tree
+    // does not model the host↔shadow-root link (a shadow root is a detached
+    // fragment here). Empty whenever nothing is focused.
+    pub(crate) focus_hosts: Vec<NodeId>,
+    // The id named by the current document's URL fragment, for `:target`. JS sets
+    // it from the queried document's URL right before a `:target` query.
+    pub(crate) target_id: Option<String>,
+    // Live constraint-validation selector state, set by JS right before a
+    // `:valid`/`:invalid`/`:in-range`/`:out-of-range` query (the Rust matcher
+    // can't call back into the JS validity engine). A per-node bitmask:
+    // 1 = :valid, 2 = :invalid, 4 = :in-range, 8 = :out-of-range. Treated as a
+    // query-time snapshot — replaced wholesale on each prime so stale entries
+    // never linger.
+    pub(crate) validity_state: HashMap<NodeId, u8>,
+    // Whether the document is in design mode (`document.designMode = "on"`). When
+    // set, every element is editable, so plain elements match `:read-write` (and
+    // none match `:read-only`). A document-global flag JS pushes on assignment.
+    pub(crate) design_mode: bool,
+    // Nodes that are *real documents* (detached/iframe documents). They share the
+    // create_document_fragment backing (NodeData::Document) with plain
+    // DocumentFragments, so this set is how `:root` tells "document element of a
+    // document" from "root of a fragment". The main document (NodeId 0) is always real.
+    pub(crate) real_documents: HashSet<NodeId>,
+    // Custom elements that are "defined" (custom element state "custom") — JS marks a
+    // node here when it is constructed or successfully upgraded. Read by the `:defined`
+    // pseudo-class for hyphenated HTML elements (built-ins are always defined without
+    // consulting this set). Definedness is monotonic per node, so this is set once, not
+    // pushed per-query.
+    pub(crate) ce_defined: HashSet<NodeId>,
+    // A form-associated/autonomous custom element's `CustomStateSet` contents, keyed by
+    // node. JS pushes the full list whenever `ElementInternals.states` is mutated
+    // (add/delete/clear). Read by the `:state(ident)` pseudo-class. Unlike `ce_defined`
+    // this is NOT monotonic — states toggle — so an empty list drops the entry entirely.
+    pub(crate) ce_states: HashMap<NodeId, Vec<String>>,
+    // Popovers currently in the "showing" state (top layer). JS toggles membership on
+    // showPopover/hidePopover; read by the `:popover-open` pseudo-class. Non-monotonic.
+    pub(crate) popover_open: HashSet<NodeId>,
+    // Dialogs currently showing as MODAL (via showModal()). JS toggles membership on
+    // showModal/close; read by the `:modal` pseudo-class. Non-monotonic.
+    pub(crate) dialog_modal: HashSet<NodeId>,
+    // Elements currently in the fullscreen element stack (via requestFullscreen()). JS
+    // toggles membership on enter/exit; read by the `:fullscreen` pseudo-class. All
+    // elements on the stack match `:fullscreen` (not just the topmost). Non-monotonic.
+    pub(crate) fullscreen: HashSet<NodeId>,
 }
 
 impl DomTree {
@@ -162,6 +356,22 @@ impl DomTree {
                 free_list: Vec::new(),
                 document: NodeId(0),
                 id_index: HashMap::new(),
+                mutations_enabled: false,
+                pending_mutations: Vec::new(),
+                suppress_mutations: 0,
+                checked_state: HashMap::new(),
+                indeterminate_state: HashMap::new(),
+                focused: None,
+                focus_hosts: Vec::new(),
+                target_id: None,
+                validity_state: HashMap::new(),
+                design_mode: false,
+                real_documents: HashSet::new(),
+                ce_defined: HashSet::new(),
+                ce_states: HashMap::new(),
+                popover_open: HashSet::new(),
+                dialog_modal: HashSet::new(),
+                fullscreen: HashSet::new(),
             }),
         }
     }
@@ -172,6 +382,327 @@ impl DomTree {
 
     pub(crate) fn borrow_inner(&self) -> std::cell::Ref<'_, DomTreeInner> {
         self.inner.borrow()
+    }
+
+    /// Turn Rust-side mutation recording on/off. Off clears any queued records.
+    /// The JS bridge enables this while at least one MutationObserver is active.
+    pub fn set_mutation_recording(&self, on: bool) {
+        let mut inner = self.inner.borrow_mut();
+        inner.mutations_enabled = on;
+        if !on {
+            inner.pending_mutations.clear();
+        }
+    }
+
+    pub fn is_recording_mutations(&self) -> bool {
+        self.inner.borrow().mutations_enabled
+    }
+
+    /// Take and clear the queued mutation records (delivered to JS observers).
+    pub fn drain_mutations(&self) -> Vec<MutationRecord> {
+        std::mem::take(&mut self.inner.borrow_mut().pending_mutations)
+    }
+
+    /// Phase 0b: dynamic checked state. Set when JS assigns `el.checked`.
+    pub fn set_checked(&self, id: NodeId, checked: bool) {
+        self.inner.borrow_mut().checked_state.insert(id, checked);
+    }
+
+    /// Clear the dynamic checked override so `checked()` falls back to the
+    /// `checked` content attribute. This is the "dirty checkedness flag = false"
+    /// step of the form reset algorithm (HTML §4.10.21.4).
+    pub fn clear_checked(&self, id: NodeId) {
+        self.inner.borrow_mut().checked_state.remove(&id);
+    }
+
+    /// Resolve an element's checked state: the JS-set state if present, else the
+    /// `checked` attribute default. Used by `:checked` and the checked getter.
+    pub fn checked(&self, id: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        if let Some(&c) = inner.checked_state.get(&id) {
+            return c;
+        }
+        inner
+            .nodes
+            .get(id.index())
+            .and_then(|n| n.as_ref())
+            .map(|n| n.get_attribute("checked").is_some())
+            .unwrap_or(false)
+    }
+
+    /// Set a checkbox's `indeterminate` IDL state (drives `:indeterminate`).
+    pub fn set_indeterminate(&self, id: NodeId, indeterminate: bool) {
+        self.inner.borrow_mut().indeterminate_state.insert(id, indeterminate);
+    }
+
+    /// A checkbox's `indeterminate` IDL state. No content-attribute default, so a
+    /// node JS never touched is not indeterminate.
+    pub fn indeterminate(&self, id: NodeId) -> bool {
+        self.inner.borrow().indeterminate_state.get(&id).copied().unwrap_or(false)
+    }
+
+    /// Replace the live constraint-validation selector state wholesale. JS
+    /// computes the bitmask for every validity-bearing element in the document
+    /// and pushes the full set right before a `:valid`/`:invalid`/`:in-range`/
+    /// `:out-of-range` query, so the map is always a fresh snapshot.
+    pub fn set_validity_state_bulk(&self, entries: &[(NodeId, u8)]) {
+        let mut inner = self.inner.borrow_mut();
+        inner.validity_state.clear();
+        for (id, flags) in entries {
+            inner.validity_state.insert(*id, *flags);
+        }
+    }
+
+    /// The validity bitmask JS last pushed for this node (0 = none of the
+    /// constraint-validation pseudo-classes apply).
+    pub fn validity_state(&self, id: NodeId) -> u8 {
+        self.inner.borrow().validity_state.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Mark a custom element as "defined" (state "custom"), so `:defined` matches it.
+    pub fn set_ce_defined(&self, id: NodeId) {
+        self.inner.borrow_mut().ce_defined.insert(id);
+    }
+
+    /// Whether a node has been marked a defined custom element.
+    pub fn is_ce_defined(&self, id: NodeId) -> bool {
+        self.inner.borrow().ce_defined.contains(&id)
+    }
+
+    /// Replace a node's custom-state set (the `:state()` pseudo consults it). An empty
+    /// list removes the entry so nothing lingers after `states.clear()`.
+    pub fn set_ce_states(&self, id: NodeId, states: Vec<String>) {
+        let mut inner = self.inner.borrow_mut();
+        if states.is_empty() {
+            inner.ce_states.remove(&id);
+        } else {
+            inner.ce_states.insert(id, states);
+        }
+    }
+
+    /// Whether a node currently carries the given custom state (exact, case-sensitive).
+    pub fn has_ce_state(&self, id: NodeId, state: &str) -> bool {
+        self.inner
+            .borrow()
+            .ce_states
+            .get(&id)
+            .is_some_and(|v| v.iter().any(|s| s == state))
+    }
+
+    /// Toggle a popover's "showing" membership (drives `:popover-open`).
+    pub fn set_popover_open(&self, id: NodeId, open: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if open {
+            inner.popover_open.insert(id);
+        } else {
+            inner.popover_open.remove(&id);
+        }
+    }
+
+    /// Whether a node is a currently-showing popover.
+    pub fn is_popover_open(&self, id: NodeId) -> bool {
+        self.inner.borrow().popover_open.contains(&id)
+    }
+
+    /// Toggle a dialog's "modal" membership (drives the `:modal` pseudo-class).
+    pub fn set_dialog_modal(&self, id: NodeId, modal: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if modal {
+            inner.dialog_modal.insert(id);
+        } else {
+            inner.dialog_modal.remove(&id);
+        }
+    }
+
+    /// Whether a node is a currently-open modal dialog.
+    pub fn is_dialog_modal(&self, id: NodeId) -> bool {
+        self.inner.borrow().dialog_modal.contains(&id)
+    }
+
+    /// Toggle an element's fullscreen membership (drives the `:fullscreen` pseudo-class).
+    pub fn set_fullscreen(&self, id: NodeId, on: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if on {
+            inner.fullscreen.insert(id);
+        } else {
+            inner.fullscreen.remove(&id);
+        }
+    }
+
+    /// Whether a node is currently in the fullscreen element stack.
+    pub fn is_fullscreen(&self, id: NodeId) -> bool {
+        self.inner.borrow().fullscreen.contains(&id)
+    }
+
+    /// Set whether the document is in design mode (drives `:read-write`/`:read-only`).
+    pub fn set_design_mode(&self, on: bool) {
+        self.inner.borrow_mut().design_mode = on;
+    }
+
+    /// Whether the document is in design mode (every element is then editable).
+    pub fn design_mode(&self) -> bool {
+        self.inner.borrow().design_mode
+    }
+
+    /// Phase 0b: the focused element (drives `:focus` and `document.activeElement`).
+    /// Clearing focus (`None`) also clears the shadow-host focus chain.
+    pub fn set_focus(&self, id: Option<NodeId>) {
+        let mut inner = self.inner.borrow_mut();
+        inner.focused = id;
+        if id.is_none() {
+            inner.focus_hosts.clear();
+        }
+    }
+
+    /// The shadow hosts that contain the focused element (see `focus_hosts`). Each
+    /// also matches `:focus`. Set by JS whenever focus moves into a shadow tree.
+    pub fn set_focus_hosts(&self, ids: Vec<NodeId>) {
+        self.inner.borrow_mut().focus_hosts = ids;
+    }
+
+    /// Whether `id` is a shadow host containing the focused element (so `:focus`
+    /// matches it per HTML "has the focus").
+    pub fn is_focus_host(&self, id: NodeId) -> bool {
+        self.inner.borrow().focus_hosts.contains(&id)
+    }
+
+    /// Whether `id` matches `:focus-within`: it is, or is a light-tree ancestor of,
+    /// the focused element or any shadow host containing the focused element. The
+    /// host chain carries the cross-shadow reach (the Rust tree can't walk from a
+    /// shadow node to its host), so walking each host's light-tree ancestry here
+    /// covers the full shadow-including ancestor set.
+    pub fn focus_within(&self, id: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let is_inclusive_ancestor = |mut cur: Option<NodeId>| -> bool {
+            while let Some(c) = cur {
+                if c == id {
+                    return true;
+                }
+                cur = match inner.nodes.get(c.index()).and_then(|n| n.as_ref()) {
+                    Some(n) => n.parent,
+                    None => return false,
+                };
+            }
+            false
+        };
+        if let Some(f) = inner.focused {
+            if is_inclusive_ancestor(Some(f)) {
+                return true;
+            }
+        }
+        inner
+            .focus_hosts
+            .iter()
+            .any(|&h| is_inclusive_ancestor(Some(h)))
+    }
+
+    /// The id named by the current document's URL fragment, for `:target`. An
+    /// empty string clears it (no fragment → `:target` matches nothing).
+    pub fn set_target_id(&self, value: Option<String>) {
+        self.inner.borrow_mut().target_id = value.filter(|s| !s.is_empty());
+    }
+
+    pub fn target_id(&self) -> Option<String> {
+        self.inner.borrow().target_id.clone()
+    }
+
+    /// Mark a node as a real document (detached/iframe document) so `:root` can
+    /// distinguish it from a plain DocumentFragment with the same backing kind.
+    pub fn mark_real_document(&self, id: NodeId) {
+        self.inner.borrow_mut().real_documents.insert(id);
+    }
+
+    /// Whether `id` is a real document: the main document, or one explicitly marked.
+    pub fn is_real_document(&self, id: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        id == inner.document || inner.real_documents.contains(&id)
+    }
+
+    pub fn focused(&self) -> Option<NodeId> {
+        self.inner.borrow().focused
+    }
+
+    /// Record an attribute mutation. Called from the op layer, which performs
+    /// attribute writes via `with_node_mut` rather than a child-list method.
+    pub fn record_attribute_mutation(
+        &self,
+        target: NodeId,
+        name: &str,
+        namespace: Option<String>,
+        old_value: Option<String>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.mutations_enabled {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::Attributes,
+                target,
+                added: Vec::new(),
+                removed: Vec::new(),
+                prev_sibling: None,
+                next_sibling: None,
+                attr_name: Some(name.to_string()),
+                attr_namespace: namespace,
+                old_value,
+            });
+        }
+    }
+
+    /// Record a characterData (text/comment contents) mutation.
+    pub fn record_character_data_mutation(&self, target: NodeId, old_value: Option<String>) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.mutations_enabled {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::CharacterData,
+                target,
+                added: Vec::new(),
+                removed: Vec::new(),
+                prev_sibling: None,
+                next_sibling: None,
+                attr_name: None,
+                attr_namespace: None,
+                old_value,
+            });
+        }
+    }
+
+    /// Begin/end a childList-record suppression scope (see `suppress_mutations`).
+    /// While suppressed, `append_child`/`insert_before`/`detach` skip their
+    /// per-primitive childList records; the caller synthesizes the single
+    /// spec-shaped record via `record_childlist_mutation`. Nesting-safe.
+    pub fn push_suppress_mutations(&self) {
+        self.inner.borrow_mut().suppress_mutations += 1;
+    }
+    pub fn pop_suppress_mutations(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.suppress_mutations = inner.suppress_mutations.saturating_sub(1);
+    }
+
+    /// Push one synthesized childList mutation record for a compound operation
+    /// (the DOM "queue a tree mutation record" with the full added ∪ removed set).
+    /// Recorded regardless of the suppress depth — it IS the replacement for the
+    /// suppressed per-primitive records — but still only while recording is on.
+    pub fn record_childlist_mutation(
+        &self,
+        target: NodeId,
+        added: Vec<NodeId>,
+        removed: Vec<NodeId>,
+        prev_sibling: Option<NodeId>,
+        next_sibling: Option<NodeId>,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.mutations_enabled {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::ChildList,
+                target,
+                added,
+                removed,
+                prev_sibling,
+                next_sibling,
+                attr_name: None,
+                attr_namespace: None,
+                old_value: None,
+            });
+        }
     }
 
     pub fn new_node(&self, data: NodeData) -> NodeId {
@@ -227,7 +758,9 @@ impl DomTree {
 
         let mut inner = self.inner.borrow_mut();
 
-        let old_last = inner.nodes.get(parent_id.index())
+        let old_last = inner
+            .nodes
+            .get(parent_id.index())
             .and_then(|n| n.as_ref())
             .and_then(|n| n.last_child);
 
@@ -249,12 +782,48 @@ impl DomTree {
             }
             parent.last_child = Some(child_id);
         }
+
+        // Phase 0c: childList addition (appended after the previous last child).
+        if inner.mutations_enabled && inner.suppress_mutations == 0 {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::ChildList,
+                target: parent_id,
+                added: vec![child_id],
+                removed: Vec::new(),
+                prev_sibling: old_last,
+                next_sibling: None,
+                attr_name: None,
+                attr_namespace: None,
+                old_value: None,
+            });
+        }
     }
 
     pub fn insert_before(&self, existing_id: NodeId, new_sibling_id: NodeId) {
+        // A node can never be inserted before itself: doing so would wire the node's
+        // prev/next siblings to point at itself, turning the sibling list into a cycle
+        // that hangs every subsequent tree walk. (The DOM "pre-insert" algorithm avoids
+        // ever calling this by advancing the reference child to the node's next sibling,
+        // but guard here too so no caller can corrupt the tree.)
+        if existing_id == new_sibling_id {
+            return;
+        }
+        // Detach the moving node FIRST, then read the reference's parent/prev_sibling.
+        // Order matters: if `new_sibling_id` was `existing_id`'s previous sibling (i.e.
+        // moving a node to just before its own next sibling — a no-op move), detaching
+        // it rewires `existing_id.prev_sibling`. Reading prev BEFORE the detach would
+        // capture the moving node itself as the anchor, wiring it as its own previous
+        // sibling — a cycle that drops the rest of the list. Read AFTER detach so the
+        // anchor is the moving node's former predecessor.
+        self.detach(new_sibling_id);
+
         let (parent_id, prev_id) = {
             let inner = self.inner.borrow();
-            let node = match inner.nodes.get(existing_id.index()).and_then(|n| n.as_ref()) {
+            let node = match inner
+                .nodes
+                .get(existing_id.index())
+                .and_then(|n| n.as_ref())
+            {
                 Some(n) => n,
                 None => return,
             };
@@ -263,8 +832,6 @@ impl DomTree {
                 None => return,
             }
         };
-
-        self.detach(new_sibling_id);
 
         let mut inner = self.inner.borrow_mut();
 
@@ -285,15 +852,31 @@ impl DomTree {
         } else if let Some(Some(parent)) = inner.nodes.get_mut(parent_id.index()) {
             parent.first_child = Some(new_sibling_id);
         }
+
+        // Phase 0c: childList addition, inserted before `existing_id`.
+        if inner.mutations_enabled && inner.suppress_mutations == 0 {
+            inner.pending_mutations.push(MutationRecord {
+                kind: MutationKind::ChildList,
+                target: parent_id,
+                added: vec![new_sibling_id],
+                removed: Vec::new(),
+                prev_sibling: prev_id,
+                next_sibling: Some(existing_id),
+                attr_name: None,
+                attr_namespace: None,
+                old_value: None,
+            });
+        }
     }
 
     pub fn detach(&self, node_id: NodeId) {
         let mut inner = self.inner.borrow_mut();
 
-        let (parent_id, prev_id, next_id) = match inner.nodes.get(node_id.index()).and_then(|n| n.as_ref()) {
-            Some(node) => (node.parent, node.prev_sibling, node.next_sibling),
-            None => return,
-        };
+        let (parent_id, prev_id, next_id) =
+            match inner.nodes.get(node_id.index()).and_then(|n| n.as_ref()) {
+                Some(node) => (node.parent, node.prev_sibling, node.next_sibling),
+                None => return,
+            };
 
         if let Some(prev) = prev_id {
             if let Some(Some(node)) = inner.nodes.get_mut(prev.index()) {
@@ -319,6 +902,25 @@ impl DomTree {
             node.parent = None;
             node.prev_sibling = None;
             node.next_sibling = None;
+        }
+
+        // Phase 0c: a detach from a real parent is a childList removal. Siblings
+        // were captured above, before the unlink. (Detaching an already-orphan
+        // node returned early, so `parent_id` here means it had a parent.)
+        if inner.mutations_enabled && inner.suppress_mutations == 0 {
+            if let Some(parent) = parent_id {
+                inner.pending_mutations.push(MutationRecord {
+                    kind: MutationKind::ChildList,
+                    target: parent,
+                    added: Vec::new(),
+                    removed: vec![node_id],
+                    prev_sibling: prev_id,
+                    next_sibling: next_id,
+                    attr_name: None,
+                    attr_namespace: None,
+                    old_value: None,
+                });
+            }
         }
     }
 
@@ -390,12 +992,16 @@ impl DomTree {
     pub fn children(&self, node_id: NodeId) -> Vec<NodeId> {
         let inner = self.inner.borrow();
         let mut result = Vec::new();
-        let mut current = inner.nodes.get(node_id.index())
+        let mut current = inner
+            .nodes
+            .get(node_id.index())
             .and_then(|n| n.as_ref())
             .and_then(|n| n.first_child);
         while let Some(child_id) = current {
             result.push(child_id);
-            current = inner.nodes.get(child_id.index())
+            current = inner
+                .nodes
+                .get(child_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.next_sibling);
         }
@@ -407,13 +1013,17 @@ impl DomTree {
         let mut result = Vec::new();
         let mut stack = Vec::new();
 
-        let mut first = inner.nodes.get(node_id.index())
+        let mut first = inner
+            .nodes
+            .get(node_id.index())
             .and_then(|n| n.as_ref())
             .and_then(|n| n.first_child);
         let mut children_to_push = Vec::new();
         while let Some(child_id) = first {
             children_to_push.push(child_id);
-            first = inner.nodes.get(child_id.index())
+            first = inner
+                .nodes
+                .get(child_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.next_sibling);
         }
@@ -424,13 +1034,17 @@ impl DomTree {
         while let Some(current) = stack.pop() {
             result.push(current);
 
-            let mut child = inner.nodes.get(current.index())
+            let mut child = inner
+                .nodes
+                .get(current.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.first_child);
             let mut children_to_push = Vec::new();
             while let Some(child_id) = child {
                 children_to_push.push(child_id);
-                child = inner.nodes.get(child_id.index())
+                child = inner
+                    .nodes
+                    .get(child_id.index())
                     .and_then(|n| n.as_ref())
                     .and_then(|n| n.next_sibling);
             }
@@ -445,12 +1059,16 @@ impl DomTree {
     pub fn ancestors(&self, node_id: NodeId) -> Vec<NodeId> {
         let inner = self.inner.borrow();
         let mut result = Vec::new();
-        let mut current = inner.nodes.get(node_id.index())
+        let mut current = inner
+            .nodes
+            .get(node_id.index())
             .and_then(|n| n.as_ref())
             .and_then(|n| n.parent);
         while let Some(parent_id) = current {
             result.push(parent_id);
-            current = inner.nodes.get(parent_id.index())
+            current = inner
+                .nodes
+                .get(parent_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.parent);
         }
@@ -458,11 +1076,50 @@ impl DomTree {
     }
 
     pub fn get_element_by_id(&self, id: &str) -> Option<NodeId> {
-        self.inner.borrow().id_index.get(id).copied()
+        // DOM §dom-document-getelementbyid: return the FIRST element, in tree
+        // order, among the document's descendants whose ID is `id`. An element's
+        // ID is its non-empty `id` attribute — so the empty string never matches.
+        //
+        // We walk the live tree (pre-order) rather than consulting a stored index:
+        // an index keyed by id can neither honour tree order across duplicate ids
+        // nor stay live across innerHTML/outerHTML/subtree mutations. Walking from
+        // the document root also gives connectedness for free — a detached element
+        // (appended to a fragment or another orphan, not to the document) is simply
+        // not reachable, so it is correctly excluded.
+        if id.is_empty() {
+            return None;
+        }
+        let inner = self.inner.borrow();
+        let mut stack: Vec<NodeId> = Vec::new();
+        push_children_rev(&inner, inner.document, &mut stack);
+        while let Some(cur) = stack.pop() {
+            if let Some(Some(node)) = inner.nodes.get(cur.index()) {
+                if let NodeData::Element { ref attrs, .. } = node.data {
+                    if attrs
+                        .iter()
+                        .any(|a| a.name.local.as_ref() == "id" && a.value.as_str() == id)
+                    {
+                        return Some(cur);
+                    }
+                }
+                push_children_rev(&inner, cur, &mut stack);
+            }
+        }
+        None
     }
 
     pub fn text_content(&self, node_id: NodeId) -> String {
         let inner = self.inner.borrow();
+        // A CharacterData node's textContent is its OWN data. For Element /
+        // Document / DocumentFragment it is the concatenation of descendant Text
+        // nodes (excluding Comment/PI), which collect_text_inner handles.
+        if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
+            match &node.data {
+                NodeData::Text { contents } | NodeData::Comment { contents } => return contents.clone(),
+                NodeData::ProcessingInstruction { data, .. } => return data.clone(),
+                _ => {}
+            }
+        }
         let mut result = String::new();
         collect_text_inner(&inner, node_id, &mut result);
         result
@@ -471,7 +1128,9 @@ impl DomTree {
     pub fn append_text(&self, parent_id: NodeId, text: &str) {
         let last_child_is_text = {
             let inner = self.inner.borrow();
-            inner.nodes.get(parent_id.index())
+            inner
+                .nodes
+                .get(parent_id.index())
                 .and_then(|n| n.as_ref())
                 .and_then(|n| n.last_child)
                 .and_then(|lc| inner.nodes.get(lc.index()))
@@ -483,7 +1142,9 @@ impl DomTree {
         if last_child_is_text {
             let last_child_id = {
                 let inner = self.inner.borrow();
-                inner.nodes.get(parent_id.index())
+                inner
+                    .nodes
+                    .get(parent_id.index())
                     .and_then(|n| n.as_ref())
                     .and_then(|n| n.last_child)
                     .unwrap()
@@ -503,14 +1164,43 @@ impl DomTree {
         self.append_child(parent_id, text_id);
     }
 
+    /// The root that holds a fragment's parsed nodes as its direct children.
+    ///
+    /// `parse_fragment[_ctx]` wraps parsed content in a synthetic `html`
+    /// element (the fragment-parsing "root"); its children ARE the fragment.
+    /// Unlike [`find_body_or_root`], this never descends into a `body` child —
+    /// crucial when the context element is `html`, where the fragment legitimately
+    /// contains `head`/`body` elements we want to import *as* nodes rather than
+    /// unwrapping. Returns the document itself if there is no element child.
+    pub fn fragment_root(&self) -> NodeId {
+        let doc = self.document();
+        for child in self.children(doc) {
+            if self
+                .get_node(child)
+                .map(|n| n.as_element().is_some())
+                .unwrap_or(false)
+            {
+                return child;
+            }
+        }
+        doc
+    }
+
     pub fn find_body_or_root(&self) -> NodeId {
         let doc = self.document();
         for child in self.children(doc) {
             if let Some(n) = self.get_node(child) {
-                if n.as_element().map(|name| name.local.as_ref() == "html").unwrap_or(false) {
+                if n.as_element()
+                    .map(|name| name.local.as_ref() == "html")
+                    .unwrap_or(false)
+                {
                     for html_child in self.children(child) {
                         if let Some(hc) = self.get_node(html_child) {
-                            if hc.as_element().map(|name| name.local.as_ref() == "body").unwrap_or(false) {
+                            if hc
+                                .as_element()
+                                .map(|name| name.local.as_ref() == "body")
+                                .unwrap_or(false)
+                            {
                                 return html_child;
                             }
                         }
@@ -530,25 +1220,56 @@ impl DomTree {
     }
 
     fn import_node_from(&self, parent_id: NodeId, source: &DomTree, source_node_id: NodeId) {
-        let node_data = {
+        let (mut node_data, source_template_contents) = {
             let source_inner = source.inner.borrow();
             match source_inner.nodes.get(source_node_id.index()) {
-                Some(Some(node)) => node.data.clone(),
+                Some(Some(node)) => {
+                    let tc = match &node.data {
+                        NodeData::Element { template_contents, .. } => *template_contents,
+                        _ => None,
+                    };
+                    (node.data.clone(), tc)
+                }
                 _ => return,
             }
         };
 
+        // A cloned <template> must NOT keep the source tree's content-node id (it
+        // would dangle into the discarded source tree). Reset it; if the source had
+        // template contents, rebuild a fresh content node in THIS tree and import
+        // the source's contents into it. A template's children live under its
+        // separate content subtree, not under the element itself, so importing
+        // `source.children(template)` alone would silently drop all its markup.
+        if let NodeData::Element { template_contents, .. } = &mut node_data {
+            *template_contents = None;
+        }
         let new_id = self.new_node(node_data);
         self.append_child(parent_id, new_id);
 
-        let children = source.children(source_node_id);
-        for child_id in children {
+        if let Some(src_tc) = source_template_contents {
+            let content_id = self.new_node(NodeData::Document);
+            self.with_node_mut(new_id, |node| {
+                if let NodeData::Element { template_contents, .. } = &mut node.data {
+                    *template_contents = Some(content_id);
+                }
+            });
+            for child_id in source.children(src_tc) {
+                self.import_node_from(content_id, source, child_id);
+            }
+        }
+
+        for child_id in source.children(source_node_id) {
             self.import_node_from(new_id, source, child_id);
         }
     }
 
     pub fn len(&self) -> usize {
-        self.inner.borrow().nodes.iter().filter(|n| n.is_some()).count()
+        self.inner
+            .borrow()
+            .nodes
+            .iter()
+            .filter(|n| n.is_some())
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -566,6 +1287,27 @@ impl DomTree {
     }
 }
 
+/// Push `parent`'s children onto `stack` in reverse document order, so that a
+/// `stack.pop()`-driven loop visits them left-to-right (a pre-order / tree-order
+/// traversal). Used by `get_element_by_id`.
+fn push_children_rev(inner: &DomTreeInner, parent: NodeId, stack: &mut Vec<NodeId>) {
+    let start = stack.len();
+    let mut child = inner
+        .nodes
+        .get(parent.index())
+        .and_then(|n| n.as_ref())
+        .and_then(|n| n.first_child);
+    while let Some(child_id) = child {
+        stack.push(child_id);
+        child = inner
+            .nodes
+            .get(child_id.index())
+            .and_then(|n| n.as_ref())
+            .and_then(|n| n.next_sibling);
+    }
+    stack[start..].reverse();
+}
+
 fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
     if let Some(Some(node)) = inner.nodes.get(node_id.index()) {
         match &node.data {
@@ -574,7 +1316,9 @@ fn collect_text_inner(inner: &DomTreeInner, node_id: NodeId, buf: &mut String) {
                 let mut child = node.first_child;
                 while let Some(child_id) = child {
                     collect_text_inner(inner, child_id, buf);
-                    child = inner.nodes.get(child_id.index())
+                    child = inner
+                        .nodes
+                        .get(child_id.index())
                         .and_then(|n| n.as_ref())
                         .and_then(|n| n.next_sibling);
                 }
@@ -623,9 +1367,15 @@ mod tests {
     fn test_multiple_children() {
         let tree = DomTree::new();
         let doc = tree.document();
-        let c1 = tree.new_node(NodeData::Text { contents: "a".into() });
-        let c2 = tree.new_node(NodeData::Text { contents: "b".into() });
-        let c3 = tree.new_node(NodeData::Text { contents: "c".into() });
+        let c1 = tree.new_node(NodeData::Text {
+            contents: "a".into(),
+        });
+        let c2 = tree.new_node(NodeData::Text {
+            contents: "b".into(),
+        });
+        let c3 = tree.new_node(NodeData::Text {
+            contents: "c".into(),
+        });
         tree.append_child(doc, c1);
         tree.append_child(doc, c2);
         tree.append_child(doc, c3);
@@ -637,8 +1387,12 @@ mod tests {
     fn test_detach() {
         let tree = DomTree::new();
         let doc = tree.document();
-        let c1 = tree.new_node(NodeData::Text { contents: "a".into() });
-        let c2 = tree.new_node(NodeData::Text { contents: "b".into() });
+        let c1 = tree.new_node(NodeData::Text {
+            contents: "a".into(),
+        });
+        let c2 = tree.new_node(NodeData::Text {
+            contents: "b".into(),
+        });
         tree.append_child(doc, c1);
         tree.append_child(doc, c2);
 
@@ -647,12 +1401,68 @@ mod tests {
     }
 
     #[test]
+    fn phase0c_rust_mutations_are_recorded_only_when_enabled() {
+        let tree = DomTree::new();
+        let doc = tree.document();
+
+        // Disabled by default: a mutation records nothing (no leak / no double
+        // fire alongside the JS-instrumented path).
+        let pre = tree.new_node(NodeData::Text { contents: "x".into() });
+        tree.append_child(doc, pre);
+        assert!(tree.drain_mutations().is_empty());
+
+        // Enabled: childList add → one record with the right shape.
+        tree.set_mutation_recording(true);
+        let c1 = tree.new_node(NodeData::Text { contents: "a".into() });
+        tree.append_child(doc, c1);
+        let recs = tree.drain_mutations();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].kind, MutationKind::ChildList);
+        assert_eq!(recs[0].target, doc);
+        assert_eq!(recs[0].added, vec![c1]);
+        assert!(recs[0].removed.is_empty());
+        assert_eq!(recs[0].prev_sibling, Some(pre)); // appended after `pre`
+
+        // Drain clears the queue.
+        assert!(tree.drain_mutations().is_empty());
+
+        // Detach of a real child → one childList removal record.
+        tree.detach(c1);
+        let recs = tree.drain_mutations();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].kind, MutationKind::ChildList);
+        assert_eq!(recs[0].target, doc);
+        assert_eq!(recs[0].removed, vec![c1]);
+        assert!(recs[0].added.is_empty());
+
+        // insert_before → addition with the right next-sibling.
+        let c2 = tree.new_node(NodeData::Text { contents: "b".into() });
+        tree.insert_before(pre, c2);
+        let recs = tree.drain_mutations();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].added, vec![c2]);
+        assert_eq!(recs[0].next_sibling, Some(pre));
+
+        // Turning recording off clears any queue and stops recording.
+        tree.set_mutation_recording(false);
+        let c3 = tree.new_node(NodeData::Text { contents: "c".into() });
+        tree.append_child(doc, c3);
+        assert!(tree.drain_mutations().is_empty());
+    }
+
+    #[test]
     fn test_insert_before() {
         let tree = DomTree::new();
         let doc = tree.document();
-        let c1 = tree.new_node(NodeData::Text { contents: "a".into() });
-        let c2 = tree.new_node(NodeData::Text { contents: "b".into() });
-        let c3 = tree.new_node(NodeData::Text { contents: "c".into() });
+        let c1 = tree.new_node(NodeData::Text {
+            contents: "a".into(),
+        });
+        let c2 = tree.new_node(NodeData::Text {
+            contents: "b".into(),
+        });
+        let c3 = tree.new_node(NodeData::Text {
+            contents: "c".into(),
+        });
         tree.append_child(doc, c1);
         tree.append_child(doc, c3);
         tree.insert_before(c3, c2);
@@ -672,8 +1482,12 @@ mod tests {
         });
         tree.append_child(doc, div);
 
-        let t1 = tree.new_node(NodeData::Text { contents: "Hello ".into() });
-        let t2 = tree.new_node(NodeData::Text { contents: "World".into() });
+        let t1 = tree.new_node(NodeData::Text {
+            contents: "Hello ".into(),
+        });
+        let t2 = tree.new_node(NodeData::Text {
+            contents: "World".into(),
+        });
         tree.append_child(div, t1);
         tree.append_child(div, t2);
 
@@ -721,7 +1535,9 @@ mod tests {
             mathml_annotation_xml_integration_point: false,
         });
         tree.append_child(doc, div);
-        let text = tree.new_node(NodeData::Text { contents: "hi".into() });
+        let text = tree.new_node(NodeData::Text {
+            contents: "hi".into(),
+        });
         tree.append_child(div, text);
 
         assert_eq!(tree.len(), 3);

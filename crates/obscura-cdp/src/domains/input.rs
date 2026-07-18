@@ -323,6 +323,23 @@ pub async fn handle(
 
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 match event_type {
+                    "keyDown" | "rawKeyDown" if key == "Escape" => {
+                        // A trusted Escape keydown is a "close request": dispatch the
+                        // keydown and, unless a listener cancels it (a focused text field
+                        // may swallow Escape), run the UA close-request algorithm — which
+                        // closes the topmost popover or fires `cancel`/close on the topmost
+                        // modal dialog. Both steps in one eval so the default action sees
+                        // this exact event's canceled flag.
+                        let js = "(function() {\
+                                var target = document.activeElement || document.body;\
+                                var evt = new KeyboardEvent('keydown', {bubbles:true,cancelable:true,composed:true,key:'Escape',code:'Escape'});\
+                                var notPrevented = target.dispatchEvent(evt);\
+                                if (notPrevented && typeof globalThis._processCloseRequest === 'function') {\
+                                    try { globalThis._processCloseRequest(); } catch (e) {}\
+                                }\
+                            })()";
+                        page.evaluate(js);
+                    }
                     "keyDown" | "rawKeyDown" => {
                         let js = format!(
                             "(function() {{\

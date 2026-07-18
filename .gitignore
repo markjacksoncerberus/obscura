@@ -1,2 +1,7 @@
 target/
 .DS_Store
+
+shots/
+.claude/*
+!.claude/commands/
+out/__pycache__/

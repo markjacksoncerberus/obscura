@@ -8,11 +8,15 @@ members = [
     "crates/obscura-js",
     "crates/obscura-mcp",
     "crates/obscura-cli",
+    "crates/obscura-render",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Bumped to satisfy the Blitz rendering stack (Stylo/Parley) used by
+# `obscura-render`. The non-render build is unaffected by this requirement.
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/h4ckf0r0day/obscura"
 
@@ -23,6 +27,7 @@ obscura-browser = { path = "crates/obscura-browser" }
 obscura-cdp = { path = "crates/obscura-cdp" }
 obscura-js = { path = "crates/obscura-js" }
 obscura-mcp = { path = "crates/obscura-mcp" }
+obscura-render = { path = "crates/obscura-render" }
 
 html5ever = "0.29"
 markup5ever = "0.14"
@@ -42,3 +47,18 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
+
+# Use the local Blitz fork (../blitz) instead of the published 0.3.0-alpha.4
+# crates. The fork's `main` is ahead of the published alpha: it carries
+# Parley 0.10 + harfrust 0.8, which fix variable web-font shaping (the
+# "NO GLYPH" issue on modern sites that self-host woff2 fonts). anyrender,
+# peniko, and kurbo are unchanged, so only the Blitz crates are redirected.
+#
+# NOTE: this is a temporary, local-only override for renderer development. It
+# requires the fork checked out at ../blitz and must be removed before the
+# upstream PR (or replaced with a git dependency pinned to a public commit).
+[patch.crates-io]
+blitz-dom = { path = "../blitz/packages/blitz-dom" }
+blitz-html = { path = "../blitz/packages/blitz-html" }
+blitz-paint = { path = "../blitz/packages/blitz-paint" }
+blitz-traits = { path = "../blitz/packages/blitz-traits" }

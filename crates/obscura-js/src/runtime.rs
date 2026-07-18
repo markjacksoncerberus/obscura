@@ -57,7 +57,7 @@ impl ObscuraJsRuntime {
         runtime
             .execute_script(
                 "<obscura:init>",
-                "globalThis.__obscura_objects = {}; globalThis.__obscura_oid = 0; globalThis.__obscura_init();".to_string(),
+                "globalThis.__obscura_init();".to_string(),
             )
             .expect("init should not fail");
 
@@ -107,7 +107,7 @@ impl ObscuraJsRuntime {
         let escaped = ua.replace('\\', "\\\\").replace('\'', "\\'");
         let _ = self.runtime.execute_script(
             "<set-ua>",
-            format!("globalThis.__obscura_ua = '{}';", escaped),
+            format!("__obscura_ua = '{}';", escaped),
         );
     }
     pub fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value, String> {
@@ -145,13 +145,13 @@ impl ObscuraJsRuntime {
                 "(async function() {{\n\
                     try {{\n\
                         var __result = await ({expr});\n\
-                        globalThis.__obscura_objects['{oid}'] = __result;\n\
-                        globalThis.__obscura_await_meta = {meta_fn};\n\
-                        globalThis.__obscura_await_rejected = false;\n\
+                        __obscura_objects['{oid}'] = __result;\n\
+                        __obscura_await_meta = {meta_fn};\n\
+                        __obscura_await_rejected = false;\n\
                     }} catch(e) {{\n\
-                        globalThis.__obscura_objects['{oid}'] = e;\n\
-                        globalThis.__obscura_await_meta = {err_meta_fn};\n\
-                        globalThis.__obscura_await_rejected = true;\n\
+                        __obscura_objects['{oid}'] = e;\n\
+                        __obscura_await_meta = {err_meta_fn};\n\
+                        __obscura_await_rejected = true;\n\
                     }}\n\
                 }})()",
                 expr = cleaned_expr,
@@ -164,7 +164,7 @@ impl ObscuraJsRuntime {
                 "(function() {{\n\
                     var __result;\n\
                     try {{ __result = ({expr}); }} catch(e) {{ __result = undefined; }}\n\
-                    globalThis.__obscura_objects['{oid}'] = __result;\n\
+                    __obscura_objects['{oid}'] = __result;\n\
                     return {meta_fn};\n\
                 }})()",
                 expr = cleaned_expr,
@@ -180,14 +180,14 @@ impl ObscuraJsRuntime {
 
         let meta_str = if await_promise {
             self.resolve_promises().await;
-            let rejected = self.runtime.execute_script("<readRejected>", "globalThis.__obscura_await_rejected".to_string())
+            let rejected = self.runtime.execute_script("<readRejected>", "__obscura_await_rejected".to_string())
                 .map_err(|e| format!("JS error: {}", e))?;
             if self.v8_to_json(rejected)?.as_bool().unwrap_or(false) {
-                let err = self.runtime.execute_script("<readError>", format!("String(globalThis.__obscura_objects['{0}'] && (globalThis.__obscura_objects['{0}'].message || globalThis.__obscura_objects['{0}']))", oid))
+                let err = self.runtime.execute_script("<readError>", format!("String(__obscura_objects['{0}'] && (__obscura_objects['{0}'].message || __obscura_objects['{0}']))", oid))
                     .map_err(|e| format!("JS error: {}", e))?;
                 return Err(format!("Promise rejected: {}", self.v8_to_json(err)?.as_str().unwrap_or("")));
             }
-            self.runtime.execute_script("<readMeta>", "globalThis.__obscura_await_meta".to_string())
+            self.runtime.execute_script("<readMeta>", "__obscura_await_meta".to_string())
                 .map_err(|e| format!("JS error: {}", e))?
         } else {
             result
@@ -200,11 +200,11 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("__obscura_objects['{}']", oid),
         );
 
         if await_promise && return_by_value {
-            let read = self.runtime.execute_script("<readResult>", format!("globalThis.__obscura_objects['{}']", oid))
+            let read = self.runtime.execute_script("<readResult>", format!("__obscura_objects['{}']", oid))
                 .map_err(|e| format!("JS error: {}", e))?;
             let json_val = self.v8_to_json(read)?;
             return Ok(Self::info_from_json(&json_val));
@@ -234,8 +234,8 @@ impl ObscuraJsRuntime {
                     var __fn = ({fn_decl});\n\
                     var __this = ({this_expr});\n\
                     var __result = await __fn.call(__this, {args});\n\
-                    globalThis.__obscura_objects['{oid}'] = __result;\n\
-                    globalThis.__obscura_await_meta = {meta_fn};\n\
+                    __obscura_objects['{oid}'] = __result;\n\
+                    __obscura_await_meta = {meta_fn};\n\
                 }})()",
                 setup = setup,
                 fn_decl = function_declaration,
@@ -254,7 +254,7 @@ impl ObscuraJsRuntime {
             if return_by_value {
                 let read = self.runtime.execute_script(
                     "<readResult>",
-                    format!("globalThis.__obscura_objects['{}']", oid),
+                    format!("__obscura_objects['{}']", oid),
                 ).map_err(|e| format!("JS error: {}", e))?;
                 let json_val = self.v8_to_json(read)?;
                 return Ok(Self::info_from_json(&json_val));
@@ -262,7 +262,7 @@ impl ObscuraJsRuntime {
 
             let meta_result = self.runtime.execute_script(
                 "<readMeta>",
-                "globalThis.__obscura_await_meta".to_string(),
+                "__obscura_await_meta".to_string(),
             ).map_err(|e| format!("JS error: {}", e))?;
             let meta_str = self.v8_to_json(meta_result)?;
             let meta_json = if let serde_json::Value::String(s) = &meta_str {
@@ -272,7 +272,7 @@ impl ObscuraJsRuntime {
             };
             self.object_store.insert(
                 oid.clone(),
-                format!("globalThis.__obscura_objects['{}']", oid),
+                format!("__obscura_objects['{}']", oid),
             );
             return Ok(Self::info_from_meta(&meta_json, Some(oid)));
         }
@@ -303,7 +303,7 @@ impl ObscuraJsRuntime {
                 var __fn = ({fn_decl});\n\
                 var __this = ({this_expr});\n\
                 var __result = __fn.call(__this, {args});\n\
-                globalThis.__obscura_objects['{oid}'] = __result;\n\
+                __obscura_objects['{oid}'] = __result;\n\
                 return {meta_fn};\n\
             }})()",
             setup = setup,
@@ -324,7 +324,7 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("__obscura_objects['{}']", oid),
         );
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
     }
@@ -341,7 +341,7 @@ impl ObscuraJsRuntime {
         self.object_counter += 1;
         let oid = self.make_oid(self.object_counter);
         let code = format!(
-            "globalThis.__obscura_objects['{}'] = ({});",
+            "__obscura_objects['{}'] = ({});",
             oid, js_expression,
         );
         self.runtime
@@ -349,7 +349,7 @@ impl ObscuraJsRuntime {
             .map_err(|e| format!("Store error: {}", e))?;
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("__obscura_objects['{}']", oid),
         );
         Ok(oid)
     }
@@ -363,7 +363,7 @@ impl ObscuraJsRuntime {
         let code = format!(
             "(function() {{\n\
                 var __result = ({expr});\n\
-                globalThis.__obscura_objects['{oid}'] = __result;\n\
+                __obscura_objects['{oid}'] = __result;\n\
                 return {meta_fn};\n\
             }})()",
             expr = js_expression,
@@ -382,7 +382,7 @@ impl ObscuraJsRuntime {
         };
         self.object_store.insert(
             oid.clone(),
-            format!("globalThis.__obscura_objects['{}']", oid),
+            format!("__obscura_objects['{}']", oid),
         );
         Ok(Self::info_from_meta(&meta_json, Some(oid)))
     }
@@ -390,7 +390,7 @@ impl ObscuraJsRuntime {
     pub fn release_object(&mut self, object_id: &str) {
         if self.object_store.remove(object_id).is_some() {
             let code = format!(
-                "delete globalThis.__obscura_objects['{}'];",
+                "delete __obscura_objects['{}'];",
                 object_id,
             );
             let _ = self.runtime.execute_script("<release>", code);
@@ -400,7 +400,7 @@ impl ObscuraJsRuntime {
     pub fn release_object_group(&mut self) {
         let _ = self.runtime.execute_script(
             "<releaseGroup>",
-            "globalThis.__obscura_objects = {};".to_string(),
+            "__obscura_objects = {};".to_string(),
         );
         self.object_store.clear();
     }
@@ -1149,8 +1149,10 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let ua = rt.evaluate("navigator.userAgent").unwrap();
         assert!(ua.as_str().unwrap().contains("Chrome"), "UA should contain Chrome: {}", ua);
+        // Real non-automated Chrome exposes `navigator.webdriver === false`
+        // (present and false), so that's the browser-accurate value to match.
         let wd = rt.evaluate("navigator.webdriver").unwrap();
-        assert_eq!(wd, serde_json::Value::Null);
+        assert_eq!(wd, serde_json::json!(false));
         let plugins = rt.evaluate("navigator.plugins.length").unwrap();
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
         let chrome = rt.evaluate("typeof window.chrome").unwrap();
@@ -1818,6 +1820,507 @@ mod tests {
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert!(html.contains("<html>"));
         assert!(html.contains("<p>Test</p>"));
+    }
+
+    #[test]
+    fn test_iframe_srcdoc_script_executes_against_frame_window() {
+        // iframe increment 4 (Option C): a same-origin srcdoc frame's inline
+        // <script> runs, sees its OWN document, and reaches parent via window.parent.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body><script>parent.__frameSignal = 42; document.body.setAttribute(\\'data-x\\', \\'ran\\');<\\/script></body>');\n\
+                   document.body.appendChild(f);\n\
+                   const cd = f.contentDocument; /* triggers frame script execution */\n\
+                   return [globalThis.__frameSignal === 42, cd.body.getAttribute('data-x') === 'ran'];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true]),
+            "frame script should run, touch its own document, and reach parent: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_iframe_frame_lifecycle_events_reach_listeners() {
+        // iframe increment 4 step 2: a frame script's document/window event
+        // listeners fire. DOMContentLoaded dispatched at the frame document
+        // bubbles to the frame window; `load` fires at the frame window.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   const code = \"window.__hits = [];\" +\n\
+                     \"document.addEventListener('DOMContentLoaded', () => window.__hits.push('doc-dcl'));\" +\n\
+                     \"window.addEventListener('DOMContentLoaded', () => window.__hits.push('win-dcl'));\" +\n\
+                     \"window.addEventListener('load', () => window.__hits.push('win-load'));\";\n\
+                   f.setAttribute('srcdoc', '<body><scr'+'ipt>'+code+'</scr'+'ipt></body>');\n\
+                   document.body.appendChild(f);\n\
+                   const w = f.contentWindow; /* builds frame + runs scripts + fires lifecycle */\n\
+                   return w.__hits;\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["doc-dcl", "win-dcl", "win-load"]),
+            "frame document+window lifecycle listeners should all fire in order: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_iframe_inline_module_script_runs_strict() {
+        // iframe increment 4 step 4: an inline <script type=module> with no static
+        // import/export runs (strict-mode) against the frame window.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body><scr'+'ipt type=\"module\">parent.__mod = 7;</scr'+'ipt></body>');\n\
+                   document.body.appendChild(f);\n\
+                   f.contentDocument;\n\
+                   return globalThis.__mod;\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(result.as_f64(), Some(7.0), "inline frame module should run: {:?}", result);
+    }
+
+    #[test]
+    fn test_iframe_module_with_import_is_skipped_not_fatal() {
+        // A frame module with a top-level import can't run under Option C (no
+        // per-frame realm) — it must be SKIPPED, not throw and not partially run.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body><scr'+'ipt type=\"module\">import x from \"y\"; parent.__bad = 1;</scr'+'ipt></body>');\n\
+                   document.body.appendChild(f);\n\
+                   f.contentDocument;\n\
+                   return globalThis.__bad === undefined;\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true), "module with import must be skipped: {:?}", result);
+    }
+
+    #[test]
+    fn test_iframe_srcdoc_url_semantics() {
+        // about:srcdoc: document.URL is 'about:srcdoc'; baseURI is the parent's URL
+        // (http://example.com/test from setup_runtime).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body>hi</body>');\n\
+                   document.body.appendChild(f);\n\
+                   const cd = f.contentDocument;\n\
+                   const loc = f.contentWindow.location;\n\
+                   return [cd.URL, cd.baseURI, loc.href, loc.origin];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["about:srcdoc", "http://example.com/test", "about:srcdoc", "http://example.com"]),
+            "srcdoc: document.URL + location.href == about:srcdoc, baseURI + origin inherited from parent: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_attribute_lowercase_toggle_validate() {
+        // HTML setAttribute lowercases the name; toggleAttribute add/remove/force;
+        // invalid name -> InvalidCharacterError.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const el = document.createElement('div');\n\
+                   el.setAttribute('FOO', '1');\n\
+                   const a = [el.getAttribute('foo'), el.getAttribute('FOO'), el.hasAttribute('FOO')];\n\
+                   const t1 = el.toggleAttribute('Bar');\n\
+                   const t2 = el.toggleAttribute('bar');\n\
+                   const t3 = el.toggleAttribute('baz', true);\n\
+                   const t4 = el.toggleAttribute('baz', true);\n\
+                   let threw = false; try { el.setAttribute('', 'x'); } catch (e) { threw = e.name === 'InvalidCharacterError'; }\n\
+                   return [a, t1, t2, el.hasAttribute('bar'), t3, t4, el.getAttribute('baz'), threw];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([["1", "1", true], true, false, false, true, true, "", true]),
+            "attribute lowercase/toggle/validate wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_queryselector_invalid_throws() {
+        // Invalid selectors throw SyntaxError; valid-but-unimplemented pseudo-
+        // classes (e.g. :required) parse and just match nothing (no throw).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body><p class='x'>hi</p></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const ts = (fn) => { try { fn(); return false; } catch (e) { return e.name === 'SyntaxError'; } };\n\
+                   return [\n\
+                     ts(() => document.querySelector('>')),\n\
+                     ts(() => document.querySelector(':foobarbaz')),\n\
+                     ts(() => document.querySelector('[att=]')),\n\
+                     !ts(() => document.querySelectorAll(':required')),\n\
+                     document.querySelectorAll('.x').length,\n\
+                   ];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true, true, true, 1]),
+            "querySelector throw/no-throw wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_classlist_domtokenlist() {
+        // Real DOMTokenList: literal value, ordered-set length, iteration, the
+        // [object DOMTokenList] tag, and add/remove/toggle/replace re-serialize.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const el = document.createElement('span');\n\
+                   el.className = '   a  a b ';\n\
+                   const cl = el.classList;\n\
+                   const tag = Object.prototype.toString.call(cl);\n\
+                   const before = [cl.value, cl.length, cl.item(0), cl.contains('a'), [...cl].join(','), cl[1]];\n\
+                   cl.add('c'); cl.remove('b'); cl.toggle('d');\n\
+                   const mid = el.className + '|' + cl.contains('c') + ',' + cl.contains('b') + ',' + cl.contains('d');\n\
+                   const replaced = cl.replace('a', 'z');\n\
+                   return [tag, before, mid, replaced, el.className, el.classList === cl];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "[object DOMTokenList]",
+                ["   a  a b ", 2, "a", true, "a,b", "b"],
+                "a c d|true,false,true",
+                true,
+                "z c d",
+                true
+            ]),
+            "classList/DOMTokenList wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_url_host_setter() {
+        // WHATWG host setter: ignore stuff after a delimiter, parse :port, keep
+        // existing port when hostname-only is set.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const a = new URL('http://example.net/path'); a.host = 'example.com:8080/stuff';\n\
+                   const b = new URL('http://example.net/path'); b.host = 'example.com:8080#x';\n\
+                   const c = new URL('http://example.net:8080/p'); c.hostname = 'foo.com';\n\
+                   return [a.host, a.href, b.host, c.host, c.port];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["example.com:8080", "http://example.com:8080/path", "example.com:8080", "foo.com:8080", "8080"]),
+            "host setter wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_url_searchparams() {
+        // Real URLSearchParams: form-urlencoded parse/serialize (+ for space) and
+        // two-way sync with the owning URL (mutate params -> URL.search updates;
+        // set URL.search -> params reflect).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const u = new URL('https://x.com/?a=1&b=2');\n\
+                   const sp = u.searchParams;\n\
+                   sp.append('c', 'hi there');\n\
+                   const r1 = u.search;                       /* ?a=1&b=2&c=hi+there */\n\
+                   sp.set('a', '9');\n\
+                   const r2 = u.search;                       /* ?a=9&b=2&c=hi+there */\n\
+                   u.search = 'z=1';                          /* URL -> params */\n\
+                   const r3 = sp.get('z') + ',' + sp.has('a') + ',' + sp.size;  /* 1,false,1 */\n\
+                   const sp2 = new URLSearchParams('p=a%20b&q=c+d');\n\
+                   const r4 = sp2.get('p') + ',' + sp2.get('q') + ',' + sp2.toString(); /* a b,c d,p=a+b&q=c+d */\n\
+                   return [r1, r2, r3, r4];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "?a=1&b=2&c=hi+there",
+                "?a=9&b=2&c=hi+there",
+                "1,false,1",
+                "a b,c d,p=a+b&q=c+d"
+            ]),
+            "URLSearchParams / two-way sync wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_url_setters() {
+        // URL component setters re-serialize via the url crate (op_url_set).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const u = new URL('https://example.com/path?q=1#h');\n\
+                   u.protocol = 'http:';\n\
+                   u.hostname = 'other.com';\n\
+                   u.port = '8080';\n\
+                   u.pathname = '/new';\n\
+                   u.search = '?x=2';\n\
+                   u.hash = '#frag';\n\
+                   return [u.href, u.host, u.pathname, u.search, u.hash, u.protocol];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["http://other.com:8080/new?x=2#frag", "other.com:8080", "/new", "?x=2", "#frag", "http:"]),
+            "URL setters wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_url_blob_origin_and_malformed_query() {
+        // blob: origin is the INNER origin only when inner scheme is http(s) (WHATWG);
+        // blob:ftp/ws/etc -> null. And a malformed % in the query must not throw.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const httpInner = new URL('blob:https://example.org/x').origin;\n\
+                   const ftpInner = new URL('blob:ftp://host/path').origin;\n\
+                   let threw = false; let href = '';\n\
+                   try { href = new URL('http://h/p?%GH&a=b').href; } catch (e) { threw = true; }\n\
+                   return [httpInner, ftpInner, threw, href.includes('%GH')];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["https://example.org", "null", false, true]),
+            "blob origin / malformed-query handling wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_url_empty_query_fragment() {
+        // WHATWG: empty fragment/query -> hash/search getters are "" (the leading
+        // #/? only appears when non-empty), though href keeps the trailing char.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const a = new URL('http://x/foo?bar=baz#');\n\
+                   const b = new URL('http://x/foo?');\n\
+                   return [a.hash, a.href.endsWith('#'), b.search, b.href.endsWith('?')];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["", true, "", true]),
+            "empty fragment/query should give empty hash/search but keep href: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_url_whatwg_parsing() {
+        // Capabilities the old regex couldn't do, now via the Rust url crate:
+        // userinfo, port, dot-segment normalization, query/hash split, throwing on
+        // invalid input, and relative resolution against a path base.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const a = new URL('https://user:pass@host.com:8080/a/b/../c?x=1#frag');\n\
+                   let threw = false; try { new URL('not a valid url'); } catch (e) { threw = (e instanceof TypeError); }\n\
+                   const rel = new URL('../d', 'https://host.com/a/b/c').href;\n\
+                   return [a.pathname, a.search, a.hash, a.username, a.password, a.port, a.host, threw, rel];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["/a/c", "?x=1", "#frag", "user", "pass", "8080", "host.com:8080", true, "https://host.com/a/d"]),
+            "WHATWG URL parsing wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_url_opaque_scheme_protocol() {
+        // URL parser must extract the protocol for opaque-path schemes (blob:,
+        // data:, about:) — previously only http(s) matched, so blob: protocol was ''
+        // (broke iframe blob: src location.protocol). Origin of opaque schemes is null.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const blob = new URL('blob:obscura/abc');\n\
+                   const data = new URL('data:text/html,hi');\n\
+                   const http = new URL('https://example.com/p?q=1');\n\
+                   return [blob.protocol, blob.origin, data.protocol, http.protocol, http.origin];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["blob:", "null", "data:", "https:", "https://example.com"]),
+            "URL opaque-scheme parsing wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_blob_object_url_stored_synchronously() {
+        // iframe backlog #1 (race fix): URL.createObjectURL must store the blob
+        // content + type SYNCHRONOUSLY so a consumer fetching the URL on the next
+        // tick (e.g. an iframe src load) sees it. (The async iframe load itself is
+        // CDP-verified.)
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const u = URL.createObjectURL(new Blob(['hello'], { type: 'text/html' }));\n\
+                   return [u.startsWith('blob:'), __blobStore[u], __blobTypes[u]];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, "hello", "text/html"]),
+            "blob object URL should store content+type synchronously: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_named_window_access() {
+        // HTML named property access on Window: <el id=foo> -> window.foo. Must be
+        // a live lookup, non-enumerable (off Object.keys/for-in), must not shadow a
+        // real global, and assigning replaces it with a normal property.
+        let mut rt = setup_runtime(
+            "<!DOCTYPE html><html><body><iframe id='myframe'></iframe><div id='document'></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   __exposeNamedGlobals(); /* Rust runs this before page scripts */\n\
+                   const byId = (typeof myframe !== 'undefined') && myframe.tagName === 'IFRAME';\n\
+                   const live = (window.myframe === document.getElementById('myframe'));\n\
+                   const enumHidden = !Object.keys(globalThis).includes('myframe');\n\
+                   const noShadow = (document === globalThis.document); /* id='document' didn't clobber */\n\
+                   const dyn = (function(){ const d = document.createElement('div'); d.id = 'made'; document.body.appendChild(d); return window.made === d; })();\n\
+                   globalThis.myframe = 42; /* assignment replaces the getter */\n\
+                   const assignable = (globalThis.myframe === 42);\n\
+                   return [byId, live, enumHidden, noShadow, dyn, assignable];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true, true, true, true, true]),
+            "named window access wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_iframe_srcdoc_reprocessing() {
+        // iframe backlog #2: changing/removing srcdoc reprocesses the frame so its
+        // contentDocument reflects the new content (and removing falls back to blank).
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const f = document.createElement('iframe');\n\
+                   f.setAttribute('srcdoc', '<body>first</body>');\n\
+                   document.body.appendChild(f);\n\
+                   const a = f.contentDocument.body.textContent;\n\
+                   f.srcdoc = '<body>second</body>';   /* property -> setAttribute -> reprocess */\n\
+                   const b = f.contentDocument.body.textContent;\n\
+                   const propGet = f.srcdoc;            /* reflects attribute */\n\
+                   f.removeAttribute('srcdoc');         /* reprocess -> about:blank */\n\
+                   const c = f.contentDocument.body.textContent;\n\
+                   return [a, b, propGet, c];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["first", "second", "<body>second</body>", ""]),
+            "srcdoc reprocessing wrong: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_insert_adjacent_text_and_element() {
+        // testharness.js calls el.insertAdjacentText('afterend', ...) when rendering
+        // results — its absence crashed heavy WPT result rendering. Cover all four
+        // positions for both insertAdjacentText and insertAdjacentElement.
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body><div id='t'><span>x</span></div></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\n\
+                   const t = document.getElementById('t');\n\
+                   t.insertAdjacentText('afterbegin', 'A');\n\
+                   t.insertAdjacentText('beforeend', 'B');\n\
+                   const e = document.createElement('i'); e.textContent = 'E';\n\
+                   const ret = t.insertAdjacentElement('beforebegin', e);\n\
+                   t.insertAdjacentText('afterend', 'C');\n\
+                   return [\n\
+                     t.textContent,                              /* A x B */\n\
+                     t.previousSibling && t.previousSibling.tagName, /* I */\n\
+                     t.nextSibling && t.nextSibling.textContent,  /* C */\n\
+                     ret === e,                                   /* returns the element */\n\
+                     typeof t.insertAdjacentText                  /* function */\n\
+                   ];\n\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["AxB", "I", "C", true, "function"]),
+            "insertAdjacentText/Element placement wrong: {:?}",
+            result
+        );
     }
 
     #[test]

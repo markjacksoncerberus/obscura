@@ -9,8 +9,8 @@ use selectors::matching::{
     NeedsSelectorFlags,
 };
 use selectors::parser::{self, ParseRelative, SelectorParseErrorKind};
-use selectors::{Element, OpaqueElement, SelectorList};
 use selectors::visitor::SelectorVisitor;
+use selectors::{Element, OpaqueElement, SelectorList};
 
 use crate::tree::{DomTree, NodeData, NodeId};
 
@@ -102,9 +102,96 @@ pub enum PseudoClass {
     Hover,
     Active,
     Focus,
+    /// `:focus-within` — matches an element that is (or is a shadow-including
+    /// ancestor of) the focused element: the focused element itself, its inclusive
+    /// ancestors in the light tree, and any shadow host whose shadow tree contains
+    /// the focused element (plus that host's ancestors).
+    FocusWithin,
     Enabled,
     Disabled,
     Checked,
+    /// `:link` / `:any-link` — a/area/link with an href. (We have no browsing
+    /// history, so every link is unvisited and :link == :any-link.)
+    Link,
+    /// `:visited` — never matches (no history; also the privacy-safe default).
+    Visited,
+    /// `:target` — the element whose id equals the document's URL fragment.
+    Target,
+    /// `:lang(en, fr, …)` — matched against the element's language (its nearest
+    /// ancestor-or-self `lang` attribute), per the CSS prefix rule.
+    Lang(Vec<String>),
+    /// `:state(ident)` — the custom-state pseudo-class. Matches a custom element whose
+    /// `ElementInternals.states` currently holds this (case-sensitive) identifier.
+    State(String),
+    /// A standard CSS pseudo-class we accept as valid (so querySelector does not
+    /// throw) but don't implement matching for — it never matches.
+    Other(String),
+}
+
+/// HTML "valid custom element name": starts with [a-z], contains a '-', every code
+/// point is a PCENChar, and it is not one of the reserved hyphenated SVG/MathML names.
+/// Used by `:defined` to tell a would-be custom element from a built-in.
+fn is_valid_custom_element_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if matches!(
+        name,
+        "annotation-xml" | "color-profile" | "font-face" | "font-face-src"
+            | "font-face-uri" | "font-face-format" | "font-face-name" | "missing-glyph"
+    ) {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !('a'..='z').contains(&first) {
+        return false;
+    }
+    let mut has_hyphen = false;
+    for c in name.chars() {
+        let u = c as u32;
+        if c == '-' {
+            has_hyphen = true;
+            continue;
+        }
+        let ok = c == '.'
+            || ('0'..='9').contains(&c)
+            || c == '_'
+            || ('a'..='z').contains(&c)
+            || u == 0xB7
+            || (0xC0..=0xD6).contains(&u)
+            || (0xD8..=0xF6).contains(&u)
+            || (0xF8..=0x37D).contains(&u)
+            || (0x37F..=0x1FFF).contains(&u)
+            || (0x200C..=0x200D).contains(&u)
+            || (0x203F..=0x2040).contains(&u)
+            || (0x2070..=0x218F).contains(&u)
+            || (0x2C00..=0x2FEF).contains(&u)
+            || (0x3001..=0xD7FF).contains(&u)
+            || (0xF900..=0xFDCF).contains(&u)
+            || (0xFDF0..=0xFFFD).contains(&u)
+            || (0x10000..=0xEFFFF).contains(&u);
+        if !ok {
+            return false;
+        }
+    }
+    has_hyphen
+}
+
+/// Standard CSS pseudo-class names that are syntactically valid (so a selector
+/// using them must NOT throw), beyond the ones we actively match. Genuinely
+/// unknown names are rejected (-> SyntaxError) by the parser.
+fn is_known_pseudo_class(name: &str) -> bool {
+    matches!(
+        name,
+        "link" | "visited" | "any-link" | "local-link" | "target" | "target-within"
+            | "focus-visible" | "indeterminate" | "default" | "required"
+            | "optional" | "valid" | "invalid" | "in-range" | "out-of-range" | "read-only"
+            | "read-write" | "placeholder-shown" | "autofill" | "current" | "past" | "future"
+            | "playing" | "paused" | "user-invalid" | "user-valid" | "blank" | "defined"
+            | "fullscreen" | "modal" | "picture-in-picture" | "popover-open" | "open"
+            | "muted" | "volume-locked" | "seeking" | "buffering" | "stalled"
+    )
 }
 
 impl parser::NonTSPseudoClass for PseudoClass {
@@ -135,9 +222,32 @@ impl ToCss for PseudoClass {
             PseudoClass::Hover => dest.write_str(":hover"),
             PseudoClass::Active => dest.write_str(":active"),
             PseudoClass::Focus => dest.write_str(":focus"),
+            PseudoClass::FocusWithin => dest.write_str(":focus-within"),
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
+            PseudoClass::Link => dest.write_str(":link"),
+            PseudoClass::Visited => dest.write_str(":visited"),
+            PseudoClass::Target => dest.write_str(":target"),
+            PseudoClass::Lang(langs) => {
+                dest.write_str(":lang(")?;
+                for (i, l) in langs.iter().enumerate() {
+                    if i > 0 {
+                        dest.write_str(", ")?;
+                    }
+                    dest.write_str(l)?;
+                }
+                dest.write_str(")")
+            }
+            PseudoClass::State(ident) => {
+                dest.write_str(":state(")?;
+                cssparser::serialize_identifier(ident, dest)?;
+                dest.write_str(")")
+            }
+            PseudoClass::Other(name) => {
+                dest.write_str(":")?;
+                dest.write_str(name)
+            }
         }
     }
 }
@@ -146,10 +256,29 @@ impl ToCss for PseudoClass {
 pub enum PseudoElement {
     Before,
     After,
+    FirstLine,
+    FirstLetter,
+    // ::slotted(<compound-selector>) — a functional pseudo-element. We parse and
+    // retain its argument text but never match it (it only ever matches assigned
+    // nodes inside a shadow tree, which we don't model), so a selector using it
+    // parses successfully and selects nothing — what WPT expects (vs. throwing).
+    Slotted(String),
+    // ::part(<ident>+) — a shadow-part pseudo-element. Like ::slotted we parse it
+    // (retaining the part-name list for round-tripping) but never match it, since
+    // matching needs cross-shadow part mapping we don't model. This keeps rules using
+    // ::part() in the CSSOM (so their cssText/selectorText serialize) rather than
+    // silently dropping them.
+    Part(String),
 }
 
 impl parser::PseudoElement for PseudoElement {
     type Impl = ObscuraSelector;
+
+    // ::part() accepts trailing state/user-action pseudo-classes (e.g.
+    // `::part(inner):state(foo)`, `::part(inner):hover`) — CSS Shadow Parts §3.1.
+    fn accepts_state_pseudo_classes(&self) -> bool {
+        matches!(self, PseudoElement::Part(_))
+    }
 }
 
 impl ToCss for PseudoElement {
@@ -157,6 +286,18 @@ impl ToCss for PseudoElement {
         match self {
             PseudoElement::Before => dest.write_str("::before"),
             PseudoElement::After => dest.write_str("::after"),
+            PseudoElement::FirstLine => dest.write_str("::first-line"),
+            PseudoElement::FirstLetter => dest.write_str("::first-letter"),
+            PseudoElement::Slotted(arg) => {
+                dest.write_str("::slotted(")?;
+                dest.write_str(arg)?;
+                dest.write_str(")")
+            }
+            PseudoElement::Part(arg) => {
+                dest.write_str("::part(")?;
+                dest.write_str(arg)?;
+                dest.write_str(")")
+            }
         }
     }
 }
@@ -167,6 +308,20 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
     type Impl = ObscuraSelector;
     type Error = SelectorParseErrorKind<'i>;
 
+    // Enable the Selectors-4 logical-combination pseudo-classes. The selectors
+    // crate already implements their matching (`Component::Is`/`Where`/`Has`);
+    // these hooks only gate PARSING (default off). `:is()`/`:where()` use
+    // forgiving selector-list parsing; `:has()` uses a forgiving relative
+    // selector list, matched against the candidate's real descendants/siblings
+    // (our `DomElement` implements the needed traversal).
+    fn parse_is_and_where(&self) -> bool {
+        true
+    }
+
+    fn parse_has(&self) -> bool {
+        true
+    }
+
     fn parse_non_ts_pseudo_class(
         &self,
         _location: cssparser::SourceLocation,
@@ -176,9 +331,14 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "hover" => Ok(PseudoClass::Hover),
             "active" => Ok(PseudoClass::Active),
             "focus" => Ok(PseudoClass::Focus),
+            "focus-within" => Ok(PseudoClass::FocusWithin),
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
+            "link" | "any-link" => Ok(PseudoClass::Link),
+            "visited" => Ok(PseudoClass::Visited),
+            "target" => Ok(PseudoClass::Target),
+            other if is_known_pseudo_class(other) => Ok(PseudoClass::Other(other.to_string())),
             _ => Err(cssparser::ParseError {
                 kind: cssparser::ParseErrorKind::Custom(
                     SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
@@ -186,6 +346,94 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
                 location: _location,
             }),
         }
+    }
+
+    fn parse_pseudo_element(
+        &self,
+        location: cssparser::SourceLocation,
+        name: CowRcStr<'i>,
+    ) -> Result<PseudoElement, cssparser::ParseError<'i, Self::Error>> {
+        // The CSS2 pseudo-elements are valid in both one-colon (legacy) and
+        // two-colon syntax; the crate routes both here. They never match a real
+        // element (match_pseudo_element returns false), so a selector using them
+        // parses successfully and simply selects nothing — which is what WPT's
+        // "pseudo-element ... not matching" subtests expect (vs. throwing).
+        match name.as_ref().to_ascii_lowercase().as_str() {
+            "before" => Ok(PseudoElement::Before),
+            "after" => Ok(PseudoElement::After),
+            "first-line" => Ok(PseudoElement::FirstLine),
+            "first-letter" => Ok(PseudoElement::FirstLetter),
+            _ => Err(cssparser::ParseError {
+                kind: cssparser::ParseErrorKind::Custom(
+                    SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name),
+                ),
+                location,
+            }),
+        }
+    }
+
+    fn parse_functional_pseudo_element<'t>(
+        &self,
+        name: CowRcStr<'i>,
+        arguments: &mut cssparser::Parser<'i, 't>,
+    ) -> Result<PseudoElement, cssparser::ParseError<'i, Self::Error>> {
+        // ::slotted(...) parses-but-never-matches (see PseudoElement::Slotted). We
+        // capture the argument's source text for round-tripping and consume the
+        // remaining tokens so the functional block parses cleanly.
+        if name.eq_ignore_ascii_case("slotted") {
+            let start = arguments.position();
+            while arguments.next().is_ok() {}
+            let arg = arguments.slice_from(start).trim().to_string();
+            return Ok(PseudoElement::Slotted(arg));
+        }
+        if name.eq_ignore_ascii_case("part") {
+            // ::part(<ident>+) — a non-empty space-separated list of part names.
+            // We keep the serialized names for round-tripping but never match.
+            let mut parts = String::new();
+            loop {
+                let ident = arguments.expect_ident()?;
+                if !parts.is_empty() {
+                    parts.push(' ');
+                }
+                cssparser::serialize_identifier(ident.as_ref(), &mut parts).ok();
+                if arguments.is_exhausted() {
+                    break;
+                }
+            }
+            return Ok(PseudoElement::Part(parts));
+        }
+        Err(arguments.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name)))
+    }
+
+    fn parse_non_ts_functional_pseudo_class<'t>(
+        &self,
+        name: CowRcStr<'i>,
+        parser: &mut cssparser::Parser<'i, 't>,
+        _after_part: bool,
+    ) -> Result<PseudoClass, cssparser::ParseError<'i, Self::Error>> {
+        if name.eq_ignore_ascii_case("lang") {
+            // :lang() takes a comma-separated list of language ranges (idents or
+            // strings); the list must be non-empty.
+            let mut langs = Vec::new();
+            loop {
+                langs.push(parser.expect_ident_or_string()?.as_ref().to_owned());
+                if parser.try_parse(|p| p.expect_comma()).is_err() {
+                    break;
+                }
+            }
+            if !langs.is_empty() {
+                return Ok(PseudoClass::Lang(langs));
+            }
+        }
+        if name.eq_ignore_ascii_case("state") {
+            // :state(<ident>) — a single CSS identifier, nothing else. A dimension
+            // (`16px`), `=`, `name=value`, whitespace-separated idents, or an empty
+            // argument all fail to parse (-> SyntaxError), which is what WPT expects.
+            let ident = parser.expect_ident()?.as_ref().to_owned();
+            parser.expect_exhausted()?;
+            return Ok(PseudoClass::State(ident));
+        }
+        Err(parser.new_custom_error(SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name)))
     }
 }
 
@@ -198,6 +446,568 @@ pub struct DomElement<'a> {
 impl<'a> DomElement<'a> {
     pub fn new(tree: &'a DomTree, node_id: NodeId) -> Self {
         DomElement { tree, node_id }
+    }
+
+    /// `:required` / `:optional`. `:required` matches a form control to which the
+    /// `required` attribute applies (input of a requirable type, select, textarea)
+    /// that currently carries it. `:optional` matches *any* input/select/textarea
+    /// that is not `:required` — including types the attribute can't apply to (e.g.
+    /// `type=hidden`/`submit`), which are optional by virtue of never being required
+    /// (per WPT `required-optional-hidden`). All other elements match neither.
+    fn match_required_optional(&self, want_required: bool) -> bool {
+        self.tree
+            .with_node(self.node_id, |n| {
+                let name = match n.as_element() {
+                    Some(qn) => qn.local.as_ref(),
+                    None => return false,
+                };
+                if !matches!(name, "input" | "select" | "textarea") {
+                    return false;
+                }
+                let can_require = match name {
+                    "select" | "textarea" => true,
+                    "input" => {
+                        let t = n
+                            .get_attribute("type")
+                            .map(|t| t.to_ascii_lowercase())
+                            .unwrap_or_else(|| "text".into());
+                        // The required attribute applies to these input types (a
+                        // missing/empty type is text). NOT: hidden/range/color/
+                        // submit/image/reset/button.
+                        matches!(
+                            t.as_str(),
+                            "" | "text"
+                                | "search"
+                                | "url"
+                                | "tel"
+                                | "email"
+                                | "password"
+                                | "date"
+                                | "month"
+                                | "week"
+                                | "time"
+                                | "datetime-local"
+                                | "number"
+                                | "checkbox"
+                                | "radio"
+                                | "file"
+                        )
+                    }
+                    _ => false,
+                };
+                let is_required = can_require && n.get_attribute("required").is_some();
+                want_required == is_required
+            })
+            .unwrap_or(false)
+    }
+
+    /// `:read-write` / `:read-only`. An element is `:read-write` if it is a mutable
+    /// form control (an `input` to which `readonly` *applies*, or a `textarea`,
+    /// without a `readonly` attribute and not disabled) OR it is editable (inside a
+    /// `contenteditable` editing host, or the document is in design mode). Every
+    /// other element is `:read-only`. Non-elements match neither. `want_read_write`
+    /// picks the half. All inputs are read live off the tree (so toggling
+    /// readonly/disabled/contenteditable + requerying just works).
+    fn match_read_write_read_only(&self, want_read_write: bool) -> bool {
+        let is_element = self
+            .tree
+            .with_node(self.node_id, |n| n.as_element().is_some())
+            .unwrap_or(false);
+        if !is_element {
+            return false;
+        }
+        self.is_read_write() == want_read_write
+    }
+
+    fn is_read_write(&self) -> bool {
+        let local = self
+            .tree
+            .with_node(self.node_id, |n| {
+                n.as_element().map(|qn| qn.local.as_ref().to_string())
+            })
+            .flatten();
+        match local.as_deref() {
+            Some("input") => self
+                .tree
+                .with_node(self.node_id, |n| {
+                    let t = n
+                        .get_attribute("type")
+                        .map(|t| t.to_ascii_lowercase())
+                        .unwrap_or_else(|| "text".into());
+                    // `readonly` applies only to these input types (missing → text).
+                    let applies = matches!(
+                        t.as_str(),
+                        "" | "text"
+                            | "search"
+                            | "url"
+                            | "tel"
+                            | "email"
+                            | "password"
+                            | "date"
+                            | "month"
+                            | "week"
+                            | "time"
+                            | "datetime-local"
+                            | "number"
+                    );
+                    applies
+                        && n.get_attribute("readonly").is_none()
+                        && n.get_attribute("disabled").is_none()
+                })
+                .unwrap_or(false),
+            Some("textarea") => self
+                .tree
+                .with_node(self.node_id, |n| {
+                    n.get_attribute("readonly").is_none()
+                        && n.get_attribute("disabled").is_none()
+                })
+                .unwrap_or(false),
+            // Any other element is read-write iff it is editable.
+            Some(_) => self.is_editable(),
+            None => false,
+        }
+    }
+
+    /// Whether a (non-form-control) element is editable: the document is in design
+    /// mode, or the nearest self-or-ancestor with an explicit `contenteditable`
+    /// value resolves to editable ("" / "true" / "plaintext-only", not "false").
+    fn is_editable(&self) -> bool {
+        if self.tree.design_mode() {
+            return true;
+        }
+        let mut cur = Some(DomElement::new(self.tree, self.node_id));
+        while let Some(el) = cur {
+            let v = el
+                .tree
+                .with_node(el.node_id, |n| {
+                    n.get_attribute("contenteditable").map(|s| s.to_ascii_lowercase())
+                })
+                .flatten();
+            if let Some(v) = v {
+                match v.as_str() {
+                    "false" => return false,
+                    "inherit" => {}
+                    _ => return true,
+                }
+            }
+            cur = el.parent_element();
+        }
+        false
+    }
+
+    /// Whether the element is "actually disabled" per HTML — backs `:disabled`
+    /// (matches iff true) and `:enabled` (a disable-able element that is NOT
+    /// actually disabled). The disable-able elements are
+    /// button/input/select/textarea/optgroup/option/fieldset; every other element
+    /// matches neither pseudo-class. An element is disabled by its own `disabled`
+    /// attribute, an `<option>` also by its parent `<optgroup>`'s, and any of these
+    /// inside a disabled `<fieldset>` — except within that fieldset's first
+    /// `<legend>` — is disabled too (covering nested fieldsets). All read live off
+    /// the tree, so toggling `disabled` / reparenting + requerying just works.
+    fn is_disableable(&self) -> bool {
+        self.tree
+            .with_node(self.node_id, |n| {
+                matches!(
+                    n.as_element().map(|qn| qn.local.as_ref()),
+                    Some(
+                        "input"
+                            | "button"
+                            | "select"
+                            | "textarea"
+                            | "optgroup"
+                            | "option"
+                            | "fieldset"
+                    )
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn is_actually_disabled(&self) -> bool {
+        if !self.is_disableable() {
+            return false;
+        }
+        // 1) Own `disabled` attribute.
+        let (has_disabled, is_option) = self
+            .tree
+            .with_node(self.node_id, |n| {
+                (
+                    n.get_attribute("disabled").is_some(),
+                    n.as_element().map(|qn| qn.local.as_ref() == "option").unwrap_or(false),
+                )
+            })
+            .unwrap_or((false, false));
+        if has_disabled {
+            return true;
+        }
+        // 2) An `<option>` whose parent `<optgroup>` carries a `disabled` attribute.
+        if is_option {
+            if let Some(parent) = self.parent_element() {
+                let parent_disabled_optgroup = parent
+                    .tree
+                    .with_node(parent.node_id, |n| {
+                        n.as_element()
+                            .map(|qn| qn.local.as_ref() == "optgroup")
+                            .unwrap_or(false)
+                            && n.get_attribute("disabled").is_some()
+                    })
+                    .unwrap_or(false);
+                if parent_disabled_optgroup {
+                    return true;
+                }
+            }
+        }
+        // 3) A descendant of a disabled `<fieldset>`, but not within that fieldset's
+        //    first `<legend>` element child.
+        self.is_disabled_by_fieldset()
+    }
+
+    fn is_disabled_by_fieldset(&self) -> bool {
+        // Walk ancestors. The direct child of an ancestor on `self`'s upward path is
+        // `prev_id`; if an ancestor is a disabled `<fieldset>` and `self` did NOT
+        // enter it through its first `<legend>` child, `self` is disabled.
+        let mut prev_id = self.node_id;
+        let mut parent = self.parent_element();
+        while let Some(p) = parent {
+            let is_disabled_fieldset = p
+                .tree
+                .with_node(p.node_id, |n| {
+                    n.as_element().map(|qn| qn.local.as_ref() == "fieldset").unwrap_or(false)
+                        && n.get_attribute("disabled").is_some()
+                })
+                .unwrap_or(false);
+            if is_disabled_fieldset && p.first_legend_child_id() != Some(prev_id) {
+                return true;
+            }
+            prev_id = p.node_id;
+            parent = p.parent_element();
+        }
+        false
+    }
+
+    /// The node id of this element's first child element that is a `<legend>`, if any.
+    fn first_legend_child_id(&self) -> Option<NodeId> {
+        let node = self.tree.get_node(self.node_id)?;
+        let mut current = node.first_child;
+        while let Some(child_id) = current {
+            let child = self.tree.get_node(child_id)?;
+            if child.is_element() {
+                let is_legend = self
+                    .tree
+                    .with_node(child_id, |n| {
+                        n.as_element().map(|qn| qn.local.as_ref() == "legend").unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if is_legend {
+                    return Some(child_id);
+                }
+            }
+            current = child.next_sibling;
+        }
+        None
+    }
+
+    /// The local name of this node if it is an element, lower-cased input `type`
+    /// helper aside.
+    fn local_name(&self) -> Option<String> {
+        self.tree
+            .with_node(self.node_id, |n| n.as_element().map(|qn| qn.local.as_ref().to_string()))
+            .flatten()
+    }
+
+    /// `:defined` — see the match arm. A hyphenated HTML element, or one carrying an
+    /// `is` attribute (a would-be customized built-in), is defined only after JS marks
+    /// it in the tree's `ce_defined` set; everything else is defined unconditionally.
+    fn match_defined(&self) -> bool {
+        let info = self
+            .tree
+            .with_node(self.node_id, |n| {
+                n.as_element()
+                    .map(|qn| (qn.local.as_ref().to_string(), qn.ns == ns!(html)))
+            })
+            .flatten();
+        let (local, is_html) = match info {
+            Some(v) => v,
+            None => return false,
+        };
+        let has_is = self
+            .tree
+            .with_node(self.node_id, |n| n.get_attribute("is").is_some())
+            .unwrap_or(false);
+        if has_is || (is_html && is_valid_custom_element_name(&local)) {
+            self.tree.is_ce_defined(self.node_id)
+        } else {
+            true
+        }
+    }
+
+    /// The lower-cased `type` of an `<input>` (missing/empty → `text`).
+    fn input_type(&self) -> String {
+        self.tree
+            .with_node(self.node_id, |n| {
+                n.get_attribute("type").map(|t| t.to_ascii_lowercase())
+            })
+            .flatten()
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "text".into())
+    }
+
+    /// `:indeterminate` — matches:
+    /// - an `<input type=checkbox>` whose `indeterminate` IDL flag is set;
+    /// - an `<input type=radio>` whose radio button group contains no checked
+    ///   member (a nameless radio is a group of one — itself);
+    /// - a `<progress>` element with no `value` content attribute.
+    fn match_indeterminate(&self) -> bool {
+        match self.local_name().as_deref() {
+            Some("input") => match self.input_type().as_str() {
+                "checkbox" => self.tree.indeterminate(self.node_id),
+                "radio" => {
+                    let name = self
+                        .tree
+                        .with_node(self.node_id, |n| {
+                            n.get_attribute("name").map(|s| s.to_string())
+                        })
+                        .flatten()
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        // Nameless radios form no shared group: indeterminate iff
+                        // this radio itself is not checked.
+                        !self.tree.checked(self.node_id)
+                    } else {
+                        !self.radio_group_has_checked(&name)
+                    }
+                }
+                _ => false,
+            },
+            Some("progress") => self
+                .tree
+                .with_node(self.node_id, |n| n.get_attribute("value").is_none())
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// The topmost ancestor of this node (its tree root), found by walking parents.
+    fn root_node(&self) -> NodeId {
+        let mut cur = self.node_id;
+        while let Some(parent) = self.tree.get_node(cur).and_then(|n| n.parent) {
+            cur = parent;
+        }
+        cur
+    }
+
+    /// Whether any `<input type=radio>` with the given non-empty `name`, in the
+    /// same tree as this element, is currently checked. (Form-owner partitioning of
+    /// radio groups is not modelled; rare in practice — noted as a cap.)
+    fn radio_group_has_checked(&self, name: &str) -> bool {
+        let mut stack = vec![self.root_node()];
+        while let Some(id) = stack.pop() {
+            let node = match self.tree.get_node(id) {
+                Some(n) => n,
+                None => continue,
+            };
+            let is_named_radio = node
+                .as_element()
+                .map(|qn| qn.local.as_ref() == "input")
+                .unwrap_or(false)
+                && node
+                    .get_attribute("type")
+                    .map(|t| t.eq_ignore_ascii_case("radio"))
+                    .unwrap_or(false)
+                && node.get_attribute("name") == Some(name);
+            if is_named_radio && self.tree.checked(id) {
+                return true;
+            }
+            let mut child = node.first_child;
+            while let Some(cid) = child {
+                stack.push(cid);
+                child = self.tree.get_node(cid).and_then(|n| n.next_sibling);
+            }
+        }
+        false
+    }
+
+    /// `:placeholder-shown` — an `<input>` of a placeholder-applicable type, or a
+    /// `<textarea>`, that has a non-empty `placeholder` attribute and an empty
+    /// value. (Value is read off the content attribute / text content; a value set
+    /// only via the JS `.value` IDL is not visible here — noted as a cap.)
+    fn match_placeholder_shown(&self) -> bool {
+        let local = match self.local_name() {
+            Some(l) => l,
+            None => return false,
+        };
+        match local.as_str() {
+            "input" => {
+                let applies = matches!(
+                    self.input_type().as_str(),
+                    "text" | "search" | "url" | "tel" | "email" | "password" | "number"
+                );
+                if !applies {
+                    return false;
+                }
+                self.tree
+                    .with_node(self.node_id, |n| {
+                        let has_placeholder =
+                            n.get_attribute("placeholder").map(|p| !p.is_empty()).unwrap_or(false);
+                        let value_empty =
+                            n.get_attribute("value").map(|v| v.is_empty()).unwrap_or(true);
+                        has_placeholder && value_empty
+                    })
+                    .unwrap_or(false)
+            }
+            "textarea" => {
+                let has_placeholder = self
+                    .tree
+                    .with_node(self.node_id, |n| {
+                        n.get_attribute("placeholder").map(|p| !p.is_empty()).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                has_placeholder && self.textarea_value_is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a `<textarea>` has no text content (its default value is empty).
+    fn textarea_value_is_empty(&self) -> bool {
+        let node = match self.tree.get_node(self.node_id) {
+            Some(n) => n,
+            None => return true,
+        };
+        let mut child = node.first_child;
+        while let Some(cid) = child {
+            if let Some(c) = self.tree.get_node(cid) {
+                if let Some(text) = c.text_content_of_text_node() {
+                    if !text.is_empty() {
+                        return false;
+                    }
+                }
+                child = c.next_sibling;
+            } else {
+                break;
+            }
+        }
+        true
+    }
+
+    /// `:default` — matches a checkbox/radio carrying the `checked` content
+    /// attribute, an `<option>` carrying the `selected` content attribute, or a
+    /// submit button (`<button type=submit>`, `<input type=submit|image>`) that is
+    /// its form owner's default button (the first such submit button in tree order
+    /// owned by that form).
+    fn match_default(&self) -> bool {
+        let local = match self.local_name() {
+            Some(l) => l,
+            None => return false,
+        };
+        match local.as_str() {
+            "input" => match self.input_type().as_str() {
+                "checkbox" | "radio" => self
+                    .tree
+                    .with_node(self.node_id, |n| n.get_attribute("checked").is_some())
+                    .unwrap_or(false),
+                "submit" | "image" => self.is_form_default_button(),
+                _ => false,
+            },
+            "button" => {
+                if self.is_submit_button() {
+                    self.is_form_default_button()
+                } else {
+                    false
+                }
+            }
+            "option" => self
+                .tree
+                .with_node(self.node_id, |n| n.get_attribute("selected").is_some())
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// Whether this element is a "submit button": an `<input type=submit|image>`
+    /// or a `<button>` whose type is submit (the missing/invalid default).
+    fn is_submit_button(&self) -> bool {
+        match self.local_name().as_deref() {
+            Some("input") => matches!(self.input_type().as_str(), "submit" | "image"),
+            Some("button") => {
+                // A button's type defaults to "submit"; only an explicit
+                // "button"/"reset" opts out (any other value, incl. invalid, is submit).
+                let t = self
+                    .tree
+                    .with_node(self.node_id, |n| {
+                        n.get_attribute("type").map(|t| t.to_ascii_lowercase())
+                    })
+                    .flatten();
+                !matches!(t.as_deref(), Some("button") | Some("reset"))
+            }
+            _ => false,
+        }
+    }
+
+    /// This element's form owner: the `<form>` named by its `form` attribute if
+    /// present (and that id resolves to a form), else its nearest `<form>` ancestor.
+    fn form_owner(&self) -> Option<NodeId> {
+        let form_attr = self
+            .tree
+            .with_node(self.node_id, |n| n.get_attribute("form").map(|s| s.to_string()))
+            .flatten();
+        if let Some(id) = form_attr {
+            // An explicit `form` attribute associates with the form of that id, or
+            // nothing if it doesn't resolve to a form element.
+            let target = self.tree.get_element_by_id(&id)?;
+            let is_form = self
+                .tree
+                .with_node(target, |n| {
+                    n.as_element().map(|qn| qn.local.as_ref() == "form").unwrap_or(false)
+                })
+                .unwrap_or(false);
+            return if is_form { Some(target) } else { None };
+        }
+        // Otherwise the nearest ancestor <form>.
+        let mut parent = self.parent_element();
+        while let Some(p) = parent {
+            let is_form = p
+                .tree
+                .with_node(p.node_id, |n| {
+                    n.as_element().map(|qn| qn.local.as_ref() == "form").unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if is_form {
+                return Some(p.node_id);
+            }
+            parent = p.parent_element();
+        }
+        None
+    }
+
+    /// Whether this submit button is its form owner's default button — i.e. it has
+    /// a form owner and is the first submit button (in tree order) owned by it.
+    fn is_form_default_button(&self) -> bool {
+        let owner = match self.form_owner() {
+            Some(o) => o,
+            None => return false,
+        };
+        // Scan the tree in document (pre-order) order for the first submit button
+        // whose form owner is `owner`.
+        let mut stack = vec![self.root_node()];
+        // A simple pre-order DFS: push children in reverse so they pop in order.
+        while let Some(id) = stack.pop() {
+            let candidate = DomElement::new(self.tree, id);
+            if candidate.is_submit_button() && candidate.form_owner() == Some(owner) {
+                return id == self.node_id;
+            }
+            // Collect children, then push reversed for pre-order traversal.
+            let mut kids = Vec::new();
+            let mut child = self.tree.get_node(id).and_then(|n| n.first_child);
+            while let Some(cid) = child {
+                kids.push(cid);
+                child = self.tree.get_node(cid).and_then(|n| n.next_sibling);
+            }
+            for cid in kids.into_iter().rev() {
+                stack.push(cid);
+            }
+        }
+        false
     }
 }
 
@@ -219,7 +1029,18 @@ impl<'a> Element for DomElement<'a> {
     type Impl = ObscuraSelector;
 
     fn opaque(&self) -> OpaqueElement {
-        OpaqueElement::new(self)
+        // `self` is a throwaway stack temporary (DomElement is Copy and rebuilt
+        // per node from a NodeId, since the tree stores clones). Using its
+        // address would give an unstable, aliasing identity that corrupts the
+        // selectors crate's NthIndexCache — breaking :nth-child(An+B) and the
+        // *-of-type pseudo-classes. Derive a stable, unique, non-null identity
+        // from the (stable) tree reference plus the node's arena index instead.
+        let id = (self.tree as *const DomTree as usize)
+            .wrapping_add((self.node_id.index() + 1).wrapping_mul(8));
+        // SAFETY: () is zero-sized (align 1), so a reference to it only needs to
+        // be non-null and aligned; `id` is non-null and we never dereference it
+        // for data — selectors uses it solely for identity/equality.
+        unsafe { OpaqueElement::new(&*(id as *const ())) }
     }
 
     fn parent_element(&self) -> Option<Self> {
@@ -311,20 +1132,26 @@ impl<'a> Element for DomElement<'a> {
     fn has_namespace(&self, ns: &CssNamespace) -> bool {
         self.tree
             .with_node(self.node_id, |n| {
-                n.as_element()
-                    .map(|name| name.ns == ns.0)
-                    .unwrap_or(false)
+                n.as_element().map(|name| name.ns == ns.0).unwrap_or(false)
             })
             .unwrap_or(false)
     }
 
     fn is_same_type(&self, other: &Self) -> bool {
-        let self_name = self.tree.with_node(self.node_id, |n| {
-            n.as_element().map(|name| (name.local.clone(), name.ns.clone()))
-        }).flatten();
-        let other_name = self.tree.with_node(other.node_id, |n| {
-            n.as_element().map(|name| (name.local.clone(), name.ns.clone()))
-        }).flatten();
+        let self_name = self
+            .tree
+            .with_node(self.node_id, |n| {
+                n.as_element()
+                    .map(|name| (name.local.clone(), name.ns.clone()))
+            })
+            .flatten();
+        let other_name = self
+            .tree
+            .with_node(other.node_id, |n| {
+                n.as_element()
+                    .map(|name| (name.local.clone(), name.ns.clone()))
+            })
+            .flatten();
         match (self_name, other_name) {
             (Some((al, ans)), Some((bl, bns))) => al == bl && ans == bns,
             _ => false,
@@ -362,10 +1189,9 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |node| {
                 node.attrs()
                     .map(|attrs| {
-                        attrs.iter().any(|a| {
-                            a.name.ns == html5ever::ns!()
-                                && a.name.local == local_name.0
-                        })
+                        attrs
+                            .iter()
+                            .any(|a| a.name.ns == html5ever::ns!() && a.name.local == local_name.0)
                     })
                     .unwrap_or(false)
             })
@@ -374,10 +1200,140 @@ impl<'a> Element for DomElement<'a> {
 
     fn match_non_ts_pseudo_class(
         &self,
-        _pc: &PseudoClass,
+        pc: &PseudoClass,
         _context: &mut MatchingContext<'_, Self::Impl>,
     ) -> bool {
-        false
+        match pc {
+            // No pointer state in a headless tree.
+            PseudoClass::Hover | PseudoClass::Active => false,
+            // Phase 0b: live focus state. `:focus` matches the focused element, and
+            // — per HTML "has the focus" — any shadow host whose shadow tree contains
+            // the focused element (the host chain JS syncs alongside `focused`), so a
+            // host lights up while a descendant in its shadow tree holds focus.
+            PseudoClass::Focus => {
+                self.tree.focused() == Some(self.node_id) || self.tree.is_focus_host(self.node_id)
+            }
+            // `:focus-within` — this element is, or is a shadow-including ancestor of,
+            // the focused element (Selectors-4). Computed in the tree from the live
+            // focused node + its shadow-host chain.
+            PseudoClass::FocusWithin => self.tree.focus_within(self.node_id),
+            // :disabled/:enabled = "actually disabled" per HTML (own attr, option's
+            // optgroup, or a disabled <fieldset> ancestor); :checked from live state.
+            PseudoClass::Disabled => self.is_actually_disabled(),
+            PseudoClass::Enabled => self.is_disableable() && !self.is_actually_disabled(),
+            PseudoClass::Checked => self
+                .tree
+                .with_node(self.node_id, |n| {
+                    let name = match n.as_element() {
+                        Some(qn) => qn.local.as_ref(),
+                        None => return false,
+                    };
+                    match pc {
+                        PseudoClass::Checked => {
+                            let is_check_radio = name == "input"
+                                && n.get_attribute("type")
+                                    .map(|t| {
+                                        let t = t.to_ascii_lowercase();
+                                        t == "checkbox" || t == "radio"
+                                    })
+                                    .unwrap_or(false);
+                            // Phase 0b: live checked state overrides the attr default.
+                            (is_check_radio && self.tree.checked(self.node_id))
+                                || (name == "option" && n.get_attribute("selected").is_some())
+                        }
+                        _ => false,
+                    }
+                })
+                .unwrap_or(false),
+            // :link / :any-link match a/area/link with href; :visited never does.
+            PseudoClass::Link => self.is_link(),
+            PseudoClass::Visited => false,
+            // :target — the element whose id equals the document's URL fragment
+            // (set by JS on the tree before the query). Empty fragment → no match.
+            PseudoClass::Target => match self.tree.target_id() {
+                Some(t) if !t.is_empty() => self
+                    .tree
+                    .with_node(self.node_id, |n| {
+                        n.get_attribute("id").map(|v| v == t.as_str()).unwrap_or(false)
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            },
+            // :lang(...) matches against the element's language, which is the
+            // value of the nearest `lang` attribute on the element or an ancestor.
+            // A range matches if it equals the language or is a prefix of it
+            // followed by "-" (case-insensitive); "*" matches any non-empty lang.
+            PseudoClass::Lang(ranges) => {
+                let mut cur = Some(self.node_id);
+                let mut lang = String::new();
+                while let Some(id) = cur {
+                    match self
+                        .tree
+                        .with_node(id, |n| (n.get_attribute("lang").map(|s| s.to_string()), n.parent))
+                    {
+                        Some((Some(v), _)) => {
+                            lang = v;
+                            break;
+                        }
+                        Some((None, parent)) => cur = parent,
+                        None => break,
+                    }
+                }
+                let lang = lang.to_ascii_lowercase();
+                ranges.iter().any(|r| {
+                    let r = r.to_ascii_lowercase();
+                    if r == "*" {
+                        return !lang.is_empty();
+                    }
+                    !r.is_empty() && (lang == r || lang.starts_with(&(r + "-")))
+                })
+            }
+            // :state(ident) — matches iff the element's live CustomStateSet (pushed by
+            // JS on every add/delete/clear) currently holds this exact identifier.
+            PseudoClass::State(ident) => self.tree.has_ce_state(self.node_id, ident),
+            PseudoClass::Other(name) => match name.as_str() {
+                // :required / :optional are pure tag + type + attribute state, so
+                // we evaluate them straight off the tree (no JS round-trip needed).
+                "required" => self.match_required_optional(true),
+                "optional" => self.match_required_optional(false),
+                // The constraint-validation live-state pseudo-classes read the
+                // bitmask JS pushed right before the query (see `validity_state`).
+                "valid" => self.tree.validity_state(self.node_id) & 1 != 0,
+                "invalid" => self.tree.validity_state(self.node_id) & 2 != 0,
+                "in-range" => self.tree.validity_state(self.node_id) & 4 != 0,
+                "out-of-range" => self.tree.validity_state(self.node_id) & 8 != 0,
+                // :read-write / :read-only are mutability state — evaluated live off
+                // the tree (input/textarea readonly+disabled+type, contenteditable
+                // ancestor walk) plus the design-mode global flag.
+                "read-write" => self.match_read_write_read_only(true),
+                "read-only" => self.match_read_write_read_only(false),
+                // :indeterminate — a checkbox whose `indeterminate` IDL is set, a
+                // radio whose group has no checked member, or a valueless <progress>.
+                "indeterminate" => self.match_indeterminate(),
+                // :placeholder-shown — an input/textarea currently showing its
+                // placeholder text (placeholder set, value empty, applicable type).
+                "placeholder-shown" => self.match_placeholder_shown(),
+                // :default — a form's default submit button, a checkbox/radio with
+                // the `checked` attribute, or an option with the `selected` attribute.
+                "default" => self.match_default(),
+                // :popover-open — a popover element ([popover]) currently in the
+                // showing state (JS toggles the flag on showPopover/hidePopover).
+                "popover-open" => self.tree.is_popover_open(self.node_id),
+                // :modal — an element that is currently modal: a dialog opened via
+                // showModal() (JS toggles the flag on showModal/close).
+                "modal" => self.tree.is_dialog_modal(self.node_id),
+                // :fullscreen — an element currently in the fullscreen element stack
+                // (JS toggles the flag on requestFullscreen/exitFullscreen). Every
+                // element on the stack matches, not just the topmost.
+                "fullscreen" => self.tree.is_fullscreen(self.node_id),
+                // :defined — built-in elements are always defined; a hyphenated
+                // HTML-namespace element (or a customized built-in via `is`) is defined
+                // only once JS has constructed/upgraded it (marked in `ce_defined`).
+                "defined" => self.match_defined(),
+                // Other accepted-but-unimplemented standard pseudo-classes never match.
+                _ => false,
+            },
+        }
     }
 
     fn match_pseudo_element(
@@ -395,7 +1351,10 @@ impl<'a> Element for DomElement<'a> {
             .with_node(self.node_id, |n| {
                 n.as_element()
                     .map(|name| {
-                        matches!(name.local.as_ref(), "a" | "area" | "link")
+                        // :link / :visited apply only to a and area elements with an
+                        // href — NOT <link> elements (WPT: "not matching link elements
+                        // with href attributes").
+                        matches!(name.local.as_ref(), "a" | "area")
                             && n.get_attribute("href").is_some()
                     })
                     .unwrap_or(false)
@@ -469,14 +1428,14 @@ impl<'a> Element for DomElement<'a> {
     }
 
     fn is_root(&self) -> bool {
+        // :root matches the document element — an element whose parent is a real
+        // document. A plain DocumentFragment shares the Document backing kind but
+        // is NOT a document, so its child element is not a root (WPT: ":root ...
+        // not matching document root element" in the fragment context).
         self.tree
             .with_node(self.node_id, |n| {
                 n.parent
-                    .map(|parent_id| {
-                        self.tree
-                            .with_node(parent_id, |p| p.is_document())
-                            .unwrap_or(false)
-                    })
+                    .map(|parent_id| self.tree.is_real_document(parent_id))
                     .unwrap_or(false)
             })
             .unwrap_or(false)
@@ -499,6 +1458,20 @@ pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, S
 }
 
 impl DomTree {
+    /// The opaque identity to use as the `:scope` scoping root for a query rooted
+    /// at `node`, or `None` when `node` is not an element. With `None` the
+    /// selectors crate falls back to `:scope` == `:root` (the document element),
+    /// which is the correct behaviour for a document-rooted query
+    /// (`document.querySelector(":scope")`); for an element-rooted query
+    /// (`el.querySelector(":scope > p")`) the scoping root is `el` itself.
+    fn scope_opaque_for(&self, node: NodeId) -> Option<OpaqueElement> {
+        if self.with_node(node, |n| n.is_element()).unwrap_or(false) {
+            Some(DomElement::new(self, node).opaque())
+        } else {
+            None
+        }
+    }
+
     pub fn query_selector(&self, selector: &str) -> Result<Option<NodeId>, String> {
         self.query_selector_from(self.document(), selector)
     }
@@ -507,8 +1480,13 @@ impl DomTree {
         self.query_selector_all_from(self.document(), selector)
     }
 
-    pub fn query_selector_from(&self, root: NodeId, selector: &str) -> Result<Option<NodeId>, String> {
+    pub fn query_selector_from(
+        &self,
+        root: NodeId,
+        selector: &str,
+    ) -> Result<Option<NodeId>, String> {
         let selector_list = parse_selector(selector)?;
+        let scope = self.scope_opaque_for(root);
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
             MatchingMode::Normal,
@@ -518,6 +1496,7 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        context.scope_element = scope;
 
         for desc_id in self.descendants(root) {
             let is_element = self.with_node(desc_id, |n| n.is_element()).unwrap_or(false);
@@ -535,8 +1514,26 @@ impl DomTree {
         Ok(None)
     }
 
-    pub fn query_selector_all_from(&self, root: NodeId, selector: &str) -> Result<Vec<NodeId>, String> {
+    /// Match a single element against a selector list (DOM `Element.matches` /
+    /// `Element.closest`). Parses the selector (Err on invalid syntax → JS throws
+    /// SyntaxError); a non-element node never matches. Combinators walk the
+    /// element's real ancestors/siblings in the arena, so this is correct for
+    /// detached subtrees. `scope` is the `:scope` scoping root — for `matches()`
+    /// it is the element itself; for `closest()` it is the original context
+    /// element, held fixed across the ancestor walk (so `:has(> :scope)` resolves
+    /// `:scope` to the context node, not the ancestor under test).
+    pub fn element_matches(
+        &self,
+        node: NodeId,
+        selector: &str,
+        scope: Option<NodeId>,
+    ) -> Result<bool, String> {
         let selector_list = parse_selector(selector)?;
+        let is_element = self.with_node(node, |n| n.is_element()).unwrap_or(false);
+        if !is_element {
+            return Ok(false);
+        }
+        let scope = scope.and_then(|s| self.scope_opaque_for(s));
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
             MatchingMode::Normal,
@@ -546,6 +1543,32 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        context.scope_element = scope;
+        let element = DomElement::new(self, node);
+        Ok(selectors::matching::matches_selector_list(
+            &selector_list,
+            &element,
+            &mut context,
+        ))
+    }
+
+    pub fn query_selector_all_from(
+        &self,
+        root: NodeId,
+        selector: &str,
+    ) -> Result<Vec<NodeId>, String> {
+        let selector_list = parse_selector(selector)?;
+        let scope = self.scope_opaque_for(root);
+        let mut caches = selectors::context::SelectorCaches::default();
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            &mut caches,
+            QuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        context.scope_element = scope;
         let mut results = Vec::new();
 
         for desc_id in self.descendants(root) {
@@ -563,10 +1586,51 @@ impl DomTree {
         }
         Ok(results)
     }
+
+    /// For the CSS cascade: parse `selector` (a style-rule selector list) and,
+    /// among the complex selectors that match `node`, return the HIGHEST
+    /// specificity (packed u32 as the selectors crate computes it — correctly
+    /// honouring `:is()`/`:where()`/`:has()`). Returns `Ok(None)` when the element
+    /// matches no selector in the list, the node is not an element, or the
+    /// selector fails to parse. The per-selector specificity (not the list's) is
+    /// what the cascade needs: a rule `.a, #b` contributes `#b`'s specificity when
+    /// it matched via `#b`. Scope is left as `:root` (author stylesheets resolve
+    /// `:scope` to the document element).
+    pub fn selector_match_specificity(
+        &self,
+        node: NodeId,
+        selector: &str,
+    ) -> Option<u32> {
+        let selector_list = parse_selector(selector).ok()?;
+        if !self.with_node(node, |n| n.is_element()).unwrap_or(false) {
+            return None;
+        }
+        let mut caches = selectors::context::SelectorCaches::default();
+        let mut context = MatchingContext::new(
+            MatchingMode::Normal,
+            None,
+            &mut caches,
+            QuirksMode::NoQuirks,
+            NeedsSelectorFlags::No,
+            MatchingForInvalidation::No,
+        );
+        let element = DomElement::new(self, node);
+        let mut best: Option<u32> = None;
+        for sel in selector_list.slice() {
+            if selectors::matching::matches_selector(sel, 0, None, &element, &mut context) {
+                let spec = sel.specificity();
+                if best.map_or(true, |b| spec > b) {
+                    best = Some(spec);
+                }
+            }
+        }
+        best
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::tree::NodeId;
     use crate::tree_sink::parse_html;
 
     #[test]
@@ -580,12 +1644,250 @@ mod tests {
 
     #[test]
     fn test_query_selector_class() {
-        let tree =
-            parse_html(r#"<div class="foo bar">Content</div><div class="baz">Other</div>"#);
+        let tree = parse_html(r#"<div class="foo bar">Content</div><div class="baz">Other</div>"#);
         let result = tree.query_selector(".foo").unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
         assert_eq!(node.get_attribute("class"), Some("foo bar"));
+    }
+
+    #[test]
+    fn phase5_form_pseudo_classes_match_by_attribute() {
+        let tree = parse_html(
+            r#"<form>
+                 <input id="c1" type="checkbox" checked>
+                 <input id="c2" type="checkbox">
+                 <input id="t" type="text" disabled>
+                 <button id="b">ok</button>
+               </form>"#,
+        );
+        let id_of = |nid: NodeId| tree.get_node(nid).unwrap().get_attribute("id").unwrap().to_string();
+
+        // :checked — only the checked checkbox.
+        let checked = tree.query_selector_all(":checked").unwrap();
+        assert_eq!(checked.len(), 1);
+        assert_eq!(id_of(checked[0]), "c1");
+
+        // :disabled — the disabled text input (not the enabled ones).
+        let disabled = tree.query_selector_all(":disabled").unwrap();
+        assert_eq!(disabled.len(), 1);
+        assert_eq!(id_of(disabled[0]), "t");
+
+        // :enabled — the two checkboxes + the button (form elements w/o disabled).
+        let enabled = tree.query_selector_all(":enabled").unwrap();
+        let mut ids: Vec<String> = enabled.iter().map(|&n| id_of(n)).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["b", "c1", "c2"]);
+
+        // input:checked compound still works.
+        let compound = tree.query_selector_all("input:checked").unwrap();
+        assert_eq!(compound.len(), 1);
+        assert_eq!(id_of(compound[0]), "c1");
+
+        // :hover never matches in a headless tree.
+        assert!(tree.query_selector_all(":hover").unwrap().is_empty());
+    }
+
+    #[test]
+    fn structural_nth_and_of_type_pseudo_classes() {
+        // Regression: a stable opaque() identity is required for the selectors
+        // crate's NthIndexCache; without it An+B and *-of-type were broken.
+        let tree = parse_html(
+            r#"<ul><li id=a>1</li><li id=b>2</li><li id=c>3</li><li id=d>4</li><li id=e>5</li></ul>
+               <p><em id=ea>a</em><b id=bb>b</b><em id=ec>c</em><i id=id>d</i><em id=ee>e</em></p>"#,
+        );
+        let ids = |sel: &str| {
+            let mut v: Vec<String> = tree
+                .query_selector_all(sel)
+                .unwrap()
+                .iter()
+                .map(|&n| tree.get_node(n).unwrap().get_attribute("id").unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids("li:nth-child(2)"), vec!["b"]);
+        assert_eq!(ids("li:nth-child(odd)"), vec!["a", "c", "e"]);
+        assert_eq!(ids("li:nth-child(2n+1)"), vec!["a", "c", "e"]);
+        assert_eq!(ids("li:nth-last-child(2)"), vec!["d"]);
+        assert_eq!(ids("em:first-of-type"), vec!["ea"]);
+        assert_eq!(ids("em:last-of-type"), vec!["ee"]);
+        assert_eq!(ids("em:nth-of-type(2)"), vec!["ec"]);
+        assert_eq!(ids("li:first-child"), vec!["a"]);
+        assert_eq!(ids("li:last-child"), vec!["e"]);
+    }
+
+    #[test]
+    fn link_pseudo_classes() {
+        let tree = parse_html(
+            r#"<a id=a href="x">link</a><a id=b>no href</a>
+               <area id=c href="y"><link id=d href="z" rel=stylesheet><span id=e>x</span>"#,
+        );
+        let ids = |sel: &str| {
+            let mut v: Vec<String> = tree
+                .query_selector_all(sel)
+                .unwrap()
+                .iter()
+                .filter_map(|&n| tree.get_node(n).unwrap().get_attribute("id").map(|s| s.to_string()))
+                .collect();
+            v.sort();
+            v
+        };
+        // :link / :any-link match a and area WITH href — NOT <link> elements (d)
+        // (WPT: "not matching link elements with href attributes"), nor the bare
+        // href-less <a> (b) or <span> (e).
+        assert_eq!(ids(":link"), vec!["a", "c"]);
+        assert_eq!(ids(":any-link"), vec!["a", "c"]);
+        assert_eq!(ids("a:link"), vec!["a"]);
+        // :visited never matches (no history).
+        assert!(ids(":visited").is_empty());
+    }
+
+    #[test]
+    fn lang_pseudo_class_with_inheritance() {
+        let tree = parse_html(
+            r#"<div lang="en">
+                 <p id=a>x</p>
+                 <p id=b lang="fr">y</p>
+                 <p id=c lang="en-US">z</p>
+               </div>
+               <p id=d>nolang</p>"#,
+        );
+        let ids = |sel: &str| {
+            let mut v: Vec<String> = tree
+                .query_selector_all(sel)
+                .unwrap()
+                .iter()
+                .filter_map(|&n| tree.get_node(n).unwrap().get_attribute("id").map(|s| s.to_string()))
+                .collect();
+            v.sort();
+            v
+        };
+        // a inherits en; c is en-US (prefix match); b is fr; d has no language.
+        assert_eq!(ids(":lang(en)"), vec!["a", "c"]);
+        assert_eq!(ids(":lang(fr)"), vec!["b"]);
+        assert_eq!(ids(":lang(en-US)"), vec!["c"]);
+        assert_eq!(ids(":lang(en, fr)"), vec!["a", "b", "c"]);
+        // p:lang(en) excludes the no-language and fr paragraphs.
+        assert_eq!(ids("p:lang(en)"), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn css2_pseudo_elements_parse_but_never_match() {
+        // Regression: the four CSS2 pseudo-elements must PARSE (one- and
+        // two-colon) and select nothing, rather than throwing a parse error.
+        let tree = parse_html("<p>hi<span>x</span></p>");
+        for sel in [
+            "::before", "::after", "::first-line", "::first-letter",
+            ":before", ":after", ":first-line", ":first-letter",
+            "p::first-line", "span:first-letter",
+        ] {
+            let r = tree.query_selector_all(sel);
+            assert!(r.is_ok(), "selector {sel:?} should parse, got {r:?}");
+            assert!(r.unwrap().is_empty(), "selector {sel:?} should match nothing");
+        }
+        // An unknown pseudo-element still errors (so querySelector throws).
+        assert!(tree.query_selector_all("::bogus-pe").is_err());
+    }
+
+    #[test]
+    fn slotted_functional_pseudo_element_parses_but_never_matches() {
+        // Regression: ::slotted(<compound>) must PARSE and select nothing rather
+        // than throwing. cssparser auto-closes the unterminated-paren form at EOF,
+        // so it parses too. An unknown functional pseudo-element still errors.
+        let tree = parse_html("<p>hi<span>x</span></p>");
+        for sel in ["::slotted(foo)", "::slotted(foo", "::slotted(*)", "span::slotted(a)"] {
+            let r = tree.query_selector_all(sel);
+            assert!(r.is_ok(), "selector {sel:?} should parse, got {r:?}");
+            assert!(r.unwrap().is_empty(), "selector {sel:?} should match nothing");
+        }
+        assert!(tree.query_selector_all("::bogus-fn(x)").is_err());
+    }
+
+    #[test]
+    fn target_pseudo_class_matches_url_fragment_id() {
+        let tree = parse_html(r#"<div id="a"></div><section id="b"></section>"#);
+        let ids = |sel: &str| {
+            let mut v: Vec<String> = tree
+                .query_selector_all(sel)
+                .unwrap()
+                .iter()
+                .filter_map(|&n| tree.get_node(n).unwrap().get_attribute("id").map(|s| s.to_string()))
+                .collect();
+            v.sort();
+            v
+        };
+        // No fragment set → :target matches nothing.
+        assert!(ids(":target").is_empty());
+        // Fragment "b" → only #b matches (and compound forms agree).
+        tree.set_target_id(Some("b".to_string()));
+        assert_eq!(ids(":target"), vec!["b"]);
+        assert_eq!(ids("section:target"), vec!["b"]);
+        assert!(ids("div:target").is_empty());
+        // Empty fragment clears it.
+        tree.set_target_id(Some(String::new()));
+        assert!(ids(":target").is_empty());
+    }
+
+    #[test]
+    fn phase0b_dynamic_checked_and_focus() {
+        let tree = parse_html(
+            r#"<input id="a" type="checkbox"><input id="b" type="checkbox"><input id="c" type="text">"#,
+        );
+        let a = tree.query_selector("#a").unwrap().unwrap();
+        let c = tree.query_selector("#c").unwrap().unwrap();
+
+        // No checked attribute and no state → :checked empty.
+        assert!(tree.query_selector_all(":checked").unwrap().is_empty());
+        // Live checked state (no attribute) → :checked matches it.
+        tree.set_checked(a, true);
+        assert_eq!(tree.query_selector_all(":checked").unwrap(), vec![a]);
+        tree.set_checked(a, false);
+        assert!(tree.query_selector_all(":checked").unwrap().is_empty());
+
+        // Live focus → :focus matches the focused element.
+        assert!(tree.query_selector_all(":focus").unwrap().is_empty());
+        tree.set_focus(Some(c));
+        assert_eq!(tree.query_selector_all(":focus").unwrap(), vec![c]);
+        tree.set_focus(None);
+        assert!(tree.query_selector_all(":focus").unwrap().is_empty());
+    }
+
+    #[test]
+    fn focus_within_and_shadow_host_focus() {
+        // `#inner` is the (light-tree) focused element; `#outer` its ancestor.
+        let tree = parse_html(
+            r#"<div id="outer"><div id="mid"><input id="inner"></div></div><div id="host"></div><input id="sib">"#,
+        );
+        let outer = tree.query_selector("#outer").unwrap().unwrap();
+        let mid = tree.query_selector("#mid").unwrap().unwrap();
+        let inner = tree.query_selector("#inner").unwrap().unwrap();
+        let host = tree.query_selector("#host").unwrap().unwrap();
+        let sib = tree.query_selector("#sib").unwrap().unwrap();
+
+        // Nothing focused → neither pseudo matches.
+        assert!(tree.query_selector_all(":focus").unwrap().is_empty());
+        assert!(tree.query_selector_all(":focus-within").unwrap().is_empty());
+
+        // Focus #inner: :focus is just #inner; :focus-within is #inner + ancestors.
+        tree.set_focus(Some(inner));
+        assert_eq!(tree.query_selector_all(":focus").unwrap(), vec![inner]);
+        let fw = tree.query_selector_all(":focus-within").unwrap();
+        assert!(fw.contains(&inner) && fw.contains(&mid) && fw.contains(&outer));
+        assert!(!fw.contains(&sib) && !fw.contains(&host));
+
+        // A shadow host containing the focused element matches BOTH :focus and
+        // :focus-within (the host chain the JS side syncs). Simulate: focus lives in
+        // #host's shadow tree, so #host is in the focus-host chain.
+        tree.set_focus(Some(inner));
+        tree.set_focus_hosts(vec![host]);
+        assert!(tree.query_selector_all(":focus").unwrap().contains(&host));
+        assert!(tree.query_selector_all(":focus-within").unwrap().contains(&host));
+
+        // Clearing focus drops the host chain too.
+        tree.set_focus(None);
+        assert!(tree.query_selector_all(":focus").unwrap().is_empty());
+        assert!(tree.query_selector_all(":focus-within").unwrap().is_empty());
     }
 
     #[test]
@@ -604,8 +1906,7 @@ mod tests {
 
     #[test]
     fn test_query_selector_descendant() {
-        let tree =
-            parse_html(r#"<div id="outer"><div id="inner"><span>Target</span></div></div>"#);
+        let tree = parse_html(r#"<div id="outer"><div id="inner"><span>Target</span></div></div>"#);
         let result = tree.query_selector("#outer span").unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
@@ -614,9 +1915,8 @@ mod tests {
 
     #[test]
     fn test_query_selector_attribute() {
-        let tree = parse_html(
-            r#"<input type="text" name="user"><input type="password" name="pass">"#,
-        );
+        let tree =
+            parse_html(r#"<input type="text" name="user"><input type="password" name="pass">"#);
         let result = tree.query_selector(r#"input[type="password"]"#).unwrap();
         assert!(result.is_some());
         let node = tree.get_node(result.unwrap()).unwrap();
@@ -665,13 +1965,15 @@ mod tests {
 
     #[test]
     fn test_query_selector_from_returns_first_in_subtree_only() {
-        let tree = parse_html(
-            r#"<section id="s"><p>first</p><p>second</p></section><p>outside</p>"#,
-        );
+        let tree =
+            parse_html(r#"<section id="s"><p>first</p><p>second</p></section><p>outside</p>"#);
         let s = tree.get_element_by_id("s").expect("section#s");
 
         // Scoped to #s: skip the outside paragraph; return the first inside.
-        let first_in_s = tree.query_selector_from(s, "p").unwrap().expect("a p inside");
+        let first_in_s = tree
+            .query_selector_from(s, "p")
+            .unwrap()
+            .expect("a p inside");
         assert_eq!(tree.text_content(first_in_s), "first");
     }
 

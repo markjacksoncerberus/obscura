@@ -36,21 +36,21 @@ impl StealthHttpClient {
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
-        // Issue #184: `set_default_paths()` reads OpenSSL's compile-time CA
-        // paths, which only resolve on Linux. On Windows the store ends up
-        // empty and every TLS handshake fails with CERTIFICATE_VERIFY_FAILED.
-        // `CertStore::default()` uses wreq's bundled Mozilla roots
-        // (`webpki-root-certs`), which works the same on every platform.
-        let cert_store = wreq::tls::CertStore::default();
-
-        let emulation_opts = wreq_util::EmulationOption::builder()
-            .emulation(wreq_util::Emulation::Chrome145)
-            .emulation_os(wreq_util::EmulationOS::Linux)
+        // Emulate Chrome 145 on Linux so our TLS (JA3/JA4) and HTTP/2 fingerprint
+        // matches a real Chrome — anti-bot layers (e.g. Cloudflare) flag a
+        // Chrome User-Agent arriving over a non-Chrome handshake.
+        let emulation = wreq_util::Emulation::builder()
+            .profile(wreq_util::Profile::Chrome145)
+            .platform(wreq_util::Platform::Linux)
             .build();
 
+        // No explicit cert store: wreq's default `webpki-roots` feature loads the
+        // bundled Mozilla roots (`webpki-root-certs`) on every platform. Issue
+        // #184: the old `set_default_paths()` read OpenSSL's compile-time CA
+        // paths, which only resolve on Linux, leaving the store empty (and every
+        // handshake failing with CERTIFICATE_VERIFY_FAILED) on Windows.
         let mut builder = wreq::Client::builder()
-            .emulation(emulation_opts)
-            .cert_store(cert_store)
+            .emulation(emulation)
             .timeout(Duration::from_secs(30))
             .redirect(wreq::redirect::Policy::none());
 

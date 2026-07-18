@@ -47,7 +47,9 @@ impl TreeSink for DomTree {
 
     fn elem_name<'a>(&'a self, target: &'a NodeId) -> ObscuraElemName<'a> {
         let borrow = self.borrow_inner();
-        let node = borrow.nodes.get(target.index())
+        let node = borrow
+            .nodes
+            .get(target.index())
             .and_then(|n| n.as_ref())
             .expect("elem_name called on invalid node");
         let name_ptr: *const QualName = match &node.data {
@@ -85,7 +87,10 @@ impl TreeSink for DomTree {
         if flags.template {
             let template_doc = self.new_node(NodeData::Document);
             self.with_node_mut(id, |node| {
-                if let NodeData::Element { template_contents, .. } = &mut node.data {
+                if let NodeData::Element {
+                    template_contents, ..
+                } = &mut node.data
+                {
                     *template_contents = Some(template_doc);
                 }
             });
@@ -124,7 +129,9 @@ impl TreeSink for DomTree {
         prev_element: &NodeId,
         child: NodeOrText<NodeId>,
     ) {
-        let has_parent = self.with_node(*element, |n| n.parent.is_some()).unwrap_or(false);
+        let has_parent = self
+            .with_node(*element, |n| n.parent.is_some())
+            .unwrap_or(false);
         if has_parent {
             self.append_before_sibling(element, child);
         } else {
@@ -149,7 +156,10 @@ impl TreeSink for DomTree {
 
     fn add_attrs_if_missing(&self, target: &NodeId, attrs: Vec<HtmlAttribute>) {
         self.with_node_mut(*target, |node| {
-            if let NodeData::Element { attrs: existing, .. } = &mut node.data {
+            if let NodeData::Element {
+                attrs: existing, ..
+            } = &mut node.data
+            {
                 for attr in attrs {
                     let dominated = existing.iter().any(|a| a.name == attr.name);
                     if !dominated {
@@ -207,7 +217,9 @@ impl TreeSink for DomTree {
 
     fn get_template_contents(&self, target: &NodeId) -> NodeId {
         self.with_node(*target, |n| match &n.data {
-            NodeData::Element { template_contents, .. } => *template_contents,
+            NodeData::Element {
+                template_contents, ..
+            } => *template_contents,
             _ => None,
         })
         .flatten()
@@ -218,14 +230,26 @@ impl TreeSink for DomTree {
         x == y
     }
 
-    fn set_quirks_mode(&self, _mode: QuirksMode) {
+    // Declarative Shadow DOM (`<template shadowrootmode>`). html5ever natively
+    // converts these at parse time — but our shadow-root model lives in JS
+    // (`ShadowRoot`/`attachShadow`), not the Rust tree, so we can't build a real
+    // JS shadow from inside the sink. Returning `false` here makes the parser
+    // leave the `<template shadowrootmode>` as an ordinary template element (with
+    // its markup preserved in `template_contents`). The JS layer then performs the
+    // declarative-shadow conversion after parsing, but ONLY in the opt-in contexts
+    // (main-document load + `setHTMLUnsafe`), never for plain `innerHTML`.
+    fn allow_declarative_shadow_roots(&self, _intended_parent: &NodeId) -> bool {
+        false
     }
+
+    fn set_quirks_mode(&self, _mode: QuirksMode) {}
 
     fn is_mathml_annotation_xml_integration_point(&self, target: &NodeId) -> bool {
         self.with_node(*target, |n| match &n.data {
-            NodeData::Element { mathml_annotation_xml_integration_point, .. } => {
-                *mathml_annotation_xml_integration_point
-            }
+            NodeData::Element {
+                mathml_annotation_xml_integration_point,
+                ..
+            } => *mathml_annotation_xml_integration_point,
             _ => false,
         })
         .unwrap_or(false)
@@ -243,10 +267,26 @@ pub fn parse_html(html: &str) -> DomTree {
 }
 
 pub fn parse_fragment(html: &str) -> DomTree {
-    use html5ever::tendril::TendrilSink;
-    use html5ever::{parse_fragment, ParseOpts, QualName};
+    parse_fragment_ctx(html, "body")
+}
 
-    let context_name = QualName::new(None, ns!(html), local_name!("body"));
+/// Fragment-parse `html` using an HTML element named `context_local` as the
+/// fragment-parsing context element (HTML §html-fragment-parsing-algorithm).
+///
+/// The context element governs the parser's initial insertion mode, so the
+/// same markup parses differently under different contexts — e.g. a bare
+/// `<td>` survives under a `tr`/`table` context but is dropped under `body`,
+/// and a `<body onerror>` token yields a real `body` element only under an
+/// `html` context (under `body`/`div` it is a stray body start-tag and its
+/// attributes are dropped). `element.innerHTML` and the `outerHTML` setter
+/// therefore MUST parse with the real element as context, not a hardcoded
+/// `body` — otherwise `document.body.outerHTML = "<body …></body>"` (whose
+/// context per spec is the parent `<html>`) loses the new body entirely.
+pub fn parse_fragment_ctx(html: &str, context_local: &str) -> DomTree {
+    use html5ever::tendril::TendrilSink;
+    use html5ever::{parse_fragment, LocalName, ParseOpts, QualName};
+
+    let context_name = QualName::new(None, ns!(html), LocalName::from(context_local));
     let tree = DomTree::new();
     parse_fragment(tree, ParseOpts::default(), context_name, vec![])
         .from_utf8()
@@ -319,5 +359,27 @@ mod tests {
         let text = tree.text_content(tree.document());
         assert!(text.contains("Hello"));
         assert!(text.contains("World"));
+    }
+
+    #[test]
+    fn parse_fragment_ctx_html_yields_body() {
+        // <body …> is a stray body start-tag under `body`/`div` context (dropped),
+        // but under an `html` context it produces a real head+body pair — the
+        // behaviour `document.body.outerHTML = "<body …></body>"` depends on.
+        let elem_name = |tree: &DomTree, c: NodeId| -> Option<String> {
+            tree.get_node(c).and_then(|n| n.as_element().map(|q| q.local.as_ref().to_string()))
+        };
+        let dropped = parse_fragment_ctx("<body id=x></body>", "body");
+        assert!(dropped
+            .children(dropped.fragment_root())
+            .iter()
+            .all(|c| elem_name(&dropped, *c).as_deref() != Some("body")));
+        let kept = parse_fragment_ctx("<body id=x></body>", "html");
+        let names: Vec<String> = kept
+            .children(kept.fragment_root())
+            .iter()
+            .filter_map(|c| elem_name(&kept, *c))
+            .collect();
+        assert!(names.contains(&"body".to_string()), "html-context should yield a body, got {names:?}");
     }
 }

@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
+use crate::render_mode::{RenderMode, ViewportConfig};
+
 pub struct BrowserContext {
     pub id: String,
     pub cookie_jar: Arc<CookieJar>,
@@ -12,6 +14,12 @@ pub struct BrowserContext {
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
     pub stealth: bool,
+    /// When (and whether) pages are visually rendered. Defaults to
+    /// [`RenderMode::Never`]; set from `--render-mode`.
+    pub render_mode: RenderMode,
+    /// Initial viewport every new page in this context starts with. Per-page
+    /// `Emulation.setDeviceMetricsOverride` overrides it afterwards.
+    pub default_viewport: ViewportConfig,
     /// When true, CDP-driven navigation to file:// URLs is permitted.
     /// Default is false: a remote CDP client cannot point the browser
     /// at /etc/shadow even if Obscura is running as a privileged user.
@@ -31,10 +39,7 @@ impl BrowserContext {
     /// Create a BrowserContext with an optional storage directory.
     /// When `storage_dir` is set, cookies are automatically loaded from
     /// `{storage_dir}/cookies.json` on creation.
-    pub fn with_storage(
-        id: String,
-        storage_dir: Option<PathBuf>,
-    ) -> Self {
+    pub fn with_storage(id: String, storage_dir: Option<PathBuf>) -> Self {
         Self::_new_inner(id, None, false, None, storage_dir)
     }
 
@@ -68,16 +73,17 @@ impl BrowserContext {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!("Failed to load cookies from {}: {}", cookie_path.display(), e);
+                        tracing::warn!(
+                            "Failed to load cookies from {}: {}",
+                            cookie_path.display(),
+                            e
+                        );
                     }
                 }
             }
         }
 
-        let mut client = ObscuraHttpClient::with_options(
-            cookie_jar.clone(),
-            proxy_url.as_deref(),
-        );
+        let mut client = ObscuraHttpClient::with_options(cookie_jar.clone(), proxy_url.as_deref());
         if stealth {
             client.block_trackers = true;
         }
@@ -100,6 +106,8 @@ impl BrowserContext {
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
             stealth,
+            render_mode: RenderMode::default(),
+            default_viewport: ViewportConfig::default(),
             allow_file_access: false,
             storage_dir,
         }
@@ -156,12 +164,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn with_full_options_falls_back_to_chrome_default() {
-        let ctx = BrowserContext::with_full_options(
-            "test".to_string(),
-            None,
-            false,
-            None,
-        );
+        let ctx = BrowserContext::with_full_options("test".to_string(), None, false, None);
         assert!(ctx.user_agent.contains("Chrome"));
         let client_ua = ctx.http_client.user_agent.read().await.clone();
         assert!(client_ua.contains("Chrome"));
