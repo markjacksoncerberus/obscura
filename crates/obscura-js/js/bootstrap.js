@@ -972,9 +972,13 @@ const _parseStyleDecls = (text) => {
         }
       } else if (name === 'transition') {
         const low = value.toLowerCase();
-        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && !_MATHFN_NAME_RE.test(value)) {
-          const c = _canonTransitionShorthand(value); if (c == null) continue;  // invalid <single-transition># → drop
-          value = c;
+        if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(value) || _MATHFN_NAME_RE.test(value)) {
+          // CSS-wide keyword / var()/env() / math-fn: kept as one `transition` blob key
+          // (the getter/computed echo it); do NOT expand into longhands.
+        } else {
+          const lh = _expandTransitionShort(value); if (!lh) continue;  // invalid <single-transition># → drop
+          for (const ln of _TRANSITION_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `transition` key
         }
       } else if (name === 'animation-duration' || name === 'animation-delay') {
         const low = value.toLowerCase();
@@ -1504,9 +1508,20 @@ class CSSStyleDeclaration {
       }
     } else if (!custom && name === 'transition') {
       const low = stored.toLowerCase();
-      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && !_MATHFN_NAME_RE.test(stored)) {
-        const c = _canonTransitionShorthand(stored); if (c == null) return;  // invalid <single-transition># → ignore
-        stored = c;
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored) || _MATHFN_NAME_RE.test(stored)) {
+        // CSS-wide / var()/env() / math-fn: kept as one `transition` blob key (the
+        // getter/computed echo it); clear any expanded longhands, then store below.
+        for (const ln of _TRANSITION_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandTransitionShort(stored); if (!lh) return;   // invalid <single-transition># → ignore
+        if ('transition' in this._props) { delete this._props['transition']; delete this._priority['transition']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln of _TRANSITION_LONGHANDS) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `transition` key
       }
     } else if (!custom && (name === 'animation-duration' || name === 'animation-delay')) {
       const low = stored.toLowerCase();
@@ -1670,6 +1685,14 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'transition') {                            // shorthand: clear its five longhands
+      const old = (key in this._props) ? this._props[key]
+        : _serTransitionFromLonghands((ln) => this._props[ln]);
+      delete this._props['transition']; delete this._priority['transition'];  // any CSS-wide/var blob key
+      for (const ln of _TRANSITION_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     if (_ALIGN_SHORTHAND_LH[key]) {                         // gap/place-* shorthand: clear its longhands
       const old = _serializeAlignShorthand(this, key);
       delete this._props[key]; delete this._priority[key];   // any var()-stored shorthand key
@@ -1771,6 +1794,10 @@ class CSSStyleDeclaration {
     if (key === 'animation') {                                // reconstruct from its eleven longhands
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
       return _serAnimationFromLonghands((ln) => this._props[ln]);
+    }
+    if (key === 'transition') {                               // reconstruct from its five longhands
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      return _serTransitionFromLonghands((ln) => this._props[ln]);
     }
     if (key === 'animation-range') {                          // reconstruct from its two longhands
       if (key in this._props) return this._props[key];        // (never stored; guard for safety)
@@ -8664,6 +8691,7 @@ const _GCS_DEFAULTS = {
   'scroll-padding-right': 'auto', 'scroll-padding-top': 'auto',
   'scroll-snap-align': 'none', 'scroll-snap-stop': 'normal', 'scroll-snap-type': 'none',
   // css-transitions — none inherit. (The `transition` shorthand default is above.)
+  'transition-behavior': 'normal',
   'transition-delay': '0s', 'transition-duration': '0s',
   'transition-property': 'all', 'transition-timing-function': 'ease',
   // css-animations — none inherit. (The `animation` shorthand default is above.)
@@ -15429,10 +15457,14 @@ const _canonSingleTransPropOrNone = (tok) => {
   if (tok.toLowerCase() === 'none') return 'none';
   return _canonSingleTransProp(tok);
 };
+// transition-behavior = <transition-behavior-value>#, <transition-behavior-value>
+// = normal | allow-discrete. In the `transition` shorthand this keyword may appear
+// anywhere within a layer and serializes LAST (`display 3s allow-discrete`).
+const _TRANS_BEHAVIOR_KW = new Set(['normal', 'allow-discrete']);
 const _parseSingleTransition = (layer) => {
   const toks = _wsTokens(layer.trim());
   if (!toks.length) return null;
-  let prop = null, dur = null, tf = null, delay = null, times = 0;
+  let prop = null, dur = null, tf = null, delay = null, behavior = null, times = 0;
   for (const t of toks) {
     if (_isTimeTok(t)) {
       if (times === 0) { if (parseFloat(t) < 0) return null; dur = t; }  // duration ≥ 0s
@@ -15447,13 +15479,20 @@ const _parseSingleTransition = (layer) => {
       tf = e;
       continue;
     }
+    const low = t.toLowerCase();
+    if (_TRANS_BEHAVIOR_KW.has(low)) {             // behavior keyword wins over <custom-ident>
+      if (behavior !== null) return null;          // two behavior keywords
+      behavior = low;
+      continue;
+    }
     if (prop !== null) return null;                // two properties (`none top`)
     const p = _canonSingleTransPropOrNone(t);
     if (p === null) return null;                   // `initial` / a bad property
     prop = p;
   }
   return { prop: prop == null ? 'all' : prop, dur: dur == null ? '0s' : dur,
-    tf: tf == null ? 'ease' : tf, delay: delay == null ? '0s' : delay };
+    tf: tf == null ? 'ease' : tf, delay: delay == null ? '0s' : delay,
+    behavior: behavior == null ? 'normal' : behavior };
 };
 const _serSingleTransition = (c) => {
   const parts = [];
@@ -15461,6 +15500,7 @@ const _serSingleTransition = (c) => {
   if (c.dur !== '0s' || c.delay !== '0s') parts.push(c.dur);  // duration precedes any delay
   if (c.tf !== 'ease') parts.push(c.tf);
   if (c.delay !== '0s') parts.push(c.delay);
+  if (c.behavior && c.behavior !== 'normal') parts.push(c.behavior);  // behavior serializes last
   return parts.length ? parts.join(' ') : 'all';           // all-default layer → `all`
 };
 // transition = <single-transition>#. Returns the canonical shorthand or null.
@@ -15473,6 +15513,47 @@ const _canonTransitionShorthand = (value) => {
     const c = _parseSingleTransition(l);
     if (c === null) return null;
     out.push(_serSingleTransition(c));
+  }
+  return out.join(', ');
+};
+
+// The `transition` shorthand expands into five per-layer longhands. Like `animation`
+// (#216), setProperty stores all five in `_props` so `el.style.transitionDelay` reads
+// back, and the shorthand getter + getComputedStyle reconstruct from them.
+const _TRANSITION_LONGHANDS = [                     // parse/serialize order per layer
+  'transition-property', 'transition-duration', 'transition-timing-function',
+  'transition-delay', 'transition-behavior',
+];
+// Split the shorthand into its five longhand values (per-layer values joined into
+// comma lists). Returns a { longhand: value } map, or null for an invalid value.
+const _expandTransitionShort = (value) => {
+  const layers = _commaSplitTop(String(value)).map((s) => s.trim());
+  if (!layers.length) return null;
+  const cols = [[], [], [], [], []];               // prop, dur, tf, delay, behavior
+  for (const l of layers) {
+    if (!l) return null;                           // empty layer (stray comma)
+    const c = _parseSingleTransition(l);
+    if (c === null) return null;
+    cols[0].push(c.prop); cols[1].push(c.dur); cols[2].push(c.tf);
+    cols[3].push(c.delay); cols[4].push(c.behavior);
+  }
+  const out = {};
+  _TRANSITION_LONGHANDS.forEach((ln, i) => { out[ln] = cols[i].join(', '); });
+  return out;
+};
+// Reconstruct the `transition` shorthand from its longhands, read via `get(longhand)`
+// (the specified `_props` for the getter, `resolve()` for getComputedStyle). Returns
+// '' when the five longhands disagree on layer count or any is missing — the shorthand
+// then cannot represent the declaration. Otherwise serializes each layer.
+const _serTransitionFromLonghands = (get) => {
+  const lists = _TRANSITION_LONGHANDS.map((ln) => _commaSplitTop(String(get(ln) || '')).map((s) => s.trim()));
+  const n = lists[0].length;
+  if (!n || lists.some((a) => a.length !== n || a.some((x) => !x))) return '';
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push(_serSingleTransition({
+      prop: lists[0][i], dur: lists[1][i], tf: lists[2][i], delay: lists[3][i], behavior: lists[4][i],
+    }));
   }
   return out.join(', ');
 };
@@ -15509,11 +15590,14 @@ const _ANIM_DIRECTION_KW = new Set(['normal', 'reverse', 'alternate', 'alternate
 const _ANIM_FILL_MODE_KW = new Set(['none', 'forwards', 'backwards', 'both']);
 const _ANIM_PLAY_STATE_KW = new Set(['running', 'paused']);
 const _ANIM_COMPOSITION_KW = new Set(['replace', 'add', 'accumulate']);
+// Per-layer keyword-list longhands: <keyword>#. (Not animation-only — `transition-behavior`
+// rides the same generic comma-keyword-list validator.)
 const _ANIM_KEYWORD_LISTS = new Map([
   ['animation-direction', _ANIM_DIRECTION_KW],
   ['animation-fill-mode', _ANIM_FILL_MODE_KW],
   ['animation-play-state', _ANIM_PLAY_STATE_KW],
   ['animation-composition', _ANIM_COMPOSITION_KW],
+  ['transition-behavior', _TRANS_BEHAVIOR_KW],
 ]);
 const _canonAnimKeywordList = (value, kwSet) => {
   const items = _commaSplitTop(String(value)).map((s) => s.trim());
@@ -18872,6 +18956,15 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // through to the standard engine (→ the `none` initial).
     if (kebab === 'animation') {
       const s = _serAnimationFromLonghands((ln) => resolve(ln), true);
+      if (s !== '') return s;
+    }
+    // `transition` shorthand: reconstruct from the COMPUTED longhands (unset longhands
+    // resolve to their initials → the default reconstructs to `all`). This also gives
+    // the right answer when a CSS-wide `transition` blob was stored inline and a
+    // longhand was then overridden (e.g. `transition: initial; transition-delay: 1s`
+    // → `0s 1s`) — the blob does not shadow the per-longhand computed values.
+    if (kebab === 'transition') {
+      const s = _serTransitionFromLonghands((ln) => resolve(ln));
       if (s !== '') return s;
     }
     // `color` is inherited: resolve through the ancestor chain (also handles
