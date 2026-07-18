@@ -18451,21 +18451,43 @@ const _computeIntegerValue = (el, v) => {
   if (n === null || !isFinite(n)) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
   return String(Math.round(n));
 };
-// Fold a <time> value (incl. math) to canonical seconds. Mixed s/ms resolve
-// consistently (`round(10s,6000ms)` and `12s` both → `12s`).
-const _computeTimeValue = (v, el) => {
-  const s = String(v).trim();
-  if (_TF_VAR_RE.test(s) || !/[\d(]/.test(s)) return null;
-  // The CSS tokenizer auto-closes blocks left open at EOF (e.g. `calc(max(…, 10s)`,
-  // one `)` short) — mirror that before evaluating.
-  // `lengths`/`emPx` let a length sub-expression inside sign/abs collapse to the
-  // <number> that scales the time (`5s + 15s * sign(40px - 2em)` → `5s` when 2em=40px);
-  // with `time` also set, `_evalMath` resolves time units first and falls through to
-  // length only for the non-time units, so plain `<time>` values stay byte-identical.
+// Fold a <time> value (incl. math) to canonical seconds. The grammar is a comma
+// list (`<time>#`), so each layer resolves independently (`-500ms, calc(2 * 3s)`
+// → `-0.5s, 6s`). Mixed s/ms resolve consistently (`round(10s,6000ms)` and `12s`
+// both → `12s`). `kebab` drives the animation-duration `auto` coupling: a computed
+// `auto` duration resolves to `0s` ONLY when animation-timeline is the initial
+// single `auto` (a document/time-driven timeline); a timeline LIST or any
+// scroll-driven timeline (`--t`, `none`, `scroll()`, `view()`) keeps `auto`. Every
+// other <time> property has no `auto` in its grammar, so that branch is inert.
+const _computeTimeValue = (v, el, kebab) => {
+  const s0 = String(v).trim();
+  if (_TF_VAR_RE.test(s0)) return null;                   // var()/env() deferred — caller keeps v
+  const isDur = kebab === 'animation-duration';
+  let autoZero = false;
+  if (isDur) {
+    const tl = _commaSplitTop(String((_specifiedDecl(el, 'animation-timeline') || {}).value || 'auto'))
+      .map((x) => x.trim().toLowerCase());
+    autoZero = tl.length === 1 && (tl[0] === '' || tl[0] === 'auto');
+  }
   const vp = _vpUnits();
-  const sec = _evalMath(_balanceParens(s), 0, { time: true, lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, nonFinite: true, ..._siblingOpts(el, s) });
-  if (sec === null) return _FILTER_MATH_RE.test(s) ? (_canonMathExpr(s) || s) : null;
-  return _serNumber(_nfClamp(sec)) + 's';
+  const out = [];
+  for (const raw of _commaSplitTop(s0)) {
+    const it = raw.trim();
+    if (isDur && it.toLowerCase() === 'auto') { out.push(autoZero ? '0s' : 'auto'); continue; }
+    if (!/[\d(]/.test(it)) return null;                   // unexpected non-numeric layer — leave the whole value to the caller
+    // The CSS tokenizer auto-closes blocks left open at EOF (e.g. `calc(max(…, 10s)`,
+    // one `)` short) — mirror that before evaluating.
+    // `lengths`/`emPx` let a length sub-expression inside sign/abs collapse to the
+    // <number> that scales the time (`5s + 15s * sign(40px - 2em)` → `5s` when 2em=40px);
+    // `cqZero` collapses an unresolved container unit (cqw/… with no container) to 0 so a
+    // `sign(2cqw - 10px)` gate folds to its sign; with `time` also set, `_evalMath`
+    // resolves time units first and falls through to length only for the non-time units,
+    // so plain `<time>` values stay byte-identical.
+    const sec = _evalMath(_balanceParens(it), 0, { time: true, lengths: true, cqZero: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, nonFinite: true, ..._siblingOpts(el, it) });
+    if (sec === null) { out.push(_FILTER_MATH_RE.test(it) ? (_canonMathExpr(it) || it) : it); continue; }
+    out.push(_serNumber(_nfClamp(sec)) + 's');
+  }
+  return out.join(', ');
 };
 // Computed value of an animation-range-{start,end} value. The specified value is
 // already canonicalized (names lowercased, default offsets dropped) by setProperty;
@@ -18620,7 +18642,7 @@ const _normComputed = (el, kebab, v) => {
     return _CLAMP_NEG_PROPS.has(kebab) ? _clampNegPx(r) : r;
   }
   if (_INTEGER_COMPUTED_PROPS.has(kebab)) { const r = _computeIntegerValue(el, v); return r === null ? v : r; }
-  if (_TIME_COMPUTED_PROPS.has(kebab)) { const r = _computeTimeValue(v, el); return r === null ? v : r; }
+  if (_TIME_COMPUTED_PROPS.has(kebab)) { const r = _computeTimeValue(v, el, kebab); return r === null ? v : r; }
   if (kebab === 'caret-color') {
     // `[ auto | <color> ]{1,2}`. Each value resolves as a colour (`auto` and
     // `currentColor` → the element's own computed colour). The 2nd value is

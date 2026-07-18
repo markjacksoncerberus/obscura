@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #218).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #219).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-transitions/parsing/transition-delay-computed.html` | 0/1 | **1/1** | ✅ 100% | **Quest #219 The Time-Computed Verdict.** `_computeTimeValue` folded only the FIRST comma layer of a `<time>#` list, so `-500ms, calc(2 * 3s)` stayed verbatim instead of `-0.5s, 6s`. Made it comma-aware (`_commaSplitTop`, resolve each layer, rejoin). **+1.** |
+| `css/css-animations/parsing/animation-delay-computed.html` | 3/4 | **4/4** | ✅ 100% | **Quest #219.** Added `cqZero: true` to the `_computeTimeValue` math opts so an unresolved container unit collapses to 0 — `calc(10s + (sign(2cqw - 10px) * 5s))` folds to `5s` (cqw→0 with no container ⇒ `sign(-10px)` = -1). **+1.** |
+| `css/css-animations/parsing/animation-duration-computed.html` | 11/15 | **15/15** | ✅ 100% | **Quest #219.** Comma-split (`20s, 10s` was truncated to `20s`) + the cqw-`sign()` fold + the `auto` coupling: `animation-duration: auto` computes to `0s` only when `animation-timeline` is the initial single `auto` (a document/time-driven timeline); a timeline LIST or scroll timeline (`--t`, `none`, `scroll()`, `view()`) keeps `auto`. **+4.** |
 | `css/css-fonts/parsing/font-variation-settings-invalid.html` | 0/18 | **18/18** | ✅ 100% | **Quest #218 The Font-Variation-Settings Verdict.** `font-variation-settings` was pure raw-store (unvalidated → accepted everything). Wired it into the css-fonts validate/canon/computed machinery, mirroring `font-feature-settings`: `_parseVariationTag` (a 4-char 0x20–0x7E `<string>` tag + a REQUIRED `<number>`; a calc value must fold to a UNITLESS number via `_calcConstValue`). Rejects a bare number/tag-only, unquoted tags, 3/5-char tags, control/>0x7E chars in the tag, extra pairs without commas, `100px`/`42%`/`calc(100px)`/`calc(100%)`, a dangling trailing comma, mismatched quotes. **+18.** |
 | `css/css-fonts/parsing/font-variation-settings-valid.html` | 6/7 | **7/7** | ✅ 100% | **Quest #218.** `_canonFontVariationSettings` serializes the tag as a CSSOM string and the value via `_serNumber` (`'wght' 1e3, 'slnt' -450.0e-1`→`"wght" 1000, "slnt" -45`; single→double quotes; layer order preserved — NOT sorted at specified time). **+1.** |
 | `css/css-fonts/parsing/font-variation-settings-computed.html` | 4/8 | **8/8** | ✅ 100% | **Quest #218.** `_computeFontVariationSettings` folds each calc `<number>` (`"XHGT" calc(0.4 + 0.3)`→`"XHGT" 0.7`; NOT rounded, unlike feature-settings), dedups by tag keeping the rightmost (`"wght" 700, "wght" 500`→`"wght" 500`), and sorts tags in codepoint order (`"wght" 100, "wdth" 200`→`"wdth" 200, "wght" 100`). **+4.** |
