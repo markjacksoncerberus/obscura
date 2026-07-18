@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #217).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #218).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-fonts/parsing/font-variation-settings-invalid.html` | 0/18 | **18/18** | ✅ 100% | **Quest #218 The Font-Variation-Settings Verdict.** `font-variation-settings` was pure raw-store (unvalidated → accepted everything). Wired it into the css-fonts validate/canon/computed machinery, mirroring `font-feature-settings`: `_parseVariationTag` (a 4-char 0x20–0x7E `<string>` tag + a REQUIRED `<number>`; a calc value must fold to a UNITLESS number via `_calcConstValue`). Rejects a bare number/tag-only, unquoted tags, 3/5-char tags, control/>0x7E chars in the tag, extra pairs without commas, `100px`/`42%`/`calc(100px)`/`calc(100%)`, a dangling trailing comma, mismatched quotes. **+18.** |
+| `css/css-fonts/parsing/font-variation-settings-valid.html` | 6/7 | **7/7** | ✅ 100% | **Quest #218.** `_canonFontVariationSettings` serializes the tag as a CSSOM string and the value via `_serNumber` (`'wght' 1e3, 'slnt' -450.0e-1`→`"wght" 1000, "slnt" -45`; single→double quotes; layer order preserved — NOT sorted at specified time). **+1.** |
+| `css/css-fonts/parsing/font-variation-settings-computed.html` | 4/8 | **8/8** | ✅ 100% | **Quest #218.** `_computeFontVariationSettings` folds each calc `<number>` (`"XHGT" calc(0.4 + 0.3)`→`"XHGT" 0.7`; NOT rounded, unlike feature-settings), dedups by tag keeping the rightmost (`"wght" 700, "wght" 500`→`"wght" 500`), and sorts tags in codepoint order (`"wght" 100, "wdth" 200`→`"wdth" 200, "wght" 100`). **+4.** |
 | `css/css-animations/parsing/keyframes-name-invalid.html` | 0/20 | **20/20** | ✅ 100% | **Quest #214 The Keyframes-Name Verdict.** `@keyframes NAME {}` at-rule name parsing was raw-store — invalid names were accepted (`sheet.cssRules.length` = 1 where 0 expected). Added `_isValidKeyframesName` (reuses the animation-name token grammar `_canonAnimNameTok`, then additionally rejects bare `none`) gating the `keyframes` push in `_cssParseRuleList` — an invalid `<keyframes-name>` drops the whole at-rule. Rejects bare `none`/CSS-wide/`default`, `12`/`-12`/`12foo`, `foo.bar`, `one two`, `one, two` comma lists, `""`. **+20.** |
 | `css/css-animations/parsing/keyframes-name-valid.html` | 39/39 | **39/39** | ✅ 100% | **Quest #214 (held).** Valid `<custom-ident>` (incl. ` foo `, `-foo`, `not`/`and`/`auto`/`normal`) and `<string>` (incl. `"none"`, `"one two"`, `"initial"`) names still accepted — stash-proved unchanged. |
 | `css/css-animations/parsing/animation-range-start-computed.html` | 0/30 | **30/30** | ✅ 100% | **Quest #213 The Animation-Range Computed Verdict.** Registered `animation-range-start: normal` in `_GCS_DEFAULTS` (→ `_CSS_KNOWN_PROPS`/`_initialOf`) + a computed serializer `_computeAnimRange` resolving each offset via `_trComp` (em→px, calc folded, % kept) then re-dropping the default 0% offset. `entry 1em`→`entry 10px`, `exit calc(41% + 1%)`→`exit 42%`, `contain calc(10% + 10px)` kept symbolic. **+30.** |

@@ -17929,6 +17929,7 @@ const _canonFont = (name, value) => {
   if (_FV_CC[name]) return _ccOrderedCanon(value, _FV_CC[name].cats, _FV_CC[name].opts);
   if (name === 'font-variant-alternates') return _canonFontVariantAlternates(value);
   if (name === 'font-feature-settings') return _canonFontFeatureSettings(value);
+  if (name === 'font-variation-settings') return _canonFontVariationSettings(value);
   const en = _FONT_ENUM[name];
   if (en) {
     const s = String(value).trim(), l = s.toLowerCase();
@@ -17939,6 +17940,7 @@ const _canonFont = (name, value) => {
 const _FONT_VALIDATED = new Set([
   'font-style', 'font-weight', 'font-width', 'font-stretch', 'font-size',
   'font-size-adjust', 'font-family', 'font-synthesis', 'font-feature-settings',
+  'font-variation-settings',
   'font-variant-ligatures', 'font-variant-numeric', 'font-variant-east-asian',
   'font-variant-alternates', ...Object.keys(_FONT_ENUM),
 ]);
@@ -18227,6 +18229,56 @@ const _computeFontFeatureSettings = (el, v) => {
     map.set(p.tag, val);
   }
   return [...map.keys()].sort().map((k) => { const val = map.get(k); return _serCssString(k) + (val === 1 ? '' : ' ' + val); }).join(', ');
+};
+// font-variation-settings: normal | [ <opentype-tag> <number> ]#. Same tag grammar as
+// font-feature-settings (a 4-char 0x20–0x7E <string>, serialized as a CSSOM string), but
+// the value is a REQUIRED <number> (not an optional <integer>|on|off) kept as a float
+// (feature-settings rounds to an integer). A calc() value must be <number>-typed — a
+// length/percentage calc (`calc(100px)`, `calc(100%)`) is invalid.
+const _parseVariationTag = (part) => {
+  const s = String(part).trim();
+  const m = /^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')([\s\S]*)$/.exec(s);
+  if (!m) return null;
+  const content = _unescapeIdent(m[1].slice(1, -1));
+  if (content.length !== 4) return null;
+  for (const ch of content) { const cp = ch.codePointAt(0); if (cp < 0x20 || cp > 0x7E) return null; }
+  const rest = m[2].trim();
+  if (rest === '') return null;                                // the <number> is required
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(rest)) return { tag: content, val: parseFloat(rest) };
+  if (_MATHFN_NAME_RE.test(rest)) {                            // calc → keep symbolic (folded at computed time)
+    const cv = _calcConstValue(rest);
+    if (cv === null || cv.u !== '') return null;               // must fold to a unitless <number>
+    return { tag: content, val: rest };
+  }
+  return null;
+};
+const _canonFontVariationSettings = (v) => {
+  const s = String(v).trim();
+  if (s.toLowerCase() === 'normal') return 'normal';
+  const out = [];
+  for (const part of _commaSplitQuoted(s)) {
+    const p = _parseVariationTag(part);
+    if (p === null) return null;
+    const tail = (typeof p.val === 'number') ? ' ' + _serNumber(p.val)
+                                             : ' ' + (_canonMathExpr(String(p.val)) || String(p.val));
+    out.push(_serCssString(p.tag) + tail);
+  }
+  return out.length ? out.join(', ') : null;
+};
+// COMPUTED font-variation-settings: fold each calc <number>, dedup by tag (last wins),
+// sort tags in codepoint order. The value is a float and is NOT rounded.
+const _computeFontVariationSettings = (el, v) => {
+  const s = String(v).trim();
+  if (s.toLowerCase() === 'normal') return 'normal';
+  const map = new Map();
+  for (const part of _commaSplitQuoted(s)) {
+    const p = _parseVariationTag(part);
+    if (p === null) return v;
+    let val = p.val;
+    if (typeof val !== 'number') { const n = _evalMath(String(val), 0, { lengths: true, cqZero: true }); val = n === null ? 0 : n; }
+    map.set(p.tag, val);
+  }
+  return [...map.keys()].sort().map((k) => _serCssString(k) + ' ' + _serNumber(map.get(k))).join(', ');
 };
 
 // The `font-variant` shorthand expands into (and stores as) its six longhands, like
@@ -18559,6 +18611,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'grid-auto-columns' || kebab === 'grid-auto-rows') return _computeGridAutoTracks(v, el);
   if (kebab === 'grid-template-columns' || kebab === 'grid-template-rows') return _computeGridTemplate(v, el);
   if (kebab === 'font-feature-settings') return _computeFontFeatureSettings(el, v);
+  if (kebab === 'font-variation-settings') return _computeFontVariationSettings(el, v);
   if (_SIZE_COMPUTED_PROPS.has(kebab)) return _computeSizeValue(kebab, v, el);
   if (_SH_COMPUTED[kebab]) return _computeBoxShorthand(kebab, v, el);
   if (_SCROLL_PADDING_LH.has(kebab) && String(v).trim().toLowerCase() === 'auto') return 'auto';
