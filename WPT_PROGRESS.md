@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #225).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #226).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-text-decor/parsing/text-decoration-line-valid.html` | 18/67 | **67/67** | ✅ 100% | **Quest #226 The Text-Decoration Verdict.** The whole `text-decoration` family was raw-store. `text-decoration-line = none \| [ underline \|\| overline \|\| line-through \|\| blink ] \| spelling-error \| grammar-error` now canonicalizes to the fixed order `underline overline line-through blink` via `_canonTextDecorationLine`. `overline underline`→`underline overline`, `line-through overline underline`→`underline overline line-through`. **+49.** |
+| `css/css-text-decor/parsing/text-decoration-line-invalid.html` | 0/14 | **14/14** | ✅ 100% | **Quest #226.** Rejects `auto`/`noone`/`under-line`, `none underline` (none can't combine), `underline underline` (duplicate), `spelling-error grammar-error`, `blink underline line-through grammar-error`. **+14.** |
+| `css/css-text-decor/parsing/text-decoration-shorthand.html` | 0/5 | **5/5** | ✅ 100% | **Quest #226.** `text-decoration = <line> \|\| <style> \|\| <color> \|\| <thickness>` (L4) now truly expands into its four longhands (`_expandTextDecoration`, `test_shorthand_value` reads each back + `.style.length`). `overline from-font dotted green` → line/thickness/style/color longhands. **+5.** |
+| `css/css-text-decor/parsing/text-decoration-computed.html` | 0/14 | **14/14** | ✅ 100% | **Quest #226.** The `text-decoration` shorthand was unregistered in computed style. Registered in `_CSS_KNOWN_PROPS` + a `resolve()` branch reconstructing from the COMPUTED longhands (order line·style·thickness·color, colour → rgb() but omitted when the SPECIFIED colour is the `currentcolor` initial). `underline overline line-through red`→`… rgb(255, 0, 0)`, `rgba(10, 20, 30, 0.4) dotted`→`dotted rgba(10, 20, 30, 0.4)`, `currentcolor`/`auto`/`solid`→`none`. **+14.** |
+| `css/css-text-decor/parsing/text-decoration-valid.html` | 10/17 | **17/17** | ✅ 100% | **Quest #226.** Specified shorthand serialization drops each component at its initial (all-initial → `none`): `double overline underline`→`underline overline double`, `overline green from-font`→`overline from-font green`, `underline auto`→`underline`. **+7.** |
+| `css/css-text-decor/parsing/text-decoration-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #226.** Rejects `double overline underline dotted` (two styles), `red line-through green` (two colours), `overline blue underline` (the line component cannot resume after a non-line token). **+3.** |
 | `css/css-multicol/parsing/columns-computed.html` | 0/27 | **27/27** | ✅ 100% | **Quest #225 The Multi-Column Verdict.** The whole css-multicol family was raw-store. `columns` (`[<'column-width'> \|\| <'column-count'>] [ / <'column-height'>]?`, css-multicol-2) is now self-canonicalized (`_canonColumns`/`_parseColumns`/`_slashSplitTop` — length→width, integer→count, `auto` fills width-first) and computed via `_computeColumns` (widths/height → px, count integer). `0.25em`→`10px`, `2 0.25em / 2.5em`→`10px 2 / 100px`, `auto / auto`→`auto`. **+27.** |
 | `css/css-multicol/parsing/columns-valid.html` | 10/24 | **24/24** | ✅ 100% | **Quest #225.** Self-canon `columns`: `2 10px`→`10px 2`, `auto 3`→`3`, `1 0`→`0px 1`, `10px 2 / auto`→`10px 2`. **+14.** |
 | `css/css-multicol/parsing/columns-invalid.html` | 0/17 | **17/17** | ✅ 100% | **Quest #225.** Rejects `10px 20px`/`10 20`/`0 0`/`0 7px` (double-classify), 3-token bodies, and every lone-`/` form. **+17.** |

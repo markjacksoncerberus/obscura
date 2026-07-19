@@ -1052,6 +1052,16 @@ const _parseStyleDecls = (text) => {
           for (const ln of _FLEX_FLOW_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
           continue;                                          // expanded into longhands; no `flex-flow` key
         }
+      } else if (name === 'text-decoration') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandTextDecoration(value); if (!lh) continue;  // invalid <text-decoration> → drop
+          for (const ln of _TD_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `text-decoration` key
+        }
+      } else if (_TEXTDECOR_VALIDATED.has(name)) {
+        const c = _canonTextDecor(name, value); if (c == null) continue;  // invalid text-decoration-line/-thickness → drop
+        value = c;
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1340,6 +1350,12 @@ class CSSStyleDeclaration {
       // -fill) + the `columns` shorthand: validate + canonicalize (invalid → ignore).
       // `column-rule` is a border-expand shorthand handled earlier.
       const c = _canonMulticol(name, stored);
+      if (c === null) return;
+      stored = c;
+    } else if (!custom && _TEXTDECOR_VALIDATED.has(name)) {
+      // css-text-decor longhands text-decoration-line / text-decoration-thickness:
+      // validate + canonicalize (`||` order for line; invalid → ignore).
+      const c = _canonTextDecor(name, stored);
       if (c === null) return;
       stored = c;
     } else if (!custom && _CSSTEXT_VALIDATED.has(name)) {
@@ -1653,6 +1669,22 @@ class CSSStyleDeclaration {
         this._notifyChange();
         return;                                              // expanded into longhands; no `flex-flow` key
       }
+    } else if (!custom && name === 'text-decoration') {
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
+        // CSS-wide / var(): kept as one `text-decoration` blob key; clear longhands.
+        for (const ln of _TD_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandTextDecoration(stored); if (!lh) return;  // invalid <text-decoration> → ignore
+        if ('text-decoration' in this._props) { delete this._props['text-decoration']; delete this._priority['text-decoration']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln of _TD_LONGHANDS) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `text-decoration` key
+      }
     } else if (!custom && _ANIM_KEYWORD_LISTS.has(name)) {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
@@ -1756,6 +1788,14 @@ class CSSStyleDeclaration {
         : _serFlexFlow(this._props['flex-direction'], this._props['flex-wrap']);
       delete this._props['flex-flow']; delete this._priority['flex-flow'];  // any CSS-wide/var blob key
       for (const ln of _FLEX_FLOW_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'text-decoration') {                       // shorthand: clear its four longhands
+      const old = (key in this._props) ? this._props[key]
+        : _serTextDecorationFromLonghands((ln) => this._props[ln]);
+      delete this._props['text-decoration']; delete this._priority['text-decoration'];  // any CSS-wide/var blob key
+      for (const ln of _TD_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -1889,6 +1929,10 @@ class CSSStyleDeclaration {
     if (key === 'flex') {                                     // reconstruct from its three longhands
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
       return _serFlexFromLonghands((ln) => this._props[ln]);
+    }
+    if (key === 'text-decoration') {                          // reconstruct from its four longhands
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      return _serTextDecorationFromLonghands((ln) => this._props[ln]);
     }
     if (key === 'flex-flow') {                                // reconstruct from flex-direction/flex-wrap
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
@@ -8692,6 +8736,7 @@ const _GCS_DEFAULTS = {
   'text-decoration-style': 'solid', 'text-emphasis-color': 'currentColor',
   'text-emphasis-position': 'auto', 'text-emphasis-style': 'none', 'text-shadow': 'none',
   'text-underline-position': 'auto', 'text-decoration-skip-ink': 'auto',
+  'text-decoration-thickness': 'auto',
   // css-writing-modes. unicode-bidi does not inherit; the rest do.
   direction: 'ltr', 'text-combine-upright': 'none', 'text-orientation': 'mixed',
   'unicode-bidi': 'normal', 'writing-mode': 'horizontal-tb',
@@ -12651,6 +12696,101 @@ const _canonCssText = (name, value) => {
   }
   return s;
 };
+
+// ── CSS Text Decoration (css-text-decor) value parsing ────────────────────────
+// The `text-decoration-line` longhand + `text-decoration-thickness` were pure
+// raw-store (every `*-invalid` at 0/N, the `text-decoration-line` `||` order never
+// canonicalized) and the `text-decoration` SHORTHAND + its computed style were
+// unregistered. `_canonTextDecor` validates + canonicalizes the two longhands;
+// `_expandTextDecoration` splits the `||` shorthand into its four longhands;
+// `_serTextDecoration` reconstructs it. A null canon return = invalid → ignore.
+const _TD_LINE_ORDER = ['underline', 'overline', 'line-through', 'blink'];
+const _TD_LINE_KW = new Set(_TD_LINE_ORDER);
+const _TD_STYLE_KW = new Set(['solid', 'double', 'dotted', 'dashed', 'wavy']);
+// `text-decoration-line = none | [ underline || overline || line-through || blink ]
+//  | spelling-error | grammar-error`. Canonical order is the source order above;
+// `none`/`spelling-error`/`grammar-error` may not combine with anything else.
+const _canonTextDecorationLine = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (!toks.length) return null;
+  const lows = toks.map((t) => t.toLowerCase());
+  if (lows.length === 1 && (lows[0] === 'none' || lows[0] === 'spelling-error' || lows[0] === 'grammar-error')) return lows[0];
+  const seen = new Set();
+  for (const l of lows) {
+    if (!_TD_LINE_KW.has(l) || seen.has(l)) return null;   // unknown / none-etc-mixed / duplicate → invalid
+    seen.add(l);
+  }
+  return _TD_LINE_ORDER.filter((k) => seen.has(k)).join(' ');
+};
+// `text-decoration-thickness = auto | from-font | <length-percentage>`.
+const _canonTextDecorationThickness = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length !== 1) return null;
+  const l = toks[0].toLowerCase();
+  if (l === 'auto' || l === 'from-font') return l;
+  return _canonLenPctSigned(toks[0], true);                // <length-percentage> (calc/%/em kept)
+};
+const _TEXTDECOR_VALIDATED = new Set(['text-decoration-line', 'text-decoration-thickness']);
+const _canonTextDecor = (name, value) => {
+  const s = String(value).trim();
+  if (_CSS_WIDE.has(s.toLowerCase()) || _TF_VAR_RE.test(s)) return s;  // CSS-wide / var()/env() → pass through
+  if (name === 'text-decoration-line') return _canonTextDecorationLine(s);
+  if (name === 'text-decoration-thickness') return _canonTextDecorationThickness(s);
+  return null;
+};
+// The `text-decoration` shorthand: `<line> || <style> || <color> || <thickness>`
+// (CSS Text Decoration L4). Each component appears at most once; the line
+// keywords must form a single contiguous run (`overline blue underline` is
+// invalid — the line component cannot resume after a non-line token).
+const _TD_LONGHANDS = ['text-decoration-line', 'text-decoration-style', 'text-decoration-color', 'text-decoration-thickness'];
+const _isTdLineKw = (l) => _TD_LINE_KW.has(l) || l === 'none' || l === 'spelling-error' || l === 'grammar-error';
+const _expandTextDecoration = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (!toks.length) return null;
+  const lineToks = []; let style = null, color = null, thickness = null;
+  let lineStarted = false, lineEnded = false;
+  for (const t of toks) {
+    const l = t.toLowerCase();
+    if (_isTdLineKw(l)) {
+      if (lineEnded) return null;                          // line run interrupted then resumed → invalid
+      lineStarted = true; lineToks.push(t);
+    } else {
+      if (lineStarted) lineEnded = true;
+      if (_TD_STYLE_KW.has(l)) { if (style != null) return null; style = l; }
+      else if (_isValidColor(t)) { if (color != null) return null; color = _canonColorSpecified(t); }
+      else {
+        const th = _canonTextDecorationThickness(t);
+        if (th == null || thickness != null) return null;  // not a thickness / duplicate → invalid
+        thickness = th;
+      }
+    }
+  }
+  const line = lineToks.length ? _canonTextDecorationLine(lineToks.join(' ')) : 'none';
+  if (line == null) return null;
+  return {
+    'text-decoration-line': line,
+    'text-decoration-style': style == null ? 'solid' : style,
+    'text-decoration-color': color == null ? 'currentcolor' : color,
+    'text-decoration-thickness': thickness == null ? 'auto' : thickness,
+  };
+};
+// Reconstruct `text-decoration` from its four longhand values (order
+// line·style·thickness·color, each omitted at its initial; all-initial → `none`).
+// `colorInitial` forces the color omitted — used at computed time, where the
+// specified initial `currentcolor` is what makes the color absent even though it
+// resolves to an rgb() value.
+const _serTextDecoration = (line, style, thick, color, colorInitial) => {
+  if (line == null || style == null || thick == null || color == null) return '';
+  const parts = [];
+  if (line !== 'none') parts.push(line);
+  if (style !== 'solid') parts.push(style);
+  if (thick !== 'auto') parts.push(thick);
+  if (!colorInitial && color !== 'currentcolor') parts.push(color);
+  return parts.length ? parts.join(' ') : 'none';
+};
+const _serTextDecorationFromLonghands = (get) => _serTextDecoration(
+  get('text-decoration-line'), get('text-decoration-style'),
+  get('text-decoration-thickness'), get('text-decoration-color'), false);
 
 // ── CSS Overflow (css-overflow-3/4) value parsing ─────────────────────────────
 // The overflow longhands (overflow-x/-y/-block/-inline), scrollbar-gutter,
@@ -19460,6 +19600,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('animation-range');                                  // the `animation-range` shorthand (computed reconstructed from its stored value)
   add('flex');                                             // the `flex` shorthand (reconstructed from flex-grow/-shrink/-basis)
   add('flex-flow');                                        // the `flex-flow` shorthand (reconstructed from flex-direction/-wrap)
+  add('text-decoration');                                  // the `text-decoration` shorthand (reconstructed from its 4 longhands)
   add('column-rule');                                      // the `column-rule` shorthand (reconstructed from its 3 longhands)
   add('columns');                                          // the `columns` shorthand (self-canonical; computed lengths resolved)
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
@@ -19529,6 +19670,17 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     }
     // `flex-flow` shorthand: reconstruct from the computed flex-direction/flex-wrap.
     if (kebab === 'flex-flow') return _serFlexFlow(resolve('flex-direction'), resolve('flex-wrap'));
+    // `text-decoration` shorthand: reconstruct from the COMPUTED longhands (order
+    // line·style·thickness·color). The colour resolves to rgb() when set, but is
+    // omitted when the SPECIFIED colour is the `currentcolor` initial (its computed
+    // value would otherwise resolve to the element's `color`, hiding the default).
+    if (kebab === 'text-decoration') {
+      const specColor = _specifiedDecl(el, 'text-decoration-color').value;
+      const colorInitial = !specColor || _canonColorSpecified(specColor).toLowerCase() === 'currentcolor';
+      const s = _serTextDecoration(resolve('text-decoration-line'), resolve('text-decoration-style'),
+        resolve('text-decoration-thickness'), resolve('text-decoration-color'), colorInitial);
+      if (s !== '') return s;
+    }
     // `column-rule` shorthand: reconstruct from the COMPUTED longhands — width and
     // colour always print, the style prints only when it is not `none` (CSSOM
     // serialization for column-rule/border-like shorthands at computed time).
@@ -22725,6 +22877,15 @@ globalThis.CSS = {
       if (_MULTICOL_VALIDATED.has(name)) {               // css-multicol longhands + `columns` shorthand
         if (/\bvar\(/i.test(val)) return true;
         return _canonMulticol(name, _canonStandardValue(val)) != null;
+      }
+      if (_TEXTDECOR_VALIDATED.has(name)) {              // text-decoration-line / -thickness
+        if (/\bvar\(/i.test(val)) return true;
+        return _canonTextDecor(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'text-decoration') {                  // the `text-decoration` shorthand
+        const c = _canonStandardValue(val);
+        if (/\bvar\(/i.test(val)) return true;
+        return _CSS_WIDE.has(c.toLowerCase()) || _expandTextDecoration(c) != null;
       }
       if (name === 'column-rule') {                      // the `column-rule` shorthand
         if (/\bvar\(/i.test(val)) return true;
