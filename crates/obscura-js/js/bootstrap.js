@@ -1335,6 +1335,13 @@ class CSSStyleDeclaration {
       const c = _canonCssUi(name, stored);
       if (c === null) return;
       stored = c;
+    } else if (!custom && _MULTICOL_VALIDATED.has(name)) {
+      // css-multicol longhands (column-width/-count/-rule-width/-style/-color/-span/
+      // -fill) + the `columns` shorthand: validate + canonicalize (invalid → ignore).
+      // `column-rule` is a border-expand shorthand handled earlier.
+      const c = _canonMulticol(name, stored);
+      if (c === null) return;
+      stored = c;
     } else if (!custom && _CSSTEXT_VALIDATED.has(name)) {
       // css-text longhands + the text-wrap/white-space shorthands: validate +
       // canonicalize the grammar (invalid → ignore). Precedes the length/_MATH_GATE
@@ -8940,6 +8947,7 @@ const _BORDER_EXPAND = {
   'border-style': ['border-top-style', 'border-right-style', 'border-bottom-style', 'border-left-style'],
   'border-color': ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color'],
   'outline': ['outline-width', 'outline-style', 'outline-color'],
+  'column-rule': ['column-rule-width', 'column-rule-style', 'column-rule-color'],
 };
 // Parse `<line-width> || <line-style> || <color>` (border/outline side), VALIDATING
 // each token and rejecting duplicates / unclassifiable tokens (so `2px solid
@@ -8998,6 +9006,12 @@ const _expandBorderShorthand = (sh, value) => {
     const p = _parseBorderSideStrict(value, true); if (!p) return null;
     return { 'outline-width': p.width, 'outline-style': p.style, 'outline-color': p.color };
   }
+  if (sh === 'column-rule') {
+    // `<'column-rule-width'> || <'column-rule-style'> || <'column-rule-color'>`
+    // — the border-side grammar (no `auto` line-style; `auto` → invalid <color>).
+    const p = _parseBorderSideStrict(value, false); if (!p) return null;
+    return { 'column-rule-width': p.width, 'column-rule-style': p.style, 'column-rule-color': p.color };
+  }
   if (sh === 'border') {
     const p = _parseBorderSideStrict(value, false); if (!p) return null;
     const out = {};
@@ -9039,6 +9053,17 @@ const _serializeBorderShorthand = (decl, sh) => {
     const w = p['outline-width'], s = p['outline-style'], c = p['outline-color'];
     if (w == null || s == null || c == null) return '';
     return _joinBorderSide(w, s, c);
+  }
+  if (sh === 'column-rule') {
+    const w = p['column-rule-width'], s = p['column-rule-style'], c = p['column-rule-color'];
+    if (w == null || s == null || c == null) return '';
+    const parts = [];
+    if (w !== _LW_INIT) parts.push(w);
+    if (s !== _LS_INIT) parts.push(s);
+    if (c !== _LC_INIT) parts.push(c);
+    // All-initial serializes to the width initial `medium` (not `none`, unlike
+    // border/outline — matches the column-rule-valid WPT reference).
+    return parts.length ? parts.join(' ') : _LW_INIT;
   }
   if (sh === 'border') {
     for (const comp of ['width', 'style', 'color']) {
@@ -12212,6 +12237,169 @@ const _canonCssUi = (name, value) => {
   }
   if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;
+};
+
+// ── CSS Multi-column Layout (css-multicol) value parsing ─────────────────────
+// The multicol longhands + the `columns` shorthand stored their value RAW — no
+// grammar check — so every `*-invalid` value was wrongly accepted and calc()/em
+// never resolved at computed time. `_canonMulticol` validates + canonicalizes the
+// longhands and self-canonicalizes the `columns` shorthand (there is no
+// `columns-shorthand.html`, so it need not expand into longhands — it round-trips
+// as a single canonical key). `column-rule` is a border/outline-style shorthand and
+// lives in `_BORDER_EXPAND` (expands into its three longhands) — NOT here.
+//
+// column-count : `auto | <integer [1,∞]>`   (a number-typed calc folds at computed)
+// column-width : `auto | <length [0,∞]>`     (unitless 0 → 0px; calc folded/clamped)
+// column-rule-width : `<line-width>` = thin|medium|thick | <length [0,∞]>
+// column-rule-color : `<color>`
+// column-span  : `none | all`   ·  column-fill : `auto | balance | balance-all`
+// column-rule-style : `<line-style>` (border line styles; NO `auto`)
+// columns : `[ <'column-width'> || <'column-count'> ] [ / <'column-height'> ]?`
+//           (css-multicol-2; <column-height> shares the <column-width> grammar).
+const _MULTICOL_ENUM = {
+  'column-span': new Set(['none', 'all']),
+  'column-fill': new Set(['auto', 'balance', 'balance-all']),
+  'column-rule-style': _LINE_STYLE_KW,
+};
+// A single <'column-width'> component: `auto | <length [0,∞]>` (unitless 0 → 0px;
+// a literal negative length is invalid; a length calc is kept and clamped at
+// computed time). Also serves <'column-height'>.
+const _canonColumnWidth = (s) => {
+  const toks = _wsTokens(String(s).trim());
+  if (toks.length !== 1) return null;
+  const t = toks[0];
+  if (t.toLowerCase() === 'auto') return 'auto';
+  if (_isZeroTok(t)) return '0px';
+  if (_isLengthTok(t)) {
+    if (/^-/.test(t) && !_MATHFN_NAME_RE.test(t)) return null; // literal negative → invalid
+    return _canonLineWidth(t);
+  }
+  return null;
+};
+// A single <'column-rule-width'>: `<line-width>` (adds the thin/medium/thick
+// keywords to the <length [0,∞]> grammar; identical to outline-width).
+const _canonColumnRuleWidth = (s) => {
+  const toks = _wsTokens(String(s).trim());
+  if (toks.length !== 1) return null;
+  const t = toks[0], tl = t.toLowerCase();
+  if (_LINE_WIDTH_KW.has(tl)) return tl;
+  if (_isZeroTok(t)) return '0px';
+  if (_isLengthTok(t)) {
+    if (/^-/.test(t) && !_MATHFN_NAME_RE.test(t)) return null;
+    return _canonLineWidth(t);
+  }
+  return null;
+};
+// A single <'column-count'>: `auto | <integer [1,∞]>`. A number-typed calc is kept
+// symbolic here (folded to an integer at computed time); a length/percentage calc,
+// a fractional literal, zero, or a negative integer is invalid.
+const _canonColumnCount = (s) => {
+  const toks = _wsTokens(String(s).trim());
+  if (toks.length !== 1) return null;
+  const t = toks[0], tl = t.toLowerCase();
+  if (tl === 'auto') return 'auto';
+  if (_MATHFN_NAME_RE.test(t)) {
+    const root = _parseCalcTree(t);
+    if (root === null || _mt(root, null) !== 'number') return null; // must be <number>/<integer>-typed
+    return _canonMathExpr(t) || t;
+  }
+  if (/^\+?\d+$/.test(t)) { const n = parseInt(t, 10); return n >= 1 ? String(n) : null; }
+  return null;
+};
+// Split a string on top-level `/` (paren-aware, so a calc()'s division `/` is kept).
+const _slashSplitTop = (s) => {
+  const out = []; let depth = 0, cur = '';
+  for (const ch of String(s)) {
+    if (ch === '(') { depth++; cur += ch; }
+    else if (ch === ')') { depth = depth > 0 ? depth - 1 : 0; cur += ch; }
+    else if (ch === '/' && depth === 0) { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out;
+};
+// Serialize a parsed `columns` into its canonical form: width then count (each
+// dropped when `auto`, both-auto/none → `auto`), then ` / <height>` when the
+// height is a non-`auto` value.
+const _serColumns = (width, count, height) => {
+  const parts = [];
+  if (width && width !== 'auto') parts.push(width);
+  if (count && count !== 'auto') parts.push(count);
+  const body = parts.length ? parts.join(' ') : 'auto';
+  return (height && height !== 'auto') ? body + ' / ' + height : body;
+};
+// Parse a `columns` value into {width, count, height} (each canonical or null), or
+// null when invalid. In the `||` body a token classifies as: a length (incl. a
+// unitless 0 → column-width), a positive integer (→ column-count), or `auto`
+// (fills column-width first, then column-count). At most one of each; a lone `/`
+// side, an empty body/height, or >2 body tokens is invalid.
+const _parseColumns = (s) => {
+  const segs = _slashSplitTop(String(s).trim());
+  if (segs.length > 2) return null;
+  let height;
+  if (segs.length === 2) {
+    const h = _canonColumnWidth(segs[1].trim());
+    if (h == null) return null;                            // empty / invalid <column-height>
+    height = h;
+  }
+  const body = segs[0].trim();
+  const toks = _wsTokens(body);
+  if (!toks.length || toks.length > 2) return null;
+  let width = null, count = null, autos = 0;
+  for (const t of toks) {
+    if (t.toLowerCase() === 'auto') { autos++; continue; }
+    if (_isZeroTok(t)) { if (width != null) return null; width = '0px'; continue; }
+    if (/^\+?\d+$/.test(t)) {                              // bare positive integer → column-count
+      const n = parseInt(t, 10);
+      if (n < 1 || count != null) return null;
+      count = String(n); continue;
+    }
+    if (_isLengthTok(t)) {                                 // length (incl. calc) → column-width
+      if (/^-/.test(t) && !_MATHFN_NAME_RE.test(t)) return null;
+      if (width != null) return null; width = _canonLineWidth(t); continue;
+    }
+    return null;                                           // `none` / unclassifiable
+  }
+  for (let i = 0; i < autos; i++) {
+    if (width == null) width = 'auto';
+    else if (count == null) count = 'auto';
+    else return null;                                      // three auto-fillable slots → too many
+  }
+  return { width, count, height };
+};
+const _canonColumns = (s) => {
+  const p = _parseColumns(s);
+  return p ? _serColumns(p.width, p.count, p.height) : null;
+};
+const _MULTICOL_VALIDATED = new Set([
+  'column-width', 'column-count', 'column-rule-width', 'column-rule-style',
+  'column-rule-color', 'column-span', 'column-fill', 'columns',
+]);
+const _canonMulticol = (name, value) => {
+  const s = String(value).trim();
+  const low = s.toLowerCase();
+  if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(s)) return s;      // CSS-wide / var()/env() → pass through
+  const enumSet = _MULTICOL_ENUM[name];
+  if (enumSet) return enumSet.has(low) ? low : null;
+  if (name === 'column-rule-color') {                         // `<color>` (single token)
+    const toks = _wsTokens(s);
+    if (toks.length !== 1 || !_isValidColor(toks[0])) return null;
+    return _canonColorSpecified(toks[0]);
+  }
+  if (name === 'column-width') return _canonColumnWidth(s);
+  if (name === 'column-rule-width') return _canonColumnRuleWidth(s);
+  if (name === 'column-count') return _canonColumnCount(s);
+  if (name === 'columns') return _canonColumns(s);
+  return null;
+};
+// Computed `columns`: resolve the width/height <length>s to px (em folded, clamped
+// ≥0), keep the count integer, then re-serialize with the same drop rules.
+const _computeColumns = (el, v) => {
+  const p = _parseColumns(v);
+  if (!p) return v;                                          // already canonical — defensive
+  const vp = _vpUnits();
+  const compLen = (x) => (x == null || x === 'auto') ? x : _clampNegPx(_trComp(x, el, true, vp));
+  return _serColumns(compLen(p.width), p.count, compLen(p.height));
 };
 
 // ── CSS Text (css-text) value parsing ────────────────────────────────────────
@@ -18587,6 +18775,7 @@ const _LENGTH_COMPUTED_PROPS = new Set([
   'inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end',
   'width', 'height',
   'flex-basis', 'text-indent', 'outline-offset',
+  'column-width', 'column-rule-width',                   // css-multicol: auto/keyword pass through; calc → px, ≥0
   'letter-spacing', 'word-spacing',                      // <length> | normal (keyword passes through)
   'row-gap', 'column-gap',                               // <length-percentage> | normal (non-negative)
   ..._SCROLL_MARGIN_LH,                                  // scroll-margin-* : <length> (signed)
@@ -18598,6 +18787,7 @@ const _CLAMP_NEG_PROPS = new Set([
   'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
   'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
   'row-gap', 'column-gap',                                // gap is non-negative (a resolved negative calc clamps to 0)
+  'column-width', 'column-rule-width',                    // css-multicol widths are non-negative (resolved negative → 0)
   'flex-basis',                                           // flex-basis is <'width'> — non-negative (resolved negative → 0)
   ..._SCROLL_PADDING_LH,                                  // scroll-padding is non-negative (resolved negative → 0)
 ]);
@@ -18791,6 +18981,14 @@ const _normComputed = (el, kebab, v) => {
     const out = toks.map((t) => (t.toLowerCase() === 'auto' ? 'auto' : (_computeIntegerValue(el, t) || t)));
     while (out.length > 1 && out[out.length - 1] === out[out.length - 2]) out.pop();
     return out.join(' ');
+  }
+  if (kebab === 'column-count') {                         // `auto` | <integer [1,∞]> (calc folded, clamped ≥1)
+    const s = String(v).trim();
+    if (s.toLowerCase() === 'auto') return 'auto';
+    const iv = _computeIntegerValue(el, s);
+    if (iv === null) return v;
+    const n = parseInt(iv, 10);
+    return String(isFinite(n) && n >= 1 ? n : 1);
   }
   if (kebab === 'tab-size') {                              // <number [0,∞]> stays; <length> resolves to px, clamps ≥0
     const s = String(v).trim();
@@ -19262,6 +19460,8 @@ const _CSS_KNOWN_PROPS = (() => {
   add('animation-range');                                  // the `animation-range` shorthand (computed reconstructed from its stored value)
   add('flex');                                             // the `flex` shorthand (reconstructed from flex-grow/-shrink/-basis)
   add('flex-flow');                                        // the `flex-flow` shorthand (reconstructed from flex-direction/-wrap)
+  add('column-rule');                                      // the `column-rule` shorthand (reconstructed from its 3 longhands)
+  add('columns');                                          // the `columns` shorthand (self-canonical; computed lengths resolved)
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
@@ -19329,6 +19529,26 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     }
     // `flex-flow` shorthand: reconstruct from the computed flex-direction/flex-wrap.
     if (kebab === 'flex-flow') return _serFlexFlow(resolve('flex-direction'), resolve('flex-wrap'));
+    // `column-rule` shorthand: reconstruct from the COMPUTED longhands — width and
+    // colour always print, the style prints only when it is not `none` (CSSOM
+    // serialization for column-rule/border-like shorthands at computed time).
+    if (kebab === 'column-rule') {
+      const w = resolve('column-rule-width'), s = resolve('column-rule-style'), c = resolve('column-rule-color');
+      if (w && s && c) {
+        const parts = [w];
+        if (s !== 'none') parts.push(s);
+        parts.push(c);
+        return parts.join(' ');
+      }
+    }
+    // `columns` shorthand: resolve the width/height <length>s of the self-canonical
+    // specified value to px (the count stays an integer), re-serializing with the
+    // width/count/height drop rules.
+    if (kebab === 'columns') {
+      const spec = _specifiedDecl(el, 'columns').value;
+      if (spec && !_CSS_WIDE.has(spec.toLowerCase())) return _computeColumns(el, spec);
+      return 'auto';                                       // initial / CSS-wide → the `auto` initial
+    }
     // grid placement shorthands: reconstruct from the COMPUTED <grid-line> longhands
     // (integer math folded to plain integers), re-dropping redundant elided lines.
     if (kebab === 'grid-column' || kebab === 'grid-row') {
@@ -22501,6 +22721,15 @@ globalThis.CSS = {
       if (_CSSTEXT_VALIDATED.has(name)) {                // css-text longhands + text-wrap/white-space
         if (/\bvar\(/i.test(val)) return true;
         return _canonCssText(name, _canonStandardValue(val)) != null;
+      }
+      if (_MULTICOL_VALIDATED.has(name)) {               // css-multicol longhands + `columns` shorthand
+        if (/\bvar\(/i.test(val)) return true;
+        return _canonMulticol(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'column-rule') {                      // the `column-rule` shorthand
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _expandBorderShorthand('column-rule', c) != null;
       }
       if (_OVERFLOW_VALIDATED.has(name)) {               // css-overflow longhands (+ overflow-clip-margin)
         if (/\bvar\(/i.test(val)) return true;
