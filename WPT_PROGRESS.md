@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-19 (Quest #227).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-19 (Quest #228).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-text-decor/parsing/text-decoration-inset-computed.html` | 0/16 | **16/16** | ✅ 100% | **Quest #228 The Text-Decoration-Inset Verdict.** `text-decoration-inset = auto \| <length-percentage>{1,2}` (signed; two identical components collapse). Was raw-store/unregistered. ROOT CAUSE of the computed fails: the `font` shorthand never expanded in the author-stylesheet cascade, so `#target { font: 20px Ahem }` left font-size at 16px and every `em`/`ch` folded wrong. Added `font` to `_SHORTHAND_LONGHANDS` + `_expandShorthand` (splits via `_parseFontShorthand`) AND to the inline `_parseStyleDecls` parser → font-size now cascades. `_computeTextDecorationInset` folds each `<length-percentage>` to px (em→px, `ch`≈em for the Ahem test font, `%` kept, mixed→calc). `0.5em`→`10px`, `1ch -1ch`→`20px -20px`, `calc(10% + 1ch) calc(-20%)`→`calc(10% + 20px) -20%`. **+16.** |
+| `css/css-text-decor/parsing/text-decoration-inset-valid.html` | 10/16 | **16/16** | ✅ 100% | **Quest #228.** `_canonTextDecorationInset` via `_canonLenPctSigned` (calc/%/em kept, negatives allowed), two identical → one: `0`→`0px`, `0px 0px`→`0px`, `-1ch -1ch`→`-1ch`, `calc(1em / 4) calc(-1ch)`→`calc(0.25em) calc(-1ch)`, `0 20%`→`0px 20%`. **+6.** |
+| `css/css-text-decor/parsing/text-decoration-inset-invalid.html` | 0/8 | **8/8** | ✅ 100% | **Quest #228.** `auto` cannot combine, only lone; rejects `none`/`normal`/`auto auto`/`0 auto`/`1px auto`/`auto -1px`/`45deg`. **+8.** |
 | `css/css-text-decor/parsing/text-emphasis-computed.html` | 0/7 | **7/7** | ✅ 100% | **Quest #227 The Text-Emphasis Verdict.** The `text-emphasis` shorthand (`<'text-emphasis-style'> \|\| <'text-emphasis-color'>`) was unregistered in computed style. `_expandTextEmphasis` splits it into the style/color longhands (colour is always a single token); registered in `_CSS_KNOWN_PROPS` + a `resolve()` branch printing BOTH the computed style and colour (colour resolves currentcolor → the element's `color`, never omitted). `dot red`→`dot rgb(255, 0, 0)`, `open sesame`→`open sesame rgb(0, 0, 255)`, `black`→`none rgb(0, 0, 0)`. **+7.** |
 | `css/css-text-decor/parsing/text-emphasis-style-computed.html` | 6/9 | **9/9** | ✅ 100% | **Quest #227.** `_computeTextEmphasisStyle` drops the default `filled` and adds the writing-mode default shape (`circle` horizontal): `filled circle`→`circle`, `filled`→`circle`, `open`→`open circle`. **+3.** |
 | `css/css-text-decor/parsing/text-emphasis-style-computed-vertical-lr.html` | 6/9 | **9/9** | ✅ 100% | **Quest #227.** Same, vertical typographic mode → default shape `sesame` (read via `_computedPropOf(el, 'writing-mode')`): `filled`→`sesame`, `open`→`open sesame`. **+3.** |

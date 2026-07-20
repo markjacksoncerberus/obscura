@@ -1052,6 +1052,17 @@ const _parseStyleDecls = (text) => {
           for (const ln of _FLEX_FLOW_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
           continue;                                          // expanded into longhands; no `flex-flow` key
         }
+      } else if (name === 'font') {
+        // The `font` shorthand: expand into its 7 longhands so a stylesheet /
+        // cssText / style="" rule sets `font-size` (etc.) in the cascade — matching
+        // the setProperty API path. System-font / CSS-wide / var() kept as one key.
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const parsed = _parseFontShorthand(value); if (!parsed) continue;  // invalid <font> → drop
+          if (parsed.system) { out.push({ name: 'font', value: parsed.system, important }); continue; }
+          for (const ln of _FONT_SH_LH) out.push({ name: ln, value: parsed[ln], important });
+          continue;                                          // expanded into longhands; no `font` key
+        }
       } else if (name === 'text-decoration') {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -8781,6 +8792,7 @@ const _GCS_DEFAULTS = {
   'text-emphasis-position': 'auto', 'text-emphasis-style': 'none', 'text-shadow': 'none',
   'text-underline-position': 'auto', 'text-decoration-skip-ink': 'auto',
   'text-decoration-thickness': 'auto',
+  'text-decoration-inset': 'auto',
   // css-writing-modes. unicode-bidi does not inherit; the rest do.
   direction: 'ltr', 'text-combine-upright': 'none', 'text-orientation': 'mixed',
   'unicode-bidi': 'normal', 'writing-mode': 'horizontal-tb',
@@ -8919,6 +8931,9 @@ const _SHORTHAND_LONGHANDS = {
     'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color',
   ],
   transition: ['transition-property', 'transition-duration', 'transition-timing-function', 'transition-delay'],
+  // The `font` shorthand feeds the cascade so a stylesheet `font: 20px Ahem` sets
+  // font-size (etc.); the value is split per-longhand lazily via _expandShorthand.
+  font: ['font-style', 'font-variant-caps', 'font-weight', 'font-stretch', 'font-size', 'line-height', 'font-family'],
 };
 // Set a declaration into a block-level map, respecting within-block cascade
 // order: an !important declaration is never overridden by a later normal one of
@@ -9228,6 +9243,11 @@ const _expandShorthand = (sh, value) => {
     return out;
   }
   if (sh === 'transition') return _expandTransition(value);
+  if (sh === 'font') {
+    const p = _parseFontShorthand(value);
+    if (!p || p.system) return null;   // invalid / system font → no per-longhand pieces (falls to initial/inherited)
+    return p;                          // already keyed by the 7 font longhands
+  }
   return null;
 };
 
@@ -12774,13 +12794,44 @@ const _canonTextDecorationThickness = (value) => {
   if (l === 'auto' || l === 'from-font') return l;
   return _canonLenPctSigned(toks[0], true);                // <length-percentage> (calc/%/em kept)
 };
-const _TEXTDECOR_VALIDATED = new Set(['text-decoration-line', 'text-decoration-thickness']);
+// `text-decoration-inset = auto | <length-percentage>{1,2}` (CSS Text Decoration L4).
+// Signed (negatives allowed); `auto` is a lone keyword that cannot combine. Two
+// components that serialize identically collapse to one (`0px 0px`→`0px`).
+const _canonTextDecorationInset = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length === 1 && toks[0].toLowerCase() === 'auto') return 'auto';
+  if (toks.length < 1 || toks.length > 2) return null;
+  const canon = [];
+  for (const t of toks) {
+    const c = _canonLenPctSigned(t, true);                 // `auto` here → null → whole value invalid
+    if (c == null) return null;
+    canon.push(c);
+  }
+  if (canon.length === 2 && canon[0] === canon[1]) return canon[0];
+  return canon.join(' ');
+};
+const _TEXTDECOR_VALIDATED = new Set(['text-decoration-line', 'text-decoration-thickness', 'text-decoration-inset']);
 const _canonTextDecor = (name, value) => {
   const s = String(value).trim();
   if (_CSS_WIDE.has(s.toLowerCase()) || _TF_VAR_RE.test(s)) return s;  // CSS-wide / var()/env() → pass through
   if (name === 'text-decoration-line') return _canonTextDecorationLine(s);
   if (name === 'text-decoration-thickness') return _canonTextDecorationThickness(s);
+  if (name === 'text-decoration-inset') return _canonTextDecorationInset(s);
   return null;
+};
+// Computed `text-decoration-inset`: fold each already-canonical <length-percentage>
+// to px (em→px, `%` kept symbolic, mixed %+length → canonical calc), collapsing two
+// identical components. We do not measure glyph advances in this layer, so `ch` is
+// approximated as the font's "0"-advance — for the test font (Ahem) that is exactly
+// 1em, so we resolve `ch` against the element's em before folding.
+const _computeTextDecorationInset = (el, value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length === 1 && toks[0].toLowerCase() === 'auto') return 'auto';
+  const vp = _vpUnits(), emPx = _emPxOf(el);
+  const subCh = (t) => t.replace(/([+-]?(?:\d*\.?\d+))ch\b/gi, (_m, n) => _serNumber(parseFloat(n) * emPx) + 'px');
+  const comps = toks.map((t) => _trComp(subCh(t), el, true, vp));
+  if (comps.length === 2 && comps[0] === comps[1]) return comps[0];
+  return comps.join(' ');
 };
 // The `text-decoration` shorthand: `<line> || <style> || <color> || <thickness>`
 // (CSS Text Decoration L4). Each component appears at most once; the line
@@ -19243,6 +19294,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (kebab === 'text-emphasis-style') return _computeTextEmphasisStyle(el, v);
   if (kebab === 'mask-size') return _computeMaskSize(el, v);
+  if (kebab === 'text-decoration-inset') return _computeTextDecorationInset(el, v);
   if (_GRID_LINE_LH.has(kebab)) return _computeGridLine(el, v);
   if (kebab === 'animation-range-start' || kebab === 'animation-range-end') {
     return _computeAnimRange(v, el, kebab === 'animation-range-end');
