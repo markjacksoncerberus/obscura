@@ -1062,6 +1062,16 @@ const _parseStyleDecls = (text) => {
       } else if (_TEXTDECOR_VALIDATED.has(name)) {
         const c = _canonTextDecor(name, value); if (c == null) continue;  // invalid text-decoration-line/-thickness → drop
         value = c;
+      } else if (name === 'text-emphasis') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandTextEmphasis(value); if (!lh) continue;  // invalid <text-emphasis> → drop
+          for (const ln of _TE_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `text-emphasis` key
+        }
+      } else if (_TEXTEMPHASIS_VALIDATED.has(name)) {
+        const c = _canonTextEmphasisLonghand(name, value); if (c == null) continue;  // invalid text-emphasis-style/-position → drop
+        value = c;
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1356,6 +1366,12 @@ class CSSStyleDeclaration {
       // css-text-decor longhands text-decoration-line / text-decoration-thickness:
       // validate + canonicalize (`||` order for line; invalid → ignore).
       const c = _canonTextDecor(name, stored);
+      if (c === null) return;
+      stored = c;
+    } else if (!custom && _TEXTEMPHASIS_VALIDATED.has(name)) {
+      // css-text-decor longhands text-emphasis-style / text-emphasis-position:
+      // validate + canonicalize (drop default fill/`right`, reorder; invalid → ignore).
+      const c = _canonTextEmphasisLonghand(name, stored);
       if (c === null) return;
       stored = c;
     } else if (!custom && _CSSTEXT_VALIDATED.has(name)) {
@@ -1685,6 +1701,22 @@ class CSSStyleDeclaration {
         this._notifyChange();
         return;                                              // expanded into longhands; no `text-decoration` key
       }
+    } else if (!custom && name === 'text-emphasis') {
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
+        // CSS-wide / var(): kept as one `text-emphasis` blob key; clear longhands.
+        for (const ln of _TE_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandTextEmphasis(stored); if (!lh) return;  // invalid <text-emphasis> → ignore
+        if ('text-emphasis' in this._props) { delete this._props['text-emphasis']; delete this._priority['text-emphasis']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln of _TE_LONGHANDS) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `text-emphasis` key
+      }
     } else if (!custom && _ANIM_KEYWORD_LISTS.has(name)) {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
@@ -1796,6 +1828,14 @@ class CSSStyleDeclaration {
         : _serTextDecorationFromLonghands((ln) => this._props[ln]);
       delete this._props['text-decoration']; delete this._priority['text-decoration'];  // any CSS-wide/var blob key
       for (const ln of _TD_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'text-emphasis') {                         // shorthand: clear its two longhands
+      const old = (key in this._props) ? this._props[key]
+        : _serTextEmphasisFromLonghands((ln) => this._props[ln]);
+      delete this._props['text-emphasis']; delete this._priority['text-emphasis'];  // any CSS-wide/var blob key
+      for (const ln of _TE_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -1933,6 +1973,10 @@ class CSSStyleDeclaration {
     if (key === 'text-decoration') {                          // reconstruct from its four longhands
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
       return _serTextDecorationFromLonghands((ln) => this._props[ln]);
+    }
+    if (key === 'text-emphasis') {                            // reconstruct from its two longhands
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      return _serTextEmphasisFromLonghands((ln) => this._props[ln]);
     }
     if (key === 'flex-flow') {                                // reconstruct from flex-direction/flex-wrap
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
@@ -12792,6 +12836,121 @@ const _serTextDecorationFromLonghands = (get) => _serTextDecoration(
   get('text-decoration-line'), get('text-decoration-style'),
   get('text-decoration-thickness'), get('text-decoration-color'), false);
 
+// ── CSS Text Emphasis (css-text-decor) value parsing ──────────────────────────
+// The text-emphasis-style / -position longhands + the `text-emphasis` shorthand
+// were pure raw-store: -position never dropped the default `right` / reordered
+// over·under first (and accepted `auto left`), -style never dropped the default
+// `filled` or added the writing-mode default shape, and the shorthand was
+// unregistered in computed style (`text-emphasis-computed` 0/7). The colour
+// longhand (`text-emphasis-color`, a `<color>`) is already handled by _COLOR_PROPS.
+const _TE_FILL_KW = new Set(['filled', 'open']);
+const _TE_SHAPE_KW = new Set(['dot', 'circle', 'double-circle', 'triangle', 'sesame']);
+const _TE_STRING_RE = /^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')$/;
+// text-emphasis-style = none | [ [ filled | open ] || [ dot | circle | double-circle
+// | triangle | sesame ] ] | <string>. Parse → { none } | { str } | { fill, shape } | null.
+const _parseTextEmphasisStyle = (value) => {
+  const s = String(value).trim();
+  if (!s) return null;
+  if (s.toLowerCase() === 'none') return { none: true };
+  const sm = _TE_STRING_RE.exec(s);
+  if (sm) return { str: _unescapeIdent(sm[1].slice(1, -1)) };
+  const toks = _wsTokens(s);
+  if (!toks.length || toks.length > 2) return null;
+  let fill = null, shape = null;
+  for (const t of toks) {
+    const l = t.toLowerCase();
+    if (_TE_FILL_KW.has(l)) { if (fill != null) return null; fill = l; }
+    else if (_TE_SHAPE_KW.has(l)) { if (shape != null) return null; shape = l; }
+    else return null;                                          // unknown / string-mixed → invalid
+  }
+  return { fill, shape };
+};
+// Specified serialization: canonical `fill shape` order; a <string> re-serialized.
+const _canonTextEmphasisStyle = (value) => {
+  const p = _parseTextEmphasisStyle(value);
+  if (!p) return null;
+  if (p.none) return 'none';
+  if (p.str != null) return _serCssString(p.str);
+  return [p.fill, p.shape].filter(Boolean).join(' ');
+};
+// Computed serialization: an omitted fill defaults to `filled` (then dropped, since it
+// is the initial); an omitted shape defaults to the writing-mode default — `circle` in
+// a horizontal typographic mode, `sesame` in a vertical one (CSS Text Decor §8.4).
+const _computeTextEmphasisStyle = (el, value) => {
+  const p = _parseTextEmphasisStyle(value);
+  if (!p) return value;
+  if (p.none) return 'none';
+  if (p.str != null) return _serCssString(p.str);
+  const wm = String(_computedPropOf(el, 'writing-mode', 'horizontal-tb')).trim().toLowerCase();
+  const vertical = wm.indexOf('vertical') === 0 || wm.indexOf('sideways') === 0;
+  const fill = p.fill || 'filled';
+  const shape = p.shape || (vertical ? 'sesame' : 'circle');
+  return fill === 'filled' ? shape : (fill + ' ' + shape);
+};
+// text-emphasis-position = auto | [ [ over | under ] && [ right | left ]? ]. Canonical
+// order is over·under first, then `left` only (the default `right` is dropped); `auto`
+// is a standalone keyword. Computed == specified (no length resolution).
+const _TE_POS_V = new Set(['over', 'under']);
+const _TE_POS_H = new Set(['right', 'left']);
+const _canonTextEmphasisPosition = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length === 1 && toks[0].toLowerCase() === 'auto') return 'auto';
+  let vert = null, horiz = null;
+  for (const t of toks) {
+    const l = t.toLowerCase();
+    if (_TE_POS_V.has(l)) { if (vert != null) return null; vert = l; }
+    else if (_TE_POS_H.has(l)) { if (horiz != null) return null; horiz = l; }
+    else return null;                                          // `auto` mixed / unknown → invalid
+  }
+  if (vert == null) return null;                               // over|under is required
+  return horiz === 'left' ? (vert + ' left') : vert;          // `right` is the default → dropped
+};
+const _TEXTEMPHASIS_VALIDATED = new Set(['text-emphasis-style', 'text-emphasis-position']);
+const _canonTextEmphasisLonghand = (name, value) => {
+  const s = String(value).trim();
+  if (_CSS_WIDE.has(s.toLowerCase()) || _TF_VAR_RE.test(s)) return s;  // CSS-wide / var()/env()
+  if (name === 'text-emphasis-style') return _canonTextEmphasisStyle(s);
+  if (name === 'text-emphasis-position') return _canonTextEmphasisPosition(s);
+  return null;
+};
+// The `text-emphasis` shorthand: <'text-emphasis-style'> || <'text-emphasis-color'>.
+// A colour is always a single token (keyword / hex / func()); every other token is
+// part of the style component.
+const _TE_LONGHANDS = ['text-emphasis-style', 'text-emphasis-color'];
+const _expandTextEmphasis = (value) => {
+  const s = String(value).trim();
+  if (!s) return null;
+  const toks = _wsTokens(s);
+  if (!toks.length) return null;
+  const styleToks = []; let color = null;
+  for (const t of toks) {
+    const l = t.toLowerCase();
+    if (l === 'none' || _TE_STRING_RE.test(t) || _TE_FILL_KW.has(l) || _TE_SHAPE_KW.has(l)) {
+      styleToks.push(t);
+    } else if (_isValidColor(t)) {
+      if (color != null) return null;                          // two colours → invalid
+      color = _canonColorSpecified(t);
+    } else return null;                                        // unknown token → invalid
+  }
+  let style;
+  if (styleToks.length === 0) style = 'none';                  // colour-only → style initial
+  else { style = _canonTextEmphasisStyle(styleToks.join(' ')); if (style == null) return null; }
+  return {
+    'text-emphasis-style': style,
+    'text-emphasis-color': color == null ? 'currentcolor' : color,
+  };
+};
+// Reconstruct `text-emphasis` from its two longhands (style || color; each omitted at
+// its initial — style `none`, color `currentcolor`; all-initial → `none`).
+const _serTextEmphasisFromLonghands = (get) => {
+  const style = get('text-emphasis-style'), color = get('text-emphasis-color');
+  if (style == null || color == null) return '';
+  const parts = [];
+  if (style !== 'none') parts.push(style);
+  if (String(color).toLowerCase() !== 'currentcolor') parts.push(color);
+  return parts.length ? parts.join(' ') : 'none';
+};
+
 // ── CSS Overflow (css-overflow-3/4) value parsing ─────────────────────────────
 // The overflow longhands (overflow-x/-y/-block/-inline), scrollbar-gutter,
 // block-ellipsis and overflow-clip-margin stored their value RAW in setProperty
@@ -19082,6 +19241,7 @@ const _computeMaskSize = (el, v) => {
 };
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  if (kebab === 'text-emphasis-style') return _computeTextEmphasisStyle(el, v);
   if (kebab === 'mask-size') return _computeMaskSize(el, v);
   if (_GRID_LINE_LH.has(kebab)) return _computeGridLine(el, v);
   if (kebab === 'animation-range-start' || kebab === 'animation-range-end') {
@@ -19601,6 +19761,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('flex');                                             // the `flex` shorthand (reconstructed from flex-grow/-shrink/-basis)
   add('flex-flow');                                        // the `flex-flow` shorthand (reconstructed from flex-direction/-wrap)
   add('text-decoration');                                  // the `text-decoration` shorthand (reconstructed from its 4 longhands)
+  add('text-emphasis');                                    // the `text-emphasis` shorthand (reconstructed from its style/color longhands)
   add('column-rule');                                      // the `column-rule` shorthand (reconstructed from its 3 longhands)
   add('columns');                                          // the `columns` shorthand (self-canonical; computed lengths resolved)
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
@@ -19680,6 +19841,13 @@ globalThis.getComputedStyle = (el, _pseudo) => {
       const s = _serTextDecoration(resolve('text-decoration-line'), resolve('text-decoration-style'),
         resolve('text-decoration-thickness'), resolve('text-decoration-color'), colorInitial);
       if (s !== '') return s;
+    }
+    // `text-emphasis` shorthand: <style> || <color>, always printing BOTH the computed
+    // style and the computed colour (the colour resolves currentcolor → the element's
+    // `color`, and — unlike text-decoration — is never omitted).
+    if (kebab === 'text-emphasis') {
+      const style = resolve('text-emphasis-style'), color = resolve('text-emphasis-color');
+      if (style && color) return style + ' ' + color;
     }
     // `column-rule` shorthand: reconstruct from the COMPUTED longhands — width and
     // colour always print, the style prints only when it is not `none` (CSSOM
@@ -22886,6 +23054,15 @@ globalThis.CSS = {
         const c = _canonStandardValue(val);
         if (/\bvar\(/i.test(val)) return true;
         return _CSS_WIDE.has(c.toLowerCase()) || _expandTextDecoration(c) != null;
+      }
+      if (_TEXTEMPHASIS_VALIDATED.has(name)) {           // text-emphasis-style / -position
+        if (/\bvar\(/i.test(val)) return true;
+        return _canonTextEmphasisLonghand(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'text-emphasis') {                    // the `text-emphasis` shorthand
+        const c = _canonStandardValue(val);
+        if (/\bvar\(/i.test(val)) return true;
+        return _CSS_WIDE.has(c.toLowerCase()) || _expandTextEmphasis(c) != null;
       }
       if (name === 'column-rule') {                      // the `column-rule` shorthand
         if (/\bvar\(/i.test(val)) return true;

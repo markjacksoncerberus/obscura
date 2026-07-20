@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-18 (Quest #226).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-19 (Quest #227).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-text-decor/parsing/text-emphasis-computed.html` | 0/7 | **7/7** | ✅ 100% | **Quest #227 The Text-Emphasis Verdict.** The `text-emphasis` shorthand (`<'text-emphasis-style'> \|\| <'text-emphasis-color'>`) was unregistered in computed style. `_expandTextEmphasis` splits it into the style/color longhands (colour is always a single token); registered in `_CSS_KNOWN_PROPS` + a `resolve()` branch printing BOTH the computed style and colour (colour resolves currentcolor → the element's `color`, never omitted). `dot red`→`dot rgb(255, 0, 0)`, `open sesame`→`open sesame rgb(0, 0, 255)`, `black`→`none rgb(0, 0, 0)`. **+7.** |
+| `css/css-text-decor/parsing/text-emphasis-style-computed.html` | 6/9 | **9/9** | ✅ 100% | **Quest #227.** `_computeTextEmphasisStyle` drops the default `filled` and adds the writing-mode default shape (`circle` horizontal): `filled circle`→`circle`, `filled`→`circle`, `open`→`open circle`. **+3.** |
+| `css/css-text-decor/parsing/text-emphasis-style-computed-vertical-lr.html` | 6/9 | **9/9** | ✅ 100% | **Quest #227.** Same, vertical typographic mode → default shape `sesame` (read via `_computedPropOf(el, 'writing-mode')`): `filled`→`sesame`, `open`→`open sesame`. **+3.** |
+| `css/css-text-decor/parsing/text-emphasis-position-computed.html` | 5/7 | **7/7** | ✅ 100% | **Quest #227.** `text-emphasis-position` = `auto \| [ [over\|under] && [right\|left]? ]` now canonicalizes (over·under first, default `right` dropped): `over right`→`over`, `under right`→`under`. **+2.** |
+| `css/css-text-decor/parsing/text-emphasis-position-valid.html` | 4/5 | **5/5** | ✅ 100% | **Quest #227.** `right under`→`under` (reorder + drop `right`). **+1.** |
+| `css/css-text-decor/parsing/text-emphasis-position-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #227.** Rejects `auto auto`/`auto left`/`over auto` (`auto` only alone), `left over right`/`under right over` (duplicate axis). **+5.** |
 | `css/css-text-decor/parsing/text-decoration-line-valid.html` | 18/67 | **67/67** | ✅ 100% | **Quest #226 The Text-Decoration Verdict.** The whole `text-decoration` family was raw-store. `text-decoration-line = none \| [ underline \|\| overline \|\| line-through \|\| blink ] \| spelling-error \| grammar-error` now canonicalizes to the fixed order `underline overline line-through blink` via `_canonTextDecorationLine`. `overline underline`→`underline overline`, `line-through overline underline`→`underline overline line-through`. **+49.** |
 | `css/css-text-decor/parsing/text-decoration-line-invalid.html` | 0/14 | **14/14** | ✅ 100% | **Quest #226.** Rejects `auto`/`noone`/`under-line`, `none underline` (none can't combine), `underline underline` (duplicate), `spelling-error grammar-error`, `blink underline line-through grammar-error`. **+14.** |
 | `css/css-text-decor/parsing/text-decoration-shorthand.html` | 0/5 | **5/5** | ✅ 100% | **Quest #226.** `text-decoration = <line> \|\| <style> \|\| <color> \|\| <thickness>` (L4) now truly expands into its four longhands (`_expandTextDecoration`, `test_shorthand_value` reads each back + `.style.length`). `overline from-font dotted green` → line/thickness/style/color longhands. **+5.** |
