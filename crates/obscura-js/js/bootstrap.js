@@ -859,6 +859,13 @@ const _parseStyleDecls = (text) => {
         const c = _canonCssUi('cursor', value); if (c === null) continue; // invalid <cursor> → drop
         value = c;
       }
+      else if (_LISTSTYLE_VALIDATED.has(name)) {
+        // css-lists longhands list-style-position/-image/-type: validate + canon
+        // (invalid → drop). Must precede _GRADIENT_PROPS (which holds list-style-
+        // image but would accept `auto`/a comma layer list).
+        const c = _canonListStyleLonghand(name, value); if (c === null) continue;
+        value = c;
+      }
       else if (_GRADIENT_PROPS.has(name)) {
         if (_imageFuncInvalid(value)) continue;            // invalid image() → drop declaration
         if (_gradientInvalid(value)) continue;             // malformed gradient interpolation method → drop
@@ -1083,6 +1090,13 @@ const _parseStyleDecls = (text) => {
       } else if (_TEXTEMPHASIS_VALIDATED.has(name)) {
         const c = _canonTextEmphasisLonghand(name, value); if (c == null) continue;  // invalid text-emphasis-style/-position → drop
         value = c;
+      } else if (name === 'list-style') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandListStyle(value); if (!lh) continue;  // invalid <list-style> → drop
+          for (const ln of _LS_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `list-style` key
+        }
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1353,6 +1367,13 @@ class CSSStyleDeclaration {
         if (c === null) return;
         stored = c;
       }
+    } else if (!custom && _LISTSTYLE_VALIDATED.has(name)) {
+      // css-lists longhands list-style-position/-image/-type: validate + canon
+      // (invalid → ignore). Must precede _GRADIENT_PROPS (which holds list-style-
+      // image but would accept `auto`/a comma layer list).
+      const c = _canonListStyleLonghand(name, stored);
+      if (c === null) return;
+      stored = c;
     } else if (!custom && _GRADIENT_PROPS.has(name)) {
       if (_imageFuncInvalid(stored)) return;               // invalid image() → ignore (keep prior value)
       if (_gradientInvalid(stored)) return;                // malformed gradient interpolation method → ignore
@@ -1728,6 +1749,22 @@ class CSSStyleDeclaration {
         this._notifyChange();
         return;                                              // expanded into longhands; no `text-emphasis` key
       }
+    } else if (!custom && name === 'list-style') {
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
+        // CSS-wide / var(): kept as one `list-style` blob key; clear longhands.
+        for (const ln of _LS_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandListStyle(stored); if (!lh) return;  // invalid <list-style> → ignore
+        if ('list-style' in this._props) { delete this._props['list-style']; delete this._priority['list-style']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln of _LS_LONGHANDS) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `list-style` key
+      }
     } else if (!custom && _ANIM_KEYWORD_LISTS.has(name)) {
       const low = stored.toLowerCase();
       if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
@@ -1847,6 +1884,14 @@ class CSSStyleDeclaration {
         : _serTextEmphasisFromLonghands((ln) => this._props[ln]);
       delete this._props['text-emphasis']; delete this._priority['text-emphasis'];  // any CSS-wide/var blob key
       for (const ln of _TE_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'list-style') {                            // shorthand: clear its three longhands
+      const old = (key in this._props) ? this._props[key]
+        : _serListStyleFromLonghands((ln) => this._props[ln]);
+      delete this._props['list-style']; delete this._priority['list-style'];  // any CSS-wide/var blob key
+      for (const ln of _LS_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -1988,6 +2033,10 @@ class CSSStyleDeclaration {
     if (key === 'text-emphasis') {                            // reconstruct from its two longhands
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
       return _serTextEmphasisFromLonghands((ln) => this._props[ln]);
+    }
+    if (key === 'list-style') {                               // reconstruct from its three longhands
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      return _serListStyleFromLonghands((ln) => this._props[ln]);
     }
     if (key === 'flex-flow') {                                // reconstruct from flex-direction/flex-wrap
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
@@ -13002,6 +13051,120 @@ const _serTextEmphasisFromLonghands = (get) => {
   return parts.length ? parts.join(' ') : 'none';
 };
 
+// ── CSS Lists `list-style` family (css-lists-3) value parsing ─────────────────
+// The three longhands stored their value RAW (list-style-position/-image/-type):
+// every `*-invalid` value was wrongly accepted (0/N) — `auto` on position/image,
+// a bare `symbols(cyclic)`, multi-token values — and `symbols()` never dropped
+// its default `symbolic` type. `_canon*` validate + canonicalize each (null =
+// invalid → ignore, matching CSSOM). The `list-style` SHORTHAND (<'position'> ||
+// <'image'> || <'type'>) expands into the three longhands via `_expandListStyle`.
+// CSS-wide keywords and var()/env() pass through untouched (gated at dispatch).
+// All JS — no Rust.
+const _LISTSTYLE_VALIDATED = new Set(['list-style-position', 'list-style-image', 'list-style-type']);
+const _LS_STRING_RE = /^(?:"(?:[^"\\]|\\[\s\S])*"|'(?:[^'\\]|\\[\s\S])*')$/;
+const _SYMBOLS_TYPE_KW = new Set(['cyclic', 'numeric', 'alphabetic', 'symbolic', 'fixed']);
+const _canonListStylePosition = (v) => {
+  const low = v.trim().toLowerCase();
+  return (low === 'inside' || low === 'outside') ? low : null;   // reject `auto`, multi-value
+};
+const _canonListStyleImage = (v) => {
+  const s = v.trim();
+  if (s.toLowerCase() === 'none') return 'none';
+  const toks = _wsTokens(s);
+  if (toks.length !== 1 || !_BG_IMAGE_FN_RE.test(toks[0])) return null;   // `auto`, `url() none` → invalid
+  if (_imageFuncInvalid(s) || _gradientInvalid(s) || _crossFadeInvalid(s)) return null;
+  return _canonImageSet(_canonGradients(s, null, false));
+};
+// symbols() = symbols( <symbols-type>? <string># ) — <image> is rejected in this
+// context. Minimum symbols: alphabetic/numeric need >=2, the rest >=1. `symbolic`
+// (the default type) is dropped on serialization; strings re-serialize canonical.
+const _canonSymbols = (t) => {
+  const m = /^symbols\(([\s\S]*)\)$/i.exec(t.trim());
+  if (!m) return null;
+  const parts = _wsTokens(m[1].trim());
+  if (!parts.length) return null;
+  let type = 'symbolic', i = 0;
+  if (_SYMBOLS_TYPE_KW.has(parts[0].toLowerCase())) { type = parts[0].toLowerCase(); i = 1; }
+  const syms = parts.slice(i);
+  if (!syms.length) return null;
+  const out = [];
+  for (const s of syms) {
+    if (!_LS_STRING_RE.test(s)) return null;                     // only <string> (no <image>/ident)
+    out.push(_serCssString(_unescapeIdent(s.slice(1, -1))));
+  }
+  if (out.length < (type === 'alphabetic' || type === 'numeric' ? 2 : 1)) return null;
+  return 'symbols(' + (type === 'symbolic' ? '' : type + ' ') + out.join(' ') + ')';
+};
+// list-style-type = <counter-style> | <string> | none;
+// <counter-style> = <counter-style-name> | symbols().
+const _canonListStyleType = (v) => {
+  const s = v.trim();
+  const toks = _wsTokens(s);
+  if (toks.length !== 1) return null;                            // multi-token (`ident "str"`) → invalid
+  const t = toks[0], low = t.toLowerCase();
+  if (low === 'none') return 'none';
+  if (_LS_STRING_RE.test(t)) return _serCssString(_unescapeIdent(t.slice(1, -1)));
+  if (/^symbols\(/i.test(t)) return _canonSymbols(t);
+  if (_GRID_CI_RE.test(t) && !_CSS_WIDE.has(low)) return t;      // <counter-style-name> (case preserved)
+  return null;
+};
+const _canonListStyleLonghand = (name, value) => {
+  const s = String(value).trim();
+  if (_CSS_WIDE.has(s.toLowerCase()) || _TF_VAR_RE.test(s)) return s;  // CSS-wide / var()/env()
+  if (name === 'list-style-position') return _canonListStylePosition(s);
+  if (name === 'list-style-image') return _canonListStyleImage(s);
+  if (name === 'list-style-type') return _canonListStyleType(s);
+  return null;
+};
+// The `list-style` shorthand: <'list-style-position'> || <'list-style-image'> ||
+// <'list-style-type'>. Classify each top-level token; a `none` is deferred and
+// then assigned to list-style-type first, then list-style-image. Because both of
+// those longhands have the initial value `none`, this yields exactly the spec's
+// "a single none sets both" serialization. Returns the three longhands or null.
+const _LS_LONGHANDS = ['list-style-position', 'list-style-image', 'list-style-type'];
+const _expandListStyle = (value) => {
+  const s = String(value).trim();
+  if (!s) return null;
+  const toks = _wsTokens(s);
+  if (!toks.length) return null;
+  let pos = null, img = null, type = null, nones = 0;
+  for (const t of toks) {
+    const low = t.toLowerCase();
+    if (low === 'inside' || low === 'outside') {
+      if (pos != null) return null; pos = low;                   // position given twice → invalid
+    } else if (low === 'none') {
+      nones++;                                                    // defer: could be image or type
+    } else if (_BG_IMAGE_FN_RE.test(t)) {
+      if (img != null) return null;
+      const c = _canonListStyleImage(t); if (c == null) return null; img = c;
+    } else {
+      if (type != null) return null;                             // type given twice → invalid
+      const c = _canonListStyleType(t); if (c == null) return null; type = c;
+    }
+  }
+  for (let k = 0; k < nones; k++) {
+    if (type == null) type = 'none';
+    else if (img == null) img = 'none';
+    else return null;                                            // nowhere to place this `none` → invalid
+  }
+  return {
+    'list-style-position': pos == null ? 'outside' : pos,
+    'list-style-image': img == null ? 'none' : img,
+    'list-style-type': type == null ? 'disc' : type,
+  };
+};
+// Reconstruct `list-style` from its three longhands: drop each at its initial
+// (position `outside`, image `none`, type `disc`); all-initial → `outside`.
+const _serListStyleFromLonghands = (get) => {
+  const pos = get('list-style-position'), img = get('list-style-image'), type = get('list-style-type');
+  if (pos == null || img == null || type == null) return '';
+  const parts = [];
+  if (String(pos).toLowerCase() !== 'outside') parts.push(pos);
+  if (String(img).toLowerCase() !== 'none') parts.push(img);
+  if (String(type).toLowerCase() !== 'disc') parts.push(type);
+  return parts.length ? parts.join(' ') : 'outside';
+};
+
 // ── CSS Overflow (css-overflow-3/4) value parsing ─────────────────────────────
 // The overflow longhands (overflow-x/-y/-block/-inline), scrollbar-gutter,
 // block-ellipsis and overflow-clip-margin stored their value RAW in setProperty
@@ -17143,7 +17306,14 @@ const _canonGradientStop = (arg, el, type, emPx, lhPx) => {
 const _canonGradientStopSpecified = (arg) => {
   const toks = _wsTokens(String(arg).trim());
   if (!toks.length) return arg;
-  return toks.map((t) => (/^calc\(/i.test(t) ? _canonSortedCalc(t) : t)).join(' ');
+  return toks.map((t, k) => {
+    if (/^calc\(/i.test(t)) return _canonSortedCalc(t);
+    // A leading hex <color> stop serializes canonically to rgb() (CSSOM specified
+    // serialization: `#006`→`rgb(0, 0, 102)`). Named/function colours already
+    // serialize canonically, so they're left byte-verbatim (zero blast radius).
+    if (k === 0 && /^#[0-9a-f]{3,8}$/i.test(t)) return _canonColorSpecified(t);
+    return t;
+  }).join(' ');
 };
 const _canonGradientInner = (inner, el, computed, type) => {
   const args = _commaSplitTop(inner).map((a) => a.trim());
@@ -19814,6 +19984,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('flex-flow');                                        // the `flex-flow` shorthand (reconstructed from flex-direction/-wrap)
   add('text-decoration');                                  // the `text-decoration` shorthand (reconstructed from its 4 longhands)
   add('text-emphasis');                                    // the `text-emphasis` shorthand (reconstructed from its style/color longhands)
+  add('list-style');                                       // the `list-style` shorthand (reconstructed from its 3 longhands)
   add('column-rule');                                      // the `column-rule` shorthand (reconstructed from its 3 longhands)
   add('columns');                                          // the `columns` shorthand (self-canonical; computed lengths resolved)
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
@@ -19900,6 +20071,12 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     if (kebab === 'text-emphasis') {
       const style = resolve('text-emphasis-style'), color = resolve('text-emphasis-color');
       if (style && color) return style + ' ' + color;
+    }
+    // `list-style` shorthand: reconstruct from the COMPUTED longhands (position ||
+    // image || type), dropping each at its initial (outside/none/disc).
+    if (kebab === 'list-style') {
+      const s = _serListStyleFromLonghands(resolve);
+      if (s !== '') return s;
     }
     // `column-rule` shorthand: reconstruct from the COMPUTED longhands — width and
     // colour always print, the style prints only when it is not `none` (CSSOM
@@ -23115,6 +23292,15 @@ globalThis.CSS = {
         const c = _canonStandardValue(val);
         if (/\bvar\(/i.test(val)) return true;
         return _CSS_WIDE.has(c.toLowerCase()) || _expandTextEmphasis(c) != null;
+      }
+      if (_LISTSTYLE_VALIDATED.has(name)) {              // list-style-position/-image/-type
+        if (/\bvar\(/i.test(val)) return true;
+        return _canonListStyleLonghand(name, _canonStandardValue(val)) != null;
+      }
+      if (name === 'list-style') {                       // the `list-style` shorthand
+        const c = _canonStandardValue(val);
+        if (/\bvar\(/i.test(val)) return true;
+        return _CSS_WIDE.has(c.toLowerCase()) || _expandListStyle(c) != null;
       }
       if (name === 'column-rule') {                      // the `column-rule` shorthand
         if (/\bvar\(/i.test(val)) return true;
