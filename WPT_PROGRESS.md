@@ -10,12 +10,21 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #229).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #230).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-lists/parsing/counter-reset-valid.html` | 11/16 | **16/16** | ✅ 100% | **Quest #230 The Counter Verdict.** The whole `counter-reset`/`-increment`/`-set` family was raw-store (stored verbatim, no grammar check → every `-invalid` at 0/N, no computed fold). Grammar `[ <counter-name> <integer>? \| <reversed-counter-name> <integer>? ]+ \| none` (reversed reset-only). `_canonCounter` tokenizes via `_gridLineTokens` (escape/paren aware), validates each `<counter-name>` (`<custom-ident>` minus CSS-wide/`default`/`none`) + optional `<integer>` (literal or `_canonMathExpr`'d calc), and fills the omitted default (`0`, or `1` for increment) on every plain name — a `reversed()` name with no integer keeps none. `chapter`→`chapter 0`, `reversed(chapter) 9 chapter`→`reversed(chapter) 9 chapter 0`. **+5.** |
+| `css/css-lists/parsing/counter-reset-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #230.** Rejects `none chapter`, `reversed(none)`, `reversed(3)`, bare `3`, `99 imagenum` (leading integer), `section -1, imagenum 99` (comma), `section 3.14` (non-integer literal), and every CSS-wide keyword / `default` as a counter name. **+15.** |
+| `css/css-lists/parsing/counter-reset-computed.html` | 5/10 | **10/10** | ✅ 100% | **Quest #230.** `_computeCounter` folds each `<integer>` (cqZero collapses `sign(2cqw - 10px)` with no container). `myCounter calc(10 + (sign(2cqw - 10px) * 5))`→`myCounter 5`; `myCounter`→`myCounter 0`. **+5.** |
+| `css/css-lists/parsing/counter-increment-valid.html` | 8/10 | **10/10** | ✅ 100% | **Quest #230.** Omitted default is `1`: `chapter`→`chapter 1`, `first -1 second third 99`→`first -1 second 1 third 99`; `section calc(1)` kept symbolic. **+2.** |
+| `css/css-lists/parsing/counter-increment-invalid.html` | 0/13 | **13/13** | ✅ 100% | **Quest #230.** `reversed()` is reset-only → `reversed(chapter)` invalid for increment/set. Plus the shared rejections. **+13.** |
+| `css/css-lists/parsing/counter-increment-computed.html` | 5/10 | **10/10** | ✅ 100% | **Quest #230.** `myCounter`→`myCounter 1`; `myCounter calc(10 + (sign(2cqw - 10px) * 10))`→`myCounter 0`. **+5.** |
+| `css/css-lists/parsing/counter-set-valid.html` | 8/10 | **10/10** | ✅ 100% | **Quest #230.** Omitted default `0` (like reset); `counter-set` was entirely unregistered (not in `_GCS_DEFAULTS`). **+2.** |
+| `css/css-lists/parsing/counter-set-invalid.html` | 0/13 | **13/13** | ✅ 100% | **Quest #230.** Shared rejections + `reversed()` rejected (set has no reversed grammar). **+13.** |
+| `css/css-lists/parsing/counter-set-computed.html` | 0/10 | **10/10** | ✅ 100% | **Quest #230.** Was 0/10 because `counter-set` wasn't a known property → getComputedStyle returned empty. Added `counter-set: none` to `_GCS_DEFAULTS`. **+10.** |
 | `css/css-lists/parsing/list-style-valid.html` | 5/17 | **17/17** | ✅ 100% | **Quest #229 The List-Style Verdict.** The `list-style` shorthand (`<'position'> \|\| <'image'> \|\| <'type'>`) was unmodelled (stored verbatim → longhands empty, no computed). `_expandListStyle` classifies each token; a lone `none` sets both image+type to none (both initials are `none`). `_serListStyleFromLonghands` drops each at its initial (outside/none/disc); all-initial→`outside`. Wired the 5 touch points like `text-emphasis`. Bonus: surgical hex→rgb canon of a leading gradient stop colour in the shared `_canonGradientStopSpecified` (`#006`→`rgb(0, 0, 102)`, zero blast radius). **+12.** |
 | `css/css-lists/parsing/list-style-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #229.** `_expandListStyle` rejects a repeated component: `inside disc outside` (position twice), `square circle` (type twice). **+2.** |
 | `css/css-lists/parsing/list-style-computed.sub.html` | 0/5 | **5/5** | ✅ 100% | **Quest #229.** Registered `list-style` in `_CSS_KNOWN_PROPS` + a computed `resolve()` branch reconstructing from the computed longhands via `_serListStyleFromLonghands`. `outside none none`→`none`, `outside url("…") disc`→`url("…")`. **+5.** |

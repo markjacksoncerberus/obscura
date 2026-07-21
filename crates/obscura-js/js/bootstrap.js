@@ -866,6 +866,13 @@ const _parseStyleDecls = (text) => {
         const c = _canonListStyleLonghand(name, value); if (c === null) continue;
         value = c;
       }
+      else if (_COUNTER_VALIDATED.has(name)) {
+        // css-lists counter-reset/-increment/-set: validate + canon (invalid → drop).
+        if (!_CSS_WIDE.has(value.toLowerCase()) && !_TF_VAR_RE.test(value)) {
+          const c = _canonCounter(name, value); if (c === null) continue;
+          value = c;
+        }
+      }
       else if (_GRADIENT_PROPS.has(name)) {
         if (_imageFuncInvalid(value)) continue;            // invalid image() → drop declaration
         if (_gradientInvalid(value)) continue;             // malformed gradient interpolation method → drop
@@ -1374,6 +1381,13 @@ class CSSStyleDeclaration {
       const c = _canonListStyleLonghand(name, stored);
       if (c === null) return;
       stored = c;
+    } else if (!custom && _COUNTER_VALIDATED.has(name)) {
+      // css-lists counter-reset/-increment/-set: validate + canon (invalid → ignore).
+      if (!_CSS_WIDE.has(stored.toLowerCase()) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonCounter(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
     } else if (!custom && _GRADIENT_PROPS.has(name)) {
       if (_imageFuncInvalid(stored)) return;               // invalid image() → ignore (keep prior value)
       if (_gradientInvalid(stored)) return;                // malformed gradient interpolation method → ignore
@@ -8846,7 +8860,7 @@ const _GCS_DEFAULTS = {
   direction: 'ltr', 'text-combine-upright': 'none', 'text-orientation': 'mixed',
   'unicode-bidi': 'normal', 'writing-mode': 'horizontal-tb',
   // css-lists. counter-* do not inherit; the list-style-* properties do.
-  'counter-increment': 'none', 'counter-reset': 'none', 'list-style-image': 'none',
+  'counter-increment': 'none', 'counter-reset': 'none', 'counter-set': 'none', 'list-style-image': 'none',
   'list-style-position': 'outside', 'list-style-type': 'disc',
   // css-overflow. Only block-ellipsis inherits.
   'block-ellipsis': 'no-ellipsis', continue: 'normal', 'max-lines': 'auto',
@@ -13163,6 +13177,96 @@ const _serListStyleFromLonghands = (get) => {
   if (String(img).toLowerCase() !== 'none') parts.push(img);
   if (String(type).toLowerCase() !== 'disc') parts.push(type);
   return parts.length ? parts.join(' ') : 'outside';
+};
+
+// ── CSS Lists counter-reset / counter-increment / counter-set ──────────────────
+// Grammar:
+//   counter-reset     = [ <counter-name> <integer>? | <reversed-counter-name> <integer>? ]+ | none
+//   counter-increment = [ <counter-name> <integer>? ]+ | none
+//   counter-set       = [ <counter-name> <integer>? ]+ | none
+// <counter-name> is a <custom-ident> excluding the CSS-wide keywords, `default`
+// and `none`; <reversed-counter-name> = reversed( <counter-name> ) and is only
+// valid in counter-reset. On serialization every plain <counter-name> gets an
+// explicit <integer> (the omitted default is `1` for counter-increment, `0` for
+// the other two); a `reversed()` name with NO integer keeps none (its start value
+// is computed from the sibling count). All three were raw-store (stored verbatim,
+// no validation) — hence every *-invalid at 0/N and *-computed never folding calc.
+const _COUNTER_VALIDATED = new Set(['counter-reset', 'counter-increment', 'counter-set']);
+const _COUNTER_NAME_RESERVED = new Set([..._CSS_WIDE, 'default', 'none']);
+const _counterDefaultInt = (name) => (name === 'counter-increment' ? '1' : '0');
+// A <counter-name>: a <custom-ident> that is not a reserved word. Compared against
+// the UNESCAPED, lowercased ident so `\69 nherit` is rejected like `inherit`.
+const _isCounterName = (t) =>
+  _GRID_CI_RE.test(t) && !_COUNTER_NAME_RESERVED.has(_unescapeCssIdent(t).toLowerCase());
+// A counter <integer> at specified time: a literal signed integer (kept as-is), or
+// a math function canonicalized via _canonMathExpr (kept symbolic — it folds at
+// computed time). A non-integer literal like `3.14` is neither → null (invalid).
+const _canonCounterInt = (t) => {
+  if (/^[+-]?\d+$/.test(t)) return String(parseInt(t, 10));
+  return _MATHFN_NAME_RE.test(t) ? _canonMathExpr(t) : null;
+};
+const _isCounterIntTok = (t) => /^[+-]?\d+$/.test(t) || _MATHFN_NAME_RE.test(t);
+// Specified-value canon. Returns the canonical string or null (invalid → drop).
+const _canonCounter = (name, value) => {
+  const s = String(value).trim();
+  if (s.toLowerCase() === 'none') return 'none';
+  const allowReversed = (name === 'counter-reset');
+  const toks = _gridLineTokens(s);          // escape/paren aware; null on `[`/`]`
+  if (toks === null || !toks.length) return null;
+  const dflt = _counterDefaultInt(name);
+  const out = [];
+  let i = 0;
+  while (i < toks.length) {
+    const t = toks[i];
+    let nameTok, reversed = false;
+    const rm = /^reversed\(\s*([\s\S]*?)\s*\)$/i.exec(t);
+    if (rm) {
+      if (!allowReversed) return null;                          // reversed() only in counter-reset
+      const inner = rm[1].trim();
+      if (!_isCounterName(inner)) return null;                  // reversed(none)/reversed(3) → invalid
+      nameTok = 'reversed(' + _canonGridIdent(inner) + ')';
+      reversed = true;
+    } else if (_isCounterName(t)) {
+      nameTok = _canonGridIdent(t);
+    } else {
+      return null;                                              // bare integer / none / CSS-wide / junk
+    }
+    i++;
+    let intTok = null;
+    if (i < toks.length && _isCounterIntTok(toks[i])) {
+      intTok = _canonCounterInt(toks[i]); if (intTok === null) return null;
+      i++;
+    }
+    if (intTok === null && !reversed) intTok = dflt;            // plain name → fill default; reversed keeps none
+    out.push(intTok === null ? nameTok : nameTok + ' ' + intTok);
+  }
+  return out.join(' ');
+};
+// Fold a counter <integer> at computed time. A literal passes through; a math
+// function resolves to a rounded integer (cqZero collapses an unresolved container
+// unit so a `sign(2cqw - 10px)` gate yields its sign); an unresolvable calc stays
+// symbolic (defensive — every value here was already canonicalized at set time).
+const _computeCounterInt = (el, t) => {
+  if (/^[+-]?\d+$/.test(t)) return String(parseInt(t, 10));
+  const vp = _vpUnits();
+  const n = _evalMath(t, 0, { lengths: true, angle: true, time: true, cqZero: true,
+    emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, ..._siblingOpts(el, t) });
+  return (n === null || !isFinite(n)) ? t : String(Math.round(n));
+};
+// Computed value: the specified value is already canonical, so just fold each
+// <integer> component. `none` is unchanged.
+const _computeCounter = (el, value) => {
+  const s = String(value).trim();
+  if (!s || s.toLowerCase() === 'none') return s.toLowerCase() === 'none' ? 'none' : s;
+  const toks = _gridLineTokens(s);
+  if (toks === null) return s;
+  const out = [];
+  let i = 0;
+  while (i < toks.length) {
+    out.push(toks[i]); i++;                                     // name or reversed(name)
+    if (i < toks.length && _isCounterIntTok(toks[i])) { out.push(_computeCounterInt(el, toks[i])); i++; }
+  }
+  return out.join(' ');
 };
 
 // ── CSS Overflow (css-overflow-3/4) value parsing ─────────────────────────────
@@ -19465,6 +19569,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'text-emphasis-style') return _computeTextEmphasisStyle(el, v);
   if (kebab === 'mask-size') return _computeMaskSize(el, v);
   if (kebab === 'text-decoration-inset') return _computeTextDecorationInset(el, v);
+  if (_COUNTER_VALIDATED.has(kebab)) return _computeCounter(el, v);
   if (_GRID_LINE_LH.has(kebab)) return _computeGridLine(el, v);
   if (kebab === 'animation-range-start' || kebab === 'animation-range-end') {
     return _computeAnimRange(v, el, kebab === 'animation-range-end');
@@ -23301,6 +23406,11 @@ globalThis.CSS = {
         const c = _canonStandardValue(val);
         if (/\bvar\(/i.test(val)) return true;
         return _CSS_WIDE.has(c.toLowerCase()) || _expandListStyle(c) != null;
+      }
+      if (_COUNTER_VALIDATED.has(name)) {                // counter-reset/-increment/-set
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _canonCounter(name, c) != null;
       }
       if (name === 'column-rule') {                      // the `column-rule` shorthand
         if (/\bvar\(/i.test(val)) return true;
