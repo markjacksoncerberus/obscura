@@ -1122,6 +1122,19 @@ const _parseStyleDecls = (text) => {
           const c = _canonBorderLogicalLh(name, value); if (c === null) continue;  // invalid → drop
           value = c;
         }
+      } else if (_BOX_LOGICAL_SH2[name]) {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandBoxLogical(name, value); if (!lh) continue;  // out of grammar → drop
+          for (const ln of _BOX_LOGICAL_SH2[name]) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no shorthand key
+        }
+      } else if (_BOX_LOGICAL_LH.has(name)) {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonBoxLogicalLh(name, value); if (c === null) continue;  // invalid → drop
+          value = c;
+        }
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1239,6 +1252,24 @@ class CSSStyleDeclaration {
         const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
         delete this._props[name]; delete this._priority[name];   // drop any prior CSS-wide shorthand key
         for (const ln of _BORDER_LOGICAL_SH[name]) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                                 // expanded; no shorthand key kept
+      }
+    }
+    if (!custom && _BOX_LOGICAL_SH2[name] && !/\bvar\(/i.test(stored)) {
+      // css-logical margin/padding/inset-block/-inline (+ physical inset): expand
+      // into — and store as — its edge longhands so `el.style.marginBlockStart` and
+      // the longhand getter reflect the shorthand. CSS-wide → single-key storage.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low)) {
+        const lh = _expandBoxLogical(name, stored);
+        if (!lh) return;                                        // out of grammar → keep prior value
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        delete this._props[name]; delete this._priority[name];   // drop any prior CSS-wide / blob shorthand key
+        for (const ln of _BOX_LOGICAL_SH2[name]) {
           if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
           this._props[ln] = lh[ln]; this._priority[ln] = prio;
         }
@@ -1855,6 +1886,15 @@ class CSSStyleDeclaration {
         if (c === null) return;
         stored = c;
       }
+    } else if (!custom && _BOX_LOGICAL_LH.has(name)) {
+      // css-logical margin/padding/inset block/inline longhands: validate + canon a
+      // single [<length-percentage>|auto] (padding [0,∞], no auto). Invalid → ignore.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonBoxLogicalLh(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
     } else if (!custom && _SIZE_VALIDATED.has(name)) {
       // css-sizing / css-logical dimension props (width/height/block-size/…, min-/
       // max-, physical + flow-relative): reject out-of-grammar values (bad keyword,
@@ -2022,6 +2062,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (_BOX_LOGICAL_SH2[key]) {                            // css-logical margin/padding/inset shorthand: clear longhands
+      const old = (key in this._props) ? this._props[key] : _serBoxLogicalSh((ln) => this._props[ln], key, this);
+      delete this._props[key]; delete this._priority[key];   // any CSS-wide / blob shorthand key
+      for (const ln of _BOX_LOGICAL_SH2[key]) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     if (key === 'font') {                                   // font shorthand: clear its longhands + single key
       const old = _serializeFontShorthand(this);
       delete this._props['font']; delete this._priority['font'];
@@ -2147,6 +2194,10 @@ class CSSStyleDeclaration {
     if (_BORDER_LOGICAL_SH[key]) {                          // css-logical 2-value border shorthand
       if (key in this._props) return this._props[key];     // CSS-wide kept as a single key
       return _serBorderLogicalSh((ln) => this._props[ln], key, this);  // reconstruct from longhands
+    }
+    if (_BOX_LOGICAL_SH2[key]) {                            // css-logical margin/padding/inset (+ physical inset) shorthand
+      if (key in this._props) return this._props[key];     // CSS-wide / blob kept as a single key
+      return _serBoxLogicalSh((ln) => this._props[ln], key, this);  // reconstruct from longhands
     }
     if (key === 'font') return _serializeFontShorthand(this);  // system/CSS-wide key or reconstruct from longhands
     if (key === 'font-variant') return _serializeFontVariantShorthand(this);  // CSS-wide key or reconstruct from longhands
@@ -9118,6 +9169,15 @@ const _SHORTHAND_LONGHANDS = {
     'border-inline-start-width', 'border-inline-start-style', 'border-inline-start-color',
     'border-inline-end-width', 'border-inline-end-style', 'border-inline-end-color',
   ],
+  // css-logical margin/padding/inset (+ physical inset) — feed the cascade so a
+  // stylesheet `margin-block: 10px` sets the edge longhands for getComputedStyle.
+  'margin-block': ['margin-block-start', 'margin-block-end'],
+  'margin-inline': ['margin-inline-start', 'margin-inline-end'],
+  'padding-block': ['padding-block-start', 'padding-block-end'],
+  'padding-inline': ['padding-inline-start', 'padding-inline-end'],
+  'inset-block': ['inset-block-start', 'inset-block-end'],
+  'inset-inline': ['inset-inline-start', 'inset-inline-end'],
+  'inset': ['top', 'right', 'bottom', 'left'],
 };
 // Set a declaration into a block-level map, respecting within-block cascade
 // order: an !important declaration is never overridden by a later normal one of
@@ -9551,6 +9611,7 @@ const _expandShorthand = (sh, value) => {
   // the two-value color/style/width forms, and the border-side (per-edge + both-edge).
   if (_BORDER_LOGICAL_SH[sh]) return _expandBorderLogical(sh, value);
   if (_BORDER_LOGICAL_SIDE_EDGE[sh] || _BORDER_LOGICAL_SIDE_BOTH[sh]) return _expandBorderShorthand(sh, value);
+  if (_BOX_LOGICAL_SH2[sh]) return _expandBoxLogical(sh, value);
   if (sh === 'font') {
     const p = _parseFontShorthand(value);
     if (!p || p.system) return null;   // invalid / system font → no per-longhand pieces (falls to initial/inherited)
@@ -19334,6 +19395,77 @@ const _serBorderLogicalSh = (read, name, decl) => {
   return _serializeBoxValue(name, vals);
 };
 
+// ── css-logical flow-relative MARGIN / PADDING / INSET (+ physical inset) ─────
+// margin-block/-inline, padding-block/-inline, inset-block/-inline are two-value
+// `[ <length-percentage> | auto ]{1,2}` shorthands (padding is `[0,∞]`, no auto);
+// the physical `inset` is the 4-value `<'top'>{1,4}`. All expand EAGERLY into
+// their longhands (so `el.style.marginBlockStart` reads back and the LONGHAND
+// getter reflects the shorthand), mirroring scroll-margin-block.
+const _BOX_LOGICAL_SH2 = {
+  'margin-block': ['margin-block-start', 'margin-block-end'],
+  'margin-inline': ['margin-inline-start', 'margin-inline-end'],
+  'padding-block': ['padding-block-start', 'padding-block-end'],
+  'padding-inline': ['padding-inline-start', 'padding-inline-end'],
+  'inset-block': ['inset-block-start', 'inset-block-end'],
+  'inset-inline': ['inset-inline-start', 'inset-inline-end'],
+  'inset': ['top', 'right', 'bottom', 'left'],
+};
+// The 12 flow-relative longhands (margin/padding/inset block/inline start/end).
+const _BOX_LOGICAL_LH = new Set([
+  'margin-block-start', 'margin-block-end', 'margin-inline-start', 'margin-inline-end',
+  'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
+  'inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end',
+]);
+// margin/inset component = `auto | <length-percentage>` (signed). null → invalid.
+const _canonMarginInsetComp = (t) => {
+  const low = String(t).toLowerCase();
+  return low === 'auto' ? 'auto' : _canonLenPctSigned(t, true);
+};
+// padding component = `<length-percentage [0,∞]>` (no auto/none/normal). null → invalid.
+const _canonPaddingComp = (t) => {
+  const low = String(t).toLowerCase();
+  if (low === 'auto' || low === 'none' || low === 'normal') return null;
+  return _canonGapItem(t);                                  // non-negative <length-percentage> (bare 0 → 0px)
+};
+const _boxLogicalCanonFor = (name) => name.startsWith('padding') ? _canonPaddingComp : _canonMarginInsetComp;
+// Validate a single flow-relative box LONGHAND value (a single component token).
+const _canonBoxLogicalLh = (name, value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length !== 1) return null;                      // longhand is a single value
+  return _boxLogicalCanonFor(name)(toks[0]);
+};
+// Expand a box shorthand into { longhand: canon } (2-edge block/inline, 4-edge inset),
+// or null when out of grammar (bad component / comma-joined token / too many tokens).
+const _expandBoxLogical = (name, value) => {
+  const lh = _BOX_LOGICAL_SH2[name];
+  const canon = _boxLogicalCanonFor(name);
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > lh.length) return null;
+  const parts = toks.map((t) => canon(t));
+  if (parts.some((p) => p === null)) return null;
+  const edges = lh.length === 4 ? _boxEdges(parts)
+    : (parts.length === 2 ? [parts[0], parts[1]] : [parts[0], parts[0]]);
+  const out = {};
+  lh.forEach((n, i) => { out[n] = edges[i]; });
+  return out;
+};
+// Reconstruct a box shorthand from stored/computed longhands via `read` (collapse
+// per _serializeBoxValue), or '' if a longhand is absent / they disagree on importance.
+const _serBoxLogicalSh = (read, name, decl) => {
+  const lh = _BOX_LOGICAL_SH2[name];
+  if (decl) {
+    let imp = null;
+    for (const ln of lh) {
+      if (!(ln in decl._props)) return '';
+      const p = decl._priority[ln] === 'important';
+      if (imp === null) imp = p; else if (imp !== p) return '';
+    }
+  }
+  const vals = lh.map((ln) => read(ln));
+  if (vals.some((v) => v == null || v === '')) return '';
+  return _serializeBoxValue(name, vals);
+};
+
 // ── CSS Fonts (css-fonts) value parsing ──────────────────────────────────────
 // These longhands stored their value RAW (no grammar check), so every `*-invalid`
 // value was wrongly accepted, the keyword→canonical rewrites never happened, and
@@ -20752,6 +20884,13 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // equal pair to a single value.
     if (_BORDER_LOGICAL_SH[kebab]) {
       const vals = _BORDER_LOGICAL_SH[kebab].map((ln) => resolve(ln));
+      if (vals.some((x) => !x)) return '';
+      return _serializeBoxValue(kebab, vals);
+    }
+    // css-logical margin/padding/inset-block/-inline (+ physical inset): reconstruct
+    // the computed value from the computed edge longhands, collapsing equal edges.
+    if (_BOX_LOGICAL_SH2[kebab]) {
+      const vals = _BOX_LOGICAL_SH2[kebab].map((ln) => resolve(ln));
       if (vals.some((x) => !x)) return '';
       return _serializeBoxValue(kebab, vals);
     }
@@ -24081,6 +24220,16 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         const c = _canonStandardValue(val);
         return _CSS_WIDE.has(c.toLowerCase()) || _canonBorderLogicalLh(name, c) != null;
+      }
+      if (_BOX_LOGICAL_SH2[name]) {                      // css-logical margin/padding/inset (+ physical inset) shorthands
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _expandBoxLogical(name, c) != null;
+      }
+      if (_BOX_LOGICAL_LH.has(name)) {                   // css-logical margin/padding/inset block/inline longhands
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _canonBoxLogicalLh(name, c) != null;
       }
       if (name === 'font') {                             // the `font` shorthand
         if (/\bvar\(/i.test(val)) return true;

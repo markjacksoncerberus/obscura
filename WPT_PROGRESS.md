@@ -10,12 +10,24 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #244).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #245).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-logical/parsing/inset-shorthand.html` | 0/20 | **20/20** | ✅ 100% | **Quest #245 The Logical-Box Verdict.** margin/padding/inset-block/-inline + physical `inset` were stored as blobs (computed via `_computeBoxShorthand`) so the LONGHAND getter never reflected the shorthand (every `-shorthand`/`-invalid` 0/N). Now they EAGERLY expand into edge longhands (`_BOX_LOGICAL_SH2`) with per-family validators (`_canonMarginInsetComp` = `<length-percentage>|auto`; `_canonPaddingComp` = `[0,∞]`, no auto), across all touch points (setProperty/inline/getter/removeProperty/getComputedStyle/CSS.supports/cascade) mirroring scroll-margin-block. **+20.** |
+| `css/css-logical/parsing/inset-block-inline-shorthand.html` | 0/12 | **12/12** | ✅ 100% | **Quest #245.** **+12.** |
+| `css/css-logical/parsing/margin-block-inline-shorthand.html` | 0/12 | **12/12** | ✅ 100% | **Quest #245.** **+12.** |
+| `css/css-logical/parsing/padding-block-inline-shorthand.html` | 0/12 | **12/12** | ✅ 100% | **Quest #245.** **+12.** |
+| `css/css-logical/parsing/padding-block-inline-invalid.html` | 0/17 | **17/17** | ✅ 100% | **Quest #245.** `<length-percentage [0,∞]>` (rejects `none`/`auto`/negative/unitless/multi-token/comma). **+17.** |
+| `css/css-logical/parsing/margin-block-inline-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #245.** `<length-percentage>|auto`. **+7.** |
+| `css/css-logical/parsing/inset-block-inline-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #245.** **+7.** |
+| `css/css-logical/parsing/inset-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #245.** physical `inset` = `<'top'>{1,4}`. **+3.** |
+| `css/css-logical/parsing/inset-block-inline-valid.html` | 8/12 | **12/12** | ✅ 100% | **Quest #245.** **+4.** |
+| `css/css-logical/parsing/inset-valid.html` | 5/8 | **8/8** | ✅ 100% | **Quest #245.** **+3.** |
+| `css/css-logical/parsing/padding-block-inline-valid.html` | 8/9 | **9/9** | ✅ 100% | **Quest #245.** **+1.** |
+| `css/css-logical/parsing/margin-block-inline-valid.html` | 13/14 | **14/14** | ✅ 100% | **Quest #245.** **+1.** CAP: margin/padding `-computed` %-values (`10%`→`20px`) need layout (containing-block width) — left symbolic, same cap as sizing. |
 | `css/css-logical/parsing/border-block-color-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #244 The Logical-Border Verdict.** The whole css-logical border family (color/style/width longhands + block/inline shorthands) was raw-store/unregistered. Colour longhands → `_COLOR_PROPS`; style/width longhands → new `_BORDER_LOGICAL_LH` validators (`<line-style>`/`<line-width>`) + `_GCS_DEFAULTS` + `_WIDTH_COMPUTED_PROPS` (widths compute to px, zeroed when the sibling style is `none`/`hidden`). The two-value shorthands (`_BORDER_LOGICAL_SH`) expand into longhands across all touch points (setProperty/inline/getter/removeProperty/getComputedStyle/CSS.supports/cascade) mirroring scroll-margin-block; `border-block`/`border-inline` + per-edge forms via `_BORDER_EXPAND`. **+8.** |
 | `css/css-logical/parsing/border-inline-color-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #244.** **+8.** |
 | `css/css-logical/parsing/border-block-color-invalid.html` | 0/15 | **12/15** | 🟡 80% | **Quest #244.** 3 remaining are pre-existing `_isValidColor` strictness gaps (`rgb(10%, 20, 30%)` type-mixing etc.), shared with physical `<color>`. **+12.** |
