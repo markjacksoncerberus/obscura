@@ -859,6 +859,10 @@ const _parseStyleDecls = (text) => {
         const c = _canonCssUi('cursor', value); if (c === null) continue; // invalid <cursor> → drop
         value = c;
       }
+      else if (name === 'color-interpolation-filters') {
+        const c = _canonCssUi(name, value); if (c === null) continue; // invalid keyword → drop
+        value = c;
+      }
       else if (_LISTSTYLE_VALIDATED.has(name)) {
         // css-lists longhands list-style-position/-image/-type: validate + canon
         // (invalid → drop). Must precede _GRADIENT_PROPS (which holds list-style-
@@ -8862,6 +8866,14 @@ const _GCS_DEFAULTS = {
   // css-lists. counter-* do not inherit; the list-style-* properties do.
   'counter-increment': 'none', 'counter-reset': 'none', 'counter-set': 'none', 'list-style-image': 'none',
   'list-style-position': 'outside', 'list-style-type': 'disc',
+  // filter-effects (SVG paint-server presentation attrs as CSS). flood-color/
+  // lighting-color are <color> (in _COLOR_PROPS); their initials are concrete
+  // colours (black/white), NOT currentColor. color-interpolation-filters is a
+  // keyword enum (initial linearrgb, inherits). flood-opacity is <opacity>
+  // (initial 1) — only SVG-root tests exercise it (harness cap), registered
+  // for hygiene so getComputedStyle returns its initial.
+  'flood-color': 'black', 'lighting-color': 'white',
+  'color-interpolation-filters': 'linearrgb', 'flood-opacity': '1',
   // css-overflow. Only block-ellipsis inherits.
   'block-ellipsis': 'no-ellipsis', continue: 'normal', 'max-lines': 'auto',
   'overflow-block': 'visible', 'overflow-inline': 'visible', 'overflow-x': 'visible',
@@ -9586,6 +9598,12 @@ const _COLOR_PROPS = new Set([
   'color','background-color','border-top-color','border-right-color','border-bottom-color',
   'border-left-color','outline-color','text-decoration-color','column-rule-color','caret-color',
   'text-emphasis-color',
+  // filter-effects: SVG paint-server presentation attributes exposed as CSS
+  // <color> properties. flood-color initial `black`, lighting-color initial
+  // `white`; neither inherits (color-interpolation-filters — a keyword enum —
+  // is validated separately via _CSSUI_ENUM). currentColor resolves to the
+  // element's own computed colour at computed-time, exactly like caret-color.
+  'flood-color','lighting-color',
 ]);
 // Colour *shorthands* — 1–4 space-separated <color> values (border-color and its
 // flow-relative siblings). Each value canonicalizes independently like a longhand
@@ -11960,6 +11978,9 @@ const _INHERITED_PROPS = new Set([
   'quotes',
   // css-color-adjust: every property in this family inherits.
   'color-scheme', 'color-adjust', 'forced-color-adjust', 'print-color-adjust',
+  // filter-effects: only color-interpolation-filters inherits (flood-color,
+  // lighting-color and flood-opacity do NOT).
+  'color-interpolation-filters',
 ]);
 const _CSS_WIDE = new Set(['initial', 'inherit', 'unset', 'revert', 'revert-layer']);
 // Initial (computed) value for a property. The defaults table doubles as the
@@ -12267,6 +12288,9 @@ const _CSSUI_ENUM = {
   'field-sizing': new Set(['fixed', 'content']),
   'interactivity': new Set(['auto', 'inert']),
   'outline-style': new Set(['auto', 'none', 'dotted', 'dashed', 'solid', 'double', 'groove', 'ridge', 'inset', 'outset']),
+  // filter-effects: `auto | sRGB | linearRGB`, canonicalized ASCII-lowercase
+  // (`sRGB`→`srgb`, `LiNeArRgB`→`linearrgb`). Inherits; initial `linearrgb`.
+  'color-interpolation-filters': new Set(['auto', 'srgb', 'linearrgb']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -12274,6 +12298,7 @@ const _CSSUI_ENUM = {
 const _CSSUI_VALIDATED = new Set([
   'box-sizing', 'resize', 'user-select', 'field-sizing', 'interactivity', 'outline-style',
   'caret-color', 'outline-color', 'text-overflow', 'outline-width', 'outline-offset', 'cursor',
+  'color-interpolation-filters',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);

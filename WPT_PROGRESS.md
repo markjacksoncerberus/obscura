@@ -10,12 +10,21 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #230).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #231).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/filter-effects/parsing/flood-color-valid.html` | 5/8 | **8/8** | ✅ 100% | **Quest #231 The Filter-Color Verdict.** `flood-color`/`lighting-color` were UNREGISTERED SVG-presentation `<color>` props (raw-store — round-tripped literals but never canonicalized). Added both to `_COLOR_PROPS` → free specified `<color>` canon (`#00FF00`→`rgb(0, 255, 0)`, `rgb(100%, 100%, 0%)`→`rgb(255, 255, 0)`, `hsl(120, 100%, 50%)`→`rgb(0, 255, 0)`). **+3.** |
+| `css/filter-effects/parsing/flood-color-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #231.** The `_COLOR_PROPS` API-setProperty branch gates on `_isValidColor` → `none` and `black white` rejected. **+2.** |
+| `css/filter-effects/parsing/flood-color-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #231.** The generic computed color branch resolves `currentcolor`→`_computedColorOf(el)` (on `#target{color:lime}`→`rgb(0, 255, 0)`) and all named/hex/rgb/hsl → rgb(). **+8.** |
+| `css/filter-effects/parsing/lighting-color-parsing-valid.html` | 2/5 | **5/5** | ✅ 100% | **Quest #231.** Same `_COLOR_PROPS` treatment as flood-color (initial `white`, not `black`). `#102030`→`rgb(16, 32, 48)`, `currentColor`→`currentcolor`. **+3.** |
+| `css/filter-effects/parsing/lighting-color-parsing-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #231.** Rejects `auto`, `none`, `#a`. **+3.** |
+| `css/filter-effects/parsing/lighting-color-computed.html` | 0/1 | **1/1** | ✅ 100% | **Quest #231.** `rgb(1, 2, 3)` computes verbatim. **+1.** |
+| `css/filter-effects/parsing/color-interpolation-filters-parsing-valid.html` | 1/4 | **4/4** | ✅ 100% | **Quest #231.** Keyword enum `auto \| sRGB \| linearRGB` canonicalized ASCII-lowercase via `_CSSUI_ENUM` — `sRGB`→`srgb`, `LiNeArRgB`→`linearrgb`. **+3.** |
+| `css/filter-effects/parsing/color-interpolation-filters-parsing-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #231.** Rejects `none`, `linearRGB sRGB`, `auto sRGB linearRGB` (multi-keyword). **+3.** |
+| `css/filter-effects/parsing/color-interpolation-filters-computed.html` | 0/3 | **3/3** | ✅ 100% | **Quest #231.** Registered `color-interpolation-filters: linearrgb` in `_GCS_DEFAULTS` + the inherited set; computed echoes the lowercased specified keyword. **+3.** |
 | `css/css-lists/parsing/counter-reset-valid.html` | 11/16 | **16/16** | ✅ 100% | **Quest #230 The Counter Verdict.** The whole `counter-reset`/`-increment`/`-set` family was raw-store (stored verbatim, no grammar check → every `-invalid` at 0/N, no computed fold). Grammar `[ <counter-name> <integer>? \| <reversed-counter-name> <integer>? ]+ \| none` (reversed reset-only). `_canonCounter` tokenizes via `_gridLineTokens` (escape/paren aware), validates each `<counter-name>` (`<custom-ident>` minus CSS-wide/`default`/`none`) + optional `<integer>` (literal or `_canonMathExpr`'d calc), and fills the omitted default (`0`, or `1` for increment) on every plain name — a `reversed()` name with no integer keeps none. `chapter`→`chapter 0`, `reversed(chapter) 9 chapter`→`reversed(chapter) 9 chapter 0`. **+5.** |
 | `css/css-lists/parsing/counter-reset-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #230.** Rejects `none chapter`, `reversed(none)`, `reversed(3)`, bare `3`, `99 imagenum` (leading integer), `section -1, imagenum 99` (comma), `section 3.14` (non-integer literal), and every CSS-wide keyword / `default` as a counter name. **+15.** |
 | `css/css-lists/parsing/counter-reset-computed.html` | 5/10 | **10/10** | ✅ 100% | **Quest #230.** `_computeCounter` folds each `<integer>` (cqZero collapses `sign(2cqw - 10px)` with no container). `myCounter calc(10 + (sign(2cqw - 10px) * 5))`→`myCounter 5`; `myCounter`→`myCounter 0`. **+5.** |
