@@ -11594,9 +11594,8 @@ const _hwbSpecified = (parts) => {
   return body + ')';
 };
 // hwb() computes to sRGB rgb()/rgba(): pure-hue sRGB scaled by whiteness/blackness.
-const _computeHwb = (inner, specified) => {
-  const parts = _splitTopLevel(inner);
-  if (parts.length < 3 || parts.length > 4) return null;
+const _computeHwb = (comps, alpha, specified) => {
+  const parts = alpha == null ? comps : comps.concat([alpha]);  // flat [h, w, b, α?] for the resolvers below
   const num = (tok, base) => {
     const t = String(tok).trim();
     if (t.toLowerCase() === 'none') return 0;   // missing component → 0
@@ -11641,6 +11640,27 @@ const _computeHwb = (inner, specified) => {
   const snap = (x) => Math.round(x * 1e6) / 1e6;
   return _serColor(snap(r), snap(g), snap(b), a);
 };
+// Split a MODERN colour-function body (hwb/lab/lch/oklab/oklch/color()) into its
+// space-separated components + an optional trailing `/ <alpha>`. Returns
+// `{comps, alpha}` (alpha null unless a single top-level `/` preceded exactly one
+// final value), or null when the body uses a comma, a duplicated/misplaced `/`, or
+// a stray/leading/trailing/doubled separator — none of which the modern grammar
+// allows. Unlike `_splitTopLevel` (which conflates ','/'/'/space), this keeps the
+// separators distinct so a comma'd hwb() or a bare (non-`/`) alpha is rejected.
+const _modernColorParts = (inner) => {
+  const toks = _colorSepTokens(inner);
+  if (!toks.length || toks[0].s || toks[toks.length - 1].s) return null;         // empty / leading / trailing sep
+  for (let i = 1; i < toks.length; i++) if (toks[i].s && toks[i - 1].s) return null;  // doubled sep
+  let slashAt = -1;
+  for (let i = 0; i < toks.length; i++) {
+    if (toks[i].s === ',') return null;                                          // no comma in modern syntax
+    if (toks[i].s === '/') { if (slashAt !== -1) return null; slashAt = i; }     // at most one '/'
+  }
+  const vals = toks.filter((x) => x.v).map((x) => x.v);
+  if (slashAt === -1) return { comps: vals, alpha: null };
+  if (slashAt !== toks.length - 2) return null;                                  // '/' must precede the final value
+  return { comps: vals.slice(0, -1), alpha: vals[vals.length - 1] };
+};
 // Compute the modern <color> functions whose computed value stays in their own
 // space (+ hwb→sRGB). Returns the serialized computed value, or null when `value`
 // isn't one of these functions or a channel can't resolve — the caller then falls
@@ -11652,21 +11672,28 @@ const _computeModernColor = (value, specified) => {
   if (lp <= 0 || !s.endsWith(')')) return null;
   const fname = _unescapeIdent(s.slice(0, lp)).toLowerCase();
   const inner = s.slice(lp + 1, -1);
-  if (fname === 'hwb') return _computeHwb(inner, specified);
+  if (fname !== 'hwb' && fname !== 'color' && !_MODERN_LAB_FNS[fname]) return null;
+  // Enforce the shared modern separator grammar (no commas; alpha only via a
+  // single trailing `/`) — a comma'd hwb() or a bare 4th (non-`/`) component is
+  // INVALID even though `_splitTopLevel` would have swallowed the distinction.
+  const mp = _modernColorParts(inner);
+  if (mp === null) return null;
+  const alphaTok = mp.alpha === null ? undefined : mp.alpha;
+  if (fname === 'hwb') {
+    if (mp.comps.length !== 3) return null;
+    return _computeHwb(mp.comps, mp.alpha, specified);
+  }
   if (fname === 'color') {
-    const parts = _splitTopLevel(inner);
-    if (parts.length < 4 || parts.length > 5) return null;
-    const space = _COLOR_FN_SPACES[parts[0].toLowerCase()];
+    if (mp.comps.length !== 4) return null;
+    const space = _COLOR_FN_SPACES[mp.comps[0].toLowerCase()];
     if (!space) return null;
     const specs = [{ base: 1, clamp: null }, { base: 1, clamp: null }, { base: 1, clamp: null }];
-    const body = _modernBody(parts.slice(1, 4), specs, parts.length === 5 ? parts[4] : undefined, specified);
+    const body = _modernBody(mp.comps.slice(1, 4), specs, alphaTok, specified);
     return body === null ? null : `color(${space} ${body})`;
   }
   const specs = _MODERN_LAB_FNS[fname];
-  if (!specs) return null;
-  const parts = _splitTopLevel(inner);
-  if (parts.length < 3 || parts.length > 4) return null;
-  const body = _modernBody(parts.slice(0, 3), specs, parts.length === 4 ? parts[3] : undefined, specified);
+  if (mp.comps.length !== 3) return null;
+  const body = _modernBody(mp.comps.slice(0, 3), specs, alphaTok, specified);
   return body === null ? null : `${fname}(${body})`;
 };
 

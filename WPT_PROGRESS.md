@@ -309,14 +309,14 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #245).
 | `css/css-color/parsing/color-invalid-named-color.html` | 1/184 | **153/184** | ⬆️ | **Quest #192 The Color Verdict.** Gated every `_COLOR_PROPS` setProperty on the (already-robust) `_isValidColor` — unknown idents like `redd` now rejected. **+152.** |
 | `css/css-color/parsing/color-invalid-relative-color.html` | 0/161 | **132/161** | ⬆️ | **Quest #192.** Relative-colour syntax structure validated via the gate. **+132.** |
 | `css/css-color/parsing/color-invalid-color-layers-function.html` | 0/93 | **93/93** | ✅ 100% | **Quest #192.** **+93.** |
-| `css/css-color/parsing/color-invalid-color-function.html` | 0/124 | **90/124** | ⬆️ | **Quest #192.** `color(<space> …)` channel/space validation. **+90.** |
+| `css/css-color/parsing/color-invalid-color-function.html` | 0/124 | **124/124** | ✅ 100% | **Quest #192 → #247 The Modern-Color Verdict.** `_modernColorParts` rejects comma'd/mis-`/`'d/bad-arity `color()` bodies. **+90, +34** (stash-proved). |
 | `css/css-color/parsing/color-invalid-color-mix-function.html` | 0/141 | **33/141** | ⬆️ | **Quest #192.** `color-mix()` gate (loose branch still passes some — see cap). **+33.** |
 | `css/css-color/parsing/color-invalid-rgb.html` | 0/30 | **30/30** | ✅ 100% | **Quest #246 The Legacy-sRGB/HSL Verdict.** NEW `_validSrgbHsl` enforces the legacy(comma)-vs-modern(space) grammar: same-type channels, no `none` in legacy, exact arity, no mixed `,`+`/`. **+15** (was 15/30 from #192's `_rgbComponents` count). |
-| `css/css-color/parsing/color-invalid-lab.html` | 0/18 | **12/18** | ⬆️ | **Quest #192.** **+12.** |
+| `css/css-color/parsing/color-invalid-lab.html` | 0/18 | **18/18** | ✅ 100% | **Quest #192 → #247.** lab/lch/oklab/oklch reject a bare 4th component (alpha needs `/`). **+12, +6.** |
 | `css/css-color/parsing/color-invalid-hex-color.html` | 0/10 | **10/10** | ✅ 100% | **Quest #192.** `#12`/`#123456789`/odd-length hex rejected. **+10.** |
 | `css/css-color/parsing/color-invalid.html` | 0/11 | **10/11** | 🟡 91% | **Quest #246.** rgb/hsl legacy-type/arity rejection. **+2.** CAP: `hsl(calc(0.56turn * -0.43turn), …)` needs calc `<angle>²` unit-analysis. |
 | `css/css-color/parsing/color-invalid-hsl.html` | 0/23 | **23/23** | ✅ 100% | **Quest #246.** legacy hsl requires `<hue>` + two `<percentage>` (rejects bare-number sat/light) + no `none`/arity/mixed-sep. **+15.** |
-| `css/css-color/parsing/color-invalid-hwb.html` | 0/6 | **2/6** | ⬆️ | **Quest #192.** **+2.** |
+| `css/css-color/parsing/color-invalid-hwb.html` | 0/6 | **6/6** | ✅ 100% | **Quest #192 → #247.** hwb() has NO legacy comma form — comma'd bodies rejected. **+2, +4.** |
 | `css/css-backgrounds/parsing/background-color-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #192.** `none`/`black white`/`black, white` rejected (cross-realm via the shared gate). **+3.** |
 | `css/css-multicol/parsing/column-rule-color-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #192.** Cross-realm via the shared gate. **+2.** |
 | `css/css-grid/parsing/grid-shorthand-valid.html` | 32/49 | **49/49** | ✅ 100% | **Quest #191 The Grid Verdict.** `grid` shorthand (`_parseGridShort`/`_serGridShort`): Form 1 `<'grid-template'>`, Form 2/3 auto-flow forms (`<rows> / auto-flow [dense] <auto-columns>` etc.) over all six grid-template-*/grid-auto-* longhands. **+17.** |
