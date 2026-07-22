@@ -11721,6 +11721,13 @@ const _hwbSpecified = (parts) => {
 // hwb() computes to sRGB rgb()/rgba(): pure-hue sRGB scaled by whiteness/blackness.
 const _computeHwb = (comps, alpha, specified) => {
   const parts = alpha == null ? comps : comps.concat([alpha]);  // flat [h, w, b, α?] for the resolvers below
+  // A `none` component can't survive the conversion to sRGB (it would resolve to 0),
+  // so at SPECIFIED time CSS Color 4 keeps the colour in its own `hwb(...)` form —
+  // exactly as it does for an unresolvable calc. `num()` below maps `none`→0 (needed
+  // for the computed sRGB path), so the none-trigger must fire BEFORE resolution.
+  // (`hwb(none none none)`→`hwb(none none none)`, `hwb(120 30% 50% / none)`→
+  // `hwb(120 30 50 / none)`; the symbolic-calc case already routes here via null.)
+  if (specified && parts.some((p) => String(p).trim().toLowerCase() === 'none')) return _hwbSpecified(parts);
   const num = (tok, base) => {
     const t = String(tok).trim();
     if (t.toLowerCase() === 'none') return 0;   // missing component → 0
