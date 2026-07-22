@@ -10100,6 +10100,44 @@ const _SYSTEM_COLOR_RGB = {
   selecteditem: 'rgb(0, 117, 255)', selecteditemtext: 'rgb(255, 255, 255)',
   visitedtext: 'rgb(85, 26, 139)',
 };
+// Is `tok` an UNRESOLVABLE-at-parse-time math function — one whose value depends on
+// font/viewport-relative units (`sign(1em - 10px)`) so it can't fold to a constant?
+// A math function that folds (`calc(infinity)`, `calc(50% + 10%)`) is NOT symbolic —
+// it resolves eagerly. A bare number/percentage/`none` (no `(`) is never symbolic.
+const _colorTokIsSymbolic = (tok) => {
+  const t = String(tok).trim();
+  return t.indexOf('(') !== -1 && _calcConstValue(t) === null;
+};
+// SPECIFIED serialization of an rgb()/rgba() whose channel or alpha carries an
+// unresolvable calc (`sign(1em - 10px)`): CSS Color 4 keeps the colour in MODERN
+// syntax (`rgb(r g b / a)`, always `rgb(`) rather than resolving to legacy sRGB —
+// each concrete channel resolves to a clamped 0-255 <integer> (`0%`→`0`, `400`→`255`,
+// `-400`→`0`), a `none` stays `none`, the unresolvable channel keeps its canonically
+// serialized calc() (operands reordered: `sign(1em-10px) * 10%` → `10% * sign(1em-10px)`),
+// and the alpha follows the modern-alpha rule (`50%`→`0.5`, symbolic kept, ≥1 dropped).
+// Returns null when nothing is symbolic (→ the caller resolves to legacy sRGB via
+// `_computeColor`) or on any unparseable channel.
+const _rgbModern = (parts) => {
+  if (parts.length < 3 || parts.length > 4) return null;
+  if (!parts.some(_colorTokIsSymbolic)) return null;   // no unresolvable calc → legacy path
+  const chan = (tok) => {
+    const t = String(tok).trim();
+    if (t.toLowerCase() === 'none') return 'none';
+    if (_colorTokIsSymbolic(t)) return _canonMathExpr(t);
+    const v = _resolveChannel(_evalMath(t, 255, { lengths: true, nonFinite: true }), 255);
+    if (v === null) return null;
+    return String(Math.max(0, Math.min(255, Math.round(v))));
+  };
+  const r = chan(parts[0]), g = chan(parts[1]), b = chan(parts[2]);
+  if (r === null || g === null || b === null) return null;
+  let body = `rgb(${r} ${g} ${b}`;
+  if (parts.length === 4) {
+    const a = _modernAlpha(parts[3], true);
+    if (a === null) return null;
+    if (a !== '') body += ' / ' + a;
+  }
+  return body + ')';
+};
 const _canonColorSpecified = (value) => {
   if (!value) return value;
   const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
@@ -10151,6 +10189,19 @@ const _canonColorSpecified = (value) => {
   if (low.startsWith('color-mix(')) {
     const cm = _canonColorMix(s);
     if (cm !== null) return cm;
+  }
+  // rgb()/rgba() with an unresolvable-calc channel/alpha serializes in MODERN form
+  // (kept symbolic) instead of resolving to legacy sRGB. Skipped when nothing is
+  // symbolic (→ legacy `_computeColor` below) or for var()/env()-bearing values.
+  {
+    const lpc = s.indexOf('(');
+    if (lpc > 0 && s.endsWith(')') && !/\b(?:var|env)\(/i.test(s)) {
+      const fn = _unescapeIdent(s.slice(0, lpc)).toLowerCase();
+      if (fn === 'rgb' || fn === 'rgba') {
+        const rm = _rgbModern(_splitTopLevel(s.slice(lpc + 1, -1)));
+        if (rm !== null) return rm;
+      }
+    }
   }
   const out = _computeColor(s);
   // _computeColor returns its argument unchanged for anything that isn't a legacy
