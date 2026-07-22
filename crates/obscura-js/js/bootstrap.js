@@ -10138,6 +10138,69 @@ const _rgbModern = (parts) => {
   }
   return body + ')';
 };
+// SPECIFIED serialization of an hsl()/hsla() whose hue/sat/light/alpha is `none` OR an
+// unresolvable calc: CSS Color 4 keeps it in MODERN `hsl(h s l[ / a])` form (never
+// resolving to sRGB, which would erase the `none`). The hue normalizes into [0, 360)
+// (a calc kept symbolic); saturation/lightness drop their `%` to a bare <number>
+// lower-clamped at 0 (`80%`→`80`, `-100`→`0`, `300`→`300`, a calc kept symbolic); the
+// alpha follows the modern-alpha rule. Returns null on an unparseable channel.
+const _hslSpecified = (parts) => {
+  const comp = (tok, hue) => {
+    const t = String(tok).trim();
+    if (t.toLowerCase() === 'none') return 'none';
+    if (t.indexOf('(') !== -1) return _canonMathExpr(t);   // calc kept symbolic
+    let v = _evalMath(t, hue ? 0 : 100, { angle: hue, lengths: true, nonFinite: true });
+    if (v === null) return null;
+    if (Number.isNaN(v)) v = 0;
+    if (hue) { if (!isFinite(v)) v = 0; v = ((v % 360) + 360) % 360; }
+    else if (v < 0) v = 0;                                  // sat/light negative → 0
+    return _serNumber(v);
+  };
+  const h = comp(parts[0], true), s = comp(parts[1], false), l = comp(parts[2], false);
+  if (h === null || s === null || l === null) return null;
+  let body = `hsl(${h} ${s} ${l}`;
+  if (parts.length === 4) {
+    const a = _modernAlpha(parts[3], true);
+    if (a === null) return null;
+    if (a !== '') body += ' / ' + a;
+  }
+  return body + ')';
+};
+// SPECIFIED serialization of an hsl()/hsla() that fully resolves (no `none`, no
+// unresolvable calc) → legacy sRGB `rgb()`/`rgba()`. Unlike `_computeColor`'s primitive
+// regex hsl branch (which can't cross an inner `calc()` paren, so `hsl(calc(infinity)
+// …)` fell through verbatim), this evaluates each channel through `_evalMath` so a
+// folding calc resolves: `calc(infinity)` hue → non-finite → 0, alpha ±∞/NaN → the
+// [0,1] bound. Returns null on an unparseable channel (→ caller keeps verbatim).
+const _hslResolve = (parts) => {
+  if (parts.length < 3 || parts.length > 4) return null;
+  const num = (tok, base) => {
+    const t = String(tok).trim();
+    if (t.toLowerCase() === 'none') return 0;
+    return _evalMath(t, base, { angle: base === 0, lengths: true, nonFinite: true });
+  };
+  let h = num(parts[0], 0);
+  if (h === null) return null;
+  if (!isFinite(h)) h = 0;                                  // ±∞/NaN hue → 0
+  let s = num(parts[1], 100), l = num(parts[2], 100);
+  if (s === null || l === null) return null;
+  if (Number.isNaN(s)) s = 0; if (Number.isNaN(l)) l = 0;
+  if (!isFinite(s)) s = s > 0 ? 100 : 0;
+  if (!isFinite(l)) l = l > 0 ? 100 : 0;
+  let a = 1;
+  if (parts.length === 4) { a = _resolveChannel(num(parts[3], 1), 1); if (a === null) return null; }
+  const [r, g, b] = _hslToRgb(h, s / 100, l / 100);
+  return _serColor(r, g, b, a);
+};
+// Dispatch an hsl()/hsla() at SPECIFIED time: own-space `hsl(...)` when any component
+// is `none` or an unresolvable calc, else resolve to legacy sRGB. Returns null on a
+// wrong-arity / unparseable body (→ caller falls back to `_computeColor`).
+const _hslSpecifiedOrResolve = (inner) => {
+  const parts = _splitTopLevel(inner);
+  if (parts.length < 3 || parts.length > 4) return null;
+  const ownSpace = parts.some((p) => String(p).trim().toLowerCase() === 'none' || _colorTokIsSymbolic(p));
+  return ownSpace ? _hslSpecified(parts) : _hslResolve(parts);
+};
 const _canonColorSpecified = (value) => {
   if (!value) return value;
   const s = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim();
@@ -10200,6 +10263,12 @@ const _canonColorSpecified = (value) => {
       if (fn === 'rgb' || fn === 'rgba') {
         const rm = _rgbModern(_splitTopLevel(s.slice(lpc + 1, -1)));
         if (rm !== null) return rm;
+      } else if (fn === 'hsl' || fn === 'hsla') {
+        // hsl() keeps its own modern form for a `none`/unresolvable-calc component,
+        // and otherwise resolves to legacy sRGB (incl. folding `calc(infinity)`, which
+        // `_computeColor`'s regex can't reach). Handles ALL hsl() specified serialization.
+        const hs = _hslSpecifiedOrResolve(s.slice(lpc + 1, -1));
+        if (hs !== null) return hs;
       }
     }
   }
