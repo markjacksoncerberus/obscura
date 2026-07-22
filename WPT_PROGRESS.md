@@ -30,8 +30,8 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #245).
 | `css/css-logical/parsing/margin-block-inline-valid.html` | 13/14 | **14/14** | ✅ 100% | **Quest #245.** **+1.** CAP: margin/padding `-computed` %-values (`10%`→`20px`) need layout (containing-block width) — left symbolic, same cap as sizing. |
 | `css/css-logical/parsing/border-block-color-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #244 The Logical-Border Verdict.** The whole css-logical border family (color/style/width longhands + block/inline shorthands) was raw-store/unregistered. Colour longhands → `_COLOR_PROPS`; style/width longhands → new `_BORDER_LOGICAL_LH` validators (`<line-style>`/`<line-width>`) + `_GCS_DEFAULTS` + `_WIDTH_COMPUTED_PROPS` (widths compute to px, zeroed when the sibling style is `none`/`hidden`). The two-value shorthands (`_BORDER_LOGICAL_SH`) expand into longhands across all touch points (setProperty/inline/getter/removeProperty/getComputedStyle/CSS.supports/cascade) mirroring scroll-margin-block; `border-block`/`border-inline` + per-edge forms via `_BORDER_EXPAND`. **+8.** |
 | `css/css-logical/parsing/border-inline-color-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #244.** **+8.** |
-| `css/css-logical/parsing/border-block-color-invalid.html` | 0/15 | **12/15** | 🟡 80% | **Quest #244.** 3 remaining are pre-existing `_isValidColor` strictness gaps (`rgb(10%, 20, 30%)` type-mixing etc.), shared with physical `<color>`. **+12.** |
-| `css/css-logical/parsing/border-inline-color-invalid.html` | 0/15 | **12/15** | 🟡 80% | **Quest #244.** **+12.** |
+| `css/css-logical/parsing/border-block-color-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #244 → #246.** The 3 remaining `_isValidColor` type-mixing caps (`rgb(10%, 20, 30%)`) closed by #246's `_validSrgbHsl`. **+12, +3.** |
+| `css/css-logical/parsing/border-inline-color-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #244 → #246.** **+12, +3.** |
 | `css/css-logical/parsing/border-block-color-valid.html` | 5/7 | **7/7** | ✅ 100% | **Quest #244.** **+2.** |
 | `css/css-logical/parsing/border-inline-color-valid.html` | 5/7 | **7/7** | ✅ 100% | **Quest #244.** **+2.** |
 | `css/css-logical/parsing/border-block-style-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #244.** `<line-style>` single-keyword validator (rejects `auto`/multi-token/comma). **+6.** |
@@ -311,11 +311,11 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #245).
 | `css/css-color/parsing/color-invalid-color-layers-function.html` | 0/93 | **93/93** | ✅ 100% | **Quest #192.** **+93.** |
 | `css/css-color/parsing/color-invalid-color-function.html` | 0/124 | **90/124** | ⬆️ | **Quest #192.** `color(<space> …)` channel/space validation. **+90.** |
 | `css/css-color/parsing/color-invalid-color-mix-function.html` | 0/141 | **33/141** | ⬆️ | **Quest #192.** `color-mix()` gate (loose branch still passes some — see cap). **+33.** |
-| `css/css-color/parsing/color-invalid-rgb.html` | 0/30 | **15/30** | ⬆️ | **Quest #192.** `_rgbComponents` gate. **+15.** |
+| `css/css-color/parsing/color-invalid-rgb.html` | 0/30 | **30/30** | ✅ 100% | **Quest #246 The Legacy-sRGB/HSL Verdict.** NEW `_validSrgbHsl` enforces the legacy(comma)-vs-modern(space) grammar: same-type channels, no `none` in legacy, exact arity, no mixed `,`+`/`. **+15** (was 15/30 from #192's `_rgbComponents` count). |
 | `css/css-color/parsing/color-invalid-lab.html` | 0/18 | **12/18** | ⬆️ | **Quest #192.** **+12.** |
 | `css/css-color/parsing/color-invalid-hex-color.html` | 0/10 | **10/10** | ✅ 100% | **Quest #192.** `#12`/`#123456789`/odd-length hex rejected. **+10.** |
-| `css/css-color/parsing/color-invalid.html` | 0/11 | **8/11** | ⬆️ | **Quest #192.** `auto`/`123`/`rgb(1)`/malformed rejected. **+8.** |
-| `css/css-color/parsing/color-invalid-hsl.html` | 0/23 | **8/23** | ⬆️ | **Quest #192.** **+8.** |
+| `css/css-color/parsing/color-invalid.html` | 0/11 | **10/11** | 🟡 91% | **Quest #246.** rgb/hsl legacy-type/arity rejection. **+2.** CAP: `hsl(calc(0.56turn * -0.43turn), …)` needs calc `<angle>²` unit-analysis. |
+| `css/css-color/parsing/color-invalid-hsl.html` | 0/23 | **23/23** | ✅ 100% | **Quest #246.** legacy hsl requires `<hue>` + two `<percentage>` (rejects bare-number sat/light) + no `none`/arity/mixed-sep. **+15.** |
 | `css/css-color/parsing/color-invalid-hwb.html` | 0/6 | **2/6** | ⬆️ | **Quest #192.** **+2.** |
 | `css/css-backgrounds/parsing/background-color-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #192.** `none`/`black white`/`black, white` rejected (cross-realm via the shared gate). **+3.** |
 | `css/css-multicol/parsing/column-rule-color-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #192.** Cross-realm via the shared gate. **+2.** |

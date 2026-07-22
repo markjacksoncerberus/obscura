@@ -10400,6 +10400,92 @@ const _canonColorMix = (value) => {
   const head = method ? 'color-mix(' + method + ', ' : 'color-mix(';
   return head + outA + ', ' + outB + ')';
 };
+// ── Strict legacy-vs-modern sRGB / HSL syntax validation (CSS Color 4 §5.1/§5.2)
+// The legacy COMMA syntax and the modern SPACE syntax have different, non-
+// interchangeable grammars, and `_isValidColor` must reject values that mix or
+// violate them — the resolver `_rgbComponents`/`_computeColor` is deliberately
+// lenient and only runs AFTER this gate passes. Legacy: `fn(a, b, c[, α])`, all
+// three channels the SAME numeric type, `none` FORBIDDEN, alpha may not be
+// `none`; hsl's saturation/lightness must be <percentage>. Modern: `fn(a b c[ /
+// α])`, each channel an independent type, `none` allowed. Mixing a ',' and a
+// '/', a doubled/leading/trailing comma, or the wrong arity is invalid.
+//
+// Tokenize a colour-function body into an ordered stream of value tokens ({v})
+// and hard separators ({s:','|'/'}), respecting nested parens (calc). Whitespace
+// delimits values but is not itself a separator.
+const _colorSepTokens = (inner) => {
+  const out = []; let depth = 0, cur = '';
+  const flush = () => { if (cur.trim()) out.push({ v: cur.trim() }); cur = ''; };
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === '(') { depth++; cur += c; }
+    else if (c === ')') { depth = Math.max(0, depth - 1); cur += c; }
+    else if (depth === 0 && (c === ',' || c === '/')) { flush(); out.push({ s: c }); }
+    else if (depth === 0 && (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f')) { flush(); }
+    else cur += c;
+  }
+  flush();
+  return out;
+};
+// Classify a single colour-component token's type: 'none' | 'number' |
+// 'percentage' | 'angle' | 'math' (calc/var/… — a type wildcard) | 'invalid'.
+const _colorCompType = (t) => {
+  if (_asciiLower(t) === 'none') return 'none';
+  if (t.indexOf('(') !== -1) return 'math';        // calc()/var()/min()/… — wildcard
+  const m = /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?(%|deg|grad|rad|turn)?$/i.exec(t);
+  if (!m) return 'invalid';
+  if (!m[1]) return 'number';
+  return m[1] === '%' ? 'percentage' : 'angle';
+};
+// Validate an rgb()/rgba()/hsl()/hsla() body against the legacy/modern grammar.
+const _validSrgbHsl = (isHsl, inner) => {
+  const toks = _colorSepTokens(inner);
+  if (!toks.length || toks[0].s || toks[toks.length - 1].s) return false;         // empty / leading / trailing sep
+  for (let i = 1; i < toks.length; i++) if (toks[i].s && toks[i - 1].s) return false;  // doubled sep
+  const seps = toks.filter((x) => x.s).map((x) => x.s);
+  const vals = toks.filter((x) => x.v).map((x) => x.v);
+  const hasComma = seps.indexOf(',') !== -1, hasSlash = seps.indexOf('/') !== -1;
+  if (hasComma && hasSlash) return false;                                          // mixed separators
+  const isType = (ty, set) => ty === 'math' || set.indexOf(ty) !== -1;            // math is a type wildcard
+  if (hasComma) {
+    // LEGACY: strictly `v , v , v [, v]` — every value boundary a single comma.
+    for (let i = 0; i < toks.length; i++) if ((i % 2 === 0) !== !!toks[i].v) return false;
+    if (vals.length < 3 || vals.length > 4) return false;
+    const ty = vals.map(_colorCompType);
+    if (isHsl) {
+      if (!isType(ty[0], ['number', 'angle'])) return false;                       // <hue>
+      if (!isType(ty[1], ['percentage']) || !isType(ty[2], ['percentage'])) return false;
+    } else {
+      let concrete = null;                                                         // three channels share ONE type
+      for (let i = 0; i < 3; i++) {
+        if (ty[i] === 'math') continue;
+        if (ty[i] !== 'number' && ty[i] !== 'percentage') return false;            // none/angle/invalid → out
+        if (concrete === null) concrete = ty[i];
+        else if (ty[i] !== concrete) return false;
+      }
+    }
+    if (vals.length === 4 && !isType(ty[3], ['number', 'percentage'])) return false;  // legacy alpha: no `none`
+    return true;
+  }
+  // MODERN: no commas; channels space-separated; optional single `/ <alpha>`.
+  if (seps.length > 1) return false;
+  let channels = vals.length;
+  if (hasSlash) {
+    if (!toks[toks.length - 2] || !toks[toks.length - 2].s) return false;          // '/' must precede the final value
+    channels = vals.length - 1;
+  }
+  if (channels !== 3) return false;
+  const ty = vals.map(_colorCompType);
+  if (isHsl) {
+    if (!isType(ty[0], ['number', 'angle', 'none'])) return false;                 // <hue> | none
+    if (!isType(ty[1], ['percentage', 'number', 'none'])) return false;
+    if (!isType(ty[2], ['percentage', 'number', 'none'])) return false;
+  } else {
+    for (let i = 0; i < 3; i++) if (!isType(ty[i], ['number', 'percentage', 'none'])) return false;
+  }
+  if (hasSlash && !isType(ty[3], ['number', 'percentage', 'none'])) return false;
+  return true;
+};
 // Is `value` a syntactically valid CSS <color>? Used by CSS.supports().
 const _isValidColor = (value) => {
   if (!value) return false;
@@ -10438,11 +10524,8 @@ const _isValidColor = (value) => {
   if (lp > 0 && low.endsWith(')')) {
     const fname = _unescapeIdent(low.slice(0, lp));
     const inner = low.slice(lp + 1, -1);
-    if (fname === 'rgb' || fname === 'rgba') return _rgbComponents(inner) !== null;
-    if (fname === 'hsl' || fname === 'hsla') {
-      const parts = inner.split(/[,\/\s]+/).filter((x) => x.length);
-      return parts.length >= 3 && parts.every((p) => p === 'none' || !Number.isNaN(parseFloat(p)));
-    }
+    if (fname === 'rgb' || fname === 'rgba') return _validSrgbHsl(false, inner) && _rgbComponents(inner) !== null;
+    if (fname === 'hsl' || fname === 'hsla') return _validSrgbHsl(true, inner);
   }
   // Modern colour functions whose computed value we can resolve — lab/lch/oklab/
   // oklch, color(<space> …), hwb — are valid <color>s. (`_computeModernColor`
