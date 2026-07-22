@@ -15026,6 +15026,14 @@ const _posCompComputed = (c, emPx, lhPx) => {
   // right/bottom: measured from the far edge → 100% − offset.
   const pm = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(off);
   if (pm) return _serNumber(100 - parseFloat(pm[1])) + '%';
+  // A calc offset that CARRIES a percentage (`calc(10% * sign(1em − 1px))` → `10%`,
+  // or a mixed `calc(50% + 10px)`) must keep the % — decompose into {pct, px} and
+  // serialize 100% − offset. The length-only fold below would drop the % (→ `100% −
+  // 0px`), which is what made `right calc(10% * sign(1em − 1px))` compute wrong.
+  if (/%/.test(off)) {
+    const sub = _opSub100(off, emPx, lhPx);
+    if (sub != null) return sub;
+  }
   // length offset measured from the far edge → 100% − offset, the offset resolved
   // to px (px stays px, em/rem/etc. → px), the sign folded into the calc operator.
   const lpx = _evalMath(off, 0, { lengths: true, emPx, lhPx });
@@ -15512,13 +15520,29 @@ const _opPctPx = (tok, emPx, lhPx) => {
   const s = String(tok).trim();
   const pm = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/.exec(s);
   if (pm) return { pct: parseFloat(pm[1]), px: 0 };
+  // A MIXED length-percentage (`calc(100% - 20px)`) must keep BOTH parts — the
+  // length-only fold below (base 0) would silently drop the % (→ pct 0), so a
+  // rect()/xywh() `100% − <edge>` conversion would keep 100% where the edge's own
+  // 100% should cancel. When the value is linear in the %-base (no min/max/clamp/abs
+  // kink whose slope bends between probes), decompose via two probes: v(base) =
+  // (pct/100)·base + px, so pct = v(100) − v(0) and px = v(0).
+  if (/%/.test(s) && !/\b(?:min|max|clamp|abs)\(/i.test(s)) {
+    const opts = { lengths: true, emPx, lhPx };
+    const v0 = _evalMath(s, 0, opts), v1 = _evalMath(s, 100, opts), v2 = _evalMath(s, 200, opts);
+    if (v0 !== null && v1 !== null && v2 !== null && isFinite(v0) && isFinite(v1) && isFinite(v2)
+        && Math.abs((v2 - v1) - (v1 - v0)) < 1e-6) {          // linear in the %-base
+      return { pct: v1 - v0, px: v0 };
+    }
+  }
   const v = _evalMath(s, 0, { lengths: true, emPx, lhPx });
   return v === null ? null : { pct: 0, px: v };
 };
-// Serialize a { pct, px } computed offset: a lone % or px, else calc(P% ± Lpx).
+// Serialize a { pct, px } computed offset: a lone % (px 0) or else calc(P% ± Lpx).
+// These come from a `100% − <edge>` conversion (rect/xywh right & bottom), so the
+// percentage is part of the value's type — keep it even when it folds to 0
+// (`rect(… calc(100% − 20px) …)` right edge → `calc(0% + 20px)`, not `20px`).
 const _opSerCalc100 = (pct, px) => {
   if (Math.abs(px) < 1e-9) return _serNumber(pct) + '%';
-  if (Math.abs(pct) < 1e-9) return _serNumber(px) + 'px';
   return 'calc(' + _serNumber(pct) + '% ' + (px < 0 ? '- ' + _serNumber(-px) : '+ ' + _serNumber(px)) + 'px)';
 };
 // 100% − <length-percentage> (the rect()/xywh() right & bottom edges → inset()).
