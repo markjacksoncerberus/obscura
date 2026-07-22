@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #235).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #236).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-sizing/parsing/max-width-computed.html` | 11/12 | **12/12** | ✅ 100% | **Quest #236 The Fit-Content-Calc Verdict.** `fit-content(calc(10% + 40px))`→`fit-content(40px)` (the `%` dropped). The SPECIFIED canon `_canonLengthTimeMath` ran the whole `fit-content(calc(…))` through `_canonMathExpr`, which sheds the required calc() wrapper → stored invalid `fit-content(10% + 40px)`, then computed folded the bare `%` against 0. Made it fit-content-aware: canonicalize the argument alone, preserving its calc() wrapper. **+1.** |
+| `css/css-sizing/parsing/min-width-computed.html` | 10/11 | **11/11** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
+| `css/css-sizing/parsing/max-height-computed.html` | 11/12 | **12/12** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
+| `css/css-sizing/parsing/min-height-computed.html` | 10/11 | **11/11** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
 | `css/css-backgrounds/parsing/border-image-width-computed.html` | 0/12 | **12/12** | ✅ 100% | **Quest #235 The Border-Image-Dim Verdict.** The four border-image dimension/repeat longhands were UNREGISTERED in computed style ("doesn't seem to be supported"). Registered `border-image-slice`/`-width`/`-outset`/`-repeat` in `_GCS_DEFAULTS` + a `_computeBorderImageDim` fold per component (number stays, `%` stays, `<length>`→px, calc folds by type; PURE-length calc→px, mixed length+% stays symbolic). Also extended the specified canon (`_biComp`) to accept math functions. **+12.** |
 | `css/css-backgrounds/parsing/border-image-outset-computed.html` | 0/7 | **7/7** | ✅ 100% | **Quest #235.** `_computeBorderImageDim` folds each `<length>`|`<number>` component (`0 calc(0.5em+10px) 3 calc(-0.5em+10px)`→`0 30px 3 0px`; `calc(10 + sign(2cqw-10px)*5)`→`5`). **+7.** |
 | `css/css-backgrounds/parsing/border-image-slice-computed.html` | 0/7 | **7/7** | ✅ 100% | **Quest #235.** Folds each `<number>`|`<percentage>` (`calc(20% + sign(2cqw-10px)*5%)`→`15%`); `fill` kept last. **+7.** |

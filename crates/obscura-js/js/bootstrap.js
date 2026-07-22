@@ -10885,6 +10885,19 @@ const _canonLengthTimeMath = (name, v) => {
   const isLen = _LENGTH_COMPUTED_PROPS.has(name) || _SIZE_COMPUTED_PROPS.has(name);
   const isTime = _TIME_COMPUTED_PROPS.has(name);
   if (!isLen && !isTime) return v;
+  // fit-content( <length-percentage> ): the parenthesised argument is a
+  // <length-percentage>, NOT a math sub-expression of a surrounding calc. Running the
+  // whole value through `_canonMathExpr` treats `fit-content(` as an unknown function
+  // and serializes its sum argument at "root" position, shedding the calc() wrapper
+  // (`fit-content(calc(10% + 40px))` → `fit-content(10% + 40px)`) — but a bare
+  // `10% + 40px` is not a valid <length-percentage>, and computed then folds the % to 0.
+  // Canonicalize the argument alone, preserving its calc() wrapper.
+  const fc = /^fit-content\(\s*([\s\S]*?)\s*\)$/i.exec(v.trim());
+  if (fc) {
+    const inner = fc[1];
+    const c = _MATHFN_NAME_RE.test(inner) ? (_canonMathExpr(inner, { canonLen: isLen }) || inner) : inner;
+    return 'fit-content(' + c + ')';
+  }
   return _canonMathExpr(v, { canonLen: isLen, canonTime: isTime }) || v;
 };
 // SPECIFIED-value canonicalization of the line-width (a <length>) embedded in a
