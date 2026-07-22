@@ -10,12 +10,25 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #242).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #243).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-logical/parsing/block-size-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #243 The Logical-Sizing Verdict.** The whole css-sizing/css-logical dimension family stored raw — no property rejected out-of-grammar values (physical `width`/`height` invalid ALSO 0/N). NEW `_isValidSizeValue(name, v)` validating the shared single-value grammar `[auto\|none] \| <length-percentage [0,∞]> \| min-content\|max-content\|fit-content(<lp>)\|stretch\|contain` (auto everywhere but max-*, none only max-*), gating BOTH the inline parser + API setProperty for `_SIZE_VALIDATED` (width/height + block/inline-size, physical + logical, min/max) + a `_mathReject` malformed-math check + a bare-`0`→`0px` canon. **+10.** |
+| `css/css-logical/parsing/inline-size-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #243.** Same `_isValidSizeValue` gate. **+10.** |
+| `css/css-logical/parsing/min-block-size-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #243.** **+10.** |
+| `css/css-logical/parsing/min-inline-size-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #243.** **+10.** |
+| `css/css-logical/parsing/max-block-size-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #243.** max-* takes `none` not `auto`. **+10.** |
+| `css/css-logical/parsing/max-inline-size-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #243.** **+10.** |
+| `css/css-sizing/parsing/width-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #243 (bonus).** Same shared primitive covers the physical siblings. **+4.** |
+| `css/css-sizing/parsing/height-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #243 (bonus).** **+4.** |
+| `css/css-sizing/parsing/min-width-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #243 (bonus).** **+11.** |
+| `css/css-sizing/parsing/min-height-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #243 (bonus).** **+11.** |
+| `css/css-sizing/parsing/max-width-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #243 (bonus).** **+4.** |
+| `css/css-sizing/parsing/max-height-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #243 (bonus).** **+4.** |
+| `css/css-sizing/parsing/width-valid.html` | 9/10 | **10/10** | ✅ 100% | **Quest #243 (bonus).** bare `0`→`0px` canon. **+1** (×6 across width/height/min-/max-). |
 | `css/css-sizing/parsing/max-width-computed.html` | 11/12 | **12/12** | ✅ 100% | **Quest #236 The Fit-Content-Calc Verdict.** `fit-content(calc(10% + 40px))`→`fit-content(40px)` (the `%` dropped). The SPECIFIED canon `_canonLengthTimeMath` ran the whole `fit-content(calc(…))` through `_canonMathExpr`, which sheds the required calc() wrapper → stored invalid `fit-content(10% + 40px)`, then computed folded the bare `%` against 0. Made it fit-content-aware: canonicalize the argument alone, preserving its calc() wrapper. **+1.** |
 | `css/css-sizing/parsing/min-width-computed.html` | 10/11 | **11/11** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
 | `css/css-sizing/parsing/max-height-computed.html` | 11/12 | **12/12** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |

@@ -1125,6 +1125,16 @@ const _parseStyleDecls = (text) => {
         continue;                                          // expanded into longhands; no `offset` key
       } else if (name === 'opacity') {
         value = _canonOpacitySpecified(value);
+      } else if (_SIZE_VALIDATED.has(name)) {
+        // css-sizing / css-logical dimension props: drop out-of-grammar declarations
+        // (bad keyword, negative <length-%>, bare non-zero number, multi-token) and
+        // malformed math (see the setProperty branch). Canonicalized below.
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          if (!_isValidSizeValue(name, value)) continue;   // out-of-grammar → drop declaration
+          if (_mathReject(value, ['length'], 'length')) continue;  // malformed math → drop
+          if (/^[+-]?0(?:\.0+)?$/.test(value.trim())) value = '0px';  // bare <length> 0 → 0px
+        }
       } else if (_BORDER_SH_PROPS.has(name)) {
         value = _canonShorthandLenMath(value);       // line-width calc() in border/outline/column-rule shorthand
       }
@@ -1804,6 +1814,18 @@ class CSSStyleDeclaration {
       }
       this._notifyChange();
       return;                                              // expanded into longhands; no `offset` key
+    } else if (!custom && _SIZE_VALIDATED.has(name)) {
+      // css-sizing / css-logical dimension props (width/height/block-size/…, min-/
+      // max-, physical + flow-relative): reject out-of-grammar values (bad keyword,
+      // negative <length-%>, bare non-zero number, multi-token) AND malformed/
+      // mistyped math. CSS-wide keywords + var()/env() pass through untouched; the
+      // value is canonicalized below by _canonLengthTimeMath (`0`→`0px`, calc canon).
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        if (!_isValidSizeValue(name, stored)) return;        // out-of-grammar → ignore
+        if (_mathReject(stored, ['length'], 'length')) return;  // malformed math → ignore
+        if (/^[+-]?0(?:\.0+)?$/.test(stored.trim())) stored = '0px';  // bare <length> 0 → 0px
+      }
     } else if (!custom && _MATH_GATE_PROPS[name]) {
       const g = _MATH_GATE_PROPS[name];
       if (_mathReject(stored, g.types, g.pct)) return;     // malformed/mistyped math function → ignore
@@ -9092,6 +9114,53 @@ const _WIDTH_COMPUTED_PROPS = new Set([
 const _isLengthTok = (t) =>
   /^[+-]?(\d*\.?\d+)(px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vi|vb|vmin|vmax|cm|mm|in|pt|pc|q)$/i.test(t)
   || /^calc\(/i.test(t) || /^(min|max|clamp)\(/i.test(t);
+// ── css-sizing / css-logical dimension grammar validation ─────────────────────
+// The sizing properties (width/height + block/inline-size, their min-/max- forms,
+// physical AND flow-relative) all share the single-value grammar
+//   [auto | none] | <length-percentage [0,∞]> | min-content | max-content
+//   | fit-content(<length-percentage [0,∞]>) | stretch | fit-content | contain
+// where `auto` is allowed everywhere EXCEPT max-* (which takes `none` instead).
+// These share validation because a logical property must behave EXACTLY like its
+// physical sibling. `_isValidSizeValue` returns false only when confidently
+// out-of-grammar (a bare non-zero <number>, a negative <length-%> literal, a
+// disallowed/misspelled keyword, or more than one top-level token); it accepts
+// anything it can't disprove (CSS-wide keywords, var()/env(), math functions —
+// whose sign/type the setProperty math gate checks separately).
+const _SIZE_VALIDATED = new Set([
+  'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
+  'block-size', 'inline-size', 'min-block-size', 'min-inline-size',
+  'max-block-size', 'max-inline-size',
+]);
+// Intrinsic-sizing keywords valid on every sizing property (css-sizing-3/4). Kept
+// in sync with `_SIZE_KW_PASS` (the computed-path pass-through set).
+const _SIZE_INTRINSIC_KW = new Set(['min-content', 'max-content', 'fit-content', 'stretch', 'contain']);
+// A single non-negative <length-percentage> token (unitless allowed only for `0`),
+// or a math function (its sign/type is undecidable here → accept, the math gate
+// type-checks it downstream). Returns false for a bare non-zero number, a negative
+// literal, or a non-length token.
+const _sizeLenPctOk = (t) => {
+  if (_MATHFN_NAME_RE.test(t) || _TF_VAR_RE.test(t)) return true;   // calc()/min()/…/var() → undecidable, accept
+  const m = /^([+-]?)(\d*\.?\d+)(px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vi|vb|vmin|vmax|svw|svh|lvw|lvh|dvw|dvh|cqw|cqh|cqi|cqb|cqmin|cqmax|cm|mm|in|pt|pc|q|%)?$/i.exec(t);
+  if (!m) return false;
+  if (!m[3]) return parseFloat(m[1] + m[2]) === 0;                  // bare <number>: only 0 is a valid <length>
+  return m[1] !== '-' || parseFloat(m[2]) === 0;                    // negative <length-%> → invalid ([0,∞])
+};
+const _isValidSizeValue = (name, value) => {
+  const s = String(value).trim();
+  if (!s) return false;
+  const low = s.toLowerCase();
+  if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(s)) return true;        // handled elsewhere
+  const toks = _wsTokens(s);
+  if (toks.length !== 1) return false;                             // sizing is a single value
+  const t = toks[0], tl = t.toLowerCase();
+  const isMax = name.startsWith('max-');
+  if (tl === 'auto') return !isMax;                               // auto everywhere but max-*
+  if (tl === 'none') return isMax;                               // none only on max-*
+  if (_SIZE_INTRINSIC_KW.has(tl)) return true;
+  const fc = /^fit-content\(\s*([\s\S]*)\)$/i.exec(t);
+  if (fc) return _sizeLenPctOk(fc[1].trim());
+  return _sizeLenPctOk(t);
+};
 // Parse a `border`/`border-<side>` value (`<line-width> || <line-style> || <color>`,
 // any order) into its three longhand pieces, defaulting any omitted component.
 const _parseBorderSide = (value) => {
