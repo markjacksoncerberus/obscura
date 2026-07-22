@@ -5,3 +5,5 @@ shots/
 .claude/*
 !.claude/commands/
 out/__pycache__/
+out/
+scripts/__pycache__/

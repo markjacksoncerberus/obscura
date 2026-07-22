@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #234).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #235).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-backgrounds/parsing/border-image-width-computed.html` | 0/12 | **12/12** | ✅ 100% | **Quest #235 The Border-Image-Dim Verdict.** The four border-image dimension/repeat longhands were UNREGISTERED in computed style ("doesn't seem to be supported"). Registered `border-image-slice`/`-width`/`-outset`/`-repeat` in `_GCS_DEFAULTS` + a `_computeBorderImageDim` fold per component (number stays, `%` stays, `<length>`→px, calc folds by type; PURE-length calc→px, mixed length+% stays symbolic). Also extended the specified canon (`_biComp`) to accept math functions. **+12.** |
+| `css/css-backgrounds/parsing/border-image-outset-computed.html` | 0/7 | **7/7** | ✅ 100% | **Quest #235.** `_computeBorderImageDim` folds each `<length>`|`<number>` component (`0 calc(0.5em+10px) 3 calc(-0.5em+10px)`→`0 30px 3 0px`; `calc(10 + sign(2cqw-10px)*5)`→`5`). **+7.** |
+| `css/css-backgrounds/parsing/border-image-slice-computed.html` | 0/7 | **7/7** | ✅ 100% | **Quest #235.** Folds each `<number>`|`<percentage>` (`calc(20% + sign(2cqw-10px)*5%)`→`15%`); `fill` kept last. **+7.** |
+| `css/css-backgrounds/parsing/border-image-repeat-computed.html` | 0/3 | **3/3** | ✅ 100% | **Quest #235.** Keyword identity — registration in `_GCS_DEFAULTS` alone (`round space`→`round space`). **+3.** |
 | `css/filter-effects/parsing/flood-color-valid.html` | 5/8 | **8/8** | ✅ 100% | **Quest #231 The Filter-Color Verdict.** `flood-color`/`lighting-color` were UNREGISTERED SVG-presentation `<color>` props (raw-store — round-tripped literals but never canonicalized). Added both to `_COLOR_PROPS` → free specified `<color>` canon (`#00FF00`→`rgb(0, 255, 0)`, `rgb(100%, 100%, 0%)`→`rgb(255, 255, 0)`, `hsl(120, 100%, 50%)`→`rgb(0, 255, 0)`). **+3.** |
 | `css/filter-effects/parsing/flood-color-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #231.** The `_COLOR_PROPS` API-setProperty branch gates on `_isValidColor` → `none` and `black white` rejected. **+2.** |
 | `css/filter-effects/parsing/flood-color-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #231.** The generic computed color branch resolves `currentcolor`→`_computedColorOf(el)` (on `#target{color:lime}`→`rgb(0, 255, 0)`) and all named/hex/rgb/hsl → rgb(). **+8.** |

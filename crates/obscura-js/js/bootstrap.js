@@ -8891,6 +8891,11 @@ const _GCS_DEFAULTS = {
   // via _canonGradients (see _GRADIENT_PROPS). mask-image/border-image-source do
   // not inherit. list-style-image is registered above (css-lists, inherited).
   'mask-image': 'none', 'border-image-source': 'none',
+  // css-backgrounds border-image dimension/repeat longhands (none inherit). The
+  // computed value folds each slice/width/outset component to its absolute form
+  // (see _computeBorderImageDim); repeat is keyword identity.
+  'border-image-slice': '100%', 'border-image-width': '1',
+  'border-image-outset': '0', 'border-image-repeat': 'stretch',
   // css-masking mask longhands (none inherit). mask-image/mask-position are
   // registered elsewhere (_GRADIENT_PROPS / _POSITION_PROPS); these are the
   // raw-store longhands now validated via _MASK_VALIDATED / _canonMaskType.
@@ -14499,6 +14504,23 @@ const _biCollapse = (toks) => {
   if (e[3] === e[1]) { out.pop(); if (e[2] === e[0]) { out.pop(); if (e[1] === e[0]) out.pop(); } }
   return out.join(' ');
 };
+// Accept + canonicalize ONE slice/width/outset component: a non-negative literal
+// of an allowed kind (`_biNum`/`_biPct`/`_biLen` all reject a leading `-`), OR a
+// math function whose type is one of `spec.types` (a calc MAY resolve negative /
+// out of range — that's clamped at computed time, valid at parse). A math token is
+// kept symbolic (`_canonMathExpr`); folding to an absolute value happens later in
+// _computeBorderImageDim. Returns the canonical token, or null if not valid here.
+const _BI_SLICE_SPEC  = { num: true, pct: true, len: false, types: ['number'], pctType: 'number' };
+const _BI_WIDTH_SPEC  = { num: true, pct: true, len: true, types: ['length', 'number'], pctType: 'length' };
+const _BI_OUTSET_SPEC = { num: true, pct: false, len: true, types: ['length', 'number'], pctType: null };
+const _biComp = (tok, spec) => {
+  if (spec.num && _biNum(tok)) return tok;
+  if (spec.pct && _biPct(tok)) return tok;
+  if (spec.len && _biLen(tok)) return tok;
+  if (_MATHFN_NAME_RE.test(tok) && _mathValid(tok, spec.types, spec.pctType))
+    return _canonMathExpr(tok, { canonLen: true }) || tok;
+  return null;
+};
 // border-image-slice: [<number [0,∞]> | <percentage [0,∞]>]{1,4} && fill?  (`fill`
 // contiguous with — before or after — the number run, serialized LAST).
 const _canonBiSlice = (value) => {
@@ -14511,8 +14533,9 @@ const _canonBiSlice = (value) => {
   if (fillPos !== -1 && fillPos !== 0 && fillPos !== toks.length - 1) return null;   // fill must be an end
   const nums = toks.filter((t) => t.toLowerCase() !== 'fill');
   if (nums.length < 1 || nums.length > 4) return null;
-  for (const t of nums) if (!_biNum(t) && !_biPct(t)) return null;
-  const c = _biCollapse(nums); if (c === null) return null;
+  const canon = [];
+  for (const t of nums) { const c = _biComp(t, _BI_SLICE_SPEC); if (c === null) return null; canon.push(c); }
+  const c = _biCollapse(canon); if (c === null) return null;
   return fillPos !== -1 ? c + ' fill' : c;
 };
 // border-image-width: [<length-percentage [0,∞]> | <number [0,∞]> | auto]{1,4}.
@@ -14521,10 +14544,8 @@ const _canonBiWidth = (value) => {
   if (toks.length < 1 || toks.length > 4) return null;
   const canon = [];
   for (const t of toks) {
-    const l = t.toLowerCase();
-    if (l === 'auto') canon.push('auto');
-    else if (_biNum(t) || _biPct(t) || _biLen(t)) canon.push(t);
-    else return null;
+    if (t.toLowerCase() === 'auto') { canon.push('auto'); continue; }
+    const c = _biComp(t, _BI_WIDTH_SPEC); if (c === null) return null; canon.push(c);
   }
   return _biCollapse(canon);
 };
@@ -14532,8 +14553,9 @@ const _canonBiWidth = (value) => {
 const _canonBiOutset = (value) => {
   const toks = _wsTokens(value);
   if (toks.length < 1 || toks.length > 4) return null;
-  for (const t of toks) if (!_biNum(t) && !_biLen(t)) return null;
-  return _biCollapse(toks);
+  const canon = [];
+  for (const t of toks) { const c = _biComp(t, _BI_OUTSET_SPEC); if (c === null) return null; canon.push(c); }
+  return _biCollapse(canon);
 };
 // border-image-repeat: [stretch | repeat | round | space]{1,2}  (two equal → one).
 const _canonBiRepeat = (value) => {
@@ -19636,8 +19658,39 @@ const _computeMaskSize = (el, v) => {
     _wsTokens(layer.trim()).map((tok) => _clampNegPx(_trComp(tok, el, true, vp))).join(' ')
   ).join(', ');
 };
+// Computed value of a border-image slice/width/outset longhand. Each already-
+// canonical space-separated component resolves to its absolute form: a plain
+// <number> stays a number, a <percentage> stays a percentage, a <length> resolves
+// to px (clamped ≥0), a math function folds by its type — number-typed → number,
+// percentage-typed → `N%`, PURE-length → px (a mixed length+% calc stays symbolic
+// since `%` has no computed base here). `auto`/`fill` pass through. `cqZero` folds
+// a container unit inside a `sign(2cqw…)` gate to 0 (no container).
+const _BI_DIM_LH = new Set(['border-image-slice', 'border-image-width', 'border-image-outset']);
+const _foldBiComp = (el, tok) => {
+  const l = tok.toLowerCase();
+  if (l === 'auto' || l === 'fill') return l;
+  if (_biNum(tok)) return _serNumber(parseFloat(tok));
+  if (_biPct(tok)) return _serNumber(parseFloat(tok)) + '%';
+  if (_biLen(tok)) return _clampNegPx(_trComp(tok, el, true, _vpUnits()));
+  if (_MATHFN_NAME_RE.test(tok)) {
+    const root = _parseCalcTree(tok);
+    if (root !== null) {
+      const opts = Object.assign(
+        { lengths: true, cqZero: true, emPx: _emPxOf(el), nonFinite: true }, _vpUnits(), _siblingOpts(el, tok));
+      const tyP = _mt(root, 'percentage');
+      if (tyP === 'number') { const nv = _evalMath(tok, 0, opts); if (nv !== null) return _serNumber(_nfClamp(Math.max(0, nv))); }
+      else if (tyP === 'percentage') { const nv = _evalMath(tok, 100, opts); if (nv !== null) return _serNumber(_nfClamp(Math.max(0, nv))) + '%'; }
+      else if (tyP === 'length' && _mt(root, null) === 'length') {
+        const nv = _evalMath(tok, 0, opts); if (nv !== null) return _clampNegPx(_serNumber(_nfClamp(nv)) + 'px');
+      }
+    }
+  }
+  return tok;                                               // mixed length+% / unresolvable → keep symbolic
+};
+const _computeBorderImageDim = (el, v) => _wsTokens(String(v).trim()).map((t) => _foldBiComp(el, t)).join(' ');
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
+  if (_BI_DIM_LH.has(kebab)) return _computeBorderImageDim(el, v);
   if (kebab === 'text-emphasis-style') return _computeTextEmphasisStyle(el, v);
   if (kebab === 'mask-size') return _computeMaskSize(el, v);
   if (kebab === 'text-decoration-inset') return _computeTextDecorationInset(el, v);
