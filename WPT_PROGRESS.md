@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #236).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #237).
 
 ## Scoreboard
 
@@ -20,6 +20,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #236).
 | `css/css-sizing/parsing/min-width-computed.html` | 10/11 | **11/11** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
 | `css/css-sizing/parsing/max-height-computed.html` | 11/12 | **12/12** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
 | `css/css-sizing/parsing/min-height-computed.html` | 10/11 | **11/11** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
+| `css/css-backgrounds/parsing/background-repeat-computed.html` | 12/13 | **13/13** | ✅ 100% | **Quest #237 The Repeat-Collapse Verdict.** Computed `background-repeat: repeat repeat`→`repeat repeat` (should collapse to `repeat`). The two-keyword `<repeat-style>` must collapse in the COMPUTED value (equal pair → single keyword; `repeat no-repeat`/`no-repeat repeat` → `repeat-x`/`repeat-y`) exactly like mask-repeat, while the SPECIFIED canon keeps the pair (background-repeat-valid accepts both forms). Added a `background-repeat` branch to `_normComputed` that folds each comma-layer's pair via the existing `_canonMaskRepeat2`. **+1.** |
 | `css/css-backgrounds/parsing/border-image-width-computed.html` | 0/12 | **12/12** | ✅ 100% | **Quest #235 The Border-Image-Dim Verdict.** The four border-image dimension/repeat longhands were UNREGISTERED in computed style ("doesn't seem to be supported"). Registered `border-image-slice`/`-width`/`-outset`/`-repeat` in `_GCS_DEFAULTS` + a `_computeBorderImageDim` fold per component (number stays, `%` stays, `<length>`→px, calc folds by type; PURE-length calc→px, mixed length+% stays symbolic). Also extended the specified canon (`_biComp`) to accept math functions. **+12.** |
 | `css/css-backgrounds/parsing/border-image-outset-computed.html` | 0/7 | **7/7** | ✅ 100% | **Quest #235.** `_computeBorderImageDim` folds each `<length>`|`<number>` component (`0 calc(0.5em+10px) 3 calc(-0.5em+10px)`→`0 30px 3 0px`; `calc(10 + sign(2cqw-10px)*5)`→`5`). **+7.** |
 | `css/css-backgrounds/parsing/border-image-slice-computed.html` | 0/7 | **7/7** | ✅ 100% | **Quest #235.** Folds each `<number>`|`<percentage>` (`calc(20% + sign(2cqw-10px)*5%)`→`15%`); `fill` kept last. **+7.** |

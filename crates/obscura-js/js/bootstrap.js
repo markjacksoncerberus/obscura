@@ -19706,6 +19706,17 @@ const _normComputed = (el, kebab, v) => {
   if (_BI_DIM_LH.has(kebab)) return _computeBorderImageDim(el, v);
   if (kebab === 'text-emphasis-style') return _computeTextEmphasisStyle(el, v);
   if (kebab === 'mask-size') return _computeMaskSize(el, v);
+  if (kebab === 'background-repeat') {
+    // Computed collapses each layer's two-keyword <repeat-style> to its shortest
+    // form (equal pair → one keyword; repeat/no-repeat → repeat-x/-y), exactly like
+    // mask-repeat. The SPECIFIED canon keeps the pair (background-repeat-valid
+    // accepts both `repeat` and `repeat repeat`), so this lives only in computed.
+    return _commaSplitTop(String(v)).map((layer) => {
+      const toks = _wsTokens(layer.trim());
+      if (toks.length === 2) return _canonMaskRepeat2(toks[0].toLowerCase(), toks[1].toLowerCase());
+      return layer.trim();
+    }).join(', ');
+  }
   if (kebab === 'text-decoration-inset') return _computeTextDecorationInset(el, v);
   if (_COUNTER_VALIDATED.has(kebab)) return _computeCounter(el, v);
   if (_GRID_LINE_LH.has(kebab)) return _computeGridLine(el, v);
