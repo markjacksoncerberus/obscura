@@ -9152,8 +9152,8 @@ const _parseBorderSideStrict = (value, outlineStyle) => {
     const low = t.toLowerCase();
     if (_LINE_STYLE_KW.has(low) || (outlineStyle && low === 'auto')) {
       if (style != null) return null; style = low;
-    } else if (_LINE_WIDTH_KW.has(low) || _isLengthTok(t)) {
-      if (width != null) return null; width = _LINE_WIDTH_KW.has(low) ? low : _canonLineWidth(t);
+    } else if (_LINE_WIDTH_KW.has(low) || _isLengthTok(t) || _isZeroTok(t)) {
+      if (width != null) return null; width = _LINE_WIDTH_KW.has(low) ? low : (_isZeroTok(t) ? '0px' : _canonLineWidth(t));
     } else if (_isValidColor(t)) {
       if (color != null) return null; color = _canonColorSpecified(t);
     } else return null;
@@ -9225,6 +9225,16 @@ const _joinBorderSide = (w, s, c) => {
   if (c !== _LC_INIT) parts.push(c);
   return parts.length ? parts.join(' ') : _LS_INIT;
 };
+// `outline` serializes `<color> || <style> || <width>` (css-ui-4) — the REVERSE
+// component order of border (`3px ridge rgba(…)`→`rgba(…) ridge 3px`). Same
+// drop-at-initial rules and the all-initial → `none` fallback.
+const _joinOutline = (w, s, c) => {
+  const parts = [];
+  if (c !== _LC_INIT) parts.push(c);
+  if (s !== _LS_INIT) parts.push(s);
+  if (w !== _LW_INIT) parts.push(w);
+  return parts.length ? parts.join(' ') : _LS_INIT;
+};
 const _serializeBorderShorthand = (decl, sh) => {
   const p = decl._props;
   if (sh === 'border-width' || sh === 'border-style' || sh === 'border-color') {
@@ -9242,7 +9252,7 @@ const _serializeBorderShorthand = (decl, sh) => {
   if (sh === 'outline') {
     const w = p['outline-width'], s = p['outline-style'], c = p['outline-color'];
     if (w == null || s == null || c == null) return '';
-    return _joinBorderSide(w, s, c);
+    return _joinOutline(w, s, c);
   }
   if (sh === 'column-rule') {
     const w = p['column-rule-width'], s = p['column-rule-style'], c = p['column-rule-color'];
