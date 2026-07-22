@@ -10,12 +10,32 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #243).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #244).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-logical/parsing/border-block-color-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #244 The Logical-Border Verdict.** The whole css-logical border family (color/style/width longhands + block/inline shorthands) was raw-store/unregistered. Colour longhands → `_COLOR_PROPS`; style/width longhands → new `_BORDER_LOGICAL_LH` validators (`<line-style>`/`<line-width>`) + `_GCS_DEFAULTS` + `_WIDTH_COMPUTED_PROPS` (widths compute to px, zeroed when the sibling style is `none`/`hidden`). The two-value shorthands (`_BORDER_LOGICAL_SH`) expand into longhands across all touch points (setProperty/inline/getter/removeProperty/getComputedStyle/CSS.supports/cascade) mirroring scroll-margin-block; `border-block`/`border-inline` + per-edge forms via `_BORDER_EXPAND`. **+8.** |
+| `css/css-logical/parsing/border-inline-color-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #244.** **+8.** |
+| `css/css-logical/parsing/border-block-color-invalid.html` | 0/15 | **12/15** | 🟡 80% | **Quest #244.** 3 remaining are pre-existing `_isValidColor` strictness gaps (`rgb(10%, 20, 30%)` type-mixing etc.), shared with physical `<color>`. **+12.** |
+| `css/css-logical/parsing/border-inline-color-invalid.html` | 0/15 | **12/15** | 🟡 80% | **Quest #244.** **+12.** |
+| `css/css-logical/parsing/border-block-color-valid.html` | 5/7 | **7/7** | ✅ 100% | **Quest #244.** **+2.** |
+| `css/css-logical/parsing/border-inline-color-valid.html` | 5/7 | **7/7** | ✅ 100% | **Quest #244.** **+2.** |
+| `css/css-logical/parsing/border-block-style-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #244.** `<line-style>` single-keyword validator (rejects `auto`/multi-token/comma). **+6.** |
+| `css/css-logical/parsing/border-inline-style-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #244.** **+6.** |
+| `css/css-logical/parsing/border-block-style-computed.html` | 0/13 | **13/13** | ✅ 100% | **Quest #244.** **+13.** |
+| `css/css-logical/parsing/border-inline-style-computed.html` | 0/13 | **13/13** | ✅ 100% | **Quest #244.** **+13.** |
+| `css/css-logical/parsing/border-block-style-valid.html` | 12/13 | **13/13** | ✅ 100% | **Quest #244.** **+1.** |
+| `css/css-logical/parsing/border-inline-style-valid.html` | 12/13 | **13/13** | ✅ 100% | **Quest #244.** **+1.** |
+| `css/css-logical/parsing/border-block-width-computed.html` | 0/11 | **11/11** | ✅ 100% | **Quest #244.** `<line-width>` → px (via `_WIDTH_COMPUTED_PROPS`); computed 0 when the border style is none/hidden (added to the shared width branch + cascade-expand the logical shorthands so the sibling style resolves). **+11.** |
+| `css/css-logical/parsing/border-inline-width-computed.html` | 0/11 | **11/11** | ✅ 100% | **Quest #244.** **+11.** |
+| `css/css-logical/parsing/border-block-width-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #244.** `<line-width>` validator (rejects `-20px`/`10`/`30%`/`auto`/multi-token/comma). **+7.** |
+| `css/css-logical/parsing/border-inline-width-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #244.** **+7.** |
+| `css/css-logical/parsing/border-block-width-valid.html` | 5/10 | **10/10** | ✅ 100% | **Quest #244.** **+5.** |
+| `css/css-logical/parsing/border-inline-width-valid.html` | 5/10 | **10/10** | ✅ 100% | **Quest #244.** **+5.** |
+| `css/css-logical/parsing/border-block-valid.html` | 4/6 | **6/6** | ✅ 100% | **Quest #244.** `border-block`/`border-block-start`/`-end` border-side shorthands via `_BORDER_EXPAND`. **+2.** |
+| `css/css-logical/parsing/border-inline-valid.html` | 4/6 | **6/6** | ✅ 100% | **Quest #244.** **+2.** |
 | `css/css-logical/parsing/block-size-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #243 The Logical-Sizing Verdict.** The whole css-sizing/css-logical dimension family stored raw — no property rejected out-of-grammar values (physical `width`/`height` invalid ALSO 0/N). NEW `_isValidSizeValue(name, v)` validating the shared single-value grammar `[auto\|none] \| <length-percentage [0,∞]> \| min-content\|max-content\|fit-content(<lp>)\|stretch\|contain` (auto everywhere but max-*, none only max-*), gating BOTH the inline parser + API setProperty for `_SIZE_VALIDATED` (width/height + block/inline-size, physical + logical, min/max) + a `_mathReject` malformed-math check + a bare-`0`→`0px` canon. **+10.** |
 | `css/css-logical/parsing/inline-size-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #243.** Same `_isValidSizeValue` gate. **+10.** |
 | `css/css-logical/parsing/min-block-size-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #243.** **+10.** |

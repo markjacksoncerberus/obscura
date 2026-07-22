@@ -1109,6 +1109,19 @@ const _parseStyleDecls = (text) => {
           for (const ln of _LS_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
           continue;                                          // expanded into longhands; no `list-style` key
         }
+      } else if (_BORDER_LOGICAL_SH[name]) {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandBorderLogical(name, value); if (!lh) continue;  // out of grammar → drop
+          for (const ln of _BORDER_LOGICAL_SH[name]) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no shorthand key
+        }
+      } else if (_BORDER_LOGICAL_LH.has(name)) {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonBorderLogicalLh(name, value); if (c === null) continue;  // invalid → drop
+          value = c;
+        }
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1207,6 +1220,25 @@ class CSSStyleDeclaration {
         const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
         delete this._props[name]; delete this._priority[name];   // drop any prior CSS-wide shorthand key
         for (const ln of _SCROLL_SH_LH[name]) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                                 // expanded; no shorthand key kept
+      }
+    }
+    if (!custom && _BORDER_LOGICAL_SH[name] && !/\bvar\(/i.test(stored)) {
+      // css-logical two-value border shorthand (border-block-color/-style/-width +
+      // inline): expand into — and store as — its start/end longhands so
+      // `el.style.borderBlockStartColor` reads back. A CSS-wide keyword belongs to
+      // both longhands → skip to single-key storage. Invalid → ignore.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low)) {
+        const lh = _expandBorderLogical(name, stored);
+        if (!lh) return;                                        // out of grammar → keep prior value
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        delete this._props[name]; delete this._priority[name];   // drop any prior CSS-wide shorthand key
+        for (const ln of _BORDER_LOGICAL_SH[name]) {
           if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
           this._props[ln] = lh[ln]; this._priority[ln] = prio;
         }
@@ -1814,6 +1846,15 @@ class CSSStyleDeclaration {
       }
       this._notifyChange();
       return;                                              // expanded into longhands; no `offset` key
+    } else if (!custom && _BORDER_LOGICAL_LH.has(name)) {
+      // css-logical border style/width longhands: validate + canonicalize a single
+      // <line-style>/<line-width> (invalid → ignore). CSS-wide + var()/env() pass through.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonBorderLogicalLh(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
     } else if (!custom && _SIZE_VALIDATED.has(name)) {
       // css-sizing / css-logical dimension props (width/height/block-size/…, min-/
       // max-, physical + flow-relative): reject out-of-grammar values (bad keyword,
@@ -1974,6 +2015,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (_BORDER_LOGICAL_SH[key]) {                          // css-logical 2-value border shorthand: clear longhands
+      const old = (key in this._props) ? this._props[key] : _serBorderLogicalSh((ln) => this._props[ln], key, this);
+      delete this._props[key]; delete this._priority[key];   // any CSS-wide shorthand key
+      for (const ln of _BORDER_LOGICAL_SH[key]) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     if (key === 'font') {                                   // font shorthand: clear its longhands + single key
       const old = _serializeFontShorthand(this);
       delete this._props['font']; delete this._priority['font'];
@@ -2095,6 +2143,10 @@ class CSSStyleDeclaration {
     if (_SCROLL_SH_LH[key]) {                               // scroll-margin/scroll-padding shorthand
       if (key in this._props) return this._props[key];     // CSS-wide kept as a single key
       return _serializeScrollShorthand(this, key);         // reconstruct from longhands
+    }
+    if (_BORDER_LOGICAL_SH[key]) {                          // css-logical 2-value border shorthand
+      if (key in this._props) return this._props[key];     // CSS-wide kept as a single key
+      return _serBorderLogicalSh((ln) => this._props[ln], key, this);  // reconstruct from longhands
     }
     if (key === 'font') return _serializeFontShorthand(this);  // system/CSS-wide key or reconstruct from longhands
     if (key === 'font-variant') return _serializeFontVariantShorthand(this);  // CSS-wide key or reconstruct from longhands
@@ -8830,6 +8882,13 @@ const _GCS_DEFAULTS = {
   'border-bottom-width': '0px', 'border-left-width': '0px',
   'border-top-style': 'none', 'border-right-style': 'none',
   'border-bottom-style': 'none', 'border-left-style': 'none',
+  // css-logical flow-relative border style/width longhands (computed identity like
+  // their physical siblings; colour longhands live in _COLOR_PROPS). Width computes
+  // to px via _WIDTH_COMPUTED_PROPS; initial 0px (initial style `none` forces 0).
+  'border-block-start-style': 'none', 'border-block-end-style': 'none',
+  'border-inline-start-style': 'none', 'border-inline-end-style': 'none',
+  'border-block-start-width': '0px', 'border-block-end-width': '0px',
+  'border-inline-start-width': '0px', 'border-inline-end-width': '0px',
   'z-index': 'auto', 'pointer-events': 'auto',
   'box-sizing': 'content-box', cursor: 'auto',
   // css-backgrounds longhands (not inherited) + `filter`. Computed serialization
@@ -9038,6 +9097,27 @@ const _SHORTHAND_LONGHANDS = {
   // The `font` shorthand feeds the cascade so a stylesheet `font: 20px Ahem` sets
   // font-size (etc.); the value is split per-longhand lazily via _expandShorthand.
   font: ['font-style', 'font-variant-caps', 'font-weight', 'font-stretch', 'font-size', 'line-height', 'font-family'],
+  // css-logical flow-relative border shorthands — feed the cascade so a stylesheet
+  // `border-block-style: dotted` sets border-block-start/-end-style for getComputedStyle
+  // (split per-longhand lazily via _expandShorthand).
+  'border-block-color': ['border-block-start-color', 'border-block-end-color'],
+  'border-inline-color': ['border-inline-start-color', 'border-inline-end-color'],
+  'border-block-style': ['border-block-start-style', 'border-block-end-style'],
+  'border-inline-style': ['border-inline-start-style', 'border-inline-end-style'],
+  'border-block-width': ['border-block-start-width', 'border-block-end-width'],
+  'border-inline-width': ['border-inline-start-width', 'border-inline-end-width'],
+  'border-block-start': ['border-block-start-width', 'border-block-start-style', 'border-block-start-color'],
+  'border-block-end': ['border-block-end-width', 'border-block-end-style', 'border-block-end-color'],
+  'border-inline-start': ['border-inline-start-width', 'border-inline-start-style', 'border-inline-start-color'],
+  'border-inline-end': ['border-inline-end-width', 'border-inline-end-style', 'border-inline-end-color'],
+  'border-block': [
+    'border-block-start-width', 'border-block-start-style', 'border-block-start-color',
+    'border-block-end-width', 'border-block-end-style', 'border-block-end-color',
+  ],
+  'border-inline': [
+    'border-inline-start-width', 'border-inline-start-style', 'border-inline-start-color',
+    'border-inline-end-width', 'border-inline-end-style', 'border-inline-end-color',
+  ],
 };
 // Set a declaration into a block-level map, respecting within-block cascade
 // order: an !important declaration is never overridden by a later normal one of
@@ -9110,6 +9190,9 @@ const _LINE_WIDTH_PX = { thin: 1, medium: 3, thick: 5 };
 const _WIDTH_COMPUTED_PROPS = new Set([
   'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
   'outline-width',
+  // css-logical flow-relative border widths — computed like the physical siblings.
+  'border-block-start-width', 'border-block-end-width',
+  'border-inline-start-width', 'border-inline-end-width',
 ]);
 const _isLengthTok = (t) =>
   /^[+-]?(\d*\.?\d+)(px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vi|vb|vmin|vmax|cm|mm|in|pt|pc|q)$/i.test(t)
@@ -9214,6 +9297,30 @@ const _BORDER_EXPAND = {
   'border-color': ['border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color'],
   'outline': ['outline-width', 'outline-style', 'outline-color'],
   'column-rule': ['column-rule-width', 'column-rule-style', 'column-rule-color'],
+  // css-logical flow-relative border-side shorthands (<line-width> || <line-style>
+  // || <color>). The per-edge forms map to one edge; border-block/border-inline
+  // apply the parsed side to BOTH the start and end edges.
+  'border-block-start': ['border-block-start-width', 'border-block-start-style', 'border-block-start-color'],
+  'border-block-end': ['border-block-end-width', 'border-block-end-style', 'border-block-end-color'],
+  'border-inline-start': ['border-inline-start-width', 'border-inline-start-style', 'border-inline-start-color'],
+  'border-inline-end': ['border-inline-end-width', 'border-inline-end-style', 'border-inline-end-color'],
+  'border-block': [
+    'border-block-start-width', 'border-block-start-style', 'border-block-start-color',
+    'border-block-end-width', 'border-block-end-style', 'border-block-end-color',
+  ],
+  'border-inline': [
+    'border-inline-start-width', 'border-inline-start-style', 'border-inline-start-color',
+    'border-inline-end-width', 'border-inline-end-style', 'border-inline-end-color',
+  ],
+};
+// The four per-edge flow-relative border-side shorthands + the two both-edge ones.
+const _BORDER_LOGICAL_SIDE_EDGE = {
+  'border-block-start': 'border-block-start', 'border-block-end': 'border-block-end',
+  'border-inline-start': 'border-inline-start', 'border-inline-end': 'border-inline-end',
+};
+const _BORDER_LOGICAL_SIDE_BOTH = {
+  'border-block': ['border-block-start', 'border-block-end'],
+  'border-inline': ['border-inline-start', 'border-inline-end'],
 };
 // Parse `<line-width> || <line-style> || <color>` (border/outline side), VALIDATING
 // each token and rejecting duplicates / unclassifiable tokens (so `2px solid
@@ -9288,6 +9395,18 @@ const _expandBorderShorthand = (sh, value) => {
     }
     return Object.assign(out, _BORDER_IMAGE_INITIAL);
   }
+  if (_BORDER_LOGICAL_SIDE_EDGE[sh]) {                       // border-block-start/-end, border-inline-start/-end
+    const p = _parseBorderSideStrict(value, false); if (!p) return null;
+    return { [sh + '-width']: p.width, [sh + '-style']: p.style, [sh + '-color']: p.color };
+  }
+  if (_BORDER_LOGICAL_SIDE_BOTH[sh]) {                       // border-block / border-inline (both edges)
+    const p = _parseBorderSideStrict(value, false); if (!p) return null;
+    const out = {};
+    for (const edge of _BORDER_LOGICAL_SIDE_BOTH[sh]) {
+      out[edge + '-width'] = p.width; out[edge + '-style'] = p.style; out[edge + '-color'] = p.color;
+    }
+    return out;
+  }
   return null;
 };
 // Reconstruct a border/outline shorthand from the longhands present (CSSOM
@@ -9324,6 +9443,19 @@ const _serializeBorderShorthand = (decl, sh) => {
     const w = p['border-' + side + '-width'], s = p['border-' + side + '-style'], c = p['border-' + side + '-color'];
     if (w == null || s == null || c == null) return '';
     return _joinBorderSide(w, s, c);
+  }
+  if (_BORDER_LOGICAL_SIDE_EDGE[sh]) {                       // border-block-start/-end, border-inline-start/-end
+    const w = p[sh + '-width'], s = p[sh + '-style'], c = p[sh + '-color'];
+    if (w == null || s == null || c == null) return '';
+    return _joinBorderSide(w, s, c);
+  }
+  if (_BORDER_LOGICAL_SIDE_BOTH[sh]) {                       // border-block / border-inline (both edges must agree)
+    const [e0, e1] = _BORDER_LOGICAL_SIDE_BOTH[sh];
+    for (const comp of ['width', 'style', 'color']) {
+      const v = p[e0 + '-' + comp];
+      if (v == null || p[e1 + '-' + comp] == null || p[e1 + '-' + comp] !== v) return '';
+    }
+    return _joinBorderSide(p[e0 + '-width'], p[e0 + '-style'], p[e0 + '-color']);
   }
   if (sh === 'outline') {
     const w = p['outline-width'], s = p['outline-style'], c = p['outline-color'];
@@ -9415,6 +9547,10 @@ const _expandShorthand = (sh, value) => {
     return out;
   }
   if (sh === 'transition') return _expandTransition(value);
+  // css-logical flow-relative border shorthands (for the cascade → getComputedStyle):
+  // the two-value color/style/width forms, and the border-side (per-edge + both-edge).
+  if (_BORDER_LOGICAL_SH[sh]) return _expandBorderLogical(sh, value);
+  if (_BORDER_LOGICAL_SIDE_EDGE[sh] || _BORDER_LOGICAL_SIDE_BOTH[sh]) return _expandBorderShorthand(sh, value);
   if (sh === 'font') {
     const p = _parseFontShorthand(value);
     if (!p || p.system) return null;   // invalid / system font → no per-longhand pieces (falls to initial/inherited)
@@ -9701,6 +9837,10 @@ const _COLOR_PROPS = new Set([
   // is validated separately via _CSSUI_ENUM). currentColor resolves to the
   // element's own computed colour at computed-time, exactly like caret-color.
   'flood-color','lighting-color',
+  // css-logical flow-relative border colour longhands (behave exactly like the
+  // physical border-*-color siblings: <color>, currentColor → the element's colour).
+  'border-block-start-color','border-block-end-color',
+  'border-inline-start-color','border-inline-end-color',
 ]);
 // Colour *shorthands* — 1–4 space-separated <color> values (border-color and its
 // flow-relative siblings). Each value canonicalizes independently like a longhand
@@ -19111,6 +19251,89 @@ const _serializeScrollShorthand = (decl, name) => {
   return _serializeBoxValue(name, vals);
 };
 
+// ── css-logical flow-relative BORDER properties ──────────────────────────────
+// The block/inline border longhands (border-<block|inline>-<start|end>-<color|
+// style|width>) behave EXACTLY like their physical siblings; the two-value
+// shorthands (border-block-color/-style/-width + inline) are `<component>{1,2}`,
+// applied to the start then end edge (a single value fills both). Colours flow
+// through _COLOR_PROPS (validate/canon/computed); style + width get the small
+// validators below. This mirrors the scroll-margin-block machinery above.
+const _BORDER_LOGICAL_SH = {
+  'border-block-color': ['border-block-start-color', 'border-block-end-color'],
+  'border-inline-color': ['border-inline-start-color', 'border-inline-end-color'],
+  'border-block-style': ['border-block-start-style', 'border-block-end-style'],
+  'border-inline-style': ['border-inline-start-style', 'border-inline-end-style'],
+  'border-block-width': ['border-block-start-width', 'border-block-end-width'],
+  'border-inline-width': ['border-inline-start-width', 'border-inline-end-width'],
+};
+// The style + width block/inline LONGHANDS (colour longhands live in _COLOR_PROPS).
+const _BORDER_LOGICAL_STYLE_LH = new Set([
+  'border-block-start-style', 'border-block-end-style',
+  'border-inline-start-style', 'border-inline-end-style',
+]);
+const _BORDER_LOGICAL_WIDTH_LH = new Set([
+  'border-block-start-width', 'border-block-end-width',
+  'border-inline-start-width', 'border-inline-end-width',
+]);
+const _BORDER_LOGICAL_LH = new Set([..._BORDER_LOGICAL_STYLE_LH, ..._BORDER_LOGICAL_WIDTH_LH]);
+// A single <line-style> keyword (`none|hidden|dotted|…`; `auto` invalid). null → invalid.
+const _canonBorderStyleValue = (t) => {
+  const low = String(t).toLowerCase();
+  return _LINE_STYLE_KW.has(low) ? low : null;
+};
+// A single <line-width> = <length [0,∞]> | thin|medium|thick. Rejects a percentage,
+// a bare non-zero <number>, a negative <length> literal, `auto`, junk. calc()/min()/…
+// pass through (a resolved-negative clamps at computed time). null → invalid.
+const _canonLineWidthValue = (t) => {
+  const s = String(t).trim(), low = s.toLowerCase();
+  if (_LINE_WIDTH_KW.has(low)) return low;
+  if (_isZeroTok(s)) return '0px';
+  if (/%\s*$/.test(s)) return null;                          // percentage not allowed
+  if (/^[+-]?(?:\d*\.?\d+)$/.test(s)) return null;           // bare non-zero <number>
+  if (/^-/.test(s) && !_MATHFN_NAME_RE.test(s)) return null; // negative <length> literal
+  if (_isLengthTok(s)) return _canonLineWidth(s);            // <length> incl calc/min/max/clamp
+  return null;
+};
+// Canonicalize a single block/inline border LONGHAND value (a single component
+// token; multi-token → invalid). Colour longhands never reach here (_COLOR_PROPS).
+const _canonBorderLogicalLh = (name, value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length !== 1) return null;                        // longhand is a single value
+  return _BORDER_LOGICAL_STYLE_LH.has(name) ? _canonBorderStyleValue(toks[0]) : _canonLineWidthValue(toks[0]);
+};
+// Expand a two-value block/inline border shorthand into { startLH, endLH } (each
+// canonicalized), or null when out of grammar (bad component, comma, >2 tokens).
+const _expandBorderLogical = (name, value) => {
+  const lh = _BORDER_LOGICAL_SH[name];
+  const comp = name.endsWith('-color') ? 'color' : name.endsWith('-style') ? 'style' : 'width';
+  const canon1 = comp === 'color'
+    ? (t) => (_isValidColor(t) ? _canonColorSpecified(t) : null)
+    : comp === 'style' ? _canonBorderStyleValue : _canonLineWidthValue;
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 2) return null;       // <component>{1,2} (a comma lands in a token → rejected)
+  const parts = toks.map((t) => canon1(t));
+  if (parts.some((p) => p === null)) return null;
+  const [start, end] = parts.length === 2 ? [parts[0], parts[1]] : [parts[0], parts[0]];
+  return { [lh[0]]: start, [lh[1]]: end };
+};
+// Reconstruct a two-value block/inline border shorthand's value from the stored
+// longhands (specified or computed via `read`), or '' if a longhand is absent /
+// they disagree on importance. Collapses an equal pair to a single value.
+const _serBorderLogicalSh = (read, name, decl) => {
+  const lh = _BORDER_LOGICAL_SH[name];
+  if (decl) {
+    let imp = null;
+    for (const ln of lh) {
+      if (!(ln in decl._props)) return '';
+      const p = decl._priority[ln] === 'important';
+      if (imp === null) imp = p; else if (imp !== p) return '';
+    }
+  }
+  const vals = lh.map((ln) => read(ln));
+  if (vals.some((v) => !v)) return '';
+  return _serializeBoxValue(name, vals);
+};
+
 // ── CSS Fonts (css-fonts) value parsing ──────────────────────────────────────
 // These longhands stored their value RAW (no grammar check), so every `*-invalid`
 // value was wrongly accepted, the keyword→canonical rewrites never happened, and
@@ -20004,6 +20227,12 @@ const _normComputed = (el, kebab, v) => {
   }
   if (_WIDTH_COMPUTED_PROPS.has(kebab)) {                    // border-*-width/outline-width → absolute px
     const s = String(v).trim(), low = s.toLowerCase();
+    // A border's computed width is 0 when its border-style is `none`/`hidden`
+    // (CSS Backgrounds §border-width). Physical + flow-relative; outline excluded.
+    if (el && kebab.startsWith('border-') && kebab.endsWith('-width')) {
+      const bs = _computedPropOf(el, kebab.slice(0, -'-width'.length) + '-style', 0);
+      if (bs === 'none' || bs === 'hidden') return '0px';
+    }
     if (_LINE_WIDTH_PX[low] != null) return _LINE_WIDTH_PX[low] + 'px';
     const px = _trComp(s, el, true, _vpUnits());            // <length>/calc → px (em/vw resolved)
     const m = /^(-?[\d.]+(?:e[+-]?\d+)?)px$/i.exec(px);
@@ -20488,6 +20717,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
+  for (const k of Object.keys(_BORDER_LOGICAL_SH)) add(k);  // css-logical 2-value border-block/inline color/style/width shorthands
   for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
   return set;
 })();
@@ -20514,6 +20744,14 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // longhands, collapsing to the shortest 1–4 (or 1–2) edge form.
     if (_SCROLL_SH_LH[kebab]) {
       const vals = _SCROLL_SH_LH[kebab].map((ln) => resolve(ln));
+      if (vals.some((x) => !x)) return '';
+      return _serializeBoxValue(kebab, vals);
+    }
+    // css-logical two-value border shorthand (border-block-color/-style/-width +
+    // inline): reconstruct from the COMPUTED start/end longhands, collapsing an
+    // equal pair to a single value.
+    if (_BORDER_LOGICAL_SH[kebab]) {
+      const vals = _BORDER_LOGICAL_SH[kebab].map((ln) => resolve(ln));
       if (vals.some((x) => !x)) return '';
       return _serializeBoxValue(kebab, vals);
     }
@@ -23833,6 +24071,16 @@ globalThis.CSS = {
       if (_SCROLL_SH_LH[name]) {                         // scroll-margin/scroll-padding shorthands
         if (/\bvar\(/i.test(val)) return true;
         return _expandScrollShorthand(name, _canonStandardValue(val)) != null;
+      }
+      if (_BORDER_LOGICAL_SH[name]) {                    // css-logical 2-value border shorthands
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _expandBorderLogical(name, c) != null;
+      }
+      if (_BORDER_LOGICAL_LH.has(name)) {                // css-logical border style/width longhands
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _canonBorderLogicalLh(name, c) != null;
       }
       if (name === 'font') {                             // the `font` shorthand
         if (/\bvar\(/i.test(val)) return true;
