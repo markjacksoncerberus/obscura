@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #231).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #232).
 
 ## Scoreboard
 
@@ -25,6 +25,14 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #231).
 | `css/filter-effects/parsing/color-interpolation-filters-parsing-valid.html` | 1/4 | **4/4** | ✅ 100% | **Quest #231.** Keyword enum `auto \| sRGB \| linearRGB` canonicalized ASCII-lowercase via `_CSSUI_ENUM` — `sRGB`→`srgb`, `LiNeArRgB`→`linearrgb`. **+3.** |
 | `css/filter-effects/parsing/color-interpolation-filters-parsing-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #231.** Rejects `none`, `linearRGB sRGB`, `auto sRGB linearRGB` (multi-keyword). **+3.** |
 | `css/filter-effects/parsing/color-interpolation-filters-computed.html` | 0/3 | **3/3** | ✅ 100% | **Quest #231.** Registered `color-interpolation-filters: linearrgb` in `_GCS_DEFAULTS` + the inherited set; computed echoes the lowercased specified keyword. **+3.** |
+| `css/css-break/parsing/break-after-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #232 The Fragmentation Verdict.** The whole css-break family was raw-store on the invalid path: break-*/box-decoration-break were registered (computed passed) but never rejected out-of-grammar values, and orphans/widows accepted `auto`/negative/`0`/multi-value + never folded calc. Added break-after/-before/-inside/box-decoration-break to `_CSSUI_ENUM`+`_CSSUI_VALIDATED` (keyword enums), so `none`/`avoid region`/`slice clone` reject. **+2.** |
+| `css/css-break/parsing/break-before-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #232.** Rejects `none`, `avoid region` (multi-keyword). **+2.** |
+| `css/css-break/parsing/break-inside-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #232.** `break-inside` is the subset enum `auto \| avoid \| avoid-page \| avoid-column \| avoid-region` — rejects `region` (a forced-break keyword) and `auto avoid` (multi). **+2.** |
+| `css/css-break/parsing/box-decoration-break-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #232.** `slice \| clone` — rejects `auto` and `slice clone`. **+2.** |
+| `css/css-break/parsing/orphans-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #232.** `orphans`/`widows` = `<integer [1,∞]>`. New `_canonCssUi` branch rejects `auto`, `1 234` (multi), `-234`, `-1`, `0`; a number-typed calc is kept symbolic. **+5.** |
+| `css/css-break/parsing/orphans-computed.html` | 2/3 | **3/3** | ✅ 100% | **Quest #232.** New `_normComputed` branch folds the calc via `_computeIntegerValue`, clamped ≥1: `calc(1 + 234)`→`235`. **+1.** |
+| `css/css-break/parsing/widows-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #232.** Same `<integer [1,∞]>` validation as orphans. **+5.** |
+| `css/css-break/parsing/widows-computed.html` | 2/3 | **3/3** | ✅ 100% | **Quest #232.** `calc(1 + 234)`→`235`. **+1.** |
 | `css/css-lists/parsing/counter-reset-valid.html` | 11/16 | **16/16** | ✅ 100% | **Quest #230 The Counter Verdict.** The whole `counter-reset`/`-increment`/`-set` family was raw-store (stored verbatim, no grammar check → every `-invalid` at 0/N, no computed fold). Grammar `[ <counter-name> <integer>? \| <reversed-counter-name> <integer>? ]+ \| none` (reversed reset-only). `_canonCounter` tokenizes via `_gridLineTokens` (escape/paren aware), validates each `<counter-name>` (`<custom-ident>` minus CSS-wide/`default`/`none`) + optional `<integer>` (literal or `_canonMathExpr`'d calc), and fills the omitted default (`0`, or `1` for increment) on every plain name — a `reversed()` name with no integer keeps none. `chapter`→`chapter 0`, `reversed(chapter) 9 chapter`→`reversed(chapter) 9 chapter 0`. **+5.** |
 | `css/css-lists/parsing/counter-reset-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #230.** Rejects `none chapter`, `reversed(none)`, `reversed(3)`, bare `3`, `99 imagenum` (leading integer), `section -1, imagenum 99` (comma), `section 3.14` (non-integer literal), and every CSS-wide keyword / `default` as a counter name. **+15.** |
 | `css/css-lists/parsing/counter-reset-computed.html` | 5/10 | **10/10** | ✅ 100% | **Quest #230.** `_computeCounter` folds each `<integer>` (cqZero collapses `sign(2cqw - 10px)` with no container). `myCounter calc(10 + (sign(2cqw - 10px) * 5))`→`myCounter 5`; `myCounter`→`myCounter 0`. **+5.** |

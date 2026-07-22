@@ -12291,6 +12291,13 @@ const _CSSUI_ENUM = {
   // filter-effects: `auto | sRGB | linearRGB`, canonicalized ASCII-lowercase
   // (`sRGB`→`srgb`, `LiNeArRgB`→`linearrgb`). Inherits; initial `linearrgb`.
   'color-interpolation-filters': new Set(['auto', 'srgb', 'linearrgb']),
+  // css-break fragmentation keywords. break-before/break-after share the full
+  // <break-inside> ∪ page/column/region break values; break-inside is the subset
+  // that only forbids a break INSIDE the box (no forced-break keywords).
+  'break-after': new Set(['auto', 'avoid', 'avoid-page', 'page', 'left', 'right', 'recto', 'verso', 'avoid-column', 'column', 'avoid-region', 'region']),
+  'break-before': new Set(['auto', 'avoid', 'avoid-page', 'page', 'left', 'right', 'recto', 'verso', 'avoid-column', 'column', 'avoid-region', 'region']),
+  'break-inside': new Set(['auto', 'avoid', 'avoid-page', 'avoid-column', 'avoid-region']),
+  'box-decoration-break': new Set(['slice', 'clone']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -12299,6 +12306,10 @@ const _CSSUI_VALIDATED = new Set([
   'box-sizing', 'resize', 'user-select', 'field-sizing', 'interactivity', 'outline-style',
   'caret-color', 'outline-color', 'text-overflow', 'outline-width', 'outline-offset', 'cursor',
   'color-interpolation-filters',
+  // css-break: break-*/box-decoration-break are keyword enums; orphans/widows are
+  // <integer [1,∞]> (validated below, a number-typed calc kept symbolic → folded
+  // at computed time).
+  'break-after', 'break-before', 'break-inside', 'box-decoration-break', 'orphans', 'widows',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -12376,6 +12387,21 @@ const _canonCssUi = (name, value) => {
   if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(s)) return s;      // CSS-wide / var()/env() → pass through
   const enumSet = _CSSUI_ENUM[name];
   if (enumSet) return enumSet.has(low) ? low : null;
+  if (name === 'orphans' || name === 'widows') {
+    // css-break: `<integer [1,∞]>`. A number-typed calc is kept symbolic here and
+    // folded/clamped at computed time; `auto`, a fractional/zero/negative literal,
+    // or more than one token (`1 234`) is invalid.
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    if (_MATHFN_NAME_RE.test(t)) {
+      const root = _parseCalcTree(t);
+      if (root === null || _mt(root, null) !== 'number') return null; // must be <number>/<integer>-typed
+      return _canonMathExpr(t) || t;
+    }
+    if (/^\+?\d+$/.test(t)) { const n = parseInt(t, 10); return n >= 1 ? String(n) : null; }
+    return null;
+  }
   if (name === 'caret-color' || name === 'outline-color') {
     // `[ auto | <color> ]` — caret-color takes one or two (the 2nd is the text
     // colour overlapping a block caret); outline-color takes exactly one.
@@ -19640,6 +19666,12 @@ const _normComputed = (el, kebab, v) => {
     const iv = _computeIntegerValue(el, s);
     if (iv === null) return v;
     const n = parseInt(iv, 10);
+    return String(isFinite(n) && n >= 1 ? n : 1);
+  }
+  if (kebab === 'orphans' || kebab === 'widows') {          // <integer [1,∞]> (calc folded, clamped ≥1)
+    const r = _computeIntegerValue(el, String(v).trim());
+    if (r === null) return v;
+    const n = parseInt(r, 10);
     return String(isFinite(n) && n >= 1 ? n : 1);
   }
   if (kebab === 'tab-size') {                              // <number [0,∞]> stays; <length> resolves to px, clamps ≥0
