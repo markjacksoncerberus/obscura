@@ -10489,7 +10489,12 @@ const _validSrgbHsl = (isHsl, inner) => {
 // Is `value` a syntactically valid CSS <color>? Used by CSS.supports().
 const _isValidColor = (value) => {
   if (!value) return false;
-  const low = String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim().toLowerCase();
+  // ASCII-lowercase (not Unicode) — CSS keyword matching is ASCII-case-insensitive,
+  // so a look-alike like the KELVIN SIGN (U+212A, which JS `.toLowerCase()` folds to
+  // ASCII `k`) must NOT turn `blacK` into the named colour `black`. Every CSS colour
+  // keyword and function name is ASCII, so `_asciiLower` is equivalent for the valid
+  // cases and correctly leaves non-ASCII code points untouched (→ no keyword match).
+  const low = _asciiLower(String(value).replace(/\/\*[\s\S]*?\*\//g, '').trim());
   if (low === 'transparent' || low === 'currentcolor' || _CSS_NAMED_COLORS[low] || _SYSTEM_COLORS.has(low)) return true;
   if (/^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(low)) return true;
   // alpha() relative-alpha function (CSS Color 5) — valid when its grammar + origin

@@ -306,7 +306,7 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #245).
 | `css/css-backgrounds/parsing/background-size-valid.html` | 7/9 | **9/9** | ✅ 100% | **Quest #193.** `1px` → `1px auto`, `auto auto` → `auto` canonicalization. **+2.** |
 | `css/css-backgrounds/parsing/background-size-computed.html` | 10/16 | **14/16** | ⬆️ | **Quest #193** (bonus — the longhand canon feeds the computed path). **+4** (2 caps: `calc(…+0.5em)` needs layout). |
 | `css/css-backgrounds/parsing/background-computed.html` | 37/39 | **39/39** | ✅ 100% | **Quest #193** (bonus — shorthand expansion feeds computed). **+2.** |
-| `css/css-color/parsing/color-invalid-named-color.html` | 1/184 | **153/184** | ⬆️ | **Quest #192 The Color Verdict.** Gated every `_COLOR_PROPS` setProperty on the (already-robust) `_isValidColor` — unknown idents like `redd` now rejected. **+152.** |
+| `css/css-color/parsing/color-invalid-named-color.html` | 1/184 | **184/184** | ✅ 100% | **Quest #192 → #248 The Kelvin Verdict.** `_isValidColor` now ASCII-lowercases (`_asciiLower`) instead of Unicode `.toLowerCase()`, so `blacK` (U+212A KELVIN SIGN) no longer folds to `black`. **+152, +31.** |
 | `css/css-color/parsing/color-invalid-relative-color.html` | 0/161 | **132/161** | ⬆️ | **Quest #192.** Relative-colour syntax structure validated via the gate. **+132.** |
 | `css/css-color/parsing/color-invalid-color-layers-function.html` | 0/93 | **93/93** | ✅ 100% | **Quest #192.** **+93.** |
 | `css/css-color/parsing/color-invalid-color-function.html` | 0/124 | **124/124** | ✅ 100% | **Quest #192 → #247 The Modern-Color Verdict.** `_modernColorParts` rejects comma'd/mis-`/`'d/bad-arity `color()` bodies. **+90, +34** (stash-proved). |
