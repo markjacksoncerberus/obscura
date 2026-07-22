@@ -899,6 +899,7 @@ const _parseStyleDecls = (text) => {
         if (!_isValidIndividualTransform(name, value)) continue;  // invalid scale/rotate/translate → drop
         value = _canonIndividualTransform(name, value, null, false);
       } else if (name === 'content') {
+        if (!_CSS_WIDE.has(value.toLowerCase()) && !_TF_VAR_RE.test(value) && !_isValidContent(value)) continue;  // invalid <content> → drop
         value = _canonContent(value, null, false);
       } else if (name === 'offset-rotate') {
         if (!_isValidOffsetRotate(value)) continue;        // invalid [auto|reverse]||<angle> → drop
@@ -1528,6 +1529,7 @@ class CSSStyleDeclaration {
       if (!_isValidIndividualTransform(name, stored)) return;  // invalid scale/rotate/translate → ignore
       stored = _canonIndividualTransform(name, stored, null, false);
     } else if (!custom && name === 'content') {
+      if (!_CSS_WIDE.has(stored.toLowerCase()) && !_TF_VAR_RE.test(stored) && !_isValidContent(stored)) return;  // invalid <content> → ignore
       stored = _canonContent(stored, null, false);
     } else if (!custom && name === 'offset-rotate') {
       if (!_isValidOffsetRotate(stored)) return;           // invalid [auto|reverse]||<angle> → ignore
@@ -18075,6 +18077,71 @@ const _canonCounterFns = (value) => {
     i = end;
   }
   return out;
+};
+// css-content: validate a `content` value against the CSS Content 3 grammar so an
+// out-of-grammar declaration is DROPPED (matching CSSOM) instead of stored raw.
+//   content = normal | none | [ <content-replacement> | <content-list> ]
+//             [ / [ <string> | <counter> ]+ ]?
+//   <content-list>        = [ <string> | contents | <image> | <counter> | <quote>
+//                             | <leader()> | attr() ]+
+//   <content-replacement> = <image>   (a lone <image> is also a valid list of one)
+//   <counter>             = counter( <counter-name> , <counter-style>? )
+//                         | counters( <counter-name> , <string> , <counter-style>? )
+//   <quote>               = open-quote | close-quote | no-open-quote | no-close-quote
+// CSS-wide keywords and var()/env() are gated OUT by the caller (they pass through).
+const _CONTENT_QUOTE_KW = new Set(['open-quote', 'close-quote', 'no-open-quote', 'no-close-quote']);
+const _isContentString = (t) =>
+  /^"(?:[^"\\]|\\[\s\S])*"$/.test(t) || /^'(?:[^'\\]|\\[\s\S])*'$/.test(t);
+// counter()/counters() with the required arg counts. counter(): <counter-name>
+// [, <counter-style>] (1–2 args). counters(): <counter-name>, <string> [,
+// <counter-style>] (2–3, the 2nd a <string> separator). Empty args reject
+// `counter()`/`counters(counter-name)`/trailing-comma forms.
+const _isContentCounter = (t) => {
+  const m = /^(counters?)\(([\s\S]*)\)$/i.exec(String(t).trim());
+  if (!m) return false;
+  const isCounters = m[1].toLowerCase() === 'counters';
+  const args = _splitCommaQuoted(m[2]).map((a) => a.trim());
+  if (args.some((a) => a === '')) return false;             // empty/missing arg
+  if (isCounters) return args.length >= 2 && args.length <= 3 && _isContentString(args[1]);
+  return args.length >= 1 && args.length <= 2;
+};
+const _isContentImage = (t) => _BG_IMAGE_FN_RE.test(String(t).trim());
+// attr() must carry a non-empty <attr-name> (bare `attr()` is invalid).
+const _isContentAttr = (t) => {
+  const m = /^attr\(([\s\S]*)\)$/i.exec(String(t).trim());
+  return !!m && m[1].trim() !== '';
+};
+const _isContentListItem = (t) => {
+  const low = String(t).toLowerCase();
+  if (_CONTENT_QUOTE_KW.has(low) || low === 'contents') return true;
+  return _isContentString(t) || _isContentCounter(t) || _isContentImage(t)
+    || _isContentAttr(t) || /^leader\(/i.test(low);
+};
+// The alt-text list after `/` is restricted to [ <string> | <counter> ]+ (no
+// <image>, no <quote>, no attr()/contents/leader).
+const _isContentAltItem = (t) => _isContentString(t) || _isContentCounter(t);
+const _isValidContent = (value) => {
+  // Neutralize CSS escapes (`counter(\})`, `counters(\}, ".")`) to a plain ident char
+  // BEFORE tokenizing — an escaped `}`/`)`/`,`/`"` would otherwise corrupt the
+  // paren/quote/comma bookkeeping of the shared _wsTokens/_splitCommaQuoted helpers.
+  // Validation never needs the literal character, only the token structure.
+  const s = String(value).trim().replace(/\\[\s\S]/g, 'a');
+  if (s === '') return false;
+  const low = s.toLowerCase();
+  if (low === 'normal' || low === 'none') return true;
+  const toks = _wsTokens(s);
+  if (!toks.length) return false;
+  const slash = toks.indexOf('/');
+  if (slash >= 0 && toks.indexOf('/', slash + 1) >= 0) return false;   // more than one `/`
+  const mainToks = slash < 0 ? toks : toks.slice(0, slash);
+  const altToks = slash < 0 ? null : toks.slice(slash + 1);
+  if (!mainToks.length) return false;                        // `/ …` with no content
+  for (const t of mainToks) if (!_isContentListItem(t)) return false;
+  if (altToks) {
+    if (!altToks.length) return false;                       // trailing `… /`
+    for (const t of altToks) if (!_isContentAltItem(t)) return false;
+  }
+  return true;
 };
 // css-content: canonicalize a `content` value — a list of content-items (strings,
 // counter()/counters(), url()/<image>, open-quote/close-quote/…) plus an optional
