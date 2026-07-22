@@ -9071,6 +9071,17 @@ const _LINE_STYLE_KW = new Set([
   'none', 'hidden', 'dotted', 'dashed', 'solid', 'double', 'groove', 'ridge', 'inset', 'outset',
 ]);
 const _LINE_WIDTH_KW = new Set(['thin', 'medium', 'thick']);
+// Computed <line-width> keyword → CSS px (the conventional thin/medium/thick map,
+// shared by Chrome/Firefox). border-*-width/outline-width resolve to these at
+// computed time (see the `_WIDTH_COMPUTED_PROPS` branch in `_normComputed`).
+const _LINE_WIDTH_PX = { thin: 1, medium: 3, thick: 5 };
+// border-*-width + outline-width computed value = an absolute <length>: a keyword
+// maps via `_LINE_WIDTH_PX`, everything else resolves through `_trComp` to px, is
+// clamped ≥0, and floors to an integer device pixel (`2.5px`→`2px`, DPR 1).
+const _WIDTH_COMPUTED_PROPS = new Set([
+  'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
+  'outline-width',
+]);
 const _isLengthTok = (t) =>
   /^[+-]?(\d*\.?\d+)(px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vi|vb|vmin|vmax|cm|mm|in|pt|pc|q)$/i.test(t)
   || /^calc\(/i.test(t) || /^(min|max|clamp)\(/i.test(t);
@@ -19674,6 +19685,14 @@ const _normComputed = (el, kebab, v) => {
     const n = parseInt(r, 10);
     return String(isFinite(n) && n >= 1 ? n : 1);
   }
+  if (_WIDTH_COMPUTED_PROPS.has(kebab)) {                    // border-*-width/outline-width → absolute px
+    const s = String(v).trim(), low = s.toLowerCase();
+    if (_LINE_WIDTH_PX[low] != null) return _LINE_WIDTH_PX[low] + 'px';
+    const px = _trComp(s, el, true, _vpUnits());            // <length>/calc → px (em/vw resolved)
+    const m = /^(-?[\d.]+(?:e[+-]?\d+)?)px$/i.exec(px);
+    if (m) { let n = parseFloat(m[1]); if (!(n > 0)) n = 0; return Math.floor(n) + 'px'; }
+    return px;                                               // unresolvable (e.g. symbolic %) → leave as-is
+  }
   if (kebab === 'tab-size') {                              // <number [0,∞]> stays; <length> resolves to px, clamps ≥0
     const s = String(v).trim();
     if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(s)) return s;
@@ -20283,6 +20302,16 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     if (kebab === 'transition') {
       const s = _serTransitionFromLonghands((ln) => resolve(ln));
       if (s !== '') return s;
+    }
+    // `border-width` shorthand: reconstruct from the COMPUTED edge longhands (each
+    // resolves keyword/em/calc → px), collapsing to the shortest 1–4 edge form. The
+    // longhand widths already fold via the `_WIDTH_COMPUTED_PROPS` branch, so this
+    // is the only place the shorthand needs teaching (border-style/-color shorthands
+    // keep their existing specified-echo path — untouched here).
+    if (kebab === 'border-width') {
+      const vals = ['top', 'right', 'bottom', 'left'].map((s) => resolve('border-' + s + '-width'));
+      if (vals.some((x) => !x)) return '';
+      return _serializeBoxValue(kebab, vals);
     }
     // `color` is inherited: resolve through the ancestor chain (also handles
     // `currentColor`, `inherit`, and the rgb(0, 0, 0) initial value).

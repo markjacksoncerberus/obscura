@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #232).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #233).
 
 ## Scoreboard
 
@@ -33,6 +33,8 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-21 (Quest #232).
 | `css/css-break/parsing/orphans-computed.html` | 2/3 | **3/3** | ✅ 100% | **Quest #232.** New `_normComputed` branch folds the calc via `_computeIntegerValue`, clamped ≥1: `calc(1 + 234)`→`235`. **+1.** |
 | `css/css-break/parsing/widows-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #232.** Same `<integer [1,∞]>` validation as orphans. **+5.** |
 | `css/css-break/parsing/widows-computed.html` | 2/3 | **3/3** | ✅ 100% | **Quest #232.** `calc(1 + 234)`→`235`. **+1.** |
+| `css/css-ui/parsing/outline-width-computed.html` | 5/9 | **9/9** | ✅ 100% | **Quest #233 The Width-Computed Verdict.** `outline-width`/`border-*-width` computed value = an absolute `<length>` but the engine echoed specified (`0.5em`→`0.5em`, thin/medium/thick kept as keywords, calc unfolded). New `_normComputed` `_WIDTH_COMPUTED_PROPS` branch: keyword→px via `_LINE_WIDTH_PX` (thin 1 / medium 3 / thick 5), else `_trComp`→px, clamped ≥0, floored to an integer device px. `2.5px`→`2px`, `0.5em`→`20px`, `calc(10px - 0.5em)`→`0px`, and thin/medium/thick match the border-*-width references. **+4.** |
+| `css/css-backgrounds/parsing/border-width-computed.html` | 7/11 | **11/11** | ✅ 100% | **Quest #233.** Same shared width-resolution primitive resolves each border-*-width longhand (fixing the `thin ≤ medium ≤ thick` numeric-ordering assertion that was NaN on keyword pass-through), and a new getComputedStyle resolve() branch reconstructs the `border-width` SHORTHAND from the computed longhands via `_serializeBoxValue` (`2px thin medium thick`→`2px 1px 3px 5px`, `0.5em`→`20px`). **+4.** |
 | `css/css-lists/parsing/counter-reset-valid.html` | 11/16 | **16/16** | ✅ 100% | **Quest #230 The Counter Verdict.** The whole `counter-reset`/`-increment`/`-set` family was raw-store (stored verbatim, no grammar check → every `-invalid` at 0/N, no computed fold). Grammar `[ <counter-name> <integer>? \| <reversed-counter-name> <integer>? ]+ \| none` (reversed reset-only). `_canonCounter` tokenizes via `_gridLineTokens` (escape/paren aware), validates each `<counter-name>` (`<custom-ident>` minus CSS-wide/`default`/`none`) + optional `<integer>` (literal or `_canonMathExpr`'d calc), and fills the omitted default (`0`, or `1` for increment) on every plain name — a `reversed()` name with no integer keeps none. `chapter`→`chapter 0`, `reversed(chapter) 9 chapter`→`reversed(chapter) 9 chapter 0`. **+5.** |
 | `css/css-lists/parsing/counter-reset-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #230.** Rejects `none chapter`, `reversed(none)`, `reversed(3)`, bare `3`, `99 imagenum` (leading integer), `section -1, imagenum 99` (comma), `section 3.14` (non-integer literal), and every CSS-wide keyword / `default` as a counter name. **+15.** |
 | `css/css-lists/parsing/counter-reset-computed.html` | 5/10 | **10/10** | ✅ 100% | **Quest #230.** `_computeCounter` folds each `<integer>` (cqZero collapses `sign(2cqw - 10px)` with no container). `myCounter calc(10 + (sign(2cqw - 10px) * 5))`→`myCounter 5`; `myCounter`→`myCounter 0`. **+5.** |
