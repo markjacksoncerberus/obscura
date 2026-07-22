@@ -12354,6 +12354,13 @@ const _CSSUI_ENUM = {
   'caption-side': new Set(['top', 'bottom']),
   'empty-cells': new Set(['show', 'hide']),
   'table-layout': new Set(['auto', 'fixed']),
+  // css-ruby single-keyword enums (ruby-overhang has a `none`→`spaces` alias, so it
+  // is handled by a dedicated `_canonCssUi` branch, not here). ruby-position's full
+  // `[ alternate || [over|under] ] | inter-character` grammar is not exercised by the
+  // WPT (only over/under/inter-character), so a plain enum is the tested-surface scope.
+  'ruby-align': new Set(['start', 'center', 'space-between', 'space-around']),
+  'ruby-merge': new Set(['separate', 'merge', 'auto']),
+  'ruby-position': new Set(['over', 'under', 'inter-character']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -12370,6 +12377,8 @@ const _CSSUI_VALIDATED = new Set([
   'direction', 'text-combine-upright', 'text-orientation', 'unicode-bidi', 'writing-mode',
   // css-tables: four keyword enums + border-spacing (`<length [0,∞]>{1,2}`).
   'border-collapse', 'caption-side', 'empty-cells', 'table-layout', 'border-spacing',
+  // css-ruby: three keyword enums + ruby-overhang (`auto | spaces`, legacy `none`→`spaces`).
+  'ruby-align', 'ruby-merge', 'ruby-position', 'ruby-overhang',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -12536,6 +12545,17 @@ const _canonCssUi = (name, value) => {
       return null;                                               // percentage / unitless non-zero / keyword → invalid
     }
     return out.join(' ');
+  }
+  if (name === 'ruby-overhang') {
+    // css-ruby: `auto | spaces`. The legacy `none` keyword is accepted and
+    // canonicalized to `spaces` (per the WPT: `ruby-overhang: none` → `spaces`).
+    // Any other keyword (`simple`) or two-token value is invalid.
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const tl = toks[0].toLowerCase();
+    if (tl === 'auto' || tl === 'spaces') return tl;
+    if (tl === 'none') return 'spaces';
+    return null;
   }
   if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;

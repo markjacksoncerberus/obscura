@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #241).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #242).
 
 ## Scoreboard
 
@@ -20,6 +20,11 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #241).
 | `css/css-sizing/parsing/min-width-computed.html` | 10/11 | **11/11** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
 | `css/css-sizing/parsing/max-height-computed.html` | 11/12 | **12/12** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
 | `css/css-sizing/parsing/min-height-computed.html` | 10/11 | **11/11** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
+| `css/css-ruby/parsing/ruby-overhang-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #242 The Ruby-Grammar Verdict.** All four css-ruby properties were raw-store (unregistered but stored-raw so valid round-tripped; every `-invalid` 0/N). Three are keyword enums (ruby-align `start\|center\|space-between\|space-around`, ruby-merge `separate\|merge\|auto`, ruby-position `over\|under\|inter-character`) → `_CSSUI_ENUM`+`_CSSUI_VALIDATED`. `ruby-overhang` = `auto\|spaces` with a legacy `none`→`spaces` alias → a dedicated `_canonCssUi` branch. No `_GCS_DEFAULTS` registration (no computed tests; property-order held 1/1). **+11.** |
+| `css/css-ruby/parsing/ruby-align-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #242.** Enum `start\|center\|space-between\|space-around`. **+4.** |
+| `css/css-ruby/parsing/ruby-merge-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #242.** Enum `separate\|merge\|auto` (rejects `collapse`/`none`/two-keyword). **+6.** |
+| `css/css-ruby/parsing/ruby-position-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #242.** Enum `over\|under\|inter-character` (rejects `above`/`over under`). **+5.** |
+| `css/css-ruby/parsing/ruby-overhang-valid.html` | 2/3 | **3/3** | ✅ 100% | **Quest #242.** Legacy `ruby-overhang: none` canonicalizes to `spaces`. **+1.** |
 | `css/css-tables/parsing/border-spacing-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #241 The Table-Grammar Verdict.** All five css-tables properties were raw-store (every `-invalid` 0/N; border-spacing-computed 1/4, valid 2/3). Four are keyword enums (border-collapse `separate\|collapse`, caption-side `top\|bottom`, empty-cells `show\|hide`, table-layout `auto\|fixed`) → added to `_CSSUI_ENUM`+`_CSSUI_VALIDATED`. `border-spacing` = `<length [0,∞]>{1,2}` (no %, no unitless-non-zero) got the full treatment: a `_canonCssUi` branch (1–2 non-negative lengths, calc kept symbolic) + a `_normComputed` branch (each component `_trComp`→px, clamp≥0, equal pair collapses). **+4.** |
 | `css/css-tables/parsing/border-collapse-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #241.** Enum `separate\|collapse` via `_CSSUI_ENUM`. **+2.** |
 | `css/css-tables/parsing/caption-side-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #241.** Enum `top\|bottom` (rejects `auto`/`left`/`right`/two-keyword). **+4.** |
