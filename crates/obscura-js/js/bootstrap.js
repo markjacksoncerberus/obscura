@@ -12349,6 +12349,11 @@ const _CSSUI_ENUM = {
   'text-orientation': new Set(['mixed', 'upright', 'sideways']),
   'unicode-bidi': new Set(['normal', 'embed', 'isolate', 'bidi-override', 'isolate-override', 'plaintext']),
   'writing-mode': new Set(['horizontal-tb', 'vertical-rl', 'vertical-lr', 'sideways-rl', 'sideways-lr']),
+  // css-tables single-keyword enums (border-spacing is <length>{1,2}, handled below).
+  'border-collapse': new Set(['separate', 'collapse']),
+  'caption-side': new Set(['top', 'bottom']),
+  'empty-cells': new Set(['show', 'hide']),
+  'table-layout': new Set(['auto', 'fixed']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -12363,6 +12368,8 @@ const _CSSUI_VALIDATED = new Set([
   'break-after', 'break-before', 'break-inside', 'box-decoration-break', 'orphans', 'widows',
   // css-writing-modes keyword enums (reject `auto`/two-keyword combos).
   'direction', 'text-combine-upright', 'text-orientation', 'unicode-bidi', 'writing-mode',
+  // css-tables: four keyword enums + border-spacing (`<length [0,∞]>{1,2}`).
+  'border-collapse', 'caption-side', 'empty-cells', 'table-layout', 'border-spacing',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -12510,6 +12517,25 @@ const _canonCssUi = (name, value) => {
     if (_isZeroTok(t)) return '0px';
     if (_isLengthTok(t)) return _canonLineWidth(t);
     return null;
+  }
+  if (name === 'border-spacing') {
+    // `<length [0,∞]>{1,2}` (css-tables): one or two non-negative lengths (no
+    // percentage). Unitless 0 → 0px; a literal negative length is invalid; a length
+    // calc is kept symbolic (folded/clamped at computed time). Each component is
+    // canonicalized independently (a distinct pair is NOT collapsed at specified
+    // time — that only happens in computed).
+    const toks = _wsTokens(s);
+    if (toks.length < 1 || toks.length > 2) return null;
+    const out = [];
+    for (const t of toks) {
+      if (_isZeroTok(t)) { out.push('0px'); continue; }
+      if (_isLengthTok(t)) {
+        if (/^-/.test(t) && !_MATHFN_NAME_RE.test(t)) return null; // literal negative → invalid
+        out.push(_canonLineWidth(t)); continue;
+      }
+      return null;                                               // percentage / unitless non-zero / keyword → invalid
+    }
+    return out.join(' ');
   }
   if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;
@@ -19819,6 +19845,18 @@ const _normComputed = (el, kebab, v) => {
       if (toks.length === 2) return _canonMaskRepeat2(toks[0].toLowerCase(), toks[1].toLowerCase());
       return layer.trim();
     }).join(', ');
+  }
+  if (kebab === 'border-spacing') {
+    // `<length [0,∞]>{1,2}` (css-tables): the horizontal (and optional vertical)
+    // inter-cell spacing. Computed = each component resolved to px (em/calc folded),
+    // a resolved negative clamped to 0. An equal pair collapses to a single value
+    // (`0 0`→`0px`), a distinct pair stays two (`10px 20px`).
+    const toks = _wsTokens(String(v).trim());
+    if (toks.length < 1 || toks.length > 2) return v;
+    const h = _clampNegPx(_trComp(toks[0], el, true, _vpUnits()));
+    if (toks.length === 1) return h;
+    const w = _clampNegPx(_trComp(toks[1], el, true, _vpUnits()));
+    return h === w ? h : h + ' ' + w;
   }
   if (kebab === 'text-decoration-inset') return _computeTextDecorationInset(el, v);
   if (_COUNTER_VALIDATED.has(kebab)) return _computeCounter(el, v);

@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #240).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #241).
 
 ## Scoreboard
 
@@ -20,6 +20,13 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #240).
 | `css/css-sizing/parsing/min-width-computed.html` | 10/11 | **11/11** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
 | `css/css-sizing/parsing/max-height-computed.html` | 11/12 | **12/12** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
 | `css/css-sizing/parsing/min-height-computed.html` | 10/11 | **11/11** | ✅ 100% | **Quest #236.** Same fit-content root cause. **+1.** |
+| `css/css-tables/parsing/border-spacing-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #241 The Table-Grammar Verdict.** All five css-tables properties were raw-store (every `-invalid` 0/N; border-spacing-computed 1/4, valid 2/3). Four are keyword enums (border-collapse `separate\|collapse`, caption-side `top\|bottom`, empty-cells `show\|hide`, table-layout `auto\|fixed`) → added to `_CSSUI_ENUM`+`_CSSUI_VALIDATED`. `border-spacing` = `<length [0,∞]>{1,2}` (no %, no unitless-non-zero) got the full treatment: a `_canonCssUi` branch (1–2 non-negative lengths, calc kept symbolic) + a `_normComputed` branch (each component `_trComp`→px, clamp≥0, equal pair collapses). **+4.** |
+| `css/css-tables/parsing/border-collapse-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #241.** Enum `separate\|collapse` via `_CSSUI_ENUM`. **+2.** |
+| `css/css-tables/parsing/caption-side-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #241.** Enum `top\|bottom` (rejects `auto`/`left`/`right`/two-keyword). **+4.** |
+| `css/css-tables/parsing/empty-cells-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #241.** Enum `show\|hide`. **+2.** |
+| `css/css-tables/parsing/table-layout-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #241.** Enum `auto\|fixed`. **+2.** |
+| `css/css-tables/parsing/border-spacing-computed.html` | 1/4 | **4/4** | ✅ 100% | **Quest #241.** `_normComputed` folds each length to px (`calc(10px + 0.5em) calc(10px - 0.5em)`→`30px 0px`), clamps resolved negatives to 0, collapses an equal pair (`0`→`0px`). **+3.** |
+| `css/css-tables/parsing/border-spacing-valid.html` | 2/3 | **3/3** | ✅ 100% | **Quest #241.** Specified calc canon per component (`calc(10px + 0.5em)`→`calc(0.5em + 10px)`). **+1.** |
 | `css/css-writing-modes/parsing/direction-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #240 The Writing-Modes-Enum Verdict.** The five css-writing-modes keyword-enum properties (`direction`/`text-combine-upright`/`text-orientation`/`unicode-bidi`/`writing-mode`) were registered but stored raw — valid keywords round-tripped (`-computed` passed) but nothing rejected `auto` or two-keyword combos, so every `-invalid` was 0/2. Added all five to `_CSSUI_ENUM` + `_CSSUI_VALIDATED`; the setProperty path's generic `_canonCssUi` enum branch now rejects out-of-grammar values. **+2.** |
 | `css/css-writing-modes/parsing/text-combine-upright-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #240.** Same enum vein (`none|all`; `digits` form a documented scope note). **+2.** |
 | `css/css-writing-modes/parsing/text-orientation-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #240.** Same enum vein (`mixed|upright|sideways`). **+2.** |
