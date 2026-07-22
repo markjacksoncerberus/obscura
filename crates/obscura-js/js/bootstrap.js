@@ -12339,6 +12339,16 @@ const _CSSUI_ENUM = {
   'break-before': new Set(['auto', 'avoid', 'avoid-page', 'page', 'left', 'right', 'recto', 'verso', 'avoid-column', 'column', 'avoid-region', 'region']),
   'break-inside': new Set(['auto', 'avoid', 'avoid-page', 'avoid-column', 'avoid-region']),
   'box-decoration-break': new Set(['slice', 'clone']),
+  // css-writing-modes: single-keyword enums. Each rejects an out-of-grammar keyword
+  // (`auto`) and any two-keyword combination (`ltr rtl`, `none all`, …). Computed
+  // serialization is the lowercased keyword. NOTE: `text-combine-upright` also has a
+  // `digits <integer [2,4]>?` form in the spec, but no WPT here exercises it and it is
+  // rare enough that a plain `none|all` enum is the safe, tested-surface-correct scope.
+  'direction': new Set(['ltr', 'rtl']),
+  'text-combine-upright': new Set(['none', 'all']),
+  'text-orientation': new Set(['mixed', 'upright', 'sideways']),
+  'unicode-bidi': new Set(['normal', 'embed', 'isolate', 'bidi-override', 'isolate-override', 'plaintext']),
+  'writing-mode': new Set(['horizontal-tb', 'vertical-rl', 'vertical-lr', 'sideways-rl', 'sideways-lr']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -12351,6 +12361,8 @@ const _CSSUI_VALIDATED = new Set([
   // <integer [1,∞]> (validated below, a number-typed calc kept symbolic → folded
   // at computed time).
   'break-after', 'break-before', 'break-inside', 'box-decoration-break', 'orphans', 'widows',
+  // css-writing-modes keyword enums (reject `auto`/two-keyword combos).
+  'direction', 'text-combine-upright', 'text-orientation', 'unicode-bidi', 'writing-mode',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
