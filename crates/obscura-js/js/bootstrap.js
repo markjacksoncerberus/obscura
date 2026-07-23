@@ -9180,6 +9180,11 @@ const _GCS_DEFAULTS = {
   'vertical-align': 'baseline',
   // css-box margin-trim — does not inherit; initial `none`.
   'margin-trim': 'none',
+  // css-rhythm block-step-* — none inherit. Initials: size `none`, insert
+  // `margin-box`, align `auto`, round `up`. The three enums compute to identity;
+  // block-step-size folds its length to px (see _normComputed).
+  'block-step-size': 'none', 'block-step-insert': 'margin-box',
+  'block-step-align': 'auto', 'block-step-round': 'up',
   // css-align (shared with css-flexbox) — none inherit.
   'align-content': 'normal', 'align-items': 'normal', 'align-self': 'auto',
   'column-gap': 'normal', 'justify-content': 'normal', 'justify-items': 'legacy center',
@@ -13037,6 +13042,16 @@ const _CSSUI_ENUM = {
   // normal`. Rejects `true`/`10px`/`default`/`none`/`auto`. Computed = keyword identity.
   'column-rule-visibility-items': new Set(['all', 'around', 'between', 'normal']),
   'row-rule-visibility-items': new Set(['all', 'around', 'between', 'normal']),
+  // css-rhythm (Rhythmic Sizing 1) block-step-* keyword longhands. block-step-align
+  // = where the box sits within its (larger) stepped block size; block-step-insert =
+  // which box edge the extra space is inserted into (the -box keywords, NOT
+  // `margin`/`padding`/`border-box`); block-step-round = how the size rounds to a
+  // multiple of the step. Each rejects any two-keyword combination and out-of-grammar
+  // token; computed = the lowercased keyword. (block-step-size is a <length>, handled
+  // by a dedicated _canonCssUi branch.)
+  'block-step-align': new Set(['auto', 'center', 'start', 'end']),
+  'block-step-insert': new Set(['margin-box', 'padding-box', 'content-box']),
+  'block-step-round': new Set(['up', 'down', 'nearest']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -13061,6 +13076,10 @@ const _CSSUI_VALIDATED = new Set([
   'column-rule-break', 'row-rule-break',
   // css-gaps rule-visibility-items longhands (keyword identity, computed = specified).
   'column-rule-visibility-items', 'row-rule-visibility-items',
+  // css-rhythm block-step-* longhands: three keyword enums (align/insert/round) +
+  // block-step-size (`none | <length [0,∞]>`, a dedicated _canonCssUi branch + a
+  // computed px-fold in _normComputed).
+  'block-step-align', 'block-step-insert', 'block-step-round', 'block-step-size',
   // css-inline line-height (`normal | <number> | <length-percentage>`, non-negative)
   // + baseline-shift (`<length-percentage> | sub | super | top | center | bottom`)
   // + vertical-align (`[first|last] || <alignment-baseline> || <baseline-shift>`).
@@ -13242,6 +13261,22 @@ const _canonCssUi = (name, value) => {
       return null;                                               // percentage / unitless non-zero / keyword → invalid
     }
     return out.join(' ');
+  }
+  if (name === 'block-step-size') {
+    // css-rhythm (Rhythmic Sizing 1): `none | <length [0,∞]>`. A single token —
+    // `none`, a non-negative literal length (unitless 0 → 0px), or a length-typed
+    // calc kept symbolic (folded/clamped at computed time). A literal negative, a
+    // percentage, a unitless non-zero, `auto`, or more than one token is invalid.
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    if (t.toLowerCase() === 'none') return 'none';
+    if (_isZeroTok(t)) return '0px';
+    if (_isLengthTok(t)) {
+      if (/^-/.test(t) && !_MATHFN_NAME_RE.test(t)) return null;  // literal negative → invalid
+      return _canonLineWidth(t);
+    }
+    return null;                                                 // %/unitless/keyword → invalid
   }
   if (name === 'ruby-overhang') {
     // css-ruby: `auto | spaces`. The legacy `none` keyword is accepted and
@@ -21401,6 +21436,14 @@ const _normComputed = (el, kebab, v) => {
     if (toks.length === 1) return h;
     const w = _clampNegPx(_trComp(toks[1], el, true, _vpUnits()));
     return h === w ? h : h + ' ' + w;
+  }
+  if (kebab === 'block-step-size') {
+    // css-rhythm: `none | <length [0,∞]>`. Computed = `none` unchanged, else the
+    // length resolved to px (em/calc folded against this element's font-size), a
+    // resolved negative clamped to 0 (`calc(10px - 0.5em)`@40px → -10 → 0px).
+    const t = String(v).trim();
+    if (t.toLowerCase() === 'none') return 'none';
+    return _clampNegPx(_trComp(t, el, true, _vpUnits()));
   }
   if (kebab === 'line-height') return _computeLineHeight(el, v);
   if (kebab === 'baseline-shift') return _computeBaselineShift(el, v);

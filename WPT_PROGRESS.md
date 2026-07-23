@@ -10,12 +10,21 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #266 — css-gaps rule-inset + rule-visibility-items SECURED; the whole rule-inset/visibility vein +854).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #267 — css-rhythm `block-step-*` longhands SECURED; +65).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-rhythm/parsing/block-step-align-invalid.html` | 0/13 | **13/13** | ✅ 100% | **Quest #267 The Block-Step Longhand Verdict.** `block-step-align` = `auto\|center\|start\|end` → `_CSSUI_ENUM`+`_CSSUI_VALIDATED`. (block-step-round-invalid.html also tests this prop — a WPT copy-paste.) |
+| `css/css-rhythm/parsing/block-step-align-computed.html` | 0/4 | **4/4** | ✅ 100% | **Quest #267.** Computed = keyword identity (initial `auto`). |
+| `css/css-rhythm/parsing/block-step-insert-invalid.html` | 0/12 | **12/12** | ✅ 100% | **Quest #267.** `block-step-insert` = `margin-box\|padding-box\|content-box` (the `-box` keywords only) → `_CSSUI_ENUM`. |
+| `css/css-rhythm/parsing/block-step-insert-computed.html` | 0/3 | **3/3** | ✅ 100% | **Quest #267.** Identity (initial `margin-box`). |
+| `css/css-rhythm/parsing/block-step-round-invalid.html` | 0/18 | **18/18** | ✅ 100% | **Quest #267.** Tests `block-step-align` (WPT copy-paste) — covered by the align enum. |
+| `css/css-rhythm/parsing/block-step-round-computed.html` | 0/3 | **3/3** | ✅ 100% | **Quest #267.** `block-step-round` = `up\|down\|nearest`; identity (initial `up`). |
+| `css/css-rhythm/parsing/block-step-size-valid.html` | 5/6 | **6/6** | ✅ 100% | **Quest #267.** `block-step-size` = `none \| <length [0,∞]>` via a dedicated `_canonCssUi` branch (modelled on `border-spacing`). |
+| `css/css-rhythm/parsing/block-step-size-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #267.** Rejects `auto`/`-1px`/`min-content`/`10%`/unitless `20`. |
+| `css/css-rhythm/parsing/block-step-size-computed.html` | 0/6 | **6/6** | ✅ 100% | **Quest #267.** `_normComputed`: `none` unchanged, else length→px (`_trComp`), negative clamped to 0. |
 | `css/css-gaps/parsing/rule-inset-valid.html` | 30/51 | **51/51** | ✅ 100% | **Quest #266 The Rule-Inset & Visibility Verdict.** Registered the `inset` super-shorthand (`quad` shape): `{axis}-rule-inset` + bidi `rule-inset`, value `<iv>{1,2} [ / <iv>{1,2} ]?` (pre-slash cap, post-slash junction). Serialization: all-four-equal→single value, else `cs ce / js je`. |
 | `css/css-gaps/parsing/rule-inset-invalid.html` | 0/30 | **30/30** | ✅ 100% | **Quest #266.** Rejects >1 slash, empty side, >2 per side (`_slashSplitTop` + `_parseInsetPair`). |
 | `css/css-gaps/parsing/rule-inset-computed.html` | 0/45 | **45/45** | ✅ 100% | **Quest #266.** |
