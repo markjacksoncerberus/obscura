@@ -13086,6 +13086,11 @@ const _CSSUI_ENUM = {
   'block-step-align': new Set(['auto', 'center', 'start', 'end']),
   'block-step-insert': new Set(['margin-box', 'padding-box', 'content-box']),
   'block-step-round': new Set(['up', 'down', 'nearest']),
+  // css-color-adjust: forced-color-adjust = `auto | none | preserve-parent-color`
+  // (inherited). Rejects `1`/`default` and any two-keyword combination. color-scheme
+  // has a richer grammar (`normal | [light|dark|<custom-ident>]+ && only?`) handled by
+  // a dedicated _canonCssUi branch.
+  'forced-color-adjust': new Set(['auto', 'none', 'preserve-parent-color']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -13114,6 +13119,9 @@ const _CSSUI_VALIDATED = new Set([
   // block-step-size (`none | <length [0,∞]>`, a dedicated _canonCssUi branch + a
   // computed px-fold in _normComputed).
   'block-step-align', 'block-step-insert', 'block-step-round', 'block-step-size',
+  // css-color-adjust: forced-color-adjust (enum) + color-scheme (`normal |
+  // [light|dark|<custom-ident>]+ && only?`, a dedicated _canonCssUi branch).
+  'forced-color-adjust', 'color-scheme',
   // css-inline line-height (`normal | <number> | <length-percentage>`, non-negative)
   // + baseline-shift (`<length-percentage> | sub | super | top | center | bottom`)
   // + vertical-align (`[first|last] || <alignment-baseline> || <baseline-shift>`).
@@ -13199,6 +13207,40 @@ const _serCursor = (value, computed, el) => {
   }
   out.push(kw);
   return out.join(', ');
+};
+// css-color-adjust: `color-scheme = normal | [ light | dark | <custom-ident> ]+ && only?`.
+// `normal` stands alone. Otherwise a run of one-or-more scheme idents (light/dark are
+// keywords, anything else a <custom-ident> — `none` and `purple` are ordinary custom
+// idents here) plus an optional `only` keyword which, per the `&&`, may sit only at the
+// very start or very end of the run (never interleaved) and at most once. `<custom-ident>`
+// excludes the CSS-wide keywords, `default`, and the property's own keywords
+// (normal/light/dark/only). Serialization keeps the scheme idents in author order and
+// moves `only` to the end (`only light`→`light only`, `only none`→`none only`).
+const _COLOR_SCHEME_RESERVED = new Set(['normal', 'light', 'dark', 'only', 'default']);
+const _canonColorScheme = (value) => {
+  const s = String(value).trim();
+  if (s.toLowerCase() === 'normal') return 'normal';
+  if (s.indexOf(',') >= 0) return null;                        // a comma list is invalid
+  const toks = _wsTokens(s);
+  if (!toks.length) return null;
+  const schemes = [];
+  let only = false;
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    const low = t.toLowerCase();
+    if (low === 'only') {
+      if (only) return null;                                   // a second `only`
+      if (i !== 0 && i !== toks.length - 1) return null;       // `only` only at a run end
+      only = true;
+      continue;
+    }
+    if (low === 'light' || low === 'dark') { schemes.push(low); continue; }
+    if (!_GRID_CI_RE.test(t)) return null;                     // not a valid CSS ident
+    if (_COLOR_SCHEME_RESERVED.has(low) || _CSS_WIDE.has(low)) return null;  // reserved / CSS-wide
+    schemes.push(t);                                           // <custom-ident> (case-preserved)
+  }
+  if (!schemes.length) return null;                            // `only` with no scheme ident
+  return only ? schemes.join(' ') + ' only' : schemes.join(' ');
 };
 const _canonCssUi = (name, value) => {
   const s = String(value).trim();
@@ -13312,6 +13354,7 @@ const _canonCssUi = (name, value) => {
     }
     return null;                                                 // %/unitless/keyword → invalid
   }
+  if (name === 'color-scheme') return _canonColorScheme(s);
   if (name === 'ruby-overhang') {
     // css-ruby: `auto | spaces`. The legacy `none` keyword is accepted and
     // canonicalized to `spaces` (per the WPT: `ruby-overhang: none` → `spaces`).

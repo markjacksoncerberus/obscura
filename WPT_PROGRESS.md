@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #268 — the whole css-rhythm `block-step` family SECURED; +131 across #267–#268).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #269 — color-scheme + forced-color-adjust SECURED; +29).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-color-adjust/parsing/color-scheme-valid.html` | 17/22 | **22/22** | ✅ 100% | **Quest #269 The Color-Scheme Verdict.** `color-scheme` = `normal \| [light\|dark\|<custom-ident>]+ && only?` via `_canonColorScheme`; `only` moves to the end (`only light`→`light only`). |
+| `css/css-color-adjust/parsing/color-scheme-invalid.html` | 0/16 | **16/16** | ✅ 100% | **Quest #269.** Rejects `normal` combined, `only` interleaved/doubled, `default`, a comma list, CSS-wide as a custom-ident. |
+| `css/css-color-adjust/parsing/color-scheme-computed.html` | 11/13 | **13/13** | ✅ 100% | **Quest #269.** Computed = stored canonical (identity). |
+| `css/css-forced-color-adjust/parsing/forced-color-adjust-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #269.** `forced-color-adjust` = `auto\|none\|preserve-parent-color` → `_CSSUI_ENUM`. |
 | `css/css-rhythm/parsing/block-step-valid.html` | 9/34 | **34/34** | ✅ 100% | **Quest #268 The Block-Step Shorthand Verdict.** `block-step` = `||` of the 4 longhands via `_expandBlockStep`/`_serBlockStep` (serialized size·insert·align·round, defaults dropped, all-default→`none`). Wired like `flex-flow`. |
 | `css/css-rhythm/parsing/block-step-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #268.** Rejects a duplicate longhand (`auto auto`, `none none`, `300px none`) + a token in no category (`border-box`). |
 | `css/css-rhythm/parsing/block-step-computed.html` | 0/34 | **34/34** | ✅ 100% | **Quest #268.** Resolver reconstructs from COMPUTED longhands (size folds em→px). |
