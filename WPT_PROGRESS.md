@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #271 — css-page `page` property SECURED; +11).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #272 — css-page `size`/`page-orientation` descriptor rejection; +19).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-page/parsing/size-invalid.html` | 0/14 | **14/14** | ✅ 100% | **Quest #272 The Descriptor-Rejection Verdict.** `size` is an @page DESCRIPTOR — `_DESCRIPTOR_ONLY` blocklist rejects it as an element property (inline parser + setProperty). |
+| `css/css-page/parsing/page-orientation-invalid.tentative.html` | 0/4 | **4/4** | ✅ 100% | **Quest #272.** `page-orientation` likewise rejected as an element property. |
+| `css/css-page/parsing/page-orientation-computed.tentative.html` | 0/1 | **1/1** | ✅ 100% | **Quest #272.** Inline `style="page-orientation:…"` stripped from the getComputedStyle cascade → computed "". |
 | `css/css-page/parsing/page-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #271 The Page-Name Verdict.** `page` = `auto\|<custom-ident>` → dedicated `_canonCssUi` branch (rejects `not valid`, `not,valid`, `123px`, `calc(10%+1px)`, `default`). |
 | `css/css-page/parsing/page-computed.html` | 0/6 | **6/6** | ✅ 100% | **Quest #271.** Registered `page:auto` in `_GCS_DEFAULTS`; computed = specified (`AUTO`→`auto`, `TABLE`/`BLABLABLA` case-preserved). |
 | `css/css-position/parsing/position-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #270 The Position-Offset Verdict.** `position` = `static\|relative\|absolute\|sticky\|fixed` → `_CSSUI_ENUM`+`_CSSUI_VALIDATED` (rejects `auto`, `static relative`). |

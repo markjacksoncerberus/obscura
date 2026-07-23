@@ -823,6 +823,12 @@ const _isBalancedDeclValue = (value) => {
 // list of { name, value, important }. Invalid custom-property names are dropped;
 // standard names are ASCII-lowercased (custom names keep their case); standard
 // values are trimmed (empty → dropped), custom values canonicalized.
+// CSS descriptors that are ONLY valid inside an at-rule (never as an element's style
+// property). Setting one on an element — inline `style="…"` or `el.style.size = …` —
+// must be ignored (CSSOM), and it must never appear in getComputedStyle. `size` and
+// `page-orientation` are `@page` descriptors (css-page-3). (The `@page` rule itself is
+// a separate CSSOM path; this only blocks the element-property misuse.)
+const _DESCRIPTOR_ONLY = new Set(['size', 'page-orientation']);
 const _parseStyleDecls = (text) => {
   const out = [];
   for (const part of String(text == null ? '' : text).split(';')) {
@@ -840,6 +846,7 @@ const _parseStyleDecls = (text) => {
       value = _canonCustomValue(value);
     } else {
       name = name.toLowerCase();
+      if (_DESCRIPTOR_ONLY.has(name)) continue;            // @page descriptor set as an element property → drop
       value = value.trim();
       if (value === '') continue;
       value = _canonStandardValue(value);
@@ -1218,7 +1225,7 @@ class CSSStyleDeclaration {
     name = String(name);
     const custom = name.startsWith('--');
     if (custom) { if (!_isValidCustomPropName(name)) return; }
-    else name = name.toLowerCase();
+    else { name = name.toLowerCase(); if (_DESCRIPTOR_ONLY.has(name)) return; }  // @page descriptor as element property → ignore
     value = String(value == null ? '' : value);
     if (custom && value !== '' && !_isBalancedDeclValue(value)) return; // invalid <declaration-value> → ignore
     if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
@@ -22064,7 +22071,13 @@ const _buildCascade = (el) => {
     // Inline style — highest author source at each importance level.
     let inlineText = '';
     try { inlineText = el.getAttribute && el.getAttribute('style'); } catch { inlineText = ''; }
-    if (inlineText) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC, decls: _cssParseDecls(inlineText) });
+    if (inlineText) {
+      const decls = _cssParseDecls(inlineText);
+      // @page (and other at-rule-only) descriptors are invalid as element properties:
+      // an inline `style="page-orientation:…"` must not reach the computed value.
+      for (const dn of _DESCRIPTOR_ONLY) delete decls[dn];
+      sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC, decls });
+    }
     // Live CSSOM inline declarations (`el.style.foo = …`) set through the object
     // model do NOT reflect into the style="" attribute read above, yet they are
     // the highest-priority *normal* author source — above every <style> rule (an
