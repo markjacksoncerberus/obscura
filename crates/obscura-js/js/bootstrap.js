@@ -9126,6 +9126,7 @@ const _GCS_DEFAULTS = {
   'forced-color-adjust': 'auto', 'print-color-adjust': 'economy',
   // css-anchor-position — none inherit. Computed = specified (canonical keyword/list).
   'position-visibility': 'anchors-visible', 'position-try-order': 'normal', 'anchor-scope': 'none',
+  'position-try-fallbacks': 'none',
 };
 // ---------------------------------------------------------------------------
 // Shorthand → longhand expansion (for the cascade / getComputedStyle).
@@ -12933,6 +12934,9 @@ const _CSSUI_VALIDATED = new Set([
   // (`always | anchors-valid || anchors-visible || no-overflow`), anchor-scope
   // (`none | all | <dashed-ident>#`) — the last two have dedicated _canonCssUi branches.
   'position-try-order', 'position-visibility', 'anchor-scope',
+  // css-anchor-position: position-try-fallbacks — `none | [ [<dashed-ident> ||
+  // <try-tactic>] | <'position-area'> ]#` (dedicated _canonCssUi branch).
+  'position-try-fallbacks',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13148,6 +13152,7 @@ const _canonCssUi = (name, value) => {
   if (name === 'margin-trim') return _canonMarginTrim(s, false);
   if (name === 'position-visibility') return _canonPositionVisibility(s);
   if (name === 'anchor-scope') return _canonAnchorScope(s);
+  if (name === 'position-try-fallbacks') return _canonPositionTryFallbacks(s);
   if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;
 };
@@ -13191,6 +13196,117 @@ const _canonAnchorScope = (value) => {
     const t = toks[0];
     if (!/^--/.test(t) || !_GRID_CI_RE.test(t)) return null;     // must be a <dashed-ident>
     out.push(t);
+  }
+  return out.length ? out.join(', ') : null;
+};
+
+// ── css-anchor-position position-try-fallbacks ───────────────────────────────
+// Grammar (CSS Anchor Positioning 1): `none | [ [<dashed-ident> || <try-tactic>] |
+// <'position-area'> ]#`, where <try-tactic> = `flip-block || flip-inline || flip-start
+// || flip-x || flip-y`. Each comma-item is EITHER a dashed-ident-and-tactics run OR a
+// <position-area>; the two alternatives never mix (`--foo left`, `flip-start left` →
+// invalid). `none` is only ever the sole value.
+//
+// In the `[<dashed-ident> || <try-tactic>]` alternative the `||` combinator makes each
+// component appear at most once as a CONTIGUOUS unit — the single dashed-ident sits
+// before or after the (contiguous) flip-keyword run, never splitting it
+// (`flip-inline --bar flip-block` is invalid, but `--bar flip-inline flip-block` and
+// `flip-inline flip-block --bar` are valid). Serialization: dashed-ident first, then
+// the flip keywords in AUTHOR order (Chromium keeps the specified tactic order —
+// `flip-start flip-inline flip-block` round-trips unchanged).
+const _TRY_TACTICS = new Set(['flip-block', 'flip-inline', 'flip-start', 'flip-x', 'flip-y']);
+const _canonDashedTactic = (toks) => {
+  let dashed = null, dashedIdx = -1;
+  const tactics = [];
+  const seen = new Set();
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i], tl = t.toLowerCase();
+    if (_TRY_TACTICS.has(tl)) {
+      if (seen.has(tl)) return null;                           // repeated flip keyword → invalid
+      seen.add(tl); tactics.push(tl);
+    } else if (/^--/.test(t) && _GRID_CI_RE.test(t)) {
+      if (dashed !== null) return null;                        // at most one <dashed-ident>
+      dashed = t; dashedIdx = i;
+    } else {
+      return null;                                             // not a tactic/dashed-ident → this alt fails
+    }
+  }
+  if (dashed === null && tactics.length === 0) return null;
+  if (dashed !== null) {                                       // contiguity: tactics must not straddle it
+    let before = false, after = false;
+    for (let i = 0; i < toks.length; i++) {
+      if (i === dashedIdx) continue;
+      if (i < dashedIdx) before = true; else after = true;
+    }
+    if (before && after) return null;                          // `flip-inline --bar flip-block` → invalid
+  }
+  const parts = [];
+  if (dashed !== null) parts.push(dashed);
+  for (const t of tactics) parts.push(t);
+  return parts.join(' ');
+};
+// <position-area> keyword groups. Each definite keyword belongs to a coordinate
+// system ('physical' x/y, 'logical' block/inline, 'self' self-block/self-inline) with
+// a rank (0 = first/x/block axis, 1 = second/y/inline axis), or an order-ambiguous
+// {1,2} group ('startsys' start/end, 'selfstartsys' self-start/self-end). `center` and
+// `span-all` are system-neutral and fill whichever axis is left.
+const _PA_GROUPS = [
+  [new Set(['left', 'right', 'span-left', 'span-right', 'x-start', 'x-end', 'span-x-start', 'span-x-end', 'x-self-start', 'x-self-end', 'span-x-self-start', 'span-x-self-end']), 'physical', 0],
+  [new Set(['top', 'bottom', 'span-top', 'span-bottom', 'y-start', 'y-end', 'span-y-start', 'span-y-end', 'y-self-start', 'y-self-end', 'span-y-self-start', 'span-y-self-end']), 'physical', 1],
+  [new Set(['block-start', 'block-end', 'span-block-start', 'span-block-end']), 'logical', 0],
+  [new Set(['inline-start', 'inline-end', 'span-inline-start', 'span-inline-end']), 'logical', 1],
+  [new Set(['self-block-start', 'self-block-end', 'span-self-block-start', 'span-self-block-end']), 'self', 0],
+  [new Set(['self-inline-start', 'self-inline-end', 'span-self-inline-start', 'span-self-inline-end']), 'self', 1],
+  [new Set(['start', 'end', 'span-start', 'span-end']), 'startsys', -1],
+  [new Set(['self-start', 'self-end', 'span-self-start', 'span-self-end']), 'selfstartsys', -1],
+  [new Set(['center', 'span-all']), 'any', -1],
+];
+const _paClassify = (tl) => {
+  for (const [set, sys, rank] of _PA_GROUPS) if (set.has(tl)) return { sys, rank };
+  return null;
+};
+const _canonPositionArea = (toks) => {
+  if (toks.length < 1 || toks.length > 2) return null;
+  const k = toks.map((t) => t.toLowerCase());
+  const c = k.map(_paClassify);
+  if (c.some((x) => x === null)) return null;                  // a non-position-area keyword
+  if (k.length === 1) return k[0];                             // single keyword is a complete <position-area>
+  const c1 = c[0], c2 = c[1];
+  const syss = [c1, c2].filter((x) => x.sys !== 'any').map((x) => x.sys);
+  if (syss.length === 2 && syss[0] !== syss[1]) return null;   // mixed coordinate systems → invalid
+  const sys = syss.length ? syss[0] : 'any';
+  if (sys === 'startsys' || sys === 'selfstartsys') {
+    // {1,2} same-group form: keep author order (first = block-ish, second = inline-ish),
+    // collapse an identical pair to one keyword (`start start` → `start`).
+    return k[0] === k[1] ? k[0] : k[0] + ' ' + k[1];
+  }
+  let r1 = c1.rank, r2 = c2.rank;
+  if (r1 === -1 && r2 === -1) return k[0] === k[1] ? k[0] : k[0] + ' ' + k[1]; // both neutral
+  if (r1 === -1) r1 = 1 - r2;                                  // a neutral fills the complementary axis
+  if (r2 === -1) r2 = 1 - r1;
+  if (r1 === r2) return null;                                  // same axis twice (`left right`) → invalid
+  const first = r1 === 0 ? k[0] : k[1];
+  const second = r1 === 0 ? k[1] : k[0];
+  return first === second ? first : first + ' ' + second;      // rank-0 axis first; collapse identical
+};
+const _canonFallbackItem = (item) => {
+  const toks = _wsTokens(item);
+  if (toks.length === 0) return null;
+  const a = _canonDashedTactic(toks);                          // [<dashed-ident> || <try-tactic>]
+  if (a !== null) return a;
+  return _canonPositionArea(toks);                             // <'position-area'>
+};
+const _canonPositionTryFallbacks = (value) => {
+  const v = String(value).trim();
+  if (v === '') return null;
+  if (v.toLowerCase() === 'none') return 'none';
+  const items = _commaSplitTop(v).map((s) => s.trim());
+  const out = [];
+  for (const item of items) {
+    if (item === '' || item.toLowerCase() === 'none') return null; // empty item / `none` mixed in → invalid
+    const c = _canonFallbackItem(item);
+    if (c === null) return null;
+    out.push(c);
   }
   return out.length ? out.join(', ') : null;
 };
