@@ -10,12 +10,21 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #263 — css-gaps color/style/width/break line-decoration vein SECURED).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #264 — css-gaps rule-inset FOUNDATION + start-end level SECURED).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-gaps/parsing/rule-inset-cap-start-end-computed.html` | 0/32 | **32/32** | ✅ 100% | **Quest #264 The Rule-Inset Foundation Verdict.** The rule-INSET family (8 stored leaf longhands per `axis×position×side`, each `<inset-value> = <length-percentage> \| overlap-join`) was raw-store. Built the whole `_RI_*` infra (all value shapes) + registered the start-end level. Leaf computed = `_computeInsetValue` (`overlap-join` identity; else `_trComp`→px, % kept). |
+| `css/css-gaps/parsing/rule-inset-cap-start-end-invalid.html` | 0/24 | **24/24** | ✅ 100% | **Quest #264.** Leaf = a single `<inset-value>` token (rejects `auto`/`none`/`10`/`10px 20px`/`overlap-join 10px`). |
+| `css/css-gaps/parsing/rule-inset-junction-start-end-computed.html` | 0/32 | **32/32** | ✅ 100% | **Quest #264.** |
+| `css/css-gaps/parsing/rule-inset-junction-start-end-invalid.html` | 0/24 | **24/24** | ✅ 100% | **Quest #264.** |
+| `css/css-gaps/parsing/rule-inset-start-end-valid.html` | 30/36 | **36/36** | ✅ 100% | **Quest #264.** `{axis}-rule-inset-start`/`-end` + bidi `rule-inset-start`/`-end` — `dup` shape: a single `<inset-value>` sets both target leaves (cap+junction of that side). |
+| `css/css-gaps/parsing/rule-inset-start-end-invalid.html` | 0/48 | **48/48** | ✅ 100% | **Quest #264.** |
+| `css/css-gaps/parsing/rule-inset-start-end-computed.html` | 0/36 | **36/36** | ✅ 100% | **Quest #264.** |
+| `css/css-gaps/parsing/rule-inset-start-end-shorthand.html` | 0/60 | **60/60** | ✅ 100% | **Quest #264.** `_expandRuleInset` stores the leaf longhands; `_serRuleInset` reconstructs. |
+| `css/css-gaps/parsing/rule-inset-start-end-bidirectional-shorthand.html` | 0/50 | **50/50** | ✅ 100% | **Quest #264.** Bidi expands each axis's per-axis shorthand and merges. Wired the 6 touch points like `_GAP_BIDI_SH`. |
 | `css/css-gaps/parsing/gap-decorations-color-computed.html` | 5/33 | **33/33** | ✅ 100% | **Quest #263 The Line-List Computed Verdict.** The list computed serialization was raw-store. NEW `_computeGapRuleList` (structure kept, repeat integer folded via `_computeIntegerValue`, each leaf resolved). Factored `_computeColorFull` out of the `_normComputed` colour branch (byte-identical) so a gap colour leaf resolves like a standalone `<color>`. Intercept placed atop `_normComputed`, before the length/colour branches. |
 | `css/css-gaps/parsing/gap-decorations-style-computed.html` | 60/63 | **63/63** | ✅ 100% | **Quest #263.** style leaf = keyword identity; repeat integer folds. |
 | `css/css-gaps/parsing/gap-decorations-width-computed.html` | 12/24 | **24/24** | ✅ 100% | **Quest #263.** width leaf → px (calc/em folded, clamp ≥0). Bugfix: `_canonLengthTimeMath` was shedding a `calc()` wrapper INSIDE `repeat(...)` (treats `repeat(` as a function) — guarded the gap-rule props out (they self-canonicalize). |

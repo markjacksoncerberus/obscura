@@ -1149,6 +1149,21 @@ const _parseStyleDecls = (text) => {
           for (const ln of _GAP_BIDI_SH[name]) out.push({ name: ln, value: lh[ln], important });
           continue;                                          // expanded into longhands; no shorthand key
         }
+      } else if (_RI_SH[name] || _RI_BIDI[name]) {
+        // css-gaps rule-inset shorthand (per-axis or bidirectional): expand into its
+        // leaf longhands. CSS-wide / var() keep the raw shorthand key (getter path).
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandRuleInset(name, value); if (!lh) continue;  // out of grammar → drop
+          for (const ln in lh) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no shorthand key
+        }
+      } else if (_RI_LEAF.has(name)) {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonRuleInsetLeaf(value); if (c === null) continue;  // invalid <inset-value> → drop
+          value = c;
+        }
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1361,6 +1376,17 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
+    if (!custom && (_RI_SH[name] || _RI_BIDI[name]) && !/\bvar\(/i.test(stored)) {
+      // css-gaps rule-inset shorthand (per-axis or bidirectional): expand into — and
+      // store as — its leaf longhands so the longhands read back and the shorthand
+      // reconstructs. A CSS-wide keyword goes to every leaf. Invalid → ignore.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const lh = _expandRuleInset(name, stored); if (!lh) return;
+      delete this._props[name]; delete this._priority[name];   // never keep a shorthand key
+      for (const ln in lh) { this._props[ln] = lh[ln]; this._priority[ln] = prio; }
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && (name === 'grid-column' || name === 'grid-row') && !/\bvar\(/i.test(stored)) {
       // grid-column / grid-row shorthand: expand into — and store as — its two
       // <grid-line> longhands (grid-<axis>-start/-end) so `el.style.gridColumnStart`
@@ -1506,6 +1532,11 @@ class CSSStyleDeclaration {
       // validate + canonicalize the grammar (invalid → ignore). Must precede the
       // _COLOR_PROPS branch for caret-color/outline-color (that branch skips validation).
       const c = _canonCssUi(name, stored);
+      if (c === null) return;
+      stored = c;
+    } else if (!custom && _RI_LEAF.has(name)) {
+      // css-gaps rule-inset leaf longhand: a single <inset-value> (invalid → ignore).
+      const c = _canonRuleInsetLeaf(stored);
       if (c === null) return;
       stored = c;
     } else if (!custom && _MULTICOL_VALIDATED.has(name)) {
@@ -2149,6 +2180,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (_RI_SH[key] || _RI_BIDI[key]) {                     // css-gaps rule-inset shorthand: clear its leaf longhands
+      const old = (key in this._props) ? this._props[key] : _serRuleInset((n) => this._props[n] || '', key);
+      delete this._props[key]; delete this._priority[key];   // any var()/CSS-wide-stored shorthand key
+      for (const ln of _riAffectedLh(key)) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     if (key === 'grid-column' || key === 'grid-row' || key === 'grid-area') {  // placement shorthand: clear its longhands
       const axis = key === 'grid-column' ? 'column' : 'row';
       const old = (key in this._props) ? this._props[key]
@@ -2271,6 +2309,10 @@ class CSSStyleDeclaration {
     if (_GAP_BIDI_SH[key]) {                                // css-gaps `rule-*` shorthand
       if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
       return _serGapBidiSh((n) => this._props[n] || '', key);  // reconstruct from column-*/row-*
+    }
+    if (_RI_SH[key] || _RI_BIDI[key]) {                     // css-gaps rule-inset shorthand
+      if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
+      return _serRuleInset((n) => this._props[n] || '', key);  // reconstruct from leaf longhands
     }
     if (key === 'grid-column' || key === 'grid-row') {     // placement shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
@@ -9163,6 +9205,11 @@ const _GCS_DEFAULTS = {
   // the row-rule-* line props mirror the column-rule-* initials.
   'column-rule-break': 'none', 'row-rule-break': 'none',
   'row-rule-color': 'currentColor', 'row-rule-style': 'none', 'row-rule-width': 'medium',
+  // rule-inset leaf longhands: initial `0` (computed `0px`); not inherited.
+  'column-rule-inset-cap-start': '0px', 'column-rule-inset-cap-end': '0px',
+  'column-rule-inset-junction-start': '0px', 'column-rule-inset-junction-end': '0px',
+  'row-rule-inset-cap-start': '0px', 'row-rule-inset-cap-end': '0px',
+  'row-rule-inset-junction-start': '0px', 'row-rule-inset-junction-end': '0px',
   // css-shapes — none inherit. shape-image-threshold is a <number>.
   'shape-image-threshold': '0', 'shape-margin': '0px', 'shape-outside': 'none',
   // css-scroll-snap — none inherit. scroll-margin-* default 0px, scroll-padding-* auto.
@@ -13799,6 +13846,144 @@ const _serGapBidiSh = (get, key) => {
   const a = get(pair[0]), b = get(pair[1]);
   if (!a || !b) return '';
   return a === b ? a : '';
+};
+
+// ── CSS Gap Decorations: the rule-INSET family ───────────────────────────────
+// The gap-decoration rule inset controls how far a rule is pulled back from its
+// gap intersections. There are 8 STORED leaf longhands, one per
+//   axis {column,row} × position {cap,junction} × side {start,end}
+// each taking a single <inset-value> = <length-percentage> | overlap-join
+// (initial `0`; computed folds a <length> → px and keeps %/calc symbolic;
+// overlap-join is a keyword). Above them sits a tower of shorthands (each level is
+// registered progressively — this module implements ALL shapes, the _RI_SH /
+// _RI_BIDI tables gate which levels are live):
+//   {axis}-rule-inset-cap / -junction   → the {start,end} of one position   <iv>{1,2}
+//   {axis}-rule-inset-start / -end      → the {cap,junction} of one side     single <iv> (both)
+//   {axis}-rule-inset                   → all four of one axis   <iv>{1,2} [ / <iv>{1,2} ]?
+//   rule-inset-cap/-junction/-start/-end/-inset  → the same, applied to BOTH axes.
+// A shorthand serializes (getPropertyValue / computed) only when its longhands are
+// representable by its grammar, else '' (CSSOM "serialize a CSS value").
+//
+// The 8 stored leaf longhands.
+const _RI_LEAF = new Set([
+  'column-rule-inset-cap-start', 'column-rule-inset-cap-end',
+  'column-rule-inset-junction-start', 'column-rule-inset-junction-end',
+  'row-rule-inset-cap-start', 'row-rule-inset-cap-end',
+  'row-rule-inset-junction-start', 'row-rule-inset-junction-end',
+]);
+// Validate + canonicalize ONE <inset-value> token, or null.
+const _canonInsetValue = (tok) => {
+  const t = String(tok).trim();
+  if (t.toLowerCase() === 'overlap-join') return 'overlap-join';
+  return _canonLenPctSigned(t, true);                 // <length-percentage> signed (calc ok)
+};
+// Validate a leaf longhand value: EXACTLY one <inset-value> token, or null.
+const _canonRuleInsetLeaf = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length !== 1) return null;
+  return _canonInsetValue(toks[0]);
+};
+// Computed <inset-value>: overlap-join identity; else the <length-%> folded to px
+// (% / mixed calc kept symbolic) — identical folding to a baseline-shift length.
+const _computeInsetValue = (el, v) => {
+  const s = String(v).trim();
+  if (s.toLowerCase() === 'overlap-join') return 'overlap-join';
+  return _trComp(s, el, true, _vpUnits());
+};
+// Parse one "side" (`<iv>{1,2}`, no slash) → [start, end] (1 value → both), or null.
+const _parseInsetPair = (str) => {
+  const toks = _wsTokens(String(str).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  const a = _canonInsetValue(toks[0]);
+  if (a === null) return null;
+  if (toks.length === 1) return [a, a];
+  const b = _canonInsetValue(toks[1]);
+  return b === null ? null : [a, b];
+};
+// Parse a shorthand value against its shape → an array of canonical leaves in the
+// shorthand's longhand order, or null:
+//   dup  : <iv>                         → [v, v]
+//   pair : <iv>{1,2}                    → [start, end]
+//   quad : <iv>{1,2} [ / <iv>{1,2} ]?   → [cap-start, cap-end, junction-start, junction-end]
+const _parseInsetShape = (value, shape) => {
+  const s = String(value).trim();
+  if (shape === 'dup') {
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const v = _canonInsetValue(toks[0]);
+    return v === null ? null : [v, v];
+  }
+  if (shape === 'pair') return _parseInsetPair(s);
+  if (shape === 'quad') {
+    const sides = _slashSplitTop(s);
+    if (sides.length < 1 || sides.length > 2) return null;   // >1 slash → invalid
+    const cap = _parseInsetPair(sides[0]);
+    if (!cap) return null;
+    let jun = cap;                                           // no junction side → duplicate cap
+    if (sides.length === 2) { jun = _parseInsetPair(sides[1]); if (!jun) return null; }
+    return [cap[0], cap[1], jun[0], jun[1]];
+  }
+  return null;
+};
+// Per-axis inset shorthands: the ordered leaf longhands they set + the value shape.
+const _RI_SH = {
+  'column-rule-inset-start': { lh: ['column-rule-inset-cap-start', 'column-rule-inset-junction-start'], shape: 'dup' },
+  'column-rule-inset-end':   { lh: ['column-rule-inset-cap-end', 'column-rule-inset-junction-end'], shape: 'dup' },
+  'row-rule-inset-start':    { lh: ['row-rule-inset-cap-start', 'row-rule-inset-junction-start'], shape: 'dup' },
+  'row-rule-inset-end':      { lh: ['row-rule-inset-cap-end', 'row-rule-inset-junction-end'], shape: 'dup' },
+};
+// Bidirectional (both-axes) inset shorthands: the column + row per-axis shorthands.
+const _RI_BIDI = {
+  'rule-inset-start': ['column-rule-inset-start', 'row-rule-inset-start'],
+  'rule-inset-end':   ['column-rule-inset-end', 'row-rule-inset-end'],
+};
+// The ordered leaf longhands a rule-inset shorthand ultimately writes (per-axis: its
+// own `.lh`; bidirectional: both axes' leaves concatenated).
+const _riAffectedLh = (name) => {
+  if (_RI_BIDI[name]) { const out = []; for (const ax of _RI_BIDI[name]) out.push(..._RI_SH[ax].lh); return out; }
+  return _RI_SH[name] ? _RI_SH[name].lh.slice() : [];
+};
+// Expand a rule-inset shorthand value → { leaf-longhand: canon, ... }, or null when
+// out of grammar. A CSS-wide keyword goes to every affected leaf.
+const _expandRuleInset = (name, value) => {
+  const low = String(value).trim().toLowerCase();
+  if (_CSS_WIDE.has(low)) { const o = {}; for (const ln of _riAffectedLh(name)) o[ln] = low; return o; }
+  if (_RI_BIDI[name]) {
+    const out = {};
+    for (const ax of _RI_BIDI[name]) { const m = _expandRuleInset(ax, value); if (!m) return null; Object.assign(out, m); }
+    return out;
+  }
+  const sh = _RI_SH[name];
+  if (!sh) return null;
+  const leaves = _parseInsetShape(value, sh.shape);
+  if (!leaves) return null;
+  const o = {}; sh.lh.forEach((ln, i) => { o[ln] = leaves[i]; });
+  return o;
+};
+// Serialize a rule-inset shorthand from its longhand values (via `get`) — the same
+// logic drives getPropertyValue (get = stored) and computed (get = resolved):
+//   dup  : both equal → the value, else '' (unrepresentable)
+//   pair : start==end → one value, else `start end`
+//   quad : all four equal → one value, else `cap-start cap-end / junction-start junction-end`
+//   bidi : column-ser === row-ser → that, else '' (axes disagree)
+const _serRuleInset = (get, name) => {
+  if (_RI_BIDI[name]) {
+    const c = _serRuleInset(get, _RI_BIDI[name][0]);
+    const r = _serRuleInset(get, _RI_BIDI[name][1]);
+    return (c && c === r) ? c : '';
+  }
+  const sh = _RI_SH[name];
+  if (!sh) return '';
+  const vals = sh.lh.map(get);
+  if (vals.some((x) => !x)) return '';
+  if (sh.shape === 'dup') return vals[0] === vals[1] ? vals[0] : '';
+  if (sh.shape === 'pair') return vals[0] === vals[1] ? vals[0] : vals.join(' ');
+  if (sh.shape === 'quad') {
+    const [cs, ce, js, je] = vals;
+    if (cs === ce && ce === js && js === je) return cs;
+    return cs + ' ' + ce + ' / ' + js + ' ' + je;
+  }
+  return '';
 };
 
 // ── CSS Text (css-text) value parsing ────────────────────────────────────────
@@ -21169,6 +21354,7 @@ const _normComputed = (el, kebab, v) => {
   // _COLOR_PROPS branches (which would mangle the whole list). Single-leaf values fall
   // through to those existing per-property paths (multicol column-rule-* untouched).
   if (_GAP_RULE_LEAF[kebab] && _isGapList(v)) return _computeGapRuleList(el, kebab, v);
+  if (_RI_LEAF.has(kebab)) return _computeInsetValue(el, v);    // css-gaps rule-inset leaf → folded <inset-value>
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_BI_DIM_LH.has(kebab)) return _computeBorderImageDim(el, v);
   if (kebab === 'text-emphasis-style') return _computeTextEmphasisStyle(el, v);
@@ -21731,6 +21917,8 @@ const _CSS_KNOWN_PROPS = (() => {
   add('column-rule');                                      // the `column-rule` shorthand (reconstructed from its 3 longhands)
   add('columns');                                          // the `columns` shorthand (self-canonical; computed lengths resolved)
   for (const k of Object.keys(_GAP_BIDI_SH)) add(k);       // css-gaps `rule-*` bidirectional shorthands
+  for (const k of Object.keys(_RI_SH)) add(k);             // css-gaps per-axis rule-inset shorthands
+  for (const k of Object.keys(_RI_BIDI)) add(k);           // css-gaps bidirectional rule-inset shorthands
   add('rule');                                             // css-gaps `rule` mega-shorthand (bidirectional column-rule)
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
@@ -21859,6 +22047,11 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // longhands — the value when both axes agree, else '' (unrepresentable).
     if (_GAP_BIDI_SH[kebab]) {
       return _serGapBidiSh((n) => resolve(n), kebab);
+    }
+    // css-gaps rule-inset shorthand: reconstruct from the COMPUTED leaf longhands
+    // (same drop/collapse rules as the specified serialization).
+    if (_RI_SH[kebab] || _RI_BIDI[kebab]) {
+      return _serRuleInset((n) => resolve(n), kebab);
     }
     // css-gaps `rule` mega-shorthand (bidirectional column-rule): reconstruct the
     // `<width> [<style>] <color>` form from the COMPUTED longhands, but only when BOTH
@@ -25123,6 +25316,16 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         const c = _canonStandardValue(val);
         return _CSS_WIDE.has(c.toLowerCase()) || _expandGapBidi(name, c) != null;
+      }
+      if (_RI_LEAF.has(name)) {                          // css-gaps rule-inset leaf longhand
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _canonRuleInsetLeaf(c) != null;
+      }
+      if (_RI_SH[name] || _RI_BIDI[name]) {              // css-gaps rule-inset shorthands
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _expandRuleInset(name, c) != null;
       }
       if (_OVERFLOW_VALIDATED.has(name)) {               // css-overflow longhands (+ overflow-clip-margin)
         if (/\bvar\(/i.test(val)) return true;
