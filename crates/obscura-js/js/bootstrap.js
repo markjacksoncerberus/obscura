@@ -1379,6 +1379,26 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
+    if (!custom && name === 'overscroll-behavior' && !/\bvar\(/i.test(stored)) {
+      // css-overscroll-behavior shorthand: expand into — and store as —
+      // overscroll-behavior-x/-y so `el.style.overscrollBehaviorX` reads back. A
+      // CSS-wide keyword goes to both longhands. (Physical only; -inline/-block are
+      // independent logical longhands with no shorthand here.)
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const low = stored.toLowerCase();
+      let x, y;
+      if (_CSS_WIDE.has(low)) { x = y = low; }
+      else {
+        const lh = _parseOverscrollShorthand(stored);
+        if (!lh) return;                                        // invalid → keep prior value
+        x = lh['overscroll-behavior-x']; y = lh['overscroll-behavior-y'];
+      }
+      delete this._props['overscroll-behavior']; delete this._priority['overscroll-behavior'];  // never keep a shorthand key
+      this._props['overscroll-behavior-x'] = x; this._priority['overscroll-behavior-x'] = prio;
+      this._props['overscroll-behavior-y'] = y; this._priority['overscroll-behavior-y'] = prio;
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
     if (!custom && _GAP_BIDI_SH[name] && !/\bvar\(/i.test(stored)) {
       // css-gaps `rule-*` shorthand: expand into — and store as — its column-* and
       // row-* longhands (same value in both) so the longhands read back and the
@@ -2207,6 +2227,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (key === 'overscroll-behavior') {                    // shorthand: clear overscroll-behavior-x/-y (+ any raw key)
+      const old = (key in this._props) ? this._props[key] : _serializeOverscrollShorthand((n) => this._props[n] || '');
+      delete this._props['overscroll-behavior']; delete this._priority['overscroll-behavior'];
+      for (const ln of _OVERSCROLL_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     if (key === 'overflow') {                               // overflow shorthand: clear overflow-x/-y (+ any raw key)
       const old = (key in this._props) ? this._props[key] : _serializeOverflowShorthand((n) => this._props[n] || '');
       delete this._props['overflow']; delete this._priority['overflow'];
@@ -2350,6 +2377,10 @@ class CSSStyleDeclaration {
     if (key === 'overflow') {                              // shorthand
       if (key in this._props) return this._props[key];     // raw key (set via style attribute / cssText)
       return _serializeOverflowShorthand((n) => this._props[n] || '');  // reconstruct from overflow-x/-y
+    }
+    if (key === 'overscroll-behavior') {                   // css-overscroll-behavior shorthand
+      if (key in this._props) return this._props[key];     // raw key (set via style attribute / cssText)
+      return _serializeOverscrollShorthand((n) => this._props[n] || '');  // reconstruct from -x/-y
     }
     if (_GAP_BIDI_SH[key]) {                                // css-gaps `rule-*` shorthand
       if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
@@ -9097,6 +9128,9 @@ const _GCS_DEFAULTS = {
   'z-index': 'auto', 'pointer-events': 'auto',
   page: 'auto',                                    // css-page: `auto | <custom-ident>` (computed = specified, case-preserved)
   'view-transition-name': 'none', 'view-transition-class': 'none', 'view-transition-group': 'normal',  // css-view-transitions (computed = specified; none inherited)
+  // css-overscroll-behavior: four per-axis keyword longhands, initial `auto`, not inherited (computed = specified).
+  'overscroll-behavior-x': 'auto', 'overscroll-behavior-y': 'auto', 'overscroll-behavior-inline': 'auto', 'overscroll-behavior-block': 'auto',
+  'text-size-adjust': 'auto',                      // css-size-adjust: `auto | none | <percentage>` (inherited; computed none→100%)
   'box-sizing': 'content-box', cursor: 'auto',
   // css-backgrounds longhands (not inherited) + `filter`. Computed serialization
   // is identity here (keyword / position / url), which lets var() substitution
@@ -12730,6 +12764,8 @@ const _INHERITED_PROPS = new Set([
   // filter-effects: only color-interpolation-filters inherits (flood-color,
   // lighting-color and flood-opacity do NOT).
   'color-interpolation-filters',
+  // css-size-adjust: text-size-adjust inherits (initial `auto`).
+  'text-size-adjust',
 ]);
 const _CSS_WIDE = new Set(['initial', 'inherit', 'unset', 'revert', 'revert-layer']);
 // Initial (computed) value for a property. The defaults table doubles as the
@@ -13113,6 +13149,15 @@ const _CSSUI_ENUM = {
   // css-position: `position` is a plain keyword enum. Rejects `auto` and any
   // two-keyword combination (`static relative`). Computed = the lowercased keyword.
   'position': new Set(['static', 'relative', 'absolute', 'sticky', 'fixed']),
+  // css-overscroll-behavior: the four per-axis longhands — `contain | none | auto |
+  // chain` (single keyword). The `overscroll-behavior` shorthand ([…]{1,2} → x/y)
+  // expands into -x/-y via _expandOverscroll; -inline/-block are independent logical
+  // longhands with no shorthand here. Rejects `normal`/`0` and any two-keyword combo.
+  // Computed = the lowercased keyword (identity); initial `auto`, not inherited.
+  'overscroll-behavior-x': new Set(['contain', 'none', 'auto', 'chain']),
+  'overscroll-behavior-y': new Set(['contain', 'none', 'auto', 'chain']),
+  'overscroll-behavior-inline': new Set(['contain', 'none', 'auto', 'chain']),
+  'overscroll-behavior-block': new Set(['contain', 'none', 'auto', 'chain']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -13172,6 +13217,11 @@ const _CSSUI_VALIDATED = new Set([
   // <custom-ident>`. Dedicated _canonCssUi branches; custom-idents case-preserved,
   // computed = specified (registered in _GCS_DEFAULTS, none inherited).
   'view-transition-name', 'view-transition-class', 'view-transition-group',
+  // css-overscroll-behavior: four per-axis keyword-enum longhands (computed = specified).
+  'overscroll-behavior-x', 'overscroll-behavior-y', 'overscroll-behavior-inline', 'overscroll-behavior-block',
+  // css-size-adjust: text-size-adjust = `auto | none | <percentage [0,∞]>` (a
+  // dedicated _canonCssUi branch; computed `none`→`100%`, else percentage identity).
+  'text-size-adjust',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13451,6 +13501,24 @@ const _canonCssUi = (name, value) => {
       return _canonLineWidth(t);
     }
     return null;                                                 // %/unitless/keyword → invalid
+  }
+  if (name === 'text-size-adjust') {
+    // css-size-adjust: `auto | none | <percentage [0,∞]>`. A single token — `auto`/
+    // `none` keywords, a non-negative literal percentage (`200%`, `0%`), or a
+    // percentage-typed calc kept symbolic (`calc(10% + 5%)`→`calc(15%)`,
+    // `calc(10% * sibling-index())` symbolic). Rejects `reverse`, unitless `0`, a
+    // <length> (`10px`), and a negative literal (`-100%`).
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    const tl = t.toLowerCase();
+    if (tl === 'auto' || tl === 'none') return tl;
+    if (_MATHFN_NAME_RE.test(t)) {
+      if (!_mathValid(t, ['percentage'], 'percentage')) return null;  // must be <percentage>-typed
+      return _canonMathExpr(t) || t;
+    }
+    if (_PLAIN_PCT_RE.test(t)) return parseFloat(t) < 0 ? null : t;   // non-negative literal %
+    return null;                                                       // length/number/unitless → invalid
   }
   if (name === 'color-scheme') return _canonColorScheme(s);
   if (name === 'ruby-overhang') {
@@ -15056,6 +15124,27 @@ const _parseOverflowShorthand = (value) => {
 // value"). Returns '' when either longhand is missing.
 const _serializeOverflowShorthand = (get) => {
   const x = get('overflow-x'), y = get('overflow-y');
+  if (!x || !y) return '';
+  return x === y ? x : x + ' ' + y;
+};
+
+// ── css-overscroll-behavior `overscroll-behavior` shorthand ──────────────────
+// `[ contain | none | auto | chain ]{1,2}` → overscroll-behavior-x (first value)
+// + overscroll-behavior-y (second, or a copy of the first). Exactly the `overflow`
+// pattern (physical x/y, `{1,2}`, collapse equal axes on serialize). The keyword
+// set is shared with the longhand enum. Returns {'…-x','…-y'} or null when invalid.
+const _OVERSCROLL_SH_LH = ['overscroll-behavior-x', 'overscroll-behavior-y'];
+const _OVERSCROLL_KW = _CSSUI_ENUM['overscroll-behavior-x'];
+const _parseOverscrollShorthand = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  const x = toks[0].toLowerCase();
+  const y = toks.length === 2 ? toks[1].toLowerCase() : x;
+  if (!_OVERSCROLL_KW.has(x) || !_OVERSCROLL_KW.has(y)) return null;
+  return { 'overscroll-behavior-x': x, 'overscroll-behavior-y': y };
+};
+const _serializeOverscrollShorthand = (get) => {
+  const x = get('overscroll-behavior-x'), y = get('overscroll-behavior-y');
   if (!x || !y) return '';
   return x === y ? x : x + ' ' + y;
 };
@@ -21673,6 +21762,16 @@ const _normComputed = (el, kebab, v) => {
     if (t.toLowerCase() === 'none') return 'none';
     return _clampNegPx(_trComp(t, el, true, _vpUnits()));
   }
+  if (kebab === 'text-size-adjust') {
+    // css-size-adjust: computed = `auto` unchanged; `none` → `100%`; a literal
+    // percentage is identity. A percentage-typed calc that can't fully resolve
+    // (`calc(10% * sibling-index())` — sibling-index unsupported) stays symbolic (CAP).
+    const t = String(v).trim();
+    const tl = t.toLowerCase();
+    if (tl === 'none') return '100%';
+    if (tl === 'auto') return 'auto';
+    return v;
+  }
   if (kebab === 'line-height') return _computeLineHeight(el, v);
   if (kebab === 'baseline-shift') return _computeBaselineShift(el, v);
   if (kebab === 'vertical-align') return _canonVerticalAlign(v, el, true);
@@ -22246,6 +22345,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('offset');                                           // the `offset` shorthand (expands to its 5 longhands)
   add('font');                                             // the `font` shorthand (expands to its 7 longhands)
   add('overflow');                                         // the `overflow` shorthand (expands to overflow-x/-y)
+  add('overscroll-behavior');                              // the `overscroll-behavior` shorthand (expands to -x/-y)
   add('mask');                                             // the `mask` shorthand (expands to its 8 longhands)
   add('animation-range');                                  // the `animation-range` shorthand (computed reconstructed from its stored value)
   add('flex');                                             // the `flex` shorthand (reconstructed from flex-grow/-shrink/-basis)
@@ -22322,6 +22422,13 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // (which carry the visible↔auto coupling), collapsing equal axes to one value.
     if (kebab === 'overflow') {
       const xv = resolve('overflow-x'), yv = resolve('overflow-y');
+      if (!xv || !yv) return '';
+      return xv === yv ? xv : xv + ' ' + yv;
+    }
+    // `overscroll-behavior` shorthand: reconstruct from computed -x/-y, collapsing
+    // equal axes to one value (computed longhands are keyword identity).
+    if (kebab === 'overscroll-behavior') {
+      const xv = resolve('overscroll-behavior-x'), yv = resolve('overscroll-behavior-y');
       if (!xv || !yv) return '';
       return xv === yv ? xv : xv + ' ' + yv;
     }
@@ -25682,6 +25789,11 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         const c = _canonStandardValue(val);
         return _CSS_WIDE.has(c.toLowerCase()) || _parseOverflowShorthand(c) != null;
+      }
+      if (name === 'overscroll-behavior') {              // the `overscroll-behavior` shorthand
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _parseOverscrollShorthand(c) != null;
       }
       if (_SCROLL_SH_LH[name]) {                         // scroll-margin/scroll-padding shorthands
         if (/\bvar\(/i.test(val)) return true;

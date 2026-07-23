@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quests #276–#278 — the css-view-transitions `view-transition-name`/`-class`/`-group` `<custom-ident>` vein; +47).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quests #279–#281 — the css-overscroll-behavior family + css-size-adjust `text-size-adjust`; +51).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-overscroll-behavior/parsing/overscroll-behavior-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #279+#280.** The four `overscroll-behavior-{x,y,inline,block}` longhands (`contain \| none \| auto \| chain` enum) + the `overscroll-behavior` shorthand (`[…]{1,2}` → x/y) were raw-store. #279: `_CSSUI_ENUM` + `_CSSUI_VALIDATED` + `_GCS_DEFAULTS` `'auto'` (longhands). #280: mirrored the `overflow` shorthand across 6 touch points (`_parseOverscrollShorthand`/`_serializeOverscrollShorthand`). **+15 (invalid 0→15).** |
+| `css/css-overscroll-behavior/parsing/overscroll-behavior-computed.html` | 0/16 | **16/16** | ✅ 100% | **Quest #279** — the four longhand enums registered in `_GCS_DEFAULTS` (computed = identity). **+16.** |
+| `css/css-overscroll-behavior/parsing/overscroll-behavior-valid.html` | 24/28 | **28/28** | ✅ 100% | **Quest #280** — shorthand collapse (`contain contain`→`contain`) via `_serializeOverscrollShorthand`. **+4.** |
+| `css/css-size-adjust/parsing/text-size-adjust-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #281 The Text-Size-Adjust Verdict.** `text-size-adjust` = `auto \| none \| <percentage [0,∞]>` was raw-store. NEW dedicated `_canonCssUi` branch (keywords; a math fn gated by `_mathValid(t,['percentage'],'percentage')`; a non-negative literal %) + `_CSSUI_VALIDATED` + `_GCS_DEFAULTS` + `_INHERITED_PROPS` + a `_normComputed` branch (`none`→`100%`). **+4.** |
+| `css/css-size-adjust/parsing/text-size-adjust-valid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #281** — incl. `calc(10% + 5%)`→`calc(15%)` + a symbolic `sibling-index()` calc kept. **+7.** |
+| `css/css-size-adjust/parsing/text-size-adjust-computed.html` | 0/6 | **5/6** | ⚠️ CAP | **Quest #281** — `none`→`100%`, `auto`/% identity. **+5.** CAP: `calc(10% * sibling-index())`→`10%` needs `sibling-index()` in `_evalMath` (documented #238). |
 | `css/css-view-transitions/parsing/view-transition-name-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #276 The View-Transition-Name Verdict.** `view-transition-name` = `none \| <custom-ident> \| match-element` was raw-store (invalid 0/11, computed 0/11 unregistered). NEW `_canonCssUi` branch (single token; `none`/`match-element` keywords CI→lower, else case-preserved `<custom-ident>` via `_GRID_CI_RE` excluding CSS-wide+`default`) + `_CSSUI_VALIDATED` + inline-parser branch + `'view-transition-name':'none'`→`_GCS_DEFAULTS` (not inherited, computed=specified). **+22 (name-invalid 0→11, name-computed 0→11).** |
 | `css/css-view-transitions/parsing/view-transition-name-computed.html` | 0/11 | **11/11** | ✅ 100% | **Quest #276** (see above). |
 | `css/css-view-transitions/parsing/view-transition-class-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #277 The View-Transition-Class Verdict.** `view-transition-class` = `none \| <custom-ident>+` was raw-store (invalid 0/7, computed 0/11 unregistered). NEW `_canonCssUi` branch (`none` ALONE is the keyword; else a space list of case-preserved `<custom-ident>`, each excluding CSS-wide+`default`+`none` — `foo none` invalid) + `_CSSUI_VALIDATED` + inline-parser branch + `'view-transition-class':'none'`→`_GCS_DEFAULTS`. **+18 (class-invalid 0→7, class-computed 0→11).** |
