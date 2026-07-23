@@ -870,6 +870,10 @@ const _parseStyleDecls = (text) => {
         const c = _canonCssUi(name, value); if (c === null) continue; // invalid keyword → drop
         value = c;
       }
+      else if (name === 'view-transition-name' || name === 'view-transition-class' || name === 'view-transition-group') {
+        const c = _canonCssUi(name, value); if (c === null) continue; // invalid <custom-ident> grammar → drop
+        value = c;
+      }
       else if (_LISTSTYLE_VALIDATED.has(name)) {
         // css-lists longhands list-style-position/-image/-type: validate + canon
         // (invalid → drop). Must precede _GRADIENT_PROPS (which holds list-style-
@@ -9092,6 +9096,7 @@ const _GCS_DEFAULTS = {
   'border-inline-start-width': '0px', 'border-inline-end-width': '0px',
   'z-index': 'auto', 'pointer-events': 'auto',
   page: 'auto',                                    // css-page: `auto | <custom-ident>` (computed = specified, case-preserved)
+  'view-transition-name': 'none', 'view-transition-class': 'none', 'view-transition-group': 'normal',  // css-view-transitions (computed = specified; none inherited)
   'box-sizing': 'content-box', cursor: 'auto',
   // css-backgrounds longhands (not inherited) + `filter`. Computed serialization
   // is identity here (keyword / position / url), which lets var() substitution
@@ -13161,6 +13166,12 @@ const _CSSUI_VALIDATED = new Set([
   // css-page: `page` = `auto | <custom-ident>` (a dedicated _canonCssUi branch;
   // custom-ident case-preserved, computed = specified).
   'page',
+  // css-view-transitions: `view-transition-name` = `none | <custom-ident> |
+  // match-element`; `view-transition-class` = `none | <custom-ident>+`;
+  // `view-transition-group` (tentative) = `normal | nearest | contain |
+  // <custom-ident>`. Dedicated _canonCssUi branches; custom-idents case-preserved,
+  // computed = specified (registered in _GCS_DEFAULTS, none inherited).
+  'view-transition-name', 'view-transition-class', 'view-transition-group',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13298,6 +13309,41 @@ const _canonCssUi = (name, value) => {
     if (t.toLowerCase() === 'auto') return 'auto';
     if (t.toLowerCase() === 'default') return null;          // <custom-ident> excludes `default`
     return _GRID_CI_RE.test(t) ? t : null;                  // a single case-preserved identifier
+  }
+  if (name === 'view-transition-name' || name === 'view-transition-group') {
+    // css-view-transitions: a single keyword or <custom-ident>.
+    //   view-transition-name  = `none | <custom-ident> | match-element`
+    //   view-transition-group = `normal | nearest | contain | <custom-ident>` (tentative)
+    // The keywords are case-insensitive → lowercased; a <custom-ident> is
+    // case-PRESERVED and excludes the CSS-wide keywords (handled at the top of
+    // _canonCssUi) and `default`. For -group `none` is an ordinary custom-ident;
+    // for -name `none` is the keyword. Rejects a multi-token / <string> / number /
+    // dimension / #hex.
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    const tl = t.toLowerCase();
+    const kw = name === 'view-transition-name'
+      ? (tl === 'none' || tl === 'match-element')
+      : (tl === 'normal' || tl === 'nearest' || tl === 'contain');
+    if (kw) return tl;
+    if (tl === 'default') return null;                       // <custom-ident> excludes `default`
+    return _GRID_CI_RE.test(t) ? t : null;                  // a single case-preserved identifier
+  }
+  if (name === 'view-transition-class') {
+    // css-view-transitions-2: `none | <custom-ident>+`. `none` ALONE is the keyword;
+    // otherwise a space-separated list of <custom-ident>, each case-PRESERVED and
+    // excluding the CSS-wide keywords + `default`, and `none` may NOT appear in a
+    // multi-ident list (`foo none` is invalid). Rejects a <string> / number / #hex.
+    const toks = _wsTokens(s);
+    if (toks.length < 1) return null;
+    if (toks.length === 1 && toks[0].toLowerCase() === 'none') return 'none';
+    for (const t of toks) {
+      const tl = t.toLowerCase();
+      if (tl === 'none' || tl === 'default' || _CSS_WIDE.has(tl)) return null;  // reserved idents excluded
+      if (!_GRID_CI_RE.test(t)) return null;
+    }
+    return toks.join(' ');
   }
   if (name === 'z-index') {
     // css-position: `auto | <integer>` (signed, unbounded). A number-typed calc is
