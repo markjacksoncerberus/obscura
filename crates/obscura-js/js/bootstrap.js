@@ -1078,6 +1078,13 @@ const _parseStyleDecls = (text) => {
           for (const ln of _POSITION_TRY_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
           continue;                                          // expanded into longhands; no `position-try` key
         }
+      } else if (name === 'block-step') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandBlockStep(value); if (!lh) continue;  // invalid <block-step> → drop
+          for (const ln of _BLOCK_STEP_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `block-step` key
+        }
       } else if (name === 'font') {
         // The `font` shorthand: expand into its 7 longhands so a stylesheet /
         // cssText / style="" rule sets `font-size` (etc.) in the cascade — matching
@@ -1885,6 +1892,21 @@ class CSSStyleDeclaration {
         this._notifyChange();
         return;                                              // expanded into longhands; no `position-try` key
       }
+    } else if (!custom && name === 'block-step') {
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
+        for (const ln of _BLOCK_STEP_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandBlockStep(stored); if (!lh) return;  // invalid <block-step> → ignore
+        if ('block-step' in this._props) { delete this._props['block-step']; delete this._priority['block-step']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln of _BLOCK_STEP_LONGHANDS) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `block-step` key
+      }
     } else if (!custom && name === 'text-decoration') {
       const low = stored.toLowerCase();
       if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
@@ -2074,6 +2096,14 @@ class CSSStyleDeclaration {
         : _serFlexFlow(this._props['flex-direction'], this._props['flex-wrap']);
       delete this._props['flex-flow']; delete this._priority['flex-flow'];  // any CSS-wide/var blob key
       for (const ln of _FLEX_FLOW_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'block-step') {                            // shorthand: clear its four longhands
+      const old = (key in this._props) ? this._props[key]
+        : _serBlockStep((ln) => this._props[ln]);
+      delete this._props['block-step']; delete this._priority['block-step'];  // any CSS-wide/var blob key
+      for (const ln of _BLOCK_STEP_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -2275,6 +2305,10 @@ class CSSStyleDeclaration {
     if (key === 'flex-flow') {                                // reconstruct from flex-direction/flex-wrap
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
       return _serFlexFlow(this._props['flex-direction'], this._props['flex-wrap']);
+    }
+    if (key === 'block-step') {                               // reconstruct from its four longhands
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      return _serBlockStep((ln) => this._props[ln]);
     }
     if (key === 'position-try') {                             // reconstruct from position-try-order/-fallbacks
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
@@ -18358,6 +18392,47 @@ const _serFlexFlow = (dir, wrap) => {
   return parts.length ? parts.join(' ') : 'row';
 };
 
+// ── css-rhythm: the `block-step` shorthand (Rhythmic Sizing 1 §4) ──────────────
+// `block-step = <'block-step-size'> || <'block-step-insert'> || <'block-step-align'>
+// || <'block-step-round'>` — an order-independent `||` of the four longhands, each at
+// most once. Serialization is the FIXED order size · insert · align · round with each
+// component dropped at its initial; when ALL are initial the shorthand collapses to
+// `none` (the size initial). The four categories are disjoint (`none`/`<length>` is
+// size, and the three enum sets share no keyword), so each token classifies uniquely.
+const _BLOCK_STEP_LONGHANDS = ['block-step-size', 'block-step-insert', 'block-step-align', 'block-step-round'];
+const _BLOCK_STEP_INITIAL = { 'block-step-size': 'none', 'block-step-insert': 'margin-box', 'block-step-align': 'auto', 'block-step-round': 'up' };
+// Expand `block-step` into its four longhands, or null if invalid.
+const _expandBlockStep = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 4) return null;
+  const out = {};
+  for (const tok of toks) {
+    const low = tok.toLowerCase();
+    let cat = null, canon = null;
+    const size = _canonCssUi('block-step-size', tok);          // none | <length [0,∞]>
+    if (size !== null) { cat = 'block-step-size'; canon = size; }
+    else if (_CSSUI_ENUM['block-step-insert'].has(low)) { cat = 'block-step-insert'; canon = low; }
+    else if (_CSSUI_ENUM['block-step-align'].has(low)) { cat = 'block-step-align'; canon = low; }
+    else if (_CSSUI_ENUM['block-step-round'].has(low)) { cat = 'block-step-round'; canon = low; }
+    else return null;                                          // token in no category
+    if (cat in out) return null;                               // a second value for one longhand
+    out[cat] = canon;
+  }
+  for (const ln of _BLOCK_STEP_LONGHANDS) if (!(ln in out)) out[ln] = _BLOCK_STEP_INITIAL[ln];
+  return out;
+};
+// Reconstruct `block-step` from its longhands (specified or computed). Drops each
+// component at its initial; all-initial → `none`.
+const _serBlockStep = (get) => {
+  const vals = _BLOCK_STEP_LONGHANDS.map((ln) => get(ln));
+  if (vals.some((x) => !x)) return '';
+  const parts = [];
+  for (let i = 0; i < _BLOCK_STEP_LONGHANDS.length; i++) {
+    if (vals[i] !== _BLOCK_STEP_INITIAL[_BLOCK_STEP_LONGHANDS[i]]) parts.push(vals[i]);
+  }
+  return parts.length ? parts.join(' ') : 'none';
+};
+
 // animation-range-start / animation-range-end (Scroll Animations 1 §5.2). Each is
 //   [ normal | <length-percentage> | <timeline-range-name> <length-percentage>? ]#
 // where <timeline-range-name> = cover | contain | entry | exit | entry-crossing
@@ -21974,6 +22049,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('flex');                                             // the `flex` shorthand (reconstructed from flex-grow/-shrink/-basis)
   add('flex-flow');                                        // the `flex-flow` shorthand (reconstructed from flex-direction/-wrap)
   add('position-try');                                     // the `position-try` shorthand (reconstructed from position-try-order/-fallbacks)
+  add('block-step');                                       // the `block-step` shorthand (reconstructed from its 4 block-step-* longhands)
   add('text-decoration');                                  // the `text-decoration` shorthand (reconstructed from its 4 longhands)
   add('text-emphasis');                                    // the `text-emphasis` shorthand (reconstructed from its style/color longhands)
   add('list-style');                                       // the `list-style` shorthand (reconstructed from its 3 longhands)
@@ -22070,6 +22146,11 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // -fallbacks (both compute to their stored canonical value; the order is dropped
     // when it is the `normal` initial).
     if (kebab === 'position-try') return _serPositionTry(resolve('position-try-order'), resolve('position-try-fallbacks'));
+    // `block-step` shorthand: reconstruct from the COMPUTED longhands (order size ·
+    // insert · align · round, each dropped at its initial; all-initial → `none`). The
+    // size longhand computes its length to px, so `block-step: 2em` computes with the
+    // resolved `80px`.
+    if (kebab === 'block-step') return _serBlockStep((ln) => resolve(ln));
     // `text-decoration` shorthand: reconstruct from the COMPUTED longhands (order
     // line·style·thickness·color). The colour resolves to rgb() when set, but is
     // omitted when the SPECIFIED colour is the `currentcolor` initial (its computed

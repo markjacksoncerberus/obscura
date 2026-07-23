@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #267 — css-rhythm `block-step-*` longhands SECURED; +65).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #268 — the whole css-rhythm `block-step` family SECURED; +131 across #267–#268).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-rhythm/parsing/block-step-valid.html` | 9/34 | **34/34** | ✅ 100% | **Quest #268 The Block-Step Shorthand Verdict.** `block-step` = `||` of the 4 longhands via `_expandBlockStep`/`_serBlockStep` (serialized size·insert·align·round, defaults dropped, all-default→`none`). Wired like `flex-flow`. |
+| `css/css-rhythm/parsing/block-step-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #268.** Rejects a duplicate longhand (`auto auto`, `none none`, `300px none`) + a token in no category (`border-box`). |
+| `css/css-rhythm/parsing/block-step-computed.html` | 0/34 | **34/34** | ✅ 100% | **Quest #268.** Resolver reconstructs from COMPUTED longhands (size folds em→px). |
 | `css/css-rhythm/parsing/block-step-align-invalid.html` | 0/13 | **13/13** | ✅ 100% | **Quest #267 The Block-Step Longhand Verdict.** `block-step-align` = `auto\|center\|start\|end` → `_CSSUI_ENUM`+`_CSSUI_VALIDATED`. (block-step-round-invalid.html also tests this prop — a WPT copy-paste.) |
 | `css/css-rhythm/parsing/block-step-align-computed.html` | 0/4 | **4/4** | ✅ 100% | **Quest #267.** Computed = keyword identity (initial `auto`). |
 | `css/css-rhythm/parsing/block-step-insert-invalid.html` | 0/12 | **12/12** | ✅ 100% | **Quest #267.** `block-step-insert` = `margin-box\|padding-box\|content-box` (the `-box` keywords only) → `_CSSUI_ENUM`. |
