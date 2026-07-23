@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #257).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #258).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-anchor-position/parsing/position-visibility-parsing.html` | 12/30 | **30/30** | ✅ 100% | **Quest #258 The Anchor-Enum Verdict.** css-anchor-position props were raw-store/unregistered. NEW `_canonPositionVisibility` (`always \| [anchors-valid \|\| anchors-visible \|\| no-overflow]` — `always` stands alone; the three flags combine order-independently, reorder to canonical anchors-valid·anchors-visible·no-overflow at parse time). Wired `_CSSUI_VALIDATED`+`_canonCssUi`+`_GCS_DEFAULTS`(anchors-visible). **+62 across the three props.** |
+| `css/css-anchor-position/parsing/position-visibility-computed.html` | 0/19 | **19/19** | ✅ 100% | **Quest #258.** computed = specified (stored canonical); initial `anchors-visible`, not inherited. |
+| `css/css-anchor-position/parsing/position-try-order-parsing.html` | 9/12 | **12/12** | ✅ 100% | **Quest #258.** `position-try-order` = keyword enum `normal \| most-width \| most-height \| most-block-size \| most-inline-size` → `_CSSUI_ENUM` (rejects two-keyword/comma combos). |
+| `css/css-anchor-position/parsing/position-try-order-computed.html` | 0/7 | **7/7** | ✅ 100% | **Quest #258.** computed = keyword identity; initial `normal`, not inherited. |
+| `css/css-anchor-position/parsing/anchor-scope-parsing.html` | 12/17 | **17/17** | ✅ 100% | **Quest #258.** NEW `_canonAnchorScope` (`none \| all \| <dashed-ident>#` — comma-list of dashed-idents, each one token, no `none`/`all` mixed, no bare idents; case-preserved, author order kept). |
+| `css/css-anchor-position/parsing/anchor-scope-computed.html` | 0/10 | **10/10** | ✅ 100% | **Quest #258.** computed = specified list; initial `none`, not inherited. |
 | `css/css-box/parsing/clear-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #257 The Box-Enum Verdict.** clear/float/visibility were raw-store (invalid accepted). Added three keyword enums to `_CSSUI_ENUM`+`_CSSUI_VALIDATED` (clear `none\|left\|right\|both\|inline-start\|inline-end`, float drops `both`, visibility `visible\|hidden\|collapse`) + `order` = `<integer>` (signed) via a `_canonCssUi` branch. **+10.** |
 | `css/css-box/parsing/float-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #257.** rejects `auto`/`right bottom`/`top, left`. |
 | `css/css-box/parsing/visibility-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #257.** rejects `auto`/`hidden collapse`. |

@@ -9124,6 +9124,8 @@ const _GCS_DEFAULTS = {
   // legacy alias for print-color-adjust (initial `economy`).
   'color-scheme': 'normal', 'color-adjust': 'economy',
   'forced-color-adjust': 'auto', 'print-color-adjust': 'economy',
+  // css-anchor-position — none inherit. Computed = specified (canonical keyword/list).
+  'position-visibility': 'anchors-visible', 'position-try-order': 'normal', 'anchor-scope': 'none',
 };
 // ---------------------------------------------------------------------------
 // Shorthand → longhand expansion (for the cascade / getComputedStyle).
@@ -12895,6 +12897,10 @@ const _CSSUI_ENUM = {
   'clear': new Set(['none', 'left', 'right', 'both', 'inline-start', 'inline-end']),
   'float': new Set(['none', 'left', 'right', 'inline-start', 'inline-end']),
   'visibility': new Set(['visible', 'hidden', 'collapse']),
+  // css-anchor-position: position-try-order is a plain keyword enum
+  // (`normal | most-width | most-height | most-block-size | most-inline-size`).
+  // Rejects any two-keyword or comma-separated combination.
+  'position-try-order': new Set(['normal', 'most-width', 'most-height', 'most-block-size', 'most-inline-size']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -12923,6 +12929,10 @@ const _CSSUI_VALIDATED = new Set([
   'margin-trim',
   // css-box keyword enums + css-flexbox order (`<integer>`, signed).
   'clear', 'float', 'visibility', 'order',
+  // css-anchor-position: position-try-order (enum, above), position-visibility
+  // (`always | anchors-valid || anchors-visible || no-overflow`), anchor-scope
+  // (`none | all | <dashed-ident>#`) — the last two have dedicated _canonCssUi branches.
+  'position-try-order', 'position-visibility', 'anchor-scope',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13136,8 +13146,53 @@ const _canonCssUi = (name, value) => {
   }
   if (name === 'vertical-align') return _canonVerticalAlign(s, null, false);
   if (name === 'margin-trim') return _canonMarginTrim(s, false);
+  if (name === 'position-visibility') return _canonPositionVisibility(s);
+  if (name === 'anchor-scope') return _canonAnchorScope(s);
   if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;
+};
+
+// ── css-anchor-position position-visibility ──────────────────────────────────
+// Grammar (CSS Anchor Positioning 1): `always | [ anchors-valid || anchors-visible
+// || no-overflow ]`. The `always` keyword stands alone (never combines); the three
+// flags combine in any order (order-independent `||`) with no repeats and serialize
+// in the fixed order anchors-valid · anchors-visible · no-overflow — the same for
+// SPECIFIED and COMPUTED (the -valid file already expects the reorder at parse time,
+// so the stored value is canonical and computed is identity).
+const _POS_VIS_FLAGS = ['anchors-valid', 'anchors-visible', 'no-overflow'];
+const _canonPositionVisibility = (value) => {
+  const toks = _asciiLower(String(value).trim()).split(/\s+/).filter(Boolean);
+  if (toks.length === 0) return null;
+  if (toks.length === 1 && toks[0] === 'always') return 'always';
+  const seen = new Set();
+  for (const t of toks) {
+    if (!_POS_VIS_FLAGS.includes(t) || seen.has(t)) return null; // unknown/`always`/repeat → invalid
+    seen.add(t);
+  }
+  return _POS_VIS_FLAGS.filter((f) => seen.has(f)).join(' ');
+};
+
+// ── css-anchor-position anchor-scope ─────────────────────────────────────────
+// Grammar: `none | all | <dashed-ident>#` (CSS Anchor Positioning 1). `none`/`all`
+// stand alone; otherwise a comma-separated list of <dashed-ident>s, each exactly one
+// token (`--a --b` space-joined is invalid), with no `none`/`all` mixed into the list
+// and no bare (non-dashed) idents. <dashed-ident>s are case-sensitive → kept verbatim,
+// and the list preserves author order (`--bar, --foo` stays). Computed = specified.
+const _canonAnchorScope = (value) => {
+  const v = String(value).trim();
+  if (v === '') return null;
+  const low = v.toLowerCase();
+  if (low === 'none' || low === 'all') return low;
+  const parts = _commaSplitTop(v).map((p) => p.trim());
+  const out = [];
+  for (const p of parts) {
+    const toks = _wsTokens(p);
+    if (toks.length !== 1) return null;                          // exactly one ident per comma-item
+    const t = toks[0];
+    if (!/^--/.test(t) || !_GRID_CI_RE.test(t)) return null;     // must be a <dashed-ident>
+    out.push(t);
+  }
+  return out.length ? out.join(', ') : null;
 };
 
 // ── css-box margin-trim ──────────────────────────────────────────────────────
