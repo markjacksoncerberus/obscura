@@ -19730,6 +19730,12 @@ const _serBorderLogicalSh = (read, name, decl) => {
 // their longhands (so `el.style.marginBlockStart` reads back and the LONGHAND
 // getter reflects the shorthand), mirroring scroll-margin-block.
 const _BOX_LOGICAL_SH2 = {
+  // physical margin/padding (4-edge) — eager expansion validates components (so a
+  // bad token / wrong arity is rejected) AND makes the LONGHAND getter reflect the
+  // shorthand (`el.style.marginTop` after `el.style.margin = …`). They remain in
+  // _BOX_SHORTHANDS below so cssText still recombines the stored longhands.
+  'margin': ['margin-top', 'margin-right', 'margin-bottom', 'margin-left'],
+  'padding': ['padding-top', 'padding-right', 'padding-bottom', 'padding-left'],
   'margin-block': ['margin-block-start', 'margin-block-end'],
   'margin-inline': ['margin-inline-start', 'margin-inline-end'],
   'padding-block': ['padding-block-start', 'padding-block-end'],
@@ -19738,8 +19744,13 @@ const _BOX_LOGICAL_SH2 = {
   'inset-inline': ['inset-inline-start', 'inset-inline-end'],
   'inset': ['top', 'right', 'bottom', 'left'],
 };
-// The 12 flow-relative longhands (margin/padding/inset block/inline start/end).
+// The box-model longhands validated by _canonBoxLogicalLh: the 4 physical margin +
+// 4 physical padding edges, plus the 12 flow-relative (margin/padding/inset
+// block/inline start/end). physical top/right/bottom/left are NOT here — they are
+// also `inset` longhands and validated on the position path.
 const _BOX_LOGICAL_LH = new Set([
+  'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+  'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
   'margin-block-start', 'margin-block-end', 'margin-inline-start', 'margin-inline-end',
   'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
   'inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end',
