@@ -9084,6 +9084,7 @@ const _GCS_DEFAULTS = {
   'border-block-start-width': '0px', 'border-block-end-width': '0px',
   'border-inline-start-width': '0px', 'border-inline-end-width': '0px',
   'z-index': 'auto', 'pointer-events': 'auto',
+  page: 'auto',                                    // css-page: `auto | <custom-ident>` (computed = specified, case-preserved)
   'box-sizing': 'content-box', cursor: 'auto',
   // css-backgrounds longhands (not inherited) + `filter`. Computed serialization
   // is identity here (keyword / position / url), which lets var() substitution
@@ -13144,6 +13145,9 @@ const _CSSUI_VALIDATED = new Set([
   // a dedicated _canonCssUi branch; a number-typed calc kept symbolic → folded at
   // computed via _INTEGER_COMPUTED_PROPS).
   'position', 'z-index',
+  // css-page: `page` = `auto | <custom-ident>` (a dedicated _canonCssUi branch;
+  // custom-ident case-preserved, computed = specified).
+  'page',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13269,6 +13273,18 @@ const _canonCssUi = (name, value) => {
     }
     if (/^\+?\d+$/.test(t)) { const n = parseInt(t, 10); return n >= 1 ? String(n) : null; }
     return null;
+  }
+  if (name === 'page') {
+    // css-page: `auto | <custom-ident>`. `auto` is a keyword (case-insensitive,
+    // lowercased); a <custom-ident> is case-PRESERVED (`TABLE` stays `TABLE`). The
+    // custom-ident excludes the CSS-wide keywords (handled at the top of _canonCssUi)
+    // and `default`. Rejects a multi-token / comma value, a number/dimension, calc().
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    if (t.toLowerCase() === 'auto') return 'auto';
+    if (t.toLowerCase() === 'default') return null;          // <custom-ident> excludes `default`
+    return _GRID_CI_RE.test(t) ? t : null;                  // a single case-preserved identifier
   }
   if (name === 'z-index') {
     // css-position: `auto | <integer>` (signed, unbounded). A number-typed calc is
