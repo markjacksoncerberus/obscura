@@ -13931,11 +13931,18 @@ const _RI_SH = {
   'column-rule-inset-end':   { lh: ['column-rule-inset-cap-end', 'column-rule-inset-junction-end'], shape: 'dup' },
   'row-rule-inset-start':    { lh: ['row-rule-inset-cap-start', 'row-rule-inset-junction-start'], shape: 'dup' },
   'row-rule-inset-end':      { lh: ['row-rule-inset-cap-end', 'row-rule-inset-junction-end'], shape: 'dup' },
+  // cap-junction level (#265): the two {start,end} of one position — <iv>{1,2}.
+  'column-rule-inset-cap':      { lh: ['column-rule-inset-cap-start', 'column-rule-inset-cap-end'], shape: 'pair' },
+  'row-rule-inset-cap':         { lh: ['row-rule-inset-cap-start', 'row-rule-inset-cap-end'], shape: 'pair' },
+  'column-rule-inset-junction': { lh: ['column-rule-inset-junction-start', 'column-rule-inset-junction-end'], shape: 'pair' },
+  'row-rule-inset-junction':    { lh: ['row-rule-inset-junction-start', 'row-rule-inset-junction-end'], shape: 'pair' },
 };
 // Bidirectional (both-axes) inset shorthands: the column + row per-axis shorthands.
 const _RI_BIDI = {
   'rule-inset-start': ['column-rule-inset-start', 'row-rule-inset-start'],
   'rule-inset-end':   ['column-rule-inset-end', 'row-rule-inset-end'],
+  'rule-inset-cap':      ['column-rule-inset-cap', 'row-rule-inset-cap'],
+  'rule-inset-junction': ['column-rule-inset-junction', 'row-rule-inset-junction'],
 };
 // The ordered leaf longhands a rule-inset shorthand ultimately writes (per-axis: its
 // own `.lh`; bidirectional: both axes' leaves concatenated).

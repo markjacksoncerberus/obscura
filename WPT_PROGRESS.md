@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #264 — css-gaps rule-inset FOUNDATION + start-end level SECURED).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #265 — css-gaps rule-inset cap-junction level SECURED).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-gaps/parsing/rule-inset-cap-junction-valid.html` | 42/48 | **48/48** | ✅ 100% | **Quest #265 The Rule-Inset Cap-Junction Verdict.** Registered the cap-junction (`pair`) level over #264's infra: `{axis}-rule-inset-cap`/`-junction` + bidi `rule-inset-cap`/`-junction`, value `<inset-value>{1,2}`. |
+| `css/css-gaps/parsing/rule-inset-cap-junction-invalid.html` | 0/60 | **60/60** | ✅ 100% | **Quest #265.** Rejects `/`, >2 tokens, `10px blue`. |
+| `css/css-gaps/parsing/rule-inset-cap-junction-computed.html` | 0/48 | **48/48** | ✅ 100% | **Quest #265.** Pair collapses `start==end`→single. |
+| `css/css-gaps/parsing/rule-inset-cap-junction-shorthand.html` | 0/60 | **60/60** | ✅ 100% | **Quest #265.** |
+| `css/css-gaps/parsing/rule-inset-cap-bidirectional-shorthand.html` | 0/25 | **25/25** | ✅ 100% | **Quest #265.** |
+| `css/css-gaps/parsing/rule-inset-junction-bidirectional-shorthand.html` | 0/25 | **25/25** | ✅ 100% | **Quest #265.** |
 | `css/css-gaps/parsing/rule-inset-cap-start-end-computed.html` | 0/32 | **32/32** | ✅ 100% | **Quest #264 The Rule-Inset Foundation Verdict.** The rule-INSET family (8 stored leaf longhands per `axis×position×side`, each `<inset-value> = <length-percentage> \| overlap-join`) was raw-store. Built the whole `_RI_*` infra (all value shapes) + registered the start-end level. Leaf computed = `_computeInsetValue` (`overlap-join` identity; else `_trComp`→px, % kept). |
 | `css/css-gaps/parsing/rule-inset-cap-start-end-invalid.html` | 0/24 | **24/24** | ✅ 100% | **Quest #264.** Leaf = a single `<inset-value>` token (rejects `auto`/`none`/`10`/`10px 20px`/`overlap-join 10px`). |
 | `css/css-gaps/parsing/rule-inset-junction-start-end-computed.html` | 0/32 | **32/32** | ✅ 100% | **Quest #264.** |
