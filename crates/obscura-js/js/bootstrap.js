@@ -9128,6 +9128,11 @@ const _GCS_DEFAULTS = {
   'font-variant-east-asian': 'normal', 'font-variant-emoji': 'normal',
   'font-variant-ligatures': 'normal', 'font-variant-numeric': 'normal',
   'font-variant-position': 'normal', 'font-variation-settings': 'normal',
+  // font-palette = normal | light | dark | <palette-identifier> (a <dashed-ident>).
+  // Validated in setProperty (_isValidFontPalette) but was never registered here,
+  // so getComputedStyle reported it unsupported. Computed value is the specified
+  // keyword/ident verbatim (identity) — no _normComputed branch needed.
+  'font-palette': 'normal',
   // css-ui properties. caret-color/outline-color are <color> (in _COLOR_PROPS);
   // their initial is `currentColor`, which the colour normalizer resolves to
   // the element's own computed colour. outline-width initial `medium` matches
@@ -12693,6 +12698,7 @@ const _INHERITED_PROPS = new Set([
   'font-variant', 'font-variant-alternates', 'font-variant-caps',
   'font-variant-east-asian', 'font-variant-emoji', 'font-variant-ligatures',
   'font-variant-numeric', 'font-variant-position', 'font-variation-settings',
+  'font-palette',                                       // font-palette inherits (CSS Fonts 4 §6.1)
   // css-ui: caret-color, caret-shape, cursor and interactivity inherit (the
   // outline-* and nav-* properties and appearance/resize/user-select do NOT).
   'caret-color', 'caret-shape', 'interactivity',
@@ -14399,7 +14405,13 @@ const _canonCssText = (name, value) => {
     if (toks.length !== 1) return null;
     const t = toks[0];
     if (t.toLowerCase() === 'auto') return 'auto';
-    if (/^"(?:[^"\\]|\\.)*"$/.test(t) || /^'(?:[^'\\]|\\.)*'$/.test(t)) return _canonStandardValue(t);
+    // A <string>: decode CSS escape sequences and re-serialize canonically, so an
+    // escaped codepoint (`"\1400"`) becomes the actual character (`"᐀"`) — the same
+    // canon font-language-override / font-feature-settings apply to their strings.
+    // (_serCssString is defined later but resolves at setProperty call time.)
+    if (/^"(?:[^"\\]|\\.)*"$/.test(t) || /^'(?:[^'\\]|\\.)*'$/.test(t)) {
+      return _serCssString(_unescapeIdent(t.slice(1, -1)));
+    }
     return null;
   }
   if (name === 'hyphenate-limit-chars') {                   // [ auto | <integer [0,∞]> ]{1,3}
@@ -22023,6 +22035,43 @@ const _substituteVars = (el, value, guard) => {
   return out.trim();
 };
 const _GCS_INLINE_SPEC = Number.MAX_SAFE_INTEGER;
+// HTML presentational hints — legacy attributes that map to CSS at the very
+// bottom of the author cascade: they lose to every author rule (even a `*`
+// selector) but win over the UA/initial value. Currently only <font size>,
+// mapped via the HTML "rules for parsing a legacy font size" (size="1".."7",
+// or +N/-N relative to 3, → an absolute <font-size> keyword).
+const _LEGACY_FONT_SIZE_KW = ['x-small', 'small', 'medium', 'large', 'x-large', 'xx-large', 'xxx-large'];
+const _parseLegacyFontSize = (raw) => {
+  const s = String(raw);
+  let i = 0;
+  while (i < s.length && /[\t\n\f\r ]/.test(s[i])) i++;    // skip leading ASCII whitespace
+  if (i >= s.length) return null;
+  let mode = 0;                                            // 0 absolute, +1 / -1 relative-to-3
+  if (s[i] === '+') { mode = 1; i++; }
+  else if (s[i] === '-') { mode = -1; i++; }
+  let d = '';
+  while (i < s.length && s[i] >= '0' && s[i] <= '9') { d += s[i]; i++; }
+  if (d === '') return null;                               // no digits → no hint
+  let n = parseInt(d, 10);
+  if (mode === 1) n = 3 + n; else if (mode === -1) n = 3 - n;
+  if (n < 1) n = 1; else if (n > 7) n = 7;                 // clamp to 1..7
+  return _LEGACY_FONT_SIZE_KW[n - 1];
+};
+const _presHintDecls = (el) => {
+  // Returns a decls map { name: {value, important} } of presentational-hint
+  // declarations for `el`, or null when the element contributes none.
+  let decls = null;
+  try {
+    if (el.localName === 'font') {
+      const sz = el.getAttribute('size');
+      if (sz != null && sz !== '') {
+        const kw = _parseLegacyFontSize(sz);
+        if (kw) { decls = {}; _expandDeclInto(decls, 'font-size', kw, false); }
+      }
+    }
+  } catch (e) {}
+  return decls;
+};
 const _buildCascade = (el) => {
   // Returns the list of matched declaration sources for `el`, each
   // { spec, order, decls }, including inline style as the highest source.
@@ -22042,6 +22091,12 @@ const _buildCascade = (el) => {
     }
     const combined = flat.map((r) => r.selectorText).join(' ');
     try { _primeTarget(combined, el); _primeValidity(combined, el); } catch (e) {}
+    // Presentational hints sit below every author rule: spec 0 with an order (-1)
+    // preceding the first author rule (order 0), so any author declaration of the
+    // same property wins the same-specificity tie, while the hint still overrides
+    // the UA/initial when nothing else sets the property.
+    const hintDecls = _presHintDecls(el);
+    if (hintDecls) sources.push({ spec: 0, order: -1, decls: hintDecls });
     let order = 0;
     for (const rule of flat) {
       const spec = parseInt(_dom('selector_match_specificity', String(nid), rule.selectorText), 10);
