@@ -10,12 +10,22 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #265 — css-gaps rule-inset cap-junction level SECURED).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #266 — css-gaps rule-inset + rule-visibility-items SECURED; the whole rule-inset/visibility vein +854).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-gaps/parsing/rule-inset-valid.html` | 30/51 | **51/51** | ✅ 100% | **Quest #266 The Rule-Inset & Visibility Verdict.** Registered the `inset` super-shorthand (`quad` shape): `{axis}-rule-inset` + bidi `rule-inset`, value `<iv>{1,2} [ / <iv>{1,2} ]?` (pre-slash cap, post-slash junction). Serialization: all-four-equal→single value, else `cs ce / js je`. |
+| `css/css-gaps/parsing/rule-inset-invalid.html` | 0/30 | **30/30** | ✅ 100% | **Quest #266.** Rejects >1 slash, empty side, >2 per side (`_slashSplitTop` + `_parseInsetPair`). |
+| `css/css-gaps/parsing/rule-inset-computed.html` | 0/45 | **45/45** | ✅ 100% | **Quest #266.** |
+| `css/css-gaps/parsing/rule-inset-shorthand.html` | 0/100 | **100/100** | ✅ 100% | **Quest #266.** |
+| `css/css-gaps/parsing/rule-inset-bidirectional-shorthand.html` | 0/81 | **81/81** | ✅ 100% | **Quest #266.** |
+| `css/css-gaps/parsing/rule-visibility-items-valid.html` | 12/12 | **12/12** | ✅ 100% | **Quest #266.** `{axis}-rule-visibility-items` = `all\|around\|between\|normal` enum → `_CSSUI_ENUM`; the `rule-visibility-items` shorthand via existing `_GAP_BIDI_SH`. |
+| `css/css-gaps/parsing/rule-visibility-items-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #266.** Rejects `true`/`10px`/`default`/`none`/`auto`. |
+| `css/css-gaps/parsing/rule-visibility-items-computed.html` | 0/12 | **12/12** | ✅ 100% | **Quest #266.** Computed = keyword identity (initial `normal`). |
+| `css/css-gaps/parsing/rule-visibility-items-shorthand.html` | 0/12 | **12/12** | ✅ 100% | **Quest #266.** |
+| `css/css-gaps/parsing/gap-decorations-bidirectional-shorthands.html` | 12/14 | **14/14** | ✅ 100% | **Quest #266 (bonus).** The 2 remaining fails were the `rule-visibility-items` shorthand — cleared by registering the family (#263's cap closed). |
 | `css/css-gaps/parsing/rule-inset-cap-junction-valid.html` | 42/48 | **48/48** | ✅ 100% | **Quest #265 The Rule-Inset Cap-Junction Verdict.** Registered the cap-junction (`pair`) level over #264's infra: `{axis}-rule-inset-cap`/`-junction` + bidi `rule-inset-cap`/`-junction`, value `<inset-value>{1,2}`. |
 | `css/css-gaps/parsing/rule-inset-cap-junction-invalid.html` | 0/60 | **60/60** | ✅ 100% | **Quest #265.** Rejects `/`, >2 tokens, `10px blue`. |
 | `css/css-gaps/parsing/rule-inset-cap-junction-computed.html` | 0/48 | **48/48** | ✅ 100% | **Quest #265.** Pair collapses `start==end`→single. |

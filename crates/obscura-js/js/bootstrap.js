@@ -9204,6 +9204,7 @@ const _GCS_DEFAULTS = {
   // css-gaps — none inherit. rule-break initial is `none` (computed = specified keyword);
   // the row-rule-* line props mirror the column-rule-* initials.
   'column-rule-break': 'none', 'row-rule-break': 'none',
+  'column-rule-visibility-items': 'normal', 'row-rule-visibility-items': 'normal',
   'row-rule-color': 'currentColor', 'row-rule-style': 'none', 'row-rule-width': 'medium',
   // rule-inset leaf longhands: initial `0` (computed `0px`); not inherited.
   'column-rule-inset-cap-start': '0px', 'column-rule-inset-cap-end': '0px',
@@ -13032,6 +13033,10 @@ const _CSSUI_ENUM = {
   // Rejects `auto`/`true`/`10px`/`default` and any two-keyword combination.
   'column-rule-break': new Set(['none', 'normal', 'intersection']),
   'row-rule-break': new Set(['none', 'normal', 'intersection']),
+  // css-gaps: the per-axis rule-visibility-items longhands — `all | around | between |
+  // normal`. Rejects `true`/`10px`/`default`/`none`/`auto`. Computed = keyword identity.
+  'column-rule-visibility-items': new Set(['all', 'around', 'between', 'normal']),
+  'row-rule-visibility-items': new Set(['all', 'around', 'between', 'normal']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -13054,6 +13059,8 @@ const _CSSUI_VALIDATED = new Set([
   'alignment-baseline', 'dominant-baseline',
   // css-gaps rule-break longhands (keyword identity, computed = specified).
   'column-rule-break', 'row-rule-break',
+  // css-gaps rule-visibility-items longhands (keyword identity, computed = specified).
+  'column-rule-visibility-items', 'row-rule-visibility-items',
   // css-inline line-height (`normal | <number> | <length-percentage>`, non-negative)
   // + baseline-shift (`<length-percentage> | sub | super | top | center | bottom`)
   // + vertical-align (`[first|last] || <alignment-baseline> || <baseline-shift>`).
@@ -13697,6 +13704,7 @@ const _computeColumns = (el, v) => {
 // intersection` keyword enum (validated via _CSSUI_ENUM/_canonCssUi; computed identity).
 const _GAP_BIDI_SH = {
   'rule-break': ['column-rule-break', 'row-rule-break'],
+  'rule-visibility-items': ['column-rule-visibility-items', 'row-rule-visibility-items'],
   'rule-color': ['column-rule-color', 'row-rule-color'],
   'rule-style': ['column-rule-style', 'row-rule-style'],
   'rule-width': ['column-rule-width', 'row-rule-width'],
@@ -13772,7 +13780,7 @@ const _canonGapRuleList = (value, leaf) => {
 // canonical form or null. Break longhands are keyword enums; color/style/width are
 // the shared line-list grammar.
 const _canonGapRuleLonghand = (name, value) => {
-  if (name === 'column-rule-break' || name === 'row-rule-break') return _canonCssUi(name, value);
+  if (_CSSUI_ENUM[name]) return _canonCssUi(name, value);   // rule-break / rule-visibility-items keyword enums
   const leaf = _GAP_RULE_LEAF[name];
   if (leaf) return _canonGapRuleList(value, leaf);
   return null;
@@ -13936,6 +13944,10 @@ const _RI_SH = {
   'row-rule-inset-cap':         { lh: ['row-rule-inset-cap-start', 'row-rule-inset-cap-end'], shape: 'pair' },
   'column-rule-inset-junction': { lh: ['column-rule-inset-junction-start', 'column-rule-inset-junction-end'], shape: 'pair' },
   'row-rule-inset-junction':    { lh: ['row-rule-inset-junction-start', 'row-rule-inset-junction-end'], shape: 'pair' },
+  // inset super-shorthand (#266): all four of one axis — <iv>{1,2} [ / <iv>{1,2} ]?
+  // (pre-slash = cap side, post-slash = junction side; 1 value per side → both).
+  'column-rule-inset': { lh: ['column-rule-inset-cap-start', 'column-rule-inset-cap-end', 'column-rule-inset-junction-start', 'column-rule-inset-junction-end'], shape: 'quad' },
+  'row-rule-inset':    { lh: ['row-rule-inset-cap-start', 'row-rule-inset-cap-end', 'row-rule-inset-junction-start', 'row-rule-inset-junction-end'], shape: 'quad' },
 };
 // Bidirectional (both-axes) inset shorthands: the column + row per-axis shorthands.
 const _RI_BIDI = {
@@ -13943,6 +13955,7 @@ const _RI_BIDI = {
   'rule-inset-end':   ['column-rule-inset-end', 'row-rule-inset-end'],
   'rule-inset-cap':      ['column-rule-inset-cap', 'row-rule-inset-cap'],
   'rule-inset-junction': ['column-rule-inset-junction', 'row-rule-inset-junction'],
+  'rule-inset':          ['column-rule-inset', 'row-rule-inset'],
 };
 // The ordered leaf longhands a rule-inset shorthand ultimately writes (per-axis: its
 // own `.lh`; bidirectional: both axes' leaves concatenated).
