@@ -9159,8 +9159,10 @@ const _GCS_DEFAULTS = {
   'column-count': 'auto', 'column-fill': 'balance', 'column-rule-color': 'currentColor',
   'column-rule-style': 'none', 'column-rule-width': 'medium', 'column-span': 'none',
   'column-width': 'auto',
-  // css-gaps — none inherit. rule-break initial is `none` (computed = specified keyword).
+  // css-gaps — none inherit. rule-break initial is `none` (computed = specified keyword);
+  // the row-rule-* line props mirror the column-rule-* initials.
   'column-rule-break': 'none', 'row-rule-break': 'none',
+  'row-rule-color': 'currentColor', 'row-rule-style': 'none', 'row-rule-width': 'medium',
   // css-shapes — none inherit. shape-image-threshold is a <number>.
   'shape-image-threshold': '0', 'shape-margin': '0px', 'shape-outside': 'none',
   // css-scroll-snap — none inherit. scroll-margin-* default 0px, scroll-padding-* auto.
@@ -13593,11 +13595,18 @@ const _canonColumns = (s) => {
 const _MULTICOL_VALIDATED = new Set([
   'column-width', 'column-count', 'column-rule-width', 'column-rule-style',
   'column-rule-color', 'column-span', 'column-fill', 'columns',
+  // css-gaps: the row-rule-* mirrors of the column-rule-* line props (list grammar).
+  'row-rule-width', 'row-rule-style', 'row-rule-color',
 ]);
 const _canonMulticol = (name, value) => {
   const s = String(value).trim();
   const low = s.toLowerCase();
   if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(s)) return s;      // CSS-wide / var()/env() → pass through
+  // css-gaps: column-rule-*/row-rule-* color/style/width take the shared <line-*-list>
+  // grammar (repeat()/auto-repeat + comma list). A single value round-trips identically
+  // to the legacy single-leaf canon, so this is a safe superset for the multicol longhands.
+  const gapLeaf = _GAP_RULE_LEAF[name];
+  if (gapLeaf) return _canonGapRuleList(s, gapLeaf);
   const enumSet = _MULTICOL_ENUM[name];
   if (enumSet) return enumSet.has(low) ? low : null;
   if (name === 'column-rule-color') {                         // `<color>` (single token)
@@ -13633,11 +13642,84 @@ const _computeColumns = (el, v) => {
 // intersection` keyword enum (validated via _CSSUI_ENUM/_canonCssUi; computed identity).
 const _GAP_BIDI_SH = {
   'rule-break': ['column-rule-break', 'row-rule-break'],
+  'rule-color': ['column-rule-color', 'row-rule-color'],
+  'rule-style': ['column-rule-style', 'row-rule-style'],
+  'rule-width': ['column-rule-width', 'row-rule-width'],
+};
+// The leaf type of each gap-decoration color/style/width longhand. color/style/width
+// share ONE list grammar (below); only the per-leaf validator differs.
+const _GAP_RULE_LEAF = {
+  'column-rule-color': 'color', 'row-rule-color': 'color',
+  'column-rule-style': 'style', 'row-rule-style': 'style',
+  'column-rule-width': 'width', 'row-rule-width': 'width',
+};
+// Validate + canonicalize ONE <color|line-style|line-width> leaf token, or null.
+const _canonGapLeaf = (leaf, tok) => {
+  if (leaf === 'color') return _isValidColor(tok) ? _canonColorSpecified(tok) : null;
+  if (leaf === 'style') { const l = tok.toLowerCase(); return _LINE_STYLE_KW.has(l) ? l : null; }
+  if (leaf === 'width') return _canonColumnRuleWidth(tok);   // thin/medium/thick | <length [0,∞]>
+  return null;
+};
+// A comma-separated leaf run inside repeat(): `<leaf>#` — each item exactly one token.
+// Returns the array of canonical leaves, or null (empty run / invalid / space-joined).
+const _canonGapLeafRun = (leaf, segs) => {
+  if (!segs.length) return null;
+  const out = [];
+  for (const seg of segs) {
+    const toks = _wsTokens(seg.trim());
+    if (toks.length !== 1) return null;                 // space-separated leaves inside repeat → invalid
+    const c = _canonGapLeaf(leaf, toks[0]);
+    if (c === null) return null;
+    out.push(c);
+  }
+  return out;
+};
+// The shared CSS Gap Decorations line list grammar (color/style/width differ only in
+// the leaf type):
+//   value            = <line-list> | <auto-line-list>
+//   <line-list>      = <item>#                          (comma list, ≥1)
+//   <auto-line-list> = <item>* <auto-repeat> <item>*    (exactly ONE auto-repeat)
+//   <item>           = <leaf> | repeat( <integer [1,∞]> , <leaf># )
+//   <auto-repeat>    = repeat( auto , <leaf># )
+// Returns the canonical (specified) serialization, or null when invalid. Single-value
+// forms round-trip identically to the multicol single-leaf canon (superset).
+const _REPEAT_RE = /^repeat\(([\s\S]*)\)$/i;
+const _canonGapRuleList = (value, leaf) => {
+  const s = String(value).trim();
+  if (!s) return null;
+  const items = _commaSplitTop(s).map((x) => x.trim());
+  if (items.some((x) => x === '')) return null;          // empty item (leading/trailing/double comma)
+  const parts = [];
+  let autoSeen = 0;
+  for (const item of items) {
+    const m = _REPEAT_RE.exec(item);
+    if (m) {
+      const inner = _commaSplitTop(m[1]).map((x) => x.trim());
+      if (inner.length < 2) return null;                 // need a count + ≥1 leaf
+      const leaves = _canonGapLeafRun(leaf, inner.slice(1));
+      if (leaves === null) return null;
+      let count;
+      if (inner[0].toLowerCase() === 'auto') { autoSeen++; count = 'auto'; }
+      else { count = _canonColumnCount(inner[0]); if (count === null || count === 'auto') return null; }
+      parts.push('repeat(' + count + ', ' + leaves.join(', ') + ')');
+    } else {
+      const toks = _wsTokens(item);
+      if (toks.length !== 1) return null;                // top-level space-separated leaves → invalid
+      const c = _canonGapLeaf(leaf, toks[0]);
+      if (c === null) return null;
+      parts.push(c);
+    }
+  }
+  if (autoSeen > 1) return null;                         // at most one auto-repeat
+  return parts.join(', ');
 };
 // Validate ONE value against a gap-decoration longhand's grammar, returning the
-// canonical form or null. The break longhands are keyword enums (via _canonCssUi).
+// canonical form or null. Break longhands are keyword enums; color/style/width are
+// the shared line-list grammar.
 const _canonGapRuleLonghand = (name, value) => {
   if (name === 'column-rule-break' || name === 'row-rule-break') return _canonCssUi(name, value);
+  const leaf = _GAP_RULE_LEAF[name];
+  if (leaf) return _canonGapRuleList(value, leaf);
   return null;
 };
 // Expand a "rule-*" shorthand's single value into { column-*: canon, row-*: canon },

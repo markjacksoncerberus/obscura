@@ -10,12 +10,18 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #261 — css-gaps `rule-break` family secured).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #262 — css-gaps `<line-*-list>` grammar secured).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-gaps/parsing/gap-decorations-color-valid.html` | 31/45 | **45/45** | ✅ 100% | **Quest #262 The Line-List Verdict.** The shared `<line-*-list>` grammar (`repeat(<n>, <leaf>#)` / `repeat(auto, …)` + comma list) was raw-store beyond a single leaf. NEW `_canonGapRuleList(value, leaf)` — paren-aware item split, per-leaf validators, ≤1 auto-repeat, count via `_canonColumnCount`. `_canonMulticol` delegates the 6 `*-rule-{color,style,width}` longhands (single value round-trips identically → multicol safe). |
+| `css/css-gaps/parsing/gap-decorations-color-invalid.html` | 6/18 | **18/18** | ✅ 100% | **Quest #262.** Rejects `auto`, space-joined leaves, `repeat(auto, a b c)`, `repeat(0/-1, …)`, double auto-repeat. |
+| `css/css-gaps/parsing/gap-decorations-style-valid.html` | 31/45 | **45/45** | ✅ 100% | **Quest #262.** leaf = `<line-style>` (`_LINE_STYLE_KW`). |
+| `css/css-gaps/parsing/gap-decorations-style-invalid.html` | 6/18 | **18/18** | ✅ 100% | **Quest #262.** |
+| `css/css-gaps/parsing/gap-decorations-width-valid.html` | 31/45 | **45/45** | ✅ 100% | **Quest #262.** leaf = `<line-width>` (reused `_canonColumnRuleWidth`). |
+| `css/css-gaps/parsing/gap-decorations-width-invalid.html` | 9/27 | **27/27** | ✅ 100% | **Quest #262.** Also rejects `30%`, `-20px`, bare-number `10 20 30`. Added `row-rule-{color,style,width}` to `_MULTICOL_VALIDATED`+`_GCS_DEFAULTS`; `rule-{color,style,width}` shorthands into `_GAP_BIDI_SH`. |
 | `css/css-gaps/parsing/rule-break-invalid.html` | 0/12 | **12/12** | ✅ 100% | **Quest #261 The Rule-Break Verdict.** css-gaps `column-rule-break`/`row-rule-break` were raw-store — `auto`/`true`/`10px`/`default` wrongly accepted. Added both to `_CSSUI_ENUM` (`none \| normal \| intersection`) + `_CSSUI_VALIDATED`. NEW generic `_GAP_BIDI_SH` infra for the `rule-*` bidirectional shorthands (`_expandGapBidi`/`_serGapBidiSh`) wired across all 6 shorthand touch points like `overflow`. |
 | `css/css-gaps/parsing/rule-break-computed.html` | 0/9 | **9/9** | ✅ 100% | **Quest #261.** Longhands → `_GCS_DEFAULTS` (`none`, not inherited; computed = keyword identity). The `rule-break` shorthand reconstructs from the computed column-*/row-* longhands (value when both agree, else `''`). |
 | `css/css-anchor-position/parsing/position-try-parsing.html` | 8/35 | **35/35** | ✅ 100% | **Quest #260 The Position-Try Verdict.** The `position-try` shorthand = `<'position-try-order'>? <'position-try-fallbacks'>`. NEW `_expandPositionTry` (strips a leading order keyword — appearing ONCE at the start — then validates the rest as fallbacks; `none normal`/`flip-block most-height`/`normal --foo, most-width --bar` invalid since the stray order keyword lands in the fallbacks grammar) + `_serPositionTry` (drops `normal`). Wired like `flex-flow` across all 6 touch points (inline parser, setProperty, removeProperty, getPropertyValue, getComputedStyle, `_CSS_KNOWN_PROPS`). **Completes the arc — `css/css-anchor-position/parsing/` is 220/220, +146 across #258–#260.** |
