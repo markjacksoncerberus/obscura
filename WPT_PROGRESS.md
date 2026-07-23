@@ -10,7 +10,7 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #254).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #257).
 
 ## Scoreboard
 
