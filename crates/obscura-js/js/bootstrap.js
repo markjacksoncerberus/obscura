@@ -1142,6 +1142,13 @@ const _parseStyleDecls = (text) => {
           const c = _canonBoxLogicalLh(name, value); if (c === null) continue;  // invalid → drop
           value = c;
         }
+      } else if (_GAP_BIDI_SH[name]) {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandGapBidi(name, value); if (!lh) continue;  // out of grammar → drop
+          for (const ln of _GAP_BIDI_SH[name]) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no shorthand key
+        }
       } else if (_ANIM_KEYWORD_LISTS.has(name)) {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -1336,6 +1343,21 @@ class CSSStyleDeclaration {
       delete this._props['overflow']; delete this._priority['overflow'];  // never keep a shorthand key
       this._props['overflow-x'] = x; this._priority['overflow-x'] = prio;
       this._props['overflow-y'] = y; this._priority['overflow-y'] = prio;
+      this._notifyChange();
+      return;                                                   // expanded; no shorthand key kept
+    }
+    if (!custom && _GAP_BIDI_SH[name] && !/\bvar\(/i.test(stored)) {
+      // css-gaps `rule-*` shorthand: expand into — and store as — its column-* and
+      // row-* longhands (same value in both) so the longhands read back and the
+      // shorthand reconstructs. A CSS-wide keyword goes to both. Invalid → ignore.
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      const pair = _GAP_BIDI_SH[name];
+      const low = stored.toLowerCase();
+      let vals;
+      if (_CSS_WIDE.has(low)) vals = { [pair[0]]: low, [pair[1]]: low };
+      else { const lh = _expandGapBidi(name, stored); if (!lh) return; vals = lh; }
+      delete this._props[name]; delete this._priority[name];   // never keep a shorthand key
+      for (const ln of pair) { this._props[ln] = vals[ln]; this._priority[ln] = prio; }
       this._notifyChange();
       return;                                                   // expanded; no shorthand key kept
     }
@@ -2120,6 +2142,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (_GAP_BIDI_SH[key]) {                                // css-gaps `rule-*` shorthand: clear both longhands
+      const old = (key in this._props) ? this._props[key] : _serGapBidiSh((n) => this._props[n] || '', key);
+      delete this._props[key]; delete this._priority[key];   // any var()/CSS-wide-stored shorthand key
+      for (const ln of _GAP_BIDI_SH[key]) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     if (key === 'grid-column' || key === 'grid-row' || key === 'grid-area') {  // placement shorthand: clear its longhands
       const axis = key === 'grid-column' ? 'column' : 'row';
       const old = (key in this._props) ? this._props[key]
@@ -2238,6 +2267,10 @@ class CSSStyleDeclaration {
     if (key === 'overflow') {                              // shorthand
       if (key in this._props) return this._props[key];     // raw key (set via style attribute / cssText)
       return _serializeOverflowShorthand((n) => this._props[n] || '');  // reconstruct from overflow-x/-y
+    }
+    if (_GAP_BIDI_SH[key]) {                                // css-gaps `rule-*` shorthand
+      if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
+      return _serGapBidiSh((n) => this._props[n] || '', key);  // reconstruct from column-*/row-*
     }
     if (key === 'grid-column' || key === 'grid-row') {     // placement shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
@@ -9126,6 +9159,8 @@ const _GCS_DEFAULTS = {
   'column-count': 'auto', 'column-fill': 'balance', 'column-rule-color': 'currentColor',
   'column-rule-style': 'none', 'column-rule-width': 'medium', 'column-span': 'none',
   'column-width': 'auto',
+  // css-gaps — none inherit. rule-break initial is `none` (computed = specified keyword).
+  'column-rule-break': 'none', 'row-rule-break': 'none',
   // css-shapes — none inherit. shape-image-threshold is a <number>.
   'shape-image-threshold': '0', 'shape-margin': '0px', 'shape-outside': 'none',
   // css-scroll-snap — none inherit. scroll-margin-* default 0px, scroll-padding-* auto.
@@ -12936,6 +12971,10 @@ const _CSSUI_ENUM = {
   // (`normal | most-width | most-height | most-block-size | most-inline-size`).
   // Rejects any two-keyword or comma-separated combination.
   'position-try-order': new Set(['normal', 'most-width', 'most-height', 'most-block-size', 'most-inline-size']),
+  // css-gaps: the per-axis rule-break longhands — `none | normal | intersection`.
+  // Rejects `auto`/`true`/`10px`/`default` and any two-keyword combination.
+  'column-rule-break': new Set(['none', 'normal', 'intersection']),
+  'row-rule-break': new Set(['none', 'normal', 'intersection']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -12956,6 +12995,8 @@ const _CSSUI_VALIDATED = new Set([
   'ruby-align', 'ruby-merge', 'ruby-position', 'ruby-overhang',
   // css-inline SVG baseline enums (keyword identity, computed = specified).
   'alignment-baseline', 'dominant-baseline',
+  // css-gaps rule-break longhands (keyword identity, computed = specified).
+  'column-rule-break', 'row-rule-break',
   // css-inline line-height (`normal | <number> | <length-percentage>`, non-negative)
   // + baseline-shift (`<length-percentage> | sub | super | top | center | bottom`)
   // + vertical-align (`[first|last] || <alignment-baseline> || <baseline-shift>`).
@@ -13578,6 +13619,42 @@ const _computeColumns = (el, v) => {
   const vp = _vpUnits();
   const compLen = (x) => (x == null || x === 'auto') ? x : _clampNegPx(_trComp(x, el, true, vp));
   return _serColumns(compLen(p.width), p.count, compLen(p.height));
+};
+
+// ── CSS Gap Decorations (css-gaps) value parsing ─────────────────────────────
+// The CSS Gap Decorations module adds row-rule-* longhands mirroring the multicol
+// column-rule-* set, plus per-property "rule-*" shorthands that set BOTH the column
+// and the row longhand to the SAME value. A "rule-*" shorthand serializes
+// (getPropertyValue / computed) only when its two longhands are EQUAL — otherwise it
+// is unrepresentable and serializes to the empty string (CSSOM "serialize a CSS value"
+// for shorthands whose longhands disagree).
+//
+// rule-break sets column-rule-break/row-rule-break — each a `none | normal |
+// intersection` keyword enum (validated via _CSSUI_ENUM/_canonCssUi; computed identity).
+const _GAP_BIDI_SH = {
+  'rule-break': ['column-rule-break', 'row-rule-break'],
+};
+// Validate ONE value against a gap-decoration longhand's grammar, returning the
+// canonical form or null. The break longhands are keyword enums (via _canonCssUi).
+const _canonGapRuleLonghand = (name, value) => {
+  if (name === 'column-rule-break' || name === 'row-rule-break') return _canonCssUi(name, value);
+  return null;
+};
+// Expand a "rule-*" shorthand's single value into { column-*: canon, row-*: canon },
+// or null when the value is out of the longhand grammar.
+const _expandGapBidi = (name, value) => {
+  const pair = _GAP_BIDI_SH[name];
+  const canon = _canonGapRuleLonghand(pair[0], value);
+  if (canon === null) return null;
+  return { [pair[0]]: canon, [pair[1]]: canon };
+};
+// Serialize a "rule-*" shorthand from its two longhand values (via `get`): the value
+// when both are present and equal, else '' (unrepresentable / mismatched).
+const _serGapBidiSh = (get, key) => {
+  const pair = _GAP_BIDI_SH[key];
+  const a = get(pair[0]), b = get(pair[1]);
+  if (!a || !b) return '';
+  return a === b ? a : '';
 };
 
 // ── CSS Text (css-text) value parsing ────────────────────────────────────────
@@ -21519,6 +21596,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('list-style');                                       // the `list-style` shorthand (reconstructed from its 3 longhands)
   add('column-rule');                                      // the `column-rule` shorthand (reconstructed from its 3 longhands)
   add('columns');                                          // the `columns` shorthand (self-canonical; computed lengths resolved)
+  for (const k of Object.keys(_GAP_BIDI_SH)) add(k);       // css-gaps `rule-*` bidirectional shorthands
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
@@ -21641,6 +21719,11 @@ globalThis.getComputedStyle = (el, _pseudo) => {
         parts.push(c);
         return parts.join(' ');
       }
+    }
+    // css-gaps `rule-*` shorthand: reconstruct from the COMPUTED column-*/row-*
+    // longhands — the value when both axes agree, else '' (unrepresentable).
+    if (_GAP_BIDI_SH[kebab]) {
+      return _serGapBidiSh((n) => resolve(n), kebab);
     }
     // `columns` shorthand: resolve the width/height <length>s of the self-canonical
     // specified value to px (the count stays an integer), re-serializing with the
@@ -24886,6 +24969,11 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         const c = _canonStandardValue(val);
         return _CSS_WIDE.has(c.toLowerCase()) || _expandBorderShorthand('column-rule', c) != null;
+      }
+      if (_GAP_BIDI_SH[name]) {                          // the css-gaps `rule-*` shorthands
+        if (/\bvar\(/i.test(val)) return true;
+        const c = _canonStandardValue(val);
+        return _CSS_WIDE.has(c.toLowerCase()) || _expandGapBidi(name, c) != null;
       }
       if (_OVERFLOW_VALIDATED.has(name)) {               // css-overflow longhands (+ overflow-clip-margin)
         if (/\bvar\(/i.test(val)) return true;

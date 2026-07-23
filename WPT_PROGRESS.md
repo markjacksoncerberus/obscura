@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #260 — `css/css-anchor-position/parsing/` FULLY SECURED, 220/220).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #261 — css-gaps `rule-break` family secured).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-gaps/parsing/rule-break-invalid.html` | 0/12 | **12/12** | ✅ 100% | **Quest #261 The Rule-Break Verdict.** css-gaps `column-rule-break`/`row-rule-break` were raw-store — `auto`/`true`/`10px`/`default` wrongly accepted. Added both to `_CSSUI_ENUM` (`none \| normal \| intersection`) + `_CSSUI_VALIDATED`. NEW generic `_GAP_BIDI_SH` infra for the `rule-*` bidirectional shorthands (`_expandGapBidi`/`_serGapBidiSh`) wired across all 6 shorthand touch points like `overflow`. |
+| `css/css-gaps/parsing/rule-break-computed.html` | 0/9 | **9/9** | ✅ 100% | **Quest #261.** Longhands → `_GCS_DEFAULTS` (`none`, not inherited; computed = keyword identity). The `rule-break` shorthand reconstructs from the computed column-*/row-* longhands (value when both agree, else `''`). |
 | `css/css-anchor-position/parsing/position-try-parsing.html` | 8/35 | **35/35** | ✅ 100% | **Quest #260 The Position-Try Verdict.** The `position-try` shorthand = `<'position-try-order'>? <'position-try-fallbacks'>`. NEW `_expandPositionTry` (strips a leading order keyword — appearing ONCE at the start — then validates the rest as fallbacks; `none normal`/`flip-block most-height`/`normal --foo, most-width --bar` invalid since the stray order keyword lands in the fallbacks grammar) + `_serPositionTry` (drops `normal`). Wired like `flex-flow` across all 6 touch points (inline parser, setProperty, removeProperty, getPropertyValue, getComputedStyle, `_CSS_KNOWN_PROPS`). **Completes the arc — `css/css-anchor-position/parsing/` is 220/220, +146 across #258–#260.** |
 | `css/css-anchor-position/parsing/position-try-computed.html` | 0/9 | **9/9** | ✅ 100% | **Quest #260.** getComputedStyle reconstructs from the computed position-try-order/-fallbacks longhands. |
 | `css/css-anchor-position/parsing/position-try-fallbacks-parsing.html` | 33/57 | **57/57** | ✅ 100% | **Quest #259 The Try-Fallbacks Verdict.** `position-try-fallbacks` was raw-store. NEW `_canonPositionTryFallbacks` for `none \| [ [<dashed-ident> \|\| <try-tactic>] \| <'position-area'> ]#`. Each comma-item is EITHER a dashed-ident+tactics run OR a `<position-area>` (never mixed). In the tactics alt the `\|\|` components are each CONTIGUOUS — the dashed-ident sits before/after the flip-keyword run, never splitting it (`flip-inline --bar flip-block` invalid); serialize dashed-ident first, flip keywords in author order. `<try-tactic>` = flip-block/flip-inline/flip-start/flip-x/flip-y. **+48.** |
