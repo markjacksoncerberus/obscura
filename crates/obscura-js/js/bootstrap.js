@@ -9063,6 +9063,8 @@ const _GCS_DEFAULTS = {
   // css-tables. table-layout does not inherit; the rest do.
   'border-collapse': 'separate', 'border-spacing': '0px', 'caption-side': 'top',
   'empty-cells': 'show', 'table-layout': 'auto',
+  // css-inline SVG baseline enums — neither inherits. Computed = specified keyword.
+  'alignment-baseline': 'baseline', 'dominant-baseline': 'auto',
   // css-align (shared with css-flexbox) — none inherit.
   'align-content': 'normal', 'align-items': 'normal', 'align-self': 'auto',
   'column-gap': 'normal', 'justify-content': 'normal', 'justify-items': 'legacy center',
@@ -12873,6 +12875,13 @@ const _CSSUI_ENUM = {
   'ruby-align': new Set(['start', 'center', 'space-between', 'space-around']),
   'ruby-merge': new Set(['separate', 'merge', 'auto']),
   'ruby-position': new Set(['over', 'under', 'inter-character']),
+  // css-inline (SVG baseline) single-keyword enums. Both share the same 9 baseline
+  // keywords EXCEPT the first slot: alignment-baseline begins with `baseline` (it
+  // aligns to the parent's dominant baseline), dominant-baseline with `auto`. Neither
+  // accepts the other's first keyword, nor `none`/`top`/`center`/`bottom`, nor any
+  // two-keyword combination. Computed value is the lowercased keyword (identity).
+  'alignment-baseline': new Set(['baseline', 'text-bottom', 'alphabetic', 'ideographic', 'middle', 'central', 'mathematical', 'hanging', 'text-top']),
+  'dominant-baseline': new Set(['auto', 'text-bottom', 'alphabetic', 'ideographic', 'middle', 'central', 'mathematical', 'hanging', 'text-top']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -12891,6 +12900,8 @@ const _CSSUI_VALIDATED = new Set([
   'border-collapse', 'caption-side', 'empty-cells', 'table-layout', 'border-spacing',
   // css-ruby: three keyword enums + ruby-overhang (`auto | spaces`, legacy `none`→`spaces`).
   'ruby-align', 'ruby-merge', 'ruby-position', 'ruby-overhang',
+  // css-inline SVG baseline enums (keyword identity, computed = specified).
+  'alignment-baseline', 'dominant-baseline',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);

@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #245).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #252).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-inline/parsing/alignment-baseline-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #252 The SVG-Baseline Verdict.** `alignment-baseline`/`dominant-baseline` were raw-store/unregistered (both `-invalid` 0/N, `-computed` 0/N — the props weren't in getComputedStyle). Two 9-keyword SVG baseline enums (differ only in first slot: alignment=`baseline`, dominant=`auto`) added to `_CSSUI_ENUM`+`_CSSUI_VALIDATED`+`_GCS_DEFAULTS`. Reject `none`/`top`/`center`/`bottom`/two-keyword. Computed = specified keyword. **+28.** |
+| `css/css-inline/parsing/alignment-baseline-computed.html` | 0/9 | **9/9** | ✅ 100% | **Quest #252.** |
+| `css/css-inline/parsing/dominant-baseline-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #252.** |
+| `css/css-inline/parsing/dominant-baseline-computed.html` | 0/9 | **9/9** | ✅ 100% | **Quest #252.** |
 | `css/css-logical/parsing/inset-shorthand.html` | 0/20 | **20/20** | ✅ 100% | **Quest #245 The Logical-Box Verdict.** margin/padding/inset-block/-inline + physical `inset` were stored as blobs (computed via `_computeBoxShorthand`) so the LONGHAND getter never reflected the shorthand (every `-shorthand`/`-invalid` 0/N). Now they EAGERLY expand into edge longhands (`_BOX_LOGICAL_SH2`) with per-family validators (`_canonMarginInsetComp` = `<length-percentage>|auto`; `_canonPaddingComp` = `[0,∞]`, no auto), across all touch points (setProperty/inline/getter/removeProperty/getComputedStyle/CSS.supports/cascade) mirroring scroll-margin-block. **+20.** |
 | `css/css-logical/parsing/inset-block-inline-shorthand.html` | 0/12 | **12/12** | ✅ 100% | **Quest #245.** **+12.** |
 | `css/css-logical/parsing/margin-block-inline-shorthand.html` | 0/12 | **12/12** | ✅ 100% | **Quest #245.** **+12.** |
