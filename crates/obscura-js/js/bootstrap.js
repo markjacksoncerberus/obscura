@@ -13091,6 +13091,9 @@ const _CSSUI_ENUM = {
   // has a richer grammar (`normal | [light|dark|<custom-ident>]+ && only?`) handled by
   // a dedicated _canonCssUi branch.
   'forced-color-adjust': new Set(['auto', 'none', 'preserve-parent-color']),
+  // css-position: `position` is a plain keyword enum. Rejects `auto` and any
+  // two-keyword combination (`static relative`). Computed = the lowercased keyword.
+  'position': new Set(['static', 'relative', 'absolute', 'sticky', 'fixed']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -13137,6 +13140,10 @@ const _CSSUI_VALIDATED = new Set([
   // css-anchor-position: position-try-fallbacks — `none | [ [<dashed-ident> ||
   // <try-tactic>] | <'position-area'> ]#` (dedicated _canonCssUi branch).
   'position-try-fallbacks',
+  // css-position: `position` (keyword enum, above) + `z-index` (`auto | <integer>`,
+  // a dedicated _canonCssUi branch; a number-typed calc kept symbolic → folded at
+  // computed via _INTEGER_COMPUTED_PROPS).
+  'position', 'z-index',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13261,6 +13268,22 @@ const _canonCssUi = (name, value) => {
       return _canonMathExpr(t) || t;
     }
     if (/^\+?\d+$/.test(t)) { const n = parseInt(t, 10); return n >= 1 ? String(n) : null; }
+    return null;
+  }
+  if (name === 'z-index') {
+    // css-position: `auto | <integer>` (signed, unbounded). A number-typed calc is
+    // kept symbolic here and folded at computed time (_INTEGER_COMPUTED_PROPS);
+    // `none`/`10px`/a fractional literal (`0.5`)/`auto 123` is invalid.
+    if (low === 'auto') return 'auto';
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    if (_MATHFN_NAME_RE.test(t)) {
+      const root = _parseCalcTree(t);
+      if (root === null || _mt(root, null) !== 'number') return null; // must be <number>/<integer>-typed
+      return _canonMathExpr(t) || t;
+    }
+    if (/^[+-]?\d+$/.test(t)) return String(parseInt(t, 10));
     return null;
   }
   if (name === 'caret-color' || name === 'outline-color') {
@@ -14193,6 +14216,10 @@ const _canonLenPctSigned = (tok, allowPct) => {
   const t = String(tok).trim();
   if (_MATHFN_NAME_RE.test(t)) {
     if (!allowPct && /%/.test(t)) return null;
+    // The calc must resolve to <length> (or <length-percentage> when allowPct) — a
+    // `calc(20deg)`/`calc(1s)` typed as angle/time is not a valid inset/margin offset.
+    // A symbolic/unknown-typed expression stays accepted (_mathValid → true).
+    if (!_mathValid(t, ['length'], allowPct ? 'length' : null)) return null;
     return _canonMathExpr(t, { canonLen: true }) || t;
   }
   if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(t)) return _isZeroTok(t) ? '0px' : null;
@@ -20582,15 +20609,17 @@ const _BOX_LOGICAL_SH2 = {
   'inset': ['top', 'right', 'bottom', 'left'],
 };
 // The box-model longhands validated by _canonBoxLogicalLh: the 4 physical margin +
-// 4 physical padding edges, plus the 12 flow-relative (margin/padding/inset
-// block/inline start/end). physical top/right/bottom/left are NOT here — they are
-// also `inset` longhands and validated on the position path.
+// 4 physical padding edges, the 12 flow-relative (margin/padding/inset block/inline
+// start/end), plus the 4 physical inset offsets (top/right/bottom/left). Each is a
+// single `[<length-percentage>|auto]` (padding [0,∞], no auto) — _boxLogicalCanonFor
+// maps the non-padding names (including top/…/left) to _canonMarginInsetComp.
 const _BOX_LOGICAL_LH = new Set([
   'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
   'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
   'margin-block-start', 'margin-block-end', 'margin-inline-start', 'margin-inline-end',
   'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
   'inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end',
+  'top', 'right', 'bottom', 'left',
 ]);
 // margin/inset component = `auto | <length-percentage>` (signed). null → invalid.
 const _canonMarginInsetComp = (t) => {

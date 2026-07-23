@@ -10,12 +10,19 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #269 — color-scheme + forced-color-adjust SECURED; +29).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #270 — css-position invalid gates SECURED; +24).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-position/parsing/position-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #270 The Position-Offset Verdict.** `position` = `static\|relative\|absolute\|sticky\|fixed` → `_CSSUI_ENUM`+`_CSSUI_VALIDATED` (rejects `auto`, `static relative`). |
+| `css/css-position/parsing/top-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #270.** `top`/`right`/`bottom`/`left` = `auto\|<length-percentage>` → added to `_BOX_LOGICAL_LH` (rejects `min-content`, bare `60`, `10px 20%`). |
+| `css/css-position/parsing/right-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #270.** Same physical-inset offset gate as `top`. |
+| `css/css-position/parsing/bottom-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #270.** Same physical-inset offset gate as `top`. |
+| `css/css-position/parsing/left-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #270.** Same physical-inset offset gate as `top`. |
+| `css/css-position/parsing/z-index-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #270.** `z-index` = `auto\|<integer>` → dedicated `_canonCssUi` branch (rejects `none`, `10px`, `0.5`, `auto 123`). |
+| `css/css-position/parsing/inset-invalid.html` | 16/22 | **22/22** | ✅ 100% | **Quest #270.** `_canonLenPctSigned` now type-checks the calc — `calc(20deg)` (angle) rejected for inset/margin offsets. |
 | `css/css-color-adjust/parsing/color-scheme-valid.html` | 17/22 | **22/22** | ✅ 100% | **Quest #269 The Color-Scheme Verdict.** `color-scheme` = `normal \| [light\|dark\|<custom-ident>]+ && only?` via `_canonColorScheme`; `only` moves to the end (`only light`→`light only`). |
 | `css/css-color-adjust/parsing/color-scheme-invalid.html` | 0/16 | **16/16** | ✅ 100% | **Quest #269.** Rejects `normal` combined, `only` interleaved/doubled, `default`, a comma list, CSS-wide as a custom-ident. |
 | `css/css-color-adjust/parsing/color-scheme-computed.html` | 11/13 | **13/13** | ✅ 100% | **Quest #269.** Computed = stored canonical (identity). |
