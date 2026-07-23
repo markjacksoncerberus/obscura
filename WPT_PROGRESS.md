@@ -10,12 +10,17 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #252).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #253).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-inline/parsing/line-height-computed.html` | 3/13 | **13/13** | ✅ 100% | **Quest #253 The Line-Height Verdict.** line-height + baseline-shift were raw-store. line-height = `normal \| <number [0,∞]> \| <length-percentage [0,∞]>` (reuse `_canonFontLineHeight`); computed resolves length/%/calc→px (% against font-size, cqZero, clamp≥0) but KEEPS a `<number>` as a number (inherits as number) — the px OM value is applied at the getComputedStyle boundary. baseline-shift = `<lp> \| sub\|super\|top\|center\|bottom` (reuse `_canonLenPctSigned`); computed length→px, `%` kept symbolic. **+32.** |
+| `css/css-inline/parsing/line-height-invalid.html` | 0/8 | **8/8** | ✅ 100% | **Quest #253.** rejects `auto`/negatives/multi-token. |
+| `css/css-inline/parsing/baseline-shift-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #253.** rejects bare number `5`/multi-token/comma. |
+| `css/css-inline/parsing/baseline-shift-computed.html` | 0/8 | **8/8** | ✅ 100% | **Quest #253.** |
+| `css/css-inline/parsing/baseline-shift-valid.html` | 8/9 | **9/9** | ✅ 100% | **Quest #253.** |
 | `css/css-inline/parsing/alignment-baseline-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #252 The SVG-Baseline Verdict.** `alignment-baseline`/`dominant-baseline` were raw-store/unregistered (both `-invalid` 0/N, `-computed` 0/N — the props weren't in getComputedStyle). Two 9-keyword SVG baseline enums (differ only in first slot: alignment=`baseline`, dominant=`auto`) added to `_CSSUI_ENUM`+`_CSSUI_VALIDATED`+`_GCS_DEFAULTS`. Reject `none`/`top`/`center`/`bottom`/two-keyword. Computed = specified keyword. **+28.** |
 | `css/css-inline/parsing/alignment-baseline-computed.html` | 0/9 | **9/9** | ✅ 100% | **Quest #252.** |
 | `css/css-inline/parsing/dominant-baseline-invalid.html` | 0/4 | **4/4** | ✅ 100% | **Quest #252.** |

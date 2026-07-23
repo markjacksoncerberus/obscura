@@ -9065,6 +9065,8 @@ const _GCS_DEFAULTS = {
   'empty-cells': 'show', 'table-layout': 'auto',
   // css-inline SVG baseline enums — neither inherits. Computed = specified keyword.
   'alignment-baseline': 'baseline', 'dominant-baseline': 'auto',
+  // css-inline baseline-shift — does not inherit; initial `0` → `0px`.
+  'baseline-shift': '0px',
   // css-align (shared with css-flexbox) — none inherit.
   'align-content': 'normal', 'align-items': 'normal', 'align-self': 'auto',
   'column-gap': 'normal', 'justify-content': 'normal', 'justify-items': 'legacy center',
@@ -12902,6 +12904,9 @@ const _CSSUI_VALIDATED = new Set([
   'ruby-align', 'ruby-merge', 'ruby-position', 'ruby-overhang',
   // css-inline SVG baseline enums (keyword identity, computed = specified).
   'alignment-baseline', 'dominant-baseline',
+  // css-inline line-height (`normal | <number> | <length-percentage>`, non-negative)
+  // + baseline-shift (`<length-percentage> | sub | super | top | center | bottom`).
+  'line-height', 'baseline-shift',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13079,6 +13084,24 @@ const _canonCssUi = (name, value) => {
     if (tl === 'auto' || tl === 'spaces') return tl;
     if (tl === 'none') return 'spaces';
     return null;
+  }
+  if (name === 'line-height') {
+    // css-inline: `normal | <number [0,∞]> | <length-percentage [0,∞]>` (+ calc).
+    // Exactly one token (`2 10px` / `auto 10px` are invalid). Reuses the same
+    // single-token grammar the `font` shorthand's line-height slot uses.
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    return _canonFontLineHeight(toks[0]);
+  }
+  if (name === 'baseline-shift') {
+    // css-inline: `<length-percentage> | sub | super | top | center | bottom`.
+    // A single token (`sub super` / `20px sub` / a comma list are invalid); a bare
+    // <number> other than 0 is invalid (0 → 0px). Signed (negatives allowed).
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const tl = toks[0].toLowerCase();
+    if (tl === 'sub' || tl === 'super' || tl === 'top' || tl === 'center' || tl === 'bottom') return tl;
+    return _canonLenPctSigned(toks[0], true);
   }
   if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;
@@ -20527,6 +20550,44 @@ const _foldBiComp = (el, tok) => {
   return tok;                                               // mixed length+% / unresolvable → keep symbolic
 };
 const _computeBorderImageDim = (el, v) => _wsTokens(String(v).trim()).map((t) => _foldBiComp(el, t)).join(' ');
+// css-inline baseline-shift computed value: keywords pass through; a <length>
+// resolves to px (em/calc folded against the element font-size); a bare `%` is kept
+// symbolic (it resolves against the used line-height, which needs layout).
+const _BASELINE_SHIFT_KW = new Set(['sub', 'super', 'top', 'center', 'bottom']);
+const _computeBaselineShift = (el, v) => {
+  const s = String(v).trim();
+  if (_BASELINE_SHIFT_KW.has(s.toLowerCase())) return s.toLowerCase();
+  return _trComp(s, el, true, _vpUnits());
+};
+// css-inline line-height COMPUTED value. `normal` stays; a <number> keeps its number
+// (it inherits as a number and multiplies each descendant's own font-size — the px
+// RESOLVED value is applied at the getComputedStyle boundary, see resolve()); a
+// <length>/<percentage>/calc computes to an absolute px length (% against font-size,
+// clamped ≥0). A number-typed calc folds to a bare number; a container unit inside a
+// `sign(2cqw…)` gate folds to 0 (cqZero, no container).
+const _computeLineHeight = (el, v) => {
+  const s = String(v).trim();
+  if (s.toLowerCase() === 'normal') return 'normal';
+  const fs = () => (el ? (parseFloat(_computedPropOf(el, 'font-size', 0)) || 16) : 16);
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(s)) return _serNumber(Math.max(0, parseFloat(s)));
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(s)) return _serNumber(Math.max(0, parseFloat(s) / 100 * fs())) + 'px';
+  if (_MATHFN_NAME_RE.test(s)) {
+    const root = _parseCalcTree(s);
+    if (root !== null) {
+      const f = fs();
+      const opts = Object.assign({ lengths: true, cqZero: true, emPx: f, nonFinite: true }, _vpUnits(), _siblingOpts(el, s));
+      if (_mt(root, 'length') === 'number') {                 // pure <number> calc → the number (inherits as number)
+        const nv = _evalMath(s, 0, opts);
+        if (nv !== null) return _serNumber(Math.max(0, _nfClamp(nv)));
+      } else {                                                 // length / % / mixed → px (% base = font-size)
+        const nv = _evalMath(s, f, opts);
+        if (nv !== null) return _serNumber(Math.max(0, _nfClamp(nv))) + 'px';
+      }
+    }
+    return s;
+  }
+  return _clampNegPx(_trComp(s, el, true, _vpUnits()));         // plain <length> → px, clamp ≥0
+};
 const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_BI_DIM_LH.has(kebab)) return _computeBorderImageDim(el, v);
@@ -20555,6 +20616,8 @@ const _normComputed = (el, kebab, v) => {
     const w = _clampNegPx(_trComp(toks[1], el, true, _vpUnits()));
     return h === w ? h : h + ' ' + w;
   }
+  if (kebab === 'line-height') return _computeLineHeight(el, v);
+  if (kebab === 'baseline-shift') return _computeBaselineShift(el, v);
   if (kebab === 'text-decoration-inset') return _computeTextDecorationInset(el, v);
   if (_COUNTER_VALIDATED.has(kebab)) return _computeCounter(el, v);
   if (_GRID_LINE_LH.has(kebab)) return _computeGridLine(el, v);
@@ -21265,6 +21328,19 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // Modelled standard properties resolve through the full computed-value
     // engine: CSS-wide keywords (initial/inherit/unset/revert), per-property
     // inheritance through the ancestor chain, and colour/opacity normalization.
+    if (kebab === 'line-height') {
+      // The COMPUTED line-height of a <number> is the number (it inherits as a
+      // number); its RESOLVED (OM) value is that number × this element's computed
+      // font-size, in px. `normal` and already-px values pass through unchanged.
+      const cv = _computedPropOf(el, kebab, 0);
+      const lc = String(cv).trim().toLowerCase();
+      if (lc === 'normal') return 'normal';
+      if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(lc)) {
+        const fs = parseFloat(_computedPropOf(el, 'font-size', 0)) || 16;
+        return _serNumber(Math.max(0, parseFloat(lc)) * fs) + 'px';
+      }
+      return cv;
+    }
     if (!kebab.startsWith('--') && (_CSS_KNOWN_PROPS.has(kebab) || _COLOR_PROPS.has(kebab))) {
       return _computedPropOf(el, kebab, 0);
     }
