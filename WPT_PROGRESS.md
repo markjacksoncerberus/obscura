@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #262 — css-gaps `<line-*-list>` grammar secured).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quest #263 — css-gaps color/style/width/break line-decoration vein SECURED).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-gaps/parsing/gap-decorations-color-computed.html` | 5/33 | **33/33** | ✅ 100% | **Quest #263 The Line-List Computed Verdict.** The list computed serialization was raw-store. NEW `_computeGapRuleList` (structure kept, repeat integer folded via `_computeIntegerValue`, each leaf resolved). Factored `_computeColorFull` out of the `_normComputed` colour branch (byte-identical) so a gap colour leaf resolves like a standalone `<color>`. Intercept placed atop `_normComputed`, before the length/colour branches. |
+| `css/css-gaps/parsing/gap-decorations-style-computed.html` | 60/63 | **63/63** | ✅ 100% | **Quest #263.** style leaf = keyword identity; repeat integer folds. |
+| `css/css-gaps/parsing/gap-decorations-width-computed.html` | 12/24 | **24/24** | ✅ 100% | **Quest #263.** width leaf → px (calc/em folded, clamp ≥0). Bugfix: `_canonLengthTimeMath` was shedding a `calc()` wrapper INSIDE `repeat(...)` (treats `repeat(` as a function) — guarded the gap-rule props out (they self-canonicalize). |
+| `css/css-gaps/parsing/gap-decorations-bidirectional-shorthands.html` | 10/14 | **12/14** | ⚠️ 86% | **Quest #263.** `rule-*` + `rule` mega-shorthand computed reconstruct from column-*/row-* longhands (value when both axes agree, else `''`). CAP: `rule-visibility-items`/`rule-inset` are separate gap-decoration families (future quests). |
 | `css/css-gaps/parsing/gap-decorations-color-valid.html` | 31/45 | **45/45** | ✅ 100% | **Quest #262 The Line-List Verdict.** The shared `<line-*-list>` grammar (`repeat(<n>, <leaf>#)` / `repeat(auto, …)` + comma list) was raw-store beyond a single leaf. NEW `_canonGapRuleList(value, leaf)` — paren-aware item split, per-leaf validators, ≤1 auto-repeat, count via `_canonColumnCount`. `_canonMulticol` delegates the 6 `*-rule-{color,style,width}` longhands (single value round-trips identically → multicol safe). |
 | `css/css-gaps/parsing/gap-decorations-color-invalid.html` | 6/18 | **18/18** | ✅ 100% | **Quest #262.** Rejects `auto`, space-joined leaves, `repeat(auto, a b c)`, `repeat(0/-1, …)`, double auto-repeat. |
 | `css/css-gaps/parsing/gap-decorations-style-valid.html` | 31/45 | **45/45** | ✅ 100% | **Quest #262.** leaf = `<line-style>` (`_LINE_STYLE_KW`). |

@@ -9984,6 +9984,9 @@ const _COLOR_PROPS = new Set([
   // physical border-*-color siblings: <color>, currentColor → the element's colour).
   'border-block-start-color','border-block-end-color',
   'border-inline-start-color','border-inline-end-color',
+  // css-gaps: row-rule-color mirrors column-rule-color. A SINGLE value resolves as a
+  // <color> here; a list is intercepted earlier in _normComputed by the gap-list path.
+  'row-rule-color',
 ]);
 // Colour *shorthands* — 1–4 space-separated <color> values (border-color and its
 // flow-relative siblings). Each value canonicalizes independently like a longhand
@@ -11444,6 +11447,11 @@ const _calcConstValue = (str) => {
 // serialization untouched. Returns `v` unchanged otherwise.
 const _canonLengthTimeMath = (name, v) => {
   if (!_MATHFN_NAME_RE.test(v)) return v;
+  // css-gaps line props (column-rule-width/row-rule-width) already self-canonicalize via
+  // _canonGapRuleList — their value may be a repeat()/comma list, not a bare length math.
+  // Running it through _canonMathExpr would treat `repeat(` as a function and shed the
+  // inner calc() wrapper (`repeat(5, calc(0.5em + 10px))` → an invalid bare `0.5em + 10px`).
+  if (_GAP_RULE_LEAF[name]) return v;
   const isLen = _LENGTH_COMPUTED_PROPS.has(name) || _SIZE_COMPUTED_PROPS.has(name);
   const isTime = _TIME_COMPUTED_PROPS.has(name);
   if (!isLen && !isTime) return v;
@@ -13721,6 +13729,60 @@ const _canonGapRuleLonghand = (name, value) => {
   const leaf = _GAP_RULE_LEAF[name];
   if (leaf) return _canonGapRuleList(value, leaf);
   return null;
+};
+// A value is a LIST (vs a single leaf) when it holds a `repeat(` or a top-level comma.
+// Single-leaf gap-rule values defer to the existing per-property computed paths (so
+// the multicol column-rule-* computed tests are untouched); only lists take the path
+// below.
+const _isGapList = (v) => /\brepeat\s*\(/i.test(v) || _commaSplitTop(v).length > 1;
+// Full computed <color> resolution (shared by the _normComputed color branch and the
+// gap-rule color leaf): currentColor, modern colour spaces, color-mix(), relative
+// colour, alpha-adjust, contrast-color, then legacy named/hex/rgb/hsl.
+const _computeColorFull = (el, v, isColorProp) => {
+  if (String(v).trim().toLowerCase() === 'currentcolor') {
+    return isColorProp ? _computeColor(_initialOf('color')) : _computedColorOf(el);
+  }
+  const modern = _computeModernColor(v); if (modern !== null) return modern;
+  const mixed = _computeColorMixComputed(v, el); if (mixed !== null) return mixed;
+  const alphaC = _computeAlphaComputed(v, el); if (alphaC !== null) return alphaC;
+  const cc = _computeContrastColorComputed(v, el); if (cc !== null) return cc;
+  const rel = _computeRelativeComputed(v, el); if (rel !== null) return rel;
+  return _computeColor(v);
+};
+// Computed value of a single gap-rule leaf: colour → computed colour; width →
+// <length>/calc resolved to px (keyword thin/medium/thick mapped, clamp ≥0); style →
+// keyword identity.
+const _computeGapLeaf = (el, leaf, tok) => {
+  const t = String(tok).trim();
+  if (leaf === 'color') return _computeColorFull(el, t, false);
+  if (leaf === 'width') {
+    const px = _LINE_WIDTH_PX[t.toLowerCase()];
+    if (px != null) return px + 'px';
+    return _clampNegPx(_trComp(t, el, true, _vpUnits()));
+  }
+  return t.toLowerCase();                                   // style: keyword identity
+};
+// Computed serialization of a gap-rule <line-*-list>: the list structure is KEPT
+// (repeat stays a repeat), the repeat integer folds (calc → integer), and every leaf
+// resolves to its computed form.
+const _computeGapRuleList = (el, kebab, v) => {
+  const leaf = _GAP_RULE_LEAF[kebab];
+  const items = _commaSplitTop(String(v).trim()).map((x) => x.trim());
+  const parts = [];
+  for (const item of items) {
+    const m = _REPEAT_RE.exec(item);
+    if (m) {
+      const inner = _commaSplitTop(m[1]).map((x) => x.trim());
+      const countRaw = inner[0];
+      const count = (countRaw.toLowerCase() === 'auto')
+        ? 'auto' : (_computeIntegerValue(el, countRaw) || countRaw);
+      const leaves = inner.slice(1).map((seg) => _computeGapLeaf(el, leaf, seg));
+      parts.push('repeat(' + count + ', ' + leaves.join(', ') + ')');
+    } else {
+      parts.push(_computeGapLeaf(el, leaf, item));
+    }
+  }
+  return parts.join(', ');
 };
 // Expand a "rule-*" shorthand's single value into { column-*: canon, row-*: canon },
 // or null when the value is out of the longhand grammar.
@@ -20835,7 +20897,7 @@ const _LENGTH_COMPUTED_PROPS = new Set([
   'inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end',
   'width', 'height',
   'flex-basis', 'text-indent', 'outline-offset',
-  'column-width', 'column-rule-width',                   // css-multicol: auto/keyword pass through; calc → px, ≥0
+  'column-width', 'column-rule-width', 'row-rule-width',  // css-multicol/css-gaps: keyword pass through; calc → px, ≥0
   'letter-spacing', 'word-spacing',                      // <length> | normal (keyword passes through)
   'row-gap', 'column-gap',                               // <length-percentage> | normal (non-negative)
   ..._SCROLL_MARGIN_LH,                                  // scroll-margin-* : <length> (signed)
@@ -20847,7 +20909,7 @@ const _CLAMP_NEG_PROPS = new Set([
   'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
   'padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end',
   'row-gap', 'column-gap',                                // gap is non-negative (a resolved negative calc clamps to 0)
-  'column-width', 'column-rule-width',                    // css-multicol widths are non-negative (resolved negative → 0)
+  'column-width', 'column-rule-width', 'row-rule-width',   // css-multicol/css-gaps widths are non-negative (resolved negative → 0)
   'flex-basis',                                           // flex-basis is <'width'> — non-negative (resolved negative → 0)
   ..._SCROLL_PADDING_LH,                                  // scroll-padding is non-negative (resolved negative → 0)
 ]);
@@ -21102,6 +21164,11 @@ const _computeLineHeight = (el, v) => {
   return _clampNegPx(_trComp(s, el, true, _vpUnits()));         // plain <length> → px, clamp ≥0
 };
 const _normComputed = (el, kebab, v) => {
+  // css-gaps: a MULTI-item / repeat() gap-rule value computes its list (structure kept,
+  // integer folded, each leaf resolved). Must precede the _LENGTH_COMPUTED_PROPS /
+  // _COLOR_PROPS branches (which would mangle the whole list). Single-leaf values fall
+  // through to those existing per-property paths (multicol column-rule-* untouched).
+  if (_GAP_RULE_LEAF[kebab] && _isGapList(v)) return _computeGapRuleList(el, kebab, v);
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_BI_DIM_LH.has(kebab)) return _computeBorderImageDim(el, v);
   if (kebab === 'text-emphasis-style') return _computeTextEmphasisStyle(el, v);
@@ -21366,24 +21433,9 @@ const _normComputed = (el, kebab, v) => {
     return v;
   }
   if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
-    if (String(v).trim().toLowerCase() === 'currentcolor') {
-      return kebab === 'color' ? _computeColor(_initialOf('color')) : _computedColorOf(el);
-    }
-    // Modern colour functions whose computed value stays in their own colour
-    // space (lab/lch/oklab/oklch, color()) or convert to sRGB (hwb); fall back to
-    // the legacy named/hex/rgb/hsl computation when not one of those.
-    const modern = _computeModernColor(v);
-    if (modern !== null) return modern;
-    // color-mix() / relative colour syntax need real cross-space colour maths.
-    const mixed = _computeColorMixComputed(v, el);
-    if (mixed !== null) return mixed;
-    const alphaC = _computeAlphaComputed(v, el);
-    if (alphaC !== null) return alphaC;
-    const cc = _computeContrastColorComputed(v, el);
-    if (cc !== null) return cc;
-    const rel = _computeRelativeComputed(v, el);
-    if (rel !== null) return rel;
-    return _computeColor(v);
+    // currentColor, modern colour spaces, color-mix()/relative/alpha/contrast, then
+    // the legacy named/hex/rgb/hsl computation.
+    return _computeColorFull(el, v, kebab === 'color');
   }
   return v;
 };
@@ -21679,6 +21731,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('column-rule');                                      // the `column-rule` shorthand (reconstructed from its 3 longhands)
   add('columns');                                          // the `columns` shorthand (self-canonical; computed lengths resolved)
   for (const k of Object.keys(_GAP_BIDI_SH)) add(k);       // css-gaps `rule-*` bidirectional shorthands
+  add('rule');                                             // css-gaps `rule` mega-shorthand (bidirectional column-rule)
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
@@ -21806,6 +21859,20 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // longhands — the value when both axes agree, else '' (unrepresentable).
     if (_GAP_BIDI_SH[kebab]) {
       return _serGapBidiSh((n) => resolve(n), kebab);
+    }
+    // css-gaps `rule` mega-shorthand (bidirectional column-rule): reconstruct the
+    // `<width> [<style>] <color>` form from the COMPUTED longhands, but only when BOTH
+    // axes agree on all three components (else unrepresentable → '').
+    if (kebab === 'rule') {
+      const cw = resolve('column-rule-width'), cs = resolve('column-rule-style'), cc = resolve('column-rule-color');
+      const rw = resolve('row-rule-width'), rs = resolve('row-rule-style'), rc = resolve('row-rule-color');
+      if (cw && cs && cc && cw === rw && cs === rs && cc === rc) {
+        const parts = [cw];
+        if (cs !== 'none') parts.push(cs);
+        parts.push(cc);
+        return parts.join(' ');
+      }
+      return '';
     }
     // `columns` shorthand: resolve the width/height <length>s of the self-canonical
     // specified value to px (the count stays an integer), re-serializing with the
