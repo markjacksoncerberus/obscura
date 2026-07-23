@@ -12888,6 +12888,13 @@ const _CSSUI_ENUM = {
   // two-keyword combination. Computed value is the lowercased keyword (identity).
   'alignment-baseline': new Set(['baseline', 'text-bottom', 'alphabetic', 'ideographic', 'middle', 'central', 'mathematical', 'hanging', 'text-top']),
   'dominant-baseline': new Set(['auto', 'text-bottom', 'alphabetic', 'ideographic', 'middle', 'central', 'mathematical', 'hanging', 'text-top']),
+  // css-box single-keyword enums. `clear`/`float` share the flow-relative
+  // inline-start/inline-end (float has no `both`, no `auto`; clear has no `auto`);
+  // `visibility` is visible/hidden/collapse. Each rejects `auto` and any
+  // two-keyword combination (`left right`, `hidden collapse`, `top, left`).
+  'clear': new Set(['none', 'left', 'right', 'both', 'inline-start', 'inline-end']),
+  'float': new Set(['none', 'left', 'right', 'inline-start', 'inline-end']),
+  'visibility': new Set(['visible', 'hidden', 'collapse']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -12914,6 +12921,8 @@ const _CSSUI_VALIDATED = new Set([
   'line-height', 'baseline-shift', 'vertical-align',
   // css-box margin-trim: `none | block || inline | [block-start||inline-start||block-end||inline-end]`.
   'margin-trim',
+  // css-box keyword enums + css-flexbox order (`<integer>`, signed).
+  'clear', 'float', 'visibility', 'order',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13109,6 +13118,21 @@ const _canonCssUi = (name, value) => {
     const tl = toks[0].toLowerCase();
     if (tl === 'sub' || tl === 'super' || tl === 'top' || tl === 'center' || tl === 'bottom') return tl;
     return _canonLenPctSigned(toks[0], true);
+  }
+  if (name === 'order') {
+    // css-flexbox: `<integer>` (signed; 0/negative allowed). A number-typed calc is
+    // kept symbolic (folded at computed time via _INTEGER_COMPUTED_PROPS); `auto`, a
+    // fractional literal (`123.45`), or more than one token (`123 45`) is invalid.
+    const toks = _wsTokens(s);
+    if (toks.length !== 1) return null;
+    const t = toks[0];
+    if (_MATHFN_NAME_RE.test(t)) {
+      const root = _parseCalcTree(t);
+      if (root === null || _mt(root, null) !== 'number') return null;  // must be <number>/<integer>-typed
+      return _canonMathExpr(t) || t;
+    }
+    if (/^[+-]?\d+$/.test(t)) return String(parseInt(t, 10));
+    return null;
   }
   if (name === 'vertical-align') return _canonVerticalAlign(s, null, false);
   if (name === 'margin-trim') return _canonMarginTrim(s, false);

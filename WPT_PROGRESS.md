@@ -16,6 +16,10 @@ Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #254).
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-box/parsing/clear-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #257 The Box-Enum Verdict.** clear/float/visibility were raw-store (invalid accepted). Added three keyword enums to `_CSSUI_ENUM`+`_CSSUI_VALIDATED` (clear `none\|left\|right\|both\|inline-start\|inline-end`, float drops `both`, visibility `visible\|hidden\|collapse`) + `order` = `<integer>` (signed) via a `_canonCssUi` branch. **+10.** |
+| `css/css-box/parsing/float-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #257.** rejects `auto`/`right bottom`/`top, left`. |
+| `css/css-box/parsing/visibility-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #257.** rejects `auto`/`hidden collapse`. |
+| `css/css-flexbox/parsing/order-invalid.html` | 0/3 | **3/3** | ✅ 100% | **Quest #257.** `order` = single signed `<integer>` (rejects `auto`/`123.45`/`123 45`); a number-typed calc kept symbolic, folded at computed via `_INTEGER_COMPUTED_PROPS`. |
 | `css/css-box/parsing/margin-shorthand.html` | 0/20 | **20/20** | ✅ 100% | **Quest #256 The Box-Edge Verdict.** physical `margin`/`padding` were stored as a blob so the LONGHAND getter never reflected the shorthand. Added both (4-edge) to `_BOX_LOGICAL_SH2` (eager expansion via `_expandBoxLogical`, kept in `_BOX_SHORTHANDS` for cssText recombine) + the 8 physical longhands to `_BOX_LOGICAL_LH` (validated by `_canonBoxLogicalLh` — margin `auto\|<lp>`, padding `<lp [0,∞]>`). **+56 across the family.** |
 | `css/css-box/parsing/padding-shorthand.html` | 0/20 | **20/20** | ✅ 100% | **Quest #256.** eager expansion populates padding-top/right/bottom/left. |
 | `css/css-box/parsing/margin-invalid.html` | 0/7 | **6/7** | 🟡 86% | **Quest #256.** component validation rejects `available`/`border-box`/5-token/`calc() auto`. CAP: `margin-bottom-left` (a non-existent property) still stores raw — rejecting unknown props needs a full registry (raw-store is load-bearing). |
