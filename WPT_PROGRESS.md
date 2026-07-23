@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #253).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #254).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-inline/parsing/vertical-align-computed.html` | 0/23 | **23/23** | ✅ 100% | **Quest #254 The Vertical-Align Verdict.** vertical-align was raw-store. It's the CSS Inline 3 `||` grammar `[first\|last] \|\| <alignment-baseline> \|\| <baseline-shift>` (order-independent, serialized in fixed order; default `baseline` alignment + zero shift dropped; all-default → `baseline`). NEW `_canonVerticalAlign` (reuses `_canonLenPctSigned` for the shift + `_computeBaselineShift` for computed length→px). **+43.** |
+| `css/css-inline/parsing/vertical-align-invalid.html` | 0/9 | **9/9** | ✅ 100% | **Quest #254.** rejects `none`/`auto`/two-in-a-category/comma. |
+| `css/css-inline/parsing/vertical-align-valid.html` | 19/30 | **30/30** | ✅ 100% | **Quest #254.** canonicalizes `super middle first`→`first middle super`, `baseline 0`→`baseline`. |
 | `css/css-inline/parsing/line-height-computed.html` | 3/13 | **13/13** | ✅ 100% | **Quest #253 The Line-Height Verdict.** line-height + baseline-shift were raw-store. line-height = `normal \| <number [0,∞]> \| <length-percentage [0,∞]>` (reuse `_canonFontLineHeight`); computed resolves length/%/calc→px (% against font-size, cqZero, clamp≥0) but KEEPS a `<number>` as a number (inherits as number) — the px OM value is applied at the getComputedStyle boundary. baseline-shift = `<lp> \| sub\|super\|top\|center\|bottom` (reuse `_canonLenPctSigned`); computed length→px, `%` kept symbolic. **+32.** |
 | `css/css-inline/parsing/line-height-invalid.html` | 0/8 | **8/8** | ✅ 100% | **Quest #253.** rejects `auto`/negatives/multi-token. |
 | `css/css-inline/parsing/baseline-shift-invalid.html` | 0/5 | **5/5** | ✅ 100% | **Quest #253.** rejects bare number `5`/multi-token/comma. |

@@ -9067,6 +9067,8 @@ const _GCS_DEFAULTS = {
   'alignment-baseline': 'baseline', 'dominant-baseline': 'auto',
   // css-inline baseline-shift — does not inherit; initial `0` → `0px`.
   'baseline-shift': '0px',
+  // css-inline vertical-align — does not inherit; initial `baseline`.
+  'vertical-align': 'baseline',
   // css-align (shared with css-flexbox) — none inherit.
   'align-content': 'normal', 'align-items': 'normal', 'align-self': 'auto',
   'column-gap': 'normal', 'justify-content': 'normal', 'justify-items': 'legacy center',
@@ -12905,8 +12907,9 @@ const _CSSUI_VALIDATED = new Set([
   // css-inline SVG baseline enums (keyword identity, computed = specified).
   'alignment-baseline', 'dominant-baseline',
   // css-inline line-height (`normal | <number> | <length-percentage>`, non-negative)
-  // + baseline-shift (`<length-percentage> | sub | super | top | center | bottom`).
-  'line-height', 'baseline-shift',
+  // + baseline-shift (`<length-percentage> | sub | super | top | center | bottom`)
+  // + vertical-align (`[first|last] || <alignment-baseline> || <baseline-shift>`).
+  'line-height', 'baseline-shift', 'vertical-align',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13103,6 +13106,7 @@ const _canonCssUi = (name, value) => {
     if (tl === 'sub' || tl === 'super' || tl === 'top' || tl === 'center' || tl === 'bottom') return tl;
     return _canonLenPctSigned(toks[0], true);
   }
+  if (name === 'vertical-align') return _canonVerticalAlign(s, null, false);
   if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;
 };
@@ -20559,6 +20563,39 @@ const _computeBaselineShift = (el, v) => {
   if (_BASELINE_SHIFT_KW.has(s.toLowerCase())) return s.toLowerCase();
   return _trComp(s, el, true, _vpUnits());
 };
+// css-inline vertical-align = [ first | last ] || <'alignment-baseline'> ||
+// <'baseline-shift'> (an order-independent `||` combination, serialized in that
+// fixed order). Each category matches ≤ once. The alignment-baseline default
+// (`baseline`) and a zero baseline-shift are dropped; when everything is default the
+// value serializes as the single keyword `baseline`. `computed` folds the shift's
+// <length> to px (% kept symbolic). Any top-level comma / unknown token / duplicate
+// in a category → null (invalid).
+const _VALIGN_SOURCE = new Set(['first', 'last']);
+const _VALIGN_BASELINE = new Set(['baseline', 'text-bottom', 'alphabetic', 'ideographic', 'middle', 'central', 'mathematical', 'text-top']);
+const _canonVerticalAlign = (value, el, computed) => {
+  const s = String(value).trim();
+  if (_commaSplitTop(s).length > 1) return null;              // a top-level comma is never valid
+  const toks = _wsTokens(s);
+  if (toks.length < 1 || toks.length > 3) return null;
+  let source = null, align = null, shift = null;
+  for (const t of toks) {
+    const tl = t.toLowerCase();
+    if (_VALIGN_SOURCE.has(tl)) { if (source !== null) return null; source = tl; continue; }
+    if (_VALIGN_BASELINE.has(tl)) { if (align !== null) return null; align = tl; continue; }
+    // <'baseline-shift'>: a keyword (sub/super/top/center/bottom) or <length-percentage>.
+    if (shift !== null) return null;
+    if (_BASELINE_SHIFT_KW.has(tl)) { shift = tl; continue; }
+    const c = _canonLenPctSigned(t, true);
+    if (c === null) return null;
+    shift = c;
+  }
+  if (computed && shift !== null && !_BASELINE_SHIFT_KW.has(shift)) shift = _computeBaselineShift(el, shift);
+  const parts = [];
+  if (source) parts.push(source);
+  if (align && align !== 'baseline') parts.push(align);        // baseline is the default → dropped
+  if (shift !== null && shift !== '0px') parts.push(shift);    // a zero-length shift is the default → dropped
+  return parts.length ? parts.join(' ') : 'baseline';
+};
 // css-inline line-height COMPUTED value. `normal` stays; a <number> keeps its number
 // (it inherits as a number and multiplies each descendant's own font-size — the px
 // RESOLVED value is applied at the getComputedStyle boundary, see resolve()); a
@@ -20618,6 +20655,7 @@ const _normComputed = (el, kebab, v) => {
   }
   if (kebab === 'line-height') return _computeLineHeight(el, v);
   if (kebab === 'baseline-shift') return _computeBaselineShift(el, v);
+  if (kebab === 'vertical-align') return _canonVerticalAlign(v, el, true);
   if (kebab === 'text-decoration-inset') return _computeTextDecorationInset(el, v);
   if (_COUNTER_VALIDATED.has(kebab)) return _computeCounter(el, v);
   if (_GRID_LINE_LH.has(kebab)) return _computeGridLine(el, v);
