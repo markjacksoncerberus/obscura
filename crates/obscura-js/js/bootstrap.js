@@ -9069,6 +9069,8 @@ const _GCS_DEFAULTS = {
   'baseline-shift': '0px',
   // css-inline vertical-align — does not inherit; initial `baseline`.
   'vertical-align': 'baseline',
+  // css-box margin-trim — does not inherit; initial `none`.
+  'margin-trim': 'none',
   // css-align (shared with css-flexbox) — none inherit.
   'align-content': 'normal', 'align-items': 'normal', 'align-self': 'auto',
   'column-gap': 'normal', 'justify-content': 'normal', 'justify-items': 'legacy center',
@@ -12910,6 +12912,8 @@ const _CSSUI_VALIDATED = new Set([
   // + baseline-shift (`<length-percentage> | sub | super | top | center | bottom`)
   // + vertical-align (`[first|last] || <alignment-baseline> || <baseline-shift>`).
   'line-height', 'baseline-shift', 'vertical-align',
+  // css-box margin-trim: `none | block || inline | [block-start||inline-start||block-end||inline-end]`.
+  'margin-trim',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13107,8 +13111,52 @@ const _canonCssUi = (name, value) => {
     return _canonLenPctSigned(toks[0], true);
   }
   if (name === 'vertical-align') return _canonVerticalAlign(s, null, false);
+  if (name === 'margin-trim') return _canonMarginTrim(s, false);
   if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;
+};
+
+// ── css-box margin-trim ──────────────────────────────────────────────────────
+// Grammar (CSS Box 4): `none | block || inline | [ block-start || inline-start ||
+// block-end || inline-end ]`. The two multi-keyword forms are mutually exclusive
+// (the `block`/`inline` AXIS form and the four-SIDE form cannot mix), `none` stands
+// alone, and no keyword repeats.
+//
+// Serialization: an axis collapses to its keyword only when the OTHER axis is either
+// fully present (both sides) or fully absent — so `block-start block-end` → `block`,
+// all four sides → `block inline`, but `block-start block-end inline-start` keeps its
+// individual sides (the inline axis is only half-present). SPECIFIED preserves the
+// author's token order in the non-collapsed cases (`inline-start block-start` stays,
+// `inline block` stays); COMPUTED reorders sides to the canonical
+// block-start · inline-start · block-end · inline-end (and the axis form to
+// block · inline).
+const _MARGIN_TRIM_AXIS = ['block', 'inline'];
+const _MARGIN_TRIM_SIDES = ['block-start', 'inline-start', 'block-end', 'inline-end'];
+const _canonMarginTrim = (value, computed) => {
+  const v = String(value).trim();
+  if (v === '') return null;
+  const toks = _asciiLower(v).split(/\s+/);
+  if (toks.length === 1 && toks[0] === 'none') return 'none';
+  if (toks.includes('none')) return null;                      // `none` never combines
+  const seen = new Set();
+  for (const t of toks) { if (seen.has(t)) return null; seen.add(t); }  // no repeats
+  const isAxis = toks.every((t) => _MARGIN_TRIM_AXIS.includes(t));
+  const isSides = toks.every((t) => _MARGIN_TRIM_SIDES.includes(t));
+  if (!isAxis && !isSides) return null;                        // unknown token or mixed forms
+  if (isAxis) {                                                // `block || inline`
+    if (computed) return _MARGIN_TRIM_AXIS.filter((a) => seen.has(a)).join(' ');
+    return toks.join(' ');                                     // specified: keep author order
+  }
+  // four-side form
+  const blockBoth = seen.has('block-start') && seen.has('block-end');
+  const inlineBoth = seen.has('inline-start') && seen.has('inline-end');
+  const hasBlock = seen.has('block-start') || seen.has('block-end');
+  const hasInline = seen.has('inline-start') || seen.has('inline-end');
+  if (blockBoth && inlineBoth) return 'block inline';
+  if (blockBoth && !hasInline) return 'block';
+  if (inlineBoth && !hasBlock) return 'inline';
+  if (computed) return _MARGIN_TRIM_SIDES.filter((s) => seen.has(s)).join(' ');
+  return toks.join(' ');                                       // specified: keep author order
 };
 
 // ── CSS Multi-column Layout (css-multicol) value parsing ─────────────────────
@@ -20656,6 +20704,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'line-height') return _computeLineHeight(el, v);
   if (kebab === 'baseline-shift') return _computeBaselineShift(el, v);
   if (kebab === 'vertical-align') return _canonVerticalAlign(v, el, true);
+  if (kebab === 'margin-trim') return _canonMarginTrim(v, true);
   if (kebab === 'text-decoration-inset') return _computeTextDecorationInset(el, v);
   if (_COUNTER_VALIDATED.has(kebab)) return _computeCounter(el, v);
   if (_GRID_LINE_LH.has(kebab)) return _computeGridLine(el, v);
