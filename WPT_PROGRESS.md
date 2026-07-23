@@ -10,12 +10,14 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #259).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-22 (Quest #260 — `css/css-anchor-position/parsing/` FULLY SECURED, 220/220).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-anchor-position/parsing/position-try-parsing.html` | 8/35 | **35/35** | ✅ 100% | **Quest #260 The Position-Try Verdict.** The `position-try` shorthand = `<'position-try-order'>? <'position-try-fallbacks'>`. NEW `_expandPositionTry` (strips a leading order keyword — appearing ONCE at the start — then validates the rest as fallbacks; `none normal`/`flip-block most-height`/`normal --foo, most-width --bar` invalid since the stray order keyword lands in the fallbacks grammar) + `_serPositionTry` (drops `normal`). Wired like `flex-flow` across all 6 touch points (inline parser, setProperty, removeProperty, getPropertyValue, getComputedStyle, `_CSS_KNOWN_PROPS`). **Completes the arc — `css/css-anchor-position/parsing/` is 220/220, +146 across #258–#260.** |
+| `css/css-anchor-position/parsing/position-try-computed.html` | 0/9 | **9/9** | ✅ 100% | **Quest #260.** getComputedStyle reconstructs from the computed position-try-order/-fallbacks longhands. |
 | `css/css-anchor-position/parsing/position-try-fallbacks-parsing.html` | 33/57 | **57/57** | ✅ 100% | **Quest #259 The Try-Fallbacks Verdict.** `position-try-fallbacks` was raw-store. NEW `_canonPositionTryFallbacks` for `none \| [ [<dashed-ident> \|\| <try-tactic>] \| <'position-area'> ]#`. Each comma-item is EITHER a dashed-ident+tactics run OR a `<position-area>` (never mixed). In the tactics alt the `\|\|` components are each CONTIGUOUS — the dashed-ident sits before/after the flip-keyword run, never splitting it (`flip-inline --bar flip-block` invalid); serialize dashed-ident first, flip keywords in author order. `<try-tactic>` = flip-block/flip-inline/flip-start/flip-x/flip-y. **+48.** |
 | `css/css-anchor-position/parsing/position-try-fallbacks-computed.html` | 0/24 | **24/24** | ✅ 100% | **Quest #259.** Full `<position-area>` grammar via `_canonPositionArea` (physical/logical/self coordinate systems + start/self-start {1,2} groups + center/span-all neutrals): `top left`→`left top` (rank-0 axis first), `start start`→`start` (collapse identical). Computed = specified canonical; initial `none`, not inherited. |
 | `css/css-anchor-position/parsing/position-visibility-parsing.html` | 12/30 | **30/30** | ✅ 100% | **Quest #258 The Anchor-Enum Verdict.** css-anchor-position props were raw-store/unregistered. NEW `_canonPositionVisibility` (`always \| [anchors-valid \|\| anchors-visible \|\| no-overflow]` — `always` stands alone; the three flags combine order-independently, reorder to canonical anchors-valid·anchors-visible·no-overflow at parse time). Wired `_CSSUI_VALIDATED`+`_canonCssUi`+`_GCS_DEFAULTS`(anchors-visible). **+62 across the three props.** |

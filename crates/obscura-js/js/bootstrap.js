@@ -1071,6 +1071,13 @@ const _parseStyleDecls = (text) => {
           for (const ln of _FLEX_FLOW_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
           continue;                                          // expanded into longhands; no `flex-flow` key
         }
+      } else if (name === 'position-try') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandPositionTry(value); if (!lh) continue;  // invalid <position-try> → drop
+          for (const ln of _POSITION_TRY_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `position-try` key
+        }
       } else if (name === 'font') {
         // The `font` shorthand: expand into its 7 longhands so a stylesheet /
         // cssText / style="" rule sets `font-size` (etc.) in the cascade — matching
@@ -1810,6 +1817,21 @@ class CSSStyleDeclaration {
         this._notifyChange();
         return;                                              // expanded into longhands; no `flex-flow` key
       }
+    } else if (!custom && name === 'position-try') {
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
+        for (const ln of _POSITION_TRY_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandPositionTry(stored); if (!lh) return;  // invalid <position-try> → ignore
+        if ('position-try' in this._props) { delete this._props['position-try']; delete this._priority['position-try']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln of _POSITION_TRY_LONGHANDS) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `position-try` key
+      }
     } else if (!custom && name === 'text-decoration') {
       const low = stored.toLowerCase();
       if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
@@ -1983,6 +2005,14 @@ class CSSStyleDeclaration {
         : _serFlexFromLonghands((ln) => this._props[ln]);
       delete this._props['flex']; delete this._priority['flex'];  // any CSS-wide/var blob key
       for (const ln of _FLEX_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'position-try') {                          // shorthand: clear position-try-order/-fallbacks
+      const old = (key in this._props) ? this._props[key]
+        : _serPositionTry(this._props['position-try-order'], this._props['position-try-fallbacks']);
+      delete this._props['position-try']; delete this._priority['position-try'];  // any CSS-wide/var blob key
+      for (const ln of _POSITION_TRY_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -2178,6 +2208,10 @@ class CSSStyleDeclaration {
     if (key === 'flex-flow') {                                // reconstruct from flex-direction/flex-wrap
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
       return _serFlexFlow(this._props['flex-direction'], this._props['flex-wrap']);
+    }
+    if (key === 'position-try') {                             // reconstruct from position-try-order/-fallbacks
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      return _serPositionTry(this._props['position-try-order'], this._props['position-try-fallbacks']);
     }
     if (_BORDER_EXPAND[key]) {                              // border/outline shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
@@ -13311,6 +13345,35 @@ const _canonPositionTryFallbacks = (value) => {
   return out.length ? out.join(', ') : null;
 };
 
+// ── css-anchor-position `position-try` shorthand ─────────────────────────────
+// `position-try = <'position-try-order'>? <'position-try-fallbacks'>`. The optional
+// leading order keyword (`normal | most-*`) appears ONCE at the very start (before the
+// fallbacks list); the rest is the required <'position-try-fallbacks'>. So `none
+// normal` (order after fallbacks), `flip-block most-height` (order keyword mid-value),
+// `most-height, flip-start` (order alone, fallbacks starts empty), and a per-item order
+// (`normal --foo, most-width --bar`) are all invalid — the stray order keyword lands
+// inside the fallbacks grammar, which rejects it. Serialization drops the order when
+// it is the `normal` initial (`normal none` → `none`).
+const _POSITION_TRY_LONGHANDS = ['position-try-order', 'position-try-fallbacks'];
+const _expandPositionTry = (value) => {
+  const v = String(value).trim();
+  if (v === '') return null;
+  const items = _commaSplitTop(v).map((s) => s.trim());
+  let order = 'normal';
+  const firstToks = _wsTokens(items[0]);
+  if (firstToks.length && _CSSUI_ENUM['position-try-order'].has(firstToks[0].toLowerCase())) {
+    order = firstToks[0].toLowerCase();
+    items[0] = firstToks.slice(1).join(' ');                  // strip the order keyword from the first item
+  }
+  const fb = _canonPositionTryFallbacks(items.join(', '));    // fallbacks required (empty → invalid)
+  if (fb === null) return null;
+  return { 'position-try-order': order, 'position-try-fallbacks': fb };
+};
+const _serPositionTry = (order, fallbacks) => {
+  if (!order || !fallbacks) return '';
+  return order === 'normal' ? fallbacks : order + ' ' + fallbacks;
+};
+
 // ── css-box margin-trim ──────────────────────────────────────────────────────
 // Grammar (CSS Box 4): `none | block || inline | [ block-start || inline-start ||
 // block-end || inline-end ]`. The two multi-keyword forms are mutually exclusive
@@ -21450,6 +21513,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('animation-range');                                  // the `animation-range` shorthand (computed reconstructed from its stored value)
   add('flex');                                             // the `flex` shorthand (reconstructed from flex-grow/-shrink/-basis)
   add('flex-flow');                                        // the `flex-flow` shorthand (reconstructed from flex-direction/-wrap)
+  add('position-try');                                     // the `position-try` shorthand (reconstructed from position-try-order/-fallbacks)
   add('text-decoration');                                  // the `text-decoration` shorthand (reconstructed from its 4 longhands)
   add('text-emphasis');                                    // the `text-emphasis` shorthand (reconstructed from its style/color longhands)
   add('list-style');                                       // the `list-style` shorthand (reconstructed from its 3 longhands)
@@ -21538,6 +21602,10 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     }
     // `flex-flow` shorthand: reconstruct from the computed flex-direction/flex-wrap.
     if (kebab === 'flex-flow') return _serFlexFlow(resolve('flex-direction'), resolve('flex-wrap'));
+    // `position-try` shorthand: reconstruct from the computed position-try-order/
+    // -fallbacks (both compute to their stored canonical value; the order is dropped
+    // when it is the `normal` initial).
+    if (kebab === 'position-try') return _serPositionTry(resolve('position-try-order'), resolve('position-try-fallbacks'));
     // `text-decoration` shorthand: reconstruct from the COMPUTED longhands (order
     // line·style·thickness·color). The colour resolves to rgb() when set, but is
     // omitted when the SPECIFIED colour is the `currentcolor` initial (its computed
