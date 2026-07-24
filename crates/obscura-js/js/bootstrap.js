@@ -846,6 +846,7 @@ const _parseStyleDecls = (text) => {
       value = _canonCustomValue(value);
     } else {
       name = name.toLowerCase();
+      if (_RADIUS_ALIAS[name]) name = _RADIUS_ALIAS[name];   // -webkit-border(-*)-radius → canonical (Compat legacy alias)
       if (_DESCRIPTOR_ONLY.has(name)) continue;            // @page descriptor set as an element property → drop
       value = value.trim();
       if (value === '') continue;
@@ -1245,6 +1246,7 @@ class CSSStyleDeclaration {
     let stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
     if (!custom && stored === '') { this.removeProperty(name); return; }
     if (!custom && _GRID_GAP_ALIAS[name]) name = _GRID_GAP_ALIAS[name];  // grid-row-gap→row-gap (legacy alias)
+    if (!custom && _RADIUS_ALIAS[name]) name = _RADIUS_ALIAS[name];  // -webkit-border(-*)-radius → canonical (Compat legacy alias)
     if (!custom && _ALIGN_SHORTHAND_LH[name] && !/\bvar\(/i.test(stored)) {
       // gap/grid-gap/place-* shorthand (no var()): expand into — and store as — its
       // two longhands so `el.style.rowGap`/`el.style.alignContent` read back. The
@@ -1316,6 +1318,25 @@ class CSSStyleDeclaration {
         const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
         delete this._props[name]; delete this._priority[name];   // drop any prior var()-stored shorthand key
         for (const ln of Object.keys(lh)) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                                 // expanded; no shorthand key kept
+      }
+    }
+    if (!custom && name === 'border-radius' && !/\bvar\(/i.test(stored)) {
+      // css-backgrounds-3 border-radius (no var()): expand into — and store as — its
+      // four physical corner longhands so `el.style.borderTopLeftRadius` reads back
+      // and border-radius reconstructs canonically. A CSS-wide keyword belongs to
+      // every longhand → skip to single-key storage below. Invalid → ignore.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low)) {
+        const lh = _expandBorderRadius(stored);
+        if (!lh) return;                                        // out of grammar → keep prior value
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        delete this._props[name]; delete this._priority[name];   // drop any prior var()/CSS-wide shorthand key
+        for (const ln of _BORDER_RADIUS_LH) {
           if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
           this._props[ln] = lh[ln]; this._priority[ln] = prio;
         }
@@ -2161,6 +2182,7 @@ class CSSStyleDeclaration {
   removeProperty(name) {
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
+    if (_RADIUS_ALIAS[key]) key = _RADIUS_ALIAS[key];  // -webkit-border(-*)-radius → canonical
     if (key === 'offset') {                                // shorthand: clear its five longhands
       const old = _serializeOffsetShorthand(this);
       for (const ln of _OFFSET_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
@@ -2274,6 +2296,13 @@ class CSSStyleDeclaration {
         delete this._props[radLH]; delete this._priority[radLH];
         delete this._props[shapeLH]; delete this._priority[shapeLH];
       }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'border-radius') {                          // css-backgrounds-3 border-radius: clear its four corner longhands
+      const old = this.getPropertyValue(key);
+      delete this._props[key]; delete this._priority[key];   // any CSS-wide/var shorthand key
+      for (const ln of _BORDER_RADIUS_LH) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -2403,6 +2432,7 @@ class CSSStyleDeclaration {
   getPropertyValue(name) {
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
+    if (_RADIUS_ALIAS[key]) key = _RADIUS_ALIAS[key];  // -webkit-border(-*)-radius → canonical
     if (key === 'offset') return _serializeOffsetShorthand(this);  // reconstruct from longhands
     if (key === 'animation') {                                // reconstruct from its eleven longhands
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
@@ -2455,6 +2485,10 @@ class CSSStyleDeclaration {
     if (_CORNER_COMBINED_SH[key]) {                        // css-borders-4 combined corner shorthand
       if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
       return _serCornerCombined((n) => this._props[n], key, false, 0, 0);  // reconstruct from radius + shape longhands
+    }
+    if (key === 'border-radius') {                        // css-backgrounds-3 border-radius
+      if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
+      return _serBorderRadiusSh((n) => this._props[n]);    // reconstruct + collapse from the four corner longhands
     }
     if (_BORDER_EXPAND[key]) {                              // border/outline shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
@@ -2527,6 +2561,7 @@ class CSSStyleDeclaration {
   getPropertyPriority(name) {
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
+    if (_RADIUS_ALIAS[key]) key = _RADIUS_ALIAS[key];  // -webkit-border(-*)-radius → canonical
     return this._priority[key] || "";
   }
   get cssText() {
@@ -9196,6 +9231,9 @@ const _GCS_DEFAULTS = {
   // argument (see _computeSizeValue); min-* `auto` → 0px. block/inline-size resolve
   // only explicit lengths (auto/%/min-content need layout). None inherit.
   'min-width': 'auto', 'min-height': 'auto', 'max-width': 'none', 'max-height': 'none',
+  // css-backgrounds-3 border-*-radius corner longhands: initial 0px, not inherited.
+  'border-top-left-radius': '0px', 'border-top-right-radius': '0px',
+  'border-bottom-right-radius': '0px', 'border-bottom-left-radius': '0px',
   'block-size': 'auto', 'inline-size': 'auto',
   'min-block-size': 'auto', 'min-inline-size': 'auto',
   'max-block-size': 'none', 'max-inline-size': 'none',
@@ -9514,6 +9552,11 @@ const _SHORTHAND_LONGHANDS = {
   'inset-block': ['inset-block-start', 'inset-block-end'],
   'inset-inline': ['inset-inline-start', 'inset-inline-end'],
   'inset': ['top', 'right', 'bottom', 'left'],
+  // css-backgrounds-3 border-radius — feed the cascade so a stylesheet / cssText
+  // `border-radius: 1px 2px` expands per-corner for getComputedStyle (split lazily
+  // via _expandBorderRadius in _expandShorthand).
+  'border-radius': ['border-top-left-radius', 'border-top-right-radius',
+    'border-bottom-right-radius', 'border-bottom-left-radius'],
 };
 // Set a declaration into a block-level map, respecting within-block cascade
 // order: an !important declaration is never overridden by a later normal one of
@@ -9959,6 +10002,7 @@ const _expandShorthand = (sh, value) => {
   if (_GAP_RULE_SH[sh]) return _expandGapRuleShorthand(sh, value);  // css-gaps column-rule/row-rule/rule
   if (_CORNER_SHAPE_SH[sh]) return _parseCornerShapeShorthand(sh, value, false);  // css-borders-4 corner-shape shorthands
   if (_CORNER_COMBINED_SH[sh]) return _parseCornerCombined(sh, value, false, 0, 0);  // css-borders-4 combined corner shorthand
+  if (sh === 'border-radius') return _expandBorderRadius(value);  // css-backgrounds-3 border-radius → 4 corner longhands
   if (sh === 'font') {
     const p = _parseFontShorthand(value);
     if (!p || p.system) return null;   // invalid / system font → no per-longhand pieces (falls to initial/inherited)
@@ -10138,7 +10182,8 @@ const _cssParseDecls = (body) => {
     const m = /!\s*important\s*$/i.exec(value);
     if (m) { important = true; value = value.slice(0, m.index).trim(); }
     // Custom properties keep their case; standard properties are ASCII-lowercased.
-    const name = rawName.startsWith('--') ? rawName : rawName.toLowerCase();
+    let name = rawName.startsWith('--') ? rawName : rawName.toLowerCase();
+    if (_RADIUS_ALIAS[name]) name = _RADIUS_ALIAS[name];   // -webkit-border(-*)-radius → canonical (Compat legacy alias)
     // A custom property with an invalid <declaration-value> is dropped — the
     // earlier valid declaration of the same name (if any) is preserved.
     if (name.startsWith('--') && !_isBalancedDeclValue(value)) continue;
@@ -13441,6 +13486,12 @@ const _CSSUI_VALIDATED = new Set([
   'corner-bottom-left-shape', 'corner-bottom-right-shape',
   'corner-start-start-shape', 'corner-start-end-shape',
   'corner-end-start-shape', 'corner-end-end-shape',
+  // css-backgrounds-3: the four physical border-*-radius corner longhands
+  // (`<length-percentage [0,∞]>{1,2}`, a dedicated _canonCssUi branch; computed
+  // resolves lengths to px in _normComputed). The `border-radius` SHORTHAND is
+  // handled separately (expand/serialize). Not inherited; initial `0px`.
+  'border-top-left-radius', 'border-top-right-radius',
+  'border-bottom-right-radius', 'border-bottom-left-radius',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13758,6 +13809,80 @@ const _serCornerCombined = (get, sh, computed, emPx, lhPx) => {
   return segs[0];
 };
 
+// ── border-radius (css-backgrounds-3 §the-border-radius) ─────────────────────
+// A real shorthand over the four PHYSICAL corner longhands. Grammar:
+//   <length-percentage [0,∞]>{1,4} [ / <length-percentage [0,∞]>{1,4} ]?
+// (horizontal radii before the `/`, vertical after — each group a 1–4 box-edge
+// list). Each corner longhand is `<lp>{1,2}` (horizontal then optional vertical,
+// an equal pair collapsing to one value). `-webkit-border-radius` + its four
+// `-webkit-border-*-radius` longhands are Compat-spec legacy aliases → mapped to
+// the canonical names by _RADIUS_ALIAS at every touch point (setProperty /
+// removeProperty / getPropertyValue / computed / CSS.supports).
+const _BORDER_RADIUS_LH = [
+  'border-top-left-radius', 'border-top-right-radius',
+  'border-bottom-right-radius', 'border-bottom-left-radius',
+];
+const _BORDER_RADIUS_LH_SET = new Set(_BORDER_RADIUS_LH);
+const _RADIUS_ALIAS = {
+  '-webkit-border-radius': 'border-radius',
+  '-webkit-border-top-left-radius': 'border-top-left-radius',
+  '-webkit-border-top-right-radius': 'border-top-right-radius',
+  '-webkit-border-bottom-right-radius': 'border-bottom-right-radius',
+  '-webkit-border-bottom-left-radius': 'border-bottom-left-radius',
+};
+// One corner longhand: `<lp [0,∞]>{1,2}` → canonical string (equal pair → one
+// value), or null if out of grammar. `computed` resolves lengths to px and clamps
+// a resolved negative radius to 0px.
+const _serBorderRadiusLH = (value, computed, emPx, lhPx) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  for (const t of toks) if (!_isNonNegShapeLP(t)) return null;
+  const vals = toks.map((t) => {
+    const x = _opLp(t, computed, emPx, lhPx);
+    return computed ? _opClampRadius(x) : x;
+  });
+  return (vals.length === 2 && vals[0] === vals[1]) ? vals[0] : vals.join(' ');
+};
+// Expand a `border-radius` value into its four corner longhands (specified
+// strings), or null if out of grammar. A top-level `/` (paren-aware, so a calc()'s
+// inner `/` is safe) splits the horizontal / vertical groups; each group is a 1–4
+// box-edge list of non-negative <length-percentage>. No slash → vertical = horizontal.
+const _expandBorderRadius = (value) => {
+  const s = String(value).trim();
+  if (!s || _commaSplitTop(s).length > 1) return null;
+  const segs = _slashSplitTop(s);
+  if (segs.length > 2) return null;                              // at most one top-level `/`
+  const hT = _wsTokens(segs[0].trim());
+  const vT = segs.length === 2 ? _wsTokens(segs[1].trim()) : hT;
+  if (hT.length < 1 || hT.length > 4) return null;
+  if (vT.length < 1 || vT.length > 4) return null;
+  for (const t of hT) if (!_isNonNegShapeLP(t)) return null;
+  for (const t of vT) if (!_isNonNegShapeLP(t)) return null;
+  const H = _boxEdges(hT), V = _boxEdges(vT);
+  const out = {};
+  _BORDER_RADIUS_LH.forEach((ln, i) => {
+    const h = _opLp(H[i], false, 0, 0), v = _opLp(V[i], false, 0, 0);
+    out[ln] = h === v ? h : h + ' ' + v;
+  });
+  return out;
+};
+// Reconstruct the `border-radius` shorthand from its four corner longhands (read
+// via `get`): '' when any corner is missing (unrepresentable). Each corner string
+// is `h [v]`; the horizontal radii box-collapse to the pre-`/` group, the vertical
+// to the post-`/` group, and `/ <vertical>` is dropped when the two groups agree.
+const _serBorderRadiusSh = (get) => {
+  const H = [], V = [];
+  for (const ln of _BORDER_RADIUS_LH) {
+    const c = get(ln);
+    if (c == null || c === '') return '';
+    const t = _wsTokens(String(c));
+    if (t.length < 1) return '';
+    H.push(t[0]); V.push(t.length >= 2 ? t[1] : t[0]);
+  }
+  const hStr = _opCollapse4(H), vStr = _opCollapse4(V);
+  return hStr === vStr ? hStr : hStr + ' / ' + vStr;
+};
+
 // ── display (css-display-3) ──────────────────────────────────────────────────
 // display = [ <display-outside> || <display-inside> ]      (the two-value syntax)
 //         | <display-listitem> | <display-internal> | <display-box> | <display-legacy>
@@ -13872,6 +13997,7 @@ const _canonCssUi = (name, value) => {
   const enumSet = _CSSUI_ENUM[name];
   if (enumSet) return enumSet.has(low) ? low : null;
   if (_CORNER_SHAPE_LONGHANDS.has(name)) return _canonCornerShapeValue(s, false);  // css-borders-4 single-corner longhand
+  if (_BORDER_RADIUS_LH_SET.has(name)) return _serBorderRadiusLH(s, false, 0, 0);  // css-backgrounds-3 corner radius longhand
   if (name === 'display') return _canonDisplay(s);            // css-display two-value syntax → canonical short form
   if (name === 'orphans' || name === 'widows') {
     // css-break: `<integer [1,∞]>`. A number-typed calc is kept symbolic here and
@@ -22455,6 +22581,11 @@ const _normComputed = (el, kebab, v) => {
     const c = _canonCornerShapeValue(v, true);
     return c === null ? v : c;
   }
+  if (_BORDER_RADIUS_LH_SET.has(kebab)) {                       // css-backgrounds-3: corner radius → px-resolved lengths
+    const emPx = _emPxOf(el), lhPx = _lineHeightPx(el, emPx);
+    const c = _serBorderRadiusLH(v, true, emPx, lhPx);
+    return c === null ? v : c;
+  }
   if (_RI_LEAF.has(kebab)) return _computeInsetValue(el, v);    // css-gaps rule-inset leaf → folded <inset-value>
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_BI_DIM_LH.has(kebab)) return _computeBorderImageDim(el, v);
@@ -23138,6 +23269,9 @@ const _CSS_KNOWN_PROPS = (() => {
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
   for (const k of Object.keys(_BORDER_LOGICAL_SH)) add(k);  // css-logical 2-value border-block/inline color/style/width shorthands
   for (const k of Object.keys(_GRID_GAP_ALIAS)) add(k);     // grid-row-gap/grid-column-gap legacy aliases
+  add('border-radius');                                     // css-backgrounds-3 border-radius shorthand (reconstructed from its 4 corner longhands)
+  for (const ln of _BORDER_RADIUS_LH) add(ln);              // the four physical border-*-radius corner longhands
+  for (const k of Object.keys(_RADIUS_ALIAS)) add(k);       // -webkit-border(-*)-radius Compat legacy aliases
   return set;
 })();
 globalThis.getComputedStyle = (el, _pseudo) => {
@@ -23153,6 +23287,7 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // Box-alignment shorthands: reconstruct the computed value from the computed
     // longhands (grid-*-gap are legacy aliases for a single longhand).
     if (_GRID_GAP_ALIAS[kebab]) return resolve(_GRID_GAP_ALIAS[kebab]);
+    if (_RADIUS_ALIAS[kebab]) return resolve(_RADIUS_ALIAS[kebab]);  // -webkit-border(-*)-radius → canonical
     if (_ALIGN_SHORTHAND_LH[kebab]) {
       const [a, b] = _ALIGN_SHORTHAND_LH[kebab];
       const av = resolve(a), bv = resolve(b);
@@ -23278,6 +23413,12 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     if (_CORNER_COMBINED_SH[kebab]) {
       const emPx = _emPxOf(el), lhPx = _lineHeightPx(el, emPx);
       const s = _serCornerCombined((n) => resolve(n), kebab, true, emPx, lhPx);
+      if (s !== '') return s;
+    }
+    // css-backgrounds-3 border-radius: reconstruct from the COMPUTED corner longhands
+    // (each length px-resolved) and box-collapse the horizontal / vertical groups.
+    if (kebab === 'border-radius') {
+      const s = _serBorderRadiusSh((n) => resolve(n));
       if (s !== '') return s;
     }
     // css-gaps `rule-*` shorthand: reconstruct from the COMPUTED column-*/row-*
@@ -26603,6 +26744,15 @@ globalThis.CSS = {
       if (_GAP_RULE_SH[name]) {                            // css-gaps column-rule/row-rule/rule shorthand
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
         return _parseGapRuleShorthand(_canonStandardValue(val)) != null;  // validate the <gap-rule-list>
+      }
+      if (name === 'border-radius' || _RADIUS_ALIAS[name]) {  // css-backgrounds-3 border-radius (+ -webkit- aliases)
+        if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
+        const canon = _canonStandardValue(val);
+        if (_CSS_WIDE.has(canon.toLowerCase())) return true;
+        const target = _RADIUS_ALIAS[name] || name;
+        return (target === 'border-radius')
+          ? _expandBorderRadius(canon) != null              // the shorthand
+          : _serBorderRadiusLH(canon, false, 0, 0) != null; // an aliased corner longhand
       }
       if (_CORNER_SHAPE_SH[name]) {                        // css-borders-4 corner-shape shorthands
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid

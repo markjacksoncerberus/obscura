@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #306–#308 — the combined `corner` / `corner-<edge>` / `corner-<corner>` shorthands; +120).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #309–#311 — `border-radius` promoted to a real shorthand + `-webkit-border-radius` legacy alias; +33).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-backgrounds/parsing/border-radius-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #309 The Border-Radius Validation Verdict.** `border-radius` promoted from raw-store echo to a real shorthand over the 4 physical corner longhands. Grammar `<lp [0,∞]>{1,4} [ / <lp>{1,4} ]?` (`_expandBorderRadius` — paren-aware `_slashSplitTop`, `_boxEdges` per group, `_isNonNegShapeLP`). Rejects `auto`/`none`/5-value/`-1px`/`1px -2px`/`1em /`/`1px / 2px / 3px`/`4 / 5`; longhand `<lp>{1,2}` rejects `10px 20px 30px`. **+11.** |
+| `css/css-backgrounds/parsing/border-radius-computed.html` | 0/14 | **14/14** | ✅ 100% | **Quest #310 The Border-Radius Computed Verdict.** Corner longhands px-resolve in `_normComputed` (`_serBorderRadiusLH`; `calc(-0.5em+10px)`→`0px` clamp, `5em`→`200px`); the shorthand reconstructs from the COMPUTED longhands and box-collapses (`5em / 1px 2% 3px 4%`→`200px / 1px 2% 3px 4%`). **+14.** |
+| `css/css-backgrounds/parsing/border-radius-valid.html` | 20/23 | **23/23** | ✅ 100% | **Quest #311 The Border-Radius Serialization Verdict.** Canonical shorthand collapse (`_serBorderRadiusSh` box-collapses H/V groups, drops `/ V` when equal): `1px 1px 1px 2% / 1px 2% 1px 2%`→`1px 1px 1px 2% / 1px 2%`. **+3.** |
+| `css/css-backgrounds/parsing/webkit-border-radius-valid.html` | 20/25 | **25/25** | ✅ 100% | **Quest #311.** `-webkit-border-radius` + 4 `-webkit-border-*-radius` are Compat legacy aliases (`_RADIUS_ALIAS` at every touch point: setProperty/removeProperty/getProperty(-Priority)/computed/CSS.supports/`_parseStyleDecls`/`_cssParseDecls`); cross-alias cssText round-trips via `_SHORTHAND_LONGHANDS`. **+5.** |
 | `css/css-borders/corner-shape/corner-valid.html` | 4/9 | **9/9** | ✅ 100% | **Quest #306 The Corner Four-Value Verdict.** The combined `corner` shorthand (border-radius ⊗ corner-shape, per corner): `/`-separated segment per corner, `normal \| [<lp>{1,2} && <corner-shape-value>]`, `{1,4}` box-edge transpose. `_CORNER_COMBINED_SH` engine. **+5.** |
 | `css/css-borders/corner-shape/corner-invalid.html` | 0/14 | **14/14** | ✅ 100% | **Quest #306.** Both radius AND shape mandatory (lone `10px`/`scoop`/`4px 12px` invalid); `auto`/`none`/`3% normal`/5-token/`-1px`/`angle` rejected. **+14.** |
 | `css/css-borders/corner-shape/corners-invalid.html` | 0/23 | **23/23** | ✅ 100% | **Quest #306.** `corners` (renamed to `corner` in Aug 2025) hard-rejected (`if (name === 'corners') return;`) so it stops raw-storing. **+23.** |
