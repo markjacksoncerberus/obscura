@@ -10,12 +10,13 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #291–#293 — css-align `justify-items: legacy` computed + the css-text-decor skip/style/underline-position vein; +51).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #300–#302 — the Compat legacy WebKit `display` aliases + `-webkit-box` line-clamp blockification; +18).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-overflow/parsing/webkit-box-computed.html` | 2/20 | **20/20** | ✅ 100% | **Quests #300–#302 The WebKit-Box Verdict.** The four Compat legacy `display` aliases + the line-clamp blockification. **#300**: `-webkit-box`/`-webkit-inline-box` added to `_DISPLAY_PREDEFINED` (valid, specified verbatim; computed = self). **#301**: `-webkit-flex`/`-webkit-inline-flex` compute to `flex`/`inline-flex` (a `_computedPropOf` display-alias branch). **#302**: a `-webkit(-inline)-box` with `-webkit-box-orient: vertical` AND an active clamp (`_hasActiveLineClamp` = numeric `-webkit-line-clamp`, numeric/auto `line-clamp`, or `continue: discard`) blockifies to `flow-root`/`inline-block`. **+18.** |
 | `css/css-fonts/parsing/font-palette-values-invalid.html` | 1/27 | **27/27** | ✅ 100% | **Quests #297–#299 The Font-Palette-Values Verdict.** NEW `@font-palette-values` at-rule + `CSSFontPaletteValuesRule`: `_cssParseRuleList` prelude-validity branch (`_isFpvName`, drops missing/non-dashed/two-token names), `_makeRule` branch, and descriptor grammars — `font-family` (`_fpvCanonFontFamily`, no generics), `base-palette` (`light\|dark\|<integer [0,∞]>`), `override-colors` (`[<int> <absolute-color>]#`, absolute-colour gate rejecting currentColor/system/light-dark, color-mix allowed). **+26.** |
 | `css/css-fonts/parsing/font-palette-values-valid.html` | 11/36 | **36/36** | ✅ 100% | **Quests #297–#299.** `.name`/`.cssText`/accessors, escaped names (`--\{`→`--{`), last-VALID-wins descriptors (`_fpvSplitDecls`), nested `color-mix()` in override-colors. **+25.** |
 | `css/css-align/parsing/justify-items-computed.html` | 18/20 | **20/20** | ✅ 100% | **Quest #291.** css-align §6.2 bare `legacy` computes to the inherited justify-items value if it's a legacy value, else `normal`. Flipped `_GCS_DEFAULTS['justify-items']` `legacy center`→`legacy` + NEW `_normComputed` justify-items parent-walk branch. **+2.** |

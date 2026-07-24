@@ -13475,6 +13475,11 @@ const _DISPLAY_PREDEFINED = new Set([
   'table-row-group', 'table-header-group', 'table-footer-group', 'table-row',
   'table-cell', 'table-column-group', 'table-column', 'table-caption',
   'ruby-base', 'ruby-text', 'ruby-base-container', 'ruby-text-container',
+  // Compat spec legacy WebKit display aliases (CSS Compatibility §Legacy aliases).
+  // All four are accepted verbatim as the SPECIFIED value; -webkit-flex/-inline-flex
+  // map to flex/inline-flex at COMPUTED time, while -webkit-box/-inline-box compute to
+  // themselves (except under the line-clamp blockification below). See _computedPropOf.
+  '-webkit-box', '-webkit-inline-box', '-webkit-flex', '-webkit-inline-flex',
 ]);
 // Collapse (outside, inside) — after defaults are filled — to its canonical string.
 // Only the "default outside for that inside" pair collapses to a bare single keyword;
@@ -13536,6 +13541,20 @@ const _BLOCKIFY_MAP = {
   'ruby-base-container': 'block', 'ruby-text-container': 'block',
 };
 const _isBlockifiable = (v) => _BLOCKIFY_MAP[v] !== undefined || v.startsWith('inline ');
+// A "-webkit-box" element has an ACTIVE line clamp when any of the three clamp
+// mechanisms is engaged: `-webkit-line-clamp: <integer>` (not none), the css-overflow
+// `line-clamp: <integer>|auto` (not none), or `continue: discard`. This gates the
+// -webkit(-inline)-box → flow-root/inline-block computed-value transformation. Reads the
+// element's own computed values (these clamp longhands do not inherit).
+const _hasActiveLineClamp = (el, guard) => {
+  const wlc = String(_computedPropOf(el, '-webkit-line-clamp', guard + 1) || '').toLowerCase();
+  if (wlc && wlc !== 'none') return true;                  // <integer [1,∞]>
+  const lc = String(_computedPropOf(el, 'line-clamp', guard + 1) || '').toLowerCase();
+  if (lc && lc !== 'none') return true;                    // <integer> || <block-ellipsis>, or auto
+  const cont = String(_computedPropOf(el, 'continue', guard + 1) || '').toLowerCase();
+  if (cont === 'discard') return true;
+  return false;
+};
 const _blockifyDisplay = (v) => {
   const m = _BLOCKIFY_MAP[v];
   if (m) return m;
@@ -22484,6 +22503,25 @@ const _computedPropOf = (el, kebab, guard) => {
     if (low === 'inherit') return inheritFrom();
     // unset / revert / revert-layer: inherit for inherited properties, else initial.
     return _INHERITED_PROPS.has(kebab) ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab));
+  }
+  if (kebab === 'display' && low[0] === '-') {
+    // Compat legacy WebKit display aliases (CSS Compatibility spec).
+    //   -webkit-flex / -webkit-inline-flex compute to flex / inline-flex.
+    //   -webkit-box / -webkit-inline-box compute to THEMSELVES — EXCEPT when the
+    //   element establishes a "-webkit-line-clamp" clamp context: a vertical
+    //   `-webkit-box-orient` combined with an active line clamp (a numeric
+    //   `-webkit-line-clamp`, a numeric/auto `line-clamp`, or `continue: discard`)
+    //   blockifies the display to flow-root (-webkit-box) / inline-block
+    //   (-webkit-inline-box). See css-overflow-4 §continue + Blink's line-clamp impl.
+    if (low === '-webkit-flex') return 'flex';
+    if (low === '-webkit-inline-flex') return 'inline-flex';
+    if (low === '-webkit-box' || low === '-webkit-inline-box') {
+      const orient = String(_computedPropOf(el, '-webkit-box-orient', guard + 1) || '').toLowerCase();
+      if (orient === 'vertical' && _hasActiveLineClamp(el, guard)) {
+        return low === '-webkit-box' ? 'flow-root' : 'inline-block';
+      }
+      return low;
+    }
   }
   if (kebab === 'display' && _isBlockifiable(low)) {
     // CSS Display §2.7: a floated / absolutely-positioned box blockifies its display
