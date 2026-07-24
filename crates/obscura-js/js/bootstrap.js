@@ -12614,7 +12614,20 @@ const _relativeStruct = (value, el) => {
   for (let i = 0; i < 3; i++) {
     const tok = rest[i];
     if (tok.toLowerCase() === 'none') { noneOut[i] = true; continue; }
-    const r = _csChan(_relSubst(tok, env), base[i] != null ? base[i] : 0, i === hueIdx);
+    const isHue = i === hueIdx;
+    const sub = _relSubst(tok, env);   // channel keywords → their numeric values
+    // Channel type-check (CSS Color 5 relative syntax): a hue slot takes only
+    // <number>|<angle> (never a bare <percentage>), every other channel takes
+    // <number>|<percentage>. Because the keywords substitute to <number>s, a calc()
+    // that additively mixes a channel with an incompatible dimension — `calc(r + 1%)`
+    // (number+percentage), `calc(h + 1deg)` (number+angle), `calc(x + 1%)` — is a calc
+    // type error that `_mathReject` catches via the real `_mt` type algebra; a bare
+    // literal percentage in the hue slot is caught explicitly (it isn't a math fn).
+    if (isHue) {
+      if (/^[-+]?(?:\d+\.?\d*|\.\d+)%$/.test(tok)) return null;
+      if (_mathReject(sub, ['number', 'angle'], null)) return null;
+    } else if (_mathReject(sub, ['number'], 'number')) return null;
+    const r = _csChan(sub, base[i] != null ? base[i] : 0, isHue);
     if (!r) return null;
     coords[i] = r.v / scale[i];
   }
