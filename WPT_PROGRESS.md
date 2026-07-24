@@ -10,12 +10,23 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #303–#305 — css-scrollbars `scrollbar-width`/`scrollbar-color` + the NEW css-borders-4 `corner-shape` feature; +248).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #306–#308 — the combined `corner` / `corner-<edge>` / `corner-<corner>` shorthands; +120).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-borders/corner-shape/corner-valid.html` | 4/9 | **9/9** | ✅ 100% | **Quest #306 The Corner Four-Value Verdict.** The combined `corner` shorthand (border-radius ⊗ corner-shape, per corner): `/`-separated segment per corner, `normal \| [<lp>{1,2} && <corner-shape-value>]`, `{1,4}` box-edge transpose. `_CORNER_COMBINED_SH` engine. **+5.** |
+| `css/css-borders/corner-shape/corner-invalid.html` | 0/14 | **14/14** | ✅ 100% | **Quest #306.** Both radius AND shape mandatory (lone `10px`/`scoop`/`4px 12px` invalid); `auto`/`none`/`3% normal`/5-token/`-1px`/`angle` rejected. **+14.** |
+| `css/css-borders/corner-shape/corners-invalid.html` | 0/23 | **23/23** | ✅ 100% | **Quest #306.** `corners` (renamed to `corner` in Aug 2025) hard-rejected (`if (name === 'corners') return;`) so it stops raw-storing. **+23.** |
+| `css/css-borders/corner-shape/corner-top-left-valid.html` | 3/11 | **11/11** | ✅ 100% | **Quest #307 The Per-Corner Verdict.** Single-corner (no `/`); `test_shorthand_value` verifies `border-top-left-radius` + `corner-top-left-shape` longhands (`normal`→`0px`+`round`) AND `.length`. **+8.** |
+| `css/css-borders/corner-shape/corner-top-left-invalid.html` | 0/10 | **10/10** | ✅ 100% | **Quest #307.** `4px / normal`, `round / 4px` (a single corner takes no `/`), `round round`, etc. rejected. **+10.** |
+| `css/css-borders/corner-shape/corner-top-valid.html` | 2/14 | **14/14** | ✅ 100% | **Quest #307.** Physical 2-corner edge (`corner-top` → top-left + top-right longhand pairs). **+12.** |
+| `css/css-borders/corner-shape/corner-block-start-valid.html` | 2/14 | **14/14** | ✅ 100% | **Quest #307.** Flow-relative 2-corner edge → the logical `border-start-start-radius`/`corner-start-start-shape` longhand pairs (raw-store, verbatim). **+12.** |
+| `css/css-borders/corner-shape/corner-computed.html` | 0/22 | **22/22** | ✅ 100% | **Quest #308 The Corner-Computed Verdict.** Shape → `superellipse(<n>)`, radius lengths → px (`3% 5rem …`→`3% 80px …`), all-zero+round → `normal` (`0px round`→`normal`), re-collapsed via `{1,4}`. Radii px-resolved via `_opLp` while longhands stay raw-store. **+22.** |
+| `css/css-borders/corner-shape/corner-top-left-computed.html` | 0/6 | **6/6** | ✅ 100% | **Quest #308.** Single-corner computed (`2% notch`→`2% superellipse(-infinity)`). **+6.** |
+| `css/css-borders/corner-shape/corner-top-computed.html` | 0/4 | **4/4** | ✅ 100% | **Quest #308.** Physical-edge computed. **+4.** |
+| `css/css-borders/corner-shape/corner-block-start-computed.html` | 0/4 | **4/4** | ✅ 100% | **Quest #308.** Flow-relative-edge computed. **+4.** |
 | `css/css-borders/corner-shape/corner-shape-invalid.html` | 0/71 | **71/71** | ✅ 100% | **Quest #305 The Corner-Shape Verdict.** NEW css-borders-4 `corner-shape` feature: `<corner-shape-value>` = `round\|scoop\|bevel\|notch\|square\|squircle\|superellipse(<number>)` (`_canonCornerShapeValue`; `superellipse()` takes exactly one <number> incl. `infinity`/`-infinity`/calc — `superellipse(8 8)`/`(4,0.1)`/`(foo)`/`()` invalid; `straight`/`auto`/`10px` invalid). 8 single-corner longhands (4 physical + 4 flow-relative) + 9 shorthands (`corner-shape` 4-value + `corner-<edge>-shape` 2-value). **+71.** |
 | `css/css-borders/corner-shape/corner-shape-valid.html` | 118/241 | **241/241** | ✅ 100% | **Quest #305.** Specified keeps the keyword; `superellipse(.5)`→`superellipse(0.5)`, `superellipse(calc(0.5 * 4))`→`superellipse(calc(2))`. Shorthands expand into longhands (`_parseCornerShapeShorthand` via `_boxEdges`) and reconstruct+collapse (`_serCornerShapeSh` via `_serializeBoxValue`). **+123.** |
 | `css/css-borders/corner-shape/corner-shape-computed.html` | 0/38 | **38/38** | ✅ 100% | **Quest #305.** Computed maps every value → `superellipse(<number>)` (`round`→`superellipse(1)`, `square`→`superellipse(infinity)`, `notch`→`superellipse(-infinity)`) via a `_normComputed` branch; shorthands reconstruct from the computed longhands. **+38.** |

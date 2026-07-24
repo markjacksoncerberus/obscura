@@ -1304,6 +1304,25 @@ class CSSStyleDeclaration {
         return;                                                 // expanded; no shorthand key kept
       }
     }
+    if (!custom && name === 'corners') return;                 // css-borders-4: renamed to `corner` in 2025 — never valid
+    if (!custom && _CORNER_COMBINED_SH[name] && !/\bvar\(/i.test(stored)) {
+      // css-borders-4 combined corner shorthand (corner / corner-<edge> / corner-<corner>,
+      // no var()): expand a border-radius ⊗ corner-shape value into — and store as — its
+      // radius + shape longhands. CSS-wide keywords skip to single-key storage below.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low)) {
+        const lh = _parseCornerCombined(name, stored, false, 0, 0);
+        if (!lh) return;                                       // out of grammar → ignore
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        delete this._props[name]; delete this._priority[name];   // drop any prior var()-stored shorthand key
+        for (const ln of Object.keys(lh)) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                                 // expanded; no shorthand key kept
+      }
+    }
     if (!custom && _BORDER_EXPAND[name] && !/\bvar\(/i.test(stored)) {
       // border/outline shorthand (no var()): expand into — and store as — its
       // longhands so `el.style.borderTopColor` reads back. Invalid → ignore.
@@ -2248,6 +2267,16 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (_CORNER_COMBINED_SH[key]) {                         // css-borders-4 combined corner shorthand: clear its longhands
+      const old = this.getPropertyValue(key);
+      delete this._props[key]; delete this._priority[key];   // any CSS-wide/var shorthand key
+      for (const [radLH, shapeLH] of _CORNER_COMBINED_SH[key]) {
+        delete this._props[radLH]; delete this._priority[radLH];
+        delete this._props[shapeLH]; delete this._priority[shapeLH];
+      }
+      this._notifyChange();
+      return old;
+    }
     if (_BORDER_EXPAND[key]) {                              // border/outline: clear its longhands
       const old = this.getPropertyValue(key);
       delete this._props[key]; delete this._priority[key];   // any var()-stored shorthand key
@@ -2422,6 +2451,10 @@ class CSSStyleDeclaration {
     if (_CORNER_SHAPE_SH[key]) {                            // css-borders-4 corner-shape / corner-<edge>-shape
       if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
       return _serCornerShapeSh((n) => this._props[n], key);  // reconstruct + collapse from single-corner longhands
+    }
+    if (_CORNER_COMBINED_SH[key]) {                        // css-borders-4 combined corner shorthand
+      if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
+      return _serCornerCombined((n) => this._props[n], key, false, 0, 0);  // reconstruct from radius + shape longhands
     }
     if (_BORDER_EXPAND[key]) {                              // border/outline shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
@@ -9925,6 +9958,7 @@ const _expandShorthand = (sh, value) => {
   if (_BOX_LOGICAL_SH2[sh]) return _expandBoxLogical(sh, value);
   if (_GAP_RULE_SH[sh]) return _expandGapRuleShorthand(sh, value);  // css-gaps column-rule/row-rule/rule
   if (_CORNER_SHAPE_SH[sh]) return _parseCornerShapeShorthand(sh, value, false);  // css-borders-4 corner-shape shorthands
+  if (_CORNER_COMBINED_SH[sh]) return _parseCornerCombined(sh, value, false, 0, 0);  // css-borders-4 combined corner shorthand
   if (sh === 'font') {
     const p = _parseFontShorthand(value);
     if (!p || p.system) return null;   // invalid / system font → no per-longhand pieces (falls to initial/inherited)
@@ -13608,6 +13642,120 @@ const _serCornerShapeSh = (get, key) => {
   const vals = lh.map((n) => get(n));
   if (vals.some((v) => !v)) return '';
   return _serializeBoxValue(key, vals);
+};
+
+// ── the combined `corner` / `corner-<edge>` / `corner-<corner>` shorthands ────
+// (css-borders-4 §corner-shorthand) — each combines a `border-*-radius` (a non-negative
+// <length-percentage>{1,2}) with a `corner-*-shape` (a <corner-shape-value>) PER CORNER.
+// A value is one `/`-separated corner segment per corner (border-radius corner order
+// top-left · top-right · bottom-right · bottom-left, with the {1,4}/{1,2} edge
+// expansion); each segment is `normal | [ <lp>{1,2} && <corner-shape-value> ]`. A
+// segment's `normal` == radius 0 + shape round (the initial); on serialization a corner
+// collapses back to `normal` when its radius is all-zero AND its shape is round.
+// Each shorthand maps to an ordered list of [border-radius longhand, corner-shape
+// longhand] pairs — the radius longhands are raw-store (unregistered as own properties,
+// so border-radius's existing behavior is untouched); computed radii are px-resolved
+// here at reconstruction time. `corners` (the pre-2025 name) is rejected outright.
+const _CORNER_COMBINED_SH = {
+  'corner': [
+    ['border-top-left-radius', 'corner-top-left-shape'],
+    ['border-top-right-radius', 'corner-top-right-shape'],
+    ['border-bottom-right-radius', 'corner-bottom-right-shape'],
+    ['border-bottom-left-radius', 'corner-bottom-left-shape'],
+  ],
+  'corner-top': [['border-top-left-radius', 'corner-top-left-shape'], ['border-top-right-radius', 'corner-top-right-shape']],
+  'corner-right': [['border-top-right-radius', 'corner-top-right-shape'], ['border-bottom-right-radius', 'corner-bottom-right-shape']],
+  'corner-bottom': [['border-bottom-left-radius', 'corner-bottom-left-shape'], ['border-bottom-right-radius', 'corner-bottom-right-shape']],
+  'corner-left': [['border-top-left-radius', 'corner-top-left-shape'], ['border-bottom-left-radius', 'corner-bottom-left-shape']],
+  'corner-block-start': [['border-start-start-radius', 'corner-start-start-shape'], ['border-start-end-radius', 'corner-start-end-shape']],
+  'corner-block-end': [['border-end-start-radius', 'corner-end-start-shape'], ['border-end-end-radius', 'corner-end-end-shape']],
+  'corner-inline-start': [['border-start-start-radius', 'corner-start-start-shape'], ['border-end-start-radius', 'corner-end-start-shape']],
+  'corner-inline-end': [['border-start-end-radius', 'corner-start-end-shape'], ['border-end-end-radius', 'corner-end-end-shape']],
+  'corner-top-left': [['border-top-left-radius', 'corner-top-left-shape']],
+  'corner-top-right': [['border-top-right-radius', 'corner-top-right-shape']],
+  'corner-bottom-right': [['border-bottom-right-radius', 'corner-bottom-right-shape']],
+  'corner-bottom-left': [['border-bottom-left-radius', 'corner-bottom-left-shape']],
+  'corner-start-start': [['border-start-start-radius', 'corner-start-start-shape']],
+  'corner-start-end': [['border-start-end-radius', 'corner-start-end-shape']],
+  'corner-end-start': [['border-end-start-radius', 'corner-end-start-shape']],
+  'corner-end-end': [['border-end-end-radius', 'corner-end-end-shape']],
+};
+// (top-level `/` splitting reuses the paren-aware `_slashSplitTop` defined below.)
+// Parse ONE corner segment → { radius: [tok..], shape: canon } or null. `computed`
+// maps the shape keyword to its superellipse() form. BOTH a radius (1–2 <lp>) and a
+// shape are required (a lone `10px` / lone `scoop` is invalid); `normal` stands alone.
+const _parseCornerSegment = (seg, computed) => {
+  const s = String(seg).trim();
+  if (!s) return null;
+  if (s.toLowerCase() === 'normal') return { radius: ['0px'], shape: computed ? 'superellipse(1)' : 'round' };
+  const toks = _wsTokens(s);
+  let shape = null; const rad = [];
+  for (const t of toks) {
+    const sh = _canonCornerShapeValue(t, computed);
+    if (sh !== null) { if (shape !== null) return null; shape = sh; continue; }  // exactly one shape
+    if (_isNonNegShapeLP(t)) { if (rad.length >= 2) return null; rad.push(t); continue; }  // 1–2 radii
+    return null;                                                 // neither a shape nor a valid radius
+  }
+  if (shape === null || rad.length < 1) return null;             // radius && shape both mandatory
+  return { radius: rad, shape };
+};
+// Expand a combined corner shorthand value into `{longhand: value}`, or null if out of
+// grammar. Radius longhands hold the specified radius string; shape longhands the canon
+// shape. `computed`/`emPx`/`lhPx` px-resolve radii for the computed reconstruction.
+const _parseCornerCombined = (sh, value, computed, emPx, lhPx) => {
+  const s = String(value).trim();
+  if (!s || _commaSplitTop(s).length > 1) return null;          // no top-level comma
+  const pairs = _CORNER_COMBINED_SH[sh];
+  const maxSeg = pairs.length;                                   // 4 | 2 | 1
+  const segs = _slashSplitTop(s);
+  if (segs.length < 1 || segs.length > maxSeg) return null;
+  const parsed = segs.map((seg) => _parseCornerSegment(seg, computed));
+  if (parsed.some((p) => p === null)) return null;
+  const slots = maxSeg === 4 ? _boxEdges(parsed)
+    : maxSeg === 2 ? (parsed.length === 2 ? parsed : [parsed[0], parsed[0]])
+    : parsed;
+  const out = {};
+  pairs.forEach(([radLH, shapeLH], i) => {
+    out[radLH] = _serCornerRadius(slots[i].radius, computed, emPx, lhPx);
+    out[shapeLH] = slots[i].shape;
+  });
+  return out;
+};
+// Serialize a segment's 1–2 radius tokens, resolving lengths (computed) and collapsing
+// an equal pair to one value (border-radius longhand serialization).
+const _serCornerRadius = (radToks, computed, emPx, lhPx) => {
+  const vals = radToks.map((t) => _opLp(t, computed, emPx, lhPx));
+  return (vals.length === 2 && vals[0] === vals[1]) ? vals[0] : vals.join(' ');
+};
+// Serialize ONE corner from its stored radius + shape strings: `normal` when the radius
+// is all-zero and the shape is round, else `<radius> <shape>` (radius resolved to px at
+// computed time). Returns null when either half is missing.
+const _serOneCornerSeg = (radStr, shapeStr, computed, emPx, lhPx) => {
+  if (radStr == null || radStr === '' || shapeStr == null || shapeStr === '') return null;
+  const radVals = _wsTokens(String(radStr)).map((t) => _opLp(t, computed, emPx, lhPx));
+  const roundShape = computed ? 'superellipse(1)' : 'round';
+  if (shapeStr === roundShape && radVals.every(_opIsZero)) return 'normal';
+  const rad = (radVals.length === 2 && radVals[0] === radVals[1]) ? radVals[0] : radVals.join(' ');
+  return rad + ' ' + shapeStr;
+};
+// The 4-corner {1,4} collapse (top-left · top-right · bottom-right · bottom-left),
+// joining segments with ` / ` (the corner shorthand's per-corner separator).
+const _collapseCornerSegs4 = (arr) => {
+  const [t, r, b, l] = arr;
+  if (l !== r) return [t, r, b, l].join(' / ');
+  if (b !== t) return [t, r, b].join(' / ');
+  if (r !== t) return [t, r].join(' / ');
+  return t;
+};
+// Reconstruct a combined corner shorthand from its longhands (via `get`): '' when a
+// longhand is missing (unrepresentable). `computed` px-resolves radii.
+const _serCornerCombined = (get, sh, computed, emPx, lhPx) => {
+  const pairs = _CORNER_COMBINED_SH[sh];
+  const segs = pairs.map(([radLH, shapeLH]) => _serOneCornerSeg(get(radLH), get(shapeLH), computed, emPx, lhPx));
+  if (segs.some((x) => x === null)) return '';
+  if (pairs.length === 4) return _collapseCornerSegs4(segs);
+  if (pairs.length === 2) return segs[0] === segs[1] ? segs[0] : segs.join(' / ');
+  return segs[0];
 };
 
 // ── display (css-display-3) ──────────────────────────────────────────────────
@@ -22984,6 +23132,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('row-rule');                                         // css-gaps `row-rule` shorthand (mirrors column-rule, row axis)
   add('rule');                                             // css-gaps `rule` mega-shorthand (bidirectional column-rule)
   for (const k of Object.keys(_CORNER_SHAPE_SH)) add(k);   // css-borders-4 corner-shape / corner-<edge>-shape shorthands
+  for (const k of Object.keys(_CORNER_COMBINED_SH)) add(k); // css-borders-4 combined corner / corner-<edge> / corner-<corner> shorthands
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
@@ -23120,6 +23269,15 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // collapse to the shortest equivalent value.
     if (_CORNER_SHAPE_SH[kebab]) {
       const s = _serCornerShapeSh((n) => resolve(n), kebab);
+      if (s !== '') return s;
+    }
+    // css-borders-4 combined corner shorthand: reconstruct from the COMPUTED shape
+    // longhands (keyword → superellipse(<n>)) and the specified radius longhands
+    // (raw-store; lengths px-resolved here), collapsing to the shortest value. A corner
+    // with all-zero radius + round shape re-collapses to `normal`.
+    if (_CORNER_COMBINED_SH[kebab]) {
+      const emPx = _emPxOf(el), lhPx = _lineHeightPx(el, emPx);
+      const s = _serCornerCombined((n) => resolve(n), kebab, true, emPx, lhPx);
       if (s !== '') return s;
     }
     // css-gaps `rule-*` shorthand: reconstruct from the COMPUTED column-*/row-*
@@ -26449,6 +26607,10 @@ globalThis.CSS = {
       if (_CORNER_SHAPE_SH[name]) {                        // css-borders-4 corner-shape shorthands
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
         return _parseCornerShapeShorthand(name, _canonStandardValue(val), false) != null;
+      }
+      if (_CORNER_COMBINED_SH[name]) {                     // css-borders-4 combined corner shorthand
+        if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
+        return _parseCornerCombined(name, _canonStandardValue(val), false, 0, 0) != null;
       }
       if (_BORDER_EXPAND[name]) {                          // border/outline shorthand
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
