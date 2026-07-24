@@ -10,12 +10,17 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quests #279–#281 — the css-overscroll-behavior family + css-size-adjust `text-size-adjust`; +51).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quests #282–#284 — css-scroll-anchoring `overflow-anchor` + the css-display `display` two-value syntax + blockification; +207).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-display/parsing/display-invalid.html` | 0/55 | **55/55** | ✅ 100% | **Quest #283.** `display` two-value syntax was raw-store (no invalid gate). NEW `_canonDisplay` (CSS Display 3 grammar `[<display-outside> \|\| <display-inside>] \| <display-listitem> \| …`) rejects two-outsides/insides, `list-item` with flex/grid/table/ruby, box/legacy/internal keyword combos, >3 tokens. **+55.** |
+| `css/css-display/parsing/display-valid.html` | 36/108 | **108/108** | ✅ 100% | **Quest #283.** `_canonDisplay` collapses the two-value forms to their canonical short string (`block flow`→`block`, `inline flow-root`→`inline-block`, `flow list-item`→`list-item`, `inline ruby`→`ruby`). **+72.** |
+| `css/css-display/parsing/display-computed.html` | 36/112 | **112/112** | ✅ 100% | **Quest #283+#284.** #283: computed = the canonical stored form (identity), +72. #284: floated/abspos elements blockify their display (CSS Display §2.7; `inline-table`→`table`, internal table/ruby→`block`) via `_blockifyDisplay` in `_computedPropOf`, +4. |
+| `css/css-scroll-anchoring/parsing/overflow-anchor-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #282.** `overflow-anchor` = `auto \| none` was raw-store. `_CSSUI_ENUM` + `_CSSUI_VALIDATED` + `_GCS_DEFAULTS` `'auto'`. **+2.** |
+| `css/css-scroll-anchoring/parsing/overflow-anchor-computed.html` | 0/2 | **2/2** | ✅ 100% | **Quest #282** — the enum registered in `_GCS_DEFAULTS` (computed = identity). **+2.** |
 | `css/css-overscroll-behavior/parsing/overscroll-behavior-invalid.html` | 0/15 | **15/15** | ✅ 100% | **Quest #279+#280.** The four `overscroll-behavior-{x,y,inline,block}` longhands (`contain \| none \| auto \| chain` enum) + the `overscroll-behavior` shorthand (`[…]{1,2}` → x/y) were raw-store. #279: `_CSSUI_ENUM` + `_CSSUI_VALIDATED` + `_GCS_DEFAULTS` `'auto'` (longhands). #280: mirrored the `overflow` shorthand across 6 touch points (`_parseOverscrollShorthand`/`_serializeOverscrollShorthand`). **+15 (invalid 0→15).** |
 | `css/css-overscroll-behavior/parsing/overscroll-behavior-computed.html` | 0/16 | **16/16** | ✅ 100% | **Quest #279** — the four longhand enums registered in `_GCS_DEFAULTS` (computed = identity). **+16.** |
 | `css/css-overscroll-behavior/parsing/overscroll-behavior-valid.html` | 24/28 | **28/28** | ✅ 100% | **Quest #280** — shorthand collapse (`contain contain`→`contain`) via `_serializeOverscrollShorthand`. **+4.** |

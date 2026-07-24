@@ -874,6 +874,13 @@ const _parseStyleDecls = (text) => {
         const c = _canonCssUi(name, value); if (c === null) continue; // invalid <custom-ident> grammar → drop
         value = c;
       }
+      else if (name === 'display') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonDisplay(value); if (c === null) continue; // invalid <display> → drop
+          value = c;                                       // canonical short form
+        }
+      }
       else if (_LISTSTYLE_VALIDATED.has(name)) {
         // css-lists longhands list-style-position/-image/-type: validate + canon
         // (invalid → drop). Must precede _GRADIENT_PROPS (which holds list-style-
@@ -9131,6 +9138,7 @@ const _GCS_DEFAULTS = {
   // css-overscroll-behavior: four per-axis keyword longhands, initial `auto`, not inherited (computed = specified).
   'overscroll-behavior-x': 'auto', 'overscroll-behavior-y': 'auto', 'overscroll-behavior-inline': 'auto', 'overscroll-behavior-block': 'auto',
   'text-size-adjust': 'auto',                      // css-size-adjust: `auto | none | <percentage>` (inherited; computed none→100%)
+  'overflow-anchor': 'auto',                       // css-scroll-anchoring: `auto | none` (not inherited; computed = specified)
   'box-sizing': 'content-box', cursor: 'auto',
   // css-backgrounds longhands (not inherited) + `filter`. Computed serialization
   // is identity here (keyword / position / url), which lets var() substitution
@@ -13158,6 +13166,10 @@ const _CSSUI_ENUM = {
   'overscroll-behavior-y': new Set(['contain', 'none', 'auto', 'chain']),
   'overscroll-behavior-inline': new Set(['contain', 'none', 'auto', 'chain']),
   'overscroll-behavior-block': new Set(['contain', 'none', 'auto', 'chain']),
+  // css-scroll-anchoring: overflow-anchor = `auto | none` (whether the element is a
+  // scroll-anchoring candidate). Rejects `all` and any two-keyword combo (`auto none`).
+  // Computed = the lowercased keyword (identity); initial `auto`, not inherited.
+  'overflow-anchor': new Set(['auto', 'none']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -13222,6 +13234,12 @@ const _CSSUI_VALIDATED = new Set([
   // css-size-adjust: text-size-adjust = `auto | none | <percentage [0,∞]>` (a
   // dedicated _canonCssUi branch; computed `none`→`100%`, else percentage identity).
   'text-size-adjust',
+  // css-scroll-anchoring: overflow-anchor (`auto | none` keyword enum, computed = specified).
+  'overflow-anchor',
+  // css-display: `display` — predefined single keywords + the two-value `[
+  // <display-outside> || <display-inside> ]` / `<display-listitem>` syntax canonicalized
+  // to its shortest form (a dedicated _canonCssUi → _canonDisplay branch; computed = specified).
+  'display',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13327,12 +13345,97 @@ const _canonColorScheme = (value) => {
   if (!schemes.length) return null;                            // `only` with no scheme ident
   return only ? schemes.join(' ') + ' only' : schemes.join(' ');
 };
+// ── display (css-display-3) ──────────────────────────────────────────────────
+// display = [ <display-outside> || <display-inside> ]      (the two-value syntax)
+//         | <display-listitem> | <display-internal> | <display-box> | <display-legacy>
+// <display-outside> = block | inline | run-in
+// <display-inside>  = flow | flow-root | table | flex | grid | ruby
+// <display-listitem> = <display-outside>? && [ flow | flow-root ]? && list-item
+// The predefined single keywords (<display-box> none/contents, <display-legacy>
+// inline-block/-flex/-grid/-table, <display-internal> table-*/ruby-base/-text/…) are
+// accepted verbatim. The two-value + list-item forms canonicalize to the SHORTEST
+// equivalent form (browsers store display as one internal value and serialize its
+// canonical string): `block flow`→`block`, `inline flow-root`→`inline-block`,
+// `flow list-item`→`list-item`, `inline ruby`→`ruby`, `flow-root run-in`→`run-in
+// flow-root`, … Computed value == this specified canonical form (identity).
+const _DISPLAY_OUTSIDE = new Set(['block', 'inline', 'run-in']);
+const _DISPLAY_INSIDE = new Set(['flow', 'flow-root', 'table', 'flex', 'grid', 'ruby']);
+const _DISPLAY_PREDEFINED = new Set([
+  'none', 'contents',
+  'inline-block', 'inline-table', 'inline-flex', 'inline-grid',
+  'table-row-group', 'table-header-group', 'table-footer-group', 'table-row',
+  'table-cell', 'table-column-group', 'table-column', 'table-caption',
+  'ruby-base', 'ruby-text', 'ruby-base-container', 'ruby-text-container',
+]);
+// Collapse (outside, inside) — after defaults are filled — to its canonical string.
+// Only the "default outside for that inside" pair collapses to a bare single keyword;
+// the rest keep the two-value form. flow is the default inside (drops out), so every
+// `<outside> flow` collapses to just the outside keyword. ruby's principal box is
+// inline-level, so `inline ruby`→`ruby` and `block ruby` stays two-value.
+const _DISPLAY_CANON = {
+  'block':  { 'flow': 'block',  'flow-root': 'flow-root',       'flex': 'flex',        'grid': 'grid',       'table': 'table',        'ruby': 'block ruby' },
+  'inline': { 'flow': 'inline', 'flow-root': 'inline-block',    'flex': 'inline-flex', 'grid': 'inline-grid','table': 'inline-table', 'ruby': 'ruby' },
+  'run-in': { 'flow': 'run-in', 'flow-root': 'run-in flow-root','flex': 'run-in flex', 'grid': 'run-in grid','table': 'run-in table', 'ruby': 'run-in ruby' },
+};
+const _canonDisplay = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length < 1 || toks.length > 3) return null;
+  const low = toks.map((t) => t.toLowerCase());
+  // A lone predefined single keyword (box / legacy / internal) → verbatim (lowercased).
+  if (low.length === 1 && _DISPLAY_PREDEFINED.has(low[0])) return low[0];
+  // Otherwise the two-value form: each token is one of outside / inside / list-item,
+  // no category repeated, no box/legacy/internal keyword mixed in.
+  let out = null, ins = null, li = false;
+  for (const t of low) {
+    if (_DISPLAY_OUTSIDE.has(t)) { if (out) return null; out = t; }
+    else if (_DISPLAY_INSIDE.has(t)) { if (ins) return null; ins = t; }
+    else if (t === 'list-item') { if (li) return null; li = true; }
+    else return null;                                     // a box/legacy/internal keyword combined with anything, or garbage
+  }
+  if (li) {
+    // <display-listitem>: list-item forbids flex/grid/table/ruby (only flow/flow-root).
+    if (ins && ins !== 'flow' && ins !== 'flow-root') return null;
+    const parts = [];
+    if (out && out !== 'block') parts.push(out);          // default outside = block (dropped)
+    if (ins === 'flow-root') parts.push('flow-root');     // default inside = flow (dropped)
+    parts.push('list-item');
+    return parts.join(' ');
+  }
+  if (!ins) ins = 'flow';                                 // outside-only → inside defaults to flow
+  if (!out) out = (ins === 'ruby') ? 'inline' : 'block';  // inside-only → outside defaults (ruby is inline-level)
+  return _DISPLAY_CANON[out][ins];
+};
+// CSS Display §2.7 "Automatic Box Type Transformations": a floated or
+// absolutely-positioned box (and the root element) is *blockified* — its outer
+// display type computes to block. This maps a specified/canonical display value to
+// its blockified computed form. Values not listed (block, flow-root, flex, grid,
+// table, list-item, contents, none, and the already-block-outer two-value forms)
+// are unaffected; an `inline …` two-value form drops its `inline` (block is the
+// default outer). Note browsers report inline-block/inline-table's blockified inner
+// as the plain single keyword (block/table), matching this map + the WPT.
+const _BLOCKIFY_MAP = {
+  'inline': 'block', 'inline-block': 'block', 'inline-table': 'table',
+  'inline-flex': 'flex', 'inline-grid': 'grid', 'run-in': 'block',
+  'table-row-group': 'block', 'table-header-group': 'block', 'table-footer-group': 'block',
+  'table-row': 'block', 'table-column': 'block', 'table-column-group': 'block',
+  'table-cell': 'block', 'table-caption': 'block',
+  'ruby': 'block', 'ruby-base': 'block', 'ruby-text': 'block',
+  'ruby-base-container': 'block', 'ruby-text-container': 'block',
+};
+const _isBlockifiable = (v) => _BLOCKIFY_MAP[v] !== undefined || v.startsWith('inline ');
+const _blockifyDisplay = (v) => {
+  const m = _BLOCKIFY_MAP[v];
+  if (m) return m;
+  if (v.startsWith('inline ')) return v.slice(7);         // `inline flow-root list-item` → `flow-root list-item`
+  return v;
+};
 const _canonCssUi = (name, value) => {
   const s = String(value).trim();
   const low = s.toLowerCase();
   if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(s)) return s;      // CSS-wide / var()/env() → pass through
   const enumSet = _CSSUI_ENUM[name];
   if (enumSet) return enumSet.has(low) ? low : null;
+  if (name === 'display') return _canonDisplay(s);            // css-display two-value syntax → canonical short form
   if (name === 'orphans' || name === 'widows') {
     // css-break: `<integer [1,∞]>`. A number-typed calc is kept symbolic here and
     // folded/clamped at computed time; `auto`, a fractional/zero/negative literal,
@@ -22086,6 +22189,14 @@ const _computedPropOf = (el, kebab, guard) => {
     if (low === 'inherit') return inheritFrom();
     // unset / revert / revert-layer: inherit for inherited properties, else initial.
     return _INHERITED_PROPS.has(kebab) ? inheritFrom() : _normComputed(el, kebab, _initialOf(kebab));
+  }
+  if (kebab === 'display' && _isBlockifiable(low)) {
+    // CSS Display §2.7: a floated / absolutely-positioned box blockifies its display
+    // (`inline-table`→`table`, `inline`→`block`, …). Only reached for a blockifiable
+    // value — block/flex/grid/list-item/contents/none stay on the fast path below.
+    const pos = _computedPropOf(el, 'position', guard + 1);
+    const flt = (pos === 'absolute' || pos === 'fixed') ? null : _computedPropOf(el, 'float', guard + 1);
+    if (pos === 'absolute' || pos === 'fixed' || (flt && flt !== 'none')) return _blockifyDisplay(low);
   }
   return _normComputed(el, kebab, v);
 };
