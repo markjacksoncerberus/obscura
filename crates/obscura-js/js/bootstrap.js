@@ -23086,6 +23086,10 @@ const _cssParseRuleList = (cssText) => {
       } else if (name === 'keyframes' || name === '-webkit-keyframes') {
         // An invalid <keyframes-name> makes the whole at-rule invalid → drop it (CSSOM).
         if (_isValidKeyframesName(condition)) rules.push({ type: 'keyframes', name, condition, prelude, body });
+      } else if (name === 'font-palette-values') {
+        // The prelude must be a single <dashed-ident>; anything else (no name,
+        // non-dashed name, or two names) makes the whole at-rule invalid → drop it.
+        if (_isFpvName(condition)) rules.push({ type: 'font-palette-values', name, condition, prelude, body });
       } else {
         rules.push({ type: 'at', name, condition, prelude, body });
       }
@@ -23709,8 +23713,137 @@ const _keyframesProxy = (kf) => new Proxy(kf, {
   },
 });
 
+// @font-palette-values (CSS Fonts 4 §2.4.6) — CSSFontPaletteValuesRule: a named
+// palette-override at-rule. The prelude is a single <dashed-ident>; an absent,
+// non-dashed, or multi-token name makes the whole at-rule invalid (dropped in
+// _cssParseRuleList). Exposes readonly .name plus the three descriptor accessors
+// (.fontFamily / .basePalette / .overrideColors) — CSSOM. Descriptor grammars land
+// in follow-up quests; until then the accessors default to "" and cssText carries
+// no body. There is deliberately NO CSSRule.FONT_PALETTE_VALUES_RULE constant.
+const _isFpvName = (cond) => !!cond && /^--/.test(cond) && _GRID_CI_RE.test(cond);
+// Split a descriptor block into ordered { name, value } declarations, respecting
+// strings and bracket nesting (so a `,` or `;` inside color-mix(…)/a string never
+// ends a declaration early). Duplicates are preserved in source order so the
+// last VALID declaration of each descriptor can win (invalid ones drop silently).
+const _fpvSplitDecls = (body) => {
+  const out = []; let depth = 0, q = '', cur = '';
+  const s = String(body == null ? '' : body);
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { cur += c; if (c === '\\' && i + 1 < s.length) cur += s[++i]; else if (c === q) q = ''; continue; }
+    if (c === '"' || c === "'") { q = c; cur += c; }
+    else if (c === '(' || c === '[' || c === '{') { depth++; cur += c; }
+    else if (c === ')' || c === ']' || c === '}') { if (depth > 0) depth--; cur += c; }
+    else if (c === ';' && depth === 0) { out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur);
+  const decls = [];
+  for (const part of out) {
+    const idx = part.indexOf(':');
+    if (idx < 0) continue;
+    const name = part.slice(0, idx).trim().toLowerCase();
+    const value = part.slice(idx + 1).trim();
+    if (name) decls.push({ name, value });
+  }
+  return decls;
+};
+// font-family descriptor = <family-name># — a comma list of <string> | <custom-ident>+,
+// with NO <generic-family> (serif/…) and no CSS-wide keyword. Reuses the property-level
+// _canonOneFamily but rejects a lone generic (valid for the property, invalid here).
+const _fpvCanonFontFamily = (v) => {
+  const parts = _splitCommaQuoted(String(v).trim());
+  const out = [];
+  for (const raw of parts) {
+    const p = raw.trim();
+    if (p === '') return null;
+    if (_FONT_GENERIC.has(p.toLowerCase())) return null;   // generic family not allowed in the descriptor
+    const c = _canonOneFamily(p);
+    if (c === null) return null;
+    out.push(c);
+  }
+  return out.length ? out.join(', ') : null;
+};
+// base-palette descriptor = light | dark | <integer [0,∞]>. A negative integer,
+// a non-integer, a string, a CSS-wide keyword, or a math function → invalid.
+const _fpvCanonBasePalette = (v) => {
+  const t = String(v).trim(); const low = t.toLowerCase();
+  if (low === 'light' || low === 'dark') return low;
+  if (/^\+?\d+$/.test(t)) return String(parseInt(t, 10));   // non-negative integer, normalized
+  return null;
+};
+// The override-colors <color> must be an ABSOLUTE colour: no currentColor, no
+// system colour, and no light-dark() (all resolve against rendering context, not
+// allowed in a palette override). A token scan catches these anywhere, including
+// nested inside a color-mix().
+const _fpvForbiddenColorTok = (colorStr) => {
+  const ids = String(colorStr).toLowerCase().match(/[a-z][a-z0-9-]*/g) || [];
+  for (const id of ids) if (id === 'currentcolor' || id === 'light-dark' || _SYSTEM_COLORS.has(id)) return true;
+  return false;
+};
+// One override-colors <color> → its canonical serialization, or null if it is not a
+// valid absolute colour. `allowMix` gates color-mix() (enabled in a later quest).
+const _fpvAbsoluteColor = (c, allowMix) => {
+  const s = String(c).trim();
+  if (!s) return null;
+  if (!allowMix && s.toLowerCase().startsWith('color-mix(')) return null;
+  if (!_isValidColor(s)) return null;
+  if (_fpvForbiddenColorTok(s)) return null;
+  return _canonColorSpecified(s);
+};
+// override-colors descriptor = [ <integer [0,∞]> <absolute-color> ]#. Each entry is
+// an index followed by a colour; entries are NOT deduped by index (a repeated index
+// keeps both). Any malformed entry invalidates the whole declaration.
+const _fpvCanonOverrideColors = (v, allowMix) => {
+  const entries = _splitCommaQuoted(String(v).trim());
+  const out = [];
+  for (const raw of entries) {
+    const m = /^(\+?\d+)\s+([\s\S]+)$/.exec(raw.trim());
+    if (!m) return null;
+    const color = _fpvAbsoluteColor(m[2], allowMix);
+    if (color === null) return null;
+    out.push(parseInt(m[1], 10) + ' ' + color);
+  }
+  return out.length ? out.join(', ') : null;
+};
+class CSSFontPaletteValuesRule extends CSSRule {
+  constructor(desc) {
+    super();
+    this._name = _unescapeCssIdent(String((desc && desc.condition) || '').trim());
+    this._fontFamily = '';
+    this._basePalette = '';
+    this._overrideColors = '';
+    // Apply descriptors in source order; each valid value overrides the previous,
+    // invalid values are dropped (CSS declaration-block semantics + descriptor grammar).
+    for (const { name, value } of _fpvSplitDecls(desc && desc.body)) {
+      if (name === 'font-family') { const c = _fpvCanonFontFamily(value); if (c !== null) this._fontFamily = c; }
+      else if (name === 'base-palette') { const c = _fpvCanonBasePalette(value); if (c !== null) this._basePalette = c; }
+      else if (name === 'override-colors') { const c = _fpvCanonOverrideColors(value, true); if (c !== null) this._overrideColors = c; }
+    }
+  }
+  get name() { return this._name; }
+  get fontFamily() { return this._fontFamily; }
+  get basePalette() { return this._basePalette; }
+  get overrideColors() { return this._overrideColors; }
+  get cssText() {
+    const parts = [];
+    if (this._fontFamily) parts.push('font-family: ' + this._fontFamily + ';');
+    if (this._basePalette) parts.push('base-palette: ' + this._basePalette + ';');
+    if (this._overrideColors) parts.push('override-colors: ' + this._overrideColors + ';');
+    const body = parts.length ? ' ' + parts.join(' ') + ' ' : ' ';
+    return '@font-palette-values ' + _serializeCssIdent(this._name) + ' {' + body + '}';
+  }
+}
+globalThis.CSSFontPaletteValuesRule = CSSFontPaletteValuesRule;
+
 const _makeRule = (desc, parentSheet, parentRule) => {
   let rule;
+  if (desc.type === 'font-palette-values') {
+    rule = new CSSFontPaletteValuesRule(desc);
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
   if (desc.type === 'keyframes') {
     rule = _keyframesProxy(new CSSKeyframesRule(desc));
     rule._parentStyleSheet = parentSheet || null;
