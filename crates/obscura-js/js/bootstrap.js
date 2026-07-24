@@ -1265,6 +1265,27 @@ class CSSStyleDeclaration {
         return;                                                 // expanded; no shorthand key kept
       }
     }
+    if (!custom && _GAP_RULE_SH[name] && !/\bvar\(/i.test(stored)
+        && !(name === 'column-rule' && !_isGapList(stored))) {
+      // css-gaps column-rule/row-rule/rule shorthand (no var()): expand a
+      // <gap-rule-list> into — and store as — its three (or six) list longhands.
+      // A single-value `column-rule` (not a list) is left to the multicol
+      // _BORDER_EXPAND path below (byte-identical), so only row-rule/rule + any
+      // LIST value take this branch. CSS-wide keywords skip to single-key storage.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low)) {
+        const lh = _expandGapRuleShorthand(name, stored);
+        if (!lh) return;                                        // out of grammar → ignore
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        delete this._props[name]; delete this._priority[name];   // drop any prior var()-stored shorthand key
+        for (const ln of _GAP_RULE_SH[name]) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                                 // expanded; no shorthand key kept
+      }
+    }
     if (!custom && _BORDER_EXPAND[name] && !/\bvar\(/i.test(stored)) {
       // border/outline shorthand (no var()): expand into — and store as — its
       // longhands so `el.style.borderTopColor` reads back. Invalid → ignore.
@@ -2195,6 +2216,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (_GAP_RULE_SH[key]) {                                // css-gaps column-rule/row-rule/rule: clear its longhands
+      const old = this.getPropertyValue(key);
+      delete this._props[key]; delete this._priority[key];   // any var()-stored shorthand key
+      for (const ln of _GAP_RULE_SH[key]) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     if (_BORDER_EXPAND[key]) {                              // border/outline: clear its longhands
       const old = this.getPropertyValue(key);
       delete this._props[key]; delete this._priority[key];   // any var()-stored shorthand key
@@ -2361,6 +2389,10 @@ class CSSStyleDeclaration {
     if (key === 'position-try') {                             // reconstruct from position-try-order/-fallbacks
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
       return _serPositionTry(this._props['position-try-order'], this._props['position-try-fallbacks']);
+    }
+    if (_GAP_RULE_SH[key]) {                                // css-gaps column-rule/row-rule/rule shorthand
+      if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
+      return _serGapRuleSh((n) => this._props[n], key);    // reconstruct (zip) from list longhands
     }
     if (_BORDER_EXPAND[key]) {                              // border/outline shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
@@ -9852,6 +9884,7 @@ const _expandShorthand = (sh, value) => {
   if (_BORDER_LOGICAL_SH[sh]) return _expandBorderLogical(sh, value);
   if (_BORDER_LOGICAL_SIDE_EDGE[sh] || _BORDER_LOGICAL_SIDE_BOTH[sh]) return _expandBorderShorthand(sh, value);
   if (_BOX_LOGICAL_SH2[sh]) return _expandBoxLogical(sh, value);
+  if (_GAP_RULE_SH[sh]) return _expandGapRuleShorthand(sh, value);  // css-gaps column-rule/row-rule/rule
   if (sh === 'font') {
     const p = _parseFontShorthand(value);
     if (!p || p.system) return null;   // invalid / system font → no per-longhand pieces (falls to initial/inherited)
@@ -14259,6 +14292,136 @@ const _serGapBidiSh = (get, key) => {
   const a = get(pair[0]), b = get(pair[1]);
   if (!a || !b) return '';
   return a === b ? a : '';
+};
+
+// ── CSS Gap Decorations: the column-rule / row-rule / rule SHORTHANDS ─────────
+// Gap decorations extends the multicol `column-rule` — and adds `row-rule` + the
+// bidirectional `rule` — to accept the full <gap-rule-list>: a comma list of
+//   <gap-rule> = [<line-width> || <line-style> || <line-color>]
+// and repeat()s (`repeat(<int [1,∞]>, <gap-rule>#)` / `repeat(auto, <gap-rule>#)`,
+// at most one auto-repeat). Each axis expands into its THREE parallel list longhands
+// (width/style/color), the list STRUCTURE shared across the three; `rule` sets both
+// axes. A single <gap-rule> value round-trips identically to the multicol single-
+// value form (this grammar is a superset), so the existing multicol column-rule path
+// is preserved byte-for-byte.
+const _GAP_RULE_SH = {
+  'column-rule': ['column-rule-width', 'column-rule-style', 'column-rule-color'],
+  'row-rule': ['row-rule-width', 'row-rule-style', 'row-rule-color'],
+  'rule': ['column-rule-width', 'column-rule-style', 'column-rule-color',
+           'row-rule-width', 'row-rule-style', 'row-rule-color'],
+};
+// Parse a <gap-rule-list> into the three parallel canonical leaf-list strings
+// {width, style, color} (identical list structure), or null when out of grammar.
+const _parseGapRuleShorthand = (value) => {
+  const s = String(value).trim();
+  if (!s) return null;
+  const items = _commaSplitTop(s).map((x) => x.trim());
+  if (items.some((x) => x === '')) return null;          // empty item (leading/trailing/double comma)
+  const wParts = [], sParts = [], cParts = [];
+  let autoSeen = 0;
+  for (const item of items) {
+    const m = _REPEAT_RE.exec(item);
+    if (m) {
+      const inner = _commaSplitTop(m[1]).map((x) => x.trim());
+      if (inner.length < 2) return null;                 // need a count + ≥1 <gap-rule>
+      let count;
+      if (inner[0].toLowerCase() === 'auto') { autoSeen++; count = 'auto'; }
+      else { count = _canonColumnCount(inner[0]); if (count === null || count === 'auto') return null; }
+      const w = [], st = [], c = [];
+      for (const rule of inner.slice(1)) {
+        const p = _parseBorderSideStrict(rule, false);   // one <gap-rule> = border-side grammar
+        if (!p) return null;
+        w.push(p.width); st.push(p.style); c.push(p.color);
+      }
+      wParts.push('repeat(' + count + ', ' + w.join(', ') + ')');
+      sParts.push('repeat(' + count + ', ' + st.join(', ') + ')');
+      cParts.push('repeat(' + count + ', ' + c.join(', ') + ')');
+    } else {
+      const p = _parseBorderSideStrict(item, false);
+      if (!p) return null;
+      wParts.push(p.width); sParts.push(p.style); cParts.push(p.color);
+    }
+  }
+  if (autoSeen > 1) return null;                         // at most one auto-repeat
+  return { width: wParts.join(', '), style: sParts.join(', '), color: cParts.join(', ') };
+};
+// Expand a gap-rule shorthand into its stored longhands (column / row / both axes),
+// or null when the value is out of grammar.
+const _expandGapRuleShorthand = (name, value) => {
+  const p = _parseGapRuleShorthand(value);
+  if (!p) return null;
+  const cols = { 'column-rule-width': p.width, 'column-rule-style': p.style, 'column-rule-color': p.color };
+  if (name === 'column-rule') return cols;
+  const rows = { 'row-rule-width': p.width, 'row-rule-style': p.style, 'row-rule-color': p.color };
+  if (name === 'row-rule') return rows;
+  return Object.assign(cols, rows);                      // rule → both axes
+};
+// Serialize ONE <gap-rule> from its three (already-canonical) leaves. Two modes:
+//   specified (getPropertyValue): drop each at its initial (medium/none/currentcolor),
+//     all-initial → `medium` (matching the multicol column-rule single-value form).
+//   computed: ALWAYS print the width and colour; print the style only when it is not
+//     `none` (matching the multicol column-rule computed serialization — the width
+//     keeps its keyword/px form even when it is the `medium` initial).
+const _joinGapRule = (w, s, c, computed) => {
+  if (computed) {
+    const parts = [w];
+    if (s !== _LS_INIT) parts.push(s);
+    parts.push(c);
+    return parts.join(' ');
+  }
+  const parts = [];
+  if (w !== _LW_INIT) parts.push(w);
+  if (s !== _LS_INIT) parts.push(s);
+  if (c !== _LC_INIT) parts.push(c);
+  return parts.length ? parts.join(' ') : _LW_INIT;
+};
+// Split a leaf-list string into structural items ({leaf} | {count, leaves[]}).
+const _splitGapLeafList = (str) =>
+  _commaSplitTop(String(str).trim()).map((raw) => {
+    const item = raw.trim();
+    const m = _REPEAT_RE.exec(item);
+    if (m) {
+      const inner = _commaSplitTop(m[1]).map((x) => x.trim());
+      return { count: inner[0], leaves: inner.slice(1) };
+    }
+    return { leaf: item };
+  });
+// Zip three parallel leaf-lists back into a <gap-rule-list>, or '' when their
+// structures don't align (i.e. the longhands were set separately → unrepresentable
+// as the shorthand; CSSOM "serialize a CSS value").
+const _serGapRuleShorthand = (wStr, sStr, cStr, computed) => {
+  if (!wStr || !sStr || !cStr) return '';
+  const W = _splitGapLeafList(wStr), S = _splitGapLeafList(sStr), C = _splitGapLeafList(cStr);
+  if (W.length !== S.length || W.length !== C.length) return '';
+  const out = [];
+  for (let i = 0; i < W.length; i++) {
+    const w = W[i], s = S[i], c = C[i];
+    const wr = 'count' in w, sr = 'count' in s, cr = 'count' in c;
+    if (wr !== sr || wr !== cr) return '';               // repeat/plain shape mismatch
+    if (wr) {
+      if (w.count !== s.count || w.count !== c.count) return '';
+      if (w.leaves.length !== s.leaves.length || w.leaves.length !== c.leaves.length) return '';
+      const rules = [];
+      for (let j = 0; j < w.leaves.length; j++) rules.push(_joinGapRule(w.leaves[j], s.leaves[j], c.leaves[j], computed));
+      out.push('repeat(' + w.count + ', ' + rules.join(', ') + ')');
+    } else {
+      out.push(_joinGapRule(w.leaf, s.leaf, c.leaf, computed));
+    }
+  }
+  return out.join(', ');
+};
+// Serialize a column-rule/row-rule/rule shorthand from its longhands (via `get`), or
+// '' when unrepresentable. `rule` requires both axes to agree on all three lists.
+// `computed` picks the computed vs specified per-rule serialization (see _joinGapRule).
+const _serGapRuleSh = (get, name, computed) => {
+  if (name === 'rule') {
+    const cw = get('column-rule-width'), cs = get('column-rule-style'), cc = get('column-rule-color');
+    const rw = get('row-rule-width'), rs = get('row-rule-style'), rc = get('row-rule-color');
+    if (cw !== rw || cs !== rs || cc !== rc) return '';  // axes disagree → unrepresentable
+    return _serGapRuleShorthand(cw, cs, cc, computed);
+  }
+  const lh = _GAP_RULE_SH[name];
+  return _serGapRuleShorthand(get(lh[0]), get(lh[1]), get(lh[2]), computed);
 };
 
 // ── CSS Gap Decorations: the rule-INSET family ───────────────────────────────
@@ -22495,6 +22658,7 @@ const _CSS_KNOWN_PROPS = (() => {
   for (const k of Object.keys(_GAP_BIDI_SH)) add(k);       // css-gaps `rule-*` bidirectional shorthands
   for (const k of Object.keys(_RI_SH)) add(k);             // css-gaps per-axis rule-inset shorthands
   for (const k of Object.keys(_RI_BIDI)) add(k);           // css-gaps bidirectional rule-inset shorthands
+  add('row-rule');                                         // css-gaps `row-rule` shorthand (mirrors column-rule, row axis)
   add('rule');                                             // css-gaps `rule` mega-shorthand (bidirectional column-rule)
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
@@ -22619,17 +22783,13 @@ globalThis.getComputedStyle = (el, _pseudo) => {
       const s = _serListStyleFromLonghands(resolve);
       if (s !== '') return s;
     }
-    // `column-rule` shorthand: reconstruct from the COMPUTED longhands — width and
-    // colour always print, the style prints only when it is not `none` (CSSOM
-    // serialization for column-rule/border-like shorthands at computed time).
-    if (kebab === 'column-rule') {
-      const w = resolve('column-rule-width'), s = resolve('column-rule-style'), c = resolve('column-rule-color');
-      if (w && s && c) {
-        const parts = [w];
-        if (s !== 'none') parts.push(s);
-        parts.push(c);
-        return parts.join(' ');
-      }
+    // css-gaps column-rule/row-rule/rule shorthand: reconstruct (zip) the computed
+    // <gap-rule-list> from the COMPUTED width/style/color list longhands — each leaf
+    // resolves (medium→px, currentcolor→rgb()), so at computed time no initial keyword
+    // is dropped. `rule` reconstructs only when both axes agree (else '').
+    if (_GAP_RULE_SH[kebab]) {
+      const s = _serGapRuleSh((n) => resolve(n), kebab, true);
+      if (s !== '') return s;
     }
     // css-gaps `rule-*` shorthand: reconstruct from the COMPUTED column-*/row-*
     // longhands — the value when both axes agree, else '' (unrepresentable).
@@ -22640,20 +22800,6 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // (same drop/collapse rules as the specified serialization).
     if (_RI_SH[kebab] || _RI_BIDI[kebab]) {
       return _serRuleInset((n) => resolve(n), kebab);
-    }
-    // css-gaps `rule` mega-shorthand (bidirectional column-rule): reconstruct the
-    // `<width> [<style>] <color>` form from the COMPUTED longhands, but only when BOTH
-    // axes agree on all three components (else unrepresentable → '').
-    if (kebab === 'rule') {
-      const cw = resolve('column-rule-width'), cs = resolve('column-rule-style'), cc = resolve('column-rule-color');
-      const rw = resolve('row-rule-width'), rs = resolve('row-rule-style'), rc = resolve('row-rule-color');
-      if (cw && cs && cc && cw === rw && cs === rs && cc === rc) {
-        const parts = [cw];
-        if (cs !== 'none') parts.push(cs);
-        parts.push(cc);
-        return parts.join(' ');
-      }
-      return '';
     }
     // `columns` shorthand: resolve the width/height <length>s of the self-canonical
     // specified value to px (the count stays an integer), re-serializing with the
@@ -25832,6 +25978,10 @@ globalThis.CSS = {
       const name = String(prop).trim().toLowerCase();
       const val = String(value).trim();
       if (!val) return false;
+      if (_GAP_RULE_SH[name]) {                            // css-gaps column-rule/row-rule/rule shorthand
+        if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
+        return _parseGapRuleShorthand(_canonStandardValue(val)) != null;  // validate the <gap-rule-list>
+      }
       if (_BORDER_EXPAND[name]) {                          // border/outline shorthand
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
         return _expandBorderShorthand(name, val) != null;  // else validate by expanding

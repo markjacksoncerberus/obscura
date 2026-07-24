@@ -10,12 +10,15 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quests #285–#287 — css-display `grid-lanes` + css-flexbox flex-basis/flex-direction/flex-wrap gates; +27).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #288–#290 — css-gaps `column-rule`/`row-rule`/`rule` gap-decoration shorthands take the full `<gap-rule-list>`; +79).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-gaps/parsing/gap-decorations-rule-shorthand-invalid.html` | 11/27 | **27/27** | ✅ 100% | **Quests #288–#290.** `column-rule`/`row-rule`/`rule` gap-decoration shorthands now take the full `<gap-rule-list>` (comma list of `<gap-rule>` = `<line-width> \|\| <line-style> \|\| <line-color>` + `repeat()`/auto-repeat). NEW `_parseGapRuleShorthand` transposes into the three parallel list longhands; invalid gate rejects duplicate leaves, `repeat(0/-1/auto,)`, two auto-repeats. **+16.** |
+| `css/css-gaps/parsing/gap-decorations-rule-shorthand-valid.html` | 48/75 | **75/75** | ✅ 100% | **Quests #288–#290.** `_serGapRuleSh` zips the three list longhands back into a `<gap-rule-list>`, each `<gap-rule>` dropping its initials (all-initial→`medium`). `row-rule`/`rule` newly registered as shorthands. **+27.** |
+| `css/css-gaps/parsing/gap-decorations-rule-shorthand-computed.html` | 3/39 | **39/39** | ✅ 100% | **Quests #288–#290.** Computed reconstructs from the COMPUTED list longhands (each leaf resolved), always printing width+color and style-if-not-`none`. `rule` reconstructs only when both axes agree. **+36.** |
 | `css/css-display/parsing/tentative/display-valid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #285.** css-grid-3 `grid-lanes`/`inline-grid-lanes` `display` values. `_DISPLAY_INSIDE` += `grid-lanes`, `_DISPLAY_PREDEFINED` += `inline-grid-lanes`, new `grid-lanes` column in `_DISPLAY_CANON` (`inline grid-lanes` kept two-value, NOT collapsed). **+6.** |
 | `css/css-display/parsing/tentative/display-computed.html` | 0/10 | **10/10** | ✅ 100% | **Quest #285.** Computed = specified identity + blockification (`inline grid-lanes`→`grid-lanes` for abspos/float via the existing `_blockifyDisplay` strip-`inline` fallback; `_BLOCKIFY_MAP` += `inline-grid-lanes`). **+10.** |
 | `css/css-flexbox/parsing/flex-basis-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #286.** `flex-basis` = `content \| <'width'>` was raw-store (no invalid gate). NEW `_isValidFlexBasis` = `content` OR shared `_isValidSizeValue` (rejects `none`/negatives/multi-token/`anchor-size()`), wired into the two `_SIZE_VALIDATED` touch points. **+7.** |
