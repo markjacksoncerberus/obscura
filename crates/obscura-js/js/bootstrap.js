@@ -12434,28 +12434,47 @@ const _adjustHue = (h1, h2, method) => {
   else { if (d > 180) h1 += 360; else if (d < -180) h2 += 360; }  // shorter (default)
   return [h1, h2];
 };
-// Parse a color-mix() interpolation method `in <space> [<hue> hue]?`.
+// Parse a color-mix() interpolation method `in <space> [ <hue-method> hue ]?`
+// STRICTLY (CSS Color 5 §color-interpolation-method): returns { space, hue } for a
+// well-formed method, or null for a malformed one — `in hsl hue` (a `hue` keyword
+// with no preceding method word), `in hsl shorter` (a hue method with no trailing
+// `hue`), `in lab longer hue` (a hue method on a NON-polar space), `in hsl foo`
+// (garbage), or `in hsl hsl(120deg …)` (a colour glued on for want of a comma). The
+// caller only reaches here when the leading comma-part begins with `in`.
 const _parseMixMethod = (str) => {
   const toks = _wsTokens(str.trim());
-  let space = (toks[1] || 'oklab').toLowerCase();
+  if (toks.length < 2 || toks.length > 4 || toks[0].toLowerCase() !== 'in') return null;
+  let space = toks[1].toLowerCase();
   if (space === 'xyz') space = 'xyz-d65';
+  if (!_CS_BASE[space]) return null;
   let hue = 'shorter';
-  if (toks.length >= 4 && toks[3].toLowerCase() === 'hue') hue = toks[2].toLowerCase();
+  if (toks.length > 2) {                                  // optional `<hue-method> hue`
+    if (toks.length !== 4 || !_GRADIENT_POLAR_SPACES.has(space)
+        || !_HUE_METHODS.has(toks[2].toLowerCase()) || toks[3].toLowerCase() !== 'hue') return null;
+    hue = toks[2].toLowerCase();
+  }
   return { space, hue };
 };
 // Split a color-mix() component into its <color> and optional <percentage>.
 const _splitMixComp = (str) => {
   const toks = _wsTokens(str.trim());
-  const isPct = (t) => /^[-+]?(\d+\.?\d*|\.\d+)%$/.test(t) || /^calc\(/i.test(t);
-  let pct = null, colorToks = [];
+  const litPct = (t) => /^[-+]?(\d+\.?\d*|\.\d+)%$/.test(t);
+  const isPct = (t) => litPct(t) || /^calc\(/i.test(t);
+  let pct = null, pctBad = false, colorToks = [];
   for (const t of toks) {
     if (pct === null && isPct(t) && !/^(rgb|hsl|hwb|lab|lch|oklab|oklch|color|color-mix)\(/i.test(t)) {
       const v = _evalMath(t, 100, { lengths: true });   // lengths → resolvable sign()/calc()
-      if (v !== null) { pct = v; continue; }
+      if (v !== null) {
+        // A LITERAL <percentage> operand outside [0%, 100%] invalidates color-mix() at
+        // parse time (CSS Color 5 §color-mix); a calc()-derived percentage is instead
+        // clamped at used-value time, so only a plain literal is range-checked here.
+        if (litPct(t) && (v < 0 || v > 100)) pctBad = true;
+        pct = v; continue;
+      }
     }
     colorToks.push(t);
   }
-  return { color: colorToks.join(' '), pct };
+  return { color: colorToks.join(' '), pct, pctBad };
 };
 // Computed color-mix(): resolve both operands, convert into the mix space,
 // premultiplied-interpolate (hue handled per the chosen arc), apply the
@@ -12466,10 +12485,15 @@ const _colorMixStruct = (value, el) => {
   if (lp < 0 || !s.endsWith(')')) return null;
   const parts = _commaSplitTop(s.slice(lp + 1, -1)).map((p) => p.trim()).filter((p) => p.length);
   let mi = 0, method = { space: 'oklab', hue: 'shorter' };
-  if (parts[0] && /^in(\s|$)/i.test(parts[0])) { method = _parseMixMethod(parts[0]); mi = 1; }
+  if (parts[0] && /^in(\s|$)/i.test(parts[0])) {
+    method = _parseMixMethod(parts[0]);
+    if (method === null) return null;                     // malformed interpolation method
+    mi = 1;
+  }
   if (!_CS_BASE[method.space]) return null;
   const comps = parts.slice(mi).map(_splitMixComp);
   if (comps.length < 1) return null;
+  if (comps.some((c) => c.pctBad)) return null;           // a literal percentage out of [0%,100%]
   const cols = comps.map((c) => { const s2 = _resolveColorStruct(c.color, el); return s2 ? _csConvert(s2, method.space) : null; });
   if (cols.some((c) => !c)) return null;
   // Percentage normalization (the N-ary rule, which subsumes the binary one): an
