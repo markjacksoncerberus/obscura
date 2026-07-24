@@ -10,12 +10,17 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quests #282–#284 — css-scroll-anchoring `overflow-anchor` + the css-display `display` two-value syntax + blockification; +207).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-23 (Quests #285–#287 — css-display `grid-lanes` + css-flexbox flex-basis/flex-direction/flex-wrap gates; +27).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-display/parsing/tentative/display-valid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #285.** css-grid-3 `grid-lanes`/`inline-grid-lanes` `display` values. `_DISPLAY_INSIDE` += `grid-lanes`, `_DISPLAY_PREDEFINED` += `inline-grid-lanes`, new `grid-lanes` column in `_DISPLAY_CANON` (`inline grid-lanes` kept two-value, NOT collapsed). **+6.** |
+| `css/css-display/parsing/tentative/display-computed.html` | 0/10 | **10/10** | ✅ 100% | **Quest #285.** Computed = specified identity + blockification (`inline grid-lanes`→`grid-lanes` for abspos/float via the existing `_blockifyDisplay` strip-`inline` fallback; `_BLOCKIFY_MAP` += `inline-grid-lanes`). **+10.** |
+| `css/css-flexbox/parsing/flex-basis-invalid.html` | 0/7 | **7/7** | ✅ 100% | **Quest #286.** `flex-basis` = `content \| <'width'>` was raw-store (no invalid gate). NEW `_isValidFlexBasis` = `content` OR shared `_isValidSizeValue` (rejects `none`/negatives/multi-token/`anchor-size()`), wired into the two `_SIZE_VALIDATED` touch points. **+7.** |
+| `css/css-flexbox/parsing/flex-direction-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #287.** `flex-direction` = `row\|row-reverse\|column\|column-reverse` enum via `_CSSUI_ENUM` + `_CSSUI_VALIDATED`. **+2.** |
+| `css/css-flexbox/parsing/flex-wrap-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #287.** `flex-wrap` = `nowrap\|wrap\|wrap-reverse` enum via `_CSSUI_ENUM` + `_CSSUI_VALIDATED`. **+2.** |
 | `css/css-display/parsing/display-invalid.html` | 0/55 | **55/55** | ✅ 100% | **Quest #283.** `display` two-value syntax was raw-store (no invalid gate). NEW `_canonDisplay` (CSS Display 3 grammar `[<display-outside> \|\| <display-inside>] \| <display-listitem> \| …`) rejects two-outsides/insides, `list-item` with flex/grid/table/ruby, box/legacy/internal keyword combos, >3 tokens. **+55.** |
 | `css/css-display/parsing/display-valid.html` | 36/108 | **108/108** | ✅ 100% | **Quest #283.** `_canonDisplay` collapses the two-value forms to their canonical short string (`block flow`→`block`, `inline flow-root`→`inline-block`, `flow list-item`→`list-item`, `inline ruby`→`ruby`). **+72.** |
 | `css/css-display/parsing/display-computed.html` | 36/112 | **112/112** | ✅ 100% | **Quest #283+#284.** #283: computed = the canonical stored form (identity), +72. #284: floated/abspos elements blockify their display (CSS Display §2.7; `inline-table`→`table`, internal table/ruby→`block`) via `_blockifyDisplay` in `_computedPropOf`, +4. |

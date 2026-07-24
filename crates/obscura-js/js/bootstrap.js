@@ -1205,13 +1205,15 @@ const _parseStyleDecls = (text) => {
         continue;                                          // expanded into longhands; no `offset` key
       } else if (name === 'opacity') {
         value = _canonOpacitySpecified(value);
-      } else if (_SIZE_VALIDATED.has(name)) {
-        // css-sizing / css-logical dimension props: drop out-of-grammar declarations
-        // (bad keyword, negative <length-%>, bare non-zero number, multi-token) and
-        // malformed math (see the setProperty branch). Canonicalized below.
+      } else if (_SIZE_VALIDATED.has(name) || name === 'flex-basis') {
+        // css-sizing / css-logical dimension props (+ flex-basis's `content | <'width'>`):
+        // drop out-of-grammar declarations (bad keyword, negative <length-%>, bare
+        // non-zero number, multi-token) and malformed math (see the setProperty branch).
+        // Canonicalized below.
         const low = value.toLowerCase();
-        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
-          if (!_isValidSizeValue(name, value)) continue;   // out-of-grammar → drop declaration
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && low !== 'content') {
+          const ok = name === 'flex-basis' ? _isValidFlexBasis(value) : _isValidSizeValue(name, value);
+          if (!ok) continue;                               // out-of-grammar → drop declaration
           if (_mathReject(value, ['length'], 'length')) continue;  // malformed math → drop
           if (/^[+-]?0(?:\.0+)?$/.test(value.trim())) value = '0px';  // bare <length> 0 → 0px
         }
@@ -2030,15 +2032,16 @@ class CSSStyleDeclaration {
         if (c === null) return;
         stored = c;
       }
-    } else if (!custom && _SIZE_VALIDATED.has(name)) {
+    } else if (!custom && (_SIZE_VALIDATED.has(name) || name === 'flex-basis')) {
       // css-sizing / css-logical dimension props (width/height/block-size/…, min-/
-      // max-, physical + flow-relative): reject out-of-grammar values (bad keyword,
-      // negative <length-%>, bare non-zero number, multi-token) AND malformed/
-      // mistyped math. CSS-wide keywords + var()/env() pass through untouched; the
-      // value is canonicalized below by _canonLengthTimeMath (`0`→`0px`, calc canon).
+      // max-, physical + flow-relative) + flex-basis (`content | <'width'>`): reject
+      // out-of-grammar values (bad keyword, negative <length-%>, bare non-zero number,
+      // multi-token) AND malformed/mistyped math. CSS-wide keywords + var()/env() pass
+      // through untouched; the value is canonicalized below by _canonLengthTimeMath.
       const low = stored.toLowerCase();
-      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
-        if (!_isValidSizeValue(name, stored)) return;        // out-of-grammar → ignore
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && low !== 'content') {
+        const ok = name === 'flex-basis' ? _isValidFlexBasis(stored) : _isValidSizeValue(name, stored);
+        if (!ok) return;                                     // out-of-grammar → ignore
         if (_mathReject(stored, ['length'], 'length')) return;  // malformed math → ignore
         if (/^[+-]?0(?:\.0+)?$/.test(stored.trim())) stored = '0px';  // bare <length> 0 → 0px
       }
@@ -9533,6 +9536,14 @@ const _isValidSizeValue = (name, value) => {
   if (fc) return _sizeLenPctOk(fc[1].trim());
   return _sizeLenPctOk(t);
 };
+// flex-basis (css-flexbox-1 §7.2.3) = `content | <'width'>`. Same single-value grammar
+// as width (so `none`, negatives, bare numbers, multi-token, anchor-size() all reject —
+// note width's grammar has no `none`, so flex-basis inherits that rejection) plus the
+// flex-basis-only `content` keyword.
+const _isValidFlexBasis = (value) => {
+  if (String(value).trim().toLowerCase() === 'content') return true;
+  return _isValidSizeValue('flex-basis', value);
+};
 // Parse a `border`/`border-<side>` value (`<line-width> || <line-style> || <color>`,
 // any order) into its three longhand pieces, defaulting any omitted component.
 const _parseBorderSide = (value) => {
@@ -13170,6 +13181,11 @@ const _CSSUI_ENUM = {
   // scroll-anchoring candidate). Rejects `all` and any two-keyword combo (`auto none`).
   // Computed = the lowercased keyword (identity); initial `auto`, not inherited.
   'overflow-anchor': new Set(['auto', 'none']),
+  // css-flexbox: flex-direction / flex-wrap single-keyword enums (the two flex-flow
+  // longhands). Each rejects `auto` and any two-keyword combination (`column
+  // row-reverse`, `nowrap wrap`). Computed = the lowercased keyword (identity).
+  'flex-direction': new Set(['row', 'row-reverse', 'column', 'column-reverse']),
+  'flex-wrap': new Set(['nowrap', 'wrap', 'wrap-reverse']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -13240,6 +13256,10 @@ const _CSSUI_VALIDATED = new Set([
   // <display-outside> || <display-inside> ]` / `<display-listitem>` syntax canonicalized
   // to its shortest form (a dedicated _canonCssUi → _canonDisplay branch; computed = specified).
   'display',
+  // css-flexbox: flex-direction / flex-wrap keyword enums (computed = specified). Set by
+  // the flex-flow shorthand too — its values are valid enum members, so this gate is a
+  // no-op on the shorthand path.
+  'flex-direction', 'flex-wrap',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13359,10 +13379,10 @@ const _canonColorScheme = (value) => {
 // `flow list-item`→`list-item`, `inline ruby`→`ruby`, `flow-root run-in`→`run-in
 // flow-root`, … Computed value == this specified canonical form (identity).
 const _DISPLAY_OUTSIDE = new Set(['block', 'inline', 'run-in']);
-const _DISPLAY_INSIDE = new Set(['flow', 'flow-root', 'table', 'flex', 'grid', 'ruby']);
+const _DISPLAY_INSIDE = new Set(['flow', 'flow-root', 'table', 'flex', 'grid', 'ruby', 'grid-lanes']);
 const _DISPLAY_PREDEFINED = new Set([
   'none', 'contents',
-  'inline-block', 'inline-table', 'inline-flex', 'inline-grid',
+  'inline-block', 'inline-table', 'inline-flex', 'inline-grid', 'inline-grid-lanes',
   'table-row-group', 'table-header-group', 'table-footer-group', 'table-row',
   'table-cell', 'table-column-group', 'table-column', 'table-caption',
   'ruby-base', 'ruby-text', 'ruby-base-container', 'ruby-text-container',
@@ -13372,10 +13392,14 @@ const _DISPLAY_PREDEFINED = new Set([
 // the rest keep the two-value form. flow is the default inside (drops out), so every
 // `<outside> flow` collapses to just the outside keyword. ruby's principal box is
 // inline-level, so `inline ruby`→`ruby` and `block ruby` stays two-value.
+// NB: grid-lanes (css-grid-3) collapses `block grid-lanes`→`grid-lanes` (block is the
+// default outer, dropped) but — unlike flex/grid — `inline grid-lanes` does NOT collapse
+// to the predefined `inline-grid-lanes` keyword; it keeps the two-value form. Both
+// spellings are valid input, they just serialize distinctly.
 const _DISPLAY_CANON = {
-  'block':  { 'flow': 'block',  'flow-root': 'flow-root',       'flex': 'flex',        'grid': 'grid',       'table': 'table',        'ruby': 'block ruby' },
-  'inline': { 'flow': 'inline', 'flow-root': 'inline-block',    'flex': 'inline-flex', 'grid': 'inline-grid','table': 'inline-table', 'ruby': 'ruby' },
-  'run-in': { 'flow': 'run-in', 'flow-root': 'run-in flow-root','flex': 'run-in flex', 'grid': 'run-in grid','table': 'run-in table', 'ruby': 'run-in ruby' },
+  'block':  { 'flow': 'block',  'flow-root': 'flow-root',       'flex': 'flex',        'grid': 'grid',       'table': 'table',        'ruby': 'block ruby',   'grid-lanes': 'grid-lanes' },
+  'inline': { 'flow': 'inline', 'flow-root': 'inline-block',    'flex': 'inline-flex', 'grid': 'inline-grid','table': 'inline-table', 'ruby': 'ruby',         'grid-lanes': 'inline grid-lanes' },
+  'run-in': { 'flow': 'run-in', 'flow-root': 'run-in flow-root','flex': 'run-in flex', 'grid': 'run-in grid','table': 'run-in table', 'ruby': 'run-in ruby',  'grid-lanes': 'run-in grid-lanes' },
 };
 const _canonDisplay = (value) => {
   const toks = _wsTokens(String(value).trim());
@@ -13415,7 +13439,7 @@ const _canonDisplay = (value) => {
 // as the plain single keyword (block/table), matching this map + the WPT.
 const _BLOCKIFY_MAP = {
   'inline': 'block', 'inline-block': 'block', 'inline-table': 'table',
-  'inline-flex': 'flex', 'inline-grid': 'grid', 'run-in': 'block',
+  'inline-flex': 'flex', 'inline-grid': 'grid', 'inline-grid-lanes': 'grid-lanes', 'run-in': 'block',
   'table-row-group': 'block', 'table-header-group': 'block', 'table-footer-group': 'block',
   'table-row': 'block', 'table-column': 'block', 'table-column-group': 'block',
   'table-cell': 'block', 'table-caption': 'block',
