@@ -10,12 +10,21 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #288–#290 — css-gaps `column-rule`/`row-rule`/`rule` gap-decoration shorthands take the full `<gap-rule-list>`; +79).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #291–#293 — css-align `justify-items: legacy` computed + the css-text-decor skip/style/underline-position vein; +51).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-align/parsing/justify-items-computed.html` | 18/20 | **20/20** | ✅ 100% | **Quest #291.** css-align §6.2 bare `legacy` computes to the inherited justify-items value if it's a legacy value, else `normal`. Flipped `_GCS_DEFAULTS['justify-items']` `legacy center`→`legacy` + NEW `_normComputed` justify-items parent-walk branch. **+2.** |
+| `css/css-align/parsing/place-items-computed.html` | 17/18 | **18/18** | ✅ 100% | **Quest #291.** `flex-end legacy` → `flex-end legacy center` via the resolved justify-items longhand (reconstruction reads the computed longhand). **+1.** |
+| `css/css-text-decor/parsing/text-decoration-skip-ink-invalid.html` | 0/13 | **13/13** | ✅ 100% | **Quest #292.** `text-decoration-skip-ink` = `auto\|none\|all` enum via `_CSSUI_ENUM` + `_CSSUI_VALIDATED`. **+13.** |
+| `css/css-text-decor/parsing/text-decoration-style-invalid.html` | 0/2 | **2/2** | ✅ 100% | **Quest #292.** `text-decoration-style` = `solid\|double\|dotted\|dashed\|wavy` enum (shorthand path bypasses the longhand gate). **+2.** |
+| `css/css-text-decor/parsing/text-decoration-skip-spaces-invalid.html` | 0/19 | **19/19** | ✅ 100% | **Quest #293.** `text-decoration-skip-spaces` = `none\|all\|[start\|\|end]` — NEW dedicated `_canonCssUi` `\|\|` branch (canonical `start end`). **+19.** |
+| `css/css-text-decor/parsing/text-decoration-skip-spaces-valid.html` | 5/6 | **6/6** | ✅ 100% | **Quest #293.** `end start`→`start end` reorder. **+1.** |
+| `css/css-text-decor/parsing/text-decoration-skip-spaces-computed.html` | 0/5 | **5/5** | ✅ 100% | **Quest #293.** Newly registered (`_GCS_DEFAULTS` `start end` → auto-known + inherited); computed = specified. **+5.** |
+| `css/css-text-decor/parsing/text-underline-position-invalid.html` | 0/6 | **6/6** | ✅ 100% | **Quest #293.** `text-underline-position` = `auto\|[from-font\|under]\|\|[left\|right]` — NEW dedicated `_canonCssUi` `\|\|` branch (`<line>` printed first). **+6.** |
+| `css/css-text-decor/parsing/text-underline-position-valid.html` | 7/9 | **9/9** | ✅ 100% | **Quest #293.** `right under`→`under right`, `right from-font`→`from-font right` reorders. **+2.** |
 | `css/css-gaps/parsing/gap-decorations-rule-shorthand-invalid.html` | 11/27 | **27/27** | ✅ 100% | **Quests #288–#290.** `column-rule`/`row-rule`/`rule` gap-decoration shorthands now take the full `<gap-rule-list>` (comma list of `<gap-rule>` = `<line-width> \|\| <line-style> \|\| <line-color>` + `repeat()`/auto-repeat). NEW `_parseGapRuleShorthand` transposes into the three parallel list longhands; invalid gate rejects duplicate leaves, `repeat(0/-1/auto,)`, two auto-repeats. **+16.** |
 | `css/css-gaps/parsing/gap-decorations-rule-shorthand-valid.html` | 48/75 | **75/75** | ✅ 100% | **Quests #288–#290.** `_serGapRuleSh` zips the three list longhands back into a `<gap-rule-list>`, each `<gap-rule>` dropping its initials (all-initial→`medium`). `row-rule`/`rule` newly registered as shorthands. **+27.** |
 | `css/css-gaps/parsing/gap-decorations-rule-shorthand-computed.html` | 3/39 | **39/39** | ✅ 100% | **Quests #288–#290.** Computed reconstructs from the COMPUTED list longhands (each leaf resolved), always printing width+color and style-if-not-`none`. `rule` reconstructs only when both axes agree. **+36.** |

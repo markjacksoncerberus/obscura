@@ -9230,6 +9230,7 @@ const _GCS_DEFAULTS = {
   'text-decoration-style': 'solid', 'text-emphasis-color': 'currentColor',
   'text-emphasis-position': 'auto', 'text-emphasis-style': 'none', 'text-shadow': 'none',
   'text-underline-position': 'auto', 'text-decoration-skip-ink': 'auto',
+  'text-decoration-skip-spaces': 'start end',
   'text-decoration-thickness': 'auto',
   'text-decoration-inset': 'auto',
   // css-writing-modes. unicode-bidi does not inherit; the rest do.
@@ -9316,7 +9317,7 @@ const _GCS_DEFAULTS = {
   'block-step-align': 'auto', 'block-step-round': 'up',
   // css-align (shared with css-flexbox) — none inherit.
   'align-content': 'normal', 'align-items': 'normal', 'align-self': 'auto',
-  'column-gap': 'normal', 'justify-content': 'normal', 'justify-items': 'legacy center',
+  'column-gap': 'normal', 'justify-content': 'normal', 'justify-items': 'legacy',
   'justify-self': 'auto', 'row-gap': 'normal',
   // css-flexbox (the flex-specific properties) — none inherit.
   'flex-basis': 'auto', 'flex-direction': 'row', 'flex-grow': '0', 'flex-shrink': '1',
@@ -12797,6 +12798,7 @@ const _INHERITED_PROPS = new Set([
   // text-decoration-skip-ink inherit (text-decoration-* do NOT).
   'text-emphasis-color', 'text-emphasis-position', 'text-emphasis-style',
   'text-shadow', 'text-underline-position', 'text-decoration-skip-ink',
+  'text-decoration-skip-spaces',
   // css-writing-modes: all but unicode-bidi inherit.
   'direction', 'text-combine-upright', 'text-orientation', 'writing-mode',
   // css-lists: the list-style-* properties inherit (counter-* do NOT).
@@ -13219,6 +13221,15 @@ const _CSSUI_ENUM = {
   // row-reverse`, `nowrap wrap`). Computed = the lowercased keyword (identity).
   'flex-direction': new Set(['row', 'row-reverse', 'column', 'column-reverse']),
   'flex-wrap': new Set(['nowrap', 'wrap', 'wrap-reverse']),
+  // css-text-decor: single-keyword enums. text-decoration-skip-ink = `auto | none |
+  // all` (a text-decoration-skip longhand, inherited); text-decoration-style =
+  // `solid | double | dotted | dashed | wavy` (a text-decoration shorthand longhand,
+  // NOT inherited). Each rejects an out-of-grammar keyword (`edges`/`groove`) and any
+  // two-keyword combination (`auto none`, `solid wavy`). The text-decoration shorthand
+  // expands to its longhands directly (storing into _props), bypassing this gate, so
+  // the style gate is a no-op on the shorthand path. Computed = the lowercased keyword.
+  'text-decoration-skip-ink': new Set(['auto', 'none', 'all']),
+  'text-decoration-style': new Set(['solid', 'double', 'dotted', 'dashed', 'wavy']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -13293,6 +13304,14 @@ const _CSSUI_VALIDATED = new Set([
   // the flex-flow shorthand too — its values are valid enum members, so this gate is a
   // no-op on the shorthand path.
   'flex-direction', 'flex-wrap',
+  // css-text-decor: text-decoration-skip-ink (enum, inherited) + text-decoration-style
+  // (enum, a text-decoration longhand). The text-decoration shorthand expands directly
+  // into _props, bypassing this longhand gate. Computed = specified (identity).
+  'text-decoration-skip-ink', 'text-decoration-style',
+  // css-text-decor-4: text-decoration-skip-spaces (`none | all | [start||end]`,
+  // inherited) + text-underline-position (`auto | [from-font|under] || [left|right]`,
+  // inherited). Dedicated _canonCssUi `||` branches; computed = specified (canonical).
+  'text-decoration-skip-spaces', 'text-underline-position',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13690,6 +13709,45 @@ const _canonCssUi = (name, value) => {
     const tl = toks[0].toLowerCase();
     if (tl === 'auto' || tl === 'spaces') return tl;
     if (tl === 'none') return 'spaces';
+    return null;
+  }
+  if (name === 'text-decoration-skip-spaces') {
+    // css-text-decor-4: `none | all | [ start || end ]`. `none`/`all` are exclusive
+    // single keywords; else a `||` of `start` and `end` (each at most once, at least
+    // one), canonical order `start end` (`end start` → `start end`). Rejects any
+    // combination that mixes none/all with a side (`none start`, `all end`), a repeat
+    // (`start start`), >2 tokens (`start end all`), and out-of-grammar (`auto`/`edges`).
+    const toks = _wsTokens(low);
+    if (toks.length === 1) {
+      const t = toks[0];
+      return (t === 'none' || t === 'all' || t === 'start' || t === 'end') ? t : null;
+    }
+    if (toks.length === 2) {
+      const seen = new Set(toks);
+      return (seen.size === 2 && seen.has('start') && seen.has('end')) ? 'start end' : null;
+    }
+    return null;
+  }
+  if (name === 'text-underline-position') {
+    // css-text-decor-4: `auto | [ from-font | under ] || [ left | right ]`. `auto` is
+    // exclusive. Else a `||` of one <line> keyword (from-font|under) and one <side>
+    // keyword (left|right), at least one present, each group at most once. Canonical
+    // order prints the <line> keyword first (`right under` → `under right`, `right
+    // from-font` → `from-font right`). Rejects `auto X`, two from the same group
+    // (`left right`, `under from-font`), and >2 tokens (`right under left`).
+    const toks = _wsTokens(low);
+    if (toks.length === 1) {
+      const t = toks[0];
+      return (t === 'auto' || t === 'from-font' || t === 'under' || t === 'left' || t === 'right') ? t : null;
+    }
+    if (toks.length === 2) {
+      const isLine = (t) => t === 'from-font' || t === 'under';
+      const isSide = (t) => t === 'left' || t === 'right';
+      const [a, b] = toks;
+      if (isLine(a) && isSide(b)) return a + ' ' + b;
+      if (isSide(a) && isLine(b)) return b + ' ' + a;         // reorder → <line> first
+      return null;
+    }
     return null;
   }
   if (name === 'line-height') {
@@ -22061,6 +22119,19 @@ const _normComputed = (el, kebab, v) => {
     if (tl === 'none') return '100%';
     if (tl === 'auto') return 'auto';
     return v;
+  }
+  if (kebab === 'justify-items') {
+    // css-align §6.2: a bare `legacy` (the initial value) computes to the INHERITED
+    // justify-items value when that inherited value is itself a legacy value
+    // (`legacy left/right/center`), else to `normal`. Every other justify-items value
+    // — including an explicit `legacy left/right/center` — is computed = specified.
+    // The parent walk terminates at the root (initial `legacy` → no legacy parent →
+    // `normal`), so an unstyled ancestor caps the chain at `normal`.
+    if (String(v).trim().toLowerCase() !== 'legacy') return v;
+    const inh = (el && el.parentElement)
+      ? String(_computedPropOf(el.parentElement, 'justify-items', 0)).trim().toLowerCase()
+      : 'normal';
+    return (inh === 'legacy left' || inh === 'legacy right' || inh === 'legacy center') ? inh : 'normal';
   }
   if (kebab === 'line-height') return _computeLineHeight(el, v);
   if (kebab === 'baseline-shift') return _computeBaselineShift(el, v);
