@@ -1286,6 +1286,24 @@ class CSSStyleDeclaration {
         return;                                                 // expanded; no shorthand key kept
       }
     }
+    if (!custom && _CORNER_SHAPE_SH[name] && !/\bvar\(/i.test(stored)) {
+      // css-borders-4 corner-shape / corner-<edge>-shape shorthand (no var()): expand
+      // a <corner-shape-value>{1,N} into — and store as — its 2 or 4 single-corner
+      // longhands. CSS-wide keywords skip to single-key storage.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low)) {
+        const lh = _parseCornerShapeShorthand(name, stored, false);
+        if (!lh) return;                                       // out of grammar → ignore
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        delete this._props[name]; delete this._priority[name];   // drop any prior var()-stored shorthand key
+        for (const ln of _CORNER_SHAPE_SH[name]) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                                 // expanded; no shorthand key kept
+      }
+    }
     if (!custom && _BORDER_EXPAND[name] && !/\bvar\(/i.test(stored)) {
       // border/outline shorthand (no var()): expand into — and store as — its
       // longhands so `el.style.borderTopColor` reads back. Invalid → ignore.
@@ -2223,6 +2241,13 @@ class CSSStyleDeclaration {
       this._notifyChange();
       return old;
     }
+    if (_CORNER_SHAPE_SH[key]) {                            // css-borders-4 corner-shape shorthands: clear its longhands
+      const old = this.getPropertyValue(key);
+      delete this._props[key]; delete this._priority[key];   // any CSS-wide/var shorthand key
+      for (const ln of _CORNER_SHAPE_SH[key]) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
     if (_BORDER_EXPAND[key]) {                              // border/outline: clear its longhands
       const old = this.getPropertyValue(key);
       delete this._props[key]; delete this._priority[key];   // any var()-stored shorthand key
@@ -2393,6 +2418,10 @@ class CSSStyleDeclaration {
     if (_GAP_RULE_SH[key]) {                                // css-gaps column-rule/row-rule/rule shorthand
       if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
       return _serGapRuleSh((n) => this._props[n], key);    // reconstruct (zip) from list longhands
+    }
+    if (_CORNER_SHAPE_SH[key]) {                            // css-borders-4 corner-shape / corner-<edge>-shape
+      if (key in this._props) return this._props[key];     // CSS-wide/var kept as a single key
+      return _serCornerShapeSh((n) => this._props[n], key);  // reconstruct + collapse from single-corner longhands
     }
     if (_BORDER_EXPAND[key]) {                              // border/outline shorthand
       if (key in this._props) return this._props[key];     // var() kept as a single key
@@ -9221,6 +9250,15 @@ const _GCS_DEFAULTS = {
   // the test's mediumWidth reference (a cascaded `border-top-width: medium`).
   appearance: 'none', 'caret-color': 'currentColor', 'caret-shape': 'auto',
   'field-sizing': 'fixed', 'interactivity': 'auto',
+  // css-scrollbars: both inherit, initial `auto`, computed = specified (identity).
+  'scrollbar-width': 'auto', 'scrollbar-color': 'auto',
+  // css-borders-4: the eight single-corner-shape longhands. Initial `round`; NOT
+  // inherited; computed = superellipse(1). The corner-shape/-edge shorthands are
+  // registered in _CSS_KNOWN_PROPS separately (they reconstruct from these).
+  'corner-top-left-shape': 'round', 'corner-top-right-shape': 'round',
+  'corner-bottom-left-shape': 'round', 'corner-bottom-right-shape': 'round',
+  'corner-start-start-shape': 'round', 'corner-start-end-shape': 'round',
+  'corner-end-start-shape': 'round', 'corner-end-end-shape': 'round',
   'nav-down': 'auto', 'nav-left': 'auto', 'nav-right': 'auto', 'nav-up': 'auto',
   'outline-color': 'currentColor', 'outline-offset': '0px', 'outline-style': 'none',
   'outline-width': 'medium', resize: 'none', 'user-select': 'auto',
@@ -9886,6 +9924,7 @@ const _expandShorthand = (sh, value) => {
   if (_BORDER_LOGICAL_SIDE_EDGE[sh] || _BORDER_LOGICAL_SIDE_BOTH[sh]) return _expandBorderShorthand(sh, value);
   if (_BOX_LOGICAL_SH2[sh]) return _expandBoxLogical(sh, value);
   if (_GAP_RULE_SH[sh]) return _expandGapRuleShorthand(sh, value);  // css-gaps column-rule/row-rule/rule
+  if (_CORNER_SHAPE_SH[sh]) return _parseCornerShapeShorthand(sh, value, false);  // css-borders-4 corner-shape shorthands
   if (sh === 'font') {
     const p = _parseFontShorthand(value);
     if (!p || p.system) return null;   // invalid / system font → no per-longhand pieces (falls to initial/inherited)
@@ -12831,6 +12870,8 @@ const _INHERITED_PROPS = new Set([
   // css-ui: caret-color, caret-shape, cursor and interactivity inherit (the
   // outline-* and nav-* properties and appearance/resize/user-select do NOT).
   'caret-color', 'caret-shape', 'interactivity',
+  // css-scrollbars: scrollbar-width and scrollbar-color both inherit.
+  'scrollbar-width', 'scrollbar-color',
   // css-text-decor: text-emphasis-* / text-shadow / text-underline-position /
   // text-decoration-skip-ink inherit (text-decoration-* do NOT).
   'text-emphasis-color', 'text-emphasis-position', 'text-emphasis-style',
@@ -13267,6 +13308,11 @@ const _CSSUI_ENUM = {
   // the style gate is a no-op on the shorthand path. Computed = the lowercased keyword.
   'text-decoration-skip-ink': new Set(['auto', 'none', 'all']),
   'text-decoration-style': new Set(['solid', 'double', 'dotted', 'dashed', 'wavy']),
+  // css-scrollbars: scrollbar-width = `auto | thin | none` (single keyword, inherited).
+  // Rejects `tiny`/`12px`/`20%`/`#FF0000` and any two-keyword combination (`auto none`,
+  // `thin auto`). Computed = the lowercased keyword (identity); initial `auto`.
+  // (scrollbar-color = `auto | <color>{2}` is a dedicated _canonCssUi branch.)
+  'scrollbar-width': new Set(['auto', 'thin', 'none']),
 };
 // Properties `_canonCssUi` handles. caret-color/outline-color also live in
 // _COLOR_PROPS — they MUST be dispatched here first (the generic _COLOR_PROPS
@@ -13349,6 +13395,18 @@ const _CSSUI_VALIDATED = new Set([
   // inherited) + text-underline-position (`auto | [from-font|under] || [left|right]`,
   // inherited). Dedicated _canonCssUi `||` branches; computed = specified (canonical).
   'text-decoration-skip-spaces', 'text-underline-position',
+  // css-scrollbars: scrollbar-width (`auto | thin | none` keyword enum) +
+  // scrollbar-color (`auto | <color>{2}`, a dedicated _canonCssUi branch). Both
+  // inherit; computed = specified. NOT in _COLOR_PROPS, so the CSSUI dispatch (which
+  // precedes _COLOR_PROPS) validates them; a bare or triple <color> is rejected.
+  'scrollbar-width', 'scrollbar-color',
+  // css-borders-4: the eight single-corner-shape longhands (`<corner-shape-value>`,
+  // a dedicated _canonCssUi branch). The corner-shape / corner-<edge>-shape SHORTHANDS
+  // are handled separately (_CORNER_SHAPE_SH expand/serialize). Not inherited.
+  'corner-top-left-shape', 'corner-top-right-shape',
+  'corner-bottom-left-shape', 'corner-bottom-right-shape',
+  'corner-start-start-shape', 'corner-start-end-shape',
+  'corner-end-start-shape', 'corner-end-end-shape',
 ]);
 // A literal zero (`0`, `+0.0`) — a unitless zero is a valid <length>.
 const _isZeroTok = (t) => /^[+-]?0*(?:\.0*)?0(?:e[+-]?\d+)?$/i.test(t) || /^[+-]?0+$/.test(t);
@@ -13454,6 +13512,104 @@ const _canonColorScheme = (value) => {
   if (!schemes.length) return null;                            // `only` with no scheme ident
   return only ? schemes.join(' ') + ' only' : schemes.join(' ');
 };
+// ── corner-shape (css-borders-4) ─────────────────────────────────────────────
+// <corner-shape-value> = round | scoop | bevel | notch | square | squircle |
+//                        superellipse(<number>)
+// Each keyword is an alias for a superellipse() with a fixed exponent. At COMPUTED
+// time EVERY value serializes as `superellipse(<number>)` (keyword → its exponent);
+// the SPECIFIED value keeps the author's keyword. `straight`/`auto`/`none`/`10px`
+// are invalid. `superellipse()` takes exactly ONE <number> (which includes
+// `infinity`/`-infinity` and calc()); `superellipse(8 8)`/`superellipse(4,0.1)`/
+// `superellipse(foo)`/`superellipse()` are invalid.
+const _CORNER_SHAPE_KW = {
+  round: '1', scoop: '-1', bevel: '0', notch: '-infinity',
+  square: 'infinity', squircle: '2',
+};
+// Canonicalize the single argument of a superellipse(): a plain <number> (`.5`→`0.5`),
+// the `infinity`/`-infinity` keywords, or a <number>-typed calc (`calc(0.5 * 4)`→
+// `calc(2)`). Returns the canonical token or null (a dimension/percentage/ident is
+// not a <number>).
+const _canonSuperellipseNum = (t) => {
+  const low = t.toLowerCase();
+  if (low === 'infinity' || low === '+infinity') return 'infinity';
+  if (low === '-infinity') return '-infinity';
+  if (_MATHFN_NAME_RE.test(t)) {
+    const root = _parseCalcTree(t);
+    if (root === null || _mt(root, null) !== 'number') return null;  // must be <number>-typed
+    return _canonMathExpr(t) || null;
+  }
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(t)) return String(parseFloat(t));
+  return null;
+};
+// Validate + canonicalize ONE <corner-shape-value>. `computed` maps a keyword to its
+// `superellipse(<exponent>)` form; specified keeps the keyword. Returns null if invalid.
+const _canonCornerShapeValue = (v, computed) => {
+  const s = String(v).trim();
+  const low = s.toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(_CORNER_SHAPE_KW, low)) {
+    return computed ? 'superellipse(' + _CORNER_SHAPE_KW[low] + ')' : low;
+  }
+  if (!/^superellipse\(/i.test(s) || !s.endsWith(')')) return null;
+  const inner = s.slice(s.indexOf('(') + 1, -1).trim();
+  if (inner === '' || inner.indexOf(',') >= 0) return null;   // empty / comma-separated args
+  const toks = _wsTokens(inner);
+  if (toks.length !== 1) return null;                         // exactly one <number> argument
+  const n = _canonSuperellipseNum(toks[0]);
+  if (n === null) return null;
+  return 'superellipse(' + n + ')';
+};
+// The eight single-corner longhands (four physical + four flow-relative). Each takes
+// ONE <corner-shape-value>. NOT inherited; initial `round`; computed = superellipse().
+const _CORNER_SHAPE_LONGHANDS = new Set([
+  'corner-top-left-shape', 'corner-top-right-shape',
+  'corner-bottom-left-shape', 'corner-bottom-right-shape',
+  'corner-start-start-shape', 'corner-start-end-shape',
+  'corner-end-start-shape', 'corner-end-end-shape',
+]);
+// Shorthand → its ordered longhands. `corner-shape` is the four-corner shorthand
+// (physical order top-left · top-right · bottom-right · bottom-left, the box order
+// consumed by _boxEdges/_serializeBoxValue); the `corner-<edge>-shape` shorthands are
+// two-corner (physical edges + flow-relative block/inline edges).
+const _CORNER_SHAPE_SH = {
+  'corner-shape': ['corner-top-left-shape', 'corner-top-right-shape', 'corner-bottom-right-shape', 'corner-bottom-left-shape'],
+  'corner-top-shape': ['corner-top-left-shape', 'corner-top-right-shape'],
+  'corner-right-shape': ['corner-top-right-shape', 'corner-bottom-right-shape'],
+  'corner-bottom-shape': ['corner-bottom-left-shape', 'corner-bottom-right-shape'],
+  'corner-left-shape': ['corner-top-left-shape', 'corner-bottom-left-shape'],
+  'corner-inline-start-shape': ['corner-start-start-shape', 'corner-end-start-shape'],
+  'corner-inline-end-shape': ['corner-start-end-shape', 'corner-end-end-shape'],
+  'corner-block-start-shape': ['corner-start-start-shape', 'corner-start-end-shape'],
+  'corner-block-end-shape': ['corner-end-start-shape', 'corner-end-end-shape'],
+};
+// Expand a corner-shape shorthand value into its longhands (`{longhand: canon}`), or
+// null if out of grammar. A four-corner value takes 1–4 <corner-shape-value>s
+// (border-radius-style edge expansion); a two-corner value takes 1–2. `computed` maps
+// keywords to superellipse().
+const _parseCornerShapeShorthand = (sh, value, computed) => {
+  const s = String(value).trim();
+  if (!s || _commaSplitTop(s).length > 1) return null;        // no top-level comma
+  const lh = _CORNER_SHAPE_SH[sh];
+  const max = lh.length;                                       // 4 (corner-shape) or 2 (edges)
+  const toks = _wsTokens(s);
+  if (toks.length < 1 || toks.length > max) return null;
+  const canon = toks.map((t) => _canonCornerShapeValue(t, computed));
+  if (canon.some((c) => c === null)) return null;
+  const slots = (max === 4)
+    ? _boxEdges(canon)                                        // [TL, TR, BR, BL]
+    : (canon.length === 2 ? canon : [canon[0], canon[0]]);
+  const out = {};
+  lh.forEach((n, i) => { out[n] = slots[i]; });
+  return out;
+};
+// Reconstruct a corner-shape shorthand from its longhands (via `get`): collapse to
+// the shortest equivalent value, or '' when a longhand is missing (unrepresentable).
+const _serCornerShapeSh = (get, key) => {
+  const lh = _CORNER_SHAPE_SH[key];
+  const vals = lh.map((n) => get(n));
+  if (vals.some((v) => !v)) return '';
+  return _serializeBoxValue(key, vals);
+};
+
 // ── display (css-display-3) ──────────────────────────────────────────────────
 // display = [ <display-outside> || <display-inside> ]      (the two-value syntax)
 //         | <display-listitem> | <display-internal> | <display-box> | <display-legacy>
@@ -13567,6 +13723,7 @@ const _canonCssUi = (name, value) => {
   if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(s)) return s;      // CSS-wide / var()/env() → pass through
   const enumSet = _CSSUI_ENUM[name];
   if (enumSet) return enumSet.has(low) ? low : null;
+  if (_CORNER_SHAPE_LONGHANDS.has(name)) return _canonCornerShapeValue(s, false);  // css-borders-4 single-corner longhand
   if (name === 'display') return _canonDisplay(s);            // css-display two-value syntax → canonical short form
   if (name === 'orphans' || name === 'widows') {
     // css-break: `<integer [1,∞]>`. A number-typed calc is kept symbolic here and
@@ -13663,6 +13820,22 @@ const _canonCssUi = (name, value) => {
       if (name === 'outline-color' && tl === 'invert') { out.push('invert'); continue; }
       if (_isValidColor(t)) { out.push(_canonColorSpecified(t)); continue; }
       return null;                                             // `none`/`50%`/… → invalid
+    }
+    return out.join(' ');
+  }
+  if (name === 'scrollbar-color') {
+    // css-scrollbars: `auto | <color>{2}`. `auto` stands ALONE (both thumb & track
+    // use the UA default); otherwise EXACTLY two <color> values (thumb then track),
+    // each canonicalized (`#FF0000`→`rgb(255, 0, 0)`). `auto` is NOT a <color>, so it
+    // may not mix with a colour or repeat (`auto auto`/`auto currentcolor` invalid),
+    // and a single colour is invalid (`red`/`#FF0000`). currentcolor is a valid colour.
+    if (low === 'auto') return 'auto';
+    const toks = _wsTokens(s);
+    if (toks.length !== 2) return null;
+    const out = [];
+    for (const t of toks) {
+      if (!_isValidColor(t)) return null;                      // `auto`/`none`/… → invalid
+      out.push(_canonColorSpecified(t));
     }
     return out.join(' ');
   }
@@ -22130,6 +22303,10 @@ const _normComputed = (el, kebab, v) => {
   // _COLOR_PROPS branches (which would mangle the whole list). Single-leaf values fall
   // through to those existing per-property paths (multicol column-rule-* untouched).
   if (_GAP_RULE_LEAF[kebab] && _isGapList(v)) return _computeGapRuleList(el, kebab, v);
+  if (_CORNER_SHAPE_LONGHANDS.has(kebab)) {                     // css-borders-4: keyword → superellipse(<n>)
+    const c = _canonCornerShapeValue(v, true);
+    return c === null ? v : c;
+  }
   if (_RI_LEAF.has(kebab)) return _computeInsetValue(el, v);    // css-gaps rule-inset leaf → folded <inset-value>
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_BI_DIM_LH.has(kebab)) return _computeBorderImageDim(el, v);
@@ -22806,6 +22983,7 @@ const _CSS_KNOWN_PROPS = (() => {
   for (const k of Object.keys(_RI_BIDI)) add(k);           // css-gaps bidirectional rule-inset shorthands
   add('row-rule');                                         // css-gaps `row-rule` shorthand (mirrors column-rule, row axis)
   add('rule');                                             // css-gaps `rule` mega-shorthand (bidirectional column-rule)
+  for (const k of Object.keys(_CORNER_SHAPE_SH)) add(k);   // css-borders-4 corner-shape / corner-<edge>-shape shorthands
   add('grid-row'); add('grid-column'); add('grid-area');   // grid placement shorthands (reconstructed from their <grid-line> longhands)
   for (const k of Object.keys(_ALIGN_SHORTHAND_LH)) add(k); // gap/grid-gap/place-* box-alignment shorthands
   for (const k of Object.keys(_SCROLL_SH_LH)) add(k);      // scroll-margin/scroll-padding (+ block/inline) shorthands
@@ -22935,6 +23113,13 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     // is dropped. `rule` reconstructs only when both axes agree (else '').
     if (_GAP_RULE_SH[kebab]) {
       const s = _serGapRuleSh((n) => resolve(n), kebab, true);
+      if (s !== '') return s;
+    }
+    // css-borders-4 corner-shape / corner-<edge>-shape: reconstruct from the COMPUTED
+    // single-corner longhands (each keyword resolved to superellipse(<number>)) and
+    // collapse to the shortest equivalent value.
+    if (_CORNER_SHAPE_SH[kebab]) {
+      const s = _serCornerShapeSh((n) => resolve(n), kebab);
       if (s !== '') return s;
     }
     // css-gaps `rule-*` shorthand: reconstruct from the COMPUTED column-*/row-*
@@ -26260,6 +26445,10 @@ globalThis.CSS = {
       if (_GAP_RULE_SH[name]) {                            // css-gaps column-rule/row-rule/rule shorthand
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
         return _parseGapRuleShorthand(_canonStandardValue(val)) != null;  // validate the <gap-rule-list>
+      }
+      if (_CORNER_SHAPE_SH[name]) {                        // css-borders-4 corner-shape shorthands
+        if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
+        return _parseCornerShapeShorthand(name, _canonStandardValue(val), false) != null;
       }
       if (_BORDER_EXPAND[name]) {                          // border/outline shorthand
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
