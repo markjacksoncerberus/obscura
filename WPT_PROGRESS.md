@@ -10,12 +10,16 @@ cargo build --release --features render
 .venv/bin/python scripts/wpt_run.py <test-path> --base https://wpt.live
 ```
 
-Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #309–#311 — `border-radius` promoted to a real shorthand + `-webkit-border-radius` legacy alias; +33).
+Branch: `engine-per-page-threads`. Last updated: 2026-07-24 (Quests #312–#315 — `CSS.supports('selector()')` + `insertRule` selector validation + view-transition pseudo-element grammar + `background-size` computed calc; **+885**).
 
 ## Scoreboard
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| `css/css-view-transitions/parsing/pseudo-elements-invalid.html` | 0/675 | **675/675** | ✅ 100% | **Quests #313–#314.** `insertRule` now throws SyntaxError on an invalid style-rule selector (`_assertRuleSelectorValid` via `_parseSelectorList`), and the view-transition pseudo-element grammar is tree-abiding: functional PEs need a `(* \| <custom-ident≠default/CSS-wide>)` arg, `::view-transition` takes none, a VT PE ends its compound (only `:only-child` may follow a functional one) + last-compound-only + disallowed in `:is/:where/:not/:has`. **+675.** |
+| `css/css-view-transitions/parsing/pseudo-elements-invalid-with-classes.html` | 0/20 | **20/20** | ✅ 100% | **Quests #313–#314.** Same primitives. **+20.** |
+| `css/selectors/parsing/` (whole dir, 22 files) | 63/392 | **251/392** | 🟡 64% | **Quests #312–#313.** `CSS.supports('selector(...)')` implemented (was always `false` — the `selector()` fn checked before the `property:value` split), greening every `test_valid_selector` support-assertion; `insertRule` selector validation greening every `test_invalid_selector` throw-assertion; `:has()` relative-selector support (`_parseSelectorList(src, relative)` leading combinator, matches the Rust matcher). e.g. parse-attribute 0→16, parse-not 0→23, parse-has 0→29, parse-is-where 0→27, parse-state 0→16, parse-heading 0→18. **+188.** |
+| `css/css-backgrounds/parsing/background-size-computed.html` | 14/16 | **16/16** | ✅ 100% | **Quest #315.** `background-size` computed routes through `_computeMaskSize` (identical grammar): `calc(10px + 0.5em)`@40px→`30px`, `calc(10px - 0.5em)`→`0px` (clamp), `auto`/`cover`/`contain`/`%` identity. **+2.** |
 | `css/css-backgrounds/parsing/border-radius-invalid.html` | 0/11 | **11/11** | ✅ 100% | **Quest #309 The Border-Radius Validation Verdict.** `border-radius` promoted from raw-store echo to a real shorthand over the 4 physical corner longhands. Grammar `<lp [0,∞]>{1,4} [ / <lp>{1,4} ]?` (`_expandBorderRadius` — paren-aware `_slashSplitTop`, `_boxEdges` per group, `_isNonNegShapeLP`). Rejects `auto`/`none`/5-value/`-1px`/`1px -2px`/`1em /`/`1px / 2px / 3px`/`4 / 5`; longhand `<lp>{1,2}` rejects `10px 20px 30px`. **+11.** |
 | `css/css-backgrounds/parsing/border-radius-computed.html` | 0/14 | **14/14** | ✅ 100% | **Quest #310 The Border-Radius Computed Verdict.** Corner longhands px-resolve in `_normComputed` (`_serBorderRadiusLH`; `calc(-0.5em+10px)`→`0px` clamp, `5em`→`200px`); the shorthand reconstructs from the COMPUTED longhands and box-collapses (`5em / 1px 2% 3px 4%`→`200px / 1px 2% 3px 4%`). **+14.** |
 | `css/css-backgrounds/parsing/border-radius-valid.html` | 20/23 | **23/23** | ✅ 100% | **Quest #311 The Border-Radius Serialization Verdict.** Canonical shorthand collapse (`_serBorderRadiusSh` box-collapses H/V groups, drops `/ V` when equal): `1px 1px 1px 2% / 1px 2% 1px 2%`→`1px 1px 1px 2% / 1px 2%`. **+3.** |

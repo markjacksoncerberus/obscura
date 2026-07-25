@@ -22590,7 +22590,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'opacity') { const o = _computeOpacity(v); return o === null ? v : o; }
   if (_BI_DIM_LH.has(kebab)) return _computeBorderImageDim(el, v);
   if (kebab === 'text-emphasis-style') return _computeTextEmphasisStyle(el, v);
-  if (kebab === 'mask-size') return _computeMaskSize(el, v);
+  if (kebab === 'mask-size' || kebab === 'background-size') return _computeMaskSize(el, v);
   if (kebab === 'background-repeat') {
     // Computed collapses each layer's two-keyword <repeat-style> to its shortest
     // form (equal pair → one keyword; repeat/no-repeat → repeat-x/-y), exactly like
@@ -23791,8 +23791,24 @@ const _SEL_PE = new Set(['before','after','first-line','first-letter','marker','
   'cue','cue-region','part','slotted','highlight','view-transition','view-transition-group',
   'view-transition-image-pair','view-transition-old','view-transition-new','details-content']);
 const _SEL_LEGACY_PE = new Set(['before','after','first-line','first-letter']);
+// The css-view-transitions pseudo-elements. The four *functional* ones take a
+// mandatory `(<pt-name-selector>)` argument (`*` | <custom-ident>); the root
+// `::view-transition` takes none. They are "tree-abiding" pseudo-elements: only
+// specific structural pseudo-classes may follow them (the tests exercise
+// `:only-child`, valid on the functional ones only), nothing else may join their
+// compound, they must be the LAST compound of a complex selector, and they are
+// disallowed inside :is()/:where()/:not()/:has().
+const _SEL_VT_FN_PE = new Set(['view-transition-group','view-transition-image-pair','view-transition-old','view-transition-new']);
+const _selIsVtPe = (sub) => sub.kind === 'pe' && (_SEL_VT_FN_PE.has(sub.name) || sub.name === 'view-transition');
+// Deep-scan a parsed selector list for a view-transition pseudo-element (also
+// through :is/:where/:not/:has argument lists and `nth ... of` lists).
+const _selListHasVtPe = (list) => list.some((cx) => cx.some((part) =>
+  part.compound.subs.some((sub) =>
+    _selIsVtPe(sub) ||
+    (sub.args && sub.args.sel && _selListHasVtPe(sub.args.sel)) ||
+    (sub.args && sub.args.of && _selListHasVtPe(sub.args.of)))));
 // Parse a group of selectors. Returns the AST (array of complex selectors) or null.
-const _parseSelectorList = (src) => {
+const _parseSelectorList = (src, relative) => {
   const s = String(src);
   const n = s.length;
   let i = 0;
@@ -23869,6 +23885,10 @@ const _parseSelectorList = (src) => {
     if (s[i] === '(') { const fn = readFnArgs(); if (!fn) return null; args = parsePseudoArgs(lname, fn[0]); if (args === null) return null; i = fn[1]; }
     if (dbl) {
       if (!_SEL_PE.has(lname)) return null;
+      // A functional view-transition PE requires its <pt-name-selector> argument;
+      // the root `::view-transition` must NOT be functional.
+      if (_SEL_VT_FN_PE.has(lname)) { if (!args) return null; }
+      else if (lname === 'view-transition' && args) return null;
       return { kind: 'pe', name: lname, args };
     }
     if (_SEL_LEGACY_PE.has(lname) && !args) return { kind: 'pe', name: lname, args: null };
@@ -23877,7 +23897,24 @@ const _parseSelectorList = (src) => {
     return { kind: 'pc', name: lname, args };
   };
   function parsePseudoArgs(name, raw) {       // returns serialized-arg model or null
-    if (_SEL_NESTING_FN.has(name)) { const inner = _parseSelectorList(raw); return inner ? { sel: inner } : null; }
+    if (_SEL_VT_FN_PE.has(name)) {
+      // <pt-name-selector> = '*' | <custom-ident>. <custom-ident> excludes the
+      // CSS-wide keywords and `default`; an empty argument is invalid.
+      const a = raw.trim();
+      if (a === '*') return { raw: '*' };
+      const id = _selReadIdent(a, 0);
+      if (!id || id[1] !== a.length) return null;
+      if (_CSS_WIDE.has(a.toLowerCase()) || a.toLowerCase() === 'default') return null;
+      return { raw: _serIdent(a) };
+    }
+    if (_SEL_NESTING_FN.has(name)) {
+      // :has() takes a <relative-selector-list> (each complex selector may lead
+      // with a combinator); the others take a plain <complex-selector-list>.
+      const inner = _parseSelectorList(raw, name === 'has');
+      // Pseudo-elements (view-transition) are disallowed inside :is/:where/:not/:has.
+      if (!inner || _selListHasVtPe(inner)) return null;
+      return { sel: inner };
+    }
     if (_SEL_NTH_FN.has(name)) {
       const ofIdx = raw.search(/\sof\s/i);
       if (ofIdx >= 0) {
@@ -23913,12 +23950,34 @@ const _parseSelectorList = (src) => {
       else break;
     }
     if (!type && subs.length === 0) return null;
+    // A view-transition pseudo-element must end its compound: only `:only-child`
+    // may follow (and only on the functional PEs). No type/class/id/attr and no
+    // other pseudo may join it.
+    const peIdx = subs.findIndex(_selIsVtPe);
+    if (peIdx >= 0) {
+      if (type) return null;                    // a type selector can't co-occur with the PE
+      for (let k = peIdx + 1; k < subs.length; k++) {
+        const t2 = subs[k];
+        const compatible = t2.kind === 'pc' && !t2.args && t2.name === 'only-child' &&
+          _SEL_VT_FN_PE.has(subs[peIdx].name);
+        if (!compatible) return null;
+      }
+    }
     return { type, subs };
   };
-  const parseComplex = () => {
+  const parseComplex = (relativeStart) => {
+    // A <relative-selector> (inside :has()) may begin with a combinator, with an
+    // implied `:scope` on its left. Consume that leading combinator if present.
+    let leadComb = '';
+    if (relativeStart) {
+      const save = i; ws();
+      if (s[i] === '+' || s[i] === '>' || (s[i] === '~' && s[i + 1] !== '=')) { leadComb = s[i]; i++; ws(); }
+      else if (s[i] === '|' && s[i + 1] === '|') { leadComb = '||'; i += 2; ws(); }
+      else i = save;
+    }
     const first = parseCompound();
     if (!first) return null;
-    const parts = [{ comb: '', compound: first }];
+    const parts = [{ comb: leadComb, compound: first }];
     while (true) {
       const save = i;
       let sawWs = false;
@@ -23932,6 +23991,9 @@ const _parseSelectorList = (src) => {
       else { i = save; break; }
       const next = parseCompound();
       if (!next) { if (comb === ' ') { i = save; break; } return null; }
+      // A view-transition pseudo-element can't have a descendant/sibling — once one
+      // ends a compound, no further combinator+compound may follow it.
+      if (parts[parts.length - 1].compound.subs.some(_selIsVtPe)) return null;
       parts.push({ comb, compound: next });
     }
     return parts;
@@ -23940,7 +24002,7 @@ const _parseSelectorList = (src) => {
   if (i >= n) return null;
   const list = [];
   while (true) {
-    const cx = parseComplex();
+    const cx = parseComplex(relative);
     if (!cx) return null;
     list.push(cx);
     ws();
@@ -23957,9 +24019,12 @@ const _serSelList = (list, nsi) => list.map((cx) => _serComplex(cx, nsi)).join('
 function _serComplex(parts, nsi) {
   let out = '';
   for (const p of parts) {
-    if (p.comb === '') out += _serCompound(p.compound, nsi);
-    else if (p.comb === ' ') out += ' ' + _serCompound(p.compound, nsi);
-    else out += ' ' + p.comb + ' ' + _serCompound(p.compound, nsi);
+    const c = _serCompound(p.compound, nsi);
+    if (p.comb === '') out += c;
+    else if (p.comb === ' ') out += ' ' + c;
+    // A leading combinator (relative selector inside :has()) prints with no
+    // preceding space: `:has(> img)`, not `:has( > img)`.
+    else out += (out === '' ? p.comb + ' ' + c : ' ' + p.comb + ' ' + c);
   }
   return out;
 }
@@ -24095,6 +24160,18 @@ class CSSStyleRule extends CSSRule {
 }
 globalThis.CSSStyleRule = CSSStyleRule;
 
+// A style rule whose prelude is not a valid selector list fails to parse, so
+// inserting it throws SyntaxError (CSSOM §insert-a-css-rule step 5: "If parsed
+// rule is a syntax error, throw a SyntaxError"). Validated with the same
+// recursive-descent parser CSSStyleRule.selectorText uses (the Rust matching
+// engine can't be reused here — it rejects perfectly valid stylesheet
+// pseudo-elements like `::marker`/`::view-transition-*` that never match in
+// querySelector context). At-rules carry no selector, so they skip this.
+const _assertRuleSelectorValid = (rule) => {
+  if (rule && rule.type === 'style' && _parseSelectorList(rule.selectorText) === null)
+    throw new DOMException("Failed to insert the rule: '" + rule.selectorText + "' is not a valid selector.", "SyntaxError");
+};
+
 class CSSGroupingRule extends CSSRule {
   constructor() { super(); this._ruleListObj = new CSSRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj); }
   get cssRules() { return this._ruleList; }
@@ -24106,6 +24183,7 @@ class CSSGroupingRule extends CSSRule {
     if (parsed.length !== 1) throw new DOMException("insertRule expects exactly one rule.", "SyntaxError");
     // @import / @namespace (statement at-rules) cannot live inside a grouping rule.
     if (parsed[0].type === 'stmt') throw new DOMException("Cannot insert this rule type inside a grouping rule.", "HierarchyRequestError");
+    _assertRuleSelectorValid(parsed[0]);
     arr.splice(index, 0, _makeRule(parsed[0], this.parentStyleSheet, this));
     return index;
   }
@@ -24421,6 +24499,7 @@ class CSSStyleSheet {
     if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
     const parsed = _cssParseRuleList(text);
     if (parsed.length !== 1) throw new DOMException("insertRule expects exactly one rule.", "SyntaxError");
+    _assertRuleSelectorValid(parsed[0]);
     arr.splice(index, 0, _makeRule(parsed[0], this, null));
     return index;
   }
@@ -26999,6 +27078,17 @@ globalThis.CSS = {
     }
     // One-argument condition form: CSS.supports("property: value").
     const cond = String(prop);
+    // `selector(<complex-selector-list>)` support query (CSS Conditional §3 —
+    // supports(conditionText)). Returns whether the UA recognises the selector,
+    // validated through the same syntax parser CSSStyleRule.selectorText uses. A
+    // var() reference is never valid in a selector condition. Checked before the
+    // `property:value` split because a selector can itself contain a `:` (`:hover`).
+    const selCond = /^\s*selector\(([\s\S]*)\)\s*$/i.exec(cond);
+    if (selCond) {
+      const inner = selCond[1].trim();
+      if (!inner || /\bvar\(/i.test(inner)) return false;
+      return _parseSelectorList(inner) !== null;
+    }
     const idx = cond.indexOf(':');
     if (idx < 0) return false;
     return globalThis.CSS.supports(cond.slice(0, idx).trim(), cond.slice(idx + 1).trim());
