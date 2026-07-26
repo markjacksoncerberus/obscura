@@ -1212,7 +1212,11 @@ const _parseStyleDecls = (text) => {
         // non-zero number, multi-token) and malformed math (see the setProperty branch).
         // Canonicalized below.
         const low = value.toLowerCase();
-        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && low !== 'content') {
+        if (name !== 'flex-basis' && /^anchor-size\(/i.test(value)) {
+          const c = _canonAnchorSizeFn(value);             // anchor-size() valid on sizing props — canonicalize
+          if (c === null) continue;                        // out-of-grammar anchor-size() → drop
+          value = c;
+        } else if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value) && low !== 'content') {
           const ok = name === 'flex-basis' ? _isValidFlexBasis(value) : _isValidSizeValue(name, value);
           if (!ok) continue;                               // out-of-grammar → drop declaration
           if (_mathReject(value, ['length'], 'length')) continue;  // malformed math → drop
@@ -2118,7 +2122,14 @@ class CSSStyleDeclaration {
       // multi-token) AND malformed/mistyped math. CSS-wide keywords + var()/env() pass
       // through untouched; the value is canonicalized below by _canonLengthTimeMath.
       const low = stored.toLowerCase();
-      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && low !== 'content') {
+      if (name !== 'flex-basis' && /^anchor-size\(/i.test(stored)) {
+        // css-anchor-position anchor-size() is valid on the sizing props (a
+        // @position-try property) — canonicalize it (name-first, flip-order) rather
+        // than storing it raw. flex-basis (`content | <'width'>`) does NOT take it.
+        const c = _canonAnchorSizeFn(stored);
+        if (c === null) return;                              // out-of-grammar anchor-size() → ignore
+        stored = c;
+      } else if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored) && low !== 'content') {
         const ok = name === 'flex-basis' ? _isValidFlexBasis(stored) : _isValidSizeValue(name, stored);
         if (!ok) return;                                     // out-of-grammar → ignore
         if (_mathReject(stored, ['length'], 'length')) return;  // malformed math → ignore
@@ -21743,9 +21754,68 @@ const _canonAnchorFn = (token) => {
   }
   return 'anchor(' + (name ? name + ' ' : '') + side + (fb !== null ? ', ' + fb : '') + ')';
 };
-// margin/inset component = `auto | <length-percentage>` (signed). null → invalid.
+// ── css-anchor-position anchor-size() ────────────────────────────────────────
+// `anchor-size( [ <anchor-name> || <anchor-size> ]? , <length-percentage>? )` (CSS
+// Anchor Positioning 1). BOTH the <anchor-name> (a <dashed-ident>) and the
+// <anchor-size> keyword are OPTIONAL (unlike anchor()'s required <anchor-side>), so
+// `anchor-size()`, `anchor-size(--foo)` and `anchor-size(width)` are all valid. The
+// grammar's comma is elided along with an omitted adjacent optional (CSS Values 4
+// §comma elision): `anchor-size(10px)` = fallback-only (name+size omitted → the
+// preceding comma drops), while `anchor-size(, 10px)` and `anchor-size(--foo,)` are
+// INVALID (a comma with everything on one side omitted). Serialization: name FIRST,
+// then size, then `, <fallback>` — so `anchor-size(width --foo)` canonicalizes to
+// `anchor-size(--foo width)`. The fallback is a <length-percentage> — a literal, a
+// math function, or a NESTED anchor-size() (but NOT a nested anchor(): the fallback
+// grammar is <length-percentage>, and anchor() isn't one in a sizing context).
+// Accepted on the SIZING, INSET, and MARGIN properties (every @position-try property)
+// — broader than anchor(), which is inset-only. CAP (shared with anchor()): an
+// anchor-size() nested inside calc()/min()/… is rejected (the calc parser has no
+// anchor-size() leaf) — the calc-tree-simplification valid cases don't green.
+const _ANCHOR_SIZE_KW = new Set(['width', 'height', 'block', 'inline', 'self-block', 'self-inline']);
+const _canonAnchorSizeFn = (token) => {
+  const m = /^anchor-size\(([\s\S]*)\)$/i.exec(String(token).trim());
+  if (!m) return null;
+  const args = _commaSplitTop(m[1]);
+  if (args.length > 2) return null;                                            // at most `<head> , <fallback>`
+  const parseFb = (raw) => {
+    if (raw === '') return null;                                               // an empty fallback is invalid
+    return /^anchor-size\(/i.test(raw) ? _canonAnchorSizeFn(raw) : _canonLenPctSigned(raw, true);
+  };
+  // Parse a non-empty `[ <anchor-name> || <anchor-size> ]` head → {name, size} or null.
+  const parseHead = (src) => {
+    const head = _wsTokens(src);
+    if (head.length < 1 || head.length > 2) return null;
+    let name = null, size = null;
+    for (const tk of head) {
+      if (_isDashedIdent(tk)) { if (name !== null) return null; name = tk; }
+      else { const low = tk.toLowerCase(); if (!_ANCHOR_SIZE_KW.has(low) || size !== null) return null; size = low; }
+    }
+    return { name, size };
+  };
+  let name = null, size = null, fb = null;
+  const first = args.length >= 1 ? args[0].trim() : '';
+  if (args.length === 2) {
+    if (first === '') return null;                                             // `anchor-size(, 10px)` — comma with head omitted
+    const h = parseHead(first);
+    if (h === null) return null;
+    name = h.name; size = h.size;
+    fb = parseFb(args[1].trim());
+    if (fb === null) return null;
+  } else if (first !== '') {
+    const h = parseHead(first);
+    if (h !== null) { name = h.name; size = h.size; }
+    else { fb = parseFb(first); if (fb === null) return null; }               // comma-elided fallback-only: `anchor-size(10px)`
+  }
+  const inner = (name || '') + (name && size ? ' ' : '') + (size || '');
+  return 'anchor-size(' + (inner ? inner + (fb !== null ? ', ' + fb : '') : (fb !== null ? fb : '')) + ')';
+};
+// margin/inset component = `auto | <length-percentage> | anchor-size()` (signed). null
+// → invalid. anchor-size() is valid on BOTH margins and insets (a @position-try prop);
+// anchor() is inset-only and is handled ahead of this in _canonInsetComp.
 const _canonMarginInsetComp = (t) => {
-  const low = String(t).toLowerCase();
+  const s = String(t).trim();
+  if (/^anchor-size\(/i.test(s)) return _canonAnchorSizeFn(s);
+  const low = s.toLowerCase();
   return low === 'auto' ? 'auto' : _canonLenPctSigned(t, true);
 };
 // The inset longhands additionally accept the anchor() function (see above).
