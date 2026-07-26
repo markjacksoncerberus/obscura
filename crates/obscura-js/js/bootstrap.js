@@ -829,7 +829,57 @@ const _isBalancedDeclValue = (value) => {
 // `page-orientation` are `@page` descriptors (css-page-3). (The `@page` rule itself is
 // a separate CSSOM path; this only blocks the element-property misuse.)
 const _DESCRIPTOR_ONLY = new Set(['size', 'page-orientation']);
-const _parseStyleDecls = (text) => {
+// ── @page descriptor value engines (css-page-3) ──────────────────────────────
+// These descriptors are only meaningful INSIDE an `@page` rule (a CSSPageRule's
+// `.style`); on an element they are dropped (_DESCRIPTOR_ONLY above). The parse
+// path threads an `opts.page` flag from CSSPageRule so they canonicalize there
+// but stay rejected everywhere else.
+//
+// size = auto | <length [0,∞]>{1,2} | [ <page-size> || [ portrait | landscape ] ]
+// <page-size> = a5|a4|a3|b5|b4|jis-b5|jis-b4|letter|legal|ledger  (case-insensitive → lowercased)
+// The orientation keyword `portrait` is the default, so it is DROPPED when a
+// page-size keyword is also present (`letter portrait`→`letter`); `landscape` is
+// kept and serialized AFTER the page-size (`legal landscape`, `landscape legal`→`legal landscape`).
+const _PAGE_SIZE_KW = new Set(['a5', 'a4', 'a3', 'b5', 'b4', 'jis-b5', 'jis-b4', 'letter', 'legal', 'ledger']);
+const _PAGE_ORIENTATION_KW = new Set(['upright', 'rotate-left', 'rotate-right']);
+const _canonPageSizeLen = (t) => {
+  // A non-negative <length> with a real length unit (no %, no bare number, no
+  // negative, no calc — none appear in the descriptor grammar's tested surface).
+  if (!/^\+?(?:\d+\.?\d*|\.\d+)(?:px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vi|vb|vmin|vmax|cm|mm|in|pt|pc|q)$/i.test(t)) return null;
+  return _canonLPToken(t);
+};
+const _canonPageSize = (value) => {
+  const v = String(value).trim();
+  if (v === '') return null;
+  if (v.toLowerCase() === 'auto') return 'auto';
+  const toks = _wsTokens(v);
+  if (toks.length < 1 || toks.length > 2) return null;
+  // Dimension form: 1–2 non-negative lengths (a length may not mix with a keyword).
+  const lens = toks.map(_canonPageSizeLen);
+  if (lens.every((x) => x !== null)) return lens.join(' ');
+  // Keyword form: <page-size> || [ portrait | landscape ], each at most once.
+  let pageSize = null, orient = null;
+  for (const t of toks) {
+    const tl = t.toLowerCase();
+    if (_PAGE_SIZE_KW.has(tl)) { if (pageSize !== null) return null; pageSize = tl; }
+    else if (tl === 'portrait' || tl === 'landscape') { if (orient !== null) return null; orient = tl; }
+    else return null;
+  }
+  if (pageSize !== null) return orient === 'landscape' ? pageSize + ' landscape' : pageSize;
+  return orient;   // orientation alone (page-size null → orient non-null, else all-null already returned)
+};
+// page-orientation = upright | rotate-left | rotate-right (css-page-3, tentative).
+const _canonPageOrientation = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (toks.length !== 1) return null;
+  const tl = toks[0].toLowerCase();
+  return _PAGE_ORIENTATION_KW.has(tl) ? tl : null;
+};
+const _canonPageDescriptor = (name, value) =>
+  name === 'size' ? _canonPageSize(value)
+  : name === 'page-orientation' ? _canonPageOrientation(value)
+  : null;
+const _parseStyleDecls = (text, opts) => {
   const out = [];
   for (const part of String(text == null ? '' : text).split(';')) {
     const idx = part.indexOf(':');
@@ -847,7 +897,15 @@ const _parseStyleDecls = (text) => {
     } else {
       name = name.toLowerCase();
       if (_RADIUS_ALIAS[name]) name = _RADIUS_ALIAS[name];   // -webkit-border(-*)-radius → canonical (Compat legacy alias)
-      if (_DESCRIPTOR_ONLY.has(name)) continue;            // @page descriptor set as an element property → drop
+      if (_DESCRIPTOR_ONLY.has(name)) {
+        // @page descriptor (`size`/`page-orientation`): valid only inside an @page
+        // rule (opts.page), where it is canonicalized; on an element it is dropped.
+        if (opts && opts.page) {
+          const dv = _canonPageDescriptor(name, value);
+          if (dv !== null) out.push({ name, value: dv, important });
+        }
+        continue;
+      }
       value = value.trim();
       if (value === '') continue;
       value = _canonStandardValue(value);
@@ -1243,7 +1301,22 @@ class CSSStyleDeclaration {
     name = String(name);
     const custom = name.startsWith('--');
     if (custom) { if (!_isValidCustomPropName(name)) return; }
-    else { name = name.toLowerCase(); if (_DESCRIPTOR_ONLY.has(name)) return; }  // @page descriptor as element property → ignore
+    else {
+      name = name.toLowerCase();
+      if (_DESCRIPTOR_ONLY.has(name)) {
+        // @page descriptor: valid only on a CSSPageRule's style (_pageDescriptors),
+        // where it is canonicalized; on an element style it is ignored (CSSOM).
+        if (!this._pageDescriptors) return;
+        const raw = String(value == null ? '' : value).trim();
+        if (raw === '') { this.removeProperty(name); return; }
+        const dv = _canonPageDescriptor(name, raw);
+        if (dv === null) return;                                  // invalid descriptor value → ignore
+        this._props[name] = dv;
+        this._priority[name] = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        this._notifyChange();
+        return;
+      }
+    }
     value = String(value == null ? '' : value);
     if (custom && value !== '' && !_isBalancedDeclValue(value)) return; // invalid <declaration-value> → ignore
     if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
@@ -2582,7 +2655,7 @@ class CSSStyleDeclaration {
   }
   set cssText(v) {
     this._props = {}; this._priority = {};
-    for (const d of _parseStyleDecls(v)) {
+    for (const d of _parseStyleDecls(v, this._pageDescriptors ? { page: true } : undefined)) {
       // !important within a declaration block is not overridden by a later normal
       // declaration of the same property; otherwise later wins.
       if (this._priority[d.name] === 'important' && !d.important) continue;
@@ -23791,6 +23864,10 @@ const _cssParseRuleList = (cssText) => {
         // The prelude must be a single <dashed-ident>; anything else (no name,
         // non-dashed name, or two names) makes the whole at-rule invalid → drop it.
         if (_isFpvName(condition)) rules.push({ type: 'font-palette-values', name, condition, prelude, body });
+      } else if (name === 'page') {
+        // @page <page-selector-list>? { <declaration>* <margin-rule>* } → CSSPageRule.
+        // The declaration block (`size`, `margin`, …) becomes the rule's `.style`.
+        rules.push({ type: 'page', name, condition, prelude, body });
       } else {
         rules.push({ type: 'at', name, condition, prelude, body });
       }
@@ -24514,6 +24591,87 @@ class CSSStyleRule extends CSSRule {
 }
 globalThis.CSSStyleRule = CSSStyleRule;
 
+// @page page-selector grammar (css-page-3 §page-selectors):
+//   page-selector-list = <page-selector>#
+//   page-selector      = [ <ident-token>? <pseudo-page>* ]!   (at least one present)
+//   pseudo-page        = : [ left | right | first | blank ]
+// The page name is a case-PRESERVED <custom-ident>; the pseudo-pages are
+// case-INSENSITIVE (`:First`→`:first`). No whitespace may sit between the name and
+// its pseudos or between pseudos (`named :first` is invalid). Returns the canonical
+// selector-list string, or null if the whole list is invalid (per CSSOM the
+// selectorText setter then no-ops, keeping the previous value).
+const _PAGE_PSEUDO = new Set(['left', 'right', 'first', 'blank']);
+const _canonOnePageSelector = (sel) => {
+  if (/\s/.test(sel)) return null;                     // no interior whitespace
+  let i = 0, name = '';
+  if (sel[0] !== ':') {                                // optional leading page name (a CSS ident)
+    const m = /^-?[A-Za-z_-￿][-\w-￿]*/.exec(sel);
+    if (!m) return null;
+    name = m[0];
+    i = m[0].length;
+  }
+  const pseudos = [];
+  while (i < sel.length) {                             // zero+ :pseudo-page
+    if (sel[i] !== ':') return null;
+    const m = /^[A-Za-z-]+/.exec(sel.slice(i + 1));
+    if (!m) return null;
+    const pl = m[0].toLowerCase();
+    if (!_PAGE_PSEUDO.has(pl)) return null;
+    pseudos.push(pl);
+    i += 1 + m[0].length;
+  }
+  if (name === '' && pseudos.length === 0) return null;
+  return name + pseudos.map((p) => ':' + p).join('');
+};
+const _canonPageSelector = (text) => {
+  const s = String(text == null ? '' : text).trim();
+  if (s === '') return '';                             // empty selector = every page (valid)
+  const out = [];
+  for (let part of s.split(',')) {
+    part = part.trim();
+    if (part === '') return null;                      // empty list item → invalid
+    const c = _canonOnePageSelector(part);
+    if (c === null) return null;
+    out.push(c);
+  }
+  return out.join(', ');
+};
+
+// CSSPageRule (CSSOM §CSSPageRule) — an `@page` rule. Its declaration block becomes
+// the `.style` CSSStyleDeclaration, which (unlike an element's style) accepts the
+// @page descriptors `size`/`page-orientation` via the `_pageDescriptors` flag;
+// `.selectorText` is the page selector (canonicalized via `_canonPageSelector` —
+// case-preserved page name + lowercased `:left`/`:right`/`:first`/`:blank` pseudos),
+// and per CSSOM the setter no-ops on an invalid selector (keeps the old value).
+// Nested margin at-rules (`@top-center` …) are not modelled (CAP) — only the
+// declaration block is captured into `.style`.
+class CSSPageRule extends CSSRule {
+  constructor(desc) {
+    super();
+    const c = _canonPageSelector((desc && desc.condition) || '');
+    this._selectorText = c === null ? String((desc && desc.condition) || '').trim() : c;
+    const decl = new CSSStyleDeclaration();
+    decl._pageDescriptors = true;                          // allow size / page-orientation
+    this._styleDecl = _styleProxy(decl);
+    if (desc && desc.body) this._styleDecl.cssText = desc.body;
+  }
+  get type() { return 6; }
+  get selectorText() { return this._selectorText; }
+  set selectorText(v) {
+    const c = _canonPageSelector(v);
+    if (c === null) return;                                // invalid page selector → no-op (CSSOM)
+    this._selectorText = c;
+    try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
+  }
+  get style() { return this._styleDecl; }
+  set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
+  get cssText() {
+    const block = this._styleDecl.cssText;
+    return '@page' + (this._selectorText ? ' ' + this._selectorText : '') + ' { ' + (block ? block + ' ' : '') + '}';
+  }
+}
+globalThis.CSSPageRule = CSSPageRule;
+
 // A style rule whose prelude is not a valid selector list fails to parse, so
 // inserting it throws SyntaxError (CSSOM §insert-a-css-rule step 5: "If parsed
 // rule is a syntax error, throw a SyntaxError"). Validated with the same
@@ -24545,7 +24703,8 @@ class CSSGroupingRule extends CSSRule {
     const arr = this._ruleListObj._rules;
     index = index >>> 0;
     if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
-    arr.splice(index, 1);
+    const [removed] = arr.splice(index, 1);
+    if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
   }
 }
 globalThis.CSSGroupingRule = CSSGroupingRule;
@@ -24804,6 +24963,12 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     rule._parentRule = parentRule || null;
     return rule;
   }
+  if (desc.type === 'page') {
+    rule = new CSSPageRule(desc);
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
   if (desc.type === 'style') rule = new CSSStyleRule(desc.selectorText, desc.body);
   else if (desc.type === 'group' && desc.name === 'supports') rule = new CSSSupportsRule(desc.condition);
   else if (desc.type === 'group') rule = new CSSMediaRule(desc.condition);  // media/container/document → grouping
@@ -24861,7 +25026,8 @@ class CSSStyleSheet {
     const arr = this._ruleListObj._rules;
     index = index >>> 0;
     if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
-    arr.splice(index, 1);
+    const [removed] = arr.splice(index, 1);
+    if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
   }
   addRule(selector, style, index) {
     this.insertRule((selector || '') + ' { ' + (style || '') + ' }',
