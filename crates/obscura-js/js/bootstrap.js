@@ -2833,6 +2833,13 @@ class CSSStyleDeclaration {
       // !important within a declaration block is not overridden by a later normal
       // declaration of the same property; otherwise later wins.
       if (this._priority[d.name] === 'important' && !d.important) continue;
+      // Re-declaring a property makes it the latest declaration: delete + reinsert so
+      // insertion order (which drives serialization and the shorthand-collapse
+      // adjacency rule in _serializeDeclBlock) reflects last-write position — matching
+      // CSSOM "set a CSS declaration" and the setProperty path. Without this, a later
+      // longhand keeps its earlier slot and shorthands over-collapse across a logical
+      // group that the interleaving should have blocked.
+      if (d.name in this._props) { delete this._props[d.name]; delete this._priority[d.name]; }
       this._props[d.name] = d.value;
       this._priority[d.name] = d.important ? 'important' : '';
     }
@@ -2879,10 +2886,27 @@ const _styleProxy = (decl) => new Proxy(decl, {
   set(t, p, v) {
     if (typeof p === "string") {
       // Accessors / methods on the declaration (cssText, …) delegate to the real
-      // setter; everything else is a CSS property name routed through setProperty
-      // (kebab-cased) so all storage stays on one canonical key.
+      // setter.
       if (p in t) { t[p] = v; return true; }
-      t.setProperty(_cssPropToKebab(p), v == null ? '' : String(v)); return true;
+      // A CSSStyleDeclaration only exposes an IDL attribute for each SUPPORTED CSS
+      // property (plus custom properties and legacy vendor-prefixed aliases). Setting
+      // one of those routes through setProperty (kebab-cased) so all declaration
+      // storage stays on one canonical key. Any OTHER name (`style.COLOR`,
+      // `style.unknown`) is not a supported attribute, so per WebIDL it becomes a
+      // plain expando on the object — it never enters the declaration block / cssText,
+      // yet still reads back (matching browsers: `style.foo='x'; style.foo → 'x'` with
+      // an empty cssText). Vendor-prefixed names keep the existing raw-store path.
+      const kebab = _cssPropToKebab(p);
+      // A property already present in the declaration is always addressable by its IDL
+      // attribute (so `style.foo = ''` clears it, `style.foo = x` updates it) even if
+      // it is a raw-stored name absent from _CSS_KNOWN_PROPS — the declaration itself
+      // is the authority once a value is stored.
+      if (kebab.startsWith('--') || _CSS_KNOWN_PROPS.has(kebab) || _CSS_KNOWN_PROPS.has(_toCamel(kebab))
+          || _CSS_KEBAB_ALIAS[kebab] || /^-(webkit|moz|ms|o|apple|khtml|epub)-/.test(kebab)
+          || (t._props && kebab in t._props)) {
+        t.setProperty(kebab, v == null ? '' : String(v)); return true;
+      }
+      t[p] = v; return true;                                // unsupported property → expando
     }
     t[p] = v; return true;
   }
@@ -23908,8 +23932,22 @@ const _CSS_KNOWN_PROPS = (() => {
   add('border-radius');                                     // css-backgrounds-3 border-radius shorthand (reconstructed from its 4 corner longhands)
   for (const ln of _BORDER_RADIUS_LH) add(ln);              // the four physical border-*-radius corner longhands
   for (const k of Object.keys(_RADIUS_ALIAS)) add(k);       // -webkit-border(-*)-radius Compat legacy aliases
+  for (const k of Object.keys(_BORDER_EXPAND)) add(k);      // border/outline (+ per-edge/color/style/width, logical) shorthands
+  for (const k of Object.keys(_MASK_BORDER_LH)) add(k);     // the five mask-border-* longhands
+  add('mask-border'); add('mask-border-mode');              // the mask-border shorthand + its mode longhand
+  add('background');                                        // the `background` shorthand (reconstructed from its layer longhands)
+  add('border-image');                                      // the `border-image` shorthand (reconstructed from its 5 longhands)
+  add('grid'); add('grid-template');                        // the `grid` / `grid-template` shorthands (reconstructed)
+  add('image-resolution'); add('line-clamp');               // longhands with dedicated parsers, absent from _GCS_DEFAULTS
+  add('animation-timeline');                                // an animation longhand (an `animation` expansion target) absent from _GCS_DEFAULTS
   return set;
 })();
+// The (kebab) property names a computed style exposes when enumerated — every
+// property getComputedStyle can resolve a value for (CSSOM: a computed style
+// declaration's supported property indices). Custom properties with a computed
+// value are appended per element (see _computedCustomPropNames); these standard
+// names are element-independent so they are hoisted here.
+const _COMPUTED_STD_NAMES = Object.keys(_GCS_DEFAULTS).filter((k) => /^-?[a-z][a-z-]*$/.test(k));
 globalThis.getComputedStyle = (el, _pseudo) => {
   if (!el) el = document.body || {};
   const style = el?.style || el?._style || new CSSStyleDeclaration();
@@ -24142,10 +24180,15 @@ globalThis.getComputedStyle = (el, _pseudo) => {
   // value (css-properties-values-api get-computed-style-enumeration). Computed lazily
   // and cached on first access; the object is read synchronously by callers.
   let _names = null;
-  const enumNames = () => (_names || (_names = _computedCustomPropNames(el)));
+  const enumNames = () => (_names || (_names = _COMPUTED_STD_NAMES.concat(_computedCustomPropNames(el))));
   return new Proxy(style, {
     get(target, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
+      // A computed style declaration serializes to the empty string — cssText is not
+      // meaningful for a read-only computed block (CSSOM §6.7.1). Intercepted before
+      // the `prop in target` delegation, which would otherwise echo the underlying
+      // element's inline declaration.
+      if (prop === 'cssText') return '';
       if (prop === 'getPropertyValue') return (name) => resolve(String(name));
       if (prop === 'length') return enumNames().length;
       if (prop === 'item') return (i) => enumNames()[i >>> 0] || '';
