@@ -1584,9 +1584,13 @@ class CSSStyleDeclaration {
         return;                                                 // expanded; no shorthand key kept
       }
     }
-    if (!custom && _BORDER_EXPAND[name] && !/\bvar\(/i.test(stored)) {
-      // border/outline shorthand (no var()): expand into — and store as — its
-      // longhands so `el.style.borderTopColor` reads back. Invalid → ignore.
+    if (!custom && _BORDER_EXPAND[name] && !/\bvar\(/i.test(stored) && !_CSS_WIDE.has(stored.toLowerCase())) {
+      // border/outline shorthand (no var(), not a CSS-wide keyword): expand into —
+      // and store as — its longhands so `el.style.borderTopColor` reads back.
+      // Invalid → ignore. (A CSS-wide keyword can't be split across the longhands
+      // and is handled below like text-decoration/border-radius: clear the
+      // longhands and keep it as a single shorthand key so it round-trips —
+      // `border:initial` → getPropertyValue('border')==='initial'.)
       const lh = _expandBorderShorthand(name, stored);
       if (!lh) return;
       delete this._props[name]; delete this._priority[name];   // drop any prior var()-stored shorthand key
@@ -1595,6 +1599,13 @@ class CSSStyleDeclaration {
       finally { this._styleBatch--; }
       this._notifyChange();                                    // one reflect for the whole shorthand
       return;                                                  // expanded; no shorthand key kept
+    }
+    if (!custom && _BORDER_EXPAND[name] && !/\bvar\(/i.test(stored)) {
+      // border/outline shorthand set to a CSS-wide keyword: clear any expanded
+      // longhands, then fall through to single-key storage below (getPropertyValue
+      // returns the stored keyword directly at the `_BORDER_EXPAND` reconstruction
+      // guard). Mirrors the flex/text-decoration/list-style CSS-wide handling.
+      for (const ln of _BORDER_EXPAND[name]) { delete this._props[ln]; delete this._priority[ln]; }
     }
     if (!custom && _SCROLL_SH_LH[name] && !/\bvar\(/i.test(stored)) {
       // scroll-margin/scroll-padding shorthand (physical 1–4 / logical block-inline
@@ -25621,6 +25632,68 @@ class CSSGenericRule extends CSSRule {
 const _KF_QUOTE_NAMES = new Set(['initial', 'inherit', 'unset', 'revert', 'revert-layer', 'default', 'none']);
 const _serializeKeyframesName = (n) =>
   _KF_QUOTE_NAMES.has(String(n).toLowerCase()) ? JSON.stringify(String(n)) : String(n);
+// A <keyframe-selector> is `from | to | <percentage>` (CSS Animations 1 §2 keyframes),
+// NOT a CSS selector — so a @keyframes body CANNOT be parsed with `_cssParseRuleList`
+// (which drops any block whose prelude fails `_parseSelectorList`, i.e. every `0%`/
+// `100%`/`from`/`to`). Canonicalize a comma-separated selector list (lowercasing the
+// `from`/`to` keywords; percentages kept verbatim, but must lie in [0%,100%]); return
+// null (drop the whole keyframe block) if any selector is out of grammar.
+const _KF_SEL_RE = /^(?:from|to|(?:\d+\.?\d*|\.\d+)%)$/i;
+const _canonKeyframeSelectorList = (sel) => {
+  const parts = String(sel).split(',').map((s) => s.trim());
+  if (!parts.length || parts.some((p) => p === '')) return null;
+  const out = [];
+  for (const p of parts) {
+    if (!_KF_SEL_RE.test(p)) return null;
+    const low = p.toLowerCase();
+    if (low !== 'from' && low !== 'to') {
+      const num = parseFloat(low);                 // <percentage> must be within [0,100]
+      if (!(num >= 0 && num <= 100)) return null;
+    }
+    out.push(low);
+  }
+  return out.join(', ');
+};
+// Parse a @keyframes body (or a single appendRule text) into { selectorText, body }
+// keyframe blocks. Same brace/string-aware block scan as `_cssParseRuleList`, but the
+// prelude is validated as a <keyframe-selector># — an invalid one drops that block.
+const _parseKeyframeBlocks = (cssText) => {
+  const css = String(cssText == null ? '' : cssText).replace(/\/\*[\s\S]*?\*\//g, '');
+  const out = []; let i = 0; const n = css.length;
+  while (i < n) {
+    while (i < n && /\s/.test(css[i])) i++;
+    if (i >= n) break;
+    let j = i, inStr = null;
+    while (j < n) {                                // scan the prelude up to a top-level `{`
+      const c = css[j];
+      if (!inStr && c === '\\') { j += 2; continue; }
+      if (inStr) { if (c === inStr && css[j - 1] !== '\\') inStr = null; j++; continue; }
+      if (c === '"' || c === "'") { inStr = c; j++; continue; }
+      if (c === '{') break;
+      j++;
+    }
+    if (j >= n) break;                             // dangling prelude, no block
+    const prelude = css.slice(i, j).trim();
+    let k = j + 1; const stack = ['{']; inStr = null;
+    while (k < n && stack.length > 0) {            // read the balanced { … } block
+      const c = css[k];
+      if (!inStr && c === '\\') { k += 2; continue; }
+      if (inStr) { if (c === inStr && css[k - 1] !== '\\') inStr = null; k++; continue; }
+      if (c === '"' || c === "'") inStr = c;
+      else if (c === '{' || c === '(' || c === '[') stack.push(c);
+      else if (c === '}' || c === ')' || c === ']') {
+        const top = stack[stack.length - 1];
+        if ((c === '}' && top === '{') || (c === ')' && top === '(') || (c === ']' && top === '[')) stack.pop();
+      }
+      k++;
+    }
+    const body = css.slice(j + 1, k - 1);
+    i = k;
+    const sel = _canonKeyframeSelectorList(prelude);
+    if (sel !== null) out.push({ selectorText: sel, body });
+  }
+  return out;
+};
 class CSSKeyframeRule extends CSSRule {
   constructor(keyText, body) {
     super();
@@ -25650,8 +25723,8 @@ class CSSKeyframesRule extends CSSRule {
     this._name = String((desc && desc.condition) || '').trim();
     this._ruleListObj = new CSSRuleList();
     this._ruleList = _ruleListProxy(this._ruleListObj);
-    for (const d of _cssParseRuleList((desc && desc.body) || '')) {
-      if (d.type === 'style') this._ruleListObj._rules.push(_kfRule(d, this));
+    for (const d of _parseKeyframeBlocks((desc && desc.body) || '')) {
+      this._ruleListObj._rules.push(_kfRule(d, this));
     }
   }
   get type() { return 7; }
@@ -25660,7 +25733,7 @@ class CSSKeyframesRule extends CSSRule {
   get cssRules() { return this._ruleList; }
   get length() { return this._ruleListObj._rules.length; }
   appendRule(text) {
-    for (const d of _cssParseRuleList(text)) if (d.type === 'style') this._ruleListObj._rules.push(_kfRule(d, this));
+    for (const d of _parseKeyframeBlocks(text)) this._ruleListObj._rules.push(_kfRule(d, this));
   }
   findRule(select) {
     const key = String(select).trim();
@@ -28458,6 +28531,7 @@ globalThis.CSS = {
       }
       if (_BORDER_EXPAND[name]) {                          // border/outline shorthand
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
+        if (_CSS_WIDE.has(_canonStandardValue(val).toLowerCase())) return true;  // CSS-wide keyword
         return _expandBorderShorthand(name, val) != null;  // else validate by expanding
       }
       if (_ALIGN_SHORTHAND_LH[name] || _GRID_GAP_ALIAS[name]) {  // gap/grid-gap/place-*/grid-*-gap
