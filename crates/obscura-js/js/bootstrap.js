@@ -23961,6 +23961,302 @@ globalThis.getSelection = _markNative(function getSelection() {
 // cascade reads adoptedStyleSheets (see _buildCascade) so getComputedStyle
 // honours adopted constructable sheets.
 
+// ── CSS Properties & Values API: @property / CSS.registerProperty ─────────────
+// A registered custom property is defined by a `syntax` string (the grammar its
+// values must match), an `inherits` flag, and — unless the syntax is the universal
+// `*` — an `initial-value` that must PARSE against the syntax AND be
+// "computationally independent" (no font-relative units, no var()). This is the
+// shared engine behind both `CSS.registerProperty(...)` and the `@property`
+// at-rule (→ CSSPropertyRule). All JS — no Rust.
+
+// The data types a syntax component may name (css-properties-values-api §syntax).
+// `<transform-list>` is pre-multiplied (≡ <transform-function>+) so a component
+// using it may NOT carry a `+`/`#` multiplier.
+const _PROP_SYNTAX_TYPES = new Set([
+  'length', 'number', 'percentage', 'length-percentage', 'color', 'image', 'url',
+  'integer', 'angle', 'time', 'resolution', 'transform-function', 'transform-list',
+  'custom-ident', 'string',
+]);
+// Length units that are NOT computationally independent (they depend on the font),
+// so they are rejected in a registered property's initial value even though they
+// are valid <length> units elsewhere. Absolute / viewport / container units are OK.
+const _PROP_FONTREL_UNITS = new Set([
+  'em', 'rem', 'ex', 'rex', 'ch', 'rch', 'ic', 'ric', 'cap', 'rcap', 'lh', 'rlh',
+]);
+// A bare numeric/dimension token → { num, unit } (unit '' for a plain number), or
+// null. No calc — a single numeric token only.
+const _PROP_NUM_RE = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)([a-z%]*)$/i;
+const _matchDim = (t) => {
+  const m = _PROP_NUM_RE.exec(t);
+  return m ? { num: parseFloat(m[1]), unit: m[2].toLowerCase() } : null;
+};
+// Does the value begin with a CSS math function? (calc/min/max/…)
+const _isMathFn = (t) => /^(?:calc|min|max|clamp|round|mod|rem|abs|sign|sin|cos|tan|asin|acos|atan|atan2|pow|sqrt|hypot|exp|log)\(/i.test(t);
+// Does the string contain a dimension with a font-relative unit? (used to reject
+// non-computationally-independent lengths inside a calc()).
+const _hasFontRelUnit = (s) => {
+  const re = /(?:^|[^\w.])[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?([a-z]+)/gi;
+  let m;
+  while ((m = re.exec(s))) if (_PROP_FONTREL_UNITS.has(m[1].toLowerCase())) return true;
+  return false;
+};
+// Strip CSS comments (string-aware — `/*` inside a string is literal).
+const _stripCssComments = (s) => {
+  let out = '', i = 0, inStr = null;
+  while (i < s.length) {
+    const c = s[i];
+    if (inStr) { out += c; if (c === '\\') { out += s[i + 1] || ''; i += 2; continue; } if (c === inStr) inStr = null; i++; continue; }
+    if (c === '"' || c === "'") { inStr = c; out += c; i++; continue; }
+    if (c === '/' && s[i + 1] === '*') { i += 2; while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) i++; i += 2; out += ' '; continue; }
+    out += c; i++;
+  }
+  return out;
+};
+// Is `p` a single <string> token (closed, or EOF-auto-closed per CSS tokenizing)?
+const _propMatchString = (p) =>
+  /^"(?:[^"\\]|\\[\s\S])*"$/.test(p) || /^'(?:[^'\\]|\\[\s\S])*'$/.test(p) ||   // closed "…" / '…'
+  /^"(?:[^"\\\n]|\\[\s\S])*$/.test(p) || /^'(?:[^'\\\n]|\\[\s\S])*$/.test(p);   // unclosed → EOF-closed
+// Is `p` a single <image>? (url / gradient / image-set / cross-fade / light-dark).
+const _propMatchImage = (p) => {
+  const toks = _wsTokens(p);
+  if (toks.length !== 1) return false;
+  const t = toks[0];
+  if (/^light-dark\(/i.test(t)) {                          // light-dark(<image>|none, <image>|none)
+    const inner = t.slice(t.indexOf('(') + 1, t.lastIndexOf(')'));
+    const parts = _splitCommasTopLevel(inner).map((x) => x.trim());
+    return parts.length === 2 && parts.every((x) => x.toLowerCase() === 'none' || _propMatchImage(x));
+  }
+  if (!_BG_IMAGE_FN_RE.test(t)) return false;              // not url()/gradient()/image-set()/…
+  return !(_imageFuncInvalid(p) || _gradientInvalid(p) || _crossFadeInvalid(p));
+};
+// Match a single value token against a base data type (no multiplier).
+const _propMatchType = (type, part) => {
+  const p = part.trim();
+  if (p === '') return false;
+  const math = _isMathFn(p);
+  switch (type) {
+    case 'length': {
+      if (/^[+-]?0+$/.test(p)) return true;                                // bare zero is a valid <length>
+      if (math) return _mathValid(p, ['length'], null) && !_hasFontRelUnit(p);
+      const d = _matchDim(p);
+      return !!d && d.unit !== '' && d.unit !== '%' && _MATH_UNIT_TYPE[d.unit] === 'length' && !_PROP_FONTREL_UNITS.has(d.unit);
+    }
+    case 'percentage': {
+      if (math) return _mathValid(p, ['percentage'], 'percentage');
+      const d = _matchDim(p);
+      return !!d && d.unit === '%';
+    }
+    case 'length-percentage': {
+      if (/^[+-]?0+$/.test(p)) return true;
+      if (math) return _mathValid(p, ['length', 'percentage'], 'length') && !_hasFontRelUnit(p);
+      const d = _matchDim(p);
+      if (!d) return false;
+      if (d.unit === '%') return true;
+      return d.unit !== '' && _MATH_UNIT_TYPE[d.unit] === 'length' && !_PROP_FONTREL_UNITS.has(d.unit);
+    }
+    case 'number': {
+      if (math) return _mathValid(p, ['number'], null);
+      const d = _matchDim(p);
+      return !!d && d.unit === '';
+    }
+    case 'integer': {
+      if (math) return _mathValid(p, ['number'], null);                    // calc rounds a <number> to integer
+      return /^[+-]?\d+$/.test(p);                                         // literal: no decimal/exponent
+    }
+    case 'angle': {
+      if (math) return _mathValid(p, ['angle'], null);
+      const d = _matchDim(p);
+      return !!d && _MATH_UNIT_TYPE[d.unit] === 'angle';
+    }
+    case 'time': {
+      if (math) return _mathValid(p, ['time'], null);
+      const d = _matchDim(p);
+      return !!d && _MATH_UNIT_TYPE[d.unit] === 'time';
+    }
+    case 'resolution': {
+      if (math) return _mathValid(p, ['resolution'], null);
+      const d = _matchDim(p);
+      return !!d && _MATH_UNIT_TYPE[d.unit] === 'resolution' && d.num >= 0;  // negative resolution is invalid
+    }
+    case 'color': return _isValidColor(p);
+    case 'image': return _propMatchImage(p);
+    case 'url': return _wsTokens(p).length === 1 && (/^url\(\s*(?:"[^"\n]*"|'[^'\n]*'|[^\s"'()\\]*)\s*\)$/i.test(p) || /^src\(/i.test(p));
+    case 'custom-ident': {
+      if (!_GRID_CI_RE.test(p)) return false;
+      const low = _unescapeCssIdent(p).toLowerCase();
+      return !_CSS_WIDE.has(low) && low !== 'default';
+    }
+    case 'string': return _propMatchString(p);
+    case 'transform-function': return _wsTokens(p).length === 1 && _isValidTransform(p);
+    case 'transform-list': return _isValidTransform(p);
+    default: return false;
+  }
+};
+// Match a whole value against one syntax component (applying its multiplier).
+const _propMatchComponent = (comp, value) => {
+  if (comp.mult === '') {
+    if (comp.kind === 'ident') {
+      const t = value.trim();
+      return _GRID_CI_RE.test(t) && _unescapeCssIdent(t) === comp.ident;
+    }
+    return _propMatchType(comp.name, value);
+  }
+  const parts = comp.mult === '#' ? _splitCommasTopLevel(value) : _wsTokens(value);
+  if (!parts.length) return false;
+  return parts.every((x) => {
+    const t = x.trim();
+    if (t === '') return false;
+    return comp.kind === 'ident'
+      ? (_GRID_CI_RE.test(t) && _unescapeCssIdent(t) === comp.ident)
+      : _propMatchType(comp.name, t);
+  });
+};
+// Parse a `syntax` descriptor string into a structured definition, or null if it
+// is not a valid syntax string. Returns { universal:true } for `*`, else
+// { components: [{ kind, name?|ident?, mult }] }.
+const _parsePropSyntax = (raw) => {
+  const trimmed = String(raw).trim();                      // whitespace around the whole string is allowed
+  if (trimmed === '') return null;
+  if (trimmed === '*') return { universal: true };
+  const components = [];
+  for (const rawPart of trimmed.split('|')) {
+    let p = rawPart.trim();
+    if (p === '') return null;                             // empty component (leading/trailing/`||`)
+    let mult = '';
+    const last = p[p.length - 1];
+    if (last === '+' || last === '#') { mult = last; p = p.slice(0, -1); }
+    if (p[0] === '<') {                                    // a data type: `<name>`, known lowercase name only
+      const m = /^<([a-z-]+)>$/.exec(p);
+      if (!m || !_PROP_SYNTAX_TYPES.has(m[1])) return null;
+      if (m[1] === 'transform-list' && mult) return null; // pre-multiplied → no multiplier allowed
+      components.push({ kind: 'type', name: m[1], mult });
+      continue;
+    }
+    if (!_GRID_CI_RE.test(p)) return null;                 // a custom keyword: one <custom-ident>
+    const low = _unescapeCssIdent(p).toLowerCase();
+    if (_CSS_WIDE.has(low) || low === 'default') return null;
+    components.push({ kind: 'ident', ident: _unescapeCssIdent(p), mult });
+  }
+  return { components };
+};
+// A valid <declaration-value> for the universal `*` syntax: balanced brackets, no
+// bad-string / bad-url, no top-level `;` or `!`, and (for @property) no CSS-wide
+// keyword and no var()/env() substitution.
+const _isValidDeclValue = (s) => {
+  if (!s) return false;
+  const stack = []; let i = 0; const n = s.length;
+  while (i < n) {
+    const c = s[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c === '"' || c === "'") {                          // consume a string; newline before close = bad-string
+      i++;
+      while (i < n) { const d = s[i]; if (d === '\\') { i += 2; continue; } if (d === '\n' || d === '\r' || d === '\f') return false; if (d === c) { i++; break; } i++; }
+      continue;                                            // EOF without close → auto-closed, OK
+    }
+    if ((c === 'u' || c === 'U') && /^url\(/i.test(s.slice(i)) && !(i > 0 && /[\w-]/.test(s[i - 1]))) {
+      let j = i + 4;                                       // an unquoted url( … ) — detect a bad-url
+      while (j < n && /\s/.test(s[j])) j++;
+      if (s[j] === '"' || s[j] === "'") { i += 4; continue; }  // url("…") is a normal function/string token
+      let bad = false;
+      while (j < n) {
+        const d = s[j];
+        if (d === ')') break;
+        if (d === '\\') { j += 2; continue; }
+        if (/\s/.test(d)) { while (j < n && /\s/.test(s[j])) j++; if (s[j] !== ')') bad = true; break; }
+        if (d === '"' || d === "'" || d === '(') { bad = true; break; }
+        j++;
+      }
+      if (bad) return false;
+      i = j < n ? j + 1 : n; continue;                     // EOF → auto-closed url, OK
+    }
+    if (c === '(' || c === '[' || c === '{') { stack.push(c); i++; continue; }
+    if (c === ')' || c === ']' || c === '}') {
+      if (!stack.length) return false;
+      const o = stack.pop();
+      if ((c === ')' && o !== '(') || (c === ']' && o !== '[') || (c === '}' && o !== '{')) return false;
+      i++; continue;
+    }
+    if (c === ';') return false;
+    if (c === '!' && stack.length === 0) return false;
+    i++;
+  }
+  return true;                                             // unclosed brackets/strings auto-close → valid
+};
+const _isPropUniversalValue = (v) => {
+  if (_CSS_WIDE.has(v.trim().toLowerCase())) return false; // initial/inherit/unset/revert/revert-layer
+  if (/(?:^|[^\w-])(?:var|env)\(/i.test(v)) return false;  // no substitution in a registered initial value
+  return _isValidDeclValue(v);                             // NOT trimmed: a newline after an opening quote is a bad-string
+};
+// Does `rawValue` match the parsed syntax definition `syn`?
+const _propValueValid = (syn, rawValue) => {
+  const stripped = _stripCssComments(String(rawValue));
+  if (syn.universal) return _isPropUniversalValue(stripped);
+  const value = stripped.trim();
+  for (const comp of syn.components) if (_propMatchComponent(comp, value)) return true;
+  return false;
+};
+// Registered custom properties (name → definition). Populated by
+// CSS.registerProperty and valid @property rules; kept for duplicate detection.
+const _registeredProps = new Map();
+// Parse & validate an `@property` rule's `syntax` descriptor value (a <string>).
+// Returns { value, syn } (value = the unquoted, unescaped syntax string used by
+// CSSPropertyRule.syntax) or null.
+const _parsePropSyntaxDescriptor = (raw) => {
+  const s = raw.trim();
+  const m = /^"((?:[^"\\]|\\[\s\S])*)"$/.exec(s) || /^'((?:[^'\\]|\\[\s\S])*)'$/.exec(s);
+  if (!m) return null;
+  const value = _unescapeCssIdent(m[1]);
+  const syn = _parsePropSyntax(value);
+  return syn === null ? null : { value, syn };
+};
+// Split an @property declaration block into { syntax, inherits, initialValue }
+// (raw descriptor value strings; last declaration of a name wins).
+const _parsePropRuleBody = (body) => {
+  const out = { syntax: undefined, inherits: undefined, initialValue: undefined };
+  const decls = []; let depth = 0, inStr = null, cur = '';
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (inStr) { cur += c; if (c === inStr && body[i - 1] !== '\\') inStr = null; continue; }
+    if (c === '"' || c === "'") { inStr = c; cur += c; continue; }
+    if (c === '(' || c === '[' || c === '{') { depth++; cur += c; continue; }
+    if (c === ')' || c === ']' || c === '}') { if (depth > 0) depth--; cur += c; continue; }
+    if (c === ';' && depth === 0) { decls.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  decls.push(cur);
+  for (const d of decls) {
+    const idx = d.indexOf(':');
+    if (idx < 0) continue;
+    const name = d.slice(0, idx).trim().toLowerCase();
+    const val = d.slice(idx + 1).trim();
+    if (name === 'syntax') out.syntax = val;
+    else if (name === 'inherits') out.inherits = val;
+    else if (name === 'initial-value') out.initialValue = val;
+  }
+  return out;
+};
+// Validate an `@property NAME { … }` rule; returns the CSSPropertyRule fields, or
+// null if the rule is invalid (invalid @property rules are dropped, not exposed).
+const _validatePropertyRule = (condition, body) => {
+  const name = String(condition || '').trim();
+  if (!/^--/.test(name) || !_GRID_CI_RE.test(name)) return null;   // name must be a dashed-ident
+  const d = _parsePropRuleBody(body || '');
+  if (d.syntax === undefined || d.inherits === undefined) return null;  // syntax + inherits are required
+  const inhLow = d.inherits.trim().toLowerCase();
+  if (inhLow !== 'true' && inhLow !== 'false') return null;
+  const sv = _parsePropSyntaxDescriptor(d.syntax);
+  if (sv === null) return null;
+  const hasInitial = d.initialValue !== undefined;
+  if (!sv.syn.universal && !hasInitial) return null;               // non-universal requires initial-value
+  if (hasInitial && !_propValueValid(sv.syn, d.initialValue)) return null;
+  return {
+    name: _unescapeCssIdent(name),
+    syntaxValue: sv.value,
+    inherits: inhLow === 'true',
+    initialValue: hasInitial ? d.initialValue : null,
+  };
+};
+
 // Recursive CSS rule-list parser: returns a tree of plain descriptors. Unlike
 // _cssSplitRules (which flattens top-level style rules for the cascade), this
 // preserves at-rules and their nested rule lists, tracking string and bracket
@@ -24035,6 +24331,12 @@ const _cssParseRuleList = (cssText) => {
         // @font-face { <declaration-list> } → CSSFontFaceRule. Its declaration block
         // (`src`, `font-family`, the metric overrides, …) becomes the rule's `.style`.
         rules.push({ type: 'font-face', name, condition, prelude, body });
+      } else if (name === 'property') {
+        // @property --name { syntax; inherits; initial-value } → CSSPropertyRule.
+        // An invalid rule (bad name, missing/invalid descriptor, initial-value that
+        // doesn't match the syntax) is dropped entirely (css-properties-values-api §cssom).
+        const prop = _validatePropertyRule(condition, body);
+        if (prop) rules.push({ type: 'property', name, condition, prelude, body, _prop: prop });
       } else {
         rules.push({ type: 'at', name, condition, prelude, body });
       }
@@ -24863,6 +25165,36 @@ class CSSFontFaceRule extends CSSRule {
 }
 globalThis.CSSFontFaceRule = CSSFontFaceRule;
 
+// CSSPropertyRule (css-properties-values-api §CSSPropertyRule) — an `@property`
+// rule. Read-only `.name` (the unescaped `--foo`), `.syntax` (the syntax string
+// verbatim, incl. surrounding whitespace), `.inherits` (boolean), `.initialValue`
+// (the authored declaration text, or null when absent). `.type` is 0 — @property
+// is not one of the legacy numbered CSSRule types. Invalid rules never reach here
+// (they are dropped in _cssParseRuleList / _validatePropertyRule).
+class CSSPropertyRule extends CSSRule {
+  constructor(desc) {
+    super();
+    const p = desc._prop;
+    this._name = p.name;
+    this._syntax = p.syntaxValue;
+    this._inherits = p.inherits;
+    this._initialValue = p.initialValue;
+  }
+  get type() { return 0; }
+  get name() { return this._name; }
+  get syntax() { return this._syntax; }
+  get inherits() { return this._inherits; }
+  get initialValue() { return this._initialValue; }
+  get cssText() {
+    let out = '@property ' + _serializeCssIdent(this._name) + ' { ';
+    out += 'syntax: ' + _serCssString(this._syntax) + '; ';
+    out += 'inherits: ' + (this._inherits ? 'true' : 'false') + '; ';
+    if (this._initialValue !== null) out += 'initial-value: ' + this._initialValue + '; ';
+    return out + '}';
+  }
+}
+globalThis.CSSPropertyRule = CSSPropertyRule;
+
 // A style rule whose prelude is not a valid selector list fails to parse, so
 // inserting it throws SyntaxError (CSSOM §insert-a-css-rule step 5: "If parsed
 // rule is a syntax error, throw a SyntaxError"). Validated with the same
@@ -25162,6 +25494,12 @@ const _makeRule = (desc, parentSheet, parentRule) => {
   }
   if (desc.type === 'font-face') {
     rule = new CSSFontFaceRule(desc);
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
+  if (desc.type === 'property') {
+    rule = new CSSPropertyRule(desc);
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
@@ -27815,6 +28153,46 @@ globalThis.CSS = {
     const idx = cond.indexOf(':');
     if (idx < 0) return false;
     return globalThis.CSS.supports(cond.slice(0, idx).trim(), cond.slice(idx + 1).trim());
+  },
+  // CSS.registerProperty(definition) — css-properties-values-api §the-registerproperty-function.
+  // Validates the definition (name is a dashed <custom-ident>; syntax is a valid
+  // syntax string; a non-universal syntax requires an initialValue that parses
+  // against it and is computationally independent) and records the registration.
+  // Every validity failure is a SyntaxError DOMException (per the spec + tests).
+  registerProperty(definition) {
+    // The argument is a PropertyDefinition dictionary: `name` and `inherits` are
+    // required members, `syntax` defaults to "*", `initialValue` is optional. A
+    // non-object argument or a missing required member is a TypeError (WebIDL);
+    // every other validity failure is a SyntaxError DOMException.
+    if (definition === null || typeof definition !== 'object')
+      throw new TypeError("Failed to execute 'registerProperty': parameter is not an object.");
+    if (definition.name === undefined)
+      throw new TypeError("Failed to execute 'registerProperty': required member name is undefined.");
+    if (definition.inherits === undefined)
+      throw new TypeError("Failed to execute 'registerProperty': required member inherits is undefined.");
+    // A <custom-property-name> is any string beginning with two dashes — it need
+    // not be a full valid ident (`--a, b` and `['--name',3]`→"--name,3" are OK).
+    const name = String(definition.name);
+    if (!/^--/.test(name))
+      throw new DOMException("The name provided ('" + name + "') is not a custom property name.", "SyntaxError");
+    const syntaxRaw = definition.syntax === undefined ? '*' : definition.syntax;   // syntax defaults to "*"
+    const syn = _parsePropSyntax(syntaxRaw);
+    if (syn === null)
+      throw new DOMException("The syntax provided is not a valid custom property syntax string.", "SyntaxError");
+    const hasInitial = definition.initialValue !== undefined;
+    if (!syn.universal || hasInitial) {
+      if (!hasInitial)
+        throw new DOMException("An initial value is required for a non-universal syntax.", "SyntaxError");
+      if (!_propValueValid(syn, definition.initialValue))
+        throw new DOMException("The initial value provided does not parse for the given syntax.", "SyntaxError");
+    }
+    if (_registeredProps.has(name))
+      throw new DOMException("The name provided has already been registered.", "InvalidModificationError");
+    _registeredProps.set(name, {
+      syntax: String(syntaxRaw),
+      inherits: !!definition.inherits,
+      initialValue: hasInitial ? String(definition.initialValue) : null,
+    });
   },
   escape(s){return s;}
 };
