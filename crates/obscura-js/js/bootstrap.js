@@ -1064,6 +1064,17 @@ const _parseStyleDecls = (text, opts) => {
         if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(value)) continue;      // invalid <bg-position> → drop
         value = _serializePositionSpecified(value);
       }
+      else if (name === 'font-family') {
+        // Canonicalize a valid font-family the same way setProperty does: a quoted
+        // <family-name> that is a valid unquoted <custom-ident> sequence drops its
+        // quotes (CSSOM / css-fonts-4 issue #5846). CSS-wide / var()-env() untouched;
+        // an invalid value is left as-is (the generic light canon already ran).
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = _canonFontFamily(value);
+          if (c !== null) value = c;
+        }
+      }
       else if (_ORIGIN_PROPS.has(name)) {
         if (!_isValidOrigin(name, value)) continue;        // invalid origin → drop
         value = _serializeOriginSpecified(name, value);
@@ -1671,7 +1682,11 @@ class CSSStyleDeclaration {
       const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
       const clear = () => {
         delete this._props['font']; delete this._priority['font'];
+        // `font` resets every longhand it covers — the font-shorthand longhands PLUS
+        // the whole font-variant family (only -caps is expressible in `font`; the rest
+        // reset to their initial and drop out of the block, CSS Fonts §font).
         for (const ln of _FONT_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
+        for (const ln of _FONT_VARIANT_SH_LH) { delete this._props[ln]; delete this._priority[ln]; }
       };
       const low = stored.toLowerCase();
       if (_CSS_WIDE.has(low)) { clear(); this._props['font'] = low; this._priority['font'] = prio; this._notifyChange(); return; }
@@ -2814,6 +2829,10 @@ class CSSStyleDeclaration {
       if (key in this._props) return this._props[key];     // var()/CSS-wide kept as a single key
       return _serMaskShort((n) => this._props[n] || '');
     }
+    // A CSS-wide `font-variant` shorthand is stored as a single key; each of its
+    // longhands still reports that keyword (CSSOM: the shorthand set every longhand).
+    if (!(key in this._props) && _CSS_WIDE.has(this._props['font-variant']) && _FONT_VARIANT_SH_LH.indexOf(key) >= 0)
+      return this._props['font-variant'];
     return this._props[key] || "";
   }
   getPropertyPriority(name) {
@@ -22461,7 +22480,7 @@ const _fontFromLonghands = (get, computed) => {
   if (variant !== 'normal' && variant !== 'small-caps') return '';   // only <font-variant-css2>
   // `font` resets every font-variant longhand to normal and can only represent the
   // CSS2 caps subset above — any other non-initial font-variant longhand → not expressible.
-  for (const fvl of ['font-variant-ligatures', 'font-variant-numeric', 'font-variant-east-asian', 'font-variant-alternates', 'font-variant-position']) {
+  for (const fvl of ['font-variant-ligatures', 'font-variant-numeric', 'font-variant-east-asian', 'font-variant-alternates', 'font-variant-position', 'font-variant-emoji']) {
     const fv = String(get(fvl) || 'normal');
     if (fv !== '' && fv !== 'normal') return '';
   }
@@ -22684,7 +22703,8 @@ const _computeFontVariationSettings = (el, v) => {
 // `font`. `normal` → all normal; `none` → font-variant-ligatures:none, rest normal.
 // Otherwise route each token to its longhand by keyword membership, then canonicalize
 // each longhand's tokens together (so within-longhand `||` duplicate rules apply).
-const _FONT_VARIANT_SH_LH = ['font-variant-ligatures', 'font-variant-caps', 'font-variant-alternates', 'font-variant-numeric', 'font-variant-east-asian', 'font-variant-position'];
+const _FONT_VARIANT_SH_LH = ['font-variant-ligatures', 'font-variant-caps', 'font-variant-alternates', 'font-variant-numeric', 'font-variant-east-asian', 'font-variant-position', 'font-variant-emoji'];
+const _FV_EMOJI_KW = new Set(['text', 'emoji', 'unicode']);   // font-variant-emoji non-default values
 const _FV_LIG_KW = _FV_CC['font-variant-ligatures'].cats.reduce((a, c) => { for (const k of c) a.add(k); return a; }, new Set());
 const _FV_NUM_KW = _FV_CC['font-variant-numeric'].cats.reduce((a, c) => { for (const k of c) a.add(k); return a; }, new Set());
 const _FV_EA_KW = _FV_CC['font-variant-east-asian'].cats.reduce((a, c) => { for (const k of c) a.add(k); return a; }, new Set());
@@ -22692,12 +22712,12 @@ const _FV_CAPS_KW = new Set([...(_FONT_ENUM['font-variant-caps'])].filter((k) =>
 const _FV_POS_KW = new Set(['sub', 'super']);
 const _parseFontVariantShorthand = (value) => {
   const s = String(value).trim(), l = s.toLowerCase();
-  const out = { 'font-variant-ligatures': 'normal', 'font-variant-caps': 'normal', 'font-variant-alternates': 'normal', 'font-variant-numeric': 'normal', 'font-variant-east-asian': 'normal', 'font-variant-position': 'normal' };
+  const out = { 'font-variant-ligatures': 'normal', 'font-variant-caps': 'normal', 'font-variant-alternates': 'normal', 'font-variant-numeric': 'normal', 'font-variant-east-asian': 'normal', 'font-variant-position': 'normal', 'font-variant-emoji': 'normal' };
   if (l === 'normal') return out;
   if (l === 'none') { out['font-variant-ligatures'] = 'none'; return out; }
   const toks = _fontTokens(s);
   if (toks.length === 0) return null;
-  const buckets = { lig: [], caps: [], alt: [], num: [], ea: [], pos: [] };
+  const buckets = { lig: [], caps: [], alt: [], num: [], ea: [], pos: [], emoji: [] };
   for (const tok of toks) {
     const lt = tok.toLowerCase();
     if (lt === 'normal' || lt === 'none') return null;         // singletons can't combine
@@ -22706,12 +22726,14 @@ const _parseFontVariantShorthand = (value) => {
     else if (_FV_EA_KW.has(lt)) buckets.ea.push(tok);
     else if (_FV_CAPS_KW.has(lt)) buckets.caps.push(tok);
     else if (_FV_POS_KW.has(lt)) buckets.pos.push(tok);
+    else if (_FV_EMOJI_KW.has(lt)) buckets.emoji.push(tok);
     else if (lt === 'historical-forms' || /\(/.test(tok)) buckets.alt.push(tok);
     else return null;                                          // unknown keyword
   }
-  if (buckets.caps.length > 1 || buckets.pos.length > 1) return null;
+  if (buckets.caps.length > 1 || buckets.pos.length > 1 || buckets.emoji.length > 1) return null;
   if (buckets.caps.length === 1) out['font-variant-caps'] = buckets.caps[0].toLowerCase();
   if (buckets.pos.length === 1) out['font-variant-position'] = buckets.pos[0].toLowerCase();
+  if (buckets.emoji.length === 1) out['font-variant-emoji'] = buckets.emoji[0].toLowerCase();
   for (const [b, name] of [['lig', 'font-variant-ligatures'], ['num', 'font-variant-numeric'], ['ea', 'font-variant-east-asian']]) {
     if (buckets[b].length) { const c = _ccOrderedCanon(buckets[b].join(' '), _FV_CC[name].cats, _FV_CC[name].opts); if (c === null) return null; out[name] = c; }
   }
@@ -22724,8 +22746,8 @@ const _parseFontVariantShorthand = (value) => {
 const _fontVariantFromLonghands = (get) => {
   const g = (n) => { const x = String(get(n) || ''); return x === '' ? 'normal' : x; };
   const lig = g('font-variant-ligatures'), caps = g('font-variant-caps'), alt = g('font-variant-alternates');
-  const num = g('font-variant-numeric'), ea = g('font-variant-east-asian'), pos = g('font-variant-position');
-  const rest = caps === 'normal' && alt === 'normal' && num === 'normal' && ea === 'normal' && pos === 'normal';
+  const num = g('font-variant-numeric'), ea = g('font-variant-east-asian'), pos = g('font-variant-position'), emoji = g('font-variant-emoji');
+  const rest = caps === 'normal' && alt === 'normal' && num === 'normal' && ea === 'normal' && pos === 'normal' && emoji === 'normal';
   if (lig === 'none') return rest ? 'none' : '';
   const parts = [];
   if (lig !== 'normal') parts.push(lig);
@@ -22734,11 +22756,15 @@ const _fontVariantFromLonghands = (get) => {
   if (num !== 'normal') parts.push(num);
   if (ea !== 'normal') parts.push(ea);
   if (pos !== 'normal') parts.push(pos);
+  if (emoji !== 'normal') parts.push(emoji);
   return parts.length ? parts.join(' ') : 'normal';
 };
 const _serializeFontVariantShorthand = (decl) => {
   if ('font-variant' in decl._props) return decl._props['font-variant'];  // var()/CSS-wide single key
   if (!_FONT_VARIANT_SH_LH.some((ln) => ln in decl._props)) return '';     // no longhand present → empty
+  // A CSS-wide keyword surviving in a single longhand can't be represented by the
+  // shorthand (an all-same CSS-wide keyword is stored as the single key above) → ''.
+  for (const ln of _FONT_VARIANT_SH_LH) { if (_CSS_WIDE.has(decl._props[ln])) return ''; }
   return _fontVariantFromLonghands((ln) => decl._props[ln]);
 };
 
@@ -28872,7 +28898,14 @@ globalThis.CSS = {
       syn,                                                    // parsed syntax (for computed-value resolution)
     });
   },
-  escape(s){return s;}
+  // CSS.escape(ident) — CSSOM §the-css.escape()-method: stringify the argument,
+  // then serialize it as an identifier (hex-escape a leading digit / `-`+digit /
+  // controls / NUL→U+FFFD; backslash-escape other non-ident code points).
+  escape(ident){
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'escape' on 'CSS': 1 argument required, but only 0 present.");
+    return _serializeCssIdent(String(ident));
+  }
 };
 
 // HTMLElement is a real subclass of Element: only elements in the HTML namespace
