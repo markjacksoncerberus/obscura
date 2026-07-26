@@ -879,6 +879,147 @@ const _canonPageDescriptor = (name, value) =>
   name === 'size' ? _canonPageSize(value)
   : name === 'page-orientation' ? _canonPageOrientation(value)
   : null;
+
+// ── @font-face descriptor value engines (css-fonts-4 §2) ─────────────────────
+// These descriptors are only meaningful INSIDE an `@font-face` rule (a
+// CSSFontFaceRule's `.style`, carrying `_fontFaceDescriptors`); on an element
+// style they are dropped (like the @page descriptors above). The parse path
+// threads an `opts.fontFace` flag from the rule so they canonicalize there but
+// stay rejected everywhere else.
+const _FONT_FACE_ONLY = new Set(['src', 'size-adjust', 'ascent-override', 'descent-override', 'line-gap-override']);
+// The metric-override descriptors accept `normal | <percentage [0,∞]>`; size-adjust
+// is `<percentage [0,∞]>` (no `normal`). The percentage magnitude is echoed verbatim
+// (e.g. `100000000000%` stays exact) — a leading `+` sign is dropped as canonical.
+const _canonFontPct = (value, allowNormal) => {
+  const v = String(value).trim();
+  if (v === '') return null;
+  if (allowNormal && v.toLowerCase() === 'normal') return 'normal';
+  const m = /^\+?(\d+\.?\d*|\.\d+)%$/.exec(v);
+  return m ? m[1] + '%' : null;
+};
+// `src` descriptor grammar (css-fonts-4 §2.3): a comma-separated <font-src-list>.
+// Each <font-src> is either `local( <family-name> )` or a url component
+// `<url> [ format( … ) ]? [ tech( … ) ]?`. A component that fails to parse is
+// DROPPED (not fatal) as long as at least one component survives; the whole
+// descriptor is invalid only when every component is bad (CSS Fonts §font-face-src-parsing).
+const _FONT_FORMAT_KW = new Set(['collection', 'opentype', 'truetype', 'woff', 'woff2', 'embedded-opentype', 'svg']);
+const _FONT_TECH_KW = new Set(['features-opentype', 'features-aat', 'features-graphite',
+  'color-colrv0', 'color-colrv1', 'color-sbix', 'color-cbdt', 'color-svg', 'palettes', 'variations', 'incremental']);
+// Split on top-level commas, honouring nested parens/brackets and strings.
+const _splitCommasTopLevel = (s) => {
+  const out = []; let depth = 0, inStr = null, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) { if (c === inStr && s[i - 1] !== '\\') inStr = null; continue; }
+    if (c === '"' || c === "'") inStr = c;
+    else if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') { if (depth > 0) depth--; }
+    else if (c === ',' && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
+  }
+  out.push(s.slice(start));
+  return out;
+};
+// Break a component into its top-level `ident( … )` function tokens. Returns null
+// if any bare (non-function) token appears at top level (`dummy() local(A)` junk).
+const _srcTokenize = (s) => {
+  const toks = []; let i = 0; const n = s.length;
+  while (i < n) {
+    if (/\s/.test(s[i])) { i++; continue; }
+    const fm = /^([-\w]+)\(/.exec(s.slice(i));
+    if (!fm) return null;                                       // bare non-function token → junk
+    let j = i + fm[0].length, depth = 1, inStr = null;
+    while (j < n && depth > 0) {
+      const c = s[j];
+      if (inStr) { if (c === inStr && s[j - 1] !== '\\') inStr = null; j++; continue; }
+      if (c === '"' || c === "'") inStr = c;
+      else if (c === '(') depth++;
+      else if (c === ')') depth--;
+      j++;
+    }
+    if (depth > 0) return null;                                 // unbalanced parens
+    toks.push({ name: fm[1].toLowerCase(), args: s.slice(i + fm[0].length, j - 1) });
+    i = j;
+  }
+  return toks;
+};
+const _isSrcUrlArg = (raw) => {
+  const a = raw.trim();
+  if (a === '') return false;
+  if ((a[0] === '"' && a[a.length - 1] === '"') || (a[0] === "'" && a[a.length - 1] === "'")) return a.length >= 2;
+  return !/[\s"'()]/.test(a);                                   // unquoted url-token: no whitespace/quotes/parens
+};
+const _isSrcFormatArg = (raw) => {
+  const a = raw.trim();
+  if (a === '') return false;                                   // format() empty → invalid
+  if ((a[0] === '"' && a[a.length - 1] === '"') || (a[0] === "'" && a[a.length - 1] === "'"))
+    return !a.slice(1, -1).includes(a[0]);                      // a single string (no 2nd string / stray quote)
+  return !/[\s,]/.test(a) && _FONT_FORMAT_KW.has(a.toLowerCase());   // single known keyword
+};
+const _isSrcTechArg = (raw) => {
+  const a = raw.trim();
+  if (a === '') return false;                                   // tech() empty → invalid
+  return _splitCommasTopLevel(a).every((p) => {                 // comma-separated keywords, no strings
+    const t = p.trim();
+    return t !== '' && !/[\s"']/.test(t) && _FONT_TECH_KW.has(t.toLowerCase());
+  });
+};
+const _isSrcLocalFamily = (raw) => {
+  const a = raw.trim();
+  if (a === '') return false;                                   // local() empty → invalid
+  if ((a[0] === '"' && a[a.length - 1] === '"') || (a[0] === "'" && a[a.length - 1] === "'"))
+    return !a.slice(1, -1).includes(a[0]);                      // any single string (incl. "")
+  const idents = a.split(/\s+/);                                // unquoted: one or more <custom-ident>
+  if (idents.length === 1) {
+    const low = idents[0].toLowerCase();
+    if (_CSS_WIDE.has(low) || low === 'default') return false;  // a lone CSS-wide / reserved keyword is excluded
+  }
+  return idents.every((id) => /^-?[A-Za-z_\u00A0-\uFFFF\\][\w\u00A0-\uFFFF-]*$/.test(id));
+};
+// Validate one <font-src> and return its canonical serialization, or null if it
+// doesn't parse. Per CSSOM, keyword component values serialize ASCII-lowercased —
+// so the `format()` keyword and each `tech()` keyword are lowercased (url/string
+// args are case-sensitive and preserved).
+const _canonFontSrcComponent = (comp) => {
+  const toks = _srcTokenize(comp.trim());
+  if (!toks || toks.length === 0) return null;
+  if (toks[0].name === 'local') {
+    if (toks.length !== 1 || !_isSrcLocalFamily(toks[0].args)) return null;
+    return 'local(' + toks[0].args.trim().replace(/\s+/g, ' ') + ')';
+  }
+  if (toks[0].name !== 'url' || !_isSrcUrlArg(toks[0].args)) return null;
+  // CSSOM serializes a url in `src` as a quoted string: url("…") (cssom-fontfacerule).
+  let ua = toks[0].args.trim();
+  if ((ua[0] === '"' && ua[ua.length - 1] === '"') || (ua[0] === "'" && ua[ua.length - 1] === "'")) ua = ua.slice(1, -1);
+  let out = 'url("' + ua.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '")';
+  let k = 1;
+  if (toks[k] && toks[k].name === 'format') {                  // optional format(), then optional tech(), in order
+    if (!_isSrcFormatArg(toks[k].args)) return null;
+    const fa = toks[k].args.trim();
+    out += ' format(' + (fa[0] === '"' || fa[0] === "'" ? fa : fa.toLowerCase()) + ')';
+    k++;
+  }
+  if (toks[k] && toks[k].name === 'tech') {
+    if (!_isSrcTechArg(toks[k].args)) return null;
+    out += ' tech(' + _splitCommasTopLevel(toks[k].args).map((p) => p.trim().toLowerCase()).join(', ') + ')';
+    k++;
+  }
+  return k === toks.length ? out : null;                       // no trailing/unknown functions
+};
+const _canonFontSrc = (value) => {
+  const raw = String(value).replace(/\/\*[\s\S]*?\*\//g, ' ').trim();
+  if (raw === '') return null;
+  const kept = [];
+  for (const c of _splitCommasTopLevel(raw)) {
+    if (c.trim() === '') continue;                             // empty component (stray comma/comment) — dropped
+    const cc = _canonFontSrcComponent(c);
+    if (cc !== null) kept.push(cc);                            // invalid non-empty component drops silently
+  }
+  return kept.length > 0 ? kept.join(', ') : null;            // invalid only when EVERY component is bad
+};
+const _canonFontFaceDescriptor = (name, value) =>
+  name === 'src' ? _canonFontSrc(value)
+  : name === 'size-adjust' ? _canonFontPct(value, false)
+  : _canonFontPct(value, true);   // ascent-override / descent-override / line-gap-override
 const _parseStyleDecls = (text, opts) => {
   const out = [];
   for (const part of String(text == null ? '' : text).split(';')) {
@@ -902,6 +1043,15 @@ const _parseStyleDecls = (text, opts) => {
         // rule (opts.page), where it is canonicalized; on an element it is dropped.
         if (opts && opts.page) {
           const dv = _canonPageDescriptor(name, value);
+          if (dv !== null) out.push({ name, value: dv, important });
+        }
+        continue;
+      }
+      if (_FONT_FACE_ONLY.has(name)) {
+        // @font-face descriptor (`src`/`size-adjust`/`*-override`): valid only inside
+        // an @font-face rule (opts.fontFace); on an element style it is dropped.
+        if (opts && opts.fontFace) {
+          const dv = _canonFontFaceDescriptor(name, value);
           if (dv !== null) out.push({ name, value: dv, important });
         }
         continue;
@@ -1310,6 +1460,19 @@ class CSSStyleDeclaration {
         const raw = String(value == null ? '' : value).trim();
         if (raw === '') { this.removeProperty(name); return; }
         const dv = _canonPageDescriptor(name, raw);
+        if (dv === null) return;                                  // invalid descriptor value → ignore
+        this._props[name] = dv;
+        this._priority[name] = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        this._notifyChange();
+        return;
+      }
+      if (_FONT_FACE_ONLY.has(name)) {
+        // @font-face descriptor: valid only on a CSSFontFaceRule's style
+        // (_fontFaceDescriptors); on an element style it is ignored (CSSOM).
+        if (!this._fontFaceDescriptors) return;
+        const raw = String(value == null ? '' : value).trim();
+        if (raw === '') { this.removeProperty(name); return; }
+        const dv = _canonFontFaceDescriptor(name, raw);
         if (dv === null) return;                                  // invalid descriptor value → ignore
         this._props[name] = dv;
         this._priority[name] = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
@@ -2655,7 +2818,7 @@ class CSSStyleDeclaration {
   }
   set cssText(v) {
     this._props = {}; this._priority = {};
-    for (const d of _parseStyleDecls(v, this._pageDescriptors ? { page: true } : undefined)) {
+    for (const d of _parseStyleDecls(v, this._pageDescriptors ? { page: true } : this._fontFaceDescriptors ? { fontFace: true } : undefined)) {
       // !important within a declaration block is not overridden by a later normal
       // declaration of the same property; otherwise later wins.
       if (this._priority[d.name] === 'important' && !d.important) continue;
@@ -23868,6 +24031,10 @@ const _cssParseRuleList = (cssText) => {
         // @page <page-selector-list>? { <declaration>* <margin-rule>* } → CSSPageRule.
         // The declaration block (`size`, `margin`, …) becomes the rule's `.style`.
         rules.push({ type: 'page', name, condition, prelude, body });
+      } else if (name === 'font-face') {
+        // @font-face { <declaration-list> } → CSSFontFaceRule. Its declaration block
+        // (`src`, `font-family`, the metric overrides, …) becomes the rule's `.style`.
+        rules.push({ type: 'font-face', name, condition, prelude, body });
       } else {
         rules.push({ type: 'at', name, condition, prelude, body });
       }
@@ -24672,6 +24839,30 @@ class CSSPageRule extends CSSRule {
 }
 globalThis.CSSPageRule = CSSPageRule;
 
+// CSSFontFaceRule (CSSOM §CSSFontFaceRule) — an `@font-face` rule. Its declaration
+// block becomes the `.style` CSSStyleDeclaration, which (unlike an element's style)
+// accepts the @font-face descriptors (`src`, `size-adjust`, the metric overrides, …)
+// via the `_fontFaceDescriptors` flag; on an element style those descriptors are
+// dropped. `.style` round-trips the descriptor block (the parsing tests read
+// `cssRules[i].style.getPropertyValue(descriptor)`).
+class CSSFontFaceRule extends CSSRule {
+  constructor(desc) {
+    super();
+    const decl = new CSSStyleDeclaration();
+    decl._fontFaceDescriptors = true;                          // allow src / size-adjust / *-override
+    this._styleDecl = _styleProxy(decl);
+    if (desc && desc.body) this._styleDecl.cssText = desc.body;
+  }
+  get type() { return 5; }                                     // CSSRule.FONT_FACE_RULE
+  get style() { return this._styleDecl; }
+  set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
+  get cssText() {
+    const block = this._styleDecl.cssText;
+    return '@font-face { ' + (block ? block + ' ' : '') + '}';
+  }
+}
+globalThis.CSSFontFaceRule = CSSFontFaceRule;
+
 // A style rule whose prelude is not a valid selector list fails to parse, so
 // inserting it throws SyntaxError (CSSOM §insert-a-css-rule step 5: "If parsed
 // rule is a syntax error, throw a SyntaxError"). Validated with the same
@@ -24965,6 +25156,12 @@ const _makeRule = (desc, parentSheet, parentRule) => {
   }
   if (desc.type === 'page') {
     rule = new CSSPageRule(desc);
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
+  if (desc.type === 'font-face') {
+    rule = new CSSFontFaceRule(desc);
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
