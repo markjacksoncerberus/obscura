@@ -10473,6 +10473,10 @@ const _sheetRuleCache = new WeakMap(); // styleEl -> { text, rules }
 const _styleSheetRules = (styleEl) => {
   let text = '';
   try { text = styleEl.textContent || ''; } catch { text = ''; }
+  // Note the presence of an @property rule so getComputedStyle consults the registry
+  // even for a page that never touches the CSSOM `.sheet` (which is what otherwise
+  // parses @property rules and sets this flag). Cheap regex on the (cached) text.
+  if (!_atPropSeen && /@property/i.test(text)) _atPropSeen = true;
   // If the live CSSOM sheet for this <style> has been mutated through the object
   // model (e.g. `rule.selectorText = …`) and still reflects the element's text,
   // serve the cascade from those live rules so a CSSOM edit is honoured by
@@ -23412,9 +23416,170 @@ const _computedColorOf = (el) => _computedPropOf(el, 'color', 0);
 // computed value). A custom property explicitly set to the empty value computes
 // to a single space (distinct from "not set", which inherits). var() substitution
 // is intentionally NOT performed here yet — the value passes through verbatim.
+// ── Registered custom properties → computed value (css-properties-values-api) ──
+// A custom property registered (via CSS.registerProperty OR a valid @property rule)
+// has a `syntax`, an `inherits` flag, and an initial value. Unlike an unregistered
+// custom property (which always inherits and never has an initial value), its
+// computed value is: the specified value validated against the syntax and
+// canonicalized to its computed form (colours → rgb(), lengths → px, calc folded);
+// or — when unset / invalid-at-computed-value-time — the inherited value (if it
+// inherits) else the initial value.
+
+// The @property registrations a single <style> element declares, cached by its
+// current textContent (a text change → cache miss → re-parse). Returns
+// [{ name, reg:{ syn, inherits, initialValue } }] in source order.
+const _atPropRegsOf = (styleEl) => {
+  let text = '';
+  try { text = styleEl.textContent || ''; } catch { text = ''; }
+  const cached = _atPropCache.get(styleEl);
+  if (cached && cached.text === text) return cached.regs;
+  const regs = [];
+  if (/@property/i.test(text)) {
+    for (const r of _cssParseRuleList(text)) {
+      if (r.type !== 'property' || !r._prop) continue;
+      const syn = _parsePropSyntax(r._prop.syntaxValue);
+      if (syn) regs.push({ name: r._prop.name, reg: { syn, inherits: r._prop.inherits, initialValue: r._prop.initialValue } });
+    }
+  }
+  _atPropCache.set(styleEl, { text, regs });
+  return regs;
+};
+// The effective registration for a custom-property `name` (or null when it is not
+// registered). A CSS.registerProperty registration ALWAYS wins over an @property
+// rule; among @property rules the LAST in document order wins (determine-registration).
+const _effectivePropReg = (el, name) => {
+  const js = _registeredProps.get(name);
+  if (js) return js;                                         // registerProperty wins over @property
+  if (!_atPropSeen) return null;                            // no @property rule has ever been parsed
+  const doc = (el && el.ownerDocument) || globalThis.document;
+  let styleEls = [];
+  try { styleEls = doc.querySelectorAll('style'); } catch { styleEls = []; }
+  let found = null;
+  for (const styleEl of styleEls)
+    for (const entry of _atPropRegsOf(styleEl))
+      if (entry.name === name) found = entry.reg;            // later in document order wins
+  return found;
+};
+// Canonicalize a <resolution> to dppx (96dpi = 1dppx; 1dpcm = 2.54/96 dppx). A
+// calc()/unrecognized form is kept verbatim.
+const _RES_TO_DPPX = { dppx: 1, x: 1, dpi: 1 / 96, dpcm: 2.54 / 96 };
+const _toDppx = (t) => {
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(dppx|dpi|dpcm|x)$/i.exec(String(t).trim());
+  if (!m) return String(t).trim();
+  return _serNumber(parseFloat(m[1]) * _RES_TO_DPPX[m[2].toLowerCase()]) + 'dppx';
+};
+// The content of a CSS <string> token (outer quotes stripped, escapes resolved) —
+// fed to _serCssString for canonical computed-value serialization.
+const _cssStringContent = (t) => {
+  t = String(t).trim();
+  const q = t[0];
+  if (q !== '"' && q !== "'") return t;
+  let s = t.slice(1);
+  if (s.length && s[s.length - 1] === q) s = s.slice(0, -1);   // closed; else EOF-auto-closed
+  let out = '', i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c !== '\\') { out += c; i++; continue; }
+    const nx = s[i + 1];
+    if (nx === undefined) { i++; continue; }                    // trailing backslash → dropped
+    if (/[0-9a-fA-F]/.test(nx)) {                               // hex escape (≤6 digits, optional trailing ws)
+      let h = '', j = i + 1;
+      while (j < s.length && h.length < 6 && /[0-9a-fA-F]/.test(s[j])) { h += s[j]; j++; }
+      if (j < s.length && /\s/.test(s[j])) j++;
+      out += String.fromCodePoint(parseInt(h, 16) || 0xFFFD);
+      i = j; continue;
+    }
+    out += nx; i += 2;                                          // literal escape
+  }
+  return out;
+};
+// Compute a single typed value (one syntax component, no multiplier) to its
+// computed form. Keyword (custom-ident) components serialize verbatim (unescaped).
+const _computeTypedSingle = (el, comp, t) => {
+  t = String(t).trim();
+  if (comp.kind === 'ident') return _unescapeCssIdent(t);
+  switch (comp.name) {
+    case 'length':
+    case 'length-percentage':
+      return _trComp(t, el, true, _vpUnits());              // fold calc, absolutize em, → px (or symbolic %)
+    case 'color':
+      return _computeColorFull(el, t, false);               // → rgb(r, g, b) / rgba(…)
+    case 'integer': {
+      const iv = _computeIntegerValue(el, t);
+      return iv != null ? iv : t;
+    }
+    case 'angle': {                                         // canonicalized to degrees (1turn → 360deg)
+      const a = _toDeg(t);
+      return a != null ? a : t;
+    }
+    case 'time': {                                          // canonicalized to seconds (1000ms → 1s)
+      const s = _computeTimeValue(t, el);
+      return s != null ? s : t;
+    }
+    case 'resolution':                                     // canonicalized to dppx (96dpi → 1dppx)
+      return _toDppx(t);
+    case 'string':                                          // canonical CSS string (single→double quotes, escaped)
+      return _serCssString(_cssStringContent(t));
+    default:
+      return t;                                             // number/percentage/image/url/transform-*: specified ≈ computed here
+  }
+};
+// Compute a whole syntax component (applying its `+`/`#` multiplier).
+const _computeTypedComponent = (el, comp, v) => {
+  if (comp.mult === '') return _computeTypedSingle(el, comp, v);
+  const parts = comp.mult === '#' ? _splitCommasTopLevel(v) : _wsTokens(v);
+  const sep = comp.mult === '#' ? ', ' : ' ';
+  return parts.map((p) => _computeTypedSingle(el, comp, p)).join(sep);
+};
+// The computed value of `value` under registration `reg`, or null when `value` does
+// not match the syntax (→ invalid at computed-value time). Universal `*` keeps the
+// token sequence verbatim (already var()-substituted by the caller).
+const _computeRegisteredValue = (el, reg, value, guard) => {
+  const v = String(value).trim();
+  if (reg.syn.universal) return v;
+  // A specified value may use font-relative units (they are absolutized to px at
+  // computed time), so match with allowFontRel=true.
+  for (const comp of reg.syn.components)
+    if (_propMatchComponent(comp, v, true)) return _computeTypedComponent(el, comp, v);
+  return null;
+};
+// Full computed-value resolution for a REGISTERED custom property.
+const _computedRegisteredProp = (el, name, reg, guard) => {
+  const parentComputed = () => (el.parentElement ? _computedCustomProp(el.parentElement, name, guard + 1) : '');
+  const initialComputed = () => {
+    if (reg.initialValue == null) return '';                // universal, no initial → guaranteed-invalid
+    const c = _computeRegisteredValue(el, reg, reg.initialValue, guard);
+    return c == null ? '' : c;
+  };
+  // The value that would be used when this property does not itself have a usable
+  // value: the inherited value (if it inherits) else the initial value. A registered
+  // inherited property inherits the PARENT's already-computed value, which resolves
+  // to the initial value at the root of the inheritance chain.
+  const fallback = () => (reg.inherits ? (parentComputed() || initialComputed()) : initialComputed());
+  const raw = _specifiedValue(el, name);
+  const rawStr = raw == null ? '' : String(raw);
+  if (rawStr === '') return fallback();
+  const low = rawStr.trim().toLowerCase();
+  if (_CSS_WIDE.has(low)) {
+    if (low === 'initial') return initialComputed();
+    if (low === 'inherit') return parentComputed() || initialComputed();
+    return fallback();                                       // unset / revert / revert-layer (no UA sheet)
+  }
+  const substituted = _substituteVars(el, rawStr, 0);
+  if (substituted == null) return fallback();               // undefined var() / cycle → invalid at computed-value time
+  const computed = _computeRegisteredValue(el, reg, substituted, guard);
+  return computed == null ? fallback() : computed;          // syntax-incompatible → fallback
+};
 const _computedCustomProp = (el, name, guard) => {
   guard = guard || 0;
   if (!el || guard > 200) return '';
+  // A registered custom property has full computed-value machinery (initial value,
+  // inherits flag, syntax canonicalization). Gated so unregistered properties — the
+  // common case, and every existing var() test — stay on the fast path unchanged.
+  if (_registeredProps.size || _atPropSeen) {
+    const reg = _effectivePropReg(el, name);
+    if (reg) return _computedRegisteredProp(el, name, reg, guard);
+  }
   const inheritFrom = () => (el.parentElement
     ? _computedCustomProp(el.parentElement, name, guard + 1) : '');
   const raw = _specifiedValue(el, name);
@@ -23425,7 +23590,52 @@ const _computedCustomProp = (el, name, guard) => {
     if (low === 'initial') return '';                        // guaranteed-invalid
     return inheritFrom();                                     // inherit/unset/revert(-layer)
   }
+  // The computed value substitutes any var()/env() references (an unregistered
+  // custom property is a token stream, but getComputedStyle reflects the resolved
+  // value — `--x: var(--y)` computes to --y's computed value). Gated on `var(` so a
+  // plain token stream stays byte-identical. A guaranteed-invalid substitution
+  // (undefined reference / cycle) makes the property compute to its guaranteed-
+  // invalid value → the inherited value.
+  if (/var\(/i.test(v)) {
+    const sub = _substituteVars(el, v, 0);
+    return sub == null ? inheritFrom() : sub.trim();
+  }
   return v;
+};
+// The custom-property names that appear when enumerating `el`'s computed style
+// (get-computed-style-enumeration). A name is exposed when it has a non-empty
+// computed value: candidates are every custom property declared on `el` or an
+// ancestor (an inherited one may reach `el`), plus every registered property that
+// has an initial value; each is then computed and kept only if non-empty (so a
+// non-inherited property set only on an ancestor, or a registered property with no
+// initial value and no specified value, is correctly excluded).
+const _computedCustomPropNames = (el) => {
+  const names = new Set();
+  let cur = el, g = 0;
+  while (cur && g++ < 200) {
+    try {
+      for (const src of _buildCascade(cur))
+        for (const k in src.decls) if (k.startsWith('--')) names.add(k);
+    } catch (e) {}
+    cur = cur.parentElement;
+  }
+  if (_registeredProps.size || _atPropSeen) {
+    for (const [n, r] of _registeredProps) if (r.initialValue != null) names.add(n);
+    if (_atPropSeen) {
+      const doc = (el && el.ownerDocument) || globalThis.document;
+      let styleEls = [];
+      try { styleEls = doc.querySelectorAll('style'); } catch (e) { styleEls = []; }
+      for (const styleEl of styleEls)
+        for (const entry of _atPropRegsOf(styleEl))
+          if (entry.reg.initialValue != null) names.add(entry.name);
+    }
+  }
+  const out = [];
+  for (const n of names) {
+    const v = _computedCustomProp(el, n, 0);
+    if (v !== '' && v != null) out.push(n);
+  }
+  return out;
 };
 // Split the inside of a `var(...)` into the custom-property name and an optional
 // fallback at the first TOP-LEVEL comma (the fallback may itself contain commas
@@ -23917,11 +24127,19 @@ globalThis.getComputedStyle = (el, _pseudo) => {
     if (inline) return inline;
     return _GCS_DEFAULTS[kebab] || _GCS_DEFAULTS[name] || '';
   };
+  // Enumerating a computed style exposes the custom properties that have a computed
+  // value (css-properties-values-api get-computed-style-enumeration). Computed lazily
+  // and cached on first access; the object is read synchronously by callers.
+  let _names = null;
+  const enumNames = () => (_names || (_names = _computedCustomPropNames(el)));
   return new Proxy(style, {
     get(target, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
       if (prop === 'getPropertyValue') return (name) => resolve(String(name));
-      if (prop === 'length') return 0;
+      if (prop === 'length') return enumNames().length;
+      if (prop === 'item') return (i) => enumNames()[i >>> 0] || '';
+      if (prop === Symbol.iterator) return function* () { for (const n of enumNames()) yield n; };
+      if (typeof prop === 'string' && /^\d+$/.test(prop)) return enumNames()[Number(prop)];
       if (prop in target) return target[prop];
       if (typeof prop === 'string') return resolve(prop);
       return undefined;
@@ -24030,16 +24248,21 @@ const _propMatchImage = (p) => {
   return !(_imageFuncInvalid(p) || _gradientInvalid(p) || _crossFadeInvalid(p));
 };
 // Match a single value token against a base data type (no multiplier).
-const _propMatchType = (type, part) => {
+// `allowFontRel` skips the computational-independence rejection of font-relative
+// units (em/rem/…). It is false for validating a registered property's INITIAL value
+// (which must be computationally independent), and true for matching a SPECIFIED
+// value at computed-value time (where `10em` is a perfectly valid <length> that is
+// absolutized against the element's font-size later).
+const _propMatchType = (type, part, allowFontRel) => {
   const p = part.trim();
   if (p === '') return false;
   const math = _isMathFn(p);
   switch (type) {
     case 'length': {
       if (/^[+-]?0+$/.test(p)) return true;                                // bare zero is a valid <length>
-      if (math) return _mathValid(p, ['length'], null) && !_hasFontRelUnit(p);
+      if (math) return _mathValid(p, ['length'], null) && (allowFontRel || !_hasFontRelUnit(p));
       const d = _matchDim(p);
-      return !!d && d.unit !== '' && d.unit !== '%' && _MATH_UNIT_TYPE[d.unit] === 'length' && !_PROP_FONTREL_UNITS.has(d.unit);
+      return !!d && d.unit !== '' && d.unit !== '%' && _MATH_UNIT_TYPE[d.unit] === 'length' && (allowFontRel || !_PROP_FONTREL_UNITS.has(d.unit));
     }
     case 'percentage': {
       if (math) return _mathValid(p, ['percentage'], 'percentage');
@@ -24048,11 +24271,11 @@ const _propMatchType = (type, part) => {
     }
     case 'length-percentage': {
       if (/^[+-]?0+$/.test(p)) return true;
-      if (math) return _mathValid(p, ['length', 'percentage'], 'length') && !_hasFontRelUnit(p);
+      if (math) return _mathValid(p, ['length', 'percentage'], 'length') && (allowFontRel || !_hasFontRelUnit(p));
       const d = _matchDim(p);
       if (!d) return false;
       if (d.unit === '%') return true;
-      return d.unit !== '' && _MATH_UNIT_TYPE[d.unit] === 'length' && !_PROP_FONTREL_UNITS.has(d.unit);
+      return d.unit !== '' && _MATH_UNIT_TYPE[d.unit] === 'length' && (allowFontRel || !_PROP_FONTREL_UNITS.has(d.unit));
     }
     case 'number': {
       if (math) return _mathValid(p, ['number'], null);
@@ -24087,19 +24310,22 @@ const _propMatchType = (type, part) => {
       return !_CSS_WIDE.has(low) && low !== 'default';
     }
     case 'string': return _propMatchString(p);
-    case 'transform-function': return _wsTokens(p).length === 1 && _isValidTransform(p);
-    case 'transform-list': return _isValidTransform(p);
+    // A registered property's INITIAL value must be computationally independent, so a
+    // transform carrying a font-relative length (`translateX(1em)`) is rejected there
+    // (allowFontRel=false); a SPECIFIED value (allowFontRel=true) may use one.
+    case 'transform-function': return _wsTokens(p).length === 1 && _isValidTransform(p) && (allowFontRel || !_hasFontRelUnit(p));
+    case 'transform-list': return _isValidTransform(p) && (allowFontRel || !_hasFontRelUnit(p));
     default: return false;
   }
 };
 // Match a whole value against one syntax component (applying its multiplier).
-const _propMatchComponent = (comp, value) => {
+const _propMatchComponent = (comp, value, allowFontRel) => {
   if (comp.mult === '') {
     if (comp.kind === 'ident') {
       const t = value.trim();
       return _GRID_CI_RE.test(t) && _unescapeCssIdent(t) === comp.ident;
     }
-    return _propMatchType(comp.name, value);
+    return _propMatchType(comp.name, value, allowFontRel);
   }
   const parts = comp.mult === '#' ? _splitCommasTopLevel(value) : _wsTokens(value);
   if (!parts.length) return false;
@@ -24108,7 +24334,7 @@ const _propMatchComponent = (comp, value) => {
     if (t === '') return false;
     return comp.kind === 'ident'
       ? (_GRID_CI_RE.test(t) && _unescapeCssIdent(t) === comp.ident)
-      : _propMatchType(comp.name, t);
+      : _propMatchType(comp.name, t, allowFontRel);
   });
 };
 // Parse a `syntax` descriptor string into a structured definition, or null if it
@@ -24196,8 +24422,18 @@ const _propValueValid = (syn, rawValue) => {
   return false;
 };
 // Registered custom properties (name → definition). Populated by
-// CSS.registerProperty and valid @property rules; kept for duplicate detection.
+// CSS.registerProperty; kept for duplicate detection AND consulted at
+// computed-value time (getComputedStyle → _computedCustomProp).
 const _registeredProps = new Map();
+// Flipped true the first time a valid `@property` rule is parsed (below, in
+// _cssParseRuleList). Once any registration source exists — a CSS.registerProperty
+// call OR an @property rule ever parsed — getComputedStyle consults the registry;
+// pages that use neither pay nothing (the custom-property computed path is unchanged).
+let _atPropSeen = false;
+// Per-<style> cache of the @property registrations it declares, keyed by the
+// element's current textContent → [{ name, reg }] (last-in-document-order wins at
+// lookup). Invalidated automatically when the text changes (cache miss).
+const _atPropCache = new WeakMap();
 // Parse & validate an `@property` rule's `syntax` descriptor value (a <string>).
 // Returns { value, syn } (value = the unquoted, unescaped syntax string used by
 // CSSPropertyRule.syntax) or null.
@@ -24336,7 +24572,7 @@ const _cssParseRuleList = (cssText) => {
         // An invalid rule (bad name, missing/invalid descriptor, initial-value that
         // doesn't match the syntax) is dropped entirely (css-properties-values-api §cssom).
         const prop = _validatePropertyRule(condition, body);
-        if (prop) rules.push({ type: 'property', name, condition, prelude, body, _prop: prop });
+        if (prop) { _atPropSeen = true; rules.push({ type: 'property', name, condition, prelude, body, _prop: prop }); }
       } else if (name === 'counter-style') {
         // @counter-style <counter-style-name> { <declaration-list> } → CSSCounterStyleRule.
         // An invalid name makes the whole at-rule invalid → drop it (CSSOM).
@@ -25033,9 +25269,20 @@ class CSSStyleRule extends CSSRule {
   constructor(selectorText, body) {
     super();
     this._selectorSource = String(selectorText == null ? '' : selectorText).trim();   // raw authored selector
-    this._styleDecl = _styleProxy(new CSSStyleDeclaration());
+    const rawDecl = new CSSStyleDeclaration();
+    this._styleDecl = _styleProxy(rawDecl);
     if (body) this._styleDecl.cssText = body;          // specified-value serialization
     this._cascadeDecls = _cssParseDecls(body || '');   // cascade-shape decls for getComputedStyle
+    // A CSSOM edit to this rule's style (`rule.style.setProperty(…)`) must reach the
+    // cascade: re-derive the cascade-shape decls from the live declaration block and
+    // flag the owning sheet so getComputedStyle re-reads the live rules. Set on the
+    // raw declaration (not through the _styleProxy, which would route an unknown
+    // member to setProperty) and after the initial cssText so construction is inert.
+    const self = this;
+    rawDecl._onChange = () => {
+      try { self._cascadeDecls = _cssParseDecls(self._styleDecl.cssText); } catch (e) {}
+      try { if (self._parentStyleSheet) self._parentStyleSheet._cssomDirty = true; } catch (e) {}
+    };
   }
   get type() { return 1; }
   // Serialize the selector into canonical CSSOM form on read; fall back to the raw
@@ -28401,6 +28648,7 @@ globalThis.CSS = {
       syntax: String(syntaxRaw),
       inherits: !!definition.inherits,
       initialValue: hasInitial ? String(definition.initialValue) : null,
+      syn,                                                    // parsed syntax (for computed-value resolution)
     });
   },
   escape(s){return s;}
