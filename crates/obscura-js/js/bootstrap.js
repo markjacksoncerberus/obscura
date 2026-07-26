@@ -23616,7 +23616,12 @@ const _cssParseRuleList = (cssText) => {
         rules.push({ type: 'at', name, condition, prelude, body });
       }
     } else {
-      rules.push({ type: 'style', selectorText: prelude, body });
+      // A style rule whose prelude is not a valid selector list is dropped while
+      // parsing a stylesheet (CSSOM §parse-a-list-of-rules → consume-a-qualified-rule
+      // returns nothing on an invalid prelude). `_parseSelectorList` is the JS
+      // validator — the Rust matcher can't be used here (it rejects valid PEs like
+      // `::marker`/`::view-transition-*` that never match in querySelector context).
+      if (_parseSelectorList(prelude) !== null) rules.push({ type: 'style', selectorText: prelude, body });
     }
   }
   return rules;
@@ -23758,18 +23763,104 @@ const _selReadString = (s, i) => {
   return null;   // unterminated
 };
 // Canonicalise an <an+b> microsyntax string. Returns serialized form or null.
+// The An+B grammar (CSS Syntax §5.5) is defined over CSS *tokens*, so whitespace
+// INSIDE a token is illegal even though it is allowed *between* tokens. A naive
+// `replace(/\s+/g,'')` therefore over-accepts (`+ 1n`, `12 n`, `n- 1 2` …) — we
+// must tokenise, then match the token grammar, to reject those.
 const _selSerAnB = (raw) => {
-  let t = String(raw).trim().toLowerCase();
+  const t = String(raw).trim().toLowerCase();
   if (t === 'even') return '2n';
   if (t === 'odd') return '2n+1';
-  const flat = t.replace(/\s+/g, '');
-  if (/^[+-]?\d+$/.test(flat)) return String(parseInt(flat, 10));
-  const m = /^([+-]?\d*)n([+-]\d+)?$/.exec(flat);
-  if (!m) return null;
-  let a = m[1];
-  if (a === '' || a === '+') a = 1; else if (a === '-') a = -1; else a = parseInt(a, 10);
-  let b = m[2] ? parseInt(m[2], 10) : 0;
-  let part = a === 1 ? 'n' : a === -1 ? '-n' : a + 'n';
+  if (t === '') return null;
+  // An+B ranges over only digits, `n`, `+`, `-` and whitespace.
+  if (!/^[0-9n+\-\s]+$/.test(t)) return null;
+  const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\f' || c === '\r';
+  const isDigit = (c) => c >= '0' && c <= '9';
+  const isIdentCh = (c) => c === 'n' || c === '-' || isDigit(c);   // ident chars within this alphabet
+  // 1) Tokenise into num / dim / ident / delim / ws (mirrors the CSS tokenizer).
+  const toks = []; let i = 0; const L = t.length;
+  while (i < L) {
+    const c = t[i];
+    if (isWs(c)) { let j = i + 1; while (j < L && isWs(t[j])) j++; toks.push({ k: 'ws' }); i = j; continue; }
+    if (c === '+' || c === '-') {
+      if (i + 1 < L && isDigit(t[i + 1])) {                        // sign + digits → number (maybe a dimension)
+        let j = i + 1; while (j < L && isDigit(t[j])) j++;
+        if (j < L && t[j] === 'n') { let u = j; while (u < L && isIdentCh(t[u])) u++; toks.push({ k: 'dim', val: parseInt(t.slice(i, j), 10), unit: t.slice(j, u) }); i = u; continue; }
+        toks.push({ k: 'num', val: parseInt(t.slice(i, j), 10), signed: true }); i = j; continue;
+      }
+      if (c === '-' && i + 1 < L && (t[i + 1] === 'n' || t[i + 1] === '-')) {   // `-n`, `-n-3`, `--` → ident
+        let u = i; while (u < L && isIdentCh(t[u])) u++; toks.push({ k: 'ident', s: t.slice(i, u) }); i = u; continue;
+      }
+      toks.push({ k: 'delim', s: c }); i++; continue;              // bare `+`/`-`
+    }
+    if (isDigit(c)) {
+      let j = i; while (j < L && isDigit(t[j])) j++;
+      if (j < L && t[j] === 'n') { let u = j; while (u < L && isIdentCh(t[u])) u++; toks.push({ k: 'dim', val: parseInt(t.slice(i, j), 10), unit: t.slice(j, u) }); i = u; continue; }
+      toks.push({ k: 'num', val: parseInt(t.slice(i, j), 10), signed: false }); i = j; continue;
+    }
+    // c === 'n' (guaranteed by the alphabet check) → an ident starting with n
+    let u = i; while (u < L && isIdentCh(t[u])) u++; toks.push({ k: 'ident', s: t.slice(i, u) }); i = u;
+  }
+  // 2) Decode the "a" part carried by an ident/dimension token.
+  //    Returns {a, b?} (complete), {a, pending:true} (needs a trailing signless
+  //    integer, whose value becomes a NEGATIVE b), or null.
+  const identA = (s) => {
+    const m = /^(-)?n(?:(-)(\d*))?$/.exec(s); if (!m) return null;
+    const a = m[1] ? -1 : 1;
+    if (m[2] === undefined) return { a };                          // `n` / `-n`
+    return m[3] === '' ? { a, pending: true } : { a, b: -parseInt(m[3], 10) };  // `n-` / `n-3`
+  };
+  const dimA = (u, v) => {
+    const m = /^n(?:(-)(\d*))?$/.exec(u); if (!m) return null;
+    if (m[1] === undefined) return { a: v };
+    return m[2] === '' ? { a: v, pending: true } : { a: v, b: -parseInt(m[2], 10) };
+  };
+  // 3) Match the grammar.
+  let p = 0;
+  const skipWs = () => { while (toks[p] && toks[p].k === 'ws') p++; };
+  skipWs();
+  let plus = false;                                                // consumed a leading `'+'` delim
+  if (toks[p] && toks[p].k === 'delim' && toks[p].s === '+') {
+    // `'+'? n…` — the `+` must be IMMEDIATELY followed by the n-ident (no ws).
+    if (!(toks[p + 1] && toks[p + 1].k === 'ident')) return null;
+    plus = true; p++;
+  }
+  const head = toks[p];
+  if (!head) return null;
+  let info;
+  if (head.k === 'num') {                                          // plain <integer>
+    if (plus) return null;
+    p++; skipWs(); if (toks[p]) return null;
+    return String(head.val);
+  } else if (head.k === 'dim') {
+    if (plus) return null;                                         // `+` before a dimension is illegal
+    info = dimA(head.unit, head.val);
+  } else if (head.k === 'ident') {
+    info = identA(head.s);
+    if (info && plus && info.a === -1) return null;               // `+-n…`
+  } else return null;
+  if (!info) return null;
+  p++;
+  // 4) Resolve b.
+  let b;
+  if (info.b !== undefined) {                                      // `n-3`, `2n-3` — already complete
+    skipWs(); if (toks[p]) return null; b = info.b;
+  } else if (info.pending) {                                       // `n-`, `-n-`, `2n-` — needs a signless integer
+    skipWs(); const nn = toks[p];
+    if (!nn || nn.k !== 'num' || nn.signed) return null;
+    b = -nn.val; p++; skipWs(); if (toks[p]) return null;
+  } else {                                                         // bare `n`/`-n`/`2n` — optional b tail
+    skipWs(); const nb = toks[p];
+    if (!nb) { b = 0; }
+    else if (nb.k === 'num' && nb.signed) { b = nb.val; p++; skipWs(); if (toks[p]) return null; }
+    else if (nb.k === 'delim' && (nb.s === '+' || nb.s === '-')) {
+      p++; skipWs(); const nn = toks[p];
+      if (!nn || nn.k !== 'num' || nn.signed) return null;         // sign then a SIGNLESS integer
+      b = (nb.s === '-' ? -1 : 1) * nn.val; p++; skipWs(); if (toks[p]) return null;
+    } else return null;
+  }
+  const a = info.a;
+  const part = a === 1 ? 'n' : a === -1 ? '-n' : a + 'n';
   if (b === 0) return part;
   return part + (b > 0 ? '+' + b : '-' + (-b));
 };
@@ -23791,6 +23882,11 @@ const _SEL_PE = new Set(['before','after','first-line','first-letter','marker','
   'cue','cue-region','part','slotted','highlight','view-transition','view-transition-group',
   'view-transition-image-pair','view-transition-old','view-transition-new','details-content']);
 const _SEL_LEGACY_PE = new Set(['before','after','first-line','first-letter']);
+// The user-action pseudo-classes (Selectors-4 §3.6) — the only simple selectors
+// that may follow a "leaf" pseudo-element (`::before`/`::after`/`::first-letter`…)
+// in a compound. `::part()` is element-backed (permissive); `::slotted()` allows
+// none; view-transition PEs allow only `:only-child` (handled separately).
+const _SEL_USER_ACTION_PC = new Set(['hover','active','focus','focus-visible','focus-within']);
 // The css-view-transitions pseudo-elements. The four *functional* ones take a
 // mandatory `(<pt-name-selector>)` argument (`*` | <custom-ident>); the root
 // `::view-transition` takes none. They are "tree-abiding" pseudo-elements: only
@@ -23889,6 +23985,8 @@ const _parseSelectorList = (src, relative) => {
       // the root `::view-transition` must NOT be functional.
       if (_SEL_VT_FN_PE.has(lname)) { if (!args) return null; }
       else if (lname === 'view-transition' && args) return null;
+      // `::part()` and `::slotted()` are functional PEs — bare forms are invalid.
+      else if ((lname === 'part' || lname === 'slotted') && !args) return null;
       return { kind: 'pe', name: lname, args };
     }
     if (_SEL_LEGACY_PE.has(lname) && !args) return { kind: 'pe', name: lname, args: null };
@@ -23963,6 +24061,25 @@ const _parseSelectorList = (src, relative) => {
         if (!compatible) return null;
       }
     }
+    // Pseudo-element "internal structure" (Selectors-4 §3.6): what may follow a
+    // pseudo-element in a compound depends on the PE.
+    //   ::part()    — element-backed: any pseudo-class (`:state()`, `:hover`, …) and
+    //                 even a further pseudo-element may follow (that PE then imposes
+    //                 its own rules).
+    //   ::slotted() — nothing but a pseudo-element may follow (no pseudo-classes).
+    //   others      — "leaf" PEs: only the user-action pseudo-classes may follow.
+    // (View-transition PEs are governed by the block above.)
+    let activeLeaf = null;                        // null | 'slotted' | 'leaf'
+    for (const su of subs) {
+      if (su.kind === 'pe') {
+        if (_selIsVtPe(su)) { activeLeaf = null; continue; }
+        activeLeaf = su.name === 'part' ? null : su.name === 'slotted' ? 'slotted' : 'leaf';
+        continue;
+      }
+      if (activeLeaf === 'slotted') return null;  // no simple selector after ::slotted()
+      if (activeLeaf === 'leaf' &&
+          !(su.kind === 'pc' && !su.args && _SEL_USER_ACTION_PC.has(su.name))) return null;
+    }
     return { type, subs };
   };
   const parseComplex = (relativeStart) => {
@@ -23991,9 +24108,10 @@ const _parseSelectorList = (src, relative) => {
       else { i = save; break; }
       const next = parseCompound();
       if (!next) { if (comb === ' ') { i = save; break; } return null; }
-      // A view-transition pseudo-element can't have a descendant/sibling — once one
-      // ends a compound, no further combinator+compound may follow it.
-      if (parts[parts.length - 1].compound.subs.some(_selIsVtPe)) return null;
+      // A view-transition or ::slotted() pseudo-element can't have a descendant/
+      // sibling — once one ends a compound, no further combinator+compound follows.
+      const prevSubs = parts[parts.length - 1].compound.subs;
+      if (prevSubs.some((su) => _selIsVtPe(su) || (su.kind === 'pe' && su.name === 'slotted'))) return null;
       parts.push({ comb, compound: next });
     }
     return parts;
