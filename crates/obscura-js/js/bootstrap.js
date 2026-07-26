@@ -1496,6 +1496,24 @@ class CSSStyleDeclaration {
     if (value === '') { this.removeProperty(name); return; }   // empty value ⇒ remove (CSSOM)
     let stored = custom ? _canonCustomValue(value) : _canonStandardValue(value.trim());
     if (!custom && stored === '') { this.removeProperty(name); return; }
+    if (!custom && name === 'all') {
+      // The `all` shorthand (CSS Cascade §all) resets EVERY property except
+      // direction, unicode-bidi and custom properties. It accepts ONLY a CSS-wide
+      // keyword. We keep a single sentinel key `all` = keyword and drop every
+      // property it covers that was declared before it (a property re-declared
+      // AFTER `all` is stored on top and wins). getPropertyValue reconstructs the
+      // covered longhands/shorthands from the sentinel — see _allShorthandValue.
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low)) return;                            // non-CSS-wide value → invalid, ignore
+      const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+      for (const k of Object.keys(this._props)) {
+        if (this._coveredByAll(k)) { delete this._props[k]; delete this._priority[k]; }
+      }
+      delete this._props['all']; delete this._priority['all'];
+      this._props['all'] = low; this._priority['all'] = prio;
+      this._notifyChange();
+      return;
+    }
     if (!custom && _GRID_GAP_ALIAS[name]) name = _GRID_GAP_ALIAS[name];  // grid-row-gap→row-gap (legacy alias)
     if (!custom && _RADIUS_ALIAS[name]) name = _RADIUS_ALIAS[name];  // -webkit-border(-*)-radius → canonical (Compat legacy alias)
     if (!custom && _ALIGN_SHORTHAND_LH[name] && !/\bvar\(/i.test(stored)) {
@@ -2456,6 +2474,14 @@ class CSSStyleDeclaration {
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     if (_RADIUS_ALIAS[key]) key = _RADIUS_ALIAS[key];  // -webkit-border(-*)-radius → canonical
+    if (key === 'all') {                                   // `all`: remove every declaration it covers (+ any sentinel)
+      const old = this.getPropertyValue('all');
+      for (const k of Object.keys(this._props)) {
+        if (k === 'all' || this._coveredByAll(k)) { delete this._props[k]; delete this._priority[k]; }
+      }
+      this._notifyChange();
+      return old;
+    }
     if (key === 'offset') {                                // shorthand: clear its five longhands
       const old = _serializeOffsetShorthand(this);
       for (const ln of _OFFSET_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
@@ -2702,10 +2728,46 @@ class CSSStyleDeclaration {
     this._notifyChange();
     return old || "";
   }
+  // A property `all` (CSS Cascade §all) resets; direction, unicode-bidi and custom
+  // properties are the only things it does NOT cover.
+  _coveredByAll(k) {
+    return k !== 'all' && k !== 'direction' && k !== 'unicode-bidi' && !k.startsWith('--');
+  }
+  // When an `all` sentinel is stored, compute what `key` should report, or undefined
+  // to let the normal (non-`all`) path run. `key` is already alias-normalized.
+  //  · `all` itself → the keyword iff no covered property was re-declared to a
+  //    different value after `all`, else "".
+  //  · a covered leaf longhand not re-declared → the keyword.
+  //  · a covered shorthand: no longhand re-declared → the keyword (uniform); every
+  //    longhand re-declared → undefined (normal reconstruction, e.g. "10px 20px …");
+  //    a partial mix → "" (not expressible as a single serialization).
+  _allShorthandValue(key) {
+    const allKw = this._props['all'];
+    if (allKw === undefined) return undefined;
+    if (key === 'all') {
+      for (const k in this._props) {
+        if (k !== 'all' && this._coveredByAll(k) && this._props[k] !== allKw) return '';
+      }
+      return allKw;
+    }
+    if (!this._coveredByAll(key)) return undefined;               // direction/unicode-bidi/custom → normal path
+    if (key in this._props) return undefined;                     // re-declared after `all` (leaf or single-key shorthand) → normal path
+    const lhs = _shorthandLonghandList(key);
+    if (!lhs) return allKw;                                       // leaf longhand, not re-declared
+    let anyStored = false, allStored = true;                      // shorthand: inspect its longhands
+    for (const ln of lhs) { if (ln in this._props) anyStored = true; else allStored = false; }
+    if (!anyStored) return allKw;                                 // none re-declared → uniform keyword
+    if (allStored) return undefined;                              // all re-declared → normal reconstruction
+    return '';                                                    // partial → no single serialization
+  }
   getPropertyValue(name) {
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     if (_RADIUS_ALIAS[key]) key = _RADIUS_ALIAS[key];  // -webkit-border(-*)-radius → canonical
+    if ('all' in this._props) {                            // an `all` sentinel is live → it may drive this property
+      const av = this._allShorthandValue(key);
+      if (av !== undefined) return av;
+    }
     if (key === 'offset') return _serializeOffsetShorthand(this);  // reconstruct from longhands
     if (key === 'animation') {                                // reconstruct from its eleven longhands
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
@@ -2849,6 +2911,21 @@ class CSSStyleDeclaration {
   set cssText(v) {
     this._props = {}; this._priority = {};
     for (const d of _parseStyleDecls(v, this._pageDescriptors ? { page: true } : this._fontFaceDescriptors ? { fontFace: true } : undefined)) {
+      if (d.name === 'all') {
+        // `all` (CSS Cascade §all) — accepts only a CSS-wide keyword; drop every
+        // covered property declared so far and keep a single sentinel key (see the
+        // setProperty branch). A later covered declaration re-inserts on top.
+        const low = String(d.value).toLowerCase();
+        if (!_CSS_WIDE.has(low)) continue;                        // non-CSS-wide → invalid, drop
+        if (this._priority['all'] === 'important' && !d.important) continue;
+        for (const k of Object.keys(this._props)) {
+          if (this._coveredByAll(k)) { delete this._props[k]; delete this._priority[k]; }
+        }
+        delete this._props['all']; delete this._priority['all'];
+        this._props['all'] = low;
+        this._priority['all'] = d.important ? 'important' : '';
+        continue;
+      }
       // !important within a declaration block is not overridden by a later normal
       // declaration of the same property; otherwise later wins.
       if (this._priority[d.name] === 'important' && !d.important) continue;
@@ -22380,6 +22457,45 @@ const _parentFontSizePx = (el) => {
 // reconstruct it. A system-font keyword (or CSS-wide keyword / var()) is kept as a
 // single `font` key. Reuses the css-fonts longhand canonicalizers above.
 const _FONT_SH_LH = ['font-style', 'font-variant-caps', 'font-weight', 'font-stretch', 'font-size', 'line-height', 'font-family'];
+// The longhand list of a shorthand, for the `all` sentinel's reconstruction
+// (_allShorthandValue). null → a leaf property (or a shorthand not modelled here,
+// treated as a leaf, which is correct whenever none of its longhands are stored).
+// Object-keyed maps (_BOX_LOGICAL_SH2 etc.) return per-key arrays; the rest are
+// flat longhand arrays reused verbatim from the removeProperty branches.
+const _shorthandLonghandList = (key) => {
+  if (_BOX_LOGICAL_SH2[key]) return _BOX_LOGICAL_SH2[key];
+  if (_ALIGN_SHORTHAND_LH[key]) return _ALIGN_SHORTHAND_LH[key];
+  if (_SCROLL_SH_LH[key]) return _SCROLL_SH_LH[key];
+  if (_GAP_RULE_SH[key]) return _GAP_RULE_SH[key];
+  if (_BORDER_EXPAND[key]) return _BORDER_EXPAND[key];
+  if (_BORDER_LOGICAL_SH[key]) return _BORDER_LOGICAL_SH[key];
+  if (_CORNER_SHAPE_SH[key]) return _CORNER_SHAPE_SH[key];
+  if (_GAP_BIDI_SH[key]) return _GAP_BIDI_SH[key];
+  switch (key) {
+    case 'font': return _FONT_SH_LH;
+    case 'font-variant': return _FONT_VARIANT_SH_LH;
+    case 'flex': return _FLEX_LONGHANDS;
+    case 'flex-flow': return _FLEX_FLOW_LONGHANDS;
+    case 'text-decoration': return _TD_LONGHANDS;
+    case 'text-emphasis': return _TE_LONGHANDS;
+    case 'list-style': return _LS_LONGHANDS;
+    case 'animation': return _ALL_ANIMATION_LH;
+    case 'transition': return _TRANSITION_LONGHANDS;
+    case 'overflow': return _OVERFLOW_SH_LH;
+    case 'overscroll-behavior': return _OVERSCROLL_SH_LH;
+    case 'border-radius': return _BORDER_RADIUS_LH;
+    case 'grid-template': return _GRID_TEMPLATE_LH;
+    case 'grid': return _GRID_SH_LH;
+    case 'background': return _BG_SH_LH;
+    case 'border-image': return _BI_SH_LH;
+    case 'mask': return _MASK_SH_LH;
+    case 'offset': return _OFFSET_LONGHANDS;
+    case 'position-try': return _POSITION_TRY_LONGHANDS;
+    case 'block-step': return _BLOCK_STEP_LONGHANDS;
+    case 'animation-range': return _ANIM_RANGE_LONGHANDS;
+  }
+  return null;
+};
 const _FONT_SYSTEM = new Set(['caption', 'icon', 'menu', 'message-box', 'small-caption', 'status-bar']);
 // <font-stretch-css3>: the named keywords only (no <percentage> in the shorthand).
 const _FONT_STRETCH_KW = new Set(Object.keys(_FONT_WIDTH_KW));
