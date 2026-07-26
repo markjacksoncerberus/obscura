@@ -9489,7 +9489,7 @@ const _GCS_DEFAULTS = {
   'forced-color-adjust': 'auto', 'print-color-adjust': 'economy',
   // css-anchor-position — none inherit. Computed = specified (canonical keyword/list).
   'position-visibility': 'anchors-visible', 'position-try-order': 'normal', 'anchor-scope': 'none',
-  'position-try-fallbacks': 'none',
+  'position-try-fallbacks': 'none', 'position-area': 'none',
 };
 // ---------------------------------------------------------------------------
 // Shorthand → longhand expansion (for the cascade / getComputedStyle).
@@ -11757,6 +11757,10 @@ const _calcConstValue = (str) => {
 // serialization untouched. Returns `v` unchanged otherwise.
 const _canonLengthTimeMath = (name, v) => {
   if (!_MATHFN_NAME_RE.test(v)) return v;
+  // A top-level anchor()/anchor-size() value is already canonicalized by its own inset
+  // component parser — do NOT re-run the calc serializer on it (it would treat `anchor(`
+  // as an unknown math function and shed the inner calc() wrapper of the fallback).
+  if (/^anchor(?:-size)?\(/i.test(String(v).trim())) return v;
   // css-gaps line props (column-rule-width/row-rule-width) already self-canonicalize via
   // _canonGapRuleList — their value may be a repeat()/comma list, not a bare length math.
   // Running it through _canonMathExpr would treat `repeat(` as a function and shed the
@@ -13438,6 +13442,10 @@ const _CSSUI_VALIDATED = new Set([
   // css-anchor-position: position-try-fallbacks — `none | [ [<dashed-ident> ||
   // <try-tactic>] | <'position-area'> ]#` (dedicated _canonCssUi branch).
   'position-try-fallbacks',
+  // css-anchor-position: position-area — `none | <position-area>` (a 1–2 keyword grid
+  // address; dedicated _canonCssUi → _canonPositionArea branch). Not inherited; the
+  // COMPUTED value reduces logical keywords (a separate _normComputed branch).
+  'position-area',
   // css-position: `position` (keyword enum, above) + `z-index` (`auto | <integer>`,
   // a dedicated _canonCssUi branch; a number-typed calc kept symbolic → folded at
   // computed via _INTEGER_COMPUTED_PROPS).
@@ -14291,6 +14299,7 @@ const _canonCssUi = (name, value) => {
   if (name === 'position-visibility') return _canonPositionVisibility(s);
   if (name === 'anchor-scope') return _canonAnchorScope(s);
   if (name === 'position-try-fallbacks') return _canonPositionTryFallbacks(s);
+  if (name === 'position-area') return low === 'none' ? 'none' : _canonPositionArea(_wsTokens(s));
   if (name === 'cursor') return _serCursor(s, false, null);   // specified <cursor> (invalid → null)
   return s;
 };
@@ -14389,8 +14398,8 @@ const _canonDashedTactic = (toks) => {
 // {1,2} group ('startsys' start/end, 'selfstartsys' self-start/self-end). `center` and
 // `span-all` are system-neutral and fill whichever axis is left.
 const _PA_GROUPS = [
-  [new Set(['left', 'right', 'span-left', 'span-right', 'x-start', 'x-end', 'span-x-start', 'span-x-end', 'x-self-start', 'x-self-end', 'span-x-self-start', 'span-x-self-end']), 'physical', 0],
-  [new Set(['top', 'bottom', 'span-top', 'span-bottom', 'y-start', 'y-end', 'span-y-start', 'span-y-end', 'y-self-start', 'y-self-end', 'span-y-self-start', 'span-y-self-end']), 'physical', 1],
+  [new Set(['left', 'right', 'span-left', 'span-right', 'x-start', 'x-end', 'span-x-start', 'span-x-end', 'self-x-start', 'self-x-end', 'span-self-x-start', 'span-self-x-end']), 'physical', 0],
+  [new Set(['top', 'bottom', 'span-top', 'span-bottom', 'y-start', 'y-end', 'span-y-start', 'span-y-end', 'self-y-start', 'self-y-end', 'span-self-y-start', 'span-self-y-end']), 'physical', 1],
   [new Set(['block-start', 'block-end', 'span-block-start', 'span-block-end']), 'logical', 0],
   [new Set(['inline-start', 'inline-end', 'span-inline-start', 'span-inline-end']), 'logical', 1],
   [new Set(['self-block-start', 'self-block-end', 'span-self-block-start', 'span-self-block-end']), 'self', 0],
@@ -14415,8 +14424,17 @@ const _canonPositionArea = (toks) => {
   const sys = syss.length ? syss[0] : 'any';
   if (sys === 'startsys' || sys === 'selfstartsys') {
     // {1,2} same-group form: keep author order (first = block-ish, second = inline-ish),
-    // collapse an identical pair to one keyword (`start start` → `start`).
+    // collapse an identical pair to one keyword (`start start` → `start`). `span-all`/
+    // `center` fill a slot here in author order and are NOT dropped (`start span-all`
+    // stays, `start center` stays).
     return k[0] === k[1] ? k[0] : k[0] + ' ' + k[1];
+  }
+  // Physical/logical/self systems: `span-all` is the whole-axis default filler, so it is
+  // DROPPED when paired with a definite position keyword (`left span-all` → `left`,
+  // `block-start span-all` → `block-start`). `center` is a real position and is kept.
+  // (Both-neutral `center span-all` never reaches here — its sys is 'any'.)
+  if (sys !== 'any' && (k[0] === 'span-all' || k[1] === 'span-all')) {
+    return k[0] === 'span-all' ? k[1] : k[0];
   }
   let r1 = c1.rank, r2 = c2.rank;
   if (r1 === -1 && r2 === -1) return k[0] === k[1] ? k[0] : k[0] + ' ' + k[1]; // both neutral
@@ -14426,6 +14444,44 @@ const _canonPositionArea = (toks) => {
   const first = r1 === 0 ? k[0] : k[1];
   const second = r1 === 0 ? k[1] : k[0];
   return first === second ? first : first + ' ' + second;      // rank-0 axis first; collapse identical
+};
+// <position-area> COMPUTED value (CSS Anchor Positioning §position-area computed value).
+// The specified canonical value (above) is reduced further at computed time:
+//  • an unambiguous logical/self-logical keyword in a 2-keyword value reduces to its
+//    ambiguous (start/end) short form (`block-start inline-end` → `start end`), and an
+//    identical resulting pair collapses (`block-start inline-start` → `start`);
+//  • conversely an ambiguous start/end keyword paired with `span-all` (which the
+//    start-end system keeps in the specified value) resolves to a definite logical
+//    keyword by slot — first slot → block axis, second slot → inline axis — and drops
+//    `span-all` (`start span-all` → `block-start`, `span-all start` → `inline-start`).
+// Single keywords, physical keywords, `center` and bare `span-all` are computed = specified.
+const _PA_LOGICAL_TO_SHORT = {
+  'block-start': 'start', 'block-end': 'end', 'span-block-start': 'span-start', 'span-block-end': 'span-end',
+  'inline-start': 'start', 'inline-end': 'end', 'span-inline-start': 'span-start', 'span-inline-end': 'span-end',
+  'self-block-start': 'self-start', 'self-block-end': 'self-end', 'span-self-block-start': 'span-self-start', 'span-self-block-end': 'span-self-end',
+  'self-inline-start': 'self-start', 'self-inline-end': 'self-end', 'span-self-inline-start': 'span-self-start', 'span-self-inline-end': 'span-self-end',
+};
+const _PA_AMBIG_TO_BLOCK = {
+  'start': 'block-start', 'end': 'block-end', 'span-start': 'span-block-start', 'span-end': 'span-block-end',
+  'self-start': 'self-block-start', 'self-end': 'self-block-end', 'span-self-start': 'span-self-block-start', 'span-self-end': 'span-self-block-end',
+};
+const _PA_AMBIG_TO_INLINE = {
+  'start': 'inline-start', 'end': 'inline-end', 'span-start': 'span-inline-start', 'span-end': 'span-inline-end',
+  'self-start': 'self-inline-start', 'self-end': 'self-inline-end', 'span-self-start': 'span-self-inline-start', 'span-self-end': 'span-self-inline-end',
+};
+const _computePositionArea = (stored) => {
+  const low = String(stored).trim().toLowerCase();
+  if (low === 'none' || low === '') return low || 'none';
+  const toks = low.split(/\s+/).filter(Boolean);
+  if (toks.length !== 2) return toks[0] || low;                 // single keyword → identity
+  const a = toks[0], b = toks[1];
+  // Ambiguous start/end keyword + span-all → resolve by slot, drop span-all.
+  if (b === 'span-all' && Object.prototype.hasOwnProperty.call(_PA_AMBIG_TO_BLOCK, a)) return _PA_AMBIG_TO_BLOCK[a];
+  if (a === 'span-all' && Object.prototype.hasOwnProperty.call(_PA_AMBIG_TO_INLINE, b)) return _PA_AMBIG_TO_INLINE[b];
+  // Otherwise reduce logical keywords to their short form; collapse an identical pair.
+  const ra = _PA_LOGICAL_TO_SHORT[a] || a;
+  const rb = _PA_LOGICAL_TO_SHORT[b] || b;
+  return ra === rb ? ra : ra + ' ' + rb;
 };
 const _canonFallbackItem = (item) => {
   const toks = _wsTokens(item);
@@ -21642,10 +21698,62 @@ const _BOX_LOGICAL_LH = new Set([
   'inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end',
   'top', 'right', 'bottom', 'left',
 ]);
+// ── css-anchor-position anchor() ─────────────────────────────────────────────
+// `anchor( [ <anchor-name> || <anchor-side> ] , <length-percentage>? )` (CSS Anchor
+// Positioning 1). <anchor-name> = <dashed-ident> (optional); <anchor-side> = a side
+// keyword, a <percentage>, or a percentage-typed math function (required). The optional
+// fallback is a <length-percentage> — a literal, a math function, or a NESTED anchor().
+// Serialization: name FIRST (if given), then side, then `, <fallback>` — so the
+// author-flipped `anchor(left --foo)` canonicalizes to `anchor(--foo left)`. Valid ONLY
+// on the inset longhands (top/right/bottom/left/inset-*), NOT margins/sizing (those
+// reject it — anchor-parse-invalid asserts `margin-top: anchor(--foo top)` invalid).
+// CAP: an anchor() nested INSIDE calc()/min()/… is rejected (the calc parser has no
+// anchor() leaf) — the calc-tree-simplification valid cases (a handful) don't green.
+const _ANCHOR_SIDE_KW = new Set(['inside', 'outside', 'top', 'left', 'right', 'bottom', 'start', 'end', 'self-start', 'self-end', 'center']);
+const _isDashedIdent = (t) => /^--/.test(t) && _GRID_CI_RE.test(t);
+const _canonAnchorSide = (t) => {
+  const low = t.toLowerCase();
+  if (_ANCHOR_SIDE_KW.has(low)) return low;
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)%$/.test(t)) return t.replace(/^\+/, '');      // <percentage>
+  if (_MATHFN_NAME_RE.test(t)) {                                               // percentage-typed math
+    if (!_mathValid(t, ['percentage'], 'percentage')) return null;
+    return _canonMathExpr(t, { canonLen: true }) || t;
+  }
+  return null;
+};
+const _canonAnchorFn = (token) => {
+  const m = /^anchor\(([\s\S]*)\)$/i.exec(String(token).trim());
+  if (!m) return null;
+  const args = _commaSplitTop(m[1]);
+  if (args.length < 1 || args.length > 2) return null;
+  const head = _wsTokens(args[0].trim());                                      // [ <anchor-name> || <anchor-side> ]
+  if (head.length < 1 || head.length > 2) return null;
+  let name = null, side = null;
+  for (const tk of head) {
+    if (_isDashedIdent(tk)) { if (name !== null) return null; name = tk; }     // at most one <anchor-name>
+    else { if (side !== null) return null; const cs = _canonAnchorSide(tk); if (cs === null) return null; side = cs; }
+  }
+  if (side === null) return null;                                              // <anchor-side> is required
+  let fb = null;
+  if (args.length === 2) {
+    const raw = args[1].trim();
+    if (raw === '') return null;                                               // `anchor(--foo top,)` → invalid
+    fb = /^anchor\(/i.test(raw) ? _canonAnchorFn(raw) : _canonLenPctSigned(raw, true);
+    if (fb === null) return null;                                             // fallback must be a <length-percentage>
+  }
+  return 'anchor(' + (name ? name + ' ' : '') + side + (fb !== null ? ', ' + fb : '') + ')';
+};
 // margin/inset component = `auto | <length-percentage>` (signed). null → invalid.
 const _canonMarginInsetComp = (t) => {
   const low = String(t).toLowerCase();
   return low === 'auto' ? 'auto' : _canonLenPctSigned(t, true);
+};
+// The inset longhands additionally accept the anchor() function (see above).
+const _INSET_LH = new Set(['top', 'right', 'bottom', 'left', 'inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end']);
+const _canonInsetComp = (t) => {
+  const s = String(t).trim();
+  if (/^anchor\(/i.test(s)) return _canonAnchorFn(s);
+  return _canonMarginInsetComp(t);
 };
 // padding component = `<length-percentage [0,∞]>` (no auto/none/normal). null → invalid.
 const _canonPaddingComp = (t) => {
@@ -21653,7 +21761,7 @@ const _canonPaddingComp = (t) => {
   if (low === 'auto' || low === 'none' || low === 'normal') return null;
   return _canonGapItem(t);                                  // non-negative <length-percentage> (bare 0 → 0px)
 };
-const _boxLogicalCanonFor = (name) => name.startsWith('padding') ? _canonPaddingComp : _canonMarginInsetComp;
+const _boxLogicalCanonFor = (name) => name.startsWith('padding') ? _canonPaddingComp : _INSET_LH.has(name) ? _canonInsetComp : _canonMarginInsetComp;
 // Validate a single flow-relative box LONGHAND value (a single component token).
 const _canonBoxLogicalLh = (name, value) => {
   const toks = _wsTokens(String(value).trim());
@@ -22632,6 +22740,7 @@ const _normComputed = (el, kebab, v) => {
     if (tl === 'auto') return 'auto';
     return v;
   }
+  if (kebab === 'position-area') return _computePositionArea(v);
   if (kebab === 'justify-items') {
     // css-align §6.2: a bare `legacy` (the initial value) computes to the INHERITED
     // justify-items value when that inherited value is itself a legacy value
