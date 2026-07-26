@@ -24594,6 +24594,10 @@ const _cssParseRuleList = (cssText) => {
 
 // MediaList — a minimal serializable list of media queries (CSSOM §MediaList).
 // Wrapped in a Proxy so the indexed getter (`media[0]`) reads the live item list.
+// The backing object's prototype is set to MediaList.prototype so a CSSOM object
+// (`importRule.media`, `sheet.media`) satisfies `x instanceof MediaList`.
+class MediaList {}
+globalThis.MediaList = MediaList;
 const _makeMediaList = (text) => {
   const ml = {
     _items: String(text == null ? '' : (typeof text === 'string' ? text : (text.mediaText || '')))
@@ -24610,6 +24614,7 @@ const _makeMediaList = (text) => {
     },
     toString() { return this._items.join(', '); },
   };
+  Object.setPrototypeOf(ml, MediaList.prototype);   // so `ml instanceof MediaList`
   return new Proxy(ml, {
     get(t, p) {
       if (typeof p === 'string' && /^[0-9]+$/.test(p)) return t._items[+p];
@@ -25416,6 +25421,88 @@ class CSSFontFaceRule extends CSSRule {
 }
 globalThis.CSSFontFaceRule = CSSFontFaceRule;
 
+// Parse an `@import` prelude into { href, supportsText, mediaText } (CSS Cascade
+// §at-import serialization). Grammar: `@import [<url>|<string>] <layer>?
+// [supports(<condition>)]? <media-query-list>?`. The URL is the raw (unescaped)
+// import target; supports()/layer are optional; whatever trails is the media list.
+const _parseImportRule = (prelude) => {
+  let s = String(prelude == null ? '' : prelude).replace(/^\s*@import\s*/i, '').trim();
+  let href = '';
+  const um = /^url\(/i.exec(s);
+  if (um) {                                    // url( <string> | <url-token> )
+    let i = um[0].length, q = null, buf = '';
+    for (; i < s.length; i++) {
+      const c = s[i];
+      if (q) { if (c === q && s[i - 1] !== '\\') q = null; else buf += c; continue; }
+      if (c === '"' || c === "'") { q = c; continue; }
+      if (c === ')') { i++; break; }
+      if (!/\s/.test(c)) buf += c;
+    }
+    href = buf.replace(/\\(.)/g, '$1');
+    s = s.slice(i).trim();
+  } else if (s[0] === '"' || s[0] === "'") {   // bare <string>
+    const q = s[0]; let i = 1, buf = '';
+    for (; i < s.length; i++) {
+      const c = s[i];
+      if (c === q && s[i - 1] !== '\\') { i++; break; }
+      buf += c;
+    }
+    href = buf.replace(/\\(.)/g, '$1');
+    s = s.slice(i).trim();
+  }
+  s = s.replace(/^layer(\s*\([^)]*\))?\s*/i, '').trim();   // optional cascade layer
+  let supportsText = null;
+  const sm = /^supports\(/i.exec(s);
+  if (sm) {                                    // supports( <supports-condition> )
+    let i = sm[0].length, depth = 1, q = null; const start = i;
+    for (; i < s.length; i++) {
+      const c = s[i];
+      if (q) { if (c === q && s[i - 1] !== '\\') q = null; continue; }
+      if (c === '"' || c === "'") q = c;
+      else if (c === '(') depth++;
+      else if (c === ')') { depth--; if (depth === 0) break; }
+    }
+    supportsText = s.slice(start, i).trim();
+    s = s.slice(i + 1).trim();
+  }
+  return { href, supportsText, mediaText: s };
+};
+
+// CSSImportRule (CSSOM §CSSImportRule) — an `@import` rule. Exposes the imported
+// URL (`.href`), its media query list (`.media`, a live MediaList — [PutForwards=
+// mediaText] so `rule.media = "print"` updates its text), the optional supports()
+// condition (`.supportsText`, or null), and the imported style sheet
+// (`.styleSheet`). We do not fetch the imported sheet, so `.styleSheet` is an
+// empty CSSStyleSheet owned by this rule (enough for `instanceof CSSStyleSheet`).
+// `.type` is 3 (IMPORT_RULE); serialization is `@import url("…") [supports(…)]?
+// [<media>]?;` with the URL as a double-quoted CSS string.
+class CSSImportRule extends CSSRule {
+  constructor(desc) {
+    super();
+    const p = _parseImportRule((desc && desc.prelude) || '');
+    this._href = p.href;
+    this._supportsText = p.supportsText;
+    this._media = _makeMediaList(p.mediaText);
+    const sheet = new CSSStyleSheet();
+    sheet.ownerRule = this;
+    this._styleSheet = sheet;
+  }
+  get type() { return 3; }                                 // CSSRule.IMPORT_RULE
+  get href() { return this._href; }
+  get media() { return this._media; }
+  set media(v) { this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
+  get supportsText() { return this._supportsText; }
+  get styleSheet() { return this._styleSheet; }
+  get cssText() {
+    let out = '@import url(' + _serCssString(this._href) + ')';
+    if (this._supportsText != null) out += ' supports(' + this._supportsText + ')';
+    const mt = this._media.mediaText;
+    if (mt) out += ' ' + mt;
+    return out + ';';
+  }
+}
+globalThis.CSSImportRule = CSSImportRule;
+
 // CSSPropertyRule (css-properties-values-api §CSSPropertyRule) — an `@property`
 // rule. Read-only `.name` (the unescaped `--foo`), `.syntax` (the syntax string
 // verbatim, incl. surrounding whitespace), `.inherits` (boolean), `.initialValue`
@@ -25960,6 +26047,12 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     rule._parentRule = parentRule || null;
     return rule;
   }
+  if (desc.type === 'stmt' && desc.name === 'import') {
+    rule = new CSSImportRule(desc);
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
   if (desc.type === 'style') rule = new CSSStyleRule(desc.selectorText, desc.body);
   else if (desc.type === 'group' && desc.name === 'supports') rule = new CSSSupportsRule(desc.condition);
   else if (desc.type === 'group') rule = new CSSMediaRule(desc.condition);  // media/container/document → grouping
@@ -25990,6 +26083,7 @@ class CSSStyleSheet {
   get cssRules() { return this._ruleList; }
   get rules() { return this._ruleList; }            // legacy alias
   get media() { return this._media; }
+  set media(v) { this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
   get disabled() { return this._disabled; }
   set disabled(v) { this._disabled = !!v; }
   get title() { return this._title || null; }
@@ -26004,6 +26098,7 @@ class CSSStyleSheet {
     this._cssomDirty = false;   // rules rebuilt from source text — clear CSSOM-edit flag
   }
   insertRule(text, index) {
+    if (arguments.length < 1) throw new TypeError("insertRule requires at least 1 argument.");   // WebIDL: rule is required
     const arr = this._ruleListObj._rules;
     index = index === undefined ? 0 : index >>> 0;
     if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
@@ -26014,18 +26109,27 @@ class CSSStyleSheet {
     return index;
   }
   deleteRule(index) {
+    if (arguments.length < 1) throw new TypeError("deleteRule requires at least 1 argument.");    // WebIDL: index is required
     const arr = this._ruleListObj._rules;
     index = index >>> 0;
     if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
     const [removed] = arr.splice(index, 1);
     if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
   }
+  // Legacy CSSStyleSheet members (CSSOM §legacy-css-style-sheet-members). addRule
+  // string-concatenates a selector + block into a rule, inserts it (index defaults
+  // to the end), and always returns -1; the arguments default to the string
+  // "undefined" (so `addRule()` inserts a rule with selector "undefined").
   addRule(selector, style, index) {
-    this.insertRule((selector || '') + ' { ' + (style || '') + ' }',
-      index === undefined ? this._ruleListObj._rules.length : index);
+    if (selector === undefined) selector = 'undefined';
+    if (style === undefined) style = 'undefined';
+    let rule = selector + ' { ';
+    if (style !== '') rule += style + ' ';
+    rule += '}';
+    this.insertRule(rule, index === undefined ? this._ruleListObj._rules.length : index);
     return -1;
   }
-  removeRule(index) { this.deleteRule(index || 0); }
+  removeRule(index) { this.deleteRule(index >>> 0); }   // index defaults to 0 (removes first rule)
   replaceSync(text) {
     if (!this._constructed) throw new DOMException("replaceSync can only be called on a constructed style sheet.", "NotAllowedError");
     this._setRules(String(text).replace(/@import[^;]*;/gi, ''));   // @import is ignored in replace()
