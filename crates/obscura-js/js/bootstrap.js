@@ -24337,6 +24337,10 @@ const _cssParseRuleList = (cssText) => {
         // doesn't match the syntax) is dropped entirely (css-properties-values-api §cssom).
         const prop = _validatePropertyRule(condition, body);
         if (prop) rules.push({ type: 'property', name, condition, prelude, body, _prop: prop });
+      } else if (name === 'counter-style') {
+        // @counter-style <counter-style-name> { <declaration-list> } → CSSCounterStyleRule.
+        // An invalid name makes the whole at-rule invalid → drop it (CSSOM).
+        if (_isValidCounterStyleName(condition)) rules.push({ type: 'counter-style', name, condition, prelude, body });
       } else {
         rules.push({ type: 'at', name, condition, prelude, body });
       }
@@ -25472,6 +25476,205 @@ class CSSFontPaletteValuesRule extends CSSRule {
 }
 globalThis.CSSFontPaletteValuesRule = CSSFontPaletteValuesRule;
 
+// @counter-style (css-counter-styles-3) — CSSCounterStyleRule: a named custom
+// counter style. The prelude is a <counter-style-name> (a <custom-ident> that is
+// not `none`, not a CSS-wide keyword/`default`, and not one of the six predefined
+// non-overridable styles below); an invalid name makes the whole at-rule invalid
+// (dropped in _cssParseRuleList, like @keyframes/@font-palette-values). Exposes
+// readonly .name plus a descriptor accessor per descriptor. Each descriptor value
+// is canonicalized by its grammar; an invalid descriptor is dropped (the rule
+// survives), matching the harness which accepts either an absent rule or a rule
+// whose cssText simply lacks the bad descriptor.
+const _CS_PREDEFINED_INVALID = new Set(['decimal', 'disc', 'square', 'circle', 'disclosure-open', 'disclosure-closed']);
+// A <counter-style-name> = <custom-ident> excluding `none` (and, per @counter-style,
+// the six predefined styles above). CSS-wide keywords/`default` are already excluded
+// by <custom-ident>.
+const _isValidCounterStyleName = (raw) => {
+  const t = String(raw == null ? '' : raw).trim();
+  if (t === '' || !_GRID_CI_RE.test(t)) return false;
+  const low = _unescapeCssIdent(t).toLowerCase();
+  if (_CSS_WIDE.has(low) || low === 'default' || low === 'none') return false;
+  return !_CS_PREDEFINED_INVALID.has(low);
+};
+// A <symbol> = <string> | <image> | <custom-ident>. Returns its canonical
+// serialization (url() quoted, gradient/image-set normalized; strings and idents
+// verbatim), or null if `raw` is not a single valid symbol.
+const _csCanonSymbol = (raw) => {
+  const p = String(raw == null ? '' : raw).trim();
+  if (p === '') return null;
+  if (_propMatchString(p)) return p;                       // <string> — verbatim
+  if (_propMatchType('custom-ident', p)) return p;         // <custom-ident> — verbatim
+  if (_propMatchImage(p)) {                                // <image> — canonicalize
+    const um = /^url\(\s*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s"'()\\]*))\s*\)$/i.exec(p);
+    if (um) return 'url("' + (um[1] || um[2] || um[3] || '') + '")';
+    return _canonImageSet(_canonGradients(p, null, false));
+  }
+  return null;
+};
+const _csIntNonNeg = (t) => /^\+?\d+$/.test(String(t == null ? '' : t).trim());   // <integer [0,∞]> literal
+// symbols descriptor = <symbol>+
+const _csCanonSymbols = (v) => {
+  const toks = _wsTokens(String(v == null ? '' : v).trim());
+  if (!toks.length) return null;
+  const out = [];
+  for (const t of toks) { const c = _csCanonSymbol(t); if (c === null) return null; out.push(c); }
+  return out.join(' ');
+};
+// negative descriptor = <symbol> <symbol>?
+const _csCanonNegative = (v) => {
+  const toks = _wsTokens(String(v == null ? '' : v).trim());
+  if (toks.length < 1 || toks.length > 2) return null;
+  const out = [];
+  for (const t of toks) { const c = _csCanonSymbol(t); if (c === null) return null; out.push(c); }
+  return out.join(' ');
+};
+// pad descriptor = <integer [0,∞]> && <symbol> (either order; serialized int-first)
+const _csCanonPad = (v) => {
+  const toks = _wsTokens(String(v == null ? '' : v).trim());
+  if (toks.length !== 2) return null;
+  let intTok, symTok;
+  if (_csIntNonNeg(toks[0])) { intTok = toks[0]; symTok = toks[1]; }
+  else if (_csIntNonNeg(toks[1])) { intTok = toks[1]; symTok = toks[0]; }
+  else return null;
+  const s = _csCanonSymbol(symTok);
+  return s === null ? null : String(parseInt(intTok, 10)) + ' ' + s;
+};
+// additive-symbols descriptor = [ <integer [0,∞]> && <symbol> ]# with STRICTLY
+// decreasing weights (an equal or increasing weight invalidates the descriptor).
+const _csCanonAdditiveSymbols = (v) => {
+  const groups = _splitCommasTopLevel(String(v == null ? '' : v).trim());
+  if (!groups.length) return null;
+  const out = []; let prev = Infinity;
+  for (const g of groups) {
+    const toks = _wsTokens(g.trim());
+    if (toks.length !== 2) return null;
+    let intTok, symTok;
+    if (_csIntNonNeg(toks[0])) { intTok = toks[0]; symTok = toks[1]; }
+    else if (_csIntNonNeg(toks[1])) { intTok = toks[1]; symTok = toks[0]; }
+    else return null;
+    const s = _csCanonSymbol(symTok);
+    if (s === null) return null;
+    const w = parseInt(intTok, 10);
+    if (!(w < prev)) return null;                          // must strictly decrease
+    prev = w;
+    out.push(w + ' ' + s);
+  }
+  return out.join(', ');
+};
+// range descriptor = [ [ <integer> | infinite ]{2} ]# | auto, each pair's lower
+// bound not exceeding its upper (`infinite` = -∞ as the lower, +∞ as the upper).
+const _csRangeBound = (tok, isLower) => {
+  if (tok.toLowerCase() === 'infinite') return { ser: 'infinite', num: isLower ? -Infinity : Infinity };
+  if (/^[+-]?\d+$/.test(tok)) { const n = parseInt(tok, 10); return { ser: String(n), num: n }; }
+  return null;
+};
+const _csCanonRange = (v) => {
+  const t = String(v == null ? '' : v).trim();
+  if (t.toLowerCase() === 'auto') return 'auto';
+  const groups = _splitCommasTopLevel(t);
+  if (!groups.length) return null;
+  const out = [];
+  for (const g of groups) {
+    const toks = _wsTokens(g.trim());
+    if (toks.length !== 2) return null;
+    const lo = _csRangeBound(toks[0], true), hi = _csRangeBound(toks[1], false);
+    if (!lo || !hi || lo.num > hi.num) return null;
+    out.push(lo.ser + ' ' + hi.ser);
+  }
+  return out.join(', ');
+};
+// system descriptor = cyclic | numeric | alphabetic | symbolic | additive |
+// [ fixed <integer>? ] | [ extends <counter-style-name> ]
+const _CS_SYSTEM_KW = new Set(['cyclic', 'numeric', 'alphabetic', 'symbolic', 'additive']);
+const _csCanonSystem = (v) => {
+  const toks = _wsTokens(String(v == null ? '' : v).trim());
+  if (!toks.length) return null;
+  const kw = toks[0].toLowerCase();
+  if (toks.length === 1 && _CS_SYSTEM_KW.has(kw)) return kw;
+  if (kw === 'fixed') {
+    if (toks.length === 1) return 'fixed';
+    if (toks.length === 2 && /^[+-]?\d+$/.test(toks[1])) return 'fixed ' + String(parseInt(toks[1], 10));
+    return null;
+  }
+  if (kw === 'extends') {
+    if (toks.length === 2 && _isValidCounterStyleName(toks[1])) return 'extends ' + toks[1];
+    return null;
+  }
+  return null;
+};
+// speak-as descriptor = auto | bullets | numbers | words | spell-out | <counter-style-name>
+const _CS_SPEAK_KW = new Set(['auto', 'bullets', 'numbers', 'words', 'spell-out']);
+const _csCanonSpeakAs = (v) => {
+  const t = String(v == null ? '' : v).trim(); const low = t.toLowerCase();
+  if (_CS_SPEAK_KW.has(low)) return low;
+  return _isValidCounterStyleName(t) ? t : null;
+};
+// fallback descriptor = <counter-style-name>
+const _csCanonFallback = (v) => {
+  const t = String(v == null ? '' : v).trim();
+  return _isValidCounterStyleName(t) ? t : null;
+};
+// The descriptor table: canon fn + the accessor field + CSSOM property name.
+const _CS_DESCRIPTORS = [
+  { name: 'system', field: '_system', canon: _csCanonSystem },
+  { name: 'symbols', field: '_symbols', canon: _csCanonSymbols },
+  { name: 'additive-symbols', field: '_additiveSymbols', canon: _csCanonAdditiveSymbols },
+  { name: 'negative', field: '_negative', canon: _csCanonNegative },
+  { name: 'prefix', field: '_prefix', canon: _csCanonSymbol },
+  { name: 'suffix', field: '_suffix', canon: _csCanonSymbol },
+  { name: 'range', field: '_range', canon: _csCanonRange },
+  { name: 'pad', field: '_pad', canon: _csCanonPad },
+  { name: 'speak-as', field: '_speakAs', canon: _csCanonSpeakAs },
+  { name: 'fallback', field: '_fallback', canon: _csCanonFallback },
+];
+class CSSCounterStyleRule extends CSSRule {
+  constructor(desc) {
+    super();
+    this._name = _unescapeCssIdent(String((desc && desc.condition) || '').trim());
+    for (const d of _CS_DESCRIPTORS) this[d.field] = '';
+    // Apply descriptors in source order; each valid value overrides the previous,
+    // invalid values drop (CSS declaration-block + descriptor-grammar semantics).
+    const byName = {};
+    for (const d of _CS_DESCRIPTORS) byName[d.name] = d;
+    for (const { name, value } of _fpvSplitDecls(desc && desc.body)) {
+      const d = byName[name];
+      if (!d) continue;
+      const c = d.canon(value);
+      if (c !== null) this[d.field] = c;
+    }
+  }
+  get type() { return 11; }                                // CSSRule.COUNTER_STYLE_RULE
+  get name() { return this._name; }
+  set name(v) { const t = String(v == null ? '' : v).trim(); if (_isValidCounterStyleName(t)) this._name = _unescapeCssIdent(t); }
+  get system() { return this._system; }
+  set system(v) { const c = _csCanonSystem(v); if (c !== null) this._system = c; }
+  get symbols() { return this._symbols; }
+  set symbols(v) { const c = _csCanonSymbols(v); if (c !== null) this._symbols = c; }
+  get additiveSymbols() { return this._additiveSymbols; }
+  set additiveSymbols(v) { const c = _csCanonAdditiveSymbols(v); if (c !== null) this._additiveSymbols = c; }
+  get negative() { return this._negative; }
+  set negative(v) { const c = _csCanonNegative(v); if (c !== null) this._negative = c; }
+  get prefix() { return this._prefix; }
+  set prefix(v) { const c = _csCanonSymbol(v); if (c !== null) this._prefix = c; }
+  get suffix() { return this._suffix; }
+  set suffix(v) { const c = _csCanonSymbol(v); if (c !== null) this._suffix = c; }
+  get range() { return this._range; }
+  set range(v) { const c = _csCanonRange(v); if (c !== null) this._range = c; }
+  get pad() { return this._pad; }
+  set pad(v) { const c = _csCanonPad(v); if (c !== null) this._pad = c; }
+  get speakAs() { return this._speakAs; }
+  set speakAs(v) { const c = _csCanonSpeakAs(v); if (c !== null) this._speakAs = c; }
+  get fallback() { return this._fallback; }
+  set fallback(v) { const c = _csCanonFallback(v); if (c !== null) this._fallback = c; }
+  get cssText() {
+    const parts = [];
+    for (const d of _CS_DESCRIPTORS) { const val = this[d.field]; if (val) parts.push(d.name + ': ' + val + ';'); }
+    const body = parts.length ? ' ' + parts.join(' ') + ' ' : ' ';
+    return '@counter-style ' + _serializeCssIdent(this._name) + ' {' + body + '}';
+  }
+}
+globalThis.CSSCounterStyleRule = CSSCounterStyleRule;
+
 const _makeRule = (desc, parentSheet, parentRule) => {
   let rule;
   if (desc.type === 'font-palette-values') {
@@ -25500,6 +25703,12 @@ const _makeRule = (desc, parentSheet, parentRule) => {
   }
   if (desc.type === 'property') {
     rule = new CSSPropertyRule(desc);
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
+  if (desc.type === 'counter-style') {
+    rule = new CSSCounterStyleRule(desc);
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
