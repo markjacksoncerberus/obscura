@@ -23896,15 +23896,38 @@ const _SEL_USER_ACTION_PC = new Set(['hover','active','focus','focus-visible','f
 // disallowed inside :is()/:where()/:not()/:has().
 const _SEL_VT_FN_PE = new Set(['view-transition-group','view-transition-image-pair','view-transition-old','view-transition-new']);
 const _selIsVtPe = (sub) => sub.kind === 'pe' && (_SEL_VT_FN_PE.has(sub.name) || sub.name === 'view-transition');
-// Deep-scan a parsed selector list for a view-transition pseudo-element (also
-// through :is/:where/:not/:has argument lists and `nth ... of` lists).
-const _selListHasVtPe = (list) => list.some((cx) => cx.some((part) =>
-  part.compound.subs.some((sub) =>
-    _selIsVtPe(sub) ||
-    (sub.args && sub.args.sel && _selListHasVtPe(sub.args.sel)) ||
-    (sub.args && sub.args.of && _selListHasVtPe(sub.args.of)))));
+// Does a parsed selector list contain a pseudo-element as a DIRECT compound
+// member (not descending into nested :is()/:where()/:not()/:has() argument
+// lists)? Pseudo-elements are disallowed directly inside :not()/:has()/:host()
+// — but a pseudo-element buried in a nested forgiving :is()/:where() is that
+// pseudo-class's own concern (it tolerates it forgivingly), so we do NOT recurse.
+const _selListHasDirectPe = (list) => list.some((cx) => cx.some((part) =>
+  part.compound.subs.some((sub) => sub.kind === 'pe')));
+// Split a functional-pseudo argument on its TOP-LEVEL commas (into the individual
+// complex selectors of a selector list), skipping commas nested in parens/brackets
+// or inside a string. Used for forgiving :is()/:where() member-wise parsing.
+const _splitSelectorCommas = (raw) => {
+  const out = []; let depth = 0, inStr = null, start = 0;
+  for (let k = 0; k < raw.length; k++) {
+    const c = raw[k];
+    if (inStr) { if (c === '\\') { k++; continue; } if (c === inStr) inStr = null; continue; }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === '\\') { k++; continue; }
+    if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') depth--;
+    else if (c === ',' && depth === 0) { out.push(raw.slice(start, k)); start = k + 1; }
+  }
+  out.push(raw.slice(start));
+  return out;
+};
 // Parse a group of selectors. Returns the AST (array of complex selectors) or null.
-const _parseSelectorList = (src, relative) => {
+// `ctx` threads parse context: a shared `f.forgiving` accumulator (set true when
+// a forgiving :is()/:where() had to drop or tolerate an unsupported member — which
+// makes CSS.supports(selector(...)) report false), plus scoped `inHas` (inside a
+// :has(), so a nested :has() is invalid) and `noComb` (inside a :host()/:host-
+// context() argument, where combinators are forbidden even through nested pseudos).
+const _parseSelectorList = (src, relative, ctx) => {
+  if (!ctx) ctx = { f: { forgiving: false }, inHas: false, noComb: false };
   const s = String(src);
   const n = s.length;
   let i = 0;
@@ -24006,18 +24029,47 @@ const _parseSelectorList = (src, relative) => {
       return { raw: _serIdent(a) };
     }
     if (_SEL_NESTING_FN.has(name)) {
-      // :has() takes a <relative-selector-list> (each complex selector may lead
-      // with a combinator); the others take a plain <complex-selector-list>.
-      const inner = _parseSelectorList(raw, name === 'has');
-      // Pseudo-elements (view-transition) are disallowed inside :is/:where/:not/:has.
-      if (!inner || _selListHasVtPe(inner)) return null;
+      const isHas = name === 'has';
+      const isHost = name === 'host' || name === 'host-context';
+      const forgivingFn = name === 'is' || name === 'where' ||
+        name === 'matches' || name === '-webkit-any' || name === 'any';
+      // A :has() cannot be nested inside another :has() (even indirectly).
+      if (isHas && ctx.inHas) return null;
+      // Child scope: :has() marks `inHas`; :host()/:host-context() forbid
+      // combinators. Both share this call's `f.forgiving` accumulator.
+      const child = { f: ctx.f, inHas: ctx.inHas || isHas, noComb: ctx.noComb || isHost };
+      if (forgivingFn) {
+        // :is()/:where() (and the legacy :matches()/-webkit-any()/:any()) take a
+        // <forgiving-selector-list>: each complex selector is parsed on its own,
+        // and an invalid one is DROPPED rather than failing the whole selector.
+        // Any drop — or a tolerated-but-unsupported pseudo-element — raises the
+        // forgiving flag (→ CSS.supports(selector(...)) is false) and makes the
+        // pseudo serialize its argument back verbatim.
+        const kept = [];
+        let forg = false;
+        for (const piece of _splitSelectorCommas(raw)) {
+          if (!piece.trim()) continue;              // empty member (e.g. `:is()`)
+          const one = _parseSelectorList(piece, false, child);
+          if (!one) { forg = true; continue; }
+          if (_selListHasDirectPe(one)) forg = true;   // PE tolerated, not supported
+          kept.push(...one);
+        }
+        if (forg) ctx.f.forgiving = true;
+        return { sel: kept, raw: forg ? raw.trim() : null };
+      }
+      // Non-forgiving :not()/:has()/:host()/:host-context(). :has() takes a
+      // <relative-selector-list> (each complex selector may lead with a
+      // combinator); the rest take a plain <complex-selector-list>. A pseudo-
+      // element as a direct member is invalid here.
+      const inner = _parseSelectorList(raw, isHas, child);
+      if (!inner || _selListHasDirectPe(inner)) return null;
       return { sel: inner };
     }
     if (_SEL_NTH_FN.has(name)) {
       const ofIdx = raw.search(/\sof\s/i);
       if (ofIdx >= 0) {
         const anb = _selSerAnB(raw.slice(0, ofIdx)); if (anb === null) return null;
-        const inner = _parseSelectorList(raw.slice(ofIdx + 4)); if (!inner) return null;
+        const inner = _parseSelectorList(raw.slice(ofIdx + 4), false, ctx); if (!inner) return null;
         return { anb, of: inner };
       }
       const anb = _selSerAnB(raw); return anb === null ? null : { anb };
@@ -24108,6 +24160,9 @@ const _parseSelectorList = (src, relative) => {
       else { i = save; break; }
       const next = parseCompound();
       if (!next) { if (comb === ' ') { i = save; break; } return null; }
+      // Inside a :host()/:host-context() argument (a <compound-selector>) no
+      // combinator is allowed — the shadow host is featureless.
+      if (ctx.noComb) return null;
       // A view-transition or ::slotted() pseudo-element can't have a descendant/
       // sibling — once one ends a compound, no further combinator+compound follows.
       const prevSubs = parts[parts.length - 1].compound.subs;
@@ -24181,7 +24236,9 @@ function _serSub(sub, nsi) {
   return head + sub.name + '(' + _serPseudoArgs(sub.name, sub.args, nsi) + ')';
 }
 function _serPseudoArgs(name, a, nsi) {
-  if (a.sel) return _serSelList(a.sel, nsi);
+  // A forgiving :is()/:where() that dropped/tolerated a member serializes its
+  // argument back verbatim (the invalid parts are preserved as authored).
+  if (a.sel) return a.raw != null ? a.raw : _serSelList(a.sel, nsi);
   if (a.anb !== undefined) return a.anb + (a.of ? ' of ' + _serSelList(a.of, nsi) : '');
   if (a.args) return a.args.map((x) => x.str ? _serString(x.s) : _serIdent(x.s)).join(', ');
   return a.raw || '';
@@ -27205,7 +27262,13 @@ globalThis.CSS = {
     if (selCond) {
       const inner = selCond[1].trim();
       if (!inner || /\bvar\(/i.test(inner)) return false;
-      return _parseSelectorList(inner) !== null;
+      // A selector is "supported" only if it parses WITHOUT forgiving recovery:
+      // if a forgiving :is()/:where() had to drop or tolerate an unsupported
+      // member (a pseudo-element, an unparseable selector, a :has() nested in a
+      // :has()), the UA does not fully support it → false (even though it is a
+      // valid selector for querySelector/insertRule).
+      const sctx = { f: { forgiving: false }, inHas: false, noComb: false };
+      return _parseSelectorList(inner, false, sctx) !== null && !sctx.f.forgiving;
     }
     const idx = cond.indexOf(':');
     if (idx < 0) return false;
