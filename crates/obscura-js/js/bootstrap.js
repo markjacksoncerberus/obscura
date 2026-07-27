@@ -25263,6 +25263,12 @@ const _parseSelectorList = (src, relative, ctx) => {
       else if (c === '#') { i++; const id = _selReadIdent(s, i); if (!id) return null; i = id[1]; subs.push({ kind: 'id', name: id[0] }); }
       else if (c === '[') { const a = parseAttr(); if (!a) return null; subs.push(a); }
       else if (c === ':') { const p = parsePseudo(); if (!p) return null; subs.push(p); }
+      // The nesting selector `&` (CSS Nesting §nesting-selector) is a simple selector
+      // usable anywhere a class/id/pseudo can go. Like other simple selectors it must
+      // NOT precede a type selector in the compound, so `&div` is invalid (the type
+      // selector `div` then breaks the compound → the whole selector fails to parse)
+      // while `div&`, `&.bar`, `&&` are valid.
+      else if (c === '&') { i++; subs.push({ kind: 'nest' }); }
       else break;
     }
     if (!type && subs.length === 0) return null;
@@ -25389,6 +25395,7 @@ function _serCompound(c, nsi) {
   return out;
 }
 function _serSub(sub, nsi) {
+  if (sub.kind === 'nest') return '&';
   if (sub.kind === 'class') return '.' + _serIdent(sub.name);
   if (sub.kind === 'id') return '#' + _serIdent(sub.name);
   if (sub.kind === 'attr') {
@@ -25409,6 +25416,27 @@ function _serPseudoArgs(name, a, nsi) {
   if (a.args) return a.args.map((x) => x.str ? _serString(x.s) : _serIdent(x.s)).join(', ');
   return a.raw || '';
 }
+// Does a complex selector reference the nesting selector `&` anywhere — including
+// inside a functional pseudo-class argument (`:is(.a, &.b)`)? (Mutually recursive
+// with _subHasNest; both are `const`, so the runtime call order is what matters.)
+const _subHasNest = (sub) => {
+  if (sub.kind === 'nest') return true;
+  if (sub.args && sub.args.sel) return sub.args.sel.some(_complexHasNest);
+  return false;
+};
+const _complexHasNest = (parts) => parts.some((p) => p.compound.subs.some(_subHasNest));
+// Serialize a nested style rule's <relative-selector-list>, "absolutizing" each
+// complex selector against its parent by making the nesting selector `&` explicit
+// (CSS Nesting §serialize). A complex selector is prefixed with `& ` when it leads
+// with a combinator (a relative selector — `> .bar` → `& > .bar`) OR contains no
+// `&` at all (`.foo` → `& .foo`); one that already contains an `&` and does not
+// lead with a combinator is serialized as authored (`.a > & .b`, `div&`, `&&`).
+const _serNestedComplex = (parts, nsi) => {
+  const hasLeadComb = parts[0].comb !== '';
+  if (!hasLeadComb && _complexHasNest(parts)) return _serComplex(parts, nsi);
+  return '& ' + _serComplex(parts, nsi);
+};
+const _serNestedSelList = (list, nsi) => list.map((cx) => _serNestedComplex(cx, nsi)).join(', ');
 // Parse an `@namespace` prelude → { prefix: string|null, url: string }. The url is
 // reduced to its bare content (the bytes inside url()/quotes) for prefix-equality.
 const _parseNamespacePrelude = (prelude) => {
@@ -25466,14 +25494,80 @@ for (const [k, v] of Object.entries(_CSSRULE_CONSTS)) {
 }
 globalThis.CSSRule = CSSRule;
 
+// Split a style rule's body into its declaration text and its nested rules
+// (CSS Nesting §nested-style-rules). A top-level `{` (not inside a string, ()/[]
+// nesting, or a custom-property value) marks the end of a nested rule's prelude;
+// a top-level `;` ends a declaration. This keeps a nested `& { … }` block out of
+// the declaration serializer while leaving a plain declaration-only body — the
+// overwhelming common case, with no `{` — untouched.
+const _splitNestedRuleBody = (body) => {
+  const s = String(body == null ? '' : body);
+  const n = s.length;
+  const decls = [];
+  const nested = [];
+  let buf = '', i = 0, inStr = null, depth = 0;
+  const readBlock = (start) => {          // start === index of '{' → [innerText, endIndex]
+    let k = start + 1; const stack = ['{']; let is2 = null;
+    while (k < n && stack.length) {
+      const d = s[k];
+      if (is2) { if (d === '\\') { k += 2; continue; } if (d === is2) is2 = null; k++; continue; }
+      if (d === '\\') { k += 2; continue; }
+      if (d === '"' || d === "'") { is2 = d; k++; continue; }
+      if (d === '{' || d === '(' || d === '[') stack.push(d);
+      else if (d === '}' || d === ')' || d === ']') {
+        const top = stack[stack.length - 1];
+        if ((d === '}' && top === '{') || (d === ')' && top === '(') || (d === ']' && top === '[')) stack.pop();
+      }
+      k++;
+    }
+    return [s.slice(start + 1, k - 1), k];
+  };
+  while (i < n) {
+    const c = s[i];
+    if (inStr) { buf += c; if (c === '\\') { if (i + 1 < n) buf += s[i + 1]; i += 2; continue; } if (c === inStr) inStr = null; i++; continue; }
+    if (c === '\\') { buf += c; if (i + 1 < n) buf += s[i + 1]; i += 2; continue; }
+    if (c === '"' || c === "'") { inStr = c; buf += c; i++; continue; }
+    if (c === '(' || c === '[') { depth++; buf += c; i++; continue; }
+    if (c === ')' || c === ']') { if (depth > 0) depth--; buf += c; i++; continue; }
+    if (depth === 0 && c === ';') { const d = buf.trim(); if (d) decls.push(d); buf = ''; i++; continue; }
+    if (depth === 0 && c === '{') {
+      // A custom property (`--x: { … }`) may carry a block as its value — keep it in
+      // the declaration rather than mistaking it for a nested rule.
+      if (/^\s*--/.test(buf)) { const [inner, end] = readBlock(i); buf += '{' + inner + '}'; i = end; continue; }
+      const [inner, end] = readBlock(i);
+      nested.push({ prelude: buf.trim(), body: inner });
+      buf = ''; i = end; continue;
+    }
+    buf += c; i++;
+  }
+  const tail = buf.trim();
+  if (tail) decls.push(tail);             // trailing declaration with no `;`
+  return { declText: decls.join('; '), nested };
+};
+
 class CSSStyleRule extends CSSRule {
-  constructor(selectorText, body) {
+  // `nested` marks a rule nested inside another style rule (CSS Nesting): its
+  // selector is a <relative-selector-list> parsed/serialized against the parent `&`.
+  constructor(selectorText, body, nested) {
     super();
+    this._nested = !!nested;
     this._selectorSource = String(selectorText == null ? '' : selectorText).trim();   // raw authored selector
+    this._ruleListObj = new CSSRuleList();
+    this._ruleList = _ruleListProxy(this._ruleListObj);
+    const split = _splitNestedRuleBody(body || '');
+    // Nested-rule descriptors (consumed by _makeRule once the parent links exist).
+    // A nested style rule keeps its prelude only if it is a valid nested selector;
+    // an invalid one (e.g. `&div`) is dropped, so it never appears in `.cssRules`.
+    const descs = [];
+    for (const nr of split.nested) {
+      if (nr.prelude[0] === '@') { for (const d of _cssParseRuleList(nr.prelude + ' { ' + nr.body + ' }')) descs.push(d); }
+      else if (_parseSelectorList(nr.prelude, true) !== null) descs.push({ type: 'style', selectorText: nr.prelude, body: nr.body, _nested: true });
+    }
+    this._nestedDescs = descs;
     const rawDecl = new CSSStyleDeclaration();
     this._styleDecl = _styleProxy(rawDecl);
-    if (body) this._styleDecl.cssText = body;          // specified-value serialization
-    this._cascadeDecls = _cssParseDecls(body || '');   // cascade-shape decls for getComputedStyle
+    if (split.declText) this._styleDecl.cssText = split.declText;   // specified-value serialization
+    this._cascadeDecls = _cssParseDecls(split.declText);            // cascade-shape decls for getComputedStyle
     // A CSSOM edit to this rule's style (`rule.style.setProperty(…)`) must reach the
     // cascade: re-derive the cascade-shape decls from the live declaration block and
     // flag the owning sheet so getComputedStyle re-reads the live rules. Set on the
@@ -25486,19 +25580,25 @@ class CSSStyleRule extends CSSRule {
     };
   }
   get type() { return 1; }
+  get cssRules() { return this._ruleList; }
   // Serialize the selector into canonical CSSOM form on read; fall back to the raw
   // authored text if it can't be parsed (so an exotic selector never breaks a page).
+  // A nested rule parses its selector as a <relative-selector-list> and serializes
+  // it with the nesting selector `&` made explicit.
   get selectorText() {
-    const ast = _parseSelectorList(this._selectorSource);
+    const rel = this._nested;
+    const ast = _parseSelectorList(this._selectorSource, rel);
     if (!ast) return this._selectorSource;
-    try { return _serSelList(ast, _sheetNsInfo(this._parentStyleSheet)); }
-    catch (e) { return this._selectorSource; }
+    try {
+      const nsi = _sheetNsInfo(this._parentStyleSheet);
+      return rel ? _serNestedSelList(ast, nsi) : _serSelList(ast, nsi);
+    } catch (e) { return this._selectorSource; }
   }
   // Per CSSOM: parse the value as a group of selectors; if it fails to parse, the
   // setter does nothing (the old value is retained).
   set selectorText(v) {
     const val = String(v == null ? '' : v);
-    if (_parseSelectorList(val) === null) return;      // invalid → no-op
+    if (_parseSelectorList(val, this._nested) === null) return;   // invalid → no-op
     this._selectorSource = val.trim();
     // Flag the owning sheet so getComputedStyle re-reads the live rule (CSSOM edit).
     try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
@@ -25507,7 +25607,9 @@ class CSSStyleRule extends CSSRule {
   set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
   get cssText() {
     const block = this._styleDecl.cssText;
-    return this.selectorText + ' { ' + (block ? block + ' ' : '') + '}';
+    const nestedTxt = this._ruleListObj._rules.map((r) => r.cssText).join(' ');   // nested rules follow declarations
+    const inner = [block, nestedTxt].filter(Boolean).join(' ');
+    return this.selectorText + ' { ' + (inner ? inner + ' ' : '') + '}';
   }
 }
 globalThis.CSSStyleRule = CSSStyleRule;
@@ -26311,7 +26413,7 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     rule._parentRule = parentRule || null;
     return rule;
   }
-  if (desc.type === 'style') rule = new CSSStyleRule(desc.selectorText, desc.body);
+  if (desc.type === 'style') rule = new CSSStyleRule(desc.selectorText, desc.body, desc._nested);
   else if (desc.type === 'group' && desc.name === 'supports') rule = new CSSSupportsRule(desc.condition);
   else if (desc.type === 'group') rule = new CSSMediaRule(desc.condition);  // media/container/document → grouping
   else rule = new CSSGenericRule(desc);                                     // keyframes/font-face/page/import/namespace
@@ -26319,6 +26421,11 @@ const _makeRule = (desc, parentSheet, parentRule) => {
   rule._parentRule = parentRule || null;
   if (rule instanceof CSSGroupingRule && Array.isArray(desc.rules)) {
     for (const child of desc.rules) rule._ruleListObj._rules.push(_makeRule(child, parentSheet, rule));
+  }
+  // A style rule's nested rules (CSS Nesting) are built here, once the parent links
+  // exist, so each child inherits the owning sheet and points its parentRule at us.
+  if (rule instanceof CSSStyleRule && rule._nestedDescs && rule._nestedDescs.length) {
+    for (const child of rule._nestedDescs) rule._ruleListObj._rules.push(_makeRule(child, parentSheet, rule));
   }
   return rule;
 };
