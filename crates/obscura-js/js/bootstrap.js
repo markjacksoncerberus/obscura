@@ -1309,6 +1309,20 @@ const _parseStyleDecls = (text, opts) => {
           for (const ln of _FLEX_FLOW_LONGHANDS) out.push({ name: ln, value: lh[ln], important });
           continue;                                          // expanded into longhands; no `flex-flow` key
         }
+      } else if (name === 'container') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const lh = _expandContainerShorthand(value); if (!lh) continue;  // invalid <container> → drop
+          for (const ln of _CONTAINER_SHORTHAND_LH) out.push({ name: ln, value: lh[ln], important });
+          continue;                                          // expanded into longhands; no `container` key
+        }
+      } else if (name === 'container-type' || name === 'container-name') {
+        const low = value.toLowerCase();
+        if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
+          const c = name === 'container-type' ? _canonContainerType(value) : _canonContainerName(value);
+          if (c == null) continue;                           // out of grammar → drop
+          value = c;
+        }
       } else if (name === 'position-try') {
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
@@ -2280,6 +2294,28 @@ class CSSStyleDeclaration {
         this._notifyChange();
         return;                                              // expanded into longhands; no `flex-flow` key
       }
+    } else if (!custom && name === 'container') {
+      const low = stored.toLowerCase();
+      if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
+        for (const ln of _CONTAINER_SHORTHAND_LH) { delete this._props[ln]; delete this._priority[ln]; }
+      } else {
+        const lh = _expandContainerShorthand(stored); if (!lh) return;  // invalid <container> → ignore
+        if ('container' in this._props) { delete this._props['container']; delete this._priority['container']; }
+        const prio = String(priority || '').toLowerCase() === 'important' ? 'important' : '';
+        for (const ln of _CONTAINER_SHORTHAND_LH) {
+          if (ln in this._props) { delete this._props[ln]; delete this._priority[ln]; }
+          this._props[ln] = lh[ln]; this._priority[ln] = prio;
+        }
+        this._notifyChange();
+        return;                                              // expanded into longhands; no `container` key
+      }
+    } else if (!custom && (name === 'container-type' || name === 'container-name')) {
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = name === 'container-type' ? _canonContainerType(stored) : _canonContainerName(stored);
+        if (c === null) return;                              // out of grammar → ignore (keep prior value)
+        stored = c;
+      }
     } else if (!custom && name === 'position-try') {
       const low = stored.toLowerCase();
       if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(stored)) {
@@ -2516,6 +2552,15 @@ class CSSStyleDeclaration {
         : _serFlexFlow(this._props['flex-direction'], this._props['flex-wrap']);
       delete this._props['flex-flow']; delete this._priority['flex-flow'];  // any CSS-wide/var blob key
       for (const ln of _FLEX_FLOW_LONGHANDS) { delete this._props[ln]; delete this._priority[ln]; }
+      this._notifyChange();
+      return old;
+    }
+    if (key === 'container') {                              // shorthand: clear container-name/container-type
+      const old = (key in this._props) ? this._props[key]
+        : (('container-name' in this._props || 'container-type' in this._props)
+            ? _serContainerShorthand(this._props['container-name'], this._props['container-type']) : '');
+      delete this._props['container']; delete this._priority['container'];  // any CSS-wide/var blob key
+      for (const ln of _CONTAINER_SHORTHAND_LH) { delete this._props[ln]; delete this._priority[ln]; }
       this._notifyChange();
       return old;
     }
@@ -2800,6 +2845,12 @@ class CSSStyleDeclaration {
     if (key === 'flex-flow') {                                // reconstruct from flex-direction/flex-wrap
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
       return _serFlexFlow(this._props['flex-direction'], this._props['flex-wrap']);
+    }
+    if (key === 'container') {                                 // reconstruct from container-name/container-type
+      if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
+      const n = this._props['container-name'], t = this._props['container-type'];
+      if (n === undefined && t === undefined) return '';      // neither longhand set → unset
+      return _serContainerShorthand(n, t);
     }
     if (key === 'block-step') {                               // reconstruct from its four longhands
       if (key in this._props) return this._props[key];        // CSS-wide/var kept as a single key
@@ -19937,6 +19988,71 @@ const _serFlexFlow = (dir, wrap) => {
   return parts.length ? parts.join(' ') : 'row';
 };
 
+// ── css-conditional-5 / css-contain-3: container-type / container-name / container ──
+// The query-container establishing properties + their `container` shorthand. All are
+// pure specified-value parse/serialize (no cascade), so they belong with the CSSOM
+// property machinery rather than the container-QUERY helpers further down.
+//   container-type = normal | [ [ size | inline-size ] || scroll-state ]
+//   container-name = none | <custom-ident>+
+//   container      = <'container-name'> [ '/' <'container-type'> ]?
+const _CONTAINER_SHORTHAND_LH = ['container-name', 'container-type'];
+const _CONTAINER_TYPE_SIZE = new Set(['size', 'inline-size']);
+// Reserved words that may NOT be one of container-name's <custom-ident>s: the query
+// combinators + `none` + `default`, plus the CSS-wide keywords (which <custom-ident>
+// already excludes but we list for the standalone check). `auto`/`normal` are ordinary
+// custom-idents here, so both are valid names.
+const _CONTAINER_NAME_IDENT_RESERVED = new Set(['none', 'and', 'or', 'not', 'default', 'inherit', 'initial', 'unset', 'revert', 'revert-layer']);
+const _isContainerNameIdent = (t) => _CONTAINER_IDENT_RE.test(t) && !_CONTAINER_NAME_IDENT_RESERVED.has(t.toLowerCase());
+// Canonicalize a specified `container-type` value → canonical string, or null if invalid.
+// `normal` stands alone; otherwise a `||` of a single size keyword (size|inline-size) and
+// `scroll-state`, canonical order size-then-scroll-state.
+const _canonContainerType = (value) => {
+  const toks = _wsTokens(String(value).trim());
+  if (!toks.length) return null;
+  let size = null, scroll = false;
+  for (const tok of toks) {
+    const l = tok.toLowerCase();
+    if (l === 'normal') return toks.length === 1 ? 'normal' : null;   // `normal` cannot combine
+    else if (_CONTAINER_TYPE_SIZE.has(l)) { if (size !== null) return null; size = l; }
+    else if (l === 'scroll-state') { if (scroll) return null; scroll = true; }
+    else return null;
+  }
+  const parts = [];
+  if (size) parts.push(size);
+  if (scroll) parts.push('scroll-state');
+  return parts.length ? parts.join(' ') : null;
+};
+// Canonicalize a specified `container-name` value → canonical string, or null. `none`
+// stands alone (case-folded); otherwise one or more non-reserved <custom-ident>s, joined
+// by a single space with each ident's authored case preserved.
+const _canonContainerName = (value) => {
+  const s = String(value).trim();
+  if (!s) return null;
+  if (s.toLowerCase() === 'none') return 'none';                       // the `none` keyword cannot combine
+  const toks = _wsTokens(s);
+  if (!toks.length) return null;
+  for (const tok of toks) if (!_isContainerNameIdent(tok)) return null;
+  return toks.join(' ');
+};
+// Parse a specified `container` shorthand into its two longhands, or null if invalid.
+// A single top-level `/` separates the name (before) from the type (after); with no `/`
+// the type defaults to `normal`.
+const _expandContainerShorthand = (value) => {
+  const s = String(value).trim();
+  const slash = s.indexOf('/');
+  const name = _canonContainerName(slash < 0 ? s : s.slice(0, slash));
+  if (name === null) return null;
+  let type = 'normal';
+  if (slash >= 0) { type = _canonContainerType(s.slice(slash + 1)); if (type === null) return null; }
+  return { 'container-name': name, 'container-type': type };
+};
+// Serialize the `container` shorthand from its longhands: `<name>` when the type is the
+// initial `normal`, else `<name> / <type>`.
+const _serContainerShorthand = (nameV, typeV) => {
+  const name = nameV || 'none', type = typeV || 'normal';
+  return type === 'normal' ? name : name + ' / ' + type;
+};
+
 // ── css-rhythm: the `block-step` shorthand (Rhythmic Sizing 1 §4) ──────────────
 // `block-step = <'block-step-size'> || <'block-step-insert'> || <'block-step-align'>
 // || <'block-step-round'>` — an order-independent `||` of the four longhands, each at
@@ -26344,9 +26460,101 @@ const _serContainerFeature = (inner) => {
   if (ci >= 0) return s.slice(0, ci).trim().toLowerCase() + ': ' + s.slice(ci + 1).trim();
   return s.toLowerCase();                                      // <mf-boolean>
 };
+// ── `style()` container queries (CSS Conditional 5 §style()) ───────────────────
+// The interior of `style(…)` is a `<style-query>`: a bare `<style-feature>` (a
+// declaration `prop: value`, a bare `prop`, or a `<style-range>` comparison), or a
+// boolean (and/or/not) of `<style-in-parens>`. Serialization keeps the parenthesis
+// nesting, removes insignificant whitespace, lowercases the boolean combinators, and
+// normalizes a RECOGNIZED style-feature (`name: value`, single-spaced range operators,
+// custom-property NAMES and VALUES verbatim), while an unknown property is a
+// `<general-enclosed>` kept exactly as authored.
+const _styleQueryIsBoolean = (toks) =>
+  toks.length > 0 && toks.every((t) => t[0] === '(' || /^(and|or|not)$/i.test(t) || /^[A-Za-z-]+\(/.test(t));
+// The index of the first TOP-LEVEL colon (paren-aware), or -1.
+const _topLevelColon = (s) => {
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\') { i++; continue; }
+    else if (c === '(') depth++;
+    else if (c === ')') { if (depth > 0) depth--; }
+    else if (c === ':' && depth === 0) return i;
+  }
+  return -1;
+};
+// Does `s` carry a TOP-LEVEL comparison operator (`<`/`>`/`=`) → a `<style-range>`?
+const _hasTopLevelCompare = (s) => {
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\') { i++; continue; }
+    else if (c === '(') depth++;
+    else if (c === ')') { if (depth > 0) depth--; }
+    else if (depth === 0 && (c === '<' || c === '>' || c === '=')) return true;
+  }
+  return false;
+};
+// Is the text inside a `(…)` a recognized `<style-feature>` (which we normalize) rather
+// than a `<general-enclosed>` (which we keep verbatim)? A range, a custom-property
+// declaration/bare-name, or a declaration on a KNOWN standard property is recognized.
+const _isStyleFeature = (raw) => {
+  const s = raw.trim();
+  if (_hasTopLevelCompare(s)) return true;                     // <style-range>
+  const ci = _topLevelColon(s);
+  const prop = (ci >= 0 ? s.slice(0, ci) : s).trim();
+  if (/^--/.test(prop)) return true;                          // custom property
+  return _CSS_KNOWN_PROPS.has(prop.toLowerCase());            // known standard property
+};
+// Serialize a bare `<style-feature>` (declaration / bare name / range). Property NAMES
+// keep case (custom props are case-sensitive); values are kept verbatim (only trimmed);
+// an empty value serializes as `name: ` (colon + space); range operators are single-spaced.
+const _serStyleFeature = (raw) => {
+  const s = raw.trim();
+  if (_hasTopLevelCompare(s)) {                                // <style-range>
+    const ops = [], parts = []; let depth = 0, seg = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '\\') { i++; continue; }
+      else if (c === '(') depth++;
+      else if (c === ')') { if (depth > 0) depth--; }
+      else if (depth === 0 && (c === '<' || c === '>' || c === '=')) {
+        let op = c;
+        if ((c === '<' || c === '>') && s[i + 1] === '=') op = c + '=';
+        parts.push(s.slice(seg, i)); ops.push(op); i += op.length - 1; seg = i + 1;
+      }
+    }
+    parts.push(s.slice(seg));
+    let out = parts[0].trim();
+    for (let k = 0; k < ops.length; k++) out += ' ' + ops[k] + ' ' + parts[k + 1].trim();
+    return out;
+  }
+  const ci = _topLevelColon(s);                               // declaration `name: value`
+  if (ci >= 0) return s.slice(0, ci).trim() + ': ' + s.slice(ci + 1).trim();
+  return s;                                                   // bare property name (no value)
+};
+// Serialize a `<style-in-parens>` token (including its own parens): a nested boolean
+// `<style-query>`, a recognized `<style-feature>`, or a verbatim `<general-enclosed>`.
+const _serStyleInParens = (tok) => {
+  const content = tok.slice(1, -1).trim();
+  const inToks = _tokenizeContainerQuery(content);
+  if (_styleQueryIsBoolean(inToks)) return '(' + _serStyleQuery(content) + ')';  // ( <style-query> )
+  if (_isStyleFeature(content)) return '(' + _serStyleFeature(content) + ')';    // ( <style-feature> )
+  return tok;                                                                     // <general-enclosed> — verbatim
+};
+// Serialize the interior of `style(…)` — a `<style-query>`.
+function _serStyleQuery(inner) {
+  const s = String(inner || '').trim();
+  const toks = _tokenizeContainerQuery(s);
+  if (!_styleQueryIsBoolean(toks)) return _serStyleFeature(s);   // a bare <style-feature>
+  return toks.map((t) => {
+    if (/^(and|or|not)$/i.test(t)) return t.toLowerCase();
+    if (t[0] === '(') return _serStyleInParens(t);
+    return t;                                                    // a nested general-enclosed function — verbatim
+  }).join(' ');
+}
 // Serialize a `<container-query>`: normalize each top-level token — lowercase
 // combinators, recurse into `(…)` (a nested condition vs. a size feature), lowercase
-// a `style(` function name (its inner style query kept as-authored), leave other
+// a `style(` function name and normalize its `<style-query>` interior, leave other
 // `<general-enclosed>` verbatim.
 const _serContainerQuery = (query) => {
   const toks = _tokenizeContainerQuery(String(query || '').trim());
@@ -26357,7 +26565,7 @@ const _serContainerQuery = (query) => {
       return '(' + (nested ? _serContainerQuery(t.slice(1, -1)) : _serContainerFeature(t.slice(1, -1))) + ')';
     }
     const fm = /^([A-Za-z-]+)\(/.exec(t);
-    if (fm && fm[1].toLowerCase() === 'style') return 'style(' + t.slice(fm[0].length, -1).trim() + ')';
+    if (fm && fm[1].toLowerCase() === 'style') return 'style(' + _serStyleQuery(t.slice(fm[0].length, -1)) + ')';
     if (fm) return t;                                          // other <general-enclosed> function — verbatim
     return t.toLowerCase();                                    // a bare combinator (and/or/not)
   }).join(' ');
@@ -26368,7 +26576,7 @@ const _serContainerQuery = (query) => {
 const _parseOneContainerCondition = (raw) => {
   const s = raw.trim();
   let name = '', query = s;
-  if (s && s[0] !== '(' && !/^style\s*\(/i.test(s) && !/^not\b/i.test(s)) {
+  if (s && s[0] !== '(' && !/^style\(/i.test(s) && !/^not\b/i.test(s)) {
     const m = /^[^\s(]+/.exec(s);                              // the name token (may include escapes like `\!`)
     if (m) { name = m[0]; query = s.slice(m[0].length).trim(); }
   }
@@ -26417,7 +26625,7 @@ const _isValidContainerConditionList = (prelude) => {
     const s = raw.trim();
     if (!s) return false;
     let name = '', query = s;
-    if (s[0] !== '(' && !/^style\s*\(/i.test(s) && !/^not\b/i.test(s)) {
+    if (s[0] !== '(' && !/^style\(/i.test(s) && !/^not\b/i.test(s)) {
       const mm = /^[^\s(]+/.exec(s);
       if (mm) { name = mm[0]; query = s.slice(mm[0].length).trim(); }
     }
