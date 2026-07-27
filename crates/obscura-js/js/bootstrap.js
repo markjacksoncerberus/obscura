@@ -3076,6 +3076,7 @@ class Node {
       added = [tn];
     }
     if (_watching) __obscura_exitBatch();
+    _invalidateNodeSheet(this);   // replacing a <style>'s children must re-parse its sheet
     if (_outer && (added.length || children.length)) {
       __obscura_recordChildList(this._nid, added, children, null, null);
       __notifyMutation();
@@ -4440,6 +4441,7 @@ class Element extends Node {
     const _ceLive = _ceGlobalDefCount > 0 && this.isConnected;
     if (_ceLive) { let c = this.firstChild; while (c) { _ceRemovalSteps(c); c = c.nextSibling; } }
     _dom("set_inner_html", this._nid, String(v ?? ""));
+    _invalidateNodeSheet(this);   // replacing a <style>'s children must re-parse its sheet
     if (_watching) {
       const _new = _domParse("child_nodes", this._nid) || [];
       __notifyMutation('childList', this._nid, _new, _old);
@@ -10493,7 +10495,11 @@ const _boxShorthandValue = (list, sh) => {
 const _boxShorthandSerialization = (decl, sh) => _boxShorthandValue(_styleLonghandList(decl), sh);
 // Serialize a whole declaration block to `cssText`, combining adjacent box
 // longhands into their shorthand where the CSSOM rules permit.
-const _serializeDeclBlock = (decl) => {
+// Serialize a declaration block into an ARRAY of individual `name: value;` strings
+// (CSSOM §serialize-a-css-declaration-block, before the joining step). Nested-rule
+// serialization needs each declaration on its own indented line, so it consumes the
+// list directly; `_serializeDeclBlock` joins it with a single space as before.
+const _serializeDeclList = (decl) => {
   const list = _styleLonghandList(decl);
   const out = [];
   const done = new Set();
@@ -10545,8 +10551,9 @@ const _serializeDeclBlock = (decl) => {
     out.push(`${d.name}: ${d.pending ? '' : d.value}${d.important ? ' !important' : ''};`);
     done.add(d.name);
   }
-  return out.join(' ');
+  return out;
 };
+const _serializeDeclBlock = (decl) => _serializeDeclList(decl).join(' ');
 const _cssParseDecls = (body) => {
   // body is the inside of a `{ ... }` block (or an inline style string).
   const out = {};
@@ -25421,7 +25428,14 @@ function _serPseudoArgs(name, a, nsi) {
 // with _subHasNest; both are `const`, so the runtime call order is what matters.)
 const _subHasNest = (sub) => {
   if (sub.kind === 'nest') return true;
-  if (sub.args && sub.args.sel) return sub.args.sel.some(_complexHasNest);
+  if (sub.args) {
+    // A forgiving pseudo (`:is`/`:where`) whose invalid member was preserved
+    // verbatim carries a `raw` string; a `&` there still counts. CSS Nesting: a
+    // rule dropped by forgiving parsing but containing `&` is serialized AS AUTHORED
+    // (not absolutized with a leading `& `) — e.g. `:is(!& .foo, .b)`.
+    if (sub.args.raw != null && String(sub.args.raw).indexOf('&') >= 0) return true;
+    if (sub.args.sel) return sub.args.sel.some(_complexHasNest);
+  }
   return false;
 };
 const _complexHasNest = (parts) => parts.some((p) => p.compound.subs.some(_subHasNest));
@@ -25494,6 +25508,47 @@ for (const [k, v] of Object.entries(_CSSRULE_CONSTS)) {
 }
 globalThis.CSSRule = CSSRule;
 
+// CSSGroupingRule (CSSOM) — a rule that contains a child rule list, with the
+// insertRule/deleteRule surface. Defined ABOVE CSSStyleRule because — per CSS
+// Nesting — a style rule IS a grouping rule (`CSSStyleRule extends CSSGroupingRule`),
+// and an ES `extends` clause is evaluated at class-definition time. The runtime
+// helpers it calls (`_cssParseRuleList`, `_assertRuleSelectorValid`, `_makeRule`)
+// are defined later in the file but referenced only inside method bodies, so they
+// resolve at call time.
+class CSSGroupingRule extends CSSRule {
+  constructor() { super(); this._ruleListObj = new CSSRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj); }
+  get cssRules() { return this._ruleList; }
+  insertRule(text, index) {
+    const arr = this._ruleListObj._rules;
+    index = index === undefined ? 0 : index >>> 0;
+    if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
+    const parsed = _cssParseRuleList(text);
+    if (parsed.length !== 1) throw new DOMException("insertRule expects exactly one rule.", "SyntaxError");
+    // @import / @namespace (statement at-rules) cannot live inside a grouping rule.
+    if (parsed[0].type === 'stmt') throw new DOMException("Cannot insert this rule type inside a grouping rule.", "HierarchyRequestError");
+    // A group rule nested inside a style rule inherits its nesting context: @font-face
+    // &c. are invalid children there (but perfectly valid inside a top-level @media).
+    if (_ruleInNestingContext(this) && !_nestOkDesc(parsed[0])) throw new DOMException("Cannot insert this rule type in a nesting context.", "HierarchyRequestError");
+    _assertRuleSelectorValid(parsed[0]);
+    arr.splice(index, 0, _makeRule(parsed[0], this.parentStyleSheet, this));
+    return index;
+  }
+  deleteRule(index) {
+    const arr = this._ruleListObj._rules;
+    index = index >>> 0;
+    if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
+    const [removed] = arr.splice(index, 1);
+    if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
+  }
+}
+globalThis.CSSGroupingRule = CSSGroupingRule;
+
+class CSSConditionRule extends CSSGroupingRule {
+  get conditionText() { return this._conditionText || ''; }
+  set conditionText(v) { this._conditionText = String(v); }
+}
+globalThis.CSSConditionRule = CSSConditionRule;
+
 // Split a style rule's body into its declaration text and its nested rules
 // (CSS Nesting §nested-style-rules). A top-level `{` (not inside a string, ()/[]
 // nesting, or a custom-property value) marks the end of a nested rule's prelude;
@@ -25545,7 +25600,27 @@ const _splitNestedRuleBody = (body) => {
   return { declText: decls.join('; '), nested };
 };
 
-class CSSStyleRule extends CSSRule {
+// In "nesting context" (inside a style rule, transitively) only STYLE rules and
+// nested GROUP rules (@media/@supports/@container/@layer/…) are valid children;
+// other at-rules (@font-face/@keyframes/@page/@property/@counter-style, and the
+// statement at-rules @import/@namespace/@charset) are invalid and dropped (CSS
+// Nesting §nested-group-rules). This does NOT apply at stylesheet top level, where
+// e.g. `@media { @font-face { … } }` is perfectly valid — so the filter runs only
+// on the descriptors of a style rule's nested body, recursing through nested group
+// rules to drop the same at-rules there too.
+const _nestOkDesc = (d) => d.type === 'style' || d.type === 'group';
+const _filterNestDescs = (descs) => descs.filter(_nestOkDesc).map((d) =>
+  (d.type === 'group' && Array.isArray(d.rules)) ? Object.assign({}, d, { rules: _filterNestDescs(d.rules) }) : d);
+// A rule is in nesting context iff a style rule appears anywhere on its parentRule
+// chain (the rule itself, if a style rule, counts). Used to gate insertRule.
+const _ruleInNestingContext = (rule) => {
+  for (let r = rule; r; r = r._parentRule) if (r instanceof CSSStyleRule) return true;
+  return false;
+};
+
+class CSSStyleRule extends CSSGroupingRule {
+  // Per CSS Nesting a style rule IS a grouping rule: it can hold nested style rules
+  // (and grouping rules) reached through .cssRules / insertRule / deleteRule.
   // `nested` marks a rule nested inside another style rule (CSS Nesting): its
   // selector is a <relative-selector-list> parsed/serialized against the parent `&`.
   constructor(selectorText, body, nested) {
@@ -25560,11 +25635,14 @@ class CSSStyleRule extends CSSRule {
     // an invalid one (e.g. `&div`) is dropped, so it never appears in `.cssRules`.
     const descs = [];
     for (const nr of split.nested) {
-      if (nr.prelude[0] === '@') { for (const d of _cssParseRuleList(nr.prelude + ' { ' + nr.body + ' }')) descs.push(d); }
+      // A nested at-rule: parse it, then drop any child at-rules that are invalid in
+      // nesting context (@font-face &c.), recursing into nested group rules.
+      if (nr.prelude[0] === '@') { for (const d of _filterNestDescs(_cssParseRuleList(nr.prelude + ' { ' + nr.body + ' }'))) descs.push(d); }
       else if (_parseSelectorList(nr.prelude, true) !== null) descs.push({ type: 'style', selectorText: nr.prelude, body: nr.body, _nested: true });
     }
     this._nestedDescs = descs;
     const rawDecl = new CSSStyleDeclaration();
+    this._rawDecl = rawDecl;                     // raw block for per-declaration serialization
     this._styleDecl = _styleProxy(rawDecl);
     if (split.declText) this._styleDecl.cssText = split.declText;   // specified-value serialization
     this._cascadeDecls = _cssParseDecls(split.declText);            // cascade-shape decls for getComputedStyle
@@ -25604,12 +25682,43 @@ class CSSStyleRule extends CSSRule {
     try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
   }
   get style() { return this._styleDecl; }
-  set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
+  // [PutForwards=cssText]. Only declarations flow through `.style` — nested rules are
+  // NOT part of a declaration list, so a `& { … }` block in the assigned text is
+  // dropped (and the rule's existing .cssRules are left untouched).
+  set style(v) { this._styleDecl.cssText = _splitNestedRuleBody(String(v == null ? '' : v)).declText; }
+  // Insert a child rule (CSS Nesting). Identical to CSSGroupingRule.insertRule but a
+  // child STYLE rule is marked `_nested` so its selector is parsed/serialized as a
+  // <relative-selector-list> against the parent `&`.
+  insertRule(text, index) {
+    const arr = this._ruleListObj._rules;
+    index = index === undefined ? 0 : index >>> 0;
+    if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
+    const parsed = _cssParseRuleList(text);
+    if (parsed.length !== 1) throw new DOMException("insertRule expects exactly one rule.", "SyntaxError");
+    // A style rule is a nesting context: only style rules and nested group rules may
+    // go in it — @font-face &c. (and the statement at-rules) throw HierarchyRequestError.
+    if (!_nestOkDesc(parsed[0])) throw new DOMException("Cannot insert this rule type inside a style rule.", "HierarchyRequestError");
+    if (parsed[0].type === 'style') parsed[0]._nested = true;
+    _assertRuleSelectorValid(parsed[0]);
+    arr.splice(index, 0, _makeRule(parsed[0], this.parentStyleSheet, this));
+    try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
+    return index;
+  }
   get cssText() {
-    const block = this._styleDecl.cssText;
-    const nestedTxt = this._ruleListObj._rules.map((r) => r.cssText).join(' ');   // nested rules follow declarations
-    const inner = [block, nestedTxt].filter(Boolean).join(' ');
-    return this.selectorText + ' { ' + (inner ? inner + ' ' : '') + '}';
+    const declList = _serializeDeclList(this._rawDecl);
+    const nested = this._ruleListObj._rules;
+    // No nested rules → the classic single-line form `selector { decls }`.
+    if (!nested.length) {
+      const block = declList.join(' ');
+      return this.selectorText + ' { ' + (block ? block + ' ' : '') + '}';
+    }
+    // With nested rules → the multi-line form (CSS Nesting §serialize): each
+    // declaration and each child rule on its own 2-space-indented line, declarations
+    // first. A child's OWN internal newlines are not re-indented (the spec's
+    // indentation is deliberately shallow — see the @supports case in cssom.html).
+    const lines = declList.map((d) => '  ' + d)
+      .concat(nested.map((r) => '  ' + r.cssText));
+    return this.selectorText + ' {\n' + lines.join('\n') + '\n}';
   }
 }
 globalThis.CSSStyleRule = CSSStyleRule;
@@ -25842,37 +25951,6 @@ const _assertRuleSelectorValid = (rule) => {
   if (rule && rule.type === 'style' && _parseSelectorList(rule.selectorText) === null)
     throw new DOMException("Failed to insert the rule: '" + rule.selectorText + "' is not a valid selector.", "SyntaxError");
 };
-
-class CSSGroupingRule extends CSSRule {
-  constructor() { super(); this._ruleListObj = new CSSRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj); }
-  get cssRules() { return this._ruleList; }
-  insertRule(text, index) {
-    const arr = this._ruleListObj._rules;
-    index = index === undefined ? 0 : index >>> 0;
-    if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
-    const parsed = _cssParseRuleList(text);
-    if (parsed.length !== 1) throw new DOMException("insertRule expects exactly one rule.", "SyntaxError");
-    // @import / @namespace (statement at-rules) cannot live inside a grouping rule.
-    if (parsed[0].type === 'stmt') throw new DOMException("Cannot insert this rule type inside a grouping rule.", "HierarchyRequestError");
-    _assertRuleSelectorValid(parsed[0]);
-    arr.splice(index, 0, _makeRule(parsed[0], this.parentStyleSheet, this));
-    return index;
-  }
-  deleteRule(index) {
-    const arr = this._ruleListObj._rules;
-    index = index >>> 0;
-    if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
-    const [removed] = arr.splice(index, 1);
-    if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
-  }
-}
-globalThis.CSSGroupingRule = CSSGroupingRule;
-
-class CSSConditionRule extends CSSGroupingRule {
-  get conditionText() { return this._conditionText || ''; }
-  set conditionText(v) { this._conditionText = String(v); }
-}
-globalThis.CSSConditionRule = CSSConditionRule;
 
 const _serializeGroupBlock = (rule) => {
   const inner = rule._ruleListObj._rules.map((r) => '  ' + r.cssText).join('\n');
@@ -26510,6 +26588,16 @@ globalThis.StyleSheet = class StyleSheet {};   // interface-presence only
 // A non-constructable CSSStyleSheet backing a connected <style> element, cached
 // per node and re-parsed when the element's text changes.
 const _nodeSheetMap = new WeakMap();
+// Drop a <style>/<link> element's cached sheet-vs-text sync so its next
+// `document.styleSheets`/`.sheet` access re-parses from the live text. Needed when
+// the element's children are REPLACED (innerHTML/textContent assignment): the text
+// may be byte-identical to what the sheet was last built from, yet an intervening
+// CSSOM edit (rule.style/insertRule/…) desynced the rules — spec re-parses on
+// content replacement, so the text-equality cache in `_styleSheetForNode` must be
+// forced to miss. Cheap no-op for non-sheet nodes.
+const _invalidateNodeSheet = (node) => {
+  try { const sh = _nodeSheetMap.get(node); if (sh) sh.__text = null; } catch (e) {}
+};
 const _styleSheetForNode = (node) => {
   let text = '';
   try { text = node.textContent || ''; } catch { text = ''; }
