@@ -24098,6 +24098,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('grid'); add('grid-template');                        // the `grid` / `grid-template` shorthands (reconstructed)
   add('image-resolution'); add('line-clamp');               // longhands with dedicated parsers, absent from _GCS_DEFAULTS
   add('animation-timeline');                                // an animation longhand (an `animation` expansion target) absent from _GCS_DEFAULTS
+  add('container-type'); add('container-name'); add('container');  // css-contain container-query properties (unblocks CSS.supports('container-type:size'))
   return set;
 })();
 // The (kebab) property names a computed style exposes when enumerated — every
@@ -24772,7 +24773,10 @@ const _cssParseRuleList = (cssText) => {
       const name = m ? m[1].toLowerCase() : '';
       const condition = prelude.slice(m ? m[0].length : 1).trim();
       if (name === 'media' || name === 'supports' || name === 'container' || name === 'document') {
-        rules.push({ type: 'group', name, condition, prelude, rules: _cssParseRuleList(body) });
+        // An invalid @container prelude (bad name, malformed query, empty/broken list)
+        // makes the whole at-rule invalid → drop it (CSS Conditional 5).
+        if (name !== 'container' || _isValidContainerConditionList(condition))
+          rules.push({ type: 'group', name, condition, prelude, rules: _cssParseRuleList(body) });
       } else if (name === 'keyframes' || name === '-webkit-keyframes') {
         // An invalid <keyframes-name> makes the whole at-rule invalid → drop it (CSSOM).
         if (_isValidKeyframesName(condition)) rules.push({ type: 'keyframes', name, condition, prelude, body });
@@ -25788,7 +25792,8 @@ const _buildNestedItems = (body, inScope) => {
       // @scope is a CSSScopeRule whose own body follows nesting semantics (bare
       // declaration runs become CSSNestedDeclarations, `.b {}` an implicit-:scope rule).
       if (name === 'media' || name === 'supports' || name === 'container' || name === 'document') {
-        out.push({ type: 'group', name, condition, prelude, rules: _buildNestedItems(it.body) });
+        if (name !== 'container' || _isValidContainerConditionList(condition))
+          out.push({ type: 'group', name, condition, prelude, rules: _buildNestedItems(it.body) });
       } else if (name === 'scope') {
         const sc = _parseScopePrelude(condition);
         out.push({ type: 'scope', name, condition, prelude, _start: sc.start, _end: sc.end, rules: _buildNestedItems(it.body, true) });
@@ -26270,6 +26275,211 @@ class CSSSupportsRule extends CSSConditionRule {
 }
 _exposeIface('CSSSupportsRule', CSSSupportsRule);
 _enumAccessors(CSSSupportsRule.prototype, 'matches');
+
+// ── @container / CSSContainerRule (CSS Conditional 5 §the-csscontainerrule) ──
+// Split a string on TOP-LEVEL commas (paren/bracket/string/escape-aware). Used to
+// break a `<container-condition-list>` into its comma-separated conditions.
+const _splitTopLevelCommas = (s) => {
+  const out = []; let depth = 0, inStr = null, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (!inStr && c === '\\') { i++; continue; }               // escape shields next code point
+    if (inStr) { if (c === inStr) inStr = null; continue; }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') { if (depth > 0) depth--; }
+    else if (c === ',' && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
+  }
+  out.push(s.slice(start));
+  return out;
+};
+// Tokenize a container query at the TOP level into paren-groups `(…)`, functional
+// tokens `ident(…)` (e.g. `style(…)`), and bare idents (`and`/`or`/`not`). Paren/
+// string/escape-aware so an inner `(max-width: 0px)` stays a single token.
+const _tokenizeContainerQuery = (q) => {
+  const toks = []; let i = 0; const n = q.length;
+  while (i < n) {
+    if (/\s/.test(q[i])) { i++; continue; }
+    // A functional or parenthesized token: read up to its matching close paren.
+    let j = i;
+    while (j < n && /[A-Za-z-]/.test(q[j])) j++;                // optional leading function name
+    if (j < n && q[j] === '(') {
+      let depth = 0; const start = i;
+      for (; j < n; j++) { if (q[j] === '\\') { j++; continue; } if (q[j] === '(') depth++; else if (q[j] === ')') { depth--; if (depth === 0) { j++; break; } } }
+      toks.push(q.slice(start, j)); i = j; continue;
+    }
+    // A bare ident (combinator).
+    const start = i;
+    while (i < n && !/\s/.test(q[i]) && q[i] !== '(') i++;
+    toks.push(q.slice(start, i));
+  }
+  return toks;
+};
+// Serialize a single `<size-feature>` (the text INSIDE a `(…)`): lowercase the
+// feature name, normalize a plain `feature: value`, and put single spaces around the
+// range comparison operators (`<`, `<=`, `=`, `>`, `>=`). Values (`100px`,
+// `calc(1em + 1px)`, `max(10em, 10px)`) are preserved verbatim.
+const _serContainerFeature = (inner) => {
+  const s = inner.trim();
+  // Scan for TOP-LEVEL comparison operators (paren-aware).
+  const ops = []; const parts = []; let depth = 0, seg = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(') depth++;
+    else if (c === ')') { if (depth > 0) depth--; }
+    else if (depth === 0 && (c === '<' || c === '>' || c === '=')) {
+      let op = c;
+      if ((c === '<' || c === '>') && s[i + 1] === '=') { op = c + '='; }
+      parts.push(s.slice(seg, i)); ops.push(op); i += op.length - 1; seg = i + 1;
+    }
+  }
+  parts.push(s.slice(seg));
+  const lcFeature = (t) => { t = t.trim(); return /^[A-Za-z][A-Za-z-]*$/.test(t) ? t.toLowerCase() : t; };
+  if (ops.length) {                                            // <mf-range>
+    let out = lcFeature(parts[0]);
+    for (let k = 0; k < ops.length; k++) out += ' ' + ops[k] + ' ' + lcFeature(parts[k + 1]);
+    return out;
+  }
+  const ci = s.indexOf(':');                                   // <mf-plain>: `feature: value`
+  if (ci >= 0) return s.slice(0, ci).trim().toLowerCase() + ': ' + s.slice(ci + 1).trim();
+  return s.toLowerCase();                                      // <mf-boolean>
+};
+// Serialize a `<container-query>`: normalize each top-level token — lowercase
+// combinators, recurse into `(…)` (a nested condition vs. a size feature), lowercase
+// a `style(` function name (its inner style query kept as-authored), leave other
+// `<general-enclosed>` verbatim.
+const _serContainerQuery = (query) => {
+  const toks = _tokenizeContainerQuery(String(query || '').trim());
+  return toks.map((t) => {
+    if (t[0] === '(') {                                        // ( <size-feature> ) | ( <container-condition> )
+      const innerToks = _tokenizeContainerQuery(t.slice(1, -1));
+      const nested = innerToks.some((x) => x[0] === '(' || /^(and|or|not)$/i.test(x));
+      return '(' + (nested ? _serContainerQuery(t.slice(1, -1)) : _serContainerFeature(t.slice(1, -1))) + ')';
+    }
+    const fm = /^([A-Za-z-]+)\(/.exec(t);
+    if (fm && fm[1].toLowerCase() === 'style') return 'style(' + t.slice(fm[0].length, -1).trim() + ')';
+    if (fm) return t;                                          // other <general-enclosed> function — verbatim
+    return t.toLowerCase();                                    // a bare combinator (and/or/not)
+  }).join(' ');
+};
+// Parse one `[ <container-name> ]? <container-query>?` into {name, query}. A leading
+// token that isn't `(`, `style(`, or the `not` combinator is the container name; the
+// remainder (if any) is the query.
+const _parseOneContainerCondition = (raw) => {
+  const s = raw.trim();
+  let name = '', query = s;
+  if (s && s[0] !== '(' && !/^style\s*\(/i.test(s) && !/^not\b/i.test(s)) {
+    const m = /^[^\s(]+/.exec(s);                              // the name token (may include escapes like `\!`)
+    if (m) { name = m[0]; query = s.slice(m[0].length).trim(); }
+  }
+  return { name, query: query ? _serContainerQuery(query) : '' };
+};
+const _parseContainerConditions = (prelude) =>
+  _splitTopLevelCommas(String(prelude || '')).map((p) => _parseOneContainerCondition(p));
+// Serialize a condition list back to a `conditionText` string (`name query`, joined
+// by `, `).
+const _serContainerConditions = (conds) =>
+  conds.map((c) => [c.name, c.query].filter(Boolean).join(' ')).join(', ');
+
+// A <container-name> is a <custom-ident> that isn't a reserved keyword. <custom-ident>
+// excludes the CSS-wide keywords + `default`; @container additionally reserves
+// `none`/`and`/`or`/`not`. `normal`/`auto` are ordinary custom-idents here (valid).
+// (Ident pattern inlined — `_LAYER_IDENT` is defined further down the file.)
+const _CONTAINER_NAME_RESERVED = new Set(['none', 'and', 'or', 'not', 'default', 'inherit', 'initial', 'unset', 'revert', 'revert-layer']);
+const _CONTAINER_IDENT_RE = /^(?:--|-?(?:[_a-zA-Z\u00A0-\uffff]|\\.))(?:[\w\u00A0-\uffff-]|\\.)*$/;
+const _isValidContainerName = (s) => {
+  const t = String(s == null ? '' : s).trim();
+  return _CONTAINER_IDENT_RE.test(t) && !_CONTAINER_NAME_RESERVED.has(t.toLowerCase());
+};
+// Structural validity of a <container-query> (CSS Conditional 5): `not <q-in-parens>`,
+// or a `<q-in-parens>` optionally combined with more via `and`/`or`. Each operand must
+// be a parenthesized/functional token — a bare ident (a media type like `screen`, or a
+// stray word) at operand position is invalid. Inner size-feature validity (known vs
+// unknown) is NOT judged here (both parse); this only rejects malformed structure.
+const _isValidContainerQuery = (q) => {
+  const toks = _tokenizeContainerQuery(String(q == null ? '' : q).trim());
+  if (!toks.length) return false;
+  const isOperand = (t) => !!t && (t[0] === '(' || /^[A-Za-z-]+\(/.test(t));
+  if (/^not$/i.test(toks[0])) return toks.length === 2 && isOperand(toks[1]);  // `not <one q-in-parens>`
+  if (!isOperand(toks[0])) return false;
+  for (let i = 1; i < toks.length; i += 2) {
+    if (!/^(and|or)$/i.test(toks[i]) || !isOperand(toks[i + 1])) return false;
+  }
+  return true;
+};
+// Validity of a full `@container` prelude: a non-empty comma list where every condition
+// is `[<container-name>]? <container-query>` with a valid name (if present) and — unless
+// name-only — a valid query.
+const _isValidContainerConditionList = (prelude) => {
+  const parts = _splitTopLevelCommas(String(prelude == null ? '' : prelude));
+  if (!parts.length) return false;
+  for (const raw of parts) {
+    const s = raw.trim();
+    if (!s) return false;
+    let name = '', query = s;
+    if (s[0] !== '(' && !/^style\s*\(/i.test(s) && !/^not\b/i.test(s)) {
+      const mm = /^[^\s(]+/.exec(s);
+      if (mm) { name = mm[0]; query = s.slice(mm[0].length).trim(); }
+    }
+    if (name && !_isValidContainerName(name)) return false;
+    if (name && !query) continue;                        // a name-only condition is valid
+    if (!_isValidContainerQuery(query)) return false;
+  }
+  return true;
+};
+
+// CSSContainerRule (CSS Conditional 5) — `@container [<name>]? <query> { … }`. A
+// condition rule exposing `containerName`/`containerQuery` (empty when the rule
+// carries a comma-separated condition list, per spec) and the full `conditions`
+// FrozenArray<{name, query}>. Not author-constructible (chains through the guarded
+// CSSConditionRule ctor); brand-checked attribute getters throw on the prototype.
+class CSSContainerRule extends CSSConditionRule {
+  constructor(...args) {
+    super();
+    this._conds = _parseContainerConditions(String(args[0] || ''));
+  }
+  get type() { return 0; }                                     // @container has no legacy numbered CSSRule type
+  get containerName() {
+    if (!(this instanceof CSSContainerRule)) throw new TypeError("Illegal invocation");
+    return this._conds.length === 1 ? this._conds[0].name : '';
+  }
+  get containerQuery() {
+    if (!(this instanceof CSSContainerRule)) throw new TypeError("Illegal invocation");
+    return this._conds.length === 1 ? this._conds[0].query : '';
+  }
+  get conditions() {
+    if (!(this instanceof CSSContainerRule)) throw new TypeError("Illegal invocation");
+    return Object.freeze(this._conds.map((c) => Object.freeze({ name: c.name, query: c.query })));
+  }
+  get conditionText() {
+    if (!(this instanceof CSSContainerRule)) throw new TypeError("Illegal invocation");
+    return _serContainerConditions(this._conds);
+  }
+  get cssText() { return '@container ' + this.conditionText + _serializeGroupBlock(this); }
+  get [Symbol.toStringTag]() { return 'CSSContainerRule'; }
+}
+_exposeIface('CSSContainerRule', CSSContainerRule);
+_enumAccessors(CSSContainerRule.prototype, 'containerName', 'containerQuery', 'conditions');
+
+// CSSSupportsConditionRule (CSS Conditional 5) — declared in the css-conditional-5
+// WebIDL as a grouping rule exposing `.name`. Obscura has no object that builds one
+// yet, but the interface must EXIST (idlharness checks its object, prototype chain,
+// and `name` attribute). Non-author-constructible.
+class CSSSupportsConditionRule extends CSSGroupingRule {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");
+    super();
+    this._name = String((args[0] && args[0].name) || '');
+  }
+  get type() { return 0; }
+  get name() {
+    if (!(this instanceof CSSSupportsConditionRule)) throw new TypeError("Illegal invocation");
+    return this._name;
+  }
+  get [Symbol.toStringTag]() { return 'CSSSupportsConditionRule'; }
+}
+_exposeIface('CSSSupportsConditionRule', CSSSupportsConditionRule);
+_enumAccessors(CSSSupportsConditionRule.prototype, 'name');
 
 // A <layer-name> is `<ident> [ '.' <ident> ]*` (CSS Cascade 5 §layer-names) — a
 // dotted chain of CSS identifiers. Used to validate `@layer` preludes and the
@@ -26921,7 +27131,8 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     else if (desc.type === 'layer-block') rule = new CSSLayerBlockRule(desc);   // @layer name { … } (grouping)
     else if (desc.type === 'scope') rule = new CSSScopeRule(desc);              // @scope (…) to (…) { … } (grouping)
     else if (desc.type === 'group' && desc.name === 'supports') rule = new CSSSupportsRule(desc.condition);
-    else if (desc.type === 'group') rule = new CSSMediaRule(desc.condition);  // media/container/document → grouping
+    else if (desc.type === 'group' && desc.name === 'container') rule = new CSSContainerRule(desc.condition);  // @container → CSSContainerRule
+    else if (desc.type === 'group') rule = new CSSMediaRule(desc.condition);  // media/document → grouping
     else rule = new CSSGenericRule(desc);                                     // keyframes/font-face/page/import/namespace
   } finally { _allowCssCondCtor = false; }
   rule._parentStyleSheet = parentSheet || null;
