@@ -24801,15 +24801,73 @@ const _cssParseRuleList = (cssText) => {
 // (`importRule.media`, `sheet.media`) satisfies `x instanceof MediaList`.
 class MediaList {}
 globalThis.MediaList = MediaList;
+// CSSOM §serialize-a-media-query — normalize a single media query string.
+// Tokenize into top-level tokens (bare idents + paren-groups, paren-depth aware so
+// `(max-width: 0px)` stays one token including its internal space), then: lowercase a
+// leading `not`/`only` modifier + the media type ident, lowercase each feature NAME
+// (the leading ident inside a `(…)`), and re-join with single spaces / ` and `. A
+// non-negated `all` media type followed by features drops the redundant `all and`
+// (`all and (color)` → `(color)`), but a bare `all` (no features) and a negated
+// `not all` are kept. Value text (`480px`, `#foo`) is preserved verbatim.
+const _tokenizeMQ = (q) => {
+  const toks = []; let i = 0; const n = q.length;
+  while (i < n) {
+    const c = q[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === '(') {
+      let depth = 0; const start = i;
+      while (i < n) { if (q[i] === '(') depth++; else if (q[i] === ')') { depth--; if (depth === 0) { i++; break; } } i++; }
+      toks.push(q.slice(start, i));
+    } else {
+      const start = i;
+      while (i < n && !/\s/.test(q[i]) && q[i] !== '(') i++;
+      toks.push(q.slice(start, i));
+    }
+  }
+  return toks;
+};
+const _lcMediaFeature = (paren) => {                 // lowercase the feature name only
+  const inner = paren.slice(1, -1);
+  const m = inner.match(/^(\s*)([A-Za-z][A-Za-z-]*)([\s\S]*)$/);
+  if (!m) return paren;
+  return '(' + m[1] + m[2].toLowerCase() + m[3] + ')';
+};
+const _serMediaQuery = (raw) => {
+  const q = String(raw).trim();
+  const toks = _tokenizeMQ(q);
+  if (toks.length === 0) return q;
+  let idx = 0, modifier = '';
+  const t0 = toks[0].toLowerCase();
+  if (t0 === 'not' || t0 === 'only') { modifier = t0; idx = 1; }
+  let type = '';
+  if (idx < toks.length && toks[idx][0] !== '(') {
+    const low = toks[idx].toLowerCase();
+    if (low !== 'and' && low !== 'or') { type = low; idx++; }
+  }
+  const rest = [];
+  for (; idx < toks.length; idx++) {
+    const t = toks[idx];
+    rest.push(t[0] === '(' ? _lcMediaFeature(t) : t.toLowerCase());
+  }
+  // omit a redundant leading `all and` (non-negated `all` with features)
+  if (modifier === '' && type === 'all' && rest.length && rest[0] === 'and') {
+    return rest.slice(1).join(' ');
+  }
+  const head = [modifier, type].filter(Boolean).join(' ');
+  if (!rest.length) return head;
+  return head ? head + ' ' + rest.join(' ') : rest.join(' ');
+};
+const _splitMediaText = (v) =>
+  String(v == null ? '' : (typeof v === 'string' ? v : (v.mediaText || '')))
+    .split(',').map((s) => s.trim()).filter(Boolean).map(_serMediaQuery);
 const _makeMediaList = (text) => {
   const ml = {
-    _items: String(text == null ? '' : (typeof text === 'string' ? text : (text.mediaText || '')))
-      .split(',').map((s) => s.trim()).filter(Boolean),
+    _items: _splitMediaText(text),
     get length() { return this._items.length; },
     get mediaText() { return this._items.join(', '); },
-    set mediaText(v) { this._items = String(v == null ? '' : v).split(',').map((s) => s.trim()).filter(Boolean); },
+    set mediaText(v) { this._items = _splitMediaText(v); },
     item(i) { i = i >>> 0; return i < this._items.length ? this._items[i] : null; },
-    appendMedium(m) { m = String(m); if (!this._items.includes(m)) this._items.push(m); },
+    appendMedium(m) { m = _serMediaQuery(String(m)); if (!this._items.includes(m)) this._items.push(m); },
     deleteMedium(m) {
       const idx = this._items.indexOf(String(m));
       if (idx < 0) throw new DOMException("Media query not in list.", "NotFoundError");
@@ -25515,6 +25573,25 @@ globalThis.CSSRule = CSSRule;
 // helpers it calls (`_cssParseRuleList`, `_assertRuleSelectorValid`, `_makeRule`)
 // are defined later in the file but referenced only inside method bodies, so they
 // resolve at call time.
+// Expose an interface object as a global the WebIDL way: a data property that is
+// writable + configurable but NON-enumerable (a plain `globalThis.X = …` assignment
+// is enumerable, which idlharness flags as a conformance failure).
+const _exposeIface = (name, ctor) => {
+  Object.defineProperty(globalThis, name, { value: ctor, writable: true, enumerable: false, configurable: true });
+};
+// WebIDL: an interface's regular attributes are ENUMERABLE own accessors on the
+// prototype — but ES `class get x()` accessors are non-enumerable. Re-stamp the
+// named accessors as enumerable (preserving their get/set) after class definition.
+const _enumAccessors = (proto, ...names) => {
+  for (const n of names) {
+    const d = Object.getOwnPropertyDescriptor(proto, n);
+    if (d) { d.enumerable = true; Object.defineProperty(proto, n, d); }
+  }
+};
+// Guard so CSSConditionRule (and its CSSMediaRule/CSSSupportsRule subclasses, which
+// chain through its constructor via super()) throw "Illegal constructor" for author
+// `new`, while Obscura still builds them internally in _makeRule (which flips this on).
+let _allowCssCondCtor = false;
 class CSSGroupingRule extends CSSRule {
   constructor() { super(); this._ruleListObj = new CSSRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj); }
   get cssRules() { return this._ruleList; }
@@ -25549,13 +25626,22 @@ class CSSGroupingRule extends CSSRule {
     if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
   }
 }
-globalThis.CSSGroupingRule = CSSGroupingRule;
+_exposeIface('CSSGroupingRule', CSSGroupingRule);
 
 class CSSConditionRule extends CSSGroupingRule {
-  get conditionText() { return this._conditionText || ''; }
-  set conditionText(v) { this._conditionText = String(v); }
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");
+    super();
+  }
+  // Brand check (WebIDL): reading `conditionText` on CSSConditionRule.prototype (or any
+  // non-instance) must throw a TypeError, not silently return "".
+  get conditionText() {   // readonly (CSS Conditional 4) — no setter
+    if (!(this instanceof CSSConditionRule)) throw new TypeError("Illegal invocation");
+    return this._conditionText || '';
+  }
 }
-globalThis.CSSConditionRule = CSSConditionRule;
+_exposeIface('CSSConditionRule', CSSConditionRule);
+_enumAccessors(CSSConditionRule.prototype, 'conditionText');
 
 // Split a style rule's body into its declaration text and its nested rules
 // (CSS Nesting §nested-style-rules). A top-level `{` (not inside a string, ()/[]
@@ -26095,21 +26181,47 @@ const _serializeGroupBlock = (rule) => {
   return inner ? ' {\n' + inner + '\n}' : ' {\n}';
 };
 class CSSMediaRule extends CSSConditionRule {
-  constructor(condition) { super(); this._media = _makeMediaList(condition); }
+  // `...args` (not `condition`) so the interface object's `.length` is 0 — CSSMediaRule
+  // is not author-constructible per WebIDL; Obscura builds it internally via _makeRule.
+  constructor(...args) { super(); this._media = _makeMediaList(args[0]); }
   get type() { return 4; }
-  get media() { return this._media; }
+  get media() {
+    if (!(this instanceof CSSMediaRule)) throw new TypeError("Illegal invocation");
+    return this._media;
+  }
   set media(v) { this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
-  get conditionText() { return this._media.mediaText; }
+  // CSS Conditional 4: `matches` reflects whether the query currently matches. Obscura
+  // has no viewport/media evaluation engine (matchMedia likewise reports matches:false),
+  // so this is a conservative stub — the correct type, not a real evaluation.
+  get matches() {
+    if (!(this instanceof CSSMediaRule)) throw new TypeError("Illegal invocation");
+    return false;
+  }
+  get conditionText() {
+    if (!(this instanceof CSSMediaRule)) throw new TypeError("Illegal invocation");
+    return this._media.mediaText;
+  }
   get cssText() { return '@media ' + this._media.mediaText + _serializeGroupBlock(this); }
+  get [Symbol.toStringTag]() { return 'CSSMediaRule'; }
 }
-globalThis.CSSMediaRule = CSSMediaRule;
+_exposeIface('CSSMediaRule', CSSMediaRule);
+_enumAccessors(CSSMediaRule.prototype, 'media', 'matches', 'conditionText');
 
 class CSSSupportsRule extends CSSConditionRule {
-  constructor(condition) { super(); this._conditionText = String(condition || ''); }
+  constructor(...args) { super(); this._conditionText = String(args[0] || ''); }
   get type() { return 12; }
+  // CSS Conditional 3: `matches` is whether the UA supports the condition — a real
+  // evaluation of the stored <supports-condition> (declarations via CSS.supports,
+  // selector(…) via the selector parser, and/or/not/nesting composed).
+  get matches() {
+    if (!(this instanceof CSSSupportsRule)) throw new TypeError("Illegal invocation");
+    return _evalSupportsCondition(this._conditionText);
+  }
   get cssText() { return '@supports ' + this._conditionText + _serializeGroupBlock(this); }
+  get [Symbol.toStringTag]() { return 'CSSSupportsRule'; }
 }
-globalThis.CSSSupportsRule = CSSSupportsRule;
+_exposeIface('CSSSupportsRule', CSSSupportsRule);
+_enumAccessors(CSSSupportsRule.prototype, 'matches');
 
 // Minimal carriers for at-rules we parse but don't fully model. They preserve a
 // faithful cssText round-trip and a type code; their declarations don't feed the
@@ -26635,10 +26747,13 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     rule._parentRule = parentRule || null;
     return rule;
   }
-  if (desc.type === 'style') rule = new CSSStyleRule(desc.selectorText, desc.body, desc._nested);
-  else if (desc.type === 'group' && desc.name === 'supports') rule = new CSSSupportsRule(desc.condition);
-  else if (desc.type === 'group') rule = new CSSMediaRule(desc.condition);  // media/container/document → grouping
-  else rule = new CSSGenericRule(desc);                                     // keyframes/font-face/page/import/namespace
+  _allowCssCondCtor = true;   // CSSMediaRule/CSSSupportsRule chain through the guarded CSSConditionRule ctor
+  try {
+    if (desc.type === 'style') rule = new CSSStyleRule(desc.selectorText, desc.body, desc._nested);
+    else if (desc.type === 'group' && desc.name === 'supports') rule = new CSSSupportsRule(desc.condition);
+    else if (desc.type === 'group') rule = new CSSMediaRule(desc.condition);  // media/container/document → grouping
+    else rule = new CSSGenericRule(desc);                                     // keyframes/font-face/page/import/namespace
+  } finally { _allowCssCondCtor = false; }
   rule._parentStyleSheet = parentSheet || null;
   rule._parentRule = parentRule || null;
   if (rule instanceof CSSGroupingRule && Array.isArray(desc.rules)) {
@@ -29025,8 +29140,89 @@ globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 
+// Evaluate a CSS <supports-condition> (CSS Conditional §3) — the text after
+// `@supports`, or a parenthesized one-arg CSS.supports() query — to a boolean.
+// Grammar: `not`/`and`/`or` over <supports-in-parens>, where a parenthesized group
+// is a nested condition, a `( <declaration> )` (evaluated via CSS.supports(prop,val)),
+// a `selector(...)` query, or an unrecognized general-enclosed (→ false). Mixing
+// `and` with `or` at one level, or any structural error, makes the whole thing false.
+const _evalSupportsOperand = (part) => {
+  if (part.t === 'fn') {
+    if (part.name === 'selector') {
+      const inner = part.v.slice(1, -1).trim();       // between selector( … )
+      if (!inner || /\bvar\(/i.test(inner)) return false;
+      const sctx = { f: { forgiving: false }, inHas: false, noComb: false };
+      return _parseSelectorList(inner, false, sctx) !== null && !sctx.f.forgiving;
+    }
+    return false;                                     // font-tech()/font-format()/unknown → general-enclosed
+  }
+  // a parenthesized group
+  const inner = part.v.slice(1, -1).trim();
+  if (!inner) return false;
+  if (inner[0] === '(' || /^not(\s|\()/i.test(inner) || /^selector\s*\(/i.test(inner))
+    return _evalSupportsCondition(inner);             // nested condition
+  const idx = inner.indexOf(':');                     // else a declaration
+  if (idx < 0) return false;
+  const prop = inner.slice(0, idx).trim();
+  const val = inner.slice(idx + 1).trim();
+  if (!prop || !val) return false;
+  return globalThis.CSS.supports(prop, val);
+};
+const _evalSupportsCondition = (text) => {
+  const s = String(text).trim();
+  if (!s) return false;
+  // Tokenize into top-level parts: keywords (and/or/not), parenthesized groups, and
+  // functional operands (name(…), e.g. selector(…)).
+  const parts = []; let i = 0; const n = s.length;
+  while (i < n) {
+    const c = s[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === '(') {
+      let depth = 0; const start = i;
+      while (i < n) { const d = s[i]; if (d === '(') depth++; else if (d === ')') { depth--; if (depth === 0) { i++; break; } } i++; }
+      if (depth !== 0) return false;
+      parts.push({ t: 'group', v: s.slice(start, i) });
+    } else {
+      const start = i;
+      while (i < n && !/\s/.test(s[i]) && s[i] !== '(') i++;
+      const word = s.slice(start, i);
+      if (i < n && s[i] === '(') {
+        let depth = 0; const gstart = i;
+        while (i < n) { const d = s[i]; if (d === '(') depth++; else if (d === ')') { depth--; if (depth === 0) { i++; break; } } i++; }
+        if (depth !== 0) return false;
+        parts.push({ t: 'fn', name: word.toLowerCase(), v: s.slice(gstart, i) });
+      } else {
+        parts.push({ t: 'kw', v: word.toLowerCase() });
+      }
+    }
+  }
+  if (!parts.length) return false;
+  const isKw = (p, w) => p && p.t === 'kw' && p.v === w;
+  if (isKw(parts[0], 'not')) {
+    if (parts.length !== 2 || parts[1].t === 'kw') return false;
+    return !_evalSupportsOperand(parts[1]);
+  }
+  if (parts[0].t === 'kw') return false;              // leading and/or → error
+  let acc = _evalSupportsOperand(parts[0]);
+  let op = null;
+  for (let k = 1; k < parts.length; k += 2) {
+    const conn = parts[k], operand = parts[k + 1];
+    if (!conn || conn.t !== 'kw' || (conn.v !== 'and' && conn.v !== 'or')) return false;
+    if (op === null) op = conn.v; else if (op !== conn.v) return false;   // no mixing
+    if (!operand || operand.t === 'kw') return false;
+    const val = _evalSupportsOperand(operand);
+    acc = op === 'and' ? (acc && val) : (acc || val);
+  }
+  return acc;
+};
+
 globalThis.CSS = {
-  supports(prop, value) {
+  // WebIDL overloads `supports(property, value)` and `supports(conditionText)` — the
+  // interface-object arity is the MINIMUM across overloads, so this function's
+  // `.length` must be 1. The second argument is read via `arguments` (a declared
+  // `value` param would make `.length === 2`).
+  supports(prop) {
+    const value = arguments[1];
     // Two-argument form: CSS.supports(property, value).
     if (arguments.length >= 2) {
       const name = String(prop).trim().toLowerCase();
@@ -29308,6 +29504,11 @@ globalThis.CSS = {
       const sctx = { f: { forgiving: false }, inHas: false, noComb: false };
       return _parseSelectorList(inner, false, sctx) !== null && !sctx.f.forgiving;
     }
+    // A full <supports-condition> (parenthesized / not / and / or) — CSS.supports(
+    // "(color: green)"), "(a:b) and (c:d)", "not (x:y)". Routed to the condition
+    // evaluator; only the bare `property: value` form falls through to the `:` split.
+    const ct = cond.trim();
+    if (ct[0] === '(' || /^not(\s|\()/i.test(ct)) return _evalSupportsCondition(ct);
     const idx = cond.indexOf(':');
     if (idx < 0) return false;
     return globalThis.CSS.supports(cond.slice(0, idx).trim(), cond.slice(idx + 1).trim());
