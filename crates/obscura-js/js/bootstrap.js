@@ -25707,6 +25707,9 @@ const _CSSRULE_CONSTS = {
   STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5,
   PAGE_RULE: 6, KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, MARGIN_RULE: 9,
   NAMESPACE_RULE: 10, COUNTER_STYLE_RULE: 11, SUPPORTS_RULE: 12,
+  // 13 (DOCUMENT_RULE) is obsolete and deliberately unassigned. FONT_FEATURE_VALUES_RULE
+  // is the legacy numbered type for @font-feature-values (CSS Fonts 4 §CSSRule partial).
+  FONT_FEATURE_VALUES_RULE: 14,
 };
 for (const [k, v] of Object.entries(_CSSRULE_CONSTS)) {
   Object.defineProperty(CSSRule, k, { value: v, enumerable: true });
@@ -25736,6 +25739,18 @@ const _enumAccessors = (proto, ...names) => {
     if (d) { d.enumerable = true; Object.defineProperty(proto, n, d); }
   }
 };
+// Stamp a WebIDL accessor's function name ("get fontFamily" / "set fontFamily") —
+// idlharness asserts a getter/setter reports the spec name, but an object-literal or
+// defineProperty `get(){}` names the function just "get". Used where attributes are
+// generated in a loop (CSSFontFaceDescriptors' 40 descriptors, the feature-value maps).
+const _named = (kind, attr, fn) => {
+  Object.defineProperty(fn, 'name', { value: kind + ' ' + attr, configurable: true });
+  return fn;
+};
+// CSSStyleDeclaration is [Exposed=Window] — expose its interface object so subclasses
+// (CSSFontFaceDescriptors) pass idlharness's inherited-interface existence checks and
+// authors can brand-check against it. (It stays internally constructible.)
+_exposeIface('CSSStyleDeclaration', CSSStyleDeclaration);
 // Guard so CSSConditionRule (and its CSSMediaRule/CSSSupportsRule subclasses, which
 // chain through its constructor via super()) throw "Illegal constructor" for author
 // `new`, while Obscura still builds them internally in _makeRule (which flips this on).
@@ -26186,29 +26201,175 @@ class CSSPageRule extends CSSRule {
 }
 globalThis.CSSPageRule = CSSPageRule;
 
+// CSSFontFaceDescriptors (CSS Fonts 5 §CSSFontFaceDescriptors) — the specialized
+// CSSStyleDeclaration returned by `CSSFontFaceRule.style`. Beyond the inherited
+// declaration surface it exposes one IDL attribute per @font-face descriptor, in
+// BOTH the camelCase form (`fontFamily`) and the literal dashed CSS form
+// (`font-family`) — WebIDL declares both. Each attribute is [LegacyNullToEmptyString]
+// (a null assignment becomes ""), forwarding to the underlying declaration's
+// setProperty/getPropertyValue on the canonical (kebab) property name. The accessors
+// live directly on the prototype as enumerable, brand-checked get/set pairs (reading
+// one on the bare prototype — not an instance — throws TypeError, per WebIDL).
+class CSSFontFaceDescriptors extends CSSStyleDeclaration {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    super();
+  }
+  get [Symbol.toStringTag]() { return 'CSSFontFaceDescriptors'; }
+}
+// [ camelCase IDL attribute, canonical kebab CSS property ]. The dashed alias
+// (`font-family`) is derived from the kebab name; `src` has no camel/dash split.
+const _FONT_FACE_DESCRIPTOR_ATTRS = [
+  ['src', 'src'],
+  ['fontFamily', 'font-family'], ['fontStyle', 'font-style'], ['fontWeight', 'font-weight'],
+  ['fontStretch', 'font-stretch'], ['fontWidth', 'font-width'], ['fontSize', 'font-size'],
+  ['sizeAdjust', 'size-adjust'], ['unicodeRange', 'unicode-range'],
+  ['fontFeatureSettings', 'font-feature-settings'], ['fontVariationSettings', 'font-variation-settings'],
+  ['fontNamedInstance', 'font-named-instance'], ['fontDisplay', 'font-display'],
+  ['fontLanguageOverride', 'font-language-override'], ['ascentOverride', 'ascent-override'],
+  ['descentOverride', 'descent-override'], ['lineGapOverride', 'line-gap-override'],
+  ['superscriptPositionOverride', 'superscript-position-override'],
+  ['subscriptPositionOverride', 'subscript-position-override'],
+  ['superscriptSizeOverride', 'superscript-size-override'],
+  ['subscriptSizeOverride', 'subscript-size-override'],
+];
+for (const [camel, kebab] of _FONT_FACE_DESCRIPTOR_ATTRS) {
+  // Both the camelCase and dashed IDL attribute forward to the same kebab CSS property;
+  // each gets its own correctly-named brand-checked accessor pair (idlharness asserts
+  // the getter/setter function name matches the attribute).
+  const define = (attr) => Object.defineProperty(CSSFontFaceDescriptors.prototype, attr, {
+    enumerable: true, configurable: true,
+    get: _named('get', attr, function () {
+      if (!(this instanceof CSSFontFaceDescriptors)) throw new TypeError("Illegal invocation");
+      return this.getPropertyValue(kebab);
+    }),
+    set: _named('set', attr, function (v) {                    // [LegacyNullToEmptyString]
+      if (!(this instanceof CSSFontFaceDescriptors)) throw new TypeError("Illegal invocation");
+      this.setProperty(kebab, v == null ? '' : String(v));
+    }),
+  });
+  define(camel);
+  if (camel !== kebab) define(kebab);
+}
+_exposeIface('CSSFontFaceDescriptors', CSSFontFaceDescriptors);
+
 // CSSFontFaceRule (CSSOM §CSSFontFaceRule) — an `@font-face` rule. Its declaration
-// block becomes the `.style` CSSStyleDeclaration, which (unlike an element's style)
+// block becomes the `.style` CSSFontFaceDescriptors, which (unlike an element's style)
 // accepts the @font-face descriptors (`src`, `size-adjust`, the metric overrides, …)
 // via the `_fontFaceDescriptors` flag; on an element style those descriptors are
 // dropped. `.style` round-trips the descriptor block (the parsing tests read
-// `cssRules[i].style.getPropertyValue(descriptor)`).
+// `cssRules[i].style.getPropertyValue(descriptor)`). Not author-constructible: the
+// guarded `...args` ctor gives the interface object `.length` 0 and throws on author
+// `new`; `.style` is a brand-checked getter (throwing on the bare prototype).
 class CSSFontFaceRule extends CSSRule {
-  constructor(desc) {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");   // not author-constructible
     super();
-    const decl = new CSSStyleDeclaration();
+    const desc = args[0];
+    // We run inside _makeRule's `_allowCssCondCtor = true` window, so building the
+    // (also-guarded) descriptor block here is permitted without re-flipping.
+    const decl = new CSSFontFaceDescriptors();
     decl._fontFaceDescriptors = true;                          // allow src / size-adjust / *-override
     this._styleDecl = _styleProxy(decl);
     if (desc && desc.body) this._styleDecl.cssText = desc.body;
   }
   get type() { return 5; }                                     // CSSRule.FONT_FACE_RULE
-  get style() { return this._styleDecl; }
+  get style() {
+    if (!(this instanceof CSSFontFaceRule)) throw new TypeError("Illegal invocation");
+    return this._styleDecl;
+  }
   set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
   get cssText() {
     const block = this._styleDecl.cssText;
     return '@font-face { ' + (block ? block + ' ' : '') + '}';
   }
+  get [Symbol.toStringTag]() { return 'CSSFontFaceRule'; }
 }
-globalThis.CSSFontFaceRule = CSSFontFaceRule;
+_exposeIface('CSSFontFaceRule', CSSFontFaceRule);
+_enumAccessors(CSSFontFaceRule.prototype, 'style');
+
+// CSSFontFeatureValuesMap (CSS Fonts 4 §CSSFontFeatureValuesMap) — the maplike value
+// type of each @font-feature-values sub-block, mapping a named feature value (e.g. a
+// @styleset name) to its list of OpenType feature indices. Backed by a real Map; it
+// exposes the read/write maplike surface (size/entries/keys/values/forEach/get/has +
+// set/delete/clear + @@iterator) plus the custom `set(name, values)` operation that
+// coerces a lone index or an index sequence to a list. Not author-constructible.
+class CSSFontFeatureValuesMap {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    this._m = new Map();
+  }
+  get size() { if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation"); return this._m.size; }
+  entries() { if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation"); return this._m.entries(); }
+  keys() { if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation"); return this._m.keys(); }
+  values() { if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation"); return this._m.values(); }
+  forEach(cb, ...rest) { if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation"); this._m.forEach(cb, rest[0]); }   // WebIDL forEach length is 1
+  get(key) { if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation"); return this._m.get(String(key)); }
+  has(key) { if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation"); return this._m.has(String(key)); }
+  set(featureValueName, values) {
+    if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation");
+    const list = Array.isArray(values) ? values.map(v => v >>> 0) : [values >>> 0];
+    this._m.set(String(featureValueName), list);
+    return undefined;
+  }
+  delete(key) { if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation"); return this._m.delete(String(key)); }
+  clear() { if (!(this instanceof CSSFontFeatureValuesMap)) throw new TypeError("Illegal invocation"); this._m.clear(); }
+  get [Symbol.toStringTag]() { return 'CSSFontFeatureValuesMap'; }
+}
+// The maplike surface members are WebIDL operations/attributes — they must be
+// ENUMERABLE own properties of the prototype (ES class members are non-enumerable),
+// and @@iterator is the same function object as entries().
+_enumAccessors(CSSFontFeatureValuesMap.prototype,
+  'size', 'entries', 'keys', 'values', 'forEach', 'get', 'has', 'set', 'delete', 'clear');
+Object.defineProperty(CSSFontFeatureValuesMap.prototype, Symbol.iterator,
+  { value: CSSFontFeatureValuesMap.prototype.entries, writable: true, configurable: true });
+_exposeIface('CSSFontFeatureValuesMap', CSSFontFeatureValuesMap);
+
+// CSSFontFeatureValuesRule (CSS Fonts 4 §CSSFontFeatureValuesRule) — the object model
+// of an `@font-feature-values` rule: a writable `fontFamily` plus seven readonly
+// CSSFontFeatureValuesMap sub-blocks (one per OpenType feature-value class). `.type`
+// is the legacy FONT_FEATURE_VALUES_RULE (14). Not author-constructible; the maps are
+// created lazily on first read. (@font-feature-values is not yet parsed into a rule —
+// this models the interface so the CSSOM/WebIDL surface exists.)
+const _FONT_FEATURE_VALUE_BLOCKS = ['annotation', 'ornaments', 'stylistic', 'swash', 'characterVariant', 'styleset', 'historicalForms'];
+class CSSFontFeatureValuesRule extends CSSRule {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    super();
+    this._fontFamily = '';
+    this._maps = {};
+  }
+  get type() { return 14; }                                    // CSSRule.FONT_FEATURE_VALUES_RULE
+  get fontFamily() {
+    if (!(this instanceof CSSFontFeatureValuesRule)) throw new TypeError("Illegal invocation");
+    return this._fontFamily;
+  }
+  set fontFamily(v) {
+    if (!(this instanceof CSSFontFeatureValuesRule)) throw new TypeError("Illegal invocation");
+    this._fontFamily = String(v == null ? '' : v);
+  }
+  _block(name) {
+    let m = this._maps[name];
+    if (!m) {
+      const prev = _allowCssCondCtor; _allowCssCondCtor = true;
+      try { m = new CSSFontFeatureValuesMap(); } finally { _allowCssCondCtor = prev; }
+      this._maps[name] = m;
+    }
+    return m;
+  }
+  get [Symbol.toStringTag]() { return 'CSSFontFeatureValuesRule'; }
+}
+for (const block of _FONT_FEATURE_VALUE_BLOCKS) {
+  Object.defineProperty(CSSFontFeatureValuesRule.prototype, block, {
+    enumerable: true, configurable: true,
+    get: _named('get', block, function () {
+      if (!(this instanceof CSSFontFeatureValuesRule)) throw new TypeError("Illegal invocation");
+      return this._block(block);
+    }),
+  });
+}
+_exposeIface('CSSFontFeatureValuesRule', CSSFontFeatureValuesRule);
+_enumAccessors(CSSFontFeatureValuesRule.prototype, 'fontFamily');
 
 // Parse an `@import` prelude into { href, supportsText, mediaText } (CSS Cascade
 // §at-import serialization). Grammar: `@import [<url>|<string>] <layer>?
@@ -27048,8 +27209,10 @@ const _fpvCanonOverrideColors = (v, allowMix) => {
   return out.length ? out.join(', ') : null;
 };
 class CSSFontPaletteValuesRule extends CSSRule {
-  constructor(desc) {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");   // not author-constructible
     super();
+    const desc = args[0];
     this._name = _unescapeCssIdent(String((desc && desc.condition) || '').trim());
     this._fontFamily = '';
     this._basePalette = '';
@@ -27062,10 +27225,10 @@ class CSSFontPaletteValuesRule extends CSSRule {
       else if (name === 'override-colors') { const c = _fpvCanonOverrideColors(value, true); if (c !== null) this._overrideColors = c; }
     }
   }
-  get name() { return this._name; }
-  get fontFamily() { return this._fontFamily; }
-  get basePalette() { return this._basePalette; }
-  get overrideColors() { return this._overrideColors; }
+  get name() { if (!(this instanceof CSSFontPaletteValuesRule)) throw new TypeError("Illegal invocation"); return this._name; }
+  get fontFamily() { if (!(this instanceof CSSFontPaletteValuesRule)) throw new TypeError("Illegal invocation"); return this._fontFamily; }
+  get basePalette() { if (!(this instanceof CSSFontPaletteValuesRule)) throw new TypeError("Illegal invocation"); return this._basePalette; }
+  get overrideColors() { if (!(this instanceof CSSFontPaletteValuesRule)) throw new TypeError("Illegal invocation"); return this._overrideColors; }
   get cssText() {
     const parts = [];
     if (this._fontFamily) parts.push('font-family: ' + this._fontFamily + ';');
@@ -27074,8 +27237,10 @@ class CSSFontPaletteValuesRule extends CSSRule {
     const body = parts.length ? ' ' + parts.join(' ') + ' ' : ' ';
     return '@font-palette-values ' + _serializeCssIdent(this._name) + ' {' + body + '}';
   }
+  get [Symbol.toStringTag]() { return 'CSSFontPaletteValuesRule'; }
 }
-globalThis.CSSFontPaletteValuesRule = CSSFontPaletteValuesRule;
+_exposeIface('CSSFontPaletteValuesRule', CSSFontPaletteValuesRule);
+_enumAccessors(CSSFontPaletteValuesRule.prototype, 'name', 'fontFamily', 'basePalette', 'overrideColors');
 
 // @counter-style (css-counter-styles-3) — CSSCounterStyleRule: a named custom
 // counter style. The prelude is a <counter-style-name> (a <custom-ident> that is
@@ -27285,7 +27450,8 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     return rule;
   }
   if (desc.type === 'font-palette-values') {
-    rule = new CSSFontPaletteValuesRule(desc);
+    _allowCssCondCtor = true;   // internal build of a non-author-constructible rule
+    try { rule = new CSSFontPaletteValuesRule(desc); } finally { _allowCssCondCtor = false; }
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
@@ -27303,7 +27469,8 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     return rule;
   }
   if (desc.type === 'font-face') {
-    rule = new CSSFontFaceRule(desc);
+    _allowCssCondCtor = true;   // internal build of a non-author-constructible rule (+ its descriptor block)
+    try { rule = new CSSFontFaceRule(desc); } finally { _allowCssCondCtor = false; }
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
