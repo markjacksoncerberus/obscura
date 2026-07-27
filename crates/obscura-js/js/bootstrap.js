@@ -7984,6 +7984,15 @@ const _connectResourceElement = function(el) {
   } else if (ln === 'object') {
     const data = el.getAttribute('data') || el.data;
     if (data) { el._resConnected = true; _loadElementResource(el, data, 'object'); }
+  } else if (ln === 'style') {
+    // A <style> that imports sheets fires a `load` event once its (sub)sheets load
+    // (HTML §the-style-element). We don't fetch @import targets, so fire on a queued
+    // task after connection. Scoped to @import-bearing styles so the many plain
+    // <style>s that never observe load are left untouched.
+    if (/@import/i.test(el.textContent || '')) {
+      el._resConnected = true;
+      Promise.resolve().then(() => { try { _fireIframeElementLoad(el); } catch (e) {} });
+    }
   }
 };
 
@@ -24727,7 +24736,16 @@ const _cssParseRuleList = (cssText) => {
       i = j + 1;
       if (prelude && prelude[0] === '@') {
         const m = /^@([\w-]+)/.exec(prelude);
-        rules.push({ type: 'stmt', name: m ? m[1].toLowerCase() : '', prelude });
+        const nm = m ? m[1].toLowerCase() : '';
+        if (nm === 'layer') {
+          // @layer <layer-name># ; → CSSLayerStatementRule. An empty or invalid name
+          // list makes the whole at-rule invalid → drop it (anonymous layers are only
+          // valid in block form).
+          const names = _parseLayerNameList(prelude.slice(m[0].length));
+          if (names) rules.push({ type: 'layer-statement', name: nm, prelude, nameList: names });
+        } else {
+          rules.push({ type: 'stmt', name: nm, prelude });
+        }
       }
       continue;
     }
@@ -24780,6 +24798,16 @@ const _cssParseRuleList = (cssText) => {
         // @counter-style <counter-style-name> { <declaration-list> } → CSSCounterStyleRule.
         // An invalid name makes the whole at-rule invalid → drop it (CSSOM).
         if (_isValidCounterStyleName(condition)) rules.push({ type: 'counter-style', name, condition, prelude, body });
+      } else if (name === 'layer') {
+        // @layer <layer-name>? { <rule-list> } → CSSLayerBlockRule (the block form).
+        // The name may be empty (an anonymous layer); a non-empty name must be a valid
+        // <layer-name> or the whole at-rule is invalid → drop it.
+        if (condition === '' || _isValidLayerName(condition))
+          rules.push({ type: 'layer-block', name, condition, prelude, rules: _cssParseRuleList(body) });
+      } else if (name === 'scope') {
+        // @scope (<scope-start>)? [to (<scope-end>)]? { <rule-list> } → CSSScopeRule.
+        const sc = _parseScopePrelude(condition);
+        rules.push({ type: 'scope', name, condition, prelude, _start: sc.start, _end: sc.end, rules: _cssParseRuleList(body) });
       } else {
         rules.push({ type: 'at', name, condition, prelude, body });
       }
@@ -25716,7 +25744,7 @@ const _splitNestedRuleBody = (body) => {
 // e.g. `@media { @font-face { … } }` is perfectly valid — so the filter runs only
 // on the descriptors of a style rule's nested body, recursing through nested group
 // rules to drop the same at-rules there too.
-const _nestOkDesc = (d) => d.type === 'style' || d.type === 'group';
+const _nestOkDesc = (d) => d.type === 'style' || d.type === 'group' || d.type === 'scope';
 const _filterNestDescs = (descs) => descs.filter(_nestOkDesc).map((d) =>
   (d.type === 'group' && Array.isArray(d.rules)) ? Object.assign({}, d, { rules: _filterNestDescs(d.rules) }) : d);
 // A rule is in nesting context iff a style rule appears anywhere on its parentRule
@@ -25734,7 +25762,11 @@ const _ruleInNestingContext = (rule) => {
 // like @font-face/@keyframes/@page/@scope); a declaration-run that ends up adjacent
 // to another (because the rule between them was dropped) coalesces with it, so the
 // declarations read as one consecutive block (CSS Nesting §nested-declarations-rule).
-const _buildNestedItems = (body) => {
+// Build the ordered descriptor list for a nesting-context body. `inScope` is true
+// when the body is the DIRECT body of a @scope rule — its child style rules are
+// scoped by an implicit `:scope` (not `&`), so they serialize AS AUTHORED (`.b {}`,
+// not `& .b {}`); declaration runs still become CSSNestedDeclarations either way.
+const _buildNestedItems = (body, inScope) => {
   const { items } = _splitNestedRuleBody(body);
   const out = [];
   const pushDecls = (text) => {
@@ -25751,13 +25783,20 @@ const _buildNestedItems = (body) => {
       const m = /^@([\w-]+)\s*/.exec(prelude);
       const name = m ? m[1].toLowerCase() : '';
       const condition = (m ? prelude.slice(m[0].length) : prelude.slice(1)).trim();
-      // Only conditional group rules are valid in nesting context; other at-rules
-      // (@font-face/@keyframes/@page/@property/@counter-style/@scope/@layer/…) drop.
+      // Group rules valid in a nesting context; other at-rules
+      // (@font-face/@keyframes/@page/@property/@counter-style/@layer/…) drop. A nested
+      // @scope is a CSSScopeRule whose own body follows nesting semantics (bare
+      // declaration runs become CSSNestedDeclarations, `.b {}` an implicit-:scope rule).
       if (name === 'media' || name === 'supports' || name === 'container' || name === 'document') {
         out.push({ type: 'group', name, condition, prelude, rules: _buildNestedItems(it.body) });
+      } else if (name === 'scope') {
+        const sc = _parseScopePrelude(condition);
+        out.push({ type: 'scope', name, condition, prelude, _start: sc.start, _end: sc.end, rules: _buildNestedItems(it.body, true) });
       }
     } else if (_parseSelectorList(prelude, true) !== null) {
-      out.push({ type: 'style', selectorText: prelude, body: it.body, _nested: true });
+      // Inside @scope the child selector is implicitly :scope-relative → serialize as
+      // authored (a top-level, non-`&`-absolutized style rule).
+      out.push({ type: 'style', selectorText: prelude, body: it.body, _nested: !inScope });
     }
   }
   return out;
@@ -26079,7 +26118,11 @@ const _parseImportRule = (prelude) => {
     href = buf.replace(/\\(.)/g, '$1');
     s = s.slice(i).trim();
   }
-  s = s.replace(/^layer(\s*\([^)]*\))?\s*/i, '').trim();   // optional cascade layer
+  // optional cascade layer — `layer` (anonymous → '') or `layer(<layer-name>)` (→ the
+  // name). The negative lookahead keeps `layerfoo` from matching the bare keyword.
+  let layerName = null;
+  const lm = /^layer(?:\(\s*([^)]*?)\s*\))?(?![\w-])/i.exec(s);
+  if (lm) { layerName = lm[1] !== undefined ? lm[1].trim() : ''; s = s.slice(lm[0].length).trim(); }
   let supportsText = null;
   const sm = /^supports\(/i.exec(s);
   if (sm) {                                    // supports( <supports-condition> )
@@ -26094,7 +26137,7 @@ const _parseImportRule = (prelude) => {
     supportsText = s.slice(start, i).trim();
     s = s.slice(i + 1).trim();
   }
-  return { href, supportsText, mediaText: s };
+  return { href, supportsText, mediaText: s, layerName };
 };
 
 // CSSImportRule (CSSOM §CSSImportRule) — an `@import` rule. Exposes the imported
@@ -26111,6 +26154,7 @@ class CSSImportRule extends CSSRule {
     const p = _parseImportRule((desc && desc.prelude) || '');
     this._href = p.href;
     this._supportsText = p.supportsText;
+    this._layerName = p.layerName;
     this._media = _makeMediaList(p.mediaText);
     const sheet = new CSSStyleSheet();
     sheet.ownerRule = this;
@@ -26121,9 +26165,13 @@ class CSSImportRule extends CSSRule {
   get media() { return this._media; }
   set media(v) { this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
   get supportsText() { return this._supportsText; }
+  // CSS Cascade 5 partial: the cascade layer this sheet is imported into — the layer
+  // name, '' for an anonymous `layer`, or null when no layer was specified.
+  get layerName() { return this._layerName; }
   get styleSheet() { return this._styleSheet; }
   get cssText() {
     let out = '@import url(' + _serCssString(this._href) + ')';
+    if (this._layerName != null) out += this._layerName ? ' layer(' + this._layerName + ')' : ' layer';
     if (this._supportsText != null) out += ' supports(' + this._supportsText + ')';
     const mt = this._media.mediaText;
     if (mt) out += ' ' + mt;
@@ -26222,6 +26270,119 @@ class CSSSupportsRule extends CSSConditionRule {
 }
 _exposeIface('CSSSupportsRule', CSSSupportsRule);
 _enumAccessors(CSSSupportsRule.prototype, 'matches');
+
+// A <layer-name> is `<ident> [ '.' <ident> ]*` (CSS Cascade 5 §layer-names) — a
+// dotted chain of CSS identifiers. Used to validate `@layer` preludes and the
+// `layer(<layer-name>)` argument of `@import`. Kept as authored (not resolved to a
+// full dotted path); an invalid name drops the whole at-rule.
+const _LAYER_IDENT = "-?(?:[_a-zA-Z\\u00A0-\\uffff]|\\\\.)(?:[\\w\\u00A0-\\uffff-]|\\\\.)*";
+const _LAYER_NAME_RE = new RegExp("^" + _LAYER_IDENT + "(?:\\." + _LAYER_IDENT + ")*$");
+const _isValidLayerName = (s) => _LAYER_NAME_RE.test(String(s == null ? '' : s).trim());
+// Parse a `@layer` statement's name list (`foo, bar`) into an array of layer names,
+// or null if any entry is invalid (or the list is empty — a statement rule needs
+// at least one name; an anonymous layer is only valid in block form).
+const _parseLayerNameList = (raw) => {
+  const parts = String(raw == null ? '' : raw).trim().split(',').map((s) => s.trim());
+  if (!parts.length || parts.some((p) => !_isValidLayerName(p))) return null;
+  return parts;
+};
+
+// CSSLayerBlockRule (CSS Cascade 5 §CSSLayerBlockRule) — `@layer <name>? { … }`. A
+// grouping rule exposing the layer's name (`.name`; an empty string for an anonymous
+// `@layer { }`) and its nested rules (`.cssRules`, inherited from CSSGroupingRule).
+// `.type` is 0 — @layer has no legacy numbered CSSRule type. Not author-constructible:
+// `constructor(...args)` gives the interface object `.length` 0 (WebIDL), and the
+// brand-checked `.name` getter throws on the prototype / any non-instance.
+class CSSLayerBlockRule extends CSSGroupingRule {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    super();
+    this._name = String((args[0] && args[0].condition) || '').trim();
+  }
+  get type() { return 0; }
+  get name() {
+    if (!(this instanceof CSSLayerBlockRule)) throw new TypeError("Illegal invocation");
+    return this._name;
+  }
+  get cssText() { return '@layer' + (this._name ? ' ' + this._name : '') + _serializeGroupBlock(this); }
+  get [Symbol.toStringTag]() { return 'CSSLayerBlockRule'; }
+}
+_exposeIface('CSSLayerBlockRule', CSSLayerBlockRule);
+_enumAccessors(CSSLayerBlockRule.prototype, 'name');
+
+// CSSLayerStatementRule (CSS Cascade 5 §CSSLayerStatementRule) — `@layer a, b, c;`.
+// A statement rule (no block, so a plain CSSRule) exposing the ordered list of layer
+// names it declares (`.nameList`, a WebIDL FrozenArray<CSSOMString> — a fresh frozen
+// copy each read). `.type` is 0.
+class CSSLayerStatementRule extends CSSRule {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    super();
+    this._nameList = (args[0] && args[0].nameList) || [];
+  }
+  get type() { return 0; }
+  get nameList() {
+    if (!(this instanceof CSSLayerStatementRule)) throw new TypeError("Illegal invocation");
+    return Object.freeze(this._nameList.slice());
+  }
+  get cssText() { return '@layer ' + this._nameList.join(', ') + ';'; }
+  get [Symbol.toStringTag]() { return 'CSSLayerStatementRule'; }
+}
+_exposeIface('CSSLayerStatementRule', CSSLayerStatementRule);
+_enumAccessors(CSSLayerStatementRule.prototype, 'nameList');
+
+// Parse a `@scope` prelude — `(<scope-start>)? [ to (<scope-end>) ]?` — into the two
+// selector strings (each null when absent). The inner selector text is kept verbatim.
+const _parseScopePrelude = (raw) => {
+  const s = String(raw == null ? '' : raw).trim();
+  let start = null, end = null;
+  let i = 0;
+  if (s[i] === '(') {                                  // (<scope-start>)
+    let depth = 0; const st = i;
+    for (; i < s.length; i++) { if (s[i] === '(') depth++; else if (s[i] === ')') { depth--; if (depth === 0) { i++; break; } } }
+    start = s.slice(st + 1, i - 1).trim();
+    if (start === '') start = null;
+  }
+  const rest = s.slice(i).trim();
+  const tm = /^to\s*\(/i.exec(rest);
+  if (tm) {                                            // to (<scope-end>)
+    let j = tm[0].length - 1, depth = 0; const st = j;
+    for (; j < rest.length; j++) { if (rest[j] === '(') depth++; else if (rest[j] === ')') { depth--; if (depth === 0) { j++; break; } } }
+    end = rest.slice(st + 1, j - 1).trim();
+    if (end === '') end = null;
+  }
+  return { start, end };
+};
+// CSSScopeRule (CSS Cascade 6 §CSSScopeRule) — `@scope (start)? [to (end)]? { … }`.
+// A grouping rule exposing the scope roots (`.start`/`.end`, the selector text or
+// null). `.type` is 0.
+class CSSScopeRule extends CSSGroupingRule {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    super();
+    const d = args[0] || {};
+    this._start = d._start != null ? d._start : null;
+    this._end = d._end != null ? d._end : null;
+  }
+  get type() { return 0; }
+  get start() {
+    if (!(this instanceof CSSScopeRule)) throw new TypeError("Illegal invocation");
+    return this._start;
+  }
+  get end() {
+    if (!(this instanceof CSSScopeRule)) throw new TypeError("Illegal invocation");
+    return this._end;
+  }
+  get cssText() {
+    let p = '@scope';
+    if (this._start != null) p += ' (' + this._start + ')';
+    if (this._end != null) p += ' to (' + this._end + ')';
+    return p + _serializeGroupBlock(this);
+  }
+  get [Symbol.toStringTag]() { return 'CSSScopeRule'; }
+}
+_exposeIface('CSSScopeRule', CSSScopeRule);
+_enumAccessors(CSSScopeRule.prototype, 'start', 'end');
 
 // Minimal carriers for at-rules we parse but don't fully model. They preserve a
 // faithful cssText round-trip and a type code; their declarations don't feed the
@@ -26747,9 +26908,18 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     rule._parentRule = parentRule || null;
     return rule;
   }
+  if (desc.type === 'layer-statement') {
+    _allowCssCondCtor = true;   // internal build of a non-author-constructible rule
+    try { rule = new CSSLayerStatementRule(desc); } finally { _allowCssCondCtor = false; }
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
   _allowCssCondCtor = true;   // CSSMediaRule/CSSSupportsRule chain through the guarded CSSConditionRule ctor
   try {
     if (desc.type === 'style') rule = new CSSStyleRule(desc.selectorText, desc.body, desc._nested);
+    else if (desc.type === 'layer-block') rule = new CSSLayerBlockRule(desc);   // @layer name { … } (grouping)
+    else if (desc.type === 'scope') rule = new CSSScopeRule(desc);              // @scope (…) to (…) { … } (grouping)
     else if (desc.type === 'group' && desc.name === 'supports') rule = new CSSSupportsRule(desc.condition);
     else if (desc.type === 'group') rule = new CSSMediaRule(desc.condition);  // media/container/document → grouping
     else rule = new CSSGenericRule(desc);                                     // keyframes/font-face/page/import/namespace
