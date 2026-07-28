@@ -3019,27 +3019,48 @@ class CSSStyleDeclaration {
     if (!(this instanceof CSSStyleDeclaration)) throw new TypeError("Illegal invocation");
     return this._parentRule || null;
   }
-  // cssFloat is the IDL alias for the `float` property (CSSOM; `float` is a reserved
-  // word so the attribute is spelled cssFloat), [LegacyNullToEmptyString].
-  get cssFloat() { return this.getPropertyValue('float'); }
-  set cssFloat(v) { this.setProperty('float', v == null ? '' : String(v)); }
   // CSSStyleDeclaration is iterable over the property names it exposes through the
   // indexed getter (CSSOM "supported property indices") — same order as item().
   [Symbol.iterator]() { return Object.keys(this._props)[Symbol.iterator](); }
 }
-// Internal factory: the interface is not author-constructible (see the ctor guard),
-// so every internal instantiation flips the allow-flag around a single `new`.
+// CSSStyleProperties (CSSOM §CSSStyleProperties) — the concrete CSSStyleDeclaration
+// subclass returned by every "live" style: an element's inline `.style`
+// (ElementCSSInlineStyle), `getComputedStyle()`, and a CSSStyleRule/CSSMarginRule/
+// CSSKeyframeRule `.style`. Beyond the inherited declaration surface it adds only the
+// `cssFloat` IDL alias for the `float` property (spelled cssFloat because `float` is a
+// reserved word), [LegacyNullToEmptyString]. Not author-constructible — built solely
+// through _newStyleDecl (which flips _allowStyleDeclCtor). The @font-face / @page
+// descriptor blocks are DISTINCT interfaces (CSSFontFaceDescriptors / CSSPageDescriptors)
+// that extend CSSStyleDeclaration directly, so they do NOT inherit cssFloat.
+class CSSStyleProperties extends CSSStyleDeclaration {
+  constructor() {
+    if (!_allowStyleDeclCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    super();
+  }
+  get cssFloat() { if (!(this instanceof CSSStyleProperties)) throw new TypeError("Illegal invocation"); return this.getPropertyValue('float'); }
+  set cssFloat(v) { if (!(this instanceof CSSStyleProperties)) throw new TypeError("Illegal invocation"); this.setProperty('float', v == null ? '' : String(v)); }   // [LegacyNullToEmptyString]
+  get [Symbol.toStringTag]() { return 'CSSStyleProperties'; }
+}
+// Internal factory: neither interface is author-constructible (see the ctor guards),
+// so every internal instantiation flips the allow-flag around a single `new`. Returns
+// a CSSStyleProperties — the concrete interface of every live style declaration.
 const _newStyleDecl = () => {
   _allowStyleDeclCtor = true;
-  try { return new CSSStyleDeclaration(); } finally { _allowStyleDeclCtor = false; }
+  try { return new CSSStyleProperties(); } finally { _allowStyleDeclCtor = false; }
 };
 // WebIDL: an interface's operations + attributes are ENUMERABLE own props on the
 // prototype, but ES class methods/getters are non-enumerable. Re-stamp them enumerable.
 // (Inlined — the _enumAccessors helper is defined later in the prelude.)
-for (const m of ['cssText', 'length', 'parentRule', 'cssFloat', 'item', 'getPropertyValue',
+for (const m of ['cssText', 'length', 'parentRule', 'item', 'getPropertyValue',
                  'getPropertyPriority', 'setProperty', 'removeProperty']) {
   const d = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, m);
   if (d) { d.enumerable = true; Object.defineProperty(CSSStyleDeclaration.prototype, m, d); }
+}
+// cssFloat is a CSSStyleProperties member (not on the CSSStyleDeclaration base) —
+// stamp it enumerable on that prototype.
+{
+  const d = Object.getOwnPropertyDescriptor(CSSStyleProperties.prototype, 'cssFloat');
+  if (d) { d.enumerable = true; Object.defineProperty(CSSStyleProperties.prototype, 'cssFloat', d); }
 }
 
 // Map a JS-side style property accessor to its canonical CSS property name (the
@@ -6528,8 +6549,7 @@ class Document extends Node {
     try { els = this.querySelectorAll('style, link[rel~="stylesheet"]'); } catch { els = []; }
     const out = [];
     for (const el of els) { try { out.push(_styleSheetForNode(el)); } catch (e) {} }
-    out.item = (i) => { i = i >>> 0; return i < out.length ? out[i] : null; };
-    return out;
+    return _makeStyleSheetList(out);
   }
   // document.forms is an HTMLCollection (named access by id/name), not a NodeList.
   get forms() { const d = this; return _makeHTMLCollection(() => [...d.querySelectorAll("form")]); }
@@ -24501,15 +24521,27 @@ globalThis.getComputedStyle = (el, _pseudo) => {
   const enumNames = () => (_names || (_names = _COMPUTED_STD_NAMES.concat(_computedCustomPropNames(el))));
   return new Proxy(style, {
     get(target, prop) {
-      if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
+      if (prop === Symbol.toPrimitive) return undefined;
+      // A computed style is a CSSStyleProperties (CSSOM); Object.prototype.toString
+      // must report it as such. The backing `style` object is already a
+      // CSSStyleProperties, but this proxy overrides its members, so surface the tag here.
+      if (prop === Symbol.toStringTag) return 'CSSStyleProperties';
       // A computed style declaration serializes to the empty string — cssText is not
       // meaningful for a read-only computed block (CSSOM §6.7.1). Intercepted before
       // the `prop in target` delegation, which would otherwise echo the underlying
       // element's inline declaration.
       if (prop === 'cssText') return '';
-      if (prop === 'getPropertyValue') return (name) => resolve(String(name));
+      // getPropertyValue/item are WebIDL operations — their too-few-arguments call
+      // must throw TypeError (arity), so guard before resolving.
+      if (prop === 'getPropertyValue') return function (name) {
+        if (arguments.length < 1) throw new TypeError("1 argument required");
+        return resolve(String(name));
+      };
       if (prop === 'length') return enumNames().length;
-      if (prop === 'item') return (i) => enumNames()[i >>> 0] || '';
+      if (prop === 'item') return function (i) {
+        if (arguments.length < 1) throw new TypeError("1 argument required");
+        return enumNames()[i >>> 0] || '';
+      };
       if (prop === Symbol.iterator) return function* () { for (const n of enumNames()) yield n; };
       if (typeof prop === 'string' && /^\d+$/.test(prop)) return enumNames()[Number(prop)];
       if (prop in target) return target[prop];
@@ -24986,12 +25018,43 @@ const _cssParseRuleList = (cssText) => {
   return rules;
 };
 
-// MediaList — a minimal serializable list of media queries (CSSOM §MediaList).
-// Wrapped in a Proxy so the indexed getter (`media[0]`) reads the live item list.
-// The backing object's prototype is set to MediaList.prototype so a CSSOM object
-// (`importRule.media`, `sheet.media`) satisfies `x instanceof MediaList`.
-class MediaList {}
-globalThis.MediaList = MediaList;
+// MediaList — a serializable list of media queries (CSSOM §MediaList). A real class
+// whose IDL surface (mediaText/length/item/appendMedium/deleteMedium + the `toString`
+// stringifier) lives on the PROTOTYPE as brand-checked members (idlharness requires
+// them found in the prototype chain, not as own props on the object). Instances hold
+// the query list in `_items`; `_makeMediaList` wraps one in a Proxy so the indexed
+// getter (`media[0]`) reads the live list. Not author-constructible.
+let _allowMediaListCtor = false;
+class MediaList {
+  constructor() {
+    if (!_allowMediaListCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    this._items = [];
+  }
+  get length() { if (!(this instanceof MediaList)) throw new TypeError("Illegal invocation"); return this._items.length; }
+  get mediaText() { if (!(this instanceof MediaList)) throw new TypeError("Illegal invocation"); return this._items.join(', '); }
+  set mediaText(v) { if (!(this instanceof MediaList)) throw new TypeError("Illegal invocation"); this._items = _splitMediaText(v); }   // [LegacyNullToEmptyString] via _splitMediaText
+  item(i) {
+    if (!(this instanceof MediaList)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1) throw new TypeError("1 argument required");
+    i = i >>> 0; return i < this._items.length ? this._items[i] : null;
+  }
+  appendMedium(m) {
+    if (!(this instanceof MediaList)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1) throw new TypeError("1 argument required");
+    m = _serMediaQuery(String(m)); if (!this._items.includes(m)) this._items.push(m);
+  }
+  deleteMedium(m) {
+    if (!(this instanceof MediaList)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1) throw new TypeError("1 argument required");
+    const idx = this._items.indexOf(String(m));
+    if (idx < 0) throw new DOMException("Media query not in list.", "NotFoundError");
+    this._items.splice(idx, 1);
+  }
+  toString() { return this._items.join(', '); }   // stringifier ≡ mediaText
+  get [Symbol.toStringTag]() { return 'MediaList'; }
+}
+// (MediaList's IDL members are stamped enumerable + the interface object exposed
+// non-enumerable further down, once _enumAccessors/_exposeIface are defined.)
 // CSSOM §serialize-a-media-query — normalize a single media query string.
 // Tokenize into top-level tokens (bare idents + paren-groups, paren-depth aware so
 // `(max-width: 0px)` stays one token including its internal space), then: lowercase a
@@ -25052,21 +25115,9 @@ const _splitMediaText = (v) =>
   String(v == null ? '' : (typeof v === 'string' ? v : (v.mediaText || '')))
     .split(',').map((s) => s.trim()).filter(Boolean).map(_serMediaQuery);
 const _makeMediaList = (text) => {
-  const ml = {
-    _items: _splitMediaText(text),
-    get length() { return this._items.length; },
-    get mediaText() { return this._items.join(', '); },
-    set mediaText(v) { this._items = _splitMediaText(v); },
-    item(i) { i = i >>> 0; return i < this._items.length ? this._items[i] : null; },
-    appendMedium(m) { m = _serMediaQuery(String(m)); if (!this._items.includes(m)) this._items.push(m); },
-    deleteMedium(m) {
-      const idx = this._items.indexOf(String(m));
-      if (idx < 0) throw new DOMException("Media query not in list.", "NotFoundError");
-      this._items.splice(idx, 1);
-    },
-    toString() { return this._items.join(', '); },
-  };
-  Object.setPrototypeOf(ml, MediaList.prototype);   // so `ml instanceof MediaList`
+  _allowMediaListCtor = true;
+  let ml; try { ml = new MediaList(); } finally { _allowMediaListCtor = false; }
+  ml._items = _splitMediaText(text);
   return new Proxy(ml, {
     get(t, p) {
       if (typeof p === 'string' && /^[0-9]+$/.test(p)) return t._items[+p];
@@ -25079,13 +25130,26 @@ const _makeMediaList = (text) => {
 // is mutated in place (insert/delete/replace) so the list keeps a stable identity
 // (`rules === sheet.cssRules` after replace). Numeric index access is served by a
 // Proxy reading the live backing array.
+let _allowRuleListCtor = false;
 class CSSRuleList {
-  constructor() { this._rules = []; }
-  get length() { return this._rules.length; }
-  item(i) { i = i >>> 0; return i < this._rules.length ? this._rules[i] : null; }
+  constructor() { if (!_allowRuleListCtor) throw new TypeError("Illegal constructor"); this._rules = []; }   // not author-constructible
+  get length() { if (!(this instanceof CSSRuleList)) throw new TypeError("Illegal invocation"); return this._rules.length; }
+  item(i) {
+    if (!(this instanceof CSSRuleList)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1) throw new TypeError("1 argument required");
+    i = i >>> 0; return i < this._rules.length ? this._rules[i] : null;
+  }
   [Symbol.iterator]() { return this._rules[Symbol.iterator](); }
+  get [Symbol.toStringTag]() { return 'CSSRuleList'; }
 }
-globalThis.CSSRuleList = CSSRuleList;
+// Internal factory: CSSRuleList is not author-constructible, so flip the guard around
+// each internal `new`.
+const _newRuleList = () => {
+  _allowRuleListCtor = true;
+  try { return new CSSRuleList(); } finally { _allowRuleListCtor = false; }
+};
+// (CSSRuleList's IDL members are stamped enumerable + the interface object exposed
+// non-enumerable further down, once _enumAccessors/_exposeIface are defined.)
 const _ruleListProxy = (rl) => new Proxy(rl, {
   get(t, p) {
     if (typeof p === 'string' && /^[0-9]+$/.test(p)) return t._rules[+p];
@@ -25096,6 +25160,41 @@ const _ruleListProxy = (rl) => new Proxy(rl, {
     return p in t;
   },
 });
+
+// StyleSheetList (CSSOM §StyleSheetList) — the array-like returned by
+// `document.styleSheets` / `shadowRoot.styleSheets`. Its `item`/`length` IDL members
+// live on the prototype (brand-checked, enumerable); the backing CSSStyleSheet list is
+// `_sheets`. `_makeStyleSheetList` wraps an instance in a Proxy for indexed access
+// (`styleSheets[0]`) + `.length` liveness. Not author-constructible.
+let _allowSheetListCtor = false;
+class StyleSheetList {
+  constructor() { if (!_allowSheetListCtor) throw new TypeError("Illegal constructor"); this._sheets = []; }
+  get length() { if (!(this instanceof StyleSheetList)) throw new TypeError("Illegal invocation"); return this._sheets.length; }
+  item(i) {
+    if (!(this instanceof StyleSheetList)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1) throw new TypeError("1 argument required");
+    i = i >>> 0; return i < this._sheets.length ? this._sheets[i] : null;
+  }
+  [Symbol.iterator]() { return this._sheets[Symbol.iterator](); }
+  get [Symbol.toStringTag]() { return 'StyleSheetList'; }
+}
+// (StyleSheetList's IDL members are stamped enumerable + the interface object exposed
+// non-enumerable further down, once _enumAccessors/_exposeIface are defined.)
+const _makeStyleSheetList = (sheets) => {
+  _allowSheetListCtor = true;
+  let l; try { l = new StyleSheetList(); } finally { _allowSheetListCtor = false; }
+  l._sheets = sheets;
+  return new Proxy(l, {
+    get(t, p) {
+      if (typeof p === 'string' && /^[0-9]+$/.test(p)) return t._sheets[+p];
+      return t[p];
+    },
+    has(t, p) {
+      if (typeof p === 'string' && /^[0-9]+$/.test(p)) return +p < t._sheets.length;
+      return p in t;
+    },
+  });
+};
 
 // ── CSS Selector parser + serializer (CSSOM §serialize-a-group-of-selectors) ──
 // A small recursive-descent selector parser used by CSSStyleRule.selectorText to
@@ -25816,12 +25915,22 @@ const _named = (kind, attr, fn) => {
 // (CSSFontFaceDescriptors) pass idlharness's inherited-interface existence checks and
 // authors can brand-check against it. (It stays internally constructible.)
 _exposeIface('CSSStyleDeclaration', CSSStyleDeclaration);
+_exposeIface('CSSStyleProperties', CSSStyleProperties);   // the concrete live-style interface
+// The CSSOM list interfaces (defined earlier, before these helpers existed): expose
+// each interface object non-enumerable + stamp its IDL members enumerable on the
+// prototype (idlharness requires attributes/operations to be enumerable own props).
+_exposeIface('MediaList', MediaList);
+_enumAccessors(MediaList.prototype, 'length', 'mediaText', 'item', 'appendMedium', 'deleteMedium', 'toString');
+_exposeIface('CSSRuleList', CSSRuleList);
+_enumAccessors(CSSRuleList.prototype, 'length', 'item');
+_exposeIface('StyleSheetList', StyleSheetList);
+_enumAccessors(StyleSheetList.prototype, 'length', 'item');
 // Guard so CSSConditionRule (and its CSSMediaRule/CSSSupportsRule subclasses, which
 // chain through its constructor via super()) throw "Illegal constructor" for author
 // `new`, while Obscura still builds them internally in _makeRule (which flips this on).
 let _allowCssCondCtor = false;
 class CSSGroupingRule extends CSSRule {
-  constructor() { super(); this._ruleListObj = new CSSRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj); }
+  constructor() { super(); this._ruleListObj = _newRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj); }
   get cssRules() { return this._ruleList; }
   insertRule(text, index) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'insertRule': 1 argument required");   // WebIDL: rule is required
@@ -26075,7 +26184,7 @@ class CSSStyleRule extends CSSGroupingRule {
     super();
     this._nested = !!nested;
     this._selectorSource = String(selectorText == null ? '' : selectorText).trim();   // raw authored selector
-    this._ruleListObj = new CSSRuleList();
+    this._ruleListObj = _newRuleList();
     this._ruleList = _ruleListProxy(this._ruleListObj);
     const split = _splitNestedRuleBody(body || '');
     // Ordered child descriptors: declaration-runs interleaved with nested rules
@@ -26283,7 +26392,7 @@ class CSSPageRule extends CSSGroupingRule {
     const desc = args[0];
     const c = _canonPageSelector((desc && desc.condition) || '');
     this._selectorText = c === null ? String((desc && desc.condition) || '').trim() : c;
-    const decl = _newStyleDecl();
+    const decl = new CSSPageDescriptors();                 // CSS Page 3 §CSSPageDescriptors
     decl._pageDescriptors = true;                          // allow size / page-orientation
     this._styleDecl = _styleProxy(decl);
     // Split the @page body: declarations → `.style`; `@<margin-box> {…}` at-rules →
@@ -26320,6 +26429,49 @@ class CSSPageRule extends CSSGroupingRule {
 }
 _exposeIface('CSSPageRule', CSSPageRule);
 _enumAccessors(CSSPageRule.prototype, 'selectorText', 'style', 'type');
+
+// CSSPageDescriptors (CSS Page 3 §CSSPageDescriptors) — the specialized
+// CSSStyleDeclaration returned by `CSSPageRule.style`. Beyond the inherited
+// declaration surface it exposes one IDL attribute per @page descriptor, in BOTH
+// the camelCase form (`marginTop`) AND the literal dashed CSS form (`margin-top`)
+// where they differ — WebIDL declares both. Each is [LegacyNullToEmptyString]
+// (a null assignment becomes ""), forwarding to the underlying declaration's
+// setProperty/getPropertyValue on the canonical (kebab) property name. The
+// accessors are enumerable, brand-checked get/set pairs living on the prototype
+// (reading one on the bare prototype — not an instance — throws TypeError). Built
+// only inside a CSSPageRule (the _allowPageChildCtor window) — author `new` throws.
+class CSSPageDescriptors extends CSSStyleDeclaration {
+  constructor(...args) {
+    if (!_allowPageChildCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    super();
+  }
+  get [Symbol.toStringTag]() { return 'CSSPageDescriptors'; }
+}
+// [ camelCase IDL attribute, canonical kebab CSS property ]. The dashed alias
+// is derived from the kebab name; single-word descriptors have no camel/dash split.
+const _PAGE_DESCRIPTOR_ATTRS = [
+  ['margin', 'margin'],
+  ['marginTop', 'margin-top'], ['marginRight', 'margin-right'],
+  ['marginBottom', 'margin-bottom'], ['marginLeft', 'margin-left'],
+  ['size', 'size'], ['pageOrientation', 'page-orientation'],
+  ['marks', 'marks'], ['bleed', 'bleed'],
+];
+for (const [camel, kebab] of _PAGE_DESCRIPTOR_ATTRS) {
+  const define = (attr) => Object.defineProperty(CSSPageDescriptors.prototype, attr, {
+    enumerable: true, configurable: true,
+    get: _named('get', attr, function () {
+      if (!(this instanceof CSSPageDescriptors)) throw new TypeError("Illegal invocation");
+      return this.getPropertyValue(kebab);
+    }),
+    set: _named('set', attr, function (v) {                    // [LegacyNullToEmptyString]
+      if (!(this instanceof CSSPageDescriptors)) throw new TypeError("Illegal invocation");
+      this.setProperty(kebab, v == null ? '' : String(v));
+    }),
+  });
+  define(camel);
+  if (camel !== kebab) define(kebab);
+}
+_exposeIface('CSSPageDescriptors', CSSPageDescriptors);
 
 // CSSFontFaceDescriptors (CSS Fonts 5 §CSSFontFaceDescriptors) — the specialized
 // CSSStyleDeclaration returned by `CSSFontFaceRule.style`. Beyond the inherited
@@ -27100,6 +27252,30 @@ class CSSGenericRule extends CSSRule {
   }
 }
 
+// CSSNamespaceRule (CSSOM §CSSNamespaceRule) — an `@namespace` statement at-rule. Its
+// `namespaceURI` is the declared URL and `prefix` the declared prefix (the empty
+// string for a default namespace — CSSOMString is not nullable). Both are readonly.
+// Not author-constructible (guarded like the other rule interfaces; _makeRule flips
+// the flag). It keeps `_desc` so _sheetNsInfo can still read the prelude.
+class CSSNamespaceRule extends CSSRule {
+  constructor(...args) {   // ...args → WebIDL interface-object .length 0 (not author-constructible)
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");
+    super();
+    const desc = args[0];
+    this._desc = desc;
+    const ns = _parseNamespacePrelude((desc && desc.prelude) || '') || { prefix: null, url: '' };
+    this._namespaceURI = ns.url || '';
+    this._prefix = ns.prefix || '';
+  }
+  get type() { if (!(this instanceof CSSNamespaceRule)) throw new TypeError("Illegal invocation"); return 10; }   // NAMESPACE_RULE
+  get namespaceURI() { if (!(this instanceof CSSNamespaceRule)) throw new TypeError("Illegal invocation"); return this._namespaceURI; }
+  get prefix() { if (!(this instanceof CSSNamespaceRule)) throw new TypeError("Illegal invocation"); return this._prefix; }
+  get cssText() { return this._desc.prelude.replace(/\s+$/, '') + ';'; }
+  get [Symbol.toStringTag]() { return 'CSSNamespaceRule'; }
+}
+_exposeIface('CSSNamespaceRule', CSSNamespaceRule);
+_enumAccessors(CSSNamespaceRule.prototype, 'namespaceURI', 'prefix', 'type');
+
 // @keyframes — CSSKeyframesRule (a name + a list of CSSKeyframeRule) with the
 // appendRule/findRule/deleteRule/indexed-getter surface, and CSSKeyframeRule
 // (a keyText + a declaration block). The name serializes as a CSS identifier
@@ -27196,7 +27372,7 @@ class CSSKeyframesRule extends CSSRule {
   constructor(desc) {
     super();
     this._name = String((desc && desc.condition) || '').trim();
-    this._ruleListObj = new CSSRuleList();
+    this._ruleListObj = _newRuleList();
     this._ruleList = _ruleListProxy(this._ruleListObj);
     for (const d of _parseKeyframeBlocks((desc && desc.body) || '')) {
       this._ruleListObj._rules.push(_kfRule(d, this));
@@ -27626,6 +27802,13 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     rule._parentRule = parentRule || null;
     return rule;
   }
+  if (desc.type === 'stmt' && desc.name === 'namespace') {
+    _allowCssCondCtor = true;   // internal build of a non-author-constructible rule
+    try { rule = new CSSNamespaceRule(desc); } finally { _allowCssCondCtor = false; }
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
   if (desc.type === 'layer-statement') {
     _allowCssCondCtor = true;   // internal build of a non-author-constructible rule
     try { rule = new CSSLayerStatementRule(desc); } finally { _allowCssCondCtor = false; }
@@ -27659,7 +27842,7 @@ const _makeRule = (desc, parentSheet, parentRule) => {
 class CSSStyleSheet {
   constructor(options) {
     options = options || {};
-    this._ruleListObj = new CSSRuleList();
+    this._ruleListObj = _newRuleList();
     this._ruleList = _ruleListProxy(this._ruleListObj);
     this.ownerRule = null;
     this._ownerNode = null;
@@ -27962,12 +28145,8 @@ class ShadowRoot extends DocumentFragment {
     return (c && typeof c.nodeType === 'number' && _nodeRoot(c) === this) ? c : null;
   }
   // styleSheets is connectedness-gated and our shadow trees never enter the render
-  // tree, so report an empty StyleSheetList (array-like with .item) rather than throw.
-  get styleSheets() {
-    const out = [];
-    out.item = (i) => { i = i >>> 0; return i < out.length ? out[i] : null; };
-    return out;
-  }
+  // tree, so report an empty StyleSheetList rather than throw.
+  get styleSheets() { return _makeStyleSheetList([]); }
   // getElementById is inherited from DocumentFragment (scoped to the backing node,
   // so it keeps working after the host is detached).
   // DOM §4.4 clone: "If node is a shadow root, then throw a NotSupportedError."
