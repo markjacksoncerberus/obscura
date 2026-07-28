@@ -4638,6 +4638,10 @@ class Element extends Node {
   // classList is [PutForwards=value]: `el.classList = 'x'` sets the class attr.
   set classList(v) { this.classList.value = v == null ? '' : String(v); }
   get style() {
+    // WebIDL brand check (ElementCSSInlineStyle): reading `style` on a bare prototype
+    // object (HTMLElement.prototype / SVGElement.prototype) must throw TypeError. A real
+    // element carries a numeric _nid; the prototype objects do not.
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
     // One-time lazy sync from the `style` content attribute: HTML parsing sets it
     // directly in the Rust tree (bypassing JS setAttribute), so the live decl must
     // be populated on first access. Afterwards JS setAttribute/removeAttribute keep
@@ -4661,6 +4665,7 @@ class Element extends Node {
   // for custom elements). The _styleSyncing guard suppresses the per-property
   // writeback so this is a single attribute write.
   set style(v) {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");   // WebIDL brand check ([PutForwards] on wrong object)
     v = (v == null) ? "" : String(v);
     this._styleSyncing = true;
     try { this._style.cssText = v; } finally { this._styleSyncing = false; }
@@ -6542,6 +6547,7 @@ class Document extends Node {
     };
   }
   get styleSheets() {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");   // WebIDL brand check (on Document.prototype)
     // A StyleSheetList over the document's <style> and stylesheet <link> elements.
     // Each CSSStyleSheet is cached per node (stable identity), re-parsed on text
     // change. External <link> sheets carry no rules (we don't fetch their CSS).
@@ -24286,7 +24292,14 @@ const _CSS_KNOWN_PROPS = (() => {
 // value are appended per element (see _computedCustomPropNames); these standard
 // names are element-independent so they are hoisted here.
 const _COMPUTED_STD_NAMES = Object.keys(_GCS_DEFAULTS).filter((k) => /^-?[a-z][a-z-]*$/.test(k));
-globalThis.getComputedStyle = (el, _pseudo) => {
+globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
+  // WebIDL brand check: a Window operation called with a `this` that is not the global
+  // (e.g. `getComputedStyle.call({})`) throws TypeError. Unbound calls (`this` is
+  // undefined/null in strict mode, or the global) are allowed.
+  if (this !== undefined && this !== null && this !== globalThis) throw new TypeError("Illegal invocation");
+  // `elt` is required — a 0-arg call throws TypeError. The optional `pseudoElt` default
+  // keeps the interface-object .length at 1 (a plain `(el, _pseudo)` arrow reports 2).
+  if (arguments.length < 1) throw new TypeError("Failed to execute 'getComputedStyle' on 'Window': 1 argument required, but only 0 present.");
   if (!el) el = document.body || {};
   const style = el?.style || el?._style || _newStyleDecl();
   const sources = _buildCascade(el);
@@ -25930,12 +25943,19 @@ _enumAccessors(StyleSheetList.prototype, 'length', 'item');
 // `new`, while Obscura still builds them internally in _makeRule (which flips this on).
 let _allowCssCondCtor = false;
 class CSSGroupingRule extends CSSRule {
-  constructor() { super(); this._ruleListObj = _newRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj); }
-  get cssRules() { return this._ruleList; }
-  insertRule(text, index) {
+  constructor() {
+    super();
+    // CSSGroupingRule has no IDL constructor: author `new CSSGroupingRule()` must throw.
+    // Subclasses (CSSStyleRule/CSSConditionRule/CSSPageRule/…) call super() with a
+    // leaf new.target, so they are unaffected.
+    if (new.target === CSSGroupingRule) throw new TypeError("Illegal constructor");
+    this._ruleListObj = _newRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj);
+  }
+  get cssRules() { if (!(this instanceof CSSGroupingRule)) throw new TypeError("Illegal invocation"); return this._ruleList; }
+  insertRule(text, index = 0) {   // `index` optional (default 0) → interface-object .length 1
     if (arguments.length < 1) throw new TypeError("Failed to execute 'insertRule': 1 argument required");   // WebIDL: rule is required
     const arr = this._ruleListObj._rules;
-    index = index === undefined ? 0 : index >>> 0;
+    index = index >>> 0;
     if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
     const parsed = _cssParseRuleList(text);
     if (parsed.length !== 1) {
@@ -25966,6 +25986,9 @@ class CSSGroupingRule extends CSSRule {
   }
 }
 _exposeIface('CSSGroupingRule', CSSGroupingRule);
+// WebIDL: attributes AND operations are enumerable own props on the prototype
+// (ES class getters/methods are non-enumerable). Re-stamp cssRules/insertRule/deleteRule.
+_enumAccessors(CSSGroupingRule.prototype, 'cssRules', 'insertRule', 'deleteRule');
 
 class CSSConditionRule extends CSSGroupingRule {
   constructor(...args) {
@@ -26180,8 +26203,12 @@ class CSSStyleRule extends CSSGroupingRule {
   // (and grouping rules) reached through .cssRules / insertRule / deleteRule.
   // `nested` marks a rule nested inside another style rule (CSS Nesting): its
   // selector is a <relative-selector-list> parsed/serialized against the parent `&`.
-  constructor(selectorText, body, nested) {
+  constructor(...args) {   // ...args → WebIDL interface-object .length 0 (not author-constructible)
+    // CSSStyleRule has no IDL constructor: author `new CSSStyleRule()` must throw.
+    // Obscura builds it only inside _makeRule (which flips _allowCssCondCtor on).
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");
     super();
+    const selectorText = args[0], body = args[1], nested = args[2];
     this._nested = !!nested;
     this._selectorSource = String(selectorText == null ? '' : selectorText).trim();   // raw authored selector
     this._ruleListObj = _newRuleList();
@@ -26227,6 +26254,7 @@ class CSSStyleRule extends CSSGroupingRule {
   // A nested rule parses its selector as a <relative-selector-list> and serializes
   // it with the nesting selector `&` made explicit.
   get selectorText() {
+    if (!(this instanceof CSSStyleRule)) throw new TypeError("Illegal invocation");   // WebIDL brand check
     const rel = this._nested;
     const ast = _parseSelectorList(this._selectorSource, rel);
     if (!ast) return this._selectorSource;
@@ -26238,17 +26266,24 @@ class CSSStyleRule extends CSSGroupingRule {
   // Per CSSOM: parse the value as a group of selectors; if it fails to parse, the
   // setter does nothing (the old value is retained).
   set selectorText(v) {
+    if (!(this instanceof CSSStyleRule)) throw new TypeError("Illegal invocation");   // WebIDL brand check (setter on wrong object)
     const val = String(v == null ? '' : v);
     if (_parseSelectorList(val, this._nested) === null) return;   // invalid → no-op
     this._selectorSource = val.trim();
     // Flag the owning sheet so getComputedStyle re-reads the live rule (CSSOM edit).
     try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
   }
-  get style() { return this._styleDecl; }
+  get style() {
+    if (!(this instanceof CSSStyleRule)) throw new TypeError("Illegal invocation");   // WebIDL brand check
+    return this._styleDecl;
+  }
   // [PutForwards=cssText]. Only declarations flow through `.style` — nested rules are
   // NOT part of a declaration list, so a `& { … }` block in the assigned text is
   // dropped (and the rule's existing .cssRules are left untouched).
-  set style(v) { this._styleDecl.cssText = _splitNestedRuleBody(String(v == null ? '' : v)).declText; }
+  set style(v) {
+    if (!(this instanceof CSSStyleRule)) throw new TypeError("Illegal invocation");   // WebIDL brand check ([PutForwards] setter on wrong object)
+    this._styleDecl.cssText = _splitNestedRuleBody(String(v == null ? '' : v)).declText;
+  }
   // Insert a child rule (CSS Nesting). Identical to CSSGroupingRule.insertRule but a
   // child STYLE rule is marked `_nested` so its selector is parsed/serialized as a
   // <relative-selector-list> against the parent `&`.
@@ -26294,8 +26329,12 @@ class CSSStyleRule extends CSSGroupingRule {
       .concat(childText.map((t) => '  ' + t));
     return this.selectorText + ' {\n' + lines.join('\n') + '\n}';
   }
+  get [Symbol.toStringTag]() { return 'CSSStyleRule'; }
 }
-globalThis.CSSStyleRule = CSSStyleRule;
+// WebIDL: non-enumerable interface-object global + enumerable own accessors on the
+// prototype (selectorText/style; the grouping-rule members live on CSSGroupingRule).
+_exposeIface('CSSStyleRule', CSSStyleRule);
+_enumAccessors(CSSStyleRule.prototype, 'selectorText', 'style');
 
 // @page page-selector grammar (css-page-3 §page-selectors):
 //   page-selector-list = <page-selector>#
@@ -26703,26 +26742,29 @@ const _parseImportRule = (prelude) => {
 // `.type` is 3 (IMPORT_RULE); serialization is `@import url("…") [supports(…)]?
 // [<media>]?;` with the URL as a double-quoted CSS string.
 class CSSImportRule extends CSSRule {
-  constructor(desc) {
+  constructor(...args) {   // ...args → WebIDL interface-object .length 0 (not author-constructible)
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");
     super();
+    const desc = args[0];
     const p = _parseImportRule((desc && desc.prelude) || '');
     this._href = p.href;
     this._supportsText = p.supportsText;
     this._layerName = p.layerName;
     this._media = _makeMediaList(p.mediaText);
     const sheet = new CSSStyleSheet();
-    sheet.ownerRule = this;
+    sheet._ownerRule = this;            // ownerRule is a readonly getter now (backing field)
     this._styleSheet = sheet;
   }
   get type() { return 3; }                                 // CSSRule.IMPORT_RULE
-  get href() { return this._href; }
-  get media() { return this._media; }
-  set media(v) { this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
-  get supportsText() { return this._supportsText; }
+  get href() { if (!(this instanceof CSSImportRule)) throw new TypeError("Illegal invocation"); return this._href; }
+  get media() { if (!(this instanceof CSSImportRule)) throw new TypeError("Illegal invocation"); return this._media; }
+  set media(v) { if (!(this instanceof CSSImportRule)) throw new TypeError("Illegal invocation"); this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
+  get supportsText() { if (!(this instanceof CSSImportRule)) throw new TypeError("Illegal invocation"); return this._supportsText; }
   // CSS Cascade 5 partial: the cascade layer this sheet is imported into — the layer
   // name, '' for an anonymous `layer`, or null when no layer was specified.
-  get layerName() { return this._layerName; }
-  get styleSheet() { return this._styleSheet; }
+  get layerName() { if (!(this instanceof CSSImportRule)) throw new TypeError("Illegal invocation"); return this._layerName; }
+  get styleSheet() { if (!(this instanceof CSSImportRule)) throw new TypeError("Illegal invocation"); return this._styleSheet; }
+  get [Symbol.toStringTag]() { return 'CSSImportRule'; }
   get cssText() {
     let out = '@import url(' + _serCssString(this._href) + ')';
     if (this._layerName != null) out += this._layerName ? ' layer(' + this._layerName + ')' : ' layer';
@@ -26732,7 +26774,8 @@ class CSSImportRule extends CSSRule {
     return out + ';';
   }
 }
-globalThis.CSSImportRule = CSSImportRule;
+_exposeIface('CSSImportRule', CSSImportRule);
+_enumAccessors(CSSImportRule.prototype, 'href', 'media', 'styleSheet', 'layerName', 'supportsText', 'type');
 
 // CSSPropertyRule (css-properties-values-api §CSSPropertyRule) — an `@property`
 // rule. Read-only `.name` (the unescaped `--foo`), `.syntax` (the syntax string
@@ -27797,7 +27840,8 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     return rule;
   }
   if (desc.type === 'stmt' && desc.name === 'import') {
-    rule = new CSSImportRule(desc);
+    _allowCssCondCtor = true;   // internal build of a non-author-constructible rule
+    try { rule = new CSSImportRule(desc); } finally { _allowCssCondCtor = false; }
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
@@ -27839,12 +27883,35 @@ const _makeRule = (desc, parentSheet, parentRule) => {
   return rule;
 };
 
-class CSSStyleSheet {
-  constructor(options) {
-    options = options || {};
+// StyleSheet (CSSOM §the-stylesheet-interface) — the abstract base of CSSStyleSheet.
+// Per the IDL its attributes (type/href/ownerNode/parentStyleSheet/title/media/disabled)
+// live HERE, so a CSSStyleSheet IS-A StyleSheet and CSSStyleSheet.prototype's prototype
+// is StyleSheet.prototype (the two-level interface split idlharness checks). Not
+// author-constructible (only the CSSStyleSheet subclass has an IDL constructor). Getters
+// are brand-checked so reading on the bare prototype throws TypeError.
+class StyleSheet {
+  constructor() { if (new.target === StyleSheet) throw new TypeError("Illegal constructor"); }
+  get type() { if (!(this instanceof StyleSheet)) throw new TypeError("Illegal invocation"); return 'text/css'; }
+  get href() { if (!(this instanceof StyleSheet)) throw new TypeError("Illegal invocation"); return this._href; }
+  get ownerNode() { if (!(this instanceof StyleSheet)) throw new TypeError("Illegal invocation"); return this._ownerNode; }
+  get parentStyleSheet() { if (!(this instanceof StyleSheet)) throw new TypeError("Illegal invocation"); return this._parentStyleSheet; }
+  get title() { if (!(this instanceof StyleSheet)) throw new TypeError("Illegal invocation"); return this._title || null; }
+  get media() { if (!(this instanceof StyleSheet)) throw new TypeError("Illegal invocation"); return this._media; }
+  set media(v) { if (!(this instanceof StyleSheet)) throw new TypeError("Illegal invocation"); this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
+  get disabled() { if (!(this instanceof StyleSheet)) throw new TypeError("Illegal invocation"); return this._disabled; }
+  set disabled(v) { if (!(this instanceof StyleSheet)) throw new TypeError("Illegal invocation"); this._disabled = !!v; }
+  get [Symbol.toStringTag]() { return 'StyleSheet'; }
+}
+_exposeIface('StyleSheet', StyleSheet);
+_enumAccessors(StyleSheet.prototype, 'type', 'href', 'ownerNode', 'parentStyleSheet', 'title', 'media', 'disabled');
+
+class CSSStyleSheet extends StyleSheet {
+  constructor(...args) {   // optional CSSStyleSheetInit → interface-object .length 0
+    super();
+    const options = args[0] || {};
     this._ruleListObj = _newRuleList();
     this._ruleList = _ruleListProxy(this._ruleListObj);
-    this.ownerRule = null;
+    this._ownerRule = null;
     this._ownerNode = null;
     this._parentStyleSheet = null;
     this._href = null;
@@ -27854,27 +27921,19 @@ class CSSStyleSheet {
     this._constructed = true;           // a constructable sheet (allows replace/replaceSync)
     this._baseURL = options.baseURL || null;
   }
-  get cssRules() { return this._ruleList; }
-  get rules() { return this._ruleList; }            // legacy alias
-  get media() { return this._media; }
-  set media(v) { this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
-  get disabled() { return this._disabled; }
-  set disabled(v) { this._disabled = !!v; }
-  get title() { return this._title || null; }
-  get ownerNode() { return this._ownerNode; }
-  get parentStyleSheet() { return this._parentStyleSheet; }
-  get href() { return this._href; }
-  get type() { return 'text/css'; }
+  get ownerRule() { if (!(this instanceof CSSStyleSheet)) throw new TypeError("Illegal invocation"); return this._ownerRule; }
+  get cssRules() { if (!(this instanceof CSSStyleSheet)) throw new TypeError("Illegal invocation"); return this._ruleList; }
+  get rules() { if (!(this instanceof CSSStyleSheet)) throw new TypeError("Illegal invocation"); return this._ruleList; }   // legacy alias
   _setRules(text) {
     const arr = this._ruleListObj._rules;
     arr.length = 0;
     for (const d of _cssParseRuleList(text)) arr.push(_makeRule(d, this, null));
     this._cssomDirty = false;   // rules rebuilt from source text — clear CSSOM-edit flag
   }
-  insertRule(text, index) {
+  insertRule(text, index = 0) {   // `index` optional (default 0) → interface-object .length 1
     if (arguments.length < 1) throw new TypeError("insertRule requires at least 1 argument.");   // WebIDL: rule is required
     const arr = this._ruleListObj._rules;
-    index = index === undefined ? 0 : index >>> 0;
+    index = index >>> 0;
     if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
     const parsed = _cssParseRuleList(text);
     if (parsed.length !== 1) throw new DOMException("insertRule expects exactly one rule.", "SyntaxError");
@@ -27894,27 +27953,35 @@ class CSSStyleSheet {
   // string-concatenates a selector + block into a rule, inserts it (index defaults
   // to the end), and always returns -1; the arguments default to the string
   // "undefined" (so `addRule()` inserts a rule with selector "undefined").
-  addRule(selector, style, index) {
-    if (selector === undefined) selector = 'undefined';
-    if (style === undefined) style = 'undefined';
+  // All params optional (defaults "undefined"/end) → interface-object .length 0.
+  addRule(selector = 'undefined', style = 'undefined', index) {
     let rule = selector + ' { ';
     if (style !== '') rule += style + ' ';
     rule += '}';
     this.insertRule(rule, index === undefined ? this._ruleListObj._rules.length : index);
     return -1;
   }
-  removeRule(index) { this.deleteRule(index >>> 0); }   // index defaults to 0 (removes first rule)
+  removeRule(index = 0) { this.deleteRule(index >>> 0); }   // index optional (default 0) → .length 0
   replaceSync(text) {
+    if (!(this instanceof CSSStyleSheet)) throw new TypeError("Illegal invocation");   // WebIDL brand check (before arity)
+    if (arguments.length < 1) throw new TypeError("replaceSync requires at least 1 argument.");   // arity BEFORE the constructed-sheet check
     if (!this._constructed) throw new DOMException("replaceSync can only be called on a constructed style sheet.", "NotAllowedError");
     this._setRules(String(text).replace(/@import[^;]*;/gi, ''));   // @import is ignored in replace()
   }
+  // replace() returns a Promise, so EVERY error path (brand, arity, non-constructed)
+  // must REJECT rather than throw synchronously (WebIDL promise-returning operations).
   replace(text) {
+    if (!(this instanceof CSSStyleSheet)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1) return Promise.reject(new TypeError("replace requires at least 1 argument."));
     if (!this._constructed) return Promise.reject(new DOMException("replace can only be called on a constructed style sheet.", "NotAllowedError"));
     return Promise.resolve().then(() => { this._setRules(String(text).replace(/@import[^;]*;/gi, '')); return this; });
   }
+  get [Symbol.toStringTag]() { return 'CSSStyleSheet'; }
 }
-globalThis.CSSStyleSheet = CSSStyleSheet;
-globalThis.StyleSheet = class StyleSheet {};   // interface-presence only
+_exposeIface('CSSStyleSheet', CSSStyleSheet);
+// WebIDL: attributes AND operations are enumerable own props on the prototype.
+_enumAccessors(CSSStyleSheet.prototype, 'ownerRule', 'cssRules', 'rules',
+  'insertRule', 'deleteRule', 'replace', 'replaceSync', 'addRule', 'removeRule');
 
 // A non-constructable CSSStyleSheet backing a connected <style> element, cached
 // per node and re-parsed when the element's text changes.
@@ -27945,12 +28012,16 @@ const _styleSheetForNode = (node) => {
 };
 
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
-  configurable: true,
+  configurable: true, enumerable: true,
   // Return a stable, persistent array so in-place mutation (push/pop/splice) is
   // observed by the cascade — `document.adoptedStyleSheets.push(sheet)` must apply.
-  get() { if (!this._adoptedStyleSheets) this._adoptedStyleSheets = []; return this._adoptedStyleSheets; },
-  set(sheets) { this._adoptedStyleSheets = sheets == null ? [] : Array.from(sheets); },
+  // _named stamps the accessor function names (idlharness asserts "get/set adoptedStyleSheets").
+  get: _named('get', 'adoptedStyleSheets', function () { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); if (!this._adoptedStyleSheets) this._adoptedStyleSheets = []; return this._adoptedStyleSheets; }),
+  set: _named('set', 'adoptedStyleSheets', function (sheets) { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); this._adoptedStyleSheets = sheets == null ? [] : Array.from(sheets); }),
 });
+// WebIDL: DocumentOrShadowRoot.styleSheets is an enumerable own accessor (the class
+// getter is non-enumerable).
+_enumAccessors(Document.prototype, 'styleSheets');
 
 const __mutationObservers = [];
 globalThis.MutationObserver = class MutationObserver {
@@ -28145,8 +28216,13 @@ class ShadowRoot extends DocumentFragment {
     return (c && typeof c.nodeType === 'number' && _nodeRoot(c) === this) ? c : null;
   }
   // styleSheets is connectedness-gated and our shadow trees never enter the render
-  // tree, so report an empty StyleSheetList rather than throw.
-  get styleSheets() { return _makeStyleSheetList([]); }
+  // tree, so report an empty StyleSheetList rather than throw. Reading on the bare
+  // ShadowRoot.prototype must throw TypeError (WebIDL brand check).
+  get styleSheets() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return _makeStyleSheetList([]); }
+  // adoptedStyleSheets (DocumentOrShadowRoot mixin) — a settable ObservableArray;
+  // our shadow trees never render, so it's a plain persisted array.
+  get adoptedStyleSheets() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); if (!this._adoptedStyleSheets) this._adoptedStyleSheets = []; return this._adoptedStyleSheets; }
+  set adoptedStyleSheets(sheets) { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); this._adoptedStyleSheets = sheets == null ? [] : Array.from(sheets); }
   // getElementById is inherited from DocumentFragment (scoped to the backing node,
   // so it keeps working after the host is detached).
   // DOM §4.4 clone: "If node is a shadow root, then throw a NotSupportedError."
@@ -28165,6 +28241,8 @@ class ShadowRoot extends DocumentFragment {
   }
 }
 globalThis.ShadowRoot = ShadowRoot;
+// WebIDL: the DocumentOrShadowRoot mixin members are enumerable own accessors.
+_enumAccessors(ShadowRoot.prototype, 'styleSheets', 'adoptedStyleSheets');
 // CustomElementRegistry (HTML §4.13.4). Holds the realm's definitions, keyed by both
 // name and constructor, plus pending whenDefined() promises. `define()` follows the
 // spec: validate the name + constructor, extract the lifecycle callbacks /
@@ -30631,6 +30709,10 @@ globalThis.CSS = {
     return _serializeCssIdent(String(ident));
   }
 };
+// WebIDL: a namespace object (CSS) is a NON-enumerable, writable, configurable global
+// data property (a plain assignment is enumerable, which idlharness flags). It stays a
+// plain extensible object.
+Object.defineProperty(globalThis, 'CSS', { value: globalThis.CSS, writable: true, enumerable: false, configurable: true });
 
 // HTMLElement is a real subclass of Element: only elements in the HTML namespace
 // are HTMLElement instances (foreign / non-HTML elements stay plain Element).
@@ -32476,15 +32558,27 @@ try {
 // HTMLStyleElement.sheet (and HTMLLinkElement.sheet): the associated CSSStyleSheet
 // for a connected element, lazily built/cached and re-parsed on text change. A
 // disconnected element has no associated sheet (returns null) per HTML §styling.
-for (const _iface of ['HTMLStyleElement', 'HTMLLinkElement']) {
-  Object.defineProperty(globalThis[_iface].prototype, 'sheet', {
-    configurable: true,
-    get() {
+// Install the LinkStyle `sheet` accessor on an interface prototype. Reused for the
+// SVGStyleElement interface too, which is defined later in the prelude (after the SVG
+// element classes exist).
+const _installLinkStyleSheet = (ctor) => {
+  if (!ctor) return;
+  // _named stamps the accessor's function name "get sheet" (a bare `get(){}` in a
+  // descriptor is named just "get", which idlharness rejects).
+  Object.defineProperty(ctor.prototype, 'sheet', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'sheet', function () {
+      // WebIDL brand check (LinkStyle): reading `sheet` on the bare prototype throws.
+      if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
       try { if (!this.isConnected) return null; } catch (e) { return null; }
       try { return _styleSheetForNode(this); } catch (e) { return null; }
-    },
+    }),
   });
-}
+};
+for (const _iface of ['HTMLStyleElement', 'HTMLLinkElement']) _installLinkStyleSheet(globalThis[_iface]);
+// ProcessingInstruction (its interface object global is assigned later, but the class
+// binding is in scope here) also mixes in LinkStyle — an xml-stylesheet PI has a .sheet.
+_installLinkStyleSheet(ProcessingInstruction);
 
 // ---------------------------------------------------------------------------
 // The constraint validation API (HTML §form-control-infrastructure / §the-constraint-validation-api).
@@ -34177,7 +34271,27 @@ function _cvReflLong(proto, prop, attr) {
 // created via createElementNS are wrapped with this class (see createElementNS).
 globalThis.SVGElement = class SVGElement extends Element {};
 globalThis.SVGSVGElement = class SVGSVGElement extends globalThis.SVGElement {};
+// SVGStyleElement (SVG) carries the LinkStyle `sheet` mixin (its .sheet is the parsed
+// CSSStyleSheet, like <style>). MathMLElement (mathml-core) exists as an interface so
+// idlharness's ElementCSSInlineStyle `style` checks find it; both are dependency IDLs
+// tested only for presence + member shape here.
+globalThis.SVGStyleElement = class SVGStyleElement extends globalThis.SVGElement {};
+globalThis.MathMLElement = class MathMLElement extends Element {};
 _markNative(globalThis.SVGElement); _markNative(globalThis.SVGSVGElement);
+_markNative(globalThis.SVGStyleElement); _markNative(globalThis.MathMLElement);
+_installLinkStyleSheet(globalThis.SVGStyleElement);
+// ElementCSSInlineStyle mixin: `style` must be an OWN enumerable accessor on EACH host
+// interface prototype (HTMLElement/SVGElement/MathMLElement) — idlharness runs
+// assert_own_property on each. Copy the shared Element.prototype descriptor (its get/set
+// are already named "get style"/"set style") and stamp it enumerable on the three hosts.
+{
+  const _styleDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'style');
+  if (_styleDesc) {
+    _styleDesc.enumerable = true;
+    for (const _c of [globalThis.HTMLElement, globalThis.SVGElement, globalThis.MathMLElement])
+      if (_c) Object.defineProperty(_c.prototype, 'style', _styleDesc);
+  }
+}
 // Install the on* event handler IDL accessors (HTML GlobalEventHandlers) on the
 // element/document interfaces + the window names it is still missing. NOT on
 // Element.prototype (SVG/HTML elements reach them through their own prototypes).
