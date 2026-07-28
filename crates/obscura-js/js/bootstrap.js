@@ -1465,14 +1465,25 @@ const _parseStyleDecls = (text, opts) => {
   return out;
 };
 
+// CSSStyleDeclaration is [Exposed=Window] with NO IDL constructor — author
+// `new CSSStyleDeclaration()` must throw "Illegal constructor" (idlharness asserts
+// this), while Obscura builds instances internally via _newStyleDecl (which flips the
+// flag). The guard fires ONLY for a direct `new CSSStyleDeclaration()` — a subclass
+// (CSSFontFaceDescriptors) chaining through super() has new.target === the subclass,
+// so its construction is always allowed.
+let _allowStyleDeclCtor = false;
 class CSSStyleDeclaration {
-  constructor() { this._props = {}; this._priority = {}; }
+  constructor() {
+    if (new.target === CSSStyleDeclaration && !_allowStyleDeclCtor) throw new TypeError("Illegal constructor");
+    this._props = {}; this._priority = {};
+  }
   // Fire the inline-style reflect hook, unless a shorthand expansion has opened a
   // batch (_styleBatch > 0) — expanding one shorthand into its longhands must
   // reflect as a SINGLE "update style attribute" (one attributeChanged reaction),
   // not one per longhand. Standalone declarations have no _onChange → inert.
   _notifyChange() { if (this._onChange && !this._styleBatch) this._onChange(); }
-  setProperty(name, value, priority) {
+  setProperty(name, value, priority = "") {   // priority optional (default "") → WebIDL .length 2
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'setProperty' on 'CSSStyleDeclaration': 2 arguments required");
     name = String(name);
     const custom = name.startsWith('--');
     if (custom) { if (!_isValidCustomPropName(name)) return; }
@@ -2507,6 +2518,7 @@ class CSSStyleDeclaration {
     this._notifyChange();
   }
   removeProperty(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'removeProperty' on 'CSSStyleDeclaration': 1 argument required");
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     if (_RADIUS_ALIAS[key]) key = _RADIUS_ALIAS[key];  // -webkit-border(-*)-radius → canonical
@@ -2806,6 +2818,7 @@ class CSSStyleDeclaration {
     return '';                                                    // partial → no single serialization
   }
   getPropertyValue(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'getPropertyValue' on 'CSSStyleDeclaration': 1 argument required");
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     if (_RADIUS_ALIAS[key]) key = _RADIUS_ALIAS[key];  // -webkit-border(-*)-radius → canonical
@@ -2949,6 +2962,7 @@ class CSSStyleDeclaration {
     return this._props[key] || "";
   }
   getPropertyPriority(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'getPropertyPriority' on 'CSSStyleDeclaration': 1 argument required");
     name = String(name); let key = name.startsWith('--') ? name : name.toLowerCase();
     if (_GRID_GAP_ALIAS[key]) key = _GRID_GAP_ALIAS[key];  // grid-row-gap→row-gap
     if (_RADIUS_ALIAS[key]) key = _RADIUS_ALIAS[key];  // -webkit-border(-*)-radius → canonical
@@ -2993,10 +3007,39 @@ class CSSStyleDeclaration {
     this._notifyChange();
   }
   get length() { return Object.keys(this._props).length; }
-  item(i) { return Object.keys(this._props)[i] || ""; }
+  item(i) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'item' on 'CSSStyleDeclaration': 1 argument required");
+    return Object.keys(this._props)[i] || "";
+  }
+  // The CSSRule that owns this declaration block (a rule's `.style`), else null — an
+  // element's inline style / a computed style have no owning rule (CSSOM). Brand-check
+  // so getting on the prototype object throws TypeError (WebIDL; idlharness asserts it —
+  // unlike cssText/length whose getters throw incidentally via `this._props`).
+  get parentRule() {
+    if (!(this instanceof CSSStyleDeclaration)) throw new TypeError("Illegal invocation");
+    return this._parentRule || null;
+  }
+  // cssFloat is the IDL alias for the `float` property (CSSOM; `float` is a reserved
+  // word so the attribute is spelled cssFloat), [LegacyNullToEmptyString].
+  get cssFloat() { return this.getPropertyValue('float'); }
+  set cssFloat(v) { this.setProperty('float', v == null ? '' : String(v)); }
   // CSSStyleDeclaration is iterable over the property names it exposes through the
   // indexed getter (CSSOM "supported property indices") — same order as item().
   [Symbol.iterator]() { return Object.keys(this._props)[Symbol.iterator](); }
+}
+// Internal factory: the interface is not author-constructible (see the ctor guard),
+// so every internal instantiation flips the allow-flag around a single `new`.
+const _newStyleDecl = () => {
+  _allowStyleDeclCtor = true;
+  try { return new CSSStyleDeclaration(); } finally { _allowStyleDeclCtor = false; }
+};
+// WebIDL: an interface's operations + attributes are ENUMERABLE own props on the
+// prototype, but ES class methods/getters are non-enumerable. Re-stamp them enumerable.
+// (Inlined — the _enumAccessors helper is defined later in the prelude.)
+for (const m of ['cssText', 'length', 'parentRule', 'cssFloat', 'item', 'getPropertyValue',
+                 'getPropertyPriority', 'setProperty', 'removeProperty']) {
+  const d = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, m);
+  if (d) { d.enumerable = true; Object.defineProperty(CSSStyleDeclaration.prototype, m, d); }
 }
 
 // Map a JS-side style property accessor to its canonical CSS property name (the
@@ -4414,7 +4457,7 @@ class Element extends Node {
     // The inline-style declaration carries an _onChange back-reference so any
     // CSSOM mutation reflects into the `style` content attribute (see
     // _styleWriteback); standalone declarations never get one, staying inert.
-    const decl = new CSSStyleDeclaration();
+    const decl = _newStyleDecl();
     const el = this;
     decl._onChange = () => el._styleWriteback();
     this._style = _styleProxy(decl);
@@ -24225,7 +24268,7 @@ const _CSS_KNOWN_PROPS = (() => {
 const _COMPUTED_STD_NAMES = Object.keys(_GCS_DEFAULTS).filter((k) => /^-?[a-z][a-z-]*$/.test(k));
 globalThis.getComputedStyle = (el, _pseudo) => {
   if (!el) el = document.body || {};
-  const style = el?.style || el?._style || new CSSStyleDeclaration();
+  const style = el?.style || el?._style || _newStyleDecl();
   const sources = _buildCascade(el);
   const resolve = (name) => {
     // name as authored: custom property, kebab, or camelCase.
@@ -25692,15 +25735,35 @@ const _sheetNsInfo = (sheet) => {
   return nsi;
 };
 
+// CSSRule is [Exposed=Window] with NO IDL constructor — author `new CSSRule()` must
+// throw "Illegal constructor". Every real rule is a subclass whose super() call has
+// new.target === the subclass, so the guard fires only on a direct `new CSSRule()`.
+const _csRuleBrand = (o) => { if (!(o instanceof CSSRule)) throw new TypeError("Illegal invocation"); };
 class CSSRule {
-  constructor() { this._parentRule = null; this._parentStyleSheet = null; }
+  constructor() {
+    if (new.target === CSSRule) throw new TypeError("Illegal constructor");
+    this._parentRule = null; this._parentStyleSheet = null;
+  }
   // parentRule / parentStyleSheet / type / cssText are readonly IDL attributes —
   // they must live on the prototype chain (assert_idl_attribute) and reject writes
-  // (assert_readonly). Backing fields are set through _makeRule.
-  get parentRule() { return this._parentRule; }
-  get parentStyleSheet() { return this._parentStyleSheet; }
-  get type() { return 0; }
-  get cssText() { return ''; }
+  // (assert_readonly). Getting one on the prototype object must throw TypeError
+  // (WebIDL brand check; idlharness asserts it). Backing fields are set via _makeRule.
+  get parentRule() { _csRuleBrand(this); return this._parentRule; }
+  get parentStyleSheet() { _csRuleBrand(this); return this._parentStyleSheet; }
+  get type() { _csRuleBrand(this); return 0; }
+  get cssText() { _csRuleBrand(this); return ''; }
+  // cssText is a WRITABLE attribute in CSSOM (`attribute CSSOMString cssText`), though
+  // setting it is a no-op per spec. idlharness requires a setter to exist (PutForwards/
+  // non-readonly). Brand-checked so calling on the prototype throws TypeError.
+  set cssText(_v) { _csRuleBrand(this); /* no-op per CSSOM §CSSRule */ }
+  get [Symbol.toStringTag]() { return 'CSSRule'; }
+}
+// WebIDL: readonly-attribute accessors are ENUMERABLE own props on the prototype, but
+// ES class getters are non-enumerable. Re-stamp them (helper _enumAccessors is defined
+// later in the prelude, so this is inlined).
+for (const n of ['parentRule', 'parentStyleSheet', 'type', 'cssText']) {
+  const d = Object.getOwnPropertyDescriptor(CSSRule.prototype, n);
+  if (d) { d.enumerable = true; Object.defineProperty(CSSRule.prototype, n, d); }
 }
 // Rule-type constants (exposed on the interface and on instances per WebIDL).
 const _CSSRULE_CONSTS = {
@@ -25715,7 +25778,9 @@ for (const [k, v] of Object.entries(_CSSRULE_CONSTS)) {
   Object.defineProperty(CSSRule, k, { value: v, enumerable: true });
   Object.defineProperty(CSSRule.prototype, k, { value: v, enumerable: true });
 }
-globalThis.CSSRule = CSSRule;
+// WebIDL: an interface object is a NON-enumerable global (a plain assignment is
+// enumerable, which idlharness flags). _exposeIface is defined just below; inline here.
+Object.defineProperty(globalThis, 'CSSRule', { value: CSSRule, writable: true, enumerable: false, configurable: true });
 
 // CSSGroupingRule (CSSOM) — a rule that contains a child rule list, with the
 // insertRule/deleteRule surface. Defined ABOVE CSSStyleRule because — per CSS
@@ -25759,6 +25824,7 @@ class CSSGroupingRule extends CSSRule {
   constructor() { super(); this._ruleListObj = new CSSRuleList(); this._ruleList = _ruleListProxy(this._ruleListObj); }
   get cssRules() { return this._ruleList; }
   insertRule(text, index) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'insertRule': 1 argument required");   // WebIDL: rule is required
     const arr = this._ruleListObj._rules;
     index = index === undefined ? 0 : index >>> 0;
     if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
@@ -25782,6 +25848,7 @@ class CSSGroupingRule extends CSSRule {
     return index;
   }
   deleteRule(index) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'deleteRule' on 'CSSGroupingRule': 1 argument required");   // WebIDL: index is required
     const arr = this._ruleListObj._rules;
     index = index >>> 0;
     if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
@@ -25981,7 +26048,7 @@ const _makeNestedDeclsFromText = (containerRule, text) => {
 class CSSNestedDeclarations extends CSSRule {
   constructor(declText) {
     super();
-    const rawDecl = new CSSStyleDeclaration();
+    const rawDecl = _newStyleDecl();
     this._rawDecl = rawDecl;
     this._styleDecl = _styleProxy(rawDecl);
     if (declText) this._styleDecl.cssText = String(declText);
@@ -26026,7 +26093,7 @@ class CSSStyleRule extends CSSGroupingRule {
       descs.push(d);
     }
     this._nestedDescs = descs;
-    const rawDecl = new CSSStyleDeclaration();
+    const rawDecl = _newStyleDecl();
     this._rawDecl = rawDecl;                     // raw block for per-declaration serialization
     this._styleDecl = _styleProxy(rawDecl);
     if (leadingDeclText) this._styleDecl.cssText = leadingDeclText;   // specified-value serialization (leading run)
@@ -26077,6 +26144,7 @@ class CSSStyleRule extends CSSGroupingRule {
   // child STYLE rule is marked `_nested` so its selector is parsed/serialized as a
   // <relative-selector-list> against the parent `&`.
   insertRule(text, index) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'insertRule': 1 argument required");   // WebIDL: rule is required
     const arr = this._ruleListObj._rules;
     index = index === undefined ? 0 : index >>> 0;
     if (index > arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
@@ -26166,40 +26234,92 @@ const _canonPageSelector = (text) => {
   return out.join(', ');
 };
 
-// CSSPageRule (CSSOM §CSSPageRule) — an `@page` rule. Its declaration block becomes
-// the `.style` CSSStyleDeclaration, which (unlike an element's style) accepts the
-// @page descriptors `size`/`page-orientation` via the `_pageDescriptors` flag;
-// `.selectorText` is the page selector (canonicalized via `_canonPageSelector` —
-// case-preserved page name + lowercased `:left`/`:right`/`:first`/`:blank` pseudos),
-// and per CSSOM the setter no-ops on an invalid selector (keeps the old value).
-// Nested margin at-rules (`@top-center` …) are not modelled (CAP) — only the
-// declaration block is captured into `.style`.
-class CSSPageRule extends CSSRule {
-  constructor(desc) {
+// The 16 page-margin box at-rules (css-page-3 §margin-at-rules). A `@<margin-box> {…}`
+// inside an @page rule becomes a CSSMarginRule child in the page rule's `.cssRules`.
+const _MARGIN_BOXES = new Set([
+  'top-left-corner', 'top-left', 'top-center', 'top-right', 'top-right-corner',
+  'bottom-left-corner', 'bottom-left', 'bottom-center', 'bottom-right', 'bottom-right-corner',
+  'left-top', 'left-middle', 'left-bottom', 'right-top', 'right-middle', 'right-bottom',
+]);
+// Guard: CSSPageRule + CSSMarginRule are [Exposed=Window] with NO IDL constructor —
+// author `new` must throw. Obscura builds both internally (_makeRule flips this on;
+// a page rule builds its margin children while it is still set).
+let _allowPageChildCtor = false;
+// CSSMarginRule (CSSOM §CSSMarginRule) — a page-margin box (`@top-center { … }`). Its
+// declaration block is `.style`; `.name` is the box name (WITHOUT the leading `@`).
+class CSSMarginRule extends CSSRule {
+  constructor(...args) {   // ...args → WebIDL interface-object .length 0 (not author-constructible)
+    if (!_allowPageChildCtor) throw new TypeError("Illegal constructor");
     super();
+    this._name = String(args[0] || '');
+    const decl = _newStyleDecl();
+    this._styleDecl = _styleProxy(decl);
+    if (args[1]) this._styleDecl.cssText = _splitNestedRuleBody(args[1]).declText;
+  }
+  get type() { if (!(this instanceof CSSMarginRule)) throw new TypeError("Illegal invocation"); return 9; }  // MARGIN_RULE
+  get name() { if (!(this instanceof CSSMarginRule)) throw new TypeError("Illegal invocation"); return this._name; }
+  get style() { if (!(this instanceof CSSMarginRule)) throw new TypeError("Illegal invocation"); return this._styleDecl; }
+  set style(v) { if (!(this instanceof CSSMarginRule)) throw new TypeError("Illegal invocation"); this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
+  get cssText() {
+    const block = this._styleDecl.cssText;
+    return '@' + this._name + ' { ' + (block ? block + ' ' : '') + '}';
+  }
+  get [Symbol.toStringTag]() { return 'CSSMarginRule'; }
+}
+_exposeIface('CSSMarginRule', CSSMarginRule);
+_enumAccessors(CSSMarginRule.prototype, 'name', 'style');
+
+// CSSPageRule (CSSOM §CSSPageRule) — an `@page` rule. Per css-page-3 it IS a
+// CSSGroupingRule: its `.cssRules` holds the page-margin box children (CSSMarginRule),
+// while its declaration block becomes the `.style` CSSStyleDeclaration (which, unlike
+// an element's style, accepts the @page descriptors `size`/`page-orientation` via the
+// `_pageDescriptors` flag). `.selectorText` is the page selector (canonicalized via
+// `_canonPageSelector` — case-preserved page name + lowercased pseudos); per CSSOM the
+// setter no-ops on an invalid selector.
+class CSSPageRule extends CSSGroupingRule {
+  constructor(...args) {   // ...args → WebIDL interface-object .length 0 (not author-constructible)
+    if (!_allowPageChildCtor) throw new TypeError("Illegal constructor");
+    super();
+    const desc = args[0];
     const c = _canonPageSelector((desc && desc.condition) || '');
     this._selectorText = c === null ? String((desc && desc.condition) || '').trim() : c;
-    const decl = new CSSStyleDeclaration();
+    const decl = _newStyleDecl();
     decl._pageDescriptors = true;                          // allow size / page-orientation
     this._styleDecl = _styleProxy(decl);
-    if (desc && desc.body) this._styleDecl.cssText = desc.body;
+    // Split the @page body: declarations → `.style`; `@<margin-box> {…}` at-rules →
+    // CSSMarginRule children in `.cssRules`. Non-margin nested rules are dropped.
+    const split = _splitNestedRuleBody((desc && desc.body) || '');
+    if (split.declText) this._styleDecl.cssText = split.declText;
+    for (const { prelude, body } of split.nested) {
+      const m = /^@([\w-]+)\s*$/.exec(String(prelude).trim());
+      if (m && _MARGIN_BOXES.has(m[1].toLowerCase())) {
+        const mr = new CSSMarginRule(m[1].toLowerCase(), body);
+        mr._parentRule = this; mr._parentStyleSheet = this._parentStyleSheet || null;
+        this._ruleListObj._rules.push(mr);
+      }
+    }
   }
-  get type() { return 6; }
-  get selectorText() { return this._selectorText; }
+  get type() { if (!(this instanceof CSSPageRule)) throw new TypeError("Illegal invocation"); return 6; }
+  get selectorText() { if (!(this instanceof CSSPageRule)) throw new TypeError("Illegal invocation"); return this._selectorText; }
   set selectorText(v) {
+    if (!(this instanceof CSSPageRule)) throw new TypeError("Illegal invocation");   // brand check (WebIDL setter)
     const c = _canonPageSelector(v);
     if (c === null) return;                                // invalid page selector → no-op (CSSOM)
     this._selectorText = c;
     try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
   }
-  get style() { return this._styleDecl; }
+  get style() { if (!(this instanceof CSSPageRule)) throw new TypeError("Illegal invocation"); return this._styleDecl; }
   set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
   get cssText() {
     const block = this._styleDecl.cssText;
-    return '@page' + (this._selectorText ? ' ' + this._selectorText : '') + ' { ' + (block ? block + ' ' : '') + '}';
+    const margins = this._ruleListObj._rules.map(r => r.cssText).join(' ');
+    const inner = [block, margins].filter(Boolean).join(' ');
+    return '@page' + (this._selectorText ? ' ' + this._selectorText : '') + ' { ' + (inner ? inner + ' ' : '') + '}';
   }
+  get [Symbol.toStringTag]() { return 'CSSPageRule'; }
 }
-globalThis.CSSPageRule = CSSPageRule;
+_exposeIface('CSSPageRule', CSSPageRule);
+_enumAccessors(CSSPageRule.prototype, 'selectorText', 'style', 'type');
 
 // CSSFontFaceDescriptors (CSS Fonts 5 §CSSFontFaceDescriptors) — the specialized
 // CSSStyleDeclaration returned by `CSSFontFaceRule.style`. Beyond the inherited
@@ -27053,7 +27173,7 @@ class CSSKeyframeRule extends CSSRule {
   constructor(keyText, body) {
     super();
     this._keyText = String(keyText == null ? '' : keyText).trim();
-    this._styleDecl = _styleProxy(new CSSStyleDeclaration());
+    this._styleDecl = _styleProxy(_newStyleDecl());
     if (body) this._styleDecl.cssText = body;
   }
   get type() { return 8; }
@@ -27393,9 +27513,14 @@ const _CS_DESCRIPTORS = [
   { name: 'speak-as', field: '_speakAs', canon: _csCanonSpeakAs },
   { name: 'fallback', field: '_fallback', canon: _csCanonFallback },
 ];
+// Brand check: a CSSCounterStyleRule attribute accessed on the prototype object
+// (not a real instance) must throw TypeError per WebIDL — idlharness asserts this.
+const _csBrand = (o) => { if (!(o instanceof CSSCounterStyleRule)) throw new TypeError("Illegal invocation"); };
 class CSSCounterStyleRule extends CSSRule {
-  constructor(desc) {
+  constructor(...args) {
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");   // not author-constructible
     super();
+    const desc = args[0];
     this._name = _unescapeCssIdent(String((desc && desc.condition) || '').trim());
     for (const d of _CS_DESCRIPTORS) this[d.field] = '';
     // Apply descriptors in source order; each valid value overrides the previous,
@@ -27410,36 +27535,39 @@ class CSSCounterStyleRule extends CSSRule {
     }
   }
   get type() { return 11; }                                // CSSRule.COUNTER_STYLE_RULE
-  get name() { return this._name; }
-  set name(v) { const t = String(v == null ? '' : v).trim(); if (_isValidCounterStyleName(t)) this._name = _unescapeCssIdent(t); }
-  get system() { return this._system; }
-  set system(v) { const c = _csCanonSystem(v); if (c !== null) this._system = c; }
-  get symbols() { return this._symbols; }
-  set symbols(v) { const c = _csCanonSymbols(v); if (c !== null) this._symbols = c; }
-  get additiveSymbols() { return this._additiveSymbols; }
-  set additiveSymbols(v) { const c = _csCanonAdditiveSymbols(v); if (c !== null) this._additiveSymbols = c; }
-  get negative() { return this._negative; }
-  set negative(v) { const c = _csCanonNegative(v); if (c !== null) this._negative = c; }
-  get prefix() { return this._prefix; }
-  set prefix(v) { const c = _csCanonSymbol(v); if (c !== null) this._prefix = c; }
-  get suffix() { return this._suffix; }
-  set suffix(v) { const c = _csCanonSymbol(v); if (c !== null) this._suffix = c; }
-  get range() { return this._range; }
-  set range(v) { const c = _csCanonRange(v); if (c !== null) this._range = c; }
-  get pad() { return this._pad; }
-  set pad(v) { const c = _csCanonPad(v); if (c !== null) this._pad = c; }
-  get speakAs() { return this._speakAs; }
-  set speakAs(v) { const c = _csCanonSpeakAs(v); if (c !== null) this._speakAs = c; }
-  get fallback() { return this._fallback; }
-  set fallback(v) { const c = _csCanonFallback(v); if (c !== null) this._fallback = c; }
+  get name() { _csBrand(this); return this._name; }
+  set name(v) { _csBrand(this); const t = String(v == null ? '' : v).trim(); if (_isValidCounterStyleName(t)) this._name = _unescapeCssIdent(t); }
+  get system() { _csBrand(this); return this._system; }
+  set system(v) { _csBrand(this); const c = _csCanonSystem(v); if (c !== null) this._system = c; }
+  get symbols() { _csBrand(this); return this._symbols; }
+  set symbols(v) { _csBrand(this); const c = _csCanonSymbols(v); if (c !== null) this._symbols = c; }
+  get additiveSymbols() { _csBrand(this); return this._additiveSymbols; }
+  set additiveSymbols(v) { _csBrand(this); const c = _csCanonAdditiveSymbols(v); if (c !== null) this._additiveSymbols = c; }
+  get negative() { _csBrand(this); return this._negative; }
+  set negative(v) { _csBrand(this); const c = _csCanonNegative(v); if (c !== null) this._negative = c; }
+  get prefix() { _csBrand(this); return this._prefix; }
+  set prefix(v) { _csBrand(this); const c = _csCanonSymbol(v); if (c !== null) this._prefix = c; }
+  get suffix() { _csBrand(this); return this._suffix; }
+  set suffix(v) { _csBrand(this); const c = _csCanonSymbol(v); if (c !== null) this._suffix = c; }
+  get range() { _csBrand(this); return this._range; }
+  set range(v) { _csBrand(this); const c = _csCanonRange(v); if (c !== null) this._range = c; }
+  get pad() { _csBrand(this); return this._pad; }
+  set pad(v) { _csBrand(this); const c = _csCanonPad(v); if (c !== null) this._pad = c; }
+  get speakAs() { _csBrand(this); return this._speakAs; }
+  set speakAs(v) { _csBrand(this); const c = _csCanonSpeakAs(v); if (c !== null) this._speakAs = c; }
+  get fallback() { _csBrand(this); return this._fallback; }
+  set fallback(v) { _csBrand(this); const c = _csCanonFallback(v); if (c !== null) this._fallback = c; }
   get cssText() {
     const parts = [];
     for (const d of _CS_DESCRIPTORS) { const val = this[d.field]; if (val) parts.push(d.name + ': ' + val + ';'); }
     const body = parts.length ? ' ' + parts.join(' ') + ' ' : ' ';
     return '@counter-style ' + _serializeCssIdent(this._name) + ' {' + body + '}';
   }
+  get [Symbol.toStringTag]() { return 'CSSCounterStyleRule'; }
 }
-globalThis.CSSCounterStyleRule = CSSCounterStyleRule;
+_exposeIface('CSSCounterStyleRule', CSSCounterStyleRule);
+_enumAccessors(CSSCounterStyleRule.prototype, 'name', 'system', 'symbols', 'additiveSymbols',
+  'negative', 'prefix', 'suffix', 'range', 'pad', 'speakAs', 'fallback');
 
 const _makeRule = (desc, parentSheet, parentRule) => {
   let rule;
@@ -27463,9 +27591,13 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     return rule;
   }
   if (desc.type === 'page') {
-    rule = new CSSPageRule(desc);
+    _allowPageChildCtor = true;   // internal build of a non-author-constructible rule (+ its margin children)
+    try { rule = new CSSPageRule(desc); } finally { _allowPageChildCtor = false; }
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
+    // The margin children built in the ctor captured the (then-null) parent sheet;
+    // re-point them now that the page rule's own sheet is known.
+    for (const mr of rule._ruleListObj._rules) mr._parentStyleSheet = parentSheet || null;
     return rule;
   }
   if (desc.type === 'font-face') {
@@ -27482,7 +27614,8 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     return rule;
   }
   if (desc.type === 'counter-style') {
-    rule = new CSSCounterStyleRule(desc);
+    _allowCssCondCtor = true;
+    try { rule = new CSSCounterStyleRule(desc); } finally { _allowCssCondCtor = false; }
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
