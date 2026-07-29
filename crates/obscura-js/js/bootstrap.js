@@ -6371,7 +6371,7 @@ class Document extends Node {
     // GlobalEventHandlers on* accessors reach them; everything else is plain Element.
     const C = (nsv === _HTML_NS) ? _htmlClassForLocal(local)
       : (nsv === 'http://www.w3.org/2000/svg')
-        ? (local === 'svg' ? globalThis.SVGSVGElement : globalThis.SVGElement)
+        ? _svgClassForLocal(_asciiLower(local))
         : Element;
     let el = _cache.get(nid);
     if (!el) { el = new C(nid); _cache.set(nid, el); }
@@ -6908,11 +6908,46 @@ const _htmlClassForLocal = function(local) {
   if (_isValidCustomElementName(local)) return globalThis.HTMLElement;
   return globalThis.HTMLUnknownElement;
 };
+// SVG-namespace element interface map (SVG element local names, ASCII-lowercased,
+// → interface global). Anything SVG-namespace not listed falls back to the plain
+// SVGElement interface — still more correct than the HTMLUnknownElement it would
+// otherwise get. `_svgClassForLocal` reads globalThis at CALL time so the interface
+// classes (defined much later in the prelude) resolve at element-wrap time.
+const _SVG_IFACE_BY_TAG = {
+  svg:'SVGSVGElement', style:'SVGStyleElement',
+  clippath:'SVGClipPathElement', mask:'SVGMaskElement',
+};
+const _svgClassForLocal = function(local) {
+  const n = _SVG_IFACE_BY_TAG[local];
+  return (n && globalThis[n]) || globalThis.SVGElement;
+};
+// Tags that MIGHT belong to the SVG namespace — the SVG-only element locals plus the
+// SVG root. A parsed element whose lowercased local isn't here is unambiguously HTML,
+// so the common HTML wrap pays NO extra namespace bridge call; only these trigger the
+// `namespace_uri` lookup that disambiguates SVG from HTML. (HTML/SVG-shared locals like
+// `a`/`title`/`style`/`script` are intentionally left out to avoid slowing the common
+// HTML path — a parsed SVG <a>/<title> still wraps as SVGElement only once mapped here.)
+const _MAYBE_SVG_TAGS = new Set(('svg clippath mask defs g use symbol marker pattern ' +
+  'rect circle ellipse line polyline polygon path text tspan textpath image ' +
+  'lineargradient radialgradient stop filter foreignobject switch view desc metadata ' +
+  'fedropshadow fegaussianblur feoffset feblend fecolormatrix fecomponenttransfer ' +
+  'fecomposite feconvolvematrix fediffuselighting fedisplacementmap feflood fefunca ' +
+  'fefuncb fefuncg fefuncr feimage femerge femergenode femorphology fespecularlighting ' +
+  'fetile feturbulence fedistantlight fepointlight fespotlight animate animatemotion ' +
+  'animatetransform set mpath clippath').split(' '));
 // Default wrap path (parsed elements + createElement): elements are HTML, so map
-// by their canonical (lowercased) tag name.
+// by their canonical (lowercased) tag name — UNLESS the local could be SVG, in which
+// case the element's real namespace decides (an SVG-namespace element gets its SVG
+// interface, not the HTMLUnknownElement its unknown-to-HTML local would yield).
 const _elementClassFor = function(nid) {
   const tag = _domParse("tag_name", nid);
-  return tag ? _htmlClassForLocal(_asciiLower(tag)) : (globalThis.HTMLElement || Element);
+  if (!tag) return globalThis.HTMLElement || Element;
+  const local = _asciiLower(tag);
+  if (_MAYBE_SVG_TAGS.has(local)) {
+    const ns = _domParse("namespace_uri", nid);
+    if (ns === 'http://www.w3.org/2000/svg') return _svgClassForLocal(local);
+  }
+  return _htmlClassForLocal(local);
 };
 // HTML "event handler content attributes": activate an element's parsed `on*`
 // content attributes as real event-handler listeners the FIRST time its wrapper is
@@ -34541,6 +34576,399 @@ globalThis.MathMLElement = class MathMLElement extends Element {};
 _markNative(globalThis.SVGElement); _markNative(globalThis.SVGSVGElement);
 _markNative(globalThis.SVGStyleElement); _markNative(globalThis.MathMLElement);
 _installLinkStyleSheet(globalThis.SVGStyleElement);
+
+// ─── SVG animated-attribute primitives (SVG 2 §4) ───────────────────────────
+// The reflected-value wrapper interfaces (SVGAnimated*) an SVG element's animatable
+// attributes return, plus the value objects they hold. None are author-constructible
+// ("Illegal constructor"); Obscura mints them internally through `_newSvg`, which flips
+// the guard for one construction. Each is [SameObject] per attribute, so the owning
+// element caches the wrapper (created lazily on first read, then identity-stable).
+let _allowSvgCtor = false;
+const _newSvg = (C, ...args) => {
+  _allowSvgCtor = true;
+  try { return new C(...args); } finally { _allowSvgCtor = false; }
+};
+const _svgBrand = (obj, C) => { if (!(obj instanceof C)) throw new TypeError("Illegal invocation"); };
+
+// SVGLength — a single <length> value (baseVal/animVal of SVGAnimatedLength). Minimal
+// but spec-shaped: the SVG_LENGTHTYPE_* constants + unit/value accessors.
+class SVGLength {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._unit = 1; this._value = 0; }
+  get unitType() { _svgBrand(this, SVGLength); return this._unit; }
+  get value() { _svgBrand(this, SVGLength); return this._value; }
+  set value(v) { _svgBrand(this, SVGLength); this._value = +v || 0; }
+  get valueInSpecifiedUnits() { _svgBrand(this, SVGLength); return this._value; }
+  set valueInSpecifiedUnits(v) { _svgBrand(this, SVGLength); this._value = +v || 0; }
+  get valueAsString() { _svgBrand(this, SVGLength); return String(this._value); }
+  set valueAsString(v) { _svgBrand(this, SVGLength); this._value = parseFloat(v) || 0; }
+  newValueSpecifiedUnits(unitType, valueInSpecifiedUnits) {
+    _svgBrand(this, SVGLength);
+    if (arguments.length < 2) throw new TypeError("2 arguments required");
+    this._unit = unitType >>> 0; this._value = +valueInSpecifiedUnits || 0;
+  }
+  convertToSpecifiedUnits(unitType) {
+    _svgBrand(this, SVGLength);
+    if (arguments.length < 1) throw new TypeError("1 argument required");
+    this._unit = unitType >>> 0;
+  }
+}
+{
+  const K = { SVG_LENGTHTYPE_UNKNOWN:0, SVG_LENGTHTYPE_NUMBER:1, SVG_LENGTHTYPE_PERCENTAGE:2,
+    SVG_LENGTHTYPE_EMS:3, SVG_LENGTHTYPE_EXS:4, SVG_LENGTHTYPE_PX:5, SVG_LENGTHTYPE_CM:6,
+    SVG_LENGTHTYPE_MM:7, SVG_LENGTHTYPE_IN:8, SVG_LENGTHTYPE_PT:9, SVG_LENGTHTYPE_PC:10 };
+  for (const [n, v] of Object.entries(K)) {
+    // Constants live on BOTH the interface object and the prototype (WebIDL const).
+    Object.defineProperty(SVGLength, n, { value: v, enumerable: true, configurable: false, writable: false });
+    Object.defineProperty(SVGLength.prototype, n, { value: v, enumerable: true, configurable: false, writable: false });
+  }
+}
+
+// SVGTransformList — the maplike-ish list of SVGTransform (baseVal/animVal of
+// SVGAnimatedTransformList). Minimal indexed list; the transform machinery is a no-op
+// (Obscura doesn't animate transforms yet), but the interface shape is honest.
+class SVGTransformList {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._items = []; }
+  get length() { _svgBrand(this, SVGTransformList); return this._items.length; }
+  get numberOfItems() { _svgBrand(this, SVGTransformList); return this._items.length; }
+  clear() { _svgBrand(this, SVGTransformList); this._items.length = 0; }
+  getItem(i) { _svgBrand(this, SVGTransformList); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items[i]; }
+  initialize(item) { _svgBrand(this, SVGTransformList); this._items = [item]; return item; }
+  insertItemBefore(item, i) { _svgBrand(this, SVGTransformList); this._items.splice(i >>> 0, 0, item); return item; }
+  replaceItem(item, i) { _svgBrand(this, SVGTransformList); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); this._items[i] = item; return item; }
+  removeItem(i) { _svgBrand(this, SVGTransformList); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items.splice(i, 1)[0]; }
+  appendItem(item) { _svgBrand(this, SVGTransformList); this._items.push(item); return item; }
+}
+
+// SVGAnimatedEnumeration — an animatable <enumeration> attribute (an unsigned short
+// keyword code). baseVal is writable, animVal read-only (Obscura's animVal === baseVal,
+// no active animation). `_kw`/`_map` translate between the keyword string stored on the
+// element attribute and the numeric code; the owning element seeds them.
+class SVGAnimatedEnumeration {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._v = 0; }
+  get baseVal() { _svgBrand(this, SVGAnimatedEnumeration); return this._v; }
+  set baseVal(v) { _svgBrand(this, SVGAnimatedEnumeration); this._v = v >>> 0; }
+  get animVal() { _svgBrand(this, SVGAnimatedEnumeration); return this._v; }
+}
+
+// SVGAnimatedLength — an animatable <length> attribute; baseVal/animVal are [SameObject]
+// SVGLength values (identity-stable per wrapper).
+class SVGAnimatedLength {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._base = _newSvg(SVGLength); }
+  get baseVal() { _svgBrand(this, SVGAnimatedLength); return this._base; }
+  get animVal() { _svgBrand(this, SVGAnimatedLength); return this._base; }
+}
+
+// SVGAnimatedTransformList — an animatable transform attribute; baseVal/animVal are
+// [SameObject] SVGTransformList values.
+class SVGAnimatedTransformList {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._base = _newSvg(SVGTransformList); }
+  get baseVal() { _svgBrand(this, SVGAnimatedTransformList); return this._base; }
+  get animVal() { _svgBrand(this, SVGAnimatedTransformList); return this._base; }
+}
+
+// The SVG element interfaces. Author `new SVGClipPathElement()` must throw "Illegal
+// constructor" (no [Constructor]); Obscura wraps parsed/created SVG nodes with a numeric
+// nid (see _elementClassFor / createElementNS). Each animatable attribute is a
+// [SameObject] getter caching its wrapper on the element (`_nid`-branded — reading it
+// on the bare prototype throws, per WebIDL).
+// `...args` so the interface object's `.length` is 0 (no [Constructor]); a numeric
+// nid still reaches super() on the internal wrap path, anything else throws.
+class SVGClipPathElement extends globalThis.SVGElement {
+  constructor(...args) { const nid = args[0]; if (typeof nid !== 'number') throw new TypeError("Illegal constructor"); super(nid); }
+  get [Symbol.toStringTag]() { return 'SVGClipPathElement'; }
+  get clipPathUnits() {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+    return this._clipPathUnits ??= _newSvg(SVGAnimatedEnumeration);
+  }
+  get transform() {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+    return this._transform ??= _newSvg(SVGAnimatedTransformList);
+  }
+}
+
+class SVGMaskElement extends globalThis.SVGElement {
+  constructor(...args) { const nid = args[0]; if (typeof nid !== 'number') throw new TypeError("Illegal constructor"); super(nid); }
+  get [Symbol.toStringTag]() { return 'SVGMaskElement'; }
+  get maskUnits() {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+    return this._maskUnits ??= _newSvg(SVGAnimatedEnumeration);
+  }
+  get maskContentUnits() {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+    return this._maskContentUnits ??= _newSvg(SVGAnimatedEnumeration);
+  }
+  get x() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return this._x ??= _newSvg(SVGAnimatedLength); }
+  get y() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return this._y ??= _newSvg(SVGAnimatedLength); }
+  get width() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return this._width ??= _newSvg(SVGAnimatedLength); }
+  get height() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return this._height ??= _newSvg(SVGAnimatedLength); }
+}
+
+// Expose the interface objects (non-enumerable global) + stamp the IDL attributes
+// enumerable on each prototype (ES class accessors are non-enumerable by default).
+for (const [n, C] of Object.entries({
+  SVGLength, SVGTransformList, SVGAnimatedEnumeration, SVGAnimatedLength, SVGAnimatedTransformList,
+  SVGClipPathElement, SVGMaskElement,
+})) { _exposeIface(n, C); _markNative(C); }
+_enumAccessors(SVGLength.prototype, 'unitType', 'value', 'valueInSpecifiedUnits', 'valueAsString', 'newValueSpecifiedUnits', 'convertToSpecifiedUnits');
+_enumAccessors(SVGTransformList.prototype, 'length', 'numberOfItems', 'clear', 'getItem', 'initialize', 'insertItemBefore', 'replaceItem', 'removeItem', 'appendItem');
+_enumAccessors(SVGAnimatedEnumeration.prototype, 'baseVal', 'animVal');
+_enumAccessors(SVGAnimatedLength.prototype, 'baseVal', 'animVal');
+_enumAccessors(SVGAnimatedTransformList.prototype, 'baseVal', 'animVal');
+_enumAccessors(globalThis.SVGClipPathElement.prototype, 'clipPathUnits', 'transform');
+_enumAccessors(globalThis.SVGMaskElement.prototype, 'maskUnits', 'maskContentUnits', 'x', 'y', 'width', 'height');
+
+// ─── The SVG element interface hierarchy (SVG 2 §5) ─────────────────────────
+// Every SVG element has its own WebIDL interface, arranged in the SVG 2 inheritance
+// tree (SVGElement → SVGGraphicsElement → SVGGeometryElement, plus the gradient /
+// text-content / component-transfer / animation families). Obscura wraps SVG-namespace
+// nodes with these (see _svgClassForLocal); each is non-author-constructible ("Illegal
+// constructor") and stringifies to its own [object SVGxxxElement]. Attribute reflection
+// (the SVGAnimated* getters) is only fully wired for clipPath/mask so far — the rest
+// carry the correct interface identity, with their animated-attribute members seeded for
+// a later pass. Defining a `class` with the spec name via the {[name]:class}[name] idiom
+// so `.name` / `.prototype.constructor` report the interface name idlharness expects.
+const _svgIfaceMade = {
+  SVGElement: globalThis.SVGElement, SVGStyleElement: globalThis.SVGStyleElement,
+  SVGClipPathElement: globalThis.SVGClipPathElement, SVGMaskElement: globalThis.SVGMaskElement,
+};
+const _defSvgIface = (name, baseName, tag) => {
+  const Base = _svgIfaceMade[baseName] || globalThis[baseName] || globalThis.SVGElement;
+  const C = { [name]: class extends Base {
+    constructor(...args) { const nid = args[0]; if (typeof nid !== 'number') throw new TypeError("Illegal constructor"); super(nid); }
+    get [Symbol.toStringTag]() { return name; }
+  } }[name];
+  _svgIfaceMade[name] = C;
+  _exposeIface(name, C); _markNative(C);
+  if (tag) _SVG_IFACE_BY_TAG[tag] = name;
+  return C;
+};
+// Abstract bases first (each is a primary interface idlharness checks for existence);
+// then the concrete elements. [interfaceName, baseInterfaceName, svgLocalNameLowercased].
+[
+  // ── abstract bases (no element tag) ──
+  ['SVGGraphicsElement', 'SVGElement', null],
+  ['SVGGeometryElement', 'SVGGraphicsElement', null],
+  ['SVGGradientElement', 'SVGElement', null],
+  ['SVGComponentTransferFunctionElement', 'SVGElement', null],
+  ['SVGTextContentElement', 'SVGGraphicsElement', null],
+  ['SVGTextPositioningElement', 'SVGTextContentElement', null],
+  ['SVGAnimationElement', 'SVGElement', null],
+  // ── containers / structural ──
+  ['SVGSVGElement', 'SVGGraphicsElement', 'svg'],   // reparent from the early : SVGElement stub
+  ['SVGGElement', 'SVGGraphicsElement', 'g'],
+  ['SVGDefsElement', 'SVGGraphicsElement', 'defs'],
+  ['SVGDescElement', 'SVGElement', 'desc'],
+  ['SVGTitleElement', 'SVGElement', 'title'],
+  ['SVGSymbolElement', 'SVGGraphicsElement', 'symbol'],
+  ['SVGUseElement', 'SVGGraphicsElement', 'use'],
+  ['SVGImageElement', 'SVGGraphicsElement', 'image'],
+  ['SVGSwitchElement', 'SVGGraphicsElement', 'switch'],
+  ['SVGAElement', 'SVGGraphicsElement', 'a'],
+  ['SVGViewElement', 'SVGElement', 'view'],
+  ['SVGScriptElement', 'SVGElement', 'script'],
+  ['SVGMetadataElement', 'SVGElement', 'metadata'],
+  ['SVGForeignObjectElement', 'SVGGraphicsElement', 'foreignobject'],
+  // ── geometry ──
+  ['SVGPathElement', 'SVGGeometryElement', 'path'],
+  ['SVGRectElement', 'SVGGeometryElement', 'rect'],
+  ['SVGCircleElement', 'SVGGeometryElement', 'circle'],
+  ['SVGEllipseElement', 'SVGGeometryElement', 'ellipse'],
+  ['SVGLineElement', 'SVGGeometryElement', 'line'],
+  ['SVGPolylineElement', 'SVGGeometryElement', 'polyline'],
+  ['SVGPolygonElement', 'SVGGeometryElement', 'polygon'],
+  // ── text ──
+  ['SVGTextElement', 'SVGTextPositioningElement', 'text'],
+  ['SVGTSpanElement', 'SVGTextPositioningElement', 'tspan'],
+  ['SVGTextPathElement', 'SVGTextContentElement', 'textpath'],
+  // ── paint servers / decoration ──
+  ['SVGMarkerElement', 'SVGElement', 'marker'],
+  ['SVGLinearGradientElement', 'SVGGradientElement', 'lineargradient'],
+  ['SVGRadialGradientElement', 'SVGGradientElement', 'radialgradient'],
+  ['SVGStopElement', 'SVGElement', 'stop'],
+  ['SVGPatternElement', 'SVGElement', 'pattern'],
+  // ── filters ──
+  ['SVGFilterElement', 'SVGElement', 'filter'],
+  ['SVGFEBlendElement', 'SVGElement', 'feblend'],
+  ['SVGFEColorMatrixElement', 'SVGElement', 'fecolormatrix'],
+  ['SVGFEComponentTransferElement', 'SVGElement', 'fecomponenttransfer'],
+  ['SVGFEFuncRElement', 'SVGComponentTransferFunctionElement', 'fefuncr'],
+  ['SVGFEFuncGElement', 'SVGComponentTransferFunctionElement', 'fefuncg'],
+  ['SVGFEFuncBElement', 'SVGComponentTransferFunctionElement', 'fefuncb'],
+  ['SVGFEFuncAElement', 'SVGComponentTransferFunctionElement', 'fefunca'],
+  ['SVGFECompositeElement', 'SVGElement', 'fecomposite'],
+  ['SVGFEConvolveMatrixElement', 'SVGElement', 'feconvolvematrix'],
+  ['SVGFEDiffuseLightingElement', 'SVGElement', 'fediffuselighting'],
+  ['SVGFEPointLightElement', 'SVGElement', 'fepointlight'],
+  ['SVGFESpotLightElement', 'SVGElement', 'fespotlight'],
+  ['SVGFEDistantLightElement', 'SVGElement', 'fedistantlight'],
+  ['SVGFEDisplacementMapElement', 'SVGElement', 'fedisplacementmap'],
+  ['SVGFEDropShadowElement', 'SVGElement', 'fedropshadow'],
+  ['SVGFEFloodElement', 'SVGElement', 'feflood'],
+  ['SVGFEGaussianBlurElement', 'SVGElement', 'fegaussianblur'],
+  ['SVGFEImageElement', 'SVGElement', 'feimage'],
+  ['SVGFEMergeElement', 'SVGElement', 'femerge'],
+  ['SVGFEMergeNodeElement', 'SVGElement', 'femergenode'],
+  ['SVGFEMorphologyElement', 'SVGElement', 'femorphology'],
+  ['SVGFESpecularLightingElement', 'SVGElement', 'fespecularlighting'],
+  ['SVGFETileElement', 'SVGElement', 'fetile'],
+  ['SVGFETurbulenceElement', 'SVGElement', 'feturbulence'],
+  // ── animation ──
+  ['SVGAnimateElement', 'SVGAnimationElement', 'animate'],
+  ['SVGSetElement', 'SVGAnimationElement', 'set'],
+  ['SVGAnimateMotionElement', 'SVGAnimationElement', 'animatemotion'],
+  ['SVGAnimateTransformElement', 'SVGAnimationElement', 'animatetransform'],
+  ['SVGMPathElement', 'SVGElement', 'mpath'],
+].forEach(([n, b, t]) => _defSvgIface(n, b, t));
+// ─── end SVG element interface hierarchy ────────────────────────────────────
+
+// ─── SVG value + animated-wrapper primitive types (SVG 2 §4) ────────────────
+// The remaining reflected value objects (SVGNumber/SVGAngle/SVGRect/SVGPoint/SVGMatrix/
+// SVGPreserveAspectRatio), their list interfaces, and the scalar SVGAnimated* wrappers.
+// All non-author-constructible; minted internally via _newSvg. Members are spec-shaped
+// but the values are inert (Obscura doesn't animate SVG geometry yet) — animVal mirrors
+// baseVal. This completes the SVGAnimated* type set the SVG idlharness type-checks.
+class SVGNumber {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._v = 0; }
+  get value() { _svgBrand(this, SVGNumber); return this._v; }
+  set value(v) { _svgBrand(this, SVGNumber); this._v = +v || 0; }
+}
+class SVGRect {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._x = this._y = this._w = this._h = 0; }
+  get x() { _svgBrand(this, SVGRect); return this._x; } set x(v) { _svgBrand(this, SVGRect); this._x = +v || 0; }
+  get y() { _svgBrand(this, SVGRect); return this._y; } set y(v) { _svgBrand(this, SVGRect); this._y = +v || 0; }
+  get width() { _svgBrand(this, SVGRect); return this._w; } set width(v) { _svgBrand(this, SVGRect); this._w = +v || 0; }
+  get height() { _svgBrand(this, SVGRect); return this._h; } set height(v) { _svgBrand(this, SVGRect); this._h = +v || 0; }
+}
+class SVGPoint {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._x = this._y = 0; }
+  get x() { _svgBrand(this, SVGPoint); return this._x; } set x(v) { _svgBrand(this, SVGPoint); this._x = +v || 0; }
+  get y() { _svgBrand(this, SVGPoint); return this._y; } set y(v) { _svgBrand(this, SVGPoint); this._y = +v || 0; }
+  matrixTransform(m) { _svgBrand(this, SVGPoint); return _newSvg(SVGPoint); }
+}
+class SVGMatrix {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._m = [1, 0, 0, 1, 0, 0]; }
+  get a() { _svgBrand(this, SVGMatrix); return this._m[0]; } set a(v) { _svgBrand(this, SVGMatrix); this._m[0] = +v || 0; }
+  get b() { _svgBrand(this, SVGMatrix); return this._m[1]; } set b(v) { _svgBrand(this, SVGMatrix); this._m[1] = +v || 0; }
+  get c() { _svgBrand(this, SVGMatrix); return this._m[2]; } set c(v) { _svgBrand(this, SVGMatrix); this._m[2] = +v || 0; }
+  get d() { _svgBrand(this, SVGMatrix); return this._m[3]; } set d(v) { _svgBrand(this, SVGMatrix); this._m[3] = +v || 0; }
+  get e() { _svgBrand(this, SVGMatrix); return this._m[4]; } set e(v) { _svgBrand(this, SVGMatrix); this._m[4] = +v || 0; }
+  get f() { _svgBrand(this, SVGMatrix); return this._m[5]; } set f(v) { _svgBrand(this, SVGMatrix); this._m[5] = +v || 0; }
+  multiply(o) { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  inverse() { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  translate(x, y) { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  scale(f) { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  scaleNonUniform(fx, fy) { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  rotate(a) { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  rotateFromVector(x, y) { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  flipX() { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  flipY() { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  skewX(a) { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+  skewY(a) { _svgBrand(this, SVGMatrix); return _newSvg(SVGMatrix); }
+}
+class SVGAngle {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._unit = 0; this._value = 0; }
+  get unitType() { _svgBrand(this, SVGAngle); return this._unit; }
+  get value() { _svgBrand(this, SVGAngle); return this._value; } set value(v) { _svgBrand(this, SVGAngle); this._value = +v || 0; }
+  get valueInSpecifiedUnits() { _svgBrand(this, SVGAngle); return this._value; } set valueInSpecifiedUnits(v) { _svgBrand(this, SVGAngle); this._value = +v || 0; }
+  get valueAsString() { _svgBrand(this, SVGAngle); return String(this._value); } set valueAsString(v) { _svgBrand(this, SVGAngle); this._value = parseFloat(v) || 0; }
+  newValueSpecifiedUnits(u, v) { _svgBrand(this, SVGAngle); if (arguments.length < 2) throw new TypeError("2 arguments required"); this._unit = u >>> 0; this._value = +v || 0; }
+  convertToSpecifiedUnits(u) { _svgBrand(this, SVGAngle); if (arguments.length < 1) throw new TypeError("1 argument required"); this._unit = u >>> 0; }
+}
+class SVGPreserveAspectRatio {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._align = 1; this._meet = 1; }
+  get align() { _svgBrand(this, SVGPreserveAspectRatio); return this._align; } set align(v) { _svgBrand(this, SVGPreserveAspectRatio); this._align = v >>> 0; }
+  get meetOrSlice() { _svgBrand(this, SVGPreserveAspectRatio); return this._meet; } set meetOrSlice(v) { _svgBrand(this, SVGPreserveAspectRatio); this._meet = v >>> 0; }
+}
+// SVGUnitTypes — a constants-only interface ([Exposed=Window]).
+class SVGUnitTypes { constructor() { throw new TypeError("Illegal constructor"); } }
+
+// Generic SVG list interface factory (numberOfItems + the mutation ops) for the
+// homogeneous list types. Each is non-author-constructible.
+const _defSvgList = (name) => {
+  const C = { [name]: class {
+    constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._items = []; }
+    get length() { _svgBrand(this, C); return this._items.length; }
+    get numberOfItems() { _svgBrand(this, C); return this._items.length; }
+    clear() { _svgBrand(this, C); this._items.length = 0; }
+    initialize(item) { _svgBrand(this, C); this._items = [item]; return item; }
+    getItem(i) { _svgBrand(this, C); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items[i]; }
+    insertItemBefore(item, i) { _svgBrand(this, C); this._items.splice(i >>> 0, 0, item); return item; }
+    replaceItem(item, i) { _svgBrand(this, C); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); this._items[i] = item; return item; }
+    removeItem(i) { _svgBrand(this, C); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items.splice(i, 1)[0]; }
+    appendItem(item) { _svgBrand(this, C); this._items.push(item); return item; }
+  } }[name];
+  _exposeIface(name, C); _markNative(C);
+  _enumAccessors(C.prototype, 'length', 'numberOfItems', 'clear', 'initialize', 'getItem', 'insertItemBefore', 'replaceItem', 'removeItem', 'appendItem');
+  return C;
+};
+const SVGNumberList = _defSvgList('SVGNumberList');
+const SVGLengthList = _defSvgList('SVGLengthList');
+const SVGPointList = _defSvgList('SVGPointList');
+// SVGStringList — same list shape but string-valued (no getItem-typing difference here).
+const SVGStringList = _defSvgList('SVGStringList');
+
+// Scalar SVGAnimated* wrappers (baseVal writable, animVal read-only mirror).
+const _defSvgAnimScalar = (name, coerce) => {
+  const C = { [name]: class {
+    constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._v = coerce(undefined); }
+    get baseVal() { _svgBrand(this, C); return this._v; }
+    set baseVal(v) { _svgBrand(this, C); this._v = coerce(v); }
+    get animVal() { _svgBrand(this, C); return this._v; }
+  } }[name];
+  _exposeIface(name, C); _markNative(C);
+  _enumAccessors(C.prototype, 'baseVal', 'animVal');
+  return C;
+};
+_defSvgAnimScalar('SVGAnimatedString', v => v == null ? '' : String(v));
+_defSvgAnimScalar('SVGAnimatedNumber', v => +v || 0);
+_defSvgAnimScalar('SVGAnimatedInteger', v => (v | 0));
+_defSvgAnimScalar('SVGAnimatedBoolean', v => !!v);
+
+// SameObject-backed SVGAnimated* wrappers (baseVal/animVal are the same value object).
+const _defSvgAnimObject = (name, ValueC) => {
+  const C = { [name]: class {
+    constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._base = _newSvg(ValueC); }
+    get baseVal() { _svgBrand(this, C); return this._base; }
+    get animVal() { _svgBrand(this, C); return this._base; }
+  } }[name];
+  _exposeIface(name, C); _markNative(C);
+  _enumAccessors(C.prototype, 'baseVal', 'animVal');
+  return C;
+};
+_defSvgAnimObject('SVGAnimatedRect', SVGRect);
+_defSvgAnimObject('SVGAnimatedAngle', SVGAngle);
+_defSvgAnimObject('SVGAnimatedPreserveAspectRatio', SVGPreserveAspectRatio);
+_defSvgAnimObject('SVGAnimatedLengthList', SVGLengthList);
+_defSvgAnimObject('SVGAnimatedNumberList', SVGNumberList);
+
+// Expose the value types + stamp members enumerable; seed their WebIDL constants.
+for (const [n, C] of Object.entries({ SVGNumber, SVGRect, SVGPoint, SVGMatrix, SVGAngle, SVGPreserveAspectRatio, SVGUnitTypes })) {
+  _exposeIface(n, C); _markNative(C);
+}
+_enumAccessors(SVGNumber.prototype, 'value');
+_enumAccessors(SVGRect.prototype, 'x', 'y', 'width', 'height');
+_enumAccessors(SVGPoint.prototype, 'x', 'y', 'matrixTransform');
+_enumAccessors(SVGMatrix.prototype, 'a', 'b', 'c', 'd', 'e', 'f', 'multiply', 'inverse', 'translate', 'scale', 'scaleNonUniform', 'rotate', 'rotateFromVector', 'flipX', 'flipY', 'skewX', 'skewY');
+_enumAccessors(SVGAngle.prototype, 'unitType', 'value', 'valueInSpecifiedUnits', 'valueAsString', 'newValueSpecifiedUnits', 'convertToSpecifiedUnits');
+_enumAccessors(SVGPreserveAspectRatio.prototype, 'align', 'meetOrSlice');
+{
+  const seed = (C, K) => { for (const [n, v] of Object.entries(K)) {
+    Object.defineProperty(C, n, { value: v, enumerable: true, configurable: false, writable: false });
+    Object.defineProperty(C.prototype, n, { value: v, enumerable: true, configurable: false, writable: false });
+  } };
+  seed(SVGAngle, { SVG_ANGLETYPE_UNKNOWN:0, SVG_ANGLETYPE_UNSPECIFIED:1, SVG_ANGLETYPE_DEG:2, SVG_ANGLETYPE_RAD:3, SVG_ANGLETYPE_GRAD:4 });
+  seed(SVGPreserveAspectRatio, {
+    SVG_PRESERVEASPECTRATIO_UNKNOWN:0, SVG_PRESERVEASPECTRATIO_NONE:1, SVG_PRESERVEASPECTRATIO_XMINYMIN:2,
+    SVG_PRESERVEASPECTRATIO_XMIDYMIN:3, SVG_PRESERVEASPECTRATIO_XMAXYMIN:4, SVG_PRESERVEASPECTRATIO_XMINYMID:5,
+    SVG_PRESERVEASPECTRATIO_XMIDYMID:6, SVG_PRESERVEASPECTRATIO_XMAXYMID:7, SVG_PRESERVEASPECTRATIO_XMINYMAX:8,
+    SVG_PRESERVEASPECTRATIO_XMIDYMAX:9, SVG_PRESERVEASPECTRATIO_XMAXYMAX:10,
+    SVG_MEETORSLICE_UNKNOWN:0, SVG_MEETORSLICE_MEET:1, SVG_MEETORSLICE_SLICE:2,
+  });
+  seed(SVGUnitTypes, { SVG_UNIT_TYPE_UNKNOWN:0, SVG_UNIT_TYPE_USERSPACEONUSE:1, SVG_UNIT_TYPE_OBJECTBOUNDINGBOX:2 });
+}
+// ─── end SVG value + animated-wrapper primitive types ───────────────────────
+// ─── end SVG animated-attribute primitives ──────────────────────────────────
+
 // ElementCSSInlineStyle mixin: `style` must be an OWN enumerable accessor on EACH host
 // interface prototype (HTMLElement/SVGElement/MathMLElement) — idlharness runs
 // assert_own_property on each. Copy the shared Element.prototype descriptor (its get/set
