@@ -5469,7 +5469,7 @@ class Element extends Node {
       toJSON() { return this; },
     };
   }
-  getClientRects() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? [] : [this.getBoundingClientRect()]; }
+  getClientRects() { return globalThis._newDomRectList((_popoverBoxCheck(this) && !_renderedHasBox(this)) ? [] : [this.getBoundingClientRect()]); }
   // No layout engine: a stub that always returns true unblocks Playwright's
   // actionability polling. With a real layout we'd check display, visibility,
   // opacity and rect dimensions per spec.
@@ -34958,13 +34958,15 @@ _defSvgAnimObject('SVGAnimatedLengthList', SVGLengthList);
 _defSvgAnimObject('SVGAnimatedNumberList', SVGNumberList);
 
 // Expose the value types + stamp members enumerable; seed their WebIDL constants.
-for (const [n, C] of Object.entries({ SVGNumber, SVGRect, SVGPoint, SVGMatrix, SVGAngle, SVGPreserveAspectRatio, SVGUnitTypes })) {
+// NOTE: SVGRect / SVGPoint / SVGMatrix are DELIBERATELY absent here — in SVG 2 they
+// are not standalone interfaces but `LegacyWindowAlias`es of DOMRect / DOMPoint /
+// DOMMatrix (Geometry Interfaces). The internal classes below stay as inert backing
+// for SVGAnimatedRect's dummy base, but the GLOBAL names are wired to the real
+// Geometry interfaces in the geometry block (search "LegacyWindowAlias").
+for (const [n, C] of Object.entries({ SVGNumber, SVGAngle, SVGPreserveAspectRatio, SVGUnitTypes })) {
   _exposeIface(n, C); _markNative(C);
 }
 _enumAccessors(SVGNumber.prototype, 'value');
-_enumAccessors(SVGRect.prototype, 'x', 'y', 'width', 'height');
-_enumAccessors(SVGPoint.prototype, 'x', 'y', 'matrixTransform');
-_enumAccessors(SVGMatrix.prototype, 'a', 'b', 'c', 'd', 'e', 'f', 'multiply', 'inverse', 'translate', 'scale', 'scaleNonUniform', 'rotate', 'rotateFromVector', 'flipX', 'flipY', 'skewX', 'skewY');
 _enumAccessors(SVGAngle.prototype, 'unitType', 'value', 'valueInSpecifiedUnits', 'valueAsString', 'newValueSpecifiedUnits', 'convertToSpecifiedUnits');
 _enumAccessors(SVGPreserveAspectRatio.prototype, 'align', 'meetOrSlice');
 {
@@ -37724,32 +37726,401 @@ if (!globalThis.crypto.subtle) {
   };
 }
 
-if (typeof DOMRect === 'undefined') {
-  globalThis.DOMRect = class DOMRect {
-    constructor(x=0,y=0,w=0,h=0) { this.x=x;this.y=y;this.width=w;this.height=h;this.top=y;this.right=x+w;this.bottom=y+h;this.left=x; }
-    toJSON() { return {x:this.x,y:this.y,width:this.width,height:this.height,top:this.top,right:this.right,bottom:this.bottom,left:this.left}; }
-    static fromRect(r={}) { return new DOMRect(r.x,r.y,r.width,r.height); }
+// ═════════════════════════════════════════════════════════════════════════════
+// Geometry Interfaces Module Level 1 — https://drafts.csswg.org/geometry-1/
+// DOMPoint(ReadOnly) / DOMRect(ReadOnly) / DOMQuad / DOMMatrix(ReadOnly) /
+// DOMRectList. A proper WebIDL rebuild of the earlier naive placeholders:
+//   • the readonly base + mutable subclass two-level split (matching [Exposed]);
+//   • brand-checked, ENUMERABLE prototype accessors (get-only on the *ReadOnly
+//     bases, get+set on the mutable subclasses — the IDL `inherit attribute`);
+//   • [Default] object toJSON() serializing exactly the interface's attributes;
+//   • static [NewObject] factories (fromPoint/fromRect/fromMatrix/…) as OWN
+//     props of each interface object, with WebIDL arity throws on required args;
+//   • real affine / 4×4 math so transformPoint / multiply / inverse compute.
+// The SVG value types are LegacyWindowAliases of these (SVGPoint→DOMPoint,
+// SVGRect→DOMRect, SVGMatrix/WebKitCSSMatrix→DOMMatrix) and are wired at the end.
+// ═════════════════════════════════════════════════════════════════════════════
+{
+  const _geoBrand = (o, C) => { if (!(o instanceof C)) throw new TypeError("Illegal invocation"); };
+  const _RAD = Math.PI / 180;
+
+  // ── DOMPointReadOnly / DOMPoint ────────────────────────────────────────────
+  class DOMPointReadOnly {
+    constructor(x = 0, y = 0, z = 0, w = 1) { this._x = +x; this._y = +y; this._z = +z; this._w = +w; }
+    static fromPoint(other = {}) { return new DOMPointReadOnly(other.x, other.y, other.z, other.w); }
+    get x() { _geoBrand(this, DOMPointReadOnly); return this._x; }
+    get y() { _geoBrand(this, DOMPointReadOnly); return this._y; }
+    get z() { _geoBrand(this, DOMPointReadOnly); return this._z; }
+    get w() { _geoBrand(this, DOMPointReadOnly); return this._w; }
+    matrixTransform(matrix = {}) { _geoBrand(this, DOMPointReadOnly); return _domMatrixFromInit(matrix).transformPoint(this); }
+    toJSON() { _geoBrand(this, DOMPointReadOnly); return { x: this._x, y: this._y, z: this._z, w: this._w }; }
+    get [Symbol.toStringTag]() { return 'DOMPointReadOnly'; }
+  }
+  class DOMPoint extends DOMPointReadOnly {
+    constructor(x = 0, y = 0, z = 0, w = 1) { super(x, y, z, w); }
+    static fromPoint(other = {}) { return new DOMPoint(other.x, other.y, other.z, other.w); }
+    get x() { _geoBrand(this, DOMPoint); return this._x; } set x(v) { _geoBrand(this, DOMPoint); this._x = +v; }
+    get y() { _geoBrand(this, DOMPoint); return this._y; } set y(v) { _geoBrand(this, DOMPoint); this._y = +v; }
+    get z() { _geoBrand(this, DOMPoint); return this._z; } set z(v) { _geoBrand(this, DOMPoint); this._z = +v; }
+    get w() { _geoBrand(this, DOMPoint); return this._w; } set w(v) { _geoBrand(this, DOMPoint); this._w = +v; }
+    get [Symbol.toStringTag]() { return 'DOMPoint'; }
+  }
+  _enumAccessors(DOMPointReadOnly.prototype, 'x', 'y', 'z', 'w');
+  _enumAccessors(DOMPoint.prototype, 'x', 'y', 'z', 'w');
+
+  // ── DOMRectReadOnly / DOMRect ──────────────────────────────────────────────
+  // top/right/bottom/left are computed (accounting for negative width/height).
+  class DOMRectReadOnly {
+    constructor(x = 0, y = 0, width = 0, height = 0) { this._x = +x; this._y = +y; this._w = +width; this._h = +height; }
+    static fromRect(other = {}) { return new DOMRectReadOnly(other.x, other.y, other.width, other.height); }
+    get x() { _geoBrand(this, DOMRectReadOnly); return this._x; }
+    get y() { _geoBrand(this, DOMRectReadOnly); return this._y; }
+    get width() { _geoBrand(this, DOMRectReadOnly); return this._w; }
+    get height() { _geoBrand(this, DOMRectReadOnly); return this._h; }
+    get top() { _geoBrand(this, DOMRectReadOnly); return Math.min(this._y, this._y + this._h); }
+    get right() { _geoBrand(this, DOMRectReadOnly); return Math.max(this._x, this._x + this._w); }
+    get bottom() { _geoBrand(this, DOMRectReadOnly); return Math.max(this._y, this._y + this._h); }
+    get left() { _geoBrand(this, DOMRectReadOnly); return Math.min(this._x, this._x + this._w); }
+    toJSON() { _geoBrand(this, DOMRectReadOnly); return { x: this._x, y: this._y, width: this._w, height: this._h, top: this.top, right: this.right, bottom: this.bottom, left: this.left }; }
+    get [Symbol.toStringTag]() { return 'DOMRectReadOnly'; }
+  }
+  class DOMRect extends DOMRectReadOnly {
+    constructor(x = 0, y = 0, width = 0, height = 0) { super(x, y, width, height); }
+    static fromRect(other = {}) { return new DOMRect(other.x, other.y, other.width, other.height); }
+    get x() { _geoBrand(this, DOMRect); return this._x; } set x(v) { _geoBrand(this, DOMRect); this._x = +v; }
+    get y() { _geoBrand(this, DOMRect); return this._y; } set y(v) { _geoBrand(this, DOMRect); this._y = +v; }
+    get width() { _geoBrand(this, DOMRect); return this._w; } set width(v) { _geoBrand(this, DOMRect); this._w = +v; }
+    get height() { _geoBrand(this, DOMRect); return this._h; } set height(v) { _geoBrand(this, DOMRect); this._h = +v; }
+    get [Symbol.toStringTag]() { return 'DOMRect'; }
+  }
+  _enumAccessors(DOMRectReadOnly.prototype, 'x', 'y', 'width', 'height', 'top', 'right', 'bottom', 'left');
+  _enumAccessors(DOMRect.prototype, 'x', 'y', 'width', 'height');
+
+  // ── DOMQuad ────────────────────────────────────────────────────────────────
+  class DOMQuad {
+    constructor(p1 = {}, p2 = {}, p3 = {}, p4 = {}) {
+      this._p1 = DOMPoint.fromPoint(p1); this._p2 = DOMPoint.fromPoint(p2);
+      this._p3 = DOMPoint.fromPoint(p3); this._p4 = DOMPoint.fromPoint(p4);
+    }
+    static fromRect(other = {}) {
+      const x = +other.x || 0, y = +other.y || 0, w = +other.width || 0, h = +other.height || 0;
+      return new DOMQuad({ x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h });
+    }
+    static fromQuad(other = {}) { return new DOMQuad(other.p1, other.p2, other.p3, other.p4); }
+    get p1() { _geoBrand(this, DOMQuad); return this._p1; }
+    get p2() { _geoBrand(this, DOMQuad); return this._p2; }
+    get p3() { _geoBrand(this, DOMQuad); return this._p3; }
+    get p4() { _geoBrand(this, DOMQuad); return this._p4; }
+    getBounds() {
+      _geoBrand(this, DOMQuad);
+      const xs = [this._p1._x, this._p2._x, this._p3._x, this._p4._x];
+      const ys = [this._p1._y, this._p2._y, this._p3._y, this._p4._y];
+      const left = Math.min(...xs), top = Math.min(...ys);
+      return new DOMRect(left, top, Math.max(...xs) - left, Math.max(...ys) - top);
+    }
+    toJSON() { _geoBrand(this, DOMQuad); return { p1: this._p1, p2: this._p2, p3: this._p3, p4: this._p4 }; }
+    get [Symbol.toStringTag]() { return 'DOMQuad'; }
+  }
+  _enumAccessors(DOMQuad.prototype, 'p1', 'p2', 'p3', 'p4');
+
+  // ── DOMRectList — a non-author-constructible ordered list of DOMRect ────────
+  class DOMRectList {
+    constructor() { throw new TypeError("Illegal constructor"); }
+    get length() { if (!(this instanceof DOMRectList)) throw new TypeError("Illegal invocation"); return this._items.length; }
+    item(index) {
+      if (!(this instanceof DOMRectList)) throw new TypeError("Illegal invocation");
+      if (arguments.length < 1) throw new TypeError("1 argument required");
+      index = index >>> 0;
+      return index < this._items.length ? this._items[index] : null;
+    }
+    get [Symbol.toStringTag]() { return 'DOMRectList'; }
+  }
+  _enumAccessors(DOMRectList.prototype, 'length', 'item');
+  // A DOMRectList is minted internally (getClientRects). Indexed props + an
+  // @@iterator keep it spread/for-of compatible with array-consuming callers.
+  const _newDomRectList = (rects) => {
+    const list = Object.create(DOMRectList.prototype);
+    list._items = rects.slice();
+    for (let i = 0; i < rects.length; i++)
+      Object.defineProperty(list, i, { value: rects[i], enumerable: true, configurable: true });
+    Object.defineProperty(list, Symbol.iterator, { value: Array.prototype[Symbol.iterator], configurable: true });
+    return list;
   };
-}
-if (typeof DOMPoint === 'undefined') {
-  globalThis.DOMPoint = class DOMPoint {
-    constructor(x=0,y=0,z=0,w=1) { this.x=x;this.y=y;this.z=z;this.w=w; }
-    static fromPoint(p={}) { return new DOMPoint(p.x,p.y,p.z,p.w); }
+  globalThis._newDomRectList = _newDomRectList;
+
+  // ── DOMMatrixReadOnly / DOMMatrix ──────────────────────────────────────────
+  // Storage: _m is a 16-element COLUMN-MAJOR array [m11,m12,m13,m14, m21..m24,
+  // m31..m34, m41..m44]; _is2D tracks the 2D-affine flag. Point transform:
+  //   x' = m11·x + m21·y + m31·z + m41·w  (etc.) → _m[0]·x + _m[4]·y + …
+  const _matI = () => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  const _matMul = (a, b) => {   // a·b, both column-major flat-16
+    const r = new Array(16);
+    for (let c = 0; c < 4; c++) for (let row = 0; row < 4; row++) {
+      let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + row] * b[c * 4 + k];
+      r[c * 4 + row] = s;
+    }
+    return r;
   };
-}
-if (typeof DOMMatrix === 'undefined') {
-  globalThis.DOMMatrix = class DOMMatrix {
-    constructor() { this.a=1;this.b=0;this.c=0;this.d=1;this.e=0;this.f=0;this.is2D=true;this.isIdentity=true; }
-    static fromMatrix() { return new DOMMatrix(); }
-    static fromFloat32Array() { return new DOMMatrix(); }
-    static fromFloat64Array() { return new DOMMatrix(); }
-    multiply() { return new DOMMatrix(); }
-    inverse() { return new DOMMatrix(); }
-    translate() { return new DOMMatrix(); }
-    scale() { return new DOMMatrix(); }
-    rotate() { return new DOMMatrix(); }
-    transformPoint(p) { return new DOMPoint(p?.x||0,p?.y||0); }
+  const _matXform = (m, x, y, z, w) => [
+    m[0] * x + m[4] * y + m[8] * z + m[12] * w,
+    m[1] * x + m[5] * y + m[9] * z + m[13] * w,
+    m[2] * x + m[6] * y + m[10] * z + m[14] * w,
+    m[3] * x + m[7] * y + m[11] * z + m[15] * w,
+  ];
+  const _matInv = (m) => {   // general 4×4 inverse; null if singular
+    const inv = new Array(16);
+    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (det === 0 || !isFinite(det)) return null;
+    det = 1 / det;
+    for (let i = 0; i < 16; i++) inv[i] *= det;
+    return inv;
   };
+  const _isDefault2D = (m) => m[2] === 0 && m[3] === 0 && m[6] === 0 && m[7] === 0 &&
+    m[8] === 0 && m[9] === 0 && m[10] === 1 && m[11] === 0 && m[14] === 0 && m[15] === 1;
+
+  // Build a DOMMatrix(ReadOnly) from a DOMMatrixInit dictionary (or an existing
+  // matrix object). Validates the a/m11 alias pairs and the is2D consistency.
+  const _domMatrixFromInit = (dict) => {
+    if (dict instanceof DOMMatrixReadOnly) { const r = new DOMMatrix(); r._m = dict._m.slice(); r._is2D = dict._is2D; return r; }
+    dict = dict || {};
+    const pair = (a2d, m, def) => {
+      const av = dict[a2d], mv = dict[m];
+      if (av !== undefined && mv !== undefined && !(Object.is(+av, +mv) || (+av === +mv))) throw new TypeError("Invalid matrix: " + a2d + " and " + m + " disagree");
+      return av !== undefined ? +av : (mv !== undefined ? +mv : def);
+    };
+    const m11 = pair('a', 'm11', 1), m12 = pair('b', 'm12', 0), m21 = pair('c', 'm21', 0),
+      m22 = pair('d', 'm22', 1), m41 = pair('e', 'm41', 0), m42 = pair('f', 'm42', 0);
+    const g = (k, def) => dict[k] !== undefined ? +dict[k] : def;
+    const m13 = g('m13', 0), m14 = g('m14', 0), m23 = g('m23', 0), m24 = g('m24', 0),
+      m31 = g('m31', 0), m32 = g('m32', 0), m33 = g('m33', 1), m34 = g('m34', 0), m43 = g('m43', 0), m44 = g('m44', 1);
+    const arr = [m11, m12, m13, m14, m21, m22, m23, m24, m31, m32, m33, m34, m41, m42, m43, m44];
+    const looks2D = _isDefault2D(arr);
+    let is2D;
+    if (dict.is2D !== undefined) { is2D = !!dict.is2D; if (is2D && !looks2D) throw new TypeError("Invalid matrix: is2D true but has 3D components"); }
+    else is2D = looks2D;
+    const r = new DOMMatrix(); r._m = arr; r._is2D = is2D; return r;
+  };
+
+  const _newMat = (arr, is2D) => { const r = new DOMMatrix(); r._m = arr; r._is2D = is2D; return r; };
+
+  class DOMMatrixReadOnly {
+    constructor(init = undefined) {   // = undefined so ctor .length is 0 (init is optional)
+      this._m = _matI(); this._is2D = true;
+      if (init === undefined || init === null) return;
+      if (typeof init === 'string') { this._setFromString(init); return; }
+      if (typeof init[Symbol.iterator] === 'function') {
+        const a = Array.from(init, Number);
+        if (a.length === 6) { this._m = [a[0], a[1], 0, 0, a[2], a[3], 0, 0, 0, 0, 1, 0, a[4], a[5], 0, 1]; this._is2D = true; return; }
+        if (a.length === 16) { this._m = a; this._is2D = false; return; }   // a 16-element init is always 3D per spec
+        throw new TypeError("Failed to construct 'DOMMatrix': sequence must have 6 or 16 elements");
+      }
+      this._setFromString(String(init));
+    }
+    _setFromString(s) {
+      s = String(s).trim();
+      if (s === '' || s === 'none') { this._m = _matI(); this._is2D = true; return; }
+      let mm = s.match(/^matrix\(([^)]*)\)$/);
+      if (mm) { const a = mm[1].split(',').map(x => parseFloat(x)); if (a.length === 6 && a.every(isFinite)) { this._m = [a[0], a[1], 0, 0, a[2], a[3], 0, 0, 0, 0, 1, 0, a[4], a[5], 0, 1]; this._is2D = true; return; } }
+      mm = s.match(/^matrix3d\(([^)]*)\)$/);
+      if (mm) { const a = mm[1].split(',').map(x => parseFloat(x)); if (a.length === 16 && a.every(isFinite)) { this._m = a; this._is2D = false; return; } }   // matrix3d() is always 3D
+      throw new DOMException("Failed to parse '" + s + "' as a transform list", "SyntaxError");
+    }
+    static fromMatrix(other = {}) { const r = _domMatrixFromInit(other); const o = new DOMMatrixReadOnly(); o._m = r._m; o._is2D = r._is2D; return o; }
+    static fromFloat32Array(a32) { if (arguments.length < 1) throw new TypeError("1 argument required"); return DOMMatrixReadOnly.fromMatrix(_matrixInitFromArray(a32)); }
+    static fromFloat64Array(a64) { if (arguments.length < 1) throw new TypeError("1 argument required"); return DOMMatrixReadOnly.fromMatrix(_matrixInitFromArray(a64)); }
+
+    get a() { _geoBrand(this, DOMMatrixReadOnly); return this._m[0]; }
+    get b() { _geoBrand(this, DOMMatrixReadOnly); return this._m[1]; }
+    get c() { _geoBrand(this, DOMMatrixReadOnly); return this._m[4]; }
+    get d() { _geoBrand(this, DOMMatrixReadOnly); return this._m[5]; }
+    get e() { _geoBrand(this, DOMMatrixReadOnly); return this._m[12]; }
+    get f() { _geoBrand(this, DOMMatrixReadOnly); return this._m[13]; }
+    get m11() { _geoBrand(this, DOMMatrixReadOnly); return this._m[0]; }
+    get m12() { _geoBrand(this, DOMMatrixReadOnly); return this._m[1]; }
+    get m13() { _geoBrand(this, DOMMatrixReadOnly); return this._m[2]; }
+    get m14() { _geoBrand(this, DOMMatrixReadOnly); return this._m[3]; }
+    get m21() { _geoBrand(this, DOMMatrixReadOnly); return this._m[4]; }
+    get m22() { _geoBrand(this, DOMMatrixReadOnly); return this._m[5]; }
+    get m23() { _geoBrand(this, DOMMatrixReadOnly); return this._m[6]; }
+    get m24() { _geoBrand(this, DOMMatrixReadOnly); return this._m[7]; }
+    get m31() { _geoBrand(this, DOMMatrixReadOnly); return this._m[8]; }
+    get m32() { _geoBrand(this, DOMMatrixReadOnly); return this._m[9]; }
+    get m33() { _geoBrand(this, DOMMatrixReadOnly); return this._m[10]; }
+    get m34() { _geoBrand(this, DOMMatrixReadOnly); return this._m[11]; }
+    get m41() { _geoBrand(this, DOMMatrixReadOnly); return this._m[12]; }
+    get m42() { _geoBrand(this, DOMMatrixReadOnly); return this._m[13]; }
+    get m43() { _geoBrand(this, DOMMatrixReadOnly); return this._m[14]; }
+    get m44() { _geoBrand(this, DOMMatrixReadOnly); return this._m[15]; }
+    get is2D() { _geoBrand(this, DOMMatrixReadOnly); return this._is2D; }
+    get isIdentity() { _geoBrand(this, DOMMatrixReadOnly); const m = this._m, I = _matI(); for (let i = 0; i < 16; i++) if (m[i] !== I[i]) return false; return true; }
+
+    translate(tx = 0, ty = 0, tz = 0) { _geoBrand(this, DOMMatrixReadOnly); const T = _matI(); T[12] = +tx; T[13] = +ty; T[14] = +tz; return _newMat(_matMul(this._m, T), this._is2D && (+tz || 0) === 0); }
+    scale(scaleX = 1, scaleY, scaleZ = 1, originX = 0, originY = 0, originZ = 0) {
+      _geoBrand(this, DOMMatrixReadOnly);
+      if (scaleY === undefined) scaleY = scaleX;
+      const ox = +originX, oy = +originY, oz = +originZ;
+      let m = this._m;
+      const T1 = _matI(); T1[12] = ox; T1[13] = oy; T1[14] = oz;
+      const S = _matI(); S[0] = +scaleX; S[5] = +scaleY; S[10] = +scaleZ;
+      const T2 = _matI(); T2[12] = -ox; T2[13] = -oy; T2[14] = -oz;
+      m = _matMul(_matMul(_matMul(m, T1), S), T2);
+      return _newMat(m, this._is2D && (+scaleZ || 1) === 1 && oz === 0);
+    }
+    scaleNonUniform(scaleX = 1, scaleY = 1) { _geoBrand(this, DOMMatrixReadOnly); return this.scale(scaleX, scaleY, 1, 0, 0, 0); }
+    scale3d(scale = 1, originX = 0, originY = 0, originZ = 0) {
+      _geoBrand(this, DOMMatrixReadOnly);
+      const ox = +originX, oy = +originY, oz = +originZ;
+      const T1 = _matI(); T1[12] = ox; T1[13] = oy; T1[14] = oz;
+      const S = _matI(); S[0] = S[5] = S[10] = +scale;
+      const T2 = _matI(); T2[12] = -ox; T2[13] = -oy; T2[14] = -oz;
+      return _newMat(_matMul(_matMul(_matMul(this._m, T1), S), T2), this._is2D && (+scale || 1) === 1 && oz === 0);
+    }
+    rotate(rotX = 0, rotY, rotZ) {
+      _geoBrand(this, DOMMatrixReadOnly);
+      if (rotY === undefined && rotZ === undefined) { rotZ = rotX; rotX = 0; rotY = 0; }
+      else { rotY = rotY === undefined ? 0 : rotY; rotZ = rotZ === undefined ? 0 : rotZ; }
+      let m = this._m;
+      if (+rotX) m = _matMul(m, _rotAxis(1, 0, 0, +rotX));
+      if (+rotY) m = _matMul(m, _rotAxis(0, 1, 0, +rotY));
+      if (+rotZ) m = _matMul(m, _rotAxis(0, 0, 1, +rotZ));
+      return _newMat(m, this._is2D && (+rotX || 0) === 0 && (+rotY || 0) === 0);
+    }
+    rotateFromVector(x = 0, y = 0) { _geoBrand(this, DOMMatrixReadOnly); const deg = (x === 0 && y === 0) ? 0 : Math.atan2(+y, +x) / _RAD; return _newMat(_matMul(this._m, _rotAxis(0, 0, 1, deg)), this._is2D); }
+    rotateAxisAngle(x = 0, y = 0, z = 0, angle = 0) { _geoBrand(this, DOMMatrixReadOnly); return _newMat(_matMul(this._m, _rotAxis(+x, +y, +z, +angle)), this._is2D && (+x || 0) === 0 && (+y || 0) === 0); }
+    skewX(sx = 0) { _geoBrand(this, DOMMatrixReadOnly); const K = _matI(); K[4] = Math.tan((+sx) * _RAD); return _newMat(_matMul(this._m, K), this._is2D); }
+    skewY(sy = 0) { _geoBrand(this, DOMMatrixReadOnly); const K = _matI(); K[1] = Math.tan((+sy) * _RAD); return _newMat(_matMul(this._m, K), this._is2D); }
+    multiply(other = {}) { _geoBrand(this, DOMMatrixReadOnly); const O = _domMatrixFromInit(other); return _newMat(_matMul(this._m, O._m), this._is2D && O._is2D); }
+    flipX() { _geoBrand(this, DOMMatrixReadOnly); const F = _matI(); F[0] = -1; return _newMat(_matMul(this._m, F), this._is2D); }
+    flipY() { _geoBrand(this, DOMMatrixReadOnly); const F = _matI(); F[5] = -1; return _newMat(_matMul(this._m, F), this._is2D); }
+    inverse() { _geoBrand(this, DOMMatrixReadOnly); const inv = _matInv(this._m); return inv ? _newMat(inv, this._is2D) : _newMat(new Array(16).fill(NaN), false); }
+    transformPoint(point = {}) { _geoBrand(this, DOMMatrixReadOnly); const p = _matXform(this._m, +point.x || 0, +point.y || 0, +point.z || 0, point.w === undefined ? 1 : +point.w); return new DOMPoint(p[0], p[1], p[2], p[3]); }
+    toFloat32Array() { _geoBrand(this, DOMMatrixReadOnly); return Float32Array.from(this._m); }
+    toFloat64Array() { _geoBrand(this, DOMMatrixReadOnly); return Float64Array.from(this._m); }
+    toJSON() {
+      _geoBrand(this, DOMMatrixReadOnly); const m = this._m;
+      return { a: m[0], b: m[1], c: m[4], d: m[5], e: m[12], f: m[13],
+        m11: m[0], m12: m[1], m13: m[2], m14: m[3], m21: m[4], m22: m[5], m23: m[6], m24: m[7],
+        m31: m[8], m32: m[9], m33: m[10], m34: m[11], m41: m[12], m42: m[13], m43: m[14], m44: m[15],
+        is2D: this._is2D, isIdentity: this.isIdentity };
+    }
+    toString() {
+      _geoBrand(this, DOMMatrixReadOnly); const m = this._m;
+      return this._is2D
+        ? "matrix(" + [m[0], m[1], m[4], m[5], m[12], m[13]].join(", ") + ")"
+        : "matrix3d(" + m.join(", ") + ")";
+    }
+    get [Symbol.toStringTag]() { return 'DOMMatrixReadOnly'; }
+  }
+  // Axis-angle rotation (degrees) as a column-major 4×4.
+  function _rotAxis(x, y, z, deg) {
+    const len = Math.hypot(x, y, z);
+    if (len === 0) { if (deg === 0) return _matI(); x = 0; y = 0; z = 1; }
+    else { x /= len; y /= len; z /= len; }
+    const a = deg * _RAD, s = Math.sin(a), c = Math.cos(a), t = 1 - c;
+    // Row-major R[row][col]; convert to column-major _m[col*4+row].
+    const R = [
+      t*x*x + c,     t*x*y - s*z,   t*x*z + s*y,   0,
+      t*x*y + s*z,   t*y*y + c,     t*y*z - s*x,   0,
+      t*x*z - s*y,   t*y*z + s*x,   t*z*z + c,     0,
+      0, 0, 0, 1,
+    ];
+    const m = new Array(16);
+    for (let row = 0; row < 4; row++) for (let col = 0; col < 4; col++) m[col * 4 + row] = R[row * 4 + col];
+    return m;
+  }
+  function _matrixInitFromArray(arr) {
+    const a = Array.from(arr, Number);
+    if (a.length === 6) return { m11: a[0], m12: a[1], m21: a[2], m22: a[3], m41: a[4], m42: a[5], is2D: true };
+    if (a.length === 16) return { m11: a[0], m12: a[1], m13: a[2], m14: a[3], m21: a[4], m22: a[5], m23: a[6], m24: a[7], m31: a[8], m32: a[9], m33: a[10], m34: a[11], m41: a[12], m42: a[13], m43: a[14], m44: a[15], is2D: false };
+    throw new TypeError("Matrix init array must have 6 or 16 elements");
+  }
+
+  class DOMMatrix extends DOMMatrixReadOnly {
+    constructor(init = undefined) { super(init); }
+    static fromMatrix(other = {}) { return _domMatrixFromInit(other); }
+    static fromFloat32Array(a32) { if (arguments.length < 1) throw new TypeError("1 argument required"); return _domMatrixFromInit(_matrixInitFromArray(a32)); }
+    static fromFloat64Array(a64) { if (arguments.length < 1) throw new TypeError("1 argument required"); return _domMatrixFromInit(_matrixInitFromArray(a64)); }
+    // Mutable (inherit) attributes: get + set.
+    get a() { _geoBrand(this, DOMMatrix); return this._m[0]; } set a(v) { _geoBrand(this, DOMMatrix); this._m[0] = +v; }
+    get b() { _geoBrand(this, DOMMatrix); return this._m[1]; } set b(v) { _geoBrand(this, DOMMatrix); this._m[1] = +v; }
+    get c() { _geoBrand(this, DOMMatrix); return this._m[4]; } set c(v) { _geoBrand(this, DOMMatrix); this._m[4] = +v; }
+    get d() { _geoBrand(this, DOMMatrix); return this._m[5]; } set d(v) { _geoBrand(this, DOMMatrix); this._m[5] = +v; }
+    get e() { _geoBrand(this, DOMMatrix); return this._m[12]; } set e(v) { _geoBrand(this, DOMMatrix); this._m[12] = +v; }
+    get f() { _geoBrand(this, DOMMatrix); return this._m[13]; } set f(v) { _geoBrand(this, DOMMatrix); this._m[13] = +v; }
+    get m11() { _geoBrand(this, DOMMatrix); return this._m[0]; } set m11(v) { _geoBrand(this, DOMMatrix); this._m[0] = +v; }
+    get m12() { _geoBrand(this, DOMMatrix); return this._m[1]; } set m12(v) { _geoBrand(this, DOMMatrix); this._m[1] = +v; }
+    get m13() { _geoBrand(this, DOMMatrix); return this._m[2]; } set m13(v) { _geoBrand(this, DOMMatrix); this._m[2] = +v; if (+v !== 0) this._is2D = false; }
+    get m14() { _geoBrand(this, DOMMatrix); return this._m[3]; } set m14(v) { _geoBrand(this, DOMMatrix); this._m[3] = +v; if (+v !== 0) this._is2D = false; }
+    get m21() { _geoBrand(this, DOMMatrix); return this._m[4]; } set m21(v) { _geoBrand(this, DOMMatrix); this._m[4] = +v; }
+    get m22() { _geoBrand(this, DOMMatrix); return this._m[5]; } set m22(v) { _geoBrand(this, DOMMatrix); this._m[5] = +v; }
+    get m23() { _geoBrand(this, DOMMatrix); return this._m[6]; } set m23(v) { _geoBrand(this, DOMMatrix); this._m[6] = +v; if (+v !== 0) this._is2D = false; }
+    get m24() { _geoBrand(this, DOMMatrix); return this._m[7]; } set m24(v) { _geoBrand(this, DOMMatrix); this._m[7] = +v; if (+v !== 0) this._is2D = false; }
+    get m31() { _geoBrand(this, DOMMatrix); return this._m[8]; } set m31(v) { _geoBrand(this, DOMMatrix); this._m[8] = +v; if (+v !== 0) this._is2D = false; }
+    get m32() { _geoBrand(this, DOMMatrix); return this._m[9]; } set m32(v) { _geoBrand(this, DOMMatrix); this._m[9] = +v; if (+v !== 0) this._is2D = false; }
+    get m33() { _geoBrand(this, DOMMatrix); return this._m[10]; } set m33(v) { _geoBrand(this, DOMMatrix); this._m[10] = +v; if (+v !== 1) this._is2D = false; }
+    get m34() { _geoBrand(this, DOMMatrix); return this._m[11]; } set m34(v) { _geoBrand(this, DOMMatrix); this._m[11] = +v; if (+v !== 0) this._is2D = false; }
+    get m41() { _geoBrand(this, DOMMatrix); return this._m[12]; } set m41(v) { _geoBrand(this, DOMMatrix); this._m[12] = +v; }
+    get m42() { _geoBrand(this, DOMMatrix); return this._m[13]; } set m42(v) { _geoBrand(this, DOMMatrix); this._m[13] = +v; }
+    get m43() { _geoBrand(this, DOMMatrix); return this._m[14]; } set m43(v) { _geoBrand(this, DOMMatrix); this._m[14] = +v; if (+v !== 0) this._is2D = false; }
+    get m44() { _geoBrand(this, DOMMatrix); return this._m[15]; } set m44(v) { _geoBrand(this, DOMMatrix); this._m[15] = +v; if (+v !== 1) this._is2D = false; }
+    // Mutable transform methods — mutate in place and return this.
+    multiplySelf(other = {}) { _geoBrand(this, DOMMatrix); const O = _domMatrixFromInit(other); this._m = _matMul(this._m, O._m); this._is2D = this._is2D && O._is2D; return this; }
+    preMultiplySelf(other = {}) { _geoBrand(this, DOMMatrix); const O = _domMatrixFromInit(other); this._m = _matMul(O._m, this._m); this._is2D = this._is2D && O._is2D; return this; }
+    translateSelf(tx = 0, ty = 0, tz = 0) { _geoBrand(this, DOMMatrix); const r = this.translate(tx, ty, tz); this._m = r._m; this._is2D = r._is2D; return this; }
+    scaleSelf(scaleX = 1, scaleY, scaleZ = 1, originX = 0, originY = 0, originZ = 0) { _geoBrand(this, DOMMatrix); const r = this.scale(scaleX, scaleY, scaleZ, originX, originY, originZ); this._m = r._m; this._is2D = r._is2D; return this; }
+    scale3dSelf(scale = 1, originX = 0, originY = 0, originZ = 0) { _geoBrand(this, DOMMatrix); const r = this.scale3d(scale, originX, originY, originZ); this._m = r._m; this._is2D = r._is2D; return this; }
+    rotateSelf(rotX = 0, rotY, rotZ) { _geoBrand(this, DOMMatrix); const r = this.rotate(rotX, rotY, rotZ); this._m = r._m; this._is2D = r._is2D; return this; }
+    rotateFromVectorSelf(x = 0, y = 0) { _geoBrand(this, DOMMatrix); const r = this.rotateFromVector(x, y); this._m = r._m; this._is2D = r._is2D; return this; }
+    rotateAxisAngleSelf(x = 0, y = 0, z = 0, angle = 0) { _geoBrand(this, DOMMatrix); const r = this.rotateAxisAngle(x, y, z, angle); this._m = r._m; this._is2D = r._is2D; return this; }
+    skewXSelf(sx = 0) { _geoBrand(this, DOMMatrix); const r = this.skewX(sx); this._m = r._m; this._is2D = r._is2D; return this; }
+    skewYSelf(sy = 0) { _geoBrand(this, DOMMatrix); const r = this.skewY(sy); this._m = r._m; this._is2D = r._is2D; return this; }
+    invertSelf() { _geoBrand(this, DOMMatrix); const inv = _matInv(this._m); if (inv) { this._m = inv; } else { this._m = new Array(16).fill(NaN); this._is2D = false; } return this; }
+    setMatrixValue(transformList) { _geoBrand(this, DOMMatrix); if (arguments.length < 1) throw new TypeError("1 argument required"); this._setFromString(String(transformList)); return this; }
+    get [Symbol.toStringTag]() { return 'DOMMatrix'; }
+  }
+  const _MRO_ATTRS = ['a','b','c','d','e','f','m11','m12','m13','m14','m21','m22','m23','m24','m31','m32','m33','m34','m41','m42','m43','m44','is2D','isIdentity'];
+  const _MRO_OPS = ['translate','scale','scaleNonUniform','scale3d','rotate','rotateFromVector','rotateAxisAngle','skewX','skewY','multiply','flipX','flipY','inverse','transformPoint','toFloat32Array','toFloat64Array','toJSON','toString'];
+  _enumAccessors(DOMMatrixReadOnly.prototype, ..._MRO_ATTRS);
+  _enumAccessors(DOMMatrix.prototype, ..._MRO_ATTRS.slice(0, 22));   // a..m44 (is2D/isIdentity stay inherited readonly)
+  for (const op of _MRO_OPS) { const d = Object.getOwnPropertyDescriptor(DOMMatrixReadOnly.prototype, op); if (d) { d.enumerable = true; Object.defineProperty(DOMMatrixReadOnly.prototype, op, d); } }
+
+  // WebIDL operations + static operations are ENUMERABLE own props — ES class
+  // methods (instance & static) are non-enumerable, so re-stamp them.
+  _enumAccessors(DOMPointReadOnly.prototype, 'matrixTransform', 'toJSON');
+  _enumAccessors(DOMRectReadOnly.prototype, 'toJSON');
+  _enumAccessors(DOMQuad.prototype, 'getBounds', 'toJSON');
+  _enumAccessors(DOMMatrix.prototype, 'multiplySelf', 'preMultiplySelf', 'translateSelf', 'scaleSelf', 'scale3dSelf', 'rotateSelf', 'rotateFromVectorSelf', 'rotateAxisAngleSelf', 'skewXSelf', 'skewYSelf', 'invertSelf', 'setMatrixValue');
+  _enumAccessors(DOMPointReadOnly, 'fromPoint'); _enumAccessors(DOMPoint, 'fromPoint');
+  _enumAccessors(DOMRectReadOnly, 'fromRect'); _enumAccessors(DOMRect, 'fromRect');
+  _enumAccessors(DOMQuad, 'fromRect', 'fromQuad');
+  _enumAccessors(DOMMatrixReadOnly, 'fromMatrix', 'fromFloat32Array', 'fromFloat64Array');
+  _enumAccessors(DOMMatrix, 'fromMatrix', 'fromFloat32Array', 'fromFloat64Array');
+
+  // Expose interface objects (non-enumerable) + brand for isTrusted-style checks.
+  for (const [n, C] of Object.entries({ DOMPointReadOnly, DOMPoint, DOMRectReadOnly, DOMRect, DOMQuad, DOMRectList, DOMMatrixReadOnly, DOMMatrix })) {
+    _exposeIface(n, C); _markNative(C);
+  }
+  // LegacyWindowAlias: the SVG value types are the very same objects.
+  _exposeIface('SVGPoint', DOMPoint);
+  _exposeIface('SVGRect', DOMRect);
+  _exposeIface('SVGMatrix', DOMMatrix);
+  _exposeIface('WebKitCSSMatrix', DOMMatrix);
 }
 
 if (typeof Image === 'undefined') {
