@@ -25006,6 +25006,11 @@ const _cssParseRuleList = (cssText) => {
         // @counter-style <counter-style-name> { <declaration-list> } → CSSCounterStyleRule.
         // An invalid name makes the whole at-rule invalid → drop it (CSSOM).
         if (_isValidCounterStyleName(condition)) rules.push({ type: 'counter-style', name, condition, prelude, body });
+      } else if (name === 'view-transition') {
+        // @view-transition { navigation: auto|none; types: none | <custom-ident>+ } →
+        // CSSViewTransitionRule (css-view-transitions-2 §@view-transition). The rule takes
+        // NO prelude; a non-empty one makes the whole at-rule invalid → drop it.
+        if (condition === '') rules.push({ type: 'view-transition', name, prelude, body });
       } else if (name === 'layer') {
         // @layer <layer-name>? { <rule-list> } → CSSLayerBlockRule (the block form).
         // The name may be empty (an anonymous layer); a non-empty name must be a valid
@@ -27788,6 +27793,180 @@ _exposeIface('CSSCounterStyleRule', CSSCounterStyleRule);
 _enumAccessors(CSSCounterStyleRule.prototype, 'name', 'system', 'symbols', 'additiveSymbols',
   'negative', 'prefix', 'suffix', 'range', 'pad', 'speakAs', 'fallback');
 
+// ── CSS View Transitions (css-view-transitions-2) ─────────────────────────────
+// The `types` descriptor of `@view-transition` and the `types` option of
+// startViewTransition() are a `none | <custom-ident>+`. Parse a value into a list of
+// active <custom-ident> type names — [] for `none`, or null if the value is invalid
+// (→ ignore the descriptor). A type <custom-ident> can't be a CSS-wide keyword or `none`.
+const _VT_RESERVED_TYPE = /^(none|default|inherit|initial|unset|revert|revert-layer)$/i;
+const _parseViewTransitionTypes = (value) => {
+  const s = String(value == null ? '' : value).trim();
+  if (s === '') return null;
+  if (/^none$/i.test(s)) return [];
+  const parts = s.split(/\s+/);
+  const out = [];
+  for (const p of parts) {
+    if (_VT_RESERVED_TYPE.test(p)) return null;
+    // A <custom-ident>: an identifier (allowing a leading `-`, digits after the first
+    // char, and escapes). Reject anything that isn't ident-shaped.
+    if (!/^-?(?:[_a-zA-Z -￿]|\\.)(?:[-_a-zA-Z0-9 -￿]|\\.)*$/.test(p)) return null;
+    out.push(p);
+  }
+  return out.length ? out : null;
+};
+
+// CSSViewTransitionRule (css-view-transitions-2 §CSSViewTransitionRule) — a
+// `@view-transition` rule. `navigation` is the serialized `navigation` descriptor
+// (`auto | none`, initial `none`) and `types` a [SameObject] FrozenArray<CSSOMString>
+// of the `types` descriptor's <custom-ident>s (empty for `none`/absent). Both readonly.
+// `.type` is 0 (no legacy numbered CSSRule constant). Not author-constructible.
+class CSSViewTransitionRule extends CSSRule {
+  constructor(...args) {   // ...args → WebIDL interface-object .length 0 (not author-constructible)
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");
+    super();
+    const desc = args[0];
+    this._navigation = 'none'; this._navSet = false;
+    let types = [], typesSet = false;
+    for (const { name, value } of _fpvSplitDecls(desc && desc.body)) {
+      if (name === 'navigation') {
+        const v = String(value || '').trim().toLowerCase();
+        if (v === 'auto' || v === 'none') { this._navigation = v; this._navSet = true; }
+      } else if (name === 'types') {
+        const t = _parseViewTransitionTypes(value);
+        if (t !== null) { types = t; typesSet = true; }
+      }
+    }
+    this._typesSet = typesSet;
+    // [SameObject]: freeze once so every read returns the identical FrozenArray object.
+    this._types = Object.freeze(types);
+  }
+  get type() { if (!(this instanceof CSSViewTransitionRule)) throw new TypeError("Illegal invocation"); return 0; }
+  get navigation() { if (!(this instanceof CSSViewTransitionRule)) throw new TypeError("Illegal invocation"); return this._navigation; }
+  get types() { if (!(this instanceof CSSViewTransitionRule)) throw new TypeError("Illegal invocation"); return this._types; }
+  get cssText() {
+    const parts = [];
+    if (this._navSet) parts.push('navigation: ' + this._navigation + ';');
+    if (this._typesSet) parts.push('types: ' + (this._types.length ? this._types.join(' ') : 'none') + ';');
+    return '@view-transition {' + (parts.length ? ' ' + parts.join(' ') + ' ' : ' ') + '}';
+  }
+  get [Symbol.toStringTag]() { return 'CSSViewTransitionRule'; }
+}
+_exposeIface('CSSViewTransitionRule', CSSViewTransitionRule);
+_enumAccessors(CSSViewTransitionRule.prototype, 'navigation', 'types', 'type');
+
+// ViewTransitionTypeSet (css-view-transitions-2) — the live `setlike<DOMString>` behind
+// ViewTransition.types. Backed by a real Set (`this._s`); every member is brand-checked
+// and re-stamped enumerable, and @@iterator is the SAME function object as values()
+// (setlike's default iterator yields values, not entries).
+let _allowVttsCtor = false;
+const _vttsBrand = (o) => { if (!(o instanceof ViewTransitionTypeSet)) throw new TypeError("Illegal invocation"); };
+class ViewTransitionTypeSet {
+  constructor(...args) {
+    if (!_allowVttsCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    this._s = new Set();
+  }
+  get size() { _vttsBrand(this); return this._s.size; }
+  has(value) { _vttsBrand(this); return this._s.has(String(value)); }
+  entries() { _vttsBrand(this); return this._s.entries(); }
+  keys() { _vttsBrand(this); return this._s.keys(); }
+  values() { _vttsBrand(this); return this._s.values(); }
+  forEach(callback, ...rest) { _vttsBrand(this); this._s.forEach((v) => callback.call(rest[0], v, v, this)); }
+  add(value) { _vttsBrand(this); this._s.add(String(value)); return this; }
+  delete(value) { _vttsBrand(this); return this._s.delete(String(value)); }
+  clear() { _vttsBrand(this); this._s.clear(); }
+  get [Symbol.toStringTag]() { return 'ViewTransitionTypeSet'; }
+}
+_enumAccessors(ViewTransitionTypeSet.prototype,
+  'size', 'has', 'entries', 'keys', 'values', 'forEach', 'add', 'delete', 'clear');
+Object.defineProperty(ViewTransitionTypeSet.prototype, Symbol.iterator,
+  { value: ViewTransitionTypeSet.prototype.values, writable: true, configurable: true });
+_exposeIface('ViewTransitionTypeSet', ViewTransitionTypeSet);
+const _makeViewTransitionTypeSet = (initial) => {
+  const prev = _allowVttsCtor; _allowVttsCtor = true;
+  let s; try { s = new ViewTransitionTypeSet(); } finally { _allowVttsCtor = prev; }
+  for (const t of (initial || [])) s.add(t);
+  return s;
+};
+
+// ViewTransition (css-view-transitions-2 §ViewTransition) — the object returned by
+// {Document,Element}.startViewTransition(). We do not run a real animated transition,
+// so the update callback (if any) is invoked and the three lifecycle promises resolve
+// immediately. Not author-constructible. `types` is a [SameObject] ViewTransitionTypeSet
+// (built lazily, then cached) and `transitionRoot` the transition's root Element.
+let _allowViewTransitionCtor = false;
+const _vtBrand = (o) => { if (!(o instanceof ViewTransition)) throw new TypeError("Illegal invocation"); };
+class ViewTransition {
+  constructor(...args) {
+    if (!_allowViewTransitionCtor) throw new TypeError("Illegal constructor");   // not author-constructible
+    this._updateCallbackDone = Promise.resolve(undefined);
+    this._ready = Promise.resolve(undefined);
+    this._finished = Promise.resolve(undefined);
+    this._initialTypes = [];
+    this._typesObj = null;
+    this._root = null;
+    this._skipped = false;
+  }
+  // Per WebIDL, a Promise-returning attribute getter must not throw on a brand-check
+  // failure — it returns a REJECTED promise instead (idlharness reads these on the bare
+  // prototype and expects a rejected promise, not a synchronous TypeError).
+  get updateCallbackDone() { if (!(this instanceof ViewTransition)) return Promise.reject(new TypeError("Illegal invocation")); return this._updateCallbackDone; }
+  get ready() { if (!(this instanceof ViewTransition)) return Promise.reject(new TypeError("Illegal invocation")); return this._ready; }
+  get finished() { if (!(this instanceof ViewTransition)) return Promise.reject(new TypeError("Illegal invocation")); return this._finished; }
+  skipTransition() { _vtBrand(this); this._skipped = true; }
+  get types() {   // [SameObject] — build once, then return the identical set object
+    _vtBrand(this);
+    if (!this._typesObj) this._typesObj = _makeViewTransitionTypeSet(this._initialTypes);
+    return this._typesObj;
+  }
+  get transitionRoot() { _vtBrand(this); return this._root; }
+  waitUntil(promise) {
+    _vtBrand(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'waitUntil' on 'ViewTransition': 1 argument required, but only 0 present.");
+    return undefined;
+  }
+  get [Symbol.toStringTag]() { return 'ViewTransition'; }
+}
+_exposeIface('ViewTransition', ViewTransition);
+_enumAccessors(ViewTransition.prototype,
+  'updateCallbackDone', 'ready', 'finished', 'skipTransition', 'types', 'transitionRoot', 'waitUntil');
+
+// {Document,Element}.startViewTransition(callbackOptions) → a ViewTransition. The optional
+// argument is either a ViewTransitionUpdateCallback (a function) or a
+// StartViewTransitionOptions dictionary ({ update, types }). We invoke the update callback
+// (so the author's DOM mutations apply) and hand back a ViewTransition whose promises are
+// already resolved. `.length` is 0 (the sole argument is optional).
+const _startViewTransition = function startViewTransition(...args) {
+  if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+  const callbackOptions = args[0];
+  let cb = null, types = [];
+  if (typeof callbackOptions === 'function') {
+    cb = callbackOptions;
+  } else if (callbackOptions && typeof callbackOptions === 'object') {
+    if (typeof callbackOptions.update === 'function') cb = callbackOptions.update;
+    if (Array.isArray(callbackOptions.types)) types = callbackOptions.types.map((t) => String(t));
+  }
+  const prev = _allowViewTransitionCtor; _allowViewTransitionCtor = true;
+  let vt; try { vt = new ViewTransition(); } finally { _allowViewTransitionCtor = prev; }
+  vt._initialTypes = types;
+  // transitionRoot: the document element for a document-scoped transition, else the
+  // element the call was made on (Element.startViewTransition).
+  vt._root = (this instanceof Document) ? (this.documentElement || null) : this;
+  if (cb) { try { Promise.resolve(cb.call(undefined)); } catch (e) { /* callback errors reject updateCallbackDone in the full model */ } }
+  return vt;
+};
+// activeViewTransition: the active ViewTransition, or null. We complete transitions
+// synchronously (no long-lived active transition), so this is always null.
+const _activeViewTransitionGetter = _named('get', 'activeViewTransition', function () {
+  if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+  return null;
+});
+for (const _VTHost of [Document, Element]) {
+  Object.defineProperty(_VTHost.prototype, 'startViewTransition',
+    { value: _startViewTransition, writable: true, enumerable: true, configurable: true });
+  Object.defineProperty(_VTHost.prototype, 'activeViewTransition',
+    { get: _activeViewTransitionGetter, enumerable: true, configurable: true });
+}
+
 const _makeRule = (desc, parentSheet, parentRule) => {
   let rule;
   if (desc.type === 'nested-decls') {
@@ -27835,6 +28014,13 @@ const _makeRule = (desc, parentSheet, parentRule) => {
   if (desc.type === 'counter-style') {
     _allowCssCondCtor = true;
     try { rule = new CSSCounterStyleRule(desc); } finally { _allowCssCondCtor = false; }
+    rule._parentStyleSheet = parentSheet || null;
+    rule._parentRule = parentRule || null;
+    return rule;
+  }
+  if (desc.type === 'view-transition') {
+    _allowCssCondCtor = true;   // internal build of a non-author-constructible rule
+    try { rule = new CSSViewTransitionRule(desc); } finally { _allowCssCondCtor = false; }
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
