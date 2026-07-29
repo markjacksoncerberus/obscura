@@ -34823,6 +34823,7 @@ const _defSvgIface = (name, baseName, tag) => {
   ['SVGFEMergeElement', 'SVGElement', 'femerge'],
   ['SVGFEMergeNodeElement', 'SVGElement', 'femergenode'],
   ['SVGFEMorphologyElement', 'SVGElement', 'femorphology'],
+  ['SVGFEOffsetElement', 'SVGElement', 'feoffset'],
   ['SVGFESpecularLightingElement', 'SVGElement', 'fespecularlighting'],
   ['SVGFETileElement', 'SVGElement', 'fetile'],
   ['SVGFETurbulenceElement', 'SVGElement', 'feturbulence'],
@@ -35282,6 +35283,113 @@ Object.defineProperty(_sp('SVGAElement'), 'relList', { enumerable: true, configu
   // [PutForwards=value]: `a.relList = "x"` forwards to `a.relList.value = "x"`.
   set: _named('set', 'relList', function(v) { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); (this._svgRelList ??= _makeTokenList(this, 'rel')).value = v; }) });
 _svgInstallHyperlinkUtils(_sp('SVGAElement'));
+
+// ── filter effects: SVGFilterElement + the fe* primitive family (filter-effects.idl) ──
+// Each fe* element reflects its animated attributes; most include the
+// SVGFilterPrimitiveStandardAttributes mixin (x/y/width/height + result). The constant
+// sets (blend modes, composite operators, edge modes, …) seed on interface + prototype.
+// All interfaces already exist from the SVG 2 hierarchy — this is one reflection table each.
+{
+  const _len = globalThis.SVGAnimatedLength, _enum = globalThis.SVGAnimatedEnumeration,
+    _str = globalThis.SVGAnimatedString, _num = globalThis.SVGAnimatedNumber,
+    _int = globalThis.SVGAnimatedInteger, _bool = globalThis.SVGAnimatedBoolean,
+    _numList = globalThis.SVGAnimatedNumberList, _par = globalThis.SVGAnimatedPreserveAspectRatio;
+  // SVGFilterPrimitiveStandardAttributes mixin: x/y/width/height (len) + result (str).
+  const _std = (proto) => _svgReflect(proto, { x: _len, y: _len, width: _len, height: _len, result: _str });
+  const _EDGEMODE = { SVG_EDGEMODE_UNKNOWN:0, SVG_EDGEMODE_DUPLICATE:1, SVG_EDGEMODE_WRAP:2, SVG_EDGEMODE_NONE:3 };
+
+  // SVGFilterElement (+ SVGURIReference href).
+  _svgReflect(_sp('SVGFilterElement'), { filterUnits: _enum, primitiveUnits: _enum,
+    x: _len, y: _len, width: _len, height: _len, href: _str });
+
+  // SVGFEBlendElement (+ standard attrs + blend-mode constants).
+  _svgReflect(_sp('SVGFEBlendElement'), { in1: _str, in2: _str, mode: _enum }); _std(_sp('SVGFEBlendElement'));
+  _svgSeedConsts(globalThis.SVGFEBlendElement, { SVG_FEBLEND_MODE_UNKNOWN:0, SVG_FEBLEND_MODE_NORMAL:1,
+    SVG_FEBLEND_MODE_MULTIPLY:2, SVG_FEBLEND_MODE_SCREEN:3, SVG_FEBLEND_MODE_DARKEN:4, SVG_FEBLEND_MODE_LIGHTEN:5,
+    SVG_FEBLEND_MODE_OVERLAY:6, SVG_FEBLEND_MODE_COLOR_DODGE:7, SVG_FEBLEND_MODE_COLOR_BURN:8, SVG_FEBLEND_MODE_HARD_LIGHT:9,
+    SVG_FEBLEND_MODE_SOFT_LIGHT:10, SVG_FEBLEND_MODE_DIFFERENCE:11, SVG_FEBLEND_MODE_EXCLUSION:12, SVG_FEBLEND_MODE_HUE:13,
+    SVG_FEBLEND_MODE_SATURATION:14, SVG_FEBLEND_MODE_COLOR:15, SVG_FEBLEND_MODE_LUMINOSITY:16 });
+
+  // SVGFEColorMatrixElement (+ standard attrs + type constants).
+  _svgReflect(_sp('SVGFEColorMatrixElement'), { in1: _str, type: _enum, values: _numList }); _std(_sp('SVGFEColorMatrixElement'));
+  _svgSeedConsts(globalThis.SVGFEColorMatrixElement, { SVG_FECOLORMATRIX_TYPE_UNKNOWN:0, SVG_FECOLORMATRIX_TYPE_MATRIX:1,
+    SVG_FECOLORMATRIX_TYPE_SATURATE:2, SVG_FECOLORMATRIX_TYPE_HUEROTATE:3, SVG_FECOLORMATRIX_TYPE_LUMINANCETOALPHA:4 });
+
+  // SVGFEComponentTransferElement (+ standard attrs).
+  _svgReflect(_sp('SVGFEComponentTransferElement'), { in1: _str }); _std(_sp('SVGFEComponentTransferElement'));
+
+  // SVGComponentTransferFunctionElement base (the feFunc{R,G,B,A} elements inherit it).
+  _svgReflect(_sp('SVGComponentTransferFunctionElement'), { type: _enum, tableValues: _numList,
+    slope: _num, intercept: _num, amplitude: _num, exponent: _num, offset: _num });
+  _svgSeedConsts(globalThis.SVGComponentTransferFunctionElement, { SVG_FECOMPONENTTRANSFER_TYPE_UNKNOWN:0,
+    SVG_FECOMPONENTTRANSFER_TYPE_IDENTITY:1, SVG_FECOMPONENTTRANSFER_TYPE_TABLE:2, SVG_FECOMPONENTTRANSFER_TYPE_DISCRETE:3,
+    SVG_FECOMPONENTTRANSFER_TYPE_LINEAR:4, SVG_FECOMPONENTTRANSFER_TYPE_GAMMA:5 });
+
+  // SVGFECompositeElement (+ standard attrs + operator constants).
+  _svgReflect(_sp('SVGFECompositeElement'), { in1: _str, in2: _str, operator: _enum, k1: _num, k2: _num, k3: _num, k4: _num }); _std(_sp('SVGFECompositeElement'));
+  _svgSeedConsts(globalThis.SVGFECompositeElement, { SVG_FECOMPOSITE_OPERATOR_UNKNOWN:0, SVG_FECOMPOSITE_OPERATOR_OVER:1,
+    SVG_FECOMPOSITE_OPERATOR_IN:2, SVG_FECOMPOSITE_OPERATOR_OUT:3, SVG_FECOMPOSITE_OPERATOR_ATOP:4,
+    SVG_FECOMPOSITE_OPERATOR_XOR:5, SVG_FECOMPOSITE_OPERATOR_ARITHMETIC:6 });
+
+  // SVGFEConvolveMatrixElement (+ standard attrs + edge-mode constants).
+  _svgReflect(_sp('SVGFEConvolveMatrixElement'), { in1: _str, orderX: _int, orderY: _int, kernelMatrix: _numList,
+    divisor: _num, bias: _num, targetX: _int, targetY: _int, edgeMode: _enum,
+    kernelUnitLengthX: _num, kernelUnitLengthY: _num, preserveAlpha: _bool }); _std(_sp('SVGFEConvolveMatrixElement'));
+  _svgSeedConsts(globalThis.SVGFEConvolveMatrixElement, _EDGEMODE);
+
+  // SVGFEDiffuseLightingElement (+ standard attrs).
+  _svgReflect(_sp('SVGFEDiffuseLightingElement'), { in1: _str, surfaceScale: _num, diffuseConstant: _num,
+    kernelUnitLengthX: _num, kernelUnitLengthY: _num }); _std(_sp('SVGFEDiffuseLightingElement'));
+
+  // Light-source elements (no standard-attributes mixin).
+  _svgReflect(_sp('SVGFEDistantLightElement'), { azimuth: _num, elevation: _num });
+  _svgReflect(_sp('SVGFEPointLightElement'), { x: _num, y: _num, z: _num });
+  _svgReflect(_sp('SVGFESpotLightElement'), { x: _num, y: _num, z: _num, pointsAtX: _num, pointsAtY: _num,
+    pointsAtZ: _num, specularExponent: _num, limitingConeAngle: _num });
+
+  // SVGFEDisplacementMapElement (+ standard attrs + channel-selector constants).
+  _svgReflect(_sp('SVGFEDisplacementMapElement'), { in1: _str, in2: _str, scale: _num, xChannelSelector: _enum, yChannelSelector: _enum }); _std(_sp('SVGFEDisplacementMapElement'));
+  _svgSeedConsts(globalThis.SVGFEDisplacementMapElement, { SVG_CHANNEL_UNKNOWN:0, SVG_CHANNEL_R:1, SVG_CHANNEL_G:2, SVG_CHANNEL_B:3, SVG_CHANNEL_A:4 });
+
+  // SVGFEDropShadowElement (+ standard attrs + setStdDeviation).
+  _svgReflect(_sp('SVGFEDropShadowElement'), { in1: _str, dx: _num, dy: _num, stdDeviationX: _num, stdDeviationY: _num }); _std(_sp('SVGFEDropShadowElement'));
+  _svgDefElemOp(_sp('SVGFEDropShadowElement'), 'setStdDeviation', 2, function() {});
+
+  // SVGFEFloodElement (only standard attrs).
+  _std(_sp('SVGFEFloodElement'));
+
+  // SVGFEGaussianBlurElement (+ standard attrs + edge-mode constants + setStdDeviation).
+  _svgReflect(_sp('SVGFEGaussianBlurElement'), { in1: _str, stdDeviationX: _num, stdDeviationY: _num, edgeMode: _enum }); _std(_sp('SVGFEGaussianBlurElement'));
+  _svgSeedConsts(globalThis.SVGFEGaussianBlurElement, _EDGEMODE);
+  _svgDefElemOp(_sp('SVGFEGaussianBlurElement'), 'setStdDeviation', 2, function() {});
+
+  // SVGFEImageElement (+ standard attrs + SVGURIReference href; crossOrigin is SVGAnimatedString here).
+  _svgReflect(_sp('SVGFEImageElement'), { preserveAspectRatio: _par, crossOrigin: _str, href: _str }); _std(_sp('SVGFEImageElement'));
+
+  // SVGFEMergeElement (only standard attrs); SVGFEMergeNodeElement (no mixin, just in1).
+  _std(_sp('SVGFEMergeElement'));
+  _svgReflect(_sp('SVGFEMergeNodeElement'), { in1: _str });
+
+  // SVGFEMorphologyElement (+ standard attrs + operator constants).
+  _svgReflect(_sp('SVGFEMorphologyElement'), { in1: _str, operator: _enum, radiusX: _num, radiusY: _num }); _std(_sp('SVGFEMorphologyElement'));
+  _svgSeedConsts(globalThis.SVGFEMorphologyElement, { SVG_MORPHOLOGY_OPERATOR_UNKNOWN:0, SVG_MORPHOLOGY_OPERATOR_ERODE:1, SVG_MORPHOLOGY_OPERATOR_DILATE:2 });
+
+  // SVGFEOffsetElement (+ standard attrs).
+  _svgReflect(_sp('SVGFEOffsetElement'), { in1: _str, dx: _num, dy: _num }); _std(_sp('SVGFEOffsetElement'));
+
+  // SVGFESpecularLightingElement (+ standard attrs).
+  _svgReflect(_sp('SVGFESpecularLightingElement'), { in1: _str, surfaceScale: _num, specularConstant: _num,
+    specularExponent: _num, kernelUnitLengthX: _num, kernelUnitLengthY: _num }); _std(_sp('SVGFESpecularLightingElement'));
+
+  // SVGFETileElement (+ standard attrs).
+  _svgReflect(_sp('SVGFETileElement'), { in1: _str }); _std(_sp('SVGFETileElement'));
+
+  // SVGFETurbulenceElement (+ standard attrs + turbulence/stitch constants).
+  _svgReflect(_sp('SVGFETurbulenceElement'), { baseFrequencyX: _num, baseFrequencyY: _num, numOctaves: _int,
+    seed: _num, stitchTiles: _enum, type: _enum }); _std(_sp('SVGFETurbulenceElement'));
+  _svgSeedConsts(globalThis.SVGFETurbulenceElement, { SVG_TURBULENCE_TYPE_UNKNOWN:0, SVG_TURBULENCE_TYPE_FRACTALNOISE:1,
+    SVG_TURBULENCE_TYPE_TURBULENCE:2, SVG_STITCHTYPE_UNKNOWN:0, SVG_STITCHTYPE_STITCH:1, SVG_STITCHTYPE_NOSTITCH:2 });
+}
 
 // ── the animation family (targetElement + SVGTests + onbegin/onend/onrepeat + ops) ──
 _svgNullAttr(_sp('SVGAnimationElement'), 'targetElement');
