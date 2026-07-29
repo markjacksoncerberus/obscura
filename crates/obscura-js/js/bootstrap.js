@@ -6455,9 +6455,13 @@ class Document extends Node {
       'popstateevent': PopStateEvent,
       'animationevent': AnimationEvent,
       'transitionevent': TransitionEvent,
+      'timeevent': TimeEvent,
     };
     const Cls = map[String(type || '').toLowerCase()] || Event;
-    const e = new Cls('');
+    let e;
+    // TimeEvent is non-author-constructible; createEvent flips its ctor guard to mint one.
+    if (Cls === TimeEvent) { _allowTimeEventCtor = true; try { e = new Cls(''); } finally { _allowTimeEventCtor = false; } }
+    else e = new Cls('');
     e._initialized = false; // createEvent yields an uninitialized event (needs initEvent)
     return e;
   }
@@ -34565,13 +34569,22 @@ function _cvReflLong(proto, prop, attr) {
 // Element.prototype (the GlobalEventHandlers test asserts the handlers live on
 // HTMLElement/SVGElement/Document/window but NOT on Element). SVG-namespace elements
 // created via createElementNS are wrapped with this class (see createElementNS).
-globalThis.SVGElement = class SVGElement extends Element {};
+// `...args` guarded constructor: the wrap path always passes a numeric nid (see
+// `new C(nid)`), so subclasses' super(nid) and createElementNS work, while author
+// `new SVGElement()` throws "Illegal constructor" and the interface object's length is 0.
+globalThis.SVGElement = class SVGElement extends Element {
+  constructor(...args) { const nid = args[0]; if (typeof nid !== 'number') throw new TypeError("Illegal constructor"); super(nid); }
+  get [Symbol.toStringTag]() { return 'SVGElement'; }
+};
 globalThis.SVGSVGElement = class SVGSVGElement extends globalThis.SVGElement {};
 // SVGStyleElement (SVG) carries the LinkStyle `sheet` mixin (its .sheet is the parsed
 // CSSStyleSheet, like <style>). MathMLElement (mathml-core) exists as an interface so
 // idlharness's ElementCSSInlineStyle `style` checks find it; both are dependency IDLs
 // tested only for presence + member shape here.
-globalThis.SVGStyleElement = class SVGStyleElement extends globalThis.SVGElement {};
+globalThis.SVGStyleElement = class SVGStyleElement extends globalThis.SVGElement {
+  constructor(...args) { const nid = args[0]; if (typeof nid !== 'number') throw new TypeError("Illegal constructor"); super(nid); }
+  get [Symbol.toStringTag]() { return 'SVGStyleElement'; }
+};
 globalThis.MathMLElement = class MathMLElement extends Element {};
 _markNative(globalThis.SVGElement); _markNative(globalThis.SVGSVGElement);
 _markNative(globalThis.SVGStyleElement); _markNative(globalThis.MathMLElement);
@@ -34630,13 +34643,14 @@ class SVGTransformList {
   constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._items = []; }
   get length() { _svgBrand(this, SVGTransformList); return this._items.length; }
   get numberOfItems() { _svgBrand(this, SVGTransformList); return this._items.length; }
+  get [Symbol.toStringTag]() { return 'SVGTransformList'; }
   clear() { _svgBrand(this, SVGTransformList); this._items.length = 0; }
-  getItem(i) { _svgBrand(this, SVGTransformList); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items[i]; }
-  initialize(item) { _svgBrand(this, SVGTransformList); this._items = [item]; return item; }
-  insertItemBefore(item, i) { _svgBrand(this, SVGTransformList); this._items.splice(i >>> 0, 0, item); return item; }
-  replaceItem(item, i) { _svgBrand(this, SVGTransformList); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); this._items[i] = item; return item; }
-  removeItem(i) { _svgBrand(this, SVGTransformList); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items.splice(i, 1)[0]; }
-  appendItem(item) { _svgBrand(this, SVGTransformList); this._items.push(item); return item; }
+  getItem(i) { _svgBrand(this, SVGTransformList); if (arguments.length < 1) throw new TypeError("1 argument required"); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items[i]; }
+  initialize(item) { _svgBrand(this, SVGTransformList); if (arguments.length < 1) throw new TypeError("1 argument required"); this._items = [item]; return item; }
+  insertItemBefore(item, i) { _svgBrand(this, SVGTransformList); if (arguments.length < 2) throw new TypeError("2 arguments required"); this._items.splice(i >>> 0, 0, item); return item; }
+  replaceItem(item, i) { _svgBrand(this, SVGTransformList); if (arguments.length < 2) throw new TypeError("2 arguments required"); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); this._items[i] = item; return item; }
+  removeItem(i) { _svgBrand(this, SVGTransformList); if (arguments.length < 1) throw new TypeError("1 argument required"); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items.splice(i, 1)[0]; }
+  appendItem(item) { _svgBrand(this, SVGTransformList); if (arguments.length < 1) throw new TypeError("1 argument required"); this._items.push(item); return item; }
 }
 
 // SVGAnimatedEnumeration — an animatable <enumeration> attribute (an unsigned short
@@ -34889,13 +34903,14 @@ const _defSvgList = (name) => {
     constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._items = []; }
     get length() { _svgBrand(this, C); return this._items.length; }
     get numberOfItems() { _svgBrand(this, C); return this._items.length; }
+    get [Symbol.toStringTag]() { return name; }
     clear() { _svgBrand(this, C); this._items.length = 0; }
-    initialize(item) { _svgBrand(this, C); this._items = [item]; return item; }
-    getItem(i) { _svgBrand(this, C); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items[i]; }
-    insertItemBefore(item, i) { _svgBrand(this, C); this._items.splice(i >>> 0, 0, item); return item; }
-    replaceItem(item, i) { _svgBrand(this, C); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); this._items[i] = item; return item; }
-    removeItem(i) { _svgBrand(this, C); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items.splice(i, 1)[0]; }
-    appendItem(item) { _svgBrand(this, C); this._items.push(item); return item; }
+    initialize(item) { _svgBrand(this, C); if (arguments.length < 1) throw new TypeError("1 argument required"); this._items = [item]; return item; }
+    getItem(i) { _svgBrand(this, C); if (arguments.length < 1) throw new TypeError("1 argument required"); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items[i]; }
+    insertItemBefore(item, i) { _svgBrand(this, C); if (arguments.length < 2) throw new TypeError("2 arguments required"); this._items.splice(i >>> 0, 0, item); return item; }
+    replaceItem(item, i) { _svgBrand(this, C); if (arguments.length < 2) throw new TypeError("2 arguments required"); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); this._items[i] = item; return item; }
+    removeItem(i) { _svgBrand(this, C); if (arguments.length < 1) throw new TypeError("1 argument required"); i = i >>> 0; if (i >= this._items.length) throw new DOMException("Index out of bounds", "IndexSizeError"); return this._items.splice(i, 1)[0]; }
+    appendItem(item) { _svgBrand(this, C); if (arguments.length < 1) throw new TypeError("1 argument required"); this._items.push(item); return item; }
   } }[name];
   _exposeIface(name, C); _markNative(C);
   _enumAccessors(C.prototype, 'length', 'numberOfItems', 'clear', 'initialize', 'getItem', 'insertItemBefore', 'replaceItem', 'removeItem', 'appendItem');
@@ -34967,6 +34982,380 @@ _enumAccessors(SVGPreserveAspectRatio.prototype, 'align', 'meetOrSlice');
   seed(SVGUnitTypes, { SVG_UNIT_TYPE_UNKNOWN:0, SVG_UNIT_TYPE_USERSPACEONUSE:1, SVG_UNIT_TYPE_OBJECTBOUNDINGBOX:2 });
 }
 // ─── end SVG value + animated-wrapper primitive types ───────────────────────
+
+// ─── SVG per-element attribute reflection (SVG 2 §5–§10) ────────────────────
+// Every SVG element interface now exists (the hierarchy above); this pass gives each its
+// animatable ATTRIBUTES — the [SameObject] SVGAnimated* getters — plus the value type
+// SVGTransform and the element OPERATIONS (getBBox / createSVG* / the text-content query
+// methods, …). Each animated getter is `_nid`-branded (reading it on the bare prototype
+// throws, per WebIDL) and caches its wrapper on the element (SameObject: identity-stable
+// across reads). The wrappers/ops are inert — Obscura doesn't animate SVG geometry or lay
+// SVG out — but they are spec-shaped and correctly typed, which is exactly what the SVG
+// idlharness verifies (member existence, prototype location, value type, operation arity).
+
+// SVGTransform — a single transform (an item of an SVGTransformList; the return of
+// createSVGTransform). Freshly minted as an identity SVG_TRANSFORM_MATRIX.
+class SVGTransform {
+  constructor() { if (!_allowSvgCtor) throw new TypeError("Illegal constructor"); this._type = 1; this._angle = 0; this._matrix = new globalThis.DOMMatrix(); }
+  get type() { _svgBrand(this, SVGTransform); return this._type; }
+  get matrix() { _svgBrand(this, SVGTransform); return this._matrix; }
+  get angle() { _svgBrand(this, SVGTransform); return this._angle; }
+  setMatrix() { _svgBrand(this, SVGTransform); this._type = 1; }   // .length 0 (optional matrix)
+  setTranslate(tx, ty) { _svgBrand(this, SVGTransform); if (arguments.length < 2) throw new TypeError("2 arguments required"); this._type = 2; this._angle = 0; }
+  setScale(sx, sy) { _svgBrand(this, SVGTransform); if (arguments.length < 2) throw new TypeError("2 arguments required"); this._type = 3; this._angle = 0; }
+  setRotate(a, cx, cy) { _svgBrand(this, SVGTransform); if (arguments.length < 3) throw new TypeError("3 arguments required"); this._type = 4; this._angle = +a || 0; }
+  setSkewX(a) { _svgBrand(this, SVGTransform); if (arguments.length < 1) throw new TypeError("1 argument required"); this._type = 5; this._angle = +a || 0; }
+  setSkewY(a) { _svgBrand(this, SVGTransform); if (arguments.length < 1) throw new TypeError("1 argument required"); this._type = 6; this._angle = +a || 0; }
+  get [Symbol.toStringTag]() { return 'SVGTransform'; }
+}
+_exposeIface('SVGTransform', SVGTransform); _markNative(SVGTransform);
+_enumAccessors(SVGTransform.prototype, 'type', 'matrix', 'angle', 'setMatrix', 'setTranslate', 'setScale', 'setRotate', 'setSkewX', 'setSkewY');
+
+// Seed WebIDL constants onto BOTH an interface object and its prototype.
+const _svgSeedConsts = (C, K) => { for (const [n, v] of Object.entries(K)) {
+  Object.defineProperty(C, n, { value: v, enumerable: true, configurable: false, writable: false });
+  Object.defineProperty(C.prototype, n, { value: v, enumerable: true, configurable: false, writable: false });
+} };
+_svgSeedConsts(SVGTransform, { SVG_TRANSFORM_UNKNOWN:0, SVG_TRANSFORM_MATRIX:1, SVG_TRANSFORM_TRANSLATE:2,
+  SVG_TRANSFORM_SCALE:3, SVG_TRANSFORM_ROTATE:4, SVG_TRANSFORM_SKEWX:5, SVG_TRANSFORM_SKEWY:6 });
+
+// Define an operation with an exact name + WebIDL arity (required-arg count) on a prototype.
+const _svgDefOp = (proto, name, length, fn) => {
+  Object.defineProperty(fn, 'name', { value: name, configurable: true });
+  Object.defineProperty(fn, 'length', { value: length, configurable: true });
+  Object.defineProperty(proto, name, { value: fn, writable: true, enumerable: true, configurable: true });
+};
+// Element operation: `_nid`-brands `this` first (idlharness invokes every operation with
+// `this = null` and expects a TypeError), then enforces WebIDL arity (a call with fewer
+// than `length` required args must throw TypeError), then delegates.
+const _svgDefElemOp = (proto, name, length, fn) => {
+  _svgDefOp(proto, name, length, function(...a) {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+    if (a.length < length) throw new TypeError(length + " argument" + (length === 1 ? "" : "s") + " required, but only " + a.length + " present");
+    return fn.apply(this, a);
+  });
+};
+// SVGTransformList's two non-common ops (getItem etc. already exist from its class).
+_svgDefOp(SVGTransformList.prototype, 'createSVGTransformFromMatrix', 0, function() { _svgBrand(this, SVGTransformList); return _newSvg(SVGTransform); });
+_svgDefOp(SVGTransformList.prototype, 'consolidate', 0, function() { _svgBrand(this, SVGTransformList); return this._items.length ? this._items[0] : null; });
+
+// [SameObject] animated-attribute reflection. `spec` maps each IDL attribute name to its
+// wrapper class; the getter lazily mints (via _newSvg) and caches the wrapper on the
+// element (`_svg$name` slot), so every read returns the same object.
+const _svgReflect = (proto, spec) => {
+  for (const [name, WrapperC] of Object.entries(spec)) {
+    const slot = '_svg$' + name;
+    const get = _named('get', name, function() {
+      if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+      return this[slot] ??= _newSvg(WrapperC);
+    });
+    Object.defineProperty(proto, name, { get, enumerable: true, configurable: true });
+  }
+};
+// Reflected DOMString attributes (content-attribute get/set): `spec` maps IDL name → the
+// content-attribute name. `_nid`-branded like every SVG accessor.
+const _svgReflectStr = (proto, spec) => {
+  for (const [name, attr] of Object.entries(spec)) {
+    Object.defineProperty(proto, name, { enumerable: true, configurable: true,
+      get: _named('get', name, function() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return this.getAttribute(attr) || ''; }),
+      set: _named('set', name, function(v) { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); this.setAttribute(attr, v == null ? '' : String(v)); }),
+    });
+  }
+};
+// A readonly nullable interface attribute that is currently inert (no live target/instance
+// tree). Returns null — spec-legal for a detached/absent reference — and `_nid`-branded.
+const _svgNullAttr = (proto, ...names) => {
+  for (const name of names) {
+    const get = _named('get', name, function() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return null; });
+    Object.defineProperty(proto, name, { get, enumerable: true, configurable: true });
+  }
+};
+// Single-element event-handler IDL accessors (SVGAnimationElement's onbegin/onend/onrepeat
+// aren't GlobalEventHandlers, so `_ehDefineOnProto`'s name set doesn't carry them). Reuses
+// the shared `_eh*` machinery; the `_nid` brand comes from `_ehResolveThis(this,false)`.
+const _svgDefEventHandlers = (proto, names) => {
+  for (const name of names) {
+    Object.defineProperty(proto, name, { configurable: true, enumerable: true,
+      get: _named('get', name, function() { return _ehCurrentValue(_ehResolveThis(this, false), name); }),
+      set: _named('set', name, function(v) {
+        const t = _ehResolveThis(this, false);
+        if (typeof v === 'function' || (v !== null && typeof v === 'object')) { t['__eh_' + name] = v; _ehActivate(t, name); }
+        else { t['__eh_' + name] = null; }
+      }),
+    });
+  }
+};
+const _sp = n => globalThis[n].prototype;
+const _emptyNodeList = () => globalThis.document.createDocumentFragment().childNodes;
+// crossOrigin: nullable enumerated DOMString reflecting `crossorigin`
+// ({anonymous, use-credentials}; missing default null, invalid default "anonymous").
+const _svgReflectCrossOrigin = (proto) => {
+  Object.defineProperty(proto, 'crossOrigin', { enumerable: true, configurable: true,
+    get: _named('get', 'crossOrigin', function() {
+      if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+      const v = this.getAttribute('crossorigin');
+      if (v === null) return null;
+      return v.toLowerCase() === 'use-credentials' ? 'use-credentials' : 'anonymous';
+    }),
+    set: _named('set', 'crossOrigin', function(v) {
+      if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+      if (v == null) this.removeAttribute('crossorigin'); else this.setAttribute('crossorigin', String(v));
+    }) });
+};
+// HTMLHyperlinkElementUtils (SVGAElement inlines all except href): the URL-component
+// accessors over the element's `href` content attribute resolved against the document
+// base. Inert on parse failure (empty string / no-op). Values are USVString → string.
+const _svgHrefURL = function(el) {
+  try {
+    const h = el.getAttribute('href');
+    return new URL(h == null ? '' : h, (el.ownerDocument && el.ownerDocument.baseURI) || undefined);
+  } catch (e) { return null; }
+};
+const _svgInstallHyperlinkUtils = (proto) => {
+  const ro = { origin: u => u.origin };
+  const rw = { protocol: 'protocol', username: 'username', password: 'password', host: 'host',
+    hostname: 'hostname', port: 'port', pathname: 'pathname', search: 'search', hash: 'hash' };
+  for (const [name, get] of Object.entries(ro)) {
+    Object.defineProperty(proto, name, { enumerable: true, configurable: true,
+      get: _named('get', name, function() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); const u = _svgHrefURL(this); return u ? get(u) : ''; }) });
+  }
+  for (const [name, comp] of Object.entries(rw)) {
+    Object.defineProperty(proto, name, { enumerable: true, configurable: true,
+      get: _named('get', name, function() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); const u = _svgHrefURL(this); return u ? u[comp] : ''; }),
+      set: _named('set', name, function(v) { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); const u = _svgHrefURL(this); if (!u) return; try { u[comp] = String(v); this.setAttribute('href', u.href); } catch (e) {} }) });
+  }
+};
+
+// The base SVGElement / SVGStyleElement interface objects were exposed by early plain
+// assignment (enumerable) with a parent-inherited constructor length; WebIDL wants a
+// non-enumerable global with a 0-length interface object (non-author-constructible).
+for (const n of ['SVGElement', 'SVGStyleElement']) {
+  const C = globalThis[n];
+  _exposeIface(n, C);
+  try { Object.defineProperty(C, 'length', { value: 0, configurable: true }); } catch (e) {}
+}
+
+// ── SVGElement base: className (SVGAnimatedString) + ownerSVGElement/viewportElement ──
+_svgReflect(_sp('SVGElement'), { className: globalThis.SVGAnimatedString });
+{
+  // The nearest ancestor <svg> that establishes the viewport (null for the outermost svg
+  // and for a detached element). ownerSVGElement and viewportElement share this walk — but
+  // each needs its OWN function object (`_named` renames in place, so a shared fn would end
+  // up named for whichever was stamped last).
+  const nearestSvg = () => function() {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+    let p = this.parentNode;
+    while (p && p.nodeType === 1) { if (p instanceof globalThis.SVGSVGElement) return p; p = p.parentNode; }
+    return null;
+  };
+  Object.defineProperty(_sp('SVGElement'), 'ownerSVGElement', { get: _named('get', 'ownerSVGElement', nearestSvg()), enumerable: true, configurable: true });
+  Object.defineProperty(_sp('SVGElement'), 'viewportElement', { get: _named('get', 'viewportElement', nearestSvg()), enumerable: true, configurable: true });
+}
+
+// ── SVGGraphicsElement (+ SVGTests mixin) ──
+_svgReflect(_sp('SVGGraphicsElement'), { transform: SVGAnimatedTransformList,
+  requiredExtensions: SVGStringList, systemLanguage: SVGStringList });
+_svgDefElemOp(_sp('SVGGraphicsElement'), 'getBBox', 0, function() { return new globalThis.DOMRect(); });
+_svgDefElemOp(_sp('SVGGraphicsElement'), 'getCTM', 0, function() { return new globalThis.DOMMatrix(); });
+_svgDefElemOp(_sp('SVGGraphicsElement'), 'getScreenCTM', 0, function() { return new globalThis.DOMMatrix(); });
+
+// ── SVGGeometryElement ──
+_svgReflect(_sp('SVGGeometryElement'), { pathLength: globalThis.SVGAnimatedNumber });
+_svgDefElemOp(_sp('SVGGeometryElement'), 'isPointInFill', 0, function() { return false; });
+_svgDefElemOp(_sp('SVGGeometryElement'), 'isPointInStroke', 0, function() { return false; });
+_svgDefElemOp(_sp('SVGGeometryElement'), 'getTotalLength', 0, function() { return 0; });
+_svgDefElemOp(_sp('SVGGeometryElement'), 'getPointAtLength', 1, function() { return new globalThis.DOMPoint(); });
+
+// ── SVGTextContentElement (+ constants + query ops) ──
+_svgReflect(_sp('SVGTextContentElement'), { textLength: SVGAnimatedLength, lengthAdjust: SVGAnimatedEnumeration });
+_svgSeedConsts(globalThis.SVGTextContentElement, { LENGTHADJUST_UNKNOWN:0, LENGTHADJUST_SPACING:1, LENGTHADJUST_SPACINGANDGLYPHS:2 });
+_svgDefElemOp(_sp('SVGTextContentElement'), 'getNumberOfChars', 0, function() { return 0; });
+_svgDefElemOp(_sp('SVGTextContentElement'), 'getComputedTextLength', 0, function() { return 0; });
+_svgDefElemOp(_sp('SVGTextContentElement'), 'getSubStringLength', 2, function() { return 0; });
+_svgDefElemOp(_sp('SVGTextContentElement'), 'getStartPositionOfChar', 1, function() { return new globalThis.DOMPoint(); });
+_svgDefElemOp(_sp('SVGTextContentElement'), 'getEndPositionOfChar', 1, function() { return new globalThis.DOMPoint(); });
+_svgDefElemOp(_sp('SVGTextContentElement'), 'getExtentOfChar', 1, function() { return new globalThis.DOMRect(); });
+_svgDefElemOp(_sp('SVGTextContentElement'), 'getRotationOfChar', 1, function() { return 0; });
+_svgDefElemOp(_sp('SVGTextContentElement'), 'getCharNumAtPosition', 0, function() { return -1; });
+_svgDefElemOp(_sp('SVGTextContentElement'), 'selectSubString', 2, function() {});
+
+// ── SVGTextPositioningElement ──
+_svgReflect(_sp('SVGTextPositioningElement'), { x: globalThis.SVGAnimatedLengthList, y: globalThis.SVGAnimatedLengthList,
+  dx: globalThis.SVGAnimatedLengthList, dy: globalThis.SVGAnimatedLengthList, rotate: globalThis.SVGAnimatedNumberList });
+
+// ── SVGSVGElement (x/y/width/height + SVGFitToViewBox + currentScale/currentTranslate + the ops) ──
+_svgReflect(_sp('SVGSVGElement'), { x: SVGAnimatedLength, y: SVGAnimatedLength, width: SVGAnimatedLength, height: SVGAnimatedLength,
+  viewBox: globalThis.SVGAnimatedRect, preserveAspectRatio: globalThis.SVGAnimatedPreserveAspectRatio });
+Object.defineProperty(_sp('SVGSVGElement'), 'currentScale', { enumerable: true, configurable: true,
+  get: _named('get', 'currentScale', function() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return this._currentScale ?? 1; }),
+  set: _named('set', 'currentScale', function(v) { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); this._currentScale = +v || 0; }) });
+Object.defineProperty(_sp('SVGSVGElement'), 'currentTranslate', { enumerable: true, configurable: true,
+  get: _named('get', 'currentTranslate', function() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return this._currentTranslate ??= new globalThis.DOMPoint(); }) });
+_svgDefElemOp(_sp('SVGSVGElement'), 'getIntersectionList', 2, function() { return _emptyNodeList(); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'getEnclosureList', 2, function() { return _emptyNodeList(); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'checkIntersection', 2, function() { return false; });
+_svgDefElemOp(_sp('SVGSVGElement'), 'checkEnclosure', 2, function() { return false; });
+_svgDefElemOp(_sp('SVGSVGElement'), 'deselectAll', 0, function() {});
+_svgDefElemOp(_sp('SVGSVGElement'), 'createSVGNumber', 0, function() { return _newSvg(SVGNumber); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'createSVGLength', 0, function() { return _newSvg(SVGLength); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'createSVGAngle', 0, function() { return _newSvg(SVGAngle); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'createSVGPoint', 0, function() { return new globalThis.DOMPoint(); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'createSVGMatrix', 0, function() { return new globalThis.DOMMatrix(); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'createSVGRect', 0, function() { return new globalThis.DOMRect(); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'createSVGTransform', 0, function() { return _newSvg(SVGTransform); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'createSVGTransformFromMatrix', 0, function() { return _newSvg(SVGTransform); });
+_svgDefElemOp(_sp('SVGSVGElement'), 'getElementById', 1, function(id) { id = String(id); for (const e of this.querySelectorAll('*')) if (e.id === id) return e; return null; });
+_svgDefElemOp(_sp('SVGSVGElement'), 'suspendRedraw', 1, function() { return 0; });
+_svgDefElemOp(_sp('SVGSVGElement'), 'unsuspendRedraw', 1, function() {});
+_svgDefElemOp(_sp('SVGSVGElement'), 'unsuspendRedrawAll', 0, function() {});
+_svgDefElemOp(_sp('SVGSVGElement'), 'forceRedraw', 0, function() {});
+_svgDefElemOp(_sp('SVGSVGElement'), 'pauseAnimations', 0, function() {});
+_svgDefElemOp(_sp('SVGSVGElement'), 'unpauseAnimations', 0, function() {});
+_svgDefElemOp(_sp('SVGSVGElement'), 'animationsPaused', 0, function() { return false; });
+_svgDefElemOp(_sp('SVGSVGElement'), 'getCurrentTime', 0, function() { return 0; });
+_svgDefElemOp(_sp('SVGSVGElement'), 'setCurrentTime', 1, function() {});
+
+// ── geometry elements ──
+_svgReflect(_sp('SVGRectElement'), { x: SVGAnimatedLength, y: SVGAnimatedLength, width: SVGAnimatedLength, height: SVGAnimatedLength, rx: SVGAnimatedLength, ry: SVGAnimatedLength });
+_svgReflect(_sp('SVGCircleElement'), { cx: SVGAnimatedLength, cy: SVGAnimatedLength, r: SVGAnimatedLength });
+_svgReflect(_sp('SVGEllipseElement'), { cx: SVGAnimatedLength, cy: SVGAnimatedLength, rx: SVGAnimatedLength, ry: SVGAnimatedLength });
+_svgReflect(_sp('SVGLineElement'), { x1: SVGAnimatedLength, y1: SVGAnimatedLength, x2: SVGAnimatedLength, y2: SVGAnimatedLength });
+// SVGAnimatedPoints mixin (polyline / polygon): points + animatedPoints ([SameObject] SVGPointList).
+_svgReflect(_sp('SVGPolylineElement'), { points: SVGPointList, animatedPoints: SVGPointList });
+_svgReflect(_sp('SVGPolygonElement'), { points: SVGPointList, animatedPoints: SVGPointList });
+
+// ── image / foreignObject / use ──
+_svgReflect(_sp('SVGImageElement'), { x: SVGAnimatedLength, y: SVGAnimatedLength, width: SVGAnimatedLength, height: SVGAnimatedLength,
+  preserveAspectRatio: globalThis.SVGAnimatedPreserveAspectRatio, href: globalThis.SVGAnimatedString });
+_svgReflectCrossOrigin(_sp('SVGImageElement'));
+_svgReflect(_sp('SVGForeignObjectElement'), { x: SVGAnimatedLength, y: SVGAnimatedLength, width: SVGAnimatedLength, height: SVGAnimatedLength });
+_svgReflect(_sp('SVGUseElement'), { x: SVGAnimatedLength, y: SVGAnimatedLength, width: SVGAnimatedLength, height: SVGAnimatedLength, href: globalThis.SVGAnimatedString });
+_svgNullAttr(_sp('SVGUseElement'), 'instanceRoot', 'animatedInstanceRoot');
+
+// ── marker (+ SVGFitToViewBox + constants + orient ops) ──
+_svgReflect(_sp('SVGMarkerElement'), { refX: SVGAnimatedLength, refY: SVGAnimatedLength, markerUnits: SVGAnimatedEnumeration,
+  markerWidth: SVGAnimatedLength, markerHeight: SVGAnimatedLength, orientType: SVGAnimatedEnumeration, orientAngle: globalThis.SVGAnimatedAngle,
+  viewBox: globalThis.SVGAnimatedRect, preserveAspectRatio: globalThis.SVGAnimatedPreserveAspectRatio });
+_svgReflectStr(_sp('SVGMarkerElement'), { orient: 'orient' });
+_svgSeedConsts(globalThis.SVGMarkerElement, { SVG_MARKERUNITS_UNKNOWN:0, SVG_MARKERUNITS_USERSPACEONUSE:1, SVG_MARKERUNITS_STROKEWIDTH:2,
+  SVG_MARKER_ORIENT_UNKNOWN:0, SVG_MARKER_ORIENT_AUTO:1, SVG_MARKER_ORIENT_ANGLE:2, SVG_MARKER_ORIENT_AUTO_START_REVERSE:3 });
+_svgDefElemOp(_sp('SVGMarkerElement'), 'setOrientToAuto', 0, function() {});
+_svgDefElemOp(_sp('SVGMarkerElement'), 'setOrientToAngle', 1, function() {});
+
+// ── gradients (+ SVGURIReference + spread-method constants) ──
+_svgReflect(_sp('SVGGradientElement'), { gradientUnits: SVGAnimatedEnumeration, gradientTransform: SVGAnimatedTransformList,
+  spreadMethod: SVGAnimatedEnumeration, href: globalThis.SVGAnimatedString });
+_svgSeedConsts(globalThis.SVGGradientElement, { SVG_SPREADMETHOD_UNKNOWN:0, SVG_SPREADMETHOD_PAD:1, SVG_SPREADMETHOD_REFLECT:2, SVG_SPREADMETHOD_REPEAT:3 });
+_svgReflect(_sp('SVGLinearGradientElement'), { x1: SVGAnimatedLength, y1: SVGAnimatedLength, x2: SVGAnimatedLength, y2: SVGAnimatedLength });
+_svgReflect(_sp('SVGRadialGradientElement'), { cx: SVGAnimatedLength, cy: SVGAnimatedLength, r: SVGAnimatedLength, fx: SVGAnimatedLength, fy: SVGAnimatedLength, fr: SVGAnimatedLength });
+_svgReflect(_sp('SVGStopElement'), { offset: globalThis.SVGAnimatedNumber });
+
+// ── pattern (+ SVGFitToViewBox + SVGURIReference) / symbol / view ──
+_svgReflect(_sp('SVGPatternElement'), { patternUnits: SVGAnimatedEnumeration, patternContentUnits: SVGAnimatedEnumeration,
+  patternTransform: SVGAnimatedTransformList, x: SVGAnimatedLength, y: SVGAnimatedLength, width: SVGAnimatedLength, height: SVGAnimatedLength,
+  viewBox: globalThis.SVGAnimatedRect, preserveAspectRatio: globalThis.SVGAnimatedPreserveAspectRatio, href: globalThis.SVGAnimatedString });
+_svgReflect(_sp('SVGSymbolElement'), { viewBox: globalThis.SVGAnimatedRect, preserveAspectRatio: globalThis.SVGAnimatedPreserveAspectRatio });
+_svgReflect(_sp('SVGViewElement'), { viewBox: globalThis.SVGAnimatedRect, preserveAspectRatio: globalThis.SVGAnimatedPreserveAspectRatio });
+
+// ── textPath (+ SVGURIReference + constants) ──
+_svgReflect(_sp('SVGTextPathElement'), { startOffset: SVGAnimatedLength, method: SVGAnimatedEnumeration, spacing: SVGAnimatedEnumeration, href: globalThis.SVGAnimatedString });
+_svgSeedConsts(globalThis.SVGTextPathElement, { TEXTPATH_METHODTYPE_UNKNOWN:0, TEXTPATH_METHODTYPE_ALIGN:1, TEXTPATH_METHODTYPE_STRETCH:2,
+  TEXTPATH_SPACINGTYPE_UNKNOWN:0, TEXTPATH_SPACINGTYPE_AUTO:1, TEXTPATH_SPACINGTYPE_EXACT:2 });
+
+// ── script / style (reflected DOMString + SVGURIReference / LinkStyle) ──
+_svgReflectStr(_sp('SVGScriptElement'), { type: 'type' });
+_svgReflect(_sp('SVGScriptElement'), { href: globalThis.SVGAnimatedString });
+_svgReflectCrossOrigin(_sp('SVGScriptElement'));
+_svgReflectStr(_sp('SVGStyleElement'), { type: 'type', media: 'media', title: 'title' });
+Object.defineProperty(_sp('SVGStyleElement'), 'disabled', { enumerable: true, configurable: true,
+  get: _named('get', 'disabled', function() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return !!this._svgStyleDisabled; }),
+  set: _named('set', 'disabled', function(v) { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); this._svgStyleDisabled = !!v; }) });
+
+// ── SVGMPathElement (SVGURIReference) ──
+_svgReflect(_sp('SVGMPathElement'), { href: globalThis.SVGAnimatedString });
+
+// ── SVGAElement (target + reflected attrs + relList + SVGURIReference + HTMLHyperlinkElementUtils) ──
+_svgReflect(_sp('SVGAElement'), { target: globalThis.SVGAnimatedString, href: globalThis.SVGAnimatedString });
+_svgReflectStr(_sp('SVGAElement'), { download: 'download', ping: 'ping', rel: 'rel', hreflang: 'hreflang', type: 'type', referrerPolicy: 'referrerpolicy' });
+Object.defineProperty(_sp('SVGAElement'), 'relList', { enumerable: true, configurable: true,
+  get: _named('get', 'relList', function() { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); return this._svgRelList ??= _makeTokenList(this, 'rel'); }),
+  // [PutForwards=value]: `a.relList = "x"` forwards to `a.relList.value = "x"`.
+  set: _named('set', 'relList', function(v) { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); (this._svgRelList ??= _makeTokenList(this, 'rel')).value = v; }) });
+_svgInstallHyperlinkUtils(_sp('SVGAElement'));
+
+// ── the animation family (targetElement + SVGTests + onbegin/onend/onrepeat + ops) ──
+_svgNullAttr(_sp('SVGAnimationElement'), 'targetElement');
+_svgReflect(_sp('SVGAnimationElement'), { requiredExtensions: SVGStringList, systemLanguage: SVGStringList });
+_svgDefEventHandlers(_sp('SVGAnimationElement'), ['onbegin', 'onend', 'onrepeat']);
+_svgDefElemOp(_sp('SVGAnimationElement'), 'getStartTime', 0, function() { return 0; });
+_svgDefElemOp(_sp('SVGAnimationElement'), 'getCurrentTime', 0, function() { return 0; });
+_svgDefElemOp(_sp('SVGAnimationElement'), 'getSimpleDuration', 0, function() { return 0; });
+_svgDefElemOp(_sp('SVGAnimationElement'), 'beginElement', 0, function() {});
+_svgDefElemOp(_sp('SVGAnimationElement'), 'beginElementAt', 1, function() {});
+_svgDefElemOp(_sp('SVGAnimationElement'), 'endElement', 0, function() {});
+_svgDefElemOp(_sp('SVGAnimationElement'), 'endElementAt', 1, function() {});
+
+// ── Document.rootElement (SVG root of a standalone SVG document, else null) ──
+Object.defineProperty(Document.prototype, 'rootElement', { enumerable: true, configurable: true,
+  get: _named('get', 'rootElement', function() {
+    if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
+    const de = this.documentElement;
+    return (de && de instanceof globalThis.SVGSVGElement) ? de : null;
+  }) });
+// ── Symbol.toStringTag on the value / list / animated types (so a wrapper stringifies to
+// its own [object SVGxxx], not [object Object] — the idlharness class-string check). The
+// list interfaces already carry it (their class bodies); this covers the value + animated
+// wrapper types defined as plain classes without one. ──
+for (const n of ['SVGNumber', 'SVGLength', 'SVGAngle', 'SVGRect', 'SVGPoint', 'SVGMatrix', 'SVGPreserveAspectRatio',
+  'SVGAnimatedEnumeration', 'SVGAnimatedLength', 'SVGAnimatedTransformList', 'SVGAnimatedString', 'SVGAnimatedNumber',
+  'SVGAnimatedInteger', 'SVGAnimatedBoolean', 'SVGAnimatedRect', 'SVGAnimatedAngle', 'SVGAnimatedPreserveAspectRatio',
+  'SVGAnimatedLengthList', 'SVGAnimatedNumberList']) {
+  const C = globalThis[n];
+  if (C && !Object.getOwnPropertyDescriptor(C.prototype, Symbol.toStringTag))
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: n, configurable: true });
+}
+
+// SVGAnimatedRect.baseVal is a DOMRect (not the generic SVGRect the factory minted). The
+// animVal is a DOMRectReadOnly, which Obscura's Geometry-Interfaces subset doesn't expose
+// yet, so that one subtest is a genuine dependency cap; baseVal returns a real DOMRect.
+{
+  const AR = globalThis.SVGAnimatedRect, slot = '_svgRectBase';
+  const rect = function() { _svgBrand(this, AR); return this[slot] ??= new globalThis.DOMRect(); };
+  Object.defineProperty(AR.prototype, 'baseVal', { enumerable: true, configurable: true, get: _named('get', 'baseVal', rect) });
+  Object.defineProperty(AR.prototype, 'animVal', { enumerable: true, configurable: true, get: _named('get', 'animVal', function() { _svgBrand(this, AR); return this[slot] ??= new globalThis.DOMRect(); }) });
+}
+
+// ── TimeEvent (SVG animations) — a legacy Event subclass (created via createEvent, not a
+// [Constructor]; author `new TimeEvent()` throws — guarded by `_allowTimeEventCtor`, which
+// createEvent flips). ──
+let _allowTimeEventCtor = false;
+class TimeEvent extends Event {
+  constructor(...args) { if (!_allowTimeEventCtor) throw new TypeError("Illegal constructor");
+    const t = args[0], o = args[1] == null ? {} : args[1]; super(t, o); this._detail = o.detail != null ? (o.detail | 0) : 0; this._view = o.view != null ? o.view : null; }
+  get view() { if (!(this instanceof TimeEvent)) throw new TypeError("Illegal invocation"); return this._view; }
+  get detail() { if (!(this instanceof TimeEvent)) throw new TypeError("Illegal invocation"); return this._detail; }
+  initTimeEvent(typeArg, viewArg = null, detailArg = 0) {
+    if (!(this instanceof TimeEvent)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1) throw new TypeError("1 argument required");
+    this._view = viewArg != null ? viewArg : null; this._detail = detailArg | 0;
+  }
+  get [Symbol.toStringTag]() { return 'TimeEvent'; }
+}
+_exposeIface('TimeEvent', TimeEvent); _markNative(TimeEvent);
+// No [Constructor] in the IDL — the interface object's length is 0 (built via createEvent).
+Object.defineProperty(TimeEvent, 'length', { value: 0, configurable: true });
+_enumAccessors(TimeEvent.prototype, 'view', 'detail', 'initTimeEvent');
+
+// ── SVGUseElementShadowRoot — the shadow root a <use> instantiates (ShadowRoot subclass;
+// non-author-constructible). Obscura doesn't build the use-element shadow tree, so no live
+// instance exists — this carries the interface identity idlharness checks for. ──
+class SVGUseElementShadowRoot extends ShadowRoot {
+  constructor(...args) { const nid = args[0]; if (typeof nid !== 'number') throw new TypeError("Illegal constructor"); super(nid); }
+  get [Symbol.toStringTag]() { return 'SVGUseElementShadowRoot'; }
+}
+_exposeIface('SVGUseElementShadowRoot', SVGUseElementShadowRoot); _markNative(SVGUseElementShadowRoot);
+// ─── end SVG per-element attribute reflection ───────────────────────────────
+
 // ─── end SVG animated-attribute primitives ──────────────────────────────────
 
 // ElementCSSInlineStyle mixin: `style` must be an OWN enumerable accessor on EACH host
