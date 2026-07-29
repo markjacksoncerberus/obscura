@@ -299,6 +299,9 @@ const _EH_HANDLER_NAMES = ('onabort onauxclick onbeforeinput onbeforematch ' +
   'onplay onplaying onprogress onratechange onreset onresize onscroll onscrollend ' +
   'onsecuritypolicyviolation onseeked onseeking onselect onslotchange onstalled ' +
   'onsubmit onsuspend ontimeupdate ontoggle onvolumechange onwaiting ' +
+  // css-animations-1 / css-transitions-1 GlobalEventHandlers additions.
+  'onanimationstart onanimationiteration onanimationend onanimationcancel ' +
+  'ontransitionrun ontransitionstart ontransitionend ontransitioncancel ' +
   'onwebkitanimationend onwebkitanimationiteration onwebkitanimationstart ' +
   'onwebkittransitionend onwheel').split(' ');
 const _EH_ATTR_SET = new Set(_EH_HANDLER_NAMES);
@@ -494,23 +497,40 @@ const _installBodyWinReflectAccessors = function(proto) {
     });
   }
 };
+// Resolve+validate the `this` of an event-handler IDL accessor, or throw TypeError per
+// WebIDL ("If O is not a platform object that implements I … throw a TypeError", which
+// idlharness asserts via `desc.get.call({})` / the prototype-read test). A real node host
+// carries a numeric `_nid` — the interface prototype (HTMLElement.prototype etc.) does NOT,
+// even though `proto instanceof Node` is true, so `instanceof` can't brand these; `_nid`
+// can. On the global, WebIDL's [Global] rule maps a null/undefined `this` to the global
+// (`getter.call(undefined)` must return the global's value, not throw); `{}` still throws.
+const _ehResolveThis = (t, isGlobal) => {
+  if (isGlobal) { if (t == null) return globalThis; if (t === globalThis) return t; throw new TypeError("Illegal invocation"); }
+  if (t != null && typeof t._nid === 'number') return t;
+  throw new TypeError("Illegal invocation");
+};
 // Install the on* IDL accessors on a prototype (HTMLElement / SVGElement / Document /
-// — for the names it is still missing — window). Skips a name already carrying its
-// own accessor so bespoke definitions (window's __winon_ set, CloseWatcher) win.
-const _ehDefineOnProto = function(proto) {
+// — for the names it is still missing — window; isGlobal true only for the last). Skips a
+// name already carrying its own accessor so bespoke definitions (window's __winon_ set,
+// CloseWatcher) win. The get/set are name-stamped ("get onclick" / "set onclick") and
+// brand-throw on a wrong `this` — both WebIDL conformance requirements idlharness checks.
+const _ehDefineOnProto = function(proto, isGlobal) {
   for (const name of _EH_HANDLER_NAMES) {
     if (Object.getOwnPropertyDescriptor(proto, name)) continue;
     Object.defineProperty(proto, name, {
       configurable: true, enumerable: true,
-      get() { return _ehCurrentValue(this, name); },
-      set(v) {
+      get: _named('get', name, function() {
+        return _ehCurrentValue(_ehResolveThis(this, isGlobal), name);
+      }),
+      set: _named('set', name, function(v) {
+        const t = _ehResolveThis(this, isGlobal);
         if (typeof v === 'function' || (v !== null && typeof v === 'object')) {
-          this['__eh_' + name] = v;
-          _ehActivate(this, name);
+          t['__eh_' + name] = v;
+          _ehActivate(t, name);
         } else {
-          this['__eh_' + name] = null;
+          t['__eh_' + name] = null;
         }
-      },
+      }),
     });
   }
 };
@@ -26788,20 +26808,22 @@ _enumAccessors(CSSImportRule.prototype, 'href', 'media', 'styleSheet', 'layerNam
 // (the authored declaration text, or null when absent). `.type` is 0 — @property
 // is not one of the legacy numbered CSSRule types. Invalid rules never reach here
 // (they are dropped in _cssParseRuleList / _validatePropertyRule).
+const _propBrand = (o) => { if (!(o instanceof CSSPropertyRule)) throw new TypeError("Illegal invocation"); };
 class CSSPropertyRule extends CSSRule {
-  constructor(desc) {
+  constructor(...args) {   // ...args → WebIDL interface-object .length 0 (not author-constructible)
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");
     super();
-    const p = desc._prop;
+    const p = args[0]._prop;
     this._name = p.name;
     this._syntax = p.syntaxValue;
     this._inherits = p.inherits;
     this._initialValue = p.initialValue;
   }
   get type() { return 0; }
-  get name() { return this._name; }
-  get syntax() { return this._syntax; }
-  get inherits() { return this._inherits; }
-  get initialValue() { return this._initialValue; }
+  get name() { _propBrand(this); return this._name; }
+  get syntax() { _propBrand(this); return this._syntax; }
+  get inherits() { _propBrand(this); return this._inherits; }
+  get initialValue() { _propBrand(this); return this._initialValue; }
   get cssText() {
     let out = '@property ' + _serializeCssIdent(this._name) + ' { ';
     out += 'syntax: ' + _serCssString(this._syntax) + '; ';
@@ -26809,8 +26831,10 @@ class CSSPropertyRule extends CSSRule {
     if (this._initialValue !== null) out += 'initial-value: ' + this._initialValue + '; ';
     return out + '}';
   }
+  get [Symbol.toStringTag]() { return 'CSSPropertyRule'; }
 }
-globalThis.CSSPropertyRule = CSSPropertyRule;
+_exposeIface('CSSPropertyRule', CSSPropertyRule);
+_enumAccessors(CSSPropertyRule.prototype, 'name', 'syntax', 'inherits', 'initialValue');
 
 // A style rule whose prelude is not a valid selector list fails to parse, so
 // inserting it throws SyntaxError (CSSOM §insert-a-css-rule step 5: "If parsed
@@ -27393,32 +27417,41 @@ const _parseKeyframeBlocks = (cssText) => {
   }
   return out;
 };
+const _kfBrand = (o) => { if (!(o instanceof CSSKeyframeRule)) throw new TypeError("Illegal invocation"); };
 class CSSKeyframeRule extends CSSRule {
-  constructor(keyText, body) {
+  constructor(...args) {   // ...args → WebIDL interface-object .length 0 (not author-constructible)
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");
     super();
+    const keyText = args[0], body = args[1];
     this._keyText = String(keyText == null ? '' : keyText).trim();
     this._styleDecl = _styleProxy(_newStyleDecl());
     if (body) this._styleDecl.cssText = body;
   }
   get type() { return 8; }
-  get keyText() { return this._keyText; }
-  set keyText(v) { this._keyText = String(v).trim(); }
-  get style() { return this._styleDecl; }
-  set style(v) { this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
+  get keyText() { _kfBrand(this); return this._keyText; }
+  set keyText(v) { _kfBrand(this); this._keyText = String(v).trim(); }
+  get style() { _kfBrand(this); return this._styleDecl; }
+  set style(v) { _kfBrand(this); this._styleDecl.cssText = String(v == null ? '' : v); }   // [PutForwards=cssText]
   get cssText() {
     const b = this._styleDecl.cssText;
     return this._keyText + ' { ' + (b ? b + ' ' : '') + '}';
   }
+  get [Symbol.toStringTag]() { return 'CSSKeyframeRule'; }
 }
-globalThis.CSSKeyframeRule = CSSKeyframeRule;
+_exposeIface('CSSKeyframeRule', CSSKeyframeRule);
+_enumAccessors(CSSKeyframeRule.prototype, 'keyText', 'style');
 const _kfRule = (desc, parent) => {
-  const r = new CSSKeyframeRule(desc.selectorText, desc.body);
+  const prev = _allowCssCondCtor; _allowCssCondCtor = true;   // internal build (not author-constructible)
+  let r; try { r = new CSSKeyframeRule(desc.selectorText, desc.body); } finally { _allowCssCondCtor = prev; }
   r._parentRule = parent;
   return r;
 };
+const _kfsBrand = (o) => { if (!(o instanceof CSSKeyframesRule)) throw new TypeError("Illegal invocation"); };
 class CSSKeyframesRule extends CSSRule {
-  constructor(desc) {
+  constructor(...args) {   // ...args → WebIDL interface-object .length 0 (not author-constructible)
+    if (!_allowCssCondCtor) throw new TypeError("Illegal constructor");
     super();
+    const desc = args[0];
     this._name = String((desc && desc.condition) || '').trim();
     this._ruleListObj = _newRuleList();
     this._ruleList = _ruleListProxy(this._ruleListObj);
@@ -27427,20 +27460,26 @@ class CSSKeyframesRule extends CSSRule {
     }
   }
   get type() { return 7; }
-  get name() { return this._name; }
-  set name(v) { this._name = String(v); }
-  get cssRules() { return this._ruleList; }
-  get length() { return this._ruleListObj._rules.length; }
+  get name() { _kfsBrand(this); return this._name; }
+  set name(v) { _kfsBrand(this); this._name = String(v); }
+  get cssRules() { _kfsBrand(this); return this._ruleList; }
+  get length() { _kfsBrand(this); return this._ruleListObj._rules.length; }
   appendRule(text) {
+    _kfsBrand(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'appendRule' on 'CSSKeyframesRule': 1 argument required, but only 0 present.");
     for (const d of _parseKeyframeBlocks(text)) this._ruleListObj._rules.push(_kfRule(d, this));
   }
   findRule(select) {
+    _kfsBrand(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'findRule' on 'CSSKeyframesRule': 1 argument required, but only 0 present.");
     const key = String(select).trim();
     const arr = this._ruleListObj._rules;
     for (let i = arr.length - 1; i >= 0; i--) if (arr[i]._keyText === key) return arr[i];   // last match wins
     return null;
   }
   deleteRule(select) {
+    _kfsBrand(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'deleteRule' on 'CSSKeyframesRule': 1 argument required, but only 0 present.");
     const key = String(select).trim();
     const arr = this._ruleListObj._rules;
     for (let i = arr.length - 1; i >= 0; i--) if (arr[i]._keyText === key) { arr.splice(i, 1); break; }
@@ -27449,8 +27488,14 @@ class CSSKeyframesRule extends CSSRule {
     const inner = this._ruleListObj._rules.map((r) => '  ' + r.cssText).join('\n');
     return '@keyframes ' + _serializeKeyframesName(this._name) + (inner ? ' {\n' + inner + '\n}' : ' { }');
   }
+  get [Symbol.toStringTag]() { return 'CSSKeyframesRule'; }
 }
-globalThis.CSSKeyframesRule = CSSKeyframesRule;
+_exposeIface('CSSKeyframesRule', CSSKeyframesRule);
+_enumAccessors(CSSKeyframesRule.prototype, 'name', 'cssRules', 'length');
+for (const op of ['appendRule', 'findRule', 'deleteRule']) {
+  const d = Object.getOwnPropertyDescriptor(CSSKeyframesRule.prototype, op);
+  if (d) { d.enumerable = true; Object.defineProperty(CSSKeyframesRule.prototype, op, d); }
+}
 // CSSKeyframesRule exposes an indexed getter over its keyframe rules.
 const _keyframesProxy = (kf) => new Proxy(kf, {
   get(t, p) {
@@ -27983,7 +28028,8 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     return rule;
   }
   if (desc.type === 'keyframes') {
-    rule = _keyframesProxy(new CSSKeyframesRule(desc));
+    _allowCssCondCtor = true;   // internal build of a non-author-constructible rule (+ its keyframe children)
+    try { rule = _keyframesProxy(new CSSKeyframesRule(desc)); } finally { _allowCssCondCtor = false; }
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
@@ -28006,7 +28052,8 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     return rule;
   }
   if (desc.type === 'property') {
-    rule = new CSSPropertyRule(desc);
+    _allowCssCondCtor = true;   // internal build of a non-author-constructible rule
+    try { rule = new CSSPropertyRule(desc); } finally { _allowCssCondCtor = false; }
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
     return rule;
@@ -28794,8 +28841,36 @@ globalThis.ErrorEvent = class extends Event { constructor(t,o) { o = (o == null)
 globalThis.PointerEvent = class PointerEvent extends MouseEvent {
   constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.pointerId=o.pointerId??0; this.pointerType=o.pointerType||""; this.isPrimary=!!o.isPrimary; this.pressure=o.pressure??0; this.width=o.width??1; this.height=o.height??1; }
 };
-globalThis.AnimationEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.animationName=o.animationName||""; this.elapsedTime=o.elapsedTime??0; this.pseudoElement=o.pseudoElement||""; } };
-globalThis.TransitionEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.propertyName=o.propertyName||""; this.elapsedTime=o.elapsedTime??0; this.pseudoElement=o.pseudoElement||""; } };
+// AnimationEvent / TransitionEvent (css-animations-1 / css-transitions-1) — Event
+// subclasses carrying the CSS animation/transition detail. Their WebIDL readonly
+// attributes live as brand-checked accessors on the PROTOTYPE (idlharness asserts
+// `must inherit` + that reading on the bare prototype throws), backed by private
+// `_`-fields set from the init dict. Constructor `.length` is 1 (type required,
+// the init dict optional). Exposed non-enumerably via _exposeIface.
+class AnimationEvent extends Event {
+  constructor(t, o = {}) { if (o == null) o = {}; super(t, o);
+    this._animationName = o.animationName != null ? String(o.animationName) : "";
+    this._elapsedTime = o.elapsedTime != null ? +o.elapsedTime : 0;
+    this._pseudoElement = o.pseudoElement != null ? String(o.pseudoElement) : ""; }
+  get animationName() { if (!(this instanceof AnimationEvent)) throw new TypeError("Illegal invocation"); return this._animationName; }
+  get elapsedTime() { if (!(this instanceof AnimationEvent)) throw new TypeError("Illegal invocation"); return this._elapsedTime; }
+  get pseudoElement() { if (!(this instanceof AnimationEvent)) throw new TypeError("Illegal invocation"); return this._pseudoElement; }
+  get [Symbol.toStringTag]() { return 'AnimationEvent'; }
+}
+class TransitionEvent extends Event {
+  constructor(t, o = {}) { if (o == null) o = {}; super(t, o);
+    this._propertyName = o.propertyName != null ? String(o.propertyName) : "";
+    this._elapsedTime = o.elapsedTime != null ? +o.elapsedTime : 0;
+    this._pseudoElement = o.pseudoElement != null ? String(o.pseudoElement) : ""; }
+  get propertyName() { if (!(this instanceof TransitionEvent)) throw new TypeError("Illegal invocation"); return this._propertyName; }
+  get elapsedTime() { if (!(this instanceof TransitionEvent)) throw new TypeError("Illegal invocation"); return this._elapsedTime; }
+  get pseudoElement() { if (!(this instanceof TransitionEvent)) throw new TypeError("Illegal invocation"); return this._pseudoElement; }
+  get [Symbol.toStringTag]() { return 'TransitionEvent'; }
+}
+_exposeIface('AnimationEvent', AnimationEvent);
+_exposeIface('TransitionEvent', TransitionEvent);
+_enumAccessors(AnimationEvent.prototype, 'animationName', 'elapsedTime', 'pseudoElement');
+_enumAccessors(TransitionEvent.prototype, 'propertyName', 'elapsedTime', 'pseudoElement');
 globalThis.PopStateEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.state=o.state??null; } };
 globalThis.HashChangeEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.oldURL=o.oldURL||""; this.newURL=o.newURL||""; } };
 globalThis.MessageEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o);this.data=o.data??null;this.origin=o.origin||"";this.lastEventId=o.lastEventId||"";this.source=o.source??null;this.ports=o.ports||[]; } };
@@ -34481,10 +34556,10 @@ _installLinkStyleSheet(globalThis.SVGStyleElement);
 // Install the on* event handler IDL accessors (HTML GlobalEventHandlers) on the
 // element/document interfaces + the window names it is still missing. NOT on
 // Element.prototype (SVG/HTML elements reach them through their own prototypes).
-_ehDefineOnProto(globalThis.HTMLElement.prototype);
-_ehDefineOnProto(globalThis.SVGElement.prototype);
-_ehDefineOnProto(Document.prototype);
-_ehDefineOnProto(globalThis);
+_ehDefineOnProto(globalThis.HTMLElement.prototype, false);
+_ehDefineOnProto(globalThis.SVGElement.prototype, false);
+_ehDefineOnProto(Document.prototype, false);
+_ehDefineOnProto(globalThis, true);
 // Web IDL [Unscopable] members — the @@unscopables object each interface exposes so
 // its unscopable methods (the ParentNode/ChildNode DOM-manipulation set) don't shadow
 // like-named globals inside a `with` scope (used by compiled inline event handlers;
