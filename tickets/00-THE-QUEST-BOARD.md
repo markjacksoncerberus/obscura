@@ -16,6 +16,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 ## ⚔️ Open Quests
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| ~~418–420~~ | ✅ [The Typed Verdict](418-typed-composition-verdict.md) | **The typed-composition arc — the colour as a first-class value slot, `rem` against the ROOT font-size, and keyframe values as COMPUTED values (+ the length-percentage as a two-component value)** — the whole `web-animations/animation-model/` tree (1817→2157 of 2352, 77.3%→91.7%, 24 files) + `css/css-values/rem-unit-root-element` (1→4, 100%) | **+343** | ⚔️⚔️⚔️ | **SECURED — +343, zero regressions.** #417's ⭐ named next-leverage plus the two larger buckets measured beside it. All three were **typing** failures. **#418**: a colour is ONE token, not three numbers — a second kind of hole in #417's skeleton makes `#ff0000` and `rgb(255, 0, 0)` the same shape, gives colours their own premultiplied arithmetic, and makes colour PAIRS and colour+length values work with no pair-specific code; **clamp once, at the end**, because 128 + 255 = 383 has to survive interpolation. **#419**: `rem` needs no per-element context (it is document-wide), so it resolves inside `_evalMath` with ZERO call-site changes — with a latch saying a `rem` in the root's OWN font-size means the INITIAL font-size. **#420**: §keyframes says the value is a COMPUTED value; skipping that is why `1rem` added onto `10px` answered `1rem`. Three honest exceptions — `opacity` (the spec clamps the RESULT), the transform family (resolved value is a matrix, computed value is the LIST that animates), `var()` (substituted where the declaration resolves) — the last two caught as live regressions and fixed. **NEXT: ⭐ the transform-list interpolation path** (identity padding = the same "second kind of hole" move), then shorthand expansion inside keyframes, then **`css/css-transitions/properties-value-001.html` measured at 0/560**. |
 | ~~415–417~~ | ✅ [The Composited Verdict](415-animated-computed-style-verdict.md) | **Animated computed style — the animated-value cascade source, the composition model (underlying value + implicit endpoints + composite add/accumulate + the effect stack), and the interpolation kit (the shape rule + premultiplied colour)** — `web-animations/animation-model/` (722→1791 of 2320, 31.1%→77.2%, 19 files) + the `interfaces/` suite (732→735) | **+1079** | ⚔️⚔️⚔️ | **SECURED — +1079, zero regressions.** #414's ⭐ named next-leverage. #412–#414 built a real animation engine and **none of it was visible** — `getComputedStyle` never consulted active animations. **#415** made animated values one more cascade source (no new ordering logic: inline specificity + no important flag + pushed last lands exactly where §the-cascade puts animations); **#416** the composition model, where implicit endpoints need **no neutral-value table** because a neutral value added to the underlying value *is* the underlying value; **#417** the shape rule — split a value into numbers + literal skeleton, match the skeletons, move each number, and get the discrete fallback free from the same test. **GOTCHAS:** a global re-entrancy latch hung the browser (the guard must be **per-element** and held for the whole read); digits inside quoted strings and identifiers must stay literal. **CAP:** percentage/`calc()` resolution needs layout. **⭐ NEXT: `rem` against the root font-size.** |
 |---|--------|-------|:----:|:----------:|:------:|
 | ~~412–414~~ | ✅ [The Animated Verdict](412-web-animations-verdict.md) | **The Web Animations arc — a real timing model (`AnimationTimeline`/`DocumentTimeline`/`AnimationEffect` + the §timing-model phase/progress computation + canonicalised easing), a real playback model (`Animation : EventTarget` with the pending play/pause tasks, `ready`/`finished`, `AnimationPlaybackEvent`, `Animatable`, `commitStyles`), and a spec-exact keyframe processor** — `web-animations/idlharness.window.html` (42→188, 81.7%), the 39-file `web-animations/interfaces/` behaviour suite (38→732, 86.6%) | **+840** | ⚔️⚔️⚔️ | **SECURED — +840, zero regressions.** #411's named next-leverage. Replaced a ten-line object literal (`animate()` returned a fake whose `finished` was already resolved) with the real thing. **#412** the timing model (+69 idlharness); **#413** the playback model (+77) — the frame driver ticks only while an animation is live, so an idle page costs nothing; **#414** the keyframe processor root cause (+694 behaviour) — only animatable properties are even READ, IDL attribute names only, exact read order, property-indexed keyframes merged by per-property offset rather than positionally zipped. **CAP:** the four Level-2 standalone interfaces (41 subtests) deliberately unimplemented — no engine ships them, exposing them would make feature detection lie. **NEXT:** animated computed style. |
@@ -240,6 +241,52 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-07-30 (Quests #418–#420 — the typed-composition arc, +343, ZERO regressions):**
+Took #417's ⭐ named next-leverage (`rem`) and, measuring first, found two LARGER buckets sitting beside it in the
+same suites. All three turned out to be the same kind of bug — a **typing** failure. The engine was treating a
+colour as three numbers, a length-percentage as one number, and a specified value as a computed one. Baselines
+**stash-proved** (`git stash push` → rebuild → measure → pop): the 24-file tree at **1817/2352**.
+**#418 the colour as a value slot** — under #417's numbers-and-literals model `#ff0000` contributes no numbers and
+`rgb(255, 0, 0)` contributes three, so they could never match and adding a colour onto the value beneath it fell
+through to the spec's non-additive fallback: replace. A colour is ONE token. Giving it a **second kind of hole** in
+the same skeleton makes every spelling the same shape, gives the colour its own **premultiplied** addition
+(`rgba(255,0,0,.4)` onto an opaque grey moves red by 102, not 255), and makes a value that MIXES colours with
+lengths — a colour pair like `scrollbar-color`, a `box-shadow` — work with no pair-specific code at all. The
+discipline that made it correct: **clamp ONCE, at the end**. A composited channel legitimately leaves 0–255
+(128 + 255 = 383) and must survive interpolation — from `rgb(383, …)` to `rgb(128, …)` the midpoint is 255; from a
+prematurely clamped `rgb(255, …)` it is 192. `url(…)` bodies are masked with the quoted spans (an SVG paint of
+`url(#abc)` ends in three hex digits), and named colours are only sought on properties that take one, so `tan` and
+`plum` are never plucked out of a font stack.
+**#419 `rem` against the root font-size** — `rem` was a constant 16 in the length table. `html { font-size: 62.5% }`
+is a decade-old idiom and under it EVERY `rem` in the document was wrong. Unlike `em`, `rem` needs no per-element
+context — it is a document-wide constant — so it resolves inside `_evalMath` itself with **zero call-site changes**,
+`calc()` included. The one subtlety: a `rem` in the ROOT element's own font-size refers to the INITIAL value of
+font-size, so a re-entrancy latch answers 16px while the root's font-size is resolving (`html { font-size: 2rem }`
+→ 32px, and every `rem` elsewhere then 32px). Saved-and-restored, not cleared, because the resolver reaches that
+same branch through the latch it just set. A correctness win for every `rem`-using page in the world.
+**#420 keyframe values are computed values** — §keyframes says "the property value is a **computed** value", and
+Obscura skipped the step, which is why `1rem` added onto an underlying `10px` answered `1rem`: two spellings of the
+same ten pixels have no shape in common until both are pixels. One `_normComputed` call, guarded by the same
+per-element latch the underlying value uses. **Three honest exceptions:** `opacity` and family (computing CLAMPS to
+[0,1] and a keyframe must not be clamped — the spec clamps the RESULT, so `opacity: [-0.5, 2]` halfway through a
+`steps(1, jump-both)` is 0.75 only if both endpoints survive out of range); the TRANSFORM family (CSSOM's *resolved*
+value is a matrix, but the *computed* value is the transform LIST that actually animates — caught as a live −2
+regression); and `var()` (substituted where the DECLARATION resolves, which is also what lets a filling effect track
+a variable changing underneath it — a live −1 regression, now 14/14). Second half: **a length-percentage is a
+two-component value** — `10px` and `20%` share no text but combine perfectly as `{pct, px}`, each moving on its own;
+`10%` onto `10px` is `calc(10% + 10px)`, `10px` toward `20%` at half is `calc(10% + 5px)`.
+Headline rows: `accumulation-per-property-001` 275→**360**/375, `-002` 220→**280**/312, `addition-per-property-001`
+274→**359**/375, `-002` 214→**275**/308, `interpolation-per-property-001` 422→**441**/466, `-002` 312→**339**/379,
+`effect-value-context-filling` 13→**14/14**, `scrollbar-interpolation` 0→**1/1**, `rem-unit-root-element` 1→**4/4**.
+Because `rem` touches the SHARED computed-style path, the regression sweep was widened past the ritual list to the
+`-computed` parsing suites (font-size-computed 21/21, font-computed 315/315, background-position/size-computed,
+letter-/word-spacing-computed, text-indent-computed, round-mod-rem-computed 233/243) — all identical.
+**Caps:** percentage→pixels still needs layout (the arithmetic is right now; resolving it is a layout engine's job);
+transform-list identity padding and filter-list lacuna values need type-aware list paths; shorthand expansion inside
+the keyframe list. **NEXT: ⭐ the transform-list interpolation path**, then shorthand expansion inside keyframes,
+then **`css/css-transitions/properties-value-001.html`, measured at 0/560 this session** — the widest untouched tail
+found, and it would now be built on a working interpolation kit rather than from nothing.
 
 **Session 2026-07-30 (Quests #415–#417 — the animated-computed-style arc, +1079, ZERO regressions):**
 Took #414's ⭐ named next-leverage. The previous arc built a real Web Animations engine — a timing model, a

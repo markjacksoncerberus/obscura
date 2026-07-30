@@ -11812,6 +11812,10 @@ const _evalMath = (input, percentBase, opts) => {
         // font-size & line-height (the default table assumes em = 16px); rem stays root.
         if (opts.emPx && tok.unit === 'em') return [tok.v * opts.emPx, false];
         if (opts.lhPx && tok.unit === 'lh') return [tok.v * opts.lhPx, false];
+        // `rem` is the ROOT element's font-size. Unlike `em` it needs no
+        // per-element context — it is a document-wide constant — so it is
+        // resolved here rather than threaded through every caller's opts.
+        if (tok.unit === 'rem' && opts.lengths) return [tok.v * _rootFontPx(), false];
         const f = _LENGTH_PX[tok.unit];
         if (f !== undefined) return [tok.v * f, false];
         // `opts.vw`/`opts.vh` (px per 1% of the viewport) resolve viewport-relative
@@ -21825,6 +21829,28 @@ const _canonTransform = (value, el, computed) => {
 // keyword/number/angle form, only resolving units. Each has its own grammar and
 // its own trailing-component elision rule.
 const _emPxOf = (el) => (el ? (parseFloat(_computedPropOf(el, 'font-size', 0)) || 16) : 16);
+// `rem` — the ROOT element's computed font-size. It had been hardcoded to 16px,
+// which is only right for a page that never sets one; every page that does
+// (`html { font-size: 62.5% }` is a decade-old idiom) got every `rem` length in
+// the document wrong.
+//
+// On the root element ITSELF `rem` refers to the INITIAL value of font-size, not
+// to the root's own computed value — otherwise `html { font-size: 2rem }` would
+// have to resolve against itself. The re-entrancy latch is what says that: while
+// the root's own font-size is being resolved, `rem` answers 16px, so `2rem`
+// there means 32px and every `rem` elsewhere in the document then means 32px.
+let _rootFontBusy = false;
+const _rootFontPx = () => {
+  if (_rootFontBusy) return 16;
+  let root = null;
+  try { root = globalThis.document && globalThis.document.documentElement; } catch (e) { root = null; }
+  if (!root) return 16;
+  const wasBusy = _rootFontBusy;
+  _rootFontBusy = true;
+  try { return parseFloat(_computedPropOf(root, 'font-size', 0)) || 16; }
+  catch (e) { return 16; }
+  finally { _rootFontBusy = wasBusy; }
+};
 
 // CSS Values 5 §tree-counting: resolve `sibling-index()` (the element's 1-based
 // position among its element siblings) and `sibling-count()` (the total element-
@@ -23701,7 +23727,17 @@ const _normComputed = (el, kebab, v) => {
     }
     if (_FONT_REL_SIZE.has(l) || _FONT_ABS_SIZE.has(l)) return v;
     const base = _parentFontSizePx(el);
-    const nnn = _evalMath(String(v), base, Object.assign({ lengths: true, cqZero: true, emPx: base }, _vpUnits()));
+    // A `rem` in the ROOT element's own font-size refers to the INITIAL value of
+    // font-size, not to the value being computed — so `html { font-size: 2rem }`
+    // is 32px, and every `rem` elsewhere in the document is then 32px too.
+    // Saved-and-restored rather than cleared, because `_rootFontPx` reaches this
+    // same branch through the latch it just set.
+    const wasBusy = _rootFontBusy;
+    if (el && el.ownerDocument && el.ownerDocument.documentElement === el) _rootFontBusy = true;
+    let nnn;
+    try {
+      nnn = _evalMath(String(v), base, Object.assign({ lengths: true, cqZero: true, emPx: base }, _vpUnits()));
+    } finally { _rootFontBusy = wasBusy; }
     return nnn === null ? v : _serNumber(Math.max(0, nnn)) + 'px';
   }
   if (kebab === 'font-size-adjust') {
@@ -40169,6 +40205,221 @@ if (!globalThis.crypto.subtle) {
     lits.push(s.slice(last).replace(/\s+/g, ' '));
     return { nums, lits };
   };
+
+  // ── The colour as a value slot (#418) ──────────────────────────────────────
+  // #417 modelled a CSS value as literal text with ONE kind of hole: the number.
+  // That is precisely why `#ff0000` and `rgb(255, 0, 0)` had nothing in common —
+  // one contributes no numbers at all and the other contributes three — and why
+  // adding a colour to the value underneath it fell straight through to
+  // "replace" instead of compositing.
+  //
+  // A colour is ONE token, not three numbers. It has its own arithmetic (every
+  // channel scaled by its own alpha — see below), and several spellings that
+  // all name the same value. Giving it a second kind of hole in the same
+  // skeleton buys three things at once:
+  //   • every spelling of a colour has the same SHAPE, so `#ff0000` composites
+  //     against `rgb(128, 128, 128)` as readily as `rgb(255, 0, 0)` does;
+  //   • the colour gets its own add and its own interpolation, both correct;
+  //   • a value that MIXES colours with other components — a colour pair like
+  //     `scrollbar-color`, a `box-shadow`'s colour + four lengths — needs no
+  //     extra machinery at all, because the colour hole sits in the ordinary
+  //     skeleton beside the number holes.
+  const _WA_COLOR_FNS = new Set(['rgb', 'rgba', 'hsl', 'hsla', 'hwb', 'lab', 'lch', 'oklab', 'oklch', 'color']);
+  // Named colours are only looked for on properties that actually take a colour.
+  // `#ff0000` and `rgb(…)` are unmistakable wherever they appear, but a bare
+  // ident is not: `tan`, `red` and `plum` are perfectly ordinary words, and a
+  // font stack or a custom ident must not be mistaken for a colour.
+  const _WA_MULTI_COLOR_PROPS = new Set([
+    'scrollbar-color', 'box-shadow', 'text-shadow', 'border-color', 'text-emphasis',
+    'column-rule', 'outline', 'background', 'border', 'text-decoration',
+    'border-top', 'border-right', 'border-bottom', 'border-left',
+    'border-block-color', 'border-inline-color',
+  ]);
+  const _waTakesColorIdent = (name) => !!name && (_COLOR_PROPS.has(name) || _WA_MULTI_COLOR_PROPS.has(name));
+  // Quoted spans AND `url(…)` bodies are blanked before any scanning. The url()
+  // masking is not fussiness: an SVG paint of `url(#abc)` ends in three hex
+  // digits, which is exactly the shape of a short hex colour.
+  const _waMask = (s) => {
+    let out = '', q = 0, url = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (q) { out += (c === q ? c : ' '); if (c === q) q = 0; continue; }
+      if (url) { out += (c === ')' ? c : ' '); if (c === ')') url = 0; continue; }
+      if (c === '"' || c === "'") { q = c; out += c; continue; }
+      if (c === '(' && /url$/i.test(out)) { url = 1; out += c; continue; }
+      out += c;
+    }
+    return out;
+  };
+  const _WA_HEX = /[0-9a-fA-F]/;
+  // Where the colours are, as [start, end) ranges over the masked string.
+  const _waColorRanges = (masked, allowIdent) => {
+    const out = [];
+    for (let i = 0; i < masked.length; i++) {
+      const c = masked[i];
+      if (c === '#') {
+        let j = i + 1;
+        while (j < masked.length && _WA_HEX.test(masked[j])) j++;
+        const n = j - i - 1;
+        if ((n === 3 || n === 4 || n === 6 || n === 8) && !_waIsIdentCh(masked[j])) { out.push([i, j]); i = j - 1; }
+        continue;
+      }
+      if (!/[a-zA-Z]/.test(c)) continue;
+      // Only at the START of an ident — `to` inside `translate` is not a token.
+      const prev = i > 0 ? masked[i - 1] : undefined;
+      if (_waIsIdentCh(prev) || prev === '-') continue;
+      let j = i;
+      while (j < masked.length && /[-a-zA-Z0-9]/.test(masked[j])) j++;
+      const ident = masked.slice(i, j).toLowerCase();
+      if (masked[j] === '(' && _WA_COLOR_FNS.has(ident)) {
+        let depth = 0, k = j;
+        for (; k < masked.length; k++) {
+          if (masked[k] === '(') depth++;
+          else if (masked[k] === ')') { depth--; if (!depth) { k++; break; } }
+        }
+        out.push([i, k]); i = k - 1; continue;
+      }
+      if (allowIdent && (_CSS_NAMED_COLORS[ident] || ident === 'transparent')) out.push([i, j]);
+      i = j - 1;
+    }
+    return out;
+  };
+  // A colour token → [r, g, b, alpha]. `rgb()`/`rgba()` is read DIRECTLY rather
+  // than through `_computeColor`, because a composited channel legitimately
+  // leaves the 0–255 range (128 + 255 = 383) and must survive the round trip
+  // through interpolation before it is finally clamped. Everything else — hex,
+  // `hsl()`, a named colour — goes through the engine's own colour parser.
+  const _waParseColorTok = (tok) => {
+    const rd = (m) => [parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]), m[4] === undefined ? 1 : parseFloat(m[4])];
+    const m = _WA_RGBA.exec(tok);
+    if (m) return rd(m);
+    let c = null;
+    try { c = _computeColor(tok); } catch (e) { c = null; }
+    if (!c) return null;
+    const m2 = _WA_RGBA.exec(String(c).trim());
+    return m2 ? rd(m2) : null;
+  };
+  // Unclamped on purpose — see `_waParseColorTok`. `_waClampColors` is the one
+  // place that clamps, and it runs once, on the final animated value.
+  const _waSerColorTok = (c) => {
+    const n = (x) => _waRound(x);
+    const a = Math.max(0, Math.min(1, c[3]));
+    return a >= 1 ? `rgb(${n(c[0])}, ${n(c[1])}, ${n(c[2])})`
+                  : `rgba(${n(c[0])}, ${n(c[1])}, ${n(c[2])}, ${_waRound(a)})`;
+  };
+  // The value model: `lits` is the literal text, `slots` the holes between them
+  // (`lits.length === slots.length + 1`). A slot is either a number or a colour.
+  const _waSplitValue = (s, name) => {
+    const masked = _waMask(s);
+    const cols = _waColorRanges(masked, _waTakesColorIdent(name));
+    if (!cols.length) {
+      const p = _waSplitNums(s);
+      return { lits: p.lits, slots: p.nums.map((v) => ({ c: null, n: v })) };
+    }
+    const lits = [], slots = [];
+    let at = 0;
+    const gap = (from, to) => {
+      // The gaps between colours are scanned by #417's number splitter, whose
+      // whole subtlety (digits inside idents stay literal) still applies.
+      const p = _waSplitNums(s.slice(from, to));
+      for (let i = 0; i < p.nums.length; i++) { lits.push(p.lits[i]); slots.push({ c: null, n: p.nums[i] }); }
+      return p.lits[p.lits.length - 1];
+    };
+    let pending = '';
+    for (const [a, b] of cols) {
+      const tail = gap(at, a);
+      const rgba = _waParseColorTok(s.slice(a, b));
+      if (rgba === null) { pending += tail + s.slice(a, b); at = b; continue; }
+      lits.push(pending + tail); pending = '';
+      slots.push({ c: rgba, n: 0 });
+      at = b;
+    }
+    lits.push(pending + gap(at, s.length));
+    return { lits, slots };
+  };
+  // Two values have the same shape when their literal text matches AND their
+  // holes are of the same kinds, in the same order.
+  const _waSameShape = (x, y) => {
+    if (x.lits.length !== y.lits.length || x.slots.length !== y.slots.length) return false;
+    for (let i = 0; i < x.lits.length; i++) if (x.lits[i] !== y.lits[i]) return false;
+    for (let i = 0; i < x.slots.length; i++) if ((x.slots[i].c === null) !== (y.slots[i].c === null)) return false;
+    return true;
+  };
+  const _waJoin = (lits, slots) => {
+    let out = '';
+    for (let i = 0; i < slots.length; i++) {
+      out += lits[i] + (slots[i].c ? _waSerColorTok(slots[i].c) : _waRound(slots[i].n));
+    }
+    return out + lits[lits.length - 1];
+  };
+  // A colour's channels are PREMULTIPLIED by its own alpha before they are added
+  // and divided by the resulting alpha afterwards, so a nearly-transparent
+  // colour contributes proportionally little — `rgba(255, 0, 0, 0.4)` added onto
+  // an opaque grey moves red by 102, not 255. Alpha itself saturates at 1.
+  const _waColorAdd = (a, b) => {
+    const al = Math.min(1, a[3] + b[3]);
+    const ch = (i) => (al === 0 ? 0 : (a[i] * a[3] + b[i] * b[3]) / al);
+    return [ch(0), ch(1), ch(2), al];
+  };
+  const _waColorMix = (a, b, t) => {
+    const al = a[3] + (b[3] - a[3]) * t;
+    const ch = (i) => {
+      const p = a[i] * a[3] + (b[i] * b[3] - a[i] * a[3]) * t;
+      return al === 0 ? 0 : p / al;
+    };
+    return [ch(0), ch(1), ch(2), al];
+  };
+  // The single place a colour is clamped back into range, run once on the final
+  // animated value. Clamping any earlier would throw away the overflow that the
+  // interpolation between two composited endpoints legitimately needs: from
+  // `rgb(383, …)` to `rgb(128, …)` the midpoint is 255, but from a prematurely
+  // clamped `rgb(255, …)` it is 192.
+  const _waClampColors = (s, name) => {
+    if (s.indexOf('rgb') < 0) return s;
+    const v = _waSplitValue(s, name);
+    let touched = false;
+    for (const sl of v.slots) {
+      if (!sl.c) continue;
+      const c = [
+        Math.max(0, Math.min(255, Math.round(sl.c[0]))),
+        Math.max(0, Math.min(255, Math.round(sl.c[1]))),
+        Math.max(0, Math.min(255, Math.round(sl.c[2]))),
+        Math.max(0, Math.min(1, sl.c[3])),
+      ];
+      if (c[0] !== sl.c[0] || c[1] !== sl.c[1] || c[2] !== sl.c[2] || c[3] !== sl.c[3]) touched = true;
+      sl.c = c;
+    }
+    return touched ? _waJoin(v.lits, v.slots) : s;
+  };
+  // ── The length-percentage as a two-component value (#420) ──────────────────
+  // `10px` and `20%` have nothing in common as text, and the shape rule rightly
+  // declines them — but they ARE combinable, because a computed
+  // <length-percentage> is not one number, it is TWO: so many pixels plus so
+  // many percent, either of which may be zero. Written that way, `10px` and
+  // `20%` combine by moving each component on its own, which is exactly what
+  // the spec means when it says the two halves of a `calc()` are interpolated
+  // (and added) independently. The result serializes back into the same
+  // `calc(P% + Lpx)` form the engine already computes mixed values to.
+  const _WA_LP_PX = /^([+-]?(?:\d+\.?\d*|\.\d+))px$/;
+  const _WA_LP_PCT = /^([+-]?(?:\d+\.?\d*|\.\d+))%$/;
+  const _WA_LP_CALC = /^calc\(\s*([+-]?(?:\d+\.?\d*|\.\d+))%\s*([+-])\s*((?:\d+\.?\d*|\.\d+))px\s*\)$/;
+  const _waLPParse = (s) => {
+    let m = _WA_LP_PX.exec(s);
+    if (m) return { pct: 0, px: parseFloat(m[1]) };
+    m = _WA_LP_PCT.exec(s);
+    if (m) return { pct: parseFloat(m[1]), px: 0 };
+    m = _WA_LP_CALC.exec(s);
+    if (m) return { pct: parseFloat(m[1]), px: (m[2] === '-' ? -1 : 1) * parseFloat(m[3]) };
+    return null;
+  };
+  const _waLPSer = (lp) => {
+    const pct = _waRound(lp.pct), px = _waRound(lp.px);
+    // A component that is exactly zero drops out — `calc(0% + 30px)` is `30px` —
+    // but only one of them may: an all-zero length-percentage is still `0px`.
+    if (pct === 0) return px + 'px';
+    if (px === 0) return pct + '%';
+    return `calc(${pct}% ${px < 0 ? '-' : '+'} ${Math.abs(px)}px)`;
+  };
   // Properties whose animation type is DISCRETE even though their values look
   // numeric — a `<grid-line>` of `1` and one of `5` name two different lines,
   // and there is no line 3 between them. Without this the generic shape rule
@@ -40178,60 +40429,30 @@ if (!globalThis.crypto.subtle) {
     'grid-column', 'grid-column-start', 'grid-column-end',
     'grid-area', 'grid-auto-rows', 'grid-auto-columns',
   ]);
-  const _waSameSkeleton = (x, y) => {
-    if (x.lits.length !== y.lits.length) return false;
-    for (let i = 0; i < x.lits.length; i++) if (x.lits[i] !== y.lits[i]) return false;
-    return true;
-  };
   const _waRound = (v) => Math.round(v * 1e6) / 1e6;
-  // Colours only interpolate once both endpoints are in the same space, so a
-  // colour-valued property has its endpoints computed to sRGB first — that is
-  // what lets `#00f` → `hsl(0 100% 50%)` interpolate at all instead of flipping
-  // discretely at the halfway mark.
-  const _waCanonColor = (v) => {
-    try { const c = _computeColor(String(v).trim()); return c ? String(c) : String(v); }
-    catch (e) { return String(v); }
-  };
-  // Colours interpolate with PREMULTIPLIED alpha: each channel is scaled by its
-  // own alpha before it moves and divided by the resulting alpha afterwards.
-  // Interpolating the channels straight would let a nearly-transparent colour's
-  // hue drag the result toward itself as strongly as an opaque one — which is
-  // why red→blue at half fading in gives rgba(85, 0, 170, 0.6) and not an even
-  // split. Identical to plain interpolation whenever both ends are opaque.
   const _WA_RGBA = /^rgba?\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*(?:,\s*(-?[\d.]+)\s*)?\)$/;
-  const _waColorLerp = (sa, sb, t) => {
-    const ma = _WA_RGBA.exec(sa), mb = _WA_RGBA.exec(sb);
-    if (!ma || !mb) return null;
-    const aa = ma[4] === undefined ? 1 : parseFloat(ma[4]);
-    const ab = mb[4] === undefined ? 1 : parseFloat(mb[4]);
-    const a = aa + (ab - aa) * t;
-    const ch = (i) => {
-      const p = parseFloat(ma[i]) * aa + (parseFloat(mb[i]) * ab - parseFloat(ma[i]) * aa) * t;
-      return a === 0 ? 0 : p / a;
-    };
-    return _serColor(ch(1), ch(2), ch(3), a);
-  };
   // `name` is the kebab CSS property, when the caller knows it — it is only
-  // consulted to decide whether the endpoints are colours.
+  // consulted to decide whether an ident may be a colour and whether the
+  // property's animation type is discrete.
   function _waInterpolate(a, b, t, name) {
     if (a === null || a === undefined) return b;
     if (b === null || b === undefined) return a;
-    let sa = String(a).trim(), sb = String(b).trim();
+    const sa = String(a).trim(), sb = String(b).trim();
     if (sa === sb) return sa;
     if (name && _WA_DISCRETE_PROPS.has(name)) return t < 0.5 ? sa : sb;
-    if (name && _COLOR_PROPS.has(name)) {
-      sa = _waCanonColor(sa); sb = _waCanonColor(sb);
-      const col = _waColorLerp(sa, sb, t);
-      if (col !== null) return col;
+    const x = _waSplitValue(sa, name), y = _waSplitValue(sb, name);
+    if (x.slots.length && _waSameShape(x, y)) {
+      const out = x.slots.map((sl, i) => (sl.c
+        // Colours interpolate PREMULTIPLIED: interpolating the channels straight
+        // would let a nearly-transparent colour's hue drag the result toward
+        // itself as hard as an opaque one, which is why red→blue at half while
+        // fading in is rgba(85, 0, 170, 0.6) and not an even split.
+        ? { c: _waColorMix(sl.c, y.slots[i].c, t), n: 0 }
+        : { c: null, n: sl.n + (y.slots[i].n - sl.n) * t }));
+      return _waJoin(x.lits, out);
     }
-    const x = _waSplitNums(sa), y = _waSplitNums(sb);
-    if (x.nums.length && _waSameSkeleton(x, y)) {
-      let out = '';
-      for (let i = 0; i < x.nums.length; i++) {
-        out += x.lits[i] + _waRound(x.nums[i] + (y.nums[i] - x.nums[i]) * t);
-      }
-      return out + x.lits[x.lits.length - 1];
-    }
+    const la = _waLPParse(sa), lb = _waLPParse(sb);
+    if (la && lb) return _waLPSer({ pct: la.pct + (lb.pct - la.pct) * t, px: la.px + (lb.px - la.px) * t });
     // Not interpolable → discrete: the `from` value holds until the halfway
     // point of the interval, then the `to` value takes over.
     return t < 0.5 ? sa : sb;
@@ -40247,38 +40468,107 @@ if (!globalThis.crypto.subtle) {
   // Combine a keyframe value with the value underneath it. `add` is the
   // type's addition; `accumulate` differs from it only for the types whose
   // accumulation is not plain addition (handled inside _waAccumulate).
-  const _waComposite = (op, underlying, value) => {
-    if (op === 'add') return _waAdd(underlying, value);
-    if (op === 'accumulate') return _waAccumulate(underlying, value);
+  const _waComposite = (op, underlying, value, name) => {
+    if (op === 'add') return _waAdd(underlying, value, name);
+    if (op === 'accumulate') return _waAccumulate(underlying, value, name);
     return value;
   };
   // Addition uses the same shape test as interpolation: two values of the same
-  // shape add number-by-number. Anything else is not additive, and the spec's
-  // fallback for a non-additive type is to REPLACE — the keyframe value wins.
-  const _waAdd = (underlying, value) => {
+  // shape add slot-by-slot — numbers as sums, colours by their own premultiplied
+  // rule. Anything else is not additive, and the spec's fallback for a
+  // non-additive type is to REPLACE, so the keyframe value wins.
+  const _waAdd = (underlying, value, name) => {
     if (underlying === null || underlying === undefined || underlying === '') return value;
-    const x = _waSplitNums(String(underlying).trim()), y = _waSplitNums(String(value).trim());
-    if (!x.nums.length || !_waSameSkeleton(x, y)) return value;
-    let out = '';
-    for (let i = 0; i < x.nums.length; i++) out += x.lits[i] + _waRound(x.nums[i] + y.nums[i]);
-    return out + x.lits[x.lits.length - 1];
+    if (name && _WA_DISCRETE_PROPS.has(name)) return value;
+    const su = String(underlying).trim(), sv = String(value).trim();
+    const x = _waSplitValue(su, name), y = _waSplitValue(sv, name);
+    if (x.slots.length && _waSameShape(x, y)) {
+      return _waJoin(x.lits, x.slots.map((sl, i) => (sl.c
+        ? { c: _waColorAdd(sl.c, y.slots[i].c), n: 0 }
+        : { c: null, n: sl.n + y.slots[i].n })));
+    }
+    const la = _waLPParse(su), lb = _waLPParse(sv);
+    if (la && lb) return _waLPSer({ pct: la.pct + lb.pct, px: la.px + lb.px });
+    return value;
   };
-  // Accumulation is addition for every numeric type. It parts company with
-  // addition only for types with a defined "accumulation" that isn't a sum —
-  // for those the spec falls back to replacing, which is what _waAdd already
+  // Accumulation is addition for every type Obscura models. It parts company
+  // with addition only for types with a defined "accumulation" that isn't a sum
+  // — for those the spec falls back to replacing, which is what _waAdd already
   // does for anything it cannot add.
-  const _waAccumulate = (underlying, value) => _waAdd(underlying, value);
+  const _waAccumulate = (underlying, value, name) => _waAdd(underlying, value, name);
   // §effect-accumulation, iteration composite `accumulate`: `n` copies of the
   // end-of-iteration value are accumulated onto the keyframe value. `_waAdd`'s
   // second operand wins whenever the type cannot be added — so a DISCRETE
   // property comes back untouched, which is exactly why an accumulating
-  // discrete animation just repeats its per-iteration values.
-  const _waIterAccumulate = (value, endValue, n) => {
-    const e = _waSplitNums(String(endValue).trim());
-    if (!e.nums.length) return value;
-    let scaled = '';
-    for (let i = 0; i < e.nums.length; i++) scaled += e.lits[i] + _waRound(e.nums[i] * n);
-    return _waAdd(scaled + e.lits[e.lits.length - 1], value);
+  // discrete animation just repeats its per-iteration values. A colour cannot
+  // simply be multiplied by `n` (its alpha saturates), so the n copies are
+  // folded through the same addition that would have stacked them one by one.
+  const _waIterAccumulate = (value, endValue, n, name) => {
+    const e = _waSplitValue(String(endValue).trim(), name);
+    if (!e.slots.length) return value;
+    const scaled = _waJoin(e.lits, e.slots.map((sl) => {
+      if (!sl.c) return { c: null, n: sl.n * n };
+      let c = sl.c;
+      for (let i = 1; i < n; i++) c = _waColorAdd(c, sl.c);
+      return { c, n: 0 };
+    }));
+    return _waAdd(scaled, value, name);
+  };
+
+  // §keyframes — "the property value is a COMPUTED value". A keyframe is
+  // authored in specified syntax (`1rem`, `2em`, `calc(1em + 20%)`), but every
+  // step that follows — compositing it onto the underlying value, interpolating
+  // it against its neighbour, handing it to the cascade — operates on computed
+  // values. Skipping this step is why `1rem` added onto an underlying `10px`
+  // used to answer `1rem`: two different spellings of the same 10 pixels have no
+  // shape in common until both are pixels.
+  //
+  // The guard is the same per-element latch the underlying value uses, and for
+  // the same reason: resolving `2em` asks for this element's font-size, which
+  // walks straight back into the cascade — and so into this hook. Saved and
+  // restored rather than simply cleared, because the underlying-value read may
+  // already be holding it.
+  //
+  // One exception, and it is the same lesson the colours taught: computing
+  // `opacity` CLAMPS it to [0, 1], and a keyframe value must not be clamped —
+  // the spec clamps the RESULT. `opacity: [-0.5, 2]` sampled halfway through a
+  // `steps(1, jump-both)` is 0.75, and it can only be 0.75 if both endpoints
+  // survive the trip out of range. The only conversion those properties need is
+  // percentage → number, so that is done here directly and the clamp is left to
+  // the ordinary computed-style read at the end.
+  const _WA_UNCLAMPED_NUM = new Set([
+    'opacity', 'fill-opacity', 'stroke-opacity', 'stop-opacity', 'flood-opacity',
+    'shape-image-threshold',
+  ]);
+  // Two things `getComputedStyle` cannot hand back are the computed value.
+  //
+  //   • The transform family. CSSOM's RESOLVED value for `transform` is a
+  //     matrix, but its COMPUTED value is the transform LIST — and the list is
+  //     what animates, function by function. Collapsing `rotate(90deg)` to a
+  //     matrix first would leave the interpolator moving the cells of a matrix
+  //     around, which is not the same animation and generally not even a valid
+  //     one.
+  //   • A `var()`. A custom property is substituted where the DECLARATION is
+  //     resolved, with the element's variables in hand; asked to compute
+  //     `var(--x)` on its own it has nothing to substitute from. The keyframe
+  //     keeps the reference and the cascade resolves it later — which is also
+  //     what makes a filling effect track a variable that changes underneath it.
+  const _WA_UNCOMPUTED = new Set(['transform', 'translate', 'rotate', 'scale', 'offset-rotate']);
+  const _waComputedValue = (el, kebab, v) => {
+    if (!el || v === null || v === undefined) return v;
+    if (_WA_UNCOMPUTED.has(kebab)) return v;
+    if (/var\(/i.test(String(v))) return v;
+    if (_WA_UNCLAMPED_NUM.has(kebab)) {
+      const n = _evalMath(String(v), 1, { nonFinite: true });
+      return n === null ? v : _serNumber(n);
+    }
+    const had = _waUnderlyingOf.has(el);
+    _waUnderlyingOf.add(el);
+    try {
+      const c = _normComputed(el, kebab, String(v));
+      return (c === null || c === undefined || c === '') ? v : String(c);
+    } catch (e) { return v; }
+    finally { if (!had) _waUnderlyingOf.delete(el); }
   };
 
   // §the-effect-value-of-a-keyframe-animation-effect, for ONE property, given
@@ -40296,17 +40586,21 @@ if (!globalThis.crypto.subtle) {
   const _waEffectValueFor = (eff, name, ct, progress, getUnderlying) => {
     const own = eff._frames.filter((f) => name in f.props);
     if (!own.length) return getUnderlying();
-    // Iteration accumulation happens FIRST, on the raw keyframe values, before
-    // any composition against the underlying value. The end-of-iteration value
-    // is the explicit keyframe at offset 1; when that endpoint is implicit
-    // there is nothing to accumulate (its neutral value is a no-op anyway).
+    const kebab = _waKebab(name);
+    // Every keyframe value becomes a COMPUTED value before anything is done with
+    // it — see `_waComputedValue`.
+    const valOf = (f) => _waComputedValue(eff._target, kebab, f.props[name]);
+    // Iteration accumulation happens FIRST, on the keyframe values, before any
+    // composition against the underlying value. The end-of-iteration value is
+    // the explicit keyframe at offset 1; when that endpoint is implicit there is
+    // nothing to accumulate (its neutral value is a no-op anyway).
     let iterN = 0, endVal = null;
     if (eff._iterationComposite === 'accumulate') {
       const n = ct.currentIteration;
       const last = own[own.length - 1];
-      if (n && n > 0 && n !== Infinity && last.computedOffset === 1) { iterN = n; endVal = last.props[name]; }
+      if (n && n > 0 && n !== Infinity && last.computedOffset === 1) { iterN = n; endVal = valOf(last); }
     }
-    const rawOf = (f) => iterN ? _waIterAccumulate(f.props[name], endVal, iterN) : f.props[name];
+    const rawOf = (f) => iterN ? _waIterAccumulate(valOf(f), endVal, iterN, kebab) : valOf(f);
     // Each entry is { off, easingFn, value } with `value` ALREADY composited
     // against the underlying value, which is what the interpolation sees.
     const pts = own.map((f) => {
@@ -40314,7 +40608,7 @@ if (!globalThis.crypto.subtle) {
       return {
         off: f.computedOffset,
         easingFn: f._easingFn,
-        value: op === 'replace' ? rawOf(f) : _waComposite(op, getUnderlying(), rawOf(f)),
+        value: op === 'replace' ? rawOf(f) : _waComposite(op, getUnderlying(), rawOf(f), kebab),
       };
     });
     if (pts[0].off !== 0) pts.unshift({ off: 0, easingFn: null, value: getUnderlying() });
@@ -40336,7 +40630,7 @@ if (!globalThis.crypto.subtle) {
     const span = hi.off - lo.off;
     const local = span > 0 ? Math.min(1, Math.max(0, (progress - lo.off) / span)) : 0;
     const eased = (lo.easingFn || ((x) => x))(local);
-    return _waInterpolate(lo.value, hi.value, eased, _waKebab(name));
+    return _waInterpolate(lo.value, hi.value, eased, kebab);
   };
   // Every property an effect contributes at `progress`, as an IDL-name map.
   // `mkUnderlying(name)` hands back a thunk so the underlying value is resolved
@@ -40430,7 +40724,12 @@ if (!globalThis.crypto.subtle) {
     for (const name of Object.keys(cur)) {
       const v = cur[name];
       if (v === null || v === undefined || v === '') continue;
-      _expandDeclInto(decls, _waKebab(name), String(v), false);
+      const kebab = _waKebab(name);
+      // The one and only clamp — see `_waClampColors`. It runs here, on the
+      // finished animated value, so that every earlier step (composition, then
+      // interpolation between two composited endpoints) still sees the true
+      // out-of-range channels the spec composites with.
+      _expandDeclInto(decls, kebab, _waClampColors(String(v), kebab), false);
     }
     return decls;
   };
