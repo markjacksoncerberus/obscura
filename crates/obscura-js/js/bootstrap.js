@@ -38933,6 +38933,1256 @@ if (!globalThis.crypto.subtle) {
   _winOp('resizeBy', 2, function() {});
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Web Animations Level 1 — https://drafts.csswg.org/web-animations-1/
+// (plus the Level 2 members browsers actually ship: the timeline's currentTime /
+// duration / play(), Animation's startTime / currentTime / overallProgress, and
+// KeyframeEffect's iterationComposite.)
+//
+// Obscura has no compositor and no animated computed styles, so this is the
+// TIMING and PLAYBACK model — not a renderer. That is deliberate and it is most
+// of what pages actually observe: `el.animate(...)` returns a real Animation
+// whose currentTime advances against a real DocumentTimeline, whose `ready` and
+// `finished` promises settle at the right moments, and which fires `finish` /
+// `cancel` as AnimationPlaybackEvents. A very large amount of real-world code —
+// and a very large amount of WPT — only ever awaits those promises to sequence
+// work behind "the frame has been produced". Those pages now work here.
+//
+// What we honestly do NOT do: interpolate and apply values to the target's
+// computed style during playback. `commitStyles()` writes the effect's value at
+// the current progress into inline style, which is the one place the spec makes
+// that observable through the CSSOM.
+//
+// Placed after the CSSOM View block so EventTarget(=Node), Event, DOMException,
+// _exposeIface / _enumAccessors / _named / _markNative are all in scope.
+// ═════════════════════════════════════════════════════════════════════════════
+{
+  // ── WebIDL operation installer ─────────────────────────────────────────────
+  // Stamps the spec name + declared arity, marks the function native, throws on
+  // too-few arguments, and brand-checks `this` (idlharness invokes every
+  // operation with `this === null` and expects a TypeError).
+  const _waOp = (proto, Ctor, name, len, fn) => {
+    const wrapped = function(...a) {
+      if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+      if (a.length < len) throw new TypeError("Failed to execute '" + name + "' on '" + Ctor.name + "': " + len + " argument" + (len === 1 ? '' : 's') + " required, but only " + a.length + " present.");
+      return fn.apply(this, a);
+    };
+    Object.defineProperty(wrapped, 'name', { value: name, configurable: true });
+    Object.defineProperty(wrapped, 'length', { value: len, configurable: true });
+    _markNative(wrapped);
+    Object.defineProperty(proto, name, { value: wrapped, writable: true, enumerable: true, configurable: true });
+  };
+  // Readonly (or read/write) brand-checked enumerable prototype attribute.
+  const _waAttr = (proto, Ctor, name, get, set) => {
+    const d = { configurable: true, enumerable: true,
+      get: _named('get', name, function() { if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation"); return get.call(this); }) };
+    if (set) d.set = _named('set', name, function(v) { if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation"); return set.call(this, v); });
+    Object.defineProperty(proto, name, d);
+  };
+  const _waTag = (Ctor, name) => {
+    Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: name, configurable: true });
+  };
+  // Event-handler on* accessors for a non-node EventTarget (same recipe the
+  // CSSOM View block uses for MediaQueryList / VisualViewport): the brand is
+  // `instanceof Ctor`, and the value rides the shared `_eh*` machinery, which
+  // keys these targets by a synthetic registry key.
+  const _waEventHandlers = (proto, Ctor, names) => {
+    for (const name of names) {
+      Object.defineProperty(proto, name, { configurable: true, enumerable: true,
+        get: _named('get', name, function() {
+          if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+          return _ehCurrentValue(this, name);
+        }),
+        set: _named('set', name, function(v) {
+          if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+          if (typeof v === 'function' || (v !== null && typeof v === 'object')) { this['__eh_' + name] = v; _ehActivate(this, name); }
+          else { this['__eh_' + name] = null; }
+        }),
+      });
+    }
+  };
+
+  // ── Easing (CSS Easing Functions Level 1) ──────────────────────────────────
+  // Parsed once per `easing` assignment: an invalid easing is a TypeError at the
+  // point of assignment, never a silent no-op at sample time.
+  const _EASE_KEYWORDS = {
+    'linear': null,
+    'ease': [0.25, 0.1, 0.25, 1],
+    'ease-in': [0.42, 0, 1, 1],
+    'ease-out': [0, 0, 0.58, 1],
+    'ease-in-out': [0.42, 0, 0.58, 1],
+  };
+  // Cubic Bézier P0=(0,0) P3=(1,1): solve x(t)=progress for t by Newton-Raphson
+  // with a bisection fallback, then evaluate y(t).
+  const _bezier = (x1, y1, x2, y2) => {
+    const A = (a, b) => 1 - 3 * b + 3 * a, B = (a, b) => 3 * b - 6 * a, C = (a) => 3 * a;
+    const calc = (t, a, b) => ((A(a, b) * t + B(a, b)) * t + C(a)) * t;
+    const slope = (t, a, b) => 3 * A(a, b) * t * t + 2 * B(a, b) * t + C(a);
+    return (x) => {
+      if (x <= 0) return 0;
+      if (x >= 1) return 1;
+      let t = x;
+      for (let i = 0; i < 8; i++) {
+        const s = slope(t, x1, x2);
+        if (s === 0) break;
+        const e = calc(t, x1, x2) - x;
+        if (Math.abs(e) < 1e-7) return calc(t, y1, y2);
+        t -= e / s;
+      }
+      let lo = 0, hi = 1; t = x;
+      for (let i = 0; i < 24; i++) {
+        const e = calc(t, x1, x2) - x;
+        if (Math.abs(e) < 1e-7) break;
+        if (e > 0) hi = t; else lo = t;
+        t = (lo + hi) / 2;
+      }
+      return calc(t, y1, y2);
+    };
+  };
+  const _steps = (n, pos) => (x) => {
+    // §step-easing-function. `x` may fall outside [0,1] only via extrapolation,
+    // which we clamp — the timing model never hands us one.
+    const before = pos === 'start' || pos === 'jump-start' || pos === 'jump-both';
+    let jumps = n;
+    if (pos === 'jump-none') jumps = n - 1;
+    else if (pos === 'jump-both') jumps = n + 1;
+    let step = Math.floor(x * n);
+    if (before) step += 1;
+    if (x >= 0 && step < 0) step = 0;
+    if (x <= 1 && step > jumps) step = jumps;
+    return jumps <= 0 ? 0 : step / jumps;
+  };
+  // linear() — a piecewise-linear easing over <linear-stop># where each stop is
+  // <number> with optional input percentages. Stops without an explicit input
+  // are spread evenly across the run they sit in.
+  const _linearEasingFn = (inner) => {
+    const stops = inner.split(',').map((s) => s.trim()).filter(Boolean);
+    const outs = [], ins = [];
+    for (const st of stops) {
+      const toks = st.split(/\s+/);
+      const o = parseFloat(toks[0]);
+      if (toks.length === 1) { outs.push(o); ins.push(null); }
+      else for (let i = 1; i < toks.length; i++) { outs.push(o); ins.push(parseFloat(toks[i]) / 100); }
+    }
+    const n = ins.length;
+    if (!n) return (x) => x;
+    if (ins[0] === null) ins[0] = 0;
+    if (ins[n - 1] === null) ins[n - 1] = 1;
+    for (let i = 1; i < n; i++) if (ins[i] !== null && ins[i] < ins[i - 1]) ins[i] = ins[i - 1];
+    let last = 0;
+    for (let i = 1; i < n; i++) {
+      if (ins[i] === null) continue;
+      const span = i - last;
+      if (span > 1) for (let j = last + 1; j < i; j++) ins[j] = ins[last] + (ins[i] - ins[last]) * (j - last) / span;
+      last = i;
+    }
+    return (x) => {
+      if (x <= ins[0]) return outs[0];
+      for (let i = 1; i < n; i++) {
+        if (x <= ins[i]) {
+          const d = ins[i] - ins[i - 1];
+          return d === 0 ? outs[i] : outs[i - 1] + (outs[i] - outs[i - 1]) * (x - ins[i - 1]) / d;
+        }
+      }
+      return outs[n - 1];
+    };
+  };
+  // Build the sampling function for an ALREADY-CANONICAL easing serialization.
+  const _waEasingFn = (t) => {
+    if (Object.prototype.hasOwnProperty.call(_EASE_KEYWORDS, t)) {
+      const c = _EASE_KEYWORDS[t];
+      return c ? _bezier(c[0], c[1], c[2], c[3]) : (x) => x;
+    }
+    let m = /^cubic-bezier\((.*)\)$/.exec(t);
+    if (m) { const p = m[1].split(',').map((v) => parseFloat(v)); return _bezier(p[0], p[1], p[2], p[3]); }
+    m = /^steps\((.*)\)$/.exec(t);
+    if (m) {
+      const parts = m[1].split(',').map((s) => s.trim());
+      const n = parseInt(parts[0], 10);
+      return _steps(Number.isFinite(n) && n >= 1 ? n : 1, parts.length > 1 ? parts[1] : 'end');
+    }
+    m = /^linear\((.*)\)$/.exec(t);
+    if (m) return _linearEasingFn(m[1]);
+    return (x) => x;
+  };
+  // Parse + canonicalise an `easing` value. The stored text is the CSS
+  // serialization (`step-start` → `steps(1, start)`, `steps(2, end)` →
+  // `steps(2)`), which is what getKeyframes()/getTiming() must report, and the
+  // input first goes through CSS token unescaping so `Ease\2d in-out` and
+  // `ease /**/` name the same function `ease-in-out` / `ease` does.
+  //
+  // Validation and serialization both reuse the engine's existing
+  // <easing-function> canonicaliser — the same code path `transition-timing-
+  // function` and `animation-timing-function` already go through.
+  const _waParseEasing = (input) => {
+    const raw = String(input);
+    const norm = raw
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/\\([0-9a-fA-F]{1,6})[ \t\n]?/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+      .replace(/\\([^0-9a-fA-F])/g, '$1')
+      .trim();
+    const text = _canonEasing(norm);
+    if (text === null) throw new TypeError("'" + raw + "' is not a valid value for easing");
+    return { text: text, fn: _waEasingFn(text) };
+  };
+
+  // ── AnimationTimeline ──────────────────────────────────────────────────────
+  // No IDL constructor: `new AnimationTimeline()` is a TypeError. Concrete
+  // timelines (DocumentTimeline) flip the guard through `_allowTimelineCtor`.
+  let _allowTimelineCtor = false;
+  class AnimationTimeline {
+    constructor() {
+      if (!_allowTimelineCtor) throw new TypeError("Illegal constructor");
+      this._originTime = 0;
+    }
+  }
+  Object.defineProperty(AnimationTimeline, 'length', { value: 0, configurable: true });
+  _waAttr(AnimationTimeline.prototype, AnimationTimeline, 'currentTime', function() { return this._currentTime(); });
+  _waAttr(AnimationTimeline.prototype, AnimationTimeline, 'duration', function() { return null; });
+  AnimationTimeline.prototype._currentTime = function() { return null; };
+  _waTag(AnimationTimeline, 'AnimationTimeline');
+  _exposeIface('AnimationTimeline', AnimationTimeline); _markNative(AnimationTimeline);
+
+  // ── DocumentTimeline : AnimationTimeline ───────────────────────────────────
+  // A monotonically increasing timeline whose time origin is the document's;
+  // `performance.now()` already measures from exactly that origin, so the
+  // timeline time is `performance.now() - originTime`.
+  class DocumentTimeline extends AnimationTimeline {
+    constructor(options = {}) {
+      _allowTimelineCtor = true;
+      try { super(); } finally { _allowTimelineCtor = false; }
+      if (options == null) options = {};
+      const o = Number(options.originTime === undefined ? 0 : options.originTime);
+      if (!isFinite(o)) throw new TypeError("Failed to construct 'DocumentTimeline': originTime must be finite");
+      this._originTime = o;
+    }
+    _currentTime() {
+      const now = (globalThis.performance && typeof performance.now === 'function') ? performance.now() : 0;
+      return now - this._originTime;
+    }
+  }
+  Object.defineProperty(DocumentTimeline, 'length', { value: 0, configurable: true });
+  _waTag(DocumentTimeline, 'DocumentTimeline');
+  _exposeIface('DocumentTimeline', DocumentTimeline); _markNative(DocumentTimeline);
+
+  // The document's default timeline. One per document; `document.timeline` is a
+  // [SameObject]-style readonly attribute, so it is minted once and cached.
+  const _defaultTimeline = new DocumentTimeline();
+  globalThis._waDefaultTimeline = _defaultTimeline;
+  Object.defineProperty(Document.prototype, 'timeline', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'timeline', function() {
+      // Brand-checked: reading `Document.prototype.timeline` must throw, since
+      // the prototype object is not itself a Document.
+      if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
+      // Every document has its OWN default timeline — an iframe's
+      // `document.timeline` is a different object from the top document's, and
+      // WPT checks exactly that. Minted once per document and cached.
+      if (this === globalThis.document) return _defaultTimeline;
+      if (!this._waTimeline) {
+        try { Object.defineProperty(this, '_waTimeline', { value: new DocumentTimeline(), enumerable: false, configurable: true }); }
+        catch (e) { this._waTimeline = new DocumentTimeline(); }
+      }
+      return this._waTimeline;
+    }),
+  });
+
+  // ── AnimationEffect ────────────────────────────────────────────────────────
+  // Abstract: no IDL constructor. Holds the specified timing; every computed
+  // quantity is derived on demand from it plus the associated animation's time,
+  // so nothing has to be invalidated when either changes.
+  let _allowEffectCtor = false;
+  const _FILL_MODES = ['none', 'forwards', 'backwards', 'both', 'auto'];
+  const _DIRECTIONS = ['normal', 'reverse', 'alternate', 'alternate-reverse'];
+
+  // §timing "update the timing properties of an animation effect". Every member
+  // is optional; an absent member leaves the current value alone. Out-of-range
+  // values are TypeErrors and must leave the effect UNCHANGED, so validation
+  // runs to completion before anything is written.
+  const _waUpdateTiming = (eff, input) => {
+    if (input == null) input = {};
+    if (typeof input !== 'object' && typeof input !== 'function') throw new TypeError("The provided value is not of type 'OptionalEffectTiming'");
+    const next = Object.assign({}, eff._timing);
+    if ('delay' in input) {
+      const v = Number(input.delay);
+      if (!isFinite(v)) throw new TypeError("Failed to update timing: delay must be finite");
+      next.delay = v;
+    }
+    if ('endDelay' in input) {
+      const v = Number(input.endDelay);
+      if (!isFinite(v)) throw new TypeError("Failed to update timing: endDelay must be finite");
+      next.endDelay = v;
+    }
+    if ('fill' in input && input.fill !== undefined) {
+      const v = String(input.fill);
+      if (_FILL_MODES.indexOf(v) < 0) throw new TypeError("'" + v + "' is not a valid value for fill");
+      next.fill = v;
+    }
+    if ('iterationStart' in input && input.iterationStart !== undefined) {
+      const v = Number(input.iterationStart);
+      if (!(v >= 0) || !isFinite(v)) throw new TypeError("iterationStart must be a finite, non-negative number");
+      next.iterationStart = v;
+    }
+    if ('iterations' in input && input.iterations !== undefined) {
+      const v = Number(input.iterations);
+      if (Number.isNaN(v) || v < 0) throw new TypeError("iterations must be a non-negative number");
+      next.iterations = v;
+    }
+    if ('duration' in input && input.duration !== undefined) {
+      const d = input.duration;
+      if (typeof d === 'string' && d !== 'auto') throw new TypeError("'" + d + "' is not a valid value for duration");
+      if (typeof d !== 'string') {
+        const v = Number(d);
+        if (Number.isNaN(v) || v < 0) throw new TypeError("duration must be a non-negative number or 'auto'");
+        next.duration = v;
+      } else next.duration = 'auto';
+    }
+    if ('direction' in input && input.direction !== undefined) {
+      const v = String(input.direction);
+      if (_DIRECTIONS.indexOf(v) < 0) throw new TypeError("'" + v + "' is not a valid value for direction");
+      next.direction = v;
+    }
+    if ('easing' in input && input.easing !== undefined) {
+      const parsed = _waParseEasing(input.easing);   // throws on an invalid easing
+      next.easing = parsed.text;
+      next._easingFn = parsed.fn;
+    }
+    if ('playbackRate' in input && input.playbackRate !== undefined) {
+      const v = Number(input.playbackRate);
+      if (!isFinite(v)) throw new TypeError("playbackRate must be finite");
+      next.playbackRate = v;
+    }
+    eff._timing = next;
+    if (eff._animation) eff._animation._effectTimingChanged();
+  };
+
+  // §timing-model. Returns the full ComputedEffectTiming record; the phase and
+  // progress fall out of the effect's LOCAL TIME, which is the associated
+  // animation's current time (or null when there is no animation, or the
+  // animation is idle).
+  const _waComputedTiming = (eff) => {
+    const t = eff._timing;
+    const iterDur = t.duration === 'auto' ? 0 : t.duration;
+    const iterations = t.iterations;
+    let activeDuration;
+    if (iterations === 0 || iterDur === 0) activeDuration = 0;
+    else activeDuration = iterDur * iterations;               // Infinity is fine
+    const endTime = Math.max(t.delay + activeDuration + t.endDelay, 0);
+    const localTime = eff._localTime();
+    const dir = eff._animation ? (eff._animation._playbackRate < 0 ? -1 : 1) : 1;
+    const fill = t.fill === 'auto' ? 'none' : t.fill;
+
+    // §animation-effect-phases
+    const beforeActive = Math.max(Math.min(t.delay, endTime), 0);
+    const afterActive = Math.max(Math.min(t.delay + activeDuration, endTime), 0);
+    let phase;
+    if (localTime === null) phase = 'idle';
+    else if (localTime < beforeActive || (dir < 0 && localTime === beforeActive)) phase = 'before';
+    else if (localTime > afterActive || (dir > 0 && localTime === afterActive)) phase = 'after';
+    else phase = 'active';
+
+    // §calculating-the-active-time
+    let activeTime = null;
+    if (phase === 'before') {
+      if (fill === 'backwards' || fill === 'both') activeTime = Math.max(localTime - t.delay, 0);
+    } else if (phase === 'active') {
+      activeTime = localTime - t.delay;
+    } else if (phase === 'after') {
+      if (fill === 'forwards' || fill === 'both') activeTime = Math.max(Math.min(localTime - t.delay, activeDuration), 0);
+    }
+
+    // §calculating-the-overall-progress / simple iteration progress
+    let overall = null, simple = null, currentIteration = null;
+    if (activeTime !== null) {
+      if (iterDur === 0) overall = t.iterationStart + (phase === 'before' ? 0 : iterations);
+      else overall = activeTime / iterDur + t.iterationStart;
+      if (overall === Infinity) simple = t.iterationStart % 1;
+      else simple = overall % 1;
+      if (simple === 0 && phase === 'after' && iterations !== 0 && (activeTime !== 0 || iterDur === 0)) simple = 1;
+      if (phase === 'after' && iterations === Infinity) currentIteration = Infinity;
+      else if (simple === 1) currentIteration = Math.floor(overall) - 1;
+      else currentIteration = Math.floor(overall);
+    }
+
+    // §calculating-the-directed-progress + the easing (transformed progress)
+    let progress = null;
+    if (simple !== null) {
+      let forwards = true;
+      if (t.direction === 'reverse') forwards = false;
+      else if (t.direction !== 'normal') {
+        let d = currentIteration === Infinity ? 0 : currentIteration;
+        if (t.direction === 'alternate-reverse') d += 1;
+        forwards = (Math.abs(d) % 2) === 0;
+      }
+      const directed = forwards ? simple : 1 - simple;
+      progress = (t._easingFn || ((x) => x))(directed);
+    }
+
+    return {
+      // EffectTiming members, resolved
+      delay: t.delay, endDelay: t.endDelay, fill: fill, iterationStart: t.iterationStart,
+      iterations: iterations, duration: iterDur, direction: t.direction, easing: t.easing,
+      playbackRate: t.playbackRate,
+      // ComputedEffectTiming additions
+      startTime: 0, endTime: endTime, activeDuration: activeDuration, localTime: localTime,
+      progress: progress, currentIteration: currentIteration,
+      // internal: consumers below need the phase, callers never see this record
+      _phase: phase,
+    };
+  };
+
+  class AnimationEffect {
+    constructor() {
+      if (!_allowEffectCtor) throw new TypeError("Illegal constructor");
+      this._animation = null;
+      this._timing = {
+        delay: 0, endDelay: 0, fill: 'auto', iterationStart: 0, iterations: 1,
+        duration: 'auto', direction: 'normal', easing: 'linear', playbackRate: 1,
+        _easingFn: (x) => x,
+      };
+    }
+    // The effect's local time: the associated animation's current time, or null.
+    _localTime() { return this._animation ? this._animation.currentTime : null; }
+    _endTime() { return _waComputedTiming(this).endTime; }
+  }
+  Object.defineProperty(AnimationEffect, 'length', { value: 0, configurable: true });
+  _waOp(AnimationEffect.prototype, AnimationEffect, 'getTiming', 0, function() {
+    const t = this._timing;
+    return { delay: t.delay, endDelay: t.endDelay, fill: t.fill, iterationStart: t.iterationStart,
+             iterations: t.iterations, duration: t.duration, direction: t.direction, easing: t.easing };
+  });
+  _waOp(AnimationEffect.prototype, AnimationEffect, 'getComputedTiming', 0, function() {
+    const c = _waComputedTiming(this);
+    delete c._phase;
+    return c;
+  });
+  _waOp(AnimationEffect.prototype, AnimationEffect, 'updateTiming', 0, function(timing) {
+    _waUpdateTiming(this, timing);
+  });
+  // Level 2 timing hierarchy. Obscura does not implement GroupEffect, so an
+  // effect can never HAVE a parent — null here is the accurate answer, not a
+  // stub, and the four mutators are correspondingly no-ops.
+  _waAttr(AnimationEffect.prototype, AnimationEffect, 'parent', function() { return null; });
+  _waAttr(AnimationEffect.prototype, AnimationEffect, 'previousSibling', function() { return null; });
+  _waAttr(AnimationEffect.prototype, AnimationEffect, 'nextSibling', function() { return null; });
+  _waOp(AnimationEffect.prototype, AnimationEffect, 'before', 0, function() {});
+  _waOp(AnimationEffect.prototype, AnimationEffect, 'after', 0, function() {});
+  _waOp(AnimationEffect.prototype, AnimationEffect, 'replace', 0, function() {});
+  _waOp(AnimationEffect.prototype, AnimationEffect, 'remove', 0, function() {});
+  _waTag(AnimationEffect, 'AnimationEffect');
+  _exposeIface('AnimationEffect', AnimationEffect); _markNative(AnimationEffect);
+
+  // ── KeyframeEffect : AnimationEffect ───────────────────────────────────────
+  // §processing-a-keyframes-argument. Two input shapes:
+  //   • a SEQUENCE of keyframes           [{opacity: 0}, {opacity: 1}]
+  //   • a PROPERTY-INDEXED keyframe object {opacity: [0, 1]}
+  // Both normalise to the same internal list of
+  // {offset, computedOffset, easing, composite, props:{camelCaseName: "value"}}.
+  const _COMPOSITE_OPS = ['replace', 'add', 'accumulate'];
+  const _COMPOSITE_AUTO = ['replace', 'add', 'accumulate', 'auto'];
+  const _isIterableNonString = (v) => v != null && typeof v !== 'string' && typeof v[Symbol.iterator] === 'function';
+
+  // Properties that are explicitly NOT animatable, so a keyframe object's
+  // matching member must never even be READ. (The spec builds the list of
+  // animation properties before performing any [[Get]], and WPT verifies that
+  // by installing counting accessors.)
+  const _WA_NON_ANIMATABLE = new Set([
+    'animation', 'animationComposition', 'animationDelay', 'animationDirection',
+    'animationDuration', 'animationFillMode', 'animationIterationCount',
+    'animationName', 'animationPlayState', 'animationRange', 'animationRangeEnd',
+    'animationRangeStart', 'animationTimeline', 'animationTimingFunction',
+    'transition', 'transitionBehavior', 'transitionDelay', 'transitionDuration',
+    'transitionProperty', 'transitionTimingFunction',
+    'contain', 'direction', 'textCombineUpright', 'textOrientation',
+    'unicodeBidi', 'willChange', 'writingMode',
+    // The `float` property's IDL attribute name is `cssFloat`; the CSS spelling
+    // is not a keyframe member.
+    'float',
+  ]);
+  // A keyframe's animation properties are named with IDL ATTRIBUTE NAMES —
+  // camelCase, never the dashed CSS spelling — or are custom properties.
+  const _waIsAnimationProp = (name) => {
+    if (name.startsWith('--')) return true;
+    if (name.indexOf('-') >= 0) return false;
+    // `offset` is BOTH a CSS shorthand and a keyframe dictionary member — in a
+    // keyframe it is always the member, never the property (likewise easing /
+    // composite, which have no CSS spelling but are excluded for symmetry).
+    if (name === 'offset' || name === 'easing' || name === 'composite') return false;
+    if (_WA_NON_ANIMATABLE.has(name)) return false;
+    if (name === 'cssFloat') return true;
+    return _CSS_KNOWN_PROPS.has(name);
+  };
+  // A keyframe value that the property cannot accept is DROPPED (the keyframe
+  // survives without it) rather than making the whole call throw. Validation
+  // reuses the ordinary CSSOM setter, which already implements every property's
+  // grammar — a scratch declaration keeps it off any live element.
+  let _waProbe = null;
+  const _waValueIsValid = (name, value) => {
+    if (name.startsWith('--')) return true;             // custom properties take any token stream
+    if (value === '') return false;
+    if (/\bvar\(/.test(value)) return true;             // a var() reference is only resolvable at computed-value time
+    try {
+      if (!_waProbe) _waProbe = document.createElement('div').style;
+      _waProbe.cssText = '';
+      _waProbe[name] = value;
+      return _waProbe[name] !== '' && _waProbe[name] !== undefined;
+    } catch (e) {
+      return true;    // never lose a legitimate value to a gap in our own parser
+    }
+  };
+  // The animation-property members of a keyframe-like object, in the order the
+  // spec reads them: ascending Unicode codepoint order.
+  const _waAnimationPropsOf = (obj) => {
+    const out = [];
+    for (const k of Object.keys(obj)) if (_waIsAnimationProp(k)) out.push(k);
+    return out.sort();
+  };
+  const _waReadOffset = (v) => {
+    if (v === null || v === undefined) return null;
+    const n = Number(v);
+    if (Number.isNaN(n)) throw new TypeError("Failed to read the 'offset' property: value is not a finite number");
+    return n;
+  };
+  const _waReadComposite = (v) => {
+    if (v === null || v === undefined) return 'auto';
+    const s = String(v);
+    if (_COMPOSITE_AUTO.indexOf(s) < 0) throw new TypeError("'" + s + "' is not a valid value for composite");
+    return s;
+  };
+  const _newFrame = () => ({ offset: null, easing: 'linear', composite: 'auto', props: {} });
+  // §compute-missing-keyframe-offsets, over a list whose `computedOffset` is
+  // seeded from `offset`: pin the ends, then space each run of nulls evenly
+  // between the resolved offsets that bracket it.
+  const _waComputeOffsets = (frames) => {
+    const n = frames.length;
+    if (!n) return;
+    for (const f of frames) f.computedOffset = f.offset;
+    // Only pin the FIRST keyframe to 0 when there is more than one — a lone
+    // keyframe is also the last, so it lands at 1.
+    if (n > 1 && frames[0].computedOffset === null) frames[0].computedOffset = 0;
+    if (frames[n - 1].computedOffset === null) frames[n - 1].computedOffset = 1;
+    let lastIdx = 0;
+    for (let i = 1; i < n; i++) {
+      if (frames[i].computedOffset === null) continue;
+      const span = i - lastIdx;
+      if (span > 1) {
+        const a = frames[lastIdx].computedOffset, b = frames[i].computedOffset;
+        for (let j = lastIdx + 1; j < i; j++) frames[j].computedOffset = a + (b - a) * (j - lastIdx) / span;
+      }
+      lastIdx = i;
+    }
+  };
+
+  const _waProcessKeyframes = (input) => {
+    if (input === null || input === undefined) return [];
+    if (typeof input !== 'object' && typeof input !== 'function') throw new TypeError("The provided value is not an object");
+    let frames = [];
+    // An `easing` specified on a property-indexed object with NO animation
+    // properties still has to be validated — but only after every property has
+    // been read, so the error surfaces last.
+    let orphanEasings = null;
+    if (_isIterableNonString(input)) {
+      // ── sequence form: each item is a BaseKeyframe + animation properties ──
+      for (const item of input) {
+        const f = _newFrame();
+        if (item !== null && item !== undefined) {
+          if (typeof item !== 'object' && typeof item !== 'function') throw new TypeError("Keyframes must be objects");
+          // WebIDL dictionary members are read in alphabetical order, before
+          // any animation property.
+          f.composite = _waReadComposite(item.composite);
+          if (item.easing !== undefined && item.easing !== null) f.easing = String(item.easing);
+          f.offset = _waReadOffset(item.offset);
+          for (const name of _waAnimationPropsOf(item)) {
+            const v = item[name];
+            if (v === undefined) continue;
+            const s = String(v);
+            if (_waValueIsValid(name, s)) f.props[name] = s;
+          }
+        }
+        frames.push(f);
+      }
+      _waComputeOffsets(frames);
+    } else {
+      // ── property-indexed form ──
+      // Each property contributes its OWN evenly-spaced list of keyframes;
+      // the lists are then merged by offset. That — not a positional zip — is
+      // why {left: [a,b,c], top: [d,e]} pairs `top`'s two values with left's
+      // FIRST and LAST, leaving the middle keyframe with only `left`.
+      // Each dictionary member is read EXACTLY ONCE, in WebIDL member order
+      // (alphabetical), before any animation property is touched.
+      const rawComposite = input.composite;
+      const rawEasing = input.easing;
+      const rawOffset = input.offset;
+      const byOffset = new Map();
+      const at = (off) => {
+        let f = byOffset.get(off);
+        if (!f) { f = _newFrame(); f.computedOffset = off; byOffset.set(off, f); }
+        return f;
+      };
+      for (const name of _waAnimationPropsOf(input)) {
+        const raw = input[name];
+        if (raw === undefined) continue;
+        const values = _isIterableNonString(raw) ? Array.from(raw) : [raw];
+        const own = values.map(() => _newFrame());
+        _waComputeOffsets(own);
+        // A single value sits at offset 1 (the compute-offsets procedure pins
+        // the last keyframe there), matching every other engine.
+        for (let j = 0; j < values.length; j++) {
+          if (values[j] === undefined) continue;
+          const s = String(values[j]);
+          if (!_waValueIsValid(name, s)) continue;
+          at(own[j].computedOffset).props[name] = s;
+        }
+        // Even a wholly-invalid value keeps its keyframe slot.
+        for (let j = 0; j < values.length; j++) at(own[j].computedOffset);
+      }
+      frames = Array.from(byOffset.values()).sort((a, b) => a.computedOffset - b.computedOffset);
+      // The explicit offset / easing / composite members are applied to the
+      // merged list: offsets positionally, easing + composite CYCLICALLY.
+      const offsets = _isIterableNonString(rawOffset) ? Array.from(rawOffset) : (rawOffset === undefined ? [] : [rawOffset]);
+      for (let i = 0; i < frames.length && i < offsets.length; i++) frames[i].offset = _waReadOffset(offsets[i]);
+      // With explicit offsets in play the merged per-property spacing no longer
+      // describes the list — re-run compute-missing over the whole thing so the
+      // keyframes still bracketed by nulls space out between the pinned ones.
+      if (offsets.length) _waComputeOffsets(frames);
+      const easings = _isIterableNonString(rawEasing) ? Array.from(rawEasing) : (rawEasing === undefined || rawEasing === null ? [] : [rawEasing]);
+      if (easings.length) for (let i = 0; i < frames.length; i++) frames[i].easing = String(easings[i % easings.length]);
+      if (easings.length && !frames.length) orphanEasings = easings;
+      const composites = _isIterableNonString(rawComposite) ? Array.from(rawComposite) : (rawComposite === undefined || rawComposite === null ? [] : [rawComposite]);
+      if (composites.length) for (let i = 0; i < frames.length; i++) frames[i].composite = _waReadComposite(composites[i % composites.length]);
+      else { const c = _waReadComposite(rawComposite); for (const f of frames) f.composite = c; }
+      // An explicit `offset` overrides the merged computed offset.
+      for (const f of frames) if (f.offset !== null) f.computedOffset = f.offset;
+    }
+    // Offsets must be in [0,1] and non-decreasing; each easing must parse.
+    let prev = -Infinity;
+    for (const f of frames) {
+      if (f.offset !== null) {
+        if (f.offset < 0 || f.offset > 1) throw new TypeError("Offsets must be null or in the range [0,1]");
+        if (f.offset < prev) throw new TypeError("Offsets must be non-decreasing");
+        prev = f.offset;
+      }
+      // Canonicalise the easing text and build its sampling function. Throwing
+      // here — after every keyframe has been read — is exactly what the spec's
+      // "read everything, then report" ordering requires.
+      const parsed = _waParseEasing(f.easing);
+      f.easing = parsed.text;
+      f._easingFn = parsed.fn;
+    }
+    if (orphanEasings) for (const e of orphanEasings) _waParseEasing(e);
+    return frames;
+  };
+
+  let _allowKeyframeEffectCtor = false;
+  class KeyframeEffect extends AnimationEffect {
+    constructor(target, keyframes, options = {}) {
+      _allowEffectCtor = true;
+      try { super(); } finally { _allowEffectCtor = false; }
+      // Overload 2: KeyframeEffect(KeyframeEffect source) — a deep-ish copy.
+      if (arguments.length === 1 && target instanceof KeyframeEffect) {
+        const src = target;
+        this._target = src._target;
+        this._pseudo = src._pseudo;
+        this._composite = src._composite;
+        this._iterationComposite = src._iterationComposite;
+        this._frames = src._frames.map((f) => Object.assign({}, f, { props: Object.assign({}, f.props) }));
+        this._timing = Object.assign({}, src._timing);
+        return;
+      }
+      if (arguments.length < 2 && !_allowKeyframeEffectCtor) {
+        throw new TypeError("Failed to construct 'KeyframeEffect': 2 arguments required, but only " + arguments.length + " present.");
+      }
+      if (target !== null && target !== undefined && !(target instanceof Element)) {
+        throw new TypeError("Failed to construct 'KeyframeEffect': parameter 1 is not of type 'Element'");
+      }
+      this._target = target == null ? null : target;
+      this._pseudo = null;
+      this._composite = 'replace';
+      this._iterationComposite = 'replace';
+      this._frames = _waProcessKeyframes(keyframes);
+      // The options argument is either a duration or a KeyframeEffectOptions.
+      const opts = (typeof options === 'number' || typeof options === 'string') ? { duration: options } : (options || {});
+      if (typeof options === 'number' || typeof options === 'string') {
+        const d = Number(options);
+        if (Number.isNaN(d) || d < 0) throw new TypeError("duration must be a non-negative number");
+      }
+      _waUpdateTiming(this, opts);
+      if (opts.composite !== undefined && opts.composite !== null) {
+        const c = String(opts.composite);
+        if (_COMPOSITE_OPS.indexOf(c) < 0) throw new TypeError("'" + c + "' is not a valid value for composite");
+        this._composite = c;
+      }
+      if (opts.iterationComposite !== undefined && opts.iterationComposite !== null) {
+        const c = String(opts.iterationComposite);
+        if (c !== 'replace' && c !== 'accumulate') throw new TypeError("'" + c + "' is not a valid value for iterationComposite");
+        this._iterationComposite = c;
+      }
+      if (opts.pseudoElement !== undefined && opts.pseudoElement !== null) this._pseudo = _waCheckPseudo(opts.pseudoElement);
+    }
+  }
+  // The effective overload set's shortest entry is KeyframeEffect(source) — one
+  // required argument — so the interface object's length is 1, not 2.
+  Object.defineProperty(KeyframeEffect, 'length', { value: 1, configurable: true });
+  // §pseudo-element name validation: null, or a "::" -prefixed selector.
+  const _waCheckPseudo = (v) => {
+    const s = String(v);
+    if (s === '') return null;
+    if (!/^::[a-zA-Z-]+/.test(s)) {
+      throw new DOMException("'" + s + "' is not a valid value for pseudoElement", 'SyntaxError');
+    }
+    return s;
+  };
+  _waAttr(KeyframeEffect.prototype, KeyframeEffect, 'target',
+    function() { return this._target; },
+    function(v) {
+      if (v !== null && v !== undefined && !(v instanceof Element)) throw new TypeError("Failed to set the 'target' property on 'KeyframeEffect': parameter 1 is not of type 'Element'");
+      this._target = v == null ? null : v;
+    });
+  _waAttr(KeyframeEffect.prototype, KeyframeEffect, 'pseudoElement',
+    function() { return this._pseudo; },
+    function(v) { this._pseudo = (v === null || v === undefined) ? null : _waCheckPseudo(v); });
+  _waAttr(KeyframeEffect.prototype, KeyframeEffect, 'composite',
+    function() { return this._composite; },
+    function(v) { const c = String(v); if (_COMPOSITE_OPS.indexOf(c) >= 0) this._composite = c; });
+  _waAttr(KeyframeEffect.prototype, KeyframeEffect, 'iterationComposite',
+    function() { return this._iterationComposite; },
+    function(v) { const c = String(v); if (c === 'replace' || c === 'accumulate') this._iterationComposite = c; });
+  _waOp(KeyframeEffect.prototype, KeyframeEffect, 'getKeyframes', 0, function() {
+    return this._frames.map((f) => {
+      // Property order: the dictionary members first, then the animation
+      // properties in ascending order — the order every engine reports.
+      const out = { offset: f.offset, composite: f.composite, computedOffset: f.computedOffset, easing: f.easing };
+      for (const k of Object.keys(f.props).sort()) out[k] = f.props[k];
+      return out;
+    });
+  });
+  _waOp(KeyframeEffect.prototype, KeyframeEffect, 'setKeyframes', 1, function(keyframes) {
+    this._frames = _waProcessKeyframes(keyframes);
+  });
+  _waTag(KeyframeEffect, 'KeyframeEffect');
+  _exposeIface('KeyframeEffect', KeyframeEffect); _markNative(KeyframeEffect);
+
+  // Internal minting used by Element.animate(), which is allowed to construct a
+  // KeyframeEffect from (target, keyframes) with the timing folded in.
+  globalThis._waNewKeyframeEffect = (target, keyframes, options) => {
+    _allowKeyframeEffectCtor = true;
+    try { return new KeyframeEffect(target, keyframes, options); }
+    finally { _allowKeyframeEffectCtor = false; }
+  };
+  globalThis._waComputedTimingOf = _waComputedTiming;
+
+  // ── AnimationPlaybackEvent : Event ─────────────────────────────────────────
+  // Fired for `finish`, `cancel` and `remove`. Both times are CSSNumberish? and
+  // default to null.
+  class AnimationPlaybackEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init == null ? {} : init);
+      const o = init == null ? {} : init;
+      this._currentTime = (o.currentTime === undefined || o.currentTime === null) ? null : Number(o.currentTime);
+      this._timelineTime = (o.timelineTime === undefined || o.timelineTime === null) ? null : Number(o.timelineTime);
+    }
+  }
+  Object.defineProperty(AnimationPlaybackEvent, 'length', { value: 1, configurable: true });
+  _waAttr(AnimationPlaybackEvent.prototype, AnimationPlaybackEvent, 'currentTime', function() { return this._currentTime; });
+  _waAttr(AnimationPlaybackEvent.prototype, AnimationPlaybackEvent, 'timelineTime', function() { return this._timelineTime; });
+  _waTag(AnimationPlaybackEvent, 'AnimationPlaybackEvent');
+  _exposeIface('AnimationPlaybackEvent', AnimationPlaybackEvent); _markNative(AnimationPlaybackEvent);
+
+  // ── The animation frame driver ─────────────────────────────────────────────
+  // Obscura has no compositor, so nothing ticks on its own. A single timer runs
+  // ONLY while some animation is running or has a pending play/pause task, and
+  // stops the moment the last one settles — an idle page costs nothing, which
+  // matters a great deal on the hardware this browser is for.
+  const _waLive = new Set();
+  let _waTimer = null;
+  const _waQueueTask = (fn) => { setTimeout(fn, 0); };
+  const _waSchedule = () => {
+    if (_waTimer !== null) return;
+    _waTimer = setTimeout(_waTick, 8);
+  };
+  const _waTick = () => {
+    _waTimer = null;
+    let live = false;
+    for (const a of Array.from(_waLive)) {
+      try {
+        a._runPendingTasks();
+        a._updateFinished(false, false);
+      } catch (e) { /* one bad animation must not stop the others */ }
+      const st = a.playState;
+      if (st === 'running' || a._pendingPlay || a._pendingPause) live = true;
+      else if (st === 'idle') _waLive.delete(a);
+    }
+    if (live) _waSchedule();
+  };
+
+  // ── Animation : EventTarget ────────────────────────────────────────────────
+  // The full §playing-an-animation state machine: hold time / start time /
+  // playback rate, the pending play & pause tasks, the ready and finished
+  // promises, and the finish/cancel playback events.
+  class Animation extends EventTarget {
+    constructor(effect = null, timeline = undefined) {
+      super(undefined);
+      this._id = '';
+      this._effect = null;
+      this._timeline = null;
+      this._startTime = null;
+      this._holdTime = null;
+      this._playbackRate = 1;
+      this._pendingPlaybackRate = null;
+      this._pendingPlay = false;
+      this._pendingPause = false;
+      this._replaceState = 'active';
+      this._prevCurrent = null;
+      this._finishNotified = false;
+      this._newReady(); this._resolveReady();      // an idle animation is "ready"
+      this._newFinished();
+      if (effect !== null && effect !== undefined && !(effect instanceof AnimationEffect)) {
+        throw new TypeError("Failed to construct 'Animation': parameter 1 is not of type 'AnimationEffect'");
+      }
+      if (timeline !== undefined && timeline !== null && !(timeline instanceof AnimationTimeline)) {
+        throw new TypeError("Failed to construct 'Animation': parameter 2 is not of type 'AnimationTimeline'");
+      }
+      this._timeline = timeline === undefined ? _defaultTimeline : (timeline || null);
+      if (effect != null) this._associate(effect);
+      _waLive.add(this);
+    }
+
+    // ---- promises -----------------------------------------------------------
+    // Both promises are "marked handled" internally: an animation that is
+    // cancelled with nobody awaiting it must not surface an unhandled rejection.
+    _newReady() {
+      this._readySettled = false;
+      this._ready = new Promise((res, rej) => { this._readyRes = res; this._readyRej = rej; });
+      this._ready.catch(() => {});
+    }
+    _resolveReady() { if (!this._readySettled) { this._readySettled = true; this._readyRes(this); } }
+    _rejectReady(e) { if (!this._readySettled) { this._readySettled = true; this._readyRej(e); } }
+    _newFinished() {
+      this._finishedSettled = false;
+      this._finished = new Promise((res, rej) => { this._finishedRes = res; this._finishedRej = rej; });
+      this._finished.catch(() => {});
+    }
+    _resolveFinished() { if (!this._finishedSettled) { this._finishedSettled = true; this._finishedRes(this); } }
+    _rejectFinished(e) { if (!this._finishedSettled) { this._finishedSettled = true; this._finishedRej(e); } }
+
+    // ---- time ---------------------------------------------------------------
+    _timelineTime() { return this._timeline ? this._timeline.currentTime : null; }
+    _endTimeOf() { return this._effect ? this._effect._endTime() : 0; }
+    _unconstrained() {
+      const tt = this._timelineTime();
+      if (tt === null || this._startTime === null) return null;
+      return (tt - this._startTime) * this._playbackRate;
+    }
+    // §silently-set-the-current-time — moves the animation without running the
+    // "update the finished state" procedure or touching pending tasks.
+    _silentlySetCurrentTime(t) {
+      if (this._holdTime !== null || this._startTime === null || this._timelineTime() === null || this._playbackRate === 0) {
+        this._holdTime = t;
+      } else {
+        this._startTime = this._timelineTime() - t / this._playbackRate;
+      }
+      if (this._timelineTime() === null) this._startTime = null;
+      this._prevCurrent = null;
+    }
+    _applyPendingPlaybackRate() {
+      if (this._pendingPlaybackRate !== null) { this._playbackRate = this._pendingPlaybackRate; this._pendingPlaybackRate = null; }
+    }
+    _associate(effect) {
+      if (this._effect) this._effect._animation = null;
+      this._effect = effect;
+      if (effect) {
+        if (effect._animation && effect._animation !== this) effect._animation._effect = null;
+        effect._animation = this;
+      }
+    }
+    _effectTimingChanged() { this._updateFinished(false, false); _waSchedule(); }
+
+    // ---- §updating-the-finished-state --------------------------------------
+    _updateFinished(didSeek, sync) {
+      const et = this._endTimeOf();
+      if (this._startTime !== null && !this._pendingPlay && !this._pendingPause) {
+        const uct = this._unconstrained();
+        if (uct !== null) {
+          if (this._playbackRate > 0 && uct >= et) {
+            this._holdTime = didSeek ? uct : Math.max(this._prevCurrent === null ? -Infinity : this._prevCurrent, et);
+          } else if (this._playbackRate < 0 && uct <= 0) {
+            this._holdTime = didSeek ? uct : Math.min(this._prevCurrent === null ? Infinity : this._prevCurrent, 0);
+          } else if (this._playbackRate !== 0) {
+            if (didSeek && this._holdTime !== null) this._startTime = this._timelineTime() - this._holdTime / this._playbackRate;
+            this._holdTime = null;
+          }
+        }
+      }
+      const ct = this.currentTime;
+      this._prevCurrent = ct;
+      if (this.playState === 'finished') {
+        if (!this._finishNotified) {
+          this._finishNotified = true;
+          const notify = () => {
+            // A seek out of the finished state before the task ran cancels it.
+            if (this.playState !== 'finished') return;
+            this._resolveFinished();
+            const ev = new AnimationPlaybackEvent('finish', { currentTime: this.currentTime, timelineTime: this._timelineTime() });
+            this.dispatchEvent(ev);
+          };
+          if (sync) notify(); else _waQueueTask(notify);
+        }
+      } else {
+        this._finishNotified = false;
+        if (this._finishedSettled) this._newFinished();
+      }
+    }
+
+    // ---- §playing-an-animation ---------------------------------------------
+    _play(autoRewind) {
+      const abortedPause = this._pendingPause;
+      let hasPendingReady = false;
+      let seekTime = null;
+      const et = this._endTimeOf();
+      const ct = this.currentTime;
+      const rate = this._pendingPlaybackRate !== null ? this._pendingPlaybackRate : this._playbackRate;
+      if (rate > 0 && autoRewind && (ct === null || ct < 0 || ct >= et)) seekTime = 0;
+      else if (rate < 0 && autoRewind && (ct === null || ct <= 0 || ct > et)) {
+        if (et === Infinity) throw new DOMException("Cannot play reversed animation with infinite target effect end.", "InvalidStateError");
+        seekTime = et;
+      } else if (rate === 0 && ct === null) seekTime = 0;
+      if (seekTime !== null) this._holdTime = seekTime;
+      if (this._pendingPause) { this._pendingPause = false; hasPendingReady = true; }
+      if (this._holdTime === null && seekTime === null && !abortedPause && this._pendingPlaybackRate === null) return;
+      if (this._holdTime !== null) this._startTime = null;
+      if (!hasPendingReady) this._newReady();
+      this._pendingPlay = true;
+      this._finishNotified = false;
+      if (this._finishedSettled) this._newFinished();
+      _waLive.add(this);
+      _waSchedule();
+      this._updateFinished(false, false);
+    }
+    // The pending play / pause tasks, run on the next frame the driver produces.
+    _runPendingTasks() {
+      const readyTime = this._timelineTime();
+      if (readyTime === null) return;
+      if (this._pendingPause) {
+        if (this._startTime !== null && this._holdTime === null) this._holdTime = (readyTime - this._startTime) * this._playbackRate;
+        this._applyPendingPlaybackRate();
+        this._startTime = null;
+        this._pendingPause = false;
+        this._resolveReady();
+        this._updateFinished(false, false);
+      }
+      if (this._pendingPlay) {
+        if (this._holdTime !== null) {
+          this._applyPendingPlaybackRate();
+          this._startTime = this._playbackRate === 0 ? readyTime : readyTime - this._holdTime / this._playbackRate;
+          if (this._playbackRate !== 0) this._holdTime = null;
+        } else if (this._startTime !== null && this._pendingPlaybackRate !== null) {
+          const match = (readyTime - this._startTime) * this._playbackRate;
+          this._applyPendingPlaybackRate();
+          if (this._playbackRate === 0) this._holdTime = match;
+          else this._startTime = readyTime - match / this._playbackRate;
+        } else {
+          this._applyPendingPlaybackRate();
+        }
+        this._pendingPlay = false;
+        this._resolveReady();
+        this._updateFinished(false, false);
+      }
+    }
+  }
+  Object.defineProperty(Animation, 'length', { value: 0, configurable: true });
+
+  _waAttr(Animation.prototype, Animation, 'id', function() { return this._id; }, function(v) { this._id = String(v); });
+  _waAttr(Animation.prototype, Animation, 'effect', function() { return this._effect; }, function(v) {
+    if (v !== null && v !== undefined && !(v instanceof AnimationEffect)) throw new TypeError("Failed to set the 'effect' property on 'Animation': parameter 1 is not of type 'AnimationEffect'");
+    this._associate(v == null ? null : v);
+    this._updateFinished(false, false);
+  });
+  _waAttr(Animation.prototype, Animation, 'timeline', function() { return this._timeline; }, function(v) {
+    if (v !== null && v !== undefined && !(v instanceof AnimationTimeline)) throw new TypeError("Failed to set the 'timeline' property on 'Animation': parameter 1 is not of type 'AnimationTimeline'");
+    const prev = this.currentTime;
+    this._timeline = v == null ? null : v;
+    if (prev !== null) this._silentlySetCurrentTime(prev);
+    this._updateFinished(false, false);
+  });
+  _waAttr(Animation.prototype, Animation, 'playbackRate', function() { return this._playbackRate; }, function(v) {
+    const r = Number(v);
+    if (!isFinite(r)) throw new TypeError("playbackRate must be finite");
+    const prev = this.currentTime;
+    this._pendingPlaybackRate = null;
+    this._playbackRate = r;
+    if (prev !== null) this._silentlySetCurrentTime(prev);
+    this._updateFinished(false, false);
+  });
+  _waAttr(Animation.prototype, Animation, 'playState', function() {
+    const ct = this.currentTime;
+    if (ct === null && this._startTime === null && !this._pendingPlay && !this._pendingPause) return 'idle';
+    if (this._pendingPause || (this._startTime === null && !this._pendingPlay)) return 'paused';
+    const et = this._endTimeOf();
+    if (ct !== null && ((this._playbackRate > 0 && ct >= et) || (this._playbackRate < 0 && ct <= 0))) return 'finished';
+    return 'running';
+  });
+  _waAttr(Animation.prototype, Animation, 'replaceState', function() { return this._replaceState; });
+  _waAttr(Animation.prototype, Animation, 'pending', function() {
+    return this._pendingPlay || this._pendingPause || this._pendingPlaybackRate !== null;
+  });
+  // Promise-typed attributes: WebIDL says a wrong receiver must REJECT the
+  // returned promise rather than throw, so these two brand-check by hand.
+  const _waPromiseAttr = (name, get) => {
+    Object.defineProperty(Animation.prototype, name, { configurable: true, enumerable: true,
+      get: _named('get', name, function() {
+        if (!(this instanceof Animation)) return Promise.reject(new TypeError("Illegal invocation"));
+        return get.call(this);
+      }),
+    });
+  };
+  _waPromiseAttr('ready', function() { return this._ready; });
+  _waPromiseAttr('finished', function() { return this._finished; });
+  _waAttr(Animation.prototype, Animation, 'startTime', function() { return this._startTime; }, function(v) {
+    const newTime = (v === null || v === undefined) ? null : Number(v);
+    const prev = this.currentTime;
+    this._startTime = newTime;
+    if (newTime !== null) { if (this._playbackRate !== 0) this._holdTime = null; }
+    else this._holdTime = prev;
+    if (this._pendingPlay || this._pendingPause) { this._pendingPlay = false; this._pendingPause = false; this._resolveReady(); }
+    this._updateFinished(true, false);
+  });
+  _waAttr(Animation.prototype, Animation, 'currentTime', function() {
+    if (this._holdTime !== null) return this._holdTime;
+    return this._unconstrained();
+  }, function(v) {
+    if (v === null || v === undefined) {
+      if (this.currentTime !== null) throw new TypeError("currentTime may not be changed from a resolved to an unresolved time value");
+      return;
+    }
+    const t = Number(v);
+    this._silentlySetCurrentTime(t);
+    if (this._pendingPause) {
+      this._holdTime = t;
+      this._applyPendingPlaybackRate();
+      this._startTime = null;
+      this._pendingPause = false;
+      this._resolveReady();
+    }
+    this._updateFinished(true, false);
+    _waLive.add(this); _waSchedule();
+  });
+  // Level 2: overallProgress mirrors the effect's overall progress, normalised
+  // over the whole animation rather than the current iteration.
+  _waAttr(Animation.prototype, Animation, 'overallProgress', function() {
+    if (!this._effect) return null;
+    const c = _waComputedTiming(this._effect);
+    if (c.progress === null) return null;
+    const iters = c.iterations;
+    if (!isFinite(iters) || iters === 0) return c.progress;
+    const ci = c.currentIteration === null ? 0 : c.currentIteration;
+    return Math.min(1, (ci + c.progress) / iters);
+  });
+  _waEventHandlers(Animation.prototype, Animation, ['onfinish', 'oncancel', 'onremove']);
+
+  _waOp(Animation.prototype, Animation, 'play', 0, function() { this._play(true); });
+  _waOp(Animation.prototype, Animation, 'pause', 0, function() {
+    if (this.playState === 'paused') return;
+    if (this.currentTime === null) {
+      if (this._playbackRate >= 0) this._holdTime = 0;
+      else {
+        const et = this._endTimeOf();
+        if (et === Infinity) throw new DOMException("Cannot pause reversed animation with infinite target effect end.", "InvalidStateError");
+        this._holdTime = et;
+      }
+    }
+    let hasPendingReady = false;
+    if (this._pendingPlay) { this._pendingPlay = false; hasPendingReady = true; }
+    if (!hasPendingReady) this._newReady();
+    this._pendingPause = true;
+    _waLive.add(this);
+    _waSchedule();
+    this._updateFinished(false, false);
+  });
+  _waOp(Animation.prototype, Animation, 'finish', 0, function() {
+    const rate = this._pendingPlaybackRate !== null ? this._pendingPlaybackRate : this._playbackRate;
+    const et = this._endTimeOf();
+    if (rate === 0) throw new DOMException("Cannot finish Animation with a playbackRate of 0.", "InvalidStateError");
+    if (rate > 0 && et === Infinity) throw new DOMException("Cannot finish Animation with an infinite target effect end.", "InvalidStateError");
+    this._applyPendingPlaybackRate();
+    const limit = this._playbackRate > 0 ? et : 0;
+    this._silentlySetCurrentTime(limit);
+    const tt = this._timelineTime();
+    if (this._startTime === null && tt !== null) this._startTime = tt - limit / this._playbackRate;
+    if (this._pendingPause && this._startTime !== null) { this._holdTime = null; this._pendingPause = false; this._resolveReady(); }
+    if (this._pendingPlay && this._startTime !== null) { this._pendingPlay = false; this._resolveReady(); }
+    this._updateFinished(true, true);
+  });
+  _waOp(Animation.prototype, Animation, 'cancel', 0, function() {
+    if (this.playState !== 'idle') {
+      if (this._pendingPlay || this._pendingPause) {
+        this._pendingPlay = false; this._pendingPause = false;
+        this._rejectReady(new DOMException("The user aborted a request.", "AbortError"));
+      }
+      this._newReady(); this._resolveReady();
+      this._rejectFinished(new DOMException("The user aborted a request.", "AbortError"));
+      this._newFinished();
+      const tt = this._timelineTime();
+      _waQueueTask(() => {
+        this.dispatchEvent(new AnimationPlaybackEvent('cancel', { currentTime: null, timelineTime: tt }));
+      });
+    }
+    this._holdTime = null;
+    this._startTime = null;
+    this._finishNotified = false;
+  });
+  _waOp(Animation.prototype, Animation, 'updatePlaybackRate', 1, function(rate) {
+    const r = Number(rate);
+    if (!isFinite(r)) throw new TypeError("playbackRate must be finite");
+    this._pendingPlaybackRate = r;
+    const st = this.playState;
+    if (st === 'idle' || st === 'paused') {
+      this._applyPendingPlaybackRate();
+    } else if (st === 'finished') {
+      const tt = this._timelineTime();
+      const ct = this.currentTime;
+      if (tt !== null) this._startTime = (r !== 0 && ct !== null) ? (tt - ct / r) : tt;
+      else this._startTime = null;
+      this._applyPendingPlaybackRate();
+      this._updateFinished(false, false);
+    } else {
+      this._play(false);
+    }
+  });
+  _waOp(Animation.prototype, Animation, 'reverse', 0, function() {
+    if (this._timeline === null || this._timelineTime() === null) {
+      throw new DOMException("Cannot reverse an animation with no active timeline", "InvalidStateError");
+    }
+    const rate = this._pendingPlaybackRate !== null ? this._pendingPlaybackRate : this._playbackRate;
+    if (rate === 0) return;
+    const origRate = this._playbackRate, origPending = this._pendingPlaybackRate;
+    this._pendingPlaybackRate = null;
+    this._playbackRate = -rate;
+    try { this._play(true); }
+    catch (e) { this._playbackRate = origRate; this._pendingPlaybackRate = origPending; throw e; }
+  });
+  // Obscura never automatically removes a replaced animation, so persist() only
+  // has to record the author's intent — replaceState never becomes "removed".
+  _waOp(Animation.prototype, Animation, 'persist', 0, function() { this._replaceState = 'persisted'; });
+  // §commit-computed-styles — write the effect's value AT THE CURRENT PROGRESS
+  // into the target's inline style. This is the single place the spec makes an
+  // animated value observable through the CSSOM, so it is the one place a
+  // compositor-less engine can still be fully correct.
+  _waOp(Animation.prototype, Animation, 'commitStyles', 0, function() {
+    const eff = this._effect;
+    const target = eff && eff._target;
+    if (!target) throw new DOMException("Cannot commit styles of an animation with no target element.", "InvalidStateError");
+    if (eff._pseudo) throw new DOMException("Cannot commit styles of an animation targeting a pseudo-element.", "InvalidStateError");
+    if (!target.isConnected) throw new DOMException("Cannot commit styles of an animation target that is not rendered.", "InvalidStateError");
+    const c = _waComputedTiming(eff);
+    const p = c.progress === null ? (c._phase === 'before' ? 0 : 1) : c.progress;
+    const frames = eff._frames;
+    if (!frames.length) return;
+    // Every property mentioned anywhere in the keyframe list gets committed.
+    const names = new Set();
+    for (const f of frames) for (const k of Object.keys(f.props)) names.add(k);
+    for (const name of names) {
+      const withProp = frames.filter((f) => name in f.props);
+      if (!withProp.length) continue;
+      let lo = withProp[0], hi = withProp[withProp.length - 1];
+      for (let i = 0; i < withProp.length - 1; i++) {
+        if (p >= withProp[i].computedOffset && p <= withProp[i + 1].computedOffset) { lo = withProp[i]; hi = withProp[i + 1]; break; }
+      }
+      const span = hi.computedOffset - lo.computedOffset;
+      const local = span > 0 ? Math.min(1, Math.max(0, (p - lo.computedOffset) / span)) : 0;
+      const eased = (lo._easingFn || ((x) => x))(local);
+      try { target.style[name] = _waInterpolate(lo.props[name], hi.props[name], eased); } catch (e) {}
+    }
+  });
+  _waTag(Animation, 'Animation');
+  _exposeIface('Animation', Animation); _markNative(Animation);
+
+  // Interpolate two keyframe values. Pure numbers and same-unit lengths/angles
+  // interpolate numerically; anything else is DISCRETE, flipping at the 50%
+  // mark exactly as the spec's default "not additive, not interpolable" rule.
+  const _NUM_UNIT = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)([a-zA-Z%]*)$/;
+  function _waInterpolate(a, b, t) {
+    if (a === null || a === undefined) return b;
+    if (b === null || b === undefined) return a;
+    const ma = _NUM_UNIT.exec(String(a).trim()), mb = _NUM_UNIT.exec(String(b).trim());
+    if (ma && mb && ma[2] === mb[2]) {
+      const v = parseFloat(ma[1]) + (parseFloat(mb[1]) - parseFloat(ma[1])) * t;
+      return (Math.round(v * 1e6) / 1e6) + ma[2];
+    }
+    return t < 0.5 ? a : b;
+  }
+
+  // ── AnimationTimeline.play() (Level 2) ─────────────────────────────────────
+  _waOp(AnimationTimeline.prototype, AnimationTimeline, 'play', 0, function(effect) {
+    if (effect !== null && effect !== undefined && !(effect instanceof AnimationEffect)) {
+      throw new TypeError("Failed to execute 'play' on 'AnimationTimeline': parameter 1 is not of type 'AnimationEffect'");
+    }
+    const a = new Animation(effect == null ? null : effect, this);
+    a.play();
+    return a;
+  });
+
+  // ── Animatable (Element includes Animatable) ───────────────────────────────
+  // Replaces the earlier object-literal `animate()` stub, which returned a fake
+  // whose `finished` was already resolved. Defined as enumerable own properties
+  // on Element.prototype, which is what WebIDL requires of a mixin's members.
+  const _waRelevant = (a) => {
+    const st = a.playState;
+    if (st === 'idle') return false;
+    if (st !== 'finished') return true;
+    // A finished animation is still relevant while it fills forwards.
+    const fill = a._effect ? a._effect._timing.fill : 'none';
+    return fill === 'forwards' || fill === 'both';
+  };
+  const _waAnimationsFor = (pred) => {
+    const out = [];
+    for (const a of _waLive) { if (_waRelevant(a) && a._effect && pred(a._effect._target)) out.push(a); }
+    return out;
+  };
+  const _waIsInclusiveDescendant = (node, root) => {
+    for (let n = node; n; n = n.parentNode) if (n === root) return true;
+    return false;
+  };
+  _waOp(Element.prototype, Element, 'animate', 1, function(keyframes, options) {
+    const opts = (typeof options === 'number' || typeof options === 'string') ? {} : (options || {});
+    const effect = globalThis._waNewKeyframeEffect(this, keyframes, options === undefined ? {} : options);
+    // The animation belongs to the timeline of the TARGET's document.
+    let timeline = (this.ownerDocument && this.ownerDocument.timeline) || _defaultTimeline;
+    // WebIDL dictionary semantics: a member PRESENT but `undefined` counts as
+    // absent, so `animate(kf, {timeline: undefined})` still uses the document
+    // timeline. Only an explicit `null` detaches the animation.
+    if (opts && opts.timeline !== undefined) {
+      if (opts.timeline !== null && !(opts.timeline instanceof AnimationTimeline)) {
+        throw new TypeError("Failed to execute 'animate' on 'Element': timeline is not of type 'AnimationTimeline'");
+      }
+      timeline = opts.timeline;
+    }
+    const anim = new Animation(effect, timeline);
+    if (opts && opts.id !== undefined) anim.id = String(opts.id);
+    anim.play();
+    return anim;
+  });
+  _waOp(Element.prototype, Element, 'getAnimations', 0, function(options) {
+    const subtree = !!(options && options.subtree);
+    const self = this;
+    return _waAnimationsFor((t) => t === self || (subtree && t && _waIsInclusiveDescendant(t, self)));
+  });
+  // DocumentOrShadowRoot.getAnimations(): every relevant animation whose target
+  // is in this tree.
+  const _waTreeGetAnimations = function() {
+    const root = this;
+    const doc = (root.nodeType === 9) ? root : null;
+    return _waAnimationsFor((t) => {
+      if (!t) return false;
+      if (doc) return t.ownerDocument === doc && t.isConnected;
+      return _waIsInclusiveDescendant(t, root);
+    });
+  };
+  _waOp(Document.prototype, Document, 'getAnimations', 0, _waTreeGetAnimations);
+  if (typeof globalThis.ShadowRoot === 'function') {
+    _waOp(globalThis.ShadowRoot.prototype, globalThis.ShadowRoot, 'getAnimations', 0, _waTreeGetAnimations);
+  }
+}
+
 if (typeof Image === 'undefined') {
   // Legacy Image() factory: produce a real <img> element so setting .src flows
   // through the element resource-load path (fetch → Resource Timing entry →
