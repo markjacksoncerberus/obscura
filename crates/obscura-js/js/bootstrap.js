@@ -4772,6 +4772,11 @@ class Element extends Node {
     // Changing srcdoc on an iframe reprocesses the frame (src goes through the
     // src property setter's own load path).
     if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
+    // Resizing an <iframe> resizes the frame's viewport, so the frame's media
+    // queries must be re-evaluated and any change reported to its MediaQueryLists.
+    if ((qname === 'width' || qname === 'height') && this.localName === 'iframe' && this._iframeWin) {
+      globalThis._mqScheduleReport(this._iframeWin);
+    }
     // An id'd element is reachable as a Window-named global.
     if (qname === 'id' && v) __defineNamedGlobal(String(v));
     // Writing a reflected ARIA-element content attribute directly resets any
@@ -5230,10 +5235,10 @@ class Element extends Node {
         const html = await resp.text();
         if (_self._loadGen !== _gen) return; // re-check after the awaited body
         el._iframeDoc = new _IframeDocument(html, fullUrl, el, undefined, _iframeDocKind(fullUrl, resp));
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl, null, el);
       } else {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl, null, el);
       }
       _registerIframe(el);
       await _executeFrameScripts(el); // run same-origin frame scripts before load
@@ -5241,7 +5246,7 @@ class Element extends Node {
     }).catch(() => {
       if (_self._loadGen !== _gen) return; // superseded — leave the current doc intact
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-      el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+      el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl, null, el);
       _registerIframe(el);
       _fireIframeElementLoad(el);
     });
@@ -5268,7 +5273,7 @@ class Element extends Node {
         const parentUrl = _domParse("document_url") || 'about:blank';
         this._iframeDoc = new _IframeDocument(srcdoc, 'about:srcdoc', this, parentUrl);
         // location.href === 'about:srcdoc', but origin inherited from the parent.
-        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:srcdoc', parentUrl);
+        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:srcdoc', parentUrl, this);
         _registerIframe(this);
         _executeFrameScripts(this); // async; frame scripts run against the frame win
       } else if (srcAttr && srcAttr !== 'about:blank' && !this._srcLoadStarted) {
@@ -5278,11 +5283,11 @@ class Element extends Node {
         // the same path as an assigned src (cross-origin reads still blocked by the
         // origin check above once the real doc lands).
         this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank', null, this);
         this._loadIframeSrc(srcAttr);
       } else {
         this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank', null, this);
       }
     }
     return this._iframeDoc;
@@ -5448,8 +5453,10 @@ class Element extends Node {
     __obscura_click_target = this;
     // A display:none element (self or ancestor) generates no box: an all-zero rect.
     // Gated on _popoverEverUsed so non-popover pages keep the deterministic grid.
+    // The IDL return type is `[NewObject] DOMRect` — a real one, so `getClientRects()`
+    // items stringify as [object DOMRect] and top/right/bottom/left stay derived.
     if (_popoverBoxCheck(this) && !_renderedHasBox(this)) {
-      return { x: 0, y: 0, width: 0, height: 0, top: 0, right: 0, bottom: 0, left: 0, toJSON() { return this; } };
+      return new globalThis.DOMRect(0, 0, 0, 0);
     }
     // No layout engine, but Playwright's actionability polling needs each
     // element to occupy a stable, distinct rect so hit-testing can pick the
@@ -5463,11 +5470,7 @@ class Element extends Node {
     const row = (((cell * 13) | 0) >> 0) % rowsPerScreen;
     const x = 10 + col * GX;
     const y = 10 + row * GY;
-    return {
-      x, y, width: CW, height: CH,
-      top: y, right: x + CW, bottom: y + CH, left: x,
-      toJSON() { return this; },
-    };
+    return new globalThis.DOMRect(x, y, CW, CH);
   }
   getClientRects() { return globalThis._newDomRectList((_popoverBoxCheck(this) && !_renderedHasBox(this)) ? [] : [this.getBoundingClientRect()]); }
   // No layout engine: a stub that always returns true unblocks Playwright's
@@ -5820,13 +5823,15 @@ for (const __jsAttr in __bodyColorAttrs) {
 }
 
 // `width` is overloaded by element: a `long` on <pre> (default 0) but a DOMString
-// on <hr>. A single accessor dispatches on tag name; every other element keeps
-// `width` undefined (its current behaviour — img/canvas/etc. are not reflected here).
+// on <hr>, <iframe>, <embed>, <object> and <marquee>. A single accessor dispatches
+// on tag name; every other element keeps `width` undefined (its current behaviour —
+// img/canvas/etc. are not reflected here).
+const __DOMSTRING_WH_TAGS = new Set(['iframe', 'embed', 'object', 'marquee']);
 Object.defineProperty(Element.prototype, 'width', {
   configurable: true, enumerable: true,
   get() {
     const tag = this.localName;
-    if (tag === 'hr') return this.getAttribute('width') ?? '';
+    if (tag === 'hr' || __DOMSTRING_WH_TAGS.has(tag)) return this.getAttribute('width') ?? '';
     if (tag === 'pre') {
       const num = __parseHtmlSignedInt(this.getAttribute('width'));
       if (num === null || num < -2147483648 || num > 2147483647) return 0;
@@ -5836,8 +5841,21 @@ Object.defineProperty(Element.prototype, 'width', {
   },
   set(v) {
     const tag = this.localName;
-    if (tag === 'hr') this.setAttribute('width', String(v));
+    if (tag === 'hr' || __DOMSTRING_WH_TAGS.has(tag)) this.setAttribute('width', String(v));
     else if (tag === 'pre') this.setAttribute('width', String(v | 0));
+  },
+});
+
+// `height` is a DOMString content attribute on <iframe>/<embed>/<object>/<marquee>.
+// Every other element keeps the plain-data-property behaviour it has always had
+// (`canvas.height = 5` stores an own property), so the setter re-creates an own data
+// property rather than silently dropping the assignment.
+Object.defineProperty(Element.prototype, 'height', {
+  configurable: true, enumerable: true,
+  get() { return __DOMSTRING_WH_TAGS.has(this.localName) ? (this.getAttribute('height') ?? '') : undefined; },
+  set(v) {
+    if (__DOMSTRING_WH_TAGS.has(this.localName)) this.setAttribute('height', String(v));
+    else Object.defineProperty(this, 'height', { value: v, writable: true, enumerable: true, configurable: true });
   },
 });
 
@@ -9773,7 +9791,16 @@ if (typeof TextDecoder === 'undefined') {
   _markNative(TextDecoder); _markNative(TextDecoder.prototype.decode);
 }
 
-globalThis.matchMedia = _markNative(function matchMedia(q) { return { matches: false, media: q, addListener(){}, removeListener(){}, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} }; });
+// matchMedia (CSSOM View partial Window): returns a live MediaQueryList (a real
+// EventTarget). .length 1; per WebIDL's [Global] rule a null/undefined `this` maps
+// to the global, but any other `this` (idlharness's `fn.apply({})`) throws. The
+// MediaQueryList class + factory are defined in the CSSOM View block below (only
+// referenced here at call time, never at bootstrap load time).
+globalThis.matchMedia = _markNative(function matchMedia(q) {
+  if (this != null && this !== globalThis) throw new TypeError("Illegal invocation");
+  if (arguments.length < 1) throw new TypeError("Failed to execute 'matchMedia' on 'Window': 1 argument required, but only 0 present.");
+  return globalThis._newMediaQueryList(String(q), globalThis);
+});
 // ── CSS author-stylesheet cascade (for getComputedStyle) ─────────────────────
 // A minimal but spec-shaped cascade: gather `<style>` rules, ask the Rust
 // selector engine which match this element and at what specificity (it honours
@@ -9889,6 +9916,8 @@ const _GCS_DEFAULTS = {
   // the test's mediumWidth reference (a cascaded `border-top-width: medium`).
   appearance: 'none', 'caret-color': 'currentColor', 'caret-shape': 'auto',
   'field-sizing': 'fixed', 'interactivity': 'auto',
+  // css-contain: not inherited, initial `visible`, computed = specified (identity).
+  'content-visibility': 'visible',
   // css-scrollbars: both inherit, initial `auto`, computed = specified (identity).
   'scrollbar-width': 'auto', 'scrollbar-color': 'auto',
   // css-borders-4: the eight single-corner-shape longhands. Initial `round`; NOT
@@ -13864,6 +13893,12 @@ const _CSSUI_ENUM = {
   'user-select': new Set(['auto', 'text', 'none', 'contain', 'all']),
   'field-sizing': new Set(['fixed', 'content']),
   'interactivity': new Set(['auto', 'inert']),
+  // css-contain: `content-visibility` = visible | auto | hidden. Not inherited,
+  // initial `visible`. Registering it makes `style.contentVisibility` a real IDL
+  // accessor (an unregistered property silently became a stray own JS property, so
+  // `removeProperty('content-visibility')` could never undo it) and lets
+  // `Element.checkVisibility()` read it off computed style.
+  'content-visibility': new Set(['visible', 'auto', 'hidden']),
   'outline-style': new Set(['auto', 'none', 'dotted', 'dashed', 'solid', 'double', 'groove', 'ridge', 'inset', 'outset']),
   // filter-effects: `auto | sRGB | linearRGB`, canonicalized ASCII-lowercase
   // (`sRGB`→`srgb`, `LiNeArRgB`→`linearrgb`). Inherits; initial `linearrgb`.
@@ -13979,6 +14014,7 @@ const _CSSUI_ENUM = {
 // branch does no <color> validation, so it wrongly accepts `invert`/`none`/`50%`).
 const _CSSUI_VALIDATED = new Set([
   'box-sizing', 'resize', 'user-select', 'field-sizing', 'interactivity', 'outline-style',
+  'content-visibility',
   'caret-color', 'outline-color', 'text-overflow', 'outline-width', 'outline-offset', 'cursor',
   'color-interpolation-filters',
   // css-break: break-*/box-decoration-break are keyword enums; orphans/widows are
@@ -25188,6 +25224,257 @@ const _serMediaQuery = (raw) => {
   if (!rest.length) return head;
   return head ? head + ' ' + rest.join(' ') : rest.join(' ');
 };
+
+// ── Media query EVALUATION (Media Queries Level 4) ───────────────────────────
+// `_serMediaQuery` above only normalizes a query's TEXT. This is the engine that
+// decides whether a query actually MATCHES a viewport — what `matchMedia().matches`,
+// `MediaQueryList`'s change events and `CSSMediaRule.matches` all report.
+//
+// A media query is parsed into `{modifier, type, features[]}` and then evaluated
+// against a "media context" (`{width, height, dpr, ...}` — see `_mqContextFor`).
+// Per MQ4 a query that FAILS to parse (a bad ident, an unknown media feature, a
+// malformed value) is not an error: it becomes `not all`, which never matches. So
+// `_mqParseQuery` returns null for "didn't parse" and callers substitute `not all`.
+const _MQ_IDENT_RE = /^-?[A-Za-z_][A-Za-z0-9_-]*$/;
+// Media TYPES. Unknown-but-well-formed idents are valid per MQ4 and simply never
+// match; `all` matches everything and Obscura is a screen UA.
+const _MQ_TYPE_RESERVED = new Set(['only', 'not', 'and', 'or', 'layer']);
+const _MQ_TYPES_MATCHING = new Set(['all', 'screen']);
+// Discrete features: name → the value this UA reports. A query naming one of these
+// with any OTHER value is well-formed but never matches. `null` means "the feature
+// exists in boolean form only" (evaluated via its truthiness below).
+const _MQ_DISCRETE = {
+  'orientation': null, 'scan': 'progressive', 'grid': '0',
+  'hover': 'hover', 'any-hover': 'hover',
+  'pointer': 'fine', 'any-pointer': 'fine',
+  'prefers-color-scheme': 'light', 'prefers-reduced-motion': 'no-preference',
+  'prefers-reduced-transparency': 'no-preference', 'prefers-contrast': 'no-preference',
+  'prefers-reduced-data': 'no-preference', 'forced-colors': 'none',
+  'inverted-colors': 'none', 'display-mode': 'browser',
+  'dynamic-range': 'standard', 'video-dynamic-range': 'standard',
+  'update': 'fast', 'overflow-block': 'scroll', 'overflow-inline': 'scroll',
+  'scripting': 'enabled', 'color-gamut': 'srgb', 'nav-controls': 'back',
+};
+// Range features: name → how to read the current value out of a media context, and
+// what KIND of value the query side must be (`len`, `num`, `int`, `ratio`, `res`).
+const _MQ_RANGE = {
+  'width':               { kind: 'len',   get: (c) => c.width },
+  'height':              { kind: 'len',   get: (c) => c.height },
+  'device-width':        { kind: 'len',   get: (c) => c.deviceWidth },
+  'device-height':       { kind: 'len',   get: (c) => c.deviceHeight },
+  'aspect-ratio':        { kind: 'ratio', get: (c) => (c.height ? c.width / c.height : 0) },
+  'device-aspect-ratio': { kind: 'ratio', get: (c) => (c.deviceHeight ? c.deviceWidth / c.deviceHeight : 0) },
+  'resolution':          { kind: 'res',   get: (c) => c.dpr },
+  'color':               { kind: 'int',   get: (c) => c.color },
+  'color-index':         { kind: 'int',   get: () => 0 },
+  'monochrome':          { kind: 'int',   get: () => 0 },
+};
+// Parse a media-feature VALUE into a comparable number, in the unit the matching
+// `_MQ_RANGE.get` reports. Returns null when the value doesn't fit the kind (→ the
+// whole query becomes `not all`).
+const _mqParseValue = (kind, raw) => {
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return null;
+  if (kind === 'ratio') {
+    // <ratio> = <number [0,∞]> [ / <number [0,∞]> ]?  (a bare number means N/1)
+    const m = s.match(/^([0-9]*\.?[0-9]+)\s*(?:\/\s*([0-9]*\.?[0-9]+))?$/);
+    if (!m) return null;
+    const w = parseFloat(m[1]), h = m[2] === undefined ? 1 : parseFloat(m[2]);
+    if (!(h > 0)) return null;
+    return w / h;
+  }
+  if (kind === 'res') {
+    const m = s.match(/^([0-9]*\.?[0-9]+)(dppx|x|dpi|dpcm)$/);
+    if (!m) return null;
+    const n = parseFloat(m[1]);
+    if (m[2] === 'dpi') return n / 96;          // CSS: 1dppx === 96dpi
+    if (m[2] === 'dpcm') return n / (96 / 2.54);
+    return n;                                    // dppx / x
+  }
+  if (kind === 'int' || kind === 'num') {
+    const m = s.match(/^-?[0-9]*\.?[0-9]+$/);
+    if (!m) return null;
+    const n = parseFloat(s);
+    if (kind === 'int' && !Number.isInteger(n)) return null;
+    return n;
+  }
+  // kind === 'len': a <length>. Only absolute units can be resolved without a
+  // font/layout context; `0` is unitless-legal. Font-relative units (em/rem/ex/ch)
+  // resolve against the 16px initial font size, matching `_GCS_DEFAULTS`.
+  if (s === '0') return 0;
+  const m = s.match(/^(-?[0-9]*\.?[0-9]+)(px|cm|mm|q|in|pc|pt|em|rem|ex|ch|vw|vh|vmin|vmax)$/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  const PER = { px: 1, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6, in: 96, pc: 16, pt: 96 / 72,
+                em: 16, rem: 16, ex: 8, ch: 8 };
+  if (PER[m[2]] !== undefined) return n * PER[m[2]];
+  return { vrel: m[2], n };   // viewport-relative: resolved at evaluation time
+};
+// Parse the inside of one `(…)` media feature. Handles the boolean form `(name)`,
+// the plain form `(name: value)`, and the MQ4 range forms `(name op value)`,
+// `(value op name)` and `(v1 op name op v2)`.
+const _mqParseFeature = (paren) => {
+  const inner = paren.slice(1, -1).trim();
+  if (!inner) return null;
+  // Plain / boolean form first: no comparison operator at the top level.
+  if (!/[<>=]/.test(inner)) {
+    const ci = inner.indexOf(':');
+    if (ci === -1) {                                       // (name) — boolean form
+      const name = inner.toLowerCase();
+      if (!_MQ_IDENT_RE.test(name)) return null;
+      return { name: _mqStripRange(name), bool: true, minmax: _mqMinMax(name) };
+    }
+    const name = inner.slice(0, ci).trim().toLowerCase();
+    const value = inner.slice(ci + 1).trim();
+    if (!_MQ_IDENT_RE.test(name) || !value) return null;
+    return { name: _mqStripRange(name), minmax: _mqMinMax(name), op: '=', raw: value };
+  }
+  // Range form. Split on the comparison operators, keeping them.
+  const parts = inner.split(/(<=|>=|<|>|=)/).map((s) => s.trim());
+  if (parts.length === 3) {
+    const [a, op, b] = parts;
+    const aIsName = _MQ_IDENT_RE.test(a.toLowerCase()) && _mqKnown(a.toLowerCase());
+    if (aIsName) return { name: a.toLowerCase(), op, raw: b };
+    const bName = b.toLowerCase();
+    if (!_mqKnown(bName)) return null;
+    return { name: bName, op: _mqFlipOp(op), raw: a };      // `(200px <= width)`
+  }
+  if (parts.length === 5) {
+    const [a, op1, nm, op2, b] = parts;
+    const name = nm.toLowerCase();
+    if (!_mqKnown(name)) return null;
+    // `(v1 < width < v2)` — both bounds must point the same direction.
+    if ((op1[0] === '<') !== (op2[0] === '<')) return null;
+    return { name, range2: [{ op: _mqFlipOp(op1), raw: a }, { op: op2, raw: b }] };
+  }
+  return null;
+};
+const _mqFlipOp = (op) => (op === '<' ? '>' : op === '<=' ? '>=' : op === '>' ? '<' : op === '>=' ? '<=' : '=');
+// `min-`/`max-` prefixed features are the legacy equivalents of `>=` / `<=`.
+const _mqMinMax = (name) => (name.startsWith('min-') ? '>=' : name.startsWith('max-') ? '<=' : '');
+const _mqStripRange = (name) => (_mqMinMax(name) ? name.slice(4) : name);
+const _mqKnown = (name) => _MQ_RANGE[name] !== undefined || _MQ_DISCRETE[name] !== undefined;
+// Parse one media query. Returns null if it doesn't parse (caller → `not all`).
+const _mqParseQuery = (raw) => {
+  const toks = _tokenizeMQ(String(raw).trim());
+  if (!toks.length) return { modifier: '', type: 'all', features: [] };   // "" matches all
+  let i = 0, modifier = '';
+  const t0 = toks[0].toLowerCase();
+  if (t0 === 'not' || t0 === 'only') { modifier = t0; i = 1; }
+  let type = '';
+  if (i < toks.length && toks[i][0] !== '(') {
+    const low = toks[i].toLowerCase();
+    if (_MQ_TYPE_RESERVED.has(low) || !_MQ_IDENT_RE.test(low)) return null;
+    type = low; i++;
+  } else if (modifier) {
+    return null;             // `not`/`only` require a media type
+  }
+  if (!type) type = 'all';
+  const features = [];
+  let expectAnd = i > 0 && (modifier !== '' || toks[0][0] !== '(');
+  for (; i < toks.length; i++) {
+    const t = toks[i];
+    if (expectAnd) {
+      if (t.toLowerCase() !== 'and') return null;   // only `and` may join a type to features
+      expectAnd = false;
+      if (i + 1 >= toks.length) return null;        // dangling `and`
+      continue;
+    }
+    if (t[0] !== '(') return null;
+    if (t[t.length - 1] !== ')') return null;       // unterminated paren group
+    const f = _mqParseFeature(t);
+    if (!f) return null;
+    if (!_mqKnown(f.name)) return null;             // unknown feature → `not all`
+    features.push(f);
+    expectAnd = true;
+  }
+  if (!expectAnd && features.length === 0 && toks.length > (modifier ? 2 : 1)) return null;
+  return { modifier, type, features };
+};
+// Resolve a parsed value against the context (viewport-relative units need it).
+const _mqResolve = (v, ctx) => {
+  if (v !== null && typeof v === 'object' && v.vrel) {
+    const base = v.vrel === 'vw' ? ctx.width : v.vrel === 'vh' ? ctx.height
+      : v.vrel === 'vmin' ? Math.min(ctx.width, ctx.height) : Math.max(ctx.width, ctx.height);
+    return v.n * base / 100;
+  }
+  return v;
+};
+const _mqCompare = (op, actual, expected) => {
+  switch (op) {
+    case '=':  return actual === expected;
+    case '<':  return actual < expected;
+    case '<=': return actual <= expected;
+    case '>':  return actual > expected;
+    case '>=': return actual >= expected;
+  }
+  return false;
+};
+// Evaluate one parsed feature against a media context.
+const _mqEvalFeature = (f, ctx) => {
+  const range = _MQ_RANGE[f.name];
+  if (range) {
+    const actual = range.get(ctx);
+    // Boolean form `(width)`: true when the value is neither 0 nor a zero ratio.
+    if (f.bool) return actual !== 0;
+    if (f.range2) {
+      return f.range2.every((b) => {
+        const want = _mqResolve(_mqParseValue(range.kind, b.raw), ctx);
+        return want === null ? false : _mqCompare(b.op, actual, want);
+      });
+    }
+    const want = _mqResolve(_mqParseValue(range.kind, f.raw), ctx);
+    if (want === null) return false;
+    // A `min-`/`max-` prefix overrides the plain-form `=`.
+    return _mqCompare(f.minmax || f.op, actual, want);
+  }
+  // Discrete feature.
+  const cur = f.name === 'orientation'
+    ? (ctx.height >= ctx.width ? 'portrait' : 'landscape')
+    : _MQ_DISCRETE[f.name];
+  if (f.bool) return cur !== 'none' && cur !== '0' && cur !== 'no-preference';
+  return String(f.raw).trim().toLowerCase() === String(cur);
+};
+// Evaluate a whole parsed query (`not` inverts the type+features result).
+const _mqEvalQuery = (q, ctx) => {
+  if (q === null) return false;                       // `not all`
+  const typeOk = q.type === 'all' || _MQ_TYPES_MATCHING.has(q.type);
+  const result = typeOk && q.features.every((f) => _mqEvalFeature(f, ctx));
+  return q.modifier === 'not' ? !result : result;
+};
+// A media query LIST matches when ANY of its queries match. An empty list ("")
+// matches everything.
+const _mqEvalList = (text, ctx) => {
+  const parts = String(text == null ? '' : text).split(',').map((s) => s.trim());
+  if (parts.length === 1 && parts[0] === '') return true;
+  return parts.some((p) => _mqEvalQuery(_mqParseQuery(p), ctx));
+};
+// Serialize a media query list the way `matchMedia().media` must report it: each
+// query normalized by `_serMediaQuery`, but any query that fails to parse replaced
+// by `not all` (MQ4 §error handling).
+const _mqSerializeList = (text) => {
+  const s = String(text == null ? '' : text).trim();
+  if (s === '') return '';
+  return s.split(',').map((p) => {
+    const t = p.trim();
+    return _mqParseQuery(t) === null ? 'not all' : _serMediaQuery(t);
+  }).join(', ');
+};
+// The media context ("media features are evaluated against the viewport") for a
+// window — the top-level Window or an `_IframeWindow`.
+const _mqContextFor = (win) => {
+  const w = win || globalThis;
+  const scr = globalThis.screen;
+  return {
+    width: +w.innerWidth || 0,
+    height: +w.innerHeight || 0,
+    deviceWidth: scr ? (+scr.width || 0) : 0,
+    deviceHeight: scr ? (+scr.height || 0) : 0,
+    dpr: +w.devicePixelRatio || 1,
+    color: scr ? Math.floor((+scr.colorDepth || 24) / 3) : 8,
+  };
+};
+
 const _splitMediaText = (v) =>
   String(v == null ? '' : (typeof v === 'string' ? v : (v.mediaText || '')))
     .split(',').map((s) => s.trim()).filter(Boolean).map(_serMediaQuery);
@@ -26903,12 +27190,12 @@ class CSSMediaRule extends CSSConditionRule {
     return this._media;
   }
   set media(v) { this._media.mediaText = String(v == null ? '' : v); }   // [PutForwards=mediaText]
-  // CSS Conditional 4: `matches` reflects whether the query currently matches. Obscura
-  // has no viewport/media evaluation engine (matchMedia likewise reports matches:false),
-  // so this is a conservative stub — the correct type, not a real evaluation.
+  // CSS Conditional 4: `matches` reflects whether the query currently matches — a
+  // real evaluation of the stored media query list against this window's viewport
+  // (the same `_mqEvalList` engine behind `matchMedia().matches`).
   get matches() {
     if (!(this instanceof CSSMediaRule)) throw new TypeError("Illegal invocation");
-    return false;
+    return _mqEvalList(this._media.mediaText, _mqContextFor(globalThis));
   }
   get conditionText() {
     if (!(this instanceof CSSMediaRule)) throw new TypeError("Illegal invocation");
@@ -28830,10 +29117,10 @@ globalThis.MouseEvent = class MouseEvent extends UIEvent {
     this.button = o.button ?? 0;
     this.buttons = o.buttons ?? 0;
     this.relatedTarget = o.relatedTarget ?? null;
-    // Legacy/derived coordinates (best-effort; no layout box here).
-    this.pageX = this.clientX; this.pageY = this.clientY;
-    this.x = this.clientX; this.y = this.clientY;
-    this.offsetX = 0; this.offsetY = 0;
+    // pageX/pageY/x/y/offsetX/offsetY are CSSOM View MouseEvent members — defined as
+    // brand-checked PROTOTYPE getters (deriving from clientX/clientY) in the CSSOM
+    // View block, NOT as instance own-props (which would fail idlharness's
+    // "must inherit … in prototype chain" assertion).
     this.movementX = o.movementX ?? 0; this.movementY = o.movementY ?? 0;
   }
   getModifierState(k) { return _modifierState(this, k); }
@@ -36578,9 +36865,26 @@ class _IframeDocument extends DetachedDocument {
   close() { this._writeOpen = false; }
 }
 
+// A frame's viewport is the size of its host `<iframe>` element's box, so media
+// queries inside the frame evaluate against the frame — not the top-level window.
+// Without a layout engine the box comes straight from the `width`/`height` content
+// attributes, falling back to HTML's default iframe size of 300×150.
+const _IFRAME_DEFAULT_W = 300, _IFRAME_DEFAULT_H = 150;
+const _frameViewportDim = (win, attr, dflt) => {
+  const el = win && win._hostEl;
+  if (!el) return dflt;
+  const raw = el.getAttribute ? el.getAttribute(attr) : null;
+  if (raw == null) return dflt;
+  const m = String(raw).trim().match(/^([0-9]+)/);   // HTML "parse a dimension value"
+  if (!m) return dflt;
+  return parseInt(m[1], 10);
+};
+
 class _IframeWindow {
-  constructor(doc, url, originUrl) {
+  constructor(doc, url, originUrl, hostEl) {
     this.document = doc;
+    // The host <iframe> element, so the frame's viewport can track its box.
+    this._hostEl = hostEl || null;
     // Each frame window owns its own CustomElementRegistry (HTML: a Window's registry
     // is distinct from other windows'). Back-link it onto the frame document so that
     // reactions on nodes in this document (`_ceRegistryForNode`) target THIS registry,
@@ -36601,10 +36905,6 @@ class _IframeWindow {
     this.closed = false;
     this.navigator = globalThis.navigator;
     this.screen = globalThis.screen;
-    this.innerWidth = 300;
-    this.innerHeight = 150;
-    this.outerWidth = 300;
-    this.outerHeight = 150;
     this.devicePixelRatio = globalThis.devicePixelRatio;
     this.localStorage = globalThis.localStorage;
     this.sessionStorage = globalThis.sessionStorage;
@@ -36691,8 +36991,22 @@ class _IframeWindow {
     return _dispatchPublic(this, event);
   }
 
+  // The frame's viewport, tracking its host <iframe> box (see _frameViewportDim).
+  // Accessors rather than constructor fields so a later `iframe.width = …` is
+  // immediately visible inside the frame.
+  get innerWidth() { return _frameViewportDim(this, 'width', _IFRAME_DEFAULT_W); }
+  get innerHeight() { return _frameViewportDim(this, 'height', _IFRAME_DEFAULT_H); }
+  get outerWidth() { return this.innerWidth; }
+  get outerHeight() { return this.innerHeight; }
+
   getComputedStyle(el) { return globalThis.getComputedStyle(el); }
-  matchMedia(q) { return globalThis.matchMedia(q); }
+  // Media queries inside a frame evaluate against the FRAME's viewport, and the
+  // returned list is registered on this frame window so resizing the host <iframe>
+  // reports a `change` to it.
+  matchMedia(q) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'matchMedia' on 'Window': 1 argument required, but only 0 present.");
+    return globalThis._newMediaQueryList(String(q), this);
+  }
   getSelection() { return globalThis.getSelection(); }
   fetch(input, init) { return globalThis.fetch(input, init); }
   close() { this.closed = true; }
@@ -38123,6 +38437,502 @@ if (!globalThis.crypto.subtle) {
   _exposeIface('WebKitCSSMatrix', DOMMatrix);
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// CSSOM View Module Level 1 — https://drafts.csswg.org/cssom-view-1/
+// Real WebIDL interfaces (MediaQueryList / MediaQueryListEvent / Screen /
+// VisualViewport / CaretPosition / CSSPseudoElement) replacing the earlier
+// plain-object screen/visualViewport/matchMedia stubs, plus the partial
+// Window/Document/Element/Text/HTMLElement/HTMLImageElement/MouseEvent members and
+// the GeometryUtils mixin. Placed after the Geometry block so DOMRect/DOMPoint/
+// DOMQuad and EventTarget(=Node)/Event/_exposeIface are all in scope.
+// ═════════════════════════════════════════════════════════════════════════════
+{
+  // Event-handler on* accessor installer for a NON-node EventTarget interface. The
+  // brand is `instanceof Ctor` — these interfaces have no numeric `_nid` (unlike node
+  // hosts, which _ehDefineOnProto brands via `_nid`); the value is stored/activated
+  // through the shared `_eh*` machinery (_addListener uses a synthetic key for them).
+  const _ehDefineOnObjProto = (proto, Ctor, names) => {
+    for (const name of names) {
+      Object.defineProperty(proto, name, { configurable: true, enumerable: true,
+        get: _named('get', name, function() {
+          if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+          return _ehCurrentValue(this, name);
+        }),
+        set: _named('set', name, function(v) {
+          if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+          if (typeof v === 'function' || (v !== null && typeof v === 'object')) { this['__eh_' + name] = v; _ehActivate(this, name); }
+          else { this['__eh_' + name] = null; }
+        }),
+      });
+    }
+  };
+
+  // ── MediaQueryList : EventTarget ───────────────────────────────────────────
+  // Non-author-constructible (minted by matchMedia via a guard flip; `new
+  // MediaQueryList()` throws). media/matches are readonly brand-checked accessors;
+  // addListener/removeListener are legacy aliases for add/removeEventListener('change');
+  // onchange is an event handler. Extends EventTarget(=Node) so the interface-object
+  // and interface-prototype [[Prototype]] chains match the IDL `: EventTarget`.
+  let _allowMQLCtor = false;
+  class MediaQueryList extends EventTarget {
+    constructor() { if (!_allowMQLCtor) throw new TypeError("Illegal constructor"); super(undefined); this._media = ""; this._matches = false; this._win = null; }
+    get media() { if (!(this instanceof MediaQueryList)) throw new TypeError("Illegal invocation"); return this._media; }
+    get matches() { if (!(this instanceof MediaQueryList)) throw new TypeError("Illegal invocation"); return this._matches; }
+    // Legacy aliases for add/removeEventListener('change'). The `callback` argument
+    // is nullable, so `addListener(null)`/`addListener(undefined)` are no-ops rather
+    // than errors (a null EventListener is ignored per DOM §add-an-event-listener).
+    addListener(cb) { if (!(this instanceof MediaQueryList)) throw new TypeError("Illegal invocation"); if (arguments.length < 1) throw new TypeError("Failed to execute 'addListener' on 'MediaQueryList': 1 argument required, but only 0 present."); if (cb != null) this.addEventListener('change', cb); }
+    removeListener(cb) { if (!(this instanceof MediaQueryList)) throw new TypeError("Illegal invocation"); if (arguments.length < 1) throw new TypeError("Failed to execute 'removeListener' on 'MediaQueryList': 1 argument required, but only 0 present."); if (cb != null) this.removeEventListener('change', cb); }
+    get [Symbol.toStringTag]() { return 'MediaQueryList'; }
+  }
+  _ehDefineOnObjProto(MediaQueryList.prototype, MediaQueryList, ['onchange']);
+  _enumAccessors(MediaQueryList.prototype, 'media', 'matches', 'addListener', 'removeListener');
+  _exposeIface('MediaQueryList', MediaQueryList); _markNative(MediaQueryList);
+  // Mint the MediaQueryList `matchMedia(query)` returns, bound to the window whose
+  // viewport it is evaluated against, and REGISTER it on that window so a later
+  // viewport change can report changes to it (see `_mqReportChanges`). The registry
+  // preserves creation order, which is the order change events must fire in.
+  globalThis._newMediaQueryList = (q, win) => {
+    _allowMQLCtor = true;
+    let m; try { m = new MediaQueryList(); } finally { _allowMQLCtor = false; }
+    const w = win || globalThis;
+    m._win = w;
+    m._media = _mqSerializeList(q);
+    m._matches = _mqEvalList(m._media, _mqContextFor(w));
+    (w._mqls || (w._mqls = [])).push(m);
+    return m;
+  };
+  // CSSOM View §evaluate media queries and report changes. Re-evaluates EVERY
+  // MediaQueryList belonging to `win` and fires `change` on the ones whose match
+  // state flipped, in creation order.
+  //
+  // Deliberately TWO passes: every list's `matches` is updated BEFORE any listener
+  // runs, so a handler that inspects a sibling list (two `matchMedia()` calls with
+  // the same query) sees the new value rather than a half-updated world.
+  globalThis._mqReportChanges = (win) => {
+    const w = win || globalThis;
+    const lists = w._mqls;
+    if (!lists || !lists.length) return;
+    const ctx = _mqContextFor(w);
+    const changed = [];
+    for (const m of lists) {
+      const now = _mqEvalList(m._media, ctx);
+      if (now !== m._matches) { m._matches = now; changed.push(m); }
+    }
+    for (const m of changed) {
+      m.dispatchEvent(new MediaQueryListEvent('change', { media: m._media, matches: m._matches }));
+    }
+  };
+  // Coalesce bursts of viewport changes (`iframe.width = …; iframe.height = …`) into
+  // one report, delivered before the next animation frame the page can observe.
+  const _mqPending = new Set();
+  globalThis._mqScheduleReport = (win) => {
+    const w = win || globalThis;
+    if (_mqPending.has(w)) return;
+    _mqPending.add(w);
+    globalThis.requestAnimationFrame(() => { _mqPending.delete(w); globalThis._mqReportChanges(w); });
+  };
+
+  // ── MediaQueryListEvent : Event ────────────────────────────────────────────
+  // Constructor .length 1 (type required, init dict optional). media (default "") /
+  // matches (default false) are readonly brand-checked prototype getters.
+  class MediaQueryListEvent extends Event {
+    constructor(type, o = {}) { if (o == null) o = {}; super(type, o);
+      this._media = o.media != null ? String(o.media) : "";
+      this._matches = !!o.matches; }
+    get media() { if (!(this instanceof MediaQueryListEvent)) throw new TypeError("Illegal invocation"); return this._media; }
+    get matches() { if (!(this instanceof MediaQueryListEvent)) throw new TypeError("Illegal invocation"); return this._matches; }
+    get [Symbol.toStringTag]() { return 'MediaQueryListEvent'; }
+  }
+  _enumAccessors(MediaQueryListEvent.prototype, 'media', 'matches');
+  _exposeIface('MediaQueryListEvent', MediaQueryListEvent); _markNative(MediaQueryListEvent);
+
+  // ── Screen ─────────────────────────────────────────────────────────────────
+  // [Exposed=Window] (not an EventTarget). Non-author-constructible; minted by
+  // _newScreen for `window.screen`. The 6 CSSOM-View readonly attributes are
+  // brand-checked enumerable prototype getters; the Screen Orientation extras
+  // (orientation/availTop/availLeft) ride as own props on the instance (not in this
+  // IDL, harmless — idlharness ignores extra own properties).
+  let _allowScreenCtor = false;
+  class Screen {
+    constructor() { if (!_allowScreenCtor) throw new TypeError("Illegal constructor"); this._w = 0; this._h = 0; this._aw = 0; this._ah = 0; this._cd = 24; this._pd = 24; }
+    get availWidth() { if (!(this instanceof Screen)) throw new TypeError("Illegal invocation"); return this._aw; }
+    get availHeight() { if (!(this instanceof Screen)) throw new TypeError("Illegal invocation"); return this._ah; }
+    get width() { if (!(this instanceof Screen)) throw new TypeError("Illegal invocation"); return this._w; }
+    get height() { if (!(this instanceof Screen)) throw new TypeError("Illegal invocation"); return this._h; }
+    get colorDepth() { if (!(this instanceof Screen)) throw new TypeError("Illegal invocation"); return this._cd; }
+    get pixelDepth() { if (!(this instanceof Screen)) throw new TypeError("Illegal invocation"); return this._pd; }
+    get [Symbol.toStringTag]() { return 'Screen'; }
+  }
+  _enumAccessors(Screen.prototype, 'availWidth', 'availHeight', 'width', 'height', 'colorDepth', 'pixelDepth');
+  _exposeIface('Screen', Screen); _markNative(Screen);
+  globalThis._newScreen = (w, h) => {
+    _allowScreenCtor = true;
+    let s; try { s = new Screen(); } finally { _allowScreenCtor = false; }
+    s._w = w | 0; s._h = h | 0; s._aw = w | 0; s._ah = (h | 0) - 40; s._cd = 24; s._pd = 24;
+    // Screen Orientation API extras (not part of the CSSOM View IDL under test).
+    s.availTop = 0; s.availLeft = 0;
+    s.orientation = { type: "landscape-primary", angle: 0, onchange: null, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } };
+    return s;
+  };
+
+  // ── VisualViewport : EventTarget ───────────────────────────────────────────
+  // Non-author-constructible; minted by _newVisualViewport for `window.visualViewport`.
+  // Seven readonly double attributes + onresize/onscroll/onscrollend event handlers.
+  let _allowVVCtor = false;
+  class VisualViewport extends EventTarget {
+    constructor() { if (!_allowVVCtor) throw new TypeError("Illegal constructor"); super(undefined); this._ol = 0; this._ot = 0; this._pl = 0; this._pt = 0; this._w = 0; this._h = 0; this._scale = 1; }
+    get offsetLeft() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._ol; }
+    get offsetTop() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._ot; }
+    get pageLeft() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._pl; }
+    get pageTop() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._pt; }
+    get width() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._w; }
+    get height() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._h; }
+    get scale() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._scale; }
+    get [Symbol.toStringTag]() { return 'VisualViewport'; }
+  }
+  _ehDefineOnObjProto(VisualViewport.prototype, VisualViewport, ['onresize', 'onscroll', 'onscrollend']);
+  _enumAccessors(VisualViewport.prototype, 'offsetLeft', 'offsetTop', 'pageLeft', 'pageTop', 'width', 'height', 'scale');
+  _exposeIface('VisualViewport', VisualViewport); _markNative(VisualViewport);
+  globalThis._newVisualViewport = (w, h) => {
+    _allowVVCtor = true;
+    let v; try { v = new VisualViewport(); } finally { _allowVVCtor = false; }
+    v._w = +w || 0; v._h = +h || 0;
+    return v;
+  };
+
+  // ── CaretPosition ──────────────────────────────────────────────────────────
+  // Non-author-constructible; minted by document.caretPositionFromPoint. No layout
+  // engine, so getClientRect returns an all-zero DOMRect.
+  let _allowCaretCtor = false;
+  class CaretPosition {
+    constructor() { if (!_allowCaretCtor) throw new TypeError("Illegal constructor"); this._node = null; this._offset = 0; }
+    get offsetNode() { if (!(this instanceof CaretPosition)) throw new TypeError("Illegal invocation"); return this._node; }
+    get offset() { if (!(this instanceof CaretPosition)) throw new TypeError("Illegal invocation"); return this._offset; }
+    getClientRect() { if (!(this instanceof CaretPosition)) throw new TypeError("Illegal invocation"); return new globalThis.DOMRect(); }
+    get [Symbol.toStringTag]() { return 'CaretPosition'; }
+  }
+  _enumAccessors(CaretPosition.prototype, 'offsetNode', 'offset');
+  _enumAccessors(CaretPosition.prototype, 'getClientRect');
+  _exposeIface('CaretPosition', CaretPosition); _markNative(CaretPosition);
+  globalThis._newCaretPosition = (node, offset) => {
+    _allowCaretCtor = true;
+    let c; try { c = new CaretPosition(); } finally { _allowCaretCtor = false; }
+    c._node = node || null; c._offset = offset | 0;
+    return c;
+  };
+
+  // ── CSSPseudoElement (css-pseudo, pulled in by cssom-view's GeometryUtils) ───
+  // Non-author-constructible; no live pseudo-element machinery, so this is a pure
+  // interface-shape stub (idlharness tests no CSSPseudoElement objects for this file).
+  let _allowCPECtor = false;
+  class CSSPseudoElement {
+    constructor() { if (!_allowCPECtor) throw new TypeError("Illegal constructor"); this._type = ""; this._element = null; this._parent = null; }
+    get type() { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); return this._type; }
+    get element() { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); return this._element; }
+    get parent() { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); return this._parent; }
+    get selectorText() { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); return this._type ? '::' + this._type : ''; }
+    pseudo(type) { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); if (arguments.length < 1) throw new TypeError("Failed to execute 'pseudo' on 'CSSPseudoElement': 1 argument required, but only 0 present."); return null; }
+    get [Symbol.toStringTag]() { return 'CSSPseudoElement'; }
+  }
+  _enumAccessors(CSSPseudoElement.prototype, 'type', 'element', 'parent', 'selectorText', 'pseudo');
+  _exposeIface('CSSPseudoElement', CSSPseudoElement); _markNative(CSSPseudoElement);
+
+  // ── GeometryUtils mixin ─────────────────────────────────────────────────────
+  // Text/Element/CSSPseudoElement/Document include GeometryUtils. No layout engine,
+  // so getBoxQuads returns [] and the convert* ops return an identity quad/point.
+  // Each op is an enumerable own prototype method with the exact WebIDL name/arity
+  // and a leading brand-throw (idlharness invokes ops on the bare prototype).
+  const _isViewNode = (t) => t != null && typeof t._nid === 'number';
+  const _installGeometryUtils = (proto, isValid) => {
+    // `len` is both the declared .length and the required-argument count — every
+    // convert* op takes two required arguments then one optional dictionary, so
+    // calling with fewer must throw TypeError before the brand-less body runs.
+    const mk = (name, len, fn) => {
+      const g = function(...a) {
+        if (!isValid(this)) throw new TypeError("Illegal invocation");
+        if (a.length < len) throw new TypeError("Failed to execute '" + name + "': " + len + " arguments required, but only " + a.length + " present.");
+        return fn.apply(this, a);
+      };
+      Object.defineProperty(g, 'name', { value: name, configurable: true });
+      Object.defineProperty(g, 'length', { value: len, configurable: true });
+      _markNative(g);
+      Object.defineProperty(proto, name, { value: g, writable: true, enumerable: true, configurable: true });
+    };
+    mk('getBoxQuads', 0, function() { return []; });
+    mk('convertQuadFromNode', 2, function() { return new globalThis.DOMQuad(); });
+    mk('convertRectFromNode', 2, function() { return new globalThis.DOMQuad(); });
+    mk('convertPointFromNode', 2, function() { return new globalThis.DOMPoint(); });
+  };
+  _installGeometryUtils(Element.prototype, _isViewNode);
+  _installGeometryUtils(Text.prototype, _isViewNode);
+  _installGeometryUtils(Document.prototype, _isViewNode);
+  _installGeometryUtils(CSSPseudoElement.prototype, (t) => t instanceof CSSPseudoElement);
+
+  // ── Element / HTMLElement box-metric surface (CSSOM View partials) ───────────
+  // Redefine the existing box metrics on Element.prototype as ENUMERABLE, brand-
+  // checked accessors (idlharness reads each getter on the bare prototype and
+  // requires a TypeError), and add the members that were missing. The brand is the
+  // numeric `_nid` (the interface prototype has none). Values are the same layout-
+  // less constants as before; offsetWidth/offsetHeight keep their popover box logic.
+  const _defNodeRO = (proto, name, get) => {
+    Object.defineProperty(proto, name, { configurable: true, enumerable: true,
+      get: _named('get', name, function() { if (!_isViewNode(this)) throw new TypeError("Illegal invocation"); return get.call(this); }) });
+  };
+  const _defNodeRW = (proto, name, get, set) => {
+    Object.defineProperty(proto, name, { configurable: true, enumerable: true,
+      get: _named('get', name, function() { if (!_isViewNode(this)) throw new TypeError("Illegal invocation"); return get.call(this); }),
+      set: _named('set', name, function(v) { if (!_isViewNode(this)) throw new TypeError("Illegal invocation"); if (set) set.call(this, v); }) });
+  };
+  _defNodeRW(Element.prototype, 'scrollTop', function() { return 0; }, function() {});
+  _defNodeRW(Element.prototype, 'scrollLeft', function() { return 0; }, function() {});
+  _defNodeRO(Element.prototype, 'scrollWidth', function() { return 100; });
+  _defNodeRO(Element.prototype, 'scrollHeight', function() { return 20; });
+  _defNodeRO(Element.prototype, 'clientWidth', function() { return 100; });
+  _defNodeRO(Element.prototype, 'clientHeight', function() { return 20; });
+  _defNodeRO(Element.prototype, 'clientTop', function() { return 0; });
+  _defNodeRO(Element.prototype, 'clientLeft', function() { return 0; });
+  _defNodeRO(Element.prototype, 'currentCSSZoom', function() { return 1; });
+  // offset* belong to HTMLElement in the IDL, and idlharness reads the property
+  // DESCRIPTOR off HTMLElement.prototype (assert_own_property) — inheriting them
+  // from Element.prototype is not enough. They stay on Element.prototype too, where
+  // the rest of the engine (and non-HTML elements) has always read them from.
+  const _offsetMembers = {
+    offsetTop: function() { return 0; },
+    offsetLeft: function() { return 0; },
+    offsetWidth: function() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 100; },
+    offsetHeight: function() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 20; },
+  };
+  for (const nm of Object.keys(_offsetMembers)) _defNodeRO(Element.prototype, nm, _offsetMembers[nm]);
+  // offsetParent / scrollParent are HTMLElement-only; both are nullable Element and
+  // return null without a layout tree.
+  if (typeof HTMLElement !== 'undefined') {
+    for (const nm of Object.keys(_offsetMembers)) _defNodeRO(HTMLElement.prototype, nm, _offsetMembers[nm]);
+    _defNodeRO(HTMLElement.prototype, 'offsetParent', function() { return null; });
+    _defNodeRO(HTMLElement.prototype, 'scrollParent', function() { return null; });
+  }
+  // Define an operation as an enumerable own prototype method with an exact WebIDL
+  // name and .length (WebIDL operations are enumerable; ES class methods are not).
+  const _defOp = (proto, name, len, fn) => {
+    Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    Object.defineProperty(fn, 'length', { value: len, configurable: true });
+    _markNative(fn);
+    Object.defineProperty(proto, name, { value: fn, writable: true, enumerable: true, configurable: true });
+  };
+  // getBoundingClientRect / getClientRects keep their existing layout-less bodies but
+  // gain the WebIDL brand-throw (idlharness calls every operation with `this = {}`).
+  for (const nm of ['getBoundingClientRect', 'getClientRects']) {
+    const orig = Element.prototype[nm];
+    _defOp(Element.prototype, nm, 0, function() { if (!_isViewNode(this)) throw new TypeError("Illegal invocation"); return orig.call(this); });
+  }
+  // ── checkVisibility (CSSOM View §dom-element-checkvisibility) ────────────────
+  // A real computation over computed style, replacing the `return true` stub. The
+  // element is invisible when it generates no box (`display:none` on itself or any
+  // ancestor; `display:contents` on ITSELF — an ancestor with `display:contents`
+  // still lets descendants generate boxes), or when an ANCESTOR has
+  // `content-visibility:hidden` (which skips its *contents* — an element carrying
+  // it himself still has a box, hence the ancestors-only walk).
+  //
+  // The option pairs are aliases: `checkOpacity`/`opacityProperty` and
+  // `checkVisibilityCSS`/`visibilityProperty`.
+  //
+  // NOT layout-dependent, with one honest exception: `contentVisibilityAuto` asks
+  // whether a `content-visibility:auto` subtree is currently "relevant to the user",
+  // which needs a real viewport intersection. Obscura has no layout engine and its
+  // box model reports every element at an on-screen grid position, so we answer
+  // consistently with that: `content-visibility:auto` content is treated as
+  // relevant (never skipped). Off-screen `auto` subtrees are therefore reported
+  // visible — a known limitation, not an oversight.
+  _defOp(Element.prototype, 'checkVisibility', 0, function(options = undefined) {
+    if (!_isViewNode(this)) throw new TypeError("Illegal invocation");
+    const o = (options == null) ? {} : options;
+    const checkOpacity = !!(o.checkOpacity ?? o.opacityProperty);
+    const checkCSS = !!(o.checkVisibilityCSS ?? o.visibilityProperty);
+    const gcs = (el) => { try { return globalThis.getComputedStyle(el); } catch (e) { return null; } };
+    const own = gcs(this);
+    if (!own) return false;
+    // `display:contents` generates no box for the element itself.
+    if (own.display === 'none' || own.display === 'contents') return false;
+    // `visibility` inherits, so the element's own computed value already reflects
+    // any hidden ancestor.
+    if (checkCSS && own.visibility !== 'visible') return false;
+    if (checkOpacity && parseFloat(own.opacity) === 0) return false;
+    // Walk the ancestors for the properties that do NOT inherit.
+    for (let p = this.parentElement; p; p = p.parentElement) {
+      const cs = gcs(p);
+      if (!cs) break;
+      if (cs.display === 'none') return false;
+      if (cs.contentVisibility === 'hidden') return false;
+      if (checkOpacity && parseFloat(cs.opacity) === 0) return false;
+    }
+    return true;
+  });
+
+  // ── ScrollToOptions (CSSOM View) ─────────────────────────────────────────────
+  // `scroll(options)` / `scroll(x, y)`. With a single argument the dictionary
+  // overload is chosen, so WebIDL dictionary conversion applies: a non-object (e.g.
+  // `scrollTo(25)`) is a TypeError, and `behavior` must be a valid ScrollBehavior
+  // enum value. Since these operations return a promise, the conversion failure has
+  // to REJECT it rather than throw synchronously.
+  const _SCROLL_BEHAVIORS = new Set(['auto', 'instant', 'smooth']);
+  const _toScrollToOptions = (args, opName) => {
+    if (args.length >= 2) return { left: Number(args[0]), top: Number(args[1]) };
+    if (args.length === 0) return {};
+    const a = args[0];
+    if (a === undefined || a === null) return {};
+    if (typeof a !== 'object' && typeof a !== 'function') {
+      throw new TypeError("Failed to execute '" + opName + "': The provided value is not of type 'ScrollToOptions'.");
+    }
+    const out = {};
+    if (a.left !== undefined) out.left = Number(a.left);
+    if (a.top !== undefined) out.top = Number(a.top);
+    if (a.behavior !== undefined) {
+      const b = String(a.behavior);
+      if (!_SCROLL_BEHAVIORS.has(b)) {
+        throw new TypeError("Failed to execute '" + opName + "': The provided value '" + b + "' is not a valid enum value of type ScrollBehavior.");
+      }
+      out.behavior = b;
+    }
+    return out;
+  };
+  // scroll / scrollTo / scrollBy / scrollIntoView return a promise in CSSOM View —
+  // a wrong receiver or a bad argument must reject it, not throw. Layout-less, so
+  // the scroll is instantly "complete"; the promise fulfils with the spec's scroll
+  // result object. scrollIntoView takes ScrollIntoViewOptions (or a boolean), NOT
+  // ScrollToOptions, so it skips the dictionary conversion — and it keeps its
+  // click-target side effect (Playwright's actionability polling reads it).
+  const _defScrollOp = (proto, name, body) => {
+    _defOp(proto, name, 0, function(...args) {
+      if (!_isViewNode(this)) return Promise.reject(new TypeError("Illegal invocation"));
+      let opts;
+      try { opts = _toScrollToOptions(args, name); } catch (e) { return Promise.reject(e); }
+      if (body) body.call(this, opts);
+      return Promise.resolve({ interrupted: false });
+    });
+  };
+  for (const nm of ['scroll', 'scrollTo', 'scrollBy']) _defScrollOp(Element.prototype, nm, null);
+  _defOp(Element.prototype, 'scrollIntoView', 0, function(arg = undefined) {
+    if (!_isViewNode(this)) return Promise.reject(new TypeError("Illegal invocation"));
+    __obscura_click_target = this;
+    return Promise.resolve({ interrupted: false });
+  });
+
+  // ── Range partial (CSSOM View): getClientRects / getBoundingClientRect ────────
+  // Already present as class methods (layout-less stubs); they need to be enumerable
+  // WebIDL operations with a brand-throw, and getClientRects returns a DOMRectList.
+  if (typeof globalThis.Range === 'function') {
+    const R = globalThis.Range;
+    const _rangeBrand = (t) => { if (!(t instanceof R)) throw new TypeError("Illegal invocation"); };
+    _defOp(R.prototype, 'getBoundingClientRect', 0, function() { _rangeBrand(this); return new globalThis.DOMRect(); });
+    // Layout-less: a range's single client rect is its bounding rect (matching how
+    // Element.getClientRects mirrors Element.getBoundingClientRect).
+    _defOp(R.prototype, 'getClientRects', 0, function() { _rangeBrand(this); return globalThis._newDomRectList([this.getBoundingClientRect()]); });
+  }
+
+  // ── MouseEvent partial (CSSOM View) ──────────────────────────────────────────
+  // pageX/pageY/x/y/offsetX/offsetY — readonly doubles, brand-checked prototype
+  // getters. Layout-less → 0. (clientX/clientY already exist on MouseEvent.)
+  if (typeof MouseEvent !== 'undefined') {
+    const _meCoord = {
+      pageX: function() { return this.clientX; }, pageY: function() { return this.clientY; },
+      x: function() { return this.clientX; }, y: function() { return this.clientY; },
+      offsetX: function() { return 0; }, offsetY: function() { return 0; },
+    };
+    for (const nm of Object.keys(_meCoord)) {
+      const read = _meCoord[nm];
+      Object.defineProperty(MouseEvent.prototype, nm, { configurable: true, enumerable: true,
+        get: _named('get', nm, function() { if (!(this instanceof MouseEvent)) throw new TypeError("Illegal invocation"); return read.call(this); }) });
+    }
+  }
+  // ── HTMLImageElement partial (CSSOM View): x / y (readonly long) → 0. ─────────
+  if (typeof HTMLImageElement !== 'undefined') {
+    _defNodeRO(HTMLImageElement.prototype, 'x', function() { return 0; });
+    _defNodeRO(HTMLImageElement.prototype, 'y', function() { return 0; });
+  }
+
+  // ── Window partial (CSSOM View): [Replaceable] viewport/client attributes as
+  // accessors + the scroll/move/resize operations. Values back onto _winView so the
+  // per-page document-setup updates them WITHOUT collapsing the accessor into a data
+  // property (which a bare `globalThis.innerWidth = …` assignment would). The initial
+  // fields snapshot the top-level defaults set earlier in bootstrap.
+  const _winView = {
+    innerWidth: globalThis.innerWidth | 0, innerHeight: globalThis.innerHeight | 0,
+    outerWidth: globalThis.outerWidth | 0, outerHeight: globalThis.outerHeight | 0,
+    devicePixelRatio: +globalThis.devicePixelRatio || 1,
+    scrollX: 0, scrollY: 0, screenX: 0, screenY: 0,
+    screen: globalThis.screen || null, visualViewport: globalThis.visualViewport || null,
+  };
+  globalThis._winView = _winView;
+  // The getter carries WebIDL's [Global] receiver rule: a null/undefined `this`
+  // maps to the global (idlharness asserts "Gets on a global should not require an
+  // explicit this" via `getter.call(undefined)`), but any OTHER receiver is a
+  // wrong-type object and must throw (idlharness does `desc.get.call({})`).
+  const _winBrand = (t) => { if (t != null && t !== globalThis) throw new TypeError("Illegal invocation"); };
+  const _defWinAttr = (name, get) => {
+    Object.defineProperty(globalThis, name, { configurable: true, enumerable: true,
+      get: _named('get', name, function() { _winBrand(this); return get(); }),
+      // [Replaceable]: assignment redefines the property as a data property on the
+      // receiver (spec behavior; idlharness sets these after the shape checks run).
+      // The same [Global] receiver rule applies — `desc.set.call({})` must throw.
+      set: _named('set', name, function(v) {
+        _winBrand(this);
+        Object.defineProperty(this == null ? globalThis : this, name, { value: v, writable: true, enumerable: true, configurable: true });
+      }) });
+  };
+  _defWinAttr('innerWidth', () => _winView.innerWidth);
+  _defWinAttr('innerHeight', () => _winView.innerHeight);
+  _defWinAttr('outerWidth', () => _winView.outerWidth);
+  _defWinAttr('outerHeight', () => _winView.outerHeight);
+  _defWinAttr('devicePixelRatio', () => _winView.devicePixelRatio);
+  _defWinAttr('scrollX', () => _winView.scrollX);
+  _defWinAttr('scrollY', () => _winView.scrollY);
+  _defWinAttr('pageXOffset', () => _winView.scrollX);
+  _defWinAttr('pageYOffset', () => _winView.scrollY);
+  _defWinAttr('screenX', () => _winView.screenX);
+  _defWinAttr('screenLeft', () => _winView.screenX);
+  _defWinAttr('screenY', () => _winView.screenY);
+  _defWinAttr('screenTop', () => _winView.screenY);
+  _defWinAttr('screen', () => _winView.screen);
+  _defWinAttr('visualViewport', () => _winView.visualViewport);
+  // Window operations. For a [Global] interface these are own props of the global.
+  // `len` is both the WebIDL .length and the required-argument count (every one of
+  // these ops has all-or-nothing arguments), so one guard covers both the too-few-
+  // arguments TypeError and the declared arity.
+  const _defGlobalOp = (name, len, fn) => {
+    Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    Object.defineProperty(fn, 'length', { value: len, configurable: true });
+    _markNative(fn);
+    Object.defineProperty(globalThis, name, { value: fn, writable: true, enumerable: true, configurable: true });
+  };
+  const _winOp = (name, len, fn) => {
+    _defGlobalOp(name, len, function(...a) {
+      _winBrand(this);
+      if (a.length < len) throw new TypeError("Failed to execute '" + name + "' on 'Window': " + len + " arguments required, but only " + a.length + " present.");
+      return fn.apply(this, a);
+    });
+  };
+  // scroll/scrollTo/scrollBy return a promise in CSSOM View (it settles when the
+  // scroll finishes) — so a wrong receiver, or a ScrollToOptions that fails WebIDL
+  // conversion, must REJECT it rather than throw synchronously. Nothing scrolls
+  // without a layout engine, so the promise is already settled.
+  const _winScrollOp = (name) => {
+    _defGlobalOp(name, 0, function(...args) {
+      try {
+        _winBrand(this);
+        _toScrollToOptions(args, name);
+      } catch (e) { return Promise.reject(e); }
+      return Promise.resolve({ interrupted: false });
+    });
+  };
+  _winScrollOp('scroll');
+  _winScrollOp('scrollTo');
+  _winScrollOp('scrollBy');
+  _winOp('moveTo', 2, function() {});
+  _winOp('moveBy', 2, function() {});
+  _winOp('resizeTo', 2, function() {});
+  _winOp('resizeBy', 2, function() {});
+}
+
 if (typeof Image === 'undefined') {
   // Legacy Image() factory: produce a real <img> element so setting .src flows
   // through the element resource-load path (fetch → Resource Timing entry →
@@ -38256,12 +39066,6 @@ if (typeof BroadcastChannel === 'undefined') {
   };
 }
 
-if (typeof MediaQueryList === 'undefined') {
-  globalThis.MediaQueryList = class MediaQueryList {
-    constructor(q) { this.media = q || ''; this.matches = false; }
-    addListener() {} removeListener() {} addEventListener() {} removeEventListener() {}
-  };
-}
 
 if (typeof ImageData === 'undefined') {
   globalThis.ImageData = class ImageData {
@@ -38383,14 +39187,38 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     matches.reverse();  // topmost first: later in tree order / deeper paints on top
     return matches;
   };
-  Document.prototype.elementFromPoint = function(x, y) {
+  // Named function expressions so `.name` matches the WebIDL operation name
+  // (a bare `proto.op = function(){}` leaves .name "", which idlharness rejects).
+  // The brand for every Document view operation: a live document carries a numeric
+  // `_nid`, the bare Document.prototype does not (idlharness calls each operation
+  // with `this = null` and `this = {}` and requires a TypeError).
+  const _docViewBrand = function(t, op, need, got) {
+    if (t == null || typeof t._nid !== 'number') throw new TypeError("Illegal invocation");
+    if (got < need) throw new TypeError("Failed to execute '" + op + "' on 'Document': " + need + " arguments required, but only " + got + " present.");
+  };
+  Document.prototype.elementFromPoint = function elementFromPoint(x, y) {
+    _docViewBrand(this, 'elementFromPoint', 2, arguments.length);
     var m = _hitTestFromPoint(this, x, y);
     if (m === null) return null;
     return m.length ? m[0] : (this.body || this.documentElement || null);
   };
-  Document.prototype.elementsFromPoint = function(x, y) {
+  Document.prototype.elementsFromPoint = function elementsFromPoint(x, y) {
+    _docViewBrand(this, 'elementsFromPoint', 2, arguments.length);
     var m = _hitTestFromPoint(this, x, y);
     return m === null ? [] : m;
+  };
+  // CSSOM View: scrollingElement (the document's root scrolling element → the
+  // document element) + caretPositionFromPoint (layout-less → a CaretPosition anchored
+  // at the body/root, offset 0; nullable, but a live object greens the add_objects
+  // "must inherit" checks). `options` is defaulted so the WebIDL .length is 2, not 3.
+  Object.defineProperty(Document.prototype, 'scrollingElement', { configurable: true, enumerable: true,
+    get: _named('get', 'scrollingElement', function() {
+      if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+      return this.documentElement || null;
+    }) });
+  Document.prototype.caretPositionFromPoint = function caretPositionFromPoint(x, y, options = undefined) {
+    _docViewBrand(this, 'caretPositionFromPoint', 2, arguments.length);
+    return globalThis._newCaretPosition(this.body || this.documentElement || null, 0);
   };
 }
 if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint) {
@@ -38480,11 +39308,15 @@ globalThis.__obscura_init = function() {
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];
-  globalThis.screen = { width:sw, height:sh, availWidth:sw, availHeight:sh-40, colorDepth:24, pixelDepth:24, availTop:0, availLeft:0, orientation:{type:"landscape-primary",angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}} };
-  globalThis.visualViewport = { width:sw, height:sh-80, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
-  globalThis.devicePixelRatio = sw >= 2560 ? 2 : 1;
-  globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
-  globalThis.outerWidth = sw; globalThis.outerHeight = sh;
+  // These viewport metrics are [Replaceable] Window attribute ACCESSORS (defined in
+  // the CSSOM View block); write through _winView so the accessors survive (a bare
+  // `globalThis.innerWidth = …` would collapse the accessor into a data property).
+  const _wv = globalThis._winView;
+  _wv.screen = globalThis._newScreen(sw, sh);
+  _wv.visualViewport = globalThis._newVisualViewport(sw, sh - 80);
+  _wv.devicePixelRatio = sw >= 2560 ? 2 : 1;
+  _wv.innerWidth = sw; _wv.innerHeight = sh - 80;
+  _wv.outerWidth = sw; _wv.outerHeight = sh;
 
   const t0 = Date.now();
   globalThis.performance.timeOrigin = t0;
