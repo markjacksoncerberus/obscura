@@ -16,6 +16,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 ## ⚔️ Open Quests
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| ~~421–423~~ | ✅ [The Transitioned Verdict](421-the-transitioned-verdict.md) | **The CSS Transitions arc — the style change event, the four-event lifecycle, and the transition lifecycle** — `css/css-transitions/` across 34 files | **+831** | ⚔️⚔️⚔️ | **SECURED — +831, zero regressions.** The realm had a fully-parsed `transition-*` (Quests #209/#217/#219) and **no engine behind it whatsoever**: every value jumped straight to its target and no `transitionend` ever fired. `properties-value-001.html` measured **0 of 560** — the widest untouched tail on the board. The whole arc rests on one observation: **a CSS transition IS an `Animation` with a two-keyframe effect**, so #412–#420's timing model, playback model, composition model, interpolation kit and animated-value cascade source did not have to be built again. **#421 the transition model** — a style change event (a FORCED flush, since Obscura has no rendering loop: `getComputedStyle`, the `offset*` metrics, `getAnimations()`, DOMContentLoaded, the next task boundary), a `CSSTransition : Animation`, and a cascade seat ABOVE everything else (transitions out-rank an author `!important`). Gated four deep so a page that never transitions pays one integer compare. **#422 the events** — the four-event lifecycle, `elapsedTime` over the ACTIVE interval, shorthand-aware `transition-property`, the inherited-or-initial before-value, and CSSOM-declared transitions. **#423 the lifecycle** — `getAnimations()` is a forced style flush (one hook, +53 across eight files), §animation-composite-order, the reversing shortening factor, `display:none` cancels rather than completes, and a first recalc at DOMContentLoaded. The sweep caught a real spec line: the before-change style has **declarative animations updated to the current time**, so a property an animation owns can never transition. **NEXT: ⭐ the transform-list interpolation path** (now worth more — transitions multiply it), then **`@starting-style` + `CSSStartingStyleRule`** (a whole untouched file family that plugs straight into the before-change-style machinery this arc built), then pseudo-element transitions. |
 | ~~418–420~~ | ✅ [The Typed Verdict](418-typed-composition-verdict.md) | **The typed-composition arc — the colour as a first-class value slot, `rem` against the ROOT font-size, and keyframe values as COMPUTED values (+ the length-percentage as a two-component value)** — the whole `web-animations/animation-model/` tree (1817→2157 of 2352, 77.3%→91.7%, 24 files) + `css/css-values/rem-unit-root-element` (1→4, 100%) | **+343** | ⚔️⚔️⚔️ | **SECURED — +343, zero regressions.** #417's ⭐ named next-leverage plus the two larger buckets measured beside it. All three were **typing** failures. **#418**: a colour is ONE token, not three numbers — a second kind of hole in #417's skeleton makes `#ff0000` and `rgb(255, 0, 0)` the same shape, gives colours their own premultiplied arithmetic, and makes colour PAIRS and colour+length values work with no pair-specific code; **clamp once, at the end**, because 128 + 255 = 383 has to survive interpolation. **#419**: `rem` needs no per-element context (it is document-wide), so it resolves inside `_evalMath` with ZERO call-site changes — with a latch saying a `rem` in the root's OWN font-size means the INITIAL font-size. **#420**: §keyframes says the value is a COMPUTED value; skipping that is why `1rem` added onto `10px` answered `1rem`. Three honest exceptions — `opacity` (the spec clamps the RESULT), the transform family (resolved value is a matrix, computed value is the LIST that animates), `var()` (substituted where the declaration resolves) — the last two caught as live regressions and fixed. **NEXT: ⭐ the transform-list interpolation path** (identity padding = the same "second kind of hole" move), then shorthand expansion inside keyframes, then **`css/css-transitions/properties-value-001.html` measured at 0/560**. |
 | ~~415–417~~ | ✅ [The Composited Verdict](415-animated-computed-style-verdict.md) | **Animated computed style — the animated-value cascade source, the composition model (underlying value + implicit endpoints + composite add/accumulate + the effect stack), and the interpolation kit (the shape rule + premultiplied colour)** — `web-animations/animation-model/` (722→1791 of 2320, 31.1%→77.2%, 19 files) + the `interfaces/` suite (732→735) | **+1079** | ⚔️⚔️⚔️ | **SECURED — +1079, zero regressions.** #414's ⭐ named next-leverage. #412–#414 built a real animation engine and **none of it was visible** — `getComputedStyle` never consulted active animations. **#415** made animated values one more cascade source (no new ordering logic: inline specificity + no important flag + pushed last lands exactly where §the-cascade puts animations); **#416** the composition model, where implicit endpoints need **no neutral-value table** because a neutral value added to the underlying value *is* the underlying value; **#417** the shape rule — split a value into numbers + literal skeleton, match the skeletons, move each number, and get the discrete fallback free from the same test. **GOTCHAS:** a global re-entrancy latch hung the browser (the guard must be **per-element** and held for the whole read); digits inside quoted strings and identifiers must stay literal. **CAP:** percentage/`calc()` resolution needs layout. **⭐ NEXT: `rem` against the root font-size.** |
 |---|--------|-------|:----:|:----------:|:------:|
@@ -241,6 +242,54 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-07-30 (Quests #421–#423 — the CSS Transitions arc, +831, ZERO regressions):**
+Chose the region by **measuring instead of following the map**. #420's scroll named the transform-list path as the
+⭐ next leverage; a baseline run put the whole remaining transform tail across `animation-model/` at ~84 subtests,
+while `css/css-transitions/properties-value-001.html` sat at **0 of 560** with `wpt_fails` naming the cause in one
+line — *"must not be target value after start"* and *"expected `background-color:2s` but got `""`"*. `transition-*`
+had parsed perfectly since Quest #209 and had **never once run**. Baselines **stash-proved** throughout.
+**#421 the transition model (+731)** — a CSS transition IS an `Animation` with a two-keyframe effect, so nothing in
+the value machinery had to be rebuilt. What it needed was a **style change event**: a real browser runs one per
+rendering update plus a forced one whenever script asks a style- or layout-dependent question, and since Obscura has
+no rendering loop the forced flush is the WHOLE mechanism — which is also exactly where the difference becomes
+observable. Transitions then take a cascade seat **above everything else** (css-cascade-5 puts them over an author
+`!important`), so `_waAnimatedDecls` returns `{anim, trans}` and the transition set is pushed with `important`
+stamped and infinite specificity. The discipline that mattered most was cost: `getComputedStyle` is the hottest
+shared path in the engine and this browser exists for hardware that cannot absorb a regression there, so the flush is
+gated four deep — a generation compare, a per-`<style>`-text cache of the declaring selectors, ONE `querySelectorAll`
+over their union, and a per-element fingerprint that skips every candidate whose style could not have moved. The
+first run was **correct and too slow** (560/560, harness TIMEOUT); two structural fixes brought it to 62s and harness
+OK: a transition's keyframes are **already computed values** (#420's `_waComputedValue` was buying a fresh cascade
+per keyframe on every `getComputedStyle` of a transitioning element), and a flush must not build the same cascade
+twice.
+**#422 the events (+22)** — the four-event lifecycle, with `elapsedTime` measured over the ACTIVE interval, which is
+why run/start report `min(max(-delay,0),duration)`: a negative delay is elapsed time, not delay. A shorthand in
+`transition-property` transitions its **longhands** and never itself (leaving `padding` in fired a fifth
+`transitionend` beside the four real ones). A property with no previous declaration transitions from its
+**inherited-or-initial** value — because a property absent from the previous snapshot had no matching declaration
+then, so that IS what it computed to. And an element whose inline style is scripted must be snapshotted **before it
+declares anything**, since `el.style.transitionProperty = …; el.style.padding = …` declares the transition and moves
+the value inside ONE style change event.
+**#423 the lifecycle (+78)** — eight files were failing identically with `Cannot read properties of undefined
+(reading 'effect')`, and the whole cause was that **`getAnimations()` is a forced style flush**. One hook, +53
+subtests. Then §animation-composite-order, the **reversing shortening factor** (a half-travelled transition reverses
+in half the time, and it compounds), `display:none` on the element or an ancestor **cancelling** rather than
+completing, and a first style recalc at DOMContentLoaded so a page that never calls `getComputedStyle` still has a
+before-change style on record. The zero-regression sweep earned its keep: `Animation/style-change-events` fell
+23→3, and the test was right — §starting-of-transitions says the before-change style has **declarative animations
+updated to the current time**, so a property an animation currently supplies has the same before- and after-change
+value and can never transition. Fixed; the file finished at **24/25**, one above baseline.
+**CAPS:** pseudo-element transitions (`::before`/`::after`/`::marker` are not candidates yet); the
+discrete/`allow-discrete` gate (needs a per-property animation-type table); timeline precision (`100` read back as
+`100.002` — the standing "freeze `DocumentTimeline.currentTime` per task" item, now with evidence); `@starting-style`
+does not exist; first-sighting (an element that becomes a candidate AND changes value in the same style change event
+can only record — it cannot invent a before-change value it never observed).
+**NEXT: ⭐ the transform-list interpolation path** (still #420's leverage and now worth more), **`@starting-style` +
+`CSSStartingStyleRule`** (8 untouched files, and `@starting-style` IS a before-change style override — it plugs
+straight into what this arc built), **pseudo-element transitions**, **freeze the timeline per task**, the
+discrete gate, and the still-untaken scroll-offset model.
+Scroll: [`421-the-transitioned-verdict.md`](421-the-transitioned-verdict.md).
 
 **Session 2026-07-30 (Quests #418–#420 — the typed-composition arc, +343, ZERO regressions):**
 Took #417's ⭐ named next-leverage (`rem`) and, measuring first, found two LARGER buckets sitting beside it in the

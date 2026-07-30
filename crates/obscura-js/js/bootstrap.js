@@ -67,9 +67,54 @@ const _reportError = function(err) {
 // (serialization, slice, etc.) don't re-query Rust on every access, while still
 // reflecting any mutation the instant one happens.
 let _treeGen = 0;
+// Bumped by every CSSOM inline-style write (`el.style.x = …`, setProperty,
+// removeProperty, cssText), which never reaches the style="" attribute and so
+// cannot be seen by reading attributes. The CSS Transitions style-change-event
+// gate folds it into its per-element fingerprint — see `_csFingerprint`.
+let _cssomInlineGen = 0;
+// Bumped by every op that can move an element's computed style — the tree
+// mutations above PLUS attribute writes (a class or style attribute is most of
+// what a page changes to trigger a transition). Deliberately a SEPARATE counter
+// from _treeGen: _treeGen backs a live-tree snapshot cache that must not be
+// invalidated by an attribute write.
+let _styleGen = 0;
+// Every element whose inline declaration has been written through the CSSOM.
+// These are flush CANDIDATES — and they have to be, not merely the ones that
+// declare a transition: `el.style.transitionProperty = …; el.style.padding = …`
+// declares the transition and changes the value inside ONE style change event,
+// so the element must already have been snapshotted before it declared anything.
+// Scripting an element's inline style is exactly the thing that precedes a
+// transition, so this set is both cheap and well-targeted.
+const _csInlineEls = new Set();
+// …and the separate latch for "some inline declaration actually named a
+// transition", which is what keeps the flush free for a page that has none.
+let _csTransInline = false;
+// Scripted-inline elements are snapshotted even BEFORE the page declares its
+// first transition anywhere — otherwise the very common
+//     el.style.transition = 'opacity .3s';  el.style.opacity = 0;
+// has no before-change value to transition FROM, because both halves land inside
+// a single style change event on an element the engine has never looked at.
+// Bounded, and honestly so: past this many scripted elements a page is doing
+// bulk inline styling, not preparing a transition, and the snapshot pass would
+// cost a cascade per element per style change event for nothing.
+const _CS_MAX_PRESNAP = 256;
+// Latched true once any element's style CONTENT attribute mentions a transition
+// (set by setAttribute, plus one document scan on the first style change event
+// to catch what the HTML parser wrote). A page that never does this never runs
+// the `[style*="transition"]` query at all.
+let _csInlineAttr = false;
+const _csElInlineGen = new WeakMap();
+// Armed by any style-affecting mutation; the CSS Transitions block installs it.
+// A browser runs a style change event at the next rendering update, and a page
+// that changes a class and then simply WAITS for `transitionend` (which is most
+// of the WPT event suite, and most real code) never forces a flush of its own.
+let _csArmHook = null;
 const _MUTATING_DOM_CMDS = new Set(['append_child', 'remove_child', 'insert_before', 'set_inner_html', 'set_text_content']);
+const _STYLE_DOM_CMDS = new Set(['append_child', 'remove_child', 'insert_before', 'set_inner_html', 'set_text_content',
+                                 'set_attribute', 'set_attribute_ns', 'remove_attribute', 'remove_attribute_ns']);
 const _dom = (cmd, a1, a2) => {
   if (_MUTATING_DOM_CMDS.has(cmd)) _treeGen++;
+  if (_STYLE_DOM_CMDS.has(cmd)) { _styleGen++; if (_csArmHook) _csArmHook(); }
   return Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
 };
 
@@ -1501,7 +1546,28 @@ class CSSStyleDeclaration {
   // batch (_styleBatch > 0) — expanding one shorthand into its longhands must
   // reflect as a SINGLE "update style attribute" (one attributeChanged reaction),
   // not one per longhand. Standalone declarations have no _onChange → inert.
-  _notifyChange() { if (this._onChange && !this._styleBatch) this._onChange(); }
+  _notifyChange() {
+    _cssomInlineGen++;
+    if (_csArmHook) _csArmHook();
+    // A transition declared purely through the CSSOM has no style attribute to
+    // be found by, so the element registers itself here — see `_csInlineEls`.
+    if (this._ownerEl !== undefined) {
+      // A CSSOM write does not reach the style attribute, so the style-change
+      // fingerprint cannot see it by reading attributes — the element carries its
+      // own write counter instead, and because the fingerprint walks ancestors,
+      // a write on a PARENT correctly invalidates everything that inherits it.
+      _csElInlineGen.set(this._ownerEl, (_csElInlineGen.get(this._ownerEl) || 0) + 1);
+      _csInlineEls.add(this._ownerEl);
+      if (!_csTransInline) {
+        const p = this._props;
+        if (p['transition'] !== undefined || p['transition-property'] !== undefined
+            || p['transition-duration'] !== undefined || p['transition-delay'] !== undefined) {
+          _csTransInline = true;
+        }
+      }
+    }
+    if (this._onChange && !this._styleBatch) this._onChange();
+  }
   setProperty(name, value, priority = "") {   // priority optional (default "") → WebIDL .length 2
     if (arguments.length < 2) throw new TypeError("Failed to execute 'setProperty' on 'CSSStyleDeclaration': 2 arguments required");
     name = String(name);
@@ -4501,6 +4567,7 @@ class Element extends Node {
     const decl = _newStyleDecl();
     const el = this;
     decl._onChange = () => el._styleWriteback();
+    decl._ownerEl = el;                      // so _notifyChange can register a CSSOM-declared transition
     this._style = _styleProxy(decl);
   }
   // Reflect the live inline declaration back into the `style` content attribute
@@ -4766,6 +4833,7 @@ class Element extends Node {
     // specified value is observable via el.style.getPropertyValue (HTML parsing and
     // setAttribute both land here; setting it replaces the declaration block).
     if (qname === 'style' && this._style && !this._styleSyncing) {
+      if (!_csInlineAttr && String(v).indexOf('transition') >= 0) _csInlineAttr = true;
       this._styleSyncing = true;
       try { this._style.cssText = String(v); } finally { this._styleSyncing = false; }
     }
@@ -24251,7 +24319,22 @@ const _presHintDecls = (el) => {
   } catch (e) {}
   return decls;
 };
+// A cascade memo that is only ever alive INSIDE one synchronous CSS Transitions
+// style change event (the engine sets it and nulls it in a finally). Within that
+// window nothing can mutate, so reusing a build is exactly equivalent — and the
+// flush would otherwise build the same element's cascade twice, once to learn
+// which properties are declared and once to read their computed values. Two maps
+// because the after-change style is computed with transitions suppressed, which
+// changes what _buildCascade returns.
+let _cascadeMemo = null, _cascadeMemoSuppressed = null;
 const _buildCascade = (el) => {
+  const memo = globalThis._csSuppress ? _cascadeMemoSuppressed : _cascadeMemo;
+  if (memo) { const hit = memo.get(el); if (hit !== undefined) return hit; }
+  const sources = _buildCascadeUncached(el);
+  if (memo) memo.set(el, sources);
+  return sources;
+};
+const _buildCascadeUncached = (el) => {
   // Returns the list of matched declaration sources for `el`, each
   // { spec, order, decls }, including inline style as the highest source.
   const sources = [];
@@ -24336,8 +24419,18 @@ const _buildCascade = (el) => {
     // flag. It is pushed LAST so _cascadeWinner's `order >=` tie-break lands on
     // it (the +2 is intent only: at MAX_SAFE_INTEGER the increments collapse).
     // The hook returns null in one Set-size check when nothing is animating.
-    const animDecls = globalThis._waAnimatedDecls && globalThis._waAnimatedDecls(el);
-    if (animDecls) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 2, decls: animDecls });
+    //
+    // CSS TRANSITIONS live at the OTHER end of the same list: css-cascade-5
+    // §cascade-sorting puts transition declarations above every other origin,
+    // an author `!important` included. So the hook hands back two decl sets and
+    // the transition one is pushed with `important` already stamped on each
+    // declaration (by _waAnimatedDecls) and an infinite specificity, which is
+    // exactly "wins against every finite-specificity important author rule".
+    const waDecls = globalThis._waAnimatedDecls && globalThis._waAnimatedDecls(el);
+    if (waDecls) {
+      if (waDecls.anim) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 2, decls: waDecls.anim });
+      if (waDecls.trans) sources.push({ spec: Infinity, order: Infinity, decls: waDecls.trans });
+    }
   }
   return sources;
 };
@@ -24440,6 +24533,11 @@ globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
   // `elt` is required — a 0-arg call throws TypeError. The optional `pseudoElt` default
   // keeps the interface-object .length at 1 (a plain `(el, _pseudo)` arrow reports 2).
   if (arguments.length < 1) throw new TypeError("Failed to execute 'getComputedStyle' on 'Window': 1 argument required, but only 0 present.");
+  // A style change event (css-transitions-1 §starting-of-transitions). Asking for
+  // a computed style is a forced style flush, and that is the moment a browser
+  // decides which transitions start. The hook returns on its first line unless
+  // the document actually declares a transition somewhere.
+  if (globalThis._csFlush) globalThis._csFlush();
   if (!el) el = document.body || {};
   const style = el?.style || el?._style || _newStyleDecl();
   const sources = _buildCascade(el);
@@ -29232,7 +29330,12 @@ class TransitionEvent extends Event {
   constructor(t, o = {}) { if (o == null) o = {}; super(t, o);
     this._propertyName = o.propertyName != null ? String(o.propertyName) : "";
     this._elapsedTime = o.elapsedTime != null ? +o.elapsedTime : 0;
-    this._pseudoElement = o.pseudoElement != null ? String(o.pseudoElement) : ""; }
+    this._pseudoElement = o.pseudoElement != null ? String(o.pseudoElement) : "";
+    // css-transitions-2 gives a transition event a handle on the CSSTransition
+    // it came from — a real readonly IDL attribute, so it lives on the PROTOTYPE
+    // (assert_idl_attribute requires exactly that: found in the prototype chain).
+    this._animation = o.animation != null ? o.animation : null; }
+  get animation() { if (!(this instanceof TransitionEvent)) throw new TypeError("Illegal invocation"); return this._animation; }
   get propertyName() { if (!(this instanceof TransitionEvent)) throw new TypeError("Illegal invocation"); return this._propertyName; }
   get elapsedTime() { if (!(this instanceof TransitionEvent)) throw new TypeError("Illegal invocation"); return this._elapsedTime; }
   get pseudoElement() { if (!(this instanceof TransitionEvent)) throw new TypeError("Illegal invocation"); return this._pseudoElement; }
@@ -29241,7 +29344,7 @@ class TransitionEvent extends Event {
 _exposeIface('AnimationEvent', AnimationEvent);
 _exposeIface('TransitionEvent', TransitionEvent);
 _enumAccessors(AnimationEvent.prototype, 'animationName', 'elapsedTime', 'pseudoElement');
-_enumAccessors(TransitionEvent.prototype, 'propertyName', 'elapsedTime', 'pseudoElement');
+_enumAccessors(TransitionEvent.prototype, 'propertyName', 'elapsedTime', 'pseudoElement', 'animation');
 globalThis.PopStateEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.state=o.state??null; } };
 globalThis.HashChangeEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.oldURL=o.oldURL||""; this.newURL=o.newURL||""; } };
 globalThis.MessageEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o);this.data=o.data??null;this.origin=o.origin||"";this.lastEventId=o.lastEventId||"";this.source=o.source??null;this.ports=o.ports||[]; } };
@@ -30614,6 +30717,13 @@ Object.defineProperty(globalThis, 'PerformanceObserver',
 // fill its document-lifecycle phases at the real DOMContentLoaded / load moments
 // and (at load) queue it to observers registered during parsing.
 const __navTimingDCL = function () {
+  // The document's FIRST style recalculation. A page whose script only ever
+  // changes a class and waits for `transitionend` — never calling
+  // getComputedStyle or reading a box metric — would otherwise have no
+  // before-change style on record for anything, and its very first transition
+  // would be swallowed. A browser has already computed style by this point;
+  // so, now, has Obscura.
+  try { if (globalThis._csFlush) globalThis._csFlush(); } catch (e) {}
   const p = globalThis.performance, nav = p && p._navEntry;
   if (!nav) return;
   // The document URL isn't finalized at __obscura_init (the entry is created with
@@ -38742,11 +38852,15 @@ if (!globalThis.crypto.subtle) {
   // DESCRIPTOR off HTMLElement.prototype (assert_own_property) — inheriting them
   // from Element.prototype is not enough. They stay on Element.prototype too, where
   // the rest of the engine (and non-HTML elements) has always read them from.
+  // Reading a box metric forces layout, and forcing layout forces style — which
+  // is a style change event, and therefore where `elem.offsetWidth` (the reflow
+  // idiom every transition test in WPT is written around) starts transitions.
+  const _csTouch = () => { if (globalThis._csFlush) globalThis._csFlush(); };
   const _offsetMembers = {
-    offsetTop: function() { return 0; },
-    offsetLeft: function() { return 0; },
-    offsetWidth: function() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 100; },
-    offsetHeight: function() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 20; },
+    offsetTop: function() { _csTouch(); return 0; },
+    offsetLeft: function() { _csTouch(); return 0; },
+    offsetWidth: function() { _csTouch(); return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 100; },
+    offsetHeight: function() { _csTouch(); return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 20; },
   };
   for (const nm of Object.keys(_offsetMembers)) _defNodeRO(Element.prototype, nm, _offsetMembers[nm]);
   // offsetParent / scrollParent are HTMLElement-only; both are nullable Element and
@@ -40588,8 +40702,15 @@ if (!globalThis.crypto.subtle) {
     if (!own.length) return getUnderlying();
     const kebab = _waKebab(name);
     // Every keyframe value becomes a COMPUTED value before anything is done with
-    // it — see `_waComputedValue`.
-    const valOf = (f) => _waComputedValue(eff._target, kebab, f.props[name]);
+    // it — see `_waComputedValue`. A CSS transition is the one effect whose
+    // endpoints ALREADY are computed values (they were read straight out of the
+    // before- and after-change computed styles), and re-computing them would
+    // cost a fresh cascade per keyframe on every single getComputedStyle of a
+    // transitioning element — the difference between a transition being cheap
+    // and a transition being the most expensive thing on the page.
+    const valOf = eff._csComputed
+      ? (f) => f.props[name]
+      : (f) => _waComputedValue(eff._target, kebab, f.props[name]);
     // Iteration accumulation happens FIRST, on the keyframe values, before any
     // composition against the underlying value. The end-of-iteration value is
     // the explicit keyframe at offset 1; when that endpoint is implicit there is
@@ -40677,15 +40798,27 @@ if (!globalThis.crypto.subtle) {
   const _waUnderlyingOf = new Set();
   globalThis._waAnimatedDecls = (el) => {
     if (_waLive.size === 0 || !el || _waUnderlyingOf.has(el)) return null;
+    // The after-change style of a CSS transition is computed with every running
+    // transition taken back out of the cascade (css-transitions-1
+    // §starting-of-transitions) — that suppression is a global latch, because
+    // the after-change style also INHERITS from the parent's after-change style.
+    const noTrans = !!globalThis._csSuppress;
     const anims = [];
     for (const a of _waLive) {
       const eff = a._effect;
       // Only an effect targeting THIS element, and only a principal-box effect —
       // a ::before/::after effect styles a pseudo-element, not the element.
-      if (eff && eff._target === el && !eff._pseudo) anims.push(a);
+      if (eff && eff._target === el && !eff._pseudo) {
+        if (noTrans && a._csProp !== undefined) continue;
+        anims.push(a);
+      }
     }
     if (!anims.length) return null;
-    if (anims.length > 1) anims.sort((x, y) => x._waSeq - y._waSeq);
+    // Transitions composite ON TOP of animations (they are higher in the
+    // cascade), so they must come last in the effect stack that carries `cur`
+    // downward — then the ordinary _waSeq order inside each group.
+    if (anims.length > 1) anims.sort((x, y) =>
+      ((x._csProp !== undefined) - (y._csProp !== undefined)) || (x._waSeq - y._waSeq));
 
     // The un-animated computed style — the value at the point in the cascade
     // just below the animations. Built at most ONCE per call, and only if some
@@ -40708,7 +40841,10 @@ if (!globalThis.crypto.subtle) {
     };
     // Effects composite in order, each one seeing the result of everything
     // below it as its underlying value — so `cur` carries the stack downward.
+    // `owner` remembers which SOURCE last wrote each property, so the finished
+    // value lands in the animation source or the (higher) transition source.
     const cur = Object.create(null);
+    const owner = Object.create(null);
     let any = false;
     for (const a of anims) {
       const eff = a._effect;
@@ -40717,22 +40853,32 @@ if (!globalThis.crypto.subtle) {
       const values = _waEffectValueMap(eff, c, c.progress,
         (name) => () => (name in cur) ? cur[name] : baseOf(name));
       if (!values) continue;
-      for (const name of Object.keys(values)) { cur[name] = values[name]; any = true; }
+      const isTrans = a._csProp !== undefined;
+      for (const name of Object.keys(values)) { cur[name] = values[name]; owner[name] = isTrans; any = true; }
     }
     if (!any) return null;
-    const decls = Object.create(null);
+    let animDecls = null, transDecls = null;
     for (const name of Object.keys(cur)) {
       const v = cur[name];
       if (v === null || v === undefined || v === '') continue;
       const kebab = _waKebab(name);
+      const isTrans = owner[name];
+      const into = isTrans ? (transDecls || (transDecls = Object.create(null)))
+                           : (animDecls || (animDecls = Object.create(null)));
       // The one and only clamp — see `_waClampColors`. It runs here, on the
       // finished animated value, so that every earlier step (composition, then
       // interpolation between two composited endpoints) still sees the true
       // out-of-range channels the spec composites with.
-      _expandDeclInto(decls, kebab, _waClampColors(String(v), kebab), false);
+      _expandDeclInto(into, kebab, _waClampColors(String(v), kebab), isTrans);
     }
-    return decls;
+    if (!animDecls && !transDecls) return null;
+    return { anim: animDecls, trans: transDecls };
   };
+  // Drop an animation from the live set without going through cancel() — used by
+  // the CSS Transitions engine to retire a transition the moment it completes,
+  // so a page that transitions a thousand times does not pay for a thousand
+  // dead effects on every getComputedStyle.
+  globalThis._waRetire = (a) => { _waLive.delete(a); };
 
   // ── AnimationTimeline.play() (Level 2) ─────────────────────────────────────
   _waOp(AnimationTimeline.prototype, AnimationTimeline, 'play', 0, function(effect) {
@@ -40757,8 +40903,22 @@ if (!globalThis.crypto.subtle) {
     return fill === 'forwards' || fill === 'both';
   };
   const _waAnimationsFor = (pred) => {
+    // getAnimations() is a forced style flush: the transitions a page has just
+    // triggered by changing a class or an inline style must already exist by the
+    // time it asks, exactly as with getComputedStyle.
+    if (globalThis._csFlush) globalThis._csFlush();
     const out = [];
     for (const a of _waLive) { if (_waRelevant(a) && a._effect && pred(a._effect._target)) out.push(a); }
+    // §animation-composite-order: CSS transitions come before everything else,
+    // ordered by the style change event that generated them and then by property
+    // name in codepoint order; everything else keeps its creation order.
+    out.sort((x, y) => {
+      const tx = x._csProp !== undefined, ty = y._csProp !== undefined;
+      if (tx !== ty) return tx ? -1 : 1;
+      if (tx) return (x._csGenIdx - y._csGenIdx)
+        || (x._csProp < y._csProp ? -1 : x._csProp > y._csProp ? 1 : 0);
+      return x._waSeq - y._waSeq;
+    });
     return out;
   };
   const _waIsInclusiveDescendant = (node, root) => {
@@ -40804,6 +40964,554 @@ if (!globalThis.crypto.subtle) {
   if (typeof globalThis.ShadowRoot === 'function') {
     _waOp(globalThis.ShadowRoot.prototype, globalThis.ShadowRoot, 'getAnimations', 0, _waTreeGetAnimations);
   }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CSS Transitions Level 1 — https://drafts.csswg.org/css-transitions-1/
+//
+// Obscura has parsed `transition-*` correctly since Quest #209/#217/#219 and
+// has never RUN a transition: every value jumped straight to its target and no
+// `transitionend` ever fired. This is the engine.
+//
+// The whole thing rests on one observation: **a CSS transition IS an Animation
+// with a two-keyframe effect.** Quests #412–#420 built the timing model, the
+// playback model, the composition model, the interpolation kit and — decisively
+// — the animated-value cascade source. So a transition needs no value machinery
+// of its own. It needs exactly three things:
+//
+//   1. a STYLE CHANGE EVENT, at which the before-change and after-change
+//      computed styles are compared (§starting-of-transitions);
+//   2. a CSSTransition (an Animation subclass) carrying a KeyframeEffect whose
+//      two keyframes are those two values;
+//   3. its declarations entering the cascade ABOVE everything else — transitions
+//      out-rank even an author `!important` (css-cascade-5 §cascade-sorting).
+//
+// ── When is a style change event? ────────────────────────────────────────────
+// A real browser runs one per rendering update, plus a forced one whenever
+// script asks a question whose answer depends on style (getComputedStyle) or on
+// layout (offsetWidth & friends). Obscura has no rendering loop, so the FORCED
+// flush is the whole mechanism — which is exactly the moment the observable
+// difference appears, and exactly what every transition test drives.
+//
+// ── What it costs a page that never transitions ──────────────────────────────
+// One `Set.size`-shaped check. `_csFlush` returns on its first line unless some
+// style rule in the document actually declares a transition longhand, and that
+// scan is cached per <style> element by its text. When transitions ARE declared,
+// the candidate set is ONE querySelectorAll over the union of the declaring
+// selectors, and each candidate is skipped unless a cheap fingerprint (its own
+// and its ancestors' id/class/style, plus the tree and inline-CSSOM generation
+// counters) says its style could actually have changed. Only elements that
+// really changed pay for a cascade — which on this test is two per flush out of
+// fifty candidates. That discipline is not an optimisation detail: getComputedStyle
+// is the hottest shared path in the engine, and this browser exists for hardware
+// that cannot absorb a regression there.
+// ═════════════════════════════════════════════════════════════════════════════
+{
+  const _Animation = globalThis.Animation;
+  const _KeyframeEffect = globalThis.KeyframeEffect;
+
+  // ── CSSTransition : Animation ──────────────────────────────────────────────
+  class CSSTransition extends _Animation {
+    constructor(effect, timeline) { super(effect, timeline); this._csProp = ''; }
+  }
+  Object.defineProperty(CSSTransition.prototype, 'transitionProperty', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'transitionProperty', function() {
+      if (!(this instanceof CSSTransition)) throw new TypeError("Illegal invocation");
+      return this._csProp;
+    }),
+  });
+  Object.defineProperty(CSSTransition.prototype, Symbol.toStringTag, { value: 'CSSTransition', configurable: true });
+  _exposeIface('CSSTransition', CSSTransition); _markNative(CSSTransition);
+
+  // ── Value helpers ──────────────────────────────────────────────────────────
+  // A `<x>#` computed value split on TOP-LEVEL commas only: a timing function is
+  // itself full of commas (`cubic-bezier(0, -2, 1, 3)`), and splitting inside one
+  // would silently shift every later layer's timing by one.
+  const _csSplitList = (s) => {
+    const out = []; let depth = 0, cur = '';
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '(') depth++;
+      else if (c === ')') depth--;
+      if (c === ',' && depth === 0) { out.push(cur.trim()); cur = ''; continue; }
+      cur += c;
+    }
+    out.push(cur.trim());
+    return out;
+  };
+  const _csTimeMs = (s) => {
+    const m = /^(-?[\d.]+)(m?s)$/.exec(String(s).trim());
+    if (!m) return 0;
+    const n = parseFloat(m[1]);
+    return Number.isFinite(n) ? (m[2] === 's' ? n * 1000 : n) : 0;
+  };
+  // Repeat a `<x>#` layer list to the length of transition-property, which is how
+  // css-transitions-1 §the-transition-shorthand pairs shorter lists up.
+  const _csAt = (list, i) => (list.length ? list[i % list.length] : '');
+
+  // Properties that never take part in a transition, whatever changes. The
+  // transition longhands themselves are the important ones: transitioning
+  // `transition-duration` would feed the engine its own output.
+  const _CS_NEVER = new Set([
+    'transition', 'transition-property', 'transition-duration',
+    'transition-delay', 'transition-timing-function', 'transition-behavior',
+    'animation', 'animation-name', 'animation-duration', 'animation-delay',
+    'animation-timing-function', 'animation-iteration-count', 'animation-direction',
+    'animation-fill-mode', 'animation-play-state', 'animation-composition',
+    'animation-timeline', 'animation-range', 'animation-range-start', 'animation-range-end',
+    'will-change', 'display', 'all', 'direction', 'unicode-bidi', 'contain',
+  ]);
+
+  // Does one `transition-property` layer cover the longhand `k`? Directly, as
+  // `all`, or as a shorthand that governs it.
+  const _csLayerMatches = (layer, k) => {
+    if (layer === k || layer === 'all') return true;
+    const lh = _SHORTHAND_LONGHANDS[layer];
+    return !!(lh && lh.indexOf(k) >= 0);
+  };
+  // The computed value a property had when NOTHING declared it: inherited from
+  // the parent for an inherited property, its initial value otherwise.
+  const _csImplicitBefore = (el, kebab) => {
+    if (_INHERITED_PROPS.has(kebab)) {
+      const p = el.parentNode;
+      if (!p || p.nodeType !== 1) return _GCS_DEFAULTS[kebab];
+      try { return globalThis.getComputedStyle(p).getPropertyValue(kebab) || _GCS_DEFAULTS[kebab]; }
+      catch (e) { return _GCS_DEFAULTS[kebab]; }
+    }
+    return _GCS_DEFAULTS[kebab];
+  };
+
+  // ── Per-element transition state ───────────────────────────────────────────
+  // `snap` is the after-change style of the PREVIOUS style change event — the
+  // before-change style of the next one, for every property with no running
+  // transition. `running` maps a property to its live CSSTransition.
+  const _csState = new WeakMap();
+  const _csRunningEls = new Set();       // elements with at least one live transition
+  let _csGenSeq = 0;                     // monotonic style-change-event index
+  let _csBusy = false;                   // re-entrancy latch (the flush reads computed styles)
+  globalThis._csSuppress = false;        // after-change style: transitions out of the cascade
+
+  // ── The declaring-selector scan ────────────────────────────────────────────
+  // Cached per <style> element by its exact text, the same shape (and the same
+  // invalidation) as `_styleSheetRules`' own cache. The result is a single
+  // selector LIST, so discovering every candidate element costs one query.
+  const _csSelCache = new WeakMap();
+  let _csSelGen = null, _csSelText = '';
+  const _csDeclaringSelectors = () => {
+    // The selector union can only change when a <style> is added, removed or
+    // rewritten — all of which bump _styleGen. Without this gate every flush
+    // would re-read every stylesheet's text, and on a page with fifty fixtures
+    // that is tens of kilobytes marshalled across the bridge per getComputedStyle.
+    const gen = _styleGen + '|' + _cssomInlineGen;
+    if (_csSelGen === gen) return _csSelText;
+    _csSelGen = gen;
+    _csSelText = _csDeclaringSelectorsUncached();
+    return _csSelText;
+  };
+  const _csDeclaringSelectorsUncached = () => {
+    let styleEls = [];
+    try { styleEls = document.querySelectorAll('style'); } catch (e) { return ''; }
+    const parts = [];
+    for (const se of styleEls) {
+      let text = '';
+      try { text = se.textContent || ''; } catch (e) { text = ''; }
+      const cached = _csSelCache.get(se);
+      let sel;
+      if (cached && cached.text === text) sel = cached.sel;
+      else {
+        // Cheap reject first: a sheet that never says "transition" cannot declare one.
+        if (text.indexOf('transition') < 0) sel = '';
+        else {
+          const sels = [];
+          for (const rule of _styleSheetRules(se)) {
+            const d = rule && rule.decls;
+            if (!d) continue;
+            if (d['transition-property'] !== undefined || d['transition-duration'] !== undefined
+                || d['transition-delay'] !== undefined) sels.push(rule.selectorText);
+          }
+          sel = sels.join(',');
+        }
+        _csSelCache.set(se, { text, sel });
+      }
+      if (sel) parts.push(sel);
+    }
+    return parts.join(',');
+  };
+
+  // ── The style-change fingerprint ───────────────────────────────────────────
+  // Everything that can change an element's computed style without changing the
+  // document's stylesheet text: its own and its ancestors' id / class / style
+  // attributes, the tree generation (nodes added/removed, <style> text rewritten)
+  // and the inline-CSSOM generation (`el.style.x = …`, which never reaches the
+  // style attribute). An unchanged fingerprint means we can skip the element
+  // entirely — the expensive part is the cascade, and this buys it back.
+  // `memo` is per-flush: the candidates on a page almost always share ancestors,
+  // so the chain above the first one is read once and reused by all the rest.
+  const _csFingerprint = (el, memo) => {
+    const hit = memo.get(el);
+    if (hit !== undefined) return hit;
+    let own = '';
+    try {
+      own = '\u0001' + (el.getAttribute('class') || '') + '\u0002' + (el.getAttribute('style') || '')
+          + '\u0003' + (el.getAttribute('id') || '') + '\u0004' + (_csElInlineGen.get(el) || 0);
+    } catch (e) { own = ''; }
+    const p = el.parentNode;
+    // The tree generation rides at the ROOT of the chain — computed once and
+    // shared by every candidate through the memo. A node added or removed
+    // anywhere can change what a selector matches, and there is no cheaper
+    // honest answer than letting that recompute.
+    const s = own + ((p && p.nodeType === 1) ? _csFingerprint(p, memo) : ('\u0005' + _treeGen));
+    memo.set(el, s);
+    return s;
+  };
+
+  // ── Transition events (css-transitions-2 §transition-events) ───────────────
+  // Four events, one lifecycle: `transitionrun` the moment the transition is
+  // created (BEFORE any delay), `transitionstart` when the active phase begins,
+  // then exactly one of `transitionend` / `transitioncancel`.
+  //
+  // `elapsedTime` is the time the transition has spent in its ACTIVE interval —
+  // which is why run/start report `min(max(-delay, 0), duration)` rather than 0:
+  // a negative delay means the transition is already partway through the instant
+  // it starts, and that lost time is not "delay", it is elapsed.
+  const _csFire = (el, type, prop, elapsedSec, anim) => {
+    let ev;
+    try {
+      ev = new globalThis.TransitionEvent(type, {
+        bubbles: true, cancelable: false,
+        propertyName: prop, elapsedTime: elapsedSec, pseudoElement: '', animation: anim,
+      });
+    } catch (e) { return; }
+    try { _dispatchSpec(el, ev); } catch (e) { try { el.dispatchEvent(ev); } catch (e2) {} }
+  };
+  const _csStartElapsed = (durMs, delayMs) => Math.min(Math.max(-delayMs, 0), durMs) / 1000;
+
+  // ── Starting one transition (§starting-of-transitions, the start half) ─────
+  const _csStart = (el, kebab, fromV, toV, durMs, delayMs, easing, revStart, revFactor) => {
+    const camel = kebab.startsWith('--') ? kebab : (kebab === 'float' ? 'cssFloat' : _toCamel(kebab));
+    let anim = null;
+    try {
+      // `transition-timing-function` is the EFFECT's easing, not a keyframe's:
+      // a transition's keyframes are the two plain endpoints at offsets 0 and 1
+      // (explicit offsets — `getKeyframes()` on a transition reports 0 and 1, not
+      // the computed-only nulls a scripted two-frame animation gets).
+      const eff = new _KeyframeEffect(el, [
+        { [camel]: fromV, offset: 0 },
+        { [camel]: toV, offset: 1 },
+      ], {
+        duration: durMs, delay: delayMs, easing: easing || 'linear',
+        // A transition fills BACKWARDS only: during `transition-delay` the
+        // from-value must already apply, but once it is over the after-change
+        // style — which IS the to-value — takes over from the ordinary cascade,
+        // so filling forwards would merely shadow it with an identical value.
+        fill: 'backwards',
+      });
+      // A value our own CSSOM cannot round-trip is dropped by the keyframe
+      // processor; starting a transition with no keyframe property at all would
+      // hold the element at its underlying value forever. Better no transition.
+      if (!eff._frames.length || !(camel in eff._frames[0].props)) return null;
+      eff._csComputed = true;             // both endpoints came out of a computed style
+      anim = new CSSTransition(eff, (el.ownerDocument && el.ownerDocument.timeline) || undefined);
+    } catch (e) { return null; }
+    anim._csProp = kebab;
+    anim._csFrom = fromV;
+    anim._csTo = toV;
+    anim._csDurMs = durMs;
+    anim._csDelayMs = delayMs;
+    anim._csGenIdx = _csGenSeq;         // the style change event that generated it
+    // §reversing: what this transition would go BACK to, and how much of a full
+    // duration it is worth. A plain new transition reverses to its own start
+    // value at full length.
+    anim._csRevStart = revStart !== undefined ? revStart : fromV;
+    anim._csRevFactor = revFactor !== undefined ? revFactor : 1;
+    anim._csDone = false;
+    anim._csStarted = false;
+    anim.addEventListener('finish', () => {
+      if (anim._csDone) return;
+      anim._csDone = true;
+      // A transition SEEKED straight past its delay (currentTime / startTime) must
+      // still have announced that it started before it announces that it ended.
+      _csEmitStart(el, kebab, anim);
+      const st = _csState.get(el);
+      if (st && st.running.get(kebab) === anim) {
+        st.running.delete(kebab);
+        if (!st.running.size) _csRunningEls.delete(el);
+      }
+      // Retire the effect the instant it completes: past the active phase a
+      // backwards-filling transition contributes nothing, and the after-change
+      // style already carries the target value.
+      try { globalThis._waRetire(anim); } catch (e) {}
+      _csFire(el, 'transitionend', kebab, durMs / 1000, anim);
+    });
+    anim.play();
+    // `transitionrun` is queued, not fired inline: starting a transition happens
+    // in the middle of a getComputedStyle, and a listener must not be able to
+    // re-enter the cascade from inside the flush that created the transition.
+    setTimeout(() => {
+      if (anim._csDone || anim.playState === 'idle') return;
+      _csFire(el, 'transitionrun', kebab, _csStartElapsed(durMs, delayMs), anim);
+      // The active phase begins once the delay is over — immediately when the
+      // delay is zero or negative.
+      if (delayMs > 0) setTimeout(() => _csEmitStart(el, kebab, anim), delayMs);
+      else _csEmitStart(el, kebab, anim);
+    }, 0);
+    return anim;
+  };
+  // `transitionstart`, exactly once, whenever the transition first reaches (or is
+  // seeked past) its active phase.
+  const _csEmitStart = (el, kebab, anim) => {
+    if (anim._csStarted || anim.playState === 'idle') return;
+    anim._csStarted = true;
+    _csFire(el, 'transitionstart', kebab, _csStartElapsed(anim._csDurMs, anim._csDelayMs), anim);
+  };
+  // Cancelling a transition (retargeted, or its property stopped matching):
+  // `transitioncancel` reports how far into the ACTIVE interval it had got.
+  const _csCancel = (el, kebab, anim) => {
+    if (!anim || anim._csDone) return;
+    anim._csDone = true;
+    let ct = 0;
+    try { ct = anim.currentTime || 0; } catch (e) { ct = 0; }
+    const elapsed = Math.min(Math.max(ct - anim._csDelayMs, 0), anim._csDurMs) / 1000;
+    try { anim.cancel(); } catch (e) {}
+    try { globalThis._waRetire(anim); } catch (e) {}
+    setTimeout(() => _csFire(el, 'transitioncancel', kebab, elapsed, anim), 0);
+  };
+
+  // ── One element, one style change event ────────────────────────────────────
+  const _csUpdateElement = (el, memo) => {
+    let st = _csState.get(el);
+    if (!st) { st = { snap: null, fp: null }; st.running = new Map(); _csState.set(el, st); }
+    const fp = _csFingerprint(el, memo);
+    // Nothing that could move this element's computed style has moved.
+    if (st.fp === fp && st.snap !== null) return;
+    st.fp = fp;
+
+    // The after-change style: the cascade with every running transition removed
+    // (and inheriting from ancestors computed the same way — hence a global latch).
+    const wasSuppressed = globalThis._csSuppress;
+    globalThis._csSuppress = true;
+    let after = null, declared = null;
+    try {
+      after = globalThis.getComputedStyle(el);
+      // Which properties to compare. For an explicit `transition-property` list
+      // that is the list itself; for `all` it is every property some matching
+      // declaration mentions — which is exactly the set that a class or inline
+      // change can move — unioned with whatever the previous snapshot held (so a
+      // property that LOST its last declaration is still noticed).
+      const propList = _csSplitList(after.getPropertyValue('transition-property') || 'all');
+      const durList = _csSplitList(after.getPropertyValue('transition-duration') || '0s');
+      const delayList = _csSplitList(after.getPropertyValue('transition-delay') || '0s');
+      const tfList = _csSplitList(after.getPropertyValue('transition-timing-function') || 'ease');
+      const wantsAll = propList.indexOf('all') >= 0;
+      const names = new Set();
+      if (wantsAll) {
+        try {
+          for (const src of _buildCascade(el)) for (const k in src.decls) names.add(k);
+        } catch (e) {}
+        if (st.snap) for (const k in st.snap) names.add(k);
+      }
+      // A SHORTHAND in transition-property transitions every longhand it governs
+      // (`transition: padding .01s` gives four transitions and four events).
+      for (const p of propList) {
+        if (p === 'all' || p === 'none') continue;
+        const lh = _SHORTHAND_LONGHANDS[p];
+        if (lh) for (const l of lh) names.add(l);
+        else names.add(p);
+      }
+      // §starting-of-transitions: an element that is no longer being rendered
+      // has all of its transitions cancelled. `display:none` is the way a page
+      // actually does that, and it is why hiding a transitioning element fires
+      // `transitioncancel` and not `transitionend`.
+      let hidden = false;
+      try { hidden = !el.isConnected || after.getPropertyValue('display') === 'none'; } catch (e) { hidden = false; }
+      // `display:none` on an ANCESTOR takes the box away just the same. Only
+      // walked for an element that actually has something to cancel, so the
+      // ordinary path never pays for it.
+      if (!hidden && st.running.size) {
+        for (let p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) {
+          let d = '';
+          try { d = globalThis.getComputedStyle(p).getPropertyValue('display'); } catch (e) { break; }
+          if (d === 'none') { hidden = true; break; }
+        }
+      }
+      if (hidden) {
+        for (const [k, a] of Array.from(st.running)) { _csCancel(el, k, a); st.running.delete(k); }
+        _csRunningEls.delete(el);
+      }
+      // A property that stopped matching must still be visited — that is where
+      // its transition gets cancelled.
+      for (const k of st.running.keys()) names.add(k);
+      // §starting-of-transitions: the before-change style is the previous style
+      // change event's computed style "except with any styles derived from
+      // DECLARATIVE ANIMATIONS updated to the current time". A property an
+      // animation is currently supplying therefore has the SAME before- and
+      // after-change value — the animation clobbers both — and can never start a
+      // transition, however much the underlying specified value moved.
+      let animNow = null;
+      try {
+        const d = globalThis._waAnimatedDecls(el);
+        animNow = d && d.anim;
+      } catch (e) { animNow = null; }
+      for (const k of names) {
+        // A SHORTHAND never transitions in its own right: it transitions through
+        // the longhands it governs, which are in this set alongside it. Leaving
+        // `padding` in would fire a fifth `transitionend` next to the four real
+        // ones.
+        if (hidden) continue;            // nothing starts on an element with no box
+        if (animNow && animNow[k] !== undefined) continue;   // an animation owns it: before === after
+        if (_CS_NEVER.has(k) || _SHORTHAND_LONGHANDS[k] || !/^(--|[a-z-])/.test(k)) continue;
+        // The LAST matching layer wins when a property is named more than once —
+        // and a layer matches through its shorthand too, which is what decides
+        // `transition: padding-left .01s, padding .02s` in favour of .02s.
+        let idx = -1;
+        for (let i = 0; i < propList.length; i++) if (_csLayerMatches(propList[i], k)) idx = i;
+        const durMs = idx < 0 ? 0 : _csTimeMs(_csAt(durList, idx));
+        const delayMs = idx < 0 ? 0 : _csTimeMs(_csAt(delayList, idx));
+        const running = st.running.get(k);
+        // §starting-of-transitions step 1: a running transition whose property
+        // has dropped out of `transition-property` (or whose combined duration
+        // has gone to zero) is CANCELLED — it must not go on to fire
+        // `transitionend` as though it had completed.
+        if (running && (idx < 0 || (durMs <= 0 && delayMs <= 0))) {
+          _csCancel(el, k, running);
+          st.running.delete(k);
+          continue;
+        }
+        if (idx < 0) continue;
+        if (durMs <= 0 && delayMs <= 0) continue;         // a zero-length transition is no transition
+        let afterV = '';
+        try { afterV = after.getPropertyValue(k); } catch (e) { afterV = ''; }
+        if (afterV === '' || afterV === null || afterV === undefined) continue;
+        if (running) {
+          // §starting-of-transitions: a running transition whose END VALUE still
+          // matches the after-change style is simply left alone — comparing the
+          // CURRENT (moving) value here would restart it on every flush.
+          if (running._csTo === afterV) continue;
+          // Retarget: start again from wherever the old one has got to.
+          let fromNow = null;
+          globalThis._csSuppress = false;
+          try { fromNow = globalThis.getComputedStyle(el).getPropertyValue(k); } catch (e) { fromNow = null; }
+          globalThis._csSuppress = true;
+          // §reversing a transition. Sending a half-faded element back where it
+          // came from must not take a FULL duration — it must take as long as it
+          // has actually travelled. The spec measures that with the reversing
+          // shortening factor, and it compounds: reverse a reversal and the third
+          // transition is shorter again. The trigger is the running transition's
+          // reversing-adjusted start value coming back around as the new target.
+          let newDur = durMs, newDelay = delayMs, revStart, revFactor;
+          if (running._csRevStart === afterV) {
+            let frac = 1;
+            try {
+              const p = running._effect.getComputedTiming().progress;
+              frac = (p === null || p === undefined) ? (running.currentTime > 0 ? 1 : 0) : p;
+            } catch (e) { frac = 1; }
+            const prev = running._csRevFactor;
+            revFactor = Math.min(1, Math.max(0, Math.abs(frac * prev + (1 - prev))));
+            revStart = running._csTo;                   // reverse again and we head back here
+            newDur = durMs * revFactor;
+            newDelay = delayMs >= 0 ? delayMs * revFactor : delayMs;
+          }
+          _csCancel(el, k, running);
+          st.running.delete(k);
+          if (fromNow && fromNow !== afterV) {
+            const a = _csStart(el, k, fromNow, afterV, newDur, newDelay, _csAt(tfList, idx), revStart, revFactor);
+            if (a) st.running.set(k, a);
+          }
+          continue;
+        }
+        if (st.snap === null) continue;                    // first sighting: only record
+        // A property absent from the previous snapshot had NO matching
+        // declaration at the previous style change event — so its computed value
+        // then was simply the inherited-or-initial one. That is the honest
+        // before-change value, and it is what lets `transition: all` animate a
+        // property the page declares for the very first time.
+        let beforeV = st.snap[k];
+        if (beforeV === undefined) beforeV = _csImplicitBefore(el, k);
+        if (beforeV === undefined || beforeV === '' || beforeV === afterV) continue;
+        const a = _csStart(el, k, beforeV, afterV, durMs, delayMs, _csAt(tfList, idx));
+        if (a) st.running.set(k, a);
+      }
+      // Snapshot the after-change style of every property we might compare next
+      // time, so a first sighting can only ever record and never transition.
+      const snap = Object.create(null);
+      for (const k of names) {
+        if (_CS_NEVER.has(k)) continue;
+        try { const v = after.getPropertyValue(k); if (v) snap[k] = v; } catch (e) {}
+      }
+      st.snap = snap;
+    } catch (e) { /* one bad element must not stop the flush */ }
+    finally { globalThis._csSuppress = wasSuppressed; }
+    if (st.running.size) _csRunningEls.add(el); else _csRunningEls.delete(el);
+  };
+
+  // ── The style change event ─────────────────────────────────────────────────
+  let _csLastGen = null;
+  let _csScannedInline = false;
+  let _csArmed = false;
+  // A style change event at the next task boundary. The HTML rendering update is
+  // where a browser runs one without being asked, and a page that changes a class
+  // and then simply waits for `transitionend` never asks. Re-arming is suppressed
+  // while one is already pending, so a loop of ten thousand mutations schedules
+  // exactly one.
+  _csArmHook = () => {
+    if (_csArmed) return;
+    _csArmed = true;
+    setTimeout(() => { _csArmed = false; try { _csFlush(); } catch (e) {} }, 0);
+  };
+  const _csFlush = () => {
+    if (_csBusy || globalThis._csSuppress) return;
+    if (!_csScannedInline) {
+      // Once per document: what the HTML PARSER wrote into a style attribute
+      // never passed through setAttribute, so the latch cannot have seen it.
+      _csScannedInline = true;
+      try { if (document.querySelector('[style*="transition"]')) _csInlineAttr = true; } catch (e) {}
+    }
+    // Nothing in the document has changed since the last style change event, so
+    // this one cannot possibly start, retarget or cancel anything. THIS is what
+    // keeps a flush on every getComputedStyle affordable: a page that samples a
+    // running transition a thousand times pays one integer compare a thousand
+    // times, and walks its candidates only when something actually moved.
+    const gen = _styleGen + '|' + _cssomInlineGen;
+    if (_csLastGen === gen) return;
+    let sel = '';
+    try { sel = _csDeclaringSelectors(); } catch (e) { sel = ''; }
+    const preSnap = _csInlineEls.size > 0 && _csInlineEls.size <= _CS_MAX_PRESNAP;
+    // The whole cost for a page that neither declares a transition nor scripts
+    // an inline style: two booleans and a Set size.
+    if (!sel && !_csInlineAttr && !_csTransInline && !_csRunningEls.size && !preSnap) { _csLastGen = gen; return; }
+    _csLastGen = gen;
+    _csGenSeq++;
+    _csBusy = true;
+    try {
+      const seen = new Set();
+      if (sel) {
+        let list = [];
+        try { list = document.querySelectorAll(sel); } catch (e) { list = []; }
+        for (const el of list) seen.add(el);
+      }
+      // A transition declared in the style ATTRIBUTE — one substring query.
+      if (_csInlineAttr) {
+        let list = [];
+        try { list = document.querySelectorAll('[style*="transition"]'); } catch (e) { list = []; }
+        for (const el of list) seen.add(el);
+      }
+      // …and every element whose inline style is scripted, which never reaches
+      // the attribute and so registered itself when it was written.
+      if (preSnap || _csTransInline) {
+        for (const el of _csInlineEls) { if (el.isConnected) seen.add(el); else _csInlineEls.delete(el); }
+      }
+      // An element whose transition-declaring rule stopped matching still has a
+      // running transition to look after.
+      for (const el of _csRunningEls) seen.add(el);
+      const memo = new Map();
+      _cascadeMemo = new Map(); _cascadeMemoSuppressed = new Map();
+      for (const el of seen) {
+        try { _csUpdateElement(el, memo); } catch (e) {}
+      }
+    } finally { _csBusy = false; _cascadeMemo = null; _cascadeMemoSuppressed = null; }
+  };
+  globalThis._csFlush = _csFlush;
 }
 
 if (typeof Image === 'undefined') {
