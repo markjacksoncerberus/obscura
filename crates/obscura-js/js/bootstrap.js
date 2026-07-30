@@ -24293,6 +24293,15 @@ const _buildCascade = (el) => {
       }
       if (any) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 1, decls });
     }
+    // Animated values (Web Animations §the-cascade) sit above every NORMAL
+    // author declaration, inline style included, and below an author
+    // `!important` one — which _cascadeWinner's importance-first ordering gives
+    // us as long as the source carries inline specificity and no important
+    // flag. It is pushed LAST so _cascadeWinner's `order >=` tie-break lands on
+    // it (the +2 is intent only: at MAX_SAFE_INTEGER the increments collapse).
+    // The hook returns null in one Set-size check when nothing is animating.
+    const animDecls = globalThis._waAnimatedDecls && globalThis._waAnimatedDecls(el);
+    if (animDecls) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 2, decls: animDecls });
   }
   return sources;
 };
@@ -39694,6 +39703,7 @@ if (!globalThis.crypto.subtle) {
   // stops the moment the last one settles — an idle page costs nothing, which
   // matters a great deal on the hardware this browser is for.
   const _waLive = new Set();
+  let _waNextSeq = 1;
   let _waTimer = null;
   const _waQueueTask = (fn) => { setTimeout(fn, 0); };
   const _waSchedule = () => {
@@ -39743,6 +39753,11 @@ if (!globalThis.crypto.subtle) {
         throw new TypeError("Failed to construct 'Animation': parameter 2 is not of type 'AnimationTimeline'");
       }
       this._timeline = timeline === undefined ? _defaultTimeline : (timeline || null);
+      // §animation-composite-order — two script-generated animations on the same
+      // element are ordered by the time each was created, so the later one wins
+      // the property they share. A monotonic counter captures exactly that, and
+      // survives a cancel/replay (which would reshuffle a Set's insertion order).
+      this._waSeq = _waNextSeq++;
       if (effect != null) this._associate(effect);
       _waLive.add(this);
     }
@@ -40073,43 +40088,352 @@ if (!globalThis.crypto.subtle) {
     if (!target) throw new DOMException("Cannot commit styles of an animation with no target element.", "InvalidStateError");
     if (eff._pseudo) throw new DOMException("Cannot commit styles of an animation targeting a pseudo-element.", "InvalidStateError");
     if (!target.isConnected) throw new DOMException("Cannot commit styles of an animation target that is not rendered.", "InvalidStateError");
+    // commitStyles writes the value at the CURRENT time whether or not the
+    // effect is in effect, so an out-of-range progress is clamped to the
+    // nearest end rather than dropping the effect (which is what the cascade
+    // does — see _waEffectValues).
     const c = _waComputedTiming(eff);
     const p = c.progress === null ? (c._phase === 'before' ? 0 : 1) : c.progress;
-    const frames = eff._frames;
-    if (!frames.length) return;
-    // Every property mentioned anywhere in the keyframe list gets committed.
-    const names = new Set();
-    for (const f of frames) for (const k of Object.keys(f.props)) names.add(k);
-    for (const name of names) {
-      const withProp = frames.filter((f) => name in f.props);
-      if (!withProp.length) continue;
-      let lo = withProp[0], hi = withProp[withProp.length - 1];
-      for (let i = 0; i < withProp.length - 1; i++) {
-        if (p >= withProp[i].computedOffset && p <= withProp[i + 1].computedOffset) { lo = withProp[i]; hi = withProp[i + 1]; break; }
-      }
-      const span = hi.computedOffset - lo.computedOffset;
-      const local = span > 0 ? Math.min(1, Math.max(0, (p - lo.computedOffset) / span)) : 0;
-      const eased = (lo._easingFn || ((x) => x))(local);
-      try { target.style[name] = _waInterpolate(lo.props[name], hi.props[name], eased); } catch (e) {}
+    // The underlying value here is the target's computed style with its OWN
+    // animations taken back out — the same resolution the cascade performs,
+    // reusing the same per-element guard so the nested lookup terminates.
+    let base = null;
+    const values = _waEffectValueMap(eff, c, p, (name) => () => {
+      _waUnderlyingOf.add(target);
+      try {
+        if (base === null) base = globalThis.getComputedStyle(target);
+        const v = base[name];
+        return (v === undefined || v === null) ? '' : v;
+      } catch (e) { return ''; }
+      finally { _waUnderlyingOf.delete(target); }
+    });
+    if (!values) return;
+    for (const name of Object.keys(values)) {
+      try { target.style[name] = values[name]; } catch (e) {}
     }
   });
   _waTag(Animation, 'Animation');
   _exposeIface('Animation', Animation); _markNative(Animation);
 
-  // Interpolate two keyframe values. Pure numbers and same-unit lengths/angles
-  // interpolate numerically; anything else is DISCRETE, flipping at the 50%
-  // mark exactly as the spec's default "not additive, not interpolable" rule.
   const _NUM_UNIT = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)([a-zA-Z%]*)$/;
-  function _waInterpolate(a, b, t) {
+
+  // ── The interpolation kit ──────────────────────────────────────────────────
+  // Almost every CSS value that interpolates does so the same way: the two
+  // endpoints have the SAME SHAPE and differ only in their numbers, which move
+  // component-wise. `blur(0px)`→`blur(10px)`, `rect(0px,0px,0px,0px)`,
+  // `rgb(0,0,255)`→`rgb(255,0,0)`, `brightness(1) contrast(1)` lists,
+  // `matrix(…)`, `drop-shadow(rgb(…) 0px 0px 0px)` — one rule covers them all.
+  //
+  // So: split each value into its numbers and the literal text between them. If
+  // the literal skeletons match, the values are interpolable and every number
+  // moves independently. If they do NOT match — a different unit, a different
+  // function, a differently-ordered filter list — the values are by definition
+  // not interpolable, which is exactly the spec's condition for falling back to
+  // DISCRETE. Getting the fallback for free from the same test is the point.
+  const _WA_NUM_G = /[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/g;
+  // Not every run of digits is a NUMBER. Two kinds have to stay literal, or the
+  // interpolator quietly corrupts the value:
+  //   • digits inside a quoted string — `url("…/test-1")` must never become
+  //     `url("…/test-1.499")`;
+  //   • digits that are part of an IDENTIFIER — the `-1` of `ident-1`, the `3d`
+  //     of `translate3d`, the hex of `#ff0000`.
+  // Both are recognised by what precedes them, so a single look-behind on the
+  // character before the match handles them. Leaving them literal also gives
+  // the right ANSWER for free: `ident-1` and `ident-2` then differ in their
+  // skeletons, so the pair is not interpolable and falls back to discrete —
+  // which is exactly what the spec says for a `<custom-ident>`.
+  const _waIsIdentCh = (c) => c !== undefined && /[A-Za-z0-9_#\\]/.test(c);
+  const _waSplitNums = (s) => {
+    const nums = [], lits = [];
+    // Mask out quoted spans so the scanner cannot see inside them at all.
+    let masked = '', q = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (q) { masked += (c === q ? c : ' '); if (c === q) q = 0; }
+      else if (c === '"' || c === "'") { q = c; masked += c; }
+      else masked += c;
+    }
+    let last = 0, m;
+    _WA_NUM_G.lastIndex = 0;
+    while ((m = _WA_NUM_G.exec(masked)) !== null) {
+      const i = m.index;
+      const prev = i > 0 ? masked[i - 1] : undefined;
+      // A leading sign or decimal point still belongs to an identifier when the
+      // character before IT is one (`ident-1`, `v1.5x`).
+      const anchor = (prev === '-' || prev === '+' || prev === '.') && i > 1 ? masked[i - 2] : prev;
+      if (_waIsIdentCh(anchor)) continue;
+      lits.push(s.slice(last, i).replace(/\s+/g, ' '));
+      nums.push(parseFloat(m[0]));
+      last = i + m[0].length;
+    }
+    lits.push(s.slice(last).replace(/\s+/g, ' '));
+    return { nums, lits };
+  };
+  // Properties whose animation type is DISCRETE even though their values look
+  // numeric — a `<grid-line>` of `1` and one of `5` name two different lines,
+  // and there is no line 3 between them. Without this the generic shape rule
+  // would happily blend them.
+  const _WA_DISCRETE_PROPS = new Set([
+    'grid-row', 'grid-row-start', 'grid-row-end',
+    'grid-column', 'grid-column-start', 'grid-column-end',
+    'grid-area', 'grid-auto-rows', 'grid-auto-columns',
+  ]);
+  const _waSameSkeleton = (x, y) => {
+    if (x.lits.length !== y.lits.length) return false;
+    for (let i = 0; i < x.lits.length; i++) if (x.lits[i] !== y.lits[i]) return false;
+    return true;
+  };
+  const _waRound = (v) => Math.round(v * 1e6) / 1e6;
+  // Colours only interpolate once both endpoints are in the same space, so a
+  // colour-valued property has its endpoints computed to sRGB first — that is
+  // what lets `#00f` → `hsl(0 100% 50%)` interpolate at all instead of flipping
+  // discretely at the halfway mark.
+  const _waCanonColor = (v) => {
+    try { const c = _computeColor(String(v).trim()); return c ? String(c) : String(v); }
+    catch (e) { return String(v); }
+  };
+  // Colours interpolate with PREMULTIPLIED alpha: each channel is scaled by its
+  // own alpha before it moves and divided by the resulting alpha afterwards.
+  // Interpolating the channels straight would let a nearly-transparent colour's
+  // hue drag the result toward itself as strongly as an opaque one — which is
+  // why red→blue at half fading in gives rgba(85, 0, 170, 0.6) and not an even
+  // split. Identical to plain interpolation whenever both ends are opaque.
+  const _WA_RGBA = /^rgba?\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*(?:,\s*(-?[\d.]+)\s*)?\)$/;
+  const _waColorLerp = (sa, sb, t) => {
+    const ma = _WA_RGBA.exec(sa), mb = _WA_RGBA.exec(sb);
+    if (!ma || !mb) return null;
+    const aa = ma[4] === undefined ? 1 : parseFloat(ma[4]);
+    const ab = mb[4] === undefined ? 1 : parseFloat(mb[4]);
+    const a = aa + (ab - aa) * t;
+    const ch = (i) => {
+      const p = parseFloat(ma[i]) * aa + (parseFloat(mb[i]) * ab - parseFloat(ma[i]) * aa) * t;
+      return a === 0 ? 0 : p / a;
+    };
+    return _serColor(ch(1), ch(2), ch(3), a);
+  };
+  // `name` is the kebab CSS property, when the caller knows it — it is only
+  // consulted to decide whether the endpoints are colours.
+  function _waInterpolate(a, b, t, name) {
     if (a === null || a === undefined) return b;
     if (b === null || b === undefined) return a;
-    const ma = _NUM_UNIT.exec(String(a).trim()), mb = _NUM_UNIT.exec(String(b).trim());
-    if (ma && mb && ma[2] === mb[2]) {
-      const v = parseFloat(ma[1]) + (parseFloat(mb[1]) - parseFloat(ma[1])) * t;
-      return (Math.round(v * 1e6) / 1e6) + ma[2];
+    let sa = String(a).trim(), sb = String(b).trim();
+    if (sa === sb) return sa;
+    if (name && _WA_DISCRETE_PROPS.has(name)) return t < 0.5 ? sa : sb;
+    if (name && _COLOR_PROPS.has(name)) {
+      sa = _waCanonColor(sa); sb = _waCanonColor(sb);
+      const col = _waColorLerp(sa, sb, t);
+      if (col !== null) return col;
     }
-    return t < 0.5 ? a : b;
+    const x = _waSplitNums(sa), y = _waSplitNums(sb);
+    if (x.nums.length && _waSameSkeleton(x, y)) {
+      let out = '';
+      for (let i = 0; i < x.nums.length; i++) {
+        out += x.lits[i] + _waRound(x.nums[i] + (y.nums[i] - x.nums[i]) * t);
+      }
+      return out + x.lits[x.lits.length - 1];
+    }
+    // Not interpolable → discrete: the `from` value holds until the halfway
+    // point of the interval, then the `to` value takes over.
+    return t < 0.5 ? sa : sb;
   }
+
+  // ── Composition (§combining-effects / §effect-composition) ─────────────────
+  // The composite operation in force for a keyframe: `auto` on the keyframe
+  // defers to the effect's, which itself defaults to `replace`.
+  const _waCompositeOf = (kf, eff) => {
+    const c = kf.composite;
+    return (c === undefined || c === 'auto') ? (eff._composite || 'replace') : c;
+  };
+  // Combine a keyframe value with the value underneath it. `add` is the
+  // type's addition; `accumulate` differs from it only for the types whose
+  // accumulation is not plain addition (handled inside _waAccumulate).
+  const _waComposite = (op, underlying, value) => {
+    if (op === 'add') return _waAdd(underlying, value);
+    if (op === 'accumulate') return _waAccumulate(underlying, value);
+    return value;
+  };
+  // Addition uses the same shape test as interpolation: two values of the same
+  // shape add number-by-number. Anything else is not additive, and the spec's
+  // fallback for a non-additive type is to REPLACE — the keyframe value wins.
+  const _waAdd = (underlying, value) => {
+    if (underlying === null || underlying === undefined || underlying === '') return value;
+    const x = _waSplitNums(String(underlying).trim()), y = _waSplitNums(String(value).trim());
+    if (!x.nums.length || !_waSameSkeleton(x, y)) return value;
+    let out = '';
+    for (let i = 0; i < x.nums.length; i++) out += x.lits[i] + _waRound(x.nums[i] + y.nums[i]);
+    return out + x.lits[x.lits.length - 1];
+  };
+  // Accumulation is addition for every numeric type. It parts company with
+  // addition only for types with a defined "accumulation" that isn't a sum —
+  // for those the spec falls back to replacing, which is what _waAdd already
+  // does for anything it cannot add.
+  const _waAccumulate = (underlying, value) => _waAdd(underlying, value);
+  // §effect-accumulation, iteration composite `accumulate`: `n` copies of the
+  // end-of-iteration value are accumulated onto the keyframe value. `_waAdd`'s
+  // second operand wins whenever the type cannot be added — so a DISCRETE
+  // property comes back untouched, which is exactly why an accumulating
+  // discrete animation just repeats its per-iteration values.
+  const _waIterAccumulate = (value, endValue, n) => {
+    const e = _waSplitNums(String(endValue).trim());
+    if (!e.nums.length) return value;
+    let scaled = '';
+    for (let i = 0; i < e.nums.length; i++) scaled += e.lits[i] + _waRound(e.nums[i] * n);
+    return _waAdd(scaled + e.lits[e.lits.length - 1], value);
+  };
+
+  // §the-effect-value-of-a-keyframe-animation-effect, for ONE property, given
+  // the value sitting underneath this effect in the stack.
+  //
+  // The two implicit endpoints are the subtle part: when the property-specific
+  // keyframe list has no keyframe at offset 0 (or 1), the spec inserts one
+  // holding the NEUTRAL value for composition with a composite of `add`. Adding
+  // a type's neutral value to the underlying value yields the underlying value
+  // itself for every type — so an implicit endpoint needs no per-type neutral
+  // table at all: its composited value simply IS the underlying value.
+  // `getUnderlying` is a thunk, not a value: resolving the underlying value
+  // costs a whole extra cascade, and an all-`replace` effect whose keyframes
+  // already cover offsets 0 and 1 never needs it.
+  const _waEffectValueFor = (eff, name, ct, progress, getUnderlying) => {
+    const own = eff._frames.filter((f) => name in f.props);
+    if (!own.length) return getUnderlying();
+    // Iteration accumulation happens FIRST, on the raw keyframe values, before
+    // any composition against the underlying value. The end-of-iteration value
+    // is the explicit keyframe at offset 1; when that endpoint is implicit
+    // there is nothing to accumulate (its neutral value is a no-op anyway).
+    let iterN = 0, endVal = null;
+    if (eff._iterationComposite === 'accumulate') {
+      const n = ct.currentIteration;
+      const last = own[own.length - 1];
+      if (n && n > 0 && n !== Infinity && last.computedOffset === 1) { iterN = n; endVal = last.props[name]; }
+    }
+    const rawOf = (f) => iterN ? _waIterAccumulate(f.props[name], endVal, iterN) : f.props[name];
+    // Each entry is { off, easingFn, value } with `value` ALREADY composited
+    // against the underlying value, which is what the interpolation sees.
+    const pts = own.map((f) => {
+      const op = _waCompositeOf(f, eff);
+      return {
+        off: f.computedOffset,
+        easingFn: f._easingFn,
+        value: op === 'replace' ? rawOf(f) : _waComposite(op, getUnderlying(), rawOf(f)),
+      };
+    });
+    if (pts[0].off !== 0) pts.unshift({ off: 0, easingFn: null, value: getUnderlying() });
+    if (pts[pts.length - 1].off !== 1) pts.push({ off: 1, easingFn: null, value: getUnderlying() });
+    // §step 8 — the interval endpoints. With OVERLAPPING keyframes (several
+    // sharing an offset) the tie-break is what decides the answer: the interval
+    // BELOW an overlap point is closed by the FIRST of the tied keyframes, and
+    // the interval at or above it is opened by the LAST of them. So: the start
+    // is the LAST keyframe whose offset is ≤ progress, and the end is the FIRST
+    // whose offset is strictly greater. A progress outside [0,1] — which an
+    // overshooting easing produces — falls off one end and returns that single
+    // keyframe's value, which is spec step 9.
+    let loI = -1, hiI = -1;
+    for (let i = 0; i < pts.length; i++) if (pts[i].off <= progress) loI = i;
+    for (let i = pts.length - 1; i >= 0; i--) if (pts[i].off > progress) hiI = i;
+    if (loI < 0) return pts[hiI].value;
+    if (hiI < 0) return pts[loI].value;
+    const lo = pts[loI], hi = pts[hiI];
+    const span = hi.off - lo.off;
+    const local = span > 0 ? Math.min(1, Math.max(0, (progress - lo.off) / span)) : 0;
+    const eased = (lo.easingFn || ((x) => x))(local);
+    return _waInterpolate(lo.value, hi.value, eased, _waKebab(name));
+  };
+  // Every property an effect contributes at `progress`, as an IDL-name map.
+  // `mkUnderlying(name)` hands back a thunk so the underlying value is resolved
+  // at most once, and only for the properties that actually reach for it.
+  const _waEffectValueMap = (eff, ct, progress, mkUnderlying) => {
+    const names = new Set();
+    for (const f of eff._frames) for (const k of Object.keys(f.props)) names.add(k);
+    if (!names.size) return null;
+    const out = Object.create(null);
+    for (const name of names) out[name] = _waEffectValueFor(eff, name, ct, progress, mkUnderlying(name));
+    return out;
+  };
+
+  // ── Animated values in the cascade ─────────────────────────────────────────
+  // §the-cascade puts animations ABOVE every normal author declaration —
+  // including inline style — and BELOW an author `!important` one. Pushing a
+  // single source with inline specificity and no `important` flag gets both
+  // halves of that for free from _cascadeWinner's importance-first ordering.
+  //
+  // `_buildCascade` calls this hook for EVERY element on EVERY getComputedStyle
+  // — the hottest shared path in the engine — so the first line is the whole
+  // cost for a page that animates nothing.
+  const _WA_KEBAB = new Map();
+  const _waKebab = (name) => {
+    let k = _WA_KEBAB.get(name);
+    if (k === undefined) {
+      // Keyframes name properties with IDL attribute names; the cascade speaks
+      // CSS. `cssFloat` is the one whose CSS spelling isn't a de-camelCasing.
+      k = name.startsWith('--') ? name
+        : name === 'cssFloat' ? 'float'
+        : name.replace(/([A-Z])/g, '-$1').toLowerCase();
+      _WA_KEBAB.set(name, k);
+    }
+    return k;
+  };
+  // Re-entrancy guard, scoped to the ELEMENT rather than global. Resolving an
+  // underlying value means asking for this element's computed style with its
+  // own animations taken back out — and that resolution re-enters the cascade
+  // several times over (inheritance walks, _specifiedDecl), so the guard has to
+  // hold for the whole read, not just the _buildCascade call. Keeping it
+  // per-element rather than a single flag means an ANCESTOR's animated value is
+  // still inherited normally, and the recursion still terminates because the
+  // chain only ever walks upward through a finite tree.
+  const _waUnderlyingOf = new Set();
+  globalThis._waAnimatedDecls = (el) => {
+    if (_waLive.size === 0 || !el || _waUnderlyingOf.has(el)) return null;
+    const anims = [];
+    for (const a of _waLive) {
+      const eff = a._effect;
+      // Only an effect targeting THIS element, and only a principal-box effect —
+      // a ::before/::after effect styles a pseudo-element, not the element.
+      if (eff && eff._target === el && !eff._pseudo) anims.push(a);
+    }
+    if (!anims.length) return null;
+    if (anims.length > 1) anims.sort((x, y) => x._waSeq - y._waSeq);
+
+    // The un-animated computed style — the value at the point in the cascade
+    // just below the animations. Built at most ONCE per call, and only if some
+    // effect actually reaches for it (an all-`replace` animation with explicit
+    // endpoints never does).
+    let base = null;
+    const memo = Object.create(null);
+    const baseOf = (name) => {
+      if (name in memo) return memo[name];
+      _waUnderlyingOf.add(el);
+      let v = '';
+      try {
+        if (base === null) base = globalThis.getComputedStyle(el);
+        v = base[name];
+        if (v === undefined || v === null) v = '';
+      } catch (e) { v = ''; }
+      finally { _waUnderlyingOf.delete(el); }
+      memo[name] = v;
+      return v;
+    };
+    // Effects composite in order, each one seeing the result of everything
+    // below it as its underlying value — so `cur` carries the stack downward.
+    const cur = Object.create(null);
+    let any = false;
+    for (const a of anims) {
+      const eff = a._effect;
+      const c = _waComputedTiming(eff);
+      if (c.progress === null) continue;                 // not in effect: contributes nothing
+      const values = _waEffectValueMap(eff, c, c.progress,
+        (name) => () => (name in cur) ? cur[name] : baseOf(name));
+      if (!values) continue;
+      for (const name of Object.keys(values)) { cur[name] = values[name]; any = true; }
+    }
+    if (!any) return null;
+    const decls = Object.create(null);
+    for (const name of Object.keys(cur)) {
+      const v = cur[name];
+      if (v === null || v === undefined || v === '') continue;
+      _expandDeclInto(decls, _waKebab(name), String(v), false);
+    }
+    return decls;
+  };
 
   // ── AnimationTimeline.play() (Level 2) ─────────────────────────────────────
   _waOp(AnimationTimeline.prototype, AnimationTimeline, 'play', 0, function(effect) {

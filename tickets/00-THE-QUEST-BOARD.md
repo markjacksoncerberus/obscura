@@ -16,6 +16,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 ## ⚔️ Open Quests
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| ~~415–417~~ | ✅ [The Composited Verdict](415-animated-computed-style-verdict.md) | **Animated computed style — the animated-value cascade source, the composition model (underlying value + implicit endpoints + composite add/accumulate + the effect stack), and the interpolation kit (the shape rule + premultiplied colour)** — `web-animations/animation-model/` (722→1791 of 2320, 31.1%→77.2%, 19 files) + the `interfaces/` suite (732→735) | **+1079** | ⚔️⚔️⚔️ | **SECURED — +1079, zero regressions.** #414's ⭐ named next-leverage. #412–#414 built a real animation engine and **none of it was visible** — `getComputedStyle` never consulted active animations. **#415** made animated values one more cascade source (no new ordering logic: inline specificity + no important flag + pushed last lands exactly where §the-cascade puts animations); **#416** the composition model, where implicit endpoints need **no neutral-value table** because a neutral value added to the underlying value *is* the underlying value; **#417** the shape rule — split a value into numbers + literal skeleton, match the skeletons, move each number, and get the discrete fallback free from the same test. **GOTCHAS:** a global re-entrancy latch hung the browser (the guard must be **per-element** and held for the whole read); digits inside quoted strings and identifiers must stay literal. **CAP:** percentage/`calc()` resolution needs layout. **⭐ NEXT: `rem` against the root font-size.** |
 |---|--------|-------|:----:|:----------:|:------:|
 | ~~412–414~~ | ✅ [The Animated Verdict](412-web-animations-verdict.md) | **The Web Animations arc — a real timing model (`AnimationTimeline`/`DocumentTimeline`/`AnimationEffect` + the §timing-model phase/progress computation + canonicalised easing), a real playback model (`Animation : EventTarget` with the pending play/pause tasks, `ready`/`finished`, `AnimationPlaybackEvent`, `Animatable`, `commitStyles`), and a spec-exact keyframe processor** — `web-animations/idlharness.window.html` (42→188, 81.7%), the 39-file `web-animations/interfaces/` behaviour suite (38→732, 86.6%) | **+840** | ⚔️⚔️⚔️ | **SECURED — +840, zero regressions.** #411's named next-leverage. Replaced a ten-line object literal (`animate()` returned a fake whose `finished` was already resolved) with the real thing. **#412** the timing model (+69 idlharness); **#413** the playback model (+77) — the frame driver ticks only while an animation is live, so an idle page costs nothing; **#414** the keyframe processor root cause (+694 behaviour) — only animatable properties are even READ, IDL attribute names only, exact read order, property-indexed keyframes merged by per-property offset rather than positionally zipped. **CAP:** the four Level-2 standalone interfaces (41 subtests) deliberately unimplemented — no engine ships them, exposing them would make feature detection lie. **NEXT:** animated computed style. |
 | ~~409–411~~ | ✅ [The CSSOM View Verdict](409-cssom-view-verdict.md) | **The CSSOM View Module arc — the interface surface as real WebIDL (`MediaQueryList`/`Screen`/`VisualViewport`/`CaretPosition`/`CSSPseudoElement` + `GeometryUtils` + the Window `[Replaceable]` viewport partial), a real Media Queries L4 EVALUATOR with per-frame viewports, and the Element-extension behaviour (`checkVisibility` + `ScrollToOptions`)** — `css/cssom-view/idlharness.html` (134→417, 100%), the `MediaQueryList` behaviour family (3→46, 100%, 7 files), `checkVisibility` (4→13), `element/window-scroll-arguments` (0→12 / 6→12) | **+369** | ⚔️⚔️ | **SECURED — +369, zero regressions.** #408's named next-leverage. NOTE ON PROVENANCE: the tree already held ~431 uncommitted lines of a CSSOM View WebIDL block drafted by a prior session but never built, measured, swept or chronicled — this session built it (417/417), proved it costs nothing, and wrote #410–#411 on top. **#409** the interface surface (real WebIDL replacing object-literal stubs; `offset*` duplicated OWN onto `HTMLElement.prototype` — idlharness `assert_own_property`s it there; Window viewport as `[Replaceable]` accessors backed by `_winView`; `MouseEvent` coords own-props → prototype getters). **#410 the root-cause quest:** there was **NO media-query evaluator at all** (`matches` hardcoded `false`, `CSSMediaRule.matches` an admitted stub), a frame's viewport was hardcoded 300×150 with `matchMedia` delegating to the TOP window, and `iframe.width`/`height` weren't reflected content attributes (assignment made a stray JS own-prop). Built the MQ4 engine (`_mqParseQuery`/`_mqEvalList`/`_mqSerializeList` — range syntax, `<ratio>`/`<resolution>`, and the `not all` parse-error serialization), per-frame viewports (`_hostEl`/`_frameViewportDim`), and the **two-pass** §evaluate-media-queries-and-report-changes. **#411** real `checkVisibility` (computed-style walk; `content-visibility:hidden` skips *contents*, so the walk is ancestors-only) + `ScrollToOptions` WebIDL conversion (must REJECT the promise, not throw) + root-caused `content-visibility` as an unregistered property. **CAP:** the scroll-promises pair (**42 subtests**) is blocked on **Web Animations** (`waitForCompositorReady` = `body.animate().finished`); `checkVisibility`'s last 2 need real viewport intersection; `scrollingElement`'s last 4 need blob-URL quirks-mode frames; the rest of the realm needs real layout. NEXT: **(a) a minimal Web Animations `Element.animate()`/`Animation`** — unblocks those 42 + svg's last `ShadowAnimation` cap (7) + a large `dom/events/scrolling/` family gated the same way; (b) a layout-less scroll-offset model; (c) a fresh whole-feature idlharness at 0/N. |
@@ -239,6 +240,85 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+**Session 2026-07-30 (Quests #415–#417 — the animated-computed-style arc, +1079, ZERO regressions):**
+Took #414's ⭐ named next-leverage. The previous arc built a real Web Animations engine — a timing model, a
+playback model, a spec-exact keyframe processor — and **none of it was visible**. `getComputedStyle(div).fontStyle`
+on an element halfway through `animate({ fontStyle: ['normal','italic'] })` answered `normal`. Every animated value
+stayed sealed inside the `Animation` object, so the entire `web-animations/animation-model/` tree — the part of the
+spec that says what an animation *does* — was measuring an engine that could not be observed. Baselines
+**stash-proved** (`git stash push` → rebuild → measure → pop): the 19-file suite at **722/2320**.
+- **#415 the animated-value cascade source** (`interpolation-per-property-001` 108→**343**, `discrete` 0→**5/5**) —
+  `_buildCascade(el)` already returned an ordered list of declaration sources, and that was the whole opening:
+  animated values need no value-resolution path, no units machinery and no inheritance of their own, only to be
+  *one more source*. §the-cascade puts animations above every normal author declaration — inline style included —
+  and below an author `!important` one, and `_cascadeWinner` already sorts importance-first, then specificity, then
+  source order. So a single source pushed with inline specificity, carrying **no important flag**, appended last,
+  lands in exactly the right place **for free**; no new ordering logic was written. An effect that is **not in
+  effect contributes NOTHING** — idle, or outside its active interval with no fill covering the phase, means an
+  *empty* effect value rather than a clamped one, which is precisely what a null transformed progress means
+  (`commitStyles` is the deliberate exception: it writes the value at the current time regardless). A monotonic
+  `_waSeq` stamped at `Animation` construction gives §animation-composite-order, which a `Set`'s insertion order
+  would have lost to a cancel-and-replay. **The hook's first line is a `Set.size` check** — a page that animates
+  nothing pays nothing on the engine's hottest shared path, which matters on the hardware this browser is for.
+- **#416 the composition model** (`effect-composition` 0→**13**/17, `combining-effects/clamping` 4→**12/12**,
+  `effect-value-context-filling` 1→**13**/14, `overlapping-keyframes` 0→**2/2**) — the underlying value is a
+  `getComputedStyle` call with the hook disarmed, resolved lazily through a thunk and memoised per property, so an
+  all-`replace` effect whose keyframes already cover offsets 0 and 1 never pays for it. **Implicit endpoints need
+  no per-type neutral-value table:** the spec inserts a keyframe holding the neutral value for composition with a
+  composite of `add`, and adding any type's neutral value to the underlying value yields the underlying value
+  itself — so an implicit endpoint's composited value simply *is* the underlying value. One line, exactly
+  equivalent. The effect stack composites downward so `add` onto an underlying *animation* (not just the base
+  style) comes out right. Interval endpoints are the **LAST** keyframe with offset ≤ progress and the **FIRST**
+  with offset strictly greater — with several keyframes sharing an offset that tie-break is the whole answer, and a
+  progress outside [0,1] (which an overshooting easing produces) falls off one end and returns that single
+  keyframe's value. Iteration accumulation applies **first**, to the raw keyframe values.
+- **#417 the interpolation kit** (`interpolation-per-property-001` 343→**422**, `-002` 82→**312**,
+  `iteration-composite-operation` 0→**18**/38) — the root-cause observation: almost every CSS value that
+  interpolates does so the same way, with both endpoints sharing **the same shape** and differing only in their
+  numbers. So split each value into its numbers and the literal text between them, and if the *skeletons* match,
+  move every number independently. One rule covers `blur()`, `rect()`, `matrix()`, filter lists, `box-shadow`,
+  `drop-shadow`, transforms — **and yields the discrete fallback for free**, since a different unit, function or
+  list order all fail the skeleton match, which is exactly the spec's not-interpolable condition. Colours
+  interpolate **premultiplied** in sRGB (`rgba(255,0,0,.4)`→`rgba(0,0,255,.8)` at half is `rgba(85, 0, 170, 0.6)`,
+  not an even split — otherwise a nearly-transparent colour's hue drags as hard as an opaque one).
+- **TWO GOTCHAS worth the next knight's hours.** (1) The first build of #416 **hung the browser**: the re-entrancy
+  latch was a single global flag set around the `getComputedStyle` call and cleared right after — but resolving a
+  computed value re-enters the cascade several times over (inheritance walks, `_specifiedDecl`), all **after** the
+  flag cleared. The fix is not a longer-held global flag (that would suppress an **ancestor's** animated value
+  during inheritance); it is a **per-element** guard held for the whole read, which still terminates because the
+  chain only ever walks *upward* through a finite tree. (2) **Not every run of digits is a number** — the first
+  structural build produced `url("http://localhost/test-1.499")`. Digits inside a quoted string, and digits that
+  are part of an identifier (the `-1` of `ident-1`, the `3d` of `translate3d`, the hex of `#ff0000`), must stay
+  literal; one look-behind on the preceding character handles both. Leaving them literal also gives the right
+  *answer* for free — `ident-1` and `ident-2` then differ in their skeletons and correctly fall back to discrete,
+  which is what the spec says for a `<custom-ident>`. Fixing the corruption fixed the semantics.
+- **ZERO regressions** — swept qsa 1975, classlist 1420, createElement 147, createElementNS 596, cssom idlharness
+  493, cssom-view 417, geometry 372, svg 1702, filter-effects 485, css-masking 41, css-animations 98,
+  css-transitions 64, css-view-transitions 66, css-fonts 97, css-conditional 45,
+  **event-handler-all-global-events 375/375**, **popover-focus 30/30**, url-origin 406, serialize-values 696/697,
+  outline-valid 20/20, cursor-computed 36/39, content-visibility-computed 3/3, checkVisibility 13/15,
+  **web-animations idlharness 188/230**. The whole 39-file `interfaces/` suite was re-run file-by-file against its
+  732/845 hold, with every suspect stash-proved individually. `popover-focus` read **26/30 mid-sweep and 30/30 on a
+  fresh server** — the documented CDP-session degradation, not a regression.
+- **One flake named honestly.** `Animation/overallProgress` reads 2/6 or 3/6 run-to-run **on both builds**
+  (measured 5× on the stashed baseline: 3,3,2,3,3; 4× on this one: 2,2,3,2). Its flapping subtest sets
+  `animation.startTime = document.timeline.currentTime` and then asserts `animation.currentTime === 0` — a
+  millisecond race between two clock reads. **This work does not cause it, but it does worsen its odds**, since
+  `getComputedStyle` now does strictly more work. The root fix is freezing `DocumentTimeline.currentTime` per task;
+  it was not attempted here because it is a shared timing change needing its own full sweep.
+- **CAPS (named, genuine):** percentage and `calc()` resolution needs **layout** (`width: ['0%','50%']` in a 100px
+  parent must report `25px`; the computed value *is* the percentage and only a used value resolves it) — unwinnable,
+  don't burn a session; transform lists of different length need identity padding and filter lists need per-function
+  lacuna values, neither of which the generic shape rule can know; shorthand expansion *inside* the keyframe list
+  (2 subtests).
+- **⭐ NEXT LEVERAGE: `rem` resolves against a hardcoded 16px instead of the root element's computed `font-size`** —
+  ~12 subtests right here ("a length of rem" across both interpolation files), cleanly separable from animation,
+  and a win for every `rem`-using page in the world. Then **freeze `DocumentTimeline.currentTime` per task** (real
+  spec behaviour — a document timeline's current time is the *frame* time, constant within a task, which is what
+  makes WPT's timing assertions deterministic in real browsers; de-flakes overallProgress at the root). Then the
+  **transform/filter-list interpolation paths**, and the still-untaken **scroll-offset model**. Scroll:
+  [`415-animated-computed-style-verdict.md`](415-animated-computed-style-verdict.md).
 
 **Session 2026-07-30 (Quests #412–#414 — the Web Animations arc, +840, ZERO regressions):**
 Took #411's named next-leverage — the widest adjacent tail on the board. Obscura had a **ten-line lie** where an animation engine should be (`bootstrap.js:5484`): `Element.animate()` returned an object literal whose `finished` was already resolved and whose `currentTime` was frozen at 0; there was no `Animation`, no `AnimationEffect`, no `KeyframeEffect`, no timeline, no `document.timeline`. Baselines **stash-proved**: `web-animations/idlharness.window.html` **42/230**, the 39-file `web-animations/interfaces/` behaviour suite **38/845**.
