@@ -1561,7 +1561,10 @@ class CSSStyleDeclaration {
       if (!_csTransInline) {
         const p = this._props;
         if (p['transition'] !== undefined || p['transition-property'] !== undefined
-            || p['transition-duration'] !== undefined || p['transition-delay'] !== undefined) {
+            || p['transition-duration'] !== undefined || p['transition-delay'] !== undefined
+            // …and the same for a CSS animation declared through the CSSOM
+            // (`el.style.animationName = 'x'`), which the style attribute never sees.
+            || p['animation'] !== undefined || p['animation-name'] !== undefined) {
           _csTransInline = true;
         }
       }
@@ -4833,7 +4836,7 @@ class Element extends Node {
     // specified value is observable via el.style.getPropertyValue (HTML parsing and
     // setAttribute both land here; setting it replaces the declaration block).
     if (qname === 'style' && this._style && !this._styleSyncing) {
-      if (!_csInlineAttr && String(v).indexOf('transition') >= 0) _csInlineAttr = true;
+      if (!_csInlineAttr && /transition|animation/.test(String(v))) _csInlineAttr = true;
       this._styleSyncing = true;
       try { this._style.cssText = String(v); } finally { this._styleSyncing = false; }
     }
@@ -40545,15 +40548,158 @@ if (!globalThis.crypto.subtle) {
   ]);
   const _waRound = (v) => Math.round(v * 1e6) / 1e6;
   const _WA_RGBA = /^rgba?\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*(?:,\s*(-?[\d.]+)\s*)?\)$/;
+
+  // ── A transform list is a list of FUNCTION slots ──────────────────────────
+  // css-transforms-1 §interpolation-of-transforms interpolates two lists
+  // function-by-function. Three things stand between a pair of real-world lists
+  // and that rule, and all three are the SAME move — make both sides the same
+  // shape, then let #417's skeleton kit do every bit of the arithmetic:
+  //
+  //   1. `none` IS the identity transform, so against a list it behaves as that
+  //      list's own functions in their identity form. (`none` → `translate(200px)
+  //      rotate(720deg)` answered `none`, because the two shared no skeleton.)
+  //   2. A shorter list is padded — at the tail, with the identity of each
+  //      function the longer list still has. `translate(100px)` →
+  //      `translate(200px) rotate(720deg)` must interpolate the translate *and*
+  //      rotate up from 0deg; it used to interpolate the translate and silently
+  //      drop the rotation.
+  //   3. Two spellings of one primitive (`translateX(a)` vs `translate(a, b)`,
+  //      `scaleY`, `skewX`, `rotateZ`) are the same function in different
+  //      clothes — promoting both to the primitive makes their skeletons match.
+  //
+  // Deliberately NOT here: a genuinely mismatched pair (`translate` against
+  // `scale` at the same index) needs matrix decomposition and quaternion slerp,
+  // which is a different kind of work. Those keep the discrete fallback.
+
+  // Each function's spelling as its shared primitive. `scale(2)` fills y from x
+  // (a one-argument scale is uniform); `translate`/`skew` fill from zero.
+  const _WA_TF_PRIM = {
+    translate:  (a) => ['translate', [a[0], a.length > 1 ? a[1] : '0px']],
+    translatex: (a) => ['translate', [a[0], '0px']],
+    translatey: (a) => ['translate', ['0px', a[0]]],
+    scale:      (a) => ['scale', [a[0], a.length > 1 ? a[1] : a[0]]],
+    scalex:     (a) => ['scale', [a[0], '1']],
+    scaley:     (a) => ['scale', ['1', a[0]]],
+    skew:       (a) => ['skew', [a[0], a.length > 1 ? a[1] : '0deg']],
+    skewx:      (a) => ['skew', [a[0], '0deg']],
+    skewy:      (a) => ['skew', ['0deg', a[0]]],
+    rotate:     (a) => ['rotate', [a[0]]],
+    rotatez:    (a) => ['rotate', [a[0]]],
+  };
+  // The neutral element of each primitive — what a missing function contributes.
+  const _WA_TF_IDENTITY = {
+    translate: ['0px', '0px'], translate3d: ['0px', '0px', '0px'], translatez: ['0px'],
+    scale: ['1', '1'], scale3d: ['1', '1', '1'], scalez: ['1'],
+    rotate: ['0deg'], rotatex: ['0deg'], rotatey: ['0deg'],
+    skew: ['0deg', '0deg'],
+    matrix: ['1', '0', '0', '1', '0', '0'],
+    matrix3d: ['1', '0', '0', '0', '0', '1', '0', '0', '0', '0', '1', '0', '0', '0', '0', '1'],
+  };
+  const _waTfNorm = (it) => {
+    const p = _WA_TF_PRIM[it.name];
+    if (!p) return { name: it.name, args: it.args.slice() };
+    const r = p(it.args);
+    return { name: r[0], args: r[1] };
+  };
+  // `rotate3d`'s identity is the SAME axis turned zero degrees — the axis is not
+  // a magnitude, so zeroing it would name a different rotation, not none at all.
+  // `perspective` has no finite identity, so a list needing it stays unpadded.
+  const _waTfIdentityOf = (it) => {
+    if (it.name === 'rotate3d') return { name: 'rotate3d', args: [it.args[0], it.args[1], it.args[2], '0deg'] };
+    const id = _WA_TF_IDENTITY[it.name];
+    return id ? { name: it.name, args: id.slice() } : null;
+  };
+  const _waTfSer = (items) => items
+    .map((it) => (_TF_DISP[it.name] || it.name) + '(' + it.args.join(', ') + ')').join(' ');
+  // → [itemsA, itemsB], two equal-length lists whose functions match one for one,
+  // or null when the pair cannot be aligned (the caller then keeps its existing
+  // behaviour, which for interpolation is the spec's discrete fallback).
+  const _waTfAlignItems = (sa, sb) => {
+    let pa, pb;
+    try { pa = _parseTransform(sa); pb = _parseTransform(sb); } catch (e) { return null; }
+    if (!pa || !pb) return null;
+    const A = pa.none ? [] : pa.items.map(_waTfNorm);
+    const B = pb.none ? [] : pb.items.map(_waTfNorm);
+    const n = Math.max(A.length, B.length);
+    if (!n) return null;
+    const oa = [], ob = [];
+    for (let i = 0; i < n; i++) {
+      let x = A[i], y = B[i];
+      if (!x) x = _waTfIdentityOf(y);
+      else if (!y) y = _waTfIdentityOf(x);
+      if (!x || !y || x.name !== y.name || x.args.length !== y.args.length) return null;
+      oa.push(x); ob.push(y);
+    }
+    return [oa, ob];
+  };
+  const _waTfAlign = (sa, sb) => {
+    const al = _waTfAlignItems(sa, sb);
+    return al && [_waTfSer(al[0]), _waTfSer(al[1])];
+  };
+  // The transform property has its OWN composition rules (css-transforms-2
+  // §addition-and-accumulation), not the generic slot-wise arithmetic:
+  //   • addition is list CONCATENATION (`Va ++ Vb`) — never a per-slot sum;
+  //   • accumulation is per-argument, but only when the two lists already match
+  //     function-for-function, and `scale` accumulates about ONE rather than zero
+  //     (2 ⊕ 3 = 4, because a scale of 1 is this function's do-nothing value).
+  //     Anything that will not line up falls back to addition.
+  const _WA_TF_SCALES = new Set(['scale', 'scale3d', 'scalex', 'scaley', 'scalez']);
+  const _waTfConcat = (u, v) => {
+    if (u === '' || u.toLowerCase() === 'none') return v;
+    if (v === '' || v.toLowerCase() === 'none') return u;
+    return u + ' ' + v;
+  };
+  const _waTfCompose = (su, sv, accumulate) => {
+    const u = String(su).trim(), v = String(sv).trim();
+    if (!accumulate) return _waTfConcat(u, v);
+    const al = _waTfAlignItems(u, v);
+    if (!al) return _waTfConcat(u, v);
+    const [A, B] = al;
+    const out = [];
+    for (let i = 0; i < A.length; i++) {
+      // rotate3d's first three arguments name an AXIS, not a magnitude — two
+      // rotations only accumulate when they turn about the same axis, and then
+      // it is the angle alone that adds.
+      const axis = A[i].name === 'rotate3d' ? 3 : 0;
+      if (axis && A[i].args.slice(0, 3).join() !== B[i].args.slice(0, 3).join())
+        return _waTfConcat(u, v);
+      const base = _WA_TF_SCALES.has(A[i].name) ? 1 : 0;
+      const args = [];
+      for (let j = 0; j < A[i].args.length; j++) {
+        if (j < axis) { args.push(A[i].args[j]); continue; }
+        // Each argument is one value of one type, so #417's kit adds it exactly:
+        // matching skeletons (`10px` + `4px`), and the neutral subtracted once.
+        const s = _waAdd(A[i].args[j], B[i].args[j], null);
+        args.push(base ? _waTfSubOne(s) : s);
+      }
+      out.push({ name: A[i].name, args });
+    }
+    return _waTfSer(out);
+  };
+  // `a ⊕ b` for a scale argument is `a + b − 1`. The sum arrives from `_waAdd` as
+  // a plain number (scale arguments are unitless), so the neutral comes straight off.
+  const _waTfSubOne = (s) => {
+    const n = parseFloat(s);
+    return Number.isFinite(n) && /^-?[\d.]+(e[-+]?\d+)?$/i.test(String(s).trim())
+      ? String(_waRound(n - 1)) : s;
+  };
+
   // `name` is the kebab CSS property, when the caller knows it — it is only
   // consulted to decide whether an ident may be a colour and whether the
   // property's animation type is discrete.
   function _waInterpolate(a, b, t, name) {
     if (a === null || a === undefined) return b;
     if (b === null || b === undefined) return a;
-    const sa = String(a).trim(), sb = String(b).trim();
+    let sa = String(a).trim(), sb = String(b).trim();
     if (sa === sb) return sa;
     if (name && _WA_DISCRETE_PROPS.has(name)) return t < 0.5 ? sa : sb;
+    // A transform list is aligned function-for-function BEFORE the shape test —
+    // padding and primitive promotion are exactly what give the two sides a
+    // skeleton in common (see _waTfAlign).
+    if (name === 'transform') {
+      const al = _waTfAlign(sa, sb);
+      if (al) { sa = al[0]; sb = al[1]; }
+    }
     const x = _waSplitValue(sa, name), y = _waSplitValue(sb, name);
     if (x.slots.length && _waSameShape(x, y)) {
       const out = x.slots.map((sl, i) => (sl.c
@@ -40595,6 +40741,9 @@ if (!globalThis.crypto.subtle) {
     if (underlying === null || underlying === undefined || underlying === '') return value;
     if (name && _WA_DISCRETE_PROPS.has(name)) return value;
     const su = String(underlying).trim(), sv = String(value).trim();
+    // `transform` is not slot-wise additive at all — two transform lists ADD by
+    // concatenation (see _waTfCompose).
+    if (name === 'transform') return _waTfCompose(su, sv, false);
     const x = _waSplitValue(su, name), y = _waSplitValue(sv, name);
     if (x.slots.length && _waSameShape(x, y)) {
       return _waJoin(x.lits, x.slots.map((sl, i) => (sl.c
@@ -40605,11 +40754,17 @@ if (!globalThis.crypto.subtle) {
     if (la && lb) return _waLPSer({ pct: la.pct + lb.pct, px: la.px + lb.px });
     return value;
   };
-  // Accumulation is addition for every type Obscura models. It parts company
-  // with addition only for types with a defined "accumulation" that isn't a sum
-  // — for those the spec falls back to replacing, which is what _waAdd already
-  // does for anything it cannot add.
-  const _waAccumulate = (underlying, value, name) => _waAdd(underlying, value, name);
+  // Accumulation is addition for every type Obscura models EXCEPT `transform`,
+  // whose accumulation is per-argument about each function's own neutral (and
+  // whose addition is concatenation) — see _waTfCompose. It parts company with
+  // addition elsewhere only for types with a defined "accumulation" that isn't a
+  // sum, and for those the spec falls back to replacing, which is what _waAdd
+  // already does for anything it cannot add.
+  const _waAccumulate = (underlying, value, name) => {
+    if (name === 'transform' && underlying !== null && underlying !== undefined && underlying !== '')
+      return _waTfCompose(String(underlying).trim(), String(value).trim(), true);
+    return _waAdd(underlying, value, name);
+  };
   // §effect-accumulation, iteration composite `accumulate`: `n` copies of the
   // end-of-iteration value are accumulated onto the keyframe value. `_waAdd`'s
   // second operand wins whenever the type cannot be added — so a DISCRETE
@@ -41120,15 +41275,18 @@ if (!globalThis.crypto.subtle) {
       let sel;
       if (cached && cached.text === text) sel = cached.sel;
       else {
-        // Cheap reject first: a sheet that never says "transition" cannot declare one.
-        if (text.indexOf('transition') < 0) sel = '';
+        // Cheap reject first: a sheet that says neither "transition" nor
+        // "animation" cannot declare either, and pays only one substring scan.
+        const wantsT = text.indexOf('transition') >= 0, wantsA = text.indexOf('animation') >= 0;
+        if (!wantsT && !wantsA) sel = '';
         else {
           const sels = [];
           for (const rule of _styleSheetRules(se)) {
             const d = rule && rule.decls;
             if (!d) continue;
-            if (d['transition-property'] !== undefined || d['transition-duration'] !== undefined
-                || d['transition-delay'] !== undefined) sels.push(rule.selectorText);
+            if ((wantsT && (d['transition-property'] !== undefined || d['transition-duration'] !== undefined
+                || d['transition-delay'] !== undefined))
+              || (wantsA && d['animation-name'] !== undefined)) sels.push(rule.selectorText);
           }
           sel = sels.join(',');
         }
@@ -41278,6 +41436,238 @@ if (!globalThis.crypto.subtle) {
     setTimeout(() => _csFire(el, 'transitioncancel', kebab, elapsed, anim), 0);
   };
 
+  // ══ CSS Animations (css-animations-1) ══════════════════════════════════════
+  // `@keyframes` parsed perfectly and animated NOTHING: `getAnimations()` came
+  // back empty and the computed value never left its underlying value. Exactly
+  // the shape `transition-*` was in before #421 — and the answer is the same
+  // one, one realm over:
+  //
+  //     A CSS animation IS an `Animation` whose effect's keyframes are the
+  //     `@keyframes` rule's, and whose timing is the `animation-*` longhands.
+  //
+  // So it needs nothing new from the engine: #412's timing model reads the
+  // longhands directly (`iterations`, `direction`, `fill` are the same words),
+  // #415's `_waAnimatedDecls` already gives any non-transition `Animation` a
+  // cascade seat above the author's normal declarations, and #421's style change
+  // event is exactly the moment a browser creates, updates and cancels them.
+
+  // The LAST `@keyframes` of a given name in document order wins. Grouping rules
+  // (`@media`, `@supports`) are walked, since a rule inside one still counts.
+  let _caRuleGen = null, _caRuleCache = null;
+  const _caFindKeyframes = (name) => {
+    const gen = _styleGen + '|' + _cssomInlineGen;
+    if (_caRuleGen !== gen) { _caRuleGen = gen; _caRuleCache = new Map(); }
+    if (_caRuleCache.has(name)) return _caRuleCache.get(name);
+    let hit = null;
+    const walk = (rules, depth) => {
+      if (!rules || depth > 4) return;
+      for (let i = 0; i < rules.length; i++) {
+        const r = rules[i];
+        if (!r) continue;
+        if (r.name !== undefined && r.cssRules && r.style === undefined) {
+          if (r.name === name) hit = r;
+        } else if (r.cssRules) walk(r.cssRules, depth + 1);
+      }
+    };
+    try { for (const sheet of document.styleSheets) { try { walk(sheet.cssRules, 0); } catch (e) {} } }
+    catch (e) {}
+    _caRuleCache.set(name, hit);
+    return hit;
+  };
+  // A `@keyframes` rule → the keyframe list a `KeyframeEffect` takes. Two things
+  // are specific to CSS Animations: one selector may name SEVERAL offsets
+  // (`0%, 50% { … }` is two keyframes), and a keyframe's own
+  // `animation-timing-function` declaration is that keyframe's EASING rather
+  // than a property it animates.
+  const _caKeyframesOf = (rule) => {
+    const frames = [];
+    let list = null;
+    try { list = rule.cssRules; } catch (e) { return frames; }
+    for (let i = 0; i < list.length; i++) {
+      const kr = list[i];
+      let text = '', decl = null;
+      try { text = String(kr.keyText || ''); decl = kr.style; } catch (e) { continue; }
+      if (!decl) continue;
+      const props = {}; let easing;
+      for (let j = 0; j < decl.length; j++) {
+        // `.item(j)`, not `decl[j]` — a keyframe rule's declaration block does not
+        // carry the indexed getter, and reading it silently yields "".
+        let p = '', v = '';
+        try { p = decl.item ? decl.item(j) : decl[j]; } catch (e) { continue; }
+        if (!p) continue;
+        try { v = decl.getPropertyValue(p); } catch (e) { continue; }
+        if (p === 'animation-timing-function') { easing = v; continue; }
+        if (_CS_NEVER.has(p) || _SHORTHAND_LONGHANDS[p]) continue;
+        props[p.startsWith('--') ? p : (p === 'float' ? 'cssFloat' : _toCamel(p))] = v;
+      }
+      for (const part of text.split(',')) {
+        const o = part.trim().toLowerCase();
+        const n = o === 'from' ? 0 : o === 'to' ? 1
+                : (/^[\d.]+%$/.test(o) ? parseFloat(o) / 100 : NaN);
+        if (!Number.isFinite(n) || n < 0 || n > 1) continue;
+        const f = { offset: n };
+        if (easing !== undefined) f.easing = easing;
+        for (const k in props) f[k] = props[k];
+        frames.push(f);
+      }
+    }
+    // The keyframe processor wants them in offset order; ties keep document order.
+    return frames.map((f, i) => [f, i])
+      .sort((a, b) => (a[0].offset - b[0].offset) || (a[1] - b[1])).map((p) => p[0]);
+  };
+
+  class CSSAnimation extends _Animation {
+    constructor(effect, timeline) { super(effect, timeline); this._caName = ''; }
+  }
+  Object.defineProperty(CSSAnimation.prototype, 'animationName', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'animationName', function() {
+      if (!(this instanceof CSSAnimation)) throw new TypeError("Illegal invocation");
+      return this._caName;
+    }),
+  });
+  Object.defineProperty(CSSAnimation.prototype, Symbol.toStringTag, { value: 'CSSAnimation', configurable: true });
+  _exposeIface('CSSAnimation', CSSAnimation); _markNative(CSSAnimation);
+
+  const _caFire = (el, type, name, elapsedSec, anim) => {
+    let ev = null;
+    try {
+      ev = new AnimationEvent(type, { bubbles: true, cancelable: false,
+        animationName: name, elapsedTime: elapsedSec, pseudoElement: '' });
+      ev._animation = anim;
+    } catch (e) { return; }
+    try { el.dispatchEvent(ev); } catch (e) {}
+  };
+  const _caIterations = (s) => {
+    const t = String(s).trim().toLowerCase();
+    if (t === 'infinite') return Infinity;
+    const n = parseFloat(t);
+    return Number.isFinite(n) && n >= 0 ? n : 1;
+  };
+  const _CA_DIRECTIONS = new Set(['normal', 'reverse', 'alternate', 'alternate-reverse']);
+  const _CA_FILLS = new Set(['none', 'forwards', 'backwards', 'both']);
+  // Everything about ONE `animation-name` layer that decides whether the live
+  // animation still matches what the style now asks for. Comparing this string is
+  // what keeps a flush from tearing down and rebuilding a running animation.
+  const _caSpec = (name, dur, delay, iter, dir, fill, tf, kfText) =>
+    [name, dur, delay, iter, dir, fill, tf, kfText].join('');
+
+  const _caStart = (el, spec, frames, opts, name) => {
+    let anim = null;
+    try {
+      const eff = new _KeyframeEffect(el, frames, opts);
+      if (!eff._frames.length) return null;
+      // A `@keyframes` value is written in the stylesheet, so it is a SPECIFIED
+      // value and must be computed like any other keyframe (#420) — unlike a
+      // transition's endpoints, which were read out of a computed style already.
+      anim = new CSSAnimation(eff, (el.ownerDocument && el.ownerDocument.timeline) || undefined);
+    } catch (e) { return null; }
+    anim._caName = name;
+    anim._caSpec = spec;
+    anim._caDurSec = (opts.duration || 0) / 1000;
+    anim._caDone = false;
+    anim.addEventListener('finish', () => {
+      if (anim._caDone) return;
+      anim._caDone = true;
+      const st = _csState.get(el);
+      if (st && st.anims) for (const [k, a] of st.anims) if (a === anim) st.anims.delete(k);
+      // Unlike a transition, a finished animation is NOT retired: `fill:
+      // forwards` means its final value must go on applying to the cascade.
+      if (!opts.fill || opts.fill === 'none' || opts.fill === 'backwards') {
+        try { globalThis._waRetire(anim); } catch (e) {}
+      }
+      _caFire(el, 'animationend', name, anim._caDurSec * (opts.iterations || 1), anim);
+    });
+    anim.play();
+    if (opts._paused) { try { anim.pause(); } catch (e) {} }
+    // Queued, not inline — a listener must not re-enter the cascade from inside
+    // the style change event that created the animation (the same rule
+    // `transitionrun` follows).
+    setTimeout(() => {
+      if (anim.playState === 'idle') return;
+      _caFire(el, 'animationstart', name, Math.min(Math.max(-(opts.delay || 0), 0), opts.duration || 0) / 1000, anim);
+    }, 0);
+    return anim;
+  };
+
+  // One element, one style change event — the CSS Animations half. `after` is the
+  // after-change computed style the transition pass already built, so reading the
+  // `animation-*` longhands costs nothing extra.
+  const _caUpdateElement = (el, after) => {
+    let st = _csState.get(el);
+    if (!st) return;
+    let nameList;
+    try { nameList = _csSplitList(after.getPropertyValue('animation-name') || 'none'); }
+    catch (e) { return; }
+    const live = st.anims || (st.anims = new Map());
+    const wanted = new Set();
+    const hasAny = nameList.some((n) => n && n.toLowerCase() !== 'none');
+    if (hasAny) {
+      const get = (p, dflt) => {
+        try { return _csSplitList(after.getPropertyValue(p) || dflt); } catch (e) { return [dflt]; }
+      };
+      const durL = get('animation-duration', '0s'), delayL = get('animation-delay', '0s');
+      const tfL = get('animation-timing-function', 'ease'), iterL = get('animation-iteration-count', '1');
+      const dirL = get('animation-direction', 'normal'), fillL = get('animation-fill-mode', 'none');
+      const stateL = get('animation-play-state', 'running');
+      for (let i = 0; i < nameList.length; i++) {
+        const name = nameList[i];
+        if (!name || name.toLowerCase() === 'none') continue;
+        const rule = _caFindKeyframes(name);
+        if (!rule) continue;
+        // The KEY is the layer's position: `animation-name: a, a` is two distinct
+        // animations of the same name, and each keeps its own identity.
+        const key = i + ' ' + name;
+        wanted.add(key);
+        let kfText = '';
+        try { kfText = rule.cssText || ''; } catch (e) { kfText = ''; }
+        const durS = _csAt(durL, i), delayS = _csAt(delayL, i), tf = _csAt(tfL, i);
+        const iter = _csAt(iterL, i), dirS = _csAt(dirL, i).toLowerCase();
+        const fillS = _csAt(fillL, i).toLowerCase(), paused = _csAt(stateL, i).toLowerCase() === 'paused';
+        const spec = _caSpec(name, durS, delayS, iter, dirS, fillS, tf, kfText);
+        const cur = live.get(key);
+        if (cur && cur._caSpec === spec) {
+          // Only the play state may change without restarting the animation.
+          try {
+            if (paused && cur.playState === 'running') cur.pause();
+            else if (!paused && cur.playState === 'paused') cur.play();
+          } catch (e) {}
+          continue;
+        }
+        if (cur) { try { cur.cancel(); globalThis._waRetire(cur); } catch (e) {} live.delete(key); }
+        const durMs = _csTimeMs(durS);
+        // `animation-timing-function` is the easing BETWEEN KEYFRAMES, not over
+        // the whole animation — so it becomes each keyframe's default easing and
+        // the effect itself stays linear. A keyframe that declares its own wins.
+        const frames = _caKeyframesOf(rule).map((f) => (f.easing === undefined ? { ...f, easing: tf } : f));
+        if (!frames.length) continue;
+        const a = _caStart(el, spec, frames, {
+          duration: durMs,
+          delay: _csTimeMs(delayS),
+          iterations: _caIterations(iter),
+          direction: _CA_DIRECTIONS.has(dirS) ? dirS : 'normal',
+          fill: _CA_FILLS.has(fillS) ? fillS : 'none',
+          easing: 'linear',
+          _paused: paused,
+        }, name);
+        if (a) live.set(key, a);
+      }
+    }
+    // A layer that stopped matching (or an element that lost `animation-name`)
+    // has its animation CANCELLED — css-animations-1 §animations, and the reason
+    // removing a class stops an animation dead rather than letting it finish.
+    for (const [key, a] of Array.from(live)) {
+      if (wanted.has(key)) continue;
+      live.delete(key);
+      const name = key.slice(key.indexOf(' ') + 1);
+      let elapsed = 0;
+      try { elapsed = Math.max(0, (a.currentTime || 0)) / 1000; } catch (e) { elapsed = 0; }
+      try { a.cancel(); globalThis._waRetire(a); } catch (e) {}
+      setTimeout(() => _caFire(el, 'animationcancel', name, elapsed, a), 0);
+    }
+    if (live.size) _csRunningEls.add(el);
+  };
+
   // ── One element, one style change event ────────────────────────────────────
   const _csUpdateElement = (el, memo) => {
     let st = _csState.get(el);
@@ -41294,6 +41684,11 @@ if (!globalThis.crypto.subtle) {
     let after = null, declared = null;
     try {
       after = globalThis.getComputedStyle(el);
+      // CSS Animations first: a declarative animation is part of the style the
+      // transition pass is about to compare against (§starting-of-transitions
+      // reads the before-change style "with any styles derived from declarative
+      // animations updated to the current time"), so it must be live by now.
+      try { _caUpdateElement(el, after); } catch (e) {}
       // Which properties to compare. For an explicit `transition-property` list
       // that is the list itself; for `all` it is every property some matching
       // declaration mentions — which is exactly the set that a class or inline
@@ -41465,7 +41860,7 @@ if (!globalThis.crypto.subtle) {
       // Once per document: what the HTML PARSER wrote into a style attribute
       // never passed through setAttribute, so the latch cannot have seen it.
       _csScannedInline = true;
-      try { if (document.querySelector('[style*="transition"]')) _csInlineAttr = true; } catch (e) {}
+      try { if (document.querySelector('[style*="transition"],[style*="animation"]')) _csInlineAttr = true; } catch (e) {}
     }
     // Nothing in the document has changed since the last style change event, so
     // this one cannot possibly start, retarget or cancel anything. THIS is what
@@ -41493,7 +41888,7 @@ if (!globalThis.crypto.subtle) {
       // A transition declared in the style ATTRIBUTE — one substring query.
       if (_csInlineAttr) {
         let list = [];
-        try { list = document.querySelectorAll('[style*="transition"]'); } catch (e) { list = []; }
+        try { list = document.querySelectorAll('[style*="transition"],[style*="animation"]'); } catch (e) { list = []; }
         for (const el of list) seen.add(el);
       }
       // …and every element whose inline style is scripted, which never reaches
@@ -41809,6 +42204,141 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   ShadowRoot.prototype.elementsFromPoint = function(x, y) {
     return Document.prototype.elementsFromPoint.call(globalThis.document || this, x, y);
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A reflected IDL attribute belongs to its INTERFACE, never to Element.
+//
+// Most reflectors above are written flat on `Element.prototype`, each tag-gating
+// itself, on the assumption that "a global definition is inert for every element
+// that doesn't own the attribute". That assumption is wrong in the one way that
+// matters: **an accessor is never inert.** With `target` on Element.prototype,
+//
+//     div.target = someElement;      // an ordinary expando in real code
+//
+// is not a property write at all — it is `setAttribute('target', String(el))`,
+// and the read back is a *string*. WPT's own `css/support/interpolation-testcommon.js`
+// stores its target element exactly that way, so every suite built on it died on
+// `target.style.setProperty` of undefined. The same trap swallows `.value`,
+// `.name`, `.type`, `.content`, `.color`, `.media`, `.align`, `.background`,
+// `.href`, `.src`, `.rel` (→ String) and `.open`, `.checked`, `.disabled`,
+// `.selected`, `.defer`, `.reversed`, `.compact` (→ Boolean) — on *every* element
+// in the document, including the plain `<div>`s ordinary code hangs data off.
+//
+// So, now that every interface object exists: MOVE each element-specific member
+// off Element.prototype and onto the prototypes of the interfaces that own it.
+// The accessors themselves are untouched — only their home changes — which makes
+// WebIDL-correct placement and expando-safety the very same fix.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  // member → the interfaces whose IDL declares it. An interface named here but not
+  // modelled by this engine is simply skipped; an interface that already declares
+  // its OWN version of the member keeps it (HTMLAnchorElement.text, HTMLSlotElement.name
+  // and HTMLFormElement.reset are real overrides, not copies of the shared accessor).
+  const __IFACE_MEMBERS = {
+    // ── HTML §element-specific reflections
+    action:     'HTMLFormElement',
+    as:         'HTMLLinkElement',
+    charset:    'HTMLAnchorElement HTMLLinkElement HTMLMetaElement HTMLScriptElement',
+    checked:    'HTMLInputElement',
+    content:    'HTMLMetaElement HTMLTemplateElement',
+    contentDocument: 'HTMLIFrameElement HTMLObjectElement HTMLFrameElement HTMLEmbedElement',
+    contentWindow:   'HTMLIFrameElement HTMLObjectElement HTMLFrameElement',
+    crossOrigin: 'HTMLImageElement HTMLLinkElement HTMLMediaElement HTMLScriptElement',
+    dateTime:   'HTMLModElement HTMLTimeElement',
+    defer:      'HTMLScriptElement',
+    disabled:   'HTMLButtonElement HTMLFieldSetElement HTMLInputElement HTMLLinkElement ' +
+                'HTMLOptGroupElement HTMLOptionElement HTMLSelectElement HTMLStyleElement ' +
+                'HTMLTextAreaElement',
+    event:      'HTMLScriptElement',
+    form:       'HTMLButtonElement HTMLFieldSetElement HTMLInputElement HTMLLabelElement ' +
+                'HTMLObjectElement HTMLOptionElement HTMLOutputElement HTMLSelectElement ' +
+                'HTMLTextAreaElement',
+    href:       'HTMLAnchorElement HTMLAreaElement HTMLBaseElement HTMLLinkElement',
+    hreflang:   'HTMLAnchorElement HTMLAreaElement HTMLLinkElement',
+    indeterminate: 'HTMLInputElement',
+    integrity:  'HTMLLinkElement HTMLScriptElement',
+    media:      'HTMLLinkElement HTMLMetaElement HTMLSourceElement HTMLStyleElement',
+    method:     'HTMLFormElement',
+    name:       'HTMLAnchorElement HTMLButtonElement HTMLDetailsElement HTMLEmbedElement ' +
+                'HTMLFieldSetElement HTMLFormElement HTMLFrameElement HTMLIFrameElement ' +
+                'HTMLImageElement HTMLInputElement HTMLMapElement HTMLMetaElement ' +
+                'HTMLObjectElement HTMLOutputElement HTMLParamElement HTMLSelectElement ' +
+                'HTMLSlotElement HTMLTextAreaElement',
+    noModule:   'HTMLScriptElement',
+    open:       'HTMLDetailsElement HTMLDialogElement',
+    options:    'HTMLSelectElement HTMLDataListElement',
+    placeholder: 'HTMLInputElement HTMLTextAreaElement',
+    referrerPolicy: 'HTMLAnchorElement HTMLAreaElement HTMLIFrameElement HTMLImageElement ' +
+                'HTMLLinkElement HTMLScriptElement',
+    rel:        'HTMLAnchorElement HTMLAreaElement HTMLFormElement HTMLLinkElement',
+    reset:      'HTMLFormElement',
+    rev:        'HTMLAnchorElement HTMLLinkElement',
+    scheme:     'HTMLMetaElement',
+    selected:   'HTMLOptionElement',
+    selectedIndex: 'HTMLSelectElement',
+    src:        'HTMLEmbedElement HTMLFrameElement HTMLIFrameElement HTMLImageElement ' +
+                'HTMLInputElement HTMLMediaElement HTMLScriptElement HTMLSourceElement ' +
+                'HTMLTrackElement',
+    srcdoc:     'HTMLIFrameElement',
+    submit:     'HTMLFormElement',
+    target:     'HTMLAnchorElement HTMLAreaElement HTMLBaseElement HTMLFormElement HTMLLinkElement',
+    type:       'HTMLAnchorElement HTMLButtonElement HTMLEmbedElement HTMLInputElement ' +
+                'HTMLLIElement HTMLLinkElement HTMLMenuElement HTMLOListElement ' +
+                'HTMLObjectElement HTMLParamElement HTMLScriptElement HTMLSelectElement ' +
+                'HTMLSourceElement HTMLStyleElement HTMLUListElement',
+    value:      'HTMLButtonElement HTMLDataElement HTMLInputElement HTMLLIElement ' +
+                'HTMLMeterElement HTMLOptionElement HTMLOutputElement HTMLParamElement ' +
+                'HTMLProgressElement HTMLSelectElement HTMLTextAreaElement',
+    // ── HTMLCanvasElement operations
+    getContext: 'HTMLCanvasElement',
+    toDataURL:  'HTMLCanvasElement',
+    toBlob:     'HTMLCanvasElement',
+    // ── HTML §obsolete-features (presentational attributes). These accessors already
+    // tag-gate themselves, so the move costs nothing but removes the pollution.
+    aLink:      'HTMLBodyElement',
+    align:      'HTMLDivElement HTMLEmbedElement HTMLHeadingElement HTMLHRElement ' +
+                'HTMLIFrameElement HTMLImageElement HTMLInputElement HTMLLegendElement ' +
+                'HTMLObjectElement HTMLParagraphElement HTMLTableCaptionElement ' +
+                'HTMLTableCellElement HTMLTableColElement HTMLTableElement ' +
+                'HTMLTableRowElement HTMLTableSectionElement',
+    background: 'HTMLBodyElement HTMLTableCellElement HTMLTableElement HTMLTableRowElement ' +
+                'HTMLTableSectionElement',
+    bgColor:    'HTMLBodyElement',
+    color:      'HTMLFontElement HTMLHRElement',
+    compact:    'HTMLDListElement HTMLDirectoryElement HTMLMenuElement HTMLOListElement ' +
+                'HTMLUListElement',
+    height:     'HTMLEmbedElement HTMLIFrameElement HTMLMarqueeElement HTMLObjectElement',
+    link:       'HTMLBodyElement',
+    noShade:    'HTMLHRElement',
+    reversed:   'HTMLOListElement',
+    size:       'HTMLHRElement',
+    start:      'HTMLOListElement',
+    text:       'HTMLBodyElement',
+    vLink:      'HTMLBodyElement',
+    version:    'HTMLHtmlElement',
+    width:      'HTMLEmbedElement HTMLHRElement HTMLIFrameElement HTMLMarqueeElement ' +
+                'HTMLObjectElement HTMLPreElement',
+  };
+  for (const member in __IFACE_MEMBERS) {
+    const desc = Object.getOwnPropertyDescriptor(Element.prototype, member);
+    if (!desc) continue;
+    // WebIDL: an interface member is an ENUMERABLE, configurable property. The
+    // accessors written in the `class Element` body are non-enumerable (class
+    // semantics); relocating is the moment to give them the shape WebIDL asks for.
+    desc.enumerable = true;
+    let homed = false;
+    for (const ifaceName of __IFACE_MEMBERS[member].split(' ')) {
+      const C = globalThis[ifaceName];
+      if (typeof C !== 'function' || !C.prototype) continue;
+      homed = true;
+      if (Object.prototype.hasOwnProperty.call(C.prototype, member)) continue;
+      Object.defineProperty(C.prototype, member, desc);
+    }
+    // Only vacate Element.prototype once the member has a real home — an engine
+    // build missing every named interface must not silently lose the reflection.
+    if (homed) delete Element.prototype[member];
+  }
 }
 
 globalThis.__obscura_init = function() {
