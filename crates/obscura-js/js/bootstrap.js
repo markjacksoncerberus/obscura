@@ -21592,6 +21592,14 @@ const _isValidFilterFn = (name, args) => {
   return false;                                           // unknown function
 };
 const _isValidFilter = (value) => {
+  // The same two escapes `_isValidTransform` grants, and for the same reason: a
+  // CSS-wide keyword is valid on EVERY property, and a var()/env() is resolved at
+  // computed time. Without them `filter: initial` was rejected by the style
+  // setter outright — so the declaration never existed, the cascade never saw it,
+  // and nothing downstream (a transition's before-value included) could work out
+  // that the author had asked for `none`.
+  if (_TF_VAR_RE.test(value)) return true;
+  if (_CSS_WIDE.has(String(value).trim().toLowerCase())) return true;
   const p = _parseFilterValue(value);
   if (!p) return false;
   if (p.none) return true;
@@ -40684,6 +40692,59 @@ if (!globalThis.crypto.subtle) {
       ? String(_waRound(n - 1)) : s;
   };
 
+  // ── A filter list is a list of FUNCTION slots too ─────────────────────────
+  // filter-effects-1 §animation-of-filters is the same shape as the transform
+  // list one realm over: two lists interpolate function-by-function, `none` IS
+  // the empty list, and a shorter list is padded at the tail with each missing
+  // function's LACUNA value — the argument that makes that filter do nothing.
+  // Align the two sides and #417's skeleton kit does every bit of the
+  // arithmetic, with no filter-specific code anywhere below.
+  //
+  // `drop-shadow()` and `url()` have no scalar lacuna (a shadow's is a colour and
+  // three lengths), so a list that would need one to pad stays unaligned and
+  // keeps the discrete fallback — as does anything with a nested function call,
+  // which the flat scan below deliberately refuses rather than mis-parses.
+  const _WA_FILTER_LACUNA = {
+    blur: '0px', brightness: '1', contrast: '1', grayscale: '0',
+    'hue-rotate': '0deg', invert: '0', opacity: '1', saturate: '1', sepia: '0',
+  };
+  const _WA_FILTER_FN = /([-a-z]+)\(([^()]*)\)/gi;
+  const _waFilterItems = (s) => {
+    const v = String(s).trim();
+    if (/^none$/i.test(v)) return [];
+    const out = [];
+    let m;
+    _WA_FILTER_FN.lastIndex = 0;
+    while ((m = _WA_FILTER_FN.exec(v))) out.push({ name: m[1].toLowerCase(), arg: m[2].trim() });
+    if (!out.length) return null;
+    if (v.replace(/([-a-z]+)\(([^()]*)\)/gi, ' ').trim() !== '') return null;
+    return out;
+  };
+  const _waFilterAlign = (sa, sb) => {
+    const A = _waFilterItems(sa), B = _waFilterItems(sb);
+    if (!A || !B) return null;
+    const n = Math.max(A.length, B.length);
+    if (!n) return null;
+    const oa = [], ob = [];
+    for (let i = 0; i < n; i++) {
+      let x = A[i], y = B[i];
+      if (!x) {
+        const l = _WA_FILTER_LACUNA[y.name];
+        if (l === undefined) return null;
+        x = { name: y.name, arg: l };
+      } else if (!y) {
+        const l = _WA_FILTER_LACUNA[x.name];
+        if (l === undefined) return null;
+        y = { name: x.name, arg: l };
+      }
+      if (x.name !== y.name) return null;
+      oa.push(x); ob.push(y);
+    }
+    const ser = (l) => l.map((it) => it.name + '(' + it.arg + ')').join(' ');
+    return [ser(oa), ser(ob)];
+  };
+  const _WA_FILTER_PROPS = new Set(['filter', 'backdrop-filter']);
+
   // `name` is the kebab CSS property, when the caller knows it — it is only
   // consulted to decide whether an ident may be a colour and whether the
   // property's animation type is discrete.
@@ -40698,6 +40759,9 @@ if (!globalThis.crypto.subtle) {
     // skeleton in common (see _waTfAlign).
     if (name === 'transform') {
       const al = _waTfAlign(sa, sb);
+      if (al) { sa = al[0]; sb = al[1]; }
+    } else if (name && _WA_FILTER_PROPS.has(name)) {
+      const al = _waFilterAlign(sa, sb);
       if (al) { sa = al[0]; sb = al[1]; }
     }
     const x = _waSplitValue(sa, name), y = _waSplitValue(sb, name);
@@ -40717,6 +40781,37 @@ if (!globalThis.crypto.subtle) {
     // point of the interval, then the `to` value takes over.
     return t < 0.5 ? sa : sb;
   }
+
+  // Can these two values be INTERPOLATED, or is the only honest answer a
+  // discrete flip? Exactly `_waInterpolate`'s own question, asked before the
+  // fact: same discrete-property table, same shape test, same
+  // length-percentage fallback. The CSS Transitions engine needs it because
+  // css-transitions-2 makes a non-interpolable pair a NON-transition unless
+  // `transition-behavior: allow-discrete` — so this predicate decides whether a
+  // transition exists at all. Exported on the global because the transitions
+  // engine lives in its own block and cannot see these internals.
+  globalThis._waInterpolable = (a, b, name) => {
+    if (a === null || a === undefined || b === null || b === undefined) return false;
+    let sa = String(a).trim(), sb = String(b).trim();
+    if (sa === '' || sb === '') return false;
+    if (sa === sb) return true;
+    if (name && _WA_DISCRETE_PROPS.has(name)) return false;
+    // `visibility` is not discrete, however much its two keywords look it: it has
+    // its own animation type, under which any progress strictly between the
+    // endpoints is `visible`. That is what makes `transition: visibility 2s`
+    // delay a disappearance instead of doing nothing at all.
+    if (name === 'visibility') return true;
+    if (name === 'transform') {
+      const al = _waTfAlign(sa, sb);
+      if (al) { sa = al[0]; sb = al[1]; }
+    } else if (name && _WA_FILTER_PROPS.has(name)) {
+      const al = _waFilterAlign(sa, sb);
+      if (al) { sa = al[0]; sb = al[1]; }
+    }
+    const x = _waSplitValue(sa, name), y = _waSplitValue(sb, name);
+    if (x.slots.length && _waSameShape(x, y)) return true;
+    return !!(_waLPParse(sa) && _waLPParse(sb));
+  };
 
   // ── Composition (§combining-effects / §effect-composition) ─────────────────
   // The composite operation in force for a keyframe: `auto` on the keyframe
@@ -40825,6 +40920,36 @@ if (!globalThis.crypto.subtle) {
   const _WA_UNCOMPUTED = new Set(['transform', 'translate', 'rotate', 'scale', 'offset-rotate']);
   const _waComputedValue = (el, kebab, v) => {
     if (!el || v === null || v === undefined) return v;
+    // A CSS-wide keyword is not a value to compute — it is a question for the
+    // CASCADE, and only the cascade holds the answer: `initial` is the property's
+    // initial value, `inherit` is the PARENT's computed value, `unset` is
+    // whichever of the two the property's inheritance picks. Handed to
+    // `_normComputed` instead, the keyword simply survived as itself, no length
+    // ever parsed out of it, and the interpolation fell through to a discrete
+    // flip — which is why every `from [initial]` / `[inherit]` / `[unset]` row of
+    // every interpolation test used to STEP where it should have slid. This runs
+    // ahead of the `_WA_UNCOMPUTED` escape on purpose: `transform: initial` has
+    // to become `none` before the transform list ever sees it.
+    const wide = String(v).trim().toLowerCase();
+    if (_CSS_WIDE.has(wide)) {
+      const had = _waUnderlyingOf.has(el);
+      _waUnderlyingOf.add(el);
+      try {
+        const initial = () => _normComputed(el, kebab, _initialOf(kebab));
+        // Inheriting takes the parent's computed value as it stands — animations
+        // on the parent included, which is what makes an inheriting keyframe
+        // track an animating ancestor.
+        const inherited = () => (el.parentElement
+          ? _computedPropOf(el.parentElement, kebab, 0) : initial());
+        // revert / revert-layer have no author origin to fall back to here, so
+        // they land where `unset` does.
+        const out = wide === 'inherit' ? inherited()
+          : wide === 'initial' ? initial()
+          : (_INHERITED_PROPS.has(kebab) ? inherited() : initial());
+        return (out === null || out === undefined || out === '') ? v : String(out);
+      } catch (e) { return v; }
+      finally { if (!had) _waUnderlyingOf.delete(el); }
+    }
     if (_WA_UNCOMPUTED.has(kebab)) return v;
     if (/var\(/i.test(String(v))) return v;
     if (_WA_UNCLAMPED_NUM.has(kebab)) {
@@ -40887,24 +41012,49 @@ if (!globalThis.crypto.subtle) {
         value: op === 'replace' ? rawOf(f) : _waComposite(op, getUnderlying(), rawOf(f), kebab),
       };
     });
-    if (pts[0].off !== 0) pts.unshift({ off: 0, easingFn: null, value: getUnderlying() });
-    if (pts[pts.length - 1].off !== 1) pts.push({ off: 1, easingFn: null, value: getUnderlying() });
-    // §step 8 — the interval endpoints. With OVERLAPPING keyframes (several
-    // sharing an offset) the tie-break is what decides the answer: the interval
-    // BELOW an overlap point is closed by the FIRST of the tied keyframes, and
-    // the interval at or above it is opened by the LAST of them. So: the start
-    // is the LAST keyframe whose offset is ≤ progress, and the end is the FIRST
-    // whose offset is strictly greater. A progress outside [0,1] — which an
-    // overshooting easing produces — falls off one end and returns that single
-    // keyframe's value, which is spec step 9.
-    let loI = -1, hiI = -1;
-    for (let i = 0; i < pts.length; i++) if (pts[i].off <= progress) loI = i;
-    for (let i = pts.length - 1; i >= 0; i--) if (pts[i].off > progress) hiI = i;
-    if (loI < 0) return pts[hiI].value;
-    if (hiI < 0) return pts[loI].value;
-    const lo = pts[loI], hi = pts[hiI];
+    // css-animations-1 §keyframes: a `from`/`to` the author left out is SUPPLIED
+    // by the UA from the element's own computed values — and, being a keyframe of
+    // this animation like any other, it carries the animation's
+    // `animation-timing-function`. Left linear, a one-sided
+    // `@keyframes { to { … } }` ignored its timing function entirely.
+    let implicitEasing = null;
+    if (eff._implicitEasing) {
+      if (eff._implicitEasingFn === undefined) {
+        try { eff._implicitEasingFn = _waParseEasing(eff._implicitEasing).fn; }
+        catch (e) { eff._implicitEasingFn = null; }
+      }
+      implicitEasing = eff._implicitEasingFn;
+    }
+    if (pts[0].off !== 0) pts.unshift({ off: 0, easingFn: implicitEasing, value: getUnderlying() });
+    if (pts[pts.length - 1].off !== 1) pts.push({ off: 1, easingFn: implicitEasing, value: getUnderlying() });
+    // §step 6 — populate the interval endpoints. A progress OUTSIDE [0,1] is
+    // ordinary, not exceptional: `cubic-bezier` with control points off the unit
+    // square is the standard way to ask for an overshoot, and the spec answers by
+    // EXTRAPOLATING along the first (or last) interval rather than flattening
+    // onto its endpoint. Only when several keyframes are stacked on the boundary
+    // offset — so there is no single interval to extend — does the boundary
+    // keyframe's own value stand.
+    let nAt0 = 0, nAt1 = 0;
+    for (const p of pts) { if (p.off === 0) nAt0++; if (p.off === 1) nAt1++; }
+    if (progress < 0 && nAt0 > 1) return pts[0].value;
+    if (progress >= 1 && nAt1 > 1) return pts[pts.length - 1].value;
+    // The start is the LAST keyframe whose offset is ≤ progress AND < 1 — or, when
+    // progress is negative and none qualifies, the last keyframe at offset 0. The
+    // end is the NEXT keyframe BY INDEX, not the first with a greater offset:
+    // for OVERLAPPING keyframes the two readings agree (the interval below an
+    // overlap point is still closed by the first of the tied keyframes, and the
+    // one at or above it opened by the last), but only the index reading keeps a
+    // zero-width interval out of the way when progress runs past 1.
+    let loI = -1;
+    for (let i = 0; i < pts.length; i++) if (pts[i].off <= progress && pts[i].off < 1) loI = i;
+    if (loI < 0) { for (let i = 0; i < pts.length; i++) if (pts[i].off === 0) loI = i; }
+    if (loI < 0 || loI + 1 >= pts.length) return pts[loI < 0 ? 0 : loI].value;
+    const lo = pts[loI], hi = pts[loI + 1];
     const span = hi.off - lo.off;
-    const local = span > 0 ? Math.min(1, Math.max(0, (progress - lo.off) / span)) : 0;
+    // §step 11 — the interval distance is NOT clamped. Clamping it here is what
+    // used to turn every `at (-0.3)` / `at (1.5)` row of every interpolation test
+    // into a flat endpoint read.
+    const local = span > 0 ? (progress - lo.off) / span : 0;
     const eased = (lo.easingFn || ((x) => x))(local);
     return _waInterpolate(lo.value, hi.value, eased, kebab);
   };
@@ -41557,6 +41707,15 @@ if (!globalThis.crypto.subtle) {
     try {
       const eff = new _KeyframeEffect(el, frames, opts);
       if (!eff._frames.length) return null;
+      // css-animations-1 §keyframes: a missing `from`/`to` keyframe is SUPPLIED
+      // by the UA from the element's own computed values — and, being a keyframe
+      // of this animation, it carries the animation's `animation-timing-function`
+      // like every other one. Without this an implicit endpoint eased LINEARLY,
+      // so a one-sided `@keyframes { to { … } }` ignored its timing function
+      // entirely and sat at whatever the linear sample happened to be.
+      // Parsed lazily on the other side (`_waEffectValueFor`) — the easing
+      // parser lives in the Web Animations block, which this one cannot see.
+      eff._implicitEasing = opts._implicitEasing;
       // A `@keyframes` value is written in the stylesheet, so it is a SPECIFIED
       // value and must be computed like any other keyframe (#420) — unlike a
       // transition's endpoints, which were read out of a computed style already.
@@ -41648,6 +41807,7 @@ if (!globalThis.crypto.subtle) {
           direction: _CA_DIRECTIONS.has(dirS) ? dirS : 'normal',
           fill: _CA_FILLS.has(fillS) ? fillS : 'none',
           easing: 'linear',
+          _implicitEasing: tf,
           _paused: paused,
         }, name);
         if (a) live.set(key, a);
@@ -41698,6 +41858,7 @@ if (!globalThis.crypto.subtle) {
       const durList = _csSplitList(after.getPropertyValue('transition-duration') || '0s');
       const delayList = _csSplitList(after.getPropertyValue('transition-delay') || '0s');
       const tfList = _csSplitList(after.getPropertyValue('transition-timing-function') || 'ease');
+      const behList = _csSplitList(after.getPropertyValue('transition-behavior') || 'normal');
       const wantsAll = propList.indexOf('all') >= 0;
       const names = new Set();
       if (wantsAll) {
@@ -41778,6 +41939,28 @@ if (!globalThis.crypto.subtle) {
         let afterV = '';
         try { afterV = after.getPropertyValue(k); } catch (e) { afterV = ''; }
         if (afterV === '' || afterV === null || afterV === undefined) continue;
+        // css-transitions-2 §transition-behavior: a pair of values that cannot be
+        // INTERPOLATED is only transitionable when the property's
+        // `transition-behavior` says `allow-discrete`. With the default `normal`
+        // no transition starts at all — and that is not a detail, it is the whole
+        // observable difference: `max-width: auto → 20px` under `normal` shows
+        // `20px` from the very first frame, while a transition that ran anyway
+        // would sit on `auto` for half the duration and then jump. A running
+        // transition that is retargeted at a value it cannot reach is cancelled
+        // for the same reason.
+        const allowDiscrete = _csAt(behList, idx) === 'allow-discrete';
+        if (!allowDiscrete) {
+          // The before-change value, in both branches — the previous style change
+          // event's computed style is what §starting-of-transitions compares.
+          let beforeForKind = st.snap ? st.snap[k] : undefined;
+          if (beforeForKind === undefined) beforeForKind = _csImplicitBefore(el, k);
+          let interpolable = true;
+          try { interpolable = globalThis._waInterpolable(beforeForKind, afterV, k); } catch (e) { interpolable = true; }
+          if (!interpolable) {
+            if (running) { _csCancel(el, k, running); st.running.delete(k); }
+            continue;
+          }
+        }
         if (running) {
           // §starting-of-transitions: a running transition whose END VALUE still
           // matches the after-change style is simply left alone — comparing the
