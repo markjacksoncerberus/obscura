@@ -9941,6 +9941,10 @@ const _GCS_DEFAULTS = {
   'text-size-adjust': 'auto',                      // css-size-adjust: `auto | none | <percentage>` (inherited; computed none→100%)
   'overflow-anchor': 'auto',                       // css-scroll-anchoring: `auto | none` (not inherited; computed = specified)
   'box-sizing': 'content-box', cursor: 'auto',
+  // css-sizing-4 aspect-ratio = `auto || <ratio>`; not inherited; initial `auto`.
+  // Computed = the canonical form (both numbers of the ratio are always serialized),
+  // and its animation type is the <ratio>'s own — LOGARITHMIC, see _waRatioPair.
+  'aspect-ratio': 'auto',
   // css-backgrounds longhands (not inherited) + `filter`. Computed serialization
   // is identity here (keyword / position / url), which lets var() substitution
   // into these properties round-trip (`background-clip: var(--foo)` → padding-box,
@@ -9987,6 +9991,12 @@ const _GCS_DEFAULTS = {
   // the test's mediumWidth reference (a cascaded `border-top-width: medium`).
   appearance: 'none', 'caret-color': 'currentColor', 'caret-shape': 'auto',
   'field-sizing': 'fixed', 'interactivity': 'auto',
+  // css-ui-4 accent-color = `auto | <color>`; INHERITS; initial `auto`. `auto` is a
+  // keyword, NOT a colour — it computes to itself (the UA picks the accent), so it is
+  // never interpolable against a colour. Every other value computes as an ordinary
+  // <color> (it is in _COLOR_PROPS for that, and in _CSSUI_VALIDATED so the `auto`
+  // escape is validated in ONE place rather than bolted onto the generic colour gate).
+  'accent-color': 'auto',
   // css-contain: not inherited, initial `visible`, computed = specified (identity).
   'content-visibility': 'visible',
   // css-scrollbars: both inherit, initial `auto`, computed = specified (identity).
@@ -10037,6 +10047,8 @@ const _GCS_DEFAULTS = {
   // css-images. image-orientation/image-rendering inherit; object-* do not.
   'image-orientation': 'from-image', 'image-rendering': 'auto', 'object-fit': 'fill',
   'object-position': '50% 50%',
+  // css-images-4 object-view-box = `none | <basic-shape-rect>`; not inherited.
+  'object-view-box': 'none',
   // <image>-valued properties (none initial); their gradient values canonicalize
   // via _canonGradients (see _GRADIENT_PROPS). mask-image/border-image-source do
   // not inherit. list-style-image is registered above (css-lists, inherited).
@@ -10961,6 +10973,10 @@ const _COLOR_PROPS = new Set([
   'color','background-color','border-top-color','border-right-color','border-bottom-color',
   'border-left-color','outline-color','text-decoration-color','column-rule-color','caret-color',
   'text-emphasis-color',
+  // css-ui-4 accent-color. `auto | <color>` — the `auto` keyword is short-circuited
+  // ahead of the colour computation (in _normComputed and in the var()-substitution
+  // gate) via _COLOR_AUTO_PROPS; every other value is an ordinary <color>.
+  'accent-color',
   // filter-effects: SVG paint-server presentation attributes exposed as CSS
   // <color> properties. flood-color initial `black`, lighting-color initial
   // `white`; neither inherits (color-interpolation-filters — a keyword enum —
@@ -10980,6 +10996,11 @@ const _COLOR_PROPS = new Set([
 // `<color>` (`currentColor`→`currentcolor`); a value with internal spaces/commas
 // (`rgb(0, 0, 255)`) stays whole because `_splitTopLevel` only breaks at paren
 // depth 0. Specified-serialization only (these tests read `el.style[prop]` back).
+// Colour properties whose grammar ALSO admits the `auto` keyword. `auto` is not a
+// <color>: it computes to itself and never interpolates against one. Kept as a set so
+// the two places that must know (the computed-value dispatch and the var()-substitution
+// validity gate) agree, instead of each carrying its own `name === '…'` special case.
+const _COLOR_AUTO_PROPS = new Set(['accent-color']);
 const _COLOR_SHORTHAND_PROPS = new Set([
   'border-color','border-block-color','border-inline-color',
 ]);
@@ -13634,6 +13655,9 @@ const _INHERITED_PROPS = new Set([
   // css-ui: caret-color, caret-shape, cursor and interactivity inherit (the
   // outline-* and nav-* properties and appearance/resize/user-select do NOT).
   'caret-color', 'caret-shape', 'interactivity',
+  // css-ui-4: accent-color inherits (initial `auto`), so an `unset` keyframe on it
+  // resolves to the PARENT's accent-color, not to `auto`.
+  'accent-color',
   // css-scrollbars: scrollbar-width and scrollbar-color both inherit.
   'scrollbar-width', 'scrollbar-color',
   // css-text-decor: text-emphasis-* / text-shadow / text-underline-position /
@@ -14092,6 +14116,16 @@ const _CSSUI_VALIDATED = new Set([
   'content-visibility',
   'caret-color', 'outline-color', 'text-overflow', 'outline-width', 'outline-offset', 'cursor',
   'color-interpolation-filters',
+  // css-ui-4: accent-color = `auto | <color>` (dedicated _canonCssUi branch). Also in
+  // _COLOR_PROPS for the computed/animation side; dispatched HERE first so `auto` is
+  // accepted and `none`/`50%` are rejected (the generic colour gate validates neither).
+  'accent-color',
+  // css-sizing-4: aspect-ratio = `auto || <ratio>` (dedicated _canonCssUi branch).
+  // Not inherited; initial `auto`. Computed = the canonical form, so `0.5` is `0.5 / 1`.
+  'aspect-ratio',
+  // css-images-4: object-view-box = `none | <basic-shape-rect>` (dedicated branch
+  // over the shared _opShape engine). Not inherited; initial `none`.
+  'object-view-box',
   // css-break: break-*/box-decoration-break are keyword enums; orphans/widows are
   // <integer [1,∞]> (validated below, a number-typed calc kept symbolic → folded
   // at computed time).
@@ -14686,6 +14720,51 @@ const _blockifyDisplay = (v) => {
   if (v.startsWith('inline ')) return v.slice(7);         // `inline flow-root list-item` → `flow-root list-item`
   return v;
 };
+// ── <ratio> (css-values-4 §ratios) ───────────────────────────────────────────
+// `<ratio> = <number [0,∞]> [ / <number [0,∞]> ]?` — an omitted denominator is 1.
+// `aspect-ratio` wraps it as `auto || <ratio>`, so the keyword may sit on EITHER
+// side of the ratio but never inside it. Returns `{auto, w, h}` (w === null when
+// the value is a bare `auto`), or null when the value is not this grammar.
+const _parseRatioValue = (value) => {
+  const s = String(value).trim();
+  if (!s) return null;
+  // `16/9` is a single token to a whitespace splitter — give the solidus room of its
+  // own first, so `16/9`, `16 /9` and `16 / 9` all tokenize identically.
+  const toks = _wsTokens(s.replace(/\//g, ' / ')).filter((t) => t !== '');
+  if (!toks.length) return null;
+  let auto = false;
+  const rest = [];
+  for (const t of toks) {
+    if (t.toLowerCase() === 'auto') {
+      if (auto) return null;                                   // `auto auto` → invalid
+      auto = true; continue;
+    }
+    rest.push(t);
+  }
+  if (!rest.length) return auto ? { auto: true, w: null, h: null } : null;
+  // A number, or a number-typed calc() folded to one. Rejects `1e`, `50%`, `10px`.
+  const num = (t) => {
+    if (/^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i.test(t)) return parseFloat(t);
+    if (_MATHFN_NAME_RE.test(t)) { try { const n = _evalMath(t, 0, {}); if (n !== null) return n; } catch (e) {} }
+    return null;
+  };
+  let w, h;
+  // Pulling `auto` out first means a misplaced keyword (`1 / auto`) leaves a dangling
+  // solidus behind, and neither shape below accepts it.
+  if (rest.length === 1) { w = num(rest[0]); h = 1; }
+  else if (rest.length === 3 && rest[1] === '/') { w = num(rest[0]); h = num(rest[2]); }
+  else return null;
+  if (w === null || h === null) return null;
+  if (!(w >= 0) || !(h >= 0)) return null;                     // negative / NaN → invalid
+  return { auto, w, h };
+};
+// Canonical serialization: css-values-4 serializes a <ratio> with BOTH numbers, so a
+// bare `0.5` is `0.5 / 1`. The keyword leads when both are present.
+const _serRatioValue = (r) => {
+  const ratio = (r.w === null) ? '' : _serNumber(r.w) + ' / ' + _serNumber(r.h);
+  if (!r.auto) return ratio;
+  return ratio ? 'auto ' + ratio : 'auto';
+};
 const _canonCssUi = (name, value) => {
   const s = String(value).trim();
   const low = s.toLowerCase();
@@ -14792,6 +14871,19 @@ const _canonCssUi = (name, value) => {
       return null;                                             // `none`/`50%`/… → invalid
     }
     return out.join(' ');
+  }
+  if (name === 'aspect-ratio') {
+    // css-sizing-4 §aspect-ratio: `auto || <ratio>`.
+    const r = _parseRatioValue(s);
+    return r ? _serRatioValue(r) : null;
+  }
+  if (name === 'object-view-box') return _serObjectViewBox(s, false, null);
+  if (name === 'accent-color') {
+    // css-ui-4 §widget-accent: `auto | <color>`. Exactly one value — `auto` alone, or
+    // a single canonicalized <color> (currentcolor included). Two values are invalid.
+    if (low === 'auto') return 'auto';
+    if (!_isValidColor(s)) return null;                        // `none`/`50%`/`auto red` → invalid
+    return _canonColorSpecified(s);
   }
   if (name === 'scrollbar-color') {
     // css-scrollbars: `auto | <color>{2}`. `auto` stands ALONE (both thumb & track
@@ -19231,6 +19323,42 @@ const _serClipPath = (value, computed, el) => {
 const _isValidClipPath = (value) => _serClipPath(value, false, null) != null;
 const _canonClipPath = (value) => { const r = _serClipPath(value, false, null); return r == null ? value : r; };
 const _computeClipPath = (el, value) => { const r = _serClipPath(value, true, el); return r == null ? value : r; };
+
+// object-view-box (css-images-4 §the-object-view-box) = `none | <basic-shape-rect>`,
+//   <basic-shape-rect> = <inset()> | <rect()> | <xywh()>
+// Not inherited; initial `none`. The grammar of the three functions is already
+// modelled — the shared `_opShape` engine that clip-path and offset-path use — so
+// this is a thin wrapper over it, with ONE deliberate difference: clip-path and
+// offset-path rewrite rect()/xywh() into inset() at computed-value time, and
+// object-view-box does NOT. Its computed value is the function the author wrote,
+// with each <length-percentage> resolved. (The rewrite is affine, so it would have
+// interpolated correctly either way — but `getComputedStyle` would then hand a real
+// page an `inset()` it never asked for, which is a lie a test cannot catch.)
+const _OVB_FNS = new Set(['inset', 'rect', 'xywh']);
+const _serObjectViewBox = (value, computed, el) => {
+  const v = String(value).trim();
+  if (_TF_VAR_RE.test(v) || _CSS_WIDE.has(v.toLowerCase())) return v;
+  if (v.toLowerCase() === 'none') return 'none';
+  const m = /^([A-Za-z][A-Za-z-]*)\(([\s\S]*)\)$/.exec(v);
+  if (!m) return null;                                       // a bare keyword / two functions → invalid
+  const head = m[1].toLowerCase();
+  if (!_OVB_FNS.has(head)) return null;                      // circle()/polygon()/… are not <basic-shape-rect>
+  // Validated in _opShape's SPECIFIED mode — the only mode that keeps the function.
+  const spec = _opShape(head, m[2], false, null, 16, 0);
+  if (spec == null) return null;
+  if (!computed) return spec;
+  const emPx = _emPxOf(el), lhPx = _lineHeightPx(el, emPx);
+  const im = /^([A-Za-z-]+)\(([\s\S]*)\)$/.exec(spec);
+  if (!im) return spec;
+  // Every <length-percentage> resolves; `auto`, the `round` keyword and the radius
+  // clause's `/` are not lengths and pass through untouched.
+  const out = _wsTokens(im[2]).map((t) => {
+    if (!_isPosLP(t)) return t;
+    const r = _opLp(t, true, emPx, lhPx);
+    return (r == null || r === '') ? t : r;
+  });
+  return im[1] + '(' + out.join(' ') + ')';
+};
 
 // clip-rule (CSS Masking / SVG): nonzero | evenodd. Inherited; computed = identity.
 const _canonClipRule = (value) => {
@@ -23888,6 +24016,21 @@ const _normComputed = (el, kebab, v) => {
     }
     return v;
   }
+  if (kebab === 'object-view-box') { const r = _serObjectViewBox(v, true, el); return r == null ? v : r; }
+  if (kebab === 'aspect-ratio') {
+    // Computed = the specified keyword plus the specified ratio, canonically
+    // serialized (`0.5` → `0.5 / 1`). An unparseable value can only have arrived
+    // through var() substitution; leave it alone rather than invent a ratio.
+    const r = _parseRatioValue(v);
+    return r ? _serRatioValue(r) : v;
+  }
+  if (_COLOR_AUTO_PROPS.has(kebab) && String(v).trim().toLowerCase() === 'auto') {
+    // A colour property whose grammar also admits `auto` (accent-color). `auto` is a
+    // KEYWORD, not a colour — it computes to itself. Handing it to the colour path
+    // would either mangle it or (worse) resolve it to a plausible-looking colour, and
+    // the animation model would then happily interpolate a keyword against a colour.
+    return 'auto';
+  }
   if (kebab === 'color' || _COLOR_PROPS.has(kebab)) {
     // currentColor, modern colour spaces, color-mix()/relative/alpha/contrast, then
     // the legacy named/hex/rgb/hsl computation.
@@ -23949,7 +24092,8 @@ const _computedPropOf = (el, kebab, guard) => {
   // colour, unless it is a CSS-wide keyword or currentColor (resolved below).
   if (varBearing && (kebab === 'color' || _COLOR_PROPS.has(kebab))) {
     const lowc = v.trim().toLowerCase();
-    if (!_CSS_WIDE.has(lowc) && lowc !== 'currentcolor' && !_isValidColor(v)) {
+    if (!_CSS_WIDE.has(lowc) && lowc !== 'currentcolor' && !_isValidColor(v)
+        && !(lowc === 'auto' && _COLOR_AUTO_PROPS.has(kebab))) {
       return invalidAtComputedTime();
     }
   }
@@ -40745,6 +40889,35 @@ if (!globalThis.crypto.subtle) {
   };
   const _WA_FILTER_PROPS = new Set(['filter', 'backdrop-filter']);
 
+  // ── A <ratio> interpolates LOGARITHMICALLY ────────────────────────────────
+  // css-values-4 §combine-ratio: two ratios are interpolated by interpolating
+  // their logarithms. That is not a nicety — it is what makes the halfway point
+  // between 1:2 and 2:1 be 1:1 (the square, the shape a human would draw)
+  // instead of the arithmetic 1.25:1. The generic slot model would have found a
+  // perfectly good skeleton here (`<num> / <num>`) and quietly done the wrong
+  // arithmetic in it, so the ratio has to be asked about FIRST.
+  //
+  // Two pairs have no logarithm to interpolate and are honestly discrete:
+  //   • a DEGENERATE ratio — either number 0 or infinite (§combine-ratio says so
+  //     in as many words), which is why `1 / 0` → `1 / 1` steps rather than slides;
+  //   • disagreeing `auto` keywords — `auto` is a keyword, not a magnitude, so
+  //     `auto` and `2 / 1` are simply different kinds of value.
+  const _waRatioPair = (sa, sb) => {
+    const a = _parseRatioValue(sa), b = _parseRatioValue(sb);
+    if (!a || !b) return null;
+    if (a.auto !== b.auto) return null;
+    if (a.w === null || b.w === null) return null;             // bare `auto`: no ratio to move
+    const ra = a.w / a.h, rb = b.w / b.h;
+    if (!(ra > 0) || !Number.isFinite(ra)) return null;
+    if (!(rb > 0) || !Number.isFinite(rb)) return null;
+    return { auto: a.auto, ra, rb };
+  };
+  // Properties whose value type defines no addition. css-values-4 §not-additive:
+  // "its addition operation is simply Vresult = Va" — and in §combining-effects Va
+  // is the UNDERLYING value, not the keyframe's. So an `add` keyframe on one of
+  // these contributes nothing at all; the value underneath shows through unchanged.
+  const _WA_NON_ADDITIVE_PROPS = new Set(['aspect-ratio']);
+
   // `name` is the kebab CSS property, when the caller knows it — it is only
   // consulted to decide whether an ident may be a colour and whether the
   // property's animation type is discrete.
@@ -40757,6 +40930,12 @@ if (!globalThis.crypto.subtle) {
     // A transform list is aligned function-for-function BEFORE the shape test —
     // padding and primitive promotion are exactly what give the two sides a
     // skeleton in common (see _waTfAlign).
+    if (name === 'aspect-ratio') {
+      const p = _waRatioPair(sa, sb);
+      if (!p) return t < 0.5 ? sa : sb;
+      const r = Math.exp(Math.log(p.ra) + (Math.log(p.rb) - Math.log(p.ra)) * t);
+      return _serRatioValue({ auto: p.auto, w: r, h: 1 });
+    }
     if (name === 'transform') {
       const al = _waTfAlign(sa, sb);
       if (al) { sa = al[0]; sb = al[1]; }
@@ -40801,6 +40980,7 @@ if (!globalThis.crypto.subtle) {
     // endpoints is `visible`. That is what makes `transition: visibility 2s`
     // delay a disappearance instead of doing nothing at all.
     if (name === 'visibility') return true;
+    if (name === 'aspect-ratio') return _waRatioPair(sa, sb) !== null;
     if (name === 'transform') {
       const al = _waTfAlign(sa, sb);
       if (al) { sa = al[0]; sb = al[1]; }
@@ -40835,6 +41015,8 @@ if (!globalThis.crypto.subtle) {
   const _waAdd = (underlying, value, name) => {
     if (underlying === null || underlying === undefined || underlying === '') return value;
     if (name && _WA_DISCRETE_PROPS.has(name)) return value;
+    // A type with no addition keeps the value it already had (Vresult = Va).
+    if (name && _WA_NON_ADDITIVE_PROPS.has(name)) return underlying;
     const su = String(underlying).trim(), sv = String(value).trim();
     // `transform` is not slot-wise additive at all — two transform lists ADD by
     // concatenation (see _waTfCompose).
@@ -41638,7 +41820,7 @@ if (!globalThis.crypto.subtle) {
       let text = '', decl = null;
       try { text = String(kr.keyText || ''); decl = kr.style; } catch (e) { continue; }
       if (!decl) continue;
-      const props = {}; let easing;
+      const props = {}; let easing, composite;
       for (let j = 0; j < decl.length; j++) {
         // `.item(j)`, not `decl[j]` — a keyframe rule's declaration block does not
         // carry the indexed getter, and reading it silently yields "".
@@ -41647,6 +41829,12 @@ if (!globalThis.crypto.subtle) {
         if (!p) continue;
         try { v = decl.getPropertyValue(p); } catch (e) { continue; }
         if (p === 'animation-timing-function') { easing = v; continue; }
+        // css-animations-2 §animation-composition: declared INSIDE a keyframe block
+        // it is that keyframe's own composite operation — the declarative spelling of
+        // `{ composite: 'add' }` on a Web Animations keyframe. It is in _CS_NEVER (a
+        // property must never animate itself), so without this line it was dropped
+        // before it could be read, and every `add`/`accumulate` keyframe replaced.
+        if (p === 'animation-composition') { composite = v; continue; }
         if (_CS_NEVER.has(p) || _SHORTHAND_LONGHANDS[p]) continue;
         props[p.startsWith('--') ? p : (p === 'float' ? 'cssFloat' : _toCamel(p))] = v;
       }
@@ -41657,6 +41845,10 @@ if (!globalThis.crypto.subtle) {
         if (!Number.isFinite(n) || n < 0 || n > 1) continue;
         const f = { offset: n };
         if (easing !== undefined) f.easing = easing;
+        if (composite !== undefined) {
+          const c = String(composite).trim().toLowerCase();
+          if (_CA_COMPOSITES.has(c)) f.composite = c;
+        }
         for (const k in props) f[k] = props[k];
         frames.push(f);
       }
@@ -41699,8 +41891,14 @@ if (!globalThis.crypto.subtle) {
   // Everything about ONE `animation-name` layer that decides whether the live
   // animation still matches what the style now asks for. Comparing this string is
   // what keeps a flush from tearing down and rebuilding a running animation.
-  const _caSpec = (name, dur, delay, iter, dir, fill, tf, kfText) =>
-    [name, dur, delay, iter, dir, fill, tf, kfText].join('');
+  // css-animations-2 §animation-composition: the declarative spelling of a keyframe
+  // effect's composite operation. Its three values ARE the KeyframeEffect ones, so a
+  // valid longhand needs no translation — only to be READ, which was the whole gap:
+  // every other `animation-*` longhand reached the effect and this one did not, so
+  // `animation-composition: add` parsed, computed and reflected — and did nothing.
+  const _CA_COMPOSITES = new Set(['replace', 'add', 'accumulate']);
+  const _caSpec = (name, dur, delay, iter, dir, fill, tf, comp, kfText) =>
+    [name, dur, delay, iter, dir, fill, tf, comp, kfText].join('');
 
   const _caStart = (el, spec, frames, opts, name) => {
     let anim = null;
@@ -41769,6 +41967,7 @@ if (!globalThis.crypto.subtle) {
       const tfL = get('animation-timing-function', 'ease'), iterL = get('animation-iteration-count', '1');
       const dirL = get('animation-direction', 'normal'), fillL = get('animation-fill-mode', 'none');
       const stateL = get('animation-play-state', 'running');
+      const compL = get('animation-composition', 'replace');
       for (let i = 0; i < nameList.length; i++) {
         const name = nameList[i];
         if (!name || name.toLowerCase() === 'none') continue;
@@ -41783,7 +41982,9 @@ if (!globalThis.crypto.subtle) {
         const durS = _csAt(durL, i), delayS = _csAt(delayL, i), tf = _csAt(tfL, i);
         const iter = _csAt(iterL, i), dirS = _csAt(dirL, i).toLowerCase();
         const fillS = _csAt(fillL, i).toLowerCase(), paused = _csAt(stateL, i).toLowerCase() === 'paused';
-        const spec = _caSpec(name, durS, delayS, iter, dirS, fillS, tf, kfText);
+        const compS0 = _csAt(compL, i).toLowerCase();
+        const compS = _CA_COMPOSITES.has(compS0) ? compS0 : 'replace';
+        const spec = _caSpec(name, durS, delayS, iter, dirS, fillS, tf, compS, kfText);
         const cur = live.get(key);
         if (cur && cur._caSpec === spec) {
           // Only the play state may change without restarting the animation.
@@ -41807,6 +42008,7 @@ if (!globalThis.crypto.subtle) {
           direction: _CA_DIRECTIONS.has(dirS) ? dirS : 'normal',
           fill: _CA_FILLS.has(fillS) ? fillS : 'none',
           easing: 'linear',
+          composite: compS,
           _implicitEasing: tf,
           _paused: paused,
         }, name);

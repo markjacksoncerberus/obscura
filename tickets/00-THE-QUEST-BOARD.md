@@ -16,6 +16,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 ## ⚔️ Open Quests
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| ~~430–432~~ | ✅ [The Registered Verdict](430-the-registered-verdict.md) | **The registration arc — a property the engine has never heard of does not fail a test, it fails EVERY test in the file on the first line** (`interpolation-testcommon.js` opens each subtest with `assert_true(CSS.supports(property, to))`) — `accent-color`, `aspect-ratio`, `object-view-box`, and the `animation-composition` that chasing them uncovered | **+1112** | ⚔️⚔️ | **SECURED — +1112 measured across 35 files, zero regressions, fifteen files to 100%.** **#430 `accent-color`** (`auto | <color>`, inherits) lives in BOTH `_CSSUI_VALIDATED` and `_COLOR_PROPS`; `auto` is a **keyword, not a colour**, short-circuited ahead of the colour path via `_COLOR_AUTO_PROPS` — otherwise the model interpolates a keyword against `green`. 0/204 → **204/204**. **#431 `aspect-ratio`** (`auto || <ratio>`): the generic slot model found a perfectly good skeleton (`<num> / <num>`) and would have done the WRONG arithmetic in it — css-values-4 §combine-ratio interpolates **the LOGARITHMS**, which is what makes the midpoint of 1:2 and 2:1 be `1 / 1` and not `1.25 / 1`. Degenerate ratios and disagreeing `auto` keywords have no logarithm and are honestly discrete; `<ratio>` defines no addition (`Vresult = Va`, the *underlying*). 0/249 → **249/249**. **Chasing its last two subtests found the session's biggest win: `animation-composition` was parsed, computed, reflected — and never READ.** Declared inside a keyframe block it is that keyframe's own composite operation, but it sits in `_CS_NEVER` and `_caKeyframesOf` consulted `_CS_NEVER` one line before it could look at the value, so every `add`/`accumulate` keyframe silently **replaced**. The whole `*-composition.html` band went **989 → 1591 (+602) across 29 files, twelve to 100%**. **#432 `object-view-box`** (`none | <basic-shape-rect>`) is a thin wrapper over the shared `_opShape` engine with ONE deliberate difference — `clip-path`/`offset-path` rewrite `rect()`/`xywh()` into `inset()` at computed time and this does NOT. The rewrite is affine so the tests pass either way, which is exactly why it is worth naming: expectations that round-trip through our own `getComputedStyle` cannot catch a serialization that is merely self-consistent. 0/48 → **48/48**. **Correction: the ⭐ named four properties — `contrast-color-interpolation.html` is a REFTEST with no testharness, so it is three, not four.** |
 | ~~427–429~~ | ✅ [The Extrapolated Verdict](427-the-extrapolated-verdict.md) | **The interpolation-endpoints arc — a progress outside [0,1] EXTRAPOLATES, a CSS-wide keyword is a question for the CASCADE, and a pair that cannot be interpolated is not a transition** — the whole `interpolation-testcommon.js` family swept to its edges across `css-sizing/`, `css-ui/`, `css-flexbox/`, `css-grid/`, `css-shapes/`, `css-color/`, `css-images/`, `css-multicol/`, `filter-effects/`, `css-transforms/` | **+2448** | ⚔️⚔️⚔️ | **SECURED — +2448 measured across 83 files, zero regressions, sixteen files to 100%.** #424's pointer said the ~110 remaining files needed no new engine work to be measured — true, but what they were waiting for was **three primitives in the shared interpolation core**, each costing every file in every directory a fixed fraction of its subtests. **#427** `interpolation-testcommon.js` samples `at (-0.3)`/`at (1.5)` with a deliberately overshooting `cubic-bezier`; the timing model already produced those progresses and the interval lookup threw them away twice (falling off the end, then clamping the interval distance). web-animations-1 §effect-value takes the last keyframe whose offset is ≤ progress **and < 1** and **the next keyframe BY INDEX**, and never clamps — so the first/last interval is EXTENDED. Plus a UA-supplied `from`/`to` keyframe carries the animation's `animation-timing-function`, not linear. **#428** `initial` is not a value — `_normComputed` normalises values, so the keyword survived as a string and every `from [initial]/[inherit]/[unset]` row STEPPED. Resolved through the cascade instead, ahead of the `_WA_UNCOMPUTED` escape. The same keyword one layer lower: `_isValidFilter` lacked the two escapes `_isValidTransform` already had, so **`filter: initial` was rejected by the style setter and never became a declaration at all** — a real-page bug. **#429** css-transitions-2: under `transition-behavior: normal` a non-interpolable pair starts **no transition**, so `max-width: auto → 20px` shows `20px` from the first frame. `globalThis._waInterpolable` hoists `_waInterpolate`'s own decision ahead of the fact; `visibility` is the exception that proves it. Making the model observable punished a gap in it, so the filter list got #425's transform treatment — `none` IS the empty list, pad at the tail with each function's **lacuna value**. |
 | ~~424–426~~ | ✅ [The Homed Verdict](424-the-homed-verdict.md) | **The declarative-animation arc — reflection belongs to the INTERFACE, the transform list as FUNCTION slots, and the CSS Animations engine** — the whole `interpolation-testcommon.js` family across `css/*/animation/` + `css/css-animations/` | **+1263** | ⚔️⚔️⚔️ | **SECURED — +1263 measured across 24 files, zero regressions.** The map's ⭐ said transform-list interpolation; **measuring it first** found the entire `css/css-transforms/animation/` directory **could-not-run** — `rotate-interpolation` ran **6m18s** with no summary (and did the same on a pre-#421 build, so not a regression). **#424 the root cause: an accessor is never inert.** WPT's own `css/support/interpolation-testcommon.js` does `container.target = element` — an ordinary expando — but with `target` reflected on `Element.prototype` that is `setAttribute('target', String(el))`, and the read back is a **string** whose `.style` is undefined. The same trap swallowed `.value/.name/.type/.content/.color/.media/.align/.background/.href/.src/.rel` (→String) and `.open/.checked/.disabled/.selected/.defer/.reversed/.compact` (→Boolean) **on every element in the document** — a bug for any real page whose script hangs data off a `<div>`. A table-driven relocation pass moves each element-specific member onto the prototypes of the interfaces whose IDL declares it (real overrides kept, `Element.prototype` vacated only once a member has a home, `enumerable: true` stamped as WebIDL requires): **+1111 across 18 previously-dead files**, and **~110 more** such files across `css-flexbox/`, `css-grid/`, `css-shapes/`, `css-images/`, `css-multicol/` and `filter-effects/` are now simply open. **#425 a transform list is a list of FUNCTION slots** — `none` IS the identity (so against a list it is that list's functions in identity form), a shorter list is padded at the tail with each missing function's identity, and two spellings of one primitive are promoted to the primitive. All three are the same move: make both sides the same shape and #417's skeleton kit does the arithmetic with no transform-specific code. `rotate3d`'s identity is the **same axis** turned 0deg; `transform` addition is list **concatenation** and `scale` accumulates about **one**. **#426 the CSS Animations engine** — `@keyframes` parsed perfectly and animated **nothing** (`getAnimations()` returned 0). **A CSS animation IS an `Animation` whose keyframes are the `@keyframes` rule's and whose timing is the `animation-*` longhands** — #412's timing model reads the longhands as spelled, #415's `_waAnimatedDecls` gives the cascade seat free, and #421's style change event is exactly where they are created, updated and cancelled. `animation-timing-function` is the easing **between keyframes**; the layer's INDEX is the animation's identity; a finished animation is not retired (`fill: forwards` must keep applying); a layer that stops matching is **cancelled**, not completed. **GOTCHA:** a keyframe rule's declaration block has no CSSOM **indexed getter** — `kr.style[0]` is `""` and fails silently; `.item(0)` works. **NEXT: ⭐ finish the sweep #424 opened** (~110 untouched `interpolation-testcommon.js` files, no new engine work needed to measure them); then **the transition transform-endpoint exception** (a transition snapshots the RESOLVED matrix, not the computed list — ~100 subtests, the smallest well-understood win left); then the rest of the CSS Animations lifecycle; then `@starting-style`. |
 | ~~421–423~~ | ✅ [The Transitioned Verdict](421-the-transitioned-verdict.md) | **The CSS Transitions arc — the style change event, the four-event lifecycle, and the transition lifecycle** — `css/css-transitions/` across 34 files | **+831** | ⚔️⚔️⚔️ | **SECURED — +831, zero regressions.** The realm had a fully-parsed `transition-*` (Quests #209/#217/#219) and **no engine behind it whatsoever**: every value jumped straight to its target and no `transitionend` ever fired. `properties-value-001.html` measured **0 of 560** — the widest untouched tail on the board. The whole arc rests on one observation: **a CSS transition IS an `Animation` with a two-keyframe effect**, so #412–#420's timing model, playback model, composition model, interpolation kit and animated-value cascade source did not have to be built again. **#421 the transition model** — a style change event (a FORCED flush, since Obscura has no rendering loop: `getComputedStyle`, the `offset*` metrics, `getAnimations()`, DOMContentLoaded, the next task boundary), a `CSSTransition : Animation`, and a cascade seat ABOVE everything else (transitions out-rank an author `!important`). Gated four deep so a page that never transitions pays one integer compare. **#422 the events** — the four-event lifecycle, `elapsedTime` over the ACTIVE interval, shorthand-aware `transition-property`, the inherited-or-initial before-value, and CSSOM-declared transitions. **#423 the lifecycle** — `getAnimations()` is a forced style flush (one hook, +53 across eight files), §animation-composite-order, the reversing shortening factor, `display:none` cancels rather than completes, and a first recalc at DOMContentLoaded. The sweep caught a real spec line: the before-change style has **declarative animations updated to the current time**, so a property an animation owns can never transition. **NEXT: ⭐ the transform-list interpolation path** (now worth more — transitions multiply it), then **`@starting-style` + `CSSStartingStyleRule`** (a whole untouched file family that plugs straight into the before-change-style machinery this arc built), then pseudo-element transitions. |
@@ -244,6 +245,74 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-07-31 — Quests #430–#432, the registration arc (+1112, 35 files, zero regressions)
+
+Took #427's ⭐ list of "four missing properties, ~500 dead subtests, no engine work" — and the
+first honest act was to **shrink it**. `css/css-color/animation/contrast-color-interpolation.html`
+is a **reftest** (`<link rel="match">`, no testharness). It is not 0/N; it has no N. The
+`contrast-color()` *function* has existed since #83 and the CAPS entry had conflated the two.
+Three properties, then.
+
+**Why a whole file dies at once:** `interpolation-testcommon.js` opens *every* subtest with
+`assert_true(CSS.supports(property, to), "'to' value should be supported")`. A property absent
+from the registry never reaches an animation — it fails on line one, 204 times over.
+
+**#430 `accent-color`** (css-ui-4, `auto | <color>`, **inherits**, initial `auto`). Registered into
+`_GCS_DEFAULTS`, `_INHERITED_PROPS`, and **both** `_CSSUI_VALIDATED` (which validates the grammar —
+the generic colour gate validates nothing and would take `none`/`50%`) and `_COLOR_PROPS` (which
+earns the computed dispatch, the `CSS.supports` entry, and the animation model's permission to
+read a bare ident as a colour name). The one thing that must not be fudged: **`auto` is a keyword,
+not a colour.** Handing it to `_computeColorFull` would resolve it to something *plausible*, and
+the model would then cheerfully interpolate a keyword against `green`. `_COLOR_AUTO_PROPS` is a
+set, not two `name === …` tests, because the two places that must agree — the computed dispatch
+and the `var()`-substitution validity gate — drifting apart is precisely the bug it prevents.
+`_INHERITED_PROPS` is load-bearing: the `from: 'unset'` row expects the **parent's** value.
+**0/204 → 204/204.**
+
+**#431 `aspect-ratio`** (css-sizing-4, `auto || <ratio>`, not inherited). The registration is
+ordinary. **The interesting part is that the generic interpolation kit would have found a perfectly
+good skeleton here and quietly done the wrong arithmetic in it** — `0.5 / 1` and `2 / 1` split into
+two numeric slots against identical literals, and the slot model reports `1.25 / 1` at the halfway
+point. css-values-4 §combine-ratio interpolates **the LOGARITHMS**, and that is what makes the
+midpoint of 1:2 and 2:1 be `1 / 1` — the square, the shape a human would draw. So the ratio is asked
+about **before** the shape test, never after it. Two pairs have no logarithm and are honestly
+discrete, and the test insists on both: a **degenerate** ratio (either number `0` or infinite) and
+**disagreeing `auto` keywords** (`auto` is a keyword, not a magnitude). One predicate, `_waRatioPair`,
+shared by `_waInterpolate` and `_waInterpolable`, so #429's rule holds for free and the CSS
+Transitions rows cannot disagree with the Web Animations rows. And `<ratio>` **defines no addition**:
+css-values-4 §not-additive says `Vresult = Va`, and in §combining-effects Va is the **underlying**
+value — so an `add` keyframe on a ratio contributes nothing at all. **0/249 → 249/249.**
+
+**The two subtests that would not go green were worth more than the file.** They were the
+`Compositing CSS Animations` rows, and `interpolation-testcommon.js` drives that method by writing
+`animation-composition` **inside each keyframe block**. css-animations-2: declared there, it is
+*that keyframe's own* composite operation — the declarative spelling of `{ composite: 'add' }`.
+Its three values ARE the `KeyframeEffect` ones, so it needed no translation. It needed to be
+**read**, and it never was: `animation-composition` lives in `_CS_NEVER` (a property must never
+animate itself) and `_caKeyframesOf` consults `_CS_NEVER` *before* the per-property intercepts, so
+the declaration was dropped one line too early and every `add`/`accumulate` keyframe silently
+**replaced**. `animation-timing-function` was intercepted directly above it; its neighbour never was.
+**The whole `*-composition.html` band: 989 → 1591, +602 across 29 files, twelve of them to 100%** —
+both numbers stash-proved.
+
+**#432 `object-view-box`** (css-images-4, `none | <basic-shape-rect>`). The grammar was already
+modelled — `_opShape`, the engine `clip-path` and `offset-path` share — so this is a thin wrapper,
+**with one deliberate difference**. Those two rewrite `rect()`/`xywh()` into `inset()` at
+computed-value time; `object-view-box` does not. The rewrite is *affine*, so it commutes with linear
+interpolation and the tests would have passed either way — which is exactly why it is worth naming.
+**A test whose expectations round-trip through our own `getComputedStyle` cannot catch a
+serialization that is merely self-consistent.** `getComputedStyle(img).objectViewBox` handing a real
+page an `inset()` it never asked for is a lie only a real page would find. Interpolation needed
+nothing: `inset(0px)` against `inset(20px)` is #417's skeleton kit doing what it was built for.
+**0/48 → 48/48.**
+
+**The sweep found three STALE ledger rows, not regressions** — each proved by measuring the
+*unchanged* build: `cssom/shorthand-serialization` is 6/7 on both (recorded 7/7),
+`CSSTransition-canceling` is 11/11 on both (recorded 10/11), and `clip-path-computed` is 21/21 on
+both (recorded 19/21). `properties-value-003` moved the other way — 80 → **86**, a real +6.
+Scroll: [`430-the-registered-verdict.md`](430-the-registered-verdict.md).
+
 
 ### 2026-07-31 — Quests #427–#429, the interpolation-endpoints arc (+2448, 83 files, zero regressions)
 
