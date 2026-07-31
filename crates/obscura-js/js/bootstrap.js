@@ -22189,6 +22189,12 @@ const _canonRotate = (value, el, computed) => {
   if (p.none) return 'none';
   const [x, y, z] = _rotAxisVec(p);
   const ang = (neg) => _rotSerAngle(p.angle, computed, neg, el);
+  // css-transforms-2 §5.1: "An identity transform does not count [as none]; it
+  // must serialize as 0deg." A turn of nothing has no axis worth naming, so the
+  // axis goes away with it — `rotate: 0 1 0 0deg` computes to plain `0deg`.
+  // Computed time only: a specified value keeps whatever the author wrote until
+  // the units are resolved, and before that `calc(…)` may not be zero at all.
+  if (computed) { const a0 = ang(false); if (parseFloat(a0) === 0 && /^-?(?:\d+\.?\d*|\.\d+)deg$/.test(a0)) return '0deg'; }
   if (x === 0 && y === 0 && z === 0) return '0 0 0 ' + ang(false);
   if (x === 0 && y === 0) return ang(z < 0);                  // z axis → just <angle>
   if (y === 0 && z === 0) return 'x ' + ang(x < 0);
@@ -40918,6 +40924,213 @@ if (!globalThis.crypto.subtle) {
   // these contributes nothing at all; the value underneath shows through unchanged.
   const _WA_NON_ADDITIVE_PROPS = new Set(['aspect-ratio']);
 
+  // ── The individual transform properties (#433–#435) ────────────────────────
+  // `translate` / `scale` / `rotate` are not three numbers that happen to sit
+  // side by side — each is ONE geometric value with its own arithmetic, and the
+  // generic slot model gets every part of it wrong:
+  //   • it DECLINES `1` against `10 -5 0` for having a different shape, when the
+  //     missing components are DEFAULTS (scale's y is x and its z is 1;
+  //     translate's y and z are 0px) and the two values match perfectly once
+  //     they are written out in full. That one mistake is most of the tail:
+  //     a declined pair falls through to a discrete flip;
+  //   • it ADDS two scales. Adding two transforms means COMPOSING them, and
+  //     composing two scalings MULTIPLIES them — a 2× under a 3× is 6×, not 5×;
+  //   • it has never heard that a rotation is an AXIS and an angle, so it moved
+  //     the axis numbers as if they were magnitudes.
+  // css-transforms-2 §5: when one endpoint is `none` and the other is not, the
+  // `none` is replaced by the equivalent identity — `0px` for translate, `1` for
+  // scale, `0deg` for rotate. Only two `none`s stay `none`; an identity that was
+  // computed rather than written never serializes as `none`.
+  const _WA_INDIV_TF = new Set(['translate', 'scale', 'rotate']);
+
+  // ----- scale: [x, y, z], y defaulting to x and z to 1 -----
+  const _waScaleParse = (s) => {
+    const t = String(s).trim();
+    if (t === '') return null;
+    if (t.toLowerCase() === 'none') return { none: true, c: [1, 1, 1] };
+    const p = _splitFilterTokens(t).map((x) => (/%$/.test(x) ? parseFloat(x) / 100 : parseFloat(x)));
+    if (!p.length || p.length > 3 || p.some((n) => !isFinite(n))) return null;
+    return { none: false, c: [p[0], p.length > 1 ? p[1] : p[0], p.length > 2 ? p[2] : 1] };
+  };
+  // Elide a trailing z of 1, and only THEN a y equal to x — a `2 2 3` keeps all
+  // three, because dropping the y would silently promote the z into its place.
+  const _waScaleSer = (c) => {
+    const v = c.map(_waRound);
+    if (v[2] === 1) { v.pop(); if (v[1] === v[0]) v.pop(); }
+    return v.join(' ');
+  };
+
+  // ----- translate: three <length-percentage>s, the third a pure <length> -----
+  // A computed component is `12px`, `-50%`, or the canonical `calc(P% ± Lpx)`.
+  // The two numbers alone cannot say whether a percentage is INVOLVED —
+  // `calc(0% + 480px)` and `480px` hold the same pair and serialize differently —
+  // so a flag rides along, and it is the OR of the two endpoints': the moment a
+  // percentage enters either side, the result is a percentage-carrying value for
+  // the rest of the animation.
+  const _waTrComp = (s) => {
+    const t = String(s).trim();
+    const lp = _waLPParse(t);
+    return lp ? { pct: lp.pct, px: lp.px, hasPct: t.indexOf('%') >= 0 } : null;
+  };
+  const _waTrZero = () => ({ pct: 0, px: 0, hasPct: false });
+  const _waTrParse = (s) => {
+    const t = String(s).trim();
+    if (t === '') return null;
+    if (t.toLowerCase() === 'none') return { none: true, c: [_waTrZero(), _waTrZero(), _waTrZero()] };
+    const toks = _splitFilterTokens(t);
+    if (!toks.length || toks.length > 3) return null;
+    const c = toks.map(_waTrComp);
+    if (c.some((x) => x === null)) return null;
+    while (c.length < 3) c.push(_waTrZero());
+    return { none: false, c };
+  };
+  const _waTrSerComp = (v) => {
+    const pct = _waRound(v.pct), px = _waRound(v.px);
+    if (!v.hasPct) return px + 'px';
+    if (px === 0) return pct + '%';              // the pixels drop out, the percentage never does
+    return `calc(${pct}% ${px < 0 ? '-' : '+'} ${Math.abs(px)}px)`;
+  };
+  // `0%` is not a zero LENGTH — it is a percentage that happens to be zero, and
+  // it resolves against a containing block nobody has measured yet. Only a plain
+  // zero length is elidable from the tail.
+  const _waTrSer = (c) => {
+    const zero = (v) => !v.hasPct && _waRound(v.px) === 0;
+    let n = 3;
+    if (zero(c[2])) { n = 2; if (zero(c[1])) n = 1; }
+    return c.slice(0, n).map(_waTrSerComp).join(' ');
+  };
+
+  // ----- rotate: an axis and an angle -----
+  const _waAngleDeg = (t) => {
+    const m = _FILTER_LEN_RE.exec(String(t).trim());
+    if (!m) return null;
+    const k = _ANGLE_DEG[m[2].toLowerCase()];
+    return k === undefined ? null : parseFloat(m[1]) * k;
+  };
+  const _waRotParse = (s) => {
+    const t = String(s).trim();
+    if (t === '') return null;
+    if (t.toLowerCase() === 'none') return { none: true, ax: [0, 0, 1], a: 0 };
+    const toks = _splitFilterTokens(t);
+    let ax = null;
+    if (toks.length === 1) ax = [0, 0, 1];
+    else if (toks.length === 2) {
+      const k = toks[0].toLowerCase();
+      ax = k === 'x' ? [1, 0, 0] : k === 'y' ? [0, 1, 0] : k === 'z' ? [0, 0, 1] : null;
+    } else if (toks.length === 4) ax = toks.slice(0, 3).map(parseFloat);
+    if (!ax || ax.some((n) => !isFinite(n))) return null;
+    const a = _waAngleDeg(toks[toks.length - 1]);
+    return a === null ? null : { none: false, ax, a };
+  };
+  const _waVecLen = (v) => Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  const _waVecNorm = (v) => { const L = _waVecLen(v); return L > 0 ? [v[0] / L, v[1] / L, v[2] / L] : [0, 0, 1]; };
+  const _waQuat = (ax, deg) => {
+    const n = _waVecNorm(ax), h = deg * Math.PI / 360, s = Math.sin(h);
+    return [n[0] * s, n[1] * s, n[2] * s, Math.cos(h)];
+  };
+  const _waQuatMul = (a, b) => [
+    a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+    a[3] * b[1] + a[1] * b[3] + a[2] * b[0] - a[0] * b[2],
+    a[3] * b[2] + a[2] * b[3] + a[0] * b[1] - a[1] * b[0],
+    a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+  ];
+  // Back to the axis-angle pair the property serializes. A quaternion whose
+  // VECTOR part has vanished is the identity however its w reads: 270° + 90°
+  // about one axis makes (-1, 0, 0, 0), and the honest name for that is `0deg`,
+  // not a 360° turn about an axis that no longer exists. Getting this wrong is
+  // what leaves a fully-turned rotation refusing to share an axis with the value
+  // it is animating toward.
+  const _waQuatToRot = (q) => {
+    const L = _waVecLen(q);
+    if (L < 1e-9) return { none: false, ax: [0, 0, 1], a: 0 };
+    const w = Math.max(-1, Math.min(1, q[3]));
+    return { none: false, ax: [q[0] / L, q[1] / L, q[2] / L], a: 2 * Math.acos(w) * 180 / Math.PI };
+  };
+  // Two rotations that turn about the SAME line share an angle line too, and
+  // along it the angle simply adds and interpolates — which is the only reason
+  // `100deg` → `-100deg` can pass through 0 rather than taking the short way
+  // round, and the only reason extrapolating to 900deg means anything at all.
+  // A zero rotation has no axis of its own and borrows the other's; two zero
+  // rotations answer about z. An anti-parallel axis is the same line walked
+  // backwards, so its angle is negated onto the first one's axis.
+  const _waRotCommon = (a, b) => {
+    const za = a.a === 0 || _waVecLen(a.ax) === 0;
+    const zb = b.a === 0 || _waVecLen(b.ax) === 0;
+    if (za && zb) return { ax: [0, 0, 1], a: 0, b: 0 };
+    if (za) return { ax: b.ax, a: 0, b: b.a };
+    if (zb) return { ax: a.ax, a: a.a, b: 0 };
+    const na = _waVecNorm(a.ax), nb = _waVecNorm(b.ax);
+    const d = na[0] * nb[0] + na[1] * nb[1] + na[2] * nb[2];
+    if (Math.abs(Math.abs(d) - 1) > 1e-6) return null;
+    return { ax: na, a: a.a, b: d > 0 ? b.a : -b.a };
+  };
+  // SIX SIGNIFICANT DIGITS, not six decimal places. `124.97530385…deg` written
+  // out in full rounds to 124.98 at the two-decimal precision the tests compare
+  // at, while the same number cut to six figures is `124.975`, which rounds to
+  // 124.97 — the answer every other engine gives, and the answer the test
+  // expectations are literally written in (`0.447214 -0.447214 0.774597
+  // 104.478deg` is six figures four times over). A serialization that keeps MORE
+  // digits than the platform does is not more accurate here; it is a different
+  // number.
+  const _wa6sig = (v) => { const r = _waRound(v); return r === 0 ? 0 : parseFloat(r.toPrecision(6)); };
+  const _waRotSer = (r) => _waVecNorm(r.ax).map(_wa6sig).join(' ') + ' ' + _wa6sig(r.a) + 'deg';
+
+  // The one entry point: interpolate (`t`) or compose (`t === null`) a pair of
+  // individual-transform values. Returns null when either side is not a value
+  // this model understands (an unresolved `var()`, a calc() that needs layout),
+  // and the caller falls back to the generic path.
+  const _waIndiv = (name, sa, sb, t, accumulate) => {
+    if (name === 'scale') {
+      const a = _waScaleParse(sa), b = _waScaleParse(sb);
+      if (!a || !b) return null;
+      if (a.none && b.none && t !== null) return 'none';
+      if (t === null) {
+        // Composing two scalings multiplies them; ACCUMULATING them is the same
+        // sum every other type takes, about this one's do-nothing value of 1.
+        return _waScaleSer(a.c.map((v, i) => (accumulate ? v + b.c[i] - 1 : v * b.c[i])));
+      }
+      return _waScaleSer(a.c.map((v, i) => v + (b.c[i] - v) * t));
+    }
+    if (name === 'translate') {
+      const a = _waTrParse(sa), b = _waTrParse(sb);
+      if (!a || !b) return null;
+      if (a.none && b.none && t !== null) return 'none';
+      return _waTrSer(a.c.map((v, i) => {
+        const u = b.c[i], hasPct = v.hasPct || u.hasPct;
+        return t === null
+          ? { pct: v.pct + u.pct, px: v.px + u.px, hasPct }
+          : { pct: v.pct + (u.pct - v.pct) * t, px: v.px + (u.px - v.px) * t, hasPct };
+      }));
+    }
+    const a = _waRotParse(sa), b = _waRotParse(sb);
+    if (!a || !b) return null;
+    if (a.none && b.none && t !== null) return 'none';
+    const c = _waRotCommon(a, b);
+    // Two turns about one line simply add along it — and the sum KEEPS its full
+    // angle. 270° + 90° is a 360° turn about that axis, not nothing: the value it
+    // then animates toward still shares the axis, and `n 360deg` → `none` has to
+    // wind back down through 270° and 90°. (The quaternion fallback below cannot
+    // say that: a full turn's vector part has vanished and the axis with it.)
+    if (t === null) {
+      if (c) return _waRotSer({ ax: c.ax, a: c.a + c.b });
+      return _waRotSer(_waQuatToRot(_waQuatMul(_waQuat(a.ax, a.a), _waQuat(b.ax, b.a))));
+    }
+    if (c) return _waRotSer({ ax: c.ax, a: c.a + (c.b - c.a) * t });
+    // Nothing in common but the sphere they both live on — SLERP. Each endpoint
+    // is first put in the w ≥ 0 half of the sphere: a quaternion and its negation
+    // are the SAME rotation (that is what "double cover" means), and only one of
+    // the two representatives measures the arc a viewer would call the short way
+    // round. Skip it and a full turn read as w = -1 sends the interpolation the
+    // long way about — `n 360deg` → `y 100deg` passes through 295° instead of 25°.
+    const half = (q) => (q[3] < 0 ? q.map((v) => -v) : q);
+    const qa = half(_waQuat(a.ax, a.a)), qb = half(_waQuat(b.ax, b.a));
+    const d = Math.max(-1, Math.min(1, qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3]));
+    const th = Math.acos(d), s = Math.sin(th);
+    if (Math.abs(s) < 1e-9) return _waRotSer(a);
+    const wa = Math.sin((1 - t) * th) / s, wb = Math.sin(t * th) / s;
+    return _waRotSer(_waQuatToRot(qa.map((v, i) => v * wa + qb[i] * wb)));
+  };
+
   // `name` is the kebab CSS property, when the caller knows it — it is only
   // consulted to decide whether an ident may be a colour and whether the
   // property's animation type is discrete.
@@ -40935,6 +41148,10 @@ if (!globalThis.crypto.subtle) {
       if (!p) return t < 0.5 ? sa : sb;
       const r = Math.exp(Math.log(p.ra) + (Math.log(p.rb) - Math.log(p.ra)) * t);
       return _serRatioValue({ auto: p.auto, w: r, h: 1 });
+    }
+    if (name && _WA_INDIV_TF.has(name)) {
+      const v = _waIndiv(name, sa, sb, t, false);
+      if (v !== null) return v;
     }
     if (name === 'transform') {
       const al = _waTfAlign(sa, sb);
@@ -40981,6 +41198,7 @@ if (!globalThis.crypto.subtle) {
     // delay a disappearance instead of doing nothing at all.
     if (name === 'visibility') return true;
     if (name === 'aspect-ratio') return _waRatioPair(sa, sb) !== null;
+    if (name && _WA_INDIV_TF.has(name)) return _waIndiv(name, sa, sb, 0.5, false) !== null;
     if (name === 'transform') {
       const al = _waTfAlign(sa, sb);
       if (al) { sa = al[0]; sb = al[1]; }
@@ -41012,12 +41230,19 @@ if (!globalThis.crypto.subtle) {
   // shape add slot-by-slot — numbers as sums, colours by their own premultiplied
   // rule. Anything else is not additive, and the spec's fallback for a
   // non-additive type is to REPLACE, so the keyframe value wins.
-  const _waAdd = (underlying, value, name) => {
+  const _waAdd = (underlying, value, name, accumulate) => {
     if (underlying === null || underlying === undefined || underlying === '') return value;
     if (name && _WA_DISCRETE_PROPS.has(name)) return value;
     // A type with no addition keeps the value it already had (Vresult = Va).
     if (name && _WA_NON_ADDITIVE_PROPS.has(name)) return underlying;
     const su = String(underlying).trim(), sv = String(value).trim();
+    // An individual transform composes as a TRANSFORM, not slot by slot — and
+    // the composite of two `none`s is the identity, not `none`: `none` only ever
+    // survives as `none` when nobody did anything to it.
+    if (name && _WA_INDIV_TF.has(name)) {
+      const v = _waIndiv(name, su, sv, null, !!accumulate);
+      if (v !== null) return v;
+    }
     // `transform` is not slot-wise additive at all — two transform lists ADD by
     // concatenation (see _waTfCompose).
     if (name === 'transform') return _waTfCompose(su, sv, false);
@@ -41040,7 +41265,7 @@ if (!globalThis.crypto.subtle) {
   const _waAccumulate = (underlying, value, name) => {
     if (name === 'transform' && underlying !== null && underlying !== undefined && underlying !== '')
       return _waTfCompose(String(underlying).trim(), String(value).trim(), true);
-    return _waAdd(underlying, value, name);
+    return _waAdd(underlying, value, name, true);
   };
   // §effect-accumulation, iteration composite `accumulate`: `n` copies of the
   // end-of-iteration value are accumulated onto the keyframe value. `_waAdd`'s
@@ -41099,7 +41324,13 @@ if (!globalThis.crypto.subtle) {
   //     `var(--x)` on its own it has nothing to substitute from. The keyframe
   //     keeps the reference and the cascade resolves it later — which is also
   //     what makes a filling effect track a variable that changes underneath it.
-  const _WA_UNCOMPUTED = new Set(['transform', 'translate', 'rotate', 'scale', 'offset-rotate']);
+  //
+  // `translate`/`rotate`/`scale` were once listed here alongside `transform`,
+  // and that was a mistake of association: their RESOLVED value is their
+  // computed value (css-transforms-2 §5 says so in a note), no matrix anywhere.
+  // Left uncomputed, a keyframe's `400grad` never met the `360deg` underneath it
+  // and `2em` never became pixels.
+  const _WA_UNCOMPUTED = new Set(['transform', 'offset-rotate']);
   const _waComputedValue = (el, kebab, v) => {
     if (!el || v === null || v === undefined) return v;
     // A CSS-wide keyword is not a value to compute — it is a question for the

@@ -16,6 +16,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 ## ⚔️ Open Quests
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| ~~433–435~~ | ✅ [The Individual Verdict](433-the-individual-verdict.md) | **The individual-transform arc — `translate` / `scale` / `rotate` were parsed, computed and serialized by three real grammars, and then handed to the generic slot model, which had never been told what any of them MEAN** | **+852** | ⚔️⚔️ | **SECURED — +852 measured across 11 files, zero regressions, six files to 100%.** The two files #432 flagged as "did not move AT ALL" while every neighbour did (`scale-composition` 8/80, `translate-composition` 10/112) were never a composition bug — the whole value type was missing. **#433 `scale`**: a missing component is a **DEFAULT**, not a shape mismatch (y ← x, z ← 1), so `1` and `10 -5 0` interpolate perfectly once written out — and **adding two scalings MULTIPLIES them** (2 ⊕ 3 = **6**, not 5), because adding transforms means COMPOSING them; accumulation is the ordinary sum about this type's do-nothing value of 1. 8/80 → **80/80**, 154/360 → **360/360**. **#434 `translate`**: three `<length-percentage>`s padded from `0px` — and the two numbers of a computed length-percentage **cannot say whether a percentage is INVOLVED** (`calc(0% + 480px)` and `480px` hold the same pair and serialize differently), so a `hasPct` flag rides along and ORs across the pair; the percentage term is always kept, the pixel term drops when zero, and **`0%` is not a zero length** so it is never elided from the tail. 10/112 → **112/112**, 228/408 → **408/408**. **#435 `rotate`**: an axis and an angle. Same line → the angle adds and slides (the only reason `100deg` → `-100deg` passes *through* 0 and `900deg` means anything); different lines → SLERP with **both quaternions put in the w ≥ 0 half of the sphere FIRST** — skip it and a full turn arrives as w = −1 and interpolates through **295°** where **25°** was wanted. Addition along a common axis keeps its **full** angle: 270° + 90° is a 360° turn about that axis, not nothing, and it still has to wind back down to `none` through 270° and 90°. And the platform serializes with **six SIGNIFICANT digits, not six decimal places** — `124.97530385…` in full rounds to 124.98 where the tests compare, cut to six figures it is `124.975` → 124.97. 54/132 → **132/132**, 164/360 → **360/360**. |
 | ~~430–432~~ | ✅ [The Registered Verdict](430-the-registered-verdict.md) | **The registration arc — a property the engine has never heard of does not fail a test, it fails EVERY test in the file on the first line** (`interpolation-testcommon.js` opens each subtest with `assert_true(CSS.supports(property, to))`) — `accent-color`, `aspect-ratio`, `object-view-box`, and the `animation-composition` that chasing them uncovered | **+1112** | ⚔️⚔️ | **SECURED — +1112 measured across 35 files, zero regressions, fifteen files to 100%.** **#430 `accent-color`** (`auto | <color>`, inherits) lives in BOTH `_CSSUI_VALIDATED` and `_COLOR_PROPS`; `auto` is a **keyword, not a colour**, short-circuited ahead of the colour path via `_COLOR_AUTO_PROPS` — otherwise the model interpolates a keyword against `green`. 0/204 → **204/204**. **#431 `aspect-ratio`** (`auto || <ratio>`): the generic slot model found a perfectly good skeleton (`<num> / <num>`) and would have done the WRONG arithmetic in it — css-values-4 §combine-ratio interpolates **the LOGARITHMS**, which is what makes the midpoint of 1:2 and 2:1 be `1 / 1` and not `1.25 / 1`. Degenerate ratios and disagreeing `auto` keywords have no logarithm and are honestly discrete; `<ratio>` defines no addition (`Vresult = Va`, the *underlying*). 0/249 → **249/249**. **Chasing its last two subtests found the session's biggest win: `animation-composition` was parsed, computed, reflected — and never READ.** Declared inside a keyframe block it is that keyframe's own composite operation, but it sits in `_CS_NEVER` and `_caKeyframesOf` consulted `_CS_NEVER` one line before it could look at the value, so every `add`/`accumulate` keyframe silently **replaced**. The whole `*-composition.html` band went **989 → 1591 (+602) across 29 files, twelve to 100%**. **#432 `object-view-box`** (`none | <basic-shape-rect>`) is a thin wrapper over the shared `_opShape` engine with ONE deliberate difference — `clip-path`/`offset-path` rewrite `rect()`/`xywh()` into `inset()` at computed time and this does NOT. The rewrite is affine so the tests pass either way, which is exactly why it is worth naming: expectations that round-trip through our own `getComputedStyle` cannot catch a serialization that is merely self-consistent. 0/48 → **48/48**. **Correction: the ⭐ named four properties — `contrast-color-interpolation.html` is a REFTEST with no testharness, so it is three, not four.** |
 | ~~427–429~~ | ✅ [The Extrapolated Verdict](427-the-extrapolated-verdict.md) | **The interpolation-endpoints arc — a progress outside [0,1] EXTRAPOLATES, a CSS-wide keyword is a question for the CASCADE, and a pair that cannot be interpolated is not a transition** — the whole `interpolation-testcommon.js` family swept to its edges across `css-sizing/`, `css-ui/`, `css-flexbox/`, `css-grid/`, `css-shapes/`, `css-color/`, `css-images/`, `css-multicol/`, `filter-effects/`, `css-transforms/` | **+2448** | ⚔️⚔️⚔️ | **SECURED — +2448 measured across 83 files, zero regressions, sixteen files to 100%.** #424's pointer said the ~110 remaining files needed no new engine work to be measured — true, but what they were waiting for was **three primitives in the shared interpolation core**, each costing every file in every directory a fixed fraction of its subtests. **#427** `interpolation-testcommon.js` samples `at (-0.3)`/`at (1.5)` with a deliberately overshooting `cubic-bezier`; the timing model already produced those progresses and the interval lookup threw them away twice (falling off the end, then clamping the interval distance). web-animations-1 §effect-value takes the last keyframe whose offset is ≤ progress **and < 1** and **the next keyframe BY INDEX**, and never clamps — so the first/last interval is EXTENDED. Plus a UA-supplied `from`/`to` keyframe carries the animation's `animation-timing-function`, not linear. **#428** `initial` is not a value — `_normComputed` normalises values, so the keyword survived as a string and every `from [initial]/[inherit]/[unset]` row STEPPED. Resolved through the cascade instead, ahead of the `_WA_UNCOMPUTED` escape. The same keyword one layer lower: `_isValidFilter` lacked the two escapes `_isValidTransform` already had, so **`filter: initial` was rejected by the style setter and never became a declaration at all** — a real-page bug. **#429** css-transitions-2: under `transition-behavior: normal` a non-interpolable pair starts **no transition**, so `max-width: auto → 20px` shows `20px` from the first frame. `globalThis._waInterpolable` hoists `_waInterpolate`'s own decision ahead of the fact; `visibility` is the exception that proves it. Making the model observable punished a gap in it, so the filter list got #425's transform treatment — `none` IS the empty list, pad at the tail with each function's **lacuna value**. |
 | ~~424–426~~ | ✅ [The Homed Verdict](424-the-homed-verdict.md) | **The declarative-animation arc — reflection belongs to the INTERFACE, the transform list as FUNCTION slots, and the CSS Animations engine** — the whole `interpolation-testcommon.js` family across `css/*/animation/` + `css/css-animations/` | **+1263** | ⚔️⚔️⚔️ | **SECURED — +1263 measured across 24 files, zero regressions.** The map's ⭐ said transform-list interpolation; **measuring it first** found the entire `css/css-transforms/animation/` directory **could-not-run** — `rotate-interpolation` ran **6m18s** with no summary (and did the same on a pre-#421 build, so not a regression). **#424 the root cause: an accessor is never inert.** WPT's own `css/support/interpolation-testcommon.js` does `container.target = element` — an ordinary expando — but with `target` reflected on `Element.prototype` that is `setAttribute('target', String(el))`, and the read back is a **string** whose `.style` is undefined. The same trap swallowed `.value/.name/.type/.content/.color/.media/.align/.background/.href/.src/.rel` (→String) and `.open/.checked/.disabled/.selected/.defer/.reversed/.compact` (→Boolean) **on every element in the document** — a bug for any real page whose script hangs data off a `<div>`. A table-driven relocation pass moves each element-specific member onto the prototypes of the interfaces whose IDL declares it (real overrides kept, `Element.prototype` vacated only once a member has a home, `enumerable: true` stamped as WebIDL requires): **+1111 across 18 previously-dead files**, and **~110 more** such files across `css-flexbox/`, `css-grid/`, `css-shapes/`, `css-images/`, `css-multicol/` and `filter-effects/` are now simply open. **#425 a transform list is a list of FUNCTION slots** — `none` IS the identity (so against a list it is that list's functions in identity form), a shorter list is padded at the tail with each missing function's identity, and two spellings of one primitive are promoted to the primitive. All three are the same move: make both sides the same shape and #417's skeleton kit does the arithmetic with no transform-specific code. `rotate3d`'s identity is the **same axis** turned 0deg; `transform` addition is list **concatenation** and `scale` accumulates about **one**. **#426 the CSS Animations engine** — `@keyframes` parsed perfectly and animated **nothing** (`getAnimations()` returned 0). **A CSS animation IS an `Animation` whose keyframes are the `@keyframes` rule's and whose timing is the `animation-*` longhands** — #412's timing model reads the longhands as spelled, #415's `_waAnimatedDecls` gives the cascade seat free, and #421's style change event is exactly where they are created, updated and cancelled. `animation-timing-function` is the easing **between keyframes**; the layer's INDEX is the animation's identity; a finished animation is not retired (`fill: forwards` must keep applying); a layer that stops matching is **cancelled**, not completed. **GOTCHA:** a keyframe rule's declaration block has no CSSOM **indexed getter** — `kr.style[0]` is `""` and fails silently; `.item(0)` works. **NEXT: ⭐ finish the sweep #424 opened** (~110 untouched `interpolation-testcommon.js` files, no new engine work needed to measure them); then **the transition transform-endpoint exception** (a transition snapshots the RESOLVED matrix, not the computed list — ~100 subtests, the smallest well-understood win left); then the rest of the CSS Animations lifecycle; then `@starting-style`. |
@@ -245,6 +246,74 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-07-31 — Quests #433–#435, the individual-transform arc (+852, 11 files, zero regressions)
+
+Took #432's ⭐ — *"start with the two files that did not move AT ALL"* — and the honest answer was
+that they had not moved because **nothing that had been done that session applied to them**.
+`scale-composition` (8/80) and `translate-composition` (10/112) do not fail for a composition
+reason. Obscura parses, validates, computes and serializes `translate`, `scale` and `rotate` with
+three real grammars and scores **100% on every parsing file for all three**. What the animation
+model was handed, though, was a *string*, and the generic slot model — a wonderful thing — knows
+nothing about geometry. Six files, **618/1452**.
+
+It got them wrong in three different ways, and each one is its own lesson:
+
+- **It declined pairs that match perfectly.** `scale: 1` against `10 -5 0` is one hole against
+  three, so the shape test says no and the pair falls through to a discrete flip. But a missing
+  component is a **DEFAULT** — scale's y is x and its z is 1, translate's y and z are `0px` — and
+  written out in full the two values are the same shape every time. That single mistake is most of
+  the tail, and it is why every `from [initial]` / `[inherit]` row STEPPED.
+- **It added two scales.** `underlying: 2 1` + `addFrom: 3 1` came back `5 2`. The answer is
+  `6 1`: **adding two transforms means composing them, and composing two scalings multiplies
+  them.** (Accumulation is the ordinary sum about the do-nothing value of 1 — the same `base = 1`
+  rule `_waTfCompose` already applied to `scale()` inside a transform list. They now say it in one
+  voice.)
+- **It had never heard that a rotation is an axis.** Five numbers went in and it moved the axis
+  around as if it were a magnitude.
+
+**#434's subtlety is serialization, and it is not symmetric.** A computed length-percentage is two
+numbers, and two numbers **cannot say whether a percentage is involved**: `calc(0% + 480px)` and
+`480px` hold the same pair. So a `hasPct` flag rides along, ORed across both endpoints — the moment
+a percentage enters either side the value carries one for the rest of the animation. The percentage
+term is then always kept and the pixel term drops when it is zero, which is how `none → 8px 80%
+800px` at progress 0 comes out `0px 0%`: **`0%` is not a zero length**, it is a percentage that
+happens to be zero and resolves against a containing block nobody has measured.
+
+**#435 needed three things exactly right.** (1) Addition along a common axis keeps its **full**
+angle — 270° + 90° is a 360° turn about that axis, not nothing, and routing it through quaternions
+destroys the axis (a full turn's vector part has vanished) so `n 360deg → none` can no longer wind
+back down through 270° and 90°. (2) **Both quaternions go into the w ≥ 0 half of the sphere BEFORE
+the arc is measured** — a quaternion and its negation are the same rotation, and only one of the
+two representatives measures the arc a viewer would call the short way round; skip it and a full
+turn reads as w = −1 and the interpolation goes through **295°** where **25°** was wanted. Doing it
+on the *inputs* rather than negating the *result* is what lets one code path satisfy both the
+`y 25deg` rows and the un-flipped `208.96deg` extrapolation two blocks later. (3) The platform
+serializes with **six SIGNIFICANT digits, not six decimal places**: the exact answer
+`124.97530385109731deg` rounds to 124.98 at the two decimals the tests compare at, while the same
+number cut to six figures is `124.975`, which rounds to 124.97 — and the expectations are literally
+*written* in six figures (`0.447214 -0.447214 0.774597 104.478deg`). Keeping more digits than the
+platform does is not accuracy; it is a different number.
+
+Two shared changes carried it. **`_WA_UNCOMPUTED` shrank to `transform` + `offset-rotate`** — the
+other three had been listed there by association, but `transform`'s *resolved* value is a matrix
+while these three resolve to their **computed** value (css-transforms-2 §5 says so in a note), and
+left uncomputed a keyframe's `400grad` never met the `360deg` underneath it. And **an identity
+rotation computes to `0deg`** — css-transforms-2 §5.1 verbatim: *"An identity transform does not
+count; it must serialize as 0deg."*
+
+**Result: six files 0-ish → 100%.** `scale-composition` 8 → **80/80**, `translate-composition`
+10 → **112/112**, `rotate-composition` 54 → **132/132**, `scale-interpolation` 154 → **360/360**,
+`translate-interpolation` 228 → **408/408**, `rotate-interpolation` 164 → **360/360**. Plus
+`rotate-interpolation-math-functions-tentative` 18 → 26, `scale-animation-math-functions-tentative`
+20 → 28, `interpolation-per-property-002` 340 → 342 (all three **stash-proved**). **+852.**
+
+**Ledger correction:** two entries of the held-realm ritual list are **stale paths that 404**
+(bodyLen 42, which reads as a could-not-run and is not a regression):
+`web-animations/interfaces/KeyframeEffect/effect-composition.html` is really
+`web-animations/animation-model/combining-effects/effect-composition.html` (**17/17**), and
+`css/css-transitions/CSSTransition-canceling.html` is really
+`CSSTransition-canceling.tentative.html` (**11/11**).
 
 ### 2026-07-31 — Quests #430–#432, the registration arc (+1112, 35 files, zero regressions)
 
