@@ -12471,6 +12471,18 @@ const _serCalcRoot = (node) => {
 const _canonMathExpr = (str, opts) => {
   const s = String(str).trim();
   if (!/^[a-zA-Z][a-zA-Z-]*\(/.test(s) || !s.endsWith(')')) return null;
+  // ── A `var()` is not a math expression; it is a PROMISE of one ─────────────
+  // `_FILTER_MATH_RE` counts `var(`/`env(` as a math function on purpose — for
+  // VALIDITY, an unsubstituted reference has to be accepted, since nobody can
+  // yet say what it will be. But the callers that use that same predicate to
+  // decide "fold this" then hand the reference to the calc parser, which has no
+  // idea what `--A` is and reads it as two unary minuses in front of an
+  // identifier: `opacity: var(--A)` came back out as
+  // `var(-1 * (-1 * a))` — a value no substitution can ever repair, so
+  // `opacity: var(--fade)` did not merely serialize oddly, it did NOT WORK.
+  // Refusing here fixes it once for every caller, because they all fall back to
+  // the verbatim text on null.
+  if (_TF_VAR_RE.test(s)) return null;
   const root = _parseCalcTree(s, opts);
   if (root === null) return null;
   const simp = _simpCalc(root, !!(opts && (opts.canonLen || opts.canonTime)));
@@ -21894,6 +21906,25 @@ const _TF_DISP = {
 // but the computed value the Typed OM reports keeps the camelCase. Two
 // serializers of two different values — not one with an inconsistency in it.
 const _TF_DISP_LIST = Object.assign({}, _TF_DISP, { skewx: 'skewX', skewy: 'skewY', scalez: 'scaleZ' });
+// ── A value that was never TEXT is never lowercased ────────────────────────
+// The quirk above belongs to the PARSER: `style.transform = "skewX(90deg)"` is
+// author text, and what comes back out is what the parser made of it. But
+// `commitStyles()` does not hand the CSSOM a string — §commit-computed-styles
+// sets a declaration to a VALUE, and a value arrives already knowing how it is
+// spelled. So `transform-interpolation-inline-value.html` reads `skewX(30deg)`
+// and `scaleX(1.5)` out of `div.style` from the very same engine whose parser
+// answers `skewx`/`scalex` — not a contradiction, two different doors.
+const _TF_DISP_VAL = Object.assign({}, _TF_DISP_LIST, { scalex: 'scaleX', scaley: 'scaleY' });
+// Latched (rather than threaded) for the same reason `_tfWantList` is: the value
+// has to travel the ORDINARY setProperty path — validity chain, argument
+// canonicalization, the lot — and only the last step, the spelling, differs.
+let _tfAsValue = false;
+globalThis._withTfValue = (fn) => {
+  const was = _tfAsValue;
+  _tfAsValue = true;
+  try { return fn(); }
+  finally { _tfAsValue = was; }
+};
 const _TF_VAR_RE = /\b(?:var|env)\(/i;
 // Split a transform-function's argument list on top-level commas (parens kept whole).
 const _splitTfArgs = (s) => {
@@ -22109,7 +22140,7 @@ const _canonTransform = (value, el, computed) => {
   for (const it of p.items) {
     const spec = _TF_FUNCS[it.name];
     const parts = it.args.map((arg, i) => _canonTfArg(arg, _tfArgType(spec, i)));
-    out.push((_TF_DISP[it.name] || it.name) + '(' + parts.join(', ') + ')');
+    out.push(((_tfAsValue ? _TF_DISP_VAL : _TF_DISP)[it.name] || it.name) + '(' + parts.join(', ') + ')');
   }
   return out.join(' ');
 };
@@ -24800,56 +24831,1121 @@ const _CSS_KNOWN_PROPS = (() => {
 // value are appended per element (see _computedCustomPropNames); these standard
 // names are element-independent so they are hoisted here.
 const _COMPUTED_STD_NAMES = Object.keys(_GCS_DEFAULTS).filter((k) => /^-?[a-z][a-z-]*$/.test(k));
-// ── CSS Typed OM: the computed style as a map ────────────────────────────────
-// `getComputedStyle(el).transform` is the RESOLVED value — a single matrix,
-// which has forgotten which functions made it (#436). `computedStyleMap()` is
-// the only way a page can ask for the value one step earlier: the computed
-// LIST, `translate(25px, 0px)` where getComputedStyle says
-// `matrix(1, 0, 0, 1, 25, 0)`. That is why `transform` is the one property here
-// that does not simply forward to getComputedStyle — for every other property
-// the computed value and the resolved value are the same string.
+// ── CSS Typed OM ─────────────────────────────────────────────────────────────
+// Every other CSS surface in this engine hands the page a STRING and asks it to
+// do the parsing again: `getComputedStyle(el).width` is `"42px"`, and a page
+// that wants the 42 writes a regex. The Typed OM is the answer to that — a value
+// arrives as an OBJECT that already knows it is a length, so `.value` is 42 and
+// `.unit` is `'px'` and nobody parses anything twice.
 //
-// CAP, named honestly: the values are plain `CSSStyleValue`s, not the typed
-// subclasses (`CSSUnitValue`, `CSSTransformValue`, `CSSKeywordValue`, …).
-// `toString()`, `get`/`getAll`/`has`/`size` and iteration are real; arithmetic
-// on a value is not, and a `CSSUnitValue` that cannot add would be worse than
-// no `CSSUnitValue` at all.
+// It is also, for us, a whole realm's front door. `css/css-typed-om/` is ~360
+// files and the ~250 under `the-stylepropertymap/properties/` all pull in one
+// shared `testsuite.js` that CONSTRUCTS a `CSSKeywordValue`, a `CSSUnitValue`, a
+// `CSSMathSum`, a `CSSUnparsedValue` and a twelve-component `CSSTransformValue`
+// **at script load**, before a single test runs. So every one of those files
+// died on line one with `ReferenceError: CSSKeywordValue is not defined` — 250
+// files at zero for a missing constructor, exactly #430's shape one realm over.
+//
+// The value classes below are the honest ones: `CSSNumericValue` really adds,
+// really converts units, really computes its numeric type. A `CSSUnitValue` that
+// could not add would have been worse than none at all.
+//
+// ── The unit table ───────────────────────────────────────────────────────────
+// A unit is a NAME, a base type, and — if it is absolute — a factor to its
+// family's canonical unit. The relative lengths (`em`, `vw`, `cqw`, …) have no
+// factor at all, and that is not a gap: they cannot be converted without an
+// element and a viewport, so `CSSUnitValue(1,'em').to('px')` is a TypeError and
+// not a guess.
+const _TOM_UNITS = (() => {
+  const m = new Map();
+  const put = (unit, base, canon, factor) => m.set(unit.toLowerCase(), { unit, base, canon, factor });
+  put('number', null, 'number', 1);
+  put('percent', 'percent', 'percent', 1);
+  for (const [u, f] of [['px', 1], ['cm', 96 / 2.54], ['mm', 96 / 25.4], ['q', 96 / 101.6],
+    ['in', 96], ['pt', 96 / 72], ['pc', 16]]) put(u, 'length', 'px', f);
+  for (const u of ['em', 'ex', 'ch', 'ic', 'cap', 'rem', 'rex', 'rch', 'ric', 'rcap', 'lh', 'rlh',
+    'vw', 'vh', 'vi', 'vb', 'vmin', 'vmax', 'svw', 'svh', 'lvw', 'lvh', 'dvw', 'dvh',
+    'cqw', 'cqh', 'cqi', 'cqb', 'cqmin', 'cqmax']) put(u, 'length', null, 0);
+  for (const [u, f] of [['deg', 1], ['grad', 0.9], ['rad', 180 / Math.PI], ['turn', 360]]) put(u, 'angle', 'deg', f);
+  for (const [u, f] of [['s', 1], ['ms', 0.001]]) put(u, 'time', 's', f);
+  for (const [u, f] of [['hz', 1], ['khz', 1000]]) put(u, 'frequency', 'hz', f);
+  for (const [u, f] of [['dppx', 1], ['x', 1], ['dpi', 1 / 96], ['dpcm', 2.54 / 96]]) put(u, 'resolution', 'dppx', f);
+  put('fr', 'flex', 'fr', 1);
+  return m;
+})();
+const _tomUnit = (u) => _TOM_UNITS.get(String(u).toLowerCase());
+// The canonical spelling a unit serializes and compares as (`PX` is `px`, but
+// `Q`, `Hz` and `kHz` keep their capitals — CSS units are ASCII-case-insensitive
+// and only their canonical spelling is stable).
+const _tomUnitName = (u) => { const e = _tomUnit(u); return e ? e.unit : String(u); };
+// ── A numeric TYPE is a map of exponents ─────────────────────────────────────
+// `3px` is {length: 1}; `3px * 3px` is {length: 2}; `3` is the empty map. Two
+// values add only when their types match — which is the whole reason
+// `calc(1px + 1deg)` is not a value. The one subtlety is the PERCENT HINT: a
+// percentage has no type of its own until it meets something, and `calc(1px +
+// 1%)` is a length that REMEMBERS a percentage went into it.
+const _TOM_BASES = ['length', 'angle', 'time', 'frequency', 'resolution', 'flex', 'percent'];
+const _tomTypeClone = (t) => { const o = {}; for (const k of _TOM_BASES) if (t[k]) o[k] = t[k]; if (t.percentHint !== undefined) o.percentHint = t.percentHint; return o; };
+const _tomTypeIsEqual = (a, b) => _TOM_BASES.every((k) => (a[k] || 0) === (b[k] || 0));
+const _tomTypeOfUnit = (u) => { const e = _tomUnit(u); return e && e.base ? { [e.base]: 1 } : {}; };
+// css-typed-om §add-two-types, with the percent-hint branches folded in: a bare
+// percentage takes on the type it is added to, and the sum records that it did.
+const _tomTypeAdd = (a, b) => {
+  if (a.percentHint !== undefined && b.percentHint !== undefined && a.percentHint !== b.percentHint) return null;
+  const hint = a.percentHint !== undefined ? a.percentHint : b.percentHint;
+  if (_tomTypeIsEqual(a, b)) { const o = _tomTypeClone(a); if (hint !== undefined) o.percentHint = hint; return o; }
+  // One side is a plain percentage and the other names exactly one base type:
+  // the percentage becomes that type, and the hint remembers which.
+  for (const [p, q] of [[a, b], [b, a]]) {
+    if (p.percent === 1 && !_TOM_BASES.some((k) => k !== 'percent' && p[k])) {
+      const bases = _TOM_BASES.filter((k) => k !== 'percent' && q[k]);
+      if (bases.length === 1 && q[bases[0]] === 1 && !q.percent) {
+        const o = _tomTypeClone(q); o.percentHint = bases[0]; return o;
+      }
+    }
+  }
+  return null;
+};
+const _tomTypeMul = (a, b) => {
+  if (a.percentHint !== undefined && b.percentHint !== undefined && a.percentHint !== b.percentHint) return null;
+  const o = {};
+  for (const k of _TOM_BASES) { const n = (a[k] || 0) + (b[k] || 0); if (n) o[k] = n; }
+  const hint = a.percentHint !== undefined ? a.percentHint : b.percentHint;
+  if (hint !== undefined) o.percentHint = hint;
+  return o;
+};
+const _tomTypeInv = (a) => { const o = {}; for (const k of _TOM_BASES) if (a[k]) o[k] = -a[k]; if (a.percentHint !== undefined) o.percentHint = a.percentHint; return o; };
+const _tomIsNum = (n) => typeof n === 'number' && isFinite(n);
+// ── The value classes ────────────────────────────────────────────────────────
 class CSSStyleValue {
-  constructor(v) { Object.defineProperty(this, '_v', { value: String(v == null ? '' : v) }); }
-  toString() { return this._v; }
+  constructor(v) { Object.defineProperty(this, '_v', { value: String(v == null ? '' : v), writable: true }); }
+  toString() { return this._v === undefined ? '' : this._v; }
+  static parse(property, cssText) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'parse' on 'CSSStyleValue': 2 arguments required.");
+    const all = CSSStyleValue.parseAll(property, cssText);
+    return all[0];
+  }
+  static parseAll(property, cssText) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'parseAll' on 'CSSStyleValue': 2 arguments required.");
+    const name = _tomPropName(property);
+    const text = String(cssText);
+    // A value this property would not take is a TypeError, not a SyntaxError —
+    // `parse()` is the same gate `set()` is, asked without an element.
+    if (!_tomValueOk(name, text))
+      throw new TypeError("Failed to execute 'parse' on 'CSSStyleValue': Invalid value for property '" + name + "': " + text);
+    const v = _tomReify(text, name);
+    if (v !== null && !_tomTypeGate(name, v))
+      throw new TypeError("Failed to execute 'parse' on 'CSSStyleValue': Invalid type for property '" + name + "'.");
+    return v === null ? [] : [v];
+  }
 }
 globalThis.CSSStyleValue = CSSStyleValue;
-const _typedOmValue = (el, prop) => {
-  const kebab = String(prop == null ? '' : prop);
-  if (kebab === 'transform') {
-    const list = globalThis._computedTfList(el);
-    if (list != null && list !== '') return list;
+class CSSKeywordValue extends CSSStyleValue {
+  constructor(value) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSKeywordValue': 1 argument required, but only 0 present.");
+    super('');
+    const s = String(value);
+    if (s === '') throw new TypeError("Failed to construct 'CSSKeywordValue': The value provided is an empty string.");
+    this._k = s;
   }
-  try { return getComputedStyle(el).getPropertyValue(kebab); } catch (e) { return ''; }
+  get value() { return this._k; }
+  set value(v) { const s = String(v); if (s === '') throw new TypeError('The value provided is an empty string.'); this._k = s; }
+  toString() { return this._k; }
+}
+globalThis.CSSKeywordValue = CSSKeywordValue;
+// A number with a unit — and the reason the whole realm exists. Arithmetic and
+// unit conversion live on `CSSNumericValue` so that a `CSSMathSum` can do them
+// too; the leaf only has to know its own number.
+class CSSNumericValue extends CSSStyleValue {
+  type() { return _tomTypeClone(this._type()); }
+  to(unit) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'to' on 'CSSNumericValue': 1 argument required, but only 0 present.");
+    const e = _tomUnit(unit);
+    if (!e) throw new globalThis.DOMException('Invalid unit', 'SyntaxError');
+    const sum = this._canonical();
+    if (sum === null || sum.length !== 1) throw new TypeError('Cannot convert to ' + unit);
+    const term = sum[0];
+    const from = _tomUnit(term.unit);
+    if (!from || from.base !== e.base || !from.canon || !e.canon || !e.factor)
+      throw new TypeError('Cannot convert ' + term.unit + ' to ' + unit);
+    return new CSSUnitValue(term.value * from.factor / e.factor, e.unit);
+  }
+  toSum(...units) {
+    const sum = this._canonical();
+    if (sum === null) throw new TypeError('Cannot create a sum');
+    if (!units.length) return new CSSMathSum(...sum.map((t) => new CSSUnitValue(t.value, t.unit)));
+    const out = [];
+    for (const u of units) {
+      const e = _tomUnit(u);
+      if (!e) throw new globalThis.DOMException('Invalid unit', 'SyntaxError');
+      let total = 0, any = false;
+      for (let i = sum.length - 1; i >= 0; i--) {
+        const from = _tomUnit(sum[i].unit);
+        if (from && from.base === e.base && from.canon && e.canon && e.factor) {
+          total += sum[i].value * from.factor / e.factor; any = true; sum.splice(i, 1);
+        }
+      }
+      if (!any && sum.length) throw new TypeError('Cannot convert to ' + u);
+      out.push(new CSSUnitValue(total, e.unit));
+    }
+    if (sum.length) throw new TypeError('Leftover units in toSum()');
+    return new CSSMathSum(...out);
+  }
+  equals(...others) { return others.every((o) => _tomEquals(this, o)); }
+  add(...vs) { return _tomSimplify(new CSSMathSum(this, ...vs.map(_tomNumeric))); }
+  sub(...vs) { return _tomSimplify(new CSSMathSum(this, ...vs.map((v) => new CSSMathNegate(_tomNumeric(v))))); }
+  mul(...vs) { return _tomSimplify(new CSSMathProduct(this, ...vs.map(_tomNumeric))); }
+  div(...vs) { return _tomSimplify(new CSSMathProduct(this, ...vs.map((v) => new CSSMathInvert(_tomNumeric(v))))); }
+  min(...vs) { return _tomSimplify(new CSSMathMin(this, ...vs.map(_tomNumeric))); }
+  max(...vs) { return _tomSimplify(new CSSMathMax(this, ...vs.map(_tomNumeric))); }
+  static parse(cssText) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'parse' on 'CSSNumericValue': 1 argument required, but only 0 present.");
+    const v = _tomReify(String(cssText).trim(), null);
+    if (!(v instanceof CSSNumericValue)) throw new globalThis.DOMException('Invalid numeric value', 'SyntaxError');
+    return v;
+  }
+}
+globalThis.CSSNumericValue = CSSNumericValue;
+class CSSUnitValue extends CSSNumericValue {
+  constructor(value, unit) {
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'CSSUnitValue': 2 arguments required.");
+    super('');
+    const e = _tomUnit(unit);
+    if (!e) throw new TypeError("Failed to construct 'CSSUnitValue': Invalid unit: " + unit);
+    this._n = Number(value);
+    this._u = e.unit;
+  }
+  get value() { return this._n; }
+  set value(v) { this._n = Number(v); }
+  get unit() { return this._u; }
+  _type() { return _tomTypeOfUnit(this._u); }
+  // A single term is already its own canonical sum.
+  _canonical() {
+    const e = _tomUnit(this._u);
+    if (!e) return null;
+    return e.canon && e.factor ? [{ value: this._n * e.factor, unit: e.canon }] : [{ value: this._n, unit: this._u }];
+  }
+  toString() {
+    const n = _serNumber(this._n);
+    return this._u === 'number' ? n : this._u === 'percent' ? n + '%' : n + this._u;
+  }
+}
+globalThis.CSSUnitValue = CSSUnitValue;
+// `.values` on a math value is not a plain Array — it is indexed, iterable and
+// has a length, and nothing else. Tests reach for `a.values.length` and
+// `a.values[i]`, so those are what it has.
+class CSSNumericArray {
+  constructor(vals) {
+    Object.defineProperty(this, '_a', { value: vals.slice() });
+    for (let i = 0; i < vals.length; i++)
+      Object.defineProperty(this, i, { value: vals[i], enumerable: true });
+  }
+  get length() { return this._a.length; }
+  [Symbol.iterator]() { return this._a[Symbol.iterator](); }
+  forEach(cb, thisArg) { this._a.forEach(cb, thisArg); }
+}
+globalThis.CSSNumericArray = CSSNumericArray;
+class CSSMathValue extends CSSNumericValue {
+  get operator() { return this._op; }
+  toString() { return _tomMathSer(this, true); }
+}
+globalThis.CSSMathValue = CSSMathValue;
+const _tomMathArgs = (name, args) => {
+  if (!args.length) throw new TypeError("Failed to construct '" + name + "': at least 1 argument required.");
+  return args.map(_tomNumeric);
 };
+class CSSMathSum extends CSSMathValue {
+  constructor(...args) {
+    super('');
+    const vs = _tomMathArgs('CSSMathSum', args);
+    let t = vs[0].type();
+    for (let i = 1; i < vs.length; i++) {
+      t = _tomTypeAdd(t, vs[i].type());
+      if (t === null) throw new TypeError("Failed to construct 'CSSMathSum': Incompatible types.");
+    }
+    this._op = 'sum'; this._t = t;
+    Object.defineProperty(this, 'values', { value: new CSSNumericArray(vs), enumerable: true });
+  }
+  _type() { return this._t; }
+  _canonical() {
+    const out = [];
+    for (const v of this.values) { const s = v._canonical(); if (s === null) return null; for (const term of s) _tomSumInto(out, term); }
+    return out.length ? out : [{ value: 0, unit: 'number' }];
+  }
+}
+class CSSMathProduct extends CSSMathValue {
+  constructor(...args) {
+    super('');
+    const vs = _tomMathArgs('CSSMathProduct', args);
+    let t = vs[0].type();
+    for (let i = 1; i < vs.length; i++) {
+      t = _tomTypeMul(t, vs[i].type());
+      if (t === null) throw new TypeError("Failed to construct 'CSSMathProduct': Incompatible types.");
+    }
+    this._op = 'product'; this._t = t;
+    Object.defineProperty(this, 'values', { value: new CSSNumericArray(vs), enumerable: true });
+  }
+  _type() { return this._t; }
+  // A product is canonical only when at most one factor carries a unit — which
+  // is every product CSS actually admits (`calc(2 * 3px)`), and the honest
+  // answer for the rest is "no single sum term", not a wrong one.
+  _canonical() {
+    let value = 1, unit = 'number';
+    for (const v of this.values) {
+      const s = v._canonical();
+      if (s === null || s.length !== 1) return null;
+      if (s[0].unit !== 'number') { if (unit !== 'number') return null; unit = s[0].unit; }
+      value *= s[0].value;
+    }
+    return [{ value, unit }];
+  }
+}
+class CSSMathNegate extends CSSMathValue {
+  constructor(value) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSMathNegate': 1 argument required.");
+    super('');
+    this._op = 'negate';
+    Object.defineProperty(this, 'value', { value: _tomNumeric(value), enumerable: true });
+  }
+  _type() { return this.value.type(); }
+  _canonical() { const s = this.value._canonical(); return s === null ? null : s.map((t) => ({ value: -t.value, unit: t.unit })); }
+}
+class CSSMathInvert extends CSSMathValue {
+  constructor(value) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSMathInvert': 1 argument required.");
+    super('');
+    this._op = 'invert';
+    Object.defineProperty(this, 'value', { value: _tomNumeric(value), enumerable: true });
+  }
+  _type() { return _tomTypeInv(this.value.type()); }
+  _canonical() {
+    const s = this.value._canonical();
+    if (s === null || s.length !== 1 || s[0].unit !== 'number') return null;
+    return [{ value: 1 / s[0].value, unit: 'number' }];
+  }
+}
+const _tomMinMax = (cls, op) => class extends CSSMathValue {
+  constructor(...args) {
+    super('');
+    const vs = _tomMathArgs(cls, args);
+    let t = vs[0].type();
+    for (let i = 1; i < vs.length; i++) {
+      t = _tomTypeAdd(t, vs[i].type());
+      if (t === null) throw new TypeError("Failed to construct '" + cls + "': Incompatible types.");
+    }
+    this._op = op; this._t = t;
+    Object.defineProperty(this, 'values', { value: new CSSNumericArray(vs), enumerable: true });
+  }
+  _type() { return this._t; }
+  _canonical() {
+    const ts = [];
+    for (const v of this.values) { const s = v._canonical(); if (s === null || s.length !== 1) return null; ts.push(s[0]); }
+    if (ts.some((t) => t.unit !== ts[0].unit)) return null;
+    const n = op === 'min' ? Math.min(...ts.map((t) => t.value)) : Math.max(...ts.map((t) => t.value));
+    return [{ value: n, unit: ts[0].unit }];
+  }
+};
+const CSSMathMin = _tomMinMax('CSSMathMin', 'min');
+const CSSMathMax = _tomMinMax('CSSMathMax', 'max');
+class CSSMathClamp extends CSSMathValue {
+  constructor(lower, value, upper) {
+    if (arguments.length < 3) throw new TypeError("Failed to construct 'CSSMathClamp': 3 arguments required.");
+    super('');
+    const l = _tomNumeric(lower), v = _tomNumeric(value), u = _tomNumeric(upper);
+    let t = _tomTypeAdd(l.type(), v.type());
+    if (t !== null) t = _tomTypeAdd(t, u.type());
+    if (t === null) throw new TypeError("Failed to construct 'CSSMathClamp': Incompatible types.");
+    this._op = 'clamp'; this._t = t;
+    Object.defineProperty(this, 'lower', { value: l, enumerable: true });
+    Object.defineProperty(this, 'value', { value: v, enumerable: true });
+    Object.defineProperty(this, 'upper', { value: u, enumerable: true });
+  }
+  _type() { return this._t; }
+  _canonical() {
+    const a = this.lower._canonical(), b = this.value._canonical(), c = this.upper._canonical();
+    if (!a || !b || !c || a.length !== 1 || b.length !== 1 || c.length !== 1) return null;
+    if (a[0].unit !== b[0].unit || b[0].unit !== c[0].unit) return null;
+    return [{ value: Math.min(Math.max(a[0].value, b[0].value), c[0].value), unit: b[0].unit }];
+  }
+}
+for (const [n, C] of [['CSSMathValue', CSSMathValue], ['CSSMathSum', CSSMathSum], ['CSSMathProduct', CSSMathProduct],
+  ['CSSMathNegate', CSSMathNegate], ['CSSMathInvert', CSSMathInvert], ['CSSMathMin', CSSMathMin],
+  ['CSSMathMax', CSSMathMax], ['CSSMathClamp', CSSMathClamp]]) {
+  Object.defineProperty(C, 'name', { value: n, configurable: true });
+  globalThis[n] = C;
+}
+// A bare JS number where a numeric value is wanted is `CSSUnitValue(n,'number')`
+// — the one implicit conversion the IDL allows, and the reason `x.mul(2)` reads
+// the way it does.
+const _tomNumeric = (v) => {
+  if (v instanceof CSSNumericValue) return v;
+  if (_tomIsNum(v)) return new CSSUnitValue(v, 'number');
+  if (typeof v === 'string') { const p = CSSNumericValue.parse(v); return p; }
+  throw new TypeError('Expected a CSSNumericValue');
+};
+const _tomSumInto = (out, term) => {
+  for (const t of out) if (t.unit === term.unit) { t.value += term.value; return; }
+  out.push({ value: term.value, unit: term.unit });
+};
+// The one place arithmetic collapses: a sum whose canonical form is a single
+// term IS that term, so `CSSUnitValue(1,'px').add(CSSUnitValue(2,'px'))` is
+// `3px` and not `calc(1px + 2px)`.
+const _tomSimplify = (v) => {
+  const s = v._canonical();
+  if (s !== null && s.length === 1) {
+    const e = _tomUnit(s[0].unit);
+    if (e && e.canon) return new CSSUnitValue(s[0].value, s[0].unit);
+  }
+  return v;
+};
+const _tomEquals = (a, b) => {
+  if (!(a instanceof CSSStyleValue) || !(b instanceof CSSStyleValue)) return false;
+  if (a.constructor !== b.constructor) return false;
+  if (a instanceof CSSUnitValue) return a.value === b.value && a.unit === b.unit;
+  if (a instanceof CSSKeywordValue) return a.value === b.value;
+  if (a instanceof CSSMathValue) {
+    if (a.values && b.values) {
+      if (a.values.length !== b.values.length) return false;
+      for (let i = 0; i < a.values.length; i++) if (!_tomEquals(a.values[i], b.values[i])) return false;
+      return true;
+    }
+    if (a.lower) return _tomEquals(a.lower, b.lower) && _tomEquals(a.value, b.value) && _tomEquals(a.upper, b.upper);
+    return _tomEquals(a.value, b.value);
+  }
+  return a.toString() === b.toString();
+};
+// ── Serializing a math value ────────────────────────────────────────────────
+// The outermost one wears the `calc()`; the nested ones wear bare parentheses,
+// because `calc(calc(1px + 2px) * 3)` is nobody's idea of a value. A term that
+// is a negation or a negative number joins its sum with a MINUS rather than a
+// plus followed by a sign.
+const _tomMathSer = (v, top) => {
+  if (v instanceof CSSMathSum || v instanceof CSSMathProduct) {
+    const sum = v instanceof CSSMathSum;
+    let s = '';
+    v.values.forEach((it, i) => {
+      if (i === 0) { s += _tomTermSer(it); return; }
+      if (sum) {
+        if (it instanceof CSSMathNegate) s += ' - ' + _tomTermSer(it.value);
+        else if (it instanceof CSSUnitValue && it.value < 0) s += ' - ' + new CSSUnitValue(-it.value, it.unit).toString();
+        else s += ' + ' + _tomTermSer(it);
+      } else {
+        if (it instanceof CSSMathInvert) s += ' / ' + _tomTermSer(it.value);
+        else s += ' * ' + _tomTermSer(it);
+      }
+    });
+    return top ? 'calc(' + s + ')' : '(' + s + ')';
+  }
+  if (v instanceof CSSMathNegate) return (top ? 'calc(' : '(') + '-' + _tomTermSer(v.value) + ')';
+  if (v instanceof CSSMathInvert) return (top ? 'calc(' : '(') + '1 / ' + _tomTermSer(v.value) + ')';
+  if (v instanceof CSSMathMin || v instanceof CSSMathMax)
+    return (v.operator) + '(' + [...v.values].map((x) => _tomTermSer(x)).join(', ') + ')';
+  if (v instanceof CSSMathClamp)
+    return 'clamp(' + _tomTermSer(v.lower) + ', ' + _tomTermSer(v.value) + ', ' + _tomTermSer(v.upper) + ')';
+  return String(v);
+};
+const _tomTermSer = (v) => (v instanceof CSSMathValue ? _tomMathSer(v, false) : String(v));
+// ── A value nobody could parse yet ───────────────────────────────────────────
+// `var(--A)` has no type and no value until substitution, so the Typed OM keeps
+// it as what it literally is: a list of strings with variable references between
+// them. `CSSUnparsedValue` is that list.
+class CSSVariableReferenceValue {
+  constructor(variable, fallback = null) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSVariableReferenceValue': 1 argument required.");
+    const s = String(variable);
+    if (!/^--/.test(s)) throw new TypeError("Failed to construct 'CSSVariableReferenceValue': '" + s + "' is not a custom property name.");
+    this._var = s;
+    if (fallback !== null && fallback !== undefined && !(fallback instanceof CSSUnparsedValue))
+      throw new TypeError("Failed to construct 'CSSVariableReferenceValue': fallback must be a CSSUnparsedValue.");
+    this._fb = fallback === undefined ? null : fallback;
+  }
+  get variable() { return this._var; }
+  set variable(v) { const s = String(v); if (!/^--/.test(s)) throw new TypeError('Not a custom property name'); this._var = s; }
+  get fallback() { return this._fb; }
+  toString() { return 'var(' + this._var + (this._fb === null ? '' : ',' + String(this._fb)) + ')'; }
+}
+globalThis.CSSVariableReferenceValue = CSSVariableReferenceValue;
+class CSSUnparsedValue extends CSSStyleValue {
+  constructor(members = []) {
+    super('');
+    const a = Array.from(members || []).map((m) => (m instanceof CSSVariableReferenceValue ? m : String(m)));
+    Object.defineProperty(this, '_a', { value: a });
+    for (let i = 0; i < a.length; i++)
+      Object.defineProperty(this, i, { get() { return this._a[i]; }, set(v) { this._a[i] = v; }, enumerable: true, configurable: true });
+  }
+  get length() { return this._a.length; }
+  [Symbol.iterator]() { return this._a[Symbol.iterator](); }
+  forEach(cb, thisArg) { this._a.forEach(cb, thisArg); }
+  entries() { return this._a.entries(); }
+  keys() { return this._a.keys(); }
+  values() { return this._a.values(); }
+  toString() { return this._a.map((m) => String(m)).join(''); }
+}
+globalThis.CSSUnparsedValue = CSSUnparsedValue;
+// Images are OPAQUE by design (css-typed-om §CSSImageValue): a page can move one
+// from element to element and never look inside, because there is nothing inside
+// a decoded image the CSSOM has words for.
+class CSSImageValue extends CSSStyleValue {}
+globalThis.CSSImageValue = CSSImageValue;
+// ── The transform list, as objects ───────────────────────────────────────────
+// The same list #436–#444 taught the animation model to speak, handed to a page
+// one component at a time. A component knows whether it is FLAT — `is2D` — and
+// that single bit decides both how it serializes (`translate` vs `translate3d`)
+// and what its matrix looks like, which is the same sentence #444 found in the
+// interpolator arriving from the other direction.
+const _tomAngle = (v, who) => {
+  const n = _tomNumeric(v);
+  const t = n.type();
+  if (t.angle !== 1) throw new TypeError("Failed to construct '" + who + "': expected an angle.");
+  return n;
+};
+const _tomLength = (v, who) => {
+  const n = _tomNumeric(v);
+  const t = n.type();
+  if (t.length !== 1 && t.percent !== 1) throw new TypeError("Failed to construct '" + who + "': expected a length.");
+  return n;
+};
+const _tomPlainNum = (v, who) => {
+  const n = _tomNumeric(v);
+  if (Object.keys(n.type()).length !== 0) throw new TypeError("Failed to construct '" + who + "': expected a number.");
+  return n;
+};
+class CSSTransformComponent {
+  get is2D() { return this._2d; }
+  set is2D(v) { this._2d = !!v; }
+  // Every component can answer as a matrix, and it does it by handing its own
+  // serialization back to the transform parser this engine already has — one
+  // matrix builder, not two that can disagree.
+  toMatrix() {
+    const p = _parseTransform(this.toString());
+    const M = p && !p.none && p.items.length === 1 ? _tfMatrix(p.items[0]) : null;
+    if (!M) throw new TypeError('Cannot compute a matrix from a relative unit');
+    return new globalThis.DOMMatrix(Array.from(M));
+  }
+}
+globalThis.CSSTransformComponent = CSSTransformComponent;
+class CSSTranslate extends CSSTransformComponent {
+  constructor(x, y, z) {
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'CSSTranslate': 2 arguments required.");
+    super();
+    this._x = _tomLength(x, 'CSSTranslate');
+    this._y = _tomLength(y, 'CSSTranslate');
+    this._z = z === undefined ? new CSSUnitValue(0, 'px') : _tomLength(z, 'CSSTranslate');
+    this._2d = z === undefined;
+  }
+  get x() { return this._x; } set x(v) { this._x = _tomLength(v, 'CSSTranslate'); }
+  get y() { return this._y; } set y(v) { this._y = _tomLength(v, 'CSSTranslate'); }
+  get z() { return this._z; } set z(v) { this._z = _tomLength(v, 'CSSTranslate'); }
+  toString() {
+    return this._2d ? 'translate(' + this._x + ', ' + this._y + ')'
+      : 'translate3d(' + this._x + ', ' + this._y + ', ' + this._z + ')';
+  }
+}
+class CSSRotate extends CSSTransformComponent {
+  constructor(a, b, c, d) {
+    super();
+    if (arguments.length === 1) {
+      this._x = new CSSUnitValue(0, 'number'); this._y = new CSSUnitValue(0, 'number');
+      this._z = new CSSUnitValue(1, 'number'); this._a = _tomAngle(a, 'CSSRotate'); this._2d = true;
+    } else if (arguments.length === 4) {
+      this._x = _tomPlainNum(a, 'CSSRotate'); this._y = _tomPlainNum(b, 'CSSRotate');
+      this._z = _tomPlainNum(c, 'CSSRotate'); this._a = _tomAngle(d, 'CSSRotate'); this._2d = false;
+    } else throw new TypeError("Failed to construct 'CSSRotate': 1 or 4 arguments required.");
+  }
+  get angle() { return this._a; } set angle(v) { this._a = _tomAngle(v, 'CSSRotate'); }
+  get x() { return this._x; } set x(v) { this._x = _tomPlainNum(v, 'CSSRotate'); }
+  get y() { return this._y; } set y(v) { this._y = _tomPlainNum(v, 'CSSRotate'); }
+  get z() { return this._z; } set z(v) { this._z = _tomPlainNum(v, 'CSSRotate'); }
+  toString() {
+    return this._2d ? 'rotate(' + this._a + ')'
+      : 'rotate3d(' + this._x + ', ' + this._y + ', ' + this._z + ', ' + this._a + ')';
+  }
+}
+class CSSScale extends CSSTransformComponent {
+  constructor(x, y, z) {
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'CSSScale': 2 arguments required.");
+    super();
+    this._x = _tomPlainNum(x, 'CSSScale');
+    this._y = _tomPlainNum(y, 'CSSScale');
+    this._z = z === undefined ? new CSSUnitValue(1, 'number') : _tomPlainNum(z, 'CSSScale');
+    this._2d = z === undefined;
+  }
+  get x() { return this._x; } set x(v) { this._x = _tomPlainNum(v, 'CSSScale'); }
+  get y() { return this._y; } set y(v) { this._y = _tomPlainNum(v, 'CSSScale'); }
+  get z() { return this._z; } set z(v) { this._z = _tomPlainNum(v, 'CSSScale'); }
+  toString() {
+    return this._2d ? 'scale(' + this._x + ', ' + this._y + ')'
+      : 'scale3d(' + this._x + ', ' + this._y + ', ' + this._z + ')';
+  }
+}
+class CSSSkew extends CSSTransformComponent {
+  constructor(ax, ay) {
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'CSSSkew': 2 arguments required.");
+    super();
+    this._ax = _tomAngle(ax, 'CSSSkew'); this._ay = _tomAngle(ay, 'CSSSkew'); this._2d = true;
+  }
+  get ax() { return this._ax; } set ax(v) { this._ax = _tomAngle(v, 'CSSSkew'); }
+  get ay() { return this._ay; } set ay(v) { this._ay = _tomAngle(v, 'CSSSkew'); }
+  toString() { return 'skew(' + this._ax + ', ' + this._ay + ')'; }
+}
+class CSSSkewX extends CSSTransformComponent {
+  constructor(ax) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSSkewX': 1 argument required.");
+    super();
+    this._ax = _tomAngle(ax, 'CSSSkewX'); this._2d = true;
+  }
+  get ax() { return this._ax; } set ax(v) { this._ax = _tomAngle(v, 'CSSSkewX'); }
+  toString() { return 'skewX(' + this._ax + ')'; }
+}
+class CSSSkewY extends CSSTransformComponent {
+  constructor(ay) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSSkewY': 1 argument required.");
+    super();
+    this._ay = _tomAngle(ay, 'CSSSkewY'); this._2d = true;
+  }
+  get ay() { return this._ay; } set ay(v) { this._ay = _tomAngle(v, 'CSSSkewY'); }
+  toString() { return 'skewY(' + this._ay + ')'; }
+}
+class CSSPerspective extends CSSTransformComponent {
+  constructor(len) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSPerspective': 1 argument required.");
+    super();
+    this._len = (len instanceof CSSKeywordValue && len.value === 'none') ? len : _tomLength(len, 'CSSPerspective');
+    this._2d = false;
+  }
+  get length() { return this._len; }
+  set length(v) { this._len = (v instanceof CSSKeywordValue && v.value === 'none') ? v : _tomLength(v, 'CSSPerspective'); }
+  get is2D() { return false; }
+  set is2D(_v) {}
+  toString() { return 'perspective(' + this._len + ')'; }
+}
+class CSSMatrixComponent extends CSSTransformComponent {
+  constructor(matrix, options) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSMatrixComponent': 1 argument required.");
+    super();
+    this.matrix = matrix;
+    this._2d = options && options.is2D !== undefined ? !!options.is2D : !!(matrix && matrix.is2D);
+  }
+  toString() {
+    const m = this.matrix;
+    const n = (x) => _serNumber(x);
+    return this._2d
+      ? 'matrix(' + [m.a, m.b, m.c, m.d, m.e, m.f].map(n).join(', ') + ')'
+      : 'matrix3d(' + Array.from(m.toFloat64Array()).map(n).join(', ') + ')';
+  }
+  toMatrix() { return new globalThis.DOMMatrix(Array.from(this.matrix.toFloat64Array())); }
+}
+for (const [n, C] of [['CSSTranslate', CSSTranslate], ['CSSRotate', CSSRotate], ['CSSScale', CSSScale],
+  ['CSSSkew', CSSSkew], ['CSSSkewX', CSSSkewX], ['CSSSkewY', CSSSkewY],
+  ['CSSPerspective', CSSPerspective], ['CSSMatrixComponent', CSSMatrixComponent]]) globalThis[n] = C;
+class CSSTransformValue extends CSSStyleValue {
+  constructor(components) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSTransformValue': 1 argument required.");
+    super('');
+    const a = Array.from(components);
+    for (const c of a) if (!(c instanceof CSSTransformComponent))
+      throw new TypeError("Failed to construct 'CSSTransformValue': expected CSSTransformComponents.");
+    if (!a.length) throw new TypeError("Failed to construct 'CSSTransformValue': at least one component required.");
+    Object.defineProperty(this, '_a', { value: a });
+    for (let i = 0; i < a.length; i++)
+      Object.defineProperty(this, i, { get() { return this._a[i]; }, set(v) { this._a[i] = v; }, enumerable: true, configurable: true });
+  }
+  get length() { return this._a.length; }
+  // A list is flat only when every component in it is.
+  get is2D() { return this._a.every((c) => c.is2D); }
+  [Symbol.iterator]() { return this._a[Symbol.iterator](); }
+  forEach(cb, thisArg) { this._a.forEach(cb, thisArg); }
+  entries() { return this._a.entries(); }
+  keys() { return this._a.keys(); }
+  values() { return this._a.values(); }
+  toMatrix() {
+    let M = new globalThis.DOMMatrix();
+    for (const c of this._a) M = M.multiply(c.toMatrix());
+    return M;
+  }
+  toString() { return this._a.map((c) => String(c)).join(' '); }
+}
+globalThis.CSSTransformValue = CSSTransformValue;
+// A parsed transform function, as the component it stands for. The X/Y/Z
+// spellings are the flat ones filled out (`translateX(4px)` IS
+// `translate(4px, 0px)`); the ones naming z are already deep.
+const _tomComponentOf = (it) => {
+  const L = (s) => { const v = _tomReify(String(s).trim(), null); return v instanceof CSSNumericValue ? v : null; };
+  const a = it.args.map(L);
+  if (a.some((x) => x === null)) return null;
+  const zero = () => new CSSUnitValue(0, 'px'), one = () => new CSSUnitValue(1, 'number');
+  switch (it.name) {
+    case 'translate': return new CSSTranslate(a[0], a[1] !== undefined ? a[1] : zero());
+    case 'translatex': return new CSSTranslate(a[0], zero());
+    case 'translatey': return new CSSTranslate(zero(), a[0]);
+    case 'translatez': return new CSSTranslate(zero(), zero(), a[0]);
+    case 'translate3d': return new CSSTranslate(a[0], a[1], a[2]);
+    case 'scale': return new CSSScale(a[0], a[1] !== undefined ? a[1] : a[0]);
+    case 'scalex': return new CSSScale(a[0], one());
+    case 'scaley': return new CSSScale(one(), a[0]);
+    case 'scalez': return new CSSScale(one(), one(), a[0]);
+    case 'scale3d': return new CSSScale(a[0], a[1], a[2]);
+    case 'rotate': return new CSSRotate(a[0]);
+    case 'rotatex': return new CSSRotate(1, 0, 0, a[0]);
+    case 'rotatey': return new CSSRotate(0, 1, 0, a[0]);
+    case 'rotatez': return new CSSRotate(0, 0, 1, a[0]);
+    case 'rotate3d': return new CSSRotate(a[0], a[1], a[2], a[3]);
+    case 'skew': return new CSSSkew(a[0], a[1] !== undefined ? a[1] : new CSSUnitValue(0, 'deg'));
+    case 'skewx': return new CSSSkewX(a[0]);
+    case 'skewy': return new CSSSkewY(a[0]);
+    case 'perspective': return new CSSPerspective(
+      String(it.args[0]).trim().toLowerCase() === 'none' ? new CSSKeywordValue('none') : a[0]);
+    case 'matrix': case 'matrix3d': {
+      const nums = it.args.map((x) => parseFloat(x));
+      if (nums.some((n) => !isFinite(n))) return null;
+      return new CSSMatrixComponent(new globalThis.DOMMatrixReadOnly(nums), { is2D: it.name === 'matrix' });
+    }
+  }
+  return null;
+};
+// ── Reification: CSS text back into an object ────────────────────────────────
+// css-typed-om §reify — the value's own SHAPE decides its class, and the
+// property only matters where the shape is ambiguous (`transform`). Anything
+// with no typed representation reifies as a plain `CSSStyleValue`, which is not
+// a failure: it is the spec's honest "this value has no words yet".
+const _TOM_NUM_RE = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(%|[a-zA-Z]+)?$/;
+const _TOM_IMAGE_RE = /^(?:url|src|image|image-set|-webkit-image-set|cross-fade|element|paint|(?:repeating-)?(?:linear|radial|conic)-gradient)\(/i;
+const _TOM_IDENT_RE = /^-{0,2}[A-Za-z_][-\w]*$/;
+const _tomReify = (text, prop) => {
+  const t = String(text == null ? '' : text).trim();
+  if (t === '') return null;
+  if (_TF_VAR_RE.test(t)) return _tomParseUnparsed(t);
+  const m = _TOM_NUM_RE.exec(t);
+  if (m) {
+    let u = m[2] === undefined ? 'number' : m[2] === '%' ? 'percent' : m[2];
+    // `width: 0` is a LENGTH — the unitless zero is a length that dropped its
+    // unit, not a number, and the Typed OM has to hand back the unit the
+    // property would have read it with. Which unit that is, is a question the
+    // property answers, and `_TOM_ACCEPTS` is where it already answers it.
+    if (u === 'number' && parseFloat(m[1]) === 0) {
+      const accepts = _TOM_ACCEPTS.get(prop);
+      if (accepts && !accepts.has('number') && accepts.has('length')) u = 'px';
+    }
+    if (_tomUnit(u)) return new CSSUnitValue(parseFloat(m[1]), u);
+  }
+  if (/^(?:calc|min|max|clamp)\(/i.test(t)) { const v = _tomParseMath(t); if (v) return v; }
+  if (prop === 'transform' && t.toLowerCase() !== 'none') {
+    let p = null;
+    try { p = _parseTransform(t); } catch (e) { p = null; }
+    if (p && !p.none && p.items.length) {
+      const cs = p.items.map(_tomComponentOf);
+      if (cs.every((c) => c !== null)) return new CSSTransformValue(cs);
+    }
+  }
+  if (_TOM_IMAGE_RE.test(t)) return new CSSImageValue(t);
+  if (_TOM_IDENT_RE.test(t)) return new CSSKeywordValue(t);
+  return new CSSStyleValue(t);
+};
+// A value carrying a `var()` is a LIST — the literal text between the references
+// and the references themselves. Splitting it is a bracket walk, not a regex,
+// because a fallback can itself contain a `var()`.
+const _tomParseUnparsed = (text) => {
+  const out = [];
+  let buf = '';
+  const s = String(text);
+  for (let i = 0; i < s.length; i++) {
+    if (/^var\(/i.test(s.slice(i, i + 4))) {
+      let depth = 0, j = i + 3, end = -1;
+      for (; j < s.length; j++) {
+        if (s[j] === '(') depth++;
+        else if (s[j] === ')') { depth--; if (!depth) { end = j; break; } }
+      }
+      if (end < 0) break;
+      const inner = s.slice(i + 4, end);
+      const comma = _tomTopComma(inner);
+      const name = (comma < 0 ? inner : inner.slice(0, comma)).trim();
+      const fb = comma < 0 ? null : new CSSUnparsedValue(_tomUnparsedParts(inner.slice(comma + 1)));
+      if (buf) { out.push(buf); buf = ''; }
+      try { out.push(new CSSVariableReferenceValue(name, fb)); }
+      catch (e) { out.push(s.slice(i, end + 1)); }
+      i = end;
+      continue;
+    }
+    buf += s[i];
+  }
+  if (buf) out.push(buf);
+  return new CSSUnparsedValue(out);
+};
+const _tomUnparsedParts = (s) => { const v = _tomParseUnparsed(s); return Array.from(v); };
+const _tomTopComma = (s) => {
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === '(') depth++;
+    else if (s[i] === ')') depth--;
+    else if (s[i] === ',' && !depth) return i;
+  }
+  return -1;
+};
+// ── A math function back into math objects ───────────────────────────────────
+// Ordinary recursive descent over `+ - * /`, which is all a `calc()` is once the
+// tokens are in hand. `a - b` is a sum with a negation in it and `a / b` a
+// product with an inversion — the same two shapes the constructors take, so
+// nothing here has to invent a third.
+const _tomParseMath = (text) => {
+  const s = String(text);
+  let i = 0;
+  const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+  const parseExpr = () => {
+    ws();
+    let left = parseTerm();
+    if (left === null) return null;
+    const terms = [left];
+    for (;;) {
+      ws();
+      const op = s[i];
+      if (op !== '+' && op !== '-') break;
+      i++;
+      const r = parseTerm();
+      if (r === null) return null;
+      terms.push(op === '-' ? new CSSMathNegate(r) : r);
+    }
+    if (terms.length === 1) return terms[0];
+    try { return new CSSMathSum(...terms); } catch (e) { return null; }
+  };
+  const parseTerm = () => {
+    ws();
+    let left = parseFactor();
+    if (left === null) return null;
+    const factors = [left];
+    for (;;) {
+      ws();
+      const op = s[i];
+      if (op !== '*' && op !== '/') break;
+      i++;
+      const r = parseFactor();
+      if (r === null) return null;
+      factors.push(op === '/' ? new CSSMathInvert(r) : r);
+    }
+    if (factors.length === 1) return factors[0];
+    try { return new CSSMathProduct(...factors); } catch (e) { return null; }
+  };
+  const parseFactor = () => {
+    ws();
+    if (s[i] === '(') { i++; const v = parseExpr(); ws(); if (s[i] !== ')') return null; i++; return v; }
+    const fn = /^(calc|min|max|clamp)\(/i.exec(s.slice(i));
+    if (fn) {
+      const name = fn[1].toLowerCase();
+      i += fn[0].length;
+      const args = [];
+      for (;;) {
+        const v = parseExpr();
+        if (v === null) return null;
+        args.push(v);
+        ws();
+        if (s[i] === ',') { i++; continue; }
+        break;
+      }
+      if (s[i] !== ')') return null;
+      i++;
+      try {
+        if (name === 'calc') return args.length === 1 ? args[0] : null;
+        if (name === 'min') return new CSSMathMin(...args);
+        if (name === 'max') return new CSSMathMax(...args);
+        return args.length === 3 ? new CSSMathClamp(args[0], args[1], args[2]) : null;
+      } catch (e) { return null; }
+    }
+    const num = _TOM_NUM_RE.exec((/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?(?:%|[a-zA-Z]+)?/.exec(s.slice(i)) || [''])[0]);
+    if (!num || !num[0]) return null;
+    i += num[0].length;
+    const u = num[2] === undefined ? 'number' : num[2] === '%' ? 'percent' : num[2];
+    if (!_tomUnit(u)) return null;
+    return new CSSUnitValue(parseFloat(num[1]), u);
+  };
+  const top = /^calc\(/i.test(s) || /^(?:min|max|clamp)\(/i.test(s);
+  if (!top) return null;
+  const v = parseExpr();
+  ws();
+  if (v === null || i !== s.length) return null;
+  // A top-level `calc()` stays a math value even when there is only one term in
+  // it: `calc(0px)` is not `0px` to a page that asked for the specified value.
+  if (/^calc\(/i.test(s) && !(v instanceof CSSMathValue)) { try { return new CSSMathSum(v); } catch (e) { return null; } }
+  return v;
+};
+// ── StylePropertyMap ─────────────────────────────────────────────────────────
+// One class over three sources — the computed style (read-only), an element's
+// inline style, and a rule's declaration block. They differ only in where the
+// text lives, so they differ only in the source object handed to the
+// constructor and not in a single line of the map itself.
+const _tomPropName = (prop) => {
+  const raw = String(prop == null ? '' : prop).trim();
+  if (raw.startsWith('--')) return raw;
+  const lower = raw.toLowerCase();
+  if (!_CSS_KNOWN_PROPS.has(lower) && !_CSS_KNOWN_PROPS.has(raw))
+    throw new TypeError("Invalid propertyName: '" + raw + "'");
+  return lower;
+};
+// The gate every `set()` passes through, and the reason this quest is small: the
+// per-property validity chain #442 routed the whole cascade through is exactly
+// the question `set()` has to ask, and `CSS.supports` already asks it.
+// The gate every `set()` passes through — and it asks the DECLARATION BLOCK, not
+// `CSS.supports`. They are two answers to one question and #442's whole arc was
+// about what that costs: `CSS.supports('width', '-3.14%')` says yes while
+// `style.width = '-3.14%'` silently keeps the old value, so a `set()` gated on
+// the first reports success for a write that never happened. A scratch
+// declaration is the same parser the real write will meet, so it cannot disagree
+// with it.
+let _tomProbeDecl = null;
+const _tomValueOk = (name, text) => {
+  const t = String(text).trim();
+  if (t === '') return false;                  // the empty string is no property's value
+  if (name.startsWith('--')) return true;
+  try {
+    if (!_tomProbeDecl) _tomProbeDecl = globalThis.document.createElement('div').style;
+    const d = _tomProbeDecl;
+    d.setProperty(name, '');
+    d.setProperty(name, t);
+    const got = d.getPropertyValue(name);
+    d.setProperty(name, '');
+    if (got !== '' && got != null) return true;
+  } catch (e) {}
+  // A shorthand whose getPropertyValue reconstruction this engine does not do
+  // reads back empty even when it stored fine — for those the second opinion is
+  // the only one there is.
+  if (_CSS_WIDE.has(t.toLowerCase()) || _TF_VAR_RE.test(t)) return true;
+  try { return !!globalThis.CSS.supports(name, t) && !_tomTypedSyntax(t); } catch (e) { return false; }
+};
+// …but only where the value is not one this realm is asking about. A bare
+// number, dimension or transform list reaching the fallback means the block
+// really did refuse it.
+const _TOM_TYPED_SYNTAX_RE = /^(?:[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?(?:%|[a-zA-Z]+)?|(?:calc|min|max|clamp)\([\s\S]*\)|(?:translate|scale|rotate|skew|matrix|perspective)[\w]*\([\s\S]*\))$/;
+const _tomTypedSyntax = (t) => _TOM_TYPED_SYNTAX_RE.test(String(t).trim());
+// ── A typed value knows its TYPE, and that is a question about the PROPERTY ──
+// `CSS.supports` is the right gate and it is the one `set()` asks, but it answers
+// `true` for any well-formed value of a property this engine has no grammar for
+// — and "no grammar" is most of them. That is invisible in the string world
+// (nobody writes `opacity: 3.14rad`) and it is the single largest bucket in the
+// Typed OM realm, because `testsuite.js` tests EVERY property against EVERY
+// syntax and expects a TypeError for all the ones it does not take.
+//
+// A full per-property grammar is not the answer to that. Inverting the question
+// is: instead of "which types does this property accept", ask "which properties
+// accept an ANGLE at all" — and for angle, time, frequency, resolution, flex and
+// transform the answer is a short CLOSED list, so everything not on it is a
+// confident no. Only length/percentage/number need per-property knowledge, and
+// there this engine's own computed-value tables already have it.
+const _TOM_CLOSED = {
+  angle: new Set(['rotate', 'offset-rotate', 'transform', 'image-orientation',
+    'glyph-orientation-vertical', 'glyph-orientation-horizontal', 'font-style',
+    'text-emphasis-position', 'gradient']),
+  time: new Set(['transition-delay', 'transition-duration', 'animation-delay',
+    'animation-duration', 'transition', 'animation', 'animation-range',
+    'view-timeline-inset', 'scroll-timeline']),
+  frequency: new Set([]),
+  resolution: new Set(['image-resolution', 'image-rendering']),
+  flex: new Set(['grid-template-columns', 'grid-template-rows', 'grid-auto-columns',
+    'grid-auto-rows', 'grid-template', 'grid', 'grid-template-areas']),
+};
+// The families whose accepted types this engine already knows, because its
+// computed-value machinery had to know them first. Reusing those sets rather
+// than restating them means the gate cannot drift away from the cascade.
+const _TOM_ACCEPTS = (() => {
+  const m = new Map();
+  const put = (props, types) => { for (const p of props) m.set(p, new Set(types)); };
+  put(_LENGTH_COMPUTED_PROPS, ['length', 'percent']);
+  put(_SIZE_COMPUTED_PROPS, ['length', 'percent']);
+  put(_TIME_COMPUTED_PROPS, ['time']);
+  put(_INTEGER_COMPUTED_PROPS, ['number']);
+  put(_COLOR_PROPS, []);                                   // a colour is never a number
+  put(['opacity', 'fill-opacity', 'stroke-opacity', 'stop-opacity', 'flood-opacity',
+    'shape-image-threshold'], ['number', 'percent']);
+  put(['flex-grow', 'flex-shrink', 'font-weight', 'orphans', 'widows', 'column-count',
+    'animation-iteration-count', 'stroke-miterlimit', 'fill-rule', 'z-index', 'order',
+    'font-size-adjust', 'math-depth'], ['number']);
+  put(['border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
+    'border-block-start-width', 'border-block-end-width', 'border-inline-start-width',
+    'border-inline-end-width', 'outline-width', 'perspective', 'shape-margin',
+    'text-underline-offset', 'text-decoration-thickness', 'overflow-clip-margin',
+    'stroke-width', 'stroke-dashoffset'], ['length', 'percent']);
+  put(['font-size', 'vertical-align', 'background-position-x', 'background-position-y',
+    'object-position', 'perspective-origin', 'transform-origin'], ['length', 'percent']);
+  put(['line-height', 'tab-size'], ['number', 'length', 'percent']);
+  put(['transform'], []);
+  return m;
+})();
+// The one type that is not a number at all: a transform list belongs to exactly
+// one property, and every other property in the suite tests it as invalid.
+const _tomTypeGate = (name, v) => {
+  if (v instanceof CSSTransformValue) return name === 'transform' || name === 'will-change';
+  if (!(v instanceof CSSNumericValue)) return true;
+  const t = v.type();
+  const bases = _TOM_BASES.filter((k) => t[k]);
+  if (bases.length > 1 || (bases.length === 1 && t[bases[0]] !== 1)) return false;  // `px²` is nobody's value
+  let base = bases.length ? bases[0] : 'number';
+  if (base === 'percent' && t.percentHint) base = t.percentHint;
+  const accepts = _TOM_ACCEPTS.get(name);
+  if (accepts) return accepts.has(base);
+  const closed = _TOM_CLOSED[base];
+  return closed ? closed.has(name) : true;
+};
+const _tomComputedSource = (el) => ({
+  read(kebab) {
+    if (kebab === 'transform') {
+      const list = globalThis._computedTfList(el);
+      if (list != null && list !== '') return list;
+    }
+    try { return getComputedStyle(el).getPropertyValue(kebab); } catch (e) { return ''; }
+  },
+  names() {
+    const out = [];
+    try { const cs = getComputedStyle(el); for (let i = 0; i < cs.length; i++) out.push(cs.item(i)); } catch (e) {}
+    return out;
+  },
+  cls: 'StylePropertyMapReadOnly',
+});
+const _tomDeclSource = (decl) => ({
+  read(kebab) { try { return decl.getPropertyValue(kebab); } catch (e) { return ''; } },
+  names() { const out = []; try { for (let i = 0; i < decl.length; i++) out.push(decl.item(i)); } catch (e) {} return out; },
+  write(kebab, text) { decl.setProperty(kebab, text); },
+  remove(kebab) { decl.removeProperty(kebab); },
+  clear() { try { decl.cssText = ''; } catch (e) {} },
+  cls: 'StylePropertyMap',
+});
 class StylePropertyMapReadOnly {
-  constructor(el) { Object.defineProperty(this, '_el', { value: el }); }
-  get size() { try { return getComputedStyle(this._el).length; } catch (e) { return 0; } }
+  constructor(src) { Object.defineProperty(this, '_s', { value: src }); }
+  get size() { return this._s.names().length; }
   get(prop) {
-    if (arguments.length < 1) throw new TypeError("Failed to execute 'get' on 'StylePropertyMapReadOnly': 1 argument required, but only 0 present.");
-    const v = _typedOmValue(this._el, prop);
-    return v === '' || v == null ? undefined : new CSSStyleValue(v);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'get' on '" + this._s.cls + "': 1 argument required, but only 0 present.");
+    const name = _tomPropName(prop);
+    const v = this._s.read(name);
+    return v === '' || v == null ? undefined : _tomReify(v, name);
   }
-  getAll(prop) { const v = this.get(prop); return v === undefined ? [] : [v]; }
-  has(prop) { return this.get(prop) !== undefined; }
-  *[Symbol.iterator]() {
-    let cs; try { cs = getComputedStyle(this._el); } catch (e) { return; }
-    for (let i = 0; i < cs.length; i++) { const n = cs.item(i); yield [n, this.getAll(n)]; }
+  getAll(prop) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'getAll' on '" + this._s.cls + "': 1 argument required, but only 0 present.");
+    const name = _tomPropName(prop);
+    const v = this._s.read(name);
+    if (v === '' || v == null) return [];
+    // A list-valued property is a comma-separated list of values, and each entry
+    // reifies on its own. Everything else is one value that happens to have no
+    // commas at the top level.
+    const parts = _tomTopSplit(String(v));
+    return parts.length > 1 ? parts.map((p) => _tomReify(p, name)) : [_tomReify(v, name)];
   }
+  has(prop) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'has' on '" + this._s.cls + "': 1 argument required, but only 0 present.");
+    return this.get(prop) !== undefined;
+  }
+  *[Symbol.iterator]() { for (const n of this._s.names()) yield [n, this.getAll(n)]; }
   entries() { return this[Symbol.iterator](); }
   *keys() { for (const [k] of this) yield k; }
   *values() { for (const [, v] of this) yield v; }
   forEach(cb, thisArg) { for (const [k, v] of this) cb.call(thisArg, v, k, this); }
 }
 globalThis.StylePropertyMapReadOnly = StylePropertyMapReadOnly;
-Element.prototype.computedStyleMap = function computedStyleMap() {
-  return new StylePropertyMapReadOnly(this);
+const _tomTopSplit = (s) => {
+  const out = [];
+  let depth = 0, buf = '', q = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { buf += c; if (c === q && s[i - 1] !== '\\') q = ''; continue; }
+    if (c === '"' || c === "'") { q = c; buf += c; continue; }
+    if (c === '(') depth++;
+    else if (c === ')') depth--;
+    else if (c === ',' && !depth) { out.push(buf.trim()); buf = ''; continue; }
+    buf += c;
+  }
+  if (buf.trim()) out.push(buf.trim());
+  return out;
 };
+// ── Normalization: an object back into CSS text ──────────────────────────────
+// §property-style-value-normalization, and the whole reason `set()` can throw:
+// a value has to be a value THIS property would accept, and a `CSSUnitValue` in
+// degrees is not a width no matter how well-formed it is.
+// ── Out of RANGE is not the same as invalid ─────────────────────────────────
+// `width: -3.14%` is not a width — but `width: calc(-3.14%)` IS, because CSS
+// Values §range-checking only rejects an out-of-range LITERAL at parse time; a
+// math function carries its negative all the way to used-value time and clamps
+// there. So a typed negative on a non-negative property does not throw, it puts
+// on a `calc()` — which is why the suite expects a `CSSMathSum` back out of a
+// value it handed in as a `CSSUnitValue`.
+const _tomStorable = (name, text, values) => {
+  if (_tomValueOk(name, text)) return text;
+  const negative = values.length === 1 && values[0] instanceof CSSNumericValue
+    && (() => { const s = values[0]._canonical(); return s && s.length === 1 && s[0].value < 0; })();
+  if (negative) { const wrapped = 'calc(' + text + ')'; if (_tomValueOk(name, wrapped)) return wrapped; }
+  throw new TypeError("Failed to execute 'set' on 'StylePropertyMap': Invalid value for property '" + name + "': " + text);
+};
+const _tomNormalize = (name, value) => {
+  if (value instanceof CSSStyleValue) return String(value);
+  if (value === null || value === undefined)
+    throw new TypeError("Failed to execute 'set': value must not be null.");
+  if (typeof value === 'object' && !(value instanceof CSSVariableReferenceValue) && typeof value.toString !== 'function')
+    throw new TypeError("Failed to execute 'set': invalid value.");
+  return String(value);
+};
+class StylePropertyMap extends StylePropertyMapReadOnly {
+  set(prop, ...values) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'set' on 'StylePropertyMap': 1 argument required, but only 0 present.");
+    const name = _tomPropName(prop);
+    for (const v of values) if (!_tomTypeGate(name, v))
+      throw new TypeError("Failed to execute 'set' on 'StylePropertyMap': Invalid type for property '" + name + "'.");
+    const text = values.map((v) => _tomNormalize(name, v)).join(', ');
+    this._s.write(name, _tomStorable(name, text, values));
+  }
+  append(prop, ...values) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'append' on 'StylePropertyMap': 1 argument required, but only 0 present.");
+    const name = _tomPropName(prop);
+    for (const v of values) if (!_tomTypeGate(name, v))
+      throw new TypeError("Failed to execute 'append' on 'StylePropertyMap': Invalid type for property '" + name + "'.");
+    const add = values.map((v) => _tomNormalize(name, v)).join(', ');
+    const cur = this._s.read(name);
+    const text = cur ? String(cur) + ', ' + add : add;
+    if (!_tomValueOk(name, text))
+      throw new TypeError("Failed to execute 'append' on 'StylePropertyMap': Invalid value for property '" + name + "': " + add);
+    this._s.write(name, text);
+  }
+  delete(prop) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'delete' on 'StylePropertyMap': 1 argument required, but only 0 present.");
+    this._s.remove(_tomPropName(prop));
+  }
+  clear() { this._s.clear(); }
+}
+globalThis.StylePropertyMap = StylePropertyMap;
+// `assert_class_string` — the assertion this whole realm leans on — asks
+// `Object.prototype.toString.call(v)`, which answers `[object Object]` for a
+// plain class and the interface's own name only when the prototype carries a
+// `Symbol.toStringTag`. Without these every "must be a CSSUnitValue" reads as a
+// failure on a value that IS one.
+for (const [n, C] of [
+  ['CSSStyleValue', CSSStyleValue], ['CSSKeywordValue', CSSKeywordValue],
+  ['CSSNumericValue', CSSNumericValue], ['CSSUnitValue', CSSUnitValue],
+  ['CSSNumericArray', CSSNumericArray], ['CSSMathValue', CSSMathValue],
+  ['CSSMathSum', CSSMathSum], ['CSSMathProduct', CSSMathProduct],
+  ['CSSMathNegate', CSSMathNegate], ['CSSMathInvert', CSSMathInvert],
+  ['CSSMathMin', CSSMathMin], ['CSSMathMax', CSSMathMax], ['CSSMathClamp', CSSMathClamp],
+  ['CSSUnparsedValue', CSSUnparsedValue], ['CSSVariableReferenceValue', CSSVariableReferenceValue],
+  ['CSSImageValue', CSSImageValue], ['CSSTransformValue', CSSTransformValue],
+  ['CSSTransformComponent', CSSTransformComponent], ['CSSTranslate', CSSTranslate],
+  ['CSSRotate', CSSRotate], ['CSSScale', CSSScale], ['CSSSkew', CSSSkew],
+  ['CSSSkewX', CSSSkewX], ['CSSSkewY', CSSSkewY], ['CSSPerspective', CSSPerspective],
+  ['CSSMatrixComponent', CSSMatrixComponent],
+  ['StylePropertyMapReadOnly', StylePropertyMapReadOnly], ['StylePropertyMap', StylePropertyMap],
+]) {
+  Object.defineProperty(C.prototype, Symbol.toStringTag, { value: n, configurable: true });
+  if (typeof _markNative === 'function') { try { _markNative(C); } catch (e) {} }
+}
+Element.prototype.computedStyleMap = function computedStyleMap() {
+  return new StylePropertyMapReadOnly(_tomComputedSource(this));
+};
+// The inline style map is the SAME declaration block `el.style` is — one value
+// with two faces, and #442 learned the hard way what happens when two faces of
+// one value drift. So this one reads and writes straight through `el.style`
+// rather than keeping a copy of anything.
+Object.defineProperty(Element.prototype, 'attributeStyleMap', {
+  configurable: true,
+  get() {
+    let m = this._tomInlineMap;
+    if (!m) {
+      m = new StylePropertyMap(_tomDeclSource(this.style));
+      Object.defineProperty(this, '_tomInlineMap', { value: m, configurable: true });
+    }
+    return m;
+  },
+});
 globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
   // WebIDL brand check: a Window operation called with a `this` that is not the global
   // (e.g. `getComputedStyle.call({})`) throws TypeError. Unbound calls (`this` is
@@ -31776,6 +32872,41 @@ globalThis.CSS = {
     return _serializeCssIdent(String(ident));
   }
 };
+// ── The numeric factory functions ────────────────────────────────────────────
+// css-typed-om §numeric-factory: one function per unit, so `CSS.px(4)` is the
+// whole of what a page needs to write to say "four pixels" as a value rather
+// than as a string. The FACTORY keeps the unit's conventional capitals
+// (`CSS.Q`, `CSS.Hz`, `CSS.kHz`) and the value it produces reports the
+// lowercase canonical spelling (`CSS.Q(30).unit === 'q'`) — the same split the
+// unit table already makes, since CSS units are case-insensitive and only their
+// canonical form is stable.
+for (const factory of ['number', 'percent', 'em', 'ex', 'ch', 'ic', 'rem', 'lh', 'rlh',
+  'vw', 'vh', 'vi', 'vb', 'vmin', 'vmax', 'cm', 'mm', 'Q', 'in', 'pt', 'pc', 'px',
+  'deg', 'grad', 'rad', 'turn', 's', 'ms', 'Hz', 'kHz', 'dpi', 'dpcm', 'dppx', 'fr']) {
+  const unit = factory.toLowerCase();
+  const fn = function (value) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute '" + factory + "' on 'CSS': 1 argument required, but only 0 present.");
+    return new globalThis.CSSUnitValue(Number(value), unit);
+  };
+  Object.defineProperty(fn, 'name', { value: factory, configurable: true });
+  Object.defineProperty(fn, 'length', { value: 1, configurable: true });
+  globalThis.CSS[factory] = _markNative(fn);
+}
+// A rule's DECLARED style map — the third source, and the same class again,
+// because a rule's declaration block answers `getPropertyValue`/`setProperty`
+// exactly as an element's inline one does.
+Object.defineProperty(globalThis.CSSStyleRule.prototype, 'styleMap', {
+  configurable: true,
+  get() {
+    let m = this._tomDeclMap;
+    if (!m) {
+      m = new StylePropertyMap(_tomDeclSource(this.style));
+      Object.defineProperty(this, '_tomDeclMap', { value: m, configurable: true });
+    }
+    return m;
+  },
+});
 // WebIDL: a namespace object (CSS) is a NON-enumerable, writable, configurable global
 // data property (a plain assignment is enumerable, which idlharness flags). It stays a
 // plain extensible object.
@@ -40573,7 +41704,12 @@ if (!globalThis.crypto.subtle) {
     // animations taken back out — the same resolution the cascade performs,
     // reusing the same per-element guard so the nested lookup terminates.
     let base = null;
-    const values = _waEffectValueMap(eff, c, p, (name) => () => {
+    // What lands in the inline style is a SPECIFIED value — the third
+    // serialization of an animated transform, and the one the page goes on to
+    // render and re-serialize. `_withTfSpec` asks the interpolator for it; the
+    // underlying value it may fall back to is read the ordinary way, since a
+    // value coming back out of the computed style is not this animation's.
+    const values = _withTfSpec(() => _waEffectValueMap(eff, c, p, (name) => () => {
       _waUnderlyingOf.add(target);
       try {
         if (base === null) base = globalThis.getComputedStyle(target);
@@ -40581,11 +41717,16 @@ if (!globalThis.crypto.subtle) {
         return (v === undefined || v === null) ? '' : v;
       } catch (e) { return ''; }
       finally { _waUnderlyingOf.delete(target); }
-    });
+    }));
     if (!values) return;
-    for (const name of Object.keys(values)) {
-      try { target.style[name] = values[name]; } catch (e) {}
-    }
+    // §commit-computed-styles sets each declaration to a VALUE. Ours travels as
+    // text through `style[name]`, so the one thing that must not happen on the
+    // way in is the parser's re-spelling — see `_TF_DISP_VAL`.
+    globalThis._withTfValue(() => {
+      for (const name of Object.keys(values)) {
+        try { target.style[name] = values[name]; } catch (e) {}
+      }
+    });
   });
   _waTag(Animation, 'Animation');
   _exposeIface('Animation', Animation); _markNative(Animation);
@@ -41221,7 +42362,7 @@ if (!globalThis.crypto.subtle) {
       // other spelling names an AXIS and so answers as `rotate3d` (#438).
       if (A[i].name !== 'rotate' && _WA_TF_ROT.has(A[i].name)) {
         const r = _waTfRotInterp(_waTfRotOf(A[i]), _waTfRotOf(B[i]), t);
-        if (r !== null) { out.push(r); continue; }
+        if (r !== null) { out.push(_waTfSpec ? _waTfRotSpec(A[i], B[i], r) : r); continue; }
       }
       // Argument by argument, NOT function-string against function-string. The
       // whole-string route runs the generic skeleton kit, which compares the
@@ -41238,14 +42379,91 @@ if (!globalThis.crypto.subtle) {
     }
     return out.join(' ');
   };
+  // Latched exactly as `_tfWantList` is, and for the same reason: the animated
+  // value has to be resolved by the ORDINARY machinery — keyframes, easing,
+  // alignment, the underlying value — and only its final spelling differs.
+  let _waTfSpec = false;
+  const _withTfSpec = (fn) => {
+    const was = _waTfSpec;
+    _waTfSpec = true;
+    try { return fn(); }
+    finally { _waTfSpec = was; }
+  };
+  // A rotation the author spelled by its axis keeps that spelling when both
+  // sides did — the interpolation still runs as `rotate3d` (an axis cannot be
+  // padded, #438), and only the answer is written back in the author's terms.
+  // Sliding an angle along a shared line can hand it back about the OPPOSITE
+  // direction, and about the opposite direction the same turn is the negated
+  // angle — so the axis is checked, not assumed.
+  const _waTfRotSpec = (a, b, s) => {
+    if (a.orig !== b.orig) return s;
+    const ax = _WA_TF_ROT_AXIS[a.orig];
+    if (!ax) return s;
+    const m = /^rotate3d\(([^)]*)\)$/.exec(s);
+    if (!m) return s;
+    const p = m[1].split(',').map((x) => x.trim());
+    if (p.length !== 4) return s;
+    const v = p.slice(0, 3).map(parseFloat);
+    const deg = parseFloat(p[3]);
+    if (!v.every((n) => isFinite(n)) || !isFinite(deg)) return s;
+    const same = v.every((n, i) => n === ax[i]);
+    const flip = v.every((n, i) => n === -ax[i]);
+    if (!same && !flip) return s;
+    return (_TF_DISP_VAL[a.orig] || a.orig) + '(' + _wa6sig(flip ? -deg : deg) + 'deg)';
+  };
+  // ── The SPECIFIED value keeps the author's own function ───────────────────
+  // A third serialization of one animated transform, and the one a real page
+  // sees: `commitStyles()` freezes an animation into the inline style, and what
+  // it writes is what the page then renders, serializes and hands to the next
+  // script. The computed list answers in PRIMITIVES because that is what the two
+  // sides interpolated IN (#444); the specified value answers in the function
+  // the author actually wrote — but only when BOTH sides wrote the same one.
+  // `translateX(0px)` → `translateX(50px)` is `translateX(25px)`; the moment the
+  // two disagree there is no author's spelling left to keep and the primitive is
+  // the only honest answer (`translateY(0%)` → `translateX(50%)` is a
+  // `translate`). That is the whole rule, and it is the same sentence #444 wrote
+  // one layer up: a pair serializes as what the two sides AGREE on.
+  //
+  // Which argument of the primitive an axis spelling wants back is fixed by the
+  // spelling itself — `translateX` is the x of a `translate`, `scaleZ` the z of a
+  // `scale3d` — so this is `_WA_TF_PRIM` read backwards.
+  const _WA_TF_AXIS_ARG = {
+    translatex: 0, translatey: 1, translatez: 2,
+    scalex: 0, scaley: 1, scalez: 2,
+    skewx: 0, skewy: 1,
+  };
+  // A trailing argument that says nothing is left off. `translate`'s second
+  // argument defaults to zero, `skew`'s to no angle at all, and `scale`'s to the
+  // FIRST — which is why `scale(1.5, 1.5)` is `scale(1.5)` but `scale(1.5, 2)`
+  // is not. The 3D functions never elide: `translate3d(0px, 0px, 0px)` names
+  // three axes and dropping two would name a different function.
+  const _waTfArgIsZero = (s) => {
+    const t = String(s).trim();
+    return /^[+-]?(?:\d+\.?\d*|\.\d+)(?:px|%|deg|rad|grad|turn)?$/i.test(t) && parseFloat(t) === 0;
+  };
+  const _waTfTrim = (name, args) => {
+    if (args.length !== 2) return args;
+    if (name === 'scale') return args[0] === args[1] ? [args[0]] : args;
+    if (name === 'translate' || name === 'skew') return _waTfArgIsZero(args[1]) ? [args[0]] : args;
+    return args;
+  };
   // The spelling an interpolated pair answers in. It is the shared PRIMITIVE,
   // except that `skewX`/`skewY` are primitives themselves: two `skewX`es stay
   // `skewX`, and only a mixed pair falls back to the two-argument `skew`.
   const _waTfSerOne = (a, b, args) => {
-    if (a.name === 'skew' && a.orig === b.orig) {
-      if (a.orig === 'skewx') return 'skewX(' + args[0] + ')';
-      if (a.orig === 'skewy') return 'skewY(' + args[1] + ')';
+    if (a.orig === b.orig) {
+      // The `skew` half of this holds for the COMPUTED list too — `skewX`/`skewY`
+      // are primitives in their own right (#444) — so it is not gated.
+      if (a.name === 'skew' || (_waTfSpec && _WA_TF_AXIS_ARG[a.orig] !== undefined)) {
+        const j = _WA_TF_AXIS_ARG[a.orig];
+        if (j !== undefined && args[j] !== undefined)
+          return (_TF_DISP_VAL[a.orig] || a.orig) + '(' + args[j] + ')';
+      }
+      if (_waTfSpec && a.orig === a.name)
+        return (_TF_DISP_VAL[a.name] || a.name) + '(' + _waTfTrim(a.name, args).join(', ') + ')';
     }
+    if (_waTfSpec)
+      return (_TF_DISP_VAL[a.name] || a.name) + '(' + _waTfTrim(a.name, args).join(', ') + ')';
     return (_TF_DISP[a.name] || a.name) + '(' + args.join(', ') + ')';
   };
   const _waTfSer = (items) => items
