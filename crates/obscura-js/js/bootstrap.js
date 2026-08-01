@@ -884,6 +884,50 @@ const _isBalancedDeclValue = (value) => {
   }
   return true;
 };
+// Split a declaration block into its declarations at TOP-LEVEL semicolons only
+// (css-syntax-3 §consume-a-list-of-declarations). A `;` inside a string, a
+// comment, or a function/block belongs to the VALUE, not between declarations —
+// and the commonest value on the real web that contains one is a data URI:
+//
+//   style="background: url(data:image/svg+xml;base64,PHN2Zy8+)"
+//
+// Split that text on every `;` and the declaration is torn in half: the first
+// half is `background: url(data:image/svg+xml` (an unclosed url(), garbage) and
+// the second half, `base64,PHN2Zy8+)`, has a colon in it and so parses as a
+// declaration of its own for a property named `base64,PHN2Zy8+)`. Both halves
+// are then junk, and the image never loads. `content: "a; b"` fails the same way.
+// EOF closes every open block/string, which is why nothing here reports failure:
+// an unterminated construct simply runs to the end of the text.
+const _splitDeclParts = (text) => {
+  const s = String(text == null ? '' : text);
+  const out = [];
+  const stack = [];
+  const n = s.length;
+  let start = 0, i = 0;
+  while (i < n) {
+    const c = s[i];
+    if (c === '\\' && i + 1 < n) { i += 2; continue; }        // escape — the next char is literal
+    if (c === '/' && s[i + 1] === '*') {                      // comment
+      i += 2;
+      while (i < n && !(s[i] === '*' && s[i + 1] === '/')) i++;
+      i += 2; continue;
+    }
+    if (c === '"' || c === "'") {                             // string
+      const q = c; i++;
+      while (i < n && s[i] !== q) { if (s[i] === '\\') i++; i++; }
+      i++; continue;
+    }
+    if (c === '(' || c === '[' || c === '{') stack.push(c);
+    else if (c === ')' || c === ']' || c === '}') {
+      const top = stack[stack.length - 1];
+      if ((c === ')' && top === '(') || (c === ']' && top === '[') || (c === '}' && top === '{')) stack.pop();
+    }
+    else if (c === ';' && stack.length === 0) { out.push(s.slice(start, i)); start = i + 1; }
+    i++;
+  }
+  out.push(s.slice(start));
+  return out;
+};
 // Parse a declaration block (an inline style string / cssText) into an ordered
 // list of { name, value, important }. Invalid custom-property names are dropped;
 // standard names are ASCII-lowercased (custom names keep their case); standard
@@ -1087,7 +1131,7 @@ const _canonFontFaceDescriptor = (name, value) =>
   : _canonFontPct(value, true);   // ascent-override / descent-override / line-gap-override
 const _parseStyleDecls = (text, opts) => {
   const out = [];
-  for (const part of String(text == null ? '' : text).split(';')) {
+  for (const part of _splitDeclParts(text)) {
     const idx = part.indexOf(':');
     if (idx < 0) continue;
     let name = part.slice(0, idx).trim();
@@ -1551,7 +1595,13 @@ class CSSStyleDeclaration {
     if (_csArmHook) _csArmHook();
     // A transition declared purely through the CSSOM has no style attribute to
     // be found by, so the element registers itself here — see `_csInlineEls`.
-    if (this._ownerEl !== undefined) {
+    // `!== undefined` is not the question — this runs on the PROXY, whose get
+    // trap answers an unknown member with `''` (the CSSOM "unset property"
+    // answer). So a CSSRule's declaration, which has no owning element, reported
+    // `_ownerEl === ''`, walked in here, and threw `Invalid value used as weak
+    // map key` out of `cssRule.style.setProperty(…)` — a real thrown TypeError
+    // on every CSSOM edit to a stylesheet rule. Ask for an object.
+    if (this._ownerEl !== null && typeof this._ownerEl === 'object') {
       // A CSSOM write does not reach the style attribute, so the style-change
       // fingerprint cannot see it by reading attributes — the element carries its
       // own write counter instead, and because the fingerprint walks ancestors,
@@ -10855,25 +10905,21 @@ const _serializeDeclList = (decl) => {
 };
 const _serializeDeclBlock = (decl) => _serializeDeclList(decl).join(' ');
 const _cssParseDecls = (body) => {
-  // body is the inside of a `{ ... }` block (or an inline style string).
+  // The CASCADE-shape view of a declaration block (the inside of a `{ … }` rule,
+  // or a `style=""` attribute): `{ name: {value, important} }` with shorthands
+  // expanded into their longhands, which is what `_buildCascade` /
+  // `_cascadeResolve` — and so `getComputedStyle` — read.
+  //
+  // It goes through `_parseStyleDecls`, the SAME parser the CSSOM uses, because
+  // there must not be two answers to "is this declaration valid?". A block that
+  // reads `transform: translate(30px); transform: 30px` has ONE valid
+  // declaration in it; the second is garbage and is dropped at parse time, so
+  // the first still stands. Parse it a second, laxer way and the cascade keeps
+  // the garbage AND loses the good declaration it should have lost to — the
+  // computed value disagreeing with the very `cssText` that produced it.
+  // `_parseStyleDecls` also canonicalizes, so both views agree on the value too.
   const out = {};
-  for (const part of String(body).split(';')) {
-    const idx = part.indexOf(':');
-    if (idx < 0) continue;
-    const rawName = part.slice(0, idx).trim();
-    if (!rawName) continue;
-    let value = part.slice(idx + 1).trim();
-    let important = false;
-    const m = /!\s*important\s*$/i.exec(value);
-    if (m) { important = true; value = value.slice(0, m.index).trim(); }
-    // Custom properties keep their case; standard properties are ASCII-lowercased.
-    let name = rawName.startsWith('--') ? rawName : rawName.toLowerCase();
-    if (_RADIUS_ALIAS[name]) name = _RADIUS_ALIAS[name];   // -webkit-border(-*)-radius → canonical (Compat legacy alias)
-    // A custom property with an invalid <declaration-value> is dropped — the
-    // earlier valid declaration of the same name (if any) is preserved.
-    if (name.startsWith('--') && !_isBalancedDeclValue(value)) continue;
-    _expandDeclInto(out, name, value, important);
-  }
+  for (const d of _parseStyleDecls(body)) _expandDeclInto(out, d.name, d.value, d.important);
   return out;
 };
 const _cssSplitRules = (cssText) => {
@@ -21843,6 +21889,11 @@ const _TF_DISP = {
   translatex: 'translateX', translatey: 'translateY', translatez: 'translateZ',
   rotatex: 'rotateX', rotatey: 'rotateY', rotatez: 'rotateZ',
 };
+// The same table for the COMPUTED list. The SPECIFIED value lowercases `skewX`
+// and `scaleZ` (`transform-valid.html` pins `skewX(90deg)` → `skewx(90deg)`),
+// but the computed value the Typed OM reports keeps the camelCase. Two
+// serializers of two different values — not one with an inconsistency in it.
+const _TF_DISP_LIST = Object.assign({}, _TF_DISP, { skewx: 'skewX', skewy: 'skewY', scalez: 'scaleZ' });
 const _TF_VAR_RE = /\b(?:var|env)\(/i;
 // Split a transform-function's argument list on top-level commas (parens kept whole).
 const _splitTfArgs = (s) => {
@@ -22045,7 +22096,7 @@ const _canonTransform = (value, el, computed) => {
     for (const it of p.items) {
       const spec = _TF_FUNCS[it.name];
       const parts = it.args.map((arg, i) => _tfCompArg(arg, _tfArgType(spec, i), el));
-      outl.push((_TF_DISP[it.name] || it.name) + '(' + parts.join(', ') + ')');
+      outl.push((_TF_DISP_LIST[it.name] || it.name) + '(' + parts.join(', ') + ')');
     }
     return outl.join(' ');
   }
@@ -24597,8 +24648,21 @@ const _buildCascadeUncached = (el) => {
       }
     }
     // Inline style — highest author source at each importance level.
+    // …but only while the LIVE declaration does not exist yet. `el.style` and
+    // `style=""` are one declaration block with two faces: the live one is
+    // seeded from the attribute the first time anything touches `.style`, and
+    // `setAttribute`/`removeAttribute` keep it in step from then on. What does
+    // NOT happen is the reverse — a per-property CSSOM write is deliberately
+    // not reflected back into the attribute (`_styleWriteback` is gated on
+    // there being a custom element to observe it). So once `.style` has been
+    // touched, the attribute is a STALE COPY, and reading both sources means
+    // `div.style.animation = ''` removes the animation from one of them and
+    // leaves it running in the other. Same lesson as the two parsers above:
+    // when one value has two homes, read the live one and only the live one.
     let inlineText = '';
-    try { inlineText = el.getAttribute && el.getAttribute('style'); } catch { inlineText = ''; }
+    if (!el._styleSynced) {
+      try { inlineText = el.getAttribute && el.getAttribute('style'); } catch { inlineText = ''; }
+    }
     if (inlineText) {
       const decls = _cssParseDecls(inlineText);
       // @page (and other at-rule-only) descriptors are invalid as element properties:
@@ -24736,6 +24800,56 @@ const _CSS_KNOWN_PROPS = (() => {
 // value are appended per element (see _computedCustomPropNames); these standard
 // names are element-independent so they are hoisted here.
 const _COMPUTED_STD_NAMES = Object.keys(_GCS_DEFAULTS).filter((k) => /^-?[a-z][a-z-]*$/.test(k));
+// ── CSS Typed OM: the computed style as a map ────────────────────────────────
+// `getComputedStyle(el).transform` is the RESOLVED value — a single matrix,
+// which has forgotten which functions made it (#436). `computedStyleMap()` is
+// the only way a page can ask for the value one step earlier: the computed
+// LIST, `translate(25px, 0px)` where getComputedStyle says
+// `matrix(1, 0, 0, 1, 25, 0)`. That is why `transform` is the one property here
+// that does not simply forward to getComputedStyle — for every other property
+// the computed value and the resolved value are the same string.
+//
+// CAP, named honestly: the values are plain `CSSStyleValue`s, not the typed
+// subclasses (`CSSUnitValue`, `CSSTransformValue`, `CSSKeywordValue`, …).
+// `toString()`, `get`/`getAll`/`has`/`size` and iteration are real; arithmetic
+// on a value is not, and a `CSSUnitValue` that cannot add would be worse than
+// no `CSSUnitValue` at all.
+class CSSStyleValue {
+  constructor(v) { Object.defineProperty(this, '_v', { value: String(v == null ? '' : v) }); }
+  toString() { return this._v; }
+}
+globalThis.CSSStyleValue = CSSStyleValue;
+const _typedOmValue = (el, prop) => {
+  const kebab = String(prop == null ? '' : prop);
+  if (kebab === 'transform') {
+    const list = globalThis._computedTfList(el);
+    if (list != null && list !== '') return list;
+  }
+  try { return getComputedStyle(el).getPropertyValue(kebab); } catch (e) { return ''; }
+};
+class StylePropertyMapReadOnly {
+  constructor(el) { Object.defineProperty(this, '_el', { value: el }); }
+  get size() { try { return getComputedStyle(this._el).length; } catch (e) { return 0; } }
+  get(prop) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'get' on 'StylePropertyMapReadOnly': 1 argument required, but only 0 present.");
+    const v = _typedOmValue(this._el, prop);
+    return v === '' || v == null ? undefined : new CSSStyleValue(v);
+  }
+  getAll(prop) { const v = this.get(prop); return v === undefined ? [] : [v]; }
+  has(prop) { return this.get(prop) !== undefined; }
+  *[Symbol.iterator]() {
+    let cs; try { cs = getComputedStyle(this._el); } catch (e) { return; }
+    for (let i = 0; i < cs.length; i++) { const n = cs.item(i); yield [n, this.getAll(n)]; }
+  }
+  entries() { return this[Symbol.iterator](); }
+  *keys() { for (const [k] of this) yield k; }
+  *values() { for (const [, v] of this) yield v; }
+  forEach(cb, thisArg) { for (const [k, v] of this) cb.call(thisArg, v, k, this); }
+}
+globalThis.StylePropertyMapReadOnly = StylePropertyMapReadOnly;
+Element.prototype.computedStyleMap = function computedStyleMap() {
+  return new StylePropertyMapReadOnly(this);
+};
 globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
   // WebIDL brand check: a Window operation called with a `this` that is not the global
   // (e.g. `getComputedStyle.call({})`) throws TypeError. Unbound calls (`this` is
@@ -40781,33 +40895,55 @@ if (!globalThis.crypto.subtle) {
 
   // Each function's spelling as its shared primitive. `scale(2)` fills y from x
   // (a one-argument scale is uniform); `translate`/`skew` fill from zero.
+  //
+  // Each family has TWO primitives, a flat one and a deep one, and which one a
+  // function reduces to is decided by the function, not by the list it is in:
+  // `translateX` and `translateY` are flat and meet at `translate`, but
+  // `translateZ` is deep and meets them only at `translate3d`. That is why
+  // `scaleZ(1)` → `scaleZ(2)` reads `scale3d(1, 1, 1.5)` and not `scalez(1.5)`:
+  // a function that names the z axis has already left the plane, even when
+  // nothing on the other side does.
   const _WA_TF_PRIM = {
     translate:  (a) => ['translate', [a[0], a.length > 1 ? a[1] : '0px']],
     translatex: (a) => ['translate', [a[0], '0px']],
     translatey: (a) => ['translate', ['0px', a[0]]],
+    translatez: (a) => ['translate3d', ['0px', '0px', a[0]]],
+    translate3d:(a) => ['translate3d', [a[0], a[1], a[2]]],
     scale:      (a) => ['scale', [a[0], a.length > 1 ? a[1] : a[0]]],
     scalex:     (a) => ['scale', [a[0], '1']],
     scaley:     (a) => ['scale', ['1', a[0]]],
+    scalez:     (a) => ['scale3d', ['1', '1', a[0]]],
+    scale3d:    (a) => ['scale3d', [a[0], a[1], a[2]]],
     skew:       (a) => ['skew', [a[0], a.length > 1 ? a[1] : '0deg']],
     skewx:      (a) => ['skew', [a[0], '0deg']],
     skewy:      (a) => ['skew', ['0deg', a[0]]],
     rotate:     (a) => ['rotate', [a[0]]],
-    rotatez:    (a) => ['rotate', [a[0]]],
   };
+  // A flat primitive lifted into its own deep one — what happens when a `scale`
+  // meets a `scaleZ`. The z slot takes the value that does nothing.
+  const _WA_TF_DEEP = { translate: 'translate3d', scale: 'scale3d' };
+  const _waTfTo3d = (it) => it.name === 'translate'
+    ? { name: 'translate3d', args: [it.args[0], it.args[1], '0px'], orig: it.orig }
+    : { name: 'scale3d', args: [it.args[0], it.args[1], '1'], orig: it.orig };
   // The neutral element of each primitive — what a missing function contributes.
   const _WA_TF_IDENTITY = {
-    translate: ['0px', '0px'], translate3d: ['0px', '0px', '0px'], translatez: ['0px'],
-    scale: ['1', '1'], scale3d: ['1', '1', '1'], scalez: ['1'],
-    rotate: ['0deg'], rotatex: ['0deg'], rotatey: ['0deg'],
+    translate: ['0px', '0px'], translate3d: ['0px', '0px', '0px'],
+    scale: ['1', '1'], scale3d: ['1', '1', '1'],
+    rotate: ['0deg'], rotatex: ['0deg'], rotatey: ['0deg'], rotatez: ['0deg'],
     skew: ['0deg', '0deg'], perspective: ['none'],
     matrix: ['1', '0', '0', '1', '0', '0'],
     matrix3d: ['1', '0', '0', '0', '0', '1', '0', '0', '0', '0', '1', '0', '0', '0', '0', '1'],
   };
+  // `orig` is the name the author actually wrote. The primitive is what the two
+  // sides interpolate IN; the original name is what the pair serializes AS when
+  // both sides agree on it — the only functions where those differ are
+  // `skewX`/`skewY`, which are primitives in their own right and only collapse
+  // into the two-argument `skew` when paired with something else.
   const _waTfNorm = (it) => {
     const p = _WA_TF_PRIM[it.name];
-    if (!p) return { name: it.name, args: it.args.slice() };
+    if (!p) return { name: it.name, args: it.args.slice(), orig: it.name };
     const r = p(it.args);
-    return { name: r[0], args: r[1] };
+    return { name: r[0], args: r[1], orig: it.name };
   };
   // ── Every rotation is an AXIS and an ANGLE ────────────────────────────────
   // `rotateX`/`rotateY`/`rotate`/`rotate3d` are four spellings of one thing, and
@@ -40817,8 +40953,8 @@ if (!globalThis.crypto.subtle) {
   // §interpolation-of-transforms sends the whole family to `rotate3d`, and from
   // there the rules are the ones the `rotate` PROPERTY already lives by
   // (`_waRotCommon`) — which is why this is a promotion and not a new engine.
-  const _WA_TF_ROT = new Set(['rotate', 'rotatex', 'rotatey', 'rotate3d']);
-  const _WA_TF_ROT_AXIS = { rotate: [0, 0, 1], rotatex: [1, 0, 0], rotatey: [0, 1, 0] };
+  const _WA_TF_ROT = new Set(['rotate', 'rotatex', 'rotatey', 'rotatez', 'rotate3d']);
+  const _WA_TF_ROT_AXIS = { rotate: [0, 0, 1], rotatex: [1, 0, 0], rotatey: [0, 1, 0], rotatez: [0, 0, 1] };
   const _waTfRotOf = (it) => {
     const a = it.name === 'rotate3d'
       ? _waAngleDeg(it.args[3]) : _waAngleDeg(it.args[0]);
@@ -41080,14 +41216,37 @@ if (!globalThis.crypto.subtle) {
         out.push(_waPerspSer(ka + (kb - ka) * t));
         continue;
       }
-      if (_WA_TF_ROT.has(A[i].name)) {
+      // Plain 2D `rotate` is the one rotation that keeps its own spelling: two
+      // of them are an angle and an angle, and the answer is an angle. Every
+      // other spelling names an AXIS and so answers as `rotate3d` (#438).
+      if (A[i].name !== 'rotate' && _WA_TF_ROT.has(A[i].name)) {
         const r = _waTfRotInterp(_waTfRotOf(A[i]), _waTfRotOf(B[i]), t);
         if (r !== null) { out.push(r); continue; }
       }
-      const sa = _waTfSer([A[i]]), sb = _waTfSer([B[i]]);
-      out.push(sa === sb ? sa : String(_waInterpolate(sa, sb, t, null)));
+      // Argument by argument, NOT function-string against function-string. The
+      // whole-string route runs the generic skeleton kit, which compares the
+      // literals between the numbers — so `translate(50%, 0px)` and
+      // `translate(100%, 50%)` have different skeletons (`%`/`px` vs `%`/`%`),
+      // no interpolation is found, and a pair that is perfectly interpolable
+      // steps at the halfway mark instead. Per argument, `0px` and `50%` meet
+      // as the length-percentage pair they are and give `25%`.
+      const args = A[i].args.map((a, j) => {
+        const b = B[i].args[j];
+        return a === b ? a : String(_waInterpolate(a, b, t, null));
+      });
+      out.push(_waTfSerOne(A[i], B[i], args));
     }
     return out.join(' ');
+  };
+  // The spelling an interpolated pair answers in. It is the shared PRIMITIVE,
+  // except that `skewX`/`skewY` are primitives themselves: two `skewX`es stay
+  // `skewX`, and only a mixed pair falls back to the two-argument `skew`.
+  const _waTfSerOne = (a, b, args) => {
+    if (a.name === 'skew' && a.orig === b.orig) {
+      if (a.orig === 'skewx') return 'skewX(' + args[0] + ')';
+      if (a.orig === 'skewy') return 'skewY(' + args[1] + ')';
+    }
+    return (_TF_DISP[a.name] || a.name) + '(' + args.join(', ') + ')';
   };
   const _waTfSer = (items) => items
     .map((it) => (_TF_DISP[it.name] || it.name) + '(' + it.args.join(', ') + ')').join(' ');
@@ -41110,8 +41269,16 @@ if (!globalThis.crypto.subtle) {
       let x = A[i], y = B[i];
       if (!x) x = _waTfIdentityOf(y);
       else if (!y) y = _waTfIdentityOf(x);
-      if (x && y && x.name !== y.name && _WA_TF_ROT.has(x.name) && _WA_TF_ROT.has(y.name)) {
-        x = _waTfAsRot3d(x); y = _waTfAsRot3d(y);       // two spellings of one rotation
+      if (x && y && x.name !== y.name) {
+        if (_WA_TF_ROT.has(x.name) && _WA_TF_ROT.has(y.name)) {
+          x = _waTfAsRot3d(x); y = _waTfAsRot3d(y);     // two spellings of one rotation
+        }
+        // A flat primitive and the deep one of the same family DO share a
+        // primitive — the deep one. `translateX(50px)` → `translateZ(50px)`
+        // is not a mismatch that ends the walk; it is one translation moving
+        // out of the plane, and it interpolates as `translate3d`.
+        else if (_WA_TF_DEEP[x.name] === y.name) x = _waTfTo3d(x);
+        else if (_WA_TF_DEEP[y.name] === x.name) y = _waTfTo3d(y);
       }
       if (!x || !y || x.name !== y.name || x.args.length !== y.args.length) break;
       oa.push(x); ob.push(y);
