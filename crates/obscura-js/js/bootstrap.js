@@ -40775,9 +40775,9 @@ if (!globalThis.crypto.subtle) {
   //      `scaleY`, `skewX`, `rotateZ`) are the same function in different
   //      clothes — promoting both to the primitive makes their skeletons match.
   //
-  // Deliberately NOT here: a genuinely mismatched pair (`translate` against
-  // `scale` at the same index) needs matrix decomposition and quaternion slerp,
-  // which is a different kind of work. Those keep the discrete fallback.
+  // A genuinely mismatched pair (`translate` against `scale` at the same index)
+  // is the LAST rule rather than this one: both lists collapse to a single
+  // matrix each and those are interpolated — see `_waTfInterp`.
 
   // Each function's spelling as its shared primitive. `scale(2)` fills y from x
   // (a one-argument scale is uniform); `translate`/`skew` fill from zero.
@@ -40884,12 +40884,197 @@ if (!globalThis.crypto.subtle) {
     const r = _waQuatToRot(qa.map((v, i) => v * wa + qb[i] * wb));
     return _waTfRot3d(r, r.a);
   };
+  // ── A matrix has forgotten which functions made it ────────────────────────
+  // css-transforms-1 §interpolation-of-matrices: two matrices do NOT interpolate
+  // entry by entry. `matrix(1, 0, 0, 1, 0, -6)` → `matrix(0, 7, -1, 0, 6, 0)` is
+  // a quarter turn with a sevenfold stretch, and averaging the six numbers walks
+  // the element through a squash that was never a rotation at all — halfway it
+  // answered `matrix(0.5, 3.5, -0.5, 0.5, 3, -3)` where the turn wants
+  // `matrix(2.83, 2.83, -0.71, 0.71, 3, -3)`. So each matrix is taken apart into
+  // the transform it stands for — `translate · rotate · skew · scale`, and in 3D
+  // a perspective and a quaternion besides — THOSE components are interpolated,
+  // and the result is put back together.
+  //
+  // The 2D and 3D decompositions are genuinely different algorithms, not one
+  // with the z terms dropped, so the pair is asked first whether it is flat.
+  const _WA_M2_ZERO = [2, 3, 6, 7, 8, 9, 11, 14];
+  const _waMatIs2D = (m) => _WA_M2_ZERO.every((i) => m[i] === 0) && m[10] === 1 && m[15] === 1;
+  // The four numbers of a 2D matrix's linear part hold exactly a rotation, a
+  // skew and two scales (Graphics Gems' "unmatrix"). A ZERO determinant means
+  // the matrix folds the plane onto a line — there is no such factorisation of
+  // it, and the caller's only honest answer is a discrete flip.
+  const _waMatDec2 = (m) => {
+    const a = m[0], b = m[1], c = m[4], d = m[5];
+    const det = a * d - b * c;
+    if (!det || !isFinite(det)) return null;
+    const sx = Math.hypot(a, b);
+    return { t: [m[12], m[13]], ang: Math.atan2(b, a) * 180 / Math.PI, s: [sx, det / sx], k: (a * c + b * d) / det };
+  };
+  const _waMatRec2 = (v) => {
+    const r = v.ang * Math.PI / 180, cs = Math.cos(r), sn = Math.sin(r);
+    // rotate · skew, then each column taken out to its own scale. The
+    // translation rides on top untouched — it is applied first of all.
+    const K = [cs, sn, cs * v.k - sn, sn * v.k + cs];
+    return [K[0] * v.s[0], K[1] * v.s[0], 0, 0, K[2] * v.s[1], K[3] * v.s[1], 0, 0,
+      0, 0, 1, 0, v.t[0], v.t[1], 0, 1];
+  };
+  const _waMatInterp2 = (ma, mb, t) => {
+    const A = _waMatDec2(ma), B = _waMatDec2(mb);
+    if (!A || !B) return null;
+    const s = A.s.slice();
+    let aa = A.ang, ab = B.ang;
+    // One matrix mirrored about x and the other about y differ by a HALF TURN,
+    // not by two reflections — say so before the angles are ever compared.
+    if ((s[0] < 0 && B.s[1] < 0) || (s[1] < 0 && B.s[0] < 0)) {
+      s[0] = -s[0]; s[1] = -s[1]; aa += aa < 0 ? 180 : -180;
+    }
+    // Don't turn the long way round. A zero angle stands in as a full turn so
+    // that it is measured against the turn it completes rather than against 0 —
+    // the subtraction below then brings it back down whenever that was nearer.
+    if (!aa) aa = 360;
+    if (!ab) ab = 360;
+    if (Math.abs(aa - ab) > 180) { if (aa > ab) aa -= 360; else ab -= 360; }
+    const L = (x, y) => x + (y - x) * t;
+    return _waMatRec2({
+      t: [L(A.t[0], B.t[0]), L(A.t[1], B.t[1])],
+      ang: L(aa, ab),
+      s: [L(s[0], B.s[0]), L(s[1], B.s[1])],
+      k: L(A.k, B.k),
+    });
+  };
+  const _waDot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const _waComb3 = (a, b, s) => [a[0] + b[0] * s, a[1] + b[1] * s, a[2] + b[2] * s];
+  const _waUnit3 = (a) => { const l = Math.hypot(a[0], a[1], a[2]); return l ? [a[0] / l, a[1] / l, a[2] / l] : [0, 0, 0]; };
+  // General 4×4 inverse by the adjugate. Wanted for one thing only: solving the
+  // perspective row out of a 3D matrix before the rest can be read.
+  const _waM4Inv = (m) => {
+    const g = (c, r) => m[c * 4 + r];
+    const cof = new Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      const s = [];
+      for (let cc = 0; cc < 4; cc++) if (cc !== c) for (let rr = 0; rr < 4; rr++) if (rr !== r) s.push(g(cc, rr));
+      cof[c * 4 + r] = ((c + r) % 2 ? -1 : 1)
+        * (s[0] * (s[4] * s[8] - s[5] * s[7]) - s[3] * (s[1] * s[8] - s[2] * s[7]) + s[6] * (s[1] * s[5] - s[2] * s[4]));
+    }
+    let det = 0;
+    for (let c = 0; c < 4; c++) det += g(c, 0) * cof[c * 4];
+    if (!det || !isFinite(det)) return null;
+    const out = new Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) out[c * 4 + r] = cof[r * 4 + c] / det;
+    return out;
+  };
+  // css-transforms-2 §decomposing-a-3d-matrix — "unmatrix" with quaternions in
+  // place of Euler angles, so that a rotation never locks a gimbal on its way.
+  // Perspective comes off first (it is the only part that is not a similarity),
+  // then translation, then Gram-Schmidt takes the three axes apart into three
+  // scales and three skews, and what is left over is a pure rotation.
+  const _waMatDec3 = (m0) => {
+    if (!m0[15]) return null;
+    const m = m0.map((v) => v / m0[15]);
+    const P = m.slice();
+    P[3] = P[7] = P[11] = 0; P[15] = 1;
+    const iP = _waM4Inv(P);
+    if (!iP) return null;                    // a singular upper 3×3 has no decomposition
+    let p = [0, 0, 0, 1];
+    if (m[3] || m[7] || m[11]) {
+      const rhs = [m[3], m[7], m[11], m[15]];
+      p = [0, 1, 2, 3].map((i) => rhs[0] * iP[i * 4] + rhs[1] * iP[i * 4 + 1] + rhs[2] * iP[i * 4 + 2] + rhs[3] * iP[i * 4 + 3]);
+    }
+    const row = [0, 1, 2].map((i) => [m[i * 4], m[i * 4 + 1], m[i * 4 + 2]]);
+    const s = [0, 0, 0], k = [0, 0, 0];
+    s[0] = Math.hypot(row[0][0], row[0][1], row[0][2]); row[0] = _waUnit3(row[0]);
+    k[0] = _waDot3(row[0], row[1]); row[1] = _waComb3(row[1], row[0], -k[0]);
+    s[1] = Math.hypot(row[1][0], row[1][1], row[1][2]); row[1] = _waUnit3(row[1]); k[0] /= s[1];
+    k[1] = _waDot3(row[0], row[2]); row[2] = _waComb3(row[2], row[0], -k[1]);
+    k[2] = _waDot3(row[1], row[2]); row[2] = _waComb3(row[2], row[1], -k[2]);
+    s[2] = Math.hypot(row[2][0], row[2][1], row[2][2]); row[2] = _waUnit3(row[2]);
+    k[1] /= s[2]; k[2] /= s[2];
+    // A left-handed frame is a right-handed one with every axis negated — and a
+    // reflection is not a rotation, so the sign has to move into the scales.
+    const cx = [row[1][1] * row[2][2] - row[1][2] * row[2][1],
+      row[1][2] * row[2][0] - row[1][0] * row[2][2],
+      row[1][0] * row[2][1] - row[1][1] * row[2][0]];
+    if (_waDot3(row[0], cx) < 0)
+      for (let i = 0; i < 3; i++) { s[i] = -s[i]; row[i] = row[i].map((v) => -v); }
+    const q = [
+      0.5 * Math.sqrt(Math.max(1 + row[0][0] - row[1][1] - row[2][2], 0)),
+      0.5 * Math.sqrt(Math.max(1 - row[0][0] + row[1][1] - row[2][2], 0)),
+      0.5 * Math.sqrt(Math.max(1 - row[0][0] - row[1][1] + row[2][2], 0)),
+      0.5 * Math.sqrt(Math.max(1 + row[0][0] + row[1][1] + row[2][2], 0)),
+    ];
+    if (row[2][1] > row[1][2]) q[0] = -q[0];
+    if (row[0][2] > row[2][0]) q[1] = -q[1];
+    if (row[1][0] > row[0][1]) q[2] = -q[2];
+    return { t: [m[12], m[13], m[14]], s, k, p, q };
+  };
+  const _waMatRec3 = (v) => {
+    let m = _TF_ID();
+    for (let i = 0; i < 4; i++) m[i * 4 + 3] = v.p[i];
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 3; j++) m[12 + i] += v.t[j] * m[j * 4 + i];
+    const x = v.q[0], y = v.q[1], z = v.q[2], w = v.q[3];
+    const R = _TF_ID();
+    R[0] = 1 - 2 * (y * y + z * z); R[4] = 2 * (x * y - z * w); R[8] = 2 * (x * z + y * w);
+    R[1] = 2 * (x * y + z * w); R[5] = 1 - 2 * (x * x + z * z); R[9] = 2 * (y * z - x * w);
+    R[2] = 2 * (x * z - y * w); R[6] = 2 * (y * z + x * w); R[10] = 1 - 2 * (x * x + y * y);
+    m = _tfMul(m, R);
+    const T = _TF_ID();                                   // YZ, then XZ, then XY
+    if (v.k[2]) { T[9] = v.k[2]; m = _tfMul(m, T); }
+    if (v.k[1]) { T[9] = 0; T[8] = v.k[1]; m = _tfMul(m, T); }
+    if (v.k[0]) { T[8] = 0; T[4] = v.k[0]; m = _tfMul(m, T); }
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 4; j++) m[i * 4 + j] *= v.s[i];
+    return m;
+  };
+  // The spec's own slerp, and NOT #435's: there both quaternions were pushed
+  // into the w ≥ 0 half first, because there the two endpoints were rotations an
+  // author WROTE and the short way round is what they meant. Here they came out
+  // of a decomposition in a fixed representative already, and flipping one would
+  // change the answer the platform gives.
+  const _waMatSlerp = (qa, qb, t) => {
+    let p = qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3];
+    p = Math.min(1, Math.max(-1, p));
+    if (Math.abs(p) === 1) return qa.slice();
+    const th = Math.acos(p), w = Math.sin(t * th) / Math.sqrt(1 - p * p), c = Math.cos(t * th) - p * w;
+    return qa.map((v, i) => v * c + qb[i] * w);
+  };
+  const _waMatInterp3 = (ma, mb, t) => {
+    const A = _waMatDec3(ma), B = _waMatDec3(mb);
+    if (!A || !B) return null;
+    const L = (x, y) => x + (y - x) * t;
+    return _waMatRec3({
+      t: A.t.map((v, i) => L(v, B.t[i])),
+      s: A.s.map((v, i) => L(v, B.s[i])),
+      k: A.k.map((v, i) => L(v, B.k[i])),
+      p: A.p.map((v, i) => L(v, B.p[i])),
+      q: _waMatSlerp(A.q, B.q, t),
+    });
+  };
+  // → the interpolated 4×4, or null when either matrix cannot be decomposed.
+  const _waMatInterp = (ma, mb, t) => ((!ma || !mb) ? null
+    : (_waMatIs2D(ma) && _waMatIs2D(mb)) ? _waMatInterp2(ma, mb, t) : _waMatInterp3(ma, mb, t));
+  // Can this matrix be taken apart at all? The question `_waMatInterp` answers
+  // by returning null, asked on its own because accumulation has to ask it too.
+  const _waMatOk = (m) => !!m && (_waMatIs2D(m) ? _waMatDec2(m) : _waMatDec3(m)) !== null;
+  // The entries that are ONE in the identity matrix — m11/m22 in 2D, and
+  // m11/m22/m33/m44 in 3D. css-transforms-2 §addition-and-accumulation names
+  // them out loud: they accumulate about one, exactly as a scale factor does,
+  // because one is the value at which they do nothing.
+  const _WA_TF_ONES = { matrix: new Set([0, 3]), matrix3d: new Set([0, 5, 10, 15]) };
+
   // Interpolate two ALIGNED transform lists function by function. Every function
-  // but `perspective` is just its arguments, one value each, so #417's skeleton
-  // kit does them exactly; `perspective` is the one that needs its own line.
+  // but `perspective` and the matrices is just its arguments, one value each, so
+  // #417's skeleton kit does them exactly; those two need their own line.
+  // → null when the pair has no interpolation at all, which is the whole list's
+  // answer and not one function's: a matrix nobody can decompose makes the
+  // entire animation discrete.
   const _waTfInterpItems = (A, B, t) => {
     const out = [];
     for (let i = 0; i < A.length; i++) {
+      if (A[i].name === 'matrix' || A[i].name === 'matrix3d') {
+        const r = _waMatInterp(_tfMatrix(A[i]), _tfMatrix(B[i]), t);
+        if (r === null) return null;
+        out.push(_serMatrix(r));
+        continue;
+      }
       if (A[i].name === 'perspective') {
         const ka = _waPerspK(A[i].args[0]), kb = _waPerspK(B[i].args[0]);
         out.push(_waPerspSer(ka + (kb - ka) * t));
@@ -40906,9 +41091,11 @@ if (!globalThis.crypto.subtle) {
   };
   const _waTfSer = (items) => items
     .map((it) => (_TF_DISP[it.name] || it.name) + '(' + it.args.join(', ') + ')').join(' ');
-  // → [itemsA, itemsB], two equal-length lists whose functions match one for one,
-  // or null when the pair cannot be aligned (the caller then keeps its existing
-  // behaviour, which for interpolation is the spec's discrete fallback).
+  // Walk the two lists together for as long as their functions correspond.
+  // → { A, B, ra, rb } — the matching PREFIX aligned one for one, and whatever
+  // of each original list is left over past the first pair with nothing in
+  // common. `ra`/`rb` empty means the whole pair aligned. null only when the
+  // input will not parse, or when there is nothing on either side at all.
   const _waTfAlignItems = (sa, sb) => {
     let pa, pb;
     try { pa = _parseTransform(sa); pb = _parseTransform(sb); } catch (e) { return null; }
@@ -40918,24 +41105,61 @@ if (!globalThis.crypto.subtle) {
     const n = Math.max(A.length, B.length);
     if (!n) return null;
     const oa = [], ob = [];
-    for (let i = 0; i < n; i++) {
+    let i = 0;
+    for (; i < n; i++) {
       let x = A[i], y = B[i];
       if (!x) x = _waTfIdentityOf(y);
       else if (!y) y = _waTfIdentityOf(x);
       if (x && y && x.name !== y.name && _WA_TF_ROT.has(x.name) && _WA_TF_ROT.has(y.name)) {
         x = _waTfAsRot3d(x); y = _waTfAsRot3d(y);       // two spellings of one rotation
       }
-      if (!x || !y || x.name !== y.name || x.args.length !== y.args.length) return null;
+      if (!x || !y || x.name !== y.name || x.args.length !== y.args.length) break;
       oa.push(x); ob.push(y);
     }
-    return [oa, ob];
+    return { A: oa, B: ob, ra: A.slice(i), rb: B.slice(i) };
+  };
+  // A run of transform functions as the one 4×4 matrix they stand for. null when
+  // some function in it cannot be resolved without layout (a `%` translate),
+  // which is an honest "no answer" rather than a wrong one.
+  const _waTfMatrixOf = (items) => {
+    let M = _TF_ID();
+    for (const it of items) { const F = _tfMatrix(it); if (!F) return null; M = _tfMul(M, F); }
+    return M;
+  };
+  // Two transform lists, interpolated — the ONE entry point, so that the
+  // interpolation and the predicate that decides whether a CSS transition
+  // exists at all can never give different answers (#429's rule).
+  // → the interpolated list, or null when the only honest answer is discrete.
+  const _waTfInterp = (sa, sb, t) => {
+    const al = _waTfAlignItems(sa, sb);
+    if (!al) return null;
+    let out = al.A.length ? _waTfInterpItems(al.A, al.B, t) : '';
+    if (out === null) return null;
+    if (al.ra.length || al.rb.length) {
+      // §interpolation-of-transforms, the branch that ENDS the walk: at the
+      // first pair with no primitive in common, the REMAINDER of each list is
+      // post-multiplied into a 4×4 matrix and those two are interpolated.
+      //
+      // Only the remainder — which is the whole point, and the difference
+      // between this spec and the one before it. `rotate(0deg) translate(100px)`
+      // → `rotate(720deg) scale(2) translate(200px)` mismatches at position 1,
+      // so the rotation ahead of it still winds through two entire turns and
+      // reads `rotate(180deg)` at a quarter of the way. Flatten the lists whole
+      // and that quarter-of-720° becomes a quarter of nothing at all: a matrix
+      // is where a turn count goes to die.
+      const r = _waMatInterp(_waTfMatrixOf(al.ra), _waTfMatrixOf(al.rb), t);
+      if (r === null) return null;
+      out = out ? out + ' ' + _serMatrix(r) : _serMatrix(r);
+    }
+    return out;
   };
   // The transform property has its OWN composition rules (css-transforms-2
   // §addition-and-accumulation), not the generic slot-wise arithmetic:
   //   • addition is list CONCATENATION (`Va ++ Vb`) — never a per-slot sum;
   //   • accumulation is per-argument, but only when the two lists already match
-  //     function-for-function, and `scale` accumulates about ONE rather than zero
-  //     (2 ⊕ 3 = 4, because a scale of 1 is this function's do-nothing value).
+  //     function-for-function, and an argument whose do-nothing value is ONE
+  //     rather than zero accumulates about one (2 ⊕ 3 = 4). That is every scale
+  //     factor, and the diagonal of a matrix — see `_WA_TF_ONES`.
   //     Anything that will not line up falls back to addition.
   const _WA_TF_SCALES = new Set(['scale', 'scale3d', 'scalex', 'scaley', 'scalez']);
   const _waTfConcat = (u, v) => {
@@ -40947,8 +41171,10 @@ if (!globalThis.crypto.subtle) {
     const u = String(su).trim(), v = String(sv).trim();
     if (!accumulate) return _waTfConcat(u, v);
     const al = _waTfAlignItems(u, v);
-    if (!al) return _waTfConcat(u, v);
-    const [A, B] = al;
+    // Accumulation wants the lists to line up ALL the way — anything left over
+    // past the first mismatch falls back to addition, which is concatenation.
+    if (!al || al.ra.length || al.rb.length) return _waTfConcat(u, v);
+    const A = al.A, B = al.B;
     const out = [];
     for (let i = 0; i < A.length; i++) {
       // rotate3d's first three arguments name an AXIS, not a magnitude — two
@@ -40963,6 +41189,13 @@ if (!globalThis.crypto.subtle) {
         out.push(_parseTransform(_waPerspSer(_waPerspK(A[i].args[0]) + _waPerspK(B[i].args[0]))).items[0]);
         continue;
       }
+      // A matrix accumulates ENTRY BY ENTRY, like everything else here — the
+      // only twist is which entries are one-based. But a matrix that cannot be
+      // decomposed has no accumulation at all (§15 sends the pair through the
+      // same matching as interpolation, and §13's fallback there is discrete),
+      // and discrete accumulation is simply REPLACE.
+      const ones = _WA_TF_ONES[A[i].name];
+      if (ones && !(_waMatOk(_tfMatrix(A[i])) && _waMatOk(_tfMatrix(B[i])))) return v;
       const base = _WA_TF_SCALES.has(A[i].name) ? 1 : 0;
       const args = [];
       for (let j = 0; j < A[i].args.length; j++) {
@@ -40970,7 +41203,7 @@ if (!globalThis.crypto.subtle) {
         // Each argument is one value of one type, so #417's kit adds it exactly:
         // matching skeletons (`10px` + `4px`), and the neutral subtracted once.
         const s = _waAdd(A[i].args[j], B[i].args[j], null);
-        args.push(base ? _waTfSubOne(s) : s);
+        args.push((base || (ones && ones.has(j))) ? _waTfSubOne(s) : s);
       }
       out.push({ name: A[i].name, args });
     }
@@ -41296,8 +41529,8 @@ if (!globalThis.crypto.subtle) {
       if (v !== null) return v;
     }
     if (name === 'transform') {
-      const al = _waTfAlignItems(sa, sb);
-      if (al) return _waTfInterpItems(al[0], al[1], t);
+      const v = _waTfInterp(sa, sb, t);
+      return v === null ? (t < 0.5 ? sa : sb) : v;
     } else if (name && _WA_FILTER_PROPS.has(name)) {
       const al = _waFilterAlign(sa, sb);
       if (al) { sa = al[0]; sb = al[1]; }
@@ -41341,13 +41574,13 @@ if (!globalThis.crypto.subtle) {
     if (name === 'visibility') return true;
     if (name === 'aspect-ratio') return _waRatioPair(sa, sb) !== null;
     if (name && _WA_INDIV_TF.has(name)) return _waIndiv(name, sa, sb, 0.5, false) !== null;
-    // Two transform lists that ALIGN interpolate — the per-function rules in
-    // `_waTfInterpItems` answer for every pair the alignment produced, so the
-    // generic shape test is no longer the thing that decides. Asked here rather
-    // than after alignment because the two must never disagree: this predicate
-    // is what says whether a CSS transition exists at all.
+    // Transform lists are decided by `_waTfInterp` itself, at a `t` that cannot
+    // matter — not by the generic shape test. Asking the interpolation rather
+    // than re-deriving its conditions is what keeps the two from ever
+    // disagreeing: this predicate is what says whether a CSS transition exists
+    // at all, and a pair whose only answer is a discrete flip is not one.
     if (name === 'transform') {
-      if (_waTfAlignItems(sa, sb)) return true;
+      return _waTfInterp(sa, sb, 0.5) !== null;
     } else if (name && _WA_FILTER_PROPS.has(name)) {
       const al = _waFilterAlign(sa, sb);
       if (al) { sa = al[0]; sb = al[1]; }
