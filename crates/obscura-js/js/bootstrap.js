@@ -22008,15 +22008,47 @@ const _serMatrix = (m) => {
   if (is2D) return 'matrix(' + [m[0], m[1], m[4], m[5], m[12], m[13]].map(_serNumber).join(', ') + ')';
   return 'matrix3d(' + m.map(_serNumber).join(', ') + ')';
 };
+// One specified argument resolved to its COMPUTED form: lengths absolute, angles
+// in degrees, `<number-percentage>` folded to a number. Percentages in a
+// `<length-percentage>` stay percentages — they resolve against a containing
+// block nobody has measured yet.
+const _tfCompArg = (t, type, el) => {
+  switch (type) {
+    case 'number': case 'np': { const n = _tfNum(t); return n == null ? _canonTfArg(t, type) : _serNumber(n); }
+    case 'len': case 'lp': return _trComp(t, el, true, _vpUnits());
+    case 'angle': return _rotSerAngle(t, true, false, el);
+    case 'persp': return t.trim().toLowerCase() === 'none' ? 'none' : _trComp(t, el, true, _vpUnits());
+  }
+  return t;
+};
 // Canonicalize a `transform` value. SPECIFIED keeps the function form (lowercasing
 // the name, folding scale `%`→number, unitless angle 0→0deg); COMPUTED resolves the
 // whole list to a single matrix()/matrix3d() (falling back to the specified form for
 // any layout-dependent value the matrix builder cannot resolve, e.g. `%` translate).
+//
+// `computed === 'list'` asks for the third thing, and it is the one the animation
+// model needs. css-transforms-1 §transform-property: the COMPUTED value of
+// `transform` is the specified list "with lengths made absolute" — a LIST, still.
+// The single matrix is the RESOLVED value, one step further on, and it is all
+// getComputedStyle will ever show you. Animating the resolved value is why
+// `rotate(30deg)` → `rotate(330deg)` used to take the 60° short way round a
+// matrix instead of the 300° long way round a circle, and why an underlying
+// `rotate(45deg) skew(10deg, 20deg)` could not line up with the `rotate(45deg)`
+// a keyframe wanted to accumulate onto it.
 const _canonTransform = (value, el, computed) => {
   if (_TF_VAR_RE.test(value)) return value;                // unresolved var()/env()
   const p = _parseTransform(value);
   if (!p) return value;
   if (p.none) return 'none';
+  if (computed === 'list') {
+    const outl = [];
+    for (const it of p.items) {
+      const spec = _TF_FUNCS[it.name];
+      const parts = it.args.map((arg, i) => _tfCompArg(arg, _tfArgType(spec, i), el));
+      outl.push((_TF_DISP[it.name] || it.name) + '(' + parts.join(', ') + ')');
+    }
+    return outl.join(' ');
+  }
   if (computed) {
     let M = _TF_ID();
     for (const it of p.items) { const F = _tfMatrix(it); if (!F) return _canonTransform(value, el, false); M = _tfMul(M, F); }
@@ -22029,6 +22061,24 @@ const _canonTransform = (value, el, computed) => {
     out.push((_TF_DISP[it.name] || it.name) + '(' + parts.join(', ') + ')');
   }
   return out.join(' ');
+};
+// Ask the cascade for `transform`'s COMPUTED value — the list — instead of the
+// resolved matrix everyone else sees. A latch rather than a parallel resolver
+// because the value has to come down the ORDINARY cascade: inheritance, var()
+// substitution, the animation and transition sources, the `_csSuppress` /
+// `_waUnderlyingOf` guards the caller has already set. Only the last step,
+// serialization, differs — and that is the only step this changes.
+let _tfWantList = false;
+globalThis._withTfList = (on, fn) => {
+  if (!on) return fn();
+  const was = _tfWantList;
+  _tfWantList = true;
+  try { return fn(); }
+  finally { _tfWantList = was; }
+};
+globalThis._computedTfList = (el) => {
+  try { return globalThis._withTfList(true, () => _computedPropOf(el, 'transform', 0)); }
+  catch (e) { return null; }
 };
 // ── Individual transform properties: `scale` / `rotate` / `translate` ───────
 // (CSS Transforms 2 §individual-transform-serialization). Unlike the `transform`
@@ -23902,7 +23952,7 @@ const _normComputed = (el, kebab, v) => {
   if (kebab === 'cursor') { const l = String(v).trim().toLowerCase(); if (_CSS_WIDE.has(l)) return v; const r = _serCursor(v, true, el); return r == null ? v : r; }
   if (_GRADIENT_PROPS.has(kebab)) return _canonUrls(_canonImageSet(_canonGradients(v, el, true)), el);
   if (kebab === 'filter' || kebab === 'backdrop-filter') return _canonFilter(v, el, true);
-  if (kebab === 'transform') return _canonTransform(v, el, true);
+  if (kebab === 'transform') return _canonTransform(v, el, _tfWantList ? 'list' : true);
   if (_INDIV_TRANSFORM.has(kebab)) return _canonIndividualTransform(kebab, v, el, true);
   if (kebab === 'content') return _canonContent(v, el, true);
   if (kebab === 'font-style') {
@@ -40749,7 +40799,7 @@ if (!globalThis.crypto.subtle) {
     translate: ['0px', '0px'], translate3d: ['0px', '0px', '0px'], translatez: ['0px'],
     scale: ['1', '1'], scale3d: ['1', '1', '1'], scalez: ['1'],
     rotate: ['0deg'], rotatex: ['0deg'], rotatey: ['0deg'],
-    skew: ['0deg', '0deg'],
+    skew: ['0deg', '0deg'], perspective: ['none'],
     matrix: ['1', '0', '0', '1', '0', '0'],
     matrix3d: ['1', '0', '0', '0', '0', '1', '0', '0', '0', '0', '1', '0', '0', '0', '0', '1'],
   };
@@ -40759,13 +40809,100 @@ if (!globalThis.crypto.subtle) {
     const r = p(it.args);
     return { name: r[0], args: r[1] };
   };
+  // ── Every rotation is an AXIS and an ANGLE ────────────────────────────────
+  // `rotateX`/`rotateY`/`rotate`/`rotate3d` are four spellings of one thing, and
+  // unlike the translate/scale/skew families they do NOT reduce to a shared
+  // spelling by padding: an axis is a direction, not a magnitude, so `rotateX`
+  // and `rotateY` have nothing in common to pad WITH. css-transforms-2
+  // §interpolation-of-transforms sends the whole family to `rotate3d`, and from
+  // there the rules are the ones the `rotate` PROPERTY already lives by
+  // (`_waRotCommon`) — which is why this is a promotion and not a new engine.
+  const _WA_TF_ROT = new Set(['rotate', 'rotatex', 'rotatey', 'rotate3d']);
+  const _WA_TF_ROT_AXIS = { rotate: [0, 0, 1], rotatex: [1, 0, 0], rotatey: [0, 1, 0] };
+  const _waTfRotOf = (it) => {
+    const a = it.name === 'rotate3d'
+      ? _waAngleDeg(it.args[3]) : _waAngleDeg(it.args[0]);
+    if (a === null) return null;
+    const ax = it.name === 'rotate3d' ? it.args.slice(0, 3).map(parseFloat) : _WA_TF_ROT_AXIS[it.name];
+    return ax && ax.every((n) => isFinite(n)) ? { ax, a } : null;
+  };
+  const _waTfRot3d = (r, deg) => 'rotate3d(' + _waVecNorm(r.ax).map(_wa6sig).join(', ')
+    + ', ' + _wa6sig(deg) + 'deg)';
+  const _waTfAsRot3d = (it) => {
+    const r = _waTfRotOf(it);
+    return r && { name: 'rotate3d', args: [..._waVecNorm(r.ax).map((n) => String(_wa6sig(n))), _wa6sig(r.a) + 'deg'] };
+  };
   // `rotate3d`'s identity is the SAME axis turned zero degrees — the axis is not
   // a magnitude, so zeroing it would name a different rotation, not none at all.
-  // `perspective` has no finite identity, so a list needing it stays unpadded.
+  // `perspective`'s identity is `none`: a viewer infinitely far away projects
+  // nothing, which is precisely doing nothing. It reads like a missing value and
+  // it is not one — see `_waPerspK`.
   const _waTfIdentityOf = (it) => {
     if (it.name === 'rotate3d') return { name: 'rotate3d', args: [it.args[0], it.args[1], it.args[2], '0deg'] };
     const id = _WA_TF_IDENTITY[it.name];
     return id ? { name: it.name, args: id.slice() } : null;
+  };
+  // ── `perspective` interpolates its RECIPROCAL ─────────────────────────────
+  // Not its depth. Halfway from `perspective(400px)` to `perspective(500px)` is
+  // 421.0526px, not 450px, because what moves evenly is the projection the
+  // function contributes to the matrix — the single entry −1/d — and not the
+  // distance to the eye. (1/400 and 1/500 average to 1/421.05.)
+  //
+  // `none` is then not a missing value but an ordinary endpoint: it is depth ∞,
+  // whose reciprocal is 0. Which is also why it is this function's identity, and
+  // why `scaleZ(2)` → `scaleZ(2) perspective(500px)` can be padded and animated
+  // at all instead of stepping. Running the interpolation past either end can
+  // send the reciprocal negative — an eye behind the viewer, which `[0,∞]` does
+  // not admit — so it clamps at 0, i.e. back to `none`.
+  const _waPerspK = (arg) => {
+    const t = String(arg).trim();
+    if (t.toLowerCase() === 'none') return 0;
+    const d = _tfLenPx(t);
+    return (d == null || d === 0 || !isFinite(d)) ? 0 : 1 / d;
+  };
+  const _waPerspSer = (k) => ((!isFinite(k) || k <= 0)
+    ? 'perspective(none)' : 'perspective(' + _serNumber(1 / k) + 'px)');
+  // Two rotations in a transform list, interpolated by the SAME rules the
+  // `rotate` property answers to (#435): a shared line of rotation means the
+  // angle simply slides along it — which is the only reason `rotateY(900deg)` →
+  // `rotateZ(0deg)` unwinds through 675° and 225° instead of taking some short
+  // way round — and a zero rotation has no line of its own, so it borrows the
+  // other's. Only when the two really do turn about different lines is there an
+  // arc to walk, and then both quaternions go into the w ≥ 0 half of the sphere
+  // FIRST, because a quaternion and its negation are the same rotation and only
+  // one of the two measures the arc a viewer would call the short way round.
+  const _waTfRotInterp = (ra, rb, t) => {
+    if (!ra || !rb) return null;
+    const c = _waRotCommon({ ...ra, none: false }, { ...rb, none: false });
+    if (c) return _waTfRot3d({ ax: c.ax }, c.a + (c.b - c.a) * t);
+    const half = (q) => (q[3] < 0 ? q.map((v) => -v) : q);
+    const qa = half(_waQuat(ra.ax, ra.a)), qb = half(_waQuat(rb.ax, rb.a));
+    const d = Math.max(-1, Math.min(1, qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3]));
+    const th = Math.acos(d), s = Math.sin(th);
+    if (Math.abs(s) < 1e-9) return _waTfRot3d(ra, ra.a);
+    const wa = Math.sin((1 - t) * th) / s, wb = Math.sin(t * th) / s;
+    const r = _waQuatToRot(qa.map((v, i) => v * wa + qb[i] * wb));
+    return _waTfRot3d(r, r.a);
+  };
+  // Interpolate two ALIGNED transform lists function by function. Every function
+  // but `perspective` is just its arguments, one value each, so #417's skeleton
+  // kit does them exactly; `perspective` is the one that needs its own line.
+  const _waTfInterpItems = (A, B, t) => {
+    const out = [];
+    for (let i = 0; i < A.length; i++) {
+      if (A[i].name === 'perspective') {
+        const ka = _waPerspK(A[i].args[0]), kb = _waPerspK(B[i].args[0]);
+        out.push(_waPerspSer(ka + (kb - ka) * t));
+        continue;
+      }
+      if (_WA_TF_ROT.has(A[i].name)) {
+        const r = _waTfRotInterp(_waTfRotOf(A[i]), _waTfRotOf(B[i]), t);
+        if (r !== null) { out.push(r); continue; }
+      }
+      const sa = _waTfSer([A[i]]), sb = _waTfSer([B[i]]);
+      out.push(sa === sb ? sa : String(_waInterpolate(sa, sb, t, null)));
+    }
+    return out.join(' ');
   };
   const _waTfSer = (items) => items
     .map((it) => (_TF_DISP[it.name] || it.name) + '(' + it.args.join(', ') + ')').join(' ');
@@ -40785,14 +40922,13 @@ if (!globalThis.crypto.subtle) {
       let x = A[i], y = B[i];
       if (!x) x = _waTfIdentityOf(y);
       else if (!y) y = _waTfIdentityOf(x);
+      if (x && y && x.name !== y.name && _WA_TF_ROT.has(x.name) && _WA_TF_ROT.has(y.name)) {
+        x = _waTfAsRot3d(x); y = _waTfAsRot3d(y);       // two spellings of one rotation
+      }
       if (!x || !y || x.name !== y.name || x.args.length !== y.args.length) return null;
       oa.push(x); ob.push(y);
     }
     return [oa, ob];
-  };
-  const _waTfAlign = (sa, sb) => {
-    const al = _waTfAlignItems(sa, sb);
-    return al && [_waTfSer(al[0]), _waTfSer(al[1])];
   };
   // The transform property has its OWN composition rules (css-transforms-2
   // §addition-and-accumulation), not the generic slot-wise arithmetic:
@@ -40821,6 +40957,12 @@ if (!globalThis.crypto.subtle) {
       const axis = A[i].name === 'rotate3d' ? 3 : 0;
       if (axis && A[i].args.slice(0, 3).join() !== B[i].args.slice(0, 3).join())
         return _waTfConcat(u, v);
+      // `perspective` accumulates the quantity it interpolates — its reciprocal
+      // (see `_waPerspK`), which is also the quantity whose neutral is zero.
+      if (A[i].name === 'perspective') {
+        out.push(_parseTransform(_waPerspSer(_waPerspK(A[i].args[0]) + _waPerspK(B[i].args[0]))).items[0]);
+        continue;
+      }
       const base = _WA_TF_SCALES.has(A[i].name) ? 1 : 0;
       const args = [];
       for (let j = 0; j < A[i].args.length; j++) {
@@ -41142,7 +41284,7 @@ if (!globalThis.crypto.subtle) {
     if (name && _WA_DISCRETE_PROPS.has(name)) return t < 0.5 ? sa : sb;
     // A transform list is aligned function-for-function BEFORE the shape test —
     // padding and primitive promotion are exactly what give the two sides a
-    // skeleton in common (see _waTfAlign).
+    // skeleton in common (see _waTfAlignItems).
     if (name === 'aspect-ratio') {
       const p = _waRatioPair(sa, sb);
       if (!p) return t < 0.5 ? sa : sb;
@@ -41154,8 +41296,8 @@ if (!globalThis.crypto.subtle) {
       if (v !== null) return v;
     }
     if (name === 'transform') {
-      const al = _waTfAlign(sa, sb);
-      if (al) { sa = al[0]; sb = al[1]; }
+      const al = _waTfAlignItems(sa, sb);
+      if (al) return _waTfInterpItems(al[0], al[1], t);
     } else if (name && _WA_FILTER_PROPS.has(name)) {
       const al = _waFilterAlign(sa, sb);
       if (al) { sa = al[0]; sb = al[1]; }
@@ -41199,9 +41341,13 @@ if (!globalThis.crypto.subtle) {
     if (name === 'visibility') return true;
     if (name === 'aspect-ratio') return _waRatioPair(sa, sb) !== null;
     if (name && _WA_INDIV_TF.has(name)) return _waIndiv(name, sa, sb, 0.5, false) !== null;
+    // Two transform lists that ALIGN interpolate — the per-function rules in
+    // `_waTfInterpItems` answer for every pair the alignment produced, so the
+    // generic shape test is no longer the thing that decides. Asked here rather
+    // than after alignment because the two must never disagree: this predicate
+    // is what says whether a CSS transition exists at all.
     if (name === 'transform') {
-      const al = _waTfAlign(sa, sb);
-      if (al) { sa = al[0]; sb = al[1]; }
+      if (_waTfAlignItems(sa, sb)) return true;
     } else if (name && _WA_FILTER_PROPS.has(name)) {
       const al = _waFilterAlign(sa, sb);
       if (al) { sa = al[0]; sb = al[1]; }
@@ -41330,7 +41476,13 @@ if (!globalThis.crypto.subtle) {
   // computed value (css-transforms-2 §5 says so in a note), no matrix anywhere.
   // Left uncomputed, a keyframe's `400grad` never met the `360deg` underneath it
   // and `2em` never became pixels.
-  const _WA_UNCOMPUTED = new Set(['transform', 'offset-rotate']);
+  //
+  // `transform` left here too, and that was the same mistake one layer down: its
+  // resolved value is a matrix, but its COMPUTED value is the list, and the list
+  // is what animates. It now computes through `_canonTransform`'s list mode —
+  // which is what finally lets a keyframe's `2em` meet the `40px` beneath it and
+  // a `400grad` rotation meet a `360deg` one.
+  const _WA_UNCOMPUTED = new Set(['offset-rotate']);
   const _waComputedValue = (el, kebab, v) => {
     if (!el || v === null || v === undefined) return v;
     // A CSS-wide keyword is not a value to compute — it is a question for the
@@ -41371,8 +41523,12 @@ if (!globalThis.crypto.subtle) {
     }
     const had = _waUnderlyingOf.has(el);
     _waUnderlyingOf.add(el);
+    // The guard has to be in force for the WHOLE computation, `transform`
+    // included: resolving a keyframe's `2em` asks the cascade for this element's
+    // font-size, and the cascade would otherwise walk straight back into the
+    // animations running on it — including this one.
     try {
-      const c = _normComputed(el, kebab, String(v));
+      const c = globalThis._withTfList(kebab === 'transform', () => _normComputed(el, kebab, String(v)));
       return (c === null || c === undefined || c === '') ? v : String(c);
     } catch (e) { return v; }
     finally { if (!had) _waUnderlyingOf.delete(el); }
@@ -41549,8 +41705,15 @@ if (!globalThis.crypto.subtle) {
       _waUnderlyingOf.add(el);
       let v = '';
       try {
-        if (base === null) base = globalThis.getComputedStyle(el);
-        v = base[name];
+        // `transform` underneath an effect is its COMPUTED value — the list —
+        // not the matrix getComputedStyle reports. A matrix has forgotten which
+        // functions made it, so it can never line up with the function list a
+        // keyframe wants to add to or accumulate onto it.
+        if (name === 'transform') { v = globalThis._computedTfList(el) || ''; }
+        else {
+          if (base === null) base = globalThis.getComputedStyle(el);
+          v = base[name];
+        }
         if (v === undefined || v === null) v = '';
       } catch (e) { v = ''; }
       finally { _waUnderlyingOf.delete(el); }
@@ -41790,6 +41953,15 @@ if (!globalThis.crypto.subtle) {
   };
   // The computed value a property had when NOTHING declared it: inherited from
   // the parent for an inherited property, its initial value otherwise.
+  // What a transition sees for one property in a computed style. Every property
+  // but one is simply what getComputedStyle says. `transform` is the exception:
+  // getComputedStyle reports the RESOLVED value, a single matrix, and a
+  // transition is defined over COMPUTED values — the function list. Compared as
+  // matrices, `rotate(30deg)` → `rotate(330deg)` is a 60° turn the wrong way and
+  // `none` → `rotate(90deg)` has no functions to interpolate at all.
+  const _csRead = (el, style, kebab) => (kebab === 'transform'
+    ? (globalThis._computedTfList(el) || '')
+    : style.getPropertyValue(kebab));
   const _csImplicitBefore = (el, kebab) => {
     if (_INHERITED_PROPS.has(kebab)) {
       const p = el.parentNode;
@@ -42370,7 +42542,7 @@ if (!globalThis.crypto.subtle) {
         if (idx < 0) continue;
         if (durMs <= 0 && delayMs <= 0) continue;         // a zero-length transition is no transition
         let afterV = '';
-        try { afterV = after.getPropertyValue(k); } catch (e) { afterV = ''; }
+        try { afterV = _csRead(el, after, k); } catch (e) { afterV = ''; }
         if (afterV === '' || afterV === null || afterV === undefined) continue;
         // css-transitions-2 §transition-behavior: a pair of values that cannot be
         // INTERPOLATED is only transitionable when the property's
@@ -42402,7 +42574,7 @@ if (!globalThis.crypto.subtle) {
           // Retarget: start again from wherever the old one has got to.
           let fromNow = null;
           globalThis._csSuppress = false;
-          try { fromNow = globalThis.getComputedStyle(el).getPropertyValue(k); } catch (e) { fromNow = null; }
+          try { fromNow = _csRead(el, globalThis.getComputedStyle(el), k); } catch (e) { fromNow = null; }
           globalThis._csSuppress = true;
           // §reversing a transition. Sending a half-faded element back where it
           // came from must not take a FULL duration — it must take as long as it
@@ -42448,7 +42620,7 @@ if (!globalThis.crypto.subtle) {
       const snap = Object.create(null);
       for (const k of names) {
         if (_CS_NEVER.has(k)) continue;
-        try { const v = after.getPropertyValue(k); if (v) snap[k] = v; } catch (e) {}
+        try { const v = _csRead(el, after, k); if (v) snap[k] = v; } catch (e) {}
       }
       st.snap = snap;
     } catch (e) { /* one bad element must not stop the flush */ }
