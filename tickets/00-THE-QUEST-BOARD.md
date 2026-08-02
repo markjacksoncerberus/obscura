@@ -232,7 +232,45 @@ Difficulty: ⚔️ quick & decisive · ⚔️⚔️ a proper campaign · ⚔️�
 
 ---
 
-## 🗺️ Captain's Counsel (recommended order — updated 2026-06-14, session 5)
+## 🗺️ Captain's Counsel (recommended order — **re-surveyed 2026-08-02, quest #453**)
+
+> The counsel below this box was written on **2026-06-14, session 5**, and was never
+> revised while quests #100→#453 followed each other's ⭐ pointers deeper and deeper
+> into CSS. It is kept for the record. **The live map is the measured one:**
+> **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)** — 152 files across
+> **33 top-level realms the ledger had never touched**, each compared against Chrome
+> on the same files.
+>
+> **The headline: we cover 21 of WPT's 262 top-level realms. Inside them we score
+> 88–99%. Outside them we score 0–48% against a Chrome at 93–100%.**
+>
+> Recommended order, weighted by the mission rather than by subtest count:
+> 1. **`fetch` (187/1204) + `streams` (77/585)** — the data layer of every modern
+>    page. A page whose `fetch()` fails renders EMPTY. Largest winnable block on the map.
+> 2. **`cookies` (0.8%) + `webstorage` (34.9%) + `IndexedDB` (2.9%)** — staying logged
+>    in, and working offline, which matters most where connections are metered.
+> 3. **`accname` (0.0%) + `wai-aria` (25.1%)** — accessible-name computation is how a
+>    screen reader says what a button is **and how an AI agent identifies one**. We
+>    score ZERO on the API that says what an element IS. Highest mission-value per
+>    subtest on the map; `accname` is 3 files, 144 subtests, Chrome 98.6%.
+> 4. **`pointerevents` (22.6%) + `uievents` (32.0%) + `selection` (6.0%)** — how the
+>    agent acts, where (3) is how it reads.
+> 5. **`quirks` (48.1%) + `css/CSS2` (79.5%)** — the old web, which is most of the web
+>    on a hand-me-down laptop. `css/CSS2` is the closest to bankable on the map.
+>
+> **NOT yet:** `wasm` (191k subtests) and `editing` (108k) are the biggest by weight
+> and the poorest by value — mechanical spec conformance and `contenteditable`.
+>
+> **Two findings that are not scores:** `resize-observer/eventloop.html` **HANGS the
+> engine** hard enough to wedge the harness and require a server restart (a hang is
+> worse than a wrong render — worth its own quest); and the entire **visual** half of
+> the platform is still unmeasurable here, because `wpt_baseline.py` cannot run CSS
+> reftests. A reftest runner is the campaign's largest instrumentation blind spot.
+
+<details>
+<summary>Superseded: the 2026-06-14 counsel (session 5)</summary>
+
+
 
 With **#02 Attr-Node Codex SECURED (67/67)** — a real `Attr`/`NamedNodeMap` model
 over namespace-aware Rust attribute storage — the field stands thus:
@@ -250,6 +288,8 @@ over namespace-aware Rust attribute storage — the field stands thus:
 5. The smaller self-contained realms (08 Encoding, 09 FileAPI) for breadth.
 6. **Standing leverage:** XML-document mode + iframes-delay-load (#05) and the new
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
+
+</details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
