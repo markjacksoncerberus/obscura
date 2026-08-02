@@ -307,6 +307,21 @@ TESTDRIVER_BRIDGE_JS = r"""
       try { globalThis.__obscuraUserActivation && globalThis.__obscuraUserActivation(); } catch (e) {}
       return Promise.resolve();
     };
+    // WebDriver "Get Computed Role" / "Get Computed Label". Unlike the input
+    // actions above, these are NOT synthesized by the harness — the answer has
+    // to come from the engine's own accessibility computation, which Obscura
+    // exposes as Element.computedRole / Element.computedLabel (the AOM-proposed
+    // pair). The bridge is a two-line adapter precisely because the work lives
+    // where it belongs; if these ever start returning '' for everything, the
+    // engine regressed, not the harness.
+    impl.get_computed_role = function(element) {
+      try { return Promise.resolve(element.computedRole); }
+      catch (e) { return Promise.reject(e); }
+    };
+    impl.get_computed_label = function(element) {
+      try { return Promise.resolve(element.computedLabel); }
+      catch (e) { return Promise.reject(e); }
+    };
   }
 
   // Obscura runs preload scripts *after* load, so testdriver.js has already set

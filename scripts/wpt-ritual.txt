@@ -1,0 +1,25 @@
+# The zero-regression ritual sweep — re-run this before every commit.
+#
+# These are lands the campaign already holds. The promise is zero regressions
+# per commit, and this file is what makes that promise checkable rather than
+# remembered. Run it with:
+#     .venv/bin/python scripts/wpt_run.py --tests-file scripts/wpt-ritual.txt --timeout 60
+#
+# When a change touches a SHARED path (getComputedStyle, the cascade, event
+# dispatch, Element.prototype's shape) widen the sweep past this list and say so
+# in the scroll. Paths here are curl-verified; a row that suddenly reads
+# could-not-run with bodyLen=42 is a MOVED test, not a regression — fix the path.
+dom/nodes/ParentNode-querySelector-All.html
+dom/nodes/Element-classlist.html
+dom/nodes/Document-createElement.html
+dom/nodes/Document-createElementNS.html
+dom/nodes/attributes.html
+dom/nodes/Node-appendChild.html
+dom/nodes/Node-cloneNode.html
+dom/nodes/Node-lookupNamespaceURI.html
+dom/events/EventListener-handleEvent.html
+url/url-origin.any.html
+user-timing/measure_syntax_err.any.html
+css/cssom/cssom-setProperty-shorthand.html
+css/cssom/serialize-values.html
+css/css-typed-om/the-stylepropertymap/properties/logical.html

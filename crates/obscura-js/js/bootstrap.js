@@ -45295,6 +45295,861 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// THE COMPUTED ROLE  (WAI-ARIA 1.2 §role_definitions · HTML-AAM)
+// ═════════════════════════════════════════════════════════════════════════════
+// What an element *is* — "this is a button", "this is a heading" — is the first
+// question an assistive technology asks, and it is the first question an AI
+// agent driving this browser asks too. Obscura already REFLECTED the ARIA
+// attributes (see __ariaReflectedAttrs above): it could store `role="button"`
+// and hand it back. It could not answer "what role does this element actually
+// have", which is a different question with three parts the attribute alone
+// cannot settle:
+//
+//   1. `role` is a token LIST, and the answer is the first token that names a
+//      real, non-ABSTRACT role. `role="foo button"` is a button; `role="widget"`
+//      is not a widget, because `widget` exists only to organise the taxonomy
+//      and no element may claim it.
+//   2. Roles have SYNONYMS and deprecations. `presentation` and `none` are one
+//      role with two spellings; `directory` was folded into `list`.
+//   3. When there is no `role` attribute at all — which is nearly always — the
+//      role comes from the HTML element itself, via HTML-AAM. That mapping is
+//      not a plain tag→role table: `<a>` is a link only WITH an href, `<th>` is
+//      a columnheader or a rowheader depending on `scope`, `<select>` is a
+//      combobox or a listbox depending on `multiple`/`size`, and `<img alt="">`
+//      is explicitly NOT an image — it is `none`, unless the author named it.
+//
+// Exposed as `Element.computedRole` / `Element.computedLabel` (below): the pair
+// WebDriver's "Get Computed Role"/"Get Computed Label" commands return, and the
+// pair the AOM proposal puts on Element. An agent asking Obscura "what is this
+// and what is it called" now gets an answer from the engine rather than a guess
+// from the markup.
+{
+  const _SVG_NS = 'http://www.w3.org/2000/svg';
+  const _MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
+
+  // Abstract roles exist to structure the ARIA taxonomy; an author may never use
+  // one, and a `role` token naming one is skipped as if it were misspelled.
+  const _ARIA_ABSTRACT = new Set([
+    'command', 'composite', 'input', 'landmark', 'range', 'roletype', 'section',
+    'sectionhead', 'select', 'structure', 'widget', 'window',
+  ]);
+
+  // Deprecated / synonymous spellings, resolved to the one role they name.
+  const _ARIA_SYNONYM = {
+    presentation: 'none',   // ARIA 1.2: `none` is the preferred spelling
+    directory: 'list',      // ARIA 1.2 deprecated `directory`, re-mapped to list
+    img: 'image',           // ARIA 1.3 renamed `img` to `image`
+  };
+
+  // Every concrete role an author may write. Anything not here is not a role.
+  const _ARIA_ROLES = new Set([
+    'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote',
+    'button', 'caption', 'cell', 'checkbox', 'code', 'columnheader', 'combobox',
+    'comment', 'complementary', 'contentinfo', 'definition', 'deletion',
+    'dialog', 'directory', 'document', 'emphasis', 'feed', 'figure', 'form',
+    'generic', 'grid', 'gridcell', 'group', 'heading', 'image', 'img',
+    'insertion', 'link', 'list', 'listbox', 'listitem', 'log', 'main', 'mark',
+    'marquee', 'math', 'menu', 'menubar', 'menuitem', 'menuitemcheckbox',
+    'menuitemradio', 'meter', 'navigation', 'none', 'note', 'option',
+    'paragraph', 'presentation', 'progressbar', 'radio', 'radiogroup', 'region',
+    'row', 'rowgroup', 'rowheader', 'scrollbar', 'search', 'searchbox',
+    'separator', 'slider', 'spinbutton', 'status', 'strong', 'subscript',
+    'suggestion', 'superscript', 'switch', 'tab', 'table', 'tablist',
+    'tabpanel', 'term', 'textbox', 'time', 'timer', 'toolbar', 'tooltip',
+    'tree', 'treegrid', 'treeitem',
+    // ARIA 1.3 (pull #1931) — a header/footer scoped to a section rather than
+    // to the page, the non-landmark counterparts of banner/contentinfo.
+    'sectionheader', 'sectionfooter',
+    // Extension-spec roles are valid role tokens too (graphics-aria / dpub-aria).
+    'graphics-document', 'graphics-object', 'graphics-symbol',
+  ]);
+
+  const _isHTML = (el) => el.namespaceURI == null ||
+    el.namespaceURI === 'http://www.w3.org/1999/xhtml';
+
+  const _attr = (el, name) => {
+    try { return el.getAttribute(name); } catch (e) { return null; }
+  };
+
+  // The `type` of an <input>, lowercased, with the missing/invalid default.
+  const _INPUT_TYPES = new Set([
+    'button', 'checkbox', 'color', 'date', 'datetime-local', 'email', 'file',
+    'hidden', 'image', 'month', 'number', 'password', 'radio', 'range', 'reset',
+    'search', 'submit', 'tel', 'text', 'time', 'url', 'week',
+  ]);
+  function _inputType(el) {
+    const t = String(_attr(el, 'type') || '').toLowerCase();
+    return _INPUT_TYPES.has(t) ? t : 'text';
+  }
+
+  // HTML-AAM §html-element-role-mappings. Elements whose role never varies.
+  const _HTML_FIXED_ROLES = {
+    article: 'article', aside: 'complementary', b: 'generic', bdi: 'generic',
+    bdo: 'generic', blockquote: 'blockquote', body: 'generic', button: 'button',
+    caption: 'caption', code: 'code', data: 'generic', datalist: 'listbox',
+    dd: 'definition', del: 'deletion', details: 'group', dfn: 'term',
+    dialog: 'dialog', div: 'generic', dl: 'list', dt: 'term', em: 'emphasis',
+    fieldset: 'group', figcaption: 'caption', figure: 'figure', form: 'form',
+    h1: 'heading', h2: 'heading', h3: 'heading', h4: 'heading', h5: 'heading',
+    h6: 'heading', hgroup: 'group', hr: 'separator', html: 'document',
+    i: 'generic', ins: 'insertion', li: 'listitem', main: 'main',
+    math: 'math', menu: 'list', meter: 'meter', nav: 'navigation', ol: 'list',
+    optgroup: 'group', option: 'option', output: 'status', p: 'paragraph',
+    pre: 'generic', progress: 'progressbar', q: 'generic', s: 'deletion',
+    samp: 'generic', search: 'search', small: 'generic', span: 'generic',
+    strong: 'strong', sub: 'subscript', summary: 'button', sup: 'superscript',
+    table: 'table', tbody: 'rowgroup', textarea: 'textbox', tfoot: 'rowgroup',
+    thead: 'rowgroup', time: 'time', td: 'cell', tr: 'row', u: 'generic',
+    ul: 'list',
+  };
+
+  // `<input type=X>` role, for the types that have one. The absent types
+  // (color/date/file/hidden/month/password/time/week/datetime-local) have no
+  // role mapping at all — an accessible name still applies to them, but they
+  // are not exposed with an ARIA role.
+  const _INPUT_ROLES = {
+    button: 'button', checkbox: 'checkbox', email: 'textbox', image: 'button',
+    number: 'spinbutton', radio: 'radio', range: 'slider', reset: 'button',
+    search: 'searchbox', submit: 'button', tel: 'textbox', text: 'textbox',
+    url: 'textbox',
+  };
+
+  // Elements whose role depends on their own attributes or their ancestry.
+  function _implicitRole(el) {
+    const tag = el.localName;
+
+    if (el.namespaceURI === _SVG_NS) {
+      if (tag === 'svg') return 'graphics-document';
+      if (tag === 'a') return _attr(el, 'href') != null ? 'link' : 'generic';
+      if (tag === 'g') return 'group';
+      if (tag === 'image') return 'image';
+      if (tag === 'circle' || tag === 'ellipse' || tag === 'line' ||
+          tag === 'path' || tag === 'polygon' || tag === 'polyline' ||
+          tag === 'rect' || tag === 'use') return 'graphics-symbol';
+      return '';
+    }
+    if (el.namespaceURI === _MATHML_NS) return tag === 'math' ? 'math' : '';
+    if (!_isHTML(el)) return '';
+
+    switch (tag) {
+      // A link is a link because it has a destination. Without href, <a> and
+      // <area> are just text (HTML-AAM: generic / no role).
+      case 'a': return _attr(el, 'href') != null ? 'link' : 'generic';
+      case 'area': return _attr(el, 'href') != null ? 'link' : 'generic';
+
+      // <img alt=""> declares itself decorative — it is `none`, NOT an image.
+      // But an author-supplied name overrides that declaration: an img the
+      // author bothered to label is meant to be perceived.
+      case 'img': {
+        const alt = _attr(el, 'alt');
+        if (alt === '' && !_attr(el, 'aria-label') && !_attr(el, 'aria-labelledby') &&
+            !_attr(el, 'title')) return 'none';
+        return 'image';
+      }
+
+      case 'input': {
+        const t = _inputType(el);
+        // A text/search input paired with a <datalist> is a combobox, because
+        // that is what it behaves like.
+        if ((t === 'text' || t === 'search' || t === 'tel' || t === 'url' ||
+             t === 'email') && _attr(el, 'list') != null) return 'combobox';
+        return _INPUT_ROLES[t] || '';
+      }
+
+      // A select is a drop-down (combobox) until it shows more than one row,
+      // at which point it is a listbox.
+      case 'select': {
+        const multiple = _attr(el, 'multiple') != null;
+        const size = parseInt(_attr(el, 'size') || '0', 10);
+        return (multiple || size > 1) ? 'listbox' : 'combobox';
+      }
+
+      // scope decides which axis a header heads; a <th> in a row-group with no
+      // scope falls back to a plain cell only outside a table, which we do not
+      // model — the two explicit scopes are what the mappings turn on.
+      case 'th': {
+        const scope = String(_attr(el, 'scope') || '').toLowerCase();
+        if (scope === 'row' || scope === 'rowgroup') return 'rowheader';
+        return 'columnheader';
+      }
+
+      // header/footer are landmarks only when they scope the whole page —
+      // inside an article or a section they are just wrappers.
+      case 'header': case 'footer': {
+        for (let p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) {
+          const t = p.localName;
+          if (t === 'article' || t === 'aside' || t === 'main' ||
+              t === 'nav' || t === 'section') return 'generic';
+        }
+        return tag === 'header' ? 'banner' : 'contentinfo';
+      }
+
+      // A <section> is a landmark only if it is named — an unnamed one gives a
+      // screen-reader nothing to announce, so it stays generic.
+      case 'section':
+        return (_attr(el, 'aria-label') || _attr(el, 'aria-labelledby') ||
+                _attr(el, 'title')) ? 'region' : 'generic';
+
+      default:
+        return _HTML_FIXED_ROLES[tag] || '';
+    }
+  }
+
+  // The `role` attribute, resolved: first token naming a concrete role, with
+  // synonyms folded. Returns '' when the attribute is absent or names nothing.
+  function _explicitRole(el) {
+    const raw = _attr(el, 'role');
+    if (!raw) return '';
+    for (const tokRaw of raw.split(/[\t\n\f\r ]+/)) {
+      if (!tokRaw) continue;
+      const tok = tokRaw.toLowerCase();
+      if (!_ARIA_ROLES.has(tok) || _ARIA_ABSTRACT.has(tok)) continue;
+      // An unnamed landmark is not that landmark — fall through to the next
+      // token in the list, exactly as if this one had been misspelled. That is
+      // the whole point of role="region group": the second token is the author
+      // saying what to do when the first does not apply.
+      if (_NEEDS_NAME.has(tok) && !_hasAuthorName(el)) continue;
+      return _ARIA_SYNONYM[tok] || tok;
+    }
+    return '';
+  }
+
+  // `presentation`/`none` is a REQUEST to hide an element from the a11y tree,
+  // and the UA must refuse it when honouring it would strand the user: a
+  // focusable element, or one carrying a global ARIA attribute, keeps its
+  // implicit role (ARIA §conflict_resolution_presentation_none).
+  const _GLOBAL_ARIA = [
+    'aria-atomic', 'aria-busy', 'aria-controls', 'aria-current',
+    'aria-describedby', 'aria-description', 'aria-details', 'aria-dropeffect',
+    'aria-flowto', 'aria-grabbed', 'aria-haspopup', 'aria-hidden',
+    'aria-keyshortcuts', 'aria-label', 'aria-labelledby', 'aria-live',
+    'aria-owns', 'aria-relevant', 'aria-roledescription',
+  ];
+  // "Focusable" here means REACHABLE, not tab-reachable: `tabindex="-1"` still
+  // takes focus programmatically, so an element carrying it can still be landed
+  // on and must still say what it is.
+  const _NATIVELY_FOCUSABLE = new Set([
+    'button', 'details', 'embed', 'iframe', 'input', 'select', 'textarea',
+  ]);
+  function _focusable(el) {
+    const ti = _attr(el, 'tabindex');
+    if (ti != null && /^[\t\n\f\r ]*[-+]?\d+[\t\n\f\r ]*$/.test(ti)) return true;
+    if (!_isHTML(el)) return false;
+    const tag = el.localName;
+    if (_NATIVELY_FOCUSABLE.has(tag)) return _attr(el, 'disabled') == null;
+    if (tag === 'a' || tag === 'area') return _attr(el, 'href') != null;
+    return false;
+  }
+  function _presentationRefused(el) {
+    if (_focusable(el)) return true;
+    for (const a of _GLOBAL_ARIA) if (_attr(el, a) != null) return true;
+    return false;
+  }
+
+  // The presentational-children rule (ARIA §tree_exclusion): when a container
+  // is `none`, the elements it is REQUIRED to own — a list's items, a table's
+  // rows and cells — go with it. A list with no list semantics has no listitems
+  // in it, whatever the <li> tags say; leaving them exposed would announce
+  // items belonging to a list the user was never told about.
+  const _REQUIRED_OWNER = {
+    li: new Set(['list']),
+    tr: new Set(['table', 'grid', 'treegrid']),
+    td: new Set(['table']), th: new Set(['table', 'grid', 'treegrid']),
+    tbody: new Set(['table', 'grid', 'treegrid']),
+    thead: new Set(['table', 'grid', 'treegrid']),
+    tfoot: new Set(['table', 'grid', 'treegrid']),
+    option: new Set(['listbox']),
+  };
+  function _ownedByPresentational(el, implicit) {
+    const owners = _isHTML(el) && _REQUIRED_OWNER[el.localName];
+    if (!owners) return false;
+    // Walk up through the intermediate required-owned wrappers (tr inside tbody
+    // inside table) until the element that would own this one is reached.
+    for (let p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) {
+      const pr = _computedRole(p);
+      if (owners.has(pr)) return false;
+      if (pr === 'none') {
+        // Only a container that WOULD have owned it counts: a <li> inside a
+        // presentational <div> is still a listitem.
+        const pImplicit = _explicitRole(p) === 'none' ? _implicitRole(p) : pr;
+        if (owners.has(pImplicit)) return true;
+      }
+      if (!_REQUIRED_OWNER[p.localName]) return false;
+    }
+    return false;
+  }
+
+  // `region` and `form` are landmarks, and a landmark with no name is a landmark
+  // the user cannot be told about — so ARIA says an UNNAMED one is not that role
+  // at all. This is where the role and the name stop being separable: the role
+  // of these two depends on whether an accessible name exists. Rather than run
+  // the whole name computation from inside the role computation (which would
+  // recurse straight back, since naming asks for the role), ask the narrower
+  // question the rule actually turns on — did the AUTHOR name it — which is the
+  // only way a `region`/`form` can acquire a name in the first place.
+  const _NEEDS_NAME = new Set(['region', 'form']);
+  function _hasAuthorName(el) {
+    if (!_isBlankASCII(_attr(el, 'aria-label'))) return true;
+    if (!_isBlankASCII(_attr(el, 'title'))) return true;
+    for (const t of _idrefs(el, 'aria-labelledby')) if (t) return true;
+    return false;
+  }
+
+  function _computedRole(el) {
+    if (!el || el.nodeType !== 1) return '';
+    const explicit = _explicitRole(el);
+    if (explicit) {
+      if (explicit === 'none' && _presentationRefused(el)) return _implicitRole(el);
+      return explicit;
+    }
+    const implicit = _implicitRole(el);
+    if (implicit && _ownedByPresentational(el, implicit)) return 'none';
+    return implicit;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // THE ACCESSIBLE NAME  (AccName 1.2 §computation-steps · HTML-AAM · SVG-AAM)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // What an element is CALLED. A screen reader says it aloud; an agent driving
+  // Obscura matches on it to find the button it was told to press. It is not one
+  // attribute but an ordered search: nine steps, the first that yields non-blank
+  // text wins, and several of them recurse back into the whole computation for a
+  // different node. Three things in it are easy to get subtly wrong and each is
+  // marked at its step below:
+  //
+  //   • "Blank" means blank of ASCII whitespace ONLY. A non-breaking space and
+  //     the blank braille pattern U+2800 are CONTENT — an author who wrote them
+  //     meant them, and collapsing them silently renames the element.
+  //   • A hidden node contributes nothing — UNLESS the computation was pointed
+  //     at it deliberately by aria-labelledby. Authors routinely keep a label in
+  //     a `display:none` span; refusing to read it would strand every one of
+  //     those pages. But the exemption belongs to the node that was REFERENCED
+  //     and to what it hides, not to hidden nodes under a visible referent.
+  //   • Recursion changes the rules for the node it lands on: a descendant
+  //     contributes its content whatever its role says, and a form control
+  //     contributes its VALUE rather than its markup.
+  const _ASCII_WS_G = /[\t\n\f\r ]+/g;
+  const _flattenWS = (s) => String(s).replace(_ASCII_WS_G, ' ').replace(/^ +| +$/g, '');
+  function _isBlankASCII(s) {
+    return s == null || String(s).replace(_ASCII_WS_G, '') === '';
+  }
+
+  function _CS(el, pseudo) {
+    try { return getComputedStyle(el, pseudo); } catch (e) { return null; }
+  }
+
+  // There are two DIFFERENT kinds of hidden here, and conflating them is the
+  // single easiest way to get this wrong.
+  //
+  //   `display:none`, `aria-hidden="true"` and the HTML `hidden` attribute
+  //   remove a whole SUBTREE. Nothing inside can come back.
+  //
+  //   `visibility:hidden` does not. It INHERITS, and a descendant may set
+  //   `visibility:visible` and reappear. So it must not stop the descent — it
+  //   only silences the text that actually computes to hidden, which (because
+  //   the property inherits) is exactly what asking each text node's own parent
+  //   answers, with no ancestor walk at all.
+  function _blocksDescent(el) {
+    if (_attr(el, 'aria-hidden') === 'true') return true;
+    // The `hidden` content attribute means display:none in the UA stylesheet.
+    // Obscura has no UA stylesheet, so ask the attribute directly rather than
+    // ask a computed `display` that will never say `none` on its account.
+    if (_attr(el, 'hidden') != null) return true;
+    const cs = _CS(el);
+    return cs ? cs.display === 'none' : false;
+  }
+  const _visHidden = (el) => {
+    const cs = _CS(el);
+    return !!cs && (cs.visibility === 'hidden' || cs.visibility === 'collapse');
+  };
+  // Hidden in ANY sense — the question the aria-labelledby exemption turns on,
+  // because the exemption a referenced node earns is inherited by whatever it
+  // was hiding.
+  const _hiddenNode = (el) => _blocksDescent(el) || _visHidden(el);
+
+  // Hidden by the HOST LANGUAGE — `hidden` or `display:none`, on the element or
+  // any DOM ancestor. Deliberately excludes `aria-hidden`, which is a fact about
+  // the accessibility tree rather than about rendering (see _a11yChildren).
+  function _hostHiddenAncestral(el) {
+    for (let n = el; n && n.nodeType === 1; n = n.parentNode) {
+      if (_attr(n, 'hidden') != null) return true;
+      const cs = _CS(n);
+      if (cs && cs.display === 'none') return true;
+    }
+    return false;
+  }
+  // The same question for the ROOT of a computation, where no ancestor has been
+  // checked yet.
+  function _hiddenAncestral(el) {
+    if (_visHidden(el)) return true;
+    for (let n = el; n && n.nodeType === 1; n = n.parentNode) {
+      if (_blocksDescent(n)) return true;
+    }
+    return false;
+  }
+
+  function _idrefs(el, attrName) {
+    const raw = _attr(el, attrName);
+    if (!raw) return [];
+    let root = null;
+    try { root = el.getRootNode ? el.getRootNode() : null; } catch (e) { root = null; }
+    if (!root || !root.getElementById) root = el.ownerDocument;
+    const out = [];
+    for (const id of raw.split(/[\t\n\f\r ]+/)) {
+      if (!id) continue;
+      let t = null;
+      try { t = root.getElementById(id); } catch (e) {}
+      if (t) out.push(t);
+    }
+    return out;
+  }
+
+  // Roles whose name comes from what is INSIDE them (ARIA "Name From: contents").
+  const _NAME_FROM_CONTENT = new Set([
+    'button', 'cell', 'checkbox', 'columnheader', 'comment', 'gridcell',
+    'heading', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
+    'option', 'radio', 'row', 'rowheader', 'sectionhead', 'switch', 'tab',
+    'tooltip', 'treeitem',
+  ]);
+
+  // Roles for which naming is PROHIBITED (ARIA "Name From: prohibited"). These
+  // are the structural and inline-text roles: naming a `<span>` or an `<em>`
+  // announces a label where the user expects prose.
+  const _NAME_PROHIBITED = new Set([
+    'caption', 'code', 'deletion', 'emphasis', 'generic', 'insertion', 'none',
+    'paragraph', 'presentation', 'strong', 'subscript', 'superscript',
+  ]);
+
+  // A child that lays out as a block is a separate line on screen, so its text
+  // must not run into its neighbour's when flattened into one string.
+  const _BLOCKISH = new Set([
+    'block', 'flex', 'grid', 'list-item', 'table', 'table-row', 'table-cell',
+    'table-caption', 'flow-root', 'inline-block', 'inline-flex', 'inline-grid',
+  ]);
+
+  // Form controls whose interior is machinery, not text: recursing into a
+  // <select> would read out every option as though it were the label.
+  const _OPAQUE_CONTROLS = new Set(['input', 'select', 'textarea']);
+
+  // `content: "before" / "alt text"` — css-content-3 gives the string after the
+  // slash as the ALTERNATIVE text, which is what accessibility consumes. When
+  // the alternative is present (even empty) it replaces the visual content.
+  function _pseudoText(el, which) {
+    const cs = _CS(el, which);
+    let raw = cs && cs.content;
+    if (!raw || raw === 'normal' || raw === 'none') return '';
+    const slash = _splitContentAlt(raw);
+    return _unquoteContent(slash);
+  }
+  function _splitContentAlt(raw) {
+    // Find a `/` that is not inside a string or a url()/attr() call.
+    let depth = 0, quote = null;
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw[i];
+      if (quote) { if (c === '\\') i++; else if (c === quote) quote = null; continue; }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (c === '(') depth++;
+      else if (c === ')') depth--;
+      else if (c === '/' && depth === 0) return raw.slice(i + 1);
+    }
+    return raw;
+  }
+  function _unquoteContent(raw) {
+    let out = '', quote = null;
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw[i];
+      if (quote) {
+        if (c === '\\') { out += raw[++i] || ''; continue; }
+        if (c === quote) { quote = null; continue; }
+        out += c;
+      } else if (c === '"' || c === "'") { quote = c; }
+    }
+    return out;
+  }
+
+  // The nodes a name computation descends into: the flattened tree (so a shadow
+  // root's content and a slot's assigned nodes are read, not the light-DOM
+  // placeholders), plus anything the element claims with aria-owns.
+  function _a11yChildren(el) {
+    let kids = null;
+    try {
+      const sr = el.shadowRoot;
+      if (sr) kids = Array.prototype.slice.call(sr.childNodes);
+      else if (el.localName === 'slot' && el.assignedNodes) {
+        const a = el.assignedNodes({ flatten: true });
+        kids = a && a.length ? Array.prototype.slice.call(a)
+                             : Array.prototype.slice.call(el.childNodes);
+      }
+    } catch (e) { kids = null; }
+    if (!kids) kids = Array.prototype.slice.call(el.childNodes);
+    // aria-owns reparents a subtree in the accessibility tree, and the two ways
+    // of hiding something part company here:
+    //
+    //   `aria-hidden` is INHERITED DOWN THE ACCESSIBILITY TREE, so a node that
+    //   has been reparented out from under it is no longer hidden by it — the
+    //   warning span in an aria-hidden div is read once a link owns it.
+    //
+    //   `hidden` / `display:none` is a RENDERING fact about where the element
+    //   actually is. aria-owns does not move the element on screen, so it cannot
+    //   un-hide it, and a target under one of those stays out.
+    const owned = _idrefs(el, 'aria-owns').filter((t) => !_hostHiddenAncestral(t));
+    return owned.length ? kids.concat(owned) : kids;
+  }
+
+  // Step 2C — a control reached BY RECURSION contributes the value the user
+  // sees in it, not its markup. This is what makes "Flash the screen [3] times"
+  // read correctly when the 3 is a spinbutton inside the label.
+  function _embeddedControlValue(node, role, ctx) {
+    if (_isHTML(node)) {
+      const tag = node.localName;
+      if (tag === 'textarea') return node.value != null ? String(node.value) : '';
+      if (tag === 'input') {
+        const t = _inputType(node);
+        if (t === 'text' || t === 'search' || t === 'tel' || t === 'url' ||
+            t === 'email' || t === 'number' || t === 'password' || t === 'range') {
+          return node.value != null ? String(node.value) : '';
+        }
+        return null;
+      }
+      if (tag === 'select') {
+        const parts = [];
+        try {
+          for (const opt of node.selectedOptions || []) parts.push(_accName(opt, _sub(ctx, true)));
+        } catch (e) {}
+        return parts.join(' ');
+      }
+    }
+    // An ARIA widget built out of ordinary elements. `aria-valuetext` is the
+    // author saying "read THIS, not the number" — a slider at aria-valuenow=3.0
+    // whose valuetext is "3" must be read as 3.
+    if (role === 'spinbutton' || role === 'slider') {
+      const txt = _attr(node, 'aria-valuetext');
+      if (txt != null) return txt;
+      const now = _attr(node, 'aria-valuenow');
+      if (now != null) return now;
+      return '';
+    }
+    // A non-native combobox displays its current value as its own content.
+    if (role === 'combobox') return _flattenWS(_fromContent(node, _sub(ctx, true)));
+    // A non-native listbox is represented by whichever option is selected.
+    if (role === 'listbox') {
+      const parts = [];
+      _collectSelectedOptions(node, parts, ctx);
+      return parts.join(' ');
+    }
+    return null;
+  }
+  function _collectSelectedOptions(el, out, ctx) {
+    for (const c of _a11yChildren(el)) {
+      if (c.nodeType !== 1) continue;
+      if (_computedRole(c) === 'option' && _attr(c, 'aria-selected') === 'true') {
+        out.push(_flattenWS(_fromContent(c, _sub(ctx, true))));
+      } else {
+        _collectSelectedOptions(c, out, ctx);
+      }
+    }
+  }
+
+  // Step 2E — the host language's own labelling mechanisms, per HTML-AAM /
+  // SVG-AAM. Returns null when the language offers none for this element (so the
+  // computation continues), or a string when it does — INCLUDING the empty
+  // string, which for `<img alt="">` is an author declaring "this has no name".
+  function _hostLanguageLabel(el, ctx) {
+    if (el.namespaceURI === _SVG_NS) {
+      for (const c of _a11yChildren(el)) {
+        if (c.nodeType === 1 && c.localName === 'title' && c.namespaceURI === _SVG_NS) {
+          return _fromContent(c, _sub(ctx, true));
+        }
+      }
+      return null;
+    }
+    if (!_isHTML(el)) return null;
+    const tag = el.localName;
+
+    if (tag === 'input') {
+      const t = _inputType(el);
+      if (t === 'button') {
+        const v = _attr(el, 'value');
+        return _isBlankASCII(v) ? null : v;
+      }
+      if (t === 'submit' || t === 'reset') {
+        const v = _attr(el, 'value');
+        // A submit button with no value still has a name — the UA's own label.
+        return _isBlankASCII(v) ? (t === 'submit' ? 'Submit' : 'Reset') : v;
+      }
+      if (t === 'image') {
+        const alt = _attr(el, 'alt');
+        if (!_isBlankASCII(alt)) return alt;
+        const lbl = _labelsName(el, ctx);
+        if (lbl != null) return lbl;
+        if (!_isBlankASCII(_attr(el, 'title'))) return null;  // step 2I takes it
+        return 'Submit Query';
+      }
+      if (t === 'hidden') return null;
+      // NOTE the omission: `placeholder` is NOT consulted here. HTML-AAM puts it
+      // BELOW `title`, and title is step 2I — so the placeholder is the very
+      // last resort, handled after the tooltip rather than before it.
+      return _labelsName(el, ctx);
+    }
+
+    if (tag === 'textarea' || tag === 'select' || tag === 'meter' ||
+        tag === 'progress' || tag === 'output') {
+      return _labelsName(el, ctx);
+    }
+
+    // An `alt` attribute IS the image's text alternative — and `alt=""` is a
+    // deliberate, meaningful empty one.
+    if (tag === 'img' || tag === 'area') {
+      const alt = _attr(el, 'alt');
+      return alt == null ? null : alt;
+    }
+
+    if (tag === 'fieldset') {
+      for (const c of _a11yChildren(el)) {
+        if (c.nodeType === 1 && c.localName === 'legend') return _fromContent(c, _sub(ctx, true));
+      }
+      return null;
+    }
+    if (tag === 'table') {
+      for (const c of _a11yChildren(el)) {
+        if (c.nodeType === 1 && c.localName === 'caption') return _fromContent(c, _sub(ctx, true));
+      }
+      return null;
+    }
+    if (tag === 'figure') {
+      const fc = _firstDescendant(el, 'figcaption');
+      return fc ? _fromContent(fc, _sub(ctx, true)) : null;
+    }
+    if (tag === 'details') {
+      for (const c of _a11yChildren(el)) {
+        if (c.nodeType === 1 && c.localName === 'summary') return _fromContent(c, _sub(ctx, true));
+      }
+      return null;
+    }
+    return null;
+  }
+
+  function _firstDescendant(el, tag) {
+    for (const c of _a11yChildren(el)) {
+      if (c.nodeType !== 1) continue;
+      if (c.localName === tag) return c;
+      const d = _firstDescendant(c, tag);
+      if (d) return d;
+    }
+    return null;
+  }
+
+  // The names of every <label> associated with a control, in tree order.
+  function _labelsName(el, ctx) {
+    let labels = null;
+    try { labels = el.labels; } catch (e) { labels = null; }
+    if (!labels || !labels.length) return null;
+    const parts = [];
+    for (const l of labels) {
+      const s = _fromContent(l, _sub(ctx, true));
+      if (!_isBlankASCII(s)) parts.push(_flattenWS(s));
+    }
+    return parts.length ? parts.join(' ') : null;
+  }
+
+  const _sub = (ctx, recursion) => ({
+    visited: ctx.visited, labelledby: ctx.labelledby, owners: ctx.owners,
+    recursion: recursion !== false, hiddenOK: false,
+  });
+
+  // aria-owns RELOCATES a subtree in the accessibility tree: the owner reads it,
+  // and the element it was physically nested in no longer does. Without this,
+  // owned content is read TWICE — once where it sits and once where it moved —
+  // which is worse than not supporting aria-owns at all. Built once per
+  // computation and cached on the context; an element that is itself hidden
+  // owns nothing, because its whole subtree is out of the tree already.
+  function _ownerMap(ctx, el) {
+    if (ctx.owners) return ctx.owners;
+    const map = new Map();
+    let hosts = [];
+    try {
+      const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+      hosts = Array.prototype.slice.call(
+        (root.querySelectorAll ? root : el.ownerDocument).querySelectorAll('[aria-owns]'));
+    } catch (e) { hosts = []; }
+    for (const h of hosts) {
+      if (_hiddenAncestral(h)) continue;
+      for (const t of _idrefs(h, 'aria-owns')) if (!map.has(t)) map.set(t, h);
+    }
+    ctx.owners = map;
+    return map;
+  }
+
+  // Steps 2F/2H — the text alternative of everything inside, in order.
+  function _fromContent(el, ctx) {
+    if (_isHTML(el) && _OPAQUE_CONTROLS.has(el.localName)) return '';
+    let out = _pseudoText(el, '::before');
+    // The hidden exemption reaches a node's descendants only if the node itself
+    // was hidden — a hidden span under a VISIBLE referenced node stays hidden.
+    const childHiddenOK = ctx.hiddenOK && _hiddenNode(el);
+    const owners = _ownerMap(ctx, el);
+    for (const child of _a11yChildren(el)) {
+      if (child.nodeType === 1) {
+        const owner = owners.get(child);
+        if (owner && owner !== el) continue;   // read where it was relocated to
+      }
+      const sub = _accName(child, {
+        visited: ctx.visited, labelledby: ctx.labelledby, owners: ctx.owners,
+        recursion: true, hiddenOK: childHiddenOK,
+      });
+      if (!sub) continue;
+      const cs = child.nodeType === 1 ? _CS(child) : null;
+      const blocky = cs ? _BLOCKISH.has(cs.display) : false;
+      out += blocky ? ' ' + sub + ' ' : sub;
+    }
+    return out + _pseudoText(el, '::after');
+  }
+
+  // A text node reads as it is RENDERED, not as it is written: `text-transform`
+  // is what the user actually sees, so "Call us" under `text-transform:uppercase`
+  // is named "CALL US".
+  function _renderedText(textNode) {
+    const data = textNode.data || '';
+    if (!data) return '';
+    const p = textNode.parentNode;
+    if (!p || p.nodeType !== 1) return data;
+    const cs = _CS(p);
+    if (!cs) return data;
+    // visibility inherits, so the text node's own parent already knows.
+    if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return null;
+    switch (cs.textTransform) {
+      case 'uppercase': return data.toUpperCase();
+      case 'lowercase': return data.toLowerCase();
+      case 'capitalize':
+        return data.replace(/(^|[\t\n\f\r ])([^\t\n\f\r ])/g,
+                            (m, ws, c) => ws + c.toUpperCase());
+      default: return data;
+    }
+  }
+
+  // The computation itself. `ctx` carries the three things the steps turn on:
+  //   visited   — the cycle guard (aria-labelledby can point at an ancestor)
+  //   labelledby— we are inside an aria-labelledby traversal (2B must not recurse)
+  //   recursion — this node is not the one being named (2C/2F change)
+  //   hiddenOK  — 2A's exemption applies to this node
+  function _accName(node, ctx) {
+    if (!node) return '';
+    if (node.nodeType === 3) {                          // step 2G — a text node
+      const t = ctx.hiddenOK ? (node.data || '') : _renderedText(node);
+      return t == null ? '' : t;
+    }
+    if (node.nodeType !== 1) return '';
+    // Each node contributes to a name ONCE. The set is never unwound, because
+    // the rule is not "no cycles" but "already spoken": a heading whose first
+    // link is aria-labelledby an image, and whose second link CONTAINS that same
+    // image, must not say "image" twice.
+    if (ctx.visited.has(node)) return '';
+
+    // Step 2A — hidden, and not referenced. `visibility:hidden` deliberately
+    // does NOT stop here (see _blocksDescent): a visible descendant of a hidden
+    // node is still visible, and silencing the whole subtree would lose it.
+    if (!ctx.hiddenOK && _blocksDescent(node)) return '';
+
+    ctx.visited.add(node);
+    const role = _computedRole(node);
+    const prohibited = _NAME_PROHIBITED.has(role);
+
+    // Step 2B — aria-labelledby. Not consulted when we are already following
+    // one, which is what stops two elements naming each other forever.
+    if (!ctx.labelledby && !prohibited) {
+      const targets = _idrefs(node, 'aria-labelledby');
+      if (targets.length) {
+        const parts = [];
+        for (const t of targets) {
+          if (t === node) {
+            // An element may name itself. That is not a cycle — it means "start
+            // my name with whatever the REST of the steps give me", so run them
+            // with the labelledby flag already set so 2B is not re-entered.
+            ctx.visited.delete(node);
+            parts.push(_accName(node, {
+              visited: ctx.visited, labelledby: true, recursion: true,
+              hiddenOK: true, owners: ctx.owners,
+            }));
+            ctx.visited.add(node);
+            continue;
+          }
+          parts.push(_accName(t, {
+            visited: ctx.visited, labelledby: true, recursion: true,
+            hiddenOK: true, owners: ctx.owners,
+          }));
+        }
+        const s = _flattenWS(parts.join(' '));
+        if (s) return s;
+      }
+    }
+
+    // Step 2C — an embedded control reached by recursion.
+    if (ctx.recursion) {
+      const v = _embeddedControlValue(node, role, ctx);
+      if (v != null) return v;
+    }
+
+    // Step 2D — aria-label.
+    if (!prohibited) {
+      const al = _attr(node, 'aria-label');
+      if (!_isBlankASCII(al)) return al;
+    }
+
+    // Step 2E — the host language's labelling mechanism.
+    if (!prohibited) {
+      const hl = _hostLanguageLabel(node, ctx);
+      if (hl != null) return hl;
+    }
+
+    // Steps 2F/2H — name from content. Allowed when the role says so, and
+    // always when we got here by recursion or by following a label reference:
+    // a descendant's text belongs to the name being built regardless of what
+    // the descendant's own role would permit for itself.
+    let content = '';
+    if (_NAME_FROM_CONTENT.has(role) || ctx.recursion || ctx.labelledby) {
+      content = _fromContent(node, ctx);
+      if (!_isBlankASCII(content)) return content;
+    }
+
+    // Step 2I — the tooltip of last resort.
+    const title = _attr(node, 'title');
+    if (!_isBlankASCII(title)) return title;
+
+    // …and BELOW the tooltip, the placeholder (HTML-AAM orders it last).
+    if (_isHTML(node) && (node.localName === 'input' || node.localName === 'textarea')) {
+      const ph = _attr(node, 'placeholder');
+      if (!_isBlankASCII(ph)) return ph;
+    }
+
+    // A descendant that contributed nothing but SPACE still contributed the
+    // space. `button<span><span> </span></span>label` is "button label", not
+    // "buttonlabel" — the separator is the whole meaning of that markup.
+    if (ctx.recursion && content) return content;
+
+    return '';
+  }
+
+  function _computedLabel(el) {
+    if (!el || el.nodeType !== 1) return '';
+    // The element being asked about is itself hidden: it has no name to give.
+    if (_hiddenAncestral(el)) return '';
+    return _flattenWS(_accName(el, {
+      visited: new Set(), labelledby: false, recursion: false, hiddenOK: false,
+      owners: null,
+    }));
+  }
+
+  Object.defineProperty(Element.prototype, 'computedRole', {
+    configurable: true, enumerable: true,
+    get() { return _computedRole(this); },
+  });
+  Object.defineProperty(Element.prototype, 'computedLabel', {
+    configurable: true, enumerable: true,
+    get() { return _computedLabel(this); },
+  });
+}
+
 globalThis.__obscura_init = function() {
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;

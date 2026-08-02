@@ -27,7 +27,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 | **F1** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`fetch/*` + `streams/*`** — the data layer of every modern page | **187/1204 · 77/585 (15.5% · 13.2%)**, Chrome 92.3% · 99.5% | ⚔️⚔️ | **OPEN — TOP PRIORITY. The largest winnable block on the map.** A page whose `fetch()` fails does not render badly, it renders **EMPTY**. Start with `fetch/api/headers/`, `fetch/api/request/`, `fetch/api/response/` — pure object-model files with no network dependency, very likely the same "build the class properly" shape that took `css-typed-om` from 65 to 10,815 in #446. `streams` sits underneath (`response.body`), so treat the two as one region. |
 | **F2** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **2/259 · 30/86 · 12/417 (0.8% · 34.9% · 2.9%)**, Chrome 96.9% · 86.0% · 99.8% | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
-| **F3** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`accname/*` + `wai-aria/*`** — what an element IS | **0/144 · 76/303 (0.0% · 25.1%)**, Chrome 98.6% · 100% | ⚔️⚔️ | **OPEN — highest mission-value per subtest on the whole map.** Accessible-name computation is how a screen reader says what a button is **and how an AI agent identifies one**. We are a browser built for agents and we score **ZERO** on the API that answers "what is this element". `accname` is **3 files, 144 subtests**, no rendering required — a small, self-contained, high-leverage region. |
+| **F3** | ✅ [The Accessible Verdict](454-the-accessible-verdict.md) | **`accname/*` + `wai-aria/role/*`** — what an element IS, and what it is CALLED | **818/853 (95.9%)** — was 0/853 | ⚔️⚔️ | **SECURED (Quests #454–#456, 2026-08-02).** 31 of 34 files to 100%. The 853 zeros were **two missing primitives**, not 853 defects: the engine could not answer "what is this" or "what is it called". Now `Element.computedRole` / `Element.computedLabel`. **Still open in this realm:** `accname/name/shadowdom/` (never measured), `comp_name_from_heading.tentative.html`, and `wai-aria/` OUTSIDE `role/` — the survey put the whole realm at 25.1% and `role/` is now 97.5% of it, so **re-measure before choosing**. The last 30 accname rows are two CSS gaps, not accname gaps (see the scroll's ⭐). |
 | **F4** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | **68/301 · 65/203 · 24/403 (22.6% · 32.0% · 6.0%)**, Chrome 98.7% · 96.1% · 98.8% | ⚔️⚔️⚔️ | **OPEN.** Clicking, typing, selecting. F3 is how an agent reads a page; this is how it acts on one. `selection` at 6% with **zero** could-not-run means the API is present and wrong rather than missing — usually the cheaper shape. |
 | **F5** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`quirks/*` + `css/CSS2/*`** — the old web | **75/156 · 350/440 (48.1% · 79.5%)**, Chrome 98.1% · 100% | ⚔️ | **OPEN — the cheapest rows on the map.** `css/CSS2` at 79.5% is the highest score in the whole survey. Quirks mode is not legacy trivia for our audience: the hand-me-down-laptop web is full of pages written in 2004, and they are exactly the pages that must not break. |
 | **F6** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`resize-observer/eventloop.html` HANGS THE ENGINE** | wedged the harness twice; server needed a kill + restart | ⚔️⚔️ | **OPEN — a hang is worse than a wrong render.** Playwright could not even open a new page afterwards. Excluded from `scripts/wpt-frontier-probe.txt` so the survey re-runs; that exclusion is a workaround, not a fix. |
@@ -308,6 +308,76 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-02 — Quests #454–#456 · **The Accessible Verdict** · `accname` + `wai-aria/role` **0/853 → 818/853 (95.9%)**
+
+*What is this, and what is it called?* Two questions. A screen reader asks them to
+speak a page aloud; an AI agent driving Obscura asks them to find the button it was
+told to press. **The engine could answer neither.**
+
+**Chose the standing order over the ⭐.** The pointer said `border-width.html`
+(120/136, a realm at 94%); the survey said `accname` was the **only realm on the
+whole map at exactly 0.0%**, against a Chrome at 98.6% on the same files — and it
+is this browser's own mission. ⭐ banked, not discarded.
+
+**The shape of the zero mattered more than its size.** 853 failing subtests, one
+error: `test_driver_internal.get_computed_label is not a function`. Two missing
+primitives behind every row. Obscura now computes both for real and exposes them
+as **`Element.computedRole` / `Element.computedLabel`** — the AOM pair, and what
+WebDriver's Get Computed Role/Label return — so the harness bridge is a **two-line
+adapter** rather than an implementation. If it ever answers `''` for everything,
+the engine regressed and the tests will say so.
+
+- **#454 the computed role** (`wai-aria/role` 0/401 → 391/401). Reflecting `role`
+  and *computing* it are different questions. A `role` attribute is a token LIST
+  and abstract roles are not roles; roles have synonyms; and without the attribute
+  the role comes from HTML-AAM, which is not a tag→role table — `<a>` is a link
+  only WITH an href, `<th>` turns on `scope`, `<select>` on `multiple`/`size`, and
+  **`<img alt="">` is explicitly NOT an image** — it is `none`, the author calling
+  it decorative, unless they also named it. `role="none"` is a request the UA must
+  refuse when honouring it would strand the user: **`tabindex="-1"` is focusable**
+  (reachable, if not tab-reachable), and a list that is `none` has no listitems in
+  it whatever the `<li>` tags say.
+- **#455 the accessible name** (`accname` 0/452 → 391/452). Nine ordered steps,
+  several recursing. **"Blank" means blank of ASCII whitespace ONLY** — nbsp and
+  the blank braille pattern U+2800 are content, and trimming them renames the
+  button. **A hidden node contributes nothing unless the computation was pointed
+  at it** (authors park labels in `display:none` spans) — but that exemption
+  belongs to the node that was REFERENCED and to what it was hiding, not to a
+  hidden node under a *visible* referent. And **the role and the name are mutually
+  recursive**: an unnamed `region`/`form` is not that role, so `<nav role="region">`
+  is a navigation and `<div role="ReGiOn group">` falls through to `group`.
+- **#456 the corners** (`accname` 391 → 421/452, plus the last five role rows).
+  `hidden` is an ATTRIBUTE, not a style — there is no UA stylesheet, so computed
+  `display` never says `none` on its account. **Two kinds of hidden behave
+  oppositely**: `display:none`/`aria-hidden`/`hidden` remove a subtree;
+  `visibility:hidden` INHERITS and a descendant can set `visible` and reappear, so
+  it must not stop the descent — and because it inherits, asking each **text
+  node's own parent** is the entire check. A descendant that contributed nothing
+  but SPACE still contributed the space. Each node contributes ONCE and the
+  visited set is **never unwound** ("already spoken", not "no cycles"). An element
+  may name ITSELF. **`title` beats `placeholder`** — one ordering line, 8 subtests.
+  And **`aria-owns` RELOCATES**, or owned content is read twice: `aria-hidden`
+  follows the relocation, `hidden`/`display:none` does not. One predicate for both
+  went **8/9 → 7/9**; two predicates went 9/9.
+
+**Zero regressions** — ritual sweep clean (now a committed file,
+`scripts/wpt-ritual.txt`), widened for the two new `Element.prototype` members.
+
+**CAPS named:** `role_none_conflict_resolution.tentative.html` 0/5 is **unwinnable
+by construction** (every `data-expectedrole` is the literal sentinel
+`SPEC_AMBIGUOUS_LOG_VALUE`; Chrome fails them too — do not "fix" it). The 30
+remaining `comp_name_from_content` rows are **two CSS gaps, not accname gaps**.
+
+**⭐ NEXT LEVERAGE — pseudo-element computed style.** `getComputedStyle(el, '::before')`
+accepts the pseudo argument and **ignores it entirely** (`_buildCascade` never sees
+it), so `content` reads `normal` for every pseudo in existence. Worth **21 accname
+subtests**, the **pseudo-element transition rows** the animation arc already named,
+and the untouched **`css/css-pseudo`** realm. **⭐⭐ And behind it: a UA default
+stylesheet for `display`** — `getComputedStyle(el).display` answers **`block` for
+every element in the document**, which is layout-visible, not just an accname
+inconvenience, and is a prerequisite for honest reftest work.
+
 
 ### 2026-08-02 — Quests #451–#453, the unsupported arc (+242, zero regressions, ten more files to 100%)
 
