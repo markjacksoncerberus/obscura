@@ -16,6 +16,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 ## ⚔️ Open Quests
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| ~~451–453~~ | ✅ [The Unsupported Verdict](101-the-unsupported-verdict.md) | **The unsupported arc — a corner the engine could store but could not NAME, a shorthand handed a number it has no word for, and a value the map described with a class that lied about it** | **+242** | ⚔️⚔️ | **SECURED — +242 measured across the whole 244-file `the-stylepropertymap/properties/` band (10,051 → 10,293/11,311), zero regressions, ten more files to 100% (103 → 113), 23 files now above Chrome.** **The most reusable thing this session found is not a fix:** #450's ⭐ named `logical.html` (1274/1468) as the biggest row left, and the first move was to ask what **Chrome** scores on it — **1256**. We were already ahead. Diffing Chrome's per-subtest results by name split 194 failures into **130 winnable rows**, 64 where the file argues with the spec, and 148 where we lead. **#451** css-logical's four flow-relative corner radii were absent from `_GCS_DEFAULTS`, so the engine stored them and read them back while `CSS.supports` said false and the Typed OM threw on all 52 rows; they join the parse/computed SET and deliberately not the `border-radius` expansion ARRAY. **#452** a shorthand has no typed value of its own — not because the grammar forbids it but because `border-block-start: 5px` only works as a string by also resetting the style and the colour, and `margin` is a `{1,4}` LIST; plus a `<line-width>` has no percentage, which leaked only through `set()`'s out-of-range `calc()` wrap. **#453** reification asks the PROPERTY too — one table, two doors: a shorthand's numeric, a colour (three spellings of one value, and a keyword compares by spelling; `currentcolor` points at a colour rather than naming one), and a pair-valued computed radius. **Caps named: the last 24 `logical.html` rows are a suite SELF-CONTRADICTION** (`border-radius.html` and `logical.html` demand opposite classes for the same corner) and the `currentcolor`-computed rows are a cap no engine passes. |
 | ~~448–450~~ | ✅ [The Well-Formed Verdict](100-the-well-formed-verdict.md) | **The well-formed arc — a zero that lost its unit, eight colours nobody had written, and three rules `class` gets backwards from WebIDL** | **+463** | ⚔️⚔️ | **SECURED — +463 measured, zero regressions, ten files to 100%, `css-typed-om/idlharness` 270 → 536/544.** #447's ⭐ said the row was "a LIST, not a cap" and it was right on both counts; bucketing its 274 failures split them cleanly into three quests. **#448 a unitless zero is a length, and an angle.** `_tomReify` already knew `width: 0` is `0px` — but it asks the **PROPERTY** which unit a bare zero wore, and `_tomComponentOf` called it with no property at all, because inside a transform function the property has nothing to say: **the FUNCTION does**. So `CSSStyleValue.parse('transform','translateX(0)')` threw, and so did `computedStyleMap().get('transform')` on **the commonest transform on the web — the `translateX(0)` GPU-promotion hack**. css-transforms-1 admits `<zero>` in the angle slots too, which is why `rotate(0)` is ordinary CSS; `_TOM_TF_SLOTS` is that grammar as a table. The 38 rows read as **could-not-run, not failure**, because the test file's setup block died on the first throw. **#449 a colour channel is the one place a bare JS number is not `CSS.number(n)`** — in a colour `0.5` means HALF, so a `<percentage>` slot reads `50%`, an `<angle>` slot reads `180` as `180deg`, and Lab's `<number>` slots read `7` as `7`; a value that already knows its unit is never rescaled. **And the same IDL type decides which error a refusal is**: `CSSHSL`'s hue is a union admitting a keyword, so `new CSSHSL(undefined, …).h` is legitimately `CSSKeywordValue("undefined")`, while `CSSHWB`'s hue is a bare `CSSNumericValue` and refuses the identical argument at the IDL door with a **TypeError**. Eight files 0 → **182, all to 100%**. **#450 three rules `class` gets backwards, each a difference a page can see**: an interface object on the global is **not** enumerable (`globalThis.X = C` made every `for (k in window)` sweep up the platform); prototype members **are** enumerable and class methods are not, the exact opposite; and an accessor **brand-checks its receiver** — a silent `undefined` off the prototype is a bug that surfaces three call-frames later. Plus `length` is the count of REQUIRED arguments, an interface with **no** constructor is not constructible, a WebIDL `iterable<T>`'s `entries`/`values`/`@@iterator` are **the very `Array.prototype` functions** (identity and all), and the twelve missing small/large/dynamic viewport units were two thirds of each family. **CAP named honestly: the last 8 rows are a harness quirk** — it asks a SUBCLASS's interface object for a PARENT's static as an OWN property, which WebIDL reaches through the [[Prototype]] chain instead; no conformant engine passes them. |
 | ~~445–447~~ | ✅ [The Typed Verdict](445-the-typed-verdict.md) | **The typed-value arc — the SPECIFIED value keeps the author's own function, a realm that died on line one, and a `var()` being read as arithmetic** | **+10,767** | ⚔️⚔️⚔️ | **SECURED — +10,767 measured, zero regressions, 142 files to 100%.** #444's ⭐ pointed at a third serializer and it was right. **#445**: `commitStyles()` freezes an animation into the inline style, and that is the SPECIFIED value — `translateX(25px)` where `getComputedStyle` says `matrix(1,0,0,1,25,0)` and `computedStyleMap()` says `translate(25px, 0px)`. Three serializations of one animated transform, three different values. The rule is #444's sentence one layer up: **a pair serializes as what the two sides AGREE on**. Plus the trailing-default trim, where `scale`'s second argument defaults to the FIRST — and **the half that is not a serializer at all: `commitStyles` sets a VALUE, not a STRING**, so the parser's `skewX`→`skewx` lowercasing never applies to it. **#446 a realm that died on line one** — `css/css-typed-om/`'s ~245 `properties/` files all pull in one `testsuite.js` that CONSTRUCTS the typed classes at script load, so every one threw `ReferenceError: CSSKeywordValue is not defined` before a single test ran. Built the value hierarchy for real: a numeric-type algebra, the 34-unit table (where the relative lengths have **no** conversion factor, because they cannot be converted without an element and a viewport), the seven math classes, the eight transform components. **#447 two answers again** — the `set()` gate asked `CSS.supports` while the write met the declaration block; and **a full per-property grammar is not the answer, inverting the question is**: ask which properties accept an ANGLE *at all* and the list is short and closed. **The bug the probe found was not a Typed OM bug — `opacity: var(--A)` was corrupted to `var(-1 * (-1 * a))` and computed as the initial `1`.** `css/css-typed-om/**` 65 → **10,815**; `transform-interpolation-inline-value` 24 → **41/41**. Ten ledger rows flagged as regressions were STALE and all ten stash-proved byte-identical — corrected in place. |
 | ~~442–444~~ | ✅ [The Reconciled Verdict](442-the-reconciled-verdict.md) | **The two-answers arc — there were TWO declaration parsers and only one of them validated, a declaration ends at a TOP-LEVEL semicolon, and a transform function knows whether it is FLAT** | **+110** | ⚔️⚔️ | **SECURED — +110 measured, zero regressions, TWO files to 100%.** #441's ⭐ pointed at a sentence, not a realm: `cssRules[1].cssText === ".zz { }"` while `getComputedStyle(el).transform === "30px"` — one stylesheet, one declaration, two answers. **#442**: `_parseStyleDecls` (CSSOM) runs the whole per-property validity chain; **`_cssParseDecls` — the cascade-shape parser `getComputedStyle` reads through `_buildCascade`/`_cascadeResolve` — validated custom properties and NOTHING else**, so a declaration the object model had already thrown away still won the cascade AND displaced the good one it should have lost to. Routed through the one validating parser: four lines, the widest shared change of the campaign. It broke one subtest, and the break was worth more than the subtest — `el.style` and `style=""` are **one block with two faces**, the attribute goes stale the moment `.style` is touched (`_styleWriteback` is gated on custom elements), and `_buildCascade` was reading both; two bugs had been cancelling. **#443 a declaration ends at a TOP-LEVEL semicolon** — both parsers did `String(text).split(';')`, which tears `style="background:url(data:image/svg+xml;base64,…)"` in half and leaves the second half parsing as a property named `base64,…)`. **#444 each family has a FLAT primitive and a DEEP one, and the function picks**: `scaleZ(1)`→`scaleZ(2)` is `scale3d(1, 1, 1.5)` because a function that names the z axis has already left the plane; plain 2D `rotate` is the one rotation that keeps its own spelling; `skewX` is a primitive in its own right. Reachable at all only through **`computedStyleMap()`**, the one API that reports the computed LIST instead of the resolved matrix. `transform-interpolation-computed-value` **0→82/82**, `transform-interpolation-006` 76→**96/96**. |
@@ -251,6 +252,66 @@ over namespace-aware Rust attribute storage — the field stands thus:
    namespace-aware attribute layer (#02) may unblock OTHER XML/foreign-content tests.
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-02 — Quests #451–#453, the unsupported arc (+242, zero regressions, ten more files to 100%)
+
+Took #450's ⭐ at `the-stylepropertymap/properties/logical.html` and did one thing first
+that the campaign had never done: **asked what Chrome scores on the same file.** 1274/1468
+for us, **1256/1468 for Chrome** — we were already 18 ahead of a shipping engine on the row
+the pointer called the biggest one left. A raw failure count is not a work list. Pulling
+Chrome's per-subtest report (`wpt.fyi` run API → `raw_results_url`, 319 MB) and diffing by
+subtest name split the 194 into **130 we fail and Chrome passes**, 64 where the test file
+argues with the spec, and 148 where we already lead. Ten minutes; three clean quests.
+
+- **#451 — a corner the engine could store but could not NAME.** `border-start-start-radius`
+  and its three siblings — css-logical's flow-relative corners, what a page in `vertical-rl`
+  or an RTL script actually writes — were in neither `_GCS_DEFAULTS` nor the shorthand list,
+  so `d.style.setProperty` stored them, `getComputedStyle` read them back, and
+  `CSS.supports` said **false** while the Typed OM threw `Invalid propertyName` on all 52
+  rows. They join `_BORDER_RADIUS_LH_SET` (parse + computed) and deliberately **not** the
+  `_BORDER_RADIUS_LH` array: a property that shares a grammar does not share a shorthand,
+  and `border-radius: 5px` must not touch a flow-relative corner.
+- **#452 — a shorthand has no typed value of its own.** 82 rows where `set()` let a
+  `CSSUnitValue` onto a shorthand. The grammar allows it; two other things do not.
+  `border-block-start: 5px` only works as a *string* because it ALSO resets the style and
+  the colour to their initials — that reset is the shorthand's whole meaning, and a typed
+  value carries no such intent, nor does it say which of three longhands it is for. And
+  `margin` is a `{1,4}` box-edge LIST: one value would have to mean "all four", and level 1
+  has no list form to say so with. Also **a `<line-width>` has no percentage in its
+  grammar** — that leaked only because `set()` wraps an out-of-range value in `calc()`
+  (CSS Values §range-checking refuses only a *literal*) and a `calc()` is waved through.
+  **Said out loud: `margin.html` pins `margin` shut to a length and `logical.html` pins
+  `margin-block` open to one. The suite disagrees with itself; we follow each file, which
+  is a strict superset of Chrome (it refuses both). Do not "fix" the asymmetry.**
+- **#453 — reification asks the PROPERTY too.** `1px` is not a length on `margin`, and
+  handing back a `CSSUnitValue` gives a page a number it can do arithmetic on and then not
+  set anywhere. The gate that refuses a value on the way IN is the same question, so it is
+  the same call — **one table, two doors.** Three faces: a shorthand's numeric; **a
+  colour**, because `red`, `#f00` and `rgb(255,0,0)` are one value with three spellings
+  while a `CSSKeywordValue` compares by SPELLING (`currentcolor` is the exception and not
+  an inconsistency — it names no colour, it *points* at one); and **a pair-valued computed
+  value**, a corner radius being two radii that merely serialize as one token when they
+  agree. Plus the same mistake one layer down: `_CLAMP_NEG_PROPS` clamped a resolved
+  negative **px** to `0px` and let a negative **percentage** walk through.
+  The one regression it cost taught the rule its own limit: `_tomComponentOf` reifies a
+  transform function's arguments with **no property**, and with `prop = null` the new gate
+  demoted every `45deg` — inside `rotate3d(1,2,3,45deg)` the FUNCTION is what knows.
+
+**Results:** `logical` 1274 → **1382/1468** (Chrome 1256) · `border-radius` 83 → **128/128**
+(Chrome 96) · `margin` 151 → **161/161** · `scroll-padding` 243 → **252/252** · `padding`
+→ **124/124** · `border-color` 136 → **144/148** (level with Chrome) · `border-width` 104 →
+**120/136** · `block-size`/`inline-size`/`gap`/`outline-width`/`flex-basis`/`scroll-margin`
+to **100%** · eleven `*-color.html` files 34 → **36/37** each.
+**Band: 10,051 → 10,293 / 11,311.** Zero-regression proof: the full 244-file band measured
+on both builds, plus 40 held realms (39 byte-identical, the 40th being `border-width` which
+gained).
+
+**⭐ NEXT:** `border-width.html` is 120/136 and Chrome is 136 — 16 rows, one sentence, and
+the file's own comment is the quest: *"Computed value is independent of border-style."*
+`computedStyleMap()` is defined over the **computed** value while `getComputedStyle()`
+returns the **resolved** one, and the `0 when the style is none` collapse belongs only to
+the latter. Third sighting of that distinction this session. Then `border-style.html`
+(84/132, Chrome 132 — unbucketed).
 
 ### 2026-08-02 — Quests #448–#450, the well-formed arc (+463, zero regressions, ten files to 100%)
 

@@ -9950,6 +9950,13 @@ const _GCS_DEFAULTS = {
   // css-backgrounds-3 border-*-radius corner longhands: initial 0px, not inherited.
   'border-top-left-radius': '0px', 'border-top-right-radius': '0px',
   'border-bottom-right-radius': '0px', 'border-bottom-left-radius': '0px',
+  // css-logical §2.4 flow-relative corner radii — the same `<lp>{1,2}` grammar as
+  // their physical siblings, named by the two axes they sit between (block-side
+  // first). They are longhands in their own right, NOT part of the physical
+  // `border-radius` shorthand (which stays four-cornered), so they only join
+  // _BORDER_RADIUS_LH_SET (parse + computed) and never the expansion array.
+  'border-start-start-radius': '0px', 'border-start-end-radius': '0px',
+  'border-end-start-radius': '0px', 'border-end-end-radius': '0px',
   'block-size': 'auto', 'inline-size': 'auto',
   'min-block-size': 'auto', 'min-inline-size': 'auto',
   'max-block-size': 'none', 'max-inline-size': 'none',
@@ -14610,7 +14617,16 @@ const _BORDER_RADIUS_LH = [
   'border-top-left-radius', 'border-top-right-radius',
   'border-bottom-right-radius', 'border-bottom-left-radius',
 ];
-const _BORDER_RADIUS_LH_SET = new Set(_BORDER_RADIUS_LH);
+// The flow-relative corners (css-logical §2.4). Same per-corner grammar, so they
+// share every parse/serialize/computed path with the physical four — but a
+// `border-radius` shorthand write must NOT touch them (the shorthand is defined
+// over the physical corners only), which is why they live in the SET and not in
+// the expansion ARRAY above.
+const _BORDER_RADIUS_LOGICAL_LH = [
+  'border-start-start-radius', 'border-start-end-radius',
+  'border-end-start-radius', 'border-end-end-radius',
+];
+const _BORDER_RADIUS_LH_SET = new Set([..._BORDER_RADIUS_LH, ..._BORDER_RADIUS_LOGICAL_LH]);
 const _RADIUS_ALIAS = {
   '-webkit-border-radius': 'border-radius',
   '-webkit-border-top-left-radius': 'border-top-left-radius',
@@ -23583,9 +23599,16 @@ const _CLAMP_NEG_PROPS = new Set([
   'flex-basis',                                           // flex-basis is <'width'> — non-negative (resolved negative → 0)
   ..._SCROLL_PADDING_LH,                                  // scroll-padding is non-negative (resolved negative → 0)
 ]);
+// A resolved negative on a non-negative property clamps to zero — and a
+// PERCENTAGE is resolved too. `padding-top: -3.14%` never survives the parser,
+// but `calc(-3.14%)` does (CSS Values §range-checking only refuses an
+// out-of-range LITERAL), and it is the form the Typed OM's `set()` writes for
+// exactly that reason. It has to land somewhere, and `0%` is where: a padding is
+// never negative however it got written. The unit is kept, because `0%` and `0px`
+// are the same length only once layout says so.
 const _clampNegPx = (r) => {
-  const m = /^(-?(?:\d+\.?\d*|\.\d+))px$/.exec(String(r));
-  return (m && parseFloat(m[1]) < 0) ? '0px' : r;
+  const m = /^(-?(?:\d+\.?\d*|\.\d+))(px|%)$/.exec(String(r));
+  return (m && parseFloat(m[1]) < 0) ? '0' + m[2] : r;
 };
 // The css-sizing min/max + block/inline sizing family. getComputedStyle returns the
 // computed value (not the used value): `%` and `calc(%…)` stay symbolic, keywords
@@ -25761,10 +25784,29 @@ const _tomComponentOf = (it) => {
 const _TOM_NUM_RE = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(%|[a-zA-Z]+)?$/;
 const _TOM_IMAGE_RE = /^(?:url|src|image|image-set|-webkit-image-set|cross-fade|element|paint|(?:repeating-)?(?:linear|radial|conic)-gradient)\(/i;
 const _TOM_IDENT_RE = /^-{0,2}[A-Za-z_][-\w]*$/;
-const _tomReify = (text, prop) => {
+//
+// ── …and the PROPERTY is half of that shape ──────────────────────────────────
+// `1px` looks like a length from ten feet away, but on `margin` it is not one —
+// `margin` is a four-edge shorthand and level 1 has no class that says "this
+// length is all four edges". The suite tests exactly this, with
+// `runUnsupportedPropertyTests`: hand a property a value it has no typed word
+// for and the map must answer with the BASE `CSSStyleValue`, not a subclass that
+// lies about what it is. A `CSSUnitValue(1,'px')` handed back for `margin` is a
+// value a page can `.value` and `.unit` and do arithmetic on — and then set
+// somewhere that refuses it.
+//
+// The gate that refuses a value on the way IN is the same question, so it is the
+// same call: `_tomTypeGate`. One table, two doors.
+const _tomReify = (text, prop, computed) => {
   const t = String(text == null ? '' : text).trim();
   if (t === '') return null;
   if (_TF_VAR_RE.test(t)) return _tomParseUnparsed(t);
+  // A COMPUTED value that is more than one component has no level-1 typed word
+  // either, and `border-top-left-radius` is the whole family: its computed value
+  // is a PAIR of radii (horizontal, vertical) that only *serializes* as one token
+  // when the two agree. The collapsed string is a serialization, not a scalar —
+  // handing back `CSSUnitValue(5,'px')` would drop the second half of the value.
+  if (computed && _TOM_PAIR_COMPUTED.has(prop)) return _tomMake(CSSStyleValue, t);
   const m = _TOM_NUM_RE.exec(t);
   if (m) {
     let u = m[2] === undefined ? 'number' : m[2] === '%' ? 'percent' : m[2];
@@ -25776,9 +25818,15 @@ const _tomReify = (text, prop) => {
       const accepts = _TOM_ACCEPTS.get(prop);
       if (accepts && !accepts.has('number') && accepts.has('length')) u = 'px';
     }
-    if (_tomUnit(u)) return new CSSUnitValue(parseFloat(m[1]), u);
+    if (_tomUnit(u)) {
+      const uv = new CSSUnitValue(parseFloat(m[1]), u);
+      return _tomPropTakes(prop, uv) ? uv : _tomMake(CSSStyleValue, t);
+    }
   }
-  if (/^(?:calc|min|max|clamp)\(/i.test(t)) { const v = _tomParseMath(t); if (v) return v; }
+  if (/^(?:calc|min|max|clamp)\(/i.test(t)) {
+    const v = _tomParseMath(t);
+    if (v) return _tomPropTakes(prop, v) ? v : _tomMake(CSSStyleValue, t);
+  }
   if (prop === 'transform' && t.toLowerCase() !== 'none') {
     let p = null;
     try { p = _parseTransform(t); } catch (e) { p = null; }
@@ -25788,9 +25836,45 @@ const _tomReify = (text, prop) => {
     }
   }
   if (_TOM_IMAGE_RE.test(t)) return _tomMake(CSSImageValue, t);
-  if (_TOM_IDENT_RE.test(t)) return new CSSKeywordValue(t);
+  if (_TOM_IDENT_RE.test(t)) {
+    // On a colour property an identifier that NAMES A COLOUR is a colour, and a
+    // colour has no typed representation in level 1 — `red` must not come back as
+    // `CSSKeywordValue("red")`, because a keyword is a thing you compare by
+    // spelling and `red`, `#f00` and `rgb(255,0,0)` are one value with three
+    // spellings. `currentcolor` is the exception and not an inconsistency: it
+    // names no colour at all, it points at one, and it stays the word it was.
+    if (_TOM_COLOR_PROPS.has(prop) && _tomIsColorName(t)) return _tomMake(CSSStyleValue, t);
+    return new CSSKeywordValue(t);
+  }
   return _tomMake(CSSStyleValue, t);
 };
+// …but ONLY when there is a property to ask. `_tomComponentOf` reifies a transform
+// function's ARGUMENTS, and it passes no property, because inside `rotate3d(1,2,3,45deg)`
+// the property has nothing to say — the FUNCTION is what knows (#448's sentence,
+// one door over). With no property the answer is always yes: a `45deg` there is an
+// angle because `rotate3d` says so, not because `transform` accepts angles (it
+// accepts a transform LIST and nothing else).
+const _tomPropTakes = (prop, v) => prop == null || _tomTypeGate(prop, v);
+// A bare identifier that is itself a colour: the 148 named colours, `transparent`
+// (a named colour that happens to be see-through) and the system colours.
+// `currentcolor` is deliberately NOT here.
+const _tomIsColorName = (t) => {
+  const low = String(t).toLowerCase();
+  return low === 'transparent' || !!_CSS_NAMED_COLORS[low] || _SYSTEM_COLORS.has(low);
+};
+// Where that question is worth asking: the colour LONGHANDS the cascade already
+// knows (`_COLOR_PROPS`), plus the colour shorthands and the SVG paint properties,
+// which take a `<color>` without being computed as one. Kept as its own set rather
+// than widening `_COLOR_PROPS` — that one drives real colour resolution, and a
+// paint server is not a colour just because it can be written as one.
+const _TOM_COLOR_PROPS = new Set([..._COLOR_PROPS,
+  'border-color', 'border-block-color', 'border-inline-color',
+  'fill', 'stroke', 'fill-color', 'stroke-color', 'stop-color',
+  '-webkit-text-fill-color', '-webkit-text-stroke-color', 'scrollbar-color']);
+// The properties whose COMPUTED value is a pair of components collapsed to one
+// token when both halves agree (css-backgrounds-3 corner radii: `<lp>{1,2}`,
+// plus their css-logical siblings) — the eight corners, and nothing else.
+const _TOM_PAIR_COMPUTED = _BORDER_RADIUS_LH_SET;
 // A value carrying a `var()` is a LIST — the literal text between the references
 // and the references themselves. Splitting it is a bracket walk, not a regex,
 // because a fallback can itself contain a `var()`.
@@ -26006,15 +26090,51 @@ const _TOM_ACCEPTS = (() => {
   put(['flex-grow', 'flex-shrink', 'font-weight', 'orphans', 'widows', 'column-count',
     'animation-iteration-count', 'stroke-miterlimit', 'fill-rule', 'z-index', 'order',
     'font-size-adjust', 'math-depth'], ['number']);
+  put(['shape-margin', 'text-underline-offset', 'text-decoration-thickness',
+    'overflow-clip-margin', 'stroke-width', 'stroke-dashoffset'], ['length', 'percent']);
+  // A `<line-width>` is `<length [0,∞]> | thin | medium | thick` — there is no
+  // percentage in that grammar, and a border 3% of anything has never been a
+  // thing. The string door already knows (`_canonLineWidthValue` rejects a `%`);
+  // it only slipped past because `set()` wraps an out-of-range value in a
+  // `calc()` and a `calc()` is waved through for later folding.
   put(['border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
     'border-block-start-width', 'border-block-end-width', 'border-inline-start-width',
-    'border-inline-end-width', 'outline-width', 'perspective', 'shape-margin',
-    'text-underline-offset', 'text-decoration-thickness', 'overflow-clip-margin',
-    'stroke-width', 'stroke-dashoffset'], ['length', 'percent']);
+    'border-inline-end-width', 'outline-width', 'column-rule-width', 'row-rule-width',
+    'perspective'], ['length']);
   put(['font-size', 'vertical-align', 'background-position-x', 'background-position-y',
     'object-position', 'perspective-origin', 'transform-origin'], ['length', 'percent']);
   put(['line-height', 'tab-size'], ['number', 'length', 'percent']);
   put(['transform'], []);
+  // ── A SHORTHAND has no typed value of its own ────────────────────────────────
+  // Typed OM level 1 gives a value ONE class, and a shorthand's value is never
+  // one thing. Two different reasons, both fatal:
+  //   · `border-block-start` = `<line-width> || <line-style> || <color>`. The
+  //     string `border-block-start: 5px` gets away with a lone length because it
+  //     ALSO resets the style and the colour to their initial values — that reset
+  //     is the shorthand's whole meaning. A `CSSUnitValue(5,'px')` carries no such
+  //     intent; it does not even say WHICH of the three longhands it is for.
+  //   · `margin` = `<'margin-top'>{1,4}` — a box-edge LIST. One unit value would
+  //     have to mean "all four", and level 1 has no list form to say so with.
+  // So every shorthand below takes keywords and `var()` (which are not numeric and
+  // never reach this gate) and nothing else. This is also the table `_tomReify`
+  // reads to know a shorthand's value has no typed representation at all.
+  put(['margin', 'padding', 'inset', 'scroll-margin', 'scroll-padding',
+    'border', 'border-top', 'border-right', 'border-bottom', 'border-left',
+    'border-block-start', 'border-block-end', 'border-inline-start', 'border-inline-end',
+    'border-block', 'border-inline', 'outline', 'column-rule', 'row-rule',
+    'border-width', 'border-style', 'border-color', 'border-radius',
+    'border-block-style', 'border-inline-style', 'border-block-color', 'border-inline-color'], []);
+  // …with ONE family held open, because the suite holds it open: css-logical's
+  // two-value pairs. `logical.html` asserts that `margin-block: 10px` DOES set
+  // both flow-relative edges through the Typed OM, and it is right that a pair of
+  // same-typed longhands leaves a lone length nothing to be ambiguous about.
+  // (Its physical sibling `margin` is pinned SHUT by `margin.html` one directory
+  // over. The two files disagree; we follow each, and say so in the scroll.)
+  put(['margin-block', 'margin-inline', 'padding-block', 'padding-inline',
+    'inset-block', 'inset-inline'], ['length', 'percent']);
+  put(['border-block-width', 'border-inline-width'], ['length']);
+  put(_BORDER_RADIUS_LH, ['length', 'percent']);           // the four physical corners
+  put(_BORDER_RADIUS_LOGICAL_LH, ['length', 'percent']);   // …and their css-logical siblings
   return m;
 })();
 // The one type that is not a number at all: a transform list belongs to exactly
@@ -26046,6 +26166,7 @@ const _tomComputedSource = (el) => ({
     return out;
   },
   cls: 'StylePropertyMapReadOnly',
+  computed: true,        // this map answers with COMPUTED values, not specified ones
 });
 const _tomDeclSource = (decl) => ({
   read(kebab) { try { return decl.getPropertyValue(kebab); } catch (e) { return ''; } },
@@ -26063,7 +26184,7 @@ class StylePropertyMapReadOnly {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'get' on '" + this._s.cls + "': 1 argument required, but only 0 present.");
     const name = _tomPropName(prop);
     const v = this._s.read(name);
-    return v === '' || v == null ? undefined : _tomReify(v, name);
+    return v === '' || v == null ? undefined : _tomReify(v, name, this._s.computed);
   }
   getAll(prop) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'getAll' on '" + this._s.cls + "': 1 argument required, but only 0 present.");
@@ -26074,7 +26195,8 @@ class StylePropertyMapReadOnly {
     // reifies on its own. Everything else is one value that happens to have no
     // commas at the top level.
     const parts = _tomTopSplit(String(v));
-    return parts.length > 1 ? parts.map((p) => _tomReify(p, name)) : [_tomReify(v, name)];
+    const c = this._s.computed;
+    return parts.length > 1 ? parts.map((p) => _tomReify(p, name, c)) : [_tomReify(v, name, c)];
   }
   has(prop) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'has' on '" + this._s.cls + "': 1 argument required, but only 0 present.");
