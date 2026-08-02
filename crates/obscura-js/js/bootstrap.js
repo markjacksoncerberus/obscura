@@ -24864,7 +24864,13 @@ const _TOM_UNITS = (() => {
   for (const [u, f] of [['px', 1], ['cm', 96 / 2.54], ['mm', 96 / 25.4], ['q', 96 / 101.6],
     ['in', 96], ['pt', 96 / 72], ['pc', 16]]) put(u, 'length', 'px', f);
   for (const u of ['em', 'ex', 'ch', 'ic', 'cap', 'rem', 'rex', 'rch', 'ric', 'rcap', 'lh', 'rlh',
-    'vw', 'vh', 'vi', 'vb', 'vmin', 'vmax', 'svw', 'svh', 'lvw', 'lvh', 'dvw', 'dvh',
+    'vw', 'vh', 'vi', 'vb', 'vmin', 'vmax',
+    // The small/large/dynamic viewports (css-values-4) come in the same six
+    // spellings as the default one — a table that lists only `svw`/`svh` is
+    // missing two thirds of each.
+    'svw', 'svh', 'svi', 'svb', 'svmin', 'svmax',
+    'lvw', 'lvh', 'lvi', 'lvb', 'lvmin', 'lvmax',
+    'dvw', 'dvh', 'dvi', 'dvb', 'dvmin', 'dvmax',
     'cqw', 'cqh', 'cqi', 'cqb', 'cqmin', 'cqmax']) put(u, 'length', null, 0);
   for (const [u, f] of [['deg', 1], ['grad', 0.9], ['rad', 180 / Math.PI], ['turn', 360]]) put(u, 'angle', 'deg', f);
   for (const [u, f] of [['s', 1], ['ms', 0.001]]) put(u, 'time', 's', f);
@@ -24918,7 +24924,13 @@ const _tomTypeInv = (a) => { const o = {}; for (const k of _TOM_BASES) if (a[k])
 const _tomIsNum = (n) => typeof n === 'number' && isFinite(n);
 // ── The value classes ────────────────────────────────────────────────────────
 class CSSStyleValue {
-  constructor(v) { Object.defineProperty(this, '_v', { value: String(v == null ? '' : v), writable: true }); }
+  constructor(v) {
+    // Covers CSSNumericValue / CSSMathValue / CSSImageValue / CSSColorValue too:
+    // none of them defines its own constructor, so their `new` arrives here
+    // carrying its own `new.target`.
+    _tomCtorGuard(new.target);
+    Object.defineProperty(this, '_v', { value: String(v == null ? '' : v), writable: true });
+  }
   toString() { return this._v === undefined ? '' : this._v; }
   static parse(property, cssText) {
     if (arguments.length < 2) throw new TypeError("Failed to execute 'parse' on 'CSSStyleValue': 2 arguments required.");
@@ -25036,6 +25048,7 @@ globalThis.CSSUnitValue = CSSUnitValue;
 // `a.values[i]`, so those are what it has.
 class CSSNumericArray {
   constructor(vals) {
+    _tomCtorGuard(new.target);
     Object.defineProperty(this, '_a', { value: vals.slice() });
     for (let i = 0; i < vals.length; i++)
       Object.defineProperty(this, i, { value: vals[i], enumerable: true });
@@ -25064,7 +25077,7 @@ class CSSMathSum extends CSSMathValue {
       if (t === null) throw new TypeError("Failed to construct 'CSSMathSum': Incompatible types.");
     }
     this._op = 'sum'; this._t = t;
-    Object.defineProperty(this, 'values', { value: new CSSNumericArray(vs), enumerable: true });
+    Object.defineProperty(this, '_a$values', { value: _tomMake(CSSNumericArray, vs) });
   }
   _type() { return this._t; }
   _canonical() {
@@ -25083,7 +25096,7 @@ class CSSMathProduct extends CSSMathValue {
       if (t === null) throw new TypeError("Failed to construct 'CSSMathProduct': Incompatible types.");
     }
     this._op = 'product'; this._t = t;
-    Object.defineProperty(this, 'values', { value: new CSSNumericArray(vs), enumerable: true });
+    Object.defineProperty(this, '_a$values', { value: _tomMake(CSSNumericArray, vs) });
   }
   _type() { return this._t; }
   // A product is canonical only when at most one factor carries a unit — which
@@ -25105,7 +25118,7 @@ class CSSMathNegate extends CSSMathValue {
     if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSMathNegate': 1 argument required.");
     super('');
     this._op = 'negate';
-    Object.defineProperty(this, 'value', { value: _tomNumeric(value), enumerable: true });
+    Object.defineProperty(this, '_a$value', { value: _tomNumeric(value) });
   }
   _type() { return this.value.type(); }
   _canonical() { const s = this.value._canonical(); return s === null ? null : s.map((t) => ({ value: -t.value, unit: t.unit })); }
@@ -25115,7 +25128,7 @@ class CSSMathInvert extends CSSMathValue {
     if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSMathInvert': 1 argument required.");
     super('');
     this._op = 'invert';
-    Object.defineProperty(this, 'value', { value: _tomNumeric(value), enumerable: true });
+    Object.defineProperty(this, '_a$value', { value: _tomNumeric(value) });
   }
   _type() { return _tomTypeInv(this.value.type()); }
   _canonical() {
@@ -25134,7 +25147,7 @@ const _tomMinMax = (cls, op) => class extends CSSMathValue {
       if (t === null) throw new TypeError("Failed to construct '" + cls + "': Incompatible types.");
     }
     this._op = op; this._t = t;
-    Object.defineProperty(this, 'values', { value: new CSSNumericArray(vs), enumerable: true });
+    Object.defineProperty(this, '_a$values', { value: _tomMake(CSSNumericArray, vs) });
   }
   _type() { return this._t; }
   _canonical() {
@@ -25156,9 +25169,9 @@ class CSSMathClamp extends CSSMathValue {
     if (t !== null) t = _tomTypeAdd(t, u.type());
     if (t === null) throw new TypeError("Failed to construct 'CSSMathClamp': Incompatible types.");
     this._op = 'clamp'; this._t = t;
-    Object.defineProperty(this, 'lower', { value: l, enumerable: true });
-    Object.defineProperty(this, 'value', { value: v, enumerable: true });
-    Object.defineProperty(this, 'upper', { value: u, enumerable: true });
+    Object.defineProperty(this, '_a$lower', { value: l });
+    Object.defineProperty(this, '_a$value', { value: v });
+    Object.defineProperty(this, '_a$upper', { value: u });
   }
   _type() { return this._t; }
   _canonical() {
@@ -25287,6 +25300,208 @@ globalThis.CSSUnparsedValue = CSSUnparsedValue;
 // a decoded image the CSSOM has words for.
 class CSSImageValue extends CSSStyleValue {}
 globalThis.CSSImageValue = CSSImageValue;
+// ── Colours, as objects ──────────────────────────────────────────────────────
+// css-typed-om §colors. A colour channel is the one place in this realm where a
+// BARE JS NUMBER does not mean `CSS.number(n)`: in a colour, `0.5` means HALF,
+// so a `<percentage>` slot reads it as `50%` and an `<angle>` slot as `180deg`
+// when handed `180`. Which reading applies is the channel's IDL type, and the
+// same IDL type also decides WHICH ERROR a refusal is:
+//   `CSSColorPercent`  0.5 → 50%     — a CSS.number is a SyntaxError
+//   `CSSColorNumber`   7   → 7       — Lab's a/b are plain numbers, not fractions
+//   `CSSColorAngle`    180 → 180deg  — and a NON-numeric falls through to the
+//                                      keywordish half of the union, which is why
+//                                      `new CSSHSL(undefined, …).h` is quite
+//                                      legitimately `CSSKeywordValue("undefined")`
+//   `CSSColorRGBComp`  0.5 → 50%, but `CSS.number(73)` stays 73 — r/g/b are the
+//                                      one slot that takes either reading
+// …and a slot typed as a plain `CSSNumericValue` rather than a union — CSSHWB's
+// hue is the only one — refuses a bare number at the IDL door with a **TypeError**,
+// where the union slots let it in and only then judge its TYPE with a SyntaxError.
+// Two colours, the same wrong argument, two different errors, and the IDL says so.
+const _tomChanType = (n, k) => {
+  let t;
+  try { t = n.type(); } catch (e) { return false; }
+  const ks = Object.keys(t).filter((x) => x !== 'percentHint');
+  if (k === 'number') return ks.length === 0;
+  return ks.length === 1 && t[k] === 1;
+};
+const _tomSyntax = (msg) => new globalThis.DOMException(msg, 'SyntaxError');
+const _tomColorChan = (v, kind, who, name) => {
+  const bad = () => { throw _tomSyntax("Failed to set '" + name + "' on '" + who + "': invalid channel value."); };
+  if (kind === 'numeric-angle') {
+    // The only non-union slot in the whole family: not a CSSNumericValue at all
+    // is an IDL conversion failure, and that is a TypeError before any CSS
+    // question gets asked.
+    if (!(v instanceof CSSNumericValue))
+      throw new TypeError("Failed to construct '" + who + "': '" + name + "' is not of type 'CSSNumericValue'.");
+    return _tomChanType(v, 'angle') ? v : bad();
+  }
+  if (_tomIsNum(v)) {
+    if (kind === 'angle') return new CSSUnitValue(v, 'deg');
+    if (kind === 'number') return new CSSUnitValue(v, 'number');
+    return new CSSUnitValue(v * 100, 'percent');
+  }
+  if (v instanceof CSSNumericValue) {
+    if (kind === 'angle') return _tomChanType(v, 'angle') ? v : bad();
+    if (kind === 'number') return _tomChanType(v, 'number') ? v : bad();
+    if (kind === 'percent') return _tomChanType(v, 'percent') ? v : bad();
+    // rgbcomp takes either reading, and keeps whichever it was handed.
+    return (_tomChanType(v, 'number') || _tomChanType(v, 'percent')) ? v : bad();
+  }
+  // The keywordish half of the union. Only the angle slots reach for it — the
+  // numeric slots want a number and a word is not one.
+  if (kind === 'angle') return v instanceof CSSKeywordValue ? v : new CSSKeywordValue(String(v));
+  return bad();
+};
+class CSSColorValue extends CSSStyleValue {
+  // `CSSColorValue.parse` answers with the colour's OWN family — `hsl()` comes
+  // back a CSSHSL and not an rgb triple, because the Typed OM hands back the
+  // author's own words wherever it still can (#445's sentence, one realm over).
+  static parse(cssText) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'parse' on 'CSSColorValue': 1 argument required, but only 0 present.");
+    const v = _tomParseColor(String(cssText));
+    if (v === null) throw _tomSyntax("Failed to execute 'parse' on 'CSSColorValue': Invalid color.");
+    return v;
+  }
+}
+globalThis.CSSColorValue = CSSColorValue;
+// Each subclass is its channel names paired with the kind of value each one
+// reads — so the constructor, the four setters and the serializer are all one
+// table rather than four hand-written copies that can drift apart.
+const _TOM_COLOR_SPECS = [
+  ['CSSRGB', ['r', 'g', 'b'], ['rgbcomp', 'rgbcomp', 'rgbcomp'], 'rgb'],
+  ['CSSHSL', ['h', 's', 'l'], ['angle', 'percent', 'percent'], 'hsl'],
+  ['CSSHWB', ['h', 'w', 'b'], ['numeric-angle', 'percent', 'percent'], 'hwb'],
+  ['CSSLab', ['l', 'a', 'b'], ['percent', 'number', 'number'], 'lab'],
+  ['CSSLCH', ['l', 'c', 'h'], ['percent', 'percent', 'angle'], 'lch'],
+  ['CSSOKLab', ['l', 'a', 'b'], ['percent', 'number', 'number'], 'oklab'],
+  ['CSSOKLCH', ['l', 'c', 'h'], ['percent', 'percent', 'angle'], 'oklch'],
+];
+const _TOM_COLOR_CLASSES = {};
+for (const [cname, chans, kinds, fn] of _TOM_COLOR_SPECS) {
+  const C = class extends CSSColorValue {
+    constructor(...args) {
+      if (args.length < 3) throw new TypeError("Failed to construct '" + cname + "': 3 arguments required, but only " + args.length + " present.");
+      super('');
+      for (let i = 0; i < 3; i++)
+        Object.defineProperty(this, '_c' + i, { value: _tomColorChan(args[i], kinds[i], cname, chans[i]), writable: true });
+      // An omitted alpha is 1, and 1 read as a fraction is 100% — which is why
+      // every three-argument colour in the suite expects `CSS.percent(100)`.
+      Object.defineProperty(this, '_ca', {
+        value: _tomColorChan(args[3] === undefined ? 1 : args[3], 'percent', cname, 'alpha'), writable: true });
+    }
+    toString() {
+      const p = [this._c0, this._c1, this._c2].map((x) => String(x)).join(' ');
+      const a = this._ca instanceof CSSUnitValue && this._ca.unit === 'percent' && this._ca.value === 100;
+      return fn + '(' + p + (a ? '' : ' / ' + String(this._ca)) + ')';
+    }
+  };
+  for (let i = 0; i < 3; i++) {
+    const k = kinds[i], slot = '_c' + i, nm = chans[i];
+    Object.defineProperty(C.prototype, nm, {
+      configurable: true, enumerable: true,
+      get() { return this[slot]; },
+      set(v) { this[slot] = _tomColorChan(v, k, cname, nm); },
+    });
+  }
+  Object.defineProperty(C.prototype, 'alpha', {
+    configurable: true, enumerable: true,
+    get() { return this._ca; },
+    set(v) { this._ca = _tomColorChan(v, 'percent', cname, 'alpha'); },
+  });
+  Object.defineProperty(C, 'name', { value: cname, configurable: true });
+  Object.defineProperty(C, 'length', { value: 3, configurable: true });
+  globalThis[cname] = C;
+  _TOM_COLOR_CLASSES[cname] = C;
+}
+// `color(display-p3 0 1 0)` — a colour that names its own space, so the channel
+// list is open-ended and the space is a keyword rather than a fourth channel.
+class CSSColor extends CSSColorValue {
+  constructor(colorSpace, channels, alpha) {
+    if (arguments.length < 2) throw new TypeError("Failed to construct 'CSSColor': 2 arguments required, but only " + arguments.length + " present.");
+    super('');
+    this._space = colorSpace instanceof CSSKeywordValue ? colorSpace : new CSSKeywordValue(String(colorSpace));
+    this._ch = Array.from(channels || []).map((c) => _tomColorChan(c, 'percent', 'CSSColor', 'channels'));
+    this._ca = _tomColorChan(alpha === undefined ? 1 : alpha, 'percent', 'CSSColor', 'alpha');
+  }
+  get colorSpace() { return this._space; }
+  set colorSpace(v) { this._space = v instanceof CSSKeywordValue ? v : new CSSKeywordValue(String(v)); }
+  get channels() { return this._ch; }
+  set channels(v) { this._ch = Array.from(v || []).map((c) => _tomColorChan(c, 'percent', 'CSSColor', 'channels')); }
+  get alpha() { return this._ca; }
+  set alpha(v) { this._ca = _tomColorChan(v, 'percent', 'CSSColor', 'alpha'); }
+  toString() {
+    const a = this._ca instanceof CSSUnitValue && this._ca.unit === 'percent' && this._ca.value === 100;
+    return 'color(' + String(this._space) + (this._ch.length ? ' ' + this._ch.map(String).join(' ') : '') +
+      (a ? '' : ' / ' + String(this._ca)) + ')';
+  }
+}
+Object.defineProperty(CSSColor, 'length', { value: 2, configurable: true });
+globalThis.CSSColor = CSSColor;
+// Text back into one of the classes above. A system colour has no channels a
+// page could read — its used value is the UA's business — so it reifies as the
+// KEYWORD it is, which is the spec's honest "there is nothing inside this yet".
+const _TOM_COLOR_FN_RE = /^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(([\s\S]*)\)$/i;
+const _tomParseColor = (text) => {
+  const s = String(text).trim();
+  const low = s.toLowerCase();
+  if (low === '') return null;
+  if (_CSS_WIDE.has(low) || low === 'revert' || low === 'revert-layer') return null;
+  if (_SYSTEM_COLORS.has(low) || low === 'currentcolor') return new CSSKeywordValue(low);
+  const num = (n) => new CSSUnitValue(n, 'number');
+  const pct = (n) => new CSSUnitValue(n, 'percent');
+  if (low === 'transparent') return new _TOM_COLOR_CLASSES.CSSRGB(num(0), num(0), num(0), pct(0));
+  if (_CSS_NAMED_COLORS[low] || /^#[0-9a-f]{3,8}$/i.test(s)) {
+    const c = _computeColor(low);           // → `rgb(r, g, b)` / `rgba(r, g, b, a)`
+    const m = /^rgba?\(([^)]*)\)$/.exec(String(c));
+    if (!m) return null;
+    const p = m[1].split(',').map((x) => parseFloat(x));
+    if (p.length < 3 || p.some((x) => !isFinite(x))) return null;
+    return new _TOM_COLOR_CLASSES.CSSRGB(num(p[0]), num(p[1]), num(p[2]), pct((p.length > 3 ? p[3] : 1) * 100));
+  }
+  const fm = _TOM_COLOR_FN_RE.exec(s);
+  if (!fm) return null;
+  const fn = fm[1].toLowerCase();
+  // Both the legacy comma form and the modern space+slash form, in one split:
+  // the alpha is whatever follows a `/`, or a fourth comma-separated argument.
+  const inner = fm[2];
+  const slash = inner.indexOf('/');
+  let head = slash < 0 ? inner : inner.slice(0, slash);
+  let alphaTok = slash < 0 ? null : inner.slice(slash + 1).trim();
+  const parts = head.split(/[,\s]+/).map((x) => x.trim()).filter((x) => x.length);
+  if (alphaTok === null && parts.length === 4) alphaTok = parts.pop();
+  const one = (tok, kind) => {
+    if (tok === undefined) return null;
+    const t = String(tok).trim();
+    if (t.toLowerCase() === 'none') return kind === 'angle' ? new CSSUnitValue(0, 'deg') : kind === 'percent' ? pct(0) : num(0);
+    const m2 = _TOM_NUM_RE.exec(t);
+    if (!m2) return null;
+    const val = parseFloat(m2[1]);
+    if (m2[2] === '%') return pct(val);
+    if (m2[2] === undefined) return kind === 'angle' ? new CSSUnitValue(val, 'deg') : num(val);
+    return _tomUnit(m2[2]) ? new CSSUnitValue(val, m2[2]) : null;
+  };
+  const alpha = alphaTok === null ? pct(100)
+    : (() => { const a = one(alphaTok, 'number'); return a === null ? null : (a.unit === 'percent' ? a : pct(a.value * 100)); })();
+  if (alpha === null) return null;
+  if (fn === 'color') {
+    if (!parts.length) return null;
+    const chans = parts.slice(1).map((t) => one(t, 'percent'));
+    if (chans.some((c) => c === null)) return null;
+    return new CSSColor(new CSSKeywordValue(parts[0]), chans, alpha);
+  }
+  const kinds = { rgb: ['number', 'number', 'number'], rgba: ['number', 'number', 'number'],
+    hsl: ['angle', 'percent', 'percent'], hsla: ['angle', 'percent', 'percent'],
+    hwb: ['angle', 'percent', 'percent'], lab: ['percent', 'number', 'number'],
+    lch: ['percent', 'percent', 'angle'], oklab: ['percent', 'number', 'number'],
+    oklch: ['percent', 'percent', 'angle'] }[fn];
+  if (parts.length !== 3) return null;
+  const ch = parts.map((t, i) => one(t, kinds[i]));
+  if (ch.some((c) => c === null)) return null;
+  const cls = { rgb: 'CSSRGB', rgba: 'CSSRGB', hsl: 'CSSHSL', hsla: 'CSSHSL', hwb: 'CSSHWB',
+    lab: 'CSSLab', lch: 'CSSLCH', oklab: 'CSSOKLab', oklch: 'CSSOKLCH' }[fn];
+  return new _TOM_COLOR_CLASSES[cls](ch[0], ch[1], ch[2], alpha);
+};
 // ── The transform list, as objects ───────────────────────────────────────────
 // The same list #436–#444 taught the animation model to speak, handed to a page
 // one component at a time. A component knows whether it is FLAT — `is2D` — and
@@ -25311,6 +25526,11 @@ const _tomPlainNum = (v, who) => {
   return n;
 };
 class CSSTransformComponent {
+  constructor() { _tomCtorGuard(new.target); }
+  // css-typed-om declares the `stringifier` on the BASE, not on each of the
+  // eight components — so it has to exist here even though every subclass
+  // overrides it with something that has words to say.
+  toString() { return ''; }
   get is2D() { return this._2d; }
   set is2D(v) { this._2d = !!v; }
   // Every component can answer as a matrix, and it does it by handing its own
@@ -25423,7 +25643,11 @@ class CSSMatrixComponent extends CSSTransformComponent {
   constructor(matrix, options) {
     if (arguments.length < 1) throw new TypeError("Failed to construct 'CSSMatrixComponent': 1 argument required.");
     super();
-    this.matrix = matrix;
+    // The constructor takes a `DOMMatrixReadOnly`; the ATTRIBUTE is a `DOMMatrix`.
+    // A read-only matrix handed in comes back out mutable, because a component's
+    // matrix is something a page is meant to be able to edit in place.
+    this._a$matrix = matrix instanceof globalThis.DOMMatrix ? matrix
+      : new globalThis.DOMMatrix(Array.from(matrix.toFloat64Array()));
     this._2d = options && options.is2D !== undefined ? !!options.is2D : !!(matrix && matrix.is2D);
   }
   toString() {
@@ -25469,8 +25693,34 @@ globalThis.CSSTransformValue = CSSTransformValue;
 // A parsed transform function, as the component it stands for. The X/Y/Z
 // spellings are the flat ones filled out (`translateX(4px)` IS
 // `translate(4px, 0px)`); the ones naming z are already deep.
+// Which unit a BARE ZERO wore in each argument slot. `_tomReify` already knows
+// that `width: 0` is a length rather than a number, but it asks the PROPERTY —
+// and inside a transform function the property has nothing to say, the FUNCTION
+// does. css-transforms-1 spells every slot out, and `<zero>` is admitted in the
+// angle slots as well as the length ones, which is why `translateX(0)` and
+// `rotate(0)` are both perfectly ordinary CSS. Without this the commonest
+// transform on the whole web — the `translateX(0)` GPU-promotion hack — made
+// `computedStyleMap().get('transform')` THROW.
+//   'l' = <length-percentage>, 'a' = <angle>, 'n' = <number> (needs no rescue).
+const _TOM_TF_SLOTS = {
+  translate: 'll', translatex: 'l', translatey: 'l', translatez: 'l', translate3d: 'lll',
+  scale: 'nn', scalex: 'n', scaley: 'n', scalez: 'n', scale3d: 'nnn',
+  rotate: 'a', rotatex: 'a', rotatey: 'a', rotatez: 'a', rotate3d: 'nnna',
+  skew: 'aa', skewx: 'a', skewy: 'a', perspective: 'l',
+};
 const _tomComponentOf = (it) => {
-  const L = (s) => { const v = _tomReify(String(s).trim(), null); return v instanceof CSSNumericValue ? v : null; };
+  const slots = _TOM_TF_SLOTS[it.name] || '';
+  const L = (s, i) => {
+    const v = _tomReify(String(s).trim(), null);
+    if (!(v instanceof CSSNumericValue)) return null;
+    // A unitless zero is not a number that happens to be nothing; it is a length
+    // (or an angle) that dropped its unit because zero is the same in all of them.
+    if (v instanceof CSSUnitValue && v.unit === 'number' && v.value === 0) {
+      if (slots[i] === 'l') return new CSSUnitValue(0, 'px');
+      if (slots[i] === 'a') return new CSSUnitValue(0, 'deg');
+    }
+    return v;
+  };
   const a = it.args.map(L);
   if (a.some((x) => x === null)) return null;
   const zero = () => new CSSUnitValue(0, 'px'), one = () => new CSSUnitValue(1, 'number');
@@ -25537,9 +25787,9 @@ const _tomReify = (text, prop) => {
       if (cs.every((c) => c !== null)) return new CSSTransformValue(cs);
     }
   }
-  if (_TOM_IMAGE_RE.test(t)) return new CSSImageValue(t);
+  if (_TOM_IMAGE_RE.test(t)) return _tomMake(CSSImageValue, t);
   if (_TOM_IDENT_RE.test(t)) return new CSSKeywordValue(t);
-  return new CSSStyleValue(t);
+  return _tomMake(CSSStyleValue, t);
 };
 // A value carrying a `var()` is a LIST — the literal text between the references
 // and the references themselves. Splitting it is a bracket walk, not a regex,
@@ -25806,7 +26056,8 @@ const _tomDeclSource = (decl) => ({
   cls: 'StylePropertyMap',
 });
 class StylePropertyMapReadOnly {
-  constructor(src) { Object.defineProperty(this, '_s', { value: src }); }
+  // Covers StylePropertyMap, which adds no constructor of its own.
+  constructor(src) { _tomCtorGuard(new.target); Object.defineProperty(this, '_s', { value: src }); }
   get size() { return this._s.names().length; }
   get(prop) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'get' on '" + this._s.cls + "': 1 argument required, but only 0 present.");
@@ -25829,11 +26080,14 @@ class StylePropertyMapReadOnly {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'has' on '" + this._s.cls + "': 1 argument required, but only 0 present.");
     return this.get(prop) !== undefined;
   }
-  *[Symbol.iterator]() { for (const n of this._s.names()) yield [n, this.getAll(n)]; }
-  entries() { return this[Symbol.iterator](); }
+  // A MAP iterator's `@@iterator` and `entries` are ONE function, not two that
+  // agree — `@@iterator` is installed from `entries` below, after the shape pass.
+  *entries() { for (const n of this._s.names()) yield [n, this.getAll(n)]; }
   *keys() { for (const [k] of this) yield k; }
   *values() { for (const [, v] of this) yield v; }
-  forEach(cb, thisArg) { for (const [k, v] of this) cb.call(thisArg, v, k, this); }
+  // `thisArg` is OPTIONAL, and WebIDL counts only the required arguments — so
+  // this reports `length === 1` even though it takes two.
+  forEach(cb, ...rest) { for (const [k, v] of this) cb.call(rest[0], v, k, this); }
 }
 globalThis.StylePropertyMapReadOnly = StylePropertyMapReadOnly;
 const _tomTopSplit = (s) => {
@@ -25905,6 +26159,93 @@ class StylePropertyMap extends StylePropertyMapReadOnly {
   clear() { this._s.clear(); }
 }
 globalThis.StylePropertyMap = StylePropertyMap;
+// ── The shape WebIDL asks of an interface ────────────────────────────────────
+// Three rules a `class` gets WRONG by default, and each one is a real difference
+// a page can see, not a formality:
+//   1. **An interface object on the global is NOT enumerable.** `class` written
+//      with `globalThis.X = C` is — so every `for (const k in window)` over a
+//      page's own globals sweeps up the whole platform.
+//   2. **Prototype members ARE enumerable.** `class` methods are not — the exact
+//      opposite — so `Object.keys(CSSUnitValue.prototype)` came back empty where
+//      a page enumerating an interface expects its members.
+//   3. **An accessor BRAND-CHECKS its receiver.** `get value() { return this._k }`
+//      quietly answers `undefined` when read off the prototype itself; WebIDL
+//      says that is a TypeError, and the difference matters the moment a page
+//      borrows a getter and applies it to the wrong object — a silent `undefined`
+//      is a bug that surfaces three call-frames later, a TypeError is one that
+//      surfaces here.
+// `length` is the fourth: a constructor's is its count of REQUIRED arguments,
+// which is not the same as its count of JS parameters (an optional or a rest
+// parameter contributes nothing), and for an interface with no constructor at
+// all it is 0 — so the table below states it rather than letting JS guess.
+const _TOM_IDL_LENGTH = {
+  CSSStyleValue: 0, CSSNumericValue: 0, CSSMathValue: 0, CSSNumericArray: 0,
+  CSSTransformComponent: 0, CSSImageValue: 0, CSSColorValue: 0,
+  StylePropertyMapReadOnly: 0, StylePropertyMap: 0,
+  CSSKeywordValue: 1, CSSUnitValue: 2, CSSUnparsedValue: 1, CSSVariableReferenceValue: 1,
+  CSSMathSum: 0, CSSMathProduct: 0, CSSMathMin: 0, CSSMathMax: 0,
+  CSSMathNegate: 1, CSSMathInvert: 1, CSSMathClamp: 3,
+  CSSTransformValue: 1, CSSTranslate: 2, CSSRotate: 1, CSSScale: 2,
+  CSSSkew: 2, CSSSkewX: 1, CSSSkewY: 1, CSSPerspective: 1, CSSMatrixComponent: 1,
+  CSSRGB: 3, CSSHSL: 3, CSSHWB: 3, CSSLab: 3, CSSLCH: 3, CSSOKLab: 3, CSSOKLCH: 3, CSSColor: 2,
+};
+const _tomWebIDLShape = (name, C) => {
+  Object.defineProperty(globalThis, name, { value: C, writable: true, enumerable: false, configurable: true });
+  if (_TOM_IDL_LENGTH[name] !== undefined)
+    Object.defineProperty(C, 'length', { value: _TOM_IDL_LENGTH[name], writable: false, enumerable: false, configurable: true });
+  // Static operations are members too: enumerable on the interface object.
+  for (const k of Object.getOwnPropertyNames(C)) {
+    if (k === 'length' || k === 'name' || k === 'prototype') continue;
+    const d = Object.getOwnPropertyDescriptor(C, k);
+    if (d && d.configurable && typeof d.value === 'function' && !d.enumerable)
+      Object.defineProperty(C, k, { value: d.value, writable: d.writable, enumerable: true, configurable: true });
+  }
+  const proto = C.prototype;
+  const brand = (fn, label) => {
+    const w = function (...a) {
+      if (!(this instanceof C)) throw new TypeError('Illegal invocation: ' + label + ' called on an object that is not a ' + name + '.');
+      return fn.apply(this, a);
+    };
+    // WebIDL names an accessor's function `get x` / `set x`, and idlharness asks
+    // for it by name — a wrapper that forgets to say so reads as the wrong member.
+    Object.defineProperty(w, 'name', { value: label, configurable: true });
+    Object.defineProperty(w, 'length', { value: fn.length, configurable: true });
+    return typeof _markNative === 'function' ? _markNative(w) : w;
+  };
+  for (const k of Object.getOwnPropertyNames(proto)) {
+    if (k === 'constructor') continue;
+    const d = Object.getOwnPropertyDescriptor(proto, k);
+    if (!d || !d.configurable) continue;
+    if (d.get || d.set) {
+      // A getter read off the prototype has no instance behind it. `instanceof`
+      // is the brand: an instance passes, and `C.prototype` — whose own
+      // [[Prototype]] is the PARENT's prototype — does not.
+      Object.defineProperty(proto, k, {
+        configurable: true, enumerable: true,
+        get: d.get && brand(d.get, 'get ' + k),
+        set: d.set && brand(d.set, 'set ' + k),
+      });
+    } else if (typeof d.value === 'function') {
+      Object.defineProperty(proto, k, {
+        value: brand(d.value, k), writable: true, enumerable: true, configurable: true,
+      });
+    }
+  }
+};
+// Move an attribute that a constructor stashed on the INSTANCE (as `_a$<name>`)
+// onto the prototype where WebIDL wants it. Read-only unless asked otherwise.
+const _tomProtoAttrs = (C, names, writable) => {
+  for (const n of names) {
+    const slot = '_a$' + n;
+    const g = function () { return this[slot]; };
+    const s = writable ? function (v) { this[slot] = v; } : undefined;
+    Object.defineProperty(C.prototype, n, { configurable: true, enumerable: true, get: g, set: s });
+  }
+  // …and then straight back through the same brand-check + naming pass every
+  // other member goes through, so there is exactly one definition of what an
+  // attribute looks like.
+  _tomWebIDLShape(C.name, C);
+};
 // `assert_class_string` — the assertion this whole realm leans on — asks
 // `Object.prototype.toString.call(v)`, which answers `[object Object]` for a
 // plain class and the interface's own name only when the prototype carries a
@@ -25923,29 +26264,97 @@ for (const [n, C] of [
   ['CSSRotate', CSSRotate], ['CSSScale', CSSScale], ['CSSSkew', CSSSkew],
   ['CSSSkewX', CSSSkewX], ['CSSSkewY', CSSSkewY], ['CSSPerspective', CSSPerspective],
   ['CSSMatrixComponent', CSSMatrixComponent],
+  ['CSSColorValue', CSSColorValue], ['CSSColor', CSSColor],
+  ...Object.keys(_TOM_COLOR_CLASSES).map((n) => [n, _TOM_COLOR_CLASSES[n]]),
   ['StylePropertyMapReadOnly', StylePropertyMapReadOnly], ['StylePropertyMap', StylePropertyMap],
 ]) {
   Object.defineProperty(C.prototype, Symbol.toStringTag, { value: n, configurable: true });
   if (typeof _markNative === 'function') { try { _markNative(C); } catch (e) {} }
+  _tomWebIDLShape(n, C);
 }
-Element.prototype.computedStyleMap = function computedStyleMap() {
-  return new StylePropertyMapReadOnly(_tomComputedSource(this));
+// The last four attributes that lived on the INSTANCE. WebIDL puts every one on
+// the interface prototype, and that is not decoration: `assert_inherits` is the
+// difference between a page being able to patch `CSSMathSum.prototype.values`
+// for every sum and being able to patch nothing at all.
+_tomProtoAttrs(CSSMathSum, ['values']);
+_tomProtoAttrs(CSSMathProduct, ['values']);
+_tomProtoAttrs(CSSMathMin, ['values']);
+_tomProtoAttrs(CSSMathMax, ['values']);
+_tomProtoAttrs(CSSMathNegate, ['value']);
+_tomProtoAttrs(CSSMathInvert, ['value']);
+_tomProtoAttrs(CSSMathClamp, ['lower', 'value', 'upper']);
+_tomProtoAttrs(CSSMatrixComponent, ['matrix'], true);
+// ── A value iterator IS Array's ──────────────────────────────────────────────
+// WebIDL `iterable<T>` does not merely say "you can iterate this": it says the
+// interface's `entries`/`keys`/`values`/`forEach`/`@@iterator` are the very
+// `Array.prototype` functions, identity and all. Hand-written ones that behave
+// the same still fail, and rightly — a page can compare them. All three of these
+// classes are array-like already (indexed own properties plus a `length`), which
+// is exactly the shape Array's generic methods were written against, so this is
+// a deletion rather than a reimplementation.
+// A map iterator's `@@iterator` is its `entries`, the same function object.
+Object.defineProperty(StylePropertyMapReadOnly.prototype, Symbol.iterator, {
+  value: StylePropertyMapReadOnly.prototype.entries, writable: true, enumerable: false, configurable: true,
+});
+for (const C of [CSSNumericArray, CSSTransformValue, CSSUnparsedValue]) {
+  for (const k of ['entries', 'keys', 'forEach'])
+    Object.defineProperty(C.prototype, k, { value: Array.prototype[k], writable: true, enumerable: true, configurable: true });
+  // `values` and `@@iterator` are ONE function, not two that agree.
+  Object.defineProperty(C.prototype, 'values', { value: Array.prototype.values, writable: true, enumerable: true, configurable: true });
+  Object.defineProperty(C.prototype, Symbol.iterator, { value: Array.prototype.values, writable: true, enumerable: false, configurable: true });
+}
+// ── An interface with no constructor is not constructible ────────────────────
+// `class` gives every one of these a working `new`, and WebIDL gives them none:
+// `new CSSStyleValue()` is a TypeError, and so is `new StylePropertyMap()`. The
+// check is on `new.target` so that SUBCLASSING still works — a subclass's
+// `super()` arrives with its own new.target, which is the whole point — and the
+// engine's own construction of these values goes through `_tomMake`, which lifts
+// the latch for exactly one call.
+let _tomCtorGate = 0;
+const _tomMake = (C, ...args) => { _tomCtorGate++; try { return new C(...args); } finally { _tomCtorGate--; } };
+const _tomNoCtor = new Set([CSSStyleValue, CSSNumericValue, CSSMathValue, CSSNumericArray,
+  CSSTransformComponent, CSSImageValue, CSSColorValue, StylePropertyMapReadOnly, StylePropertyMap]);
+const _tomCtorGuard = (target) => {
+  if (_tomCtorGate === 0 && _tomNoCtor.has(target))
+    throw new TypeError('Illegal constructor');
 };
+Object.defineProperty(Element.prototype, 'computedStyleMap', {
+  writable: true, enumerable: true, configurable: true,
+  value: function computedStyleMap() {
+    if (!(this instanceof Element)) throw new TypeError("Illegal invocation: 'computedStyleMap' called on an object that is not an Element.");
+    return _tomMake(StylePropertyMapReadOnly, _tomComputedSource(this));
+  },
+});
 // The inline style map is the SAME declaration block `el.style` is — one value
 // with two faces, and #442 learned the hard way what happens when two faces of
 // one value drift. So this one reads and writes straight through `el.style`
 // rather than keeping a copy of anything.
-Object.defineProperty(Element.prototype, 'attributeStyleMap', {
-  configurable: true,
-  get() {
-    let m = this._tomInlineMap;
-    if (!m) {
-      m = new StylePropertyMap(_tomDeclSource(this.style));
-      Object.defineProperty(this, '_tomInlineMap', { value: m, configurable: true });
-    }
-    return m;
-  },
+//
+// `attributeStyleMap` comes from the `ElementCSSInlineStyle` mixin, and CSSOM
+// includes that mixin on `HTMLElement`, `SVGElement` and `MathMLElement` — NOT on
+// `Element`. Putting it only on `Element` reaches every element that matters and
+// still fails `assert_own_property(HTMLElement.prototype, …)`, because a mixin
+// member belongs to each interface that includes it and inheriting it is not the
+// same as having it. So it goes on all four: the three the spec names, and
+// `Element` besides, which is where every other element in the tree finds it.
+const _tomInlineStyleMapFor = (I) => ({
+  configurable: true, enumerable: true,
+  get: (() => {
+    const g = function () {
+      if (!(this instanceof globalThis[I]))
+        throw new TypeError("Illegal invocation: 'attributeStyleMap' read off an object that is not a " + I + '.');
+      let m = this._tomInlineMap;
+      if (!m) {
+        m = _tomMake(StylePropertyMap, _tomDeclSource(this.style));
+        Object.defineProperty(this, '_tomInlineMap', { value: m, configurable: true });
+      }
+      return m;
+    };
+    Object.defineProperty(g, 'name', { value: 'get attributeStyleMap', configurable: true });
+    return typeof _markNative === 'function' ? _markNative(g) : g;
+  })(),
 });
+Object.defineProperty(Element.prototype, 'attributeStyleMap', _tomInlineStyleMapFor('Element'));
 globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
   // WebIDL brand check: a Window operation called with a `this` that is not the global
   // (e.g. `getComputedStyle.call({})`) throws TypeError. Unbound calls (`this` is
@@ -32880,8 +33289,14 @@ globalThis.CSS = {
 // lowercase canonical spelling (`CSS.Q(30).unit === 'q'`) — the same split the
 // unit table already makes, since CSS units are case-insensitive and only their
 // canonical form is stable.
-for (const factory of ['number', 'percent', 'em', 'ex', 'ch', 'ic', 'rem', 'lh', 'rlh',
-  'vw', 'vh', 'vi', 'vb', 'vmin', 'vmax', 'cm', 'mm', 'Q', 'in', 'pt', 'pc', 'px',
+for (const factory of ['number', 'percent', 'em', 'ex', 'ch', 'ic', 'cap', 'rem', 'rex', 'rch',
+  'ric', 'rcap', 'lh', 'rlh',
+  'vw', 'vh', 'vi', 'vb', 'vmin', 'vmax',
+  'svw', 'svh', 'svi', 'svb', 'svmin', 'svmax',
+  'lvw', 'lvh', 'lvi', 'lvb', 'lvmin', 'lvmax',
+  'dvw', 'dvh', 'dvi', 'dvb', 'dvmin', 'dvmax',
+  'cqw', 'cqh', 'cqi', 'cqb', 'cqmin', 'cqmax',
+  'cm', 'mm', 'Q', 'in', 'pt', 'pc', 'px',
   'deg', 'grad', 'rad', 'turn', 's', 'ms', 'Hz', 'kHz', 'dpi', 'dpcm', 'dppx', 'fr']) {
   const unit = factory.toLowerCase();
   const fn = function (value) {
@@ -32897,15 +33312,17 @@ for (const factory of ['number', 'percent', 'em', 'ex', 'ch', 'ic', 'rem', 'lh',
 // because a rule's declaration block answers `getPropertyValue`/`setProperty`
 // exactly as an element's inline one does.
 Object.defineProperty(globalThis.CSSStyleRule.prototype, 'styleMap', {
-  configurable: true,
-  get() {
+  configurable: true, enumerable: true,
+  get: _markNative(Object.defineProperty(function () {
+    if (!(this instanceof globalThis.CSSStyleRule))
+      throw new TypeError("Illegal invocation: 'styleMap' read off an object that is not a CSSStyleRule.");
     let m = this._tomDeclMap;
     if (!m) {
-      m = new StylePropertyMap(_tomDeclSource(this.style));
+      m = _tomMake(StylePropertyMap, _tomDeclSource(this.style));
       Object.defineProperty(this, '_tomDeclMap', { value: m, configurable: true });
     }
     return m;
-  },
+  }, 'name', { value: 'get styleMap', configurable: true })),
 });
 // WebIDL: a namespace object (CSS) is a NON-enumerable, writable, configurable global
 // data property (a plain assignment is enumerable, which idlharness flags). It stays a
@@ -36487,6 +36904,15 @@ globalThis.MathMLElement = class MathMLElement extends Element {};
 _markNative(globalThis.SVGElement); _markNative(globalThis.SVGSVGElement);
 _markNative(globalThis.SVGStyleElement); _markNative(globalThis.MathMLElement);
 _installLinkStyleSheet(globalThis.SVGStyleElement);
+// The `ElementCSSInlineStyle` mixin, on the three interfaces CSSOM actually
+// includes it in. It already sits on `Element` (where every element in the tree
+// finds it); these are the three the spec NAMES, and a mixin member belongs to
+// each including interface as its OWN property — inheriting it is not the same
+// thing. These three classes only exist this late in the file, which is why the
+// installation waits for them rather than running beside the map itself.
+for (const I of ['HTMLElement', 'SVGElement', 'MathMLElement'])
+  if (globalThis[I] && globalThis[I].prototype)
+    Object.defineProperty(globalThis[I].prototype, 'attributeStyleMap', _tomInlineStyleMapFor(I));
 
 // ─── SVG animated-attribute primitives (SVG 2 §4) ───────────────────────────
 // The reflected-value wrapper interfaces (SVGAnimated*) an SVG element's animatable
