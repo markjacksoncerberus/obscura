@@ -356,6 +356,8 @@ capability we do not have — we lead Chrome 1390/1398 to 1344/1398 on the ident
   `readable-streams/patched-global` is an instrumentation artefact — probed directly, `tee()`
   survives both patches the file installs.
 
+**⭐ NEXT, measured on the finished build rather than guessed: `fetch/api/response/response-clone` is STILL 6/21.** `Response.clone()` copies BYTES (`st.body.bytes.slice()`) instead of teeing the body stream — so a Response built from a `ReadableStream` clones to nothing, and the nine *use structuredClone for teed ReadableStreams* rows fail because the two halves must hand out DIFFERENT chunk objects. Spec `clone()` tees `this.body` with `cloneForBranch2 = true`, and that path now exists. Small and precise, well under a quest.
+
 Scroll: [`456-the-streaming-verdict.md`](456-the-streaming-verdict.md).
 
 ### 2026-08-03 — Quests #457–#459, **The Data Layer Verdict** (`fetch` object model **130/566 → 527/598, 88.1%**)

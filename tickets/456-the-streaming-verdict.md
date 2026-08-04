@@ -337,12 +337,32 @@ baseline a future session can diff against rather than a one-off.
 
 ## Caps / Next
 
-**⭐ NEXT — `fetch`'s stream tail, which is now unblocked and cheap.**
-`fetch/api/response/response-clone.any.html` was 2/21 and the previous session
-proved it *is not a Response bug*: fifteen of its rows need a real
-`ReadableStream` — `tee()` that duplicates, `cancel()` that does not affect the
-clone, structured-clone of teed chunks. All three now exist. Re-measure it first;
-it should be close to free.
+**⭐ NEXT — `Response.clone()` must TEE the body, not copy its bytes. Measured, not guessed.**
+`fetch/api/response/response-clone.any.html` was re-measured on the finished build
+and is **still 6/21** — so the previous session's read ("15 rows need a real
+`ReadableStream`") was only half right, and the other half is a `Response` bug
+this session can now name exactly:
+
+```js
+clone() {
+  const r = _makeResponse(st.body ? st.body.bytes.slice() : null, {...});   // ← copies BYTES
+}
+```
+
+Two consequences, both visible in the failures:
+- **A `Response` built from a `ReadableStream` clones to NOTHING.**
+  `_fetchExtractBody` stores such a body as `{bytes: <empty>, stream}`, so
+  `st.body.bytes.slice()` copies an empty array.
+- **The nine `use structuredClone for teed ReadableStreams` rows fail
+  `assert_false: expected false got true`** — the two halves must hand out
+  *different* chunk objects, because a shared buffer lets one reader observe (or
+  corrupt) the other's bytes.
+
+The spec's `clone()` **tees `this.body` with `cloneForBranch2 = true`** and gives
+one branch to each response. That path now exists: `ReadableStreamDefaultTee`
+takes the flag and structured-clones branch 2's chunks. This is a small, precise
+change in `Response.prototype.clone` / `Request.prototype.clone` — not free, but
+well under a quest.
 
 **⭐⭐ `FormData` cannot hold a File.** `FormData.append` coerces every value with
 `String(v)`, so a file upload becomes the literal text `[object File]`. The
