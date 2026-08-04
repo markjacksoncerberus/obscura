@@ -1,0 +1,66 @@
+# Wide sweep for the event-loop change (a 0ms timer became a TASK, not a microtask).
+# Timer-, event-, animation- and XHR-heavy files: everything whose ordering depends
+# on when the microtask queue is drained. Run before/after any change to _scheduleAfter.
+#
+# Post-fix baseline (2026-08-04, Quest #461, a 0ms timer became a TASK):
+#     3348 PASS / 977 FAIL / 316 other = 4641 total  (72.1%), 0 could-not-run, ~15 min.
+# With that one hunk reverted the SAME list wedged the harness after 78 minutes
+# (one idle about:blank target, no progress) and could not finish even 14 of these
+# files inside ten minutes. If a future run here suddenly crawls, suspect the event
+# loop before you suspect the tests.
+css/css-animations/animationevent-interface.html
+css/css-animations/display-interpolation.html
+css/css-animations/idlharness.html
+css/css-animations/parsing/animation-range-shorthand.html
+css/css-animations/text-decoration-inset-auto.html
+css/css-animations/transition-properties-not-animatable.html
+css/css-transitions/animations/text-shadow-interpolation.html
+css/css-transitions/animations/vertical-align-interpolation.html
+css/css-transitions/animations/z-index-interpolation.html
+css/css-transitions/properties-value-001.html
+css/css-transitions/properties-value-inherit-001.html
+css/css-transitions/properties-value-inherit-002.html
+dom/events/Body-FrameSet-Event-Handlers.html
+dom/events/Event-constructors.any.html
+dom/events/Event-dispatch-click.html
+dom/events/Event-dispatch-single-activation-behavior.html
+dom/events/Event-subclasses-constructors.html
+dom/events/EventTarget-dispatchEvent.html
+dom/events/passive-by-default.html
+dom/events/webkit-animation-iteration-event.html
+dom/events/webkit-animation-start-event.html
+dom/events/webkit-transition-end-event.html
+html/webappapis/microtask-queuing/queue-microtask.any.html
+html/webappapis/microtask-queuing/queue-microtask.window.html
+html/webappapis/timers/cleartimeout-clearinterval.any.html
+html/webappapis/timers/missing-timeout-setinterval.any.html
+html/webappapis/timers/setinterval-settimeout-clamping.any.html
+html/webappapis/timers/timer-nesting-not-inherited-in-microtask.html
+performance-timeline/droppedentriescount.any.html
+performance-timeline/idlharness.any.html
+performance-timeline/po-disconnect.any.html
+performance-timeline/po-mark-measure.any.html
+performance-timeline/po-observe-type.any.html
+performance-timeline/po-observe.any.html
+user-timing/clearMarks.html
+user-timing/clearMeasures.html
+user-timing/invoke_with_timing_attributes.html
+user-timing/mark.html
+user-timing/measure.html
+user-timing/measures.html
+web-animations/interfaces/Animation/commitStyles.html
+web-animations/interfaces/Animation/constructor.html
+web-animations/interfaces/Animation/finished.html
+web-animations/interfaces/Animation/onfinish.html
+web-animations/interfaces/Animation/startTime.html
+web-animations/interfaces/Animation/style-change-events.html
+xhr/idlharness.any.html
+xhr/overridemimetype-blob.html
+xhr/responsetext-decoding.htm
+xhr/responsetype.any.html
+xhr/send-redirect.htm
+xhr/send-usp.any.html
+xhr/setrequestheader-bogus-name.htm
+xhr/setrequestheader-content-type.htm
+xhr/status-async.htm
+xhr/status-basic.htm

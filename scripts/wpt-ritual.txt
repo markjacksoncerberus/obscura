@@ -39,3 +39,18 @@ xhr/responsetext-decoding.htm
 xhr/responsedocument-decoding.htm
 xhr/responsexml-get-twice.htm
 xhr/setrequestheader-bogus-name.htm
+# ── The streams realm (Quests #460–#462). `response.body` IS a ReadableStream,
+#    so a change to the fetch body path shows up here first. These eight cover
+#    the readable side, the writable side, the pipe, the transform and BYOB.
+streams/readable-streams/templated.any.html
+streams/readable-streams/tee.any.html
+streams/readable-streams/default-reader.any.html
+streams/writable-streams/aborting.any.html
+streams/piping/pipe-through.any.html
+streams/transform-streams/general.any.html
+streams/readable-byte-streams/general.any.html
+streams/queuing-strategies.any.html
+# ── The event loop (Quest #461): a 0ms timer is a TASK, not a microtask. These
+#    two break loudly if _scheduleAfter ever goes back to Promise.resolve().then.
+html/webappapis/timers/timer-nesting-not-inherited-in-microtask.html
+html/webappapis/microtask-queuing/queue-microtask.any.html

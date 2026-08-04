@@ -691,9 +691,43 @@ let _tid = 0;
 const _clearedTimers = new Set();
 const _intervals = new Set();
 
+// ── A TASK IS NOT A MICROTASK ────────────────────────────────────────────────
+// HTML's event loop runs ONE task, then drains the ENTIRE microtask queue, then
+// runs the next task. `setTimeout(fn, 0)` used to be `Promise.resolve().then(fn)`
+// — a microtask — so a zero-delay timer INTERLEAVED with the promise jobs
+// already queued instead of waiting behind them. Every idiom that means "let
+// everything pending settle, then look" quietly saw a half-finished world:
+// measured here, only THREE of five hundred chained promise jobs had run by the
+// time a 0ms timer fired. That is not a slow timer, it is the wrong queue, and
+// it shows up as ordering bugs and phantom timeouts anywhere promises and
+// timers are used together — which today is most of the platform.
+//
+// A real task has to leave JS entirely, so the runtime performs its microtask
+// checkpoint before control comes back; `op_sleep(0)` is that round trip. Tasks
+// are pumped ONE at a time and in insertion order, because HTML requires both:
+// two timers with the same delay fire in the order they were set.
+const _taskQueue = [];
+let _taskPumpArmed = false;
+const _pumpTasks = () => {
+  _taskPumpArmed = false;
+  const fn = _taskQueue.shift();
+  // Re-arm BEFORE running the task: the next round trip overlaps this task's
+  // work, and the runtime still drains microtasks before delivering it.
+  if (_taskQueue.length > 0) _armTaskPump();
+  if (fn !== undefined) {
+    try { fn(); } catch (e) { try { _reportError(e); } catch (e2) {} }
+  }
+};
+const _armTaskPump = () => {
+  if (_taskPumpArmed) return;
+  _taskPumpArmed = true;
+  Deno.core.ops.op_sleep(0).then(_pumpTasks);
+};
+const _queueTask = (fn) => { _taskQueue.push(fn); _armTaskPump(); };
+
 const _scheduleAfter = (delay, fn) => {
   const d = Math.max(0, Number(delay) || 0);
-  if (d === 0) Promise.resolve().then(fn);
+  if (d === 0) _queueTask(fn);
   else Deno.core.ops.op_sleep(d).then(fn);
 };
 
@@ -40798,65 +40832,2892 @@ globalThis.stop = function() {};
 globalThis.postMessage = function() {};
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
-if (typeof ReadableStream === 'undefined') {
-  globalThis.ReadableStream = class ReadableStream {
-    constructor(source = {}, strategy = {}) {
-      this._source = source; this._queue = []; this._closed = false;
-      this.locked = false;
-      if (source.start) source.start({ enqueue: (chunk) => this._queue.push(chunk), close: () => { this._closed = true; }, error: () => {} });
+// ══════════════════════════════════════════════════════════════════════════════
+// The Streams Standard  (https://streams.spec.whatwg.org/)
+// ══════════════════════════════════════════════════════════════════════════════
+// A stream is how the platform says "here is data, but not all of it, and not
+// yet". Everything that arrives over a network arrives this way: `response.body`
+// IS a ReadableStream, and so is `Blob.stream()`, `TextDecoderStream`, and every
+// upload with a progress bar. Obscura shipped a ~25-line stub whose `tee()`
+// returned two EMPTY streams and whose reader answered `{done: true}` for a
+// stream that had not finished — which does not look like a broken stream, it
+// looks like a page whose data ran out early.
+//
+// This is the real thing, written to the spec's abstract operations rather than
+// to its class surface, because almost every rule here lives in the ops:
+//
+//   * A stream is a QUEUE with a high-water mark, not a buffer. `desiredSize`
+//     going negative is how backpressure is expressed, and a source that never
+//     sees it will happily out-run a slow consumer until the tab dies.
+//   * A reader LOCKS the stream. Two readers of one stream would each see half
+//     the chunks — so the lock is not politeness, it is the only thing standing
+//     between a caller and silently-interleaved data.
+//   * Errors PROPAGATE both ways along a pipe, and cancelling one branch of a
+//     `tee()` must not starve the other.
+//
+// Internal slots are `_`-prefixed properties; brand checks test for the slot the
+// spec names, exactly as the reference implementation does. Promise plumbing
+// captures the ORIGINAL `Promise.prototype.then` at load time: a page that
+// patches `then` must not be able to intercept the engine's own pipe machinery
+// (WPT checks this in `piping/then-interception`), and more importantly a hostile
+// page must not be able to observe or reorder another origin's stream reads.
+(function initStreams(global) {
+  'use strict';
+
+  // ── Captured primordials ───────────────────────────────────────────────────
+  // Everything below goes through these, never through the live globals.
+  const NativePromise = Promise;
+  const nativeThen = Promise.prototype.then;
+  const nativeResolve = Promise.resolve.bind(Promise);
+  const nativeReject = Promise.reject.bind(Promise);
+  const nativeAll = Promise.all.bind(Promise);
+
+  const pthen = (p, f, r) => nativeThen.call(p, f, r);
+  const newPromise = (executor) => new NativePromise(executor);
+  const promiseResolvedWith = (v) => nativeResolve(v);
+  const promiseRejectedWith = (e) => nativeReject(e);
+  function setPromiseIsHandledToTrue(promise) { pthen(promise, undefined, () => {}); }
+  function transformPromiseWith(promise, f, r) { return pthen(promise, f, r); }
+  function uponPromise(promise, onFulfilled, onRejected) {
+    setPromiseIsHandledToTrue(pthen(promise, onFulfilled, onRejected));
+  }
+  const uponFulfillment = (promise, f) => uponPromise(promise, f);
+  const uponRejection = (promise, r) => uponPromise(promise, undefined, r);
+
+  // ── Small WebIDL-shaped helpers ────────────────────────────────────────────
+  // The suite tests argument coercion as hard as it tests behaviour, because a
+  // constructor that accepts nonsense produces a stream that fails much later,
+  // somewhere the author cannot connect back to the call that broke it.
+  const isObject = (x) => (typeof x === 'object' && x !== null) || typeof x === 'function';
+  // A DICTIONARY is not an object: WebIDL converts `null` and `undefined` to an
+  // EMPTY dictionary rather than refusing them, which is why `new ReadableStream()`
+  // and `stream.getReader(null)` are both legal. `typeof null === 'object'` is the
+  // whole difference, and getting it wrong refuses the most ordinary call there is.
+  const isDictionary = (x) => typeof x === 'object' || typeof x === 'function';
+  function assertDictionary(obj, context) {
+    if (obj !== undefined && !isDictionary(obj)) throw new TypeError(`${context} is not an object.`);
+  }
+  function assertObject(x, context) {
+    if (!isObject(x)) throw new TypeError(`${context} is not an object.`);
+  }
+  function assertFunction(x, context) {
+    if (typeof x !== 'function') throw new TypeError(`${context} is not a function.`);
+  }
+  function assertRequiredArgument(x, position, context) {
+    if (x === undefined) throw new TypeError(`Parameter ${position} is required in '${context}'.`);
+  }
+  function assertRequiredField(x, field, context) {
+    if (x === undefined) throw new TypeError(`${field} is required in '${context}'.`);
+  }
+  const censorNegativeZero = (x) => (x === 0 ? 0 : x);
+  const integerPart = (x) => censorNegativeZero(Math.trunc(x));
+  function convertUnrestrictedDouble(value) { return Number(value); }
+  function convertUnsignedLongLongWithEnforceRange(value, context) {
+    const upperBound = Number.MAX_SAFE_INTEGER;
+    let x = Number(value);
+    x = censorNegativeZero(x);
+    if (!Number.isFinite(x)) throw new TypeError(`${context} is not a finite number`);
+    x = integerPart(x);
+    if (x < 0 || x > upperBound)
+      throw new TypeError(`${context} is outside the accepted range of 0 to ${upperBound}, inclusive`);
+    if (!Number.isFinite(x) || x === 0) return 0;
+    return x;
+  }
+  // Reflecting a possibly-patched method off a user object: the spec looks the
+  // member up ONCE and keeps the function, so a getter that changes its answer
+  // between the lookup and the call cannot re-aim the algorithm mid-flight.
+  function promiseCall(F, V, args) {
+    try { return promiseResolvedWith(Reflect.apply(F, V, args)); }
+    catch (value) { return promiseRejectedWith(value); }
+  }
+  function reflectCall(F, V, args) { return Reflect.apply(F, V, args); }
+
+  // ── A queue that knows how big it is ───────────────────────────────────────
+  // Sizes are summed in the order chunks arrive, so floating-point drift is the
+  // spec's problem too; it pins the arithmetic (see `floating-point-total-queue-size`).
+  function DequeueValue(container) {
+    const pair = container._queue.shift();
+    container._queueTotalSize -= pair.size;
+    if (container._queueTotalSize < 0) container._queueTotalSize = 0;
+    return pair.value;
+  }
+  function EnqueueValueWithSize(container, value, size) {
+    size = Number(size);
+    if (!(Number.isFinite(size) && size >= 0))
+      throw new RangeError('Size must be a finite, non-NaN, non-negative number.');
+    container._queue.push({ value, size });
+    container._queueTotalSize += size;
+  }
+  function PeekQueueValue(container) { return container._queue[0].value; }
+  function ResetQueue(container) { container._queue = []; container._queueTotalSize = 0; }
+
+  // ── Queuing strategies ─────────────────────────────────────────────────────
+  function ExtractHighWaterMark(strategy, defaultHWM) {
+    const { highWaterMark } = strategy;
+    if (highWaterMark === undefined) return defaultHWM;
+    if (Number.isNaN(highWaterMark) || highWaterMark < 0)
+      throw new RangeError('Invalid highWaterMark');
+    return highWaterMark;
+  }
+  function ExtractSizeAlgorithm(strategy) {
+    const { size } = strategy;
+    if (!size) return () => 1;
+    return (chunk) => size(chunk);
+  }
+  function convertQueuingStrategy(init, context) {
+    assertDictionary(init, context);
+    const highWaterMark = init == null ? undefined : init.highWaterMark;
+    const size = init == null ? undefined : init.size;
+    return {
+      highWaterMark: highWaterMark === undefined ? undefined : convertUnrestrictedDouble(highWaterMark),
+      size: size === undefined ? undefined : convertQueuingStrategySize(size, `${context} has member 'size' that`),
+    };
+  }
+  function convertQueuingStrategySize(fn, context) {
+    assertFunction(fn, context);
+    return (chunk) => convertUnrestrictedDouble(fn(chunk));
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  ReadableStream
+  // ══════════════════════════════════════════════════════════════════════════
+  function IsReadableStream(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_readableStreamController');
+  }
+  function IsReadableStreamLocked(stream) { return stream._reader !== undefined; }
+  function IsReadableStreamDisturbed(stream) { return stream._disturbed; }
+
+  function InitializeReadableStream(stream) {
+    stream._state = 'readable';
+    stream._reader = undefined;
+    stream._storedError = undefined;
+    stream._disturbed = false;
+  }
+
+  function CreateReadableStream(startAlgorithm, pullAlgorithm, cancelAlgorithm, highWaterMark = 1, sizeAlgorithm = () => 1) {
+    const stream = Object.create(ReadableStream.prototype);
+    InitializeReadableStream(stream);
+    const controller = Object.create(ReadableStreamDefaultController.prototype);
+    SetUpReadableStreamDefaultController(
+      stream, controller, startAlgorithm, pullAlgorithm, cancelAlgorithm, highWaterMark, sizeAlgorithm);
+    return stream;
+  }
+
+  function ReadableStreamCancel(stream, reason) {
+    stream._disturbed = true;
+    if (stream._state === 'closed') return promiseResolvedWith(undefined);
+    if (stream._state === 'errored') return promiseRejectedWith(stream._storedError);
+    ReadableStreamClose(stream);
+    const reader = stream._reader;
+    if (reader !== undefined && IsReadableStreamBYOBReader(reader)) {
+      const readIntoRequests = reader._readIntoRequests;
+      reader._readIntoRequests = [];
+      for (const readIntoRequest of readIntoRequests) readIntoRequest._closeSteps(undefined);
     }
-    getReader() {
-      this.locked = true;
-      const stream = this;
-      return {
-        read() {
-          if (stream._queue.length > 0) return Promise.resolve({ value: stream._queue.shift(), done: false });
-          if (stream._closed) return Promise.resolve({ value: undefined, done: true });
-          return Promise.resolve({ value: undefined, done: true });
+    const sourceCancelPromise = stream._readableStreamController[CancelSteps](reason);
+    return transformPromiseWith(sourceCancelPromise, () => undefined);
+  }
+
+  function ReadableStreamClose(stream) {
+    stream._state = 'closed';
+    const reader = stream._reader;
+    if (reader === undefined) return;
+    defaultReaderClosedPromiseResolve(reader);
+    if (IsReadableStreamDefaultReader(reader)) {
+      const readRequests = reader._readRequests;
+      reader._readRequests = [];
+      for (const readRequest of readRequests) readRequest._closeSteps();
+    }
+  }
+
+  function ReadableStreamError(stream, e) {
+    stream._state = 'errored';
+    stream._storedError = e;
+    const reader = stream._reader;
+    if (reader === undefined) return;
+    defaultReaderClosedPromiseReject(reader, e);
+    if (IsReadableStreamDefaultReader(reader)) {
+      const readRequests = reader._readRequests;
+      reader._readRequests = [];
+      for (const readRequest of readRequests) readRequest._errorSteps(e);
+    } else {
+      const readIntoRequests = reader._readIntoRequests;
+      reader._readIntoRequests = [];
+      for (const readIntoRequest of readIntoRequests) readIntoRequest._errorSteps(e);
+    }
+  }
+
+  function ReadableStreamAddReadRequest(stream, readRequest) {
+    stream._reader._readRequests.push(readRequest);
+  }
+  function ReadableStreamFulfillReadRequest(stream, chunk, done) {
+    const reader = stream._reader;
+    const readRequest = reader._readRequests.shift();
+    if (done) readRequest._closeSteps();
+    else readRequest._chunkSteps(chunk);
+  }
+  function ReadableStreamGetNumReadRequests(stream) { return stream._reader._readRequests.length; }
+  function ReadableStreamHasDefaultReader(stream) {
+    const reader = stream._reader;
+    return reader !== undefined && IsReadableStreamDefaultReader(reader);
+  }
+
+  // ── The generic reader half (shared by default and BYOB readers) ───────────
+  function ReadableStreamReaderGenericInitialize(reader, stream) {
+    reader._stream = stream;
+    stream._reader = reader;
+    if (stream._state === 'readable') defaultReaderClosedPromiseInitialize(reader);
+    else if (stream._state === 'closed') defaultReaderClosedPromiseInitializeAsResolved(reader);
+    else defaultReaderClosedPromiseInitializeAsRejected(reader, stream._storedError);
+  }
+  function ReadableStreamReaderGenericCancel(reader, reason) {
+    return ReadableStreamCancel(reader._stream, reason);
+  }
+  function ReadableStreamReaderGenericRelease(reader) {
+    const stream = reader._stream;
+    // Releasing a lock does not close the stream — but every promise this reader
+    // handed out must settle, or an `await reader.read()` sits there forever on
+    // a stream someone else now owns.
+    if (stream._state === 'readable') {
+      defaultReaderClosedPromiseReject(
+        reader, new TypeError('Reader was released and can no longer be used to monitor the stream\'s closedness'));
+    } else {
+      defaultReaderClosedPromiseResetToRejected(
+        reader, new TypeError('Reader was released and can no longer be used to monitor the stream\'s closedness'));
+    }
+    stream._readableStreamController[ReleaseSteps]();
+    stream._reader = undefined;
+    reader._stream = undefined;
+  }
+  function readerLockException(name) {
+    return new TypeError('Cannot ' + name + ' a stream using a released reader');
+  }
+
+  function defaultReaderClosedPromiseInitialize(reader) {
+    reader._closedPromise = newPromise((resolve, reject) => {
+      reader._closedPromise_resolve = resolve;
+      reader._closedPromise_reject = reject;
+    });
+  }
+  function defaultReaderClosedPromiseInitializeAsRejected(reader, reason) {
+    defaultReaderClosedPromiseInitialize(reader);
+    defaultReaderClosedPromiseReject(reader, reason);
+  }
+  function defaultReaderClosedPromiseInitializeAsResolved(reader) {
+    defaultReaderClosedPromiseInitialize(reader);
+    defaultReaderClosedPromiseResolve(reader);
+  }
+  function defaultReaderClosedPromiseReject(reader, reason) {
+    if (reader._closedPromise_reject === undefined) return;
+    setPromiseIsHandledToTrue(reader._closedPromise);
+    reader._closedPromise_reject(reason);
+    reader._closedPromise_resolve = undefined;
+    reader._closedPromise_reject = undefined;
+  }
+  function defaultReaderClosedPromiseResetToRejected(reader, reason) {
+    defaultReaderClosedPromiseInitializeAsRejected(reader, reason);
+  }
+  function defaultReaderClosedPromiseResolve(reader) {
+    if (reader._closedPromise_resolve === undefined) return;
+    reader._closedPromise_resolve(undefined);
+    reader._closedPromise_resolve = undefined;
+    reader._closedPromise_reject = undefined;
+  }
+
+  // ── Controller "steps" symbols, so a stream can talk to either controller ──
+  const CancelSteps = Symbol('[[CancelSteps]]');
+  const PullSteps = Symbol('[[PullSteps]]');
+  const ReleaseSteps = Symbol('[[ReleaseSteps]]');
+  const AbortSteps = Symbol('[[AbortSteps]]');
+  const ErrorSteps = Symbol('[[ErrorSteps]]');
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  ReadableStreamDefaultReader
+  // ══════════════════════════════════════════════════════════════════════════
+  function IsReadableStreamDefaultReader(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_readRequests');
+  }
+  function SetUpReadableStreamDefaultReader(reader, stream) {
+    if (IsReadableStreamLocked(stream)) throw new TypeError('This stream has already been locked for exclusive reading by another reader');
+    ReadableStreamReaderGenericInitialize(reader, stream);
+    reader._readRequests = [];
+  }
+  function ReadableStreamDefaultReaderRead(reader, readRequest) {
+    const stream = reader._stream;
+    stream._disturbed = true;
+    if (stream._state === 'closed') readRequest._closeSteps();
+    else if (stream._state === 'errored') readRequest._errorSteps(stream._storedError);
+    else stream._readableStreamController[PullSteps](readRequest);
+  }
+  function ReadableStreamDefaultReaderErrorReadRequests(reader, e) {
+    const readRequests = reader._readRequests;
+    reader._readRequests = [];
+    for (const readRequest of readRequests) readRequest._errorSteps(e);
+  }
+  // Releasing a lock is not just "hand the stream back". Every read() this
+  // reader had OUTSTANDING must be REJECTED, because the chunk it was waiting
+  // for now belongs to whoever takes the lock next — an unresolved read promise
+  // is an `await` that never returns, and a page that awaits it is simply gone.
+  function ReadableStreamDefaultReaderRelease(reader) {
+    ReadableStreamReaderGenericRelease(reader);
+    ReadableStreamDefaultReaderErrorReadRequests(reader, readerLockException('read from'));
+  }
+
+  class ReadableStreamDefaultReader {
+    constructor(stream) {
+      assertRequiredArgument(stream, 1, 'ReadableStreamDefaultReader');
+      if (!IsReadableStream(stream)) throw new TypeError('First parameter is not a ReadableStream.');
+      SetUpReadableStreamDefaultReader(this, stream);
+    }
+    get closed() {
+      if (!IsReadableStreamDefaultReader(this)) return promiseRejectedWith(defaultReaderBrandCheckException('closed'));
+      return this._closedPromise;
+    }
+    cancel(reason = undefined) {
+      if (!IsReadableStreamDefaultReader(this)) return promiseRejectedWith(defaultReaderBrandCheckException('cancel'));
+      if (this._stream === undefined) return promiseRejectedWith(readerLockException('cancel'));
+      return ReadableStreamReaderGenericCancel(this, reason);
+    }
+    read() {
+      if (!IsReadableStreamDefaultReader(this)) return promiseRejectedWith(defaultReaderBrandCheckException('read'));
+      if (this._stream === undefined) return promiseRejectedWith(readerLockException('read from'));
+      let resolvePromise, rejectPromise;
+      const promise = newPromise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
+      const readRequest = {
+        _chunkSteps: (chunk) => resolvePromise({ value: chunk, done: false }),
+        _closeSteps: () => resolvePromise({ value: undefined, done: true }),
+        _errorSteps: (e) => rejectPromise(e),
+      };
+      ReadableStreamDefaultReaderRead(this, readRequest);
+      return promise;
+    }
+    releaseLock() {
+      if (!IsReadableStreamDefaultReader(this)) throw defaultReaderBrandCheckException('releaseLock');
+      if (this._stream === undefined) return;
+      ReadableStreamDefaultReaderRelease(this);
+    }
+  }
+  Object.defineProperties(ReadableStreamDefaultReader.prototype, {
+    cancel: { enumerable: true }, read: { enumerable: true }, releaseLock: { enumerable: true },
+    closed: { enumerable: true },
+  });
+  Object.defineProperty(ReadableStreamDefaultReader.prototype, Symbol.toStringTag,
+    { value: 'ReadableStreamDefaultReader', configurable: true });
+  function defaultReaderBrandCheckException(name) {
+    return new TypeError(`ReadableStreamDefaultReader.prototype.${name} can only be used on a ReadableStreamDefaultReader`);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  Async iteration —  `for await (const chunk of stream)`
+  // ══════════════════════════════════════════════════════════════════════════
+  // The iterator holds the reader's lock for its whole lifetime and releases it
+  // on return()/throw(), which is what makes `break` out of a for-await loop
+  // hand the stream back instead of stranding it locked forever.
+  const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype);
+
+  class ReadableStreamAsyncIteratorImpl {
+    constructor(reader, preventCancel) {
+      this._ongoingPromise = undefined;
+      this._isFinished = false;
+      this._reader = reader;
+      this._preventCancel = preventCancel;
+    }
+    next() {
+      const nextSteps = () => this._nextSteps();
+      this._ongoingPromise = this._ongoingPromise ? transformPromiseWith(this._ongoingPromise, nextSteps, nextSteps) : nextSteps();
+      return this._ongoingPromise;
+    }
+    return(value) {
+      // `return()` joins the SAME queue `next()` does. Two calls that overlap
+      // must settle in the order they were made — a `break` out of a for-await
+      // that resolved before the read it interrupted would report the loop
+      // finished while a chunk was still in flight.
+      const returnSteps = () => this._returnSteps(value);
+      this._ongoingPromise = this._ongoingPromise
+        ? transformPromiseWith(this._ongoingPromise, returnSteps, returnSteps)
+        : returnSteps();
+      return this._ongoingPromise;
+    }
+    _nextSteps() {
+      if (this._isFinished) return NativePromise.resolve({ value: undefined, done: true });
+      const reader = this._reader;
+      if (reader._stream === undefined) return promiseRejectedWith(readerLockException('iterate'));
+      let resolvePromise, rejectPromise;
+      const promise = newPromise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
+      const readRequest = {
+        _chunkSteps: (chunk) => { this._ongoingPromise = undefined; queueMicrotask(() => resolvePromise({ value: chunk, done: false })); },
+        _closeSteps: () => {
+          this._ongoingPromise = undefined; this._isFinished = true;
+          ReadableStreamDefaultReaderRelease(reader);
+          resolvePromise({ value: undefined, done: true });
         },
-        releaseLock() { stream.locked = false; },
-        cancel() { stream._closed = true; return Promise.resolve(); },
-        get closed() { return stream._closed ? Promise.resolve() : new Promise(() => {}); },
+        _errorSteps: (reason) => {
+          this._ongoingPromise = undefined; this._isFinished = true;
+          ReadableStreamDefaultReaderRelease(reader);
+          rejectPromise(reason);
+        },
       };
+      ReadableStreamDefaultReaderRead(reader, readRequest);
+      return promise;
     }
-    cancel() { this._closed = true; return Promise.resolve(); }
-    pipeTo(dest) { return Promise.resolve(); }
-    pipeThrough(transform) { return transform.readable || new ReadableStream(); }
-    tee() { return [new ReadableStream(), new ReadableStream()]; }
-    [Symbol.asyncIterator]() {
-      const reader = this.getReader();
-      return { next: () => reader.read(), return: () => { reader.releaseLock(); return Promise.resolve({done:true}); } };
+    _returnSteps(value) {
+      if (this._isFinished) return NativePromise.resolve({ value, done: true });
+      this._isFinished = true;
+      const reader = this._reader;
+      if (reader._stream === undefined) return promiseRejectedWith(readerLockException('finish iterating'));
+      if (!this._preventCancel) {
+        const result = ReadableStreamReaderGenericCancel(reader, value);
+        ReadableStreamDefaultReaderRelease(reader);
+        return transformPromiseWith(result, () => ({ value, done: true }));
+      }
+      ReadableStreamDefaultReaderRelease(reader);
+      return NativePromise.resolve({ value, done: true });
     }
+  }
+
+  const ReadableStreamAsyncIteratorPrototype = {
+    next() {
+      if (!IsReadableStreamAsyncIterator(this)) return promiseRejectedWith(streamAsyncIteratorBrandCheckException('next'));
+      return this._asyncIteratorImpl.next();
+    },
+    return(value) {
+      if (!IsReadableStreamAsyncIterator(this)) return promiseRejectedWith(streamAsyncIteratorBrandCheckException('return'));
+      return this._asyncIteratorImpl.return(value);
+    },
   };
-}
-if (typeof WritableStream === 'undefined') {
-  globalThis.WritableStream = class WritableStream {
-    constructor(sink = {}) { this._sink = sink; this.locked = false; }
+  Object.setPrototypeOf(ReadableStreamAsyncIteratorPrototype, AsyncIteratorPrototype);
+  function AcquireReadableStreamAsyncIterator(stream, preventCancel) {
+    const reader = AcquireReadableStreamDefaultReader(stream);
+    const impl = new ReadableStreamAsyncIteratorImpl(reader, preventCancel);
+    const iterator = Object.create(ReadableStreamAsyncIteratorPrototype);
+    iterator._asyncIteratorImpl = impl;
+    return iterator;
+  }
+  function IsReadableStreamAsyncIterator(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_asyncIteratorImpl');
+  }
+  function streamAsyncIteratorBrandCheckException(name) {
+    return new TypeError(`ReadableStreamAsyncIterator.${name} can only be used on a ReadableSteamAsyncIterator`);
+  }
+  function AcquireReadableStreamDefaultReader(stream) {
+    const reader = Object.create(ReadableStreamDefaultReader.prototype);
+    SetUpReadableStreamDefaultReader(reader, stream);
+    return reader;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  ReadableStreamDefaultController
+  // ══════════════════════════════════════════════════════════════════════════
+  function IsReadableStreamDefaultController(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_controlledReadableStream');
+  }
+  function ReadableStreamDefaultControllerCallPullIfNeeded(controller) {
+    if (!ReadableStreamDefaultControllerShouldCallPull(controller)) return;
+    // A pull already in flight is not re-entered; it is REMEMBERED, and re-run
+    // once when it settles. Without the flag a synchronous source that enqueues
+    // inside pull() recurses until the stack gives out.
+    if (controller._pulling) { controller._pullAgain = true; return; }
+    controller._pulling = true;
+    uponPromise(controller._pullAlgorithm(), () => {
+      controller._pulling = false;
+      if (controller._pullAgain) {
+        controller._pullAgain = false;
+        ReadableStreamDefaultControllerCallPullIfNeeded(controller);
+      }
+    }, (e) => { ReadableStreamDefaultControllerError(controller, e); });
+  }
+  function ReadableStreamDefaultControllerShouldCallPull(controller) {
+    const stream = controller._controlledReadableStream;
+    if (!ReadableStreamDefaultControllerCanCloseOrEnqueue(controller)) return false;
+    if (!controller._started) return false;
+    if (IsReadableStreamLocked(stream) && ReadableStreamGetNumReadRequests(stream) > 0) return true;
+    return ReadableStreamDefaultControllerGetDesiredSize(controller) > 0;
+  }
+  function ReadableStreamDefaultControllerClearAlgorithms(controller) {
+    controller._pullAlgorithm = undefined;
+    controller._cancelAlgorithm = undefined;
+    controller._strategySizeAlgorithm = undefined;
+  }
+  function ReadableStreamDefaultControllerClose(controller) {
+    if (!ReadableStreamDefaultControllerCanCloseOrEnqueue(controller)) return;
+    const stream = controller._controlledReadableStream;
+    controller._closeRequested = true;
+    // Closing does not discard what is already queued — the consumer still gets
+    // every chunk that was accepted before close() was called.
+    if (controller._queue.length === 0) {
+      ReadableStreamDefaultControllerClearAlgorithms(controller);
+      ReadableStreamClose(stream);
+    }
+  }
+  function ReadableStreamDefaultControllerEnqueue(controller, chunk) {
+    if (!ReadableStreamDefaultControllerCanCloseOrEnqueue(controller)) return;
+    const stream = controller._controlledReadableStream;
+    if (IsReadableStreamLocked(stream) && ReadableStreamGetNumReadRequests(stream) > 0) {
+      ReadableStreamFulfillReadRequest(stream, chunk, false);
+    } else {
+      let chunkSize;
+      try { chunkSize = controller._strategySizeAlgorithm(chunk); }
+      catch (chunkSizeE) { ReadableStreamDefaultControllerError(controller, chunkSizeE); throw chunkSizeE; }
+      try { EnqueueValueWithSize(controller, chunk, chunkSize); }
+      catch (enqueueE) { ReadableStreamDefaultControllerError(controller, enqueueE); throw enqueueE; }
+    }
+    ReadableStreamDefaultControllerCallPullIfNeeded(controller);
+  }
+  function ReadableStreamDefaultControllerError(controller, e) {
+    const stream = controller._controlledReadableStream;
+    if (stream._state !== 'readable') return;
+    ResetQueue(controller);
+    ReadableStreamDefaultControllerClearAlgorithms(controller);
+    ReadableStreamError(stream, e);
+  }
+  function ReadableStreamDefaultControllerGetDesiredSize(controller) {
+    const state = controller._controlledReadableStream._state;
+    if (state === 'errored') return null;
+    if (state === 'closed') return 0;
+    return controller._strategyHWM - controller._queueTotalSize;
+  }
+  function ReadableStreamDefaultControllerHasBackpressure(controller) {
+    return !ReadableStreamDefaultControllerShouldCallPull(controller);
+  }
+  function ReadableStreamDefaultControllerCanCloseOrEnqueue(controller) {
+    const state = controller._controlledReadableStream._state;
+    return !controller._closeRequested && state === 'readable';
+  }
+
+  class ReadableStreamDefaultController {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get desiredSize() {
+      if (!IsReadableStreamDefaultController(this)) throw defaultControllerBrandCheckException('desiredSize');
+      return ReadableStreamDefaultControllerGetDesiredSize(this);
+    }
+    close() {
+      if (!IsReadableStreamDefaultController(this)) throw defaultControllerBrandCheckException('close');
+      if (!ReadableStreamDefaultControllerCanCloseOrEnqueue(this)) throw new TypeError('The stream is not in a state that permits close');
+      ReadableStreamDefaultControllerClose(this);
+    }
+    enqueue(chunk = undefined) {
+      if (!IsReadableStreamDefaultController(this)) throw defaultControllerBrandCheckException('enqueue');
+      if (!ReadableStreamDefaultControllerCanCloseOrEnqueue(this)) throw new TypeError('The stream is not in a state that permits enqueue');
+      return ReadableStreamDefaultControllerEnqueue(this, chunk);
+    }
+    error(e = undefined) {
+      if (!IsReadableStreamDefaultController(this)) throw defaultControllerBrandCheckException('error');
+      ReadableStreamDefaultControllerError(this, e);
+    }
+    [CancelSteps](reason) {
+      ResetQueue(this);
+      const result = this._cancelAlgorithm(reason);
+      ReadableStreamDefaultControllerClearAlgorithms(this);
+      return result;
+    }
+    [PullSteps](readRequest) {
+      const stream = this._controlledReadableStream;
+      if (this._queue.length > 0) {
+        const chunk = DequeueValue(this);
+        if (this._closeRequested && this._queue.length === 0) {
+          ReadableStreamDefaultControllerClearAlgorithms(this);
+          ReadableStreamClose(stream);
+        } else {
+          ReadableStreamDefaultControllerCallPullIfNeeded(this);
+        }
+        readRequest._chunkSteps(chunk);
+      } else {
+        ReadableStreamAddReadRequest(stream, readRequest);
+        ReadableStreamDefaultControllerCallPullIfNeeded(this);
+      }
+    }
+    [ReleaseSteps]() { /* nothing */ }
+  }
+  Object.defineProperties(ReadableStreamDefaultController.prototype, {
+    close: { enumerable: true }, enqueue: { enumerable: true }, error: { enumerable: true },
+    desiredSize: { enumerable: true },
+  });
+  Object.defineProperty(ReadableStreamDefaultController.prototype, Symbol.toStringTag,
+    { value: 'ReadableStreamDefaultController', configurable: true });
+  function defaultControllerBrandCheckException(name) {
+    return new TypeError(`ReadableStreamDefaultController.prototype.${name} can only be used on a ReadableStreamDefaultController`);
+  }
+
+  function SetUpReadableStreamDefaultController(stream, controller, startAlgorithm, pullAlgorithm, cancelAlgorithm, highWaterMark, sizeAlgorithm) {
+    controller._controlledReadableStream = stream;
+    controller._queue = undefined;
+    controller._queueTotalSize = undefined;
+    ResetQueue(controller);
+    controller._started = false;
+    controller._closeRequested = false;
+    controller._pullAgain = false;
+    controller._pulling = false;
+    controller._strategySizeAlgorithm = sizeAlgorithm;
+    controller._strategyHWM = highWaterMark;
+    controller._pullAlgorithm = pullAlgorithm;
+    controller._cancelAlgorithm = cancelAlgorithm;
+    stream._readableStreamController = controller;
+    const startResult = startAlgorithm();
+    uponPromise(promiseResolvedWith(startResult), () => {
+      controller._started = true;
+      ReadableStreamDefaultControllerCallPullIfNeeded(controller);
+    }, (r) => { ReadableStreamDefaultControllerError(controller, r); });
+  }
+  function SetUpReadableStreamDefaultControllerFromUnderlyingSource(stream, underlyingSource, highWaterMark, sizeAlgorithm) {
+    const controller = Object.create(ReadableStreamDefaultController.prototype);
+    const startAlgorithm = underlyingSource.start === undefined
+      ? () => undefined
+      : () => underlyingSource.start(controller);
+    const pullAlgorithm = underlyingSource.pull === undefined
+      ? () => promiseResolvedWith(undefined)
+      : () => underlyingSource.pull(controller);
+    const cancelAlgorithm = underlyingSource.cancel === undefined
+      ? () => promiseResolvedWith(undefined)
+      : (reason) => underlyingSource.cancel(reason);
+    SetUpReadableStreamDefaultController(
+      stream, controller, startAlgorithm, pullAlgorithm, cancelAlgorithm, highWaterMark, sizeAlgorithm);
+  }
+
+  // ── Underlying-source dictionary conversion ────────────────────────────────
+  function convertUnderlyingDefaultOrByteSource(source, context) {
+    assertDictionary(source, context);
+    const original = source;
+    const autoAllocateChunkSize = original == null ? undefined : original.autoAllocateChunkSize;
+    const cancel = original == null ? undefined : original.cancel;
+    const pull = original == null ? undefined : original.pull;
+    const start = original == null ? undefined : original.start;
+    const type = original == null ? undefined : original.type;
+    return {
+      autoAllocateChunkSize: autoAllocateChunkSize === undefined
+        ? undefined
+        : convertUnsignedLongLongWithEnforceRange(autoAllocateChunkSize, `${context} has member 'autoAllocateChunkSize' that`),
+      cancel: cancel === undefined ? undefined : convertUnderlyingSourceCancelCallback(cancel, original, `${context} has member 'cancel' that`),
+      pull: pull === undefined ? undefined : convertUnderlyingSourcePullCallback(pull, original, `${context} has member 'pull' that`),
+      start: start === undefined ? undefined : convertUnderlyingSourceStartCallback(start, original, `${context} has member 'start' that`),
+      type: type === undefined ? undefined : convertReadableStreamType(type, `${context} has member 'type' that`),
+    };
+  }
+  function convertUnderlyingSourceCancelCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (reason) => promiseCall(fn, original, [reason]);
+  }
+  function convertUnderlyingSourcePullCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (controller) => promiseCall(fn, original, [controller]);
+  }
+  function convertUnderlyingSourceStartCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (controller) => reflectCall(fn, original, [controller]);
+  }
+  function convertReadableStreamType(type, context) {
+    type = `${type}`;
+    if (type !== 'bytes') throw new TypeError(`${context} '${type}' is not a valid enumeration value for ReadableStreamType`);
+    return type;
+  }
+  function convertReaderOptions(options, context) {
+    assertDictionary(options, context);
+    const mode = options == null ? undefined : options.mode;
+    return { mode: mode === undefined ? undefined : convertReadableStreamReaderMode(mode, `${context} has member 'mode' that`) };
+  }
+  function convertReadableStreamReaderMode(mode, context) {
+    mode = `${mode}`;
+    if (mode !== 'byob') throw new TypeError(`${context} '${mode}' is not a valid enumeration value for ReadableStreamReaderMode`);
+    return mode;
+  }
+  function convertIteratorOptions(options, context) {
+    assertDictionary(options, context);
+    const preventCancel = options == null ? undefined : options.preventCancel;
+    return { preventCancel: Boolean(preventCancel) };
+  }
+  function convertPipeOptions(options, context) {
+    assertDictionary(options, context);
+    const preventAbort = options == null ? undefined : options.preventAbort;
+    const preventCancel = options == null ? undefined : options.preventCancel;
+    const preventClose = options == null ? undefined : options.preventClose;
+    const signal = options == null ? undefined : options.signal;
+    if (signal !== undefined) assertAbortSignal(signal, `${context} has member 'signal' that`);
+    return {
+      preventAbort: Boolean(preventAbort), preventCancel: Boolean(preventCancel),
+      preventClose: Boolean(preventClose), signal,
+    };
+  }
+  function assertAbortSignal(signal, context) {
+    if (!isObject(signal) || typeof signal.aborted !== 'boolean') throw new TypeError(`${context} is not an AbortSignal.`);
+  }
+  function convertReadableWritablePair(pair, context) {
+    assertDictionary(pair, context);
+    const readable = pair === null || pair === undefined ? undefined : pair.readable;
+    assertRequiredField(readable, 'readable', 'ReadableWritablePair');
+    assertReadableStream(readable, `${context} has member 'readable' that`);
+    const writable = pair === null || pair === undefined ? undefined : pair.writable;
+    assertRequiredField(writable, 'writable', 'ReadableWritablePair');
+    assertWritableStream(writable, `${context} has member 'writable' that`);
+    return { readable, writable };
+  }
+  function assertReadableStream(x, context) {
+    if (!IsReadableStream(x)) throw new TypeError(`${context} is not a ReadableStream.`);
+  }
+  function assertWritableStream(x, context) {
+    if (!IsWritableStream(x)) throw new TypeError(`${context} is not a WritableStream.`);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  tee — one stream, two independent consumers
+  // ══════════════════════════════════════════════════════════════════════════
+  // The hard part is not duplication, it is INDEPENDENCE: each branch keeps its
+  // own queue, and the source is only cancelled once BOTH branches have given
+  // up. A tee whose branches share a cursor silently drops half the data into
+  // whichever branch read first — which is exactly what the old stub did by
+  // handing back two empty streams.
+  function ReadableStreamTee(stream, cloneForBranch2) {
+    if (IsReadableByteStreamController(stream._readableStreamController)) return ReadableByteStreamTee(stream);
+    return ReadableStreamDefaultTee(stream, cloneForBranch2);
+  }
+  function ReadableStreamDefaultTee(stream, cloneForBranch2) {
+    const reader = AcquireReadableStreamDefaultReader(stream);
+    let reading = false;
+    let readAgain = false;
+    let canceled1 = false;
+    let canceled2 = false;
+    let reason1, reason2, branch1, branch2;
+    let resolveCancelPromise;
+    const cancelPromise = newPromise((resolve) => { resolveCancelPromise = resolve; });
+
+    function pullAlgorithm() {
+      if (reading) { readAgain = true; return promiseResolvedWith(undefined); }
+      reading = true;
+      const readRequest = {
+        _chunkSteps: (chunk) => {
+          // Queued as a microtask so that a synchronous enqueue inside pull
+          // cannot re-enter this read before the first one has been recorded.
+          queueMicrotask(() => {
+            readAgain = false;
+            const chunk1 = chunk;
+            let chunk2 = chunk;
+            if (!canceled2 && cloneForBranch2) {
+              try { chunk2 = structuredClone(chunk2); }
+              catch (cloneE) {
+                ReadableStreamDefaultControllerError(branch1._readableStreamController, cloneE);
+                ReadableStreamDefaultControllerError(branch2._readableStreamController, cloneE);
+                resolveCancelPromise(ReadableStreamCancel(stream, cloneE));
+                return;
+              }
+            }
+            if (!canceled1) ReadableStreamDefaultControllerEnqueue(branch1._readableStreamController, chunk1);
+            if (!canceled2) ReadableStreamDefaultControllerEnqueue(branch2._readableStreamController, chunk2);
+            reading = false;
+            if (readAgain) pullAlgorithm();
+          });
+        },
+        _closeSteps: () => {
+          reading = false;
+          if (!canceled1) ReadableStreamDefaultControllerClose(branch1._readableStreamController);
+          if (!canceled2) ReadableStreamDefaultControllerClose(branch2._readableStreamController);
+          if (!canceled1 || !canceled2) resolveCancelPromise(undefined);
+        },
+        _errorSteps: () => { reading = false; },
+      };
+      ReadableStreamDefaultReaderRead(reader, readRequest);
+      return promiseResolvedWith(undefined);
+    }
+    function cancel1Algorithm(reason) {
+      canceled1 = true; reason1 = reason;
+      if (canceled2) resolveCancelPromise(ReadableStreamCancel(stream, [reason1, reason2]));
+      return cancelPromise;
+    }
+    function cancel2Algorithm(reason) {
+      canceled2 = true; reason2 = reason;
+      if (canceled1) resolveCancelPromise(ReadableStreamCancel(stream, [reason1, reason2]));
+      return cancelPromise;
+    }
+    const startAlgorithm = () => undefined;
+    branch1 = CreateReadableStream(startAlgorithm, pullAlgorithm, cancel1Algorithm);
+    branch2 = CreateReadableStream(startAlgorithm, pullAlgorithm, cancel2Algorithm);
+    uponRejection(reader._closedPromise, (r) => {
+      ReadableStreamDefaultControllerError(branch1._readableStreamController, r);
+      ReadableStreamDefaultControllerError(branch2._readableStreamController, r);
+      if (!canceled1 || !canceled2) resolveCancelPromise(undefined);
+    });
+    return [branch1, branch2];
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  ReadableStream.from(asyncIterable)
+  // ══════════════════════════════════════════════════════════════════════════
+  // Wraps ANY iterable — sync or async — so a generator, an array, or a string
+  // can be handed to anything that wants a stream. `return()` on the underlying
+  // iterator is called on cancel, which is how a generator gets to run its
+  // `finally` and release whatever it was holding.
+  function ReadableStreamFrom(asyncIterable) {
+    return ReadableStreamFromIterable(asyncIterable);
+  }
+  function GetIterator(obj, hint = 'sync', method) {
+    if (method === undefined) {
+      if (hint === 'async') {
+        method = GetMethod(obj, Symbol.asyncIterator);
+        if (method === undefined) {
+          const syncMethod = GetMethod(obj, Symbol.iterator);
+          if (syncMethod === undefined) throw new TypeError('The object is not iterable');
+          const syncIteratorRecord = GetIterator(obj, 'sync', syncMethod);
+          return CreateAsyncFromSyncIterator(syncIteratorRecord);
+        }
+      } else {
+        method = GetMethod(obj, Symbol.iterator);
+      }
+    }
+    if (method === undefined) throw new TypeError('The object is not iterable');
+    const iterator = reflectCall(method, obj, []);
+    if (!isObject(iterator)) throw new TypeError('The iterator method must return an object');
+    const nextMethod = iterator.next;
+    return { iterator, nextMethod, done: false };
+  }
+  function GetMethod(receiver, prop) {
+    const func = receiver[prop];
+    if (func === undefined || func === null) return undefined;
+    if (typeof func !== 'function') throw new TypeError(`${String(prop)} is not a function`);
+    return func;
+  }
+  function CreateAsyncFromSyncIterator(syncIteratorRecord) {
+    const syncIterable = { [Symbol.iterator]: () => syncIteratorRecord.iterator };
+    const asyncIterator = (async function* () { return yield* syncIterable; }());
+    const nextMethod = asyncIterator.next;
+    return { iterator: asyncIterator, nextMethod, done: false };
+  }
+  function IteratorNext(iteratorRecord) {
+    const result = reflectCall(iteratorRecord.nextMethod, iteratorRecord.iterator, []);
+    if (!isObject(result)) throw new TypeError('The iterator.next() method must return an object');
+    return result;
+  }
+  function IteratorComplete(iterResult) { return Boolean(iterResult.done); }
+  function IteratorValue(iterResult) { return iterResult.value; }
+
+  function ReadableStreamFromIterable(asyncIterable) {
+    let stream;
+    const iteratorRecord = GetIterator(asyncIterable, 'async');
+    const startAlgorithm = () => undefined;
+    function pullAlgorithm() {
+      let nextResult;
+      try { nextResult = IteratorNext(iteratorRecord); }
+      catch (e) { return promiseRejectedWith(e); }
+      const nextPromise = promiseResolvedWith(nextResult);
+      return transformPromiseWith(nextPromise, (iterResult) => {
+        if (!isObject(iterResult)) throw new TypeError('The promise returned by the iterator.next() method must fulfill with an object');
+        const done = IteratorComplete(iterResult);
+        if (done) {
+          ReadableStreamDefaultControllerClose(stream._readableStreamController);
+        } else {
+          const value = IteratorValue(iterResult);
+          ReadableStreamDefaultControllerEnqueue(stream._readableStreamController, value);
+        }
+      });
+    }
+    function cancelAlgorithm(reason) {
+      const iterator = iteratorRecord.iterator;
+      let returnMethod;
+      try { returnMethod = GetMethod(iterator, 'return'); }
+      catch (e) { return promiseRejectedWith(e); }
+      if (returnMethod === undefined) return promiseResolvedWith(undefined);
+      let returnResult;
+      try { returnResult = reflectCall(returnMethod, iterator, [reason]); }
+      catch (e) { return promiseRejectedWith(e); }
+      const returnPromise = promiseResolvedWith(returnResult);
+      return transformPromiseWith(returnPromise, (iterResult) => {
+        if (!isObject(iterResult)) throw new TypeError('The promise returned by the iterator.return() method must fulfill with an object');
+        return undefined;
+      });
+    }
+    stream = CreateReadableStream(startAlgorithm, pullAlgorithm, cancelAlgorithm, 0);
+    return stream;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  The ReadableStream class itself
+  // ══════════════════════════════════════════════════════════════════════════
+  class ReadableStream {
+    constructor(rawUnderlyingSource = undefined, rawStrategy = {}) {
+      if (rawUnderlyingSource === undefined) rawUnderlyingSource = null;
+      else assertObject(rawUnderlyingSource, 'First parameter');
+      const strategy = convertQueuingStrategy(rawStrategy, 'Second parameter');
+      const underlyingSource = convertUnderlyingDefaultOrByteSource(rawUnderlyingSource, 'First parameter');
+      InitializeReadableStream(this);
+      if (underlyingSource.type === 'bytes') {
+        if (strategy.size !== undefined) throw new RangeError('The strategy for a byte stream cannot have a size function');
+        const highWaterMark = ExtractHighWaterMark(strategy, 0);
+        SetUpReadableByteStreamControllerFromUnderlyingSource(this, underlyingSource, highWaterMark);
+      } else {
+        const sizeAlgorithm = ExtractSizeAlgorithm(strategy);
+        const highWaterMark = ExtractHighWaterMark(strategy, 1);
+        SetUpReadableStreamDefaultControllerFromUnderlyingSource(this, underlyingSource, highWaterMark, sizeAlgorithm);
+      }
+    }
+    get locked() {
+      if (!IsReadableStream(this)) throw streamBrandCheckException('locked');
+      return IsReadableStreamLocked(this);
+    }
+    cancel(reason = undefined) {
+      if (!IsReadableStream(this)) return promiseRejectedWith(streamBrandCheckException('cancel'));
+      if (IsReadableStreamLocked(this)) return promiseRejectedWith(new TypeError('Cannot cancel a stream that already has a reader'));
+      return ReadableStreamCancel(this, reason);
+    }
+    getReader(rawOptions = undefined) {
+      if (!IsReadableStream(this)) throw streamBrandCheckException('getReader');
+      const options = convertReaderOptions(rawOptions, 'First parameter');
+      if (options.mode === undefined) return AcquireReadableStreamDefaultReader(this);
+      return AcquireReadableStreamBYOBReader(this);
+    }
+    pipeThrough(rawTransform, rawOptions = {}) {
+      if (!IsReadableStream(this)) throw streamBrandCheckException('pipeThrough');
+      assertRequiredArgument(rawTransform, 1, 'pipeThrough');
+      const transform = convertReadableWritablePair(rawTransform, 'First parameter');
+      const options = convertPipeOptions(rawOptions, 'Second parameter');
+      if (IsReadableStreamLocked(this)) throw new TypeError('ReadableStream.prototype.pipeThrough cannot be used on a locked ReadableStream');
+      if (IsWritableStreamLocked(transform.writable)) throw new TypeError('ReadableStream.prototype.pipeThrough cannot be used on a locked WritableStream');
+      const promise = ReadableStreamPipeTo(
+        this, transform.writable, options.preventClose, options.preventAbort, options.preventCancel, options.signal);
+      setPromiseIsHandledToTrue(promise);
+      return transform.readable;
+    }
+    pipeTo(destination, rawOptions = undefined) {
+      if (!IsReadableStream(this)) return promiseRejectedWith(streamBrandCheckException('pipeTo'));
+      if (destination === undefined) return promiseRejectedWith('Parameter 1 is required in \'pipeTo\'.');
+      if (!IsWritableStream(destination)) return promiseRejectedWith(new TypeError('ReadableStream.prototype.pipeTo\'s first argument must be a WritableStream'));
+      let options;
+      try { options = convertPipeOptions(rawOptions, 'Second parameter'); }
+      catch (e) { return promiseRejectedWith(e); }
+      if (IsReadableStreamLocked(this)) return promiseRejectedWith(new TypeError('ReadableStream.prototype.pipeTo cannot be used on a locked ReadableStream'));
+      if (IsWritableStreamLocked(destination)) return promiseRejectedWith(new TypeError('ReadableStream.prototype.pipeTo cannot be used on a locked WritableStream'));
+      return ReadableStreamPipeTo(this, destination, options.preventClose, options.preventAbort, options.preventCancel, options.signal);
+    }
+    tee() {
+      if (!IsReadableStream(this)) throw streamBrandCheckException('tee');
+      return ReadableStreamTee(this, false);
+    }
+    values(rawOptions = undefined) {
+      if (!IsReadableStream(this)) throw streamBrandCheckException('values');
+      const options = convertIteratorOptions(rawOptions, 'First parameter');
+      return AcquireReadableStreamAsyncIterator(this, options.preventCancel);
+    }
+    static from(asyncIterable) {
+      return ReadableStreamFrom(asyncIterable);
+    }
+  }
+  Object.defineProperties(ReadableStream, { from: { enumerable: true } });
+  Object.defineProperties(ReadableStream.prototype, {
+    cancel: { enumerable: true }, getReader: { enumerable: true }, pipeThrough: { enumerable: true },
+    pipeTo: { enumerable: true }, tee: { enumerable: true }, values: { enumerable: true },
+    locked: { enumerable: true },
+  });
+  Object.defineProperty(ReadableStream.prototype, Symbol.toStringTag, { value: 'ReadableStream', configurable: true });
+  Object.defineProperty(ReadableStream.prototype, Symbol.asyncIterator, {
+    value: ReadableStream.prototype.values, writable: true, configurable: true,
+  });
+  function streamBrandCheckException(name) {
+    return new TypeError(`ReadableStream.prototype.${name} can only be used on a ReadableStream`);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  Queuing strategies
+  // ══════════════════════════════════════════════════════════════════════════
+  // `size` is an own property of the PROTOTYPE and returns the same function
+  // every time — the suite checks that identity, because a strategy that hands
+  // out a fresh closure per access cannot be compared or cached by a caller.
+  const byteLengthSizeFunction = (chunk) => chunk.byteLength;
+  Object.defineProperty(byteLengthSizeFunction, 'name', { value: 'size', configurable: true });
+
+  class ByteLengthQueuingStrategy {
+    constructor(options) {
+      assertRequiredArgument(options, 1, 'ByteLengthQueuingStrategy');
+      options = convertQueuingStrategyInit(options, 'First parameter');
+      this._byteLengthQueuingStrategyHighWaterMark = options.highWaterMark;
+    }
+    get highWaterMark() {
+      if (!IsByteLengthQueuingStrategy(this)) throw byteLengthBrandCheckException('highWaterMark');
+      return this._byteLengthQueuingStrategyHighWaterMark;
+    }
+    get size() {
+      if (!IsByteLengthQueuingStrategy(this)) throw byteLengthBrandCheckException('size');
+      return byteLengthSizeFunction;
+    }
+  }
+  Object.defineProperties(ByteLengthQueuingStrategy.prototype, { highWaterMark: { enumerable: true }, size: { enumerable: true } });
+  Object.defineProperty(ByteLengthQueuingStrategy.prototype, Symbol.toStringTag, { value: 'ByteLengthQueuingStrategy', configurable: true });
+  function byteLengthBrandCheckException(name) {
+    return new TypeError(`ByteLengthQueuingStrategy.prototype.${name} can only be used on a ByteLengthQueuingStrategy`);
+  }
+  function IsByteLengthQueuingStrategy(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_byteLengthQueuingStrategyHighWaterMark');
+  }
+
+  const countSizeFunction = () => 1;
+  Object.defineProperty(countSizeFunction, 'name', { value: 'size', configurable: true });
+
+  class CountQueuingStrategy {
+    constructor(options) {
+      assertRequiredArgument(options, 1, 'CountQueuingStrategy');
+      options = convertQueuingStrategyInit(options, 'First parameter');
+      this._countQueuingStrategyHighWaterMark = options.highWaterMark;
+    }
+    get highWaterMark() {
+      if (!IsCountQueuingStrategy(this)) throw countBrandCheckException('highWaterMark');
+      return this._countQueuingStrategyHighWaterMark;
+    }
+    get size() {
+      if (!IsCountQueuingStrategy(this)) throw countBrandCheckException('size');
+      return countSizeFunction;
+    }
+  }
+  Object.defineProperties(CountQueuingStrategy.prototype, { highWaterMark: { enumerable: true }, size: { enumerable: true } });
+  Object.defineProperty(CountQueuingStrategy.prototype, Symbol.toStringTag, { value: 'CountQueuingStrategy', configurable: true });
+  function countBrandCheckException(name) {
+    return new TypeError(`CountQueuingStrategy.prototype.${name} can only be used on a CountQueuingStrategy`);
+  }
+  function IsCountQueuingStrategy(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_countQueuingStrategyHighWaterMark');
+  }
+  function convertQueuingStrategyInit(init, context) {
+    assertDictionary(init, context);
+    const highWaterMark = init === null || init === undefined ? undefined : init.highWaterMark;
+    assertRequiredField(highWaterMark, 'highWaterMark', 'QueuingStrategyInit');
+    return { highWaterMark: convertUnrestrictedDouble(highWaterMark) };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  PLACEHOLDERS — filled in by the writable/transform and byte-stream quests.
+  // ══════════════════════════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════════════════════
+  //  WritableStream  —  the other end of every pipe
+  // ══════════════════════════════════════════════════════════════════════════
+  // A writable stream is where bytes GO: an upload, a file, a decoder, the far
+  // side of a TransformStream. Its whole job is to say "not yet" — `writer.ready`
+  // is the only thing that stops a fast producer from queueing a hundred
+  // megabytes in a tab that has sixty to spare, which is precisely the machine
+  // this browser exists for.
+  //
+  // Almost all of the complexity here is ERROR BOOKKEEPING, and it is not
+  // ceremony. A sink can fail while a write is in flight, while a close is in
+  // flight, or after the author already called abort(); each of those has to
+  // settle a different set of promises exactly once, in the right order, or the
+  // author is left holding a promise that never resolves.
+  function IsWritableStream(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_writableStreamController');
+  }
+  function IsWritableStreamLocked(stream) { return stream._writer !== undefined; }
+
+  function InitializeWritableStream(stream) {
+    stream._state = 'writable';
+    // The error is stored but NOT surfaced until something asks, so that a
+    // stream errored before anyone attached a handler does not report an
+    // unhandled rejection the author had no chance to catch.
+    stream._storedError = undefined;
+    stream._writer = undefined;
+    stream._writableStreamController = undefined;
+    stream._inFlightWriteRequest = undefined;
+    stream._closeRequest = undefined;
+    stream._inFlightCloseRequest = undefined;
+    stream._pendingAbortRequest = undefined;
+    stream._writeRequests = [];
+    stream._backpressure = false;
+  }
+
+  function CreateWritableStream(startAlgorithm, writeAlgorithm, closeAlgorithm, abortAlgorithm, highWaterMark = 1, sizeAlgorithm = () => 1) {
+    const stream = Object.create(WritableStream.prototype);
+    InitializeWritableStream(stream);
+    const controller = Object.create(WritableStreamDefaultController.prototype);
+    SetUpWritableStreamDefaultController(
+      stream, controller, startAlgorithm, writeAlgorithm, closeAlgorithm, abortAlgorithm, highWaterMark, sizeAlgorithm);
+    return stream;
+  }
+
+  function WritableStreamAbort(stream, reason) {
+    let state = stream._state;
+    if (state === 'closed' || state === 'errored') return promiseResolvedWith(undefined);
+    stream._writableStreamController._abortReason = reason;
+    if (stream._writableStreamController._abortController !== undefined)
+      stream._writableStreamController._abortController.abort(reason);
+    // Signalling abort runs the signal's listeners SYNCHRONOUSLY, and one of
+    // them is allowed to abort the stream again. Re-read the state instead of
+    // trusting the one from before the signal — otherwise the recursive call
+    // tears the sink down first and this one calls an abort algorithm that has
+    // already been cleared away.
+    state = stream._state;
+    if (state === 'closed' || state === 'errored') return promiseResolvedWith(undefined);
+    // A second abort() joins the first rather than starting another: the sink
+    // is torn down once, and both callers learn about the same teardown.
+    if (stream._pendingAbortRequest !== undefined) return stream._pendingAbortRequest._promise;
+    let wasAlreadyErroring = false;
+    if (state === 'erroring') { wasAlreadyErroring = true; reason = undefined; }
+    const promise = newPromise((resolve, reject) => {
+      stream._pendingAbortRequest = { _promise: undefined, _resolve: resolve, _reject: reject, _reason: reason, _wasAlreadyErroring: wasAlreadyErroring };
+    });
+    stream._pendingAbortRequest._promise = promise;
+    if (!wasAlreadyErroring) WritableStreamStartErroring(stream, reason);
+    return promise;
+  }
+
+  function WritableStreamClose(stream) {
+    const state = stream._state;
+    if (state === 'closed' || state === 'errored')
+      return promiseRejectedWith(new TypeError(`The stream (in ${state} state) is not in the writable state and cannot be closed`));
+    const promise = newPromise((resolve, reject) => {
+      stream._closeRequest = { _resolve: resolve, _reject: reject };
+    });
+    const writer = stream._writer;
+    // Closing releases backpressure: a writer parked on `ready` when the author
+    // decides to close must not wait forever for room it will never need.
+    if (writer !== undefined && stream._backpressure && state === 'writable') defaultWriterReadyPromiseResolve(writer);
+    WritableStreamDefaultControllerClose(stream._writableStreamController);
+    return promise;
+  }
+
+  function WritableStreamAddWriteRequest(stream) {
+    return newPromise((resolve, reject) => { stream._writeRequests.push({ _resolve: resolve, _reject: reject }); });
+  }
+  function WritableStreamDealWithRejection(stream, error) {
+    if (stream._state === 'writable') { WritableStreamStartErroring(stream, error); return; }
+    WritableStreamFinishErroring(stream);
+  }
+  function WritableStreamStartErroring(stream, reason) {
+    const controller = stream._writableStreamController;
+    stream._state = 'erroring';
+    stream._storedError = reason;
+    const writer = stream._writer;
+    if (writer !== undefined) WritableStreamDefaultWriterEnsureReadyPromiseRejected(writer, reason);
+    // Erroring only FINISHES once nothing is in flight — a sink method that is
+    // already running gets to finish before its stream is declared dead.
+    if (!WritableStreamHasOperationMarkedInFlight(stream) && controller._started) WritableStreamFinishErroring(stream);
+  }
+  function WritableStreamFinishErroring(stream) {
+    stream._state = 'errored';
+    stream._writableStreamController[ErrorSteps]();
+    const storedError = stream._storedError;
+    for (const writeRequest of stream._writeRequests) writeRequest._reject(storedError);
+    stream._writeRequests = [];
+    if (stream._pendingAbortRequest === undefined) { WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream); return; }
+    const abortRequest = stream._pendingAbortRequest;
+    stream._pendingAbortRequest = undefined;
+    if (abortRequest._wasAlreadyErroring) {
+      abortRequest._reject(storedError);
+      WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream);
+      return;
+    }
+    const promise = stream._writableStreamController[AbortSteps](abortRequest._reason);
+    uponPromise(promise,
+      () => { abortRequest._resolve(); WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream); },
+      (reason) => { abortRequest._reject(reason); WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream); });
+  }
+  function WritableStreamFinishInFlightWrite(stream) {
+    stream._inFlightWriteRequest._resolve(undefined);
+    stream._inFlightWriteRequest = undefined;
+  }
+  function WritableStreamFinishInFlightWriteWithError(stream, error) {
+    stream._inFlightWriteRequest._reject(error);
+    stream._inFlightWriteRequest = undefined;
+    WritableStreamDealWithRejection(stream, error);
+  }
+  function WritableStreamFinishInFlightClose(stream) {
+    stream._inFlightCloseRequest._resolve(undefined);
+    stream._inFlightCloseRequest = undefined;
+    if (stream._state === 'erroring') {
+      // A close that SUCCEEDED overrides an error that was on its way: the data
+      // reached the sink, so the stream closed cleanly and any pending abort is
+      // satisfied rather than rejected.
+      stream._storedError = undefined;
+      if (stream._pendingAbortRequest !== undefined) {
+        stream._pendingAbortRequest._resolve();
+        stream._pendingAbortRequest = undefined;
+      }
+    }
+    stream._state = 'closed';
+    const writer = stream._writer;
+    if (writer !== undefined) defaultWriterClosedPromiseResolve(writer);
+  }
+  function WritableStreamFinishInFlightCloseWithError(stream, error) {
+    stream._inFlightCloseRequest._reject(error);
+    stream._inFlightCloseRequest = undefined;
+    if (stream._pendingAbortRequest !== undefined) {
+      stream._pendingAbortRequest._reject(error);
+      stream._pendingAbortRequest = undefined;
+    }
+    WritableStreamDealWithRejection(stream, error);
+  }
+  function WritableStreamCloseQueuedOrInFlight(stream) {
+    return !(stream._closeRequest === undefined && stream._inFlightCloseRequest === undefined);
+  }
+  function WritableStreamHasOperationMarkedInFlight(stream) {
+    return !(stream._inFlightWriteRequest === undefined && stream._inFlightCloseRequest === undefined);
+  }
+  function WritableStreamMarkCloseRequestInFlight(stream) {
+    stream._inFlightCloseRequest = stream._closeRequest;
+    stream._closeRequest = undefined;
+  }
+  function WritableStreamMarkFirstWriteRequestInFlight(stream) {
+    stream._inFlightWriteRequest = stream._writeRequests.shift();
+  }
+  function WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream) {
+    if (stream._closeRequest !== undefined) {
+      stream._closeRequest._reject(stream._storedError);
+      stream._closeRequest = undefined;
+    }
+    const writer = stream._writer;
+    if (writer !== undefined) defaultWriterClosedPromiseReject(writer, stream._storedError);
+  }
+  function WritableStreamUpdateBackpressure(stream, backpressure) {
+    const writer = stream._writer;
+    if (writer !== undefined && backpressure !== stream._backpressure) {
+      if (backpressure) defaultWriterReadyPromiseReset(writer);
+      else defaultWriterReadyPromiseResolve(writer);
+    }
+    stream._backpressure = backpressure;
+  }
+
+  // ── WritableStreamDefaultWriter ────────────────────────────────────────────
+  class WritableStreamDefaultWriter {
+    constructor(stream) {
+      assertRequiredArgument(stream, 1, 'WritableStreamDefaultWriter');
+      assertWritableStream(stream, 'First parameter');
+      if (IsWritableStreamLocked(stream)) throw new TypeError('This stream has already been locked for exclusive writing by another writer');
+      this._ownerWritableStream = stream;
+      stream._writer = this;
+      const state = stream._state;
+      if (state === 'writable') {
+        if (!WritableStreamCloseQueuedOrInFlight(stream) && stream._backpressure) defaultWriterReadyPromiseInitialize(this);
+        else defaultWriterReadyPromiseInitializeAsResolved(this);
+        defaultWriterClosedPromiseInitialize(this);
+      } else if (state === 'erroring') {
+        defaultWriterReadyPromiseInitializeAsRejected(this, stream._storedError);
+        defaultWriterClosedPromiseInitialize(this);
+      } else if (state === 'closed') {
+        defaultWriterReadyPromiseInitializeAsResolved(this);
+        defaultWriterClosedPromiseInitializeAsResolved(this);
+      } else {
+        const storedError = stream._storedError;
+        defaultWriterReadyPromiseInitializeAsRejected(this, storedError);
+        defaultWriterClosedPromiseInitializeAsRejected(this, storedError);
+      }
+    }
+    get closed() {
+      if (!IsWritableStreamDefaultWriter(this)) return promiseRejectedWith(defaultWriterBrandCheckException('closed'));
+      return this._closedPromise;
+    }
+    get desiredSize() {
+      if (!IsWritableStreamDefaultWriter(this)) throw defaultWriterBrandCheckException('desiredSize');
+      if (this._ownerWritableStream === undefined) throw defaultWriterLockException('desiredSize');
+      return WritableStreamDefaultWriterGetDesiredSize(this);
+    }
+    get ready() {
+      if (!IsWritableStreamDefaultWriter(this)) return promiseRejectedWith(defaultWriterBrandCheckException('ready'));
+      return this._readyPromise;
+    }
+    abort(reason = undefined) {
+      if (!IsWritableStreamDefaultWriter(this)) return promiseRejectedWith(defaultWriterBrandCheckException('abort'));
+      if (this._ownerWritableStream === undefined) return promiseRejectedWith(defaultWriterLockException('abort'));
+      return WritableStreamDefaultWriterAbort(this, reason);
+    }
+    close() {
+      if (!IsWritableStreamDefaultWriter(this)) return promiseRejectedWith(defaultWriterBrandCheckException('close'));
+      const stream = this._ownerWritableStream;
+      if (stream === undefined) return promiseRejectedWith(defaultWriterLockException('close'));
+      if (WritableStreamCloseQueuedOrInFlight(stream)) return promiseRejectedWith(new TypeError('Cannot close an already-closing stream'));
+      return WritableStreamDefaultWriterClose(this);
+    }
+    releaseLock() {
+      if (!IsWritableStreamDefaultWriter(this)) throw defaultWriterBrandCheckException('releaseLock');
+      const stream = this._ownerWritableStream;
+      if (stream === undefined) return;
+      WritableStreamDefaultWriterRelease(this);
+    }
+    write(chunk = undefined) {
+      if (!IsWritableStreamDefaultWriter(this)) return promiseRejectedWith(defaultWriterBrandCheckException('write'));
+      if (this._ownerWritableStream === undefined) return promiseRejectedWith(defaultWriterLockException('write to'));
+      return WritableStreamDefaultWriterWrite(this, chunk);
+    }
+  }
+  Object.defineProperties(WritableStreamDefaultWriter.prototype, {
+    abort: { enumerable: true }, close: { enumerable: true }, releaseLock: { enumerable: true },
+    write: { enumerable: true }, closed: { enumerable: true }, desiredSize: { enumerable: true }, ready: { enumerable: true },
+  });
+  Object.defineProperty(WritableStreamDefaultWriter.prototype, Symbol.toStringTag, { value: 'WritableStreamDefaultWriter', configurable: true });
+  function IsWritableStreamDefaultWriter(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_ownerWritableStream');
+  }
+  function defaultWriterBrandCheckException(name) {
+    return new TypeError(`WritableStreamDefaultWriter.prototype.${name} can only be used on a WritableStreamDefaultWriter`);
+  }
+  function defaultWriterLockException(name) {
+    return new TypeError('Cannot ' + name + ' a stream using a released writer');
+  }
+
+  function AcquireWritableStreamDefaultWriter(stream) { return new WritableStreamDefaultWriter(stream); }
+  function WritableStreamDefaultWriterAbort(writer, reason) {
+    return WritableStreamAbort(writer._ownerWritableStream, reason);
+  }
+  function WritableStreamDefaultWriterClose(writer) { return WritableStreamClose(writer._ownerWritableStream); }
+  function WritableStreamDefaultWriterCloseWithErrorPropagation(writer) {
+    const stream = writer._ownerWritableStream;
+    const state = stream._state;
+    if (WritableStreamCloseQueuedOrInFlight(stream) || state === 'closed') return promiseResolvedWith(undefined);
+    if (state === 'errored') return promiseRejectedWith(stream._storedError);
+    return WritableStreamDefaultWriterClose(writer);
+  }
+  function WritableStreamDefaultWriterEnsureClosedPromiseRejected(writer, error) {
+    if (writer._closedPromiseState === 'pending') defaultWriterClosedPromiseReject(writer, error);
+    else defaultWriterClosedPromiseResetToRejected(writer, error);
+  }
+  function WritableStreamDefaultWriterEnsureReadyPromiseRejected(writer, error) {
+    if (writer._readyPromiseState === 'pending') defaultWriterReadyPromiseReject(writer, error);
+    else defaultWriterReadyPromiseResetToRejected(writer, error);
+  }
+  function WritableStreamDefaultWriterGetDesiredSize(writer) {
+    const stream = writer._ownerWritableStream;
+    const state = stream._state;
+    if (state === 'errored' || state === 'erroring') return null;
+    if (state === 'closed') return 0;
+    return WritableStreamDefaultControllerGetDesiredSize(stream._writableStreamController);
+  }
+  function WritableStreamDefaultWriterRelease(writer) {
+    const stream = writer._ownerWritableStream;
+    const releasedError = new TypeError('Writer was released and can no longer be used to monitor the stream\'s closedness');
+    WritableStreamDefaultWriterEnsureReadyPromiseRejected(writer, releasedError);
+    WritableStreamDefaultWriterEnsureClosedPromiseRejected(writer, releasedError);
+    stream._writer = undefined;
+    writer._ownerWritableStream = undefined;
+  }
+  function WritableStreamDefaultWriterWrite(writer, chunk) {
+    const stream = writer._ownerWritableStream;
+    const controller = stream._writableStreamController;
+    const chunkSize = WritableStreamDefaultControllerGetChunkSize(controller, chunk);
+    if (stream !== writer._ownerWritableStream) return promiseRejectedWith(defaultWriterLockException('write to'));
+    const state = stream._state;
+    if (state === 'errored') return promiseRejectedWith(stream._storedError);
+    if (WritableStreamCloseQueuedOrInFlight(stream) || state === 'closed')
+      return promiseRejectedWith(new TypeError('The stream is closing or closed and cannot be written to'));
+    if (state === 'erroring') return promiseRejectedWith(stream._storedError);
+    const promise = WritableStreamAddWriteRequest(stream);
+    WritableStreamDefaultControllerWrite(controller, chunk, chunkSize);
+    return promise;
+  }
+
+  const closeSentinel = Symbol('close sentinel');
+
+  class WritableStreamDefaultController {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get abortReason() {
+      if (!IsWritableStreamDefaultController(this)) throw defaultControllerBrandCheckException2('abortReason');
+      return this._abortReason;
+    }
+    get signal() {
+      if (!IsWritableStreamDefaultController(this)) throw defaultControllerBrandCheckException2('signal');
+      if (this._abortController === undefined) throw new TypeError('WritableStreamDefaultController.prototype.signal is not supported');
+      return this._abortController.signal;
+    }
+    error(e = undefined) {
+      if (!IsWritableStreamDefaultController(this)) throw defaultControllerBrandCheckException2('error');
+      if (this._controlledWritableStream._state !== 'writable') return;
+      WritableStreamDefaultControllerError(this, e);
+    }
+    [AbortSteps](reason) {
+      const result = this._abortAlgorithm(reason);
+      WritableStreamDefaultControllerClearAlgorithms(this);
+      return result;
+    }
+    [ErrorSteps]() { ResetQueue(this); }
+  }
+  Object.defineProperties(WritableStreamDefaultController.prototype, {
+    abortReason: { enumerable: true }, signal: { enumerable: true }, error: { enumerable: true },
+  });
+  Object.defineProperty(WritableStreamDefaultController.prototype, Symbol.toStringTag, { value: 'WritableStreamDefaultController', configurable: true });
+  function IsWritableStreamDefaultController(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_controlledWritableStream');
+  }
+  function defaultControllerBrandCheckException2(name) {
+    return new TypeError(`WritableStreamDefaultController.prototype.${name} can only be used on a WritableStreamDefaultController`);
+  }
+
+  function SetUpWritableStreamDefaultController(stream, controller, startAlgorithm, writeAlgorithm, closeAlgorithm, abortAlgorithm, highWaterMark, sizeAlgorithm) {
+    controller._controlledWritableStream = stream;
+    stream._writableStreamController = controller;
+    controller._queue = undefined;
+    controller._queueTotalSize = undefined;
+    ResetQueue(controller);
+    controller._abortReason = undefined;
+    controller._abortController = createAbortController();
+    controller._started = false;
+    controller._strategySizeAlgorithm = sizeAlgorithm;
+    controller._strategyHWM = highWaterMark;
+    controller._writeAlgorithm = writeAlgorithm;
+    controller._closeAlgorithm = closeAlgorithm;
+    controller._abortAlgorithm = abortAlgorithm;
+    const backpressure = WritableStreamDefaultControllerGetBackpressure(controller);
+    WritableStreamUpdateBackpressure(stream, backpressure);
+    const startResult = startAlgorithm();
+    uponPromise(promiseResolvedWith(startResult), () => {
+      controller._started = true;
+      WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller);
+    }, (r) => {
+      controller._started = true;
+      WritableStreamDealWithRejection(stream, r);
+    });
+  }
+  function createAbortController() {
+    try { return typeof AbortController === 'function' ? new AbortController() : undefined; }
+    catch (e) { return undefined; }
+  }
+  function SetUpWritableStreamDefaultControllerFromUnderlyingSink(stream, underlyingSink, highWaterMark, sizeAlgorithm) {
+    const controller = Object.create(WritableStreamDefaultController.prototype);
+    const startAlgorithm = underlyingSink.start === undefined ? () => undefined : () => underlyingSink.start(controller);
+    const writeAlgorithm = underlyingSink.write === undefined ? () => promiseResolvedWith(undefined) : (chunk) => underlyingSink.write(chunk, controller);
+    const closeAlgorithm = underlyingSink.close === undefined ? () => promiseResolvedWith(undefined) : () => underlyingSink.close();
+    const abortAlgorithm = underlyingSink.abort === undefined ? () => promiseResolvedWith(undefined) : (reason) => underlyingSink.abort(reason);
+    SetUpWritableStreamDefaultController(
+      stream, controller, startAlgorithm, writeAlgorithm, closeAlgorithm, abortAlgorithm, highWaterMark, sizeAlgorithm);
+  }
+  function WritableStreamDefaultControllerClearAlgorithms(controller) {
+    controller._writeAlgorithm = undefined;
+    controller._closeAlgorithm = undefined;
+    controller._abortAlgorithm = undefined;
+    controller._strategySizeAlgorithm = undefined;
+  }
+  function WritableStreamDefaultControllerClose(controller) {
+    EnqueueValueWithSize(controller, closeSentinel, 0);
+    WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller);
+  }
+  function WritableStreamDefaultControllerGetChunkSize(controller, chunk) {
+    // A size() that THROWS errors the stream but still returns a size, because
+    // the write must be accounted for before the stream tears down — otherwise
+    // the queue's total and its contents disagree forever.
+    try { return controller._strategySizeAlgorithm(chunk); }
+    catch (chunkSizeE) { WritableStreamDefaultControllerErrorIfNeeded(controller, chunkSizeE); return 1; }
+  }
+  function WritableStreamDefaultControllerGetDesiredSize(controller) {
+    return controller._strategyHWM - controller._queueTotalSize;
+  }
+  function WritableStreamDefaultControllerWrite(controller, chunk, chunkSize) {
+    try { EnqueueValueWithSize(controller, chunk, chunkSize); }
+    catch (enqueueE) { WritableStreamDefaultControllerErrorIfNeeded(controller, enqueueE); return; }
+    const stream = controller._controlledWritableStream;
+    if (!WritableStreamCloseQueuedOrInFlight(stream) && stream._state === 'writable') {
+      const backpressure = WritableStreamDefaultControllerGetBackpressure(controller);
+      WritableStreamUpdateBackpressure(stream, backpressure);
+    }
+    WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller);
+  }
+  function WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller) {
+    const stream = controller._controlledWritableStream;
+    if (!controller._started) return;
+    if (stream._inFlightWriteRequest !== undefined) return;
+    const state = stream._state;
+    if (state === 'erroring') { WritableStreamFinishErroring(stream); return; }
+    if (controller._queue.length === 0) return;
+    const value = PeekQueueValue(controller);
+    if (value === closeSentinel) WritableStreamDefaultControllerProcessClose(controller);
+    else WritableStreamDefaultControllerProcessWrite(controller, value);
+  }
+  function WritableStreamDefaultControllerErrorIfNeeded(controller, error) {
+    if (controller._controlledWritableStream._state === 'writable') WritableStreamDefaultControllerError(controller, error);
+  }
+  function WritableStreamDefaultControllerProcessClose(controller) {
+    const stream = controller._controlledWritableStream;
+    WritableStreamMarkCloseRequestInFlight(stream);
+    DequeueValue(controller);
+    const sinkClosePromise = controller._closeAlgorithm();
+    WritableStreamDefaultControllerClearAlgorithms(controller);
+    uponPromise(sinkClosePromise,
+      () => { WritableStreamFinishInFlightClose(stream); },
+      (reason) => { WritableStreamFinishInFlightCloseWithError(stream, reason); });
+  }
+  function WritableStreamDefaultControllerProcessWrite(controller, chunk) {
+    const stream = controller._controlledWritableStream;
+    WritableStreamMarkFirstWriteRequestInFlight(stream);
+    const sinkWritePromise = controller._writeAlgorithm(chunk);
+    uponPromise(sinkWritePromise, () => {
+      WritableStreamFinishInFlightWrite(stream);
+      const state = stream._state;
+      DequeueValue(controller);
+      if (!WritableStreamCloseQueuedOrInFlight(stream) && state === 'writable') {
+        const backpressure = WritableStreamDefaultControllerGetBackpressure(controller);
+        WritableStreamUpdateBackpressure(stream, backpressure);
+      }
+      WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller);
+    }, (reason) => {
+      if (stream._state === 'writable') WritableStreamDefaultControllerClearAlgorithms(controller);
+      WritableStreamFinishInFlightWriteWithError(stream, reason);
+    });
+  }
+  function WritableStreamDefaultControllerGetBackpressure(controller) {
+    return WritableStreamDefaultControllerGetDesiredSize(controller) <= 0;
+  }
+  function WritableStreamDefaultControllerError(controller, error) {
+    const stream = controller._controlledWritableStream;
+    WritableStreamDefaultControllerClearAlgorithms(controller);
+    WritableStreamStartErroring(stream, error);
+  }
+
+  // ── The writer's two promises, each with a state so they can be RESET ──────
+  // `ready` and `closed` are not one-shot: releasing a writer replaces them, and
+  // the replacement must already be rejected rather than pending, or a caller
+  // that grabbed the old one waits on a stream it no longer holds.
+  function defaultWriterClosedPromiseInitialize(writer) {
+    writer._closedPromise = newPromise((resolve, reject) => {
+      writer._closedPromise_resolve = resolve;
+      writer._closedPromise_reject = reject;
+      writer._closedPromiseState = 'pending';
+    });
+  }
+  function defaultWriterClosedPromiseInitializeAsRejected(writer, reason) {
+    defaultWriterClosedPromiseInitialize(writer);
+    defaultWriterClosedPromiseReject(writer, reason);
+  }
+  function defaultWriterClosedPromiseInitializeAsResolved(writer) {
+    defaultWriterClosedPromiseInitialize(writer);
+    defaultWriterClosedPromiseResolve(writer);
+  }
+  function defaultWriterClosedPromiseReject(writer, reason) {
+    if (writer._closedPromise_reject === undefined) return;
+    setPromiseIsHandledToTrue(writer._closedPromise);
+    writer._closedPromise_reject(reason);
+    writer._closedPromise_resolve = undefined;
+    writer._closedPromise_reject = undefined;
+    writer._closedPromiseState = 'rejected';
+  }
+  function defaultWriterClosedPromiseResetToRejected(writer, reason) {
+    defaultWriterClosedPromiseInitializeAsRejected(writer, reason);
+  }
+  function defaultWriterClosedPromiseResolve(writer) {
+    if (writer._closedPromise_resolve === undefined) return;
+    writer._closedPromise_resolve(undefined);
+    writer._closedPromise_resolve = undefined;
+    writer._closedPromise_reject = undefined;
+    writer._closedPromiseState = 'resolved';
+  }
+  function defaultWriterReadyPromiseInitialize(writer) {
+    writer._readyPromise = newPromise((resolve, reject) => {
+      writer._readyPromise_resolve = resolve;
+      writer._readyPromise_reject = reject;
+    });
+    writer._readyPromiseState = 'pending';
+  }
+  function defaultWriterReadyPromiseInitializeAsRejected(writer, reason) {
+    defaultWriterReadyPromiseInitialize(writer);
+    defaultWriterReadyPromiseReject(writer, reason);
+  }
+  function defaultWriterReadyPromiseInitializeAsResolved(writer) {
+    defaultWriterReadyPromiseInitialize(writer);
+    defaultWriterReadyPromiseResolve(writer);
+  }
+  function defaultWriterReadyPromiseReject(writer, reason) {
+    if (writer._readyPromise_reject === undefined) return;
+    setPromiseIsHandledToTrue(writer._readyPromise);
+    writer._readyPromise_reject(reason);
+    writer._readyPromise_resolve = undefined;
+    writer._readyPromise_reject = undefined;
+    writer._readyPromiseState = 'rejected';
+  }
+  function defaultWriterReadyPromiseReset(writer) { defaultWriterReadyPromiseInitialize(writer); }
+  function defaultWriterReadyPromiseResetToRejected(writer, reason) { defaultWriterReadyPromiseInitializeAsRejected(writer, reason); }
+  function defaultWriterReadyPromiseResolve(writer) {
+    if (writer._readyPromise_resolve === undefined) return;
+    writer._readyPromise_resolve(undefined);
+    writer._readyPromise_resolve = undefined;
+    writer._readyPromise_reject = undefined;
+    writer._readyPromiseState = 'fulfilled';
+  }
+
+  class WritableStream {
+    constructor(rawUnderlyingSink = undefined, rawStrategy = {}) {
+      if (rawUnderlyingSink === undefined) rawUnderlyingSink = null;
+      else assertObject(rawUnderlyingSink, 'First parameter');
+      const strategy = convertQueuingStrategy(rawStrategy, 'Second parameter');
+      const underlyingSink = convertUnderlyingSink(rawUnderlyingSink, 'First parameter');
+      InitializeWritableStream(this);
+      if (underlyingSink.type !== undefined) throw new RangeError('Invalid type is specified');
+      const sizeAlgorithm = ExtractSizeAlgorithm(strategy);
+      const highWaterMark = ExtractHighWaterMark(strategy, 1);
+      SetUpWritableStreamDefaultControllerFromUnderlyingSink(this, underlyingSink, highWaterMark, sizeAlgorithm);
+    }
+    get locked() {
+      if (!IsWritableStream(this)) throw streamBrandCheckException2('locked');
+      return IsWritableStreamLocked(this);
+    }
+    abort(reason = undefined) {
+      if (!IsWritableStream(this)) return promiseRejectedWith(streamBrandCheckException2('abort'));
+      if (IsWritableStreamLocked(this)) return promiseRejectedWith(new TypeError('Cannot abort a stream that already has a writer'));
+      return WritableStreamAbort(this, reason);
+    }
+    close() {
+      if (!IsWritableStream(this)) return promiseRejectedWith(streamBrandCheckException2('close'));
+      if (IsWritableStreamLocked(this)) return promiseRejectedWith(new TypeError('Cannot close a stream that already has a writer'));
+      if (WritableStreamCloseQueuedOrInFlight(this)) return promiseRejectedWith(new TypeError('Cannot close an already-closing stream'));
+      return WritableStreamClose(this);
+    }
     getWriter() {
-      this.locked = true;
-      const stream = this;
-      return {
-        write(chunk) { if (stream._sink.write) stream._sink.write(chunk); return Promise.resolve(); },
-        close() { if (stream._sink.close) stream._sink.close(); return Promise.resolve(); },
-        abort() { return Promise.resolve(); },
-        releaseLock() { stream.locked = false; },
-        get ready() { return Promise.resolve(); },
-        get closed() { return Promise.resolve(); },
-        get desiredSize() { return 1; },
+      if (!IsWritableStream(this)) throw streamBrandCheckException2('getWriter');
+      return AcquireWritableStreamDefaultWriter(this);
+    }
+  }
+  Object.defineProperties(WritableStream.prototype, {
+    abort: { enumerable: true }, close: { enumerable: true }, getWriter: { enumerable: true }, locked: { enumerable: true },
+  });
+  Object.defineProperty(WritableStream.prototype, Symbol.toStringTag, { value: 'WritableStream', configurable: true });
+  function streamBrandCheckException2(name) {
+    return new TypeError(`WritableStream.prototype.${name} can only be used on a WritableStream`);
+  }
+  function convertUnderlyingSink(original, context) {
+    assertDictionary(original, context);
+    const abort = original == null ? undefined : original.abort;
+    const close = original == null ? undefined : original.close;
+    const start = original == null ? undefined : original.start;
+    const type = original == null ? undefined : original.type;
+    const write = original == null ? undefined : original.write;
+    return {
+      abort: abort === undefined ? undefined : convertUnderlyingSinkAbortCallback(abort, original, `${context} has member 'abort' that`),
+      close: close === undefined ? undefined : convertUnderlyingSinkCloseCallback(close, original, `${context} has member 'close' that`),
+      start: start === undefined ? undefined : convertUnderlyingSinkStartCallback(start, original, `${context} has member 'start' that`),
+      write: write === undefined ? undefined : convertUnderlyingSinkWriteCallback(write, original, `${context} has member 'write' that`),
+      type,
+    };
+  }
+  function convertUnderlyingSinkAbortCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (reason) => promiseCall(fn, original, [reason]);
+  }
+  function convertUnderlyingSinkCloseCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return () => promiseCall(fn, original, []);
+  }
+  function convertUnderlyingSinkStartCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (controller) => reflectCall(fn, original, [controller]);
+  }
+  function convertUnderlyingSinkWriteCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (chunk, controller) => promiseCall(fn, original, [chunk, controller]);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  pipeTo  —  where the two halves meet
+  // ══════════════════════════════════════════════════════════════════════════
+  // A pipe is not a loop over read()/write(). It is a state machine that has to
+  // answer, at every instant, what happens when EITHER end fails, and what the
+  // other end is owed as a result. Getting this wrong is how a failed upload
+  // leaves a reader locked to a stream nobody will ever drain.
+  //
+  //   * source errors → destination is ABORTED (unless preventAbort)
+  //   * destination errors → source is CANCELLED (unless preventCancel)
+  //   * source closes → destination is CLOSED (unless preventClose)
+  //   * the signal aborts → BOTH ends are torn down with the signal's reason
+  //
+  // Backpressure comes for free and is the point: the next read only happens
+  // once `writer.ready` says there is room, so a slow disk throttles a fast
+  // network instead of the tab buffering the whole download in memory.
+  function ReadableStreamPipeTo(source, dest, preventClose, preventAbort, preventCancel, signal) {
+    const reader = AcquireReadableStreamDefaultReader(source);
+    const writer = AcquireWritableStreamDefaultWriter(dest);
+    source._disturbed = true;
+    let shuttingDown = false;
+    let currentWrite = promiseResolvedWith(undefined);
+
+    return newPromise((resolve, reject) => {
+      let abortAlgorithm;
+      if (signal !== undefined) {
+        abortAlgorithm = () => {
+          const error = signal.reason !== undefined ? signal.reason : new DOMException('Aborted', 'AbortError');
+          const actions = [];
+          if (!preventAbort) actions.push(() => (dest._state === 'writable' ? WritableStreamAbort(dest, error) : promiseResolvedWith(undefined)));
+          if (!preventCancel) actions.push(() => (source._state === 'readable' ? ReadableStreamCancel(source, error) : promiseResolvedWith(undefined)));
+          shutdownWithAction(() => nativeAll(actions.map((action) => action())), true, error);
+        };
+        if (signal.aborted) { abortAlgorithm(); return; }
+        if (typeof signal.addEventListener === 'function') signal.addEventListener('abort', abortAlgorithm);
+      }
+
+      function pipeLoop() {
+        return newPromise((resolveLoop, rejectLoop) => {
+          function next(done) {
+            if (done) resolveLoop();
+            else uponPromise(pipeStep(), next, rejectLoop);
+          }
+          next(false);
+        });
+      }
+      function pipeStep() {
+        if (shuttingDown) return promiseResolvedWith(true);
+        return transformPromiseWith(writer._readyPromise, () => newPromise((resolveRead, rejectRead) => {
+          ReadableStreamDefaultReaderRead(reader, {
+            _chunkSteps: (chunk) => {
+              currentWrite = transformPromiseWith(WritableStreamDefaultWriterWrite(writer, chunk), undefined, () => {});
+              resolveRead(false);
+            },
+            _closeSteps: () => resolveRead(true),
+            _errorSteps: rejectRead,
+          });
+        }));
+      }
+
+      // Error and close conditions are watched, not polled: whichever end moves
+      // first decides what the other end is told.
+      isOrBecomesErrored(source, reader._closedPromise, (storedError) => {
+        if (!preventAbort) shutdownWithAction(() => WritableStreamAbort(dest, storedError), true, storedError);
+        else shutdown(true, storedError);
+      });
+      isOrBecomesErrored(dest, writer._closedPromise, (storedError) => {
+        if (!preventCancel) shutdownWithAction(() => ReadableStreamCancel(source, storedError), true, storedError);
+        else shutdown(true, storedError);
+      });
+      isOrBecomesClosed(source, reader._closedPromise, () => {
+        if (!preventClose) shutdownWithAction(() => WritableStreamDefaultWriterCloseWithErrorPropagation(writer));
+        else shutdown();
+      });
+      if (WritableStreamCloseQueuedOrInFlight(dest) || dest._state === 'closed') {
+        const destClosed = new TypeError('the destination writable stream closed before all data could be piped to it');
+        if (!preventCancel) shutdownWithAction(() => ReadableStreamCancel(source, destClosed), true, destClosed);
+        else shutdown(true, destClosed);
+      }
+
+      setPromiseIsHandledToTrue(pipeLoop());
+
+      function waitForWritesToFinish() {
+        const oldCurrentWrite = currentWrite;
+        return transformPromiseWith(currentWrite, () => (oldCurrentWrite !== currentWrite ? waitForWritesToFinish() : undefined));
+      }
+      function isOrBecomesErrored(stream, promise, action) {
+        if (stream._state === 'errored') action(stream._storedError);
+        else uponRejection(promise, action);
+      }
+      function isOrBecomesClosed(stream, promise, action) {
+        if (stream._state === 'closed') action();
+        else uponFulfillment(promise, action);
+      }
+      function shutdownWithAction(action, originalIsError, originalError) {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        if (dest._state === 'writable' && !WritableStreamCloseQueuedOrInFlight(dest)) uponFulfillment(waitForWritesToFinish(), doTheRest);
+        else doTheRest();
+        function doTheRest() {
+          uponPromise(action(),
+            () => finalize(originalIsError, originalError),
+            (newError) => finalize(true, newError));
+        }
+      }
+      function shutdown(isError, error) {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        if (dest._state === 'writable' && !WritableStreamCloseQueuedOrInFlight(dest)) uponFulfillment(waitForWritesToFinish(), () => finalize(isError, error));
+        else finalize(isError, error);
+      }
+      function finalize(isError, error) {
+        WritableStreamDefaultWriterRelease(writer);
+        ReadableStreamDefaultReaderRelease(reader);
+        if (signal !== undefined && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', abortAlgorithm);
+        if (isError) reject(error);
+        else resolve(undefined);
+      }
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  TransformStream  —  a writable end wired to a readable end
+  // ══════════════════════════════════════════════════════════════════════════
+  // Everything the platform "streams through" is one of these: TextDecoderStream,
+  // CompressionStream, a hand-written line splitter. The subtlety is that its
+  // backpressure runs BACKWARDS — the writable side only reports room when the
+  // readable side has been drained, so a consumer that stops reading eventually
+  // stops the producer, all the way back up the chain.
+  function IsTransformStream(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_transformStreamController');
+  }
+  function InitializeTransformStream(stream, startPromise, writableHighWaterMark, writableSizeAlgorithm, readableHighWaterMark, readableSizeAlgorithm) {
+    function startAlgorithm() { return startPromise; }
+    function writeAlgorithm(chunk) { return TransformStreamDefaultSinkWriteAlgorithm(stream, chunk); }
+    function abortAlgorithm(reason) { return TransformStreamDefaultSinkAbortAlgorithm(stream, reason); }
+    function closeAlgorithm() { return TransformStreamDefaultSinkCloseAlgorithm(stream); }
+    stream._writable = CreateWritableStream(
+      startAlgorithm, writeAlgorithm, closeAlgorithm, abortAlgorithm, writableHighWaterMark, writableSizeAlgorithm);
+    function pullAlgorithm() { return TransformStreamDefaultSourcePullAlgorithm(stream); }
+    function cancelAlgorithm(reason) { return TransformStreamDefaultSourceCancelAlgorithm(stream, reason); }
+    stream._readable = CreateReadableStream(
+      startAlgorithm, pullAlgorithm, cancelAlgorithm, readableHighWaterMark, readableSizeAlgorithm);
+    stream._backpressure = undefined;
+    stream._backpressureChangePromise = undefined;
+    stream._backpressureChangePromise_resolve = undefined;
+    TransformStreamSetBackpressure(stream, true);
+    stream._transformStreamController = undefined;
+  }
+  function TransformStreamError(stream, e) {
+    ReadableStreamDefaultControllerError(stream._readable._readableStreamController, e);
+    TransformStreamErrorWritableAndUnblockWrite(stream, e);
+  }
+  function TransformStreamErrorWritableAndUnblockWrite(stream, e) {
+    TransformStreamDefaultControllerClearAlgorithms(stream._transformStreamController);
+    WritableStreamDefaultControllerErrorIfNeeded(stream._writable._writableStreamController, e);
+    TransformStreamUnblockWrite(stream);
+  }
+  function TransformStreamUnblockWrite(stream) {
+    if (stream._backpressure) TransformStreamSetBackpressure(stream, false);
+  }
+  function TransformStreamSetBackpressure(stream, backpressure) {
+    if (stream._backpressureChangePromise !== undefined) stream._backpressureChangePromise_resolve();
+    stream._backpressureChangePromise = newPromise((resolve) => { stream._backpressureChangePromise_resolve = resolve; });
+    stream._backpressure = backpressure;
+  }
+
+  class TransformStream {
+    constructor(rawTransformer = {}, rawWritableStrategy = {}, rawReadableStrategy = {}) {
+      if (rawTransformer === undefined) rawTransformer = null;
+      const writableStrategy = convertQueuingStrategy(rawWritableStrategy, 'Second parameter');
+      const readableStrategy = convertQueuingStrategy(rawReadableStrategy, 'Third parameter');
+      const transformer = convertTransformer(rawTransformer, 'First parameter');
+      if (transformer.readableType !== undefined) throw new RangeError('Invalid readableType specified');
+      if (transformer.writableType !== undefined) throw new RangeError('Invalid writableType specified');
+      const readableHighWaterMark = ExtractHighWaterMark(readableStrategy, 0);
+      const readableSizeAlgorithm = ExtractSizeAlgorithm(readableStrategy);
+      const writableHighWaterMark = ExtractHighWaterMark(writableStrategy, 1);
+      const writableSizeAlgorithm = ExtractSizeAlgorithm(writableStrategy);
+      let startPromise_resolve;
+      const startPromise = newPromise((resolve) => { startPromise_resolve = resolve; });
+      InitializeTransformStream(this, startPromise, writableHighWaterMark, writableSizeAlgorithm, readableHighWaterMark, readableSizeAlgorithm);
+      SetUpTransformStreamDefaultControllerFromTransformer(this, transformer);
+      if (transformer.start !== undefined) startPromise_resolve(transformer.start(this._transformStreamController));
+      else startPromise_resolve(undefined);
+    }
+    get readable() {
+      if (!IsTransformStream(this)) throw streamBrandCheckException3('readable');
+      return this._readable;
+    }
+    get writable() {
+      if (!IsTransformStream(this)) throw streamBrandCheckException3('writable');
+      return this._writable;
+    }
+  }
+  Object.defineProperties(TransformStream.prototype, { readable: { enumerable: true }, writable: { enumerable: true } });
+  Object.defineProperty(TransformStream.prototype, Symbol.toStringTag, { value: 'TransformStream', configurable: true });
+  function streamBrandCheckException3(name) {
+    return new TypeError(`TransformStream.prototype.${name} can only be used on a TransformStream`);
+  }
+  function convertTransformer(original, context) {
+    assertDictionary(original, context);
+    const cancel = original == null ? undefined : original.cancel;
+    const flush = original == null ? undefined : original.flush;
+    const readableType = original == null ? undefined : original.readableType;
+    const start = original == null ? undefined : original.start;
+    const transform = original == null ? undefined : original.transform;
+    const writableType = original == null ? undefined : original.writableType;
+    return {
+      cancel: cancel === undefined ? undefined : convertTransformerCancelCallback(cancel, original, `${context} has member 'cancel' that`),
+      flush: flush === undefined ? undefined : convertTransformerFlushCallback(flush, original, `${context} has member 'flush' that`),
+      readableType,
+      start: start === undefined ? undefined : convertTransformerStartCallback(start, original, `${context} has member 'start' that`),
+      transform: transform === undefined ? undefined : convertTransformerTransformCallback(transform, original, `${context} has member 'transform' that`),
+      writableType,
+    };
+  }
+  function convertTransformerFlushCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (controller) => promiseCall(fn, original, [controller]);
+  }
+  function convertTransformerStartCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (controller) => reflectCall(fn, original, [controller]);
+  }
+  function convertTransformerTransformCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (chunk, controller) => promiseCall(fn, original, [chunk, controller]);
+  }
+  function convertTransformerCancelCallback(fn, original, context) {
+    assertFunction(fn, context);
+    return (reason) => promiseCall(fn, original, [reason]);
+  }
+
+  class TransformStreamDefaultController {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get desiredSize() {
+      if (!IsTransformStreamDefaultController(this)) throw defaultControllerBrandCheckException3('desiredSize');
+      return ReadableStreamDefaultControllerGetDesiredSize(this._controlledTransformStream._readable._readableStreamController);
+    }
+    enqueue(chunk = undefined) {
+      if (!IsTransformStreamDefaultController(this)) throw defaultControllerBrandCheckException3('enqueue');
+      TransformStreamDefaultControllerEnqueue(this, chunk);
+    }
+    error(reason = undefined) {
+      if (!IsTransformStreamDefaultController(this)) throw defaultControllerBrandCheckException3('error');
+      TransformStreamDefaultControllerError(this, reason);
+    }
+    terminate() {
+      if (!IsTransformStreamDefaultController(this)) throw defaultControllerBrandCheckException3('terminate');
+      TransformStreamDefaultControllerTerminate(this);
+    }
+  }
+  Object.defineProperties(TransformStreamDefaultController.prototype, {
+    enqueue: { enumerable: true }, error: { enumerable: true }, terminate: { enumerable: true }, desiredSize: { enumerable: true },
+  });
+  Object.defineProperty(TransformStreamDefaultController.prototype, Symbol.toStringTag, { value: 'TransformStreamDefaultController', configurable: true });
+  function IsTransformStreamDefaultController(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_controlledTransformStream');
+  }
+  function defaultControllerBrandCheckException3(name) {
+    return new TypeError(`TransformStreamDefaultController.prototype.${name} can only be used on a TransformStreamDefaultController`);
+  }
+  function SetUpTransformStreamDefaultController(stream, controller, transformAlgorithm, flushAlgorithm, cancelAlgorithm) {
+    controller._controlledTransformStream = stream;
+    stream._transformStreamController = controller;
+    controller._transformAlgorithm = transformAlgorithm;
+    controller._flushAlgorithm = flushAlgorithm;
+    controller._cancelAlgorithm = cancelAlgorithm;
+    controller._finishPromise = undefined;
+    controller._finishPromise_resolve = undefined;
+    controller._finishPromise_reject = undefined;
+  }
+  function SetUpTransformStreamDefaultControllerFromTransformer(stream, transformer) {
+    const controller = Object.create(TransformStreamDefaultController.prototype);
+    // No transform() means "identity": the chunk goes straight through. That
+    // default is what makes `new TransformStream()` a usable pass-through pipe.
+    let transformAlgorithm = (chunk) => {
+      try { TransformStreamDefaultControllerEnqueue(controller, chunk); return promiseResolvedWith(undefined); }
+      catch (transformResultE) { return promiseRejectedWith(transformResultE); }
+    };
+    let flushAlgorithm = () => promiseResolvedWith(undefined);
+    let cancelAlgorithm = () => promiseResolvedWith(undefined);
+    if (transformer.transform !== undefined) transformAlgorithm = (chunk) => transformer.transform(chunk, controller);
+    if (transformer.flush !== undefined) flushAlgorithm = () => transformer.flush(controller);
+    if (transformer.cancel !== undefined) cancelAlgorithm = (reason) => transformer.cancel(reason);
+    SetUpTransformStreamDefaultController(stream, controller, transformAlgorithm, flushAlgorithm, cancelAlgorithm);
+  }
+  function TransformStreamDefaultControllerClearAlgorithms(controller) {
+    controller._transformAlgorithm = undefined;
+    controller._flushAlgorithm = undefined;
+    controller._cancelAlgorithm = undefined;
+  }
+  function TransformStreamDefaultControllerEnqueue(controller, chunk) {
+    const stream = controller._controlledTransformStream;
+    const readableController = stream._readable._readableStreamController;
+    if (!ReadableStreamDefaultControllerCanCloseOrEnqueue(readableController))
+      throw new TypeError('Readable side is not in a state that permits enqueue');
+    // The two sides can fail independently: a readable side that has been
+    // errored or cancelled must surface as an error on the WRITABLE side, or
+    // the producer keeps writing into a stream nobody is listening to.
+    try { ReadableStreamDefaultControllerEnqueue(readableController, chunk); }
+    catch (e) {
+      TransformStreamErrorWritableAndUnblockWrite(stream, e);
+      throw stream._readable._storedError;
+    }
+    const backpressure = ReadableStreamDefaultControllerHasBackpressure(readableController);
+    if (backpressure !== stream._backpressure) TransformStreamSetBackpressure(stream, true);
+  }
+  function TransformStreamDefaultControllerError(controller, e) {
+    TransformStreamError(controller._controlledTransformStream, e);
+  }
+  function TransformStreamDefaultControllerPerformTransform(controller, chunk) {
+    const transformPromise = controller._transformAlgorithm(chunk);
+    return transformPromiseWith(transformPromise, undefined, (r) => {
+      TransformStreamError(controller._controlledTransformStream, r);
+      throw r;
+    });
+  }
+  function TransformStreamDefaultControllerTerminate(controller) {
+    const stream = controller._controlledTransformStream;
+    const readableController = stream._readable._readableStreamController;
+    ReadableStreamDefaultControllerClose(readableController);
+    const error = new TypeError('TransformStream terminated');
+    TransformStreamErrorWritableAndUnblockWrite(stream, error);
+  }
+  function TransformStreamDefaultSinkWriteAlgorithm(stream, chunk) {
+    const controller = stream._transformStreamController;
+    if (stream._backpressure) {
+      // Wait for room on the readable side before transforming — this single
+      // await is the whole backpressure story of a transform chain.
+      const backpressureChangePromise = stream._backpressureChangePromise;
+      return transformPromiseWith(backpressureChangePromise, () => {
+        const writable = stream._writable;
+        const state = writable._state;
+        if (state === 'erroring') throw writable._storedError;
+        return TransformStreamDefaultControllerPerformTransform(controller, chunk);
+      });
+    }
+    return TransformStreamDefaultControllerPerformTransform(controller, chunk);
+  }
+  function TransformStreamDefaultSinkAbortAlgorithm(stream, reason) {
+    const controller = stream._transformStreamController;
+    if (controller._finishPromise !== undefined) return controller._finishPromise;
+    const readable = stream._readable;
+    controller._finishPromise = newPromise((resolve, reject) => {
+      controller._finishPromise_resolve = resolve;
+      controller._finishPromise_reject = reject;
+    });
+    const cancelPromise = controller._cancelAlgorithm(reason);
+    TransformStreamDefaultControllerClearAlgorithms(controller);
+    uponPromise(cancelPromise, () => {
+      if (readable._state === 'errored') defaultControllerFinishPromiseReject(controller, readable._storedError);
+      else {
+        ReadableStreamDefaultControllerError(readable._readableStreamController, reason);
+        defaultControllerFinishPromiseResolve(controller);
+      }
+    }, (r) => {
+      ReadableStreamDefaultControllerError(readable._readableStreamController, r);
+      defaultControllerFinishPromiseReject(controller, r);
+    });
+    return controller._finishPromise;
+  }
+  function TransformStreamDefaultSinkCloseAlgorithm(stream) {
+    const controller = stream._transformStreamController;
+    if (controller._finishPromise !== undefined) return controller._finishPromise;
+    const readable = stream._readable;
+    controller._finishPromise = newPromise((resolve, reject) => {
+      controller._finishPromise_resolve = resolve;
+      controller._finishPromise_reject = reject;
+    });
+    const flushPromise = controller._flushAlgorithm();
+    TransformStreamDefaultControllerClearAlgorithms(controller);
+    uponPromise(flushPromise, () => {
+      if (readable._state === 'errored') defaultControllerFinishPromiseReject(controller, readable._storedError);
+      else {
+        ReadableStreamDefaultControllerClose(readable._readableStreamController);
+        defaultControllerFinishPromiseResolve(controller);
+      }
+    }, (r) => {
+      ReadableStreamDefaultControllerError(readable._readableStreamController, r);
+      defaultControllerFinishPromiseReject(controller, r);
+    });
+    return controller._finishPromise;
+  }
+  function TransformStreamDefaultSourcePullAlgorithm(stream) {
+    TransformStreamSetBackpressure(stream, false);
+    return stream._backpressureChangePromise;
+  }
+  function TransformStreamDefaultSourceCancelAlgorithm(stream, reason) {
+    const controller = stream._transformStreamController;
+    if (controller._finishPromise !== undefined) return controller._finishPromise;
+    const writable = stream._writable;
+    controller._finishPromise = newPromise((resolve, reject) => {
+      controller._finishPromise_resolve = resolve;
+      controller._finishPromise_reject = reject;
+    });
+    const cancelPromise = controller._cancelAlgorithm(reason);
+    TransformStreamDefaultControllerClearAlgorithms(controller);
+    uponPromise(cancelPromise, () => {
+      if (writable._state === 'errored') defaultControllerFinishPromiseReject(controller, writable._storedError);
+      else {
+        WritableStreamDefaultControllerErrorIfNeeded(writable._writableStreamController, reason);
+        TransformStreamUnblockWrite(stream);
+        defaultControllerFinishPromiseResolve(controller);
+      }
+    }, (r) => {
+      WritableStreamDefaultControllerErrorIfNeeded(writable._writableStreamController, r);
+      TransformStreamUnblockWrite(stream);
+      defaultControllerFinishPromiseReject(controller, r);
+    });
+    return controller._finishPromise;
+  }
+  function defaultControllerFinishPromiseResolve(controller) {
+    if (controller._finishPromise_resolve === undefined) return;
+    controller._finishPromise_resolve();
+    controller._finishPromise_resolve = undefined;
+    controller._finishPromise_reject = undefined;
+  }
+  function defaultControllerFinishPromiseReject(controller, reason) {
+    if (controller._finishPromise_reject === undefined) return;
+    setPromiseIsHandledToTrue(controller._finishPromise);
+    controller._finishPromise_reject(reason);
+    controller._finishPromise_resolve = undefined;
+    controller._finishPromise_reject = undefined;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  The byte stream  —  BYOB, "bring your own buffer"
+  // ══════════════════════════════════════════════════════════════════════════
+  // A default stream hands you chunks it allocated. A BYTE stream lets the
+  // READER supply the buffer and asks the source to fill it, which is the only
+  // way to read a large download without allocating a fresh array per chunk.
+  // On the machines this browser is for, that difference is the difference
+  // between a file that downloads and a tab the OS kills.
+  //
+  // Two rules carry most of the design:
+  //
+  //   * A buffer handed across the boundary is TRANSFERRED, not shared. The
+  //     caller's view is detached on purpose — if script could still write into
+  //     a buffer the source is filling, every byte in it is a race, and a
+  //     `respond()` that resized it underneath would be a memory-safety bug
+  //     rather than a bad chunk.
+  //   * A pull-into request is only satisfied at an ELEMENT boundary. Filling
+  //     five bytes of a Uint32Array leaves one whole element plus a remainder,
+  //     and the remainder has to be carried into the next request rather than
+  //     surfaced as a partial element nobody can read.
+  const _typedArrayConstructors = new Map([
+    ['Int8Array', 1], ['Uint8Array', 1], ['Uint8ClampedArray', 1],
+    ['Int16Array', 2], ['Uint16Array', 2],
+    ['Int32Array', 4], ['Uint32Array', 4],
+    ['Float32Array', 4], ['Float64Array', 8],
+    ['BigInt64Array', 8], ['BigUint64Array', 8],
+  ]);
+  const _detachedGetter = (() => {
+    const d = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'detached');
+    return d && typeof d.get === 'function' ? d.get : undefined;
+  })();
+  const _nativeTransfer = typeof ArrayBuffer.prototype.transfer === 'function' ? ArrayBuffer.prototype.transfer : undefined;
+  function IsDetachedBuffer(O) {
+    if (_detachedGetter !== undefined) return _detachedGetter.call(O);
+    // Without the `detached` getter the only observable signal is that a
+    // detached buffer reports zero length; a genuinely empty buffer is
+    // indistinguishable, and treating it as detached is the safe direction.
+    return O.byteLength === 0;
+  }
+  function CanTransferArrayBuffer(O) { return !IsDetachedBuffer(O); }
+  function TransferArrayBuffer(O) {
+    if (_nativeTransfer !== undefined) return _nativeTransfer.call(O);
+    return O.slice(0);
+  }
+  function ArrayBufferSlice(buffer, begin, end) { return buffer.slice(begin, end); }
+
+  function IsReadableStreamBYOBReader(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_readIntoRequests');
+  }
+  function IsReadableByteStreamController(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_controlledReadableByteStream');
+  }
+  function ReadableStreamHasBYOBReader(stream) {
+    const reader = stream._reader;
+    return reader !== undefined && IsReadableStreamBYOBReader(reader);
+  }
+  function ReadableStreamAddReadIntoRequest(stream, readIntoRequest) {
+    stream._reader._readIntoRequests.push(readIntoRequest);
+  }
+  function ReadableStreamFulfillReadIntoRequest(stream, chunk, done) {
+    const reader = stream._reader;
+    const readIntoRequest = reader._readIntoRequests.shift();
+    if (done) readIntoRequest._closeSteps(chunk);
+    else readIntoRequest._chunkSteps(chunk);
+  }
+  function ReadableStreamGetNumReadIntoRequests(stream) { return stream._reader._readIntoRequests.length; }
+
+  function CreateReadableByteStream(startAlgorithm, pullAlgorithm, cancelAlgorithm) {
+    const stream = Object.create(ReadableStream.prototype);
+    InitializeReadableStream(stream);
+    const controller = Object.create(ReadableByteStreamController.prototype);
+    SetUpReadableByteStreamController(stream, controller, startAlgorithm, pullAlgorithm, cancelAlgorithm, 0, undefined);
+    return stream;
+  }
+
+  // ── ReadableStreamBYOBReader ───────────────────────────────────────────────
+  class ReadableStreamBYOBReader {
+    constructor(stream) {
+      assertRequiredArgument(stream, 1, 'ReadableStreamBYOBReader');
+      assertReadableStream(stream, 'First parameter');
+      if (IsReadableStreamLocked(stream)) throw new TypeError('This stream has already been locked for exclusive reading by another reader');
+      if (!IsReadableByteStreamController(stream._readableStreamController))
+        throw new TypeError('Cannot construct a ReadableStreamBYOBReader for a stream not constructed with a byte source');
+      ReadableStreamReaderGenericInitialize(this, stream);
+      this._readIntoRequests = [];
+    }
+    get closed() {
+      if (!IsReadableStreamBYOBReader(this)) return promiseRejectedWith(byobReaderBrandCheckException('closed'));
+      return this._closedPromise;
+    }
+    cancel(reason = undefined) {
+      if (!IsReadableStreamBYOBReader(this)) return promiseRejectedWith(byobReaderBrandCheckException('cancel'));
+      if (this._stream === undefined) return promiseRejectedWith(readerLockException('cancel'));
+      return ReadableStreamReaderGenericCancel(this, reason);
+    }
+    read(view, rawOptions = {}) {
+      if (!IsReadableStreamBYOBReader(this)) return promiseRejectedWith(byobReaderBrandCheckException('read'));
+      if (!ArrayBuffer.isView(view)) return promiseRejectedWith(new TypeError('view must be an array buffer view'));
+      if (view.byteLength === 0) return promiseRejectedWith(new TypeError('view must have non-zero byteLength'));
+      if (view.buffer.byteLength === 0) return promiseRejectedWith(new TypeError('view\'s buffer must have non-zero byteLength'));
+      if (IsDetachedBuffer(view.buffer)) return promiseRejectedWith(new TypeError('view\'s buffer has been detached'));
+      let options;
+      try { options = convertByobReadOptions(rawOptions, 'options'); }
+      catch (e) { return promiseRejectedWith(e); }
+      const min = options.min;
+      if (min === 0) return promiseRejectedWith(new TypeError('options.min must be greater than 0'));
+      if (!isDataView(view)) {
+        if (min > view.length) return promiseRejectedWith(new RangeError('options.min must be less than or equal to view\'s length'));
+      } else if (min > view.byteLength) {
+        return promiseRejectedWith(new RangeError('options.min must be less than or equal to view\'s byteLength'));
+      }
+      if (this._stream === undefined) return promiseRejectedWith(readerLockException('read from'));
+      let resolvePromise, rejectPromise;
+      const promise = newPromise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
+      const readIntoRequest = {
+        _chunkSteps: (chunk) => resolvePromise({ value: chunk, done: false }),
+        _closeSteps: (chunk) => resolvePromise({ value: chunk, done: true }),
+        _errorSteps: (e) => rejectPromise(e),
       };
+      ReadableStreamBYOBReaderRead(this, view, min, readIntoRequest);
+      return promise;
     }
-    close() { return Promise.resolve(); }
-    abort() { return Promise.resolve(); }
-  };
-}
-if (typeof TransformStream === 'undefined') {
-  globalThis.TransformStream = class TransformStream {
-    constructor(transformer = {}) {
-      this.readable = new ReadableStream();
-      this.writable = new WritableStream();
+    releaseLock() {
+      if (!IsReadableStreamBYOBReader(this)) throw byobReaderBrandCheckException('releaseLock');
+      if (this._stream === undefined) return;
+      ReadableStreamBYOBReaderRelease(this);
     }
+  }
+  Object.defineProperties(ReadableStreamBYOBReader.prototype, {
+    cancel: { enumerable: true }, read: { enumerable: true }, releaseLock: { enumerable: true }, closed: { enumerable: true },
+  });
+  Object.defineProperty(ReadableStreamBYOBReader.prototype, Symbol.toStringTag, { value: 'ReadableStreamBYOBReader', configurable: true });
+  function byobReaderBrandCheckException(name) {
+    return new TypeError(`ReadableStreamBYOBReader.prototype.${name} can only be used on a ReadableStreamBYOBReader`);
+  }
+  const isDataView = (v) => typeof DataView === 'function' && v instanceof DataView;
+  function convertByobReadOptions(options, context) {
+    assertDictionary(options, context);
+    const min = options == null ? undefined : options.min;
+    return { min: min === undefined ? 1 : convertUnsignedLongLongWithEnforceRange(min, `${context} has member 'min' that`) };
+  }
+  function ReadableStreamBYOBReaderRead(reader, view, min, readIntoRequest) {
+    const stream = reader._stream;
+    stream._disturbed = true;
+    if (stream._state === 'errored') readIntoRequest._errorSteps(stream._storedError);
+    else ReadableByteStreamControllerPullInto(stream._readableStreamController, view, min, readIntoRequest);
+  }
+  function ReadableStreamBYOBReaderRelease(reader) {
+    ReadableStreamReaderGenericRelease(reader);
+    ReadableStreamBYOBReaderErrorReadIntoRequests(reader, readerLockException('read from'));
+  }
+  function ReadableStreamBYOBReaderErrorReadIntoRequests(reader, e) {
+    const readIntoRequests = reader._readIntoRequests;
+    reader._readIntoRequests = [];
+    for (const readIntoRequest of readIntoRequests) readIntoRequest._errorSteps(e);
+  }
+  function AcquireReadableStreamBYOBReader(stream) { return new ReadableStreamBYOBReader(stream); }
+
+  // ── ReadableStreamBYOBRequest ──────────────────────────────────────────────
+  // The source's side of the same buffer. `respond(n)` says "I wrote n bytes";
+  // `respondWithNewView` says "I wrote them somewhere else" — and both detach
+  // what the source was holding, because from here on the reader owns it.
+  class ReadableStreamBYOBRequest {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get view() {
+      if (!IsReadableStreamBYOBRequest(this)) throw byobRequestBrandCheckException('view');
+      return this._view;
+    }
+    respond(bytesWritten) {
+      if (!IsReadableStreamBYOBRequest(this)) throw byobRequestBrandCheckException('respond');
+      assertRequiredArgument(bytesWritten, 1, 'respond');
+      bytesWritten = convertUnsignedLongLongWithEnforceRange(bytesWritten, 'First parameter');
+      if (this._associatedReadableByteStreamController === undefined) throw new TypeError('This BYOB request has been invalidated');
+      if (IsDetachedBuffer(this._view.buffer)) throw new TypeError('The BYOB request\'s buffer has been detached and so cannot be used as a response');
+      ReadableByteStreamControllerRespond(this._associatedReadableByteStreamController, bytesWritten);
+    }
+    respondWithNewView(view) {
+      if (!IsReadableStreamBYOBRequest(this)) throw byobRequestBrandCheckException('respondWithNewView');
+      assertRequiredArgument(view, 1, 'respondWithNewView');
+      if (!ArrayBuffer.isView(view)) throw new TypeError('You can only respond with array buffer views');
+      if (this._associatedReadableByteStreamController === undefined) throw new TypeError('This BYOB request has been invalidated');
+      if (IsDetachedBuffer(view.buffer)) throw new TypeError('The given view\'s buffer has been detached and so cannot be used as a response');
+      ReadableByteStreamControllerRespondWithNewView(this._associatedReadableByteStreamController, view);
+    }
+  }
+  Object.defineProperties(ReadableStreamBYOBRequest.prototype, {
+    respond: { enumerable: true }, respondWithNewView: { enumerable: true }, view: { enumerable: true },
+  });
+  Object.defineProperty(ReadableStreamBYOBRequest.prototype, Symbol.toStringTag, { value: 'ReadableStreamBYOBRequest', configurable: true });
+  function IsReadableStreamBYOBRequest(x) {
+    return isObject(x) && Object.prototype.hasOwnProperty.call(x, '_associatedReadableByteStreamController');
+  }
+  function byobRequestBrandCheckException(name) {
+    return new TypeError(`ReadableStreamBYOBRequest.prototype.${name} can only be used on a ReadableStreamBYOBRequest`);
+  }
+
+  // ── ReadableByteStreamController ───────────────────────────────────────────
+  class ReadableByteStreamController {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get byobRequest() {
+      if (!IsReadableByteStreamController(this)) throw byteStreamControllerBrandCheckException('byobRequest');
+      return ReadableByteStreamControllerGetBYOBRequest(this);
+    }
+    get desiredSize() {
+      if (!IsReadableByteStreamController(this)) throw byteStreamControllerBrandCheckException('desiredSize');
+      return ReadableByteStreamControllerGetDesiredSize(this);
+    }
+    close() {
+      if (!IsReadableByteStreamController(this)) throw byteStreamControllerBrandCheckException('close');
+      if (this._closeRequested) throw new TypeError('The stream has already been closed; do not close it again!');
+      const state = this._controlledReadableByteStream._state;
+      if (state !== 'readable') throw new TypeError(`The stream (in ${state} state) is not in the readable state and cannot be closed`);
+      ReadableByteStreamControllerClose(this);
+    }
+    enqueue(chunk = undefined) {
+      if (!IsReadableByteStreamController(this)) throw byteStreamControllerBrandCheckException('enqueue');
+      assertRequiredArgument(chunk, 1, 'enqueue');
+      if (!ArrayBuffer.isView(chunk)) throw new TypeError('chunk must be an array buffer view');
+      if (chunk.byteLength === 0) throw new TypeError('chunk must have non-zero byteLength');
+      if (chunk.buffer.byteLength === 0) throw new TypeError('chunk\'s buffer must have non-zero byteLength');
+      if (this._closeRequested) throw new TypeError('stream is closed or draining');
+      const state = this._controlledReadableByteStream._state;
+      if (state !== 'readable') throw new TypeError(`The stream (in ${state} state) is not in the readable state and cannot be enqueued to`);
+      ReadableByteStreamControllerEnqueue(this, chunk);
+    }
+    error(e = undefined) {
+      if (!IsReadableByteStreamController(this)) throw byteStreamControllerBrandCheckException('error');
+      ReadableByteStreamControllerError(this, e);
+    }
+    [CancelSteps](reason) {
+      ReadableByteStreamControllerClearPendingPullIntos(this);
+      ResetQueue(this);
+      const result = this._cancelAlgorithm(reason);
+      ReadableByteStreamControllerClearAlgorithms(this);
+      return result;
+    }
+    [PullSteps](readRequest) {
+      const stream = this._controlledReadableByteStream;
+      if (this._queueTotalSize > 0) {
+        ReadableByteStreamControllerFillReadRequestFromQueue(this, readRequest);
+        return;
+      }
+      // An `autoAllocateChunkSize` source can serve a plain read() too: the
+      // controller allocates the buffer the reader did not bring.
+      const autoAllocateChunkSize = this._autoAllocateChunkSize;
+      if (autoAllocateChunkSize !== undefined) {
+        let buffer;
+        try { buffer = new ArrayBuffer(autoAllocateChunkSize); }
+        catch (bufferE) { readRequest._errorSteps(bufferE); return; }
+        const pullIntoDescriptor = {
+          buffer, bufferByteLength: autoAllocateChunkSize, byteOffset: 0, byteLength: autoAllocateChunkSize,
+          bytesFilled: 0, minimumFill: 1, elementSize: 1, viewConstructor: Uint8Array, readerType: 'default',
+        };
+        this._pendingPullIntos.push(pullIntoDescriptor);
+      }
+      ReadableStreamAddReadRequest(stream, readRequest);
+      ReadableByteStreamControllerCallPullIfNeeded(this);
+    }
+    [ReleaseSteps]() {
+      if (this._pendingPullIntos.length > 0) {
+        const firstPullInto = this._pendingPullIntos[0];
+        firstPullInto.readerType = 'none';
+        this._pendingPullIntos = [firstPullInto];
+      }
+    }
+  }
+  Object.defineProperties(ReadableByteStreamController.prototype, {
+    close: { enumerable: true }, enqueue: { enumerable: true }, error: { enumerable: true },
+    byobRequest: { enumerable: true }, desiredSize: { enumerable: true },
+  });
+  Object.defineProperty(ReadableByteStreamController.prototype, Symbol.toStringTag, { value: 'ReadableByteStreamController', configurable: true });
+  function byteStreamControllerBrandCheckException(name) {
+    return new TypeError(`ReadableByteStreamController.prototype.${name} can only be used on a ReadableByteStreamController`);
+  }
+
+  function ReadableByteStreamControllerCallPullIfNeeded(controller) {
+    if (!ReadableByteStreamControllerShouldCallPull(controller)) return;
+    if (controller._pulling) { controller._pullAgain = true; return; }
+    controller._pulling = true;
+    uponPromise(controller._pullAlgorithm(), () => {
+      controller._pulling = false;
+      if (controller._pullAgain) {
+        controller._pullAgain = false;
+        ReadableByteStreamControllerCallPullIfNeeded(controller);
+      }
+    }, (e) => { ReadableByteStreamControllerError(controller, e); });
+  }
+  function ReadableByteStreamControllerClearPendingPullIntos(controller) {
+    ReadableByteStreamControllerInvalidateBYOBRequest(controller);
+    controller._pendingPullIntos = [];
+  }
+  function ReadableByteStreamControllerCommitPullIntoDescriptor(stream, pullIntoDescriptor) {
+    let done = false;
+    if (stream._state === 'closed') done = true;
+    const filledView = ReadableByteStreamControllerConvertPullIntoDescriptor(pullIntoDescriptor);
+    if (pullIntoDescriptor.readerType === 'default') ReadableStreamFulfillReadRequest(stream, filledView, done);
+    else ReadableStreamFulfillReadIntoRequest(stream, filledView, done);
+  }
+  function ReadableByteStreamControllerConvertPullIntoDescriptor(pullIntoDescriptor) {
+    const bytesFilled = pullIntoDescriptor.bytesFilled;
+    const elementSize = pullIntoDescriptor.elementSize;
+    return new pullIntoDescriptor.viewConstructor(
+      pullIntoDescriptor.buffer, pullIntoDescriptor.byteOffset, bytesFilled / elementSize);
+  }
+  function ReadableByteStreamControllerEnqueueChunkToQueue(controller, buffer, byteOffset, byteLength) {
+    controller._queue.push({ buffer, byteOffset, byteLength });
+    controller._queueTotalSize += byteLength;
+  }
+  function ReadableByteStreamControllerEnqueueClonedChunkToQueue(controller, buffer, byteOffset, byteLength) {
+    let clonedChunk;
+    try { clonedChunk = ArrayBufferSlice(buffer, byteOffset, byteOffset + byteLength); }
+    catch (cloneE) { ReadableByteStreamControllerError(controller, cloneE); throw cloneE; }
+    ReadableByteStreamControllerEnqueueChunkToQueue(controller, clonedChunk, 0, byteLength);
+  }
+  function ReadableByteStreamControllerEnqueueDetachedPullIntoToQueue(controller, firstDescriptor) {
+    if (firstDescriptor.bytesFilled > 0)
+      ReadableByteStreamControllerEnqueueClonedChunkToQueue(
+        controller, firstDescriptor.buffer, firstDescriptor.byteOffset, firstDescriptor.bytesFilled);
+    ReadableByteStreamControllerShiftPendingPullInto(controller);
+  }
+  function ReadableByteStreamControllerFillPullIntoDescriptorFromQueue(controller, pullIntoDescriptor) {
+    const maxBytesToCopy = Math.min(controller._queueTotalSize, pullIntoDescriptor.byteLength - pullIntoDescriptor.bytesFilled);
+    const maxBytesFilled = pullIntoDescriptor.bytesFilled + maxBytesToCopy;
+    let totalBytesToCopyRemaining = maxBytesToCopy;
+    let ready = false;
+    // Only whole ELEMENTS may be surfaced: a Uint32Array read that has 6 of 8
+    // bytes yields one element and keeps two bytes in the descriptor.
+    const remainderBytes = maxBytesFilled % pullIntoDescriptor.elementSize;
+    const maxAlignedBytes = maxBytesFilled - remainderBytes;
+    if (maxAlignedBytes >= pullIntoDescriptor.minimumFill) {
+      totalBytesToCopyRemaining = maxAlignedBytes - pullIntoDescriptor.bytesFilled;
+      ready = true;
+    }
+    const queue = controller._queue;
+    while (totalBytesToCopyRemaining > 0) {
+      const headOfQueue = queue[0];
+      const bytesToCopy = Math.min(totalBytesToCopyRemaining, headOfQueue.byteLength);
+      const destStart = pullIntoDescriptor.byteOffset + pullIntoDescriptor.bytesFilled;
+      new Uint8Array(pullIntoDescriptor.buffer).set(
+        new Uint8Array(headOfQueue.buffer, headOfQueue.byteOffset, bytesToCopy), destStart);
+      if (headOfQueue.byteLength === bytesToCopy) queue.shift();
+      else { headOfQueue.byteOffset += bytesToCopy; headOfQueue.byteLength -= bytesToCopy; }
+      controller._queueTotalSize -= bytesToCopy;
+      ReadableByteStreamControllerFillHeadPullIntoDescriptor(controller, bytesToCopy, pullIntoDescriptor);
+      totalBytesToCopyRemaining -= bytesToCopy;
+    }
+    return ready;
+  }
+  function ReadableByteStreamControllerFillHeadPullIntoDescriptor(controller, size, pullIntoDescriptor) {
+    pullIntoDescriptor.bytesFilled += size;
+  }
+  function ReadableByteStreamControllerHandleQueueDrain(controller) {
+    if (controller._queueTotalSize === 0 && controller._closeRequested) {
+      ReadableByteStreamControllerClearAlgorithms(controller);
+      ReadableStreamClose(controller._controlledReadableByteStream);
+    } else {
+      ReadableByteStreamControllerCallPullIfNeeded(controller);
+    }
+  }
+  function ReadableByteStreamControllerInvalidateBYOBRequest(controller) {
+    if (controller._byobRequest === null) return;
+    controller._byobRequest._associatedReadableByteStreamController = undefined;
+    controller._byobRequest._view = null;
+    controller._byobRequest = null;
+  }
+  function ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue(controller) {
+    while (controller._pendingPullIntos.length > 0) {
+      if (controller._queueTotalSize === 0) return;
+      const pullIntoDescriptor = controller._pendingPullIntos[0];
+      if (ReadableByteStreamControllerFillPullIntoDescriptorFromQueue(controller, pullIntoDescriptor)) {
+        ReadableByteStreamControllerShiftPendingPullInto(controller);
+        ReadableByteStreamControllerCommitPullIntoDescriptor(controller._controlledReadableByteStream, pullIntoDescriptor);
+      }
+    }
+  }
+  function ReadableByteStreamControllerProcessReadRequestsUsingQueue(controller) {
+    const reader = controller._controlledReadableByteStream._reader;
+    while (reader._readRequests.length > 0) {
+      if (controller._queueTotalSize === 0) return;
+      const readRequest = reader._readRequests.shift();
+      ReadableByteStreamControllerFillReadRequestFromQueue(controller, readRequest);
+    }
+  }
+  function ReadableByteStreamControllerPullInto(controller, view, min, readIntoRequest) {
+    let elementSize = 1;
+    let ctor = Uint8Array;
+    const name = view.constructor && view.constructor.name;
+    if (_typedArrayConstructors.has(name)) { elementSize = _typedArrayConstructors.get(name); ctor = view.constructor; }
+    else if (isDataView(view)) { elementSize = 1; ctor = DataView; }
+    else { ctor = view.constructor || Uint8Array; }
+    const minimumFill = min * elementSize;
+    const byteOffset = view.byteOffset;
+    const byteLength = view.byteLength;
+    let buffer;
+    try { buffer = TransferArrayBuffer(view.buffer); }
+    catch (e) { readIntoRequest._errorSteps(e); return; }
+    const pullIntoDescriptor = {
+      buffer, bufferByteLength: buffer.byteLength, byteOffset, byteLength,
+      bytesFilled: 0, minimumFill, elementSize, viewConstructor: ctor, readerType: 'byob',
+    };
+    const stream = controller._controlledReadableByteStream;
+    if (controller._pendingPullIntos.length > 0) {
+      controller._pendingPullIntos.push(pullIntoDescriptor);
+      ReadableStreamAddReadIntoRequest(stream, readIntoRequest);
+      return;
+    }
+    if (stream._state === 'closed') {
+      const emptyView = new ctor(pullIntoDescriptor.buffer, pullIntoDescriptor.byteOffset, 0);
+      readIntoRequest._closeSteps(emptyView);
+      return;
+    }
+    if (controller._queueTotalSize > 0) {
+      if (ReadableByteStreamControllerFillPullIntoDescriptorFromQueue(controller, pullIntoDescriptor)) {
+        const filledView = ReadableByteStreamControllerConvertPullIntoDescriptor(pullIntoDescriptor);
+        ReadableByteStreamControllerHandleQueueDrain(controller);
+        readIntoRequest._chunkSteps(filledView);
+        return;
+      }
+      if (controller._closeRequested) {
+        const e = new TypeError('Insufficient bytes to fill elements in the given buffer');
+        ReadableByteStreamControllerError(controller, e);
+        readIntoRequest._errorSteps(e);
+        return;
+      }
+    }
+    controller._pendingPullIntos.push(pullIntoDescriptor);
+    ReadableStreamAddReadIntoRequest(stream, readIntoRequest);
+    ReadableByteStreamControllerCallPullIfNeeded(controller);
+  }
+  function ReadableByteStreamControllerRespondInClosedState(controller, firstDescriptor) {
+    if (firstDescriptor.readerType === 'none') ReadableByteStreamControllerShiftPendingPullInto(controller);
+    const stream = controller._controlledReadableByteStream;
+    if (ReadableStreamHasBYOBReader(stream)) {
+      while (ReadableStreamGetNumReadIntoRequests(stream) > 0) {
+        const pullIntoDescriptor = ReadableByteStreamControllerShiftPendingPullInto(controller);
+        ReadableByteStreamControllerCommitPullIntoDescriptor(stream, pullIntoDescriptor);
+      }
+    }
+  }
+  function ReadableByteStreamControllerRespondInReadableState(controller, bytesWritten, pullIntoDescriptor) {
+    ReadableByteStreamControllerFillHeadPullIntoDescriptor(controller, bytesWritten, pullIntoDescriptor);
+    if (pullIntoDescriptor.readerType === 'none') {
+      ReadableByteStreamControllerEnqueueDetachedPullIntoToQueue(controller, pullIntoDescriptor);
+      ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue(controller);
+      return;
+    }
+    if (pullIntoDescriptor.bytesFilled < pullIntoDescriptor.minimumFill) return;
+    ReadableByteStreamControllerShiftPendingPullInto(controller);
+    // Whatever did not fit into a whole element goes back on the queue so the
+    // NEXT read sees it; dropping it would silently lose bytes off the wire.
+    const remainderSize = pullIntoDescriptor.bytesFilled % pullIntoDescriptor.elementSize;
+    if (remainderSize > 0) {
+      const end = pullIntoDescriptor.byteOffset + pullIntoDescriptor.bytesFilled;
+      ReadableByteStreamControllerEnqueueClonedChunkToQueue(controller, pullIntoDescriptor.buffer, end - remainderSize, remainderSize);
+    }
+    pullIntoDescriptor.bytesFilled -= remainderSize;
+    ReadableByteStreamControllerCommitPullIntoDescriptor(controller._controlledReadableByteStream, pullIntoDescriptor);
+    ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue(controller);
+  }
+  function ReadableByteStreamControllerRespondInternal(controller, bytesWritten) {
+    const firstDescriptor = controller._pendingPullIntos[0];
+    ReadableByteStreamControllerInvalidateBYOBRequest(controller);
+    const state = controller._controlledReadableByteStream._state;
+    if (state === 'closed') ReadableByteStreamControllerRespondInClosedState(controller, firstDescriptor);
+    else ReadableByteStreamControllerRespondInReadableState(controller, bytesWritten, firstDescriptor);
+    ReadableByteStreamControllerCallPullIfNeeded(controller);
+  }
+  function ReadableByteStreamControllerShiftPendingPullInto(controller) {
+    return controller._pendingPullIntos.shift();
+  }
+  function ReadableByteStreamControllerShouldCallPull(controller) {
+    const stream = controller._controlledReadableByteStream;
+    if (stream._state !== 'readable') return false;
+    if (controller._closeRequested) return false;
+    if (!controller._started) return false;
+    if (ReadableStreamHasDefaultReader(stream) && ReadableStreamGetNumReadRequests(stream) > 0) return true;
+    if (ReadableStreamHasBYOBReader(stream) && ReadableStreamGetNumReadIntoRequests(stream) > 0) return true;
+    const desiredSize = ReadableByteStreamControllerGetDesiredSize(controller);
+    return desiredSize > 0;
+  }
+  function ReadableByteStreamControllerClearAlgorithms(controller) {
+    controller._pullAlgorithm = undefined;
+    controller._cancelAlgorithm = undefined;
+  }
+  function ReadableByteStreamControllerClose(controller) {
+    const stream = controller._controlledReadableByteStream;
+    if (controller._closeRequested || stream._state !== 'readable') return;
+    if (controller._queueTotalSize > 0) { controller._closeRequested = true; return; }
+    if (controller._pendingPullIntos.length > 0) {
+      const firstPendingPullInto = controller._pendingPullIntos[0];
+      if (firstPendingPullInto.bytesFilled % firstPendingPullInto.elementSize !== 0) {
+        // A close that leaves a PARTIAL element is an error, not a close: the
+        // reader asked for whole elements and the stream cannot supply them.
+        const e = new TypeError('Insufficient bytes to fill elements in the given buffer');
+        ReadableByteStreamControllerError(controller, e);
+        throw e;
+      }
+    }
+    ReadableByteStreamControllerClearAlgorithms(controller);
+    ReadableStreamClose(stream);
+  }
+  function ReadableByteStreamControllerEnqueue(controller, chunk) {
+    const stream = controller._controlledReadableByteStream;
+    if (controller._closeRequested || stream._state !== 'readable') return;
+    const buffer = chunk.buffer;
+    const byteOffset = chunk.byteOffset;
+    const byteLength = chunk.byteLength;
+    if (IsDetachedBuffer(buffer)) throw new TypeError('chunk\'s buffer is detached and so cannot be enqueued');
+    const transferredBuffer = TransferArrayBuffer(buffer);
+    if (controller._pendingPullIntos.length > 0) {
+      const firstPendingPullInto = controller._pendingPullIntos[0];
+      if (IsDetachedBuffer(firstPendingPullInto.buffer)) throw new TypeError('The BYOB request\'s buffer has been detached and so cannot be filled with an enqueued chunk');
+      ReadableByteStreamControllerInvalidateBYOBRequest(controller);
+      firstPendingPullInto.buffer = TransferArrayBuffer(firstPendingPullInto.buffer);
+      if (firstPendingPullInto.readerType === 'none')
+        ReadableByteStreamControllerEnqueueDetachedPullIntoToQueue(controller, firstPendingPullInto);
+    }
+    if (ReadableStreamHasDefaultReader(stream)) {
+      ReadableByteStreamControllerProcessReadRequestsUsingQueue(controller);
+      if (ReadableStreamGetNumReadRequests(stream) === 0) {
+        ReadableByteStreamControllerEnqueueChunkToQueue(controller, transferredBuffer, byteOffset, byteLength);
+      } else {
+        if (controller._pendingPullIntos.length > 0) ReadableByteStreamControllerShiftPendingPullInto(controller);
+        const transferredView = new Uint8Array(transferredBuffer, byteOffset, byteLength);
+        ReadableStreamFulfillReadRequest(stream, transferredView, false);
+      }
+    } else if (ReadableStreamHasBYOBReader(stream)) {
+      ReadableByteStreamControllerEnqueueChunkToQueue(controller, transferredBuffer, byteOffset, byteLength);
+      ReadableByteStreamControllerProcessPullIntoDescriptorsUsingQueue(controller);
+    } else {
+      ReadableByteStreamControllerEnqueueChunkToQueue(controller, transferredBuffer, byteOffset, byteLength);
+    }
+    ReadableByteStreamControllerCallPullIfNeeded(controller);
+  }
+  function ReadableByteStreamControllerError(controller, e) {
+    const stream = controller._controlledReadableByteStream;
+    if (stream._state !== 'readable') return;
+    ReadableByteStreamControllerClearPendingPullIntos(controller);
+    ResetQueue(controller);
+    ReadableByteStreamControllerClearAlgorithms(controller);
+    ReadableStreamError(stream, e);
+  }
+  function ReadableByteStreamControllerFillReadRequestFromQueue(controller, readRequest) {
+    const entry = controller._queue.shift();
+    controller._queueTotalSize -= entry.byteLength;
+    ReadableByteStreamControllerHandleQueueDrain(controller);
+    const view = new Uint8Array(entry.buffer, entry.byteOffset, entry.byteLength);
+    readRequest._chunkSteps(view);
+  }
+  function ReadableByteStreamControllerGetBYOBRequest(controller) {
+    if (controller._byobRequest === null && controller._pendingPullIntos.length > 0) {
+      const firstDescriptor = controller._pendingPullIntos[0];
+      const view = new Uint8Array(
+        firstDescriptor.buffer, firstDescriptor.byteOffset + firstDescriptor.bytesFilled,
+        firstDescriptor.byteLength - firstDescriptor.bytesFilled);
+      const byobRequest = Object.create(ReadableStreamBYOBRequest.prototype);
+      byobRequest._associatedReadableByteStreamController = controller;
+      byobRequest._view = view;
+      controller._byobRequest = byobRequest;
+    }
+    return controller._byobRequest;
+  }
+  function ReadableByteStreamControllerGetDesiredSize(controller) {
+    const state = controller._controlledReadableByteStream._state;
+    if (state === 'errored') return null;
+    if (state === 'closed') return 0;
+    return controller._strategyHWM - controller._queueTotalSize;
+  }
+  function ReadableByteStreamControllerRespond(controller, bytesWritten) {
+    const firstDescriptor = controller._pendingPullIntos[0];
+    const state = controller._controlledReadableByteStream._state;
+    if (state === 'closed') {
+      if (bytesWritten !== 0) throw new TypeError('bytesWritten must be 0 when calling respond() on a closed stream');
+    } else {
+      if (bytesWritten === 0) throw new TypeError('bytesWritten must be greater than 0 when calling respond() on a readable stream');
+      if (firstDescriptor.bytesFilled + bytesWritten > firstDescriptor.byteLength) throw new RangeError('bytesWritten out of range');
+    }
+    firstDescriptor.buffer = TransferArrayBuffer(firstDescriptor.buffer);
+    ReadableByteStreamControllerRespondInternal(controller, bytesWritten);
+  }
+  function ReadableByteStreamControllerRespondWithNewView(controller, view) {
+    const firstDescriptor = controller._pendingPullIntos[0];
+    const state = controller._controlledReadableByteStream._state;
+    if (state === 'closed') {
+      if (view.byteLength !== 0) throw new TypeError('The view\'s length must be 0 when calling respondWithNewView() on a closed stream');
+    } else {
+      if (view.byteLength === 0) throw new TypeError('The view\'s length must be greater than 0 when calling respondWithNewView() on a readable stream');
+    }
+    if (firstDescriptor.byteOffset + firstDescriptor.bytesFilled !== view.byteOffset)
+      throw new RangeError('The region specified by view does not match byobRequest');
+    if (firstDescriptor.bufferByteLength !== view.buffer.byteLength)
+      throw new RangeError('The buffer of view has different capacity than byobRequest');
+    if (firstDescriptor.bytesFilled + view.byteLength > firstDescriptor.byteLength)
+      throw new RangeError('The region specified by view is larger than byobRequest');
+    const viewByteLength = view.byteLength;
+    firstDescriptor.buffer = TransferArrayBuffer(view.buffer);
+    ReadableByteStreamControllerRespondInternal(controller, viewByteLength);
+  }
+  function SetUpReadableByteStreamController(stream, controller, startAlgorithm, pullAlgorithm, cancelAlgorithm, highWaterMark, autoAllocateChunkSize) {
+    controller._controlledReadableByteStream = stream;
+    controller._pullAgain = false;
+    controller._pulling = false;
+    controller._byobRequest = null;
+    controller._queue = controller._queueTotalSize = undefined;
+    ResetQueue(controller);
+    controller._closeRequested = false;
+    controller._started = false;
+    controller._strategyHWM = highWaterMark;
+    controller._pullAlgorithm = pullAlgorithm;
+    controller._cancelAlgorithm = cancelAlgorithm;
+    controller._autoAllocateChunkSize = autoAllocateChunkSize;
+    controller._pendingPullIntos = [];
+    stream._readableStreamController = controller;
+    uponPromise(promiseResolvedWith(startAlgorithm()), () => {
+      controller._started = true;
+      ReadableByteStreamControllerCallPullIfNeeded(controller);
+    }, (r) => { ReadableByteStreamControllerError(controller, r); });
+  }
+  function SetUpReadableByteStreamControllerFromUnderlyingSource(stream, underlyingSource, highWaterMark) {
+    const controller = Object.create(ReadableByteStreamController.prototype);
+    const startAlgorithm = underlyingSource.start === undefined ? () => undefined : () => underlyingSource.start(controller);
+    const pullAlgorithm = underlyingSource.pull === undefined ? () => promiseResolvedWith(undefined) : () => underlyingSource.pull(controller);
+    const cancelAlgorithm = underlyingSource.cancel === undefined ? () => promiseResolvedWith(undefined) : (reason) => underlyingSource.cancel(reason);
+    const autoAllocateChunkSize = underlyingSource.autoAllocateChunkSize;
+    if (autoAllocateChunkSize === 0) throw new TypeError('autoAllocateChunkSize must be greater than 0');
+    SetUpReadableByteStreamController(
+      stream, controller, startAlgorithm, pullAlgorithm, cancelAlgorithm, highWaterMark, autoAllocateChunkSize);
+  }
+
+  // ── Teeing a byte stream ───────────────────────────────────────────────────
+  // Byte branches must each get their OWN buffer — two branches sharing one
+  // would let either one's reader observe (or overwrite) the other's bytes.
+  function ReadableByteStreamTee(stream) {
+    let reader = AcquireReadableStreamDefaultReader(stream);
+    let reading = false;
+    let readAgainForBranch1 = false;
+    let readAgainForBranch2 = false;
+    let canceled1 = false;
+    let canceled2 = false;
+    let reason1, reason2, branch1, branch2;
+    let resolveCancelPromise;
+    const cancelPromise = newPromise((resolve) => { resolveCancelPromise = resolve; });
+
+    function forwardReaderError(thisReader) {
+      uponRejection(thisReader._closedPromise, (r) => {
+        if (thisReader !== reader) return;
+        ReadableByteStreamControllerError(branch1._readableStreamController, r);
+        ReadableByteStreamControllerError(branch2._readableStreamController, r);
+        if (!canceled1 || !canceled2) resolveCancelPromise(undefined);
+      });
+    }
+    function pullWithDefaultReader() {
+      if (IsReadableStreamBYOBReader(reader)) {
+        ReadableStreamBYOBReaderRelease(reader);
+        reader = AcquireReadableStreamDefaultReader(stream);
+        forwardReaderError(reader);
+      }
+      const readRequest = {
+        _chunkSteps: (chunk) => {
+          queueMicrotask(() => {
+            readAgainForBranch1 = false;
+            readAgainForBranch2 = false;
+            const chunk1 = chunk;
+            let chunk2 = chunk;
+            if (!canceled1 && !canceled2) {
+              let cloneResult;
+              try { cloneResult = CloneAsUint8Array(chunk); }
+              catch (cloneE) {
+                ReadableByteStreamControllerError(branch1._readableStreamController, cloneE);
+                ReadableByteStreamControllerError(branch2._readableStreamController, cloneE);
+                resolveCancelPromise(ReadableStreamCancel(stream, cloneE));
+                return;
+              }
+              chunk2 = cloneResult;
+            }
+            if (!canceled1) ReadableByteStreamControllerEnqueue(branch1._readableStreamController, chunk1);
+            if (!canceled2) ReadableByteStreamControllerEnqueue(branch2._readableStreamController, chunk2);
+            reading = false;
+            if (readAgainForBranch1) pull1Algorithm();
+            else if (readAgainForBranch2) pull2Algorithm();
+          });
+        },
+        _closeSteps: () => {
+          reading = false;
+          if (!canceled1) ReadableByteStreamControllerClose(branch1._readableStreamController);
+          if (!canceled2) ReadableByteStreamControllerClose(branch2._readableStreamController);
+          if (branch1._readableStreamController._pendingPullIntos.length > 0)
+            ReadableByteStreamControllerRespond(branch1._readableStreamController, 0);
+          if (branch2._readableStreamController._pendingPullIntos.length > 0)
+            ReadableByteStreamControllerRespond(branch2._readableStreamController, 0);
+          if (!canceled1 || !canceled2) resolveCancelPromise(undefined);
+        },
+        _errorSteps: () => { reading = false; },
+      };
+      ReadableStreamDefaultReaderRead(reader, readRequest);
+    }
+    function pullWithBYOBReader(view, forBranch2) {
+      if (IsReadableStreamDefaultReader(reader)) {
+        ReadableStreamDefaultReaderRelease(reader);
+        reader = AcquireReadableStreamBYOBReader(stream);
+        forwardReaderError(reader);
+      }
+      const byobBranch = forBranch2 ? branch2 : branch1;
+      const otherBranch = forBranch2 ? branch1 : branch2;
+      const readIntoRequest = {
+        _chunkSteps: (chunk) => {
+          queueMicrotask(() => {
+            readAgainForBranch1 = false;
+            readAgainForBranch2 = false;
+            const byobCanceled = forBranch2 ? canceled2 : canceled1;
+            const otherCanceled = forBranch2 ? canceled1 : canceled2;
+            if (!otherCanceled) {
+              let clonedChunk;
+              try { clonedChunk = CloneAsUint8Array(chunk); }
+              catch (cloneE) {
+                ReadableByteStreamControllerError(byobBranch._readableStreamController, cloneE);
+                ReadableByteStreamControllerError(otherBranch._readableStreamController, cloneE);
+                resolveCancelPromise(ReadableStreamCancel(stream, cloneE));
+                return;
+              }
+              if (!byobCanceled) ReadableByteStreamControllerRespondWithNewView(byobBranch._readableStreamController, chunk);
+              ReadableByteStreamControllerEnqueue(otherBranch._readableStreamController, clonedChunk);
+            } else if (!byobCanceled) {
+              ReadableByteStreamControllerRespondWithNewView(byobBranch._readableStreamController, chunk);
+            }
+            reading = false;
+            if (readAgainForBranch1) pull1Algorithm();
+            else if (readAgainForBranch2) pull2Algorithm();
+          });
+        },
+        _closeSteps: (chunk) => {
+          reading = false;
+          const byobCanceled = forBranch2 ? canceled2 : canceled1;
+          const otherCanceled = forBranch2 ? canceled1 : canceled2;
+          if (!byobCanceled) ReadableByteStreamControllerClose(byobBranch._readableStreamController);
+          if (!otherCanceled) ReadableByteStreamControllerClose(otherBranch._readableStreamController);
+          if (chunk !== undefined) {
+            if (!byobCanceled) ReadableByteStreamControllerRespondWithNewView(byobBranch._readableStreamController, chunk);
+            if (!otherCanceled && otherBranch._readableStreamController._pendingPullIntos.length > 0)
+              ReadableByteStreamControllerRespond(otherBranch._readableStreamController, 0);
+          }
+          if (!byobCanceled || !otherCanceled) resolveCancelPromise(undefined);
+        },
+        _errorSteps: () => { reading = false; },
+      };
+      ReadableStreamBYOBReaderRead(reader, view, 1, readIntoRequest);
+    }
+    function pull1Algorithm() {
+      if (reading) { readAgainForBranch1 = true; return promiseResolvedWith(undefined); }
+      reading = true;
+      const byobRequest = ReadableByteStreamControllerGetBYOBRequest(branch1._readableStreamController);
+      if (byobRequest === null) pullWithDefaultReader();
+      else pullWithBYOBReader(byobRequest._view, false);
+      return promiseResolvedWith(undefined);
+    }
+    function pull2Algorithm() {
+      if (reading) { readAgainForBranch2 = true; return promiseResolvedWith(undefined); }
+      reading = true;
+      const byobRequest = ReadableByteStreamControllerGetBYOBRequest(branch2._readableStreamController);
+      if (byobRequest === null) pullWithDefaultReader();
+      else pullWithBYOBReader(byobRequest._view, true);
+      return promiseResolvedWith(undefined);
+    }
+    function cancel1Algorithm(reason) {
+      canceled1 = true; reason1 = reason;
+      if (canceled2) resolveCancelPromise(ReadableStreamCancel(stream, [reason1, reason2]));
+      return cancelPromise;
+    }
+    function cancel2Algorithm(reason) {
+      canceled2 = true; reason2 = reason;
+      if (canceled1) resolveCancelPromise(ReadableStreamCancel(stream, [reason1, reason2]));
+      return cancelPromise;
+    }
+    const startAlgorithm = () => undefined;
+    branch1 = CreateReadableByteStream(startAlgorithm, pull1Algorithm, cancel1Algorithm);
+    branch2 = CreateReadableByteStream(startAlgorithm, pull2Algorithm, cancel2Algorithm);
+    forwardReaderError(reader);
+    return [branch1, branch2];
+  }
+  function CloneAsUint8Array(O) {
+    const buffer = ArrayBufferSlice(O.buffer, O.byteOffset, O.byteOffset + O.byteLength);
+    return new Uint8Array(buffer);
+  }
+
+  // ── Publish ────────────────────────────────────────────────────────────────
+  const expose = (name, value) => {
+    Object.defineProperty(global, name, { value, writable: true, enumerable: false, configurable: true });
   };
-}
+  expose('ReadableStream', ReadableStream);
+  expose('ReadableStreamDefaultReader', ReadableStreamDefaultReader);
+  expose('ReadableStreamDefaultController', ReadableStreamDefaultController);
+  expose('ReadableStreamBYOBReader', ReadableStreamBYOBReader);
+  expose('ReadableStreamBYOBRequest', ReadableStreamBYOBRequest);
+  expose('ReadableByteStreamController', ReadableByteStreamController);
+  expose('ByteLengthQueuingStrategy', ByteLengthQueuingStrategy);
+  expose('CountQueuingStrategy', CountQueuingStrategy);
+  expose('WritableStream', WritableStream);
+  expose('WritableStreamDefaultWriter', WritableStreamDefaultWriter);
+  expose('WritableStreamDefaultController', WritableStreamDefaultController);
+  expose('TransformStream', TransformStream);
+  expose('TransformStreamDefaultController', TransformStreamDefaultController);
+})(globalThis);
+
 
 if (!globalThis.crypto) globalThis.crypto = {};
 if (!globalThis.crypto.subtle) {

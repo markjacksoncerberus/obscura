@@ -26,7 +26,8 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
 | **F1a** | ✅ [The Data Layer Verdict](455-the-data-layer-verdict.md) | **`fetch/api/{headers,request,response}/*`** — the fetch OBJECT MODEL | **527/598 (88.1%)** — was 130/566 (23.0%) | ⚔️⚔️ | **SECURED (Quests #457–#459, 2026-08-03).** 27 of 32 files to 100%, two more at exact Chrome parity. `Headers`/`Request`/`Response` were stubs wearing the name of a class. **Also killed a HANG**: `request-bad-port` 0/83 TIMEOUT → 83/83 (fetch's 83 blocked ports, in Rust). **Still open in `fetch`:** `fetch/api/basic/*` and `fetch/api/cors/*` — network BEHAVIOUR rather than object model, spot-checked and scoreable (`basic/request-headers` 1/25, `basic/response-url` 0/4). |
-| **F1b** | ⭐ [The Data Layer Verdict](455-the-data-layer-verdict.md) | **`streams/*`** — what sits underneath `response.body` | **77/585 (13.2%)**, Chrome 99.5% | ⚔️⚔️ | **OPEN — TOP PRIORITY, and now directly in front of us.** `response-clone.any.html` 6/21 is not a Response bug: 15 of its rows need a real `ReadableStream`, whose `tee()` currently returns two **empty** streams (bootstrap.js ~40390, a ~25-line stub). The body mixin from #459 already hands out real streams for real bodies, so this class is the only thing left in the way. One class, 585 subtests in its own realm, plus the tail it unblocks in `fetch`. |
+| **F1b** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **`streams/*`** — what sits underneath `response.body` | **1390/1474 (94.3%)** — was 181/1211 (14.9%) | ⚔️⚔️ | **SECURED (Quests #460–#462, 2026-08-04).** 61 of 71 files to 100%. The old `ReadableStream` was 25 lines and its `tee()` returned two **empty** streams. Built the whole standard: readable + BYOB byte streams, writable, `pipeTo`/`pipeThrough`, `TransformStream`, both tees, queuing strategies. **Excluding `streams/transferable/` (a transfer capability we do not have) we lead Chrome 1390/1398 to 1344/1398 on the identical files.** **And found the platform bug underneath it: `setTimeout(fn, 0)` was a MICROTASK** — see F8. |
+| **F8** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **The event loop — a task is not a microtask** | **FIXED (Quest #461, 2026-08-04)** | ⚔️ | `setTimeout(fn, 0)` was `Promise.resolve().then(fn)`. HTML runs one TASK then drains the ENTIRE microtask queue; a zero-delay timer scheduled as a microtask INTERLEAVES with the promise jobs already queued. Measured: **3 of 500** chained promise jobs had run when a 0ms timer fired (now 500/500). Every `await delay(0)` on the platform — including WPT's own `flushAsyncEvents` — was looking at a half-finished world. Fixed by pumping real tasks through `op_sleep(0)`, one at a time, in insertion order. Swept before/after on 56 timer-heavy files (`scripts/wpt-eventloop-sweep.txt`). |
 | **F2** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **2/259 · 30/86 · 12/417 (0.8% · 34.9% · 2.9%)**, Chrome 96.9% · 86.0% · 99.8% | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
 | **F3** | ✅ [The Accessible Verdict](454-the-accessible-verdict.md) | **`accname/*` + `wai-aria/role/*`** — what an element IS, and what it is CALLED | **818/853 (95.9%)** — was 0/853 | ⚔️⚔️ | **SECURED (Quests #454–#456, 2026-08-02).** 31 of 34 files to 100%. The 853 zeros were **two missing primitives**, not 853 defects: the engine could not answer "what is this" or "what is it called". Now `Element.computedRole` / `Element.computedLabel`. **Still open in this realm:** `accname/name/shadowdom/` (never measured), `comp_name_from_heading.tentative.html`, and `wai-aria/` OUTSIDE `role/` — the survey put the whole realm at 25.1% and `role/` is now 97.5% of it, so **re-measure before choosing**. The last 30 accname rows are two CSS gaps, not accname gaps (see the scroll's ⭐). |
 | **F4** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | **68/301 · 65/203 · 24/403 (22.6% · 32.0% · 6.0%)**, Chrome 98.7% · 96.1% · 98.8% | ⚔️⚔️⚔️ | **OPEN.** Clicking, typing, selecting. F3 is how an agent reads a page; this is how it acts on one. `selection` at 6% with **zero** could-not-run means the API is present and wrong rather than missing — usually the cheaper shape. |
@@ -309,6 +310,53 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-04 — Quests #460–#462, **The Streaming Verdict** (`streams` **181/1211 → 1390/1474, 94.3%**)
+
+*A stream is how the platform says "here is data, but not all of it, and not yet."* Obscura's
+answer was twenty-five lines, and its `tee()` returned two **empty** streams — which does not
+fail loudly, it just renders nothing. Took the previous session's ⭐ and the frontier survey's
+own **F1b**, which named `streams` *precisely because it sits under `response.body`*.
+
+**61 of 71 files to 100%. Excluding `streams/transferable/` — the one band that needs a
+capability we do not have — we lead Chrome 1390/1398 to 1344/1398 on the identical files.**
+
+- **#460 the readable side** (87/375 → **367/371**). A stream is a QUEUE with a high-water
+  mark, not a buffer; a reader's LOCK is the only thing between a caller and silently
+  interleaved data; and `tee()`'s hard part is not duplication but INDEPENDENCE. Three bugs
+  worth remembering: **`null` is an EMPTY DICTIONARY, not "not an object"** (`typeof null ===
+  'object'` is the whole difference — 25 rows on the most ordinary call in the API);
+  **`releaseLock()` must REJECT every outstanding read** or an `await reader.read()` never
+  returns (54 rows sat as `notrun` behind that one hang); and `return()` joins the same queue
+  `next()` does. `from.any.html` **49/50 against a Chrome at 14/50**; `async-iterator` 41/41
+  against 40/41.
+- **#461 the writable side and the pipe** (68/549 → **546/549**; Chrome 536/549). A writable
+  stream's whole job is to say *"not yet"*. `pipeTo` is a state machine, not a loop: source
+  errors → destination aborted, destination errors → source cancelled, signal aborts → both.
+  **`WritableStreamAbort` must RE-READ the state after signalling** — the signal's listeners
+  run synchronously and one may abort again.
+- **🔍 THE FINDING, and it is not a streams bug: `setTimeout(fn, 0)` was a MICROTASK.**
+  Chasing three piping rows that cancelled a source they should have left alone led out of
+  streams entirely. HTML runs one task, then drains the **entire** microtask queue, then the
+  next task; ours interleaved. Measured: **three of five hundred** chained promise jobs had run
+  by the time a 0ms timer fired. Every idiom meaning *"let everything settle, then look"* was
+  looking at a half-finished world. Fixed by pumping real tasks through `op_sleep(0)` — one at
+  a time, in insertion order. **500/500** after.
+- **#462 the byte stream** (22/248 → **473/474**; every file 100% on the first build). A byte
+  stream lets the READER supply the buffer — the only way to read a large download without
+  allocating per chunk, which on a hand-me-down laptop is the difference between a file that
+  downloads and a tab the OS kills. A buffer crossing the boundary is **transferred, not
+  shared**; a pull-into is satisfied only at an **element boundary**, and the remainder is
+  carried forward rather than dropped. `idlharness` 1/2 TIMEOUT → **227/228**, one ahead of
+  Chrome.
+- **CAPS named:** `streams/transferable/` 0/76 needs stream TRANSFER over `postMessage`
+  (structured-clone transferables + separate realms) — the realm's entire remaining gap to
+  Chrome. `queuing-strategies-size-function-per-global` 0/2 because **iframes share one JS
+  realm** (verified: `iframe.contentWindow.CountQueuingStrategy === window.CountQueuingStrategy`).
+  `readable-streams/patched-global` is an instrumentation artefact — probed directly, `tee()`
+  survives both patches the file installs.
+
+Scroll: [`456-the-streaming-verdict.md`](456-the-streaming-verdict.md).
 
 ### 2026-08-03 — Quests #457–#459, **The Data Layer Verdict** (`fetch` object model **130/566 → 527/598, 88.1%**)
 
