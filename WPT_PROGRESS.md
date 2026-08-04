@@ -46,6 +46,34 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **`webstorage/*` — Quest #463, the remembered verdict (2026-08-04)** | **57/1284** ⁽⁴ files HUNG the engine⁾ | **1281/1288** | **99.5%** | 44 of 51 files to 100%, could-not-run 0. `Storage` is now a real WebIDL legacy platform object (a Proxy with the named getter/setter/deleter), so `localStorage.token = t` finally stores an item. All 7 remaining failures are capability caps (6 × `window.open`, 1 × cross-origin). Scroll: `tickets/457-the-remembered-verdict.md`. |
+| `webstorage/storage_setitem.window.html` | 2/1106 | **1106/1106** | ✅ 100% | **Quest #463.** The named property setter. **+1104.** |
+| `webstorage/storage_key.window.html` | 14/22 | **22/22** | ✅ 100% | **Quest #463.** `key(i + 2**32)` is `key(i)` — WebIDL `unsigned long`. |
+| `webstorage/set.window.html` | 0/20 | **20/20** | ✅ 100% | **Quest #463.** `storage[key] = v` stores an item. **+20.** |
+| `webstorage/symbol-props.window.html` | 14/14 | **14/14** | ✅ held | **Quest #463.** Symbols never take the named path (`Type(P) is String` gates it). |
+| `webstorage/defineProperty.window.html` | 0/12 | **12/12** | ✅ 100% | **Quest #463.** A data descriptor on a string key IS a named set. **+12.** |
+| `webstorage/missing_arguments.window.html` | 0/10 | **10/10** | ✅ 100% | **Quest #463.** Arity TypeErrors. **+10.** |
+| `webstorage/storage_removeitem.window.html` | 2/8 | **8/8** | ✅ 100% | **Quest #463.** **+6.** |
+| `webstorage/storage_getitem.window.html` | 6/8 | **8/8** | ✅ 100% | **Quest #463.** |
+| `webstorage/storage_indexing.window.html` | 6/8 | **8/8** | ✅ 100% | **Quest #463.** Storage has NO indexed getter — `storage[0]` is the key `"0"`. |
+| `webstorage/event_no_duplicates.html` | 2/8 | **8/8** | ✅ 100% | **Quest #463.** Same value → no event; clearing an empty bottle → no event. **+6.** |
+| `webstorage/event_constructor.window.html` | 0/6 | **6/6** | ✅ 100% | **Quest #463.** `StorageEvent`. `url` is a plain USVString, not resolved. **+6.** |
+| `webstorage/event_initstorageevent.window.html` | 0/5 | **5/5** | ✅ 100% | **Quest #463.** **+5.** |
+| `webstorage/storage_enumerate.window.html` | 0/4 | **4/4** | ✅ 100% | **Quest #463.** `Object.keys` sees the keys and nothing else. **+4.** |
+| `webstorage/storage_supported_property_names.window.html` | 0/4 | **4/4** | ✅ 100% | **Quest #463.** **+4.** |
+| `webstorage/storage_in.window.html` | 2/4 | **4/4** | ✅ 100% | **Quest #463.** |
+| `webstorage/storage_length.window.html` | 2/4 | **4/4** | ✅ 100% | **Quest #463.** |
+| `webstorage/storage_builtins.window.html` | 0/2 | **2/2** | ✅ 100% | **Quest #463.** Storage has no `[LegacyOverrideBuiltIns]`: storing under `"getItem"` does not shadow the method. |
+| `webstorage/storage_functions_not_overwritten.window.html` | 2/2 | **2/2** | ✅ held | **Quest #463.** |
+| `webstorage/storage_clear.window.html` | 0/2 | **2/2** | ✅ 100% | **Quest #463.** |
+| `webstorage/storage_string_conversion.window.html` | 0/2 | **2/2** | ✅ 100% | **Quest #463.** |
+| `webstorage/event_basic.html` | 0/2 | **2/2** | ✅ 100% | **Quest #463.** Needed the iframe-renavigation fix (see below). |
+| `webstorage/event_body_attribute.html` | 0/2 | **2/2** | ✅ 100% | **Quest #463.** |
+| `webstorage/event_case_sensitive.html` | 0/2 | **2/2** | ✅ 100% | **Quest #463.** |
+| `webstorage/event_setattribute.html` | 0/2 | **2/2** | ✅ 100% | **Quest #463.** |
+| `webstorage/event_local_*` + `event_session_*` (14 files) | 0/14 | **12/14** | ⬆️ | **Quest #463.** A frame script's bare `localStorage` was the TOP window's, so the top document was skipped by its own broadcast. 2 left are `window.open` caps. **+12.** |
+| `webstorage/storage_{local,session}_setitem_quotaexceedederr.window.html` | **HANG** | **1/1** each | ✅ 100% | **Quest #463.** `while(true) setItem` against a quota-less Storage is an INFINITE LOOP — it wedged the harness twice. A 5 MiB per-bottle quota turns 4 hangs into 4 passes. |
+| `webstorage/storage_{local,session}_quota_independent_from_*.window.html` | **HANG** | **1/1** each | ✅ 100% | **Quest #463.** The two bottles have their own quota. |
 | **`streams/*` — Quests #460–#462, the streaming arc (2026-08-04)** | **181/1211** | **1390/1474** | **94.3%** | 61 of 71 files to 100%. Excluding `streams/transferable/` (a transfer capability we do not have) we score **1390/1398 against a Chrome at 1344/1398** on the identical files. Scroll: `tickets/456-the-streaming-verdict.md`. |
 | `streams/idlharness.any.html` | 1/2 ⏱ | **227/228** | ⬆️ | **Quests #460–#462.** Was a whole-file TIMEOUT. **Chrome scores 226/228.** **+226.** |
 | `streams/piping/abort.any.html` | 1/33 | **33/33** | ✅ 100% | **Quest #461 the writable side & the pipe.**  **+32.** |

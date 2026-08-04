@@ -54,3 +54,17 @@ streams/queuing-strategies.any.html
 #    two break loudly if _scheduleAfter ever goes back to Promise.resolve().then.
 html/webappapis/timers/timer-nesting-not-inherited-in-microtask.html
 html/webappapis/microtask-queuing/queue-microtask.any.html
+# ── webstorage (Quest #463). A real Storage is a Proxy over a shared bottle, and
+#    the event tests ride the FRAME machinery (frame-script globals, frame-window
+#    on* handlers, iframe re-navigation) — so a change to any of those shows here.
+webstorage/storage_setitem.window.html
+webstorage/storage_builtins.window.html
+webstorage/storage_enumerate.window.html
+webstorage/symbol-props.window.html
+webstorage/event_no_duplicates.html
+webstorage/event_basic.html
+webstorage/storage_local_setitem_quotaexceedederr.window.html
+# ── The frame machinery those event tests depend on (Quest #463 found three bugs
+#    here). event-handler-attributes-body-window covers <body on…> reflection.
+html/webappapis/scripting/events/event-handler-attributes-body-window.html
+dom/events/EventTarget-dispatchEvent.html

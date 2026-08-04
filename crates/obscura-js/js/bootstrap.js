@@ -525,6 +525,19 @@ const _bodyWinSetContentAttr = function(el, name, source) {
   // 5-arg OnErrorEventHandler form (event-handler-sourcetext test 5).
   const chain = (w === globalThis) ? [] : [w];
   try { fn = _ehMakeFn(name, name === 'onerror', source, chain); } catch (e) { _reportError(e); fn = null; }
+  // A markup handler that throws inside a FRAME reports to that frame's window,
+  // never to the host page — same rule `_reportFrameError` already enforces for a
+  // frame's <script>. Otherwise an iframe helper written for a different test
+  // (WPT reuses these freely) throws straight into the parent's harness and
+  // Errors the whole page even though every subtest passed. onerror keeps its own
+  // 5-argument path and is left alone.
+  if (fn && w !== globalThis && name !== 'onerror') {
+    const inner = fn;
+    fn = function() {
+      try { return inner.apply(this, arguments); }
+      catch (e) { _reportFrameError(e, w); }
+    };
+  }
   w[name] = fn;
 };
 const _bodyWinRemoveContentAttr = function(el, name) {
@@ -5372,6 +5385,11 @@ class Element extends Node {
   _loadIframeSrc(url) {
     this._srcLoadStarted = true; // markup-src auto-load (below) won't double-fire
     this._loadEventFired = false; // a (re)load fires a fresh element load event
+    // A NEW document means new scripts. `_executeFrameScripts` is idempotent per
+    // frame element, and only the `srcdoc` path used to clear that flag — so a
+    // second `iframe.src = …` built a fresh document and window whose scripts
+    // NEVER RAN. The frame looked loaded (its `load` event fired) and was inert.
+    this._frameScriptsRan = false;
     const _gen = _bumpFrameLoadGen(this); // supersede any pending about:blank load
     const _self = this;
     let fullUrl = url;
@@ -7836,6 +7854,11 @@ const _assignedSlotOf = (n) =>
 // (or null when the event isn't composed and we'd escape the origin shadow tree);
 // a document's parent is its window; a window has no parent.
 const _getEventParent = (node, event, firstIT) => {
+  // Not every EventTarget is a node. IndexedDB has a real propagation path of
+  // its own — request → transaction → connection, which is how `db.onerror`
+  // catches a failed put — so those objects name their own event parent and
+  // ride the same spec dispatcher as the DOM.
+  if (node && typeof node._idbEventParent === 'function') return node._idbEventParent();
   const slot = _assignedSlotOf(node);
   if (slot) return slot;
   if (_isSR(node)) {
@@ -7953,7 +7976,11 @@ const _dispatchSpec = function(target, event, fromPublic) {
       }
       if (_assignedSlotOf(parent)) slottable = parent;
       const prt = _retarget(_rtBase, parent);
-      if (parent === globalThis ||
+      // `_evtPassThrough` marks a non-node ancestor that is NOT a new target —
+      // an IDB transaction/connection is on the path so the event can bubble
+      // through it, but `event.target` stays the request. Without it the
+      // shadow-boundary branch below would retarget at every hop.
+      if (parent === globalThis || parent._evtPassThrough === true ||
           (typeof parent.nodeType === 'number' && _shadowIncAncestor(_nodeRoot(evTarget), parent))) {
         // Same tree as the current target (or the window): a pass-through struct.
         structs.push({ it: parent, sat: null, rt: prt, rct: _rootOfClosed(parent), sct: slotInClosed });
@@ -8068,11 +8095,16 @@ const _runFrameScript = function(code, win, url) {
   try {
     const fn = new Function(
       'window', 'self', 'document', 'location', 'parent', 'top', 'frames',
-      'frameElement', 'globalThis',
+      'frameElement', 'globalThis', 'localStorage', 'sessionStorage',
       code + '\n//# sourceURL=' + (url || 'about:blank-frame')
     );
+    // `localStorage`/`sessionStorage` are shadowed too: a bare reference in a
+    // frame script must reach the FRAME's Storage object, not the top window's.
+    // Without that, `localStorage.setItem(…)` inside an iframe looked like the
+    // top document doing the write, so the top document was skipped by the
+    // storage-event broadcast and never heard about the change at all.
     fn.call(win, win, win, win.document, win.location, win.parent, win.top,
-            win.frames, win.frameElement, win);
+            win.frames, win.frameElement, win, win.localStorage, win.sessionStorage);
   } catch (e) {
     _reportFrameError(e, win);
   }
@@ -8129,11 +8161,16 @@ const _runFrameProgram = function(parts, win, baseUrl) {
     // mid-script throw would silently break the entire frame.
     const fn = new Function(
       'window', 'self', 'document', 'location', 'parent', 'top', 'frames',
-      'frameElement', 'globalThis',
+      'frameElement', 'globalThis', 'localStorage', 'sessionStorage',
       'try {\n' + head + '\n' + body + '\n} finally {\n' + tail + '\n}'
     );
+    // `localStorage`/`sessionStorage` are shadowed too: a bare reference in a
+    // frame script must reach the FRAME's Storage object, not the top window's.
+    // Without that, `localStorage.setItem(…)` inside an iframe looked like the
+    // top document doing the write, so the top document was skipped by the
+    // storage-event broadcast and never heard about the change at all.
     fn.call(win, win, win, win.document, win.location, win.parent, win.top,
-            win.frames, win.frameElement, win);
+            win.frames, win.frameElement, win, win.localStorage, win.sessionStorage);
   } catch (e) {
     _reportFrameError(e, win);
   }
@@ -8192,6 +8229,20 @@ const _executeFrameScripts = async function(iframeEl) {
       parts.push({ code: s.textContent || '', url: base });
     }
   }
+  // A frame's window-reflecting <body on…=…> handlers, installed the same way the
+  // main document's are (__installBodyWindowHandlers). Nothing else ever touches a
+  // frame's <body> wrapper, so an iframe whose only handler is `<body onstorage=…>`
+  // used to hear nothing at all. Installed BEFORE the frame's scripts run so a
+  // later `window.onstorage = …` in frame script wins, as the ordering requires.
+  try {
+    const fb = doc.body;
+    if (fb && fb.getAttribute) {
+      for (const on of _BODY_WINDOW_HANDLERS) {
+        const attr = fb.getAttribute(on);
+        if (attr != null) _bodyWinSetContentAttr(fb, on, attr);
+      }
+    }
+  } catch (e) {}
   if (parts.length) _runFrameProgram(parts, win, base);
   // Frame lifecycle: DOMContentLoaded fires at the frame document and bubbles to
   // the frame window (real Document -> Window path); then `load` fires at the
@@ -8199,7 +8250,8 @@ const _executeFrameScripts = async function(iframeEl) {
   // inside the frame now that those are real (increment 4 step 2).
   try {
     doc.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
-    if (typeof win.onload === 'function') { try { win.onload(new Event('load')); } catch (e) {} }
+    // `win.onload` is a handler accessor now (it registers a listener), so the
+    // dispatch below delivers it — an explicit call here would fire it twice.
     win.dispatchEvent(new Event('load'));
   } catch (e) {}
 };
@@ -33645,17 +33697,250 @@ globalThis.structuredClone = globalThis.structuredClone || (function () {
 if (typeof globalThis.crossOriginIsolated === "undefined") globalThis.crossOriginIsolated = false;
 globalThis.reportError = globalThis.reportError || ((e) => console.error(e));
 
-globalThis.Storage = function Storage() {};
-Storage.prototype.getItem = function(k) { return (this._data && this._data[k]) ?? null; };
-Storage.prototype.setItem = function(k, v) { if (this._data) this._data[k] = String(v); };
-Storage.prototype.removeItem = function(k) { if (this._data) delete this._data[k]; };
-Storage.prototype.clear = function() { if (this._data) for (var k in this._data) delete this._data[k]; };
-Object.defineProperty(Storage.prototype, 'length', { get: function() { return this._data ? Object.keys(this._data).length : 0; } });
-Storage.prototype.key = function(i) { return this._data ? Object.keys(this._data)[i] ?? null : null; };
+// ---------------------------------------------------------------------------
+// Storage — the real thing (HTML: "The Storage interface").
+//
+// A Storage object is a WebIDL *legacy platform object*: it has a named getter,
+// a named setter and a named deleter, and that is the whole reason
+// `localStorage.token = t` stores an item, `"token" in localStorage` is true,
+// `Object.keys(localStorage)` lists your keys, and `delete localStorage.token`
+// logs you out. The old stub here was a plain object over a `_data` bag, so
+// every one of those spellings silently did the wrong thing — it wrote an
+// ordinary JS property that `getItem` could never see. A great many real pages
+// (and very nearly every "remember me" checkbox) are written exactly that way,
+// and on this browser they were quietly forgetting you on each navigation.
+//
+// JavaScript gives us exactly one way to build a legacy platform object: a
+// Proxy. The traps below are the WebIDL algorithms in order, with the *named
+// property visibility* algorithm doing the load-bearing work — it is what keeps
+// `storage.getItem` the method even after `storage.getItem = "x"` has stored an
+// item under that name, because Storage has no [LegacyOverrideBuiltIns].
+// ---------------------------------------------------------------------------
 
-const _mkStore = () => { var s = Object.create(Storage.prototype); s._data = {}; return s; };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+// A storage *bottle*: the shared key→value map behind every window's Storage
+// object for one (origin, kind) pair, plus a running byte count for the quota.
+// Windows get DISTINCT Storage objects over a SHARED bottle — that separation is
+// what lets a `storage` event know which document made the change and skip it,
+// which is the entire semantics of the event.
+const _storageBottles = {
+  local: { map: new Map(), used: 0 },
+  session: { map: new Map(), used: 0 },
+};
+// Every live Window (main + frames), for the storage-event broadcast.
+const _storageWindows = [];
+// Storage proxy → its state. Keyed off the proxy because the prototype methods
+// are called with `this` === the proxy.
+const _storageStates = new WeakMap();
+
+// 5 MiB per bottle, counted in UTF-16 code units over keys + values. The number
+// is not in the spec; it is the de-facto quota every engine ships, and WPT only
+// asks that *some* finite quota exists and that the two bottles have their own.
+const _STORAGE_QUOTA = 5 * 1024 * 1024;
+
+const _storageState = (o) => {
+  const st = _storageStates.get(o);
+  if (st === undefined) throw new TypeError("Illegal invocation");
+  return st;
+};
+
+// HTML "broadcast": queue a global task on every OTHER same-origin window to
+// fire a `storage` event. `storageArea` is the *receiving* window's own Storage
+// object (WPT's event_no_duplicates asserts exactly that identity), and `url` is
+// the URL of the document that made the change.
+function _storageBroadcast(state, key, oldValue, newValue) {
+  let url = "";
+  try { url = String(state.win.location.href); } catch (e) { url = ""; }
+  for (let i = 0; i < _storageWindows.length; i++) {
+    const win = _storageWindows[i];
+    if (win === state.win) continue;
+    const area = (state.kind === 'local') ? win.localStorage : win.sessionStorage;
+    if (!area || typeof win.dispatchEvent !== 'function') continue;
+    // A task, not a microtask: HTML queues a global task per window, and after
+    // Quest #461 `setTimeout(…, 0)` is a real task in insertion order.
+    setTimeout(() => {
+      win.dispatchEvent(new StorageEvent('storage', {
+        key, oldValue, newValue, url, storageArea: area,
+      }));
+    }, 0);
+  }
+}
+
+function _storageSetItem(state, key, value) {
+  key = String(key); value = String(value);
+  const map = state.bottle.map;
+  const had = map.has(key);
+  const old = had ? map.get(key) : null;
+  // "If oldValue is value, return" — no change, no event (event_no_duplicates).
+  if (had && old === value) return;
+  const delta = (key.length + value.length) - (had ? key.length + old.length : 0);
+  if (state.bottle.used + delta > _STORAGE_QUOTA)
+    throw new QuotaExceededError("Setting the value exceeded the storage quota.");
+  map.set(key, value);
+  state.bottle.used += delta;
+  _storageBroadcast(state, key, old, value);
+}
+
+function _storageRemoveItem(state, key) {
+  key = String(key);
+  const map = state.bottle.map;
+  if (!map.has(key)) return;   // removing a missing key fires nothing
+  const old = map.get(key);
+  map.delete(key);
+  state.bottle.used -= key.length + old.length;
+  _storageBroadcast(state, key, old, null);
+}
+
+class Storage {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get length() { return _storageState(this).bottle.map.size; }
+  key(n) {
+    const st = _storageState(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'key' on 'Storage': 1 argument required.");
+    // WebIDL `unsigned long`: key(i + 2**32) must behave like key(i).
+    n = Number(n); n = Number.isFinite(n) ? (n >>> 0) : 0;
+    if (n >= st.bottle.map.size) return null;
+    let i = 0;
+    for (const k of st.bottle.map.keys()) { if (i++ === n) return k; }
+    return null;
+  }
+  getItem(key) {
+    const st = _storageState(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'getItem' on 'Storage': 1 argument required.");
+    key = String(key);
+    return st.bottle.map.has(key) ? st.bottle.map.get(key) : null;
+  }
+  setItem(key, value) {
+    const st = _storageState(this);
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'setItem' on 'Storage': 2 arguments required.");
+    _storageSetItem(st, key, value);
+  }
+  removeItem(key) {
+    const st = _storageState(this);
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'removeItem' on 'Storage': 1 argument required.");
+    _storageRemoveItem(st, key);
+  }
+  clear() {
+    const st = _storageState(this);
+    // Clearing an already-empty bottle changes nothing, so it fires nothing.
+    if (st.bottle.map.size === 0) return;
+    st.bottle.map.clear();
+    st.bottle.used = 0;
+    _storageBroadcast(st, null, null, null);
+  }
+}
+globalThis.Storage = _markNative(Storage);
+
+// Build one window's Storage object over a bottle.
+function _mkStore(kind, win) {
+  const bottle = _storageBottles[kind];
+  const state = { kind, bottle, win };
+  const target = Object.create(Storage.prototype);
+
+  // WebIDL "named property visibility": P names a stored item, the object has no
+  // ordinary own property P, and nothing on the prototype chain owns P either.
+  // That last clause is why `storage.length` stays the getter and
+  // `storage.getItem` stays the method no matter what you store under those names.
+  const visible = (p) => {
+    if (typeof p === 'symbol') return false;
+    if (!bottle.map.has(p)) return false;
+    if (Reflect.getOwnPropertyDescriptor(target, p) !== undefined) return false;
+    let proto = Reflect.getPrototypeOf(target);
+    while (proto !== null) {
+      if (Object.getOwnPropertyDescriptor(proto, p) !== undefined) return false;
+      proto = Reflect.getPrototypeOf(proto);
+    }
+    return true;
+  };
+
+  let proxy;
+  proxy = new Proxy(target, {
+    get(t, p, receiver) {
+      if (visible(p)) return bottle.map.get(p);
+      return Reflect.get(t, p, receiver);
+    },
+    getOwnPropertyDescriptor(t, p) {
+      if (visible(p))
+        return { value: bottle.map.get(p), writable: true, enumerable: true, configurable: true };
+      return Reflect.getOwnPropertyDescriptor(t, p);
+    },
+    has(t, p) { return visible(p) || Reflect.has(t, p); },
+    // [[Set]]: "if O and Receiver are the same object and P is a String, invoke
+    // the named property setter" — unconditionally, shadowing or not. Symbols
+    // fall through to ordinary behaviour and land on the target.
+    set(t, p, v, receiver) {
+      if (receiver === proxy && typeof p === 'string') { _storageSetItem(state, p, v); return true; }
+      return Reflect.set(t, p, v, receiver);
+    },
+    // [[DefineOwnProperty]]: a data descriptor for a string key is a named set;
+    // an accessor descriptor is rejected.
+    defineProperty(t, p, desc) {
+      if (typeof p === 'symbol' || Reflect.getOwnPropertyDescriptor(t, p) !== undefined)
+        return Reflect.defineProperty(t, p, desc);
+      if ('get' in desc || 'set' in desc) return false;
+      _storageSetItem(state, p, desc.value);
+      return true;
+    },
+    deleteProperty(t, p) {
+      if (visible(p)) { _storageRemoveItem(state, p); return true; }
+      return Reflect.deleteProperty(t, p);
+    },
+    // WebIDL order: supported property names, then ordinary own strings, then symbols.
+    ownKeys(t) {
+      const keys = [];
+      for (const k of bottle.map.keys()) keys.push(k);
+      const own = Reflect.ownKeys(t);
+      for (const k of own) if (typeof k === 'string' && !bottle.map.has(k)) keys.push(k);
+      for (const k of own) if (typeof k === 'symbol') keys.push(k);
+      return keys;
+    },
+  });
+  _storageStates.set(proxy, state);
+  return proxy;
+}
+
+// StorageEvent — the notification a document gets when *another* document in the
+// same origin changed storage under it.
+class StorageEvent extends Event {
+  // `init = undefined` (not a bare param) so `StorageEvent.length` is 1, which
+  // WPT checks directly — custom bindings get this wrong often enough to test.
+  constructor(type, init = undefined) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'StorageEvent': 1 argument required.");
+    const o = (init == null) ? {} : init;
+    super(type, o);
+    // The base Event maps `undefined` to "" (its no-argument fallback); here the
+    // argument was definitely supplied, so WebIDL's DOMString conversion applies
+    // and `new StorageEvent(undefined)` really does have type "undefined".
+    this.type = String(type);
+    this._key = (o.key === undefined || o.key === null) ? null : String(o.key);
+    this._oldValue = (o.oldValue === undefined || o.oldValue === null) ? null : String(o.oldValue);
+    this._newValue = (o.newValue === undefined || o.newValue === null) ? null : String(o.newValue);
+    // `url` is a plain USVString, NOT a URL: it is not resolved, and `undefined`
+    // means the "" default while `null` stringifies to "null".
+    this._url = (o.url === undefined) ? "" : String(o.url);
+    this._storageArea = (o.storageArea === undefined || o.storageArea === null) ? null : o.storageArea;
+  }
+  get key() { return this._key; }
+  get oldValue() { return this._oldValue; }
+  get newValue() { return this._newValue; }
+  get url() { return this._url; }
+  get storageArea() { return this._storageArea; }
+  // Legacy initialiser — same shape as initEvent, plus the five members.
+  initStorageEvent(type, bubbles = false, cancelable = false, key = null,
+                   oldValue = null, newValue = null, url = "", storageArea = null) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'initStorageEvent' on 'StorageEvent': 1 argument required.");
+    if (typeof this.initEvent === 'function') this.initEvent(String(type), !!bubbles, !!cancelable);
+    this._key = (key === undefined || key === null) ? null : String(key);
+    this._oldValue = (oldValue === undefined || oldValue === null) ? null : String(oldValue);
+    this._newValue = (newValue === undefined || newValue === null) ? null : String(newValue);
+    this._url = (url === undefined) ? "" : String(url);
+    this._storageArea = (storageArea === undefined || storageArea === null) ? null : storageArea;
+  }
+}
+globalThis.StorageEvent = _markNative(StorageEvent);
+
+globalThis.localStorage = _mkStore('local', globalThis);
+globalThis.sessionStorage = _mkStore('session', globalThis);
+_storageWindows.push(globalThis);
 
 // btoa / atob — HTML spec base64 over a BYTE string (NOT UTF-8: the old stub
 // TextEncoder-encoded, so btoa("\x80") gave "woA=" instead of "gA==").
@@ -39785,8 +40070,21 @@ class _IframeWindow {
     this.navigator = globalThis.navigator;
     this.screen = globalThis.screen;
     this.devicePixelRatio = globalThis.devicePixelRatio;
-    this.localStorage = globalThis.localStorage;
-    this.sessionStorage = globalThis.sessionStorage;
+    // Each window gets its OWN Storage objects over the SHARED bottles — same
+    // data, distinct objects. That is what a `storage` event is built on: the
+    // document that made the change is skipped, and every other window sees the
+    // change through its own `event.storageArea`.
+    this.localStorage = _mkStore('local', this);
+    this.sessionStorage = _mkStore('session', this);
+    // Navigating an <iframe> builds a NEW window for the same element; the old
+    // one is gone as far as the page is concerned, so drop it from the broadcast
+    // list. Otherwise every `iframe.src = …` left another dead listener behind
+    // and one write produced two `storage` events.
+    if (hostEl) {
+      for (let i = _storageWindows.length - 1; i >= 0; i--)
+        if (_storageWindows[i]._hostEl === hostEl) _storageWindows.splice(i, 1);
+    }
+    _storageWindows.push(this);
     this.performance = globalThis.performance;
     this.crypto = globalThis.crypto;
     this.console = globalThis.console;
@@ -39833,6 +40131,13 @@ class _IframeWindow {
         }
       },
     });
+    // Own `on<type>` slots, so a frame's handler registers a listener on the
+    // FRAME (exactly as onerror does above) instead of becoming an inert data
+    // property. A `<body onstorage=…>` inside an iframe reflects onto its window
+    // through these; without them the assignment landed nowhere and the frame
+    // never heard its own events. Null slots also stop the Proxy's globalThis
+    // fallback from leaking the MAIN window's handler into an unset frame one.
+    for (const _slot of _FRAME_ONHANDLER_SLOTS) this[_slot] = null;
     // Same-origin frames share the page's single JS realm, so anything the frame
     // window doesn't define itself (global constructors like DOMException/Node/
     // Event, etc.) falls through to globalThis. Frame-specific props (document,
@@ -39851,10 +40156,9 @@ class _IframeWindow {
       origin: this.location.origin,
       source: globalThis,
     });
-    Promise.resolve().then(() => {
-      this.dispatchEvent?.(event);
-      if (typeof this.onmessage === 'function') { try { this.onmessage(event); } catch (e) {} }
-    });
+    // `onmessage` is now a real handler accessor (it registers a listener), so
+    // dispatchEvent alone delivers it — calling it again here would double-fire.
+    Promise.resolve().then(() => { this.dispatchEvent?.(event); });
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -39891,6 +40195,32 @@ class _IframeWindow {
   close() { this.closed = true; }
   focus() {}
   blur() {}
+}
+
+// The frame-window event-handler IDL attributes. `onerror` keeps its bespoke
+// 5-argument accessor defined in the constructor and is deliberately absent here.
+const _FRAME_ONHANDLER_SLOTS = [];
+for (const _ev of [
+  "abort","afterprint","beforeprint","beforeunload","blur","cancel","change","click",
+  "close","contextmenu","dblclick","focus","focusin","focusout","formdata",
+  "hashchange","input","invalid","keydown","keypress","keyup","languagechange",
+  "load","message","messageerror","mousedown","mouseenter","mouseleave","mousemove",
+  "mouseout","mouseover","mouseup","offline","online","pagehide","pagereveal",
+  "pageshow","pageswap","paste","popstate","rejectionhandled","reset","resize",
+  "scroll","select","storage","submit","toggle","unhandledrejection","unload","wheel",
+]) {
+  const _name = "on" + _ev, _slot = "__winon_" + _ev, _type = _ev;
+  _FRAME_ONHANDLER_SLOTS.push(_slot);
+  Object.defineProperty(_IframeWindow.prototype, _name, {
+    configurable: true, enumerable: true,
+    get() { return this[_slot] || null; },
+    set(fn) {
+      const cur = this[_slot];
+      if (cur) _removeListenerByKey(this._evtKey, _type, cur);
+      this[_slot] = (typeof fn === 'function') ? fn : null;
+      if (this[_slot]) _addListenerByKey(this._evtKey, _type, this[_slot]);
+    },
+  });
 }
 
 const __ariaQuerySelector = function(root, selector) { return null; };

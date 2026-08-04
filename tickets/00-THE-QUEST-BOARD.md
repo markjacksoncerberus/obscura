@@ -28,7 +28,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | **F1a** | ✅ [The Data Layer Verdict](455-the-data-layer-verdict.md) | **`fetch/api/{headers,request,response}/*`** — the fetch OBJECT MODEL | **527/598 (88.1%)** — was 130/566 (23.0%) | ⚔️⚔️ | **SECURED (Quests #457–#459, 2026-08-03).** 27 of 32 files to 100%, two more at exact Chrome parity. `Headers`/`Request`/`Response` were stubs wearing the name of a class. **Also killed a HANG**: `request-bad-port` 0/83 TIMEOUT → 83/83 (fetch's 83 blocked ports, in Rust). **Still open in `fetch`:** `fetch/api/basic/*` and `fetch/api/cors/*` — network BEHAVIOUR rather than object model, spot-checked and scoreable (`basic/request-headers` 1/25, `basic/response-url` 0/4). |
 | **F1b** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **`streams/*`** — what sits underneath `response.body` | **1390/1474 (94.3%)** — was 181/1211 (14.9%) | ⚔️⚔️ | **SECURED (Quests #460–#462, 2026-08-04).** 61 of 71 files to 100%. The old `ReadableStream` was 25 lines and its `tee()` returned two **empty** streams. Built the whole standard: readable + BYOB byte streams, writable, `pipeTo`/`pipeThrough`, `TransformStream`, both tees, queuing strategies. **Excluding `streams/transferable/` (a transfer capability we do not have) we lead Chrome 1390/1398 to 1344/1398 on the identical files.** **And found the platform bug underneath it: `setTimeout(fn, 0)` was a MICROTASK** — see F8. |
 | **F8** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **The event loop — a task is not a microtask** | **FIXED (Quest #461, 2026-08-04)** | ⚔️ | `setTimeout(fn, 0)` was `Promise.resolve().then(fn)`. HTML runs one TASK then drains the ENTIRE microtask queue; a zero-delay timer scheduled as a microtask INTERLEAVES with the promise jobs already queued. Measured: **3 of 500** chained promise jobs had run when a 0ms timer fired (now 500/500). Every `await delay(0)` on the platform — including WPT's own `flushAsyncEvents` — was looking at a half-finished world. Fixed by pumping real tasks through `op_sleep(0)`, one at a time, in insertion order. Swept before/after on 56 timer-heavy files (`scripts/wpt-eventloop-sweep.txt`). |
-| **F2** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **2/259 · 30/86 · 12/417 (0.8% · 34.9% · 2.9%)**, Chrome 96.9% · 86.0% · 99.8% | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
+| **F2** | 🔶 [The Remembered Verdict](457-the-remembered-verdict.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **`webstorage` DONE (Quest #463): 57/1284 → 1281/1288, 99.5%.** `cookies` 2/259 and `IndexedDB` 12/417 still OPEN | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
 | **F3** | ✅ [The Accessible Verdict](454-the-accessible-verdict.md) | **`accname/*` + `wai-aria/role/*`** — what an element IS, and what it is CALLED | **818/853 (95.9%)** — was 0/853 | ⚔️⚔️ | **SECURED (Quests #454–#456, 2026-08-02).** 31 of 34 files to 100%. The 853 zeros were **two missing primitives**, not 853 defects: the engine could not answer "what is this" or "what is it called". Now `Element.computedRole` / `Element.computedLabel`. **Still open in this realm:** `accname/name/shadowdom/` (never measured), `comp_name_from_heading.tentative.html`, and `wai-aria/` OUTSIDE `role/` — the survey put the whole realm at 25.1% and `role/` is now 97.5% of it, so **re-measure before choosing**. The last 30 accname rows are two CSS gaps, not accname gaps (see the scroll's ⭐). |
 | **F4** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | **68/301 · 65/203 · 24/403 (22.6% · 32.0% · 6.0%)**, Chrome 98.7% · 96.1% · 98.8% | ⚔️⚔️⚔️ | **OPEN.** Clicking, typing, selecting. F3 is how an agent reads a page; this is how it acts on one. `selection` at 6% with **zero** could-not-run means the API is present and wrong rather than missing — usually the cheaper shape. |
 | **F5** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`quirks/*` + `css/CSS2/*`** — the old web | **75/156 · 350/440 (48.1% · 79.5%)**, Chrome 98.1% · 100% | ⚔️ | **OPEN — the cheapest rows on the map.** `css/CSS2` at 79.5% is the highest score in the whole survey. Quirks mode is not legacy trivia for our audience: the hand-me-down-laptop web is full of pages written in 2004, and they are exactly the pages that must not break. |
@@ -310,6 +310,45 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-04 — Quest #463, **The Remembered Verdict** (`webstorage` **57/1284 → 1281/1288, 99.5%**)
+
+*A browser that forgets you on every navigation is a browser you cannot use.* Took the
+frontier survey's **F2** band over the banked ⭐ (which pointed into `fetch`, a realm we hold
+at 88%), exactly as the standing order says. **44 of 51 files to 100%, could-not-run 0, and
+every one of the 7 remaining failures is a capability cap, not a bug.**
+
+- **`Storage` was a plain object with a `_data` bag.** It is a WebIDL **legacy platform
+  object** — named getter, named setter, named deleter — and JS has exactly one way to build
+  one: a **Proxy**. Without it `localStorage.token = t` wrote an ordinary JS property that
+  `getItem` could never see. It did not throw. It did not warn. Very nearly every "remember
+  me" checkbox is written that way, and on this browser all of them silently forgot you.
+- **The load-bearing piece is the *named property visibility* algorithm**, not the `get`
+  trap: a name is invisible if anything on the prototype chain owns it. That is why
+  `storage.getItem = "x"` stores an item **and** `storage.getItem` is still the method
+  (Storage has no `[LegacyOverrideBuiltIns]`). Symbols never take the named path at all.
+- **🔍 Four files were an INFINITE LOOP, not a failure.** `while (true) setItem(…)` against a
+  quota-less Storage is a page the engine can never leave. It **wedged the harness twice** —
+  a full-realm baseline ran 96 minutes and died there; a single file with a 15s budget could
+  not be killed inside 180s. A 5 MiB per-bottle quota turns 4 hangs into 4 passes.
+- **A `storage` event is "someone ELSE changed this"** — so every window needs its **own**
+  Storage object over a **shared bottle**. One shared object cannot say who made the change.
+- **Three engine bugs underneath, none of them about storage.** (1) A frame script's bare
+  `localStorage` resolved to the **top** window's, so an iframe's write looked like the top
+  document's and the top document was skipped by its own broadcast. (2) A frame window's
+  `on<type>` handlers were inert data properties — only `onerror` had a real accessor.
+  (3) **⭐ An iframe re-navigated by `src` never ran its new document's scripts** —
+  `_executeFrameScripts` is idempotent per element and only the `srcdoc` path cleared the
+  flag, so the second `iframe.src = …` built a fresh document and window, fired a fresh
+  `load`, and ran **not one line**. It hid perfectly: WPT's `testStorages` runs each test
+  twice against one iframe and the *first* run always passed, so four files sat at exactly
+  1/2 and read like flaky async. What exposed it was pruning dead windows from the broadcast
+  and watching the score go **2/2 → 1/2** — the shape of *"the thing still answering was the
+  corpse."* One line; its tail runs far past this realm.
+- Sweep: ritual **7725/7820**, every held row exact. Widened by 8 probes for the shared
+  event/frame paths (`event-handler-attributes-body-window` 140/140, `EventTarget-dispatchEvent`
+  25/25); the two unknown rows were **stash-verified against a rebuilt pre-change binary**
+  rather than assumed. Scroll: [`457-the-remembered-verdict.md`](457-the-remembered-verdict.md).
 
 ### 2026-08-04 — Quests #460–#462, **The Streaming Verdict** (`streams` **181/1211 → 1390/1474, 94.3%**)
 
