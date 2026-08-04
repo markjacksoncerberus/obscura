@@ -850,6 +850,40 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
 /// Matches reqwest's default policy of 10.
 const FETCH_REDIRECT_LIMIT: usize = 10;
 
+/// Turn a JS-side header value into bytes on the wire.
+///
+/// Two things the obvious `req.header(k, v)` gets wrong, both of which WPT's
+/// `fetch/api/headers/header-values*` measure directly:
+///
+/// 1. **A header value is a ByteString, not a UTF-8 string.** Every code unit is
+///    one byte, so `"x\u{e9}x"` is the three bytes `78 E9 78` — not the four that
+///    Rust's UTF-8 `as_bytes()` produces. When every char fits in a byte we encode
+///    latin-1, which is byte-identical to UTF-8 for the ASCII that internal
+///    callers (`Origin`, `Cookie`, …) send, and correct for the rest.
+/// 2. **`HeaderValue`'s checked constructor is stricter than HTTP.** Fetch admits
+///    every byte except NUL, CR and LF; `http` also refuses the other C0 controls,
+///    which made `fetch()` reject with an opaque "builder error" for values Chrome
+///    sends without complaint. We re-check the three bytes that actually matter —
+///    the ones that would let a value forge a second request — and then bypass the
+///    stricter check, rather than failing the whole request over a `\x01`.
+fn header_value_bytes(v: &str) -> Option<reqwest::header::HeaderValue> {
+    let bytes: Vec<u8> = if v.chars().all(|c| (c as u32) <= 0xFF) {
+        v.chars().map(|c| c as u8).collect()
+    } else {
+        v.as_bytes().to_vec()
+    };
+    // Header splitting is the whole reason `HeaderValue` validates at all; keep
+    // that invariant even on the unchecked path below.
+    if bytes.iter().any(|b| matches!(b, 0x00 | b'\r' | b'\n')) {
+        return None;
+    }
+    if let Ok(hv) = reqwest::header::HeaderValue::from_bytes(&bytes) {
+        return Some(hv);
+    }
+    // SAFETY: checked immediately above that the value contains no NUL/CR/LF.
+    Some(unsafe { reqwest::header::HeaderValue::from_maybe_shared_unchecked(bytes) })
+}
+
 #[op2(async)]
 #[string]
 async fn op_fetch_url(
@@ -864,6 +898,20 @@ async fn op_fetch_url(
     tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
 
     if let Ok(parsed_url) = url::Url::parse(&url) {
+        // A blocked port is a fetch NETWORK ERROR — reported separately from the
+        // policy blocks below, because script must see it as a plain TypeError
+        // rather than as an abort.
+        if let Some(port) = is_blocked_port(&parsed_url) {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": url,
+                "headers": {},
+                "blocked": true,
+                "portBlocked": true,
+                "error": format!("Port {} is blocked", port),
+            }).to_string());
+        }
         if let Err(e) = validate_fetch_url(&parsed_url) {
             return Ok(serde_json::json!({
                 "status": 0,
@@ -1061,7 +1109,12 @@ async fn perform_fetch_core(
         }
 
         for (k, v) in &custom_headers {
-            req = req.header(k.as_str(), v.as_str());
+            // A value we cannot represent on the wire (NUL/CR/LF) is dropped
+            // rather than failing the request: the JS side already rejected those
+            // with a TypeError, so reaching here means an internal caller.
+            if let Some(hv) = header_value_bytes(v) {
+                req = req.header(k.as_str(), hv);
+            }
         }
 
         if !current_body.is_empty() {
@@ -1082,7 +1135,17 @@ async fn perform_fetch_core(
             if let Some(ref counter) = in_flight {
                 counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
-            e.to_string()
+            // reqwest's own Display is just "error sending request for url (…)",
+            // which says nothing about WHY. Walk the source chain so a failed
+            // fetch reports the actual cause to whoever has to debug it.
+            let mut msg = e.to_string();
+            let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+            while let Some(s) = src {
+                msg.push_str(": ");
+                msg.push_str(&s.to_string());
+                src = std::error::Error::source(s);
+            }
+            msg
         })?;
 
         if let Some(ref counter) = in_flight {
@@ -1161,10 +1224,15 @@ async fn perform_fetch_core(
 
     let status = response.status().as_u16();
 
+    // Decode header values as latin-1, not UTF-8: a header value is a ByteString,
+    // so JS must see one code unit per byte. `to_str()` accepts only visible
+    // ASCII and we were mapping everything else to the empty string — a response
+    // header carrying any byte outside that range simply VANISHED before script
+    // could read it.
     let resp_headers: std::collections::HashMap<String, String> = response
         .headers()
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .map(|(k, v)| (k.to_string(), v.as_bytes().iter().map(|b| *b as char).collect::<String>()))
         .collect();
 
     if is_cross_origin && mode == "cors" {
@@ -1294,6 +1362,31 @@ fn glob_match(pattern: &str, url: &str) -> bool {
         return url.starts_with(&pattern[..pattern.len() - 1]);
     }
     url == pattern
+}
+
+/// Fetch §port blocking — the ports a browser must never speak HTTP to.
+///
+/// Every entry is a protocol whose server can be driven by a carefully shaped
+/// HTTP request: SMTP (25), IMAP (143), IRC (6667), SSH (22), NFS (2049)… A
+/// browser without this list is a cross-protocol attack proxy — a page can post
+/// a form whose body is a valid SMTP conversation and mail from the user's own
+/// machine. The list is also why the engine no longer HANGS on these ports: we
+/// used to open the connection and wait, so one `fetch()` could wedge a tab.
+///
+/// Sorted ascending — `binary_search` depends on it.
+const BLOCKED_PORTS: &[u16] = &[
+    0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101,
+    102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427,
+    465, 512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
+    993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667,
+    6668, 6669, 6679, 6697, 10080,
+];
+
+/// Whether a URL names a port fetch must refuse. `url.port()` is `None` for the
+/// scheme's default port (80/443), which is never on the list.
+fn is_blocked_port(url: &url::Url) -> Option<u16> {
+    let port = url.port()?;
+    BLOCKED_PORTS.binary_search(&port).ok().map(|_| port)
 }
 
 fn validate_fetch_url(url: &url::Url) -> Result<(), String> {

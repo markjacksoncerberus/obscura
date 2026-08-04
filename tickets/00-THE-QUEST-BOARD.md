@@ -25,7 +25,8 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
-| **F1** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`fetch/*` + `streams/*`** — the data layer of every modern page | **187/1204 · 77/585 (15.5% · 13.2%)**, Chrome 92.3% · 99.5% | ⚔️⚔️ | **OPEN — TOP PRIORITY. The largest winnable block on the map.** A page whose `fetch()` fails does not render badly, it renders **EMPTY**. Start with `fetch/api/headers/`, `fetch/api/request/`, `fetch/api/response/` — pure object-model files with no network dependency, very likely the same "build the class properly" shape that took `css-typed-om` from 65 to 10,815 in #446. `streams` sits underneath (`response.body`), so treat the two as one region. |
+| **F1a** | ✅ [The Data Layer Verdict](455-the-data-layer-verdict.md) | **`fetch/api/{headers,request,response}/*`** — the fetch OBJECT MODEL | **527/598 (88.1%)** — was 130/566 (23.0%) | ⚔️⚔️ | **SECURED (Quests #457–#459, 2026-08-03).** 27 of 32 files to 100%, two more at exact Chrome parity. `Headers`/`Request`/`Response` were stubs wearing the name of a class. **Also killed a HANG**: `request-bad-port` 0/83 TIMEOUT → 83/83 (fetch's 83 blocked ports, in Rust). **Still open in `fetch`:** `fetch/api/basic/*` and `fetch/api/cors/*` — network BEHAVIOUR rather than object model, spot-checked and scoreable (`basic/request-headers` 1/25, `basic/response-url` 0/4). |
+| **F1b** | ⭐ [The Data Layer Verdict](455-the-data-layer-verdict.md) | **`streams/*`** — what sits underneath `response.body` | **77/585 (13.2%)**, Chrome 99.5% | ⚔️⚔️ | **OPEN — TOP PRIORITY, and now directly in front of us.** `response-clone.any.html` 6/21 is not a Response bug: 15 of its rows need a real `ReadableStream`, whose `tee()` currently returns two **empty** streams (bootstrap.js ~40390, a ~25-line stub). The body mixin from #459 already hands out real streams for real bodies, so this class is the only thing left in the way. One class, 585 subtests in its own realm, plus the tail it unblocks in `fetch`. |
 | **F2** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **2/259 · 30/86 · 12/417 (0.8% · 34.9% · 2.9%)**, Chrome 96.9% · 86.0% · 99.8% | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
 | **F3** | ✅ [The Accessible Verdict](454-the-accessible-verdict.md) | **`accname/*` + `wai-aria/role/*`** — what an element IS, and what it is CALLED | **818/853 (95.9%)** — was 0/853 | ⚔️⚔️ | **SECURED (Quests #454–#456, 2026-08-02).** 31 of 34 files to 100%. The 853 zeros were **two missing primitives**, not 853 defects: the engine could not answer "what is this" or "what is it called". Now `Element.computedRole` / `Element.computedLabel`. **Still open in this realm:** `accname/name/shadowdom/` (never measured), `comp_name_from_heading.tentative.html`, and `wai-aria/` OUTSIDE `role/` — the survey put the whole realm at 25.1% and `role/` is now 97.5% of it, so **re-measure before choosing**. The last 30 accname rows are two CSS gaps, not accname gaps (see the scroll's ⭐). |
 | **F4** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | **68/301 · 65/203 · 24/403 (22.6% · 32.0% · 6.0%)**, Chrome 98.7% · 96.1% · 98.8% | ⚔️⚔️⚔️ | **OPEN.** Clicking, typing, selecting. F3 is how an agent reads a page; this is how it acts on one. `selection` at 6% with **zero** could-not-run means the API is present and wrong rather than missing — usually the cheaper shape. |
@@ -308,6 +309,53 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-03 — Quests #457–#459, **The Data Layer Verdict** (`fetch` object model **130/566 → 527/598, 88.1%**)
+
+*A page whose `fetch()` fails does not render badly — it renders **empty**.* Took the
+frontier survey's own **#1 recommendation** (`fetch` + `streams`); the previous session took
+its #3. The baseline had **zero could-not-run**: nothing was missing, everything was wrong —
+the cheapest shape a big failing realm can have.
+
+- **#457 the header list.** `Headers` is not a map. It is an ordered LIST in which two
+  entries may share a name — `Set-Cookie` routinely does — and stored as `{name: value}`
+  **`append()` OVERWROTE**: two cookies arrived, one survived. `get()` COMBINES with `", "`;
+  iteration is sorted and combined **except `set-cookie`**, which yields one entry per value.
+  The iterator holds a **live index** (delete mid-loop skips an entry, prepend repeats the
+  current one — four tests, and only a live index gets all four). Guards refuse **silently**.
+  **The `no-cors` safelist is checked against what the header WOULD BECOME, not against what
+  you appended.** All eight `headers-*` files to 100% on the first build; `header-setcookie`
+  24/24. Rust half: **a header value is a ByteString** — values went out UTF-8-encoded, and
+  response values were **vanishing** (`to_str()` accepts only visible ASCII, rest → `""`).
+- **#458 the Request.** Every attribute a read-only accessor on the **prototype** — a request
+  that can be mutated after construction can be re-aimed after it was vetted. Every
+  unhonourable init refused at construction (credentials in the URL, `mode:"navigate"`,
+  a non-null `window`, `CONNECT`/`TRACE`/`TRACK`, `no-cors` with a method a plain form could
+  not send). **And a HANG killed: `request-bad-port` 0/83 TIMEOUT → 83/83.** Fetch's blocked
+  port list is not trivia — every entry is a protocol a shaped HTTP request can *drive*
+  (SMTP, IMAP, IRC, SSH, NFS); without it a browser is a cross-protocol attack proxy, and one
+  `fetch()` could wedge a tab. Fixed in Rust, so XHR and subresources are covered too.
+- **#459 the Response and the body.** Refusals distinguish **which kind of wrong**: a status
+  outside 200–599 is a **RangeError**, a reason phrase with a newline a **TypeError**.
+  `Response.error()` headers are immutable — script must not dress a failure up as a success.
+  A network response uses an **internal** constructor, because a response off the wire is not
+  script's to validate (its status may legitimately be 0). The Body mixin's one rule is that
+  a body may be read **once** — and **"unusable" is body-aware**: a request with no body can
+  be read and cloned freely, and getting that wrong makes an empty response look spent.
+  `text()` is *UTF-8 decode* (it strips a BOM), which exposed the `data:` URL processor
+  running on the raw string instead of a parsed URL.
+- **THE SWEEP EARNED ITS KEEP.** Four XHR rows collapsed on one line: XHR reads raw response
+  bytes through `resp._bodyBytes`, a field the old stub happened to expose. A rewrite of a
+  shared class breaks whoever reached into its internals — and **the ledger's recorded value
+  is what makes that visible**; 1/10 does not look wrong until it sits beside a row saying 10/10.
+- **Caps named honestly:** 54 `header-values*` rows are blocked in the **transport**, not the
+  engine (hyper's HTTP/1 response parser refuses a C0 control in a header value — verified by
+  hand over `openssl s_client` that the server accepts and echoes it; enabling reqwest's
+  `http2` feature changed nothing and was reverted rather than left as a no-op dependency
+  change). `*-consume-empty` 13/14 **matches Chrome 153 exactly** on the identical file.
+- **⭐ NEXT: `streams`.** `response-clone` 6/21 is the pointer — `ReadableStream.tee()`
+  literally returns two empty streams. Scroll:
+  [`455-the-data-layer-verdict.md`](455-the-data-layer-verdict.md).
 
 ### 2026-08-02 — Quests #454–#456 · **The Accessible Verdict** · `accname` + `wai-aria/role` **0/853 → 818/853 (95.9%)**
 

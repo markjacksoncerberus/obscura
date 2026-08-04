@@ -8802,7 +8802,14 @@ const _percentDecodeBytes = function(str) {
 // WHATWG "data: URL processor" (https://fetch.spec.whatwg.org/#data-url-processor).
 // Returns { mimeType, bytes } or null on failure (no comma / bad base64).
 const _processDataURL = function(url) {
-  let input = String(url).slice(5); // strip "data:"
+  // The spec's data: URL processor runs on a PARSED URL, whose opaque path is
+  // already percent-encoded UTF-8. Running it on the raw string instead means a
+  // non-ASCII character reaches the percent-decoder as a code UNIT and comes out
+  // as one mangled byte — `data:,﻿{…}` became 0xFF, and the JSON behind the
+  // BOM was unreadable.
+  let raw = String(url);
+  try { raw = new URL(raw).href; } catch (e) { /* keep the raw string */ }
+  let input = raw.slice(5); // strip "data:"
   const hashIdx = input.indexOf('#'); // exclude the fragment
   if (hashIdx !== -1) input = input.slice(0, hashIdx);
   const comma = input.indexOf(',');
@@ -8844,8 +8851,8 @@ globalThis.fetch = async (input, init = {}) => {
     if (Object.prototype.hasOwnProperty.call(__blobStore, key)) { bytes = __blobStore[key]; type = __blobTypes[key] || ''; }
     else if (_blobSnap) { bytes = _blobSnap.bytes; type = _blobSnap.type; }
     if (method === 'GET' && bytes !== undefined) {
-      return new Response(bytes, {
-        status: 200, statusText: 'OK',
+      return _makeResponse(bytes, {
+        status: 200, statusText: 'OK', type: 'basic', url,
         headers: type ? { 'content-type': type } : {},
       });
     }
@@ -8859,8 +8866,8 @@ globalThis.fetch = async (input, init = {}) => {
     const _m = (init.method || (input instanceof Request ? input.method : 'GET') || 'GET').toUpperCase();
     // A HEAD request yields the headers but an empty body.
     const _bytes = _m === 'HEAD' ? new Uint8Array() : dataResult.bytes;
-    return new Response(_bytes, {
-      status: 200, statusText: 'OK',
+    return _makeResponse(_bytes, {
+      status: 200, statusText: 'OK', type: 'basic',
       headers: { 'content-type': dataResult.mimeType },
       url,
     });
@@ -8872,8 +8879,15 @@ globalThis.fetch = async (input, init = {}) => {
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
   const method = init.method || (input instanceof Request ? input.method : "GET");
-  const hdrs = JSON.stringify(init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : init.headers || {});
-  const body = init.body ? String(init.body) : "";
+  // Build a real header list even for a plain-object init: that is what VALIDATES
+  // it. A value carrying a CR is not a header, it is a forged second request, and
+  // `fetch()` must reject with a TypeError rather than hand it to the transport.
+  const hdrs = JSON.stringify(Object.fromEntries(_headersSortCombine(
+    (init.headers != null ? new Headers(init.headers) : (input instanceof Request ? input.headers : new Headers()))._list)));
+  // A body handed to `fetch(request)` lives on the REQUEST, not the init — before
+  // this, fetching a Request built with a body sent an empty one.
+  const body = init.body ? String(init.body)
+    : ((input instanceof Request && input._st.body) ? new TextDecoder().decode(input._st.body.bytes) : "");
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
   const _resStart = (globalThis.performance && performance.now) ? performance.now() : 0;
@@ -8883,6 +8897,10 @@ globalThis.fetch = async (input, init = {}) => {
     : await _fetchPromise;
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
+    // Fetch §port blocking is a network error, not an abort: the request was
+    // never going to be made, and script should see the ordinary TypeError it
+    // sees for any other unreachable URL.
+    if (parsed.portBlocked) throw new TypeError('Failed to fetch: ' + (parsed.error || 'port blocked'));
     const err = new TypeError('net::ERR_FAILED');
     err.name = 'AbortError';
     err.__aborted = true;
@@ -8906,9 +8924,13 @@ globalThis.fetch = async (input, init = {}) => {
       performance._addResourceEntry(parsed.url || url, _it, _resStart, performance.now(), { enc: _sz, dec: _sz, status: parsed.status, contentType: _ct });
     }
   } catch (e) {}
-  return new Response(responseBody, {
+  // A response off the wire goes through the INTERNAL constructor: its status
+  // may legitimately be 0 (a network error / opaque response), which the public
+  // `new Response()` must refuse, and its headers are immutable because they are
+  // a record of what the server said, not a draft for script to edit.
+  return _makeResponse(responseBody, {
     status: parsed.status,
-    statusText: "",
+    statusText: parsed.statusText || "",
     headers: parsed.headers || {},
     type: respType,
     url: parsed.url || url,
@@ -8916,19 +8938,7 @@ globalThis.fetch = async (input, init = {}) => {
   });
 };
 
-if (typeof Headers === "undefined") {
-  globalThis.Headers = class Headers {
-    constructor(init={}) { this._h={}; if(init) { if(init instanceof Headers) { init.forEach((v,k)=>{this._h[k]=v;}); } else if(typeof init==="object") { for(const[k,v]of Object.entries(init)) this._h[k.toLowerCase()]=String(v); } } }
-    get(n) { return this._h[n.toLowerCase()]??null; } set(n,v) { this._h[n.toLowerCase()]=String(v); }
-    has(n) { return n.toLowerCase() in this._h; } delete(n) { delete this._h[n.toLowerCase()]; }
-    append(n,v) { this._h[n.toLowerCase()]=String(v); }
-    forEach(cb) { for(const[k,v] of Object.entries(this._h)) cb(v,k,this); }
-    entries() { return Object.entries(this._h)[Symbol.iterator](); }
-    keys() { return Object.keys(this._h)[Symbol.iterator](); }
-    values() { return Object.values(this._h)[Symbol.iterator](); }
-    [Symbol.iterator]() { return this.entries(); }
-  };
-}
+// (`Headers` is defined below, once the RFC 7230 token helpers it needs exist.)
 
 // RFC 7230 token (a.k.a. a "method"/"header name"): one or more `tchar`s, where
 // tchar = ALPHA / DIGIT / "!#$%&'*+-.^_`|~". Used by XHR open()/setRequestHeader().
@@ -8949,6 +8959,282 @@ const _normalizeHeaderValue = (s) => s.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
 // Methods byte-uppercased on normalization, and the forbidden (SecurityError) set.
 const _XHR_NORMALIZE_METHODS = new Set(['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT']);
 const _XHR_FORBIDDEN_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK']);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Fetch — the header LIST  (https://fetch.spec.whatwg.org/#concept-header-list)
+// ══════════════════════════════════════════════════════════════════════════════
+// A `Headers` object is not a map, and the difference is not academic. It is an
+// ordered LIST of name/value pairs in which two entries may share a name —
+// `Set-Cookie` routinely does, and so does `Accept`. Storing it as `{name: value}`
+// (which is what we did) silently drops every duplicate: two cookies arrive and
+// one survives, and the one that survives is not necessarily the session. So:
+//   • `get()` COMBINES every matching value with ", " in list order,
+//   • iteration yields the list "sorted and combined" (lowercased, byte-sorted),
+//   • `getSetCookie()` is the one door back to the individual values,
+//   • and a GUARD decides which of those a given list is even allowed to hold.
+// Every entry point validates first: a header name is an RFC 7230 token and a
+// header value carries no NUL/CR/LF, because a value that carries a CR is not a
+// header at all — it is a second, forged request.
+
+// Byte-lowercase. Header names are ASCII tokens by the time we compare them, so
+// this and `toLowerCase()` agree — but only this one is guaranteed to.
+const _bLower = (s) => s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+const _isHeaderName = (s) => _HTTP_TOKEN_RE.test(s);
+const _isHeaderValueBytes = (s) => !/[\0\n\r]/.test(s);
+// WebIDL ByteString: any code unit above 0xFF is refused outright, and a Symbol
+// never converts to a string at all (that is what makes a Symbol record key throw).
+const _hByteString = (v, what) => {
+  if (typeof v === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+  const s = String(v);
+  for (let i = 0; i < s.length; i++)
+    if (s.charCodeAt(i) > 0xff)
+      throw new TypeError("Failed to construct 'Headers': " + (what || 'argument') + ' is not a valid ByteString.');
+  return s;
+};
+
+// ── Forbidden request-headers: the ones only the USER AGENT may set ───────────
+// A page that could set `Host` or `Cookie` on a cross-origin request could
+// impersonate any other page. The list is silently ignored, not thrown on, so
+// that library code which sets them defensively still works.
+const _FORBIDDEN_REQUEST_HEADER_NAMES = new Set([
+  'accept-charset', 'accept-encoding', 'access-control-request-headers',
+  'access-control-request-method', 'connection', 'content-length', 'cookie',
+  'cookie2', 'date', 'dnt', 'expect', 'host', 'keep-alive', 'origin', 'referer',
+  'set-cookie', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'via',
+]);
+const _isForbiddenRequestHeader = (name, value) => {
+  const n = _bLower(name);
+  if (_FORBIDDEN_REQUEST_HEADER_NAMES.has(n)) return true;
+  if (n.startsWith('proxy-') || n.startsWith('sec-')) return true;
+  // `X-HTTP-Method*` is forbidden only when it SMUGGLES a forbidden method —
+  // the name is harmless, the payload is not.
+  if (n === 'x-http-method' || n === 'x-http-method-override' || n === 'x-method-override') {
+    for (const m of String(value).split(','))
+      if (_XHR_FORBIDDEN_METHODS.has(m.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '').toUpperCase())) return true;
+  }
+  return false;
+};
+// A response may not hand `Set-Cookie` to script: cookies are the UA's to keep.
+const _FORBIDDEN_RESPONSE_HEADER_NAMES = new Set(['set-cookie', 'set-cookie2']);
+
+// ── CORS safelist: what a `no-cors` request may say without a preflight ───────
+// Bytes that would let a value break out of its header, plus the separators a
+// naive server-side parser splits on.
+const _CORS_UNSAFE_BYTE_RE = /[\0-\x08\x0A-\x1F\x22\x28\x29\x3A\x3C\x3E\x3F\x40\x5B\x5C\x5D\x7B\x7D\x7F]/;
+const _CORS_LANG_RE = /^[0-9A-Za-z *,\-.;=]*$/;
+const _CORS_SAFELISTED_MIME = new Set(['application/x-www-form-urlencoded', 'multipart/form-data', 'text/plain']);
+const _NO_CORS_SAFELISTED_NAMES = new Set(['accept', 'accept-language', 'content-language', 'content-type']);
+const _isCorsSafelistedRequestHeader = (name, value) => {
+  // 128 bytes is the whole rule for length, and it is checked against the
+  // COMBINED value — appending a second short value can push the pair over.
+  if (value.length > 128) return false;
+  switch (_bLower(name)) {
+    case 'accept': return !_CORS_UNSAFE_BYTE_RE.test(value);
+    case 'accept-language': case 'content-language': return _CORS_LANG_RE.test(value);
+    case 'content-type': {
+      if (_CORS_UNSAFE_BYTE_RE.test(value)) return false;
+      const mime = _parseMimeType(value);
+      return !!mime && _CORS_SAFELISTED_MIME.has(mime.type + '/' + mime.subtype);
+    }
+    // `Range` is safelisted only in its simple single-range form.
+    case 'range': return /^bytes=[0-9]*-[0-9]*$/.test(value);
+    default: return false;
+  }
+};
+
+// "Sort and combine" — how a header list is presented to script. Names are
+// byte-lowercased and sorted; each name's values are joined with ", " — EXCEPT
+// `set-cookie`, which yields one entry per value, because two cookies that were
+// glued together are no longer two cookies.
+const _headersSortCombine = (list) => {
+  const names = [...new Set(list.map((e) => _bLower(e[0])))].sort();
+  const out = [];
+  for (const name of names) {
+    const vals = list.filter((e) => _bLower(e[0]) === name).map((e) => e[1]);
+    if (name === 'set-cookie') for (const v of vals) out.push([name, v]);
+    else out.push([name, vals.join(', ')]);
+  }
+  return out;
+};
+
+// The WebIDL default iterator: an object whose prototype chain reaches
+// %IteratorPrototype%, holding a LIVE index into the value pairs. It re-derives
+// the pairs on every `next()`, which is why deleting a header mid-loop skips an
+// entry and prepending one repeats the current entry — the tests check both.
+const _HeadersIteratorProto = Object.create(Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())));
+Object.defineProperty(_HeadersIteratorProto, 'next', {
+  value: function next() {
+    const st = this && this._headersIterState;
+    if (!st) throw new TypeError('next called on an object that is not a Headers Iterator');
+    const pairs = _headersSortCombine(st.target._list);
+    if (st.index >= pairs.length) return { value: undefined, done: true };
+    const p = pairs[st.index++];
+    return { value: st.kind === 'key' ? p[0] : st.kind === 'value' ? p[1] : [p[0], p[1]], done: false };
+  },
+  writable: true, enumerable: true, configurable: true,
+});
+Object.defineProperty(_HeadersIteratorProto, Symbol.toStringTag, { value: 'Headers Iterator', configurable: true });
+const _makeHeadersIterator = (target, kind) => {
+  const it = Object.create(_HeadersIteratorProto);
+  Object.defineProperty(it, '_headersIterState', { value: { target, kind, index: 0 } });
+  return it;
+};
+
+// WebIDL `record<ByteString, ByteString>` conversion, in the observable order the
+// spec mandates: own keys, then per key a [[GetOwnProperty]], and only for an
+// ENUMERABLE own property a [[Get]]. The ordering is observable through a Proxy
+// and WPT checks it operation by operation, so this is written to that shape.
+const _toHeaderRecord = (obj) => {
+  const out = [];
+  for (const key of Reflect.ownKeys(obj)) {
+    const desc = Reflect.getOwnPropertyDescriptor(obj, key);
+    if (desc === undefined || !desc.enumerable) continue;
+    const typedKey = _hByteString(key, 'header name');   // a Symbol key throws HERE, before the [[Get]]
+    const typedValue = _hByteString(obj[key], 'header value');
+    const prev = out.findIndex((e) => e[0] === typedKey);
+    if (prev >= 0) out[prev][1] = typedValue; else out.push([typedKey, typedValue]);
+  }
+  return out;
+};
+
+globalThis.Headers = class Headers {
+  constructor(init) {
+    Object.defineProperty(this, '_list', { value: [], writable: true });
+    Object.defineProperty(this, '_guard', { value: 'none', writable: true });
+    if (init === undefined) return;
+    // Overload resolution: an object with a callable `Symbol.iterator` is the
+    // sequence form, anything else the record form. `null` matches neither —
+    // the IDL argument is not nullable, so it is a TypeError, not an empty list.
+    if (init === null || (typeof init !== 'object' && typeof init !== 'function'))
+      throw new TypeError("Failed to construct 'Headers': The provided value is not of type '(sequence<sequence<ByteString>> or record<ByteString, ByteString>)'.");
+    const iterFn = init[Symbol.iterator];
+    if (iterFn !== undefined && iterFn !== null) {
+      if (typeof iterFn !== 'function') throw new TypeError("Failed to construct 'Headers': The object is not iterable.");
+      for (const pair of init) {
+        if (pair === null || typeof pair !== 'object') throw new TypeError("Failed to construct 'Headers': The provided value cannot be converted to a sequence.");
+        const seq = [...pair];
+        if (seq.length !== 2) throw new TypeError("Failed to construct 'Headers': Invalid value: header pairs must contain exactly two items.");
+        this.append(seq[0], seq[1]);
+      }
+    } else {
+      for (const [k, v] of _toHeaderRecord(init)) this.append(k, v);
+    }
+  }
+
+  // "Validate": name/value shape first (a TypeError either way), then the guard
+  // — which REFUSES SILENTLY rather than throwing, so that setting a forbidden
+  // header is a no-op instead of an exception in the middle of someone's library.
+  _validate(name, value) {
+    if (!_isHeaderName(name)) throw new TypeError("Failed to execute on 'Headers': Invalid name");
+    if (!_isHeaderValueBytes(value)) throw new TypeError("Failed to execute on 'Headers': Invalid value");
+    if (this._guard === 'immutable') throw new TypeError("Failed to execute on 'Headers': Headers are immutable");
+    if (this._guard === 'request' && _isForbiddenRequestHeader(name, value)) return false;
+    if (this._guard === 'response' && _FORBIDDEN_RESPONSE_HEADER_NAMES.has(_bLower(name))) return false;
+    return true;
+  }
+
+  append(name, value) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'append' on 'Headers': 2 arguments required");
+    name = _hByteString(name, 'name');
+    value = _normalizeHeaderValue(_hByteString(value, 'value'));
+    if (!this._validate(name, value)) return;
+    if (this._guard === 'request-no-cors') {
+      // The safelist is checked against what the header WOULD BECOME — a second
+      // innocuous value can push the combined pair past the limit.
+      const prev = this.get(name);
+      const combined = prev === null ? value : prev + ', ' + value;
+      if (!_isCorsSafelistedRequestHeader(name, combined)) return;
+    }
+    this._list.push([name, value]);
+  }
+
+  set(name, value) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'set' on 'Headers': 2 arguments required");
+    name = _hByteString(name, 'name');
+    value = _normalizeHeaderValue(_hByteString(value, 'value'));
+    if (!this._validate(name, value)) return;
+    if (this._guard === 'request-no-cors' && !_isCorsSafelistedRequestHeader(name, value)) return;
+    const lower = _bLower(name);
+    let replaced = false;
+    const next = [];
+    for (const e of this._list) {
+      if (_bLower(e[0]) !== lower) { next.push(e); continue; }
+      if (!replaced) { next.push([e[0], value]); replaced = true; }   // keep the first entry's POSITION
+    }
+    if (!replaced) next.push([name, value]);
+    this._list = next;
+  }
+
+  get(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'get' on 'Headers': 1 argument required");
+    name = _hByteString(name, 'name');
+    if (!_isHeaderName(name)) throw new TypeError("Failed to execute 'get' on 'Headers': Invalid name");
+    const lower = _bLower(name);
+    const vals = this._list.filter((e) => _bLower(e[0]) === lower).map((e) => e[1]);
+    return vals.length ? vals.join(', ') : null;
+  }
+
+  has(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'has' on 'Headers': 1 argument required");
+    name = _hByteString(name, 'name');
+    if (!_isHeaderName(name)) throw new TypeError("Failed to execute 'has' on 'Headers': Invalid name");
+    const lower = _bLower(name);
+    return this._list.some((e) => _bLower(e[0]) === lower);
+  }
+
+  delete(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'delete' on 'Headers': 1 argument required");
+    name = _hByteString(name, 'name');
+    if (!_isHeaderName(name)) throw new TypeError("Failed to execute 'delete' on 'Headers': Invalid name");
+    if (this._guard === 'immutable') throw new TypeError("Failed to execute 'delete' on 'Headers': Headers are immutable");
+    const lower = _bLower(name);
+    if (this._guard === 'request' && _isForbiddenRequestHeader(name, '')) return;
+    if (this._guard === 'request-no-cors' && !_NO_CORS_SAFELISTED_NAMES.has(lower) && lower !== 'range') return;
+    if (this._guard === 'response' && _FORBIDDEN_RESPONSE_HEADER_NAMES.has(lower)) return;
+    this._list = this._list.filter((e) => _bLower(e[0]) !== lower);
+  }
+
+  // The one accessor that does NOT combine: each cookie stays its own string.
+  getSetCookie() {
+    return this._list.filter((e) => _bLower(e[0]) === 'set-cookie').map((e) => e[1]);
+  }
+
+  entries() { return _makeHeadersIterator(this, 'key+value'); }
+  keys() { return _makeHeadersIterator(this, 'key'); }
+  values() { return _makeHeadersIterator(this, 'value'); }
+  [Symbol.iterator]() { return _makeHeadersIterator(this, 'key+value'); }
+
+  forEach(cb, thisArg) {
+    if (typeof cb !== 'function') throw new TypeError("Failed to execute 'forEach' on 'Headers': parameter 1 is not of type 'Function'.");
+    // Live over the same index the iterator uses — and a throwing callback stops
+    // the loop where it threw, it does not swallow anything.
+    let i = 0;
+    for (;;) {
+      const pairs = _headersSortCombine(this._list);
+      if (i >= pairs.length) break;
+      const p = pairs[i++];
+      cb.call(thisArg, p[1], p[0], this);
+    }
+  }
+};
+Object.defineProperty(Headers.prototype, Symbol.toStringTag, { value: 'Headers', configurable: true });
+
+// Internal constructor for engine-created lists (a Request's, a Response's). The
+// public constructor can only ever make a guard-"none" list, so this is the only
+// way a guarded one exists — and the guard is set BEFORE the fill, because a
+// Request must drop the `Host` its author tried to send, not accept it and then
+// notice. `raw` fills the list underneath the guard: that is for headers that
+// came off the WIRE, which were never the page's to be refused.
+const _newHeaders = (init, guard, raw) => {
+  const h = new Headers();
+  h._guard = guard || 'none';
+  if (init != null) {
+    const pairs = init instanceof Headers ? init._list.map((e) => [e[0], e[1]]) : new Headers(init)._list;
+    if (raw) h._list = pairs;
+    else { const g = h._guard; h._guard = g === 'immutable' ? 'none' : g; for (const [k, v] of pairs) h.append(k, v); h._guard = g; }
+  }
+  return h;
+};
 
 // ── XHR response decoding (XHR §"text response" + §"document response") ──────
 // The fetch core hands JS the RAW response bytes (`bodyBase64`), never a charset-
@@ -9204,8 +9490,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       xhr._setReadyState(2); // HEADERS_RECEIVED
 
       // Charset-aware decoding works off the RAW response bytes, not resp.text()
-      // (which is utf-8-only) — see _xhrResponseText / _getDocumentResponse.
-      const bytes = (resp._bodyBytes instanceof Uint8Array) ? resp._bodyBytes : new Uint8Array();
+      // (which is utf-8-only) — see _xhrResponseText / _getDocumentResponse. Read
+      // the body's own byte sequence rather than consuming the Response: XHR must
+      // not disturb a body it is only decoding.
+      const bytes = (resp._st && resp._st.body && resp._st.body.bytes instanceof Uint8Array)
+        ? resp._st.body.bytes : new Uint8Array();
       if (xhr._aborted) return;
 
       xhr._responseBytes = bytes;
@@ -9546,55 +9835,452 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function cancel
 _markNative(globalThis.requestIdleCallback);
 _markNative(globalThis.cancelIdleCallback);
 
-if (typeof Request === 'undefined') {
-  globalThis.Request = class Request {
-    constructor(input, init = {}) {
-      if (typeof input === 'string') { this.url = input; }
-      else if (input instanceof Request) { this.url = input.url; if (input._blobSnapshot) this._blobSnapshot = input._blobSnapshot; init = { ...input, ...init }; }
-      else if (typeof URL === 'function' && input instanceof URL) { this.url = input.href; }
-      else { this.url = input?.url || input?.href || String(input); }
-      // Snapshot blob: contents now (spec: a request takes a reference to the blob
-      // when created) so a later revokeObjectURL doesn't break the fetch.
-      if (!this._blobSnapshot && typeof this.url === 'string' && this.url.startsWith('blob:')) {
-        const _bk = this.url.split('#')[0];
-        if (Object.prototype.hasOwnProperty.call(__blobStore, _bk))
-          this._blobSnapshot = { bytes: __blobStore[_bk], type: __blobTypes[_bk] || '' };
+// ══════════════════════════════════════════════════════════════════════════════
+// Fetch — "extract a body"  (https://fetch.spec.whatwg.org/#bodyinit-safely-extract)
+// ══════════════════════════════════════════════════════════════════════════════
+// Returns { bytes, type }: the byte sequence, and the Content-Type the body
+// IMPLIES. That second half is the interesting one — it is why
+// `new Response("hi").headers.get('content-type')` is `text/plain;charset=UTF-8`
+// when nobody set a header. The body knows what it is, and a server that has to
+// guess gets it wrong.
+function _fetchExtractBody(body) {
+  if (body === null || body === undefined) return null;
+  if (typeof Blob !== 'undefined' && body instanceof Blob)
+    return { bytes: (body._bytes || new Uint8Array()).slice(), type: body.type ? body.type : null };
+  if (typeof FormData !== 'undefined' && body instanceof FormData) {
+    // Multipart serialization. The boundary must not occur in any part; a fixed
+    // random-looking string is what every engine uses in practice.
+    const boundary = '----ObscuraFormBoundary' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    let out = '';
+    for (const [name, value] of body) {
+      out += '--' + boundary + '\r\n';
+      const fname = (typeof File !== 'undefined' && value instanceof File) ? value.name : null;
+      out += 'Content-Disposition: form-data; name="' + String(name).replace(/"/g, '%22') + '"';
+      if (fname !== null) out += '; filename="' + String(fname).replace(/"/g, '%22') + '"';
+      out += '\r\n';
+      if (typeof Blob !== 'undefined' && value instanceof Blob) {
+        out += 'Content-Type: ' + (value.type || 'application/octet-stream') + '\r\n\r\n';
+        out += new TextDecoder().decode(value._bytes || new Uint8Array()) + '\r\n';
+      } else {
+        out += '\r\n' + String(value) + '\r\n';
       }
-      this.method = (init.method || 'GET').toUpperCase();
-      this.headers = new Headers(init.headers);
-      this.body = init.body || null;
-      this.mode = init.mode || 'cors';
-      this.credentials = init.credentials || 'same-origin';
-      this.redirect = init.redirect || 'follow';
-      this.referrer = init.referrer || '';
-      this.signal = init.signal || { aborted: false, addEventListener(){}, removeEventListener(){} };
-      this.cache = init.cache || 'default';
     }
-    clone() { const r = new Request(this.url, { method: this.method, headers: this.headers, body: this.body }); if (this._blobSnapshot) r._blobSnapshot = this._blobSnapshot; return r; }
-    async text() { return this.body ? String(this.body) : ''; }
-    async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return new TextEncoder().encode(await this.text()).buffer; }
-  };
+    out += '--' + boundary + '--\r\n';
+    return { bytes: new TextEncoder().encode(out), type: 'multipart/form-data; boundary=' + boundary };
+  }
+  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams)
+    return { bytes: new TextEncoder().encode(String(body)), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    const u8 = body instanceof ArrayBuffer
+      ? new Uint8Array(body)
+      : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+    return { bytes: u8.slice(), type: null };   // a BufferSource implies nothing
+  }
+  if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream)
+    return { bytes: new Uint8Array(), stream: body, type: null };
+  return { bytes: new TextEncoder().encode(String(body)), type: 'text/plain;charset=UTF-8' };
 }
 
-if (typeof Response === 'undefined') {
-  globalThis.Response = class Response {
-    constructor(body, init = {}) {
-      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status || 200; this.statusText = init.statusText || '';
-      this.ok = this.status >= 200 && this.status < 300;
-      this.headers = new Headers(init.headers);
-      this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+// ══════════════════════════════════════════════════════════════════════════════
+// Fetch — the Request class  (https://fetch.spec.whatwg.org/#request-class)
+// ══════════════════════════════════════════════════════════════════════════════
+// A Request is not a bag of fields: every attribute is a READ-ONLY accessor on
+// the prototype, because a request that could be mutated after construction
+// could be re-pointed after it had already been vetted. And every init the
+// engine cannot honour is refused AT CONSTRUCTION rather than silently ignored —
+// a `no-cors` request that quietly became a PUT is a request the author never
+// audited.
+const _RQ_MODES = new Set(['navigate', 'same-origin', 'no-cors', 'cors']);
+const _RQ_CREDENTIALS = new Set(['omit', 'same-origin', 'include']);
+const _RQ_CACHES = new Set(['default', 'no-store', 'reload', 'no-cache', 'force-cache', 'only-if-cached']);
+const _RQ_REDIRECTS = new Set(['follow', 'error', 'manual']);
+const _RQ_REFERRER_POLICIES = new Set(['', 'no-referrer', 'no-referrer-when-downgrade', 'same-origin',
+  'origin', 'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url']);
+// The three methods a `no-cors` request may use — the ones a plain HTML form
+// could already have sent, so they add no new capability.
+const _RQ_NO_CORS_METHODS = new Set(['GET', 'HEAD', 'POST']);
+const _rqEnum = (init, key, allowed, fallback) => {
+  if (init[key] === undefined) return fallback;
+  const v = String(init[key]);
+  if (!allowed.has(v))
+    throw new TypeError("Failed to construct 'Request': The provided value '" + v + "' is not a valid enum value for " + key + '.');
+  return v;
+};
+
+globalThis.Request = class Request {
+  constructor(input, init) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'Request': 1 argument required, but only 0 present.");
+    init = (init === undefined || init === null) ? {} : init;
+    const from = (input instanceof Request) ? input : null;
+    const st = {};
+
+    if (from) {
+      st.url = from._st.url;
+      st.method = from._st.method;
+      st.mode = from._st.mode;
+      st.credentials = from._st.credentials;
+      st.cache = from._st.cache;
+      st.redirect = from._st.redirect;
+      st.referrer = from._st.referrer;
+      st.referrerPolicy = from._st.referrerPolicy;
+      st.integrity = from._st.integrity;
+      st.keepalive = from._st.keepalive;
+      st.signal = from._st.signal;
+      st.body = from._st.body ? { bytes: from._st.body.bytes, type: from._st.body.type } : null;
+      if (from._blobSnapshot) this._blobSnapshot = from._blobSnapshot;
+    } else {
+      const urlString = (typeof input === 'string') ? input : String(input && input.href !== undefined ? input.href : input);
+      let parsed;
+      try { parsed = new URL(urlString, _domParse('document_url') || 'about:blank'); }
+      catch (e) { throw new TypeError("Failed to construct 'Request': Failed to parse URL from " + urlString); }
+      // Credentials in a request URL are a phishing primitive; the spec refuses
+      // them outright rather than stripping them and proceeding.
+      if (parsed.username || parsed.password)
+        throw new TypeError("Failed to construct 'Request': Request cannot be constructed from a URL that includes credentials: " + urlString);
+      st.url = parsed.href;
+      st.method = 'GET'; st.mode = 'cors'; st.credentials = 'same-origin'; st.cache = 'default';
+      st.redirect = 'follow'; st.referrer = 'about:client'; st.referrerPolicy = ''; st.integrity = '';
+      st.keepalive = false; st.signal = null; st.body = null;
     }
-    async text() { return new TextDecoder().decode(this._bodyBytes); }
-    async json() { return JSON.parse(await this.text()); }
-    async arrayBuffer() { return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { return new Blob([this._bodyBytes]); }
-    clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
-    static error() { return new Response(null, { status: 0 }); }
-    static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
-    static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
-  };
+
+    // `window` may only ever be null: it exists in the IDL so that a caller can
+    // DETACH a request from its window, never to attach it to another one.
+    if (init.window !== undefined && init.window !== null)
+      throw new TypeError("Failed to construct 'Request': The provided value is not of type 'any?'.");
+
+    if (init.referrer !== undefined) {
+      const ref = String(init.referrer);
+      if (ref === '') st.referrer = 'no-referrer';
+      else {
+        let p; try { p = new URL(ref, _domParse('document_url') || 'about:blank'); }
+        catch (e) { throw new TypeError("Failed to construct 'Request': Failed to parse referrer URL " + ref); }
+        st.referrer = p.href;
+      }
+    }
+    st.referrerPolicy = _rqEnum(init, 'referrerPolicy', _RQ_REFERRER_POLICIES, st.referrerPolicy);
+    // "navigate" is a mode the BROWSER assigns; a page asking for it would be
+    // claiming to be a navigation it is not.
+    const mode = _rqEnum(init, 'mode', _RQ_MODES, undefined);
+    if (mode === 'navigate')
+      throw new TypeError("Failed to construct 'Request': Cannot construct a Request with a RequestInit whose mode member is set as 'navigate'.");
+    if (mode !== undefined) st.mode = mode;
+    st.credentials = _rqEnum(init, 'credentials', _RQ_CREDENTIALS, st.credentials);
+    st.cache = _rqEnum(init, 'cache', _RQ_CACHES, st.cache);
+    st.redirect = _rqEnum(init, 'redirect', _RQ_REDIRECTS, st.redirect);
+    if (init.integrity !== undefined) st.integrity = String(init.integrity);
+    if (init.keepalive !== undefined) st.keepalive = !!init.keepalive;
+
+    if (init.method !== undefined) {
+      const m = _hByteString(init.method, 'method');
+      if (!_isHTTPToken(m))
+        throw new TypeError("Failed to construct 'Request': '" + m + "' is not a valid HTTP method.");
+      // CONNECT/TRACE/TRACK let script reach through a proxy or reflect headers
+      // back at itself; they are the UA's alone.
+      if (_XHR_FORBIDDEN_METHODS.has(m.toUpperCase()))
+        throw new TypeError("Failed to construct 'Request': '" + m + "' HTTP method is unsupported.");
+      st.method = _XHR_NORMALIZE_METHODS.has(m.toUpperCase()) ? m.toUpperCase() : m;
+    }
+    // "only-if-cached" says *do not touch the network* — meaningless, and
+    // misleading, unless the request is same-origin to begin with.
+    if (st.cache === 'only-if-cached' && st.mode !== 'same-origin')
+      throw new TypeError("Failed to construct 'Request': cache mode 'only-if-cached' can only be used with mode 'same-origin'.");
+    if (st.mode === 'no-cors' && !_RQ_NO_CORS_METHODS.has(st.method))
+      throw new TypeError("Failed to construct 'Request': '" + st.method + "' is unsupported in no-cors mode.");
+    if (init.signal !== undefined) st.signal = init.signal;
+
+    // Snapshot blob: contents now (spec: a request takes a reference to the blob
+    // when created) so a later revokeObjectURL doesn't break the fetch.
+    if (!this._blobSnapshot && typeof st.url === 'string' && st.url.startsWith('blob:')) {
+      const _bk = st.url.split('#')[0];
+      if (Object.prototype.hasOwnProperty.call(__blobStore, _bk))
+        this._blobSnapshot = { bytes: __blobStore[_bk], type: __blobTypes[_bk] || '' };
+    }
+
+    // The header list is guarded, and the guard is chosen by the mode: a no-cors
+    // request may carry only what a plain <form> could already have sent.
+    const headers = _newHeaders(null, st.mode === 'no-cors' ? 'request-no-cors' : 'request');
+    if (init.headers !== undefined) {
+      for (const [k, v] of new Headers(init.headers)._list) headers.append(k, v);
+    } else if (from) {
+      for (const [k, v] of from._headers._list) headers.append(k, v);
+    }
+
+    const initBody = (init.body !== undefined && init.body !== null) ? _fetchExtractBody(init.body) : null;
+    if ((initBody !== null || st.body !== null) && (st.method === 'GET' || st.method === 'HEAD'))
+      throw new TypeError("Failed to construct 'Request': Request with GET/HEAD method cannot have body.");
+    if (initBody !== null) {
+      st.body = initBody;
+      // The body's implied type only fills a GAP — an author's explicit
+      // Content-Type always wins over what we inferred.
+      if (st.body.type !== null && !headers.has('content-type')) headers.append('Content-Type', st.body.type);
+    } else if (from && from._st.body !== null && _bodyUnusable(from)) {
+      // Taking another request's body means taking the only copy of it. If that
+      // copy is already spent there is nothing to take.
+      throw new TypeError("Failed to construct 'Request': Cannot construct a Request with a Request object that has already been used.");
+    }
+    // Either way, a Request built FROM a request consumes that request's body —
+    // the input keeps its stream object (callers compare identity) but is spent.
+    if (from && from._st.body !== null) from._bodyUsed = true;
+
+    Object.defineProperty(this, '_st', { value: st });
+    Object.defineProperty(this, '_headers', { value: headers });
+    Object.defineProperty(this, '_bodyUsed', { value: false, writable: true });
+    Object.defineProperty(this, '_bodyStream', { value: null, writable: true });
+  }
+
+  clone() {
+    if (_bodyUnusable(this))
+      throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used");
+    const r = new Request(this);
+    // A clone is a copy, not a consumer: the original stays readable.
+    this._bodyUsed = false;
+    if (this._blobSnapshot) r._blobSnapshot = this._blobSnapshot;
+    return r;
+  }
+};
+// Read-only accessors on the PROTOTYPE — assigning `request.method = 'POST'` is
+// a silent no-op in sloppy mode and a TypeError in strict, which is the whole
+// point: nothing may re-aim a request after it was made.
+for (const [name, read] of [
+  ['method', (st) => st.method], ['url', (st) => st.url],
+  ['destination', () => ''], ['referrer', (st) => st.referrer],
+  ['referrerPolicy', (st) => st.referrerPolicy], ['mode', (st) => st.mode],
+  ['credentials', (st) => st.credentials], ['cache', (st) => st.cache],
+  ['redirect', (st) => st.redirect], ['integrity', (st) => st.integrity],
+  ['keepalive', (st) => st.keepalive], ['signal', (st) => st.signal],
+  ['isReloadNavigation', () => false], ['isHistoryNavigation', () => false],
+  ['duplex', () => 'half'],
+]) {
+  Object.defineProperty(Request.prototype, name, {
+    get: _markNative(function () { return read(this._st); }), enumerable: true, configurable: true,
+  });
 }
+// [SameObject]: `request.headers` must be the SAME Headers each time, or a
+// caller that grabbed it and set a header would be writing to a throwaway.
+Object.defineProperty(Request.prototype, 'headers', {
+  get: _markNative(function () { return this._headers; }), enumerable: true, configurable: true,
+});
+Object.defineProperty(Request.prototype, Symbol.toStringTag, { value: 'Request', configurable: true });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Fetch — the Response class  (https://fetch.spec.whatwg.org/#response-class)
+// ══════════════════════════════════════════════════════════════════════════════
+// A status outside 200–599 is not a status, and a reason phrase carrying a
+// newline is a second response. Both are refused at construction — and with
+// DIFFERENT errors, which is not pedantry: a RangeError says "that number is out
+// of range", a TypeError says "that is not a status line at all".
+const _RESP_NULL_BODY_STATUS = new Set([204, 205, 304]);
+const _RESP_REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+// A reason phrase is HTAB / SP / VCHAR / obs-text — everything but the controls.
+const _RESP_STATUS_TEXT_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
+
+// Internal constructor: a response that came off the WIRE was not built by
+// script, so it is not script's to validate. A network error legitimately has
+// status 0, which the public constructor must refuse.
+function _makeResponse(bytes, opts) {
+  const r = Object.create(Response.prototype);
+  Object.defineProperty(r, '_st', {
+    value: {
+      status: opts.status, statusText: opts.statusText || '', type: opts.type || 'default',
+      url: opts.url || '', redirected: !!opts.redirected,
+      body: bytes === null ? null : { bytes: bytes instanceof Uint8Array ? bytes : _bodyToUint8Array(bytes), type: null },
+    },
+  });
+  Object.defineProperty(r, '_headers', { value: _newHeaders(opts.headers, opts.guard || 'immutable', true) });
+  Object.defineProperty(r, '_bodyUsed', { value: false, writable: true });
+  Object.defineProperty(r, '_bodyStream', { value: null, writable: true });
+  return r;
+}
+
+globalThis.Response = class Response {
+  constructor(body, init) {
+    init = (init === undefined || init === null) ? {} : init;
+    const status = init.status === undefined ? 200 : Number(init.status);
+    if (!(status >= 200 && status <= 599))
+      throw new RangeError("Failed to construct 'Response': The status provided (" + status + ') is outside the range [200, 599].');
+    const statusText = init.statusText === undefined ? '' : _hByteString(init.statusText, 'statusText');
+    if (!_RESP_STATUS_TEXT_RE.test(statusText))
+      throw new TypeError("Failed to construct 'Response': Invalid status text: '" + statusText + "'");
+    const st = { status, statusText, type: 'default', url: '', redirected: false, body: null };
+    const headers = _newHeaders(init.headers, 'response');
+    if (body !== undefined && body !== null) {
+      // 204/205/304 say "there is no body here"; attaching one contradicts the
+      // status rather than merely being unusual.
+      if (_RESP_NULL_BODY_STATUS.has(status))
+        throw new TypeError("Failed to construct 'Response': Response with null body status cannot have body");
+      st.body = _fetchExtractBody(body);
+      if (st.body && st.body.type !== null && !headers.has('content-type')) headers.append('Content-Type', st.body.type);
+    }
+    Object.defineProperty(this, '_st', { value: st });
+    Object.defineProperty(this, '_headers', { value: headers });
+    Object.defineProperty(this, '_bodyUsed', { value: false, writable: true });
+    Object.defineProperty(this, '_bodyStream', { value: null, writable: true });
+  }
+
+  clone() {
+    if (_bodyUnusable(this))
+      throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
+    const st = this._st;
+    const r = _makeResponse(st.body ? st.body.bytes.slice() : null, {
+      status: st.status, statusText: st.statusText, type: st.type, url: st.url,
+      redirected: st.redirected, headers: this._headers, guard: this._headers._guard,
+    });
+    if (st.body) r._st.body.type = st.body.type;
+    return r;
+  }
+
+  // A network error is a real response object with nothing in it, and its
+  // headers are IMMUTABLE — script must not be able to dress a failure up as a
+  // success by adding headers to it after the fact.
+  static error() {
+    return _makeResponse(null, { status: 0, statusText: '', type: 'error', guard: 'immutable' });
+  }
+
+  static redirect(url, status) {
+    let parsed;
+    try { parsed = new URL(String(url), _domParse('document_url') || 'about:blank'); }
+    catch (e) { throw new TypeError("Failed to execute 'redirect' on 'Response': Failed to parse URL from " + url); }
+    const s = status === undefined ? 302 : Number(status);
+    if (!_RESP_REDIRECT_STATUS.has(s))
+      throw new RangeError("Failed to execute 'redirect' on 'Response': Invalid status code");
+    const r = _makeResponse(null, { status: s, statusText: '', type: 'default', guard: 'immutable' });
+    r._headers._list.push(['Location', parsed.href]);
+    return r;
+  }
+
+  static json(data, init) {
+    init = (init === undefined || init === null) ? {} : init;
+    const text = JSON.stringify(data);
+    if (text === undefined) throw new TypeError("Failed to execute 'json' on 'Response': The data is not JSON serializable");
+    const r = new Response(text, init);
+    // The serializer, not the caller, decides what this is — but an explicit
+    // Content-Type in the init still wins.
+    if (!r._headers.has('content-type')) r._headers._list.push(['Content-Type', 'application/json']);
+    else { const i = r._headers._list.findIndex((e) => _bLower(e[0]) === 'content-type'); if (r._headers._list[i][1] === 'text/plain;charset=UTF-8') r._headers._list[i][1] = 'application/json'; }
+    return r;
+  }
+};
+for (const [name, read] of [
+  ['type', (st) => st.type], ['url', (st) => st.url], ['redirected', (st) => st.redirected],
+  ['status', (st) => st.status], ['statusText', (st) => st.statusText],
+  ['ok', (st) => st.status >= 200 && st.status <= 299],
+]) {
+  Object.defineProperty(Response.prototype, name, {
+    get: _markNative(function () { return read(this._st); }), enumerable: true, configurable: true,
+  });
+}
+Object.defineProperty(Response.prototype, 'headers', {
+  get: _markNative(function () { return this._headers; }), enumerable: true, configurable: true,
+});
+Object.defineProperty(Response.prototype, Symbol.toStringTag, { value: 'Response', configurable: true });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Fetch — the Body mixin  (https://fetch.spec.whatwg.org/#body-mixin)
+// ══════════════════════════════════════════════════════════════════════════════
+// Request and Response share one body, and the rule that matters is that a body
+// may be read ONCE. `bodyUsed` is not bookkeeping — a body is a stream arriving
+// off the network, and a second reader would find nothing there. So every
+// consumer checks "disturbed or locked" FIRST and rejects with a TypeError,
+// rather than quietly handing back an empty string that reads like valid data.
+// "Unusable" is body-aware on purpose: a request with NO body can be read, and
+// cloned, as many times as you like — there is no stream to exhaust. Reading a
+// bodyless response must not make it look spent.
+const _bodyUnusable = (o) => o._st.body !== null && (!!o._bodyUsed || !!(o._bodyStream && o._bodyStream.locked));
+const _bodyConsume = (o) => {
+  if (_bodyUnusable(o))
+    return Promise.reject(new TypeError('Failed to execute on Body: body stream already read'));
+  o._bodyUsed = true;
+  return Promise.resolve(o._st.body ? o._st.body.bytes : new Uint8Array());
+};
+// "UTF-8 decode" (not "decode"): it strips a leading BOM. `JSON.parse` chokes on
+// a stray U+FEFF, so a JSON document served with a BOM would otherwise be
+// unreadable — which is most JSON written on Windows.
+const _utf8DecodeBOM = (bytes) => {
+  const s = new TextDecoder().decode(bytes);
+  return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
+};
+const _defineBodyMixin = (Proto) => {
+  Object.defineProperty(Proto, 'body', {
+    get: _markNative(function () {
+      const b = this._st.body;
+      if (b === null) return null;
+      if (!this._bodyStream) {
+        if (b.stream) this._bodyStream = b.stream;
+        else {
+          const bytes = b.bytes;
+          this._bodyStream = new ReadableStream({ start(c) { if (bytes.length) c.enqueue(bytes.slice()); c.close(); } });
+        }
+      }
+      return this._bodyStream;
+    }), enumerable: true, configurable: true,
+  });
+  Object.defineProperty(Proto, 'bodyUsed', {
+    get: _markNative(function () { return this._st.body !== null && !!this._bodyUsed; }),
+    enumerable: true, configurable: true,
+  });
+  Proto.arrayBuffer = _markNative(function arrayBuffer() { return _bodyConsume(this).then((b) => _arrayBufferFromBytes(b.slice())); });
+  Proto.bytes = _markNative(function bytes() { return _bodyConsume(this).then((b) => b.slice()); });
+  Proto.text = _markNative(function text() { return _bodyConsume(this).then((b) => _utf8DecodeBOM(b)); });
+  Proto.json = _markNative(function json() { return _bodyConsume(this).then((b) => JSON.parse(_utf8DecodeBOM(b))); });
+  Proto.blob = _markNative(function blob() {
+    // The blob's type is the body's Content-Type — including when that header is
+    // present and EMPTY, which means "no type", not "guess one".
+    const ct = this._headers.get('content-type');
+    return _bodyConsume(this).then((b) => {
+      const bl = new Blob([]);
+      bl._bytes = b.slice();
+      bl._type = _normalizeBlobType(ct === null ? '' : ct);
+      return bl;
+    });
+  });
+  Proto.formData = _markNative(function formData() {
+    const ct = this._headers.get('content-type') || '';
+    const mime = _parseMimeType(ct);
+    const essence = mime ? mime.type + '/' + mime.subtype : '';
+    if (essence === 'multipart/form-data') {
+      const bp = mime.params.find((p) => p[0] === 'boundary');
+      if (!bp) return Promise.reject(new TypeError('Failed to execute on Body: multipart/form-data with no boundary'));
+      return _bodyConsume(this).then((b) => _parseMultipartFormData(new TextDecoder().decode(b), bp[1]));
+    }
+    if (essence === 'application/x-www-form-urlencoded') {
+      return _bodyConsume(this).then((b) => {
+        const fd = new FormData();
+        for (const [k, v] of new URLSearchParams(new TextDecoder().decode(b))) fd.append(k, v);
+        return fd;
+      });
+    }
+    return Promise.reject(new TypeError('Failed to execute on Body: unsupported Content-Type for formData()'));
+  });
+};
+// Parse a multipart body back into a FormData. Deliberately minimal: enough to
+// round-trip what `_fetchExtractBody` writes and what a plain <form> posts.
+function _parseMultipartFormData(text, boundary) {
+  // A body that never mentions the boundary is not a multipart body. Returning an
+  // empty FormData there would report "the form was empty" for what is really a
+  // malformed payload.
+  if (text.indexOf('--' + boundary) < 0) throw new TypeError('Failed to execute on Body: could not parse multipart body');
+  const fd = new FormData();
+  for (const part of text.split('--' + boundary)) {
+    const sep = part.indexOf('\r\n\r\n');
+    if (sep < 0) continue;
+    const rawHeaders = part.slice(0, sep);
+    let value = part.slice(sep + 4);
+    if (value.endsWith('\r\n')) value = value.slice(0, -2);
+    const nameMatch = /name="([^"]*)"/.exec(rawHeaders);
+    if (!nameMatch) continue;
+    const fileMatch = /filename="([^"]*)"/.exec(rawHeaders);
+    if (fileMatch) {
+      const ctMatch = /content-type:\s*([^\r\n]*)/i.exec(rawHeaders);
+      fd.append(nameMatch[1], new File([value], fileMatch[1], { type: ctMatch ? ctMatch[1].trim() : '' }));
+    } else {
+      fd.append(nameMatch[1], value);
+    }
+  }
+  return fd;
+}
+_defineBodyMixin(Request.prototype);
+_defineBodyMixin(Response.prototype);
 
 // Install the shared ParentNode / ChildNode mutation mixins (defined as the
 // `_pn*` / `_cn*` module functions, all built on the spec "convert nodes into a

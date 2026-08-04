@@ -23,3 +23,19 @@ user-timing/measure_syntax_err.any.html
 css/cssom/cssom-setProperty-shorthand.html
 css/cssom/serialize-values.html
 css/css-typed-om/the-stylepropertymap/properties/logical.html
+# ── The fetch object model (Quests #457–#459). These exercise Headers/Request/
+#    Response AND the shared transport, so a change to op_fetch_url shows here.
+fetch/api/headers/headers-basic.any.html
+fetch/api/headers/headers-no-cors.any.html
+fetch/api/headers/header-setcookie.any.html
+fetch/api/request/request-structure.any.html
+fetch/api/request/request-bad-port.any.html
+fetch/api/response/response-error.any.html
+fetch/api/response/json.any.html
+# ── XHR shares the fetch transport and reads the Response's raw bytes: a rewrite
+#    of Response silently collapsed all four of these once. Do not drop them.
+xhr/data-uri.htm
+xhr/responsetext-decoding.htm
+xhr/responsedocument-decoding.htm
+xhr/responsexml-get-twice.htm
+xhr/setrequestheader-bogus-name.htm
