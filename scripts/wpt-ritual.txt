@@ -92,3 +92,9 @@ selection/addRange-08.html
 selection/setBaseAndExtent.html
 selection/idlharness.window.html
 selection/textcontrols/selectionchange.html
+# ── uievents + pointerevents (Quests #467–#468). Every UI event interface is now
+#    a WebIDL-shaped class over private fields, and these two idlharness files
+#    break loudly if an attribute drifts back onto the instance or a member loses
+#    its brand check. They also cover the Window on* handler machinery.
+uievents/idlharness.window.html
+pointerevents/idlharness.https.window.html

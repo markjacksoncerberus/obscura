@@ -30,7 +30,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | **F8** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **The event loop — a task is not a microtask** | **FIXED (Quest #461, 2026-08-04)** | ⚔️ | `setTimeout(fn, 0)` was `Promise.resolve().then(fn)`. HTML runs one TASK then drains the ENTIRE microtask queue; a zero-delay timer scheduled as a microtask INTERLEAVES with the promise jobs already queued. Measured: **3 of 500** chained promise jobs had run when a 0ms timer fired (now 500/500). Every `await delay(0)` on the platform — including WPT's own `flushAsyncEvents` — was looking at a half-finished world. Fixed by pumping real tasks through `op_sleep(0)`, one at a time, in insertion order. Swept before/after on 56 timer-heavy files (`scripts/wpt-eventloop-sweep.txt`). |
 | **F2** | ✅ [Remembered](457-the-remembered-verdict.md) · [Offline](458-the-offline-verdict.md) · [Session](459-the-session-verdict.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **ALL THREE TAKEN (Quests #463–#465).** `webstorage` 57/1284 → **1281/1288 (99.5%)** · `IndexedDB` core 3/556 → **552/576 (95.8%)** · `cookies` 132/840 → **736/840 (87.6%)**. Remaining: none of it is on DISK yet — one shared follow-up quest | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
 | **F3** | ✅ [The Accessible Verdict](454-the-accessible-verdict.md) | **`accname/*` + `wai-aria/role/*`** — what an element IS, and what it is CALLED | **818/853 (95.9%)** — was 0/853 | ⚔️⚔️ | **SECURED (Quests #454–#456, 2026-08-02).** 31 of 34 files to 100%. The 853 zeros were **two missing primitives**, not 853 defects: the engine could not answer "what is this" or "what is it called". Now `Element.computedRole` / `Element.computedLabel`. **Still open in this realm:** `accname/name/shadowdom/` (never measured), `comp_name_from_heading.tentative.html`, and `wai-aria/` OUTSIDE `role/` — the survey put the whole realm at 25.1% and `role/` is now 97.5% of it, so **re-measure before choosing**. The last 30 accname rows are two CSS gaps, not accname gaps (see the scroll's ⭐). |
-| **F4** | ⭐ [Survey](102-the-frontier-survey.md) · ✅ [Selected](460-the-selected-verdict.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | `selection` **33919/34349 (98.75%)** — was 24/403 · `pointerevents` 68/301 · `uievents` 65/203 | ⚔️⚔️⚔️ | **`selection` SECURED (Quest #466, 2026-08-05)** — 52 of 98 files to 100%; the survey had measured 6 of them and the realm is **34,349 subtests**, not 403. `pointerevents`/`uievents` still OPEN. Clicking and typing: F3 is how an agent reads a page, this is how it acts on one. **Re-measure before choosing — the survey's file lists are samples, and `scripts/wpt-selection-probe.txt` shows how far off a sample can be.** |
+| **F4** | ✅ [Selected](460-the-selected-verdict.md) · ✅ [Handled](461-the-handled-verdict.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | `selection` **33919/34349 (98.75%)** — was 24/403 · the `uievents`+`pointerevents` object model **573/609** — was 157/512 | ⚔️⚔️⚔️ | **ALL THREE TAKEN (Quests #466–#468, 2026-08-05).** `selection` 52 of 98 files to 100% — the survey had measured 6 of them and the realm is **34,349 subtests, not 403**. Both `idlharness` files went from half-failing to Chrome parity. **What remains in `uievents`/`pointerevents` is ONE cap: the input-driven files need HIT-TESTING against a real layout tree → quest F7.** **Re-measure before choosing any realm — the survey's file lists are samples, and `scripts/wpt-selection-probe.txt` shows how far off a sample can be.** |
 | **F5** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`quirks/*` + `css/CSS2/*`** — the old web | **75/156 · 350/440 (48.1% · 79.5%)**, Chrome 98.1% · 100% | ⚔️ | **OPEN — the cheapest rows on the map.** `css/CSS2` at 79.5% is the highest score in the whole survey. Quirks mode is not legacy trivia for our audience: the hand-me-down-laptop web is full of pages written in 2004, and they are exactly the pages that must not break. |
 | **F6** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`resize-observer/eventloop.html` HANGS THE ENGINE** | wedged the harness twice; server needed a kill + restart | ⚔️⚔️ | **OPEN — a hang is worse than a wrong render.** Playwright could not even open a new page afterwards. Excluded from `scripts/wpt-frontier-probe.txt` so the survey re-runs; that exclusion is a workaround, not a fix. |
 | **F7** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **A CSS REFTEST RUNNER** — the campaign's biggest blind spot | unmeasured, structurally | ⚔️⚔️⚔️ | **OPEN — instrumentation, not conformance.** `wpt_baseline.py` scores testharness assertions only and *cannot* run CSS reftests, which are most of `css/`. `css/CSS2` alone holds 2,461 reftest subtests Chrome passes that we have never scored. The ledger has never once asked "does the page **look** right". `scripts/shot.py` is the human-eye stopgap. |
@@ -310,6 +310,60 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-05 — Quests #467–#468, **The Handled Verdict** (`uievents` + `pointerevents`, 16-file probe **157/512 → 573/609**)
+
+*#466 gave an agent a way to know what it had grabbed. This is the pair of realms that
+describe the grabbing.* All eight UI event interfaces existed and every one of them stored
+its state as **ordinary, writable, own instance properties** — so `event.clientX = 0`
+**worked**. An event is a record of what happened; nothing that happened is a setting, and
+a handler that can rewrite the coordinates of the click it was handed can lie to every
+handler after it in the path.
+
+- **Rebuilt all eight as WebIDL-shaped classes over private fields**, through one helper
+  that stamps the five things an ES `class` gets wrong: members must be **enumerable
+  prototype accessors** (not own data props), every member must **brand-throw TypeError**
+  on a foreign `this`, `@@toStringTag` must exist (all eight stringified as
+  `[object Object]`), constructor `length` counts **required** args, and operations are
+  enumerable too. `uievents/idlharness` 54/163 → **163/163, exact Chrome parity**.
+- Filled in what was simply absent: `UIEvent.which`, `MouseEvent.layerX/layerY`,
+  `WheelEvent`'s `DOM_DELTA_*`, `KeyboardEvent`'s `DOM_KEY_LOCATION_*`, the three legacy
+  `init*Event` methods, `InputEvent.getTargetRanges()` (returning the **`StaticRange`s**
+  built in #466 — a live Range would be moved by the very edit the handler is being warned
+  about), and the whole of **`TextEvent`**, which has no constructor and exists only through
+  `document.createEvent`.
+- **`deltaMode` is the UNIT the wheel deltas are in** — a page that reads the numbers without
+  it scrolls three *pixels* where the user asked for three *lines*. And `getModifierState`
+  must report **false**, not `undefined`, for the modifiers `EventModifierInit` cannot set.
+- **#468 — one event type for mouse, pen and touch**, which is the whole point: on a cheap
+  tablet the finger is the only input there is. Full `PointerEvent`; **pointer capture**
+  (what makes a drag survive sliding off the thumb — without it a drag that leaves the
+  element silently stops, which reads as a broken control); the **eleven pointer
+  `GlobalEventHandlers`** (0/30 TIMEOUT → **30/30**); **`touch-action`**; and `navigator` is
+  now an actual **`Navigator`** instead of an object literal with no interface object.
+- **🔍 A stylus reports its angle two ways and the event must carry both** — tiltX/tiltY in
+  degrees, azimuth/altitude in radians. Whichever pair the author omitted is derived from the
+  other — **but if they gave one member of each pair, NEITHER is derived**, because a
+  half-specified pen is not evidence about the other half. 0/25 → **24/25**.
+- **🔍 The bug underneath was not a pointer bug: every non-body-reflecting `Window` `on*`
+  handler threw on a WebIDL call.** `get() { return this[_slot]; }` with a `null`/`undefined`
+  `this` — which for a `[Global]` interface **resolves to the global**, it does not throw —
+  was a hard `TypeError: Cannot read properties of undefined`. Every `getEventHandler()` shim
+  in the wild does exactly that. Ten subtests, fixed generically.
+- **CAP, and it is the big one: the whole input-driven half of both realms needs HIT-TESTING
+  against a real layout tree** — which element a coordinate is over, which is on top, which
+  one the pointer left. We synthesize stable per-element rects, which is enough to *click a
+  named element* and not enough to answer that. **F7 is now the named cap in four realms.**
+  Also measured: those files are *slow* — a 38-file `uievents` sweep at a 60s timeout ran
+  past 40 minutes without finishing.
+- **CAP, instrumentation: `pointerevent_constructor.html` (non-https) 32/35** asserts
+  `"getCoalescedEvents" in event === false`, true only on an **insecure** origin — and
+  `wpt_run.py` joins everything to `https://`. **Same scheme-pairing trap #465 found in
+  `cookies`.** Trust the `.https.html` sibling (60/64).
+- Sweep: the 59-file ritual on the stashed build and the new one at identical settings —
+  **byte-identical, 12,906 / 13,011** both times, for a change that rewrote every UI event
+  interface and the dispatcher's `relatedTarget` retargeting.
+  Scroll: [`461-the-handled-verdict.md`](461-the-handled-verdict.md).
 
 ### 2026-08-05 — Quest #466, **The Selected Verdict** (`selection` **24/403 (survey) → 33,919/34,349, 98.75%**)
 

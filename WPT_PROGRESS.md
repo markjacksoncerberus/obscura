@@ -46,6 +46,15 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **`uievents/*` + `pointerevents/*` — Quests #467–#468, the handled verdict (2026-08-05)** | **157/512** on a 16-file probe | **573/609** | **94.1%** | Every UI event interface stored its state as **writable own properties** — `event.clientX = 0` worked. Rebuilt as WebIDL-shaped classes over private fields. Scroll: `tickets/461-the-handled-verdict.md`. |
+| `uievents/idlharness.window.html` | 54/163 | **163/163** | ✅ 100% | **Quest #467.** Exact Chrome parity. Members enumerable on the prototype, brand-throwing, `@@toStringTag`, `length` = required args. |
+| `pointerevents/idlharness.https.window.html` | 68/203 | **198/203** | ⬆️ | **Quest #468.** Chrome 203/203; the 5 are `WheelEvent.momentum` and its dependants. |
+| `pointerevents/pointerevent_constructor.https.html` | 0/1 (died on line 1) | **60/64** | ⬆️ | **Quest #468.** Full `PointerEvent`: tilt/twist/angles, coalesced + predicted events. |
+| `pointerevents/pointerevent_on_event_handlers.html` | 0/30 ⚠️ TIMEOUT | **30/30** | ✅ 100% | **Quest #468.** The eleven pointer `GlobalEventHandlers`. A page that only listens for mouse events is a page a finger cannot use. |
+| `pointerevents/pointerevent_tiltX_tiltY_to_azimuth_altitude.html` | 0/25 | **24/25** | ⬆️ | **Quest #468.** A stylus reports its angle two ways and an event must carry both — but if the author gave one member of each pair, NEITHER is derived. |
+| `pointerevents/parsing/touch-action-{computed,valid}.html` | 0/6 each | **6/6** each | ✅ 100% | **Quest #468.** How a page says "this area scrolls the map, not the page". |
+| `uievents/constructors/event-getmodifierstate.html` | 10/16 | **16/16** | ✅ 100% | **Quest #467.** `Fn`/`Hyper`/`Super` are real modifiers with no init member: the answer is **false**, not `undefined`. |
+| `uievents/legacy/Event-subclasses-init.html` | 0/4 | **4/4** | ✅ 100% | **Quest #467.** `initMouseEvent`/`initKeyboardEvent`/`initCompositionEvent`, and a constructor `length` of 1. |
 | **`selection/*` — Quest #466, the selected verdict (2026-08-05)** | **24/403** (survey, 6 files) · controlled 18-file probe **3170/22342** | **33919/34349** · probe **22110/22110** | **98.75%** | 98 files, **52 to 100%**. Chrome on the identical files: 34292/34349. `getSelection()` returned an **object literal** — a fresh one per call, so `getSelection() === getSelection()` was false and `toString()` was `''`. Full list: `scripts/wpt-selection-probe.txt`. Scroll: `tickets/460-the-selected-verdict.md`. |
 | `selection/collapse-30.html` | 29/5133 | **5133/5133** | ✅ 100% | **Quest #466.** The single largest scoreable file in the realm. **+5104.** |
 | `selection/collapse-{00,15,45}.html` | 15/2655 each | **2655/2655** each | ✅ 100% | **Quest #466.** `collapse()` set the anchor and left the focus behind — and never made a range at all. |

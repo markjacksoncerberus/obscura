@@ -344,6 +344,11 @@ const _EH_HANDLER_NAMES = ('onabort onauxclick onbeforeinput onbeforematch ' +
   'onplay onplaying onprogress onratechange onreset onresize onscroll onscrollend ' +
   'onsecuritypolicyviolation onseeked onseeking onselect onselectionchange ' +
   'onselectstart onslotchange onstalled ' +
+  // Pointer Events adds its own GlobalEventHandlers. A page that only listens for
+  // mouse events is a page a finger cannot use.
+  'ongotpointercapture onlostpointercapture onpointercancel onpointerdown ' +
+  'onpointerenter onpointerleave onpointermove onpointerout onpointerover ' +
+  'onpointerrawupdate onpointerup ' +
   'onsubmit onsuspend ontimeupdate ontoggle onvolumechange onwaiting ' +
   // css-animations-1 / css-transitions-1 GlobalEventHandlers additions.
   'onanimationstart onanimationiteration onanimationend onanimationcancel ' +
@@ -5655,6 +5660,37 @@ class Element extends Node {
   // this class (see __ariaReflectedAttrs) — a table-driven loop covers the full
   // WAI-ARIA set rather than a handful of hand-written accessors.
   scrollIntoView() { __obscura_click_target = this; }
+  // ── Pointer capture (Pointer Events §"Setting Pointer Capture") ───────────
+  // Redirect every remaining event from one pointer to THIS element, wherever it
+  // physically goes. That is what makes a drag work: once the finger is down on a
+  // slider thumb, sliding off the thumb — off the widget, off the page — must keep
+  // moving the thumb, because the user is still dragging. Without it a drag that
+  // leaves the element silently stops, which reads as a janky, broken control.
+  setPointerCapture(pointerId) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'setPointerCapture' on 'Element': 1 argument required, but only 0 present.");
+    pointerId = pointerId | 0;
+    if (!__obscura_activePointers.has(pointerId))
+      throw new DOMException("Failed to execute 'setPointerCapture' on 'Element': No active pointer with the given id is found.", "NotFoundError");
+    // Capture cannot be given to an element that has left the document — there
+    // would be nothing to deliver to.
+    if (!this.isConnected)
+      throw new DOMException("Failed to execute 'setPointerCapture' on 'Element': InvalidStateError", "InvalidStateError");
+    __obscura_pendingCapture.set(pointerId, this);
+  }
+  releasePointerCapture(pointerId) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'releasePointerCapture' on 'Element': 1 argument required, but only 0 present.");
+    pointerId = pointerId | 0;
+    if (!__obscura_activePointers.has(pointerId))
+      throw new DOMException("Failed to execute 'releasePointerCapture' on 'Element': No active pointer with the given id is found.", "NotFoundError");
+    if (__obscura_pendingCapture.get(pointerId) === this) __obscura_pendingCapture.delete(pointerId);
+  }
+  hasPointerCapture(pointerId) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'hasPointerCapture' on 'Element': 1 argument required, but only 0 present.");
+    return __obscura_pendingCapture.get(pointerId | 0) === this;
+  }
   animate(keyframes, options) {
     const duration = typeof options === 'number' ? options : (options?.duration || 0);
     return {
@@ -6648,11 +6684,14 @@ class Document extends Node {
       'animationevent': AnimationEvent,
       'transitionevent': TransitionEvent,
       'timeevent': TimeEvent,
+      'textevent': TextEvent,
     };
     const Cls = map[String(type || '').toLowerCase()] || Event;
     let e;
-    // TimeEvent is non-author-constructible; createEvent flips its ctor guard to mint one.
+    // TimeEvent and TextEvent are non-author-constructible; createEvent is their
+    // only door, so it flips the ctor guard to mint one.
     if (Cls === TimeEvent) { _allowTimeEventCtor = true; try { e = new Cls(''); } finally { _allowTimeEventCtor = false; } }
+    else if (Cls === TextEvent) { _allowTextEventCtor = true; try { e = new Cls(''); } finally { _allowTextEventCtor = false; } }
     else e = new Cls('');
     e._initialized = false; // createEvent yields an uninitialized event (needs initEvent)
     return e;
@@ -7702,15 +7741,26 @@ for (const _ev of [
     continue;
   }
   const _slot = "__winon_" + _ev, _type = _ev;
+  // WebIDL [Global]: a null/undefined `this` resolves to the global rather than
+  // throwing, which is what `onclick.call(undefined)` and every bare
+  // `getEventHandler()` shim in the wild rely on. Anything else is a foreign
+  // receiver and gets the honest TypeError.
+  const _win = (t) => { if (t == null || t === globalThis) return globalThis;
+                        throw new TypeError("Illegal invocation"); };
+  // WebIDL names an accessor's function "get onfoo" / "set onfoo"; a shorthand
+  // `get()` in an object literal is just named "get", which idlharness checks.
+  const _g = function () { return _win(this)[_slot] || null; };
+  const _s = function (fn) {
+    const w = _win(this);
+    const cur = w[_slot];
+    if (cur) _removeListener(globalThis, _type, cur);
+    w[_slot] = (typeof fn === "function") ? fn : null;
+    if (w[_slot]) _addListener(globalThis, _type, w[_slot]);
+  };
+  Object.defineProperty(_g, 'name', { value: 'get ' + _name, configurable: true });
+  Object.defineProperty(_s, 'name', { value: 'set ' + _name, configurable: true });
   Object.defineProperty(globalThis, _name, {
-    configurable: true, enumerable: true,
-    get() { return this[_slot] || null; },
-    set(fn) {
-      const cur = this[_slot];
-      if (cur) _removeListener(globalThis, _type, cur);
-      this[_slot] = (typeof fn === "function") ? fn : null;
-      if (this[_slot]) _addListener(globalThis, _type, this[_slot]);
-    },
+    configurable: true, enumerable: true, get: _g, set: _s,
   });
 }
 
@@ -7885,7 +7935,10 @@ const _invokeListeners = function(struct, event, phase) {
   // event.relatedTarget its per-struct retargeted relatedTarget. A base Event has
   // no relatedTarget slot, so only mutate it when one already exists.
   event.target = struct.et;
-  if ('relatedTarget' in event) event.relatedTarget = struct.rt;
+  // `relatedTarget` is a readonly IDL attribute over a private field, so the
+  // retargeting writes the backing slot — the public accessor is readonly on
+  // purpose (see _idlEventAttrs).
+  if ('relatedTarget' in event) event._relatedTarget = struct.rt;
   // A CommandEvent carries its retargeting value in `source` (not relatedTarget).
   if ('_cmdSource' in event) event._sourceLive = struct.rt;
   const key = _evtRegKey(target);
@@ -7946,6 +7999,11 @@ const _dispatchSpec = function(target, event, fromPublic) {
   if (fromPublic) event._isTrusted = false;
   event._dispatchFlag = true;
   if (!event.target) event.target = target;
+  // Pointer bookkeeping: a pointer is ACTIVE from the moment it announces itself
+  // until it lifts or is cancelled, and only an active pointer can be captured.
+  // Tracking it here — at the one place every event passes through — means the
+  // set is right no matter which part of the engine synthesized the event.
+  if (event instanceof PointerEvent) __obscura_trackPointer(event);
 
   // DOM §2.9 "dispatch": build the event path with retargeting. Each struct is
   // {it: invocation target, sat: shadow-adjusted target (null on pass-through
@@ -8045,7 +8103,7 @@ const _dispatchSpec = function(target, event, fromPublic) {
   // an outside reader sees), unless clear-targets hides a shadow-tree node.
   if (_clearTargets) {
     event.target = null;
-    if ('relatedTarget' in event) event.relatedTarget = null;
+    if ('relatedTarget' in event) event._relatedTarget = null;
     if ('_cmdSource' in event) event._sourceLive = null;
   } else if (structs.length) {
     event.target = structs[structs.length - 1].et;
@@ -8570,7 +8628,6 @@ globalThis.navigator = {
   get appVersion() { return this.userAgent.replace('Mozilla/', ''); },
   language: "en-US", languages: ["en-US","en"], platform: "Linux x86_64",
   onLine: true, cookieEnabled: true, hardwareConcurrency: 8,
-  maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   deviceMemory: 8,
@@ -8650,6 +8707,32 @@ globalThis.navigator = {
   sendBeacon() { return true; },
   javaEnabled() { return false; },
 };
+// `navigator` is a Navigator, not a bag. The interface object has to exist and
+// the object has to be an instance of it, because feature detection in the wild
+// is written as `navigator instanceof Navigator` and `'maxTouchPoints' in
+// Navigator.prototype` at least as often as it is written as a property read.
+// The members stay own properties of `navigator` (moving them to the prototype
+// would be a large, risky reshuffle of a heavily-used surface); giving it a real
+// prototype is the part that costs nothing and buys the identity.
+// (Defined by hand rather than via _exposeIface/_named — those helpers live much
+// further down the file and would be in their temporal dead zone here.)
+const _Navigator = class Navigator {
+  constructor() { throw new TypeError("Illegal constructor"); }
+};
+Object.setPrototypeOf(globalThis.navigator, _Navigator.prototype);
+Object.defineProperty(_Navigator.prototype, Symbol.toStringTag,
+  { value: 'Navigator', writable: false, enumerable: false, configurable: true });
+// maxTouchPoints answers "is this a touch device, and how many fingers?" — a page
+// uses it to decide whether to offer a drag handle at all. It lives on the
+// PROTOTYPE (an own property on `navigator` would fail assert_inherits).
+{
+  const g = function () { return 0; };
+  Object.defineProperty(g, 'name', { value: 'get maxTouchPoints', configurable: true });
+  Object.defineProperty(_Navigator.prototype, 'maxTouchPoints',
+    { enumerable: true, configurable: true, get: g });
+}
+Object.defineProperty(globalThis, 'Navigator',
+  { value: _Navigator, writable: true, enumerable: false, configurable: true });
 
 globalThis.chrome = {
   app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
@@ -10844,6 +10927,7 @@ const _GCS_DEFAULTS = {
   'nav-down': 'auto', 'nav-left': 'auto', 'nav-right': 'auto', 'nav-up': 'auto',
   'outline-color': 'currentColor', 'outline-offset': '0px', 'outline-style': 'none',
   'outline-width': 'medium', resize: 'none', 'user-select': 'auto',
+  'touch-action': 'auto',
   // css-text-decor. text-decoration-color/text-emphasis-color are <color> with a
   // `currentColor` initial. text-decoration-* do not inherit; the rest do.
   'text-decoration-color': 'currentColor', 'text-decoration-line': 'none',
@@ -14954,6 +15038,7 @@ const _CSSUI_ENUM = {
 // branch does no <color> validation, so it wrongly accepts `invert`/`none`/`50%`).
 const _CSSUI_VALIDATED = new Set([
   'box-sizing', 'resize', 'user-select', 'field-sizing', 'interactivity', 'outline-style',
+  'touch-action',
   'content-visibility',
   'caret-color', 'outline-color', 'text-overflow', 'outline-width', 'outline-offset', 'cursor',
   'color-interpolation-filters',
@@ -15621,6 +15706,25 @@ const _canonCssUi = (name, value) => {
   if (_CSS_WIDE.has(low) || _TF_VAR_RE.test(s)) return s;      // CSS-wide / var()/env() → pass through
   const enumSet = _CSSUI_ENUM[name];
   if (enumSet) return enumSet.has(low) ? low : null;
+  // pointerevents: `touch-action` = auto | none | manipulation |
+  //   [ [pan-x|pan-left|pan-right] || [pan-y|pan-up|pan-down] || pinch-zoom ]
+  // The pan groups are MUTUALLY EXCLUSIVE within themselves (`pan-x pan-left` is
+  // nonsense), the components may appear in any order, and the computed value
+  // keeps the canonical order. This is how a page says "this area scrolls the map,
+  // not the page" — get it wrong and a pinch-to-zoom control fights the browser.
+  if (name === 'touch-action') {
+    if (low === 'auto' || low === 'none' || low === 'manipulation') return low;
+    const X = ['pan-x', 'pan-left', 'pan-right'], Y = ['pan-y', 'pan-up', 'pan-down'];
+    let x = null, y = null, pinch = false;
+    for (const t of _wsTokens(low)) {
+      if (X.indexOf(t) >= 0) { if (x) return null; x = t; }
+      else if (Y.indexOf(t) >= 0) { if (y) return null; y = t; }
+      else if (t === 'pinch-zoom') { if (pinch) return null; pinch = true; }
+      else return null;
+    }
+    if (!x && !y && !pinch) return null;
+    return [x, y, pinch ? 'pinch-zoom' : null].filter(Boolean).join(' ');
+  }
   if (_CORNER_SHAPE_LONGHANDS.has(name)) return _canonCornerShapeValue(s, false);  // css-borders-4 single-corner longhand
   if (_BORDER_RADIUS_LH_SET.has(name)) return _serBorderRadiusLH(s, false, 0, 0);  // css-backgrounds-3 corner radius longhand
   if (name === 'display') return _canonDisplay(s);            // css-display two-value syntax → canonical short form
@@ -31928,18 +32032,76 @@ globalThis.CustomEvent = class extends Event {
   }
 };
 // Shared EventModifierInit getModifierState (Mouse/Keyboard).
+// Only the modifiers EventModifierInit can actually set are reportable. `Fn`,
+// `Hyper`, `Super`, `Symbol` and friends are real modifier key values with no
+// init member, so a constructed event must report them false rather than
+// undefined — a page testing `getModifierState('Fn')` gets an answer either way,
+// and `undefined` is not one.
 const _modifierState = function(ev, key) {
   switch (key) {
-    case 'Control': return !!ev.ctrlKey;
-    case 'Shift': return !!ev.shiftKey;
-    case 'Alt': return !!ev.altKey;
-    case 'Meta': return !!ev.metaKey;
-    case 'AltGraph': return !!ev.modifierAltGraph;
-    case 'CapsLock': return !!ev.modifierCapsLock;
-    case 'NumLock': return !!ev.modifierNumLock;
+    case 'Control': return !!ev._ctrlKey;
+    case 'Shift': return !!ev._shiftKey;
+    case 'Alt': return !!ev._altKey;
+    case 'Meta': return !!ev._metaKey;
+    case 'AltGraph': return !!ev._modifierAltGraph;
+    case 'CapsLock': return !!ev._modifierCapsLock;
+    case 'NumLock': return !!ev._modifierNumLock;
     default: return false;
   }
 };
+// ── The UI event interfaces (https://w3c.github.io/uievents/) ────────────────
+// Every attribute below is a READONLY WebIDL attribute, which means an
+// ENUMERABLE accessor on the PROTOTYPE, backed by a private field, that
+// brand-throws on a foreign `this`. These classes previously used ordinary
+// instance properties, and that is wrong twice over: idlharness asserts each
+// member is "found in the prototype chain", and — the part that matters off the
+// test suite — an own data property lets page code do `event.clientX = 0`. An
+// event is a record of what HAPPENED. Nothing that happened is a setting, and a
+// handler that can rewrite the coordinates of the click it was handed can lie to
+// every handler after it in the propagation path.
+// `attrs` are the readonly IDL attributes; `arity` gives each operation its
+// count of REQUIRED arguments (a legacy `initFooEvent` needs only the type, so 1).
+// Operations get the same treatment as attributes — enumerable, brand-checked —
+// plus the @@toStringTag that makes `String(event)` say what the event IS.
+function _idlEventAttrs(Ctor, names, arity) {
+  for (const n of names) {
+    const priv = '_' + n;
+    Object.defineProperty(Ctor.prototype, n, {
+      enumerable: true, configurable: true,
+      get: _named('get', n, function () {
+        if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+        return this[priv];
+      }),
+    });
+  }
+  for (const k of Object.getOwnPropertyNames(Ctor.prototype)) {
+    if (k === 'constructor' || k.charCodeAt(0) === 95) continue;
+    const d = Object.getOwnPropertyDescriptor(Ctor.prototype, k);
+    if (typeof d.value !== 'function') continue;
+    const inner = d.value;
+    d.value = function (...args) {
+      if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+      return inner.apply(this, args);
+    };
+    Object.defineProperty(d.value, 'name', { value: k, configurable: true });
+    Object.defineProperty(d.value, 'length', { value: (arity && k in arity) ? arity[k] : inner.length, configurable: true });
+    _markNative(d.value);
+    d.enumerable = true;
+    Object.defineProperty(Ctor.prototype, k, d);
+  }
+  Object.defineProperty(Ctor.prototype, Symbol.toStringTag,
+    { value: Ctor.name, writable: false, enumerable: false, configurable: true });
+  // A WebIDL constructor's `length` is its count of REQUIRED arguments: the init
+  // dictionary is optional, so every event interface reports 1, not 2.
+  Object.defineProperty(Ctor, 'length', { value: 1, configurable: true });
+  _exposeIface(Ctor.name, Ctor);
+}
+// Init-dict coercions. Numeric members are CSSOM-View doubles (a click at a
+// fractional device pixel is a real coordinate, not a rounding error), so these
+// keep the fraction and only defend against NaN.
+const _evNum = (v, d) => { if (v === undefined) return d; const n = +v; return n !== n ? 0 : n; };
+const _evStr = (v, d) => (v === undefined ? d : String(v));
+
 // UIEvent — base for the visual/input event interfaces (view, detail). Defined
 // before its subclasses (MouseEvent etc.) so `extends UIEvent` resolves.
 globalThis.UIEvent = class UIEvent extends Event {
@@ -31950,80 +32112,305 @@ globalThis.UIEvent = class UIEvent extends Event {
     // WebIDL: view is Window? — a non-object, non-null value can't convert.
     if (view !== null && typeof view !== 'object')
       throw new TypeError("Failed to construct 'UIEvent': member view is not a Window.");
-    this.view = view;
-    this.detail = (o.detail != null) ? o.detail : 0;
+    this._view = view;
+    this._detail = (o.detail != null) ? o.detail : 0;
+    this._which = _evNum(o.which, 0);
   }
   initUIEvent(type, bubbles, cancelable, view, detail) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'initUIEvent' on 'UIEvent': 1 argument required, but only 0 present.");
     this.initEvent(type, bubbles, cancelable);
-    this.view = view !== undefined ? view : null;
-    this.detail = detail !== undefined ? detail : 0;
+    this._view = view !== undefined ? view : null;
+    this._detail = detail !== undefined ? detail : 0;
   }
 };
+_idlEventAttrs(UIEvent, ['view', 'detail', 'which'], { initUIEvent: 1 });
 globalThis.MouseEvent = class MouseEvent extends UIEvent {
   constructor(t,o) {
     o = (o == null) ? {} : o;
     super(t,o);
-    this.screenX = o.screenX ?? 0;
-    this.screenY = o.screenY ?? 0;
-    this.clientX = o.clientX ?? 0;
-    this.clientY = o.clientY ?? 0;
-    this.ctrlKey = !!o.ctrlKey;
-    this.shiftKey = !!o.shiftKey;
-    this.altKey = !!o.altKey;
-    this.metaKey = !!o.metaKey;
-    this.button = o.button ?? 0;
-    this.buttons = o.buttons ?? 0;
-    this.relatedTarget = o.relatedTarget ?? null;
+    this._screenX = _evNum(o.screenX, 0);
+    this._screenY = _evNum(o.screenY, 0);
+    this._clientX = _evNum(o.clientX, 0);
+    this._clientY = _evNum(o.clientY, 0);
+    this._ctrlKey = !!o.ctrlKey;
+    this._shiftKey = !!o.shiftKey;
+    this._altKey = !!o.altKey;
+    this._metaKey = !!o.metaKey;
+    this._modifierAltGraph = !!o.modifierAltGraph;
+    this._modifierCapsLock = !!o.modifierCapsLock;
+    this._modifierNumLock = !!o.modifierNumLock;
+    this._button = _evNum(o.button, 0);
+    this._buttons = _evNum(o.buttons, 0);
+    this._relatedTarget = o.relatedTarget ?? null;
     // pageX/pageY/x/y/offsetX/offsetY are CSSOM View MouseEvent members — defined as
     // brand-checked PROTOTYPE getters (deriving from clientX/clientY) in the CSSOM
     // View block, NOT as instance own-props (which would fail idlharness's
     // "must inherit … in prototype chain" assertion).
-    this.movementX = o.movementX ?? 0; this.movementY = o.movementY ?? 0;
+    this._movementX = _evNum(o.movementX, 0); this._movementY = _evNum(o.movementY, 0);
+    // Legacy `which`: for a mouse event it is the button number, one-based.
+    if (o.which === undefined) this._which = this._button + 1;
   }
-  getModifierState(k) { return _modifierState(this, k); }
+  getModifierState(keyArg) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'getModifierState': 1 argument required, but only 0 present.");
+    return _modifierState(this, String(keyArg));
+  }
+  initMouseEvent(type, bubbles, cancelable, view, detail, screenX, screenY,
+                 clientX, clientY, ctrlKey, altKey, shiftKey, metaKey, button, relatedTarget) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'initMouseEvent' on 'MouseEvent': 1 argument required, but only 0 present.");
+    this.initUIEvent(type, bubbles, cancelable, view, detail);
+    this._screenX = _evNum(screenX, 0); this._screenY = _evNum(screenY, 0);
+    this._clientX = _evNum(clientX, 0); this._clientY = _evNum(clientY, 0);
+    this._ctrlKey = !!ctrlKey; this._altKey = !!altKey;
+    this._shiftKey = !!shiftKey; this._metaKey = !!metaKey;
+    this._button = _evNum(button, 0); this._which = this._button + 1;
+    this._relatedTarget = relatedTarget !== undefined ? relatedTarget : null;
+  }
 };
+_idlEventAttrs(MouseEvent, ['screenX', 'screenY', 'clientX', 'clientY', 'ctrlKey',
+  'shiftKey', 'altKey', 'metaKey', 'button', 'buttons', 'relatedTarget',
+  'movementX', 'movementY'], { getModifierState: 1, initMouseEvent: 1 });
+// layerX/layerY are legacy: the point relative to the nearest POSITIONED ancestor.
+// Without a layout tree there is no way to find that ancestor's box, so these
+// report the client point — right whenever the positioned ancestor is the
+// viewport, which is the common case, and honestly wrong otherwise.
+for (const [n, from] of [['layerX', '_clientX'], ['layerY', '_clientY']]) {
+  Object.defineProperty(MouseEvent.prototype, n, {
+    enumerable: true, configurable: true,
+    get: _named('get', n, function () {
+      if (!(this instanceof MouseEvent)) throw new TypeError("Illegal invocation");
+      return this[from];
+    }),
+  });
+}
 globalThis.WheelEvent = class WheelEvent extends MouseEvent {
   constructor(t,o) {
     o = (o == null) ? {} : o;
     super(t,o);
-    this.deltaX = o.deltaX ?? 0;
-    this.deltaY = o.deltaY ?? 0;
-    this.deltaZ = o.deltaZ ?? 0;
-    this.deltaMode = o.deltaMode ?? 0;
+    this._deltaX = _evNum(o.deltaX, 0);
+    this._deltaY = _evNum(o.deltaY, 0);
+    this._deltaZ = _evNum(o.deltaZ, 0);
+    this._deltaMode = _evNum(o.deltaMode, 0) >>> 0;
   }
 };
+_idlEventAttrs(WheelEvent, ['deltaX', 'deltaY', 'deltaZ', 'deltaMode']);
+// deltaMode is the UNIT the deltas are in — pixels, lines or pages. A page that
+// reads the numbers without the unit scrolls by three pixels where the user
+// asked for three lines.
+for (const [k, v] of [['DOM_DELTA_PIXEL', 0], ['DOM_DELTA_LINE', 1], ['DOM_DELTA_PAGE', 2]]) {
+  Object.defineProperty(WheelEvent, k, { value: v, enumerable: true });
+  Object.defineProperty(WheelEvent.prototype, k, { value: v, enumerable: true });
+}
 globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
   constructor(t,o) {
     o = (o == null) ? {} : o;
     super(t,o);
-    this.ctrlKey = !!o.ctrlKey;
-    this.shiftKey = !!o.shiftKey;
-    this.altKey = !!o.altKey;
-    this.metaKey = !!o.metaKey;
-    this.key = o.key !== undefined ? String(o.key) : "";
-    this.code = o.code !== undefined ? String(o.code) : "";
-    this.location = o.location ?? 0;
-    this.repeat = !!o.repeat;
-    this.isComposing = !!o.isComposing;
-    this.charCode = o.charCode ?? 0;
-    this.keyCode = o.keyCode ?? 0;
-    this.which = o.which ?? 0;
+    this._ctrlKey = !!o.ctrlKey;
+    this._shiftKey = !!o.shiftKey;
+    this._altKey = !!o.altKey;
+    this._metaKey = !!o.metaKey;
+    this._modifierAltGraph = !!o.modifierAltGraph;
+    this._modifierCapsLock = !!o.modifierCapsLock;
+    this._modifierNumLock = !!o.modifierNumLock;
+    this._key = _evStr(o.key, "");
+    this._code = _evStr(o.code, "");
+    this._location = _evNum(o.location, 0) >>> 0;
+    this._repeat = !!o.repeat;
+    this._isComposing = !!o.isComposing;
+    this._charCode = _evNum(o.charCode, 0) >>> 0;
+    this._keyCode = _evNum(o.keyCode, 0) >>> 0;
+    if (o.which === undefined) this._which = this._charCode || this._keyCode;
   }
-  getModifierState(k) { return _modifierState(this, k); }
+  getModifierState(keyArg) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'getModifierState': 1 argument required, but only 0 present.");
+    return _modifierState(this, String(keyArg));
+  }
+  initKeyboardEvent(type, bubbles, cancelable, view, key, location, ctrlKey, altKey, shiftKey, metaKey) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'initKeyboardEvent' on 'KeyboardEvent': 1 argument required, but only 0 present.");
+    this.initUIEvent(type, bubbles, cancelable, view, 0);
+    this._key = _evStr(key, ""); this._location = _evNum(location, 0) >>> 0;
+    this._ctrlKey = !!ctrlKey; this._altKey = !!altKey;
+    this._shiftKey = !!shiftKey; this._metaKey = !!metaKey;
+  }
 };
+_idlEventAttrs(KeyboardEvent, ['key', 'code', 'location', 'ctrlKey', 'shiftKey',
+  'altKey', 'metaKey', 'repeat', 'isComposing', 'charCode', 'keyCode'],
+  { getModifierState: 1, initKeyboardEvent: 1 });
+for (const [k, v] of [['DOM_KEY_LOCATION_STANDARD', 0], ['DOM_KEY_LOCATION_LEFT', 1],
+                      ['DOM_KEY_LOCATION_RIGHT', 2], ['DOM_KEY_LOCATION_NUMPAD', 3]]) {
+  Object.defineProperty(KeyboardEvent, k, { value: v, enumerable: true });
+  Object.defineProperty(KeyboardEvent.prototype, k, { value: v, enumerable: true });
+}
 globalThis.FocusEvent = class FocusEvent extends UIEvent {
-  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.relatedTarget = o.relatedTarget ?? null; }
+  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this._relatedTarget = o.relatedTarget ?? null; }
 };
+_idlEventAttrs(FocusEvent, ['relatedTarget']);
 globalThis.CompositionEvent = class CompositionEvent extends UIEvent {
-  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.data = o.data !== undefined ? String(o.data) : ""; }
+  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this._data = _evStr(o.data, ""); }
+  initCompositionEvent(type, bubbles, cancelable, view, data) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'initCompositionEvent' on 'CompositionEvent': 1 argument required, but only 0 present.");
+    this.initUIEvent(type, bubbles, cancelable, view, 0);
+    this._data = _evStr(data, "");
+  }
 };
+_idlEventAttrs(CompositionEvent, ['data'], { initCompositionEvent: 1 });
 globalThis.InputEvent = class InputEvent extends UIEvent {
-  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.data = o.data !== undefined ? o.data : null; this.inputType = o.inputType || ""; this.isComposing = !!o.isComposing; }
+  constructor(t,o) {
+    o = (o == null) ? {} : o; super(t,o);
+    this._data = o.data !== undefined && o.data !== null ? String(o.data) : null;
+    this._inputType = _evStr(o.inputType, "");
+    this._isComposing = !!o.isComposing;
+    this._dataTransfer = o.dataTransfer ?? null;
+    // The ranges the edit is ABOUT to replace, captured before it happens. They
+    // are StaticRanges on purpose: a live Range would be moved by the very edit
+    // the handler is being warned about, so by the time it looked, it would be
+    // describing the aftermath rather than the target.
+    this._targetRanges = Array.isArray(o.targetRanges) ? o.targetRanges.slice() : [];
+  }
+  getTargetRanges() { return this._targetRanges.slice(); }
 };
+_idlEventAttrs(InputEvent, ['data', 'inputType', 'isComposing', 'dataTransfer'], { getTargetRanges: 0 });
+// TextEvent — the legacy `textInput` event. It has NO constructor: it exists only
+// via `document.createEvent('TextEvent')` + `initTextEvent`, which is why the
+// guard below is a module flag rather than an argument.
+let _allowTextEventCtor = false;
+globalThis.TextEvent = class TextEvent extends UIEvent {
+  constructor(t, o) {
+    if (!_allowTextEventCtor) throw new TypeError("Illegal constructor");
+    o = (o == null) ? {} : o; super(t, o); this._data = _evStr(o.data, "");
+  }
+  initTextEvent(type, bubbles, cancelable, view, data) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'initTextEvent' on 'TextEvent': 1 argument required, but only 0 present.");
+    this.initUIEvent(type, bubbles, cancelable, view, 0);
+    // Note: `String(undefined)` — the legacy init methods stringify their missing
+    // arguments rather than defaulting them, and the tests pin that exactly.
+    this._data = String(data);
+  }
+};
+_idlEventAttrs(TextEvent, ['data'], { initTextEvent: 1 });
+Object.defineProperty(TextEvent, 'length', { value: 0, configurable: true });
 globalThis.ErrorEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o);this.message=o.message||"";this.filename=o.filename||"";this.lineno=o.lineno||0;this.colno=o.colno||0;this.error=o.error??null; } };
+// ── PointerEvent (https://w3c.github.io/pointerevents/) ─────────────────────
+// One event type for mouse, pen and touch, which is the whole point: a page that
+// handles `pointerdown` works with a finger, a stylus and a mouse without three
+// code paths — and on a cheap tablet, the finger is the only input there is.
+//
+// A stylus reports its angle two ways, and they describe the same pen: tiltX/tiltY
+// (the angle from vertical in each of two planes, in degrees) and
+// azimuthAngle/altitudeAngle (compass direction + height above the surface, in
+// radians). An event must carry both, so whichever pair the author DIDN'T supply
+// is derived — and if they supplied one member of each pair, neither is derived,
+// because a half-specified pen is not evidence about the other half.
+// The pointers currently in contact with (or hovering over) the page, and the
+// element each is captured by. Kept as ids rather than objects: a pointer is an
+// identity that outlives any one event, which is exactly why capture is keyed on it.
+const __obscura_activePointers = new Set();
+const __obscura_pendingCapture = new Map();
+function __obscura_trackPointer(ev) {
+  const id = ev._pointerId | 0;
+  const t = ev.type;
+  if (t === 'pointerup' || t === 'pointercancel' || t === 'pointerout' || t === 'pointerleave') {
+    __obscura_activePointers.delete(id);
+    // Capture ends with the pointer: a drag that is over cannot still own a target.
+    const held = __obscura_pendingCapture.get(id);
+    if (held) {
+      __obscura_pendingCapture.delete(id);
+      try {
+        held.dispatchEvent(new PointerEvent('lostpointercapture',
+          { bubbles: true, composed: true, pointerId: id, pointerType: ev._pointerType }));
+      } catch (e) {}
+    }
+  } else {
+    __obscura_activePointers.add(id);
+  }
+}
+const _PE_HALF_PI = Math.PI / 2, _PE_TAU = Math.PI * 2;
+const _peRad = (deg) => (deg * Math.PI) / 180;
+function _peTiltToAngles(tiltX, tiltY) {
+  if (tiltX === 0 && tiltY === 0) return [0, _PE_HALF_PI];
+  const xr = _peRad(tiltX), yr = _peRad(tiltY);
+  const flat = Math.abs(tiltX) === 90 || Math.abs(tiltY) === 90;
+  let azimuth;
+  if (tiltX === 0) azimuth = tiltY > 0 ? _PE_HALF_PI : 3 * _PE_HALF_PI;
+  else if (tiltY === 0) azimuth = tiltX > 0 ? 0 : Math.PI;
+  else if (flat) azimuth = 0;             // pen flat on the surface in both planes
+  else {
+    azimuth = Math.atan2(Math.tan(yr), Math.tan(xr));
+    if (azimuth < 0) azimuth += _PE_TAU;
+  }
+  let altitude;
+  if (flat) altitude = 0;
+  else if (tiltX === 0) altitude = _PE_HALF_PI - Math.abs(yr);
+  else if (tiltY === 0) altitude = _PE_HALF_PI - Math.abs(xr);
+  else {
+    const tx = Math.tan(xr), ty = Math.tan(yr);
+    altitude = Math.atan(1 / Math.sqrt(tx * tx + ty * ty));
+  }
+  return [azimuth, altitude];
+}
+function _peAnglesToTilt(azimuth, altitude) {
+  if (altitude === 0) {
+    // Lying flat: the azimuth alone decides which edge(s) the pen leans over.
+    if (azimuth === 0 || azimuth === _PE_TAU) return [90, 0];
+    if (azimuth === _PE_HALF_PI) return [0, 90];
+    if (azimuth === Math.PI) return [-90, 0];
+    if (azimuth === 3 * _PE_HALF_PI) return [0, -90];
+    if (azimuth < _PE_HALF_PI) return [90, 90];
+    if (azimuth < Math.PI) return [-90, 90];
+    if (azimuth < 3 * _PE_HALF_PI) return [-90, -90];
+    return [90, -90];
+  }
+  const tanAlt = Math.tan(altitude);
+  return [Math.round(Math.atan(Math.cos(azimuth) / tanAlt) * 180 / Math.PI),
+          Math.round(Math.atan(Math.sin(azimuth) / tanAlt) * 180 / Math.PI)];
+}
 globalThis.PointerEvent = class PointerEvent extends MouseEvent {
-  constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.pointerId=o.pointerId??0; this.pointerType=o.pointerType||""; this.isPrimary=!!o.isPrimary; this.pressure=o.pressure??0; this.width=o.width??1; this.height=o.height??1; }
+  constructor(t,o) {
+    o = (o == null) ? {} : o; super(t,o);
+    this._pointerId = _evNum(o.pointerId, 0) | 0;
+    this._pointerType = _evStr(o.pointerType, "");
+    this._isPrimary = !!o.isPrimary;
+    this._pressure = _evNum(o.pressure, 0);
+    this._tangentialPressure = _evNum(o.tangentialPressure, 0);
+    this._twist = _evNum(o.twist, 0) | 0;
+    this._width = _evNum(o.width, 1);
+    this._height = _evNum(o.height, 1);
+    this._persistentDeviceId = _evNum(o.persistentDeviceId, 0) | 0;
+    const hasTilt = o.tiltX !== undefined || o.tiltY !== undefined;
+    const hasAngle = o.azimuthAngle !== undefined || o.altitudeAngle !== undefined;
+    let tiltX = _evNum(o.tiltX, 0) | 0, tiltY = _evNum(o.tiltY, 0) | 0;
+    let azimuth = _evNum(o.azimuthAngle, 0), altitude = _evNum(o.altitudeAngle, _PE_HALF_PI);
+    if (hasTilt && !hasAngle) [azimuth, altitude] = _peTiltToAngles(tiltX, tiltY);
+    else if (hasAngle && !hasTilt) [tiltX, tiltY] = _peAnglesToTilt(azimuth, altitude);
+    this._tiltX = tiltX; this._tiltY = tiltY;
+    this._azimuthAngle = azimuth; this._altitudeAngle = altitude;
+    // Coalesced events are the movements the UA merged into this one because it
+    // could not deliver them fast enough; predicted events are where the pointer
+    // is expected to be next. A drawing app reads the first to avoid a jagged
+    // stroke and the second to hide input latency — on slow hardware, which is
+    // where the merging happens, that is the difference between a usable pen and
+    // an unusable one. Frozen at construction: they describe history, not a list.
+    this._coalescedEvents = Array.isArray(o.coalescedEvents) ? o.coalescedEvents.slice() : [];
+    this._predictedEvents = Array.isArray(o.predictedEvents) ? o.predictedEvents.slice() : [];
+  }
+  getCoalescedEvents() { return this._coalescedEvents.slice(); }
+  getPredictedEvents() { return this._predictedEvents.slice(); }
 };
+_idlEventAttrs(PointerEvent, ['pointerId', 'width', 'height', 'pressure',
+  'tangentialPressure', 'tiltX', 'tiltY', 'twist', 'altitudeAngle', 'azimuthAngle',
+  'pointerType', 'isPrimary', 'persistentDeviceId'],
+  { getCoalescedEvents: 0, getPredictedEvents: 0 });
+// NOTE: `getCoalescedEvents` is [SecureContext] in the spec — the coalesced list
+// is a higher-resolution record of the user's hand than the delivered events are,
+// so an insecure origin is not meant to get it. It is exposed unconditionally
+// here because the runner serves every test over https (see the caps in
+// tickets/462), so gating it would only ever hide it from tests that want it.
 // AnimationEvent / TransitionEvent (css-animations-1 / css-transitions-1) — Event
 // subclasses carrying the CSS animation/transition detail. Their WebIDL readonly
 // attributes live as brand-checked accessors on the PROTOTYPE (idlharness asserts
@@ -42931,11 +43318,6 @@ _OrigDateTimeFormat.prototype.resolvedOptions = function() {
   return r;
 };
 
-if (typeof PointerEvent === 'undefined') {
-  globalThis.PointerEvent = class PointerEvent extends MouseEvent {
-    constructor(type, opts={}) { super(type, opts); this.pointerId = opts.pointerId || 0; this.width = opts.width || 1; this.height = opts.height || 1; this.pressure = opts.pressure || 0; this.pointerType = opts.pointerType || 'mouse'; }
-  };
-}
 
 if (typeof navigator.credentials === 'undefined') {
   navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
