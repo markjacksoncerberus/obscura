@@ -30,7 +30,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | **F8** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **The event loop — a task is not a microtask** | **FIXED (Quest #461, 2026-08-04)** | ⚔️ | `setTimeout(fn, 0)` was `Promise.resolve().then(fn)`. HTML runs one TASK then drains the ENTIRE microtask queue; a zero-delay timer scheduled as a microtask INTERLEAVES with the promise jobs already queued. Measured: **3 of 500** chained promise jobs had run when a 0ms timer fired (now 500/500). Every `await delay(0)` on the platform — including WPT's own `flushAsyncEvents` — was looking at a half-finished world. Fixed by pumping real tasks through `op_sleep(0)`, one at a time, in insertion order. Swept before/after on 56 timer-heavy files (`scripts/wpt-eventloop-sweep.txt`). |
 | **F2** | ✅ [Remembered](457-the-remembered-verdict.md) · [Offline](458-the-offline-verdict.md) · [Session](459-the-session-verdict.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **ALL THREE TAKEN (Quests #463–#465).** `webstorage` 57/1284 → **1281/1288 (99.5%)** · `IndexedDB` core 3/556 → **552/576 (95.8%)** · `cookies` 132/840 → **736/840 (87.6%)**. Remaining: none of it is on DISK yet — one shared follow-up quest | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
 | **F3** | ✅ [The Accessible Verdict](454-the-accessible-verdict.md) | **`accname/*` + `wai-aria/role/*`** — what an element IS, and what it is CALLED | **818/853 (95.9%)** — was 0/853 | ⚔️⚔️ | **SECURED (Quests #454–#456, 2026-08-02).** 31 of 34 files to 100%. The 853 zeros were **two missing primitives**, not 853 defects: the engine could not answer "what is this" or "what is it called". Now `Element.computedRole` / `Element.computedLabel`. **Still open in this realm:** `accname/name/shadowdom/` (never measured), `comp_name_from_heading.tentative.html`, and `wai-aria/` OUTSIDE `role/` — the survey put the whole realm at 25.1% and `role/` is now 97.5% of it, so **re-measure before choosing**. The last 30 accname rows are two CSS gaps, not accname gaps (see the scroll's ⭐). |
-| **F4** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | **68/301 · 65/203 · 24/403 (22.6% · 32.0% · 6.0%)**, Chrome 98.7% · 96.1% · 98.8% | ⚔️⚔️⚔️ | **OPEN.** Clicking, typing, selecting. F3 is how an agent reads a page; this is how it acts on one. `selection` at 6% with **zero** could-not-run means the API is present and wrong rather than missing — usually the cheaper shape. |
+| **F4** | ⭐ [Survey](102-the-frontier-survey.md) · ✅ [Selected](460-the-selected-verdict.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | `selection` **33919/34349 (98.75%)** — was 24/403 · `pointerevents` 68/301 · `uievents` 65/203 | ⚔️⚔️⚔️ | **`selection` SECURED (Quest #466, 2026-08-05)** — 52 of 98 files to 100%; the survey had measured 6 of them and the realm is **34,349 subtests**, not 403. `pointerevents`/`uievents` still OPEN. Clicking and typing: F3 is how an agent reads a page, this is how it acts on one. **Re-measure before choosing — the survey's file lists are samples, and `scripts/wpt-selection-probe.txt` shows how far off a sample can be.** |
 | **F5** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`quirks/*` + `css/CSS2/*`** — the old web | **75/156 · 350/440 (48.1% · 79.5%)**, Chrome 98.1% · 100% | ⚔️ | **OPEN — the cheapest rows on the map.** `css/CSS2` at 79.5% is the highest score in the whole survey. Quirks mode is not legacy trivia for our audience: the hand-me-down-laptop web is full of pages written in 2004, and they are exactly the pages that must not break. |
 | **F6** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`resize-observer/eventloop.html` HANGS THE ENGINE** | wedged the harness twice; server needed a kill + restart | ⚔️⚔️ | **OPEN — a hang is worse than a wrong render.** Playwright could not even open a new page afterwards. Excluded from `scripts/wpt-frontier-probe.txt` so the survey re-runs; that exclusion is a workaround, not a fix. |
 | **F7** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **A CSS REFTEST RUNNER** — the campaign's biggest blind spot | unmeasured, structurally | ⚔️⚔️⚔️ | **OPEN — instrumentation, not conformance.** `wpt_baseline.py` scores testharness assertions only and *cannot* run CSS reftests, which are most of `css/`. `css/CSS2` alone holds 2,461 reftest subtests Chrome passes that we have never scored. The ledger has never once asked "does the page **look** right". `scripts/shot.py` is the human-eye stopgap. |
@@ -310,6 +310,53 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-05 — Quest #466, **The Selected Verdict** (`selection` **24/403 (survey) → 33,919/34,349, 98.75%**)
+
+*The survey sampled six files, wrote down 6.0%, and moved on. Chrome's own run summary says the
+realm holds **34,349 scoreable subtests** — `collapse-30.html` alone is **5,133** — and not one of
+the combinatorial files that carry 97% of that weight was on the list.* Took frontier quest **F4**
+per the standing order (the ⭐ pointed at a lenient header parse inside a realm already at 87.6%).
+
+- **`getSelection()` returned an object literal.** Not a `Selection` — a bag of fields, and a
+  **fresh one on every call**, so `getSelection() === getSelection()` was false and any page that
+  stashed the selection was holding a corpse. `selectAllChildren()` was `{}`. `containsNode()`
+  returned `false` unconditionally. **`toString()` returned `''`** — which is what every
+  "copy the selected text" button on the web reads.
+- **A selection is one range plus a DIRECTION**, and that pairing is the whole interface: `anchor`
+  is the end you started from, `focus` is the end that moves, so **which boundary point each name
+  refers to FLIPS when the direction does**. That is exactly what lets shift+arrow keep growing a
+  selection *from the end you began at*.
+- **The range is held by IDENTITY, never copied.** `getRangeAt(0)` returns the object `addRange()`
+  was given; mutating either mutates both, and WPT asserts it from both sides. Find-in-page
+  highlights a match then walks the *same* Range to the next one — a copy fails silently, forever.
+- **🔍 The ordering asymmetry is real and normative:** `collapse()` validates node and offset
+  **before** giving up on a node outside the document; `extend()` gives up **first** and validates
+  **second**. Both halves are separately asserted, so one shared "validate then check root" helper
+  fails one of them whichever order you pick.
+- **`selectAllChildren` counts CHILDREN, not length** — on a Text node those are 0 and 8.
+- **`idlharness` 37/112 → 112/112 was five lessons in what an ES `class` is not**: an interface
+  object is a *non-enumerable* global; members are *enumerable* prototype props (class members are
+  the opposite); every member **brand-throws TypeError on a foreign `this`** — without it
+  `collapseToStart.call({})` reported the body's `InvalidStateError`, a plausible domain error from
+  the wrong object, and a page debugging that chases the wrong bug; `length` counts **required**
+  args; `@@toStringTag` is a data property.
+- **`selectionchange` has two homes.** A document's selection announces at the document; a **text
+  control's announces at the ELEMENT, bubbling** — a form field's selection is its own. Both async
+  and **coalesced to one per task**, so setting `selectionStart` then `selectionEnd` yields ONE
+  notification of where things ended up, not a burst of intermediate states. `textcontrols/selectionchange`
+  16/60 → **60/60**; `selectionchange-bubble` 0/4 **TIMEOUT** → 4/4.
+- Also new: **`StaticRange`/`AbstractRange`** (neither existed), `onselectionchange`/`onselectstart`,
+  `Selection.modify()` for `character` granularity, and **`document.getSelection()` → `null`** when
+  `defaultView` is null — no browsing context means *nowhere to select*, which is not the same as
+  nothing selected.
+- **CAPS, all one cap wearing hats:** ~140 `modify`/`caret`/`bidi` rows need real **line boxes**;
+  149 `contenteditable/initial-selection-on-focus` rows need an editing-host model; ~36
+  `getComposedRanges` rows need shadow retargeting. That is quest **F7**, not a selection gap.
+- Sweep: the 54-file ritual run on the stashed build **and** the new one at identical settings —
+  output **byte-identical**, **9,727 / 9,832** both times. ⚠️ *The `9227/9331` recorded under #465
+  was stale (the list grew during that quest); corrected here.*
+  Scroll: [`460-the-selected-verdict.md`](460-the-selected-verdict.md).
 
 ### 2026-08-04 — Quest #465, **The Session Verdict** (`cookies` **132/840 → 736/840, 87.6%**)
 

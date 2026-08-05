@@ -342,7 +342,8 @@ const _EH_HANDLER_NAMES = ('onabort onauxclick onbeforeinput onbeforematch ' +
   'onloadeddata onloadedmetadata onloadstart onmousedown onmouseenter ' +
   'onmouseleave onmousemove onmouseout onmouseover onmouseup onpaste onpause ' +
   'onplay onplaying onprogress onratechange onreset onresize onscroll onscrollend ' +
-  'onsecuritypolicyviolation onseeked onseeking onselect onslotchange onstalled ' +
+  'onsecuritypolicyviolation onseeked onseeking onselect onselectionchange ' +
+  'onselectstart onslotchange onstalled ' +
   'onsubmit onsuspend ontimeupdate ontoggle onvolumechange onwaiting ' +
   // css-animations-1 / css-transitions-1 GlobalEventHandlers additions.
   'onanimationstart onanimationiteration onanimationend onanimationcancel ' +
@@ -6669,7 +6670,10 @@ class Document extends Node {
     if (!(root instanceof Node)) throw new TypeError("createNodeIterator: root must be a Node");
     return new NodeIterator(root, __obscura_whatToShow(whatToShow), __obscura_nodeFilterArg(filter));
   }
-  getSelection() { return globalThis.getSelection(); }
+  // A document with no browsing context (a DOMParser/createHTMLDocument/XML
+  // document) has NO selection at all — not an empty one. `null` here is the
+  // difference between "nothing is selected" and "there is nowhere to select".
+  getSelection() { return __obscura_getSelectionFor(this.defaultView); }
   // DocumentOrShadowRoot.activeElement: the focused element retargeted against this
   // document — when focus is inside a shadow tree, this is the topmost shadow host in
   // the document tree (never a shadow-internal node). Falls back to <body>.
@@ -27530,21 +27534,7 @@ globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
   });
 };
 globalThis.getSelection = _markNative(function getSelection() {
-  return {
-    rangeCount: 0,
-    anchorNode: null, anchorOffset: 0,
-    focusNode: null, focusOffset: 0,
-    isCollapsed: true, type: 'None',
-    removeAllRanges() { this.rangeCount = 0; },
-    addRange(range) { this.rangeCount = 1; this._range = range; },
-    getRangeAt(i) { return this._range || null; },
-    collapse(node, offset) { this.anchorNode = node; this.anchorOffset = offset || 0; this.isCollapsed = true; },
-    extend(node, offset) { this.focusNode = node; this.focusOffset = offset || 0; },
-    selectAllChildren(node) {},
-    deleteFromDocument() {},
-    containsNode(node) { return false; },
-    toString() { return ''; },
-  };
+  return __obscura_getSelectionFor(globalThis);
 });
 
 // ── CSSOM rule tree (CSSStyleSheet / CSSRule / CSSRuleList / MediaList) ───────
@@ -37330,7 +37320,27 @@ function _cvReflLong(proto, prop, attr) {
     const d = (dir === "backward" || dir === "forward") ? dir : "none";
     const prev = _inputSel[el._nid] || { start: 0, end: 0, dir: "none" };
     _inputSel[el._nid] = { start, end, dir: d };
-    if (prev.start !== start || prev.end !== end || prev.dir !== d) _fireSelectEvent(el);
+    if (prev.start !== start || prev.end !== end || prev.dir !== d) {
+      _fireSelectEvent(el);
+      _queueSelectionChange(el);
+    }
+  }
+  // HTML "queue a selection change event": a text control announces that its
+  // selection moved by firing `selectionchange` AT THE ELEMENT (bubbling), not at
+  // the document — a form field's selection is its own, separate from the page's.
+  // The event is deliberately ASYNCHRONOUS and coalesced to at most one per task,
+  // so a routine that adjusts start and end separately, or rewrites the value and
+  // then re-selects, produces ONE notification describing where things ended up
+  // rather than a burst describing every intermediate state.
+  const _selChangePending = Object.create(null);
+  function _queueSelectionChange(el) {
+    const nid = el._nid;
+    if (_selChangePending[nid]) return;
+    _selChangePending[nid] = true;
+    _queueTask(() => {
+      delete _selChangePending[nid];
+      try { el.dispatchEvent(new Event("selectionchange", { bubbles: true })); } catch (e) {}
+    });
   }
   // Move the text entry cursor to the end of the value (0-width selection). Called
   // when the value IDL attribute is set on a selectable control.
@@ -39798,6 +39808,409 @@ Range.START_TO_START = 0; Range.START_TO_END = 1; Range.END_TO_END = 2; Range.EN
 Range.prototype.START_TO_START = 0; Range.prototype.START_TO_END = 1;
 Range.prototype.END_TO_END = 2; Range.prototype.END_TO_START = 3;
 
+// ── Selection (https://w3c.github.io/selection-api/) ─────────────────────────
+// A selection is ONE range plus a DIRECTION, and nearly every subtlety in the
+// API falls out of that pairing. `anchor` is the end you started from, `focus`
+// is the end that moves — so which of the range's two boundary points each name
+// refers to FLIPS when the direction does. Selecting "abc" left-to-right and
+// right-to-left produces the same range and opposite anchors, and that is what
+// lets shift+arrow keep growing a selection from the end you began at.
+//
+// The range is held BY IDENTITY, never copied: `getRangeAt(0)` returns the very
+// object `addRange()` was given, so mutating either one mutates the other. Page
+// code depends on that liveness — find-in-page highlights a match, then walks
+// the same Range forward to the next one. Copying here would silently break it.
+//
+// Everything below is script-visible state over the real live `Range` above; no
+// layout is involved, which is why `modify()` (line/paragraph granularity needs
+// real line boxes) is the one part of the interface left out.
+const __obscura_selections = new WeakMap();   // Window → its one Selection
+let __obscura_allowSelectionCtor = false;
+globalThis.Selection = class Selection {
+  constructor() {
+    if (!__obscura_allowSelectionCtor)
+      throw new TypeError("Illegal constructor");
+    this._win = null;             // owning Window (set by __obscura_getSelectionFor)
+    this._range = null;           // the associated range, or null
+    this._direction = 'directionless';
+    this._scPending = false;      // "has scheduled selectionchange event"
+  }
+  get [Symbol.toStringTag]() { return "Selection"; }
+
+  // The document this selection is associated with. Read live off the window so
+  // a frame that re-navigates keeps ONE Selection whose document follows along.
+  _doc() { const w = this._win; return w ? w.document : null; }
+  // The two boundary points, resolved through the direction.
+  _anchor() {
+    const r = this._range; if (!r) return null;
+    return this._direction === 'backwards' ? [r._ec, r._eo] : [r._sc, r._so];
+  }
+  _focus() {
+    const r = this._range; if (!r) return null;
+    return this._direction === 'backwards' ? [r._sc, r._so] : [r._ec, r._eo];
+  }
+  // "Set the selection's range": also the single place a selectionchange is
+  // scheduled, so no caller can move the selection silently.
+  _setRange(range, direction) {
+    const dir = range ? direction : 'directionless';
+    if (this._range === range && this._direction === dir) return;
+    this._range = range; this._direction = dir;
+    if (this._scPending) return;
+    this._scPending = true;
+    _queueTask(() => {
+      this._scPending = false;
+      const doc = this._doc();
+      if (!doc) return;
+      try { doc.dispatchEvent(new Event('selectionchange')); } catch (e) {}
+    });
+  }
+  // A node is reachable from this selection only if its ROOT is our document —
+  // a detached subtree or another document's node is simply not ours to select.
+  _inDoc(node) { return __obscura_furthestAncestor(node) === this._doc(); }
+
+  get anchorNode() { const b = this._anchor(); return b ? b[0] : null; }
+  get anchorOffset() { const b = this._anchor(); return b ? b[1] : 0; }
+  get focusNode() { const b = this._focus(); return b ? b[0] : null; }
+  get focusOffset() { const b = this._focus(); return b ? b[1] : 0; }
+  get isCollapsed() { return !this._range || this._range.collapsed; }
+  get rangeCount() { return this._range ? 1 : 0; }
+  get type() { return !this._range ? 'None' : (this._range.collapsed ? 'Caret' : 'Range'); }
+  get direction() {
+    if (!this._range) return 'none';
+    return this._direction === 'backwards' ? 'backward' : 'forward';
+  }
+
+  getRangeAt(index) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'getRangeAt' on 'Selection': 1 argument required, but only 0 present.");
+    // `unsigned long`, so getRangeAt(-1) is index 4294967295 — out of range, not 0.
+    if ((index >>> 0) !== 0 || !this._range)
+      throw new DOMException("Failed to execute 'getRangeAt' on 'Selection': " + index + " is not a valid index.", "IndexSizeError");
+    return this._range;
+  }
+  addRange(range) {
+    if (!(range instanceof Range))
+      throw new TypeError("Failed to execute 'addRange' on 'Selection': parameter 1 is not of type 'Range'.");
+    if (range._root() !== this._doc()) return;   // not in our document → do nothing
+    if (this._range) return;                     // at most one range; a second add is a no-op
+    this._setRange(range, 'directionless');
+  }
+  removeRange(range) {
+    if (!(range instanceof Range))
+      throw new TypeError("Failed to execute 'removeRange' on 'Selection': parameter 1 is not of type 'Range'.");
+    // By identity: an *equivalent* range is not the range we hold.
+    if (this._range !== range)
+      throw new DOMException("Failed to execute 'removeRange' on 'Selection': The range is not in the selection.", "NotFoundError");
+    this._setRange(null, 'directionless');
+  }
+  removeAllRanges() { this._setRange(null, 'directionless'); }
+  empty() { this.removeAllRanges(); }
+
+  collapse(node, offset) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'collapse' on 'Selection': 1 argument required, but only 0 present.");
+    if (node === null || node === undefined) { this.removeAllRanges(); return; }
+    if (!(node instanceof Node))
+      throw new TypeError("Failed to execute 'collapse' on 'Selection': parameter 1 is not of type 'Node'.");
+    if (node.nodeType === 10)
+      throw new DOMException("Failed to execute 'collapse' on 'Selection': The node provided is of type DocumentType.", "InvalidNodeTypeError");
+    offset = offset === undefined ? 0 : (offset >>> 0);
+    if (offset > __obscura_nodeLength(node))
+      throw new DOMException("Failed to execute 'collapse' on 'Selection': The offset " + offset + " is larger than the node's length.", "IndexSizeError");
+    // NOTE the ordering — collapse() validates the node and offset BEFORE it
+    // gives up on a node outside the document, while extend() below gives up
+    // FIRST and validates second. That asymmetry is in the spec, and each half
+    // of it is separately asserted by the tests.
+    if (!this._inDoc(node)) return;
+    this._setRange(__obscura_newRangeAt(node, offset, node, offset), 'directionless');
+  }
+  setPosition(node, offset) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'setPosition' on 'Selection': 1 argument required, but only 0 present.");
+    return this.collapse(node, offset === undefined ? 0 : offset);
+  }
+  collapseToStart() {
+    const r = this._range;
+    if (!r) throw new DOMException("Failed to execute 'collapseToStart' on 'Selection': there is no selection.", "InvalidStateError");
+    this._setRange(__obscura_newRangeAt(r._sc, r._so, r._sc, r._so), 'directionless');
+  }
+  collapseToEnd() {
+    const r = this._range;
+    if (!r) throw new DOMException("Failed to execute 'collapseToEnd' on 'Selection': there is no selection.", "InvalidStateError");
+    this._setRange(__obscura_newRangeAt(r._ec, r._eo, r._ec, r._eo), 'directionless');
+  }
+
+  extend(node, offset) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'extend' on 'Selection': 1 argument required, but only 0 present.");
+    if (!(node instanceof Node))
+      throw new TypeError("Failed to execute 'extend' on 'Selection': parameter 1 is not of type 'Node'.");
+    if (!this._inDoc(node)) return;              // silently ignored, see collapse()
+    if (!this._range)
+      throw new DOMException("Failed to execute 'extend' on 'Selection': there is no selection.", "InvalidStateError");
+    offset = offset === undefined ? 0 : (offset >>> 0);
+    const anchor = this._anchor();
+    // A fresh range each time: extend() REPLACES the selection's range rather
+    // than mutating it, so a page holding the old one still sees the old one.
+    const nr = new Range();
+    if (__obscura_furthestAncestor(node) !== this._range._root()) {
+      nr.setStart(node, offset); nr.setEnd(node, offset);
+      this._setRange(nr, 'forwards');
+    } else if (__obscura_bpCompare(anchor[0], anchor[1], node, offset) <= 0) {
+      nr.setEnd(node, offset); nr.setStart(anchor[0], anchor[1]);
+      this._setRange(nr, 'forwards');
+    } else {
+      nr.setStart(node, offset); nr.setEnd(anchor[0], anchor[1]);
+      this._setRange(nr, 'backwards');
+    }
+  }
+  setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset) {
+    if (arguments.length < 4)
+      throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': 4 arguments required, but only " + arguments.length + " present.");
+    if (!(anchorNode instanceof Node) || !(focusNode instanceof Node))
+      throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': parameter is not of type 'Node'.");
+    anchorOffset = anchorOffset >>> 0; focusOffset = focusOffset >>> 0;
+    if (anchorOffset > __obscura_nodeLength(anchorNode))
+      throw new DOMException("Failed to execute 'setBaseAndExtent' on 'Selection': The anchor offset is larger than the anchor node's length.", "IndexSizeError");
+    if (focusOffset > __obscura_nodeLength(focusNode))
+      throw new DOMException("Failed to execute 'setBaseAndExtent' on 'Selection': The focus offset is larger than the focus node's length.", "IndexSizeError");
+    if (!this._inDoc(anchorNode) || !this._inDoc(focusNode)) return;
+    // The range is always start-before-end; the DIRECTION records which way the
+    // caller asked for, which is the only thing that distinguishes the two.
+    if (__obscura_bpCompare(anchorNode, anchorOffset, focusNode, focusOffset) <= 0)
+      this._setRange(__obscura_newRangeAt(anchorNode, anchorOffset, focusNode, focusOffset), 'forwards');
+    else
+      this._setRange(__obscura_newRangeAt(focusNode, focusOffset, anchorNode, anchorOffset), 'backwards');
+  }
+  selectAllChildren(node) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'selectAllChildren' on 'Selection': 1 argument required, but only 0 present.");
+    if (!(node instanceof Node))
+      throw new TypeError("Failed to execute 'selectAllChildren' on 'Selection': parameter 1 is not of type 'Node'.");
+    if (node.nodeType === 10)
+      throw new DOMException("Failed to execute 'selectAllChildren' on 'Selection': The node provided is of type DocumentType.", "InvalidNodeTypeError");
+    if (!this._inDoc(node)) return;
+    // CHILD COUNT, not node length — selectAllChildren on a Text node selects
+    // its (zero) children, not its characters.
+    this._setRange(__obscura_newRangeAt(node, 0, node, node.childNodes.length), 'forwards');
+  }
+
+  deleteFromDocument() { if (this._range) this._range.deleteContents(); }
+  containsNode(node, allowPartialContainment) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'containsNode' on 'Selection': 1 argument required, but only 0 present.");
+    if (!(node instanceof Node))
+      throw new TypeError("Failed to execute 'containsNode' on 'Selection': parameter 1 is not of type 'Node'.");
+    const r = this._range;
+    if (!r || !this._inDoc(node)) return false;
+    const len = __obscura_nodeLength(node);
+    if (allowPartialContainment)
+      return __obscura_bpCompare(node, len, r._sc, r._so) === 1
+          && __obscura_bpCompare(node, 0, r._ec, r._eo) === -1;
+    return __obscura_bpCompare(node, 0, r._sc, r._so) >= 0
+        && __obscura_bpCompare(node, len, r._ec, r._eo) <= 0;
+  }
+  toString() { return this._range ? this._range.toString() : ''; }
+
+  // Selection.modify (a legacy-but-universal caret-movement primitive: it is how
+  // an arrow key moves a text cursor). Only `character` granularity is honest
+  // without layout — "line" and "paragraph" need real line boxes, and "word"
+  // needs locale segmentation, so those leave the selection where it is rather
+  // than move it somewhere plausible and wrong.
+  modify(alter, direction, granularity) {
+    if (arguments.length < 3)
+      throw new TypeError("Failed to execute 'modify' on 'Selection': 3 arguments required, but only " + arguments.length + " present.");
+    alter = String(alter).toLowerCase();
+    direction = String(direction).toLowerCase();
+    granularity = String(granularity).toLowerCase();
+    if (alter !== 'move' && alter !== 'extend') return;
+    const back = direction === 'backward' || direction === 'left';
+    if (!back && direction !== 'forward' && direction !== 'right') return;
+    if (granularity !== 'character') return;
+    const f = this._focus();
+    if (!f) return;
+    const to = __obscura_stepCharacter(f[0], f[1], back);
+    if (!to) return;
+    if (alter === 'extend') this.extend(to[0], to[1]);
+    else this.collapse(to[0], to[1]);
+  }
+
+  // Selection.getComposedRanges: the selection's range expressed in COMPOSED tree
+  // terms — the point of it is that a range crossing into a shadow tree is
+  // normally reported retargeted to the host, and this returns the un-retargeted
+  // truth to callers that pass the relevant shadow roots. Obscura holds the
+  // selection un-retargeted already, so this is the range as a StaticRange.
+  getComposedRanges() {
+    const r = this._range;
+    if (!r) return [];
+    return [new StaticRange({
+      startContainer: r._sc, startOffset: r._so,
+      endContainer: r._ec, endOffset: r._eo,
+    })];
+  }
+};
+// One character forward/backward from a boundary point, in tree order: within a
+// text node it is one code unit; at a node's edge it steps into the neighbouring
+// text node. Surrogate pairs move as one character, because half of an emoji is
+// not a place a caret can be.
+function __obscura_stepCharacter(node, offset, back) {
+  if (node.nodeType === 3) {
+    const d = node.data;
+    if (back && offset > 0) {
+      let n = offset - 1;
+      if (n > 0 && d.charCodeAt(n) >= 0xDC00 && d.charCodeAt(n) <= 0xDFFF
+          && d.charCodeAt(n - 1) >= 0xD800 && d.charCodeAt(n - 1) <= 0xDBFF) n--;
+      return [node, n];
+    }
+    if (!back && offset < d.length) {
+      let n = offset + 1;
+      if (n < d.length && d.charCodeAt(offset) >= 0xD800 && d.charCodeAt(offset) <= 0xDBFF) n++;
+      return [node, n];
+    }
+  }
+  // At an edge: find the adjacent text node in tree order and enter it.
+  const doc = node.nodeType === 9 ? node : node.ownerDocument;
+  if (!doc) return null;
+  const walker = doc.createTreeWalker(__obscura_furthestAncestor(node), 4 /* SHOW_TEXT */, null);
+  const texts = [];
+  for (let t = walker.nextNode(); t; t = walker.nextNode()) texts.push(t);
+  if (!texts.length) return null;
+  let idx = node.nodeType === 3 ? texts.indexOf(node) : -1;
+  if (idx < 0) {
+    // An element/document boundary point: the child at `offset` (or the last
+    // text before it) is where the caret actually sits.
+    const child = node.childNodes[back ? offset - 1 : offset];
+    if (!child) return null;
+    for (let i = 0; i < texts.length; i++)
+      if (__obscura_isInclusiveAncestor(child, texts[i])) { idx = i; break; }
+    if (idx < 0) return null;
+    const t = texts[idx];
+    return back ? [t, Math.max(0, t.data.length - 1)] : [t, Math.min(1, t.data.length)];
+  }
+  const next = texts[idx + (back ? -1 : 1)];
+  if (!next) return null;
+  return back ? [next, Math.max(0, next.data.length - 1)] : [next, Math.min(1, next.data.length)];
+}
+// WebIDL shape for Selection. An ES `class` gets none of this for free: an
+// interface object is a NON-enumerable global; its members are ENUMERABLE own
+// properties of the prototype; every member brand-throws a TypeError on a
+// foreign `this` (so `Selection.prototype.collapseToStart.call({})` is a
+// TypeError, not the InvalidStateError the body would otherwise raise); and a
+// method's `length` counts only its REQUIRED arguments, which an ES method
+// signature with optional parameters gets wrong.
+// The required-argument count per operation (WebIDL `length`).
+const _SEL_ARITY = {
+  getRangeAt: 1, addRange: 1, removeRange: 1, removeAllRanges: 0, empty: 0,
+  getComposedRanges: 0, collapse: 1, setPosition: 1, collapseToStart: 0,
+  collapseToEnd: 0, extend: 1, setBaseAndExtent: 4, selectAllChildren: 1,
+  modify: 0, deleteFromDocument: 0, containsNode: 1, toString: 0,
+};
+_exposeIface('Selection', Selection);
+for (const k of Object.getOwnPropertyNames(Selection.prototype)) {
+  if (k === 'constructor' || k.charCodeAt(0) === 95 /* '_' — our internals stay hidden */) continue;
+  const d = Object.getOwnPropertyDescriptor(Selection.prototype, k);
+  if (d.get) {
+    const inner = d.get;
+    d.get = _named('get', k, function () {
+      if (!(this instanceof Selection)) throw new TypeError("Illegal invocation");
+      return inner.call(this);
+    });
+  } else if (typeof d.value === 'function') {
+    const inner = d.value;
+    d.value = function (...args) {
+      if (!(this instanceof Selection)) throw new TypeError("Illegal invocation");
+      return inner.apply(this, args);
+    };
+    Object.defineProperty(d.value, 'name', { value: k, configurable: true });
+    Object.defineProperty(d.value, 'length', { value: _SEL_ARITY[k] ?? inner.length, configurable: true });
+    _markNative(d.value);
+  }
+  d.enumerable = true;
+  Object.defineProperty(Selection.prototype, k, d);
+}
+// WebIDL wants @@toStringTag as a plain data property, not the accessor an ES
+// `get [Symbol.toStringTag]()` produces.
+Object.defineProperty(Selection.prototype, Symbol.toStringTag,
+  { value: 'Selection', writable: false, enumerable: false, configurable: true });
+// Window.getSelection() / Document.getSelection() are IDL operations too: both
+// brand-check, and Document's must be enumerable like every other IDL member.
+{
+  const winGet = Object.getOwnPropertyDescriptor(globalThis, 'getSelection');
+  Object.defineProperty(globalThis, 'getSelection', {
+    ...winGet,
+    value: _markNative(function getSelection() {
+      if (this != null && this !== globalThis) throw new TypeError("Illegal invocation");
+      return __obscura_getSelectionFor(globalThis);
+    }),
+  });
+  const docGet = Document.prototype.getSelection;
+  Object.defineProperty(Document.prototype, 'getSelection', {
+    value: _markNative(function getSelection() {
+      if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
+      return docGet.call(this);
+    }),
+    writable: true, enumerable: true, configurable: true,
+  });
+}
+
+// AbstractRange / StaticRange (DOM). A StaticRange is a range that does NOT move
+// when the tree under it does — the opposite of a live Range, and the right shape
+// for reporting "where this was" (getComposedRanges, input events' getTargetRanges)
+// where a live range would silently drift out from under the reader.
+globalThis.AbstractRange = class AbstractRange {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get startContainer() { return this._sc; }
+  get startOffset() { return this._so; }
+  get endContainer() { return this._ec; }
+  get endOffset() { return this._eo; }
+  get collapsed() { return this._sc === this._ec && this._so === this._eo; }
+};
+globalThis.StaticRange = class StaticRange extends AbstractRange {
+  constructor(init) {
+    // `super()` would hit AbstractRange's guard, so StaticRange is built by
+    // reparenting a plain object — the observable result is identical.
+    const self = Object.create(StaticRange.prototype);
+    if (init == null || typeof init !== 'object')
+      throw new TypeError("Failed to construct 'StaticRange': parameter 1 is not of type 'StaticRangeInit'.");
+    for (const k of ['startContainer', 'endContainer']) {
+      const n = init[k];
+      if (!(n instanceof Node))
+        throw new TypeError("Failed to construct 'StaticRange': member " + k + " is not of type 'Node'.");
+      if (n.nodeType === 10 /* DocumentType */ || n.nodeType === 11 /* DocumentFragment */)
+        throw new DOMException("Failed to construct 'StaticRange': The node provided is of an invalid type.", "InvalidNodeTypeError");
+    }
+    self._sc = init.startContainer; self._so = init.startOffset >>> 0;
+    self._ec = init.endContainer; self._eo = init.endOffset >>> 0;
+    return self;
+  }
+  get [Symbol.toStringTag]() { return "StaticRange"; }
+};
+_exposeIface('AbstractRange', AbstractRange);
+_exposeIface('StaticRange', StaticRange);
+_enumAccessors(AbstractRange.prototype, 'startContainer', 'startOffset', 'endContainer', 'endOffset', 'collapsed');
+// A range whose endpoints are set directly. The public setStart/setEnd re-derive
+// the *other* endpoint whenever the two would cross, which is exactly wrong when
+// we already know both — so callers that have validated both points use this.
+function __obscura_newRangeAt(sc, so, ec, eo) {
+  const r = new Range();
+  r._sc = sc; r._so = so; r._ec = ec; r._eo = eo;
+  return r;
+}
+// One Selection per Window, minted lazily and kept forever: `getSelection() ===
+// getSelection()` is load-bearing (page code stashes it), and a frame's must be
+// a DIFFERENT object from the top window's even though they share a JS realm.
+function __obscura_getSelectionFor(win) {
+  if (!win) return null;
+  let s = __obscura_selections.get(win);
+  if (!s) {
+    __obscura_allowSelectionCtor = true;
+    try { s = new Selection(); } finally { __obscura_allowSelectionCtor = false; }
+    s._win = win;
+    __obscura_selections.set(win, s);
+  }
+  return s;
+}
+
 // WebIDL conformance for querySelector(All): the selector is a DOMString, so it
 // must be stringified (null -> "null", undefined -> "undefined"), and calling
 // with no argument is a TypeError (arity). Centralized here over every ParentNode
@@ -40205,7 +40618,9 @@ class _IframeWindow {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'matchMedia' on 'Window': 1 argument required, but only 0 present.");
     return globalThis._newMediaQueryList(String(q), this);
   }
-  getSelection() { return globalThis.getSelection(); }
+  // Its OWN Selection — a frame selects inside its own document, and page code
+  // compares the two objects to tell the frames apart.
+  getSelection() { return __obscura_getSelectionFor(this); }
   fetch(input, init) { return globalThis.fetch(input, init); }
   close() { this.closed = true; }
   focus() {}
@@ -50392,14 +50807,6 @@ if (typeof Path2D === 'undefined') {
 if (typeof ImageBitmap === 'undefined') {
   globalThis.ImageBitmap = class ImageBitmap { constructor(){this.width=0;this.height=0;} close(){} };
   globalThis.createImageBitmap = function() { return Promise.resolve(new ImageBitmap()); };
-}
-
-if (typeof Selection === 'undefined') {
-  globalThis.Selection = class Selection {
-    constructor(){this.anchorNode=null;this.focusNode=null;this.rangeCount=0;this.isCollapsed=true;this.type='None';}
-    getRangeAt(){return null;} collapse(){} extend(){} selectAllChildren(){} deleteFromDocument(){}
-    addRange(){} removeRange(){} removeAllRanges(){} toString(){return '';}
-  };
 }
 
 if (typeof NodeFilter === 'undefined') {

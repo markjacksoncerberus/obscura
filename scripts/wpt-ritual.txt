@@ -84,3 +84,11 @@ http://wpt.live/cookies/attributes/attributes-ctl.sub.html
 http://wpt.live/cookies/attributes/path.html
 http://wpt.live/cookies/path/match.html
 http://wpt.live/cookies/prefix/document-cookie.non-secure.html
+# ── selection (Quest #466). A Selection is one live Range plus a direction, so a
+#    change to Range, to live-range adjustment, or to the event loop shows here
+#    first. `textcontrols` covers the element-level selectionchange path.
+selection/collapse-00.html
+selection/addRange-08.html
+selection/setBaseAndExtent.html
+selection/idlharness.window.html
+selection/textcontrols/selectionchange.html

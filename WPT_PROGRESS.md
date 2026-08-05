@@ -46,6 +46,20 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **`selection/*` — Quest #466, the selected verdict (2026-08-05)** | **24/403** (survey, 6 files) · controlled 18-file probe **3170/22342** | **33919/34349** · probe **22110/22110** | **98.75%** | 98 files, **52 to 100%**. Chrome on the identical files: 34292/34349. `getSelection()` returned an **object literal** — a fresh one per call, so `getSelection() === getSelection()` was false and `toString()` was `''`. Full list: `scripts/wpt-selection-probe.txt`. Scroll: `tickets/460-the-selected-verdict.md`. |
+| `selection/collapse-30.html` | 29/5133 | **5133/5133** | ✅ 100% | **Quest #466.** The single largest scoreable file in the realm. **+5104.** |
+| `selection/collapse-{00,15,45}.html` | 15/2655 each | **2655/2655** each | ✅ 100% | **Quest #466.** `collapse()` set the anchor and left the focus behind — and never made a range at all. |
+| `selection/extend-{00,20}.html` | 0/2024, 0/2376 | **2024/2024, 2376/2376** | ✅ 100% | **Quest #466.** A selection is one range **plus a DIRECTION**; `extend()` is where the direction is decided. |
+| `selection/selectAllChildren.html` | 1652/2242 | **2242/2242** | ✅ 100% | **Quest #466.** Selects the node's **children**, not its length — they diverge on Text, the first node you'd reach for. |
+| `selection/addRange-{00,04,28,36}.html` | 1392/1624 (00) | **1624/1624** each | ✅ 100% | **Quest #466.** The range is held by **identity**: `getRangeAt(0)` is the object you added, and mutating either mutates both. |
+| `selection/idlharness.window.html` | 37/112 | **112/112** | ✅ 100% | **Quest #466.** Interface object non-enumerable, members enumerable, every member brand-throws on a foreign `this`, `length` counts required args only, `@@toStringTag` a data property. |
+| `selection/setBaseAndExtent.html` | 2/120 | **120/120** | ✅ 100% | **Quest #466.** |
+| `selection/removeAllRanges.html` | 2/116 | **116/116** | ✅ 100% | **Quest #466.** After clearing, the next `addRange()` must be **forwards**. |
+| `selection/collapseToStartEnd.html` | 0/57 | **57/57** | ✅ 100% | **Quest #466.** |
+| `selection/textcontrols/selectionchange.html` | 16/60 | **60/60** | ✅ 100% | **Quest #466.** A text control's selection announces itself **at the element, bubbling** — async and coalesced to one per task. |
+| `selection/textcontrols/selectionchange-bubble.html` | 0/4 ⚠️ TIMEOUT | **4/4** | ✅ 100% | **Quest #466.** Was awaiting an event that never fired. |
+| `selection/onselectstart-on-key-in-contenteditable.html?*` | — | **30/30** each | ✅ 100% | **Quest #466.** Chrome scores 25/30 and 23/30 on these — **we are ahead**. |
+| `selection/{getSelection,type,isCollapsed,removeRange,getRangeAt}.html` | 3/18, 1/29, 5/29, 1/29, 1/4 | **all 100%** | ✅ 100% | **Quest #466.** `document.getSelection()` is **null** when `defaultView` is null — no browsing context means nowhere to select, which is not the same as nothing selected. |
 | **`cookies/*` — Quest #465, the session verdict (2026-08-04)** | **132/840** (and **0/840 measurable** — every file could-not-run) | **736/840** | **87.6%** | 22 files, 12 to 100%. The realm was not failing, it was INVISIBLE: every test awaits `test_driver.delete_all_cookies()`, which our harness bridge did not implement, so all 22 files sat at "Running, 0 complete". Scroll: `tickets/459-the-session-verdict.md`. |
 | `cookies/attributes/attributes-ctl.sub.html` | 69/429 | **428/429** | ⬆️ | **Quest #465.** One rule: a control char ANYWHERE in a set-cookie string invalidates the ENTIRE string (HTAB excepted). **+359.** |
 | `cookies/prefix/document-cookie.non-secure.html` | 2/35 | **35/35** | ✅ 100% | **Quest #465.** `__Host-`/`__Secure-` matched case-insensitively; and the file is served over `http://`, the scheme it is written for. |
