@@ -34610,6 +34610,83 @@ const _cryptoGlobal = (function () {
     throw _notSupported("Verifying with this algorithm is not implemented yet");
   };
 
+  // ── Encryption ────────────────────────────────────────────────────────────
+  // The three AES modes a page can reach for, and what each is honestly for:
+  //
+  //   CBC — the oldest, and the only one here that is NOT authenticated. It
+  //     hides the contents and nothing else: someone who can flip bits in
+  //     transit can flip bits in the plaintext and the page has no way to
+  //     notice. Web Crypto keeps it because so much stored data is already in
+  //     it, not because it is the one to choose today.
+  //   CTR — a stream mode. Encrypting two messages under the same (key,
+  //     counter) XORs them together and loses both, which is why the counter's
+  //     WIDTH is a parameter: it says how much room a message has to grow into
+  //     before it walks into the next one's keystream.
+  //   GCM — CTR plus an authentication tag. This is the one to reach for. It
+  //     answers "was this tampered with" as well as "what does it say", and
+  //     decryption REFUSES rather than handing back plaintext when the tag does
+  //     not check out.
+  //
+  // One note on the errors below, because it looks like laziness and is not:
+  // every failure here — bad padding, a tag that did not verify, a length that
+  // does not fit — is the same OperationError with the same message. The
+  // difference between "the padding was malformed" and "the padding was fine
+  // but the tag failed" is precisely the oracle a padding-oracle attack is
+  // built out of, and no page has any use for the distinction.
+  const _cipherFailed = () => _operationError("The operation failed");
+  const _rustCipher = (fn) => {
+    let out;
+    try { out = fn(); } catch (e) { throw _cipherFailed(); }
+    return out;
+  };
+  // The seven tag lengths GCM allows. A shorter tag is a weaker promise — a
+  // 32-bit tag means a forgery succeeds once in four billion tries, which is
+  // not many tries — so the set is closed and anything else is an error rather
+  // than being quietly rounded to something we do support.
+  const _AES_GCM_TAG_LENGTHS = [32, 64, 96, 104, 112, 120, 128];
+  const _gcmTagLength = (alg) => {
+    const t = alg.tagLength === undefined ? 128 : alg.tagLength;
+    if (!_AES_GCM_TAG_LENGTHS.includes(t)) throw _operationError("Invalid AES-GCM tagLength");
+    return t;
+  };
+  const _EMPTY = new Uint8Array(0);
+  const _cipherFor = {
+    "AES-CBC": (encrypting, alg, raw, data) => {
+      if (alg.iv.length !== 16) throw _operationError("AES-CBC iv must be 16 bytes");
+      // An empty ciphertext cannot be right: PKCS#7 means even a zero-length
+      // message encrypts to one full block of padding.
+      if (!encrypting && (data.length === 0 || data.length % 16 !== 0))
+        throw _cipherFailed();
+      return _rustCipher(() => encrypting
+        ? _ops.op_crypto_aes_cbc_encrypt(raw, alg.iv, data)
+        : _ops.op_crypto_aes_cbc_decrypt(raw, alg.iv, data));
+    },
+    "AES-CTR": (encrypting, alg, raw, data) => {
+      if (alg.counter.length !== 16) throw _operationError("AES-CTR counter must be 16 bytes");
+      // Zero counter bits leaves no room to count in; more than 128 does not
+      // fit in the block. Either way the caller asked for something that has no
+      // meaning rather than for something we merely have not built.
+      if (alg.length === 0 || alg.length > 128)
+        throw _operationError("AES-CTR length must be between 1 and 128 bits");
+      // Encryption and decryption are the same XOR against the same keystream.
+      return _rustCipher(() => _ops.op_crypto_aes_ctr(raw, alg.counter, alg.length, data));
+    },
+    "AES-GCM": (encrypting, alg, raw, data) => {
+      const tagLength = _gcmTagLength(alg);
+      const aad = alg.additionalData === undefined ? _EMPTY : alg.additionalData;
+      if (!encrypting && data.length * 8 < tagLength)
+        throw _operationError("AES-GCM ciphertext is shorter than its tag");
+      return _rustCipher(() => encrypting
+        ? _ops.op_crypto_aes_gcm_encrypt(raw, alg.iv, aad, tagLength, data)
+        : _ops.op_crypto_aes_gcm_decrypt(raw, alg.iv, aad, tagLength, data));
+    },
+  };
+  const _cipher = (encrypting, alg, key, data) => {
+    const fn = _cipherFor[alg.name];
+    if (!fn) throw _notSupported((encrypting ? "Encrypting" : "Decrypting") + " with " + alg.name + " is not implemented yet");
+    return fn(encrypting, alg, _keyState.get(key).handle, data);
+  };
+
   // ── Key derivation ────────────────────────────────────────────────────────
   // Both KDFs answer the same question — "turn this secret into that many bits
   // of key material" — and differ in what they defend against. PBKDF2 takes a
@@ -34791,14 +34868,32 @@ const _cryptoGlobal = (function () {
 
     encrypt(algorithm, key, data) {
       return _promise(this, 3, arguments.length, () => {
-        _normalizeAlgorithm(algorithm, "encrypt");
-        throw _notSupported("encrypt is not implemented yet");
+        const alg = _normalizeAlgorithm(algorithm, "encrypt");
+        if (!_isCryptoKey(key)) throw new TypeError("key is not a CryptoKey");
+        if (!_isBufferSource(data)) throw new TypeError("data is not a BufferSource");
+        // The copy comes after normalization, for the same reason as digest and
+        // importKey: normalizing runs author getters, and those getters are
+        // allowed to rewrite — or transfer away — the very buffer being passed.
+        // We encrypt what the buffer held once normalization was done.
+        const bytes = _copyBytes(data);
+        const st = _keyState.get(key);
+        // Two InvalidAccessErrors that say different things: "that key belongs
+        // to another algorithm" and "that key was never allowed to encrypt".
+        if (alg.name !== st.algorithm.name) throw _invalidAccess("Key algorithm does not match");
+        if (!st.usages.includes("encrypt")) throw _invalidAccess("Key does not support 'encrypt'");
+        return _toArrayBuffer(_cipher(true, alg, key, bytes));
       });
     }
     decrypt(algorithm, key, data) {
       return _promise(this, 3, arguments.length, () => {
-        _normalizeAlgorithm(algorithm, "decrypt");
-        throw _notSupported("decrypt is not implemented yet");
+        const alg = _normalizeAlgorithm(algorithm, "decrypt");
+        if (!_isCryptoKey(key)) throw new TypeError("key is not a CryptoKey");
+        if (!_isBufferSource(data)) throw new TypeError("data is not a BufferSource");
+        const bytes = _copyBytes(data);
+        const st = _keyState.get(key);
+        if (alg.name !== st.algorithm.name) throw _invalidAccess("Key algorithm does not match");
+        if (!st.usages.includes("decrypt")) throw _invalidAccess("Key does not support 'decrypt'");
+        return _toArrayBuffer(_cipher(false, alg, key, bytes));
       });
     }
     deriveBits(algorithm, baseKey, length) {

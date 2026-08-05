@@ -311,6 +311,40 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+### 2026-08-05 — Quest #472, **The Enciphered Verdict** (`encrypt_decrypt` **4/1,267 → 1,267/1,267**, 421 AHEAD of Chrome)
+
+*Scroll: [`465-the-enciphered-verdict.md`](465-the-enciphered-verdict.md).*
+
+Three quests gave `WebCryptoAPI` real hashes, real signatures, real key agreement and a
+real key object model. What it still could not do was **encrypt one byte**: `encrypt()` and
+`decrypt()` were `throw _notSupported`. A page could prove who it was talking to and could
+keep nothing private from anyone in between — the note app that encrypts before it syncs,
+the chat client, the password manager, all of them turned away.
+
+New `crates/obscura-js/src/aes_ops.rs`: AES-CBC, AES-CTR and AES-GCM over RustCrypto's
+`aes`/`cbc`/`ghash`, plus the `aes-kw` primitive Quest #474 will need. **🔍 The counter WIDTH
+(1–128 bits) and GCM's IV and tag lengths are RUNTIME parameters Web Crypto permits and the
+typed crate APIs cannot express** — `ctr` offers three counter widths, `aes-gcm` fixes IV
+and tag length as *type parameters*. So the mode composition is written out over the audited
+primitives (public counter arithmetic and length framing only; every secret-dependent step
+is still the crate), documented at the top of the file, and guarded by **NIST SP 800-38D
+test case 2** plus a tamper-rejection test in Rust. That generality is the whole margin over
+Chrome, which refuses tag lengths the spec allows and loses thirteen subtests per refusal.
+
+**🔍 Every cipher failure is the same OperationError with the same message** — bad padding,
+a tag that did not verify, a length that does not fit. That is not laziness: the difference
+between "the padding was malformed" and "the padding was fine but the tag failed" is
+precisely the oracle a padding-oracle attack is built from. **GCM verifies before it
+decrypts**, because handing back the plaintext of a message whose tag failed is the one
+thing an authenticated cipher exists to prevent. And **the copy of the caller's bytes
+happens AFTER normalization** — the third realm where that ordering is the test; WPT
+*transfers the buffer away* from an author getter on `algorithm.name`, and the right answer
+is mode-specific: CBC yields 16 bytes of pure padding, GCM yields `tagLength/8`, CTR yields
+0, and on the decrypt side CBC and GCM must *refuse* where CTR returns empty.
+
+Ritual 66 files: **15,767/15,878**, 111 fails = the recorded 110 plus the one `idlharness`
+fail from last commit's five new guard files. **Zero regressions.**
+
 ### 2026-08-05 — Quests #470–#471, **The Derived + Signed Verdicts** (`WebCryptoAPI` realm sweep **9,884 → 13,935**; `derive_bits_keys` **3,426 → 12,435/12,445, 99.9%**)
 
 *#469 built the object model and named its own cap: no asymmetric keys. These two quests

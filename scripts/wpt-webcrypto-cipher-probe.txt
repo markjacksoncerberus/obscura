@@ -1,0 +1,30 @@
+# The cipher half of WebCryptoAPI — AES encrypt/decrypt/wrap, and all of RSA.
+# Non-worker, non-tentative files only; Chrome's own per-file baseline in the
+# comment. Harvested from the Chrome summary run (the can't-404 method):
+#   curl "https://wpt.fyi/api/runs?label=master&product=chrome&max-count=1"
+WebCryptoAPI/encrypt_decrypt/aes_cbc.https.any.html
+WebCryptoAPI/encrypt_decrypt/aes_ctr.https.any.html
+WebCryptoAPI/encrypt_decrypt/aes_gcm.https.any.html
+WebCryptoAPI/encrypt_decrypt/aes_gcm_256_iv.https.any.html
+WebCryptoAPI/encrypt_decrypt/rsa_oaep.https.any.html
+WebCryptoAPI/wrapKey_unwrapKey/wrapKey_unwrapKey.https.any.html
+WebCryptoAPI/import_export/rsa_importKey.https.any.html
+WebCryptoAPI/sign_verify/rsa_pss.https.any.html
+WebCryptoAPI/sign_verify/rsa_pkcs.https.any.html
+WebCryptoAPI/generateKey/successes_AES-CBC.https.any.html
+WebCryptoAPI/generateKey/successes_AES-CTR.https.any.html
+WebCryptoAPI/generateKey/successes_AES-GCM.https.any.html
+WebCryptoAPI/generateKey/successes_AES-KW.https.any.html
+WebCryptoAPI/generateKey/successes_RSASSA-PKCS1-v1_5.https.any.html
+WebCryptoAPI/generateKey/successes_RSA-PSS.https.any.html
+WebCryptoAPI/generateKey/successes_RSA-OAEP.https.any.html
+WebCryptoAPI/generateKey/failures_RSASSA-PKCS1-v1_5.https.any.html
+WebCryptoAPI/generateKey/failures_RSA-PSS.https.any.html
+WebCryptoAPI/generateKey/failures_RSA-OAEP.https.any.html
+WebCryptoAPI/serialization/aes-cbc.https.any.html
+WebCryptoAPI/serialization/aes-ctr.https.any.html
+WebCryptoAPI/serialization/aes-gcm.https.any.html
+WebCryptoAPI/serialization/aes-kw.https.any.html
+WebCryptoAPI/serialization/rsa-oaep.https.any.html
+WebCryptoAPI/serialization/rsa-pss.https.any.html
+WebCryptoAPI/serialization/rsassa-pkcs1-v1_5.https.any.html
