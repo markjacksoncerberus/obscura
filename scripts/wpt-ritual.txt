@@ -109,3 +109,14 @@ WebCryptoAPI/idlharness.https.any.html
 WebCryptoAPI/generateKey/failures_AES-CBC.https.any.html
 WebCryptoAPI/sign_verify/ecdsa.https.any.html
 WebCryptoAPI/derive_bits_keys/pbkdf2.https.any.html?1-1000
+# ── The cipher half (Quests #472–#474). aes_cbc/aes_ctr cover the two AES modes
+#    whose parameters are runtime values (IV width, counter width); rsa_importKey
+#    is the DER/JWK round trip and breaks loudly on any drift in the INTEGER
+#    encoding or the AlgorithmIdentifier; wrapKey_unwrapKey exercises EVERY
+#    wrapper against EVERY wrappable key, so it is the broadest single guard in
+#    the realm — and its denominator SHRINKS if an algorithm stops importing.
+WebCryptoAPI/encrypt_decrypt/aes_cbc.https.any.html
+WebCryptoAPI/encrypt_decrypt/aes_ctr.https.any.html
+WebCryptoAPI/import_export/rsa_importKey.https.any.html
+WebCryptoAPI/sign_verify/rsa_pss.https.any.html
+WebCryptoAPI/wrapKey_unwrapKey/wrapKey_unwrapKey.https.any.html

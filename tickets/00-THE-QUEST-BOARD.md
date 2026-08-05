@@ -311,6 +311,51 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+### 2026-08-05 — Quests #473–#474, **The Sealed + Wrapped Verdicts** (the 26-file cipher window **2,506/5,689 → 5,761/5,761, 100%**; **737 AHEAD of Chrome**)
+
+*Scroll: [`466-the-wrapped-verdict.md`](466-the-wrapped-verdict.md).*
+**`WebCryptoAPI` now has no algorithm family left unimplemented.**
+
+**#473 the sealed verdict — RSA.** Not a legacy curiosity: RSA is what a page meets when
+it talks to anything that already exists — a JWT signed `RS256`, a server certificate, a
+JWK Set from an identity provider. A browser that cannot import an RSA public key cannot
+verify a token issued by most of the internet. New `crates/obscura-js/src/rsa_ops.rs` over
+RustCrypto's `rsa` (0.10, because 0.9 types the OAEP label as a `String` and a Web Crypto
+label is arbitrary bytes), plus ~280 lines of `bootstrap.js`.
+
+**🔍 The largest single block in the realm needed NO RSA maths at all.**
+`import_export/rsa_importKey` is **1,056 subtests — 63% of the RSA work — and every one is
+ASN.1 and JWK**: import, export, assert the bytes come back identical. A serialization
+problem wearing a cryptography hat. *Measure what a file actually asserts before assuming
+it needs the primitive.* The design that makes it fall out for free: **the key's handle IS
+the inner PKCS#1 DER**, kept verbatim from import and re-wrapped on export — one encoder,
+one place, and the same bytes go straight to Rust so the two sides cannot drift. Three
+traps: **a DER INTEGER is SIGNED and every RSA component is not** (leading zero byte, or a
+modulus reads as negative); **RSA's AlgorithmIdentifier carries an explicit NULL** and
+omitting it is a different byte string for the same meaning; and **`alg` in a JWK names the
+padding AND the hash** in three spellings with no pattern (`RS256`/`PS256`/`RSA-OAEP-256`).
+**🔍 RSA binds the hash to the KEY; ECDSA binds it to the CALL** — the opposite of the rule
+from three quests ago — while PSS's `saltLength` belongs to the *signature* and does come
+from the call.
+
+**#474 the wrapped verdict — `wrapKey`/`unwrapKey`, 1/227 → 299/299.** The operation that
+makes key storage safe at all: its whole reason to exist is that **the key material never
+becomes a value the page can hold**, so an XSS bug on that page cannot read the key out.
+**🔍 Only AES-KW has a `wrapKey` operation of its own**; every other wrapper is a cipher
+being used on key bytes, and the spec says so by falling back from `wrapKey` to `encrypt` —
+and the retry must catch **only** NotSupportedError, never any other error. `wrapKey`
+refuses a non-extractable key (wrapping IS an export); `unwrapKey` may *produce* one, and a
+JWK with `ext:false` requested extractable is a DataError.
+
+**⚠️ A FOURTH way a recorded number can lie, and this one is too SMALL.** The
+`wrapKey_unwrapKey` denominator moved **227 → 299**: those 72 subtests were never failing,
+they *did not exist*. The suite builds its matrix out of the wrapper/key combinations that
+import successfully, so an unimplemented algorithm silently shrinks the test that would
+have measured it.
+
+Ritual 66 files, run three times this session (after #472, #473 and #474):
+**15,767/15,878, byte-identical every time.** Zero regressions.
+
 ### 2026-08-05 — Quest #472, **The Enciphered Verdict** (`encrypt_decrypt` **4/1,267 → 1,267/1,267**, 421 AHEAD of Chrome)
 
 *Scroll: [`465-the-enciphered-verdict.md`](465-the-enciphered-verdict.md).*
