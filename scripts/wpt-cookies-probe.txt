@@ -1,0 +1,36 @@
+# The `cookies/` realm (Quest #465), with the SCHEME EACH FILE IS WRITTEN FOR.
+#
+# This list carries full URLs on purpose. WPT's cookie tests come in pairs — a
+# `.https.html` file that expects a secure origin and a plain one that expects a
+# NON-secure origin — and running everything through the default `https://wpt.live`
+# base inverts the expectations of the plain half. `__secure.document-cookie.html`
+# read 3/12 over https and 12/12 over http, having changed nothing at all.
+#
+#     .venv/bin/python scripts/wpt_run.py --tests-file scripts/wpt-cookies-probe.txt --timeout 45
+#
+# NOTE: every test in this realm awaits `test_driver.delete_all_cookies()` before
+# its first assertion. That is implemented in scripts/wpt_run.py's test_driver
+# bridge (via `op_clear_cookies`); without it all 22 files read as
+# "Running, 0 complete, N remain" and the whole realm looks unmeasurable.
+http://wpt.live/cookies/name/name-ctl.html
+http://wpt.live/cookies/name/name.html
+http://wpt.live/cookies/value/value-ctl.html
+http://wpt.live/cookies/value/value.html
+http://wpt.live/cookies/path/default.html
+http://wpt.live/cookies/path/match.html
+http://wpt.live/cookies/prefix/__host.document-cookie.html
+https://wpt.live/cookies/prefix/__host.document-cookie.https.html
+http://wpt.live/cookies/prefix/__secure.document-cookie.html
+https://wpt.live/cookies/prefix/__secure.document-cookie.https.html
+http://wpt.live/cookies/prefix/document-cookie.non-secure.html
+http://wpt.live/cookies/attributes/attributes-ctl.sub.html
+http://wpt.live/cookies/attributes/expires.html
+http://wpt.live/cookies/attributes/invalid.html
+http://wpt.live/cookies/attributes/max-age.html
+http://wpt.live/cookies/attributes/path.html
+http://wpt.live/cookies/attributes/secure-non-secure.html
+https://wpt.live/cookies/attributes/secure.https.html
+http://wpt.live/cookies/size/name-and-value.html
+http://wpt.live/cookies/encoding/charset.html
+https://wpt.live/cookies/secure/set-from-dom.https.sub.html
+http://wpt.live/cookies/secure/set-from-dom.sub.html

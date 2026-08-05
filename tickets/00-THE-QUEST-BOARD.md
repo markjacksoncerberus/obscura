@@ -28,7 +28,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | **F1a** | ✅ [The Data Layer Verdict](455-the-data-layer-verdict.md) | **`fetch/api/{headers,request,response}/*`** — the fetch OBJECT MODEL | **527/598 (88.1%)** — was 130/566 (23.0%) | ⚔️⚔️ | **SECURED (Quests #457–#459, 2026-08-03).** 27 of 32 files to 100%, two more at exact Chrome parity. `Headers`/`Request`/`Response` were stubs wearing the name of a class. **Also killed a HANG**: `request-bad-port` 0/83 TIMEOUT → 83/83 (fetch's 83 blocked ports, in Rust). **Still open in `fetch`:** `fetch/api/basic/*` and `fetch/api/cors/*` — network BEHAVIOUR rather than object model, spot-checked and scoreable (`basic/request-headers` 1/25, `basic/response-url` 0/4). |
 | **F1b** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **`streams/*`** — what sits underneath `response.body` | **1390/1474 (94.3%)** — was 181/1211 (14.9%) | ⚔️⚔️ | **SECURED (Quests #460–#462, 2026-08-04).** 61 of 71 files to 100%. The old `ReadableStream` was 25 lines and its `tee()` returned two **empty** streams. Built the whole standard: readable + BYOB byte streams, writable, `pipeTo`/`pipeThrough`, `TransformStream`, both tees, queuing strategies. **Excluding `streams/transferable/` (a transfer capability we do not have) we lead Chrome 1390/1398 to 1344/1398 on the identical files.** **And found the platform bug underneath it: `setTimeout(fn, 0)` was a MICROTASK** — see F8. |
 | **F8** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **The event loop — a task is not a microtask** | **FIXED (Quest #461, 2026-08-04)** | ⚔️ | `setTimeout(fn, 0)` was `Promise.resolve().then(fn)`. HTML runs one TASK then drains the ENTIRE microtask queue; a zero-delay timer scheduled as a microtask INTERLEAVES with the promise jobs already queued. Measured: **3 of 500** chained promise jobs had run when a 0ms timer fired (now 500/500). Every `await delay(0)` on the platform — including WPT's own `flushAsyncEvents` — was looking at a half-finished world. Fixed by pumping real tasks through `op_sleep(0)`, one at a time, in insertion order. Swept before/after on 56 timer-heavy files (`scripts/wpt-eventloop-sweep.txt`). |
-| **F2** | 🔶 [Remembered](457-the-remembered-verdict.md) · [Offline](458-the-offline-verdict.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **`webstorage` DONE (#463): 57/1284 → 1281/1288, 99.5%. `IndexedDB` DONE (#464): core 3/556 → 552/576, 95.8%.** `cookies` 2/259 still OPEN | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
+| **F2** | ✅ [Remembered](457-the-remembered-verdict.md) · [Offline](458-the-offline-verdict.md) · [Session](459-the-session-verdict.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **ALL THREE TAKEN (Quests #463–#465).** `webstorage` 57/1284 → **1281/1288 (99.5%)** · `IndexedDB` core 3/556 → **552/576 (95.8%)** · `cookies` 132/840 → **736/840 (87.6%)**. Remaining: none of it is on DISK yet — one shared follow-up quest | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
 | **F3** | ✅ [The Accessible Verdict](454-the-accessible-verdict.md) | **`accname/*` + `wai-aria/role/*`** — what an element IS, and what it is CALLED | **818/853 (95.9%)** — was 0/853 | ⚔️⚔️ | **SECURED (Quests #454–#456, 2026-08-02).** 31 of 34 files to 100%. The 853 zeros were **two missing primitives**, not 853 defects: the engine could not answer "what is this" or "what is it called". Now `Element.computedRole` / `Element.computedLabel`. **Still open in this realm:** `accname/name/shadowdom/` (never measured), `comp_name_from_heading.tentative.html`, and `wai-aria/` OUTSIDE `role/` — the survey put the whole realm at 25.1% and `role/` is now 97.5% of it, so **re-measure before choosing**. The last 30 accname rows are two CSS gaps, not accname gaps (see the scroll's ⭐). |
 | **F4** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | **68/301 · 65/203 · 24/403 (22.6% · 32.0% · 6.0%)**, Chrome 98.7% · 96.1% · 98.8% | ⚔️⚔️⚔️ | **OPEN.** Clicking, typing, selecting. F3 is how an agent reads a page; this is how it acts on one. `selection` at 6% with **zero** could-not-run means the API is present and wrong rather than missing — usually the cheaper shape. |
 | **F5** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`quirks/*` + `css/CSS2/*`** — the old web | **75/156 · 350/440 (48.1% · 79.5%)**, Chrome 98.1% · 100% | ⚔️ | **OPEN — the cheapest rows on the map.** `css/CSS2` at 79.5% is the highest score in the whole survey. Quirks mode is not legacy trivia for our audience: the hand-me-down-laptop web is full of pages written in 2004, and they are exactly the pages that must not break. |
@@ -310,6 +310,48 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-04 — Quest #465, **The Session Verdict** (`cookies` **132/840 → 736/840, 87.6%**)
+
+*The realm was not failing. It was **invisible**.* Every test in WPT's `cookies/` realm opens
+with `await test_driver.delete_all_cookies()`, and our harness's test_driver bridge implemented
+input actions but not cookies — so the very first `await` in every test never resolved and all
+22 files sat forever at `Running, 0 complete, N remain`. **Not one assertion in the realm had
+ever executed.** The survey's "2/259" was measuring the size of the blind spot, not the engine.
+A page cannot clear cookies for itself either (one set for another path never appears in
+`document.cookie`), so it took one op — and the real baseline turned out to be **132/840**.
+
+> **For the map: a realm reported could-not-run has NO SCORE YET.** Ours was three times better
+> than recorded before a line of engine code changed, and five times better again after.
+
+- **🔍 And the schemes were wrong, which inverted the answers.** WPT's cookie tests come in
+  pairs: `.https.html` expects a secure origin, the plain one expects a NON-secure origin and
+  asserts every `__Secure-` cookie is *rejected*. Our runner joins every path to
+  `https://wpt.live`, so the plain half was being asked to prove something false.
+  `__secure.document-cookie.html` read **3/12 over https and 12/12 over http, having changed
+  nothing at all.** Corrected list: `scripts/wpt-cookies-probe.txt`. Five prefix files
+  **22/91 → 91/91**.
+- **One spec rule was worth 561 subtests.** RFC 6265bis §5.6: a control character ANYWHERE in a
+  set-cookie string invalidates the **entire string** — not the attribute it appears in, the
+  whole cookie (HTAB excepted, and legal even inside a name). `attributes-ctl` **69/429 →
+  428/429**. Not pedantry: it is the rule that stops a `\r\n` smuggled through a cookie header
+  from becoming response splitting.
+- **default-path is the request URI's DIRECTORY**, not its path (every cookie was effectively
+  page-scoped); **path-match is not `starts_with`** (`/foo` must not match `/foobar`); cookies
+  are keyed by **(domain, path, name)** and sent **longest-path-first**; `__Host-`/`__Secure-`
+  match **case-insensitively**; an **expired cookie is DELETED, not merely not-set** — which is
+  how every log-out works.
+- **🔍 A frame's `document.cookie` was `''` flat.** The HTTP half of every file reads its result
+  back through an iframe at `/cookies/resources/echo-cookie.html`, because **reading through an
+  iframe is how you observe a cookie at a path other than your own** — and every one of those
+  reads came back empty. It cannot just forward to the page's cookies either (visibility is by
+  path), so two ops now resolve against the FRAME's URL. Same shape as the frame bugs #463
+  found under `webstorage`: the storage was fine, the frame's *view* of it was a stub.
+- **The one cap is precisely located**: 58 of the 104 remaining failures are a transport
+  behaviour — our HTTP client rejects the ENTIRE response on a malformed header, so `fetch()`
+  throws where Chrome drops the header and continues. Named as the next ⭐.
+- Sweep: ritual **9227/9331**, every held row exact.
+  Scroll: [`459-the-session-verdict.md`](459-the-session-verdict.md).
 
 ### 2026-08-04 — Quest #464, **The Offline Verdict** (`IndexedDB` core **3/556 → 552/576, 95.8%**)
 

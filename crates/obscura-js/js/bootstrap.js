@@ -39992,8 +39992,23 @@ class _IframeDocument extends DetachedDocument {
   get visibilityState() { return 'visible'; }
   get hidden() { return false; }
   get activeElement() { return this.body; }
-  get cookie() { return ''; }
-  set cookie(v) {}
+  // A frame's cookies are resolved against the FRAME's URL, not the page's:
+  // visibility is decided by path, so a frame at `/cookies/resources/` must not
+  // see a cookie scoped to `/cookies/attributes/`. This used to return "" flat,
+  // which meant any cookie a page read through an iframe came back empty — and
+  // reading cookies through an iframe is how you observe a cookie at a path
+  // other than your own.
+  get cookie() {
+    const u = this._url;
+    if (!u || u === 'about:blank' || u === 'about:srcdoc') return '';
+    try { return Deno.core.ops.op_get_cookies_for(u); } catch (e) { return ''; }
+  }
+  set cookie(v) {
+    if (!v) return;
+    const u = this._url;
+    if (!u || u === 'about:blank' || u === 'about:srcdoc') return;
+    try { Deno.core.ops.op_set_cookie_for(u, String(v)); } catch (e) {}
+  }
   // Inherit `implementation` from Document/DetachedDocument so the returned
   // DOMImplementation is associated with this iframe document (correct node
   // document for `iframeDoc.implementation.createDocumentType`).

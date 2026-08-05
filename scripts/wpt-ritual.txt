@@ -76,3 +76,11 @@ IndexedDB/idbfactory_open.any.html
 IndexedDB/keyorder.any.html
 IndexedDB/keygenerator.any.html
 IndexedDB/idbcursor_continue_index.any.html
+# ── cookies (Quest #465). The jar is shared by the Set-Cookie path, document.cookie
+#    and every fetch, so a change to crates/obscura-net/src/cookies.rs shows here.
+#    Full URLs: these files are written for a specific scheme (see
+#    scripts/wpt-cookies-probe.txt).
+http://wpt.live/cookies/attributes/attributes-ctl.sub.html
+http://wpt.live/cookies/attributes/path.html
+http://wpt.live/cookies/path/match.html
+http://wpt.live/cookies/prefix/document-cookie.non-secure.html

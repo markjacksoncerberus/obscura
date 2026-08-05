@@ -27,95 +27,169 @@ impl CookieJar {
         }
     }
 
-    pub fn set_cookie(&self, set_cookie_str: &str, url: &Url) {
+    /// RFC 6265bis §5.6 "parse a set-cookie string", shared by the `Set-Cookie`
+    /// header path and `document.cookie`. Returns None when the whole string is
+    /// to be ignored — which, per spec, is the answer far more often than the old
+    /// permissive parser believed.
+    fn parse_set_cookie(
+        set_cookie_str: &str,
+        url: &Url,
+        from_js: bool,
+    ) -> Option<CookieEntry> {
+        // §5.6 step 1: a control character ANYWHERE in the string — %x00-08 /
+        // %x0A-1F / %x7F — kills the entire set-cookie string. Not the attribute
+        // it appears in: the whole cookie. HTAB (%x09) is the one exception, and
+        // it is legal even inside a cookie NAME.
+        if has_forbidden_ctl(set_cookie_str) {
+            return None;
+        }
+
         let parts: Vec<&str> = set_cookie_str.splitn(2, ';').collect();
-        let name_value = parts[0].trim();
+        let name_value = parts[0];
+        // `document.cookie = "foo"` (no "=") sets a cookie with an EMPTY name and
+        // "foo" as its value — it is not a no-op, and pages rely on reading it back.
         let (name, value) = match name_value.split_once('=') {
             Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
-            None => return,
+            None => (String::new(), name_value.trim().to_string()),
         };
+        // A cookie with neither a name nor a value is nothing at all.
+        if name.is_empty() && value.is_empty() {
+            return None;
+        }
+        // §5.6: name + value longer than 4096 octets → ignore.
+        if name.len() + value.len() > 4096 {
+            return None;
+        }
 
-        let mut domain = url.host_str().unwrap_or("").to_lowercase();
-        let mut path = url.path().to_string();
+        let host = url.host_str().unwrap_or("").to_lowercase();
+        let is_secure_origin = url.scheme() == "https"
+            || host == "localhost"
+            || host == "127.0.0.1"
+            || host == "[::1]";
+
+        let mut domain: Option<String> = None;
+        let mut path: Option<String> = None;
         let mut secure = false;
         let mut http_only = false;
-        let mut expires: Option<u64> = None;
-        let mut same_site = "Lax".to_string();
+        let mut expires_at: Option<u64> = None;
+        let mut max_age: Option<i64> = None;
+        let mut same_site = DEFAULT_SAME_SITE.to_string();
 
         if parts.len() > 1 {
             for attr in parts[1].split(';') {
-                let attr = attr.trim();
-                if let Some((key, val)) = attr.split_once('=') {
-                    match key.trim().to_lowercase().as_str() {
-                        "domain" => {
-                            domain = val.trim().trim_start_matches('.').to_lowercase();
+                let (key, val) = match attr.split_once('=') {
+                    Some((k, v)) => (k.trim().to_lowercase(), v.trim()),
+                    None => (attr.trim().to_lowercase(), ""),
+                };
+                match key.as_str() {
+                    "domain" => {
+                        // An empty Domain= is ignored (the cookie stays host-only).
+                        let d = val.trim_start_matches('.').to_lowercase();
+                        if !d.is_empty() {
+                            domain = Some(d);
                         }
-                        "path" => {
-                            path = val.trim().to_string();
-                        }
-                        "expires" => {
-                            if let Ok(ts) = parse_http_date(val.trim()) {
-                                expires = Some(ts);
-                            }
-                        }
-                        "max-age" => {
-                            if let Ok(secs) = val.trim().parse::<i64>() {
-                                if secs <= 0 {
-                                    expires = Some(0);
-                                } else {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    expires = Some(now + secs as u64);
-                                }
-                            }
-                        }
-                        "samesite" => {
-                            same_site = val.trim().to_string();
-                        }
-                        _ => {}
                     }
-                } else {
-                    match attr.to_lowercase().as_str() {
-                        "secure" => secure = true,
-                        "httponly" => http_only = true,
-                        _ => {}
+                    // §5.4: a Path that does not start with "/" is ignored, and the
+                    // default-path is used instead.
+                    "path" => {
+                        if val.starts_with('/') {
+                            path = Some(val.to_string());
+                        } else {
+                            path = None;
+                        }
                     }
+                    "expires" => expires_at = parse_http_date(val).ok(),
+                    // Max-Age must be a plain integer; anything else is ignored
+                    // (NOT "parse the leading digits").
+                    "max-age" => {
+                        if let Ok(secs) = val.parse::<i64>() {
+                            max_age = Some(secs);
+                        }
+                    }
+                    "samesite" => same_site = val.to_string(),
+                    "secure" => secure = true,
+                    "httponly" => http_only = true,
+                    _ => {}
                 }
             }
         }
 
-        if let Some(exp) = expires {
-            if exp == 0 {
-                let mut cookies = self.cookies.write().unwrap();
-                if let Some(domain_cookies) = cookies.get_mut(&domain) {
-                    domain_cookies.remove(&name);
-                }
-                return;
-            }
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if exp < now {
-                return;
-            }
-        }
-
-        let entry = CookieEntry {
-            name: name.clone(),
-            value,
-            path,
-            domain: domain.clone(),
-            secure,
-            http_only,
-            expires,
-            same_site,
+        // Max-Age wins over Expires whenever both are present.
+        let now = unix_now();
+        let expires = match max_age {
+            Some(secs) if secs <= 0 => Some(0),          // 0 == "delete me"
+            Some(secs) => Some(now.saturating_add(secs as u64)),
+            None => expires_at,
         };
 
+        // §5.4: a non-secure origin may not set (or overwrite) a Secure cookie.
+        if secure && !is_secure_origin {
+            return None;
+        }
+
+        // §5.4 cookie name prefixes, matched CASE-INSENSITIVELY (`__SeCuRe-` is
+        // just as reserved as `__Secure-`, and WPT checks exactly that spelling).
+        // Violating a prefix is fatal to the cookie — that is the whole point of a
+        // name prefix a server is allowed to trust.
+        let lname = name.to_ascii_lowercase();
+        if lname.starts_with("__secure-") && !(secure && is_secure_origin) {
+            return None;
+        }
+        if lname.starts_with("__host-") {
+            let host_ok = secure
+                && is_secure_origin
+                && domain.is_none()
+                && path.as_deref() == Some("/");
+            if !host_ok {
+                return None;
+            }
+        }
+
+        // §5.1.3: the Domain attribute must domain-match the host.
+        let final_domain = match &domain {
+            Some(d) => {
+                if !domain_matches(&host, d) {
+                    return None;
+                }
+                d.clone()
+            }
+            None => host.clone(),
+        };
+
+        let _ = from_js;
+        Some(CookieEntry {
+            name,
+            value,
+            path: path.unwrap_or_else(|| default_path(url)),
+            domain: final_domain,
+            secure,
+            http_only: http_only && !from_js, // script cannot mint an HttpOnly cookie
+            expires,
+            same_site,
+        })
+    }
+
+    /// Store (or, when already expired, remove) a parsed cookie.
+    fn store(&self, entry: CookieEntry) {
+        let key = cookie_key(&entry.name, &entry.path);
         let mut cookies = self.cookies.write().unwrap();
-        cookies.entry(domain).or_default().insert(name, entry);
+        if let Some(exp) = entry.expires {
+            // An Expires in the past (or Max-Age<=0) DELETES the cookie — it does
+            // not merely decline to set it, which is how every "log out" works.
+            if exp == 0 || exp < unix_now() {
+                if let Some(domain_cookies) = cookies.get_mut(&entry.domain) {
+                    domain_cookies.remove(&key);
+                }
+                return;
+            }
+        }
+        cookies.entry(entry.domain.clone()).or_default().insert(key, entry);
+    }
+
+    pub fn set_cookie(&self, set_cookie_str: &str, url: &Url) {
+        if let Some(entry) = Self::parse_set_cookie(set_cookie_str, url, false) {
+            self.store(entry);
+        }
     }
 
     pub fn get_cookie_header(&self, url: &Url) -> String {
@@ -124,7 +198,8 @@ impl CookieJar {
         let is_secure = url.scheme() == "https";
         let cookies = self.cookies.read().unwrap();
 
-        let mut matching: Vec<String> = Vec::new();
+        // (path length, "name=value") — RFC 6265 §5.4 orders longer paths first.
+        let mut matching: Vec<(usize, String)> = Vec::new();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -144,14 +219,19 @@ impl CookieJar {
                 if entry.secure && !is_secure {
                     continue;
                 }
-                if !path.starts_with(&entry.path) {
+                if !path_matches(path, &entry.path) {
                     continue;
                 }
-                matching.push(format!("{}={}", entry.name, entry.value));
+                matching.push((entry.path.len(), format!("{}={}", entry.name, entry.value)));
             }
         }
 
-        matching.join("; ")
+        matching.sort_by(|a, b| b.0.cmp(&a.0));
+        matching
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     pub fn get_all_cookies(&self) -> Vec<CookieInfo> {
@@ -193,7 +273,8 @@ impl CookieJar {
                 expires,
                 same_site,
             };
-            jar.entry(cookie.domain).or_default().insert(cookie.name, entry);
+            let key = cookie_key(&entry.name, &entry.path);
+            jar.entry(cookie.domain).or_default().insert(key, entry);
         }
     }
 
@@ -208,7 +289,8 @@ impl CookieJar {
             .unwrap_or_default()
             .as_secs();
 
-        let mut matching: Vec<String> = Vec::new();
+        // (path length, "name=value") — RFC 6265 §5.4 orders longer paths first.
+        let mut matching: Vec<(usize, String)> = Vec::new();
 
         for (domain, domain_cookies) in cookies.iter() {
             if !domain_matches(host, domain) {
@@ -226,110 +308,34 @@ impl CookieJar {
                 if entry.secure && !is_secure {
                     continue;
                 }
-                if !path.starts_with(&entry.path) {
+                if !path_matches(path, &entry.path) {
                     continue;
                 }
-                matching.push(format!("{}={}", entry.name, entry.value));
+                matching.push((entry.path.len(), format!("{}={}", entry.name, entry.value)));
             }
         }
 
-        matching.join("; ")
+        matching.sort_by(|a, b| b.0.cmp(&a.0));
+        matching
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     pub fn set_cookie_from_js(&self, cookie_str: &str, url: &Url) {
-        let parts: Vec<&str> = cookie_str.splitn(2, ';').collect();
-        let name_value = parts[0].trim();
-        let (name, value) = match name_value.split_once('=') {
-            Some((n, v)) => (n.trim().to_string(), v.trim().to_string()),
-            None => return,
-        };
-
-        let mut domain = url.host_str().unwrap_or("").to_lowercase();
-        let mut path = url.path().to_string();
-        let mut secure = false;
-        let mut expires: Option<u64> = None;
-        let mut same_site = "Lax".to_string();
-
-        if parts.len() > 1 {
-            for attr in parts[1].split(';') {
-                let attr = attr.trim();
-                if let Some((key, val)) = attr.split_once('=') {
-                    match key.trim().to_lowercase().as_str() {
-                        "domain" => {
-                            domain = val.trim().trim_start_matches('.').to_lowercase();
-                        }
-                        "path" => {
-                            path = val.trim().to_string();
-                        }
-                        "expires" => {
-                            if let Ok(ts) = parse_http_date(val.trim()) {
-                                expires = Some(ts);
-                            }
-                        }
-                        "max-age" => {
-                            if let Ok(secs) = val.trim().parse::<i64>() {
-                                if secs <= 0 {
-                                    expires = Some(0);
-                                } else {
-                                    let now = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    expires = Some(now + secs as u64);
-                                }
-                            }
-                        }
-                        "samesite" => {
-                            same_site = val.trim().to_string();
-                        }
-                        _ => {}
-                    }
-                } else {
-                    match attr.to_lowercase().as_str() {
-                        "secure" => secure = true,
-                        _ => {}
-                    }
-                }
-            }
+        if let Some(entry) = Self::parse_set_cookie(cookie_str, url, true) {
+            self.store(entry);
         }
-
-        if let Some(exp) = expires {
-            if exp == 0 {
-                let mut cookies = self.cookies.write().unwrap();
-                if let Some(domain_cookies) = cookies.get_mut(&domain) {
-                    domain_cookies.remove(&name);
-                }
-                return;
-            }
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if exp < now {
-                return;
-            }
-        }
-
-        let entry = CookieEntry {
-            name: name.clone(),
-            value,
-            path,
-            domain: domain.clone(),
-            secure,
-            http_only: false,
-            expires,
-            same_site,
-        };
-
-        let mut cookies = self.cookies.write().unwrap();
-        cookies.entry(domain).or_default().insert(name, entry);
     }
 
     pub fn delete_cookie(&self, name: &str, domain: &str) {
         let mut cookies = self.cookies.write().unwrap();
+        // The map key carries the path now, so a delete-by-name has to look at
+        // the entries rather than at the key.
         if domain.is_empty() {
             for domain_cookies in cookies.values_mut() {
-                domain_cookies.remove(name);
+                domain_cookies.retain(|_, e| e.name != name);
             }
         } else {
             let domains_to_try = [
@@ -339,7 +345,7 @@ impl CookieJar {
             ];
             for d in &domains_to_try {
                 if let Some(domain_cookies) = cookies.get_mut(d.as_str()) {
-                    domain_cookies.remove(name);
+                    domain_cookies.retain(|_, e| e.name != name);
                 }
             }
         }
@@ -353,7 +359,7 @@ impl CookieJar {
         };
         if domain.is_empty() {
             for domain_cookies in cookies.values_mut() {
-                domain_cookies.retain(|n, e| !(n == name && matches_path(&e.path)));
+                domain_cookies.retain(|_, e| !(e.name == name && matches_path(&e.path)));
             }
         } else {
             let domains_to_try = [
@@ -363,7 +369,7 @@ impl CookieJar {
             ];
             for d in &domains_to_try {
                 if let Some(domain_cookies) = cookies.get_mut(d.as_str()) {
-                    domain_cookies.retain(|n, e| !(n == name && matches_path(&e.path)));
+                    domain_cookies.retain(|_, e| !(e.name == name && matches_path(&e.path)));
                 }
             }
         }
@@ -488,6 +494,56 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     days_total += day - 1;
 
     Ok(days_total * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+/// RFC 6265bis: %x00-08 / %x0A-1F / %x7F anywhere in a set-cookie string makes
+/// the whole string invalid. HTAB (%x09) is deliberately NOT in that set — a tab
+/// is legal even inside a cookie name.
+fn has_forbidden_ctl(s: &str) -> bool {
+    s.chars().any(|c| {
+        let c = c as u32;
+        (c <= 0x08) || (0x0A..=0x1F).contains(&c) || c == 0x7F
+    })
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// RFC 6265 §5.1.4 "default-path": the request URI's DIRECTORY, not its full
+/// path. `/cookies/attributes/path.html` defaults to `/cookies/attributes`, so a
+/// cookie set there is not visible from `/other/` — using the full path instead
+/// made every cookie effectively page-scoped.
+fn default_path(url: &Url) -> String {
+    let p = url.path();
+    if p.is_empty() || !p.starts_with('/') {
+        return "/".to_string();
+    }
+    match p.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(i) => p[..i].to_string(),
+    }
+}
+
+/// RFC 6265 §5.1.4 "path-match". A prefix test is not enough: `/foo` must not
+/// match a cookie whose path is `/foobar`.
+fn path_matches(request_path: &str, cookie_path: &str) -> bool {
+    if request_path == cookie_path {
+        return true;
+    }
+    if !request_path.starts_with(cookie_path) {
+        return false;
+    }
+    cookie_path.ends_with('/') || request_path[cookie_path.len()..].starts_with('/')
+}
+
+/// Cookies are identified by (domain, path, name) — two cookies may share a name
+/// as long as their paths differ, which is exactly what the path tests check.
+fn cookie_key(name: &str, path: &str) -> String {
+    format!("{}\u{1}{}", path, name)
 }
 
 fn domain_matches(host: &str, domain: &str) -> bool {

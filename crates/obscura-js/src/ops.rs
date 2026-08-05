@@ -1475,6 +1475,53 @@ fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
     jar.set_cookie_from_js(cookie_str, &url);
 }
 
+// Cookies for a URL that is NOT the page's own — an <iframe> has its own document
+// URL, and cookie visibility is decided by path, so a frame at
+// `/cookies/resources/` must not be shown a cookie scoped to `/cookies/attributes/`.
+// `document.cookie` inside a frame used to be hardcoded to "" (there was no way to
+// ask about another URL), which silently emptied every cookie read a frame made.
+#[op2]
+#[string]
+fn op_get_cookies_for(state: &OpState, #[string] for_url: &str) -> String {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    let jar = match &gs.cookie_jar {
+        Some(j) => j,
+        None => return String::new(),
+    };
+    let url = match url::Url::parse(for_url) {
+        Ok(u) => u,
+        Err(_) => return String::new(),
+    };
+    jar.get_js_visible_cookies(&url)
+}
+
+#[op2(fast)]
+fn op_set_cookie_for(state: &OpState, #[string] for_url: &str, #[string] cookie_str: &str) {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    let jar = match &gs.cookie_jar {
+        Some(j) => j,
+        None => return,
+    };
+    if let Ok(url) = url::Url::parse(for_url) {
+        jar.set_cookie_from_js(cookie_str, &url);
+    }
+}
+
+// WPT's whole `cookies/` realm gates on `test_driver.delete_all_cookies()`, and a
+// page cannot clear a cookie it cannot see (one set for a different path never
+// appears in `document.cookie`). This op reaches the jar directly; it is a
+// test-driver primitive, deliberately not reachable from ordinary page script.
+#[op2(fast)]
+fn op_clear_cookies(state: &OpState) {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    if let Some(jar) = &gs.cookie_jar {
+        jar.clear();
+    }
+}
+
 #[op2(fast)]
 fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
     let gs = state.borrow::<SharedState>().clone();
@@ -1866,6 +1913,9 @@ pub fn build_extension() -> Extension {
             op_fetch_url_sync(),
             op_get_cookies(),
             op_set_cookie(),
+            op_clear_cookies(),
+            op_get_cookies_for(),
+            op_set_cookie_for(),
             op_navigate(),
             op_sleep(),
             op_url_parse(),

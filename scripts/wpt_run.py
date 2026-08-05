@@ -322,6 +322,32 @@ TESTDRIVER_BRIDGE_JS = r"""
       try { return Promise.resolve(element.computedLabel); }
       catch (e) { return Promise.reject(e); }
     };
+    // Cookies. EVERY test in WPT's `cookies/` realm awaits delete_all_cookies()
+    // before its first assertion, so without this the whole realm reads as
+    // "Running, 0 complete, N remain" — an instrumentation gate, not an engine
+    // gap. A page cannot do this itself: a cookie set for a different path never
+    // appears in `document.cookie`, so there is nothing to expire. `op_clear_cookies`
+    // reaches the jar directly.
+    impl.delete_all_cookies = function() {
+      try { Deno.core.ops.op_clear_cookies(); return Promise.resolve(); }
+      catch (e) {
+        // Fallback for a build without the op: expire everything visible here.
+        try {
+          for (const pair of document.cookie.split(';')) {
+            const name = pair.split('=')[0].trim();
+            if (!name) continue;
+            for (const p of ['/', location.pathname, location.pathname.replace(/[^/]*$/, '')]) {
+              document.cookie = name + '=; Max-Age=0; path=' + p;
+            }
+          }
+        } catch (e2) {}
+        return Promise.resolve();
+      }
+    };
+    impl.get_all_cookies = function() { return Promise.resolve([]); };
+    impl.get_named_cookie = function() { return Promise.resolve(null); };
+    // Single-window runner: the "test context" is always this window.
+    impl.set_test_context = function() {};
   }
 
   // Obscura runs preload scripts *after* load, so testdriver.js has already set

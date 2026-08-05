@@ -46,6 +46,21 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **`cookies/*` — Quest #465, the session verdict (2026-08-04)** | **132/840** (and **0/840 measurable** — every file could-not-run) | **736/840** | **87.6%** | 22 files, 12 to 100%. The realm was not failing, it was INVISIBLE: every test awaits `test_driver.delete_all_cookies()`, which our harness bridge did not implement, so all 22 files sat at "Running, 0 complete". Scroll: `tickets/459-the-session-verdict.md`. |
+| `cookies/attributes/attributes-ctl.sub.html` | 69/429 | **428/429** | ⬆️ | **Quest #465.** One rule: a control char ANYWHERE in a set-cookie string invalidates the ENTIRE string (HTAB excepted). **+359.** |
+| `cookies/prefix/document-cookie.non-secure.html` | 2/35 | **35/35** | ✅ 100% | **Quest #465.** `__Host-`/`__Secure-` matched case-insensitively; and the file is served over `http://`, the scheme it is written for. |
+| `cookies/prefix/__host.document-cookie{,.https}.html` | 0/18, 4/14 | **18/18, 14/14** | ✅ 100% | **Quest #465.** |
+| `cookies/prefix/__secure.document-cookie{,.https}.html` | 0/12, 6/12 | **12/12, 12/12** | ✅ 100% | **Quest #465.** The non-https file read 3/12 over https and 12/12 over http, having changed nothing — the runner was asking it to prove something false. |
+| `cookies/value/value.html` | 1/28 | **22/28** | ⬆️ | **Quest #465.** |
+| `cookies/attributes/invalid.html` | 8/26 | **21/26** | ⬆️ | **Quest #465.** |
+| `cookies/attributes/path.html` | 12/21 | **21/21** | ✅ 100% | **Quest #465.** default-path is the request URI's DIRECTORY, not its path. |
+| `cookies/path/match.html` | 4/16 | **16/16** | ✅ 100% | **Quest #465.** path-match is not `starts_with`: `/foo` must not match a cookie at `/foobar`. |
+| `cookies/path/default.html` | 0/1 | **1/1** | ✅ 100% | **Quest #465.** |
+| `cookies/attributes/expires.html` | 6/10 | **10/10** | ✅ 100% | **Quest #465.** An expired cookie is DELETED, not merely not-set — that is how every log-out works. |
+| `cookies/attributes/max-age.html` | 4/10 | **9/10** | ⬆️ | **Quest #465.** Max-Age beats Expires; a non-integer Max-Age is ignored, not partly parsed. |
+| `cookies/attributes/secure.https.html` | 0/9 | **8/9** | ⬆️ | **Quest #465.** |
+| `cookies/name/name-ctl.html`, `value/value-ctl.html` | 4/66 each | **37/66** each | ⬆️ | **Quest #465.** The DOM half is 100%. The HTTP half is a TRANSPORT cap: our client rejects the whole response on a malformed header, so `fetch()` throws where Chrome drops the header. 58 subtests, precisely located. |
+| `cookies/secure/set-from-dom.sub.html` | 0/2 | **2/2** | ✅ 100% | **Quest #465.** A non-secure origin may not set a Secure cookie. |
 | **`IndexedDB/*` — Quest #464, the offline verdict (2026-08-04)** | **3/556** | **552/576** | **95.8%** | 45-file core list, measured identically before and after. 33 of 45 files to 100%, could-not-run 0. `open()` used to return a mime: `createObjectStore` gave back `{createIndex(){}}` and `get()` a request that never fired, so an offline-first page waited forever and rendered empty. Scroll: `tickets/458-the-offline-verdict.md`. |
 | `IndexedDB/structured-clone.any.html` | 0/125 | **116/125** | ⬆️ | **Quest #464.** 🔍 IDB's cleanup step runs AFTER the microtask checkpoint — `await store.put(…)` then `store.get(…)` must still see a live transaction. Deactivating one microtask hop too early gave 121 identical `TransactionInactiveError` rejections. **+116.** |
 | `IndexedDB/idbfactory_open.any.html` | 0/29 | **29/29** | ✅ 100% | **Quest #464.** The version dance: upgradeneeded / versionchange / blocked, and an aborted upgrade rolls `db.version` back. |
