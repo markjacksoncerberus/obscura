@@ -311,6 +311,53 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+### 2026-08-05 — Quest #469, **The Hashed Verdict** (`WebCryptoAPI` **314 → 9,884** over 81 files)
+
+*The largest untouched realm left on the map — and the only one where the gap was not "a
+page renders wrong" but "a page is told a forgery is genuine".* `crypto.subtle` was twelve
+one-line stubs: `digest()` returned an **FNV scramble of the input** with the right length,
+`sign()` returned **32 zero bytes**, `generateKey()` returned a plain object literal, and
+**`verify()` returned `true` — unconditionally, for every input.** That last one has no
+page-visible symptom; it just answers "is this really from who it claims?" with "yes" about
+a forgery. `getRandomValues` — the one piece that worked — was seeded from `Math.random()`,
+which is what a page calls to mint a session token, an IV, a CSRF nonce or a password salt.
+
+**The realm was also INVISIBLE, which is why nobody had costed it.** All ~15,400
+`generateKey/*` subtests were `could-not-run` on **one missing global**: line 3 of the
+shared `algorithm_registry.js` reads `resultType: CryptoKey`. That is the *third* distinct
+way a recorded number has lied to this campaign, and the same shape as #465's: **a realm
+reported could-not-run has no score yet.**
+
+Built: `crates/obscura-js/src/crypto_ops.rs` (SHA-1/2, HMAC, PBKDF2, HKDF, OS CSPRNG, over
+audited RustCrypto crates — not hand-rolled, and not in JS, because PBKDF2 at 100k
+iterations on a low-spec machine is the difference between a slow page and one that never
+finishes) plus ~600 lines of `bootstrap.js`: real `Crypto`/`SubtleCrypto`/`CryptoKey`
+WebIDL interfaces, the **algorithm-normalization registry** (18 algorithms × ops × IDL
+parameter dictionaries), key material in a `WeakMap` (so `JSON.stringify(key)` is not an
+exfiltration route), HMAC + AES key management + JWK both ways, and `CryptoKey` made
+**[Serializable]** so a key survives `structuredClone`/IndexedDB *still non-extractable*.
+
+**🔍 The findings.** (1) **The error ORDER is the specification** — ~1,000 subtests per
+`failures_*` file of nothing but *which* error and *when*: usages → algorithm properties →
+generate → empty-usages, and empty-usages is deliberately last because `[]` is not an
+invalid usage, it is a key that can do nothing. (2) **The copy of the caller's bytes
+happens AFTER normalization** — both the digest and importKey suites prove it with an
+author getter on `algorithm.name` that mutates the buffer mid-call. (3) A usage is a
+permission; an unrecognized one is a `SyntaxError`, and `[[usages]]` is frozen at creation.
+(4) **Constant-time MAC comparison is not in the tests** — an early-return compare leaks how
+many leading bytes an attacker guessed right; done anyway. (5) `crypto.subtle` is
+`[SecureContext]`, and `wpt_run.py` is https-only, so `historical.any.html` cannot pass here
+— the #465 scheme trap again.
+
+**⚠️ AND THE ONE TO REMEMBER: 182 subtests were passing BECAUSE the stub lied.** A
+**round-trip test cannot tell a correct implementation from one where both directions are
+the same lie**: `serialization/ecdsa` scored 3/3 because a fake key cloned fine and
+`exportKey` returned 32 zeros *both times*; `sign_verify/rsa_pss` scored 56/144 because
+`verify()` said yes. Becoming honest **costs** those points, and they are itemised in the
+scroll rather than quietly absorbed. Counted honestly the realm went **314 → 9,884 (+9,570)**.
+
+Scroll: [`462-the-hashed-verdict.md`](462-the-hashed-verdict.md).
+
 ### 2026-08-05 — Quests #467–#468, **The Handled Verdict** (`uievents` + `pointerevents`, 16-file probe **157/512 → 573/609**)
 
 *#466 gave an agent a way to know what it had grabbed. This is the pair of realms that

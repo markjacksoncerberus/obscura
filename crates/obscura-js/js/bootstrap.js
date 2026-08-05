@@ -33866,16 +33866,612 @@ Object.defineProperty(Document.prototype, 'fonts', {
   },
   configurable: true,
 });
-// crypto.getRandomValues / randomUUID — Web Crypto "Crypto" surface. The old
-// stub ignored the WebIDL/spec contract entirely (no type check, no quota, and
-// it mutated non-integer views). This enforces the real semantics:
-//   - non-ArrayBufferView arg            → TypeError
-//   - a non-integer view (Float*, DataView) → TypeMismatchError
-//   - byteLength > 65536                 → QuotaExceededError
-//   - otherwise fill the bytes and return the SAME view.
-// NOTE: entropy is still Math.random (not a CSPRNG) — a known follow-up; this
-// change is conformance only and does not weaken anything vs. the prior stub.
-globalThis.crypto = globalThis.crypto || (function () {
+// Set by the Web Crypto module below: structured-clone support for CryptoKey,
+// which lives down in structuredClone but needs the key's private state. Held
+// in a script-scope binding rather than on any object, so a page cannot reach
+// the key material through it.
+let _cryptoCloneKey = null;
+// ═════════════════════════════════════════════════════════════════════════════
+// Web Cryptography API — https://w3c.github.io/webcrypto/
+//
+// What stood here before was two stubs wearing the name of a standard.
+// `crypto` was an object literal with `getRandomValues` (seeded from
+// `Math.random`) and `randomUUID`; `crypto.subtle`, installed 12,000 lines
+// further down, was a bag of one-line lies:
+//
+//     digest()      → an FNV scramble of the input, of the right LENGTH
+//     sign()        → 32 zero bytes
+//     verify()      → true.  Always.  For every input.
+//     generateKey() → { type:'secret', algorithm:{}, extractable:false, usages:[] }
+//
+// The last one is not a missing feature; it is a wrong answer to a security
+// question. A page verifies a signature to ask "is this really from who it
+// claims?" — a login token, a software update, an end-to-end-encrypted message.
+// Every such page was told "yes" about a forgery. `digest()` was the same shape
+// of wrong: any page comparing a hash against one computed anywhere else in the
+// world silently disagreed with the world.
+//
+// The layering: bytes-in/bytes-out primitives live in Rust (`crypto_ops.rs`,
+// audited RustCrypto implementations, and fast enough for the low-spec machines
+// this browser is for); ALL of the policy lives here, because the policy IS the
+// WebIDL surface — the algorithm normalization, the key usages, JWK, and above
+// all the exact ORDER the spec throws in. That ordering is not pedantry: WPT's
+// `generateKey/failures_*` files are ~1,000 subtests each of nothing but "which
+// error, and does it come before that other error", and they encode a real
+// rule — a caller must be able to tell "I asked for an algorithm you don't have"
+// (NotSupportedError) apart from "you have it, my parameters are wrong"
+// (OperationError) apart from "these usages make no sense for it" (SyntaxError).
+//
+// Structure below: byte/WebIDL helpers → the algorithm registry and
+// `normalizeAlgorithm` → CryptoKey → the per-algorithm operations →
+// SubtleCrypto → Crypto.
+// ═════════════════════════════════════════════════════════════════════════════
+const _cryptoGlobal = (function () {
+  const _ops = Deno.core.ops;
+
+  // ── Errors ────────────────────────────────────────────────────────────────
+  const _notSupported = (m) => new DOMException(m || "Unrecognized algorithm name", "NotSupportedError");
+  const _syntaxError = (m) => new DOMException(m || "Invalid key usages", "SyntaxError");
+  const _operationError = (m) => new DOMException(m || "Operation failed", "OperationError");
+  const _dataError = (m) => new DOMException(m || "Invalid key data", "DataError");
+  const _invalidAccess = (m) => new DOMException(m || "Invalid access", "InvalidAccessError");
+
+  // ── Bytes ─────────────────────────────────────────────────────────────────
+  const _isBufferSource = (v) => v instanceof ArrayBuffer || ArrayBuffer.isView(v);
+  // "Get a copy of the bytes held by the buffer source." A COPY, every time.
+  // The page owns that memory and can mutate — or transfer — it the instant we
+  // yield to the microtask queue, and WPT's digest vectors do exactly that
+  // (`mutations`, `transferBeforeCall`). Hashing whatever the buffer happened to
+  // contain at resolve time would make the result depend on a race.
+  // A detached buffer reads as zero bytes rather than throwing: the view still
+  // exists, it just has nothing left in it.
+  const _copyBytes = (v) => {
+    try {
+      if (v instanceof ArrayBuffer) return new Uint8Array(v.slice(0));
+      return new Uint8Array(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+    } catch (e) { return new Uint8Array(0); }
+  };
+  const _toArrayBuffer = (u8) =>
+    (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength) ? u8.buffer : u8.slice().buffer;
+  // Compare in constant time. `a === b` byte-by-byte with an early return leaks,
+  // through timing, how many leading bytes of a MAC an attacker guessed right —
+  // which is enough to forge one byte at a time. Length is not secret.
+  const _bytesEqual = (a, b) => {
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
+  };
+  const _randomBytes = (n) => { const b = new Uint8Array(n); if (n) _ops.op_crypto_random_bytes(b); return b; };
+
+  // base64url, no padding — JWK's encoding for every byte string it carries.
+  const _b64urlEncode = (bytes) => {
+    let s = "";
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  };
+  const _b64urlDecode = (str) => {
+    if (typeof str !== "string" || /[^A-Za-z0-9\-_]/.test(str)) throw _dataError("Invalid base64url");
+    let s = str.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    let bin;
+    try { bin = atob(s); } catch (e) { throw _dataError("Invalid base64url"); }
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  };
+
+  // ── WebIDL scalar conversions ─────────────────────────────────────────────
+  // Every integer member of a Web Crypto dictionary is [EnforceRange], so an
+  // out-of-range or non-finite value is a TypeError rather than a silent wrap.
+  const _enforceRange = (v, max, member) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) throw new TypeError("Failed to convert member '" + member + "': value is not a finite number");
+    const t = n < 0 ? Math.ceil(n) : Math.floor(n);
+    if (t < 0 || t > max) throw new TypeError("Failed to convert member '" + member + "': value is outside the accepted range");
+    return t;
+  };
+
+  // ── The algorithm registry ────────────────────────────────────────────────
+  // Each dictionary is [member, type, required], listed in the lexicographic
+  // order WebIDL converts dictionary members in (author getters can observe it).
+  const _DICTS = {
+    Algorithm: [],
+    AesCbcParams: [["iv", "BufferSource", true]],
+    AesCtrParams: [["counter", "BufferSource", true], ["length", "octet", true]],
+    AesGcmParams: [["additionalData", "BufferSource", false], ["iv", "BufferSource", true], ["tagLength", "octet", false]],
+    AesKeyGenParams: [["length", "ushort", true]],
+    AesDerivedKeyParams: [["length", "ushort", true]],
+    HmacKeyGenParams: [["hash", "HashAlgorithmIdentifier", true], ["length", "ulong", false]],
+    HmacImportParams: [["hash", "HashAlgorithmIdentifier", true], ["length", "ulong", false]],
+    HkdfParams: [["hash", "HashAlgorithmIdentifier", true], ["info", "BufferSource", true], ["salt", "BufferSource", true]],
+    Pbkdf2Params: [["hash", "HashAlgorithmIdentifier", true], ["iterations", "ulong", true], ["salt", "BufferSource", true]],
+    RsaHashedKeyGenParams: [["hash", "HashAlgorithmIdentifier", true], ["modulusLength", "ulong", true], ["publicExponent", "BigInteger", true]],
+    RsaHashedImportParams: [["hash", "HashAlgorithmIdentifier", true]],
+    RsaPssParams: [["saltLength", "ulong", true]],
+    RsaOaepParams: [["label", "BufferSource", false]],
+    EcKeyGenParams: [["namedCurve", "DOMString", true]],
+    EcKeyImportParams: [["namedCurve", "DOMString", true]],
+    EcdsaParams: [["hash", "HashAlgorithmIdentifier", true]],
+    EcdhKeyDeriveParams: [["public", "CryptoKey", true]],
+  };
+  // name → { op: dictionary-or-null }. An op absent from an algorithm's row is
+  // an op that algorithm does not support: NotSupportedError, and the tests care
+  // that it is that and not a TypeError about a missing member.
+  const _REGISTRY = {
+    "RSASSA-PKCS1-v1_5": { sign: null, verify: null, generateKey: "RsaHashedKeyGenParams", importKey: "RsaHashedImportParams", exportKey: null },
+    "RSA-PSS": { sign: "RsaPssParams", verify: "RsaPssParams", generateKey: "RsaHashedKeyGenParams", importKey: "RsaHashedImportParams", exportKey: null },
+    "RSA-OAEP": { encrypt: "RsaOaepParams", decrypt: "RsaOaepParams", generateKey: "RsaHashedKeyGenParams", importKey: "RsaHashedImportParams", exportKey: null },
+    "ECDSA": { sign: "EcdsaParams", verify: "EcdsaParams", generateKey: "EcKeyGenParams", importKey: "EcKeyImportParams", exportKey: null },
+    "ECDH": { generateKey: "EcKeyGenParams", importKey: "EcKeyImportParams", exportKey: null, deriveBits: "EcdhKeyDeriveParams" },
+    "Ed25519": { sign: null, verify: null, generateKey: null, importKey: null, exportKey: null },
+    "X25519": { generateKey: null, importKey: null, exportKey: null, deriveBits: "EcdhKeyDeriveParams" },
+    "AES-CTR": { encrypt: "AesCtrParams", decrypt: "AesCtrParams", generateKey: "AesKeyGenParams", importKey: null, exportKey: null, "get key length": "AesDerivedKeyParams" },
+    "AES-CBC": { encrypt: "AesCbcParams", decrypt: "AesCbcParams", generateKey: "AesKeyGenParams", importKey: null, exportKey: null, "get key length": "AesDerivedKeyParams" },
+    "AES-GCM": { encrypt: "AesGcmParams", decrypt: "AesGcmParams", generateKey: "AesKeyGenParams", importKey: null, exportKey: null, "get key length": "AesDerivedKeyParams" },
+    "AES-KW": { generateKey: "AesKeyGenParams", importKey: null, exportKey: null, wrapKey: null, unwrapKey: null, "get key length": "AesDerivedKeyParams" },
+    "HMAC": { sign: null, verify: null, generateKey: "HmacKeyGenParams", importKey: "HmacImportParams", exportKey: null, "get key length": "HmacImportParams" },
+    "SHA-1": { digest: null },
+    "SHA-256": { digest: null },
+    "SHA-384": { digest: null },
+    "SHA-512": { digest: null },
+    "HKDF": { deriveBits: "HkdfParams", importKey: null, "get key length": null },
+    "PBKDF2": { deriveBits: "Pbkdf2Params", importKey: null, "get key length": null },
+  };
+
+  // Normalize an algorithm (spec §14.4.1). The shape of the errors is the whole
+  // contract: an unknown NAME is NotSupportedError, a missing required MEMBER is
+  // a TypeError, and a `hash` member recurses through this same function for the
+  // "digest" op — which is why `{name:"HMAC", hash:"MD5"}` fails as
+  // NotSupportedError rather than as some HMAC-specific complaint.
+  function _normalizeAlgorithm(alg, op) {
+    if (typeof alg === "string") return _normalizeAlgorithm({ name: alg }, op);
+    if (alg === null || typeof alg !== "object")
+      throw new TypeError("Algorithm: Not an object");
+    // Read `name` exactly once — it can be an author getter, and both the digest
+    // and importKey suites use one to prove the key/data copy happens after this.
+    const rawName = alg.name;
+    if (rawName === undefined) throw new TypeError("Algorithm: member 'name' is required");
+    const name = String(rawName);
+    const upper = name.toUpperCase();
+    let registered = null;
+    for (const k in _REGISTRY) { if (k.toUpperCase() === upper) { registered = k; break; } }
+    if (registered === null) throw _notSupported("Unrecognized algorithm name");
+    const entry = _REGISTRY[registered];
+    if (!(op in entry)) throw _notSupported("The operation is not supported for " + registered);
+    const out = { name: registered };
+    const dictName = entry[op];
+    if (dictName) {
+      for (const [member, type, required] of _DICTS[dictName]) {
+        const v = alg[member];
+        if (v === undefined) {
+          if (required) throw new TypeError("Algorithm: member '" + member + "' is required");
+          continue;
+        }
+        out[member] = _convertMember(v, type, member);
+      }
+    }
+    return out;
+  }
+  function _convertMember(v, type, member) {
+    switch (type) {
+      case "BufferSource":
+        if (!_isBufferSource(v)) throw new TypeError("Algorithm: member '" + member + "' is not a BufferSource");
+        return _copyBytes(v);
+      case "BigInteger":
+        // WebIDL `typedef Uint8Array BigInteger` — a plain ArrayBuffer or some
+        // other view will not do.
+        if (!(v instanceof Uint8Array)) throw new TypeError("Algorithm: member '" + member + "' is not a Uint8Array");
+        return _copyBytes(v);
+      case "HashAlgorithmIdentifier":
+        return _normalizeAlgorithm(v, "digest");
+      case "CryptoKey":
+        if (!_isCryptoKey(v)) throw new TypeError("Algorithm: member '" + member + "' is not a CryptoKey");
+        return v;
+      case "octet": return _enforceRange(v, 255, member);
+      case "ushort": return _enforceRange(v, 65535, member);
+      case "ulong": return _enforceRange(v, 4294967295, member);
+      case "DOMString": return String(v);
+      default: return v;
+    }
+  }
+
+  // ── CryptoKey ─────────────────────────────────────────────────────────────
+  // The key material lives in a WeakMap, not on the object: `key.handle = …`
+  // must not be a thing a page can write, and `JSON.stringify(key)` must not be
+  // a way to exfiltrate a secret.
+  const _keyState = new WeakMap();
+  const _isCryptoKey = (v) => v !== null && typeof v === "object" && _keyState.has(v);
+  const _keyThis = (t) => { const s = _keyState.get(t); if (!s) throw new TypeError("Illegal invocation"); return s; };
+  class CryptoKey {
+    constructor() { throw new TypeError("Illegal constructor"); }
+    get type() { return _keyThis(this).type; }
+    get extractable() { return _keyThis(this).extractable; }
+    get algorithm() { return _keyThis(this).algorithm; }
+    get usages() { return _keyThis(this).usages.slice(); }
+  }
+  _enumAccessors(CryptoKey.prototype, "type", "extractable", "algorithm", "usages");
+  for (const n of ["type", "extractable", "algorithm", "usages"]) {
+    const d = Object.getOwnPropertyDescriptor(CryptoKey.prototype, n);
+    _named("get", n, d.get); Object.defineProperty(CryptoKey.prototype, n, d);
+  }
+  Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, { value: "CryptoKey", configurable: true });
+
+  // Build a key. `usages` is de-duplicated and frozen: the [[usages]] slot is a
+  // decision made once at creation, and a key whose permissions a later caller
+  // can append to is not a permission at all.
+  const _makeKey = (type, extractable, algorithm, usages, handle) => {
+    const key = Object.create(CryptoKey.prototype);
+    _keyState.set(key, {
+      type, extractable: !!extractable, algorithm,
+      usages: Object.freeze([...new Set(usages)]), handle,
+    });
+    return key;
+  };
+  const _keyHandle = (k) => _keyState.get(k).handle;
+
+  // ── Key usages ────────────────────────────────────────────────────────────
+  const _toUsages = (v) => {
+    if (v === null || v === undefined || typeof v[Symbol.iterator] !== "function")
+      throw new TypeError("Failed to convert keyUsages: not a sequence");
+    return Array.from(v, (u) => String(u));
+  };
+  // Anything outside the algorithm's own list is a SyntaxError — including a
+  // usage that is legal for some other algorithm. "Sign with an AES key" is not
+  // a typo to be forgiven; it is a category error, and quietly ignoring it is
+  // how a key ends up used for something it was never meant to do.
+  const _checkUsages = (usages, allowed) => {
+    for (const u of usages) if (!allowed.includes(u)) throw _syntaxError("Invalid key usage: " + u);
+  };
+  const _HASH_BLOCK_BITS = { "SHA-1": 512, "SHA-256": 512, "SHA-384": 1024, "SHA-512": 1024 };
+
+  // ── Per-algorithm operations ──────────────────────────────────────────────
+  const _AES_NAMES = ["AES-CTR", "AES-CBC", "AES-GCM", "AES-KW"];
+  const _aesUsagesFor = (name) => (name === "AES-KW" ? ["wrapKey", "unwrapKey"]
+    : ["encrypt", "decrypt", "wrapKey", "unwrapKey"]);
+
+  // generateKey. Note the order, which every `failures_*` file measures:
+  //   usages → algorithm properties → generate → empty-usages.
+  // The empty-usages check is LAST on purpose: `[]` is not an invalid usage, it
+  // is a key that can do nothing, and the spec only rejects it once everything
+  // else has been found sound.
+  const _generateKey = {};
+  for (const name of _AES_NAMES) {
+    _generateKey[name] = (alg, extractable, usages) => {
+      _checkUsages(usages, _aesUsagesFor(name));
+      if (alg.length !== 128 && alg.length !== 192 && alg.length !== 256)
+        throw _operationError("AES key length must be 128, 192 or 256 bits");
+      const key = _makeKey("secret", extractable, { name, length: alg.length }, usages, _randomBytes(alg.length / 8));
+      if (usages.length === 0) throw _syntaxError("Usages cannot be empty");
+      return key;
+    };
+  }
+  _generateKey["HMAC"] = (alg, extractable, usages) => {
+    _checkUsages(usages, ["sign", "verify"]);
+    let length = alg.length;
+    if (length === undefined) length = _HASH_BLOCK_BITS[alg.hash.name];
+    else if (length === 0) throw _operationError("HMAC key length cannot be zero");
+    const key = _makeKey("secret", extractable,
+      { name: "HMAC", hash: { name: alg.hash.name }, length }, usages, _randomBytes(Math.ceil(length / 8)));
+    if (usages.length === 0) throw _syntaxError("Usages cannot be empty");
+    return key;
+  };
+  // The public-key algorithms: parameter validation is implemented, key
+  // GENERATION is not yet (see the scroll's Caps). Validation first so the error
+  // a caller gets for a bad curve or a bad exponent is the right one; the
+  // NotSupportedError below is honest about the rest.
+  const _pkGenerate = (allowed, validate) => (alg, extractable, usages) => {
+    _checkUsages(usages, allowed);
+    validate(alg);
+    throw _notSupported("Key generation for this algorithm is not implemented yet");
+  };
+  const _EC_CURVES = ["P-256", "P-384", "P-521"];
+  const _validateEc = (alg) => {
+    if (!_EC_CURVES.includes(alg.namedCurve)) throw _notSupported("Unrecognized namedCurve");
+  };
+  const _validateRsa = (alg) => {
+    // The public exponent must be 3 or 65537. Everything else is either
+    // insecure (1 makes the "encryption" the identity function) or unsupported.
+    const e = alg.publicExponent;
+    let v = 0;
+    for (let i = 0; i < e.length; i++) v = v * 256 + e[i];
+    if (v !== 3 && v !== 65537) throw _operationError("Unsupported publicExponent");
+    if (alg.modulusLength < 256) throw _operationError("modulusLength is too small");
+  };
+  _generateKey["ECDSA"] = _pkGenerate(["sign", "verify"], _validateEc);
+  _generateKey["ECDH"] = _pkGenerate(["deriveKey", "deriveBits"], _validateEc);
+  _generateKey["Ed25519"] = _pkGenerate(["sign", "verify"], () => {});
+  _generateKey["X25519"] = _pkGenerate(["deriveKey", "deriveBits"], () => {});
+  _generateKey["RSASSA-PKCS1-v1_5"] = _pkGenerate(["sign", "verify"], _validateRsa);
+  _generateKey["RSA-PSS"] = _pkGenerate(["sign", "verify"], _validateRsa);
+  _generateKey["RSA-OAEP"] = _pkGenerate(["encrypt", "decrypt", "wrapKey", "unwrapKey"], _validateRsa);
+
+  // importKey. `keyData` is already a byte copy (BufferSource formats) or the
+  // JsonWebKey the caller passed (jwk).
+  const _jwkString = (jwk, member) => {
+    const v = jwk[member];
+    if (v === undefined) return undefined;
+    if (typeof v !== "string") throw _dataError("JWK member '" + member + "' is not a string");
+    return v;
+  };
+  // The JWK checks every symmetric import shares: the key type, the declared
+  // usages (`key_ops`), and the extractability the key was published with. A
+  // `key_ops` narrower than what the caller asked for is a DataError — the
+  // author of the key said what it may be used for, and the importer does not
+  // get to widen that.
+  const _checkJwkCommon = (jwk, usages, extractable) => {
+    if (jwk === null || typeof jwk !== "object") throw new TypeError("keyData is not a JsonWebKey");
+    if (_jwkString(jwk, "kty") !== "oct") throw _dataError("JWK kty must be 'oct'");
+    const use = _jwkString(jwk, "use");
+    if (use !== undefined && usages.length > 0) {
+      const wanted = usages.every((u) => u === "encrypt" || u === "decrypt" || u === "wrapKey" || u === "unwrapKey") ? "enc" : "sig";
+      if (use !== wanted) throw _dataError("JWK use is inconsistent with the requested usages");
+    }
+    if (jwk.key_ops !== undefined) {
+      const ops = jwk.key_ops;
+      if (!Array.isArray(ops)) throw _dataError("JWK key_ops is not a sequence");
+      for (const u of usages) if (!ops.includes(u)) throw _dataError("JWK key_ops does not include " + u);
+    }
+    if (jwk.ext === false && extractable) throw _dataError("JWK is not extractable");
+  };
+  const _jwkOctBytes = (jwk) => {
+    const k = _jwkString(jwk, "k");
+    if (k === undefined) throw _dataError("JWK member 'k' is required");
+    return _b64urlDecode(k);
+  };
+
+  const _importKey = {};
+  for (const name of _AES_NAMES) {
+    _importKey[name] = (format, keyData, alg, extractable, usages) => {
+      _checkUsages(usages, _aesUsagesFor(name));
+      let bytes;
+      if (format === "raw") {
+        bytes = keyData;
+      } else if (format === "jwk") {
+        _checkJwkCommon(keyData, usages, extractable);
+        bytes = _jwkOctBytes(keyData);
+        const alg4 = _jwkString(keyData, "alg");
+        if (alg4 !== undefined) {
+          const expected = "A" + (bytes.length * 8) + name.substring(4);
+          if (alg4 !== expected) throw _dataError("JWK alg does not match the key");
+        }
+      } else {
+        throw _notSupported("Unsupported key format for " + name);
+      }
+      const bits = bytes.length * 8;
+      if (bits !== 128 && bits !== 192 && bits !== 256) throw _dataError("Invalid AES key length");
+      return _makeKey("secret", extractable, { name, length: bits }, usages, bytes);
+    };
+  }
+  _importKey["HMAC"] = (format, keyData, alg, extractable, usages) => {
+    _checkUsages(usages, ["sign", "verify"]);
+    let bytes;
+    if (format === "raw") {
+      bytes = keyData;
+    } else if (format === "jwk") {
+      _checkJwkCommon(keyData, usages, extractable);
+      bytes = _jwkOctBytes(keyData);
+      const alg4 = _jwkString(keyData, "alg");
+      if (alg4 !== undefined && alg4 !== "HS" + alg.hash.name.substring(4))
+        throw _dataError("JWK alg does not match the hash");
+    } else {
+      throw _notSupported("Unsupported key format for HMAC");
+    }
+    let length = bytes.length * 8;
+    if (length === 0) throw _dataError("HMAC key cannot be empty");
+    if (alg.length !== undefined) {
+      // An explicit length may only trim the padding bits off the last byte —
+      // it can neither lengthen the key nor discard a whole byte of it.
+      if (alg.length > length || alg.length <= length - 8) throw _dataError("Invalid HMAC key length");
+      length = alg.length;
+    }
+    return _makeKey("secret", extractable, { name: "HMAC", hash: { name: alg.hash.name }, length }, usages, bytes);
+  };
+  for (const name of ["HKDF", "PBKDF2"]) {
+    _importKey[name] = (format, keyData, alg, extractable, usages) => {
+      if (format !== "raw") throw _notSupported("Unsupported key format for " + name);
+      _checkUsages(usages, ["deriveKey", "deriveBits"]);
+      // A password/IKM key is never extractable: the whole point is that the
+      // secret entered the browser and cannot come back out.
+      if (extractable) throw _syntaxError(name + " keys must not be extractable");
+      return _makeKey("secret", false, { name }, usages, keyData);
+    };
+  }
+
+  const _exportKey = (format, key) => {
+    const st = _keyState.get(key);
+    const name = st.algorithm.name;
+    if (format === "raw") {
+      if (name === "HKDF" || name === "PBKDF2") throw _notSupported("Unsupported export format");
+      return _toArrayBuffer(st.handle.slice());
+    }
+    if (format === "jwk") {
+      const jwk = { kty: "oct", k: _b64urlEncode(st.handle) };
+      if (name.startsWith("AES-")) jwk.alg = "A" + (st.handle.length * 8) + name.substring(4);
+      else if (name === "HMAC") jwk.alg = "HS" + st.algorithm.hash.name.substring(4);
+      else throw _notSupported("Unsupported export format");
+      jwk.key_ops = st.usages.slice();
+      jwk.ext = st.extractable;
+      return jwk;
+    }
+    throw _notSupported("Unsupported export format");
+  };
+
+  // sign/verify. Only HMAC for now (the signature algorithms need the key types
+  // generateKey does not yet produce).
+  const _sign = (alg, key, data) => {
+    const st = _keyState.get(key);
+    if (st.algorithm.name !== "HMAC") throw _notSupported("Signing with this algorithm is not implemented yet");
+    return _toArrayBuffer(_ops.op_crypto_hmac(st.algorithm.hash.name, st.handle, data));
+  };
+  const _verify = (alg, key, signature, data) => {
+    const st = _keyState.get(key);
+    if (st.algorithm.name !== "HMAC") throw _notSupported("Verifying with this algorithm is not implemented yet");
+    return _bytesEqual(signature, _ops.op_crypto_hmac(st.algorithm.hash.name, st.handle, data));
+  };
+
+  // ── SubtleCrypto ──────────────────────────────────────────────────────────
+  // Every operation returns a promise, and — per WebIDL for a Promise-returning
+  // operation — EVERY error becomes a rejection, including the argument-
+  // conversion TypeErrors. A page that wrote `.catch()` gets its catch called;
+  // it never has to also wrap the call in try/catch.
+  const _subtleBrand = new WeakSet();
+  const _subtleThis = (t) => { if (!_subtleBrand.has(t)) throw new TypeError("Illegal invocation"); };
+  const _KEY_FORMATS = ["raw", "spki", "pkcs8", "jwk"];
+  const _checkFormat = (f) => {
+    const s = String(f);
+    if (!_KEY_FORMATS.includes(s)) throw new TypeError("Failed to convert format: '" + s + "' is not a valid KeyFormat");
+    return s;
+  };
+
+  class SubtleCrypto {
+    constructor() { throw new TypeError("Illegal constructor"); }
+
+    digest(algorithm, data) {
+      return _promise(this, 2, arguments.length, () => {
+        const alg = _normalizeAlgorithm(algorithm, "digest");
+        // The copy happens AFTER normalization: normalizing can run an author
+        // getter on `algorithm.name`, and that getter is allowed to touch the
+        // data buffer. WPT asserts we hash what the buffer held once
+        // normalization was done, not what it held on entry.
+        if (!_isBufferSource(data)) throw new TypeError("data is not a BufferSource");
+        return _toArrayBuffer(_ops.op_crypto_digest(alg.name, _copyBytes(data)));
+      });
+    }
+
+    generateKey(algorithm, extractable, keyUsages) {
+      return _promise(this, 3, arguments.length, () => {
+        const alg = _normalizeAlgorithm(algorithm, "generateKey");
+        const usages = _toUsages(keyUsages);
+        const gen = _generateKey[alg.name];
+        if (!gen) throw _notSupported("generateKey is not supported for " + alg.name);
+        return gen(alg, !!extractable, usages);
+      });
+    }
+
+    importKey(format, keyData, algorithm, extractable, keyUsages) {
+      return _promise(this, 5, arguments.length, () => {
+        const fmt = _checkFormat(format);
+        const alg = _normalizeAlgorithm(algorithm, "importKey");
+        const usages = _toUsages(keyUsages);
+        // Same rule as digest: normalize first, THEN take the bytes.
+        let data;
+        if (fmt === "jwk") {
+          if (_isBufferSource(keyData)) throw new TypeError("keyData for 'jwk' must be a JsonWebKey");
+          data = keyData;
+        } else {
+          if (!_isBufferSource(keyData)) throw new TypeError("keyData is not a BufferSource");
+          data = _copyBytes(keyData);
+        }
+        const imp = _importKey[alg.name];
+        if (!imp) throw _notSupported("importKey is not supported for " + alg.name);
+        const key = imp(fmt, data, alg, !!extractable, usages);
+        const st = _keyState.get(key);
+        if ((st.type === "secret" || st.type === "private") && st.usages.length === 0)
+          throw _syntaxError("Usages cannot be empty");
+        return key;
+      });
+    }
+
+    exportKey(format, key) {
+      return _promise(this, 2, arguments.length, () => {
+        const fmt = _checkFormat(format);
+        if (!_isCryptoKey(key)) throw new TypeError("key is not a CryptoKey");
+        if (!_keyState.get(key).extractable) throw _invalidAccess("key is not extractable");
+        return _exportKey(fmt, key);
+      });
+    }
+
+    sign(algorithm, key, data) {
+      return _promise(this, 3, arguments.length, () => {
+        const alg = _normalizeAlgorithm(algorithm, "sign");
+        if (!_isCryptoKey(key)) throw new TypeError("key is not a CryptoKey");
+        if (!_isBufferSource(data)) throw new TypeError("data is not a BufferSource");
+        const bytes = _copyBytes(data);
+        const st = _keyState.get(key);
+        if (alg.name !== st.algorithm.name) throw _invalidAccess("Key algorithm does not match");
+        if (!st.usages.includes("sign")) throw _invalidAccess("Key does not support 'sign'");
+        return _sign(alg, key, bytes);
+      });
+    }
+
+    verify(algorithm, key, signature, data) {
+      return _promise(this, 4, arguments.length, () => {
+        const alg = _normalizeAlgorithm(algorithm, "verify");
+        if (!_isCryptoKey(key)) throw new TypeError("key is not a CryptoKey");
+        if (!_isBufferSource(signature)) throw new TypeError("signature is not a BufferSource");
+        if (!_isBufferSource(data)) throw new TypeError("data is not a BufferSource");
+        const sig = _copyBytes(signature);
+        const bytes = _copyBytes(data);
+        const st = _keyState.get(key);
+        if (alg.name !== st.algorithm.name) throw _invalidAccess("Key algorithm does not match");
+        if (!st.usages.includes("verify")) throw _invalidAccess("Key does not support 'verify'");
+        return _verify(alg, key, sig, bytes);
+      });
+    }
+
+    encrypt(algorithm, key, data) {
+      return _promise(this, 3, arguments.length, () => {
+        _normalizeAlgorithm(algorithm, "encrypt");
+        throw _notSupported("encrypt is not implemented yet");
+      });
+    }
+    decrypt(algorithm, key, data) {
+      return _promise(this, 3, arguments.length, () => {
+        _normalizeAlgorithm(algorithm, "decrypt");
+        throw _notSupported("decrypt is not implemented yet");
+      });
+    }
+    deriveBits(algorithm, baseKey, length) {
+      return _promise(this, 2, arguments.length, () => {
+        _normalizeAlgorithm(algorithm, "deriveBits");
+        throw _notSupported("deriveBits is not implemented yet");
+      });
+    }
+    deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
+      return _promise(this, 5, arguments.length, () => {
+        _normalizeAlgorithm(algorithm, "deriveBits");
+        throw _notSupported("deriveKey is not implemented yet");
+      });
+    }
+    wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+      return _promise(this, 4, arguments.length, () => {
+        throw _notSupported("wrapKey is not implemented yet");
+      });
+    }
+    unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
+      return _promise(this, 7, arguments.length, () => {
+        throw _notSupported("unwrapKey is not implemented yet");
+      });
+    }
+  }
+  // Every SubtleCrypto operation funnels through here: brand-check the `this`,
+  // enforce the WebIDL required-argument count, and turn any throw into a
+  // rejection.
+  function _promise(self, required, given, body) {
+    try {
+      _subtleThis(self);
+      if (given < required)
+        throw new TypeError("Failed to execute on 'SubtleCrypto': " + required + " arguments required, but only " + given + " present.");
+      return Promise.resolve(body());
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+  const _SUBTLE_ARITY = {
+    encrypt: 3, decrypt: 3, sign: 3, verify: 4, digest: 2, generateKey: 3,
+    deriveKey: 5, deriveBits: 2, importKey: 5, exportKey: 2, wrapKey: 4, unwrapKey: 7,
+  };
+  for (const [k, arity] of Object.entries(_SUBTLE_ARITY)) {
+    const d = Object.getOwnPropertyDescriptor(SubtleCrypto.prototype, k);
+    d.enumerable = true;
+    Object.defineProperty(d.value, "length", { value: arity, configurable: true });
+    _markNative(d.value);
+    Object.defineProperty(SubtleCrypto.prototype, k, d);
+  }
+  Object.defineProperty(SubtleCrypto.prototype, Symbol.toStringTag, { value: "SubtleCrypto", configurable: true });
+
+  // ── Crypto ────────────────────────────────────────────────────────────────
   const _toStr = Object.prototype.toString;
   const _intViews = {
     "[object Int8Array]": 1, "[object Uint8Array]": 1, "[object Uint8ClampedArray]": 1,
@@ -33883,13 +34479,16 @@ globalThis.crypto = globalThis.crypto || (function () {
     "[object Int32Array]": 1, "[object Uint32Array]": 1,
     "[object BigInt64Array]": 1, "[object BigUint64Array]": 1,
   };
-  function _fillRandomBytes(u8) {
-    for (let i = 0; i < u8.length; i++) u8[i] = (Math.random() * 256) | 0;
-  }
   const _hex = new Array(256);
   for (let i = 0; i < 256; i++) _hex[i] = (i + 0x100).toString(16).slice(1);
-  return {
+  const _cryptoBrand = new WeakSet();
+  class Crypto {
+    constructor() { throw new TypeError("Illegal constructor"); }
+    get subtle() { if (!_cryptoBrand.has(this)) throw new TypeError("Illegal invocation"); return _subtleInstance; }
+    // Entropy now comes from the OS CSPRNG rather than Math.random. Nothing in
+    // WPT can tell the difference; a page minting a session token can.
     getRandomValues(view) {
+      if (!_cryptoBrand.has(this)) throw new TypeError("Illegal invocation");
       if (!ArrayBuffer.isView(view))
         throw new TypeError("Failed to execute 'getRandomValues' on 'Crypto': parameter 1 is not of type 'ArrayBufferView'.");
       const brand = _toStr.call(view);
@@ -33899,21 +34498,62 @@ globalThis.crypto = globalThis.crypto || (function () {
       if (view.byteLength > 65536)
         throw new QuotaExceededError("The ArrayBufferView's byte length (" + view.byteLength +
           ") exceeds the number of bytes of entropy available via this API (65536).");
-      _fillRandomBytes(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+      if (view.byteLength) _ops.op_crypto_random_bytes(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
       return view;
-    },
+    }
     randomUUID() {
-      const b = new Uint8Array(16);
-      _fillRandomBytes(b);
+      if (!_cryptoBrand.has(this)) throw new TypeError("Illegal invocation");
+      const b = _randomBytes(16);
       b[6] = (b[6] & 0x0f) | 0x40; // version 4
       b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
       const h = _hex;
       return h[b[0]] + h[b[1]] + h[b[2]] + h[b[3]] + "-" + h[b[4]] + h[b[5]] + "-" +
         h[b[6]] + h[b[7]] + "-" + h[b[8]] + h[b[9]] + "-" +
         h[b[10]] + h[b[11]] + h[b[12]] + h[b[13]] + h[b[14]] + h[b[15]];
-    },
+    }
+  }
+  _enumAccessors(Crypto.prototype, "subtle");
+  {
+    const d = Object.getOwnPropertyDescriptor(Crypto.prototype, "subtle");
+    _named("get", "subtle", d.get); Object.defineProperty(Crypto.prototype, "subtle", d);
+  }
+  for (const k of ["getRandomValues", "randomUUID"]) {
+    const d = Object.getOwnPropertyDescriptor(Crypto.prototype, k);
+    d.enumerable = true; _markNative(d.value);
+    Object.defineProperty(Crypto.prototype, k, d);
+  }
+  Object.defineProperty(Crypto.prototype, Symbol.toStringTag, { value: "Crypto", configurable: true });
+
+  const _subtleInstance = Object.create(SubtleCrypto.prototype);
+  _subtleBrand.add(_subtleInstance);
+  const _cryptoInstance = Object.create(Crypto.prototype);
+  _cryptoBrand.add(_cryptoInstance);
+
+  // CryptoKey is [Serializable]. This is how a page KEEPS a key: hand it to
+  // IndexedDB (which serializes) and it is still there tomorrow, without the
+  // key material ever having been readable by the page — a non-extractable key
+  // survives the round trip and is STILL non-extractable. That property is the
+  // entire reason the API has a key object instead of just byte strings.
+  _cryptoCloneKey = (v) => {
+    const st = _keyState.get(v);
+    if (!st) return null;
+    return _makeKey(st.type, st.extractable, st.algorithm, st.usages, st.handle.slice());
   };
+
+  _exposeIface("Crypto", Crypto);
+  _exposeIface("SubtleCrypto", SubtleCrypto);
+  _exposeIface("CryptoKey", CryptoKey);
+  return _cryptoInstance;
 })();
+// `crypto` is `[SameObject] readonly attribute Crypto` on the global — an
+// ENUMERABLE ACCESSOR, not the data property it used to be. idlharness checks
+// for the getter by name, and the distinction is real: a data property is
+// something a page (or a script injected into one) can overwrite with its own
+// object, and every `crypto.subtle` call after that goes somewhere else.
+Object.defineProperty(globalThis, 'crypto', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'crypto', function () { return _cryptoGlobal; }),
+});
 // structuredClone — a real WHATWG StructuredSerialize/StructuredDeserialize.
 // Replaces the old `JSON.parse(JSON.stringify(v))` footgun (which dropped
 // undefined/NaN/Infinity, corrupted -0, threw on BigInt and cyclic refs, and
@@ -34031,6 +34671,14 @@ globalThis.structuredClone = globalThis.structuredClone || (function () {
       const o = Object.create(_Blob.prototype);
       o._bytes = value._bytes.slice(); o._type = value._type;
       memory.set(value, o); return o;
+    }
+
+    // CryptoKey — [Serializable]; the clone carries its own copy of the key
+    // material and its own [[extractable]]/[[usages]], so neither object can
+    // change what the other is allowed to do.
+    if (_cryptoCloneKey) {
+      const ck = _cryptoCloneKey(value);
+      if (ck) { memory.set(value, ck); return ck; }
     }
 
     // Non-serializable platform objects (no serialization steps) → DataCloneError.
@@ -46334,33 +46982,6 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   expose('TransformStreamDefaultController', TransformStreamDefaultController);
 })(globalThis);
 
-
-if (!globalThis.crypto) globalThis.crypto = {};
-if (!globalThis.crypto.subtle) {
-  globalThis.crypto.subtle = {
-    async digest(algorithm, data) {
-      const name = typeof algorithm === 'string' ? algorithm : algorithm?.name || 'SHA-256';
-      const bytes = new Uint8Array(data instanceof ArrayBuffer ? data : data.buffer || data);
-      let hash = 0x811c9dc5;
-      for (let i = 0; i < bytes.length; i++) { hash ^= bytes[i]; hash = Math.imul(hash, 0x01000193); }
-      const size = name.includes('512') ? 64 : name.includes('384') ? 48 : 32;
-      const result = new Uint8Array(size);
-      for (let i = 0; i < size; i++) { hash = Math.imul(hash ^ i, 0x45d9f3b); result[i] = (hash >>> 0) & 0xff; }
-      return result.buffer;
-    },
-    async encrypt() { throw new DOMException('NotSupportedError'); },
-    async decrypt() { throw new DOMException('NotSupportedError'); },
-    async sign() { return new ArrayBuffer(32); },
-    async verify() { return true; },
-    async generateKey() { return { type: 'secret', algorithm: {}, extractable: false, usages: [] }; },
-    async importKey() { return { type: 'secret', algorithm: {}, extractable: false, usages: [] }; },
-    async exportKey() { return new ArrayBuffer(32); },
-    async deriveBits() { return new ArrayBuffer(32); },
-    async deriveKey() { return { type: 'secret', algorithm: {}, extractable: false, usages: [] }; },
-    async wrapKey() { return new ArrayBuffer(32); },
-    async unwrapKey() { return { type: 'secret', algorithm: {}, extractable: false, usages: [] }; },
-  };
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Geometry Interfaces Module Level 1 — https://drafts.csswg.org/geometry-1/

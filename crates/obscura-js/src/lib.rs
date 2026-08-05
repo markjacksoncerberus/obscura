@@ -4,6 +4,7 @@ extern crate html5ever;
 pub mod module_loader;
 pub mod runtime;
 pub mod ops;
+pub mod crypto_ops;
 pub mod v8_flags;
 pub mod markdown;
 

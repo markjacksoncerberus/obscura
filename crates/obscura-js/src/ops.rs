@@ -1921,6 +1921,11 @@ pub fn build_extension() -> Extension {
             op_url_parse(),
             op_url_set(),
             op_text_decode(),
+            crate::crypto_ops::op_crypto_digest(),
+            crate::crypto_ops::op_crypto_hmac(),
+            crate::crypto_ops::op_crypto_random_bytes(),
+            crate::crypto_ops::op_crypto_pbkdf2(),
+            crate::crypto_ops::op_crypto_hkdf(),
         ]),
         ..Default::default()
     }
