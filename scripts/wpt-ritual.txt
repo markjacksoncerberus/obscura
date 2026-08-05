@@ -68,3 +68,11 @@ webstorage/storage_local_setitem_quotaexceedederr.window.html
 #    here). event-handler-attributes-body-window covers <body on…> reflection.
 html/webappapis/scripting/events/event-handler-attributes-body-window.html
 dom/events/EventTarget-dispatchEvent.html
+# ── IndexedDB (Quest #464). structured-clone is the canary for the microtask-
+#    checkpoint rule (IDB goes inactive AFTER the checkpoint, not inside it);
+#    keygenerator for the exhaustion flag; keyorder for cross-type key ordering.
+IndexedDB/structured-clone.any.html
+IndexedDB/idbfactory_open.any.html
+IndexedDB/keyorder.any.html
+IndexedDB/keygenerator.any.html
+IndexedDB/idbcursor_continue_index.any.html

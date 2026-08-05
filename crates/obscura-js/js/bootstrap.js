@@ -40985,18 +40985,1492 @@ globalThis.RTCPeerConnection = class RTCPeerConnection {
 globalThis.RTCSessionDescription = class RTCSessionDescription { constructor(d){this.type=d?.type;this.sdp=d?.sdp;} };
 globalThis.RTCIceCandidate = class RTCIceCandidate { constructor(d){this.candidate=d?.candidate||'';} };
 
-globalThis.indexedDB = {
-  open(name, version) {
-    const req = { result: null, error: null, onsuccess: null, onerror: null, onupgradeneeded: null };
-    Promise.resolve().then(() => {
-      req.result = { name, version: version||1, objectStoreNames: { contains(){return false;}, length:0 }, createObjectStore(){return {createIndex(){}}; }, transaction(){return {objectStore(){return {get(){return {onsuccess:null,onerror:null};},put(){return {onsuccess:null};},delete(){return {onsuccess:null};}};}}; }, close(){} };
-      if (req.onsuccess) req.onsuccess({ target: req });
-    });
-    return req;
-  },
-  deleteDatabase() { return { onsuccess: null, onerror: null }; },
+// ===========================================================================
+// IndexedDB — the real object model, in memory.
+//
+// What was here before was a mime: `open()` handed back an object whose
+// `createObjectStore` returned `{createIndex(){}}` and whose `get()` returned a
+// request that never fired. Nothing threw, so nothing looked broken — an app
+// simply never got its data back, and every offline-first page rendered empty.
+// Offline storage matters most exactly where connections are metered and
+// unreliable, which is who this browser is for, so this is the whole thing:
+// keys and their ordering, key paths, object stores, indexes, cursors,
+// transactions with real abort/rollback, and the version-upgrade dance.
+//
+// It is in-memory and per-page (no disk yet) — see the Caps note in the scroll.
+// ===========================================================================
+
+// ---- DOMStringList (the frozen-ish name list IDB hands back) ---------------
+class DOMStringList {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get length() { return this._items.length; }
+  item(index) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'item' on 'DOMStringList': 1 argument required.");
+    index = Number(index); index = Number.isFinite(index) ? (index >>> 0) : 0;
+    return index < this._items.length ? this._items[index] : null;
+  }
+  contains(string) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'contains' on 'DOMStringList': 1 argument required.");
+    return this._items.indexOf(String(string)) !== -1;
+  }
+}
+DOMStringList.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+globalThis.DOMStringList = _markNative(DOMStringList);
+const _mkStringList = (items) => {
+  const o = Object.create(DOMStringList.prototype);
+  Object.defineProperty(o, '_items', { value: items.slice(), enumerable: false });
+  for (let i = 0; i < items.length; i++)
+    Object.defineProperty(o, i, { value: items[i], enumerable: true, configurable: true });
+  return o;
 };
-globalThis.IDBKeyRange = { only(v){return v;}, lowerBound(v){return v;}, upperBound(v){return v;}, bound(l,u){return [l,u];} };
+
+// ---- Keys ------------------------------------------------------------------
+// A key is stored as {t, v} where `t` is the type tag. The tag order IS the
+// spec's cross-type ordering: number < date < string < binary < array.
+const _IDB_NUM = 0, _IDB_DATE = 1, _IDB_STR = 2, _IDB_BIN = 3, _IDB_ARR = 4;
+
+const _idbDetached = (buf) => {
+  if (buf.detached === true) return true;
+  try { new Uint8Array(buf, 0, 0); return false; } catch (e) { return true; }
+};
+
+// IDB §"convert a value to a key". Returns null for anything that is not a key —
+// including a NaN number, an invalid Date, a hole in an array, and a cycle.
+function _idbToKey(v, seen) {
+  if (typeof v === 'number') return Number.isNaN(v) ? null : { t: _IDB_NUM, v };
+  if (v instanceof Date) { const t = v.getTime(); return Number.isNaN(t) ? null : { t: _IDB_DATE, v: t }; }
+  if (typeof v === 'string') return { t: _IDB_STR, v };
+  if (v instanceof ArrayBuffer) {
+    if (_idbDetached(v)) return null;
+    return { t: _IDB_BIN, v: new Uint8Array(v.slice(0)) };
+  }
+  if (ArrayBuffer.isView(v)) {
+    if (_idbDetached(v.buffer)) return null;
+    return { t: _IDB_BIN, v: new Uint8Array(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)) };
+  }
+  if (Array.isArray(v)) {
+    seen = seen || new Set();
+    if (seen.has(v)) return null;
+    seen.add(v);
+    const out = [];
+    for (let i = 0; i < v.length; i++) {
+      if (!Object.prototype.hasOwnProperty.call(v, i)) { seen.delete(v); return null; }
+      const k = _idbToKey(v[i], seen);
+      if (k === null) { seen.delete(v); return null; }
+      out.push(k);
+    }
+    seen.delete(v);
+    return { t: _IDB_ARR, v: out };
+  }
+  return null;
+}
+
+function _idbCmp(a, b) {
+  if (a.t !== b.t) return a.t > b.t ? 1 : -1;
+  if (a.t === _IDB_BIN || a.t === _IDB_ARR) {
+    const x = a.v, y = b.v, n = Math.min(x.length, y.length);
+    for (let i = 0; i < n; i++) {
+      const c = (a.t === _IDB_BIN)
+        ? (x[i] === y[i] ? 0 : (x[i] < y[i] ? -1 : 1))
+        : _idbCmp(x[i], y[i]);
+      if (c !== 0) return c;
+    }
+    return x.length === y.length ? 0 : (x.length < y.length ? -1 : 1);
+  }
+  return a.v < b.v ? -1 : (a.v > b.v ? 1 : 0);
+}
+
+// Back to a JS value. Binary keys hand out a *fresh* ArrayBuffer each time, so a
+// reader can never reach into the store's own bytes.
+function _idbKeyValue(k) {
+  switch (k.t) {
+    case _IDB_NUM: return k.v;
+    case _IDB_DATE: return new Date(k.v);
+    case _IDB_STR: return k.v;
+    case _IDB_BIN: return new Uint8Array(k.v).buffer;
+    default: return k.v.map(_idbKeyValue);
+  }
+}
+
+const _idbDataError = (m) => new DOMException(m || "The data provided does not meet requirements.", "DataError");
+const _idbInactive = () => new DOMException("The transaction is not active.", "TransactionInactiveError");
+const _idbReadOnly = () => new DOMException("The transaction is read-only.", "ReadOnlyError");
+
+// Coerce an argument that must be a key, throwing DataError like the bindings do.
+function _idbKeyArg(v) {
+  const k = _idbToKey(v);
+  if (k === null) throw _idbDataError("The parameter is not a valid key.");
+  return k;
+}
+
+// ---- Key paths -------------------------------------------------------------
+const _IDB_IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+function _idbValidKeyPathString(s) {
+  if (s === '') return true;               // the identity key path
+  const parts = s.split('.');
+  for (const p of parts) if (!_IDB_IDENT.test(p)) return false;
+  return true;
+}
+function _idbValidKeyPath(kp) {
+  if (Array.isArray(kp)) {
+    if (kp.length === 0) return false;
+    for (const p of kp) if (typeof p !== 'string' || !_idbValidKeyPathString(p)) return false;
+    return true;
+  }
+  return typeof kp === 'string' && _idbValidKeyPathString(kp);
+}
+// A key path is a *sequence* only if it came in as a JS array; a lone string
+// stays a string, and that distinction is observable on `store.keyPath`.
+function _idbNormKeyPath(kp) {
+  if (kp === null || kp === undefined) return null;
+  if (Array.isArray(kp)) return kp.map(String);
+  return String(kp);
+}
+
+// IDB §"evaluate a key path on a value". {ok:false} is the spec's `failure`.
+function _idbEvalKeyPath(value, kp) {
+  if (Array.isArray(kp)) {
+    const out = [];
+    for (const p of kp) {
+      const r = _idbEvalKeyPath(value, p);
+      if (!r.ok) return { ok: false };
+      out.push(r.v);
+    }
+    return { ok: true, v: out };
+  }
+  if (kp === '') return { ok: true, v: value };
+  let cur = value;
+  const idents = kp.split('.');
+  for (const ident of idents) {
+    if (typeof cur === 'string' && ident === 'length') { cur = cur.length; continue; }
+    if (Array.isArray(cur) && ident === 'length') { cur = cur.length; continue; }
+    if (typeof Blob === 'function' && cur instanceof Blob) {
+      if (ident === 'size') { cur = cur.size; continue; }
+      if (ident === 'type') { cur = cur.type; continue; }
+      if (typeof File === 'function' && cur instanceof File) {
+        if (ident === 'name') { cur = cur.name; continue; }
+        if (ident === 'lastModified') { cur = cur.lastModified; continue; }
+      }
+    }
+    if (cur === null || cur === undefined) return { ok: false };
+    if (typeof cur !== 'object' && typeof cur !== 'function') return { ok: false };
+    if (!Object.prototype.hasOwnProperty.call(cur, ident)) return { ok: false };
+    cur = cur[ident];
+    if (cur === undefined) return { ok: false };
+  }
+  return { ok: true, v: cur };
+}
+
+// IDB §"check that a key could be injected into a value" — every step of the
+// path but the last must be (or be creatable as) an object.
+function _idbCanInject(value, kp) {
+  const idents = String(kp).split('.');
+  idents.pop();
+  let cur = value;
+  for (const ident of idents) {
+    if (typeof cur !== 'object' && typeof cur !== 'function') return false;
+    if (cur === null) return false;
+    if (!Object.prototype.hasOwnProperty.call(cur, ident)) return true;  // will be created
+    cur = cur[ident];
+  }
+  return (typeof cur === 'object' || typeof cur === 'function') && cur !== null;
+}
+function _idbInject(value, kp, keyValue) {
+  const idents = String(kp).split('.');
+  const last = idents.pop();
+  let cur = value;
+  for (const ident of idents) {
+    if (!Object.prototype.hasOwnProperty.call(cur, ident)) cur[ident] = {};
+    cur = cur[ident];
+  }
+  cur[last] = keyValue;
+}
+
+// ---- The store (one per page; no disk yet) ---------------------------------
+// name -> { name, version, stores: Map<name, store>, deleted }
+const _idbDatabases = new Map();
+// Every open IDBDatabase connection, so an upgrade can ask the others to close.
+const _idbConnections = [];
+
+// The largest key a generator may produce. Past it the generator is spent.
+const _IDB_MAX_GENERATED_KEY = 9007199254740992;   // 2**53
+const _idbNewStore = (name, keyPath, autoIncrement) => ({
+  name, keyPath, autoIncrement, keyGenerator: 1, keyGenExhausted: false,
+  records: [],            // sorted by key
+  indexes: new Map(),
+  deleted: false,
+});
+
+// First index whose key is >= `key` (binary search over the sorted records).
+function _idbLowerBound(records, key) {
+  let lo = 0, hi = records.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (_idbCmp(records[mid].key, key) < 0) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+// Same, for index records ordered by (key, primaryKey).
+function _idbIndexLowerBound(records, key, primaryKey) {
+  let lo = 0, hi = records.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    let c = _idbCmp(records[mid].key, key);
+    if (c === 0 && primaryKey) c = _idbCmp(records[mid].primaryKey, primaryKey);
+    if (c < 0) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+// ---- Key ranges ------------------------------------------------------------
+class IDBKeyRange {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get lower() { return this._lower === null ? undefined : _idbKeyValue(this._lower); }
+  get upper() { return this._upper === null ? undefined : _idbKeyValue(this._upper); }
+  get lowerOpen() { return this._lowerOpen; }
+  get upperOpen() { return this._upperOpen; }
+  static only(value) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'only' on 'IDBKeyRange': 1 argument required.");
+    const k = _idbKeyArg(value);
+    return _mkRange(k, k, false, false);
+  }
+  static lowerBound(lower, open = false) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'lowerBound' on 'IDBKeyRange': 1 argument required.");
+    return _mkRange(_idbKeyArg(lower), null, !!open, true);
+  }
+  static upperBound(upper, open = false) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'upperBound' on 'IDBKeyRange': 1 argument required.");
+    return _mkRange(null, _idbKeyArg(upper), true, !!open);
+  }
+  static bound(lower, upper, lowerOpen = false, upperOpen = false) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'bound' on 'IDBKeyRange': 2 arguments required.");
+    const lo = _idbKeyArg(lower), hi = _idbKeyArg(upper);
+    const c = _idbCmp(lo, hi);
+    if (c > 0 || (c === 0 && (lowerOpen || upperOpen)))
+      throw _idbDataError("The lower key is greater than the upper key.");
+    return _mkRange(lo, hi, !!lowerOpen, !!upperOpen);
+  }
+  includes(key) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'includes' on 'IDBKeyRange': 1 argument required.");
+    return _idbInRange(this, _idbKeyArg(key));
+  }
+}
+globalThis.IDBKeyRange = _markNative(IDBKeyRange);
+function _mkRange(lower, upper, lowerOpen, upperOpen) {
+  const r = Object.create(IDBKeyRange.prototype);
+  r._lower = lower; r._upper = upper; r._lowerOpen = !!lowerOpen; r._upperOpen = !!upperOpen;
+  return r;
+}
+function _idbInRange(range, key) {
+  if (range._lower !== null) {
+    const c = _idbCmp(key, range._lower);
+    if (c < 0 || (c === 0 && range._lowerOpen)) return false;
+  }
+  if (range._upper !== null) {
+    const c = _idbCmp(key, range._upper);
+    if (c > 0 || (c === 0 && range._upperOpen)) return false;
+  }
+  return true;
+}
+// A `query` argument is either a key or a key range; `undefined`/`null` means
+// "everything" only where the spec allows it.
+function _idbToRange(query, nullAllowed) {
+  if (query instanceof IDBKeyRange) return query;
+  if (query === undefined || query === null) {
+    if (nullAllowed) return _mkRange(null, null, false, false);
+    throw _idbDataError("No key or key range specified.");
+  }
+  const k = _idbKeyArg(query);
+  return _mkRange(k, k, false, false);
+}
+
+// ---- Events on IDB objects -------------------------------------------------
+// IDBRequest → IDBTransaction → IDBDatabase is a real event path (that is how
+// `db.onerror` catches a failed put), so these hook into the engine's one
+// spec-compliant dispatcher via `_idbEventParent` (see `_getEventParent`).
+function _idbEventTarget(proto) {
+  proto.addEventListener = function(type, handler, opts) {
+    _addListenerByKey(_evtRegKey(this), String(type), handler, opts);
+  };
+  proto.removeEventListener = function(type, handler, opts) {
+    _removeListenerByKey(_evtRegKey(this), String(type), handler, opts);
+  };
+  proto.dispatchEvent = function(event) { return _dispatchPublic(this, event); };
+}
+// An `on<type>` content attribute, implemented as a managed listener so that
+// setting it twice replaces rather than stacks.
+function _idbHandlerProp(proto, name) {
+  const type = name.slice(2);
+  Object.defineProperty(proto, name, {
+    configurable: true, enumerable: true,
+    get() { return (this.__idbOn && this.__idbOn[name]) || null; },
+    set(fn) {
+      if (!this.__idbOn) Object.defineProperty(this, '__idbOn', { value: {}, enumerable: false, writable: true });
+      const prev = this.__idbOn[name + '@'];
+      if (prev) this.removeEventListener(type, prev);
+      const h = (typeof fn === 'function') ? fn : null;
+      this.__idbOn[name] = h;
+      if (h) {
+        const self = this;
+        const w = function(ev) { const cur = self.__idbOn[name]; if (cur) return cur.call(self, ev); };
+        this.__idbOn[name + '@'] = w;
+        this.addEventListener(type, w);
+      } else {
+        this.__idbOn[name + '@'] = null;
+      }
+    },
+  });
+}
+// Fire an event at an IDB object and report whether it went uncancelled.
+function _idbFire(target, type, bubbles, cancelable, ctor, init) {
+  const ev = ctor ? new ctor(type, init) : new Event(type, { bubbles: !!bubbles, cancelable: !!cancelable });
+  ev._isTrusted = true;
+  return _dispatchSpec(target, ev, false);
+}
+
+class IDBVersionChangeEvent extends Event {
+  constructor(type, init = undefined) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'IDBVersionChangeEvent': 1 argument required.");
+    const o = (init == null) ? {} : init;
+    super(type, o);
+    this._oldVersion = (o.oldVersion === undefined) ? 0 : Number(o.oldVersion);
+    this._newVersion = (o.newVersion === undefined || o.newVersion === null) ? null : Number(o.newVersion);
+  }
+  get oldVersion() { return this._oldVersion; }
+  get newVersion() { return this._newVersion; }
+}
+globalThis.IDBVersionChangeEvent = _markNative(IDBVersionChangeEvent);
+
+// ---- IDBRequest ------------------------------------------------------------
+class IDBRequest {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get result() {
+    if (!this._done) throw new DOMException("The request has not finished.", "InvalidStateError");
+    return this._result;
+  }
+  get error() {
+    if (!this._done) throw new DOMException("The request has not finished.", "InvalidStateError");
+    return this._error;
+  }
+  get source() { return this._source; }
+  get transaction() { return this._transaction; }
+  get readyState() { return this._done ? 'done' : 'pending'; }
+  _idbEventParent() { return this._transaction; }
+}
+_idbEventTarget(IDBRequest.prototype);
+_idbHandlerProp(IDBRequest.prototype, 'onsuccess');
+_idbHandlerProp(IDBRequest.prototype, 'onerror');
+globalThis.IDBRequest = _markNative(IDBRequest);
+
+class IDBOpenDBRequest extends IDBRequest {}
+_idbHandlerProp(IDBOpenDBRequest.prototype, 'onblocked');
+_idbHandlerProp(IDBOpenDBRequest.prototype, 'onupgradeneeded');
+globalThis.IDBOpenDBRequest = _markNative(IDBOpenDBRequest);
+
+function _mkRequest(source, transaction, openReq) {
+  const r = Object.create((openReq ? IDBOpenDBRequest : IDBRequest).prototype);
+  r._result = undefined; r._error = null; r._done = false;
+  r._source = source ?? null; r._transaction = transaction ?? null;
+  r._perform = null; r._cursor = null;
+  return r;
+}
+
+// ---- IDBTransaction --------------------------------------------------------
+class IDBTransaction {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get db() { return this._conn; }
+  get mode() { return this._mode; }
+  get durability() { return this._durability; }
+  get error() { return this._error; }
+  get objectStoreNames() {
+    const names = (this._mode === 'versionchange')
+      ? [...this._conn._db.stores.keys()] : this._scope.slice();
+    return _mkStringList(names.sort());
+  }
+  objectStore(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'objectStore' on 'IDBTransaction': 1 argument required.");
+    name = String(name);
+    if (this._state === 'finished')
+      throw new DOMException("The transaction has finished.", "InvalidStateError");
+    const inScope = (this._mode === 'versionchange')
+      ? this._conn._db.stores.has(name) : this._scope.indexOf(name) !== -1;
+    if (!inScope) throw new DOMException("No objectStore named " + name + " in this transaction.", "NotFoundError");
+    let os = this._storeCache.get(name);
+    if (os) return os;
+    const store = this._conn._db.stores.get(name);
+    if (!store) throw new DOMException("No objectStore named " + name + " in this transaction.", "NotFoundError");
+    os = _mkObjectStore(store, this);
+    this._storeCache.set(name, os);
+    return os;
+  }
+  abort() {
+    if (this._state === 'committing' || this._state === 'finished')
+      throw new DOMException("The transaction has finished.", "InvalidStateError");
+    _idbAbortTx(this, null);
+  }
+  commit() {
+    if (this._state === 'committing' || this._state === 'finished')
+      throw new DOMException("The transaction has finished.", "InvalidStateError");
+    this._commitRequested = true;
+    _idbScheduleTx(this);
+  }
+  _idbEventParent() { return this._conn; }
+}
+_idbEventTarget(IDBTransaction.prototype);
+IDBTransaction.prototype._evtPassThrough = true;   // on the path, never the target
+_idbHandlerProp(IDBTransaction.prototype, 'onabort');
+_idbHandlerProp(IDBTransaction.prototype, 'oncomplete');
+_idbHandlerProp(IDBTransaction.prototype, 'onerror');
+globalThis.IDBTransaction = _markNative(IDBTransaction);
+
+function _mkTransaction(conn, scope, mode, durability) {
+  const tx = Object.create(IDBTransaction.prototype);
+  tx._conn = conn; tx._scope = scope; tx._mode = mode;
+  tx._durability = durability || 'default';
+  tx._state = 'active';          // active | inactive | committing | finished
+  tx._error = null;
+  tx._queue = [];
+  tx._storeCache = new Map();
+  tx._scheduled = false;
+  tx._commitRequested = false;
+  tx._snapshot = _idbSnapshot(conn._db);
+  tx._onFinish = null;
+  conn._transactions.push(tx);
+  // A transaction is active for the rest of the task that created it, and goes
+  // inactive when control returns to the event loop — i.e. AFTER the microtask
+  // checkpoint, not inside it.
+  _idbAfterCheckpoint(() => { if (tx._state === 'active') tx._state = 'inactive'; });
+  return tx;
+}
+
+// Snapshot / restore, so `abort()` really rolls back — including schema changes
+// made inside a versionchange transaction.
+function _idbSnapshot(db) {
+  const stores = [];
+  for (const [n, s] of db.stores) {
+    stores.push({
+      name: n, live: s, sname: s.name, keyPath: s.keyPath,
+      autoIncrement: s.autoIncrement, keyGenerator: s.keyGenerator,
+      keyGenExhausted: s.keyGenExhausted,
+      records: s.records.slice(),
+      indexes: [...s.indexes].map(([inm, ix]) => ({
+        name: inm, live: ix, iname: ix.name, keyPath: ix.keyPath,
+        unique: ix.unique, multiEntry: ix.multiEntry, records: ix.records.slice(),
+      })),
+    });
+  }
+  return { version: db.version, stores };
+}
+function _idbRestore(db, snap) {
+  db.version = snap.version;
+  const keep = new Set(snap.stores.map((e) => e.name));
+  for (const [n, s] of db.stores) if (!keep.has(n)) s.deleted = true;
+  db.stores.clear();
+  for (const e of snap.stores) {
+    const s = e.live;
+    s.deleted = false; s.name = e.sname; s.keyPath = e.keyPath;
+    s.autoIncrement = e.autoIncrement; s.keyGenerator = e.keyGenerator;
+    s.keyGenExhausted = e.keyGenExhausted;
+    s.records = e.records;
+    const ikeep = new Set(e.indexes.map((x) => x.name));
+    for (const [inm, ix] of s.indexes) if (!ikeep.has(inm)) ix.deleted = true;
+    s.indexes.clear();
+    for (const x of e.indexes) {
+      const ix = x.live;
+      ix.deleted = false; ix.name = x.iname; ix.keyPath = x.keyPath;
+      ix.unique = x.unique; ix.multiEntry = x.multiEntry; ix.records = x.records;
+      s.indexes.set(x.name, ix);
+    }
+    db.stores.set(e.name, s);
+  }
+}
+
+function _idbEnqueue(tx, req, perform) {
+  if (tx._state === 'finished' || tx._state === 'committing')
+    throw new DOMException("The transaction has finished.", "TransactionInactiveError");
+  if (tx._state !== 'active') throw _idbInactive();
+  req._perform = perform;
+  tx._queue.push(req);
+  _idbScheduleTx(tx);
+  return req;
+}
+
+function _idbScheduleTx(tx) {
+  if (tx._scheduled || tx._state === 'finished') return;
+  tx._scheduled = true;
+  setTimeout(() => { tx._scheduled = false; _idbRunTx(tx); }, 0);
+}
+
+// IDB's "cleanup" step runs AFTER the microtask checkpoint, not inside it — and
+// that single detail is the whole reason IndexedDB composes with promises:
+//
+//     await promiseForRequest(t, store.put(value, 'key'));
+//     const result = await promiseForRequest(t, store.get('key'));   // still active
+//
+// The `await` resumes several microtask hops after the success event (event →
+// EventWatcher promise → .then → async continuation), and the transaction has to
+// still be active when it lands. Deactivating in a single `Promise.resolve()
+// .then` is one hop too early and turns every one of those into
+// TransactionInactiveError — which is exactly what it did: `structured-clone`
+// sat at 4/125 with 121 identical unhandled rejections.
+//
+// JS gives no "the microtask queue is now empty" hook, so we walk a bounded chain
+// of microtasks: long enough for any realistic await chain, and still strictly
+// before the next TASK — so a `setTimeout` callback correctly sees the
+// transaction inactive, which is the other half of the contract.
+const _IDB_CHECKPOINT_HOPS = 32;
+function _idbAfterCheckpoint(fn) {
+  let n = _IDB_CHECKPOINT_HOPS;
+  const hop = () => { if (--n > 0) Promise.resolve().then(hop); else fn(); };
+  Promise.resolve().then(hop);
+}
+
+// The transaction's own little event loop: perform each queued request and fire
+// its event (the transaction is active throughout, so handlers may queue more
+// work), then — only once the microtask queue has drained — commit.
+function _idbRunTx(tx) {
+  if (tx._state === 'finished') return;
+  while (tx._queue.length) {
+    const req = tx._queue.shift();
+    let result, error = null;
+    tx._state = 'active';
+    try { result = req._perform(tx); }
+    catch (e) { error = e; }
+    req._done = true;
+    if (error) {
+      req._result = undefined;
+      req._error = (error && typeof error === 'object' && 'name' in error)
+        ? error : new DOMException(String(error), "UnknownError");
+      // An `error` event that nobody cancels aborts the transaction — that
+      // default action is the whole safety net of IDB.
+      const notCanceled = _idbFire(req, 'error', true, true);
+      if (tx._state === 'finished') return;
+      if (notCanceled) { _idbAbortTx(tx, req._error); return; }
+    } else {
+      req._result = result;
+      req._error = null;
+      _idbFire(req, 'success', false, false);
+      if (tx._state === 'finished') return;
+    }
+  }
+  // Nothing queued — but a promise continuation may still be on its way to
+  // queueing something, so hold the transaction open across the checkpoint.
+  _idbAfterCheckpoint(() => {
+    if (tx._state === 'finished') return;
+    tx._state = 'inactive';
+    if (tx._queue.length) { _idbScheduleTx(tx); return; }
+    _idbCommitTx(tx);
+  });
+}
+
+// The state change is SYNCHRONOUS (a finished transaction must reject the very
+// next call) but the event is a QUEUED TASK — the spec says "queue a task to fire
+// an event named complete/abort", and the difference is load-bearing: WPT writes
+//
+//     event.target.transaction.abort();
+//     assert_throws_dom("TransactionInactiveError", () => cursor.advance(1));
+//     t.done();
+//
+// and relies on `db.onabort` landing AFTER `t.done()`, where testharness ignores
+// it. Firing abort synchronously inside abort() made a passing test report
+// "unexpected db.abort" from a helper three files away.
+function _idbCommitTx(tx) {
+  if (tx._state === 'finished') return;
+  tx._state = 'finished';
+  const i = tx._conn._transactions.indexOf(tx);
+  if (i !== -1) tx._conn._transactions.splice(i, 1);
+  setTimeout(() => {
+    _idbFire(tx, 'complete', false, false);
+    if (tx._onFinish) tx._onFinish(false);   // an upgrade's open request succeeds AFTER complete
+    if (tx._conn._closePending) _idbMaybeClose(tx._conn);
+  }, 0);
+}
+
+function _idbAbortTx(tx, error) {
+  if (tx._state === 'finished') return;
+  tx._state = 'finished';
+  _idbRestore(tx._conn._db, tx._snapshot);
+  tx._error = error || new DOMException("The transaction was aborted.", "AbortError");
+  // Every request still queued fails with AbortError — and it FIRES that error,
+  // it is not silently dropped. WPT's event-ordering tests read the whole
+  // sequence (`rq_add3.error: AbortError`, `transaction.error: AbortError`, …)
+  // and a missing pair shows up as "events lengths differ".
+  const stranded = tx._queue.splice(0);
+  for (const r of stranded) { r._done = true; r._error = tx._error; r._result = undefined; }
+  const i = tx._conn._transactions.indexOf(tx);
+  if (i !== -1) tx._conn._transactions.splice(i, 1);
+  setTimeout(() => {
+    for (const r of stranded) _idbFire(r, 'error', true, true);
+    _idbFire(tx, 'abort', true, false);
+    if (tx._onFinish) tx._onFinish(true);
+    if (tx._conn._closePending) _idbMaybeClose(tx._conn);
+  }, 0);
+}
+
+// ---- IDBDatabase -----------------------------------------------------------
+class IDBDatabase {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get name() { return this._db.name; }
+  get version() { return this._version; }
+  get objectStoreNames() { return _mkStringList([...this._db.stores.keys()].sort()); }
+  createObjectStore(name, options) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'createObjectStore' on 'IDBDatabase': 1 argument required.");
+    name = String(name);
+    const tx = this._upgradeTx;
+    if (!tx || tx._state === 'finished')
+      throw new DOMException("A version change transaction is running.", "InvalidStateError");
+    if (tx._state !== 'active') throw _idbInactive();
+    const o = (options == null) ? {} : options;
+    const keyPath = _idbNormKeyPath(o.keyPath);
+    if (keyPath !== null && !_idbValidKeyPath(keyPath))
+      throw new DOMException("The keyPath option is not a valid key path.", "SyntaxError");
+    if (this._db.stores.has(name))
+      throw new DOMException("An object store with the specified name already exists.", "ConstraintError");
+    const autoIncrement = !!o.autoIncrement;
+    // An auto-generated key has to go *somewhere*: it cannot be injected into a
+    // whole-value key path, and a list key path has no single slot for it.
+    if (autoIncrement && (keyPath === '' || Array.isArray(keyPath)))
+      throw new DOMException("The autoIncrement option was set but the keyPath option was empty or an array.", "InvalidAccessError");
+    const store = _idbNewStore(name, keyPath, autoIncrement);
+    this._db.stores.set(name, store);
+    return _mkObjectStore(store, tx);
+  }
+  deleteObjectStore(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'deleteObjectStore' on 'IDBDatabase': 1 argument required.");
+    name = String(name);
+    const tx = this._upgradeTx;
+    if (!tx || tx._state === 'finished')
+      throw new DOMException("A version change transaction is running.", "InvalidStateError");
+    if (tx._state !== 'active') throw _idbInactive();
+    const store = this._db.stores.get(name);
+    if (!store) throw new DOMException("No objectStore named " + name + " in this database.", "NotFoundError");
+    store.deleted = true;
+    this._db.stores.delete(name);
+    tx._storeCache.delete(name);
+  }
+  transaction(storeNames, mode = 'readonly', options = undefined) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'transaction' on 'IDBDatabase': 1 argument required.");
+    if (this._closePending) throw new DOMException("The database connection is closing.", "InvalidStateError");
+    if (this._upgradeTx && this._upgradeTx._state !== 'finished')
+      throw new DOMException("A version change transaction is running.", "InvalidStateError");
+    let names;
+    if (typeof storeNames === 'string') names = [storeNames];
+    else if (storeNames && typeof storeNames[Symbol.iterator] === 'function') names = [...storeNames].map(String);
+    else names = [String(storeNames)];
+    if (names.length === 0)
+      throw new DOMException("The storeNames parameter was empty.", "InvalidAccessError");
+    // De-duplicate, but only after checking every name exists.
+    const seen = [];
+    for (const n of names) {
+      if (!this._db.stores.has(n))
+        throw new DOMException("One of the specified object stores was not found.", "NotFoundError");
+      if (seen.indexOf(n) === -1) seen.push(n);
+    }
+    mode = String(mode);
+    if (mode !== 'readonly' && mode !== 'readwrite') {
+      if (mode === 'versionchange')
+        throw new TypeError("The mode provided ('versionchange') is not one of 'readonly' or 'readwrite'.");
+      throw new TypeError("The mode provided ('" + mode + "') is not one of 'readonly' or 'readwrite'.");
+    }
+    const durability = (options && options.durability !== undefined) ? String(options.durability) : 'default';
+    return _mkTransaction(this, seen, mode, durability);
+  }
+  close() {
+    this._closePending = true;
+    _idbMaybeClose(this);
+  }
+  get [Symbol.toStringTag]() { return 'IDBDatabase'; }
+}
+_idbEventTarget(IDBDatabase.prototype);
+IDBDatabase.prototype._evtPassThrough = true;
+_idbHandlerProp(IDBDatabase.prototype, 'onabort');
+_idbHandlerProp(IDBDatabase.prototype, 'onclose');
+_idbHandlerProp(IDBDatabase.prototype, 'onerror');
+_idbHandlerProp(IDBDatabase.prototype, 'onversionchange');
+globalThis.IDBDatabase = _markNative(IDBDatabase);
+
+function _mkConnection(db) {
+  const c = Object.create(IDBDatabase.prototype);
+  c._db = db; c._version = db.version;
+  c._transactions = []; c._closePending = false; c._closed = false;
+  c._upgradeTx = null;
+  _idbConnections.push(c);
+  return c;
+}
+function _idbMaybeClose(conn) {
+  if (conn._closed || conn._transactions.length) return;
+  conn._closed = true;
+  const i = _idbConnections.indexOf(conn);
+  if (i !== -1) _idbConnections.splice(i, 1);
+  // Whoever was waiting on this connection to go away can proceed now.
+  for (const cb of _idbCloseWaiters.slice()) cb();
+}
+const _idbCloseWaiters = [];
+
+// ---- Records: writing ------------------------------------------------------
+// Recompute a record's index entries. `multiEntry` is the odd one: an array key
+// becomes one entry PER element, deduplicated, and an invalid element is simply
+// dropped rather than failing the write.
+function _idbIndexKeysFor(index, value) {
+  const r = _idbEvalKeyPath(value, index.keyPath);
+  if (!r.ok) return [];
+  if (index.multiEntry && Array.isArray(r.v)) {
+    const out = [];
+    for (const item of r.v) {
+      const k = _idbToKey(item);
+      if (k === null) continue;
+      if (!out.some((e) => _idbCmp(e, k) === 0)) out.push(k);
+    }
+    return out;
+  }
+  const k = _idbToKey(r.v);
+  return k === null ? [] : [k];
+}
+
+function _idbIndexInsert(index, key, primaryKey) {
+  const at = _idbIndexLowerBound(index.records, key, primaryKey);
+  index.records.splice(at, 0, { key, primaryKey });
+}
+function _idbIndexRemoveFor(index, primaryKey) {
+  index.records = index.records.filter((r) => _idbCmp(r.primaryKey, primaryKey) !== 0);
+}
+
+function _idbStoreDelete(store, primaryKey) {
+  const at = _idbLowerBound(store.records, primaryKey);
+  if (at < store.records.length && _idbCmp(store.records[at].key, primaryKey) === 0)
+    store.records.splice(at, 1);
+  for (const ix of store.indexes.values()) _idbIndexRemoveFor(ix, primaryKey);
+}
+
+// IDB §"store a record into an object store" — the whole write path, including
+// the uniqueness pre-check that must happen BEFORE anything is mutated.
+function _idbStoreRecord(store, value, key, noOverwrite) {
+  if (noOverwrite) {
+    const at = _idbLowerBound(store.records, key);
+    if (at < store.records.length && _idbCmp(store.records[at].key, key) === 0)
+      throw new DOMException("A record with the specified key already exists.", "ConstraintError");
+  }
+  const newIndexKeys = [];
+  for (const ix of store.indexes.values()) {
+    const keys = _idbIndexKeysFor(ix, value);
+    if (ix.unique) {
+      for (const ik of keys) {
+        const at = _idbIndexLowerBound(ix.records, ik, null);
+        if (at < ix.records.length && _idbCmp(ix.records[at].key, ik) === 0 &&
+            _idbCmp(ix.records[at].primaryKey, key) !== 0)
+          throw new DOMException("A mutation operation in the transaction failed because a constraint was not satisfied.", "ConstraintError");
+      }
+    }
+    newIndexKeys.push([ix, keys]);
+  }
+  _idbStoreDelete(store, key);
+  const at = _idbLowerBound(store.records, key);
+  store.records.splice(at, 0, { key, value });
+  for (const [ix, keys] of newIndexKeys) for (const ik of keys) _idbIndexInsert(ix, ik, key);
+}
+
+// ---- IDBObjectStore --------------------------------------------------------
+class IDBObjectStore {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get name() { return this._store.name; }
+  set name(v) {
+    const tx = this._tx;
+    if (this._store.deleted) throw new DOMException("The object store has been deleted.", "InvalidStateError");
+    if (!tx || tx._mode !== 'versionchange')
+      throw new DOMException("The database is not running a version change transaction.", "InvalidStateError");
+    if (tx._state !== 'active') throw _idbInactive();
+    const name = String(v);
+    if (name === this._store.name) return;
+    const db = tx._conn._db;
+    if (db.stores.has(name))
+      throw new DOMException("An object store with the specified name already exists.", "ConstraintError");
+    db.stores.delete(this._store.name);
+    tx._storeCache.delete(this._store.name);
+    this._store.name = name;
+    db.stores.set(name, this._store);
+    tx._storeCache.set(name, this);
+  }
+  get keyPath() {
+    const kp = this._store.keyPath;
+    return (kp === null) ? null : (Array.isArray(kp) ? kp.slice() : kp);
+  }
+  get autoIncrement() { return this._store.autoIncrement; }
+  get transaction() { return this._tx; }
+  get indexNames() { return _mkStringList([...this._store.indexes.keys()].sort()); }
+
+  put(value, key) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'put' on 'IDBObjectStore': 1 argument required.");
+    return _idbPut(this, value, key, arguments.length > 1, false);
+  }
+  add(value, key) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'add' on 'IDBObjectStore': 1 argument required.");
+    return _idbPut(this, value, key, arguments.length > 1, true);
+  }
+
+  delete(query) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'delete' on 'IDBObjectStore': 1 argument required.");
+    const store = _idbCheckWrite(this);
+    const range = _idbToRange(query, false);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
+      for (const r of store.records.slice()) if (_idbInRange(range, r.key)) _idbStoreDelete(store, r.key);
+      return undefined;
+    });
+  }
+  clear() {
+    const store = _idbCheckWrite(this);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
+      store.records = [];
+      for (const ix of store.indexes.values()) ix.records = [];
+      return undefined;
+    });
+  }
+  get(query) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'get' on 'IDBObjectStore': 1 argument required.");
+    const store = _idbCheckRead(this);
+    const range = _idbToRange(query, false);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
+      for (const r of store.records) if (_idbInRange(range, r.key)) return _idbCloneOut(r.value);
+      return undefined;
+    });
+  }
+  getKey(query) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'getKey' on 'IDBObjectStore': 1 argument required.");
+    const store = _idbCheckRead(this);
+    const range = _idbToRange(query, false);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
+      for (const r of store.records) if (_idbInRange(range, r.key)) return _idbKeyValue(r.key);
+      return undefined;
+    });
+  }
+  getAll(query, count) {
+    const store = _idbCheckRead(this);
+    const range = _idbToRange(query, true);
+    const n = _idbCount(count);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
+      const out = [];
+      for (const r of store.records) {
+        if (!_idbInRange(range, r.key)) continue;
+        out.push(_idbCloneOut(r.value));
+        if (out.length >= n) break;
+      }
+      return out;
+    });
+  }
+  getAllKeys(query, count) {
+    const store = _idbCheckRead(this);
+    const range = _idbToRange(query, true);
+    const n = _idbCount(count);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
+      const out = [];
+      for (const r of store.records) {
+        if (!_idbInRange(range, r.key)) continue;
+        out.push(_idbKeyValue(r.key));
+        if (out.length >= n) break;
+      }
+      return out;
+    });
+  }
+  count(query) {
+    const store = _idbCheckRead(this);
+    const range = _idbToRange(query, true);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
+      let n = 0;
+      for (const r of store.records) if (_idbInRange(range, r.key)) n++;
+      return n;
+    });
+  }
+  openCursor(query, direction = 'next') { return _idbOpenCursor(this, query, direction, true); }
+  openKeyCursor(query, direction = 'next') { return _idbOpenCursor(this, query, direction, false); }
+
+  createIndex(name, keyPath, options) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'createIndex' on 'IDBObjectStore': 2 arguments required.");
+    name = String(name);
+    const tx = this._tx;
+    if (!tx || tx._mode !== 'versionchange')
+      throw new DOMException("The database is not running a version change transaction.", "InvalidStateError");
+    if (this._store.deleted) throw new DOMException("The object store has been deleted.", "InvalidStateError");
+    if (tx._state !== 'active') throw _idbInactive();
+    // Order matters and WPT checks it: the name clash is reported BEFORE the
+    // key path is even parsed.
+    if (this._store.indexes.has(name))
+      throw new DOMException("An index with the specified name already exists.", "ConstraintError");
+    const kp = _idbNormKeyPath(keyPath);
+    if (kp === null || !_idbValidKeyPath(kp))
+      throw new DOMException("The keyPath argument contains an invalid key path.", "SyntaxError");
+    const o = (options == null) ? {} : options;
+    const multiEntry = !!o.multiEntry;
+    if (multiEntry && Array.isArray(kp))
+      throw new DOMException("The keyPath argument was an array and the multiEntry option is true.", "InvalidAccessError");
+    const index = { name, keyPath: kp, unique: !!o.unique, multiEntry, records: [], store: this._store, deleted: false };
+    this._store.indexes.set(name, index);
+    // Back-fill from the records already in the store — and a uniqueness
+    // violation here aborts the transaction, it does not just throw.
+    const wrapper = _mkIndex(index, this);
+    try {
+      for (const r of this._store.records) {
+        const keys = _idbIndexKeysFor(index, r.value);
+        for (const ik of keys) {
+          if (index.unique) {
+            const at = _idbIndexLowerBound(index.records, ik, null);
+            if (at < index.records.length && _idbCmp(index.records[at].key, ik) === 0)
+              throw new DOMException("A mutation operation in the transaction failed because a constraint was not satisfied.", "ConstraintError");
+          }
+          _idbIndexInsert(index, ik, r.key);
+        }
+      }
+    } catch (e) {
+      setTimeout(() => { if (tx._state !== 'finished') _idbAbortTx(tx, e); }, 0);
+    }
+    return wrapper;
+  }
+  index(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'index' on 'IDBObjectStore': 1 argument required.");
+    name = String(name);
+    if (this._store.deleted) throw new DOMException("The object store has been deleted.", "InvalidStateError");
+    if (!this._tx || this._tx._state === 'finished')
+      throw new DOMException("The transaction has finished.", "InvalidStateError");
+    let ix = this._indexCache.get(name);
+    if (ix) return ix;
+    const index = this._store.indexes.get(name);
+    if (!index) throw new DOMException("The specified index was not found.", "NotFoundError");
+    ix = _mkIndex(index, this);
+    this._indexCache.set(name, ix);
+    return ix;
+  }
+  deleteIndex(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'deleteIndex' on 'IDBObjectStore': 1 argument required.");
+    name = String(name);
+    const tx = this._tx;
+    if (!tx || tx._mode !== 'versionchange')
+      throw new DOMException("The database is not running a version change transaction.", "InvalidStateError");
+    if (this._store.deleted) throw new DOMException("The object store has been deleted.", "InvalidStateError");
+    if (tx._state !== 'active') throw _idbInactive();
+    const index = this._store.indexes.get(name);
+    if (!index) throw new DOMException("The specified index was not found.", "NotFoundError");
+    index.deleted = true;
+    this._store.indexes.delete(name);
+    this._indexCache.delete(name);
+  }
+}
+globalThis.IDBObjectStore = _markNative(IDBObjectStore);
+function _mkObjectStore(store, tx) {
+  const o = Object.create(IDBObjectStore.prototype);
+  o._store = store; o._tx = tx; o._indexCache = new Map();
+  return o;
+}
+
+const _idbCloneOut = (v) => globalThis.structuredClone(v);
+function _idbCount(count) {
+  if (count === undefined || count === null) return Infinity;
+  const n = Number(count);
+  if (!Number.isFinite(n) || n < 0) return Infinity;
+  const u = n >>> 0;
+  return u === 0 ? Infinity : u;
+}
+function _idbCheckRead(os) {
+  if (os._store.deleted) throw new DOMException("The object store has been deleted.", "InvalidStateError");
+  const tx = os._tx;
+  if (!tx || tx._state === 'finished' || tx._state === 'committing')
+    throw new DOMException("The transaction has finished.", "TransactionInactiveError");
+  if (tx._state !== 'active') throw _idbInactive();
+  return os._store;
+}
+function _idbCheckWrite(os) {
+  const s = _idbCheckRead(os);
+  if (os._tx._mode === 'readonly') throw _idbReadOnly();
+  return s;
+}
+
+// put / add share everything but the "must not overwrite" flag.
+function _idbPut(os, value, key, hasKey, noOverwrite) {
+  const store = _idbCheckWrite(os);
+  let k = null;
+  const gaveKey = hasKey && key !== undefined;
+  if (gaveKey && store.keyPath !== null)
+    throw _idbDataError("The object store uses in-line keys and the key parameter was provided.");
+  if (!gaveKey && store.keyPath === null && !store.autoIncrement)
+    throw _idbDataError("The object store uses out-of-line keys and has no key generator and a key parameter was not provided.");
+  if (gaveKey) k = _idbKeyArg(key);
+  // The value is cloned NOW, synchronously — a later mutation of the object the
+  // caller passed must not reach into the store, and a DataCloneError has to be
+  // thrown at them rather than surfacing later as a failed request.
+  const cloned = globalThis.structuredClone(value);
+  if (store.keyPath !== null) {
+    const r = _idbEvalKeyPath(cloned, store.keyPath);
+    if (r.ok) {
+      k = _idbToKey(r.v);
+      if (k === null) throw _idbDataError("Evaluating the object store's key path yielded a value that is not a valid key.");
+    } else if (!store.autoIncrement) {
+      throw _idbDataError("Evaluating the object store's key path did not yield a value.");
+    } else if (!_idbCanInject(cloned, store.keyPath)) {
+      throw _idbDataError("A generated key could not be inserted into the value.");
+    }
+  }
+  return _idbEnqueue(os._tx, _mkRequest(os, os._tx), () => {
+    let finalKey = k;
+    if (finalKey === null) {
+      // Exhaustion is a FLAG, not `current > 2**53`: 2**53 + 1 is not a
+      // representable double (it rounds straight back to 2**53), so the
+      // spec's "greater than 2^53" test can never become true in floating
+      // point and the generator would hand out 2**53 forever.
+      if (store.keyGenExhausted)
+        throw new DOMException("Maximum key generator value reached.", "ConstraintError");
+      finalKey = { t: _IDB_NUM, v: store.keyGenerator };
+      if (store.keyGenerator >= _IDB_MAX_GENERATED_KEY) store.keyGenExhausted = true;
+      else store.keyGenerator += 1;
+      if (store.keyPath !== null) _idbInject(cloned, store.keyPath, finalKey.v);
+    } else if (store.autoIncrement && finalKey.t === _IDB_NUM) {
+      // An explicit numeric key bumps the generator past itself — and an
+      // explicit key of 2**53 or more deliberately EXHAUSTS it, so the next
+      // auto-keyed put fails with ConstraintError. A generator must never hand
+      // out a key it cannot represent exactly.
+      const floored = Math.floor(finalKey.v);
+      if (floored >= _IDB_MAX_GENERATED_KEY) store.keyGenExhausted = true;
+      else if (floored >= store.keyGenerator) store.keyGenerator = floored + 1;
+    }
+    _idbStoreRecord(store, cloned, finalKey, noOverwrite);
+    return _idbKeyValue(finalKey);
+  });
+}
+
+// ---- IDBIndex --------------------------------------------------------------
+class IDBIndex {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get name() { return this._index.name; }
+  set name(v) {
+    const tx = this._os._tx;
+    if (this._index.deleted || this._os._store.deleted)
+      throw new DOMException("The index has been deleted.", "InvalidStateError");
+    if (!tx || tx._mode !== 'versionchange')
+      throw new DOMException("The database is not running a version change transaction.", "InvalidStateError");
+    if (tx._state !== 'active') throw _idbInactive();
+    const name = String(v);
+    if (name === this._index.name) return;
+    const store = this._os._store;
+    if (store.indexes.has(name))
+      throw new DOMException("An index with the specified name already exists.", "ConstraintError");
+    store.indexes.delete(this._index.name);
+    this._os._indexCache.delete(this._index.name);
+    this._index.name = name;
+    store.indexes.set(name, this._index);
+    this._os._indexCache.set(name, this);
+  }
+  get objectStore() { return this._os; }
+  get keyPath() { const kp = this._index.keyPath; return Array.isArray(kp) ? kp.slice() : kp; }
+  get multiEntry() { return this._index.multiEntry; }
+  get unique() { return this._index.unique; }
+  get(query) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'get' on 'IDBIndex': 1 argument required.");
+    const ix = _idbCheckIndex(this);
+    const range = _idbToRange(query, false);
+    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () => {
+      for (const r of ix.records) if (_idbInRange(range, r.key)) return _idbCloneOut(_idbLookup(ix.store, r.primaryKey));
+      return undefined;
+    });
+  }
+  getKey(query) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'getKey' on 'IDBIndex': 1 argument required.");
+    const ix = _idbCheckIndex(this);
+    const range = _idbToRange(query, false);
+    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () => {
+      for (const r of ix.records) if (_idbInRange(range, r.key)) return _idbKeyValue(r.primaryKey);
+      return undefined;
+    });
+  }
+  getAll(query, count) {
+    const ix = _idbCheckIndex(this);
+    const range = _idbToRange(query, true);
+    const n = _idbCount(count);
+    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () => {
+      const out = [];
+      for (const r of ix.records) {
+        if (!_idbInRange(range, r.key)) continue;
+        out.push(_idbCloneOut(_idbLookup(ix.store, r.primaryKey)));
+        if (out.length >= n) break;
+      }
+      return out;
+    });
+  }
+  getAllKeys(query, count) {
+    const ix = _idbCheckIndex(this);
+    const range = _idbToRange(query, true);
+    const n = _idbCount(count);
+    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () => {
+      const out = [];
+      for (const r of ix.records) {
+        if (!_idbInRange(range, r.key)) continue;
+        out.push(_idbKeyValue(r.primaryKey));
+        if (out.length >= n) break;
+      }
+      return out;
+    });
+  }
+  count(query) {
+    const ix = _idbCheckIndex(this);
+    const range = _idbToRange(query, true);
+    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () => {
+      let n = 0;
+      for (const r of ix.records) if (_idbInRange(range, r.key)) n++;
+      return n;
+    });
+  }
+  openCursor(query, direction = 'next') { return _idbOpenCursor(this, query, direction, true); }
+  openKeyCursor(query, direction = 'next') { return _idbOpenCursor(this, query, direction, false); }
+}
+globalThis.IDBIndex = _markNative(IDBIndex);
+function _mkIndex(index, os) {
+  const o = Object.create(IDBIndex.prototype);
+  o._index = index; o._os = os;
+  return o;
+}
+function _idbCheckIndex(idx) {
+  if (idx._index.deleted || idx._os._store.deleted)
+    throw new DOMException("The index has been deleted.", "InvalidStateError");
+  const tx = idx._os._tx;
+  if (!tx || tx._state === 'finished' || tx._state === 'committing')
+    throw new DOMException("The transaction has finished.", "TransactionInactiveError");
+  if (tx._state !== 'active') throw _idbInactive();
+  return idx._index;
+}
+function _idbLookup(store, primaryKey) {
+  const at = _idbLowerBound(store.records, primaryKey);
+  if (at < store.records.length && _idbCmp(store.records[at].key, primaryKey) === 0)
+    return store.records[at].value;
+  return undefined;
+}
+
+// ---- Cursors ---------------------------------------------------------------
+const _IDB_DIRECTIONS = ['next', 'nextunique', 'prev', 'prevunique'];
+
+class IDBCursor {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  get source() { return this._source; }
+  get direction() { return this._direction; }
+  get key() { return this._key === null ? undefined : _idbKeyValue(this._key); }
+  get primaryKey() { return this._primaryKey === null ? undefined : _idbKeyValue(this._primaryKey); }
+  get request() { return this._request; }
+  advance(count) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'advance' on 'IDBCursor': 1 argument required.");
+    const n = Number(count) >>> 0;
+    if (n === 0) throw new TypeError("Failed to execute 'advance' on 'IDBCursor': A count argument of 0 (zero) was supplied, must be greater than 0.");
+    _idbCursorIterate(this, null, null, n);
+  }
+  continue(key) {
+    let k = null;
+    if (key !== undefined) {
+      k = _idbKeyArg(key);
+      // Moving backwards through a forward cursor (or vice versa) is a DataError.
+      if (this._key !== null) {
+        const c = _idbCmp(k, this._key);
+        const back = (this._direction === 'next' || this._direction === 'nextunique') ? c <= 0 : c >= 0;
+        if (back) throw _idbDataError("The parameter is less than or equal to this cursor's position.");
+      }
+    }
+    _idbCursorIterate(this, k, null, 1);
+  }
+  continuePrimaryKey(key, primaryKey) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'continuePrimaryKey' on 'IDBCursor': 2 arguments required.");
+    if (this._direction !== 'next' && this._direction !== 'prev')
+      throw new DOMException("The cursor's direction is not 'next' or 'prev'.", "InvalidAccessError");
+    if (!(this._source instanceof IDBIndex))
+      throw new DOMException("The cursor's source is not an index.", "InvalidAccessError");
+    const k = _idbKeyArg(key), pk = _idbKeyArg(primaryKey);
+    _idbCursorIterate(this, k, pk, 1);
+  }
+  update(value) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'update' on 'IDBCursor': 1 argument required.");
+    const os = _idbCursorStore(this);
+    if (this._tx._mode === 'readonly') throw _idbReadOnly();
+    if (this._tx._state !== 'active') throw _idbInactive();
+    if (!this._gotValue) throw new DOMException("The cursor is being iterated or has iterated past its end.", "InvalidStateError");
+    if (this._keyOnly) throw new DOMException("The cursor is a key cursor.", "InvalidStateError");
+    const store = os._store;
+    const cloned = globalThis.structuredClone(value);
+    if (store.keyPath !== null) {
+      const r = _idbEvalKeyPath(cloned, store.keyPath);
+      if (!r.ok) throw _idbDataError("Evaluating the object store's key path did not yield a value.");
+      const k = _idbToKey(r.v);
+      if (k === null || _idbCmp(k, this._primaryKey) !== 0)
+        throw _idbDataError("The effective object store of this cursor uses in-line keys and evaluating the key path of the value parameter results in a different value than the cursor's effective key.");
+    }
+    const pk = this._primaryKey;
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
+      _idbStoreRecord(store, cloned, pk, false);
+      return _idbKeyValue(pk);
+    });
+  }
+  delete() {
+    const os = _idbCursorStore(this);
+    if (this._tx._mode === 'readonly') throw _idbReadOnly();
+    if (this._tx._state !== 'active') throw _idbInactive();
+    if (!this._gotValue) throw new DOMException("The cursor is being iterated or has iterated past its end.", "InvalidStateError");
+    if (this._keyOnly) throw new DOMException("The cursor is a key cursor.", "InvalidStateError");
+    const store = os._store, pk = this._primaryKey;
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => { _idbStoreDelete(store, pk); return undefined; });
+  }
+}
+globalThis.IDBCursor = _markNative(IDBCursor);
+
+class IDBCursorWithValue extends IDBCursor {
+  get value() { return this._value; }
+}
+globalThis.IDBCursorWithValue = _markNative(IDBCursorWithValue);
+
+function _idbCursorStore(cur) {
+  return (cur._source instanceof IDBIndex) ? cur._source._os : cur._source;
+}
+
+function _idbOpenCursor(source, query, direction, withValue) {
+  const isIndex = source instanceof IDBIndex;
+  const os = isIndex ? source._os : source;
+  if (isIndex) _idbCheckIndex(source); else _idbCheckRead(source);
+  const range = _idbToRange(query, true);
+  direction = String(direction);
+  if (_IDB_DIRECTIONS.indexOf(direction) === -1)
+    throw new TypeError("The direction provided ('" + direction + "') is not a valid IDBCursorDirection.");
+  const tx = os._tx;
+  const cursor = Object.create((withValue ? IDBCursorWithValue : IDBCursor).prototype);
+  cursor._source = source; cursor._direction = direction; cursor._range = range;
+  cursor._key = null; cursor._primaryKey = null; cursor._value = undefined;
+  cursor._gotValue = false; cursor._keyOnly = !withValue; cursor._tx = tx;
+  const req = _mkRequest(source, tx);
+  cursor._request = req;
+  req._cursor = cursor;
+  return _idbEnqueue(tx, req, () => _idbCursorStep(cursor, null, null, 1));
+}
+
+function _idbCursorIterate(cursor, key, primaryKey, count) {
+  const tx = cursor._tx;
+  if (!tx || tx._state === 'finished') throw new DOMException("The transaction has finished.", "TransactionInactiveError");
+  if (tx._state !== 'active') throw _idbInactive();
+  // A cursor whose source (or its effective object store) was deleted out from
+  // under it is not iterable any more.
+  const src = cursor._source;
+  if ((src instanceof IDBIndex) ? (src._index.deleted || src._os._store.deleted) : src._store.deleted)
+    throw new DOMException("The cursor's source or effective object store has been deleted.", "InvalidStateError");
+  if (!cursor._gotValue) throw new DOMException("The cursor is being iterated or has iterated past its end.", "InvalidStateError");
+  cursor._gotValue = false;
+  const req = cursor._request;
+  req._done = false; req._result = undefined; req._error = null;
+  _idbEnqueue(tx, req, () => _idbCursorStep(cursor, key, primaryKey, count));
+}
+
+// One iteration step: walk the (already sorted) record list in the cursor's
+// direction and take the `count`-th record that is both inside the range and
+// strictly past where the cursor already stands. A linear scan — simple, and
+// correct, which matters far more here than fast.
+function _idbCursorStep(cursor, targetKey, targetPrimaryKey, count) {
+  const isIndex = cursor._source instanceof IDBIndex;
+  const store = isIndex ? cursor._source._index.store : cursor._source._store;
+  const records = isIndex ? cursor._source._index.records : store.records;
+  const forward = (cursor._direction === 'next' || cursor._direction === 'nextunique');
+  const unique = (cursor._direction === 'nextunique' || cursor._direction === 'prevunique');
+  const range = cursor._range;
+  const pos = cursor._key, ppos = cursor._primaryKey;
+  const ordered = forward ? records : records.slice().reverse();
+  let remaining = count;
+  let lastKey = null;   // the last key accepted, for the "unique" directions
+
+  for (const r of ordered) {
+    const rkey = r.key;
+    let rpk = isIndex ? r.primaryKey : r.key;
+    if (!_idbInRange(range, rkey)) continue;
+
+    // Strictly past the current position. In an object store the key IS the
+    // primary key and so is unique; only an index can have ties to break.
+    if (pos !== null) {
+      const c = _idbCmp(rkey, pos);
+      if (forward ? c < 0 : c > 0) continue;
+      if (c === 0) {
+        if (unique || !isIndex) continue;
+        const cp = _idbCmp(rpk, ppos);
+        if (forward ? cp <= 0 : cp >= 0) continue;
+      }
+    }
+    // Honour an explicit continue(key) / continuePrimaryKey(key, primaryKey).
+    if (targetKey !== null) {
+      const c = _idbCmp(rkey, targetKey);
+      if (forward ? c < 0 : c > 0) continue;
+      if (targetPrimaryKey !== null && c === 0) {
+        const cp = _idbCmp(rpk, targetPrimaryKey);
+        if (forward ? cp < 0 : cp > 0) continue;
+      }
+    }
+    // A "unique" direction visits each index key once. The record it lands on
+    // is always the one with the LOWEST primary key — including for prevunique,
+    // where the reversed walk would otherwise hand back the highest.
+    if (unique) {
+      if (lastKey !== null && _idbCmp(rkey, lastKey) === 0) continue;
+      if (isIndex) rpk = records[_idbIndexLowerBound(records, rkey, null)].primaryKey;
+    }
+    lastKey = rkey;
+
+    if (--remaining > 0) continue;
+
+    cursor._key = rkey;
+    cursor._primaryKey = rpk;
+    cursor._gotValue = true;
+    if (!cursor._keyOnly) {
+      const v = isIndex ? _idbLookup(store, rpk) : r.value;
+      cursor._value = (v === undefined) ? undefined : _idbCloneOut(v);
+    }
+    return cursor;
+  }
+  cursor._key = null; cursor._primaryKey = null; cursor._value = undefined;
+  cursor._gotValue = false;
+  return null;
+}
+
+// ---- IDBFactory ------------------------------------------------------------
+class IDBFactory {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  cmp(first, second) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'cmp' on 'IDBFactory': 2 arguments required.");
+    return _idbCmp(_idbKeyArg(first), _idbKeyArg(second));
+  }
+  databases() {
+    const out = [];
+    for (const [name, db] of _idbDatabases) if (db.version > 0) out.push({ name, version: db.version });
+    return Promise.resolve(out);
+  }
+  open(name, version) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'open' on 'IDBFactory': 1 argument required.");
+    name = String(name);
+    let requested;
+    if (version === undefined) requested = null;
+    else {
+      // WebIDL [EnforceRange] unsigned long long, and 0 is explicitly rejected.
+      // The version is a double on the way in, so the honest ceiling is the
+      // largest integer a double represents exactly: 2**53 is rejected, 2**53-1
+      // is accepted (WPT checks both edges).
+      const n = Number(version);
+      if (!Number.isFinite(n) || n < 0 || n > Number.MAX_SAFE_INTEGER)
+        throw new TypeError("Failed to execute 'open' on 'IDBFactory': Value is outside the 'unsigned long long' value range.");
+      requested = Math.trunc(n);
+      if (requested < 1) throw new TypeError("Failed to execute 'open' on 'IDBFactory': The version provided must not be 0.");
+    }
+    const req = _mkRequest(null, null, true);
+    setTimeout(() => _idbRunOpen(req, name, requested), 0);
+    return req;
+  }
+  deleteDatabase(name) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'deleteDatabase' on 'IDBFactory': 1 argument required.");
+    name = String(name);
+    const req = _mkRequest(null, null, true);
+    setTimeout(() => _idbRunDelete(req, name), 0);
+    return req;
+  }
+}
+globalThis.IDBFactory = _markNative(IDBFactory);
+
+function _idbFailRequest(req, error) {
+  req._done = true; req._error = error; req._result = undefined;
+  _idbFire(req, 'error', true, true);
+}
+
+// Ask every other connection to step aside, then tell the caller if any of them
+// refused (that is what `blocked` means).
+function _idbVersionChangeOthers(db, exceptConn, oldVersion, newVersion) {
+  let blocked = false;
+  for (const c of _idbConnections.slice()) {
+    if (c === exceptConn || c._db !== db || c._closePending) continue;
+    _idbFire(c, 'versionchange', false, false, IDBVersionChangeEvent, { oldVersion, newVersion });
+    if (!c._closePending && !c._closed) blocked = true;
+  }
+  return blocked;
+}
+
+function _idbRunOpen(req, name, requested) {
+  let db = _idbDatabases.get(name);
+  if (!db) { db = { name, version: 0, stores: new Map() }; _idbDatabases.set(name, db); }
+  const version = (requested === null) ? (db.version === 0 ? 1 : db.version) : requested;
+  if (version < db.version) {
+    _idbFailRequest(req, new DOMException("The requested version (" + version + ") is less than the existing version (" + db.version + ").", "VersionError"));
+    return;
+  }
+  if (version === db.version) {
+    const conn = _mkConnection(db);
+    req._result = conn; req._done = true; req._source = null;
+    _idbFire(req, 'success', false, false);
+    return;
+  }
+  const oldVersion = db.version;
+  const blocked = _idbVersionChangeOthers(db, null, oldVersion, version);
+  const proceed = () => {
+    const conn = _mkConnection(db);
+    // The transaction snapshots the database, so it must be created BEFORE the
+    // version is bumped — otherwise an aborted upgrade "rolls back" to the new
+    // version and `db.version` stays where the failed upgrade left it.
+    const tx = _mkTransaction(conn, [], 'versionchange', 'default');
+    db.version = version;
+    conn._version = version;
+    conn._upgradeTx = tx;
+    req._transaction = tx;
+    req._result = conn;
+    req._done = true;
+    tx._onFinish = (aborted) => {
+      req._transaction = null;
+      conn._upgradeTx = null;
+      if (aborted) {
+        conn._version = oldVersion;   // the connection reverts with the database
+        conn._closePending = true;
+        _idbMaybeClose(conn);
+        req._result = undefined;
+        req._error = new DOMException("The transaction was aborted.", "AbortError");
+        _idbFire(req, 'error', true, true);
+      } else {
+        _idbFire(req, 'success', false, false);
+      }
+    };
+    // The upgrade transaction is active for the whole `upgradeneeded` handler AND
+    // across the microtask checkpoint that follows it, so an `await` inside the
+    // handler still gets a live transaction (see _idbAfterCheckpoint).
+    tx._state = 'active';
+    _idbFire(req, 'upgradeneeded', false, false, IDBVersionChangeEvent, { oldVersion, newVersion: version });
+    _idbScheduleTx(tx);
+  };
+  if (blocked) {
+    _idbFire(req, 'blocked', false, false, IDBVersionChangeEvent, { oldVersion, newVersion: version });
+    // Retry once the last blocking connection closes.
+    const waiter = () => {
+      for (const c of _idbConnections) if (c._db === db && !c._closed) return;
+      const i = _idbCloseWaiters.indexOf(waiter);
+      if (i !== -1) _idbCloseWaiters.splice(i, 1);
+      proceed();
+    };
+    _idbCloseWaiters.push(waiter);
+    waiter();
+    return;
+  }
+  proceed();
+}
+
+function _idbRunDelete(req, name) {
+  const db = _idbDatabases.get(name);
+  if (!db) { req._result = undefined; req._done = true;
+    _idbFire(req, 'success', false, false, IDBVersionChangeEvent, { oldVersion: 0, newVersion: null }); return; }
+  const oldVersion = db.version;
+  const blocked = _idbVersionChangeOthers(db, null, oldVersion, null);
+  const finish = () => {
+    _idbDatabases.delete(name);
+    for (const s of db.stores.values()) s.deleted = true;
+    db.stores = new Map(); db.version = 0;
+    req._result = undefined; req._done = true;
+    _idbFire(req, 'success', false, false, IDBVersionChangeEvent, { oldVersion, newVersion: null });
+  };
+  if (blocked) {
+    _idbFire(req, 'blocked', false, false, IDBVersionChangeEvent, { oldVersion, newVersion: null });
+    const waiter = () => {
+      for (const c of _idbConnections) if (c._db === db && !c._closed) return;
+      const i = _idbCloseWaiters.indexOf(waiter);
+      if (i !== -1) _idbCloseWaiters.splice(i, 1);
+      finish();
+    };
+    _idbCloseWaiters.push(waiter);
+    waiter();
+    return;
+  }
+  finish();
+}
+
+globalThis.indexedDB = Object.create(IDBFactory.prototype);
 
 globalThis.caches = {
   open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },

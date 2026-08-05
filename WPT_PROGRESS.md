@@ -46,6 +46,27 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **`IndexedDB/*` — Quest #464, the offline verdict (2026-08-04)** | **3/556** | **552/576** | **95.8%** | 45-file core list, measured identically before and after. 33 of 45 files to 100%, could-not-run 0. `open()` used to return a mime: `createObjectStore` gave back `{createIndex(){}}` and `get()` a request that never fired, so an offline-first page waited forever and rendered empty. Scroll: `tickets/458-the-offline-verdict.md`. |
+| `IndexedDB/structured-clone.any.html` | 0/125 | **116/125** | ⬆️ | **Quest #464.** 🔍 IDB's cleanup step runs AFTER the microtask checkpoint — `await store.put(…)` then `store.get(…)` must still see a live transaction. Deactivating one microtask hop too early gave 121 identical `TransactionInactiveError` rejections. **+116.** |
+| `IndexedDB/idbfactory_open.any.html` | 0/29 | **29/29** | ✅ 100% | **Quest #464.** The version dance: upgradeneeded / versionchange / blocked, and an aborted upgrade rolls `db.version` back. |
+| `IndexedDB/idbdatabase_createObjectStore.any.html` | 0/27 | **27/27** | ✅ 100% | **Quest #464.** |
+| `IndexedDB/key_invalid.any.html` | 0/35 | **34/35** | ⬆️ | **Quest #464.** NaN, invalid Date, detached buffer, array hole, cycle. |
+| `IndexedDB/keyorder.any.html` | 0/24 | **24/24** | ✅ 100% | **Quest #464.** number < date < string < binary < array. |
+| `IndexedDB/keygenerator.any.html` | 0/1 ⏱ | **21/21** | ✅ 100% | **Quest #464.** Generator exhaustion must be a FLAG: `2**53 + 1` is not a representable double, so the spec's `> 2^53` test can never become true in floating point. |
+| `IndexedDB/idbobjectstore_createIndex.any.html` | 0/21 ⏱ | **16/21** | ⬆️ | **Quest #464.** ConstraintError (name in use) precedes SyntaxError (bad key path). |
+| `IndexedDB/idbindex_getAll.any.html` | 0/19 | **18/19** | ⬆️ | **Quest #464.** |
+| `IndexedDB/key_valid.any.html` | 0/18 | **18/18** | ✅ 100% | **Quest #464.** |
+| `IndexedDB/idbobjectstore_getAll.any.html` | 0/18 | **17/18** | ⬆️ | **Quest #464.** |
+| `IndexedDB/idbindex_getAllKeys.any.html` | 0/18 | **17/18** | ⬆️ | **Quest #464.** |
+| `IndexedDB/idbobjectstore_getKey.any.html` | 0/17 | **17/17** | ✅ 100% | **Quest #464.** |
+| `IndexedDB/idbobjectstore_{add,put}.any.html` | 0/16 each | **16/16** each | ✅ 100% | **Quest #464.** add is put with "must not overwrite". |
+| `IndexedDB/idbobjectstore_getAllKeys.any.html` | 0/16 | **15/16** | ⬆️ | **Quest #464.** |
+| `IndexedDB/idbfactory_cmp.any.html` | 1/12 | **12/12** | ✅ 100% | **Quest #464.** |
+| `IndexedDB/idbkeyrange{,-includes}.any.html` | 0/10, 0/11 | **10/10, 11/11** | ✅ 100% | **Quest #464.** |
+| `IndexedDB/idbcursor_*.any.html` (5 files) | 0/37 | **35/37** | ⬆️ | **Quest #464.** next/prev/nextunique/prevunique, advance, continue, continuePrimaryKey, update, delete. `prevunique` lands on the LOWEST primary key of each index key. |
+| `IndexedDB/idbindex_{get,getKey}.any.html` | 0/8 each | **8/8** each | ✅ 100% | **Quest #464.** |
+| `IndexedDB/value.any.html` | 0/8 | **8/8** | ✅ 100% | **Quest #464.** |
+| `IndexedDB/idbtransaction_objectStoreNames.any.html` | 1/8 ⏱ | **7/8** | ⬆️ | **Quest #464.** |
 | **`webstorage/*` — Quest #463, the remembered verdict (2026-08-04)** | **57/1284** ⁽⁴ files HUNG the engine⁾ | **1281/1288** | **99.5%** | 44 of 51 files to 100%, could-not-run 0. `Storage` is now a real WebIDL legacy platform object (a Proxy with the named getter/setter/deleter), so `localStorage.token = t` finally stores an item. All 7 remaining failures are capability caps (6 × `window.open`, 1 × cross-origin). Scroll: `tickets/457-the-remembered-verdict.md`. |
 | `webstorage/storage_setitem.window.html` | 2/1106 | **1106/1106** | ✅ 100% | **Quest #463.** The named property setter. **+1104.** |
 | `webstorage/storage_key.window.html` | 14/22 | **22/22** | ✅ 100% | **Quest #463.** `key(i + 2**32)` is `key(i)` — WebIDL `unsigned long`. |

@@ -28,7 +28,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | **F1a** | ✅ [The Data Layer Verdict](455-the-data-layer-verdict.md) | **`fetch/api/{headers,request,response}/*`** — the fetch OBJECT MODEL | **527/598 (88.1%)** — was 130/566 (23.0%) | ⚔️⚔️ | **SECURED (Quests #457–#459, 2026-08-03).** 27 of 32 files to 100%, two more at exact Chrome parity. `Headers`/`Request`/`Response` were stubs wearing the name of a class. **Also killed a HANG**: `request-bad-port` 0/83 TIMEOUT → 83/83 (fetch's 83 blocked ports, in Rust). **Still open in `fetch`:** `fetch/api/basic/*` and `fetch/api/cors/*` — network BEHAVIOUR rather than object model, spot-checked and scoreable (`basic/request-headers` 1/25, `basic/response-url` 0/4). |
 | **F1b** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **`streams/*`** — what sits underneath `response.body` | **1390/1474 (94.3%)** — was 181/1211 (14.9%) | ⚔️⚔️ | **SECURED (Quests #460–#462, 2026-08-04).** 61 of 71 files to 100%. The old `ReadableStream` was 25 lines and its `tee()` returned two **empty** streams. Built the whole standard: readable + BYOB byte streams, writable, `pipeTo`/`pipeThrough`, `TransformStream`, both tees, queuing strategies. **Excluding `streams/transferable/` (a transfer capability we do not have) we lead Chrome 1390/1398 to 1344/1398 on the identical files.** **And found the platform bug underneath it: `setTimeout(fn, 0)` was a MICROTASK** — see F8. |
 | **F8** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **The event loop — a task is not a microtask** | **FIXED (Quest #461, 2026-08-04)** | ⚔️ | `setTimeout(fn, 0)` was `Promise.resolve().then(fn)`. HTML runs one TASK then drains the ENTIRE microtask queue; a zero-delay timer scheduled as a microtask INTERLEAVES with the promise jobs already queued. Measured: **3 of 500** chained promise jobs had run when a 0ms timer fired (now 500/500). Every `await delay(0)` on the platform — including WPT's own `flushAsyncEvents` — was looking at a half-finished world. Fixed by pumping real tasks through `op_sleep(0)`, one at a time, in insertion order. Swept before/after on 56 timer-heavy files (`scripts/wpt-eventloop-sweep.txt`). |
-| **F2** | 🔶 [The Remembered Verdict](457-the-remembered-verdict.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **`webstorage` DONE (Quest #463): 57/1284 → 1281/1288, 99.5%.** `cookies` 2/259 and `IndexedDB` 12/417 still OPEN | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
+| **F2** | 🔶 [Remembered](457-the-remembered-verdict.md) · [Offline](458-the-offline-verdict.md) | **`cookies/*` + `webstorage/*` + `IndexedDB/*`** — staying logged in, and working offline | **`webstorage` DONE (#463): 57/1284 → 1281/1288, 99.5%. `IndexedDB` DONE (#464): core 3/556 → 552/576, 95.8%.** `cookies` 2/259 still OPEN | ⚔️⚔️⚔️ | **OPEN.** The difference between a browser you can *use* and one you can only *look at* — no session survives a navigation without cookies. Offline storage matters most exactly where connections are metered and unreliable, which is who this browser is for. 4 of 6 `cookies` files could-not-run: check for one missing primitive before assuming six gaps. |
 | **F3** | ✅ [The Accessible Verdict](454-the-accessible-verdict.md) | **`accname/*` + `wai-aria/role/*`** — what an element IS, and what it is CALLED | **818/853 (95.9%)** — was 0/853 | ⚔️⚔️ | **SECURED (Quests #454–#456, 2026-08-02).** 31 of 34 files to 100%. The 853 zeros were **two missing primitives**, not 853 defects: the engine could not answer "what is this" or "what is it called". Now `Element.computedRole` / `Element.computedLabel`. **Still open in this realm:** `accname/name/shadowdom/` (never measured), `comp_name_from_heading.tentative.html`, and `wai-aria/` OUTSIDE `role/` — the survey put the whole realm at 25.1% and `role/` is now 97.5% of it, so **re-measure before choosing**. The last 30 accname rows are two CSS gaps, not accname gaps (see the scroll's ⭐). |
 | **F4** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`pointerevents/*` + `uievents/*` + `selection/*`** — how the agent ACTS | **68/301 · 65/203 · 24/403 (22.6% · 32.0% · 6.0%)**, Chrome 98.7% · 96.1% · 98.8% | ⚔️⚔️⚔️ | **OPEN.** Clicking, typing, selecting. F3 is how an agent reads a page; this is how it acts on one. `selection` at 6% with **zero** could-not-run means the API is present and wrong rather than missing — usually the cheaper shape. |
 | **F5** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`quirks/*` + `css/CSS2/*`** — the old web | **75/156 · 350/440 (48.1% · 79.5%)**, Chrome 98.1% · 100% | ⚔️ | **OPEN — the cheapest rows on the map.** `css/CSS2` at 79.5% is the highest score in the whole survey. Quirks mode is not legacy trivia for our audience: the hand-me-down-laptop web is full of pages written in 2004, and they are exactly the pages that must not break. |
@@ -310,6 +310,48 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-04 — Quest #464, **The Offline Verdict** (`IndexedDB` core **3/556 → 552/576, 95.8%**)
+
+*An offline-first page opened its database, wrote its data, asked for it back, and waited
+forever.* `open()` returned a **mime**: `createObjectStore` handed back `{createIndex(){}}`,
+`put()` a request whose `onsuccess` was never called, `get()` one that never fired either.
+Every call succeeded. Nothing threw. The page did not render badly — it rendered **empty**,
+and looked like a slow network. Same shape as the `tee()` that returned two empty streams and
+the `Storage` that was a `_data` bag: **a realm that never scores zero is not missing, it is
+approximated** — and a silent approximation is worse than one that throws.
+
+Replaced with the whole object model in ~1400 lines: keys (type tag = the cross-type ordering;
+NaN / invalid Date / detached buffer / array hole / cycle all rejected), key paths with
+injection, key-sorted stores with binary-search insertion, `(key, primaryKey)`-sorted indexes
+with `multiEntry` and `unique`, transactions with **real** snapshot/rollback (restored *into*
+the live objects so a page's `IDBObjectStore` handles stay valid), the four cursor directions,
+and the version dance (`upgradeneeded` / `versionchange` / `blocked` / retry). The IDB event
+path — request → transaction → connection, which is how `db.onerror` catches a failed `put` —
+rides the engine's one spec dispatcher via an `_idbEventParent` hook.
+
+- **🔍 THE FINDING: IDB and promises meet AFTER the microtask checkpoint.** The first build
+  scored 416/576 with `structured-clone` at **4/125** — all 121 failures identical
+  `TransactionInactiveError`. A transaction goes inactive when *control returns to the event
+  loop*, and IDB's cleanup runs **after** the checkpoint, not inside it. That single detail is
+  the whole reason `await store.put(…)` then `store.get(…)` works: the await resumes several
+  microtask hops later (event → EventWatcher promise → `.then` → async continuation) and the
+  transaction has to still be alive. Deactivating in one `Promise.resolve().then` is **one hop
+  too early**, and one hop is the difference between a working database and 121 rejections.
+  Fixed by walking a bounded microtask chain — past any realistic await chain, still strictly
+  before the next TASK, so a `setTimeout` callback correctly sees it inactive. **4/125 → 116/125,
+  and the realm 72.2% → 91.7% on that one change.**
+- **`abort`/`complete` are QUEUED TASKS.** The state change is synchronous (a finished
+  transaction must reject the next call) but the event is queued. WPT writes
+  `tx.abort(); assert_throws_dom(…); t.done();` and relies on `db.onabort` landing *after*
+  `t.done()`. Firing it synchronously made passing tests report "unexpected db.abort" from a
+  helper three files away. Aborting also **fires `error` at every still-queued request** —
+  dropping them silently reads as "events lengths differ".
+- **Key-generator exhaustion must be a FLAG.** `2**53 + 1` is not a representable double — it
+  rounds back to `2**53` — so the spec's "greater than 2^53" test can never become true in
+  floating point and the generator hands out `2**53` forever. `keygenerator` 15/21 → **21/21**.
+- Sweep: ritual **9027/9122**, every held row exact (the original 36 rows still sum to 7725).
+  Scroll: [`458-the-offline-verdict.md`](458-the-offline-verdict.md).
 
 ### 2026-08-04 — Quest #463, **The Remembered Verdict** (`webstorage` **57/1284 → 1281/1288, 99.5%**)
 
