@@ -98,3 +98,14 @@ selection/textcontrols/selectionchange.html
 #    its brand check. They also cover the Window on* handler machinery.
 uievents/idlharness.window.html
 pointerevents/idlharness.https.window.html
+# ── WebCryptoAPI (Quests #469–#471). The realm is shared machinery: algorithm
+#    normalization, the CryptoKey object model, structuredClone of a key, and the
+#    Window `crypto` IDL accessor. digest and the AES failures file break loudly
+#    on any drift in error ORDER; ecdsa and hmac break on the primitives; the
+#    pbkdf2 chunk is the one that would notice a derivation regression. Kept to
+#    five files because the full realm is ~40 minutes.
+WebCryptoAPI/digest/digest.https.any.html
+WebCryptoAPI/idlharness.https.any.html
+WebCryptoAPI/generateKey/failures_AES-CBC.https.any.html
+WebCryptoAPI/sign_verify/ecdsa.https.any.html
+WebCryptoAPI/derive_bits_keys/pbkdf2.https.any.html?1-1000
