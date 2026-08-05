@@ -34003,9 +34003,9 @@ const _cryptoGlobal = (function () {
     "RSA-PSS": { sign: "RsaPssParams", verify: "RsaPssParams", generateKey: "RsaHashedKeyGenParams", importKey: "RsaHashedImportParams", exportKey: null },
     "RSA-OAEP": { encrypt: "RsaOaepParams", decrypt: "RsaOaepParams", generateKey: "RsaHashedKeyGenParams", importKey: "RsaHashedImportParams", exportKey: null },
     "ECDSA": { sign: "EcdsaParams", verify: "EcdsaParams", generateKey: "EcKeyGenParams", importKey: "EcKeyImportParams", exportKey: null },
-    "ECDH": { generateKey: "EcKeyGenParams", importKey: "EcKeyImportParams", exportKey: null, deriveBits: "EcdhKeyDeriveParams" },
+    "ECDH": { generateKey: "EcKeyGenParams", importKey: "EcKeyImportParams", exportKey: null, deriveBits: "EcdhKeyDeriveParams", deriveKey: "EcdhKeyDeriveParams" },
     "Ed25519": { sign: null, verify: null, generateKey: null, importKey: null, exportKey: null },
-    "X25519": { generateKey: null, importKey: null, exportKey: null, deriveBits: "EcdhKeyDeriveParams" },
+    "X25519": { generateKey: null, importKey: null, exportKey: null, deriveBits: "EcdhKeyDeriveParams", deriveKey: "EcdhKeyDeriveParams" },
     "AES-CTR": { encrypt: "AesCtrParams", decrypt: "AesCtrParams", generateKey: "AesKeyGenParams", importKey: null, exportKey: null, "get key length": "AesDerivedKeyParams" },
     "AES-CBC": { encrypt: "AesCbcParams", decrypt: "AesCbcParams", generateKey: "AesKeyGenParams", importKey: null, exportKey: null, "get key length": "AesDerivedKeyParams" },
     "AES-GCM": { encrypt: "AesGcmParams", decrypt: "AesGcmParams", generateKey: "AesKeyGenParams", importKey: null, exportKey: null, "get key length": "AesDerivedKeyParams" },
@@ -34015,8 +34015,8 @@ const _cryptoGlobal = (function () {
     "SHA-256": { digest: null },
     "SHA-384": { digest: null },
     "SHA-512": { digest: null },
-    "HKDF": { deriveBits: "HkdfParams", importKey: null, "get key length": null },
-    "PBKDF2": { deriveBits: "Pbkdf2Params", importKey: null, "get key length": null },
+    "HKDF": { deriveBits: "HkdfParams", deriveKey: "HkdfParams", importKey: null, "get key length": null },
+    "PBKDF2": { deriveBits: "Pbkdf2Params", deriveKey: "Pbkdf2Params", importKey: null, "get key length": null },
   };
 
   // Normalize an algorithm (spec §14.4.1). The shape of the errors is the whole
@@ -34156,18 +34156,168 @@ const _cryptoGlobal = (function () {
     if (usages.length === 0) throw _syntaxError("Usages cannot be empty");
     return key;
   };
-  // The public-key algorithms: parameter validation is implemented, key
-  // GENERATION is not yet (see the scroll's Caps). Validation first so the error
-  // a caller gets for a bad curve or a bad exponent is the right one; the
-  // NotSupportedError below is honest about the rest.
+  // ── DER, for the key formats that travel between systems ──────────────────
+  // `spki` and `pkcs8` are how a key arrives from anything that is not a
+  // browser — a server, a certificate, an SSH-adjacent tool. They are ASN.1
+  // DER, so there is a small encoder/decoder here rather than a dependency;
+  // Web Crypto only ever needs a handful of shapes.
+  const _derLen = (n) => {
+    if (n < 0x80) return [n];
+    const out = []; let v = n;
+    while (v > 0) { out.unshift(v & 0xff); v >>>= 8; }
+    return [0x80 | out.length, ...out];
+  };
+  const _derTLV = (tag, body) => Uint8Array.from([tag, ..._derLen(body.length), ...body]);
+  const _derSeq = (...parts) => _derTLV(0x30, [].concat(...parts.map((p) => [...p])));
+  const _derOID = (bytes) => _derTLV(0x06, bytes);
+  const _derBitString = (bytes) => _derTLV(0x03, [0, ...bytes]);   // 0 unused bits
+  const _derOctet = (bytes) => _derTLV(0x04, [...bytes]);
+  const _derInt = (n) => _derTLV(0x02, [n]);
+  // Read one TLV at `pos`. Returns the tag, the value's bounds and where the
+  // next TLV starts. A truncated or over-long length is a hard parse failure —
+  // callers turn that into the DataError the spec asks for.
+  const _derRead = (buf, pos) => {
+    if (pos + 2 > buf.length) throw _dataError("Truncated DER");
+    const tag = buf[pos];
+    let len = buf[pos + 1], p = pos + 2;
+    if (len & 0x80) {
+      const n = len & 0x7f;
+      if (n === 0 || n > 4 || p + n > buf.length) throw _dataError("Bad DER length");
+      len = 0;
+      for (let i = 0; i < n; i++) len = (len << 8) | buf[p + i];
+      p += n;
+    }
+    if (p + len > buf.length) throw _dataError("Truncated DER");
+    return { tag, start: p, end: p + len, next: p + len };
+  };
+  const _bytesSame = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+  const _OID_EC_PUBLIC_KEY = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];      // 1.2.840.10045.2.1
+  const _CURVE_OIDS = {
+    "P-256": [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
+    "P-384": [0x2b, 0x81, 0x04, 0x00, 0x22],
+    "P-521": [0x2b, 0x81, 0x04, 0x00, 0x23],
+    "Ed25519": [0x2b, 0x65, 0x70],
+    "X25519": [0x2b, 0x65, 0x6e],
+  };
+  const _EC_CURVES = ["P-256", "P-384", "P-521"];
+  // Field size in bytes — the width every scalar and coordinate is padded to.
+  // P-521 is 66 because 521 bits is 65 bytes plus one stubborn bit.
+  const _EC_FIELD_BYTES = { "P-256": 32, "P-384": 48, "P-521": 66 };
+  const _validateEc = (alg) => {
+    if (!_EC_CURVES.includes(alg.namedCurve)) throw _notSupported("Unrecognized namedCurve");
+  };
+  // Is this algorithm one of the two curves that carry their name instead of a
+  // namedCurve member? Their key formats differ from the NIST curves throughout.
+  const _isOkp = (name) => name === "Ed25519" || name === "X25519";
+  const _curveOf = (algorithm) => (_isOkp(algorithm.name) ? algorithm.name : algorithm.namedCurve);
+
+  const _spkiEncode = (curve, point) => _derSeq(
+    _isOkp(curve) ? _derSeq(_derOID(_CURVE_OIDS[curve]))
+                  : _derSeq(_derOID(_OID_EC_PUBLIC_KEY), _derOID(_CURVE_OIDS[curve])),
+    _derBitString(point));
+  // Decode SPKI and check the curve is the one the caller said it was. A key
+  // that says P-384 inside and is imported as P-256 is a DataError, not
+  // something to quietly reinterpret.
+  const _spkiDecode = (bytes, curve) => {
+    const outer = _derRead(bytes, 0);
+    if (outer.tag !== 0x30) throw _dataError("Not a SubjectPublicKeyInfo");
+    const algId = _derRead(bytes, outer.start);
+    if (algId.tag !== 0x30) throw _dataError("Not a SubjectPublicKeyInfo");
+    const oid1 = _derRead(bytes, algId.start);
+    if (oid1.tag !== 0x06) throw _dataError("Missing algorithm OID");
+    const oid1Bytes = Array.from(bytes.subarray(oid1.start, oid1.end));
+    if (_isOkp(curve)) {
+      if (!_bytesSame(oid1Bytes, _CURVE_OIDS[curve])) throw _dataError("Wrong algorithm OID");
+    } else {
+      if (!_bytesSame(oid1Bytes, _OID_EC_PUBLIC_KEY)) throw _dataError("Not an EC public key");
+      const oid2 = _derRead(bytes, oid1.next);
+      if (oid2.tag !== 0x06) throw _dataError("Missing curve OID");
+      if (!_bytesSame(Array.from(bytes.subarray(oid2.start, oid2.end)), _CURVE_OIDS[curve]))
+        throw _dataError("Curve does not match namedCurve");
+    }
+    const bits = _derRead(bytes, algId.next);
+    if (bits.tag !== 0x03) throw _dataError("Missing public key BIT STRING");
+    return bytes.slice(bits.start + 1, bits.end);   // drop the unused-bits octet
+  };
+  const _pkcs8Encode = (curve, d, point) => _derSeq(
+    _derInt(0),
+    _isOkp(curve) ? _derSeq(_derOID(_CURVE_OIDS[curve]))
+                  : _derSeq(_derOID(_OID_EC_PUBLIC_KEY), _derOID(_CURVE_OIDS[curve])),
+    _derOctet(_isOkp(curve)
+      ? _derOctet(d)                                                   // CurvePrivateKey
+      : _derSeq(_derInt(1), _derOctet(d),                              // SEC1 ECPrivateKey
+                _derTLV(0xa1, [..._derBitString(point)]))));
+  const _pkcs8Decode = (bytes, curve) => {
+    const outer = _derRead(bytes, 0);
+    if (outer.tag !== 0x30) throw _dataError("Not a PrivateKeyInfo");
+    const ver = _derRead(bytes, outer.start);
+    if (ver.tag !== 0x02) throw _dataError("Missing version");
+    const algId = _derRead(bytes, ver.next);
+    if (algId.tag !== 0x30) throw _dataError("Missing AlgorithmIdentifier");
+    const oid1 = _derRead(bytes, algId.start);
+    const oid1Bytes = Array.from(bytes.subarray(oid1.start, oid1.end));
+    if (_isOkp(curve)) {
+      if (!_bytesSame(oid1Bytes, _CURVE_OIDS[curve])) throw _dataError("Wrong algorithm OID");
+    } else {
+      if (!_bytesSame(oid1Bytes, _OID_EC_PUBLIC_KEY)) throw _dataError("Not an EC private key");
+      const oid2 = _derRead(bytes, oid1.next);
+      if (oid2.tag !== 0x06 || !_bytesSame(Array.from(bytes.subarray(oid2.start, oid2.end)), _CURVE_OIDS[curve]))
+        throw _dataError("Curve does not match namedCurve");
+    }
+    const priv = _derRead(bytes, algId.next);
+    if (priv.tag !== 0x04) throw _dataError("Missing privateKey OCTET STRING");
+    if (_isOkp(curve)) {
+      const inner = _derRead(bytes, priv.start);
+      if (inner.tag !== 0x04) throw _dataError("Bad CurvePrivateKey");
+      return bytes.slice(inner.start, inner.end);
+    }
+    const seq = _derRead(bytes, priv.start);
+    if (seq.tag !== 0x30) throw _dataError("Bad ECPrivateKey");
+    const v = _derRead(bytes, seq.start);
+    const k = _derRead(bytes, v.next);
+    if (k.tag !== 0x04) throw _dataError("Bad ECPrivateKey");
+    // SEC1 allows a short `d`; Web Crypto keys are field-width, so left-pad.
+    const raw = bytes.slice(k.start, k.end);
+    const want = _EC_FIELD_BYTES[curve];
+    if (raw.length === want) return raw;
+    if (raw.length > want) throw _dataError("Private key is too long for the curve");
+    const padded = new Uint8Array(want);
+    padded.set(raw, want - raw.length);
+    return padded;
+  };
+
+  // ── Asymmetric key generation ─────────────────────────────────────────────
+  // A key PAIR is two CryptoKeys with different usages, and the split is not
+  // cosmetic: only the private half may sign, only the public half may verify.
+  // The final empty-usages check looks at the PRIVATE key alone, because a pair
+  // whose private half can do nothing is a pair that was generated for nothing.
+  const _makePair = (name, extractable, usages, pubUsages, privUsages, algorithm, pub, priv) => {
+    const publicKey = _makeKey("public", true, algorithm, usages.filter((u) => pubUsages.includes(u)), pub);
+    const privateKey = _makeKey("private", extractable, algorithm, usages.filter((u) => privUsages.includes(u)), priv);
+    if (_keyState.get(privateKey).usages.length === 0) throw _syntaxError("Usages cannot be empty");
+    return { publicKey, privateKey };
+  };
+  const _ecGenerate = (allowed, pubUsages, privUsages) => (alg, extractable, usages) => {
+    _checkUsages(usages, allowed);
+    let d, point, algorithm;
+    if (_isOkp(alg.name)) {
+      d = alg.name === "Ed25519" ? _ops.op_crypto_ed25519_generate() : _ops.op_crypto_x25519_generate();
+      point = alg.name === "Ed25519" ? _ops.op_crypto_ed25519_public(d) : _ops.op_crypto_x25519_public(d);
+      algorithm = { name: alg.name };
+    } else {
+      _validateEc(alg);
+      d = _ops.op_crypto_ec_generate(alg.namedCurve);
+      point = _ops.op_crypto_ec_public(alg.namedCurve, d);
+      algorithm = { name: alg.name, namedCurve: alg.namedCurve };
+    }
+    return _makePair(alg.name, extractable, usages, pubUsages, privUsages, algorithm, point, d);
+  };
+  // RSA still has validation only — see the scroll's Caps.
   const _pkGenerate = (allowed, validate) => (alg, extractable, usages) => {
     _checkUsages(usages, allowed);
     validate(alg);
     throw _notSupported("Key generation for this algorithm is not implemented yet");
-  };
-  const _EC_CURVES = ["P-256", "P-384", "P-521"];
-  const _validateEc = (alg) => {
-    if (!_EC_CURVES.includes(alg.namedCurve)) throw _notSupported("Unrecognized namedCurve");
   };
   const _validateRsa = (alg) => {
     // The public exponent must be 3 or 65537. Everything else is either
@@ -34178,10 +34328,12 @@ const _cryptoGlobal = (function () {
     if (v !== 3 && v !== 65537) throw _operationError("Unsupported publicExponent");
     if (alg.modulusLength < 256) throw _operationError("modulusLength is too small");
   };
-  _generateKey["ECDSA"] = _pkGenerate(["sign", "verify"], _validateEc);
-  _generateKey["ECDH"] = _pkGenerate(["deriveKey", "deriveBits"], _validateEc);
-  _generateKey["Ed25519"] = _pkGenerate(["sign", "verify"], () => {});
-  _generateKey["X25519"] = _pkGenerate(["deriveKey", "deriveBits"], () => {});
+  // ECDH/X25519 public keys carry NO usages: there is nothing a peer's public
+  // key entitles you to do on its own — you derive with your own private half.
+  _generateKey["ECDSA"] = _ecGenerate(["sign", "verify"], ["verify"], ["sign"]);
+  _generateKey["ECDH"] = _ecGenerate(["deriveKey", "deriveBits"], [], ["deriveKey", "deriveBits"]);
+  _generateKey["Ed25519"] = _ecGenerate(["sign", "verify"], ["verify"], ["sign"]);
+  _generateKey["X25519"] = _ecGenerate(["deriveKey", "deriveBits"], [], ["deriveKey", "deriveBits"]);
   _generateKey["RSASSA-PKCS1-v1_5"] = _pkGenerate(["sign", "verify"], _validateRsa);
   _generateKey["RSA-PSS"] = _pkGenerate(["sign", "verify"], _validateRsa);
   _generateKey["RSA-OAEP"] = _pkGenerate(["encrypt", "decrypt", "wrapKey", "unwrapKey"], _validateRsa);
@@ -34278,9 +34430,133 @@ const _cryptoGlobal = (function () {
     };
   }
 
+  // Asymmetric importKey. The public/private split is decided by the FORMAT
+  // (spki/raw are public, pkcs8 is private) or, for JWK, by whether `d` is
+  // present — and each half may only be given the usages its half can perform.
+  const _ecImport = (allowed, pubUsages, privUsages) => (format, keyData, alg, extractable, usages) => {
+    const name = alg.name;
+    const curve = _isOkp(name) ? name : alg.namedCurve;
+    if (!_isOkp(name) && !_EC_CURVES.includes(curve)) throw _notSupported("Unrecognized namedCurve");
+    const algorithm = _isOkp(name) ? { name } : { name, namedCurve: curve };
+    const fieldLen = _isOkp(name) ? 32 : _EC_FIELD_BYTES[curve];
+    let type, handle;
+
+    if (format === "spki" || format === "raw") {
+      _checkUsages(usages, pubUsages);
+      type = "public";
+      handle = format === "spki" ? _spkiDecode(keyData, curve) : keyData;
+      if (_isOkp(name)) {
+        if (handle.length !== 32) throw _dataError("Invalid public key length");
+      } else {
+        // Either SEC1 encoding is welcome: uncompressed `04‖x‖y`, or compressed
+        // `02/03‖x` at half the size. Both normalise to the uncompressed form,
+        // and the decode doubles as the on-curve check.
+        const ok = (handle.length === 1 + 2 * fieldLen && handle[0] === 0x04) ||
+                   (handle.length === 1 + fieldLen && (handle[0] === 0x02 || handle[0] === 0x03));
+        if (!ok) throw _dataError("Not a valid SEC1 point");
+        try { handle = _ops.op_crypto_ec_point_normalize(curve, handle); }
+        catch (e) { throw _dataError("Point is not on the curve"); }
+      }
+    } else if (format === "pkcs8") {
+      _checkUsages(usages, privUsages);
+      type = "private";
+      handle = _pkcs8Decode(keyData, curve);
+      _ecPublicOf(name, curve, handle);        // validates the scalar
+    } else if (format === "jwk") {
+      const jwk = keyData;
+      if (jwk === null || typeof jwk !== "object") throw new TypeError("keyData is not a JsonWebKey");
+      const kty = _jwkString(jwk, "kty");
+      if (kty !== (_isOkp(name) ? "OKP" : "EC")) throw _dataError("Wrong JWK kty");
+      if (_jwkString(jwk, "crv") !== curve) throw _dataError("JWK crv does not match namedCurve");
+      const hasD = jwk.d !== undefined;
+      type = hasD ? "private" : "public";
+      _checkUsages(usages, hasD ? privUsages : pubUsages);
+      if (jwk.key_ops !== undefined) {
+        if (!Array.isArray(jwk.key_ops)) throw _dataError("JWK key_ops is not a sequence");
+        for (const u of usages) if (!jwk.key_ops.includes(u)) throw _dataError("JWK key_ops does not include " + u);
+      }
+      if (jwk.ext === false && extractable) throw _dataError("JWK is not extractable");
+      const jwkAlg = _jwkString(jwk, "alg");
+      if (name === "Ed25519" && jwkAlg !== undefined && jwkAlg !== "EdDSA" && jwkAlg !== "Ed25519")
+        throw _dataError("JWK alg does not match the key");
+      if (hasD) {
+        const d = _b64urlDecode(_jwkString(jwk, "d"));
+        if (d.length !== fieldLen) throw _dataError("Invalid JWK 'd' length");
+        handle = d;
+        _ecPublicOf(name, curve, handle);
+      } else if (_isOkp(name)) {
+        handle = _b64urlDecode(_jwkString(jwk, "x"));
+        if (handle.length !== 32) throw _dataError("Invalid JWK 'x' length");
+      } else {
+        const x = _b64urlDecode(_jwkString(jwk, "x"));
+        const y = _b64urlDecode(_jwkString(jwk, "y"));
+        if (x.length !== fieldLen || y.length !== fieldLen) throw _dataError("Invalid JWK coordinate length");
+        handle = new Uint8Array(1 + 2 * fieldLen);
+        handle[0] = 0x04; handle.set(x, 1); handle.set(y, 1 + fieldLen);
+        try { handle = _ops.op_crypto_ec_point_normalize(curve, handle); }
+        catch (e) { throw _dataError("Point is not on the curve"); }
+      }
+    } else {
+      throw _notSupported("Unsupported key format");
+    }
+    return _makeKey(type, extractable, algorithm, usages, handle);
+  };
+  // Derive the public half from a private scalar — and, in doing so, prove the
+  // scalar is a valid one for the curve.
+  const _ecPublicOf = (name, curve, d) => {
+    try {
+      if (name === "Ed25519") return _ops.op_crypto_ed25519_public(d);
+      if (name === "X25519") return _ops.op_crypto_x25519_public(d);
+      return _ops.op_crypto_ec_public(curve, d);
+    } catch (e) { throw _dataError("Invalid private key for " + curve); }
+  };
+
+  _importKey["ECDSA"] = _ecImport(["sign", "verify"], ["verify"], ["sign"]);
+  _importKey["ECDH"] = _ecImport(["deriveKey", "deriveBits"], [], ["deriveKey", "deriveBits"]);
+  _importKey["Ed25519"] = _ecImport(["sign", "verify"], ["verify"], ["sign"]);
+  _importKey["X25519"] = _ecImport(["deriveKey", "deriveBits"], [], ["deriveKey", "deriveBits"]);
+
   const _exportKey = (format, key) => {
     const st = _keyState.get(key);
     const name = st.algorithm.name;
+    if (st.type === "public" || st.type === "private") {
+      const curve = _curveOf(st.algorithm);
+      const isOkp = _isOkp(name);
+      const point = st.type === "public" ? st.handle : _ecPublicOf(name, curve, st.handle);
+      if (format === "raw") {
+        // `raw` is the public point only. A private key exported as raw bytes
+        // would be a secret with no label on it saying what it is.
+        if (st.type !== "public") throw _notSupported("Only public keys export as 'raw'");
+        return _toArrayBuffer(point.slice());
+      }
+      if (format === "spki") {
+        if (st.type !== "public") throw _notSupported("Only public keys export as 'spki'");
+        return _toArrayBuffer(_spkiEncode(curve, point));
+      }
+      if (format === "pkcs8") {
+        if (st.type !== "private") throw _notSupported("Only private keys export as 'pkcs8'");
+        return _toArrayBuffer(_pkcs8Encode(curve, st.handle, point));
+      }
+      if (format === "jwk") {
+        const jwk = { kty: isOkp ? "OKP" : "EC", crv: curve };
+        if (isOkp) {
+          jwk.x = _b64urlEncode(point);
+          // Ed25519's JWK carries `alg: "EdDSA"` (RFC 8037) — X25519's does not,
+          // because X25519 is a key-agreement algorithm and JOSE has no `alg`
+          // for it.
+          if (name === "Ed25519") jwk.alg = "EdDSA";
+        } else {
+          const f = _EC_FIELD_BYTES[curve];
+          jwk.x = _b64urlEncode(point.subarray(1, 1 + f));
+          jwk.y = _b64urlEncode(point.subarray(1 + f, 1 + 2 * f));
+        }
+        if (st.type === "private") jwk.d = _b64urlEncode(st.handle);
+        jwk.key_ops = st.usages.slice();
+        jwk.ext = st.extractable;
+        return jwk;
+      }
+      throw _notSupported("Unsupported export format");
+    }
     if (format === "raw") {
       if (name === "HKDF" || name === "PBKDF2") throw _notSupported("Unsupported export format");
       return _toArrayBuffer(st.handle.slice());
@@ -34299,15 +34575,118 @@ const _cryptoGlobal = (function () {
 
   // sign/verify. Only HMAC for now (the signature algorithms need the key types
   // generateKey does not yet produce).
+  // ECDSA hashes the message with whichever hash the CALL names — the hash is a
+  // property of the signature, not of the key — and signs the digest.
   const _sign = (alg, key, data) => {
     const st = _keyState.get(key);
-    if (st.algorithm.name !== "HMAC") throw _notSupported("Signing with this algorithm is not implemented yet");
-    return _toArrayBuffer(_ops.op_crypto_hmac(st.algorithm.hash.name, st.handle, data));
+    const name = st.algorithm.name;
+    if (name === "HMAC")
+      return _toArrayBuffer(_ops.op_crypto_hmac(st.algorithm.hash.name, st.handle, data));
+    if (name === "ECDSA") {
+      if (st.type !== "private") throw _invalidAccess("Signing requires a private key");
+      const digest = _ops.op_crypto_digest(alg.hash.name, data);
+      return _toArrayBuffer(_ops.op_crypto_ecdsa_sign(st.algorithm.namedCurve, st.handle, digest));
+    }
+    if (name === "Ed25519") {
+      if (st.type !== "private") throw _invalidAccess("Signing requires a private key");
+      return _toArrayBuffer(_ops.op_crypto_ed25519_sign(st.handle, data));
+    }
+    throw _notSupported("Signing with this algorithm is not implemented yet");
   };
   const _verify = (alg, key, signature, data) => {
     const st = _keyState.get(key);
-    if (st.algorithm.name !== "HMAC") throw _notSupported("Verifying with this algorithm is not implemented yet");
-    return _bytesEqual(signature, _ops.op_crypto_hmac(st.algorithm.hash.name, st.handle, data));
+    const name = st.algorithm.name;
+    if (name === "HMAC")
+      return _bytesEqual(signature, _ops.op_crypto_hmac(st.algorithm.hash.name, st.handle, data));
+    if (name === "ECDSA") {
+      if (st.type !== "public") throw _invalidAccess("Verifying requires a public key");
+      const digest = _ops.op_crypto_digest(alg.hash.name, data);
+      return _ops.op_crypto_ecdsa_verify(st.algorithm.namedCurve, st.handle, signature, digest);
+    }
+    if (name === "Ed25519") {
+      if (st.type !== "public") throw _invalidAccess("Verifying requires a public key");
+      return _ops.op_crypto_ed25519_verify(st.handle, signature, data);
+    }
+    throw _notSupported("Verifying with this algorithm is not implemented yet");
+  };
+
+  // ── Key derivation ────────────────────────────────────────────────────────
+  // Both KDFs answer the same question — "turn this secret into that many bits
+  // of key material" — and differ in what they defend against. PBKDF2 takes a
+  // PASSWORD, something a human chose and an attacker can guess, and makes each
+  // guess deliberately expensive (the iteration count IS the defence). HKDF
+  // takes a secret that is already high-entropy (a Diffie-Hellman result, say)
+  // and spreads it into several independent keys without weakening it.
+  //
+  // `length` is in BITS and must be a whole number of bytes. A null length is
+  // an OperationError rather than a default: for these algorithms there is no
+  // natural output size to fall back on, and silently picking one would hand
+  // the caller a key of a size they never asked for.
+  const _deriveBitsFor = {
+    "PBKDF2": (alg, key, length) => {
+      if (alg.iterations === 0) throw _operationError("PBKDF2 requires at least one iteration");
+      return _ops.op_crypto_pbkdf2(alg.hash.name, _keyHandle(key), alg.salt, alg.iterations, length / 8);
+    },
+    "HKDF": (alg, key, length) => {
+      try {
+        return _ops.op_crypto_hkdf(alg.hash.name, _keyHandle(key), alg.salt, alg.info, length / 8);
+      } catch (e) {
+        // The only failure HKDF has: more than 255·HashLen octets requested.
+        throw _operationError("HKDF could not derive " + length + " bits");
+      }
+    },
+  };
+  // The two agreement algorithms. Unlike the KDFs these have a NATURAL output
+  // size — the shared secret is however wide the curve is — so a null length
+  // means "all of it" rather than an error, and asking for MORE than exists is
+  // an OperationError instead of being silently zero-padded.
+  const _agree = (alg, key, length) => {
+    const st = _keyState.get(key);
+    const peer = alg.public;
+    const pst = _keyState.get(peer);
+    if (!pst || pst.type !== "public") throw _invalidAccess("The 'public' member must be a public key");
+    if (pst.algorithm.name !== st.algorithm.name) throw _invalidAccess("Public key algorithm does not match");
+    if (!_isOkp(st.algorithm.name) && pst.algorithm.namedCurve !== st.algorithm.namedCurve)
+      throw _invalidAccess("Public key curve does not match");
+    let secret;
+    try {
+      secret = st.algorithm.name === "X25519"
+        ? _ops.op_crypto_x25519(st.handle, pst.handle)
+        : _ops.op_crypto_ecdh(st.algorithm.namedCurve, st.handle, pst.handle);
+    } catch (e) { throw _operationError("Key agreement failed"); }
+    if (length === null) return secret;
+    if (length % 8 !== 0 || length / 8 > secret.length)
+      throw _operationError("Cannot derive " + length + " bits from this key");
+    return secret.slice(0, length / 8);
+  };
+  _deriveBitsFor["ECDH"] = _agree;
+  _deriveBitsFor["X25519"] = _agree;
+
+  const _deriveBits = (alg, key, length) => {
+    const fn = _deriveBitsFor[alg.name];
+    if (!fn) throw _notSupported("deriveBits is not supported for " + alg.name);
+    // ECDH and X25519 handle a null length themselves (they have a natural one).
+    if (alg.name === "ECDH" || alg.name === "X25519") return fn(alg, key, length);
+    if (length === null) throw _operationError("A length is required");
+    if (length % 8 !== 0) throw _operationError("Length must be a multiple of 8 bits");
+    return fn(alg, key, length);
+  };
+
+  // "Get key length" — how many bits deriveKey must produce for the key the
+  // caller asked for. It is a property of the DERIVED key's algorithm, which is
+  // why it is normalized separately from the derivation itself.
+  const _getKeyLength = (alg) => {
+    if (alg.name.startsWith("AES-")) {
+      if (alg.length !== 128 && alg.length !== 192 && alg.length !== 256)
+        throw _operationError("AES key length must be 128, 192 or 256 bits");
+      return alg.length;
+    }
+    if (alg.name === "HMAC") {
+      if (alg.length === undefined) return _HASH_BLOCK_BITS[alg.hash.name];
+      if (alg.length === 0) throw new TypeError("HMAC key length cannot be zero");
+      return alg.length;
+    }
+    return null;   // HKDF / PBKDF2 — no length, so deriveBits will reject.
   };
 
   // ── SubtleCrypto ──────────────────────────────────────────────────────────
@@ -34424,14 +34803,40 @@ const _cryptoGlobal = (function () {
     }
     deriveBits(algorithm, baseKey, length) {
       return _promise(this, 2, arguments.length, () => {
-        _normalizeAlgorithm(algorithm, "deriveBits");
-        throw _notSupported("deriveBits is not implemented yet");
+        const alg = _normalizeAlgorithm(algorithm, "deriveBits");
+        if (!_isCryptoKey(baseKey)) throw new TypeError("baseKey is not a CryptoKey");
+        const len = (length === undefined || length === null) ? null : _enforceRange(length, 4294967295, "length");
+        const st = _keyState.get(baseKey);
+        // Two separate InvalidAccessErrors, and they say different things: the
+        // first is "that key is for a different algorithm", the second is "that
+        // key was never allowed to do this". Collapsing them would hide which.
+        if (alg.name !== st.algorithm.name) throw _invalidAccess("Key algorithm does not match");
+        if (!st.usages.includes("deriveBits")) throw _invalidAccess("Key does not support 'deriveBits'");
+        return _toArrayBuffer(_deriveBits(alg, baseKey, len));
       });
     }
     deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
       return _promise(this, 5, arguments.length, () => {
-        _normalizeAlgorithm(algorithm, "deriveBits");
-        throw _notSupported("deriveKey is not implemented yet");
+        // Three normalizations, of two different things: the DERIVATION, and
+        // the derived key's own algorithm — once to import it and once to ask
+        // how long it needs to be.
+        const alg = _normalizeAlgorithm(algorithm, "deriveBits");
+        const importAlg = _normalizeAlgorithm(derivedKeyType, "importKey");
+        const lengthAlg = _normalizeAlgorithm(derivedKeyType, "get key length");
+        if (!_isCryptoKey(baseKey)) throw new TypeError("baseKey is not a CryptoKey");
+        const usages = _toUsages(keyUsages);
+        const st = _keyState.get(baseKey);
+        if (alg.name !== st.algorithm.name) throw _invalidAccess("Key algorithm does not match");
+        if (!st.usages.includes("deriveKey")) throw _invalidAccess("Key does not support 'deriveKey'");
+        const length = _getKeyLength(lengthAlg);
+        const secret = _deriveBits(alg, baseKey, length);
+        const imp = _importKey[importAlg.name];
+        if (!imp) throw _notSupported("importKey is not supported for " + importAlg.name);
+        const key = imp("raw", secret, importAlg, !!extractable, usages);
+        const kst = _keyState.get(key);
+        if ((kst.type === "secret" || kst.type === "private") && kst.usages.length === 0)
+          throw _syntaxError("Usages cannot be empty");
+        return key;
       });
     }
     wrapKey(format, key, wrappingKey, wrapAlgorithm) {

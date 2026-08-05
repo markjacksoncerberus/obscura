@@ -311,6 +311,52 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+### 2026-08-05 — Quests #470–#471, **The Derived + Signed Verdicts** (`WebCryptoAPI` realm sweep **9,884 → 13,935**; `derive_bits_keys` **3,426 → 12,435/12,445, 99.9%**)
+
+*#469 built the object model and named its own cap: no asymmetric keys. These two quests
+are the other half of the algorithm set — and a demonstration that a gap showing up in
+three unrelated realms is not three gaps.*
+
+**#470 the derived verdict.** PBKDF2 — how a password a human can remember becomes a key,
+where the iteration count IS the defence — and HKDF — how one shared secret becomes several
+independent ones. `length` is in BITS and must be a whole number of bytes; a **null length
+is an OperationError, not a default**, because these algorithms have no natural output size
+and silently choosing one hands the caller a key of a size they never asked for. `deriveKey`
+normalizes **three** times over two different things: the derivation, and the derived key's
+own algorithm (once to import it, once to ask how long it needs to be). **🔍 And then every
+single remaining failure in the realm was ONE missing feature that is not a derivation
+feature:** 213 of each chunk's 1,001 subtests spend themselves on
+`generateKey({name:"ECDH", namedCurve:"P-256"})` — a key the suite makes purely to prove
+that the *wrong kind of key* is an `InvalidAccessError`. ~1,900 subtests, plus the last 8 of
+`sign_verify/hmac`, plus #469's 182 false greens, all waiting on the same thing.
+
+**#471 the signed verdict.** So: P-256/P-384/P-521, Ed25519 and X25519 — `ec_ops.rs` over
+the RustCrypto curve crates, plus a small ASN.1 DER codec in JS (SPKI and PKCS8 are how a
+key arrives from anything that is not a browser), JWK for `EC` and `OKP`, the public/private
+pair split, ECDSA, ECDH and X25519 agreement. **🔍 Findings.** (1) **Every P-521 signature
+and every P-384-with-SHA-1 failed, and it was not a curve bug** — RustCrypto's prehash traits
+refuse a digest shorter than the field, a sensible default that Web Crypto explicitly
+overrides (P-521 is 66 bytes wide, so *every* hash is "too short"); SEC1 §4.1.3 takes the
+leftmost `min(hashLen, fieldLen)` bits, which as bytes is zero-padding on the left.
+(2) **A public key arrives in two shapes and a browser must take both** — a compressed SEC1
+point is `02/03‖x`, half the size, and rejecting it means rejecting a good key *for being
+efficiently encoded*, which bites hardest on exactly the metered connections we exist for;
+that was all 48 remaining `ec_importKey` failures. (3) **Validating the point IS the security
+step** — an off-curve or small-subgroup "public key" is the classic invalid-curve attack, and
+the same instinct makes an all-zero X25519 secret an error and Ed25519 verification `strict`,
+because *two implementations disagreeing about whether a signature is valid is itself the
+vulnerability*. (4) **An ECDH public key carries NO usages** — none; you derive with your own
+private half. (5) Web Crypto's ECDSA signature is `r‖s`, **not** the DER form TLS uses.
+
+**Results.** `sign_verify/ecdsa` 24/324 → **324/324** (Chrome parity) · `sign_verify/hmac`
+→ **65/65** · `eddsa_small_order_points` → **14/14, and Chrome scores 8** ·
+`ec_importKey` → **264/264** · all four EC/OKP `generateKey/failures_*` → **exact Chrome
+parity** · `derive_bits_keys` → **12,435/12,445, which is 614 AHEAD of Chrome** · and the
+182 false greens of #469 earned back for real. Ritual byte-identical: **13,267/13,377**.
+
+Scrolls: [`463-the-derived-verdict.md`](463-the-derived-verdict.md),
+[`464-the-signed-verdict.md`](464-the-signed-verdict.md).
+
 ### 2026-08-05 — Quest #469, **The Hashed Verdict** (`WebCryptoAPI` **314 → 9,884** over 81 files)
 
 *The largest untouched realm left on the map — and the only one where the gap was not "a
