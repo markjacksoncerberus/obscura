@@ -797,20 +797,9 @@ globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
 globalThis.cancelAnimationFrame = globalThis.clearTimeout;
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
-class MessageChannel {
-  constructor() {
-    this.port1 = { onmessage: null, postMessage: () => {}, close() {}, addEventListener() {}, removeEventListener() {} };
-    this.port2 = { onmessage: null, postMessage: () => {}, close() {}, addEventListener() {}, removeEventListener() {} };
-    this.port1.postMessage = (data) => {
-      Promise.resolve().then(() => { if (this.port2.onmessage) this.port2.onmessage({ data }); });
-    };
-    this.port2.postMessage = (data) => {
-      Promise.resolve().then(() => { if (this.port1.onmessage) this.port1.onmessage({ data }); });
-    };
-  }
-}
-globalThis.MessageChannel = MessageChannel;
-globalThis.MessagePort = class MessagePort { constructor(){} postMessage(){} close(){} addEventListener(){} removeEventListener(){} };
+// MessageChannel / MessagePort are defined with the Web Workers block further
+// down — they are real EventTargets, and EventTarget is not bound until the DOM
+// classes are exposed. Nothing between here and there constructs one.
 
 // ── Custom-property (CSS variable) name/value rules ──────────────────────────
 // A valid custom-property name is "--" followed by ≥1 character, with no internal
@@ -35741,6 +35730,16 @@ globalThis.structuredClone = globalThis.structuredClone || (function () {
     // Non-serializable platform objects (no serialization steps) → DataCloneError.
     if ((_Response && value instanceof _Response) || (_Request && value instanceof _Request))
       throw _dataClone("An object could not be cloned.");
+    // A MessagePort is [Transferable] but NOT [Serializable]: it can only cross a
+    // boundary by being MOVED, never copied — two live copies of one end of a
+    // channel is not a thing the model can express. So a port passed without a
+    // transfer list is an ERROR, not a silent copy, and a MessageChannel (which is
+    // not transferable at all) can never cross. Refusing loudly is the whole point:
+    // a page that gets back a dead port instead of a DataCloneError has no way to
+    // find out its channel never connected.
+    if ((globalThis.MessagePort && value instanceof globalThis.MessagePort) ||
+        (globalThis.MessageChannel && value instanceof globalThis.MessageChannel))
+      throw _dataClone("A MessagePort could not be cloned.");
 
     // Arrays — preserve length (holes), copy own enumerable string keys (which
     // skips holes and symbol keys); shared/cyclic refs resolve via `memory`.
@@ -45080,75 +45079,719 @@ if (typeof navigator.credentials === 'undefined') {
 
 globalThis.opener = null;
 
-globalThis.Worker = class Worker {
-  constructor(url) {
-    this.onmessage = null;
-    this.onerror = null;
-    this._terminated = false;
-    this._listeners = {};
-    const worker = this;
+// ═══════════════════════ Web Workers (HTML §8.6) ═════════════════════════════
+// A REAL DedicatedWorkerGlobalScope.
+//
+// We have one V8 context per page (deno_core 0.350 removed the public realm
+// API), so a worker here is not a separate isolate and not a separate thread.
+// What it IS — and what almost every worker test actually asks about — is a
+// separate GLOBAL SCOPE: an object that exposes the worker surface, hides the
+// window surface, and reaches the page only through postMessage. We build that
+// scope object for real, and run the worker's scripts against it inside
+// `with (scopeProxy) { … }`, so a free identifier in worker code resolves on the
+// WORKER's global. `document` is undefined in there; `test()` after
+// importScripts("/resources/testharness.js") is the WORKER harness's `test`, not
+// the page's. That distinction is the whole reason `.any.worker.html` exists:
+// the variant asks "does this API work when there is no document?", and the only
+// way to answer honestly is to take the document away.
+//
+// The caps, named up front so nobody mistakes them for conformance:
+//   * NO PARALLELISM. A worker's code runs on the page's thread. A worker that
+//     spins forever hangs the page, where a real one would not. Every WPT worker
+//     test we have looked at asks about exposure and behaviour, not concurrency,
+//     but a test that genuinely measures off-thread progress cannot pass here.
+//   * SHARED INTRINSICS. `[] instanceof Array` holds across the boundary; a real
+//     worker has its own Array. Structured clone still copies, so mutation does
+//     not leak — only identity of the intrinsics does.
+//   * `importScripts()` BLOCKS on op_fetch_url_sync, the same op synchronous XHR
+//     uses (Quest #28). That is exactly the API's own semantics — importScripts
+//     is specified as blocking — and cheap for the same-origin case that is all
+//     WPT needs.
+// The previous implementation ran worker source through `new Function` against a
+// twelve-property object literal, with no importScripts and no WorkerGlobalScope,
+// so testharness.js could not even pick a test environment: every `.any.worker`
+// variant on the platform reported no results at all.
 
-    if (typeof url === 'string' && (url.startsWith('blob:') || url.startsWith('http'))) {
-      const blobContent = __blobStore?.[url.split('#')[0]];
-      if (blobContent != null) {
-        // Blob store now holds bytes; worker source must be text.
-        this._code = (blobContent instanceof Uint8Array) ? new TextDecoder().decode(blobContent) : blobContent;
-      } else {
-        (async () => {
-          try {
-            const resp = await fetch(url);
-            worker._code = await resp.text();
-          } catch(e) { if (worker.onerror) worker.onerror(e); }
-        })();
-      }
-    }
+// ---- The worker exposure set -------------------------------------------------
+// Window-only globals: the names a real worker does NOT see. Everything else on
+// the page global is copied onto a fresh worker scope as an own property, so
+// `'X' in self` inside a worker answers the exposure question the same way it
+// does in a real one — and `typeof document` answers "undefined".
+//
+// Deliberately a DENY list rather than an allow list: an allow list that forgets
+// one ES intrinsic breaks a worker in a way that looks like an engine bug, while
+// a deny list that forgets one interface merely over-exposes it — visible, and
+// exactly what the idlharness worker variants are there to report.
+const _WORKER_HIDDEN = new Set([
+  // The window itself, its navigation surface, and its view.
+  'window', 'Window', 'document', 'Document', 'XMLDocument', 'DetachedDocument',
+  'self', 'globalThis', 'frames', 'parent', 'top', 'opener', 'frameElement',
+  'location', 'Location', 'history', 'History', 'navigator', 'Navigator',
+  // (`origin` is NOT here: it is a WindowOrWorkerGlobalScope member, and a
+  // dedicated worker's origin is its creator's.)
+  'name', 'status', 'closed', 'length',
+  'localStorage', 'sessionStorage', 'Storage', 'StorageEvent',
+  'alert', 'confirm', 'prompt', 'print', 'open', 'close', 'stop', 'focus', 'blur',
+  'scroll', 'scrollTo', 'scrollBy', 'scrollX', 'scrollY', 'pageXOffset', 'pageYOffset',
+  'moveTo', 'moveBy', 'resizeTo', 'resizeBy', 'getScreenDetails',
+  'innerWidth', 'innerHeight', 'outerWidth', 'outerHeight', 'screenX', 'screenY',
+  'screenLeft', 'screenTop', 'devicePixelRatio', 'screen', 'Screen', 'ScreenOrientation',
+  'visualViewport', 'VisualViewport', 'matchMedia', 'MediaQueryList', 'MediaQueryListEvent',
+  'getComputedStyle', 'getSelection', 'Selection', 'requestAnimationFrame',
+  'cancelAnimationFrame', 'requestIdleCallback', 'cancelIdleCallback', 'IdleDeadline',
+  'external', 'External', 'BarProp', 'speechSynthesis', 'customElements',
+  'CustomElementRegistry', 'ElementInternals', 'VisibilityStateEntry',
+  // The DOM. None of it is exposed to a worker (this is the point of the variant).
+  'Node', 'Element', 'Attr', 'NamedNodeMap', 'NodeList', 'HTMLCollection',
+  'CharacterData', 'Text', 'Comment', 'CDATASection', 'ProcessingInstruction',
+  'DocumentFragment', 'DocumentType', 'ShadowRoot', 'Range', 'StaticRange',
+  'AbstractRange', 'NodeIterator', 'TreeWalker', 'NodeFilter', 'DOMImplementation',
+  'DOMParser', 'XMLSerializer', 'DOMTokenList', 'DOMStringMap', 'DOMStringList',
+  'MutationObserver', 'MutationRecord', 'IntersectionObserver', 'IntersectionObserverEntry',
+  'ResizeObserver', 'ResizeObserverEntry', 'ResizeObserverSize', 'PerformanceObserverInit',
+  'Image', 'Option', 'Audio', 'XSLTProcessor', 'FileList', 'DataTransfer',
+  'DataTransferItem', 'DataTransferItemList', 'Selection', 'AbortPaymentEvent',
+  'VideoFrame', 'MediaList', 'StyleSheet', 'StyleSheetList', 'FontFace', 'FontFaceSet',
+  'FontFaceSetLoadEvent', 'CaretPosition', 'TrustedTypePolicyFactory', 'trustedTypes',
+  // Events that only a window can receive.
+  'UIEvent', 'MouseEvent', 'PointerEvent', 'KeyboardEvent', 'WheelEvent', 'InputEvent',
+  'CompositionEvent', 'FocusEvent', 'TouchEvent', 'Touch', 'TouchList', 'DragEvent',
+  'ClipboardEvent', 'BeforeUnloadEvent', 'HashChangeEvent', 'PageTransitionEvent',
+  'PageRevealEvent', 'PageSwapEvent', 'PopStateEvent', 'SubmitEvent', 'FormDataEvent',
+  'ToggleEvent', 'AnimationEvent', 'TransitionEvent', 'CommandEvent', 'ContentVisibilityAutoStateChangeEvent',
+  'BeforeInstallPromptEvent', 'DeviceMotionEvent', 'DeviceOrientationEvent',
+  'Animation', 'AnimationEffect', 'AnimationPlaybackEvent', 'AnimationTimeline',
+  'DocumentTimeline', 'KeyframeEffect', 'ShadowAnimation', 'CloseWatcher',
+  'Navigation', 'NavigationHistoryEntry', 'NavigationDestination', 'NavigationTransition',
+  'NavigationCurrentEntryChangeEvent', 'NavigateEvent', 'NavigationActivation',
+  'ViewTransition', 'ViewTransitionTypeSet',
+  // The EventTarget surface a worker scope implements itself (never copy these,
+  // or a worker's addEventListener would register on the WINDOW).
+  'addEventListener', 'removeEventListener', 'dispatchEvent', 'postMessage',
+  'importScripts', 'onmessage', 'onmessageerror', 'onerror',
+  // Engine internals that are not web-facing at all.
+  'Deno', 'ObscuraState',
+]);
+// Whole families that are window-only by prefix: HTML*/SVG*/MathML* elements and
+// their collections, the CSSOM (CSS, CSSStyleDeclaration, CSSRule, …), XPath*,
+// and our own `_`-prefixed bootstrap helpers.
+const _WORKER_HIDDEN_RE = /^(?:HTML|SVG|MathML|CSS|XPath|Web(?:KitCSS)|_|\$)/;
+// Interfaces the prefix rule would hide but a worker really does have.
+const _WORKER_HIDDEN_EXCEPT = new Set(['WebSocket', 'WebSocketStream', 'WebSocketError',
+  'WebAssembly', 'WebGLRenderingContext', 'WebGL2RenderingContext', 'WebTransport',
+  'WebTransportBidirectionalStream', 'WebTransportDatagramDuplexStream', 'WebTransportError']);
+const _workerIsHidden = (k) =>
+  _WORKER_HIDDEN.has(k) || (_WORKER_HIDDEN_RE.test(k) && !_WORKER_HIDDEN_EXCEPT.has(k));
+// Computed once from the page global and cached — a page can create many workers
+// and walking every global property name is not free.
+let _workerExposedNames = null;
+const _workerExposedGlobals = function() {
+  if (_workerExposedNames) return _workerExposedNames;
+  const out = [];
+  for (const k of Object.getOwnPropertyNames(globalThis)) {
+    if (!_workerIsHidden(k)) out.push(k);
   }
-  postMessage(data) {
-    if (this._terminated) return;
-    const worker = this;
-    setTimeout(() => {
-      if (worker._terminated || !worker._code) return;
-      try {
-        const workerSelf = {
-          onmessage: null,
-          postMessage: (msg) => {
-            const evt = { data: msg };
-            if (worker.onmessage) worker.onmessage(evt);
-            const handlers = worker._listeners['message'] || [];
-            for (const h of handlers) h(evt);
-          },
-          addEventListener: (type, fn) => { workerSelf['on' + type] = fn; },
-          close: () => { worker._terminated = true; },
-          crypto: globalThis.crypto,
-          TextEncoder: globalThis.TextEncoder,
-          TextDecoder: globalThis.TextDecoder,
-          atob: globalThis.atob,
-          btoa: globalThis.btoa,
-          setTimeout: globalThis.setTimeout,
-          setInterval: globalThis.setInterval,
-          clearTimeout: globalThis.clearTimeout,
-          clearInterval: globalThis.clearInterval,
-          fetch: globalThis.fetch,
-          console: globalThis.console,
-        };
-        const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-        fn(workerSelf, workerSelf.postMessage, workerSelf.addEventListener, workerSelf.close);
-        if (workerSelf.onmessage) workerSelf.onmessage({ data });
-      } catch(e) {
-        console.error('Worker error:', e.message);
-        if (worker.onerror) worker.onerror(e);
-      }
-    }, 0);
+  return (_workerExposedNames = out);
+};
+
+// ---- WorkerLocation / WorkerNavigator ----------------------------------------
+// WorkerLocation is a frozen snapshot of the worker's script URL: unlike the
+// window's Location it has no setters at all, because a worker cannot navigate.
+class WorkerLocation {
+  constructor(href) {
+    if (!_allowWorkerScopeCtor) throw new TypeError("Illegal constructor");
+    const u = new URL(href);
+    Object.defineProperty(this, '_u', { value: u, enumerable: false, configurable: true });
   }
-  terminate() { this._terminated = true; }
-  addEventListener(type, fn) {
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(fn);
+  get href() { return this._u.href; }
+  get origin() { return this._u.origin; }
+  get protocol() { return this._u.protocol; }
+  get host() { return this._u.host; }
+  get hostname() { return this._u.hostname; }
+  get port() { return this._u.port; }
+  get pathname() { return this._u.pathname; }
+  get search() { return this._u.search; }
+  get hash() { return this._u.hash; }
+  toString() { return this._u.href; }
+  get [Symbol.toStringTag]() { return 'WorkerLocation'; }
+}
+_enumAccessors(WorkerLocation.prototype, 'href', 'origin', 'protocol', 'host',
+  'hostname', 'port', 'pathname', 'search', 'hash');
+
+// WorkerNavigator mirrors the page navigator's worker-visible half. `onLine`,
+// `userAgent` and `hardwareConcurrency` are read through at construction: a
+// worker's navigator is its own object, not the window's.
+class WorkerNavigator {
+  constructor() {
+    if (!_allowWorkerScopeCtor) throw new TypeError("Illegal constructor");
   }
-  removeEventListener(type, fn) {
-    if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter(h => h !== fn);
+  get [Symbol.toStringTag]() { return 'WorkerNavigator'; }
+}
+for (const _k of ['appCodeName', 'appName', 'appVersion', 'platform', 'product',
+                  'userAgent', 'language', 'languages', 'onLine', 'hardwareConcurrency',
+                  'deviceMemory', 'storage', 'permissions', 'locks', 'serviceWorker',
+                  'userAgentData', 'gpu']) {
+  Object.defineProperty(WorkerNavigator.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function() { return globalThis.navigator ? globalThis.navigator[_k] : undefined; }),
+  });
+}
+
+// ---- The scope objects -------------------------------------------------------
+let _allowWorkerScopeCtor = false;
+// Extends EventTarget (which is Node in this engine) so the interface-object and
+// interface-prototype [[Prototype]] chains match the IDL `: EventTarget` — the
+// same choice MediaQueryList / VisualViewport / Animation make.
+class WorkerGlobalScope extends EventTarget {
+  constructor() {
+    if (!_allowWorkerScopeCtor) throw new TypeError("Illegal constructor");
+    super(undefined);
+  }
+  get self() { return this; }
+  get location() { return this._location; }
+  get navigator() { return this._navigator; }
+  // HTML §8.6.1: fetch every URL, THEN run them in order. A failure to fetch any
+  // one of them throws before ANY of them runs, so a worker never half-loads its
+  // dependencies and then reports a confusing "x is not a function" instead of
+  // the network error that actually happened.
+  importScripts(...urls) {
+    if (!(this instanceof WorkerGlobalScope)) throw new TypeError("Illegal invocation");
+    _workerImportScripts(this, urls);
+  }
+  get [Symbol.toStringTag]() { return 'WorkerGlobalScope'; }
+}
+_enumAccessors(WorkerGlobalScope.prototype, 'self', 'location', 'navigator', 'importScripts');
+
+class DedicatedWorkerGlobalScope extends WorkerGlobalScope {
+  constructor() { super(); }
+  get name() { return this._wname; }
+  postMessage(message, transferOrOptions) {
+    if (!(this instanceof DedicatedWorkerGlobalScope)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'postMessage' on 'DedicatedWorkerGlobalScope': 1 argument required, but only 0 present.");
+    _workerPostToPage(this._wk, message);
+  }
+  close() {
+    if (!(this instanceof DedicatedWorkerGlobalScope)) throw new TypeError("Illegal invocation");
+    if (this._wk) this._wk.terminated = true;
+  }
+  get [Symbol.toStringTag]() { return 'DedicatedWorkerGlobalScope'; }
+}
+_enumAccessors(DedicatedWorkerGlobalScope.prototype, 'name', 'postMessage', 'close');
+
+// Event-handler on* accessors for these non-node EventTargets: the brand is
+// `instanceof Ctor`, and the value rides the shared `_eh*` machinery, which keys
+// such targets by a synthetic registry key.
+const _workerEventHandlers = function(proto, Ctor, names) {
+  for (const name of names) {
+    Object.defineProperty(proto, name, { configurable: true, enumerable: true,
+      get: _named('get', name, function() {
+        if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+        return _ehCurrentValue(this, name);
+      }),
+      set: _named('set', name, function(v) {
+        if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+        if (typeof v === 'function' || (v !== null && typeof v === 'object')) { this['__eh_' + name] = v; _ehActivate(this, name); }
+        else { this['__eh_' + name] = null; }
+      }),
+    });
   }
 };
+_workerEventHandlers(WorkerGlobalScope.prototype, WorkerGlobalScope,
+  ['onerror', 'onlanguagechange', 'onoffline', 'ononline', 'onrejectionhandled',
+   'onunhandledrejection']);
+_workerEventHandlers(DedicatedWorkerGlobalScope.prototype, DedicatedWorkerGlobalScope,
+  ['onmessage', 'onmessageerror']);
+
+// Build a worker's global object: an instance of the right scope interface with
+// every worker-exposed page global copied on as an own property.
+//
+// defineProperty rather than assignment, for two reasons: a global's properties
+// are writable/non-enumerable/configurable (assignment would make them
+// enumerable, and `for (var k in self)` is a thing tests do), and assignment
+// would be intercepted by any same-named accessor inherited from Node.prototype.
+const _newWorkerScope = function(Ctor, url, name) {
+  _allowWorkerScopeCtor = true;
+  let scope, loc, nav;
+  try {
+    scope = new Ctor();
+    loc = new WorkerLocation(url);
+    nav = new WorkerNavigator();
+  } finally { _allowWorkerScopeCtor = false; }
+  for (const k of _workerExposedGlobals()) {
+    let v;
+    try { v = globalThis[k]; } catch (e) { continue; }
+    try { Object.defineProperty(scope, k, { value: v, writable: true, enumerable: false, configurable: true }); }
+    catch (e) {}
+  }
+  const def = (k, v) => Object.defineProperty(scope, k, { value: v, writable: true, enumerable: false, configurable: true });
+  // `globalThis` and `self` both name the worker global. `self` is the scope
+  // interface's own [Replaceable] attribute (a prototype getter); `globalThis`
+  // is a plain own data property, exactly as it is on a real global object.
+  def('globalThis', scope);
+  def('WorkerGlobalScope', WorkerGlobalScope);
+  // Only the scope interface this worker actually IS. testharness picks its test
+  // environment by asking `'DedicatedWorkerGlobalScope' in self` before it asks
+  // about shared workers, so exposing both would be a lie a harness reads.
+  def(Ctor.name, Ctor);
+  def('WorkerLocation', WorkerLocation);
+  def('WorkerNavigator', WorkerNavigator);
+  Object.defineProperty(scope, '_location', { value: loc, enumerable: false, configurable: true });
+  Object.defineProperty(scope, '_navigator', { value: nav, enumerable: false, configurable: true });
+  Object.defineProperty(scope, '_wname', { value: name || '', enumerable: false, configurable: true });
+  // The `with` object for this scope. Its `has` trap answers true for EVERY name,
+  // which is what makes worker code resolve free identifiers against the worker
+  // global instead of falling through to the page's: an unknown name reads as
+  // `undefined` here, the way it would on a global that does not have it.
+  //
+  // ONE name is answered false: the wrapper's own handle on the scope. Without
+  // that escape hatch the mirror-back code below could not name the object it
+  // writes to — every identifier it wrote would be swallowed by the `with`.
+  Object.defineProperty(scope, '_proxy', { enumerable: false, configurable: true, value:
+    new Proxy(scope, {
+      has(t, k) { return k !== _WORKER_SCOPE_SENTINEL; },
+      get(t, k) {
+        // `with` consults Symbol.unscopables on the binding object; the worker
+        // global has none, and inheriting Element's would silently un-bind names.
+        if (k === Symbol.unscopables) return undefined;
+        return t[k];
+      },
+      set(t, k, v) { try { t[k] = v; } catch (e) {} return true; },
+    })
+  });
+  return scope;
+};
+
+// ---- Loading and running worker scripts --------------------------------------
+// The JavaScript MIME type essences (mimesniff §"JavaScript MIME type"). A worker
+// script served as anything else MUST NOT run — HTML §fetch-a-classic-worker-script
+// fails the load outright.
+//
+// This is a real security boundary, not bookkeeping: a site that lets users upload
+// a .csv and serves it as text/csv is safe until something agrees to execute it.
+// Note "text/plain" and "text/html" are NOT on the list — they are exactly the
+// types an unsuspecting endpoint hands back, which is why the spec names them as
+// blocked rather than leaving them to a sniff.
+const _JS_MIME_TYPES = new Set([
+  'application/ecmascript', 'application/javascript', 'application/x-ecmascript',
+  'application/x-javascript', 'text/ecmascript', 'text/javascript',
+  'text/javascript1.0', 'text/javascript1.1', 'text/javascript1.2',
+  'text/javascript1.3', 'text/javascript1.4', 'text/javascript1.5',
+  'text/jscript', 'text/livescript', 'text/x-ecmascript', 'text/x-javascript',
+]);
+// A MIME essence is compared case-insensitively ("TeXt/HtMl" is text/html), and
+// an EMPTY one fails: no declared type is not a JavaScript type.
+const _workerRequireJSMime = function(essence, url) {
+  if (!_JS_MIME_TYPES.has(essence))
+    throw new DOMException("Failed to load worker script (not a JavaScript MIME type): " + url, 'NetworkError');
+};
+// Blocking script fetch, over the same core synchronous XHR uses. data: and blob:
+// URLs are served in-process; everything else goes to the network.
+const _workerFetchScriptSync = function(url) {
+  // The MIME check is NOT a network-only rule. A data: URL carries its type in
+  // the URL and a blob: URL in the Blob's `type`, and both are attacker-reachable
+  // — a page that turns user content into a Blob and imports it is the exact
+  // shape the rule exists to stop. Chrome blocks all three the same way.
+  if (url.startsWith('data:')) {
+    const d = _processDataURL(url);
+    if (d === null) throw new DOMException("Failed to load worker script: " + url, 'NetworkError');
+    _workerRequireJSMime(String(d.mimeType || '').split(';')[0].trim().toLowerCase(), url);
+    return new TextDecoder().decode(d.bytes);
+  }
+  if (url.startsWith('blob:')) {
+    const key = url.split('#')[0];
+    if (!Object.prototype.hasOwnProperty.call(__blobStore, key))
+      throw new DOMException("Failed to load worker script: " + url, 'NetworkError');
+    _workerRequireJSMime(String(__blobTypes[key] || '').split(';')[0].trim().toLowerCase(), url);
+    const v = __blobStore[key];
+    return (v instanceof Uint8Array) ? new TextDecoder().decode(v) : String(v);
+  }
+  let p;
+  try {
+    const pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
+    p = JSON.parse(Deno.core.ops.op_fetch_url_sync(url, 'GET', '{}', "", pageOrigin, 'cors'));
+  } catch (e) {
+    throw new DOMException("Failed to load worker script: " + url, 'NetworkError');
+  }
+  if (p.blocked || p.corsBlocked || !(p.status >= 200 && p.status < 300))
+    throw new DOMException("Failed to load worker script: " + url, 'NetworkError');
+  _workerRequireJSMime(_mimeEssence(p.headers), url);
+  return p.bodyBase64 ? new TextDecoder().decode(_base64ToUint8Array(p.bodyBase64)) : (p.body || '');
+};
+
+// The wrapper's private handle on the worker global — the ONE identifier the
+// scope proxy refuses to claim (see the `has` trap above).
+const _WORKER_SCOPE_SENTINEL = '__obscuraWorkerGlobal__';
+// Top-level declarations of a classic script, at COLUMN ZERO only.
+//
+// Column zero, unlike the iframe scanner's leading-`[ \t]*`, because these names
+// get published on the worker global: an indented (i.e. nested) `function foo`
+// mirrored up there would SHADOW a real global with `undefined`. Classic scripts
+// put their top-level declarations flush left, so the tighter rule costs nothing
+// and removes the whole class of false positives.
+const _scanWorkerTopLevelDecls = function(code) {
+  const names = new Set(), funcs = new Set();
+  const re = /(?:^|\n)(?:async[ \t]+)?(function[ \t]*\*?|var|let|const|class)[ \t]+([A-Za-z_$][\w$]*)/g;
+  let m;
+  while ((m = re.exec(code))) { names.add(m[2]); if (m[1].indexOf('function') === 0) funcs.add(m[2]); }
+  return { names, funcs };
+};
+// Run one classic script in the worker's global scope.
+//
+// `with` — not parameter shadowing (the trick our same-realm iframes use) —
+// because a worker's scripts must SHARE a global: testharness.js installs
+// `test`/`assert_equals`/`done` onto `self`, and the very next importScripts()
+// has to see them as bare identifiers. Parameter shadowing cannot express "look
+// this name up on that object", and falling through to the page's globals would
+// silently register the worker's subtests in the PAGE's harness.
+const _workerEvalScript = function(scope, code, url) {
+  // A classic script's top-level `var` and `function` declarations BECOME
+  // PROPERTIES OF THE GLOBAL OBJECT. That is how one script hands a name to the
+  // next, and inside a `new Function` wrapper they are function-locals instead —
+  // which is precisely why every `idlharness.any.worker.html` scored 0/1:
+  // idlharness.js exports `idl_test` by hand but leaves `function fetch_spec`
+  // bare, and `idl_test` reaches it as `globalThis.fetch_spec`. One missing
+  // primitive, ~2,900 subtests across a dozen realms.
+  //
+  // Mirrored THREE times, and the placement is load-bearing:
+  //   * at the head, because function declarations are hoisted and a callback can
+  //     fire before the script's last line;
+  //   * at the END OF THE TRY, which is the only place a top-level `let`/`const`/
+  //     `class` is still in scope — they are block-scoped to the try, so a mirror
+  //     that only ran in the `finally` silently published nothing for them. That
+  //     is what left `const formats` / `const encodings_table` invisible to the
+  //     test file that imports them: every `// META: script=resources/*.js`
+  //     helper written in modern style vanished between the two importScripts;
+  //   * in the `finally`, so a script that throws part-way still publishes the
+  //     `var`s and functions it managed to build.
+  // Guarded by `typeof`, so a name that is out of scope (or that the scanner
+  // over-matched) writes nothing rather than shadowing a real global.
+  //
+  // Honest wart: top-level `let`/`const`/`class` are global LEXICAL bindings in a
+  // real script — visible to later scripts but never properties of the global.
+  // We publish them as properties, so `'x' in self` can answer true where a real
+  // worker says false. Visibility (what scripts need) is right; the reflection is
+  // one notch too generous. The iframe realm made the same trade.
+  const d = _scanWorkerTopLevelDecls(code);
+  const S = _WORKER_SCOPE_SENTINEL;
+  const mirror = (set) => {
+    let s = '';
+    for (const n of set)
+      s += 'try{if(typeof ' + n + '!=="undefined")' + S + '[' + JSON.stringify(n) + ']=' + n + ';}catch(__e){}';
+    return s;
+  };
+  const all = mirror(d.names);
+  const fn = new Function(S,
+    'with (' + S + ') {\ntry {\n' + mirror(d.funcs) + '\n' + code +
+    '\n' + all + '\n} finally {\n' + all + '\n}\n}\n//# sourceURL=' + (url || 'worker'));
+  // `this` at the top level of a classic script is the global — the scope object
+  // itself, not the proxy, so `this === self` holds inside the worker.
+  fn.call(scope, scope._proxy);
+};
+
+const _workerImportScripts = function(scope, urls) {
+  // A worker's base URL is its script URL — except for a blob: worker, whose URL
+  // has an OPAQUE PATH and so cannot serve as a base at all (`new URL('/x',
+  // 'blob:https://h/uuid')` throws). Its origin is its creator's, so the creating
+  // document's URL is the right base, and it is what makes `importScripts('/…')`
+  // work from a blob worker the way every other browser does.
+  let base = scope._location ? scope._location.href : null;
+  if (!base || base.startsWith('blob:') || base.startsWith('data:'))
+    base = _domParse("document_url") || "about:blank";
+  const resolved = [];
+  for (const u of urls) {
+    let abs;
+    try { abs = new URL(String(u), base).href; }
+    catch (e) { throw new DOMException("Failed to execute 'importScripts' on 'WorkerGlobalScope': The URL '" + u + "' is invalid.", 'SyntaxError'); }
+    resolved.push(abs);
+  }
+  const sources = resolved.map(_workerFetchScriptSync);
+  for (let i = 0; i < resolved.length; i++) _workerEvalScript(scope, sources[i], resolved[i]);
+};
+
+// ---- The two ends of the message channel -------------------------------------
+// A worker's message events are UA-originated, so they dispatch through
+// _dispatchSpec directly and keep isTrusted true (_dispatchPublic is the public
+// dispatchEvent(), which per DOM §2.8 must clear the trusted flag).
+const _workerDeliver = function(target, data, terminatedFlagOwner) {
+  setTimeout(() => {
+    if (terminatedFlagOwner && terminatedFlagOwner.terminated) return;
+    _dispatchSpec(target, new MessageEvent('message', { data: data, origin: '' }));
+  }, 0);
+};
+// page → worker. Messages posted before the worker's script has run are queued,
+// exactly as they are for a real worker still fetching its script.
+const _workerPostToWorker = function(w, message) {
+  if (w.terminated) return;
+  const cloned = structuredClone(message);
+  if (!w.started) { w.queue.push(cloned); return; }
+  _workerDeliver(w.scope, cloned, w);
+};
+// worker → page.
+const _workerPostToPage = function(w, message) {
+  if (!w || w.terminated) return;
+  const cloned = structuredClone(message);
+  _workerDeliver(w.worker, cloned, w);
+};
+// HTML "report the error": fire at the WorkerGlobalScope first; only if nothing
+// there canceled it does the Worker object hear about it. A worker whose own
+// onerror handles the failure must not also fail the page.
+const _workerFireError = function(w, err, filename) {
+  const mk = () => new ErrorEvent('error', {
+    message: (err && err.message) ? err.message : String(err),
+    filename: filename || '', lineno: 0, colno: 0, error: err, cancelable: true });
+  let handled = false;
+  if (w.scope) { const ev = mk(); _dispatchSpec(w.scope, ev); handled = !!ev.defaultPrevented; }
+  if (!handled && w.worker) _dispatchSpec(w.worker, mk());
+  if (!handled) { try { console.error('Worker error:', (err && err.message) || err); } catch (e) {} }
+};
+
+const _workerStart = function(worker) {
+  const w = worker._wk;
+  if (w.terminated) return;
+  let code;
+  try { code = _workerFetchScriptSync(w.url); }
+  catch (e) { _workerFireError(w, e, w.url); return; }
+  const scope = _newWorkerScope(DedicatedWorkerGlobalScope, w.url, w.name);
+  Object.defineProperty(scope, '_wk', { value: w, enumerable: false, configurable: true });
+  w.scope = scope;
+  w.started = true;
+  try { _workerEvalScript(scope, code, w.url); }
+  catch (e) { _workerFireError(w, e, w.url); }
+  // The queue drains AFTER the script has run: a message posted while the worker
+  // was still loading must find its onmessage handler already installed.
+  const pending = w.queue.splice(0, w.queue.length);
+  for (const m of pending) _workerDeliver(scope, m, w);
+};
+
+globalThis.Worker = class Worker extends EventTarget {
+  constructor(scriptURL, options) {
+    super(undefined);
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'Worker': 1 argument required, but only 0 present.");
+    const opts = (options == null) ? {} : options;
+    const base = _domParse("document_url") || "about:blank";
+    let url;
+    try { url = new URL(String(scriptURL), base).href; }
+    catch (e) { throw new DOMException("Failed to construct 'Worker': Invalid script URL.", 'SyntaxError'); }
+    const w = { url: url, name: String(opts.name == null ? '' : opts.name),
+                type: opts.type === 'module' ? 'module' : 'classic',
+                scope: null, worker: this, started: false, terminated: false, queue: [] };
+    Object.defineProperty(this, '_wk', { value: w, enumerable: false, configurable: true });
+    // A real worker fetches its script off-thread, so nothing about it can be
+    // observable before the creating task ends. Start on the next task.
+    setTimeout(() => _workerStart(this), 0);
+  }
+  postMessage(message, transferOrOptions) {
+    if (!(this instanceof globalThis.Worker)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'postMessage' on 'Worker': 1 argument required, but only 0 present.");
+    _workerPostToWorker(this._wk, message);
+  }
+  terminate() {
+    if (!(this instanceof globalThis.Worker)) throw new TypeError("Illegal invocation");
+    this._wk.terminated = true;
+  }
+  get [Symbol.toStringTag]() { return 'Worker'; }
+};
+_enumAccessors(globalThis.Worker.prototype, 'postMessage', 'terminate');
+_workerEventHandlers(globalThis.Worker.prototype, globalThis.Worker,
+  ['onmessage', 'onmessageerror', 'onerror']);
+_exposeIface('WorkerGlobalScope', WorkerGlobalScope);
+_exposeIface('DedicatedWorkerGlobalScope', DedicatedWorkerGlobalScope);
+_exposeIface('WorkerLocation', WorkerLocation);
+_exposeIface('WorkerNavigator', WorkerNavigator);
+_markNative(globalThis.Worker); _markNative(WorkerGlobalScope);
+_markNative(DedicatedWorkerGlobalScope); _markNative(WorkerLocation); _markNative(WorkerNavigator);
+_markNative(globalThis.Worker.prototype.postMessage); _markNative(globalThis.Worker.prototype.terminate);
+_markNative(WorkerGlobalScope.prototype.importScripts);
+_markNative(DedicatedWorkerGlobalScope.prototype.postMessage);
+_markNative(DedicatedWorkerGlobalScope.prototype.close);
+
+// ═══════════════ MessagePort / MessageChannel / SharedWorker ═════════════════
+// The channel half of the worker story. A MessagePort was previously an object
+// literal with four no-op methods and a `postMessage` that called the peer's
+// `onmessage` with a bare `{data}` — no event, no listeners, no queue, no clone.
+//
+// The queue is the part that is easy to miss and impossible to fake: a port
+// starts DISABLED, and messages posted to it pile up until someone calls
+// start(). That is what lets a page hand a port to a worker and know that
+// nothing sent in the meantime was dropped on the floor — the whole reason
+// transferring a port is safe.
+let _allowPortCtor = false;
+class MessagePort extends EventTarget {
+  constructor() {
+    // Ports are minted by MessageChannel or by a connect event, never by `new`.
+    if (!_allowPortCtor) throw new TypeError("Illegal constructor");
+    super(undefined);
+    Object.defineProperty(this, '_mp', { enumerable: false, configurable: true,
+      value: { peer: null, enabled: false, queue: [], closed: false } });
+  }
+  postMessage(message, transferOrOptions) {
+    if (!(this instanceof MessagePort)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'postMessage' on 'MessagePort': 1 argument required, but only 0 present.");
+    const m = this._mp;
+    // A disentangled port silently discards — postMessage into nowhere is not an
+    // error, it is a no-op (HTML §message-port-post-message-steps step 7).
+    if (m.closed || !m.peer) return;
+    _portEnqueue(m.peer, structuredClone(message));
+  }
+  start() {
+    if (!(this instanceof MessagePort)) throw new TypeError("Illegal invocation");
+    const m = this._mp;
+    if (m.enabled) return;
+    m.enabled = true;
+    _portDrain(this);
+  }
+  close() {
+    if (!(this instanceof MessagePort)) throw new TypeError("Illegal invocation");
+    const m = this._mp;
+    m.closed = true;
+    if (m.peer && m.peer._mp) m.peer._mp.peer = null;
+    m.peer = null;
+  }
+  get [Symbol.toStringTag]() { return 'MessagePort'; }
+}
+const _portEnqueue = function(port, data) {
+  const m = port._mp;
+  if (m.closed) return;
+  m.queue.push(data);
+  if (m.enabled) _portDrain(port);
+};
+const _portDrain = function(port) {
+  setTimeout(() => {
+    const m = port._mp;
+    if (!m.enabled || m.closed) return;
+    const batch = m.queue.splice(0, m.queue.length);
+    for (const data of batch) _dispatchSpec(port, new MessageEvent('message', { data: data, origin: '' }));
+  }, 0);
+};
+// `onmessage` is the one event handler with a side effect: assigning it STARTS
+// the port (HTML §handler-messageport-onmessage). A page that only ever writes
+// `port.onmessage = …` — which is most pages — never calls start(), and without
+// this the queue would sit there full forever.
+Object.defineProperty(MessagePort.prototype, 'onmessage', { configurable: true, enumerable: true,
+  get: _named('get', 'onmessage', function() {
+    if (!(this instanceof MessagePort)) throw new TypeError("Illegal invocation");
+    return _ehCurrentValue(this, 'onmessage');
+  }),
+  set: _named('set', 'onmessage', function(v) {
+    if (!(this instanceof MessagePort)) throw new TypeError("Illegal invocation");
+    if (typeof v === 'function' || (v !== null && typeof v === 'object')) { this['__eh_onmessage'] = v; _ehActivate(this, 'onmessage'); }
+    else { this['__eh_onmessage'] = null; }
+    this.start();
+  }),
+});
+_workerEventHandlers(MessagePort.prototype, MessagePort, ['onmessageerror', 'onclose']);
+_enumAccessors(MessagePort.prototype, 'postMessage', 'start', 'close');
+
+class MessageChannel {
+  constructor() {
+    _allowPortCtor = true;
+    let p1, p2;
+    try { p1 = new MessagePort(); p2 = new MessagePort(); } finally { _allowPortCtor = false; }
+    p1._mp.peer = p2;
+    p2._mp.peer = p1;
+    Object.defineProperty(this, '_p1', { value: p1, enumerable: false, configurable: true });
+    Object.defineProperty(this, '_p2', { value: p2, enumerable: false, configurable: true });
+  }
+  get port1() { if (!(this instanceof MessageChannel)) throw new TypeError("Illegal invocation"); return this._p1; }
+  get port2() { if (!(this instanceof MessageChannel)) throw new TypeError("Illegal invocation"); return this._p2; }
+  get [Symbol.toStringTag]() { return 'MessageChannel'; }
+}
+_enumAccessors(MessageChannel.prototype, 'port1', 'port2');
+// Mint an entangled pair for internal use (the shared-worker connect handshake).
+const _newPortPair = function() {
+  const ch = new MessageChannel();
+  return [ch.port1, ch.port2];
+};
+
+// ---- Shared workers ----------------------------------------------------------
+// A shared worker is the same global scope with a different front door: it is
+// keyed by (script URL, name), so the SECOND `new SharedWorker(url)` does not
+// start a second worker — it connects to the one already running. That sharing is
+// the entire feature, and it is what makes a shared worker worth the memory on a
+// low-spec machine: five tabs of the same site, one worker.
+class SharedWorkerGlobalScope extends WorkerGlobalScope {
+  constructor() { super(); }
+  get name() { return this._wname; }
+  close() {
+    if (!(this instanceof SharedWorkerGlobalScope)) throw new TypeError("Illegal invocation");
+    if (this._wk) this._wk.terminated = true;
+  }
+  get [Symbol.toStringTag]() { return 'SharedWorkerGlobalScope'; }
+}
+_workerEventHandlers(SharedWorkerGlobalScope.prototype, SharedWorkerGlobalScope, ['onconnect']);
+_enumAccessors(SharedWorkerGlobalScope.prototype, 'name', 'close');
+
+const _sharedWorkers = new Map();
+// HTML: the connect event carries the port in BOTH `ports` and `source` — the
+// two spellings testharness and real code respectively reach for.
+const _sharedWorkerFireConnect = function(rec, port) {
+  _dispatchSpec(rec.scope, new MessageEvent('connect', {
+    data: '', origin: '', source: port, ports: Object.freeze([port]) }));
+};
+const _sharedWorkerStart = function(rec) {
+  if (rec.terminated) return;
+  let code;
+  try { code = _workerFetchScriptSync(rec.url); }
+  catch (e) { rec.failed = true; _workerFireError(rec, e, rec.url); return; }
+  const scope = _newWorkerScope(SharedWorkerGlobalScope, rec.url, rec.name);
+  Object.defineProperty(scope, '_wk', { value: rec, enumerable: false, configurable: true });
+  rec.scope = scope;
+  rec.started = true;
+  try { _workerEvalScript(scope, code, rec.url); }
+  catch (e) { _workerFireError(rec, e, rec.url); }
+  const pending = rec.pendingConnects.splice(0, rec.pendingConnects.length);
+  for (const port of pending) _sharedWorkerFireConnect(rec, port);
+};
+
+globalThis.SharedWorker = class SharedWorker extends EventTarget {
+  constructor(scriptURL, options) {
+    super(undefined);
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'SharedWorker': 1 argument required, but only 0 present.");
+    // The second argument is a name string OR a WorkerOptions dict.
+    const name = (options == null) ? ''
+      : (typeof options === 'object' ? String(options.name == null ? '' : options.name) : String(options));
+    const base = _domParse("document_url") || "about:blank";
+    let url;
+    try { url = new URL(String(scriptURL), base).href; }
+    catch (e) { throw new DOMException("Failed to construct 'SharedWorker': Invalid script URL.", 'SyntaxError'); }
+    const key = url + ' ' + name;
+    let rec = _sharedWorkers.get(key);
+    const fresh = !rec;
+    if (fresh) {
+      rec = { url: url, name: name, scope: null, worker: this, started: false,
+              terminated: false, failed: false, pendingConnects: [] };
+      _sharedWorkers.set(key, rec);
+    }
+    const [outer, inner] = _newPortPair();
+    Object.defineProperty(this, '_port', { value: outer, enumerable: false, configurable: true });
+    Object.defineProperty(this, '_rec', { value: rec, enumerable: false, configurable: true });
+    if (rec.started) {
+      // Already running: connect on a later task, so construction stays
+      // observably identical whether or not this tab was the first.
+      setTimeout(() => _sharedWorkerFireConnect(rec, inner), 0);
+    } else {
+      rec.pendingConnects.push(inner);
+      if (fresh) setTimeout(() => _sharedWorkerStart(rec), 0);
+    }
+  }
+  get port() { if (!(this instanceof globalThis.SharedWorker)) throw new TypeError("Illegal invocation"); return this._port; }
+  get [Symbol.toStringTag]() { return 'SharedWorker'; }
+};
+_workerEventHandlers(globalThis.SharedWorker.prototype, globalThis.SharedWorker, ['onerror']);
+_enumAccessors(globalThis.SharedWorker.prototype, 'port');
+
+_exposeIface('MessagePort', MessagePort);
+_exposeIface('MessageChannel', MessageChannel);
+_exposeIface('SharedWorkerGlobalScope', SharedWorkerGlobalScope);
+_markNative(MessagePort); _markNative(MessageChannel);
+_markNative(SharedWorkerGlobalScope); _markNative(globalThis.SharedWorker);
+_markNative(MessagePort.prototype.postMessage); _markNative(MessagePort.prototype.start);
+_markNative(MessagePort.prototype.close); _markNative(SharedWorkerGlobalScope.prototype.close);
 
 const __blobStore = {};
 const __blobTypes = {};

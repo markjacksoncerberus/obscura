@@ -35,7 +35,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | **F6** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **`resize-observer/eventloop.html` HANGS THE ENGINE** | wedged the harness twice; server needed a kill + restart | ⚔️⚔️ | **OPEN — a hang is worse than a wrong render.** Playwright could not even open a new page afterwards. Excluded from `scripts/wpt-frontier-probe.txt` so the survey re-runs; that exclusion is a workaround, not a fix. |
 | **F7** | ⭐ [The Frontier Survey](102-the-frontier-survey.md) | **A CSS REFTEST RUNNER** — the campaign's biggest blind spot | unmeasured, structurally | ⚔️⚔️⚔️ | **OPEN — instrumentation, not conformance.** `wpt_baseline.py` scores testharness assertions only and *cannot* run CSS reftests, which are most of `css/`. `css/CSS2` alone holds 2,461 reftest subtests Chrome passes that we have never scored. The ledger has never once asked "does the page **look** right". `scripts/shot.py` is the human-eye stopgap. |
 | **F9** | ✅ [Decoded](467-the-decoded-verdict.md) · [Submitted](468-the-submitted-verdict.md) | **`encoding/legacy-mb-*`** — the legacy-CJK web | **93,705/93,705 (100%)** on the 104-file window — was ~0 / could-not-run | ⚔️⚔️ | **SECURED (Quests #475–#477, 2026-08-05).** The biggest realm on the platform (`/encoding/` holds **1,152,339** Chrome subtests, **1,127,087** of them here) and it did not look untouched, because `encoding` already had rows from Quest #08. Document loading used `Response.text()` — *specified* to always decode utf-8 — so every EUC-KR/Big5/Shift_JIS/EUC-JP/ISO-2022-JP page was a wall of U+FFFD. **The form half was could-not-run, not zero: `form.submit()` navigated the TEST PAGE away.** |
-| **F10** | ⭐ (named by [468](468-the-submitted-verdict.md)) | **`.any.worker.html` variants report NO RESULTS** | invisible, not failing | ⚔️⚔️ | **OPEN — instrumentation, the shape this campaign keeps finding to be largest.** Every `.any.js` test on the platform generates a worker variant; ours are could-not-run. Two turned up inside `encoding/legacy-mb-schinese` alone; across the platform it is thousands of subtests that are **invisible rather than failing**. |
+| **F10** | ✅ [Scoped](469-the-scoped-verdict.md) · [Offloaded](470-the-offloaded-verdict.md) · [Connected](471-the-connected-verdict.md) | **`.any.worker.html` + `.any.sharedworker.html`** — the variant that reported nothing | `encoding` **11,648/11,796 (98.7%)** · `WebCryptoAPI` **29,383/29,506 (99.58%)** · the sharedworker probe **1,477/2,537** — all were **0 / could-not-run** | ⚔️⚔️ | **SECURED (Quests #478–#480, 2026-08-05).** `Worker` was a 68-line diorama: worker source through `new Function` against a twelve-property object literal, **no `importScripts`**, no `WorkerGlobalScope` — so testharness never loaded and **1,740 files / 76,395 subtests reported nothing at all**. Built a real `WorkerGlobalScope`/`DedicatedWorkerGlobalScope` (a `with`-scoped global, a deny-list exposure set, blocking `importScripts`), a real `MessagePort`/`MessageChannel`/`SharedWorker`, and the JavaScript-MIME rule on `importScripts`. **⭐ The primitive: a classic script's top-level `var`/`function` declarations BECOME PROPERTIES OF THE GLOBAL** — that is how one script hands a name to the next, and inside a `new Function` wrapper they vanish. `idlharness.js` reaches its own `fetch_spec` as `globalThis.fetch_spec`; one missing primitive held the entire `idlharness` worker family at 0/1. |
 | ~~451–453~~ | ✅ [The Unsupported Verdict](101-the-unsupported-verdict.md) | **The unsupported arc — a corner the engine could store but could not NAME, a shorthand handed a number it has no word for, and a value the map described with a class that lied about it** | **+242** | ⚔️⚔️ | **SECURED — +242 measured across the whole 244-file `the-stylepropertymap/properties/` band (10,051 → 10,293/11,311), zero regressions, ten more files to 100% (103 → 113), 23 files now above Chrome.** **The most reusable thing this session found is not a fix:** #450's ⭐ named `logical.html` (1274/1468) as the biggest row left, and the first move was to ask what **Chrome** scores on it — **1256**. We were already ahead. Diffing Chrome's per-subtest results by name split 194 failures into **130 winnable rows**, 64 where the file argues with the spec, and 148 where we lead. **#451** css-logical's four flow-relative corner radii were absent from `_GCS_DEFAULTS`, so the engine stored them and read them back while `CSS.supports` said false and the Typed OM threw on all 52 rows; they join the parse/computed SET and deliberately not the `border-radius` expansion ARRAY. **#452** a shorthand has no typed value of its own — not because the grammar forbids it but because `border-block-start: 5px` only works as a string by also resetting the style and the colour, and `margin` is a `{1,4}` LIST; plus a `<line-width>` has no percentage, which leaked only through `set()`'s out-of-range `calc()` wrap. **#453** reification asks the PROPERTY too — one table, two doors: a shorthand's numeric, a colour (three spellings of one value, and a keyword compares by spelling; `currentcolor` points at a colour rather than naming one), and a pair-valued computed radius. **Caps named: the last 24 `logical.html` rows are a suite SELF-CONTRADICTION** (`border-radius.html` and `logical.html` demand opposite classes for the same corner) and the `currentcolor`-computed rows are a cap no engine passes. |
 | ~~448–450~~ | ✅ [The Well-Formed Verdict](100-the-well-formed-verdict.md) | **The well-formed arc — a zero that lost its unit, eight colours nobody had written, and three rules `class` gets backwards from WebIDL** | **+463** | ⚔️⚔️ | **SECURED — +463 measured, zero regressions, ten files to 100%, `css-typed-om/idlharness` 270 → 536/544.** #447's ⭐ said the row was "a LIST, not a cap" and it was right on both counts; bucketing its 274 failures split them cleanly into three quests. **#448 a unitless zero is a length, and an angle.** `_tomReify` already knew `width: 0` is `0px` — but it asks the **PROPERTY** which unit a bare zero wore, and `_tomComponentOf` called it with no property at all, because inside a transform function the property has nothing to say: **the FUNCTION does**. So `CSSStyleValue.parse('transform','translateX(0)')` threw, and so did `computedStyleMap().get('transform')` on **the commonest transform on the web — the `translateX(0)` GPU-promotion hack**. css-transforms-1 admits `<zero>` in the angle slots too, which is why `rotate(0)` is ordinary CSS; `_TOM_TF_SLOTS` is that grammar as a table. The 38 rows read as **could-not-run, not failure**, because the test file's setup block died on the first throw. **#449 a colour channel is the one place a bare JS number is not `CSS.number(n)`** — in a colour `0.5` means HALF, so a `<percentage>` slot reads `50%`, an `<angle>` slot reads `180` as `180deg`, and Lab's `<number>` slots read `7` as `7`; a value that already knows its unit is never rescaled. **And the same IDL type decides which error a refusal is**: `CSSHSL`'s hue is a union admitting a keyword, so `new CSSHSL(undefined, …).h` is legitimately `CSSKeywordValue("undefined")`, while `CSSHWB`'s hue is a bare `CSSNumericValue` and refuses the identical argument at the IDL door with a **TypeError**. Eight files 0 → **182, all to 100%**. **#450 three rules `class` gets backwards, each a difference a page can see**: an interface object on the global is **not** enumerable (`globalThis.X = C` made every `for (k in window)` sweep up the platform); prototype members **are** enumerable and class methods are not, the exact opposite; and an accessor **brand-checks its receiver** — a silent `undefined` off the prototype is a bug that surfaces three call-frames later. Plus `length` is the count of REQUIRED arguments, an interface with **no** constructor is not constructible, a WebIDL `iterable<T>`'s `entries`/`values`/`@@iterator` are **the very `Array.prototype` functions** (identity and all), and the twelve missing small/large/dynamic viewport units were two thirds of each family. **CAP named honestly: the last 8 rows are a harness quirk** — it asks a SUBCLASS's interface object for a PARENT's static as an OWN property, which WebIDL reaches through the [[Prototype]] chain instead; no conformant engine passes them. |
 | ~~445–447~~ | ✅ [The Typed Verdict](445-the-typed-verdict.md) | **The typed-value arc — the SPECIFIED value keeps the author's own function, a realm that died on line one, and a `var()` being read as arithmetic** | **+10,767** | ⚔️⚔️⚔️ | **SECURED — +10,767 measured, zero regressions, 142 files to 100%.** #444's ⭐ pointed at a third serializer and it was right. **#445**: `commitStyles()` freezes an animation into the inline style, and that is the SPECIFIED value — `translateX(25px)` where `getComputedStyle` says `matrix(1,0,0,1,25,0)` and `computedStyleMap()` says `translate(25px, 0px)`. Three serializations of one animated transform, three different values. The rule is #444's sentence one layer up: **a pair serializes as what the two sides AGREE on**. Plus the trailing-default trim, where `scale`'s second argument defaults to the FIRST — and **the half that is not a serializer at all: `commitStyles` sets a VALUE, not a STRING**, so the parser's `skewX`→`skewx` lowercasing never applies to it. **#446 a realm that died on line one** — `css/css-typed-om/`'s ~245 `properties/` files all pull in one `testsuite.js` that CONSTRUCTS the typed classes at script load, so every one threw `ReferenceError: CSSKeywordValue is not defined` before a single test ran. Built the value hierarchy for real: a numeric-type algebra, the 34-unit table (where the relative lengths have **no** conversion factor, because they cannot be converted without an element and a viewport), the seven math classes, the eight transform components. **#447 two answers again** — the `set()` gate asked `CSS.supports` while the write met the declaration block; and **a full per-property grammar is not the answer, inverting the question is**: ask which properties accept an ANGLE *at all* and the list is short and closed. **The bug the probe found was not a Typed OM bug — `opacity: var(--A)` was corrupted to `var(-1 * (-1 * a))` and computed as the initial `1`.** `css/css-typed-om/**` 65 → **10,815**; `transform-interpolation-inline-value` 24 → **41/41**. Ten ledger rows flagged as regressions were STALE and all ten stash-proved byte-identical — corrected in place. |
@@ -312,6 +312,86 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-05 — Quests #478–#480, **The Worker Arc** (the `.any.worker.html` family **0 / could-not-run** → `encoding` **11,648/11,796** + `WebCryptoAPI` **29,383/29,506** + the sharedworker probe **1,477/2,537**)
+
+*Scrolls: [`469-the-scoped-verdict.md`](469-the-scoped-verdict.md) · [`470-the-offloaded-verdict.md`](470-the-offloaded-verdict.md) · [`471-the-connected-verdict.md`](471-the-connected-verdict.md)*
+
+**Frontier quest F10, and the shape held for the sixth time: invisible, not failing.**
+Aggregating Chrome's run summary by **variant** rather than by realm put **1,740
+`.any.worker.html` files / 76,395 subtests** on the platform — and we scored **0**
+on every one of them. Every `.any.js` test generates a worker variant, and the top
+of that list was land three arcs of this campaign had already won on the window
+side: **WebCryptoAPI 39,722 · encoding 11,796 · fetch 2,734 · url 2,154 · html
+1,881 · IndexedDB 1,540 · streams 1,419**.
+
+**#478 the scoped verdict — `Worker` was a diorama.** Sixty-eight lines: worker
+source run through `new Function` against a twelve-property object literal, an
+`addEventListener` that *overwrote* rather than appended, and **no
+`importScripts`**. Line 7 of every generated worker test is
+`importScripts("/resources/testharness.js")`, so the harness never loaded; line 1
+of testharness's environment selection is `'document' in global_scope`, so even
+had it loaded there was no scope interface to select on. Built a real
+`WorkerGlobalScope` → `DedicatedWorkerGlobalScope`, populated from the page global
+minus a curated window-only deny list, with scripts run inside
+`with (scopeProxy) { … }`. **`with`, not the parameter-shadowing our same-realm
+iframes use** — a worker's scripts must SHARE a global (testharness installs
+`test`/`assert_equals`/`done` onto `self` at runtime and the very next
+`importScripts` must see them), and falling through to the page's globals would
+have registered the worker's subtests in the PAGE's harness: green, and meaningless.
+`importScripts` blocks over `op_fetch_url_sync` — which is not a shortcut, because
+`importScripts` *is* specified to block.
+
+**⭐⭐ THE PRIMITIVE, and it is one line of language semantics: in a classic script,
+a top-level `var` or `function` declaration BECOMES A PROPERTY OF THE GLOBAL
+OBJECT.** That is the mechanism by which one script hands a name to the next — the
+entire job `importScripts` exists to do — and inside a `new Function` wrapper those
+declarations are function-locals that vanish when the script ends. Every
+`idlharness.any.worker.html` on the platform scored **0/1**: `idlharness.js` exports
+`idl_test` by hand but leaves `function fetch_spec` bare and reaches it as
+`globalThis.fetch_spec`. Mirroring the declarations back has a trap that cost a
+whole measurement cycle: **top-level `let`/`const`/`class` are block-scoped to the
+`try`**, so a mirror running only in the `finally` published *nothing* for them —
+which is exactly why `const formats` and `const encodings_table` were invisible to
+the tests importing them. **Every `// META: script=resources/*.js` helper written in
+modern style was disappearing between two `importScripts` calls.** Result:
+`api-invalid-label.any.worker.html?1-1000` **could-not-run → 1000/1000**, the whole
+idlharness family alive, and `encoding` **0/11,796 → 11,648/11,796 (98.7%)**.
+
+**#479 the offloaded verdict — the largest block on the frontier needed NO new code.**
+`WebCryptoAPI`'s worker window: **0 → 29,383/29,506 (99.58%)** over 66 files, and
+this quest wrote no crypto at all. Cryptography is *the* thing a page does off the
+main thread — PBKDF2 at 100k iterations, an RSA keygen, AES-GCM over an upload — so
+a `crypto.subtle` that works only on the main thread is present and unusable
+exactly where it matters. **⭐ The confirmation is better than the percentage: all
+nine imperfect files fail in precisely the places their WINDOW twins fail, by
+precisely the same counts** (`ec_importKey_failures_ECDSA` short by **19**,
+`…_ECDH` by **35** — the two numbers Quest #471's scroll recorded). A worker
+failing identically is a worker running the same code; had the deny list been
+wrong or the `with` scope leaked, the failures would have been *different* ones.
+
+**#480 the connected verdict — a port starts DISABLED, and that is the whole
+feature.** `MessagePort` was five no-op methods; `MessageChannel` two object
+literals with no events, no clone and **no queue**. The queue is what makes handing
+a port to someone else safe: everything posted before the other side listens is
+*waiting there, in order*, rather than fired into a void — and without it,
+"transfer a port" is a race whose loser is whoever is on the slower machine.
+**Assigning `onmessage` implicitly starts the port**, because most real code never
+calls `start()`. `SharedWorker` is keyed by **(URL, name)** — the second
+`new SharedWorker(url)` connects to the one already running, which on a low-spec
+machine is the difference between one worker's memory and five. **⚠️ And the
+`importScripts` JavaScript-MIME rule is NOT network-only**: a `data:` URL carries
+its type in the URL and a `blob:` URL in the Blob's `type`, both attacker-reachable —
+those are the two cases where the check *looks* unnecessary because no server is
+involved, and the two cases where the content came from the page itself.
+**`…/messagechannel.any.html` — a WINDOW test — went 32/152 → 136/152**, so the
+port work paid off four times over on the main thread before a worker was involved.
+
+**Zero regressions, proved in both directions** by stashing `bootstrap.js`,
+rebuilding, and re-measuring: `structured-clone.any.html` **141/152 → 141/152**,
+`MessageEvent.any.html` **9/9 → 9/9**, and every worker/sharedworker file
+**could-not-run → scored**. Ritual: **76 files, 21,428 / 21,539, 111 fails — the exact recorded baseline.** The first pass came back **112**, one short, and the missing subtest was worth chasing: `IndexedDB/structured-clone.any.html`'s *"Not serializable: MessageChannel"* row had been **passing for the wrong reason** — the old stub kept `port1`/`port2` as own enumerable properties holding FUNCTIONS, and structured clone throws on a function. Replacing the stub with a real `MessageChannel` (ports behind prototype getters) left nothing own-enumerable to walk, so the clone quietly produced an empty object. Fixed with the actual rule rather than the accident: **a `MessagePort` is `[Transferable]` but NOT `[Serializable]`** — it can only be MOVED, never copied, so a port passed without a transfer list is a `DataCloneError`. A page handed a dead port instead of an error has no way to learn its channel never connected..
+
 
 ### 2026-08-05 — Quests #475–#477, **The Legacy-CJK Arc** (the 104-file `encoding/legacy-mb-*` window **~0 / could-not-run → 93,705 / 93,705, 100%**)
 

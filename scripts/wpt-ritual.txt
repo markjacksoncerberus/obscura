@@ -132,3 +132,26 @@ encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-decode.html?1-1000
 encoding/legacy-mb-korean/euc-kr/euckr-encode-form-korean.html?1-1000
 encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-href.html?1-1000
 encoding/legacy-mb-schinese/gbk/gbk-encoder.html
+
+# ── Web Workers (Quests #478–#480). Five guards, each on a different mechanism,
+#    because the worker scope is a lot of machinery hiding behind one API:
+#      * textdecoder-fatal.any.worker — the scope itself: does the harness load
+#        at all, i.e. does importScripts + WorkerGlobalScope still work.
+#      * api-invalid-label — the top-level-declaration mirror. Its `// META:
+#        script=resources/encodings.js` helper declares `const encodings_table`,
+#        and a `const` is the case that silently publishes NOTHING if the mirror
+#        moves back into the `finally`. This file goes 1000/1000 → 0 the instant
+#        that regresses, which is exactly the alarm we want.
+#      * dom/idlharness.any.worker — the exposure deny list. If a window-only
+#        interface leaks into the worker scope (or a worker-exposed one goes
+#        missing), idlharness is the thing that notices.
+#      * importscripts_mime_local — the JavaScript-MIME rule on all three URL
+#        schemes (network, data:, blob:). A security boundary, so it is guarded.
+#      * streams/idlharness.any.sharedworker — SharedWorker + the MessagePort
+#        queue end to end: it only scores if a port was minted, connected,
+#        started and drained.
+encoding/textdecoder-fatal.any.worker.html
+encoding/api-invalid-label.any.worker.html?1-1000
+dom/idlharness.any.worker.html
+workers/importscripts_mime_local.any.worker.html
+streams/idlharness.any.sharedworker.html
