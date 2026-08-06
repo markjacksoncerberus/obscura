@@ -1,0 +1,73 @@
+# The ENCODE half of `encoding/legacy-mb-*` — one variant per distinct file.
+# Same construction as the decode probe. These are the form-submission and
+# <a href> query tests: a legacy page must ANSWER in the encoding it was written
+# in. Quests #476-#477 took these from could-not-run/0 to 64,303/64,303.
+# NOTE: the form files here were could-not-run before #476, NOT scoring zero —
+# form.submit() navigated the test page itself away. A realm reporting no score
+# is not a realm scoring badly.
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-form-cseucpkdfmtjapanese.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-form-errors-han.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-form-errors-hangul.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-form-errors-misc.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-form-x-euc-jp.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-form.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-href-errors-han.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-href-errors-hangul.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-href-errors-misc.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-encode-href.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-form-csiso2022jp.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-form-errors-han.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-form-errors-hangul.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-form-errors-misc.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-form.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-href-errors-han.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-href-errors-hangul.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-href-errors-misc.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-href.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-csshiftjis.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-errors-han.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-errors-hangul.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-errors-misc.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-ms932.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-ms_kanji.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-shift-jis.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-sjis.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-windows-31j.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form-x-sjis.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-form.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-href-errors-han.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-href-errors-hangul.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-href-errors-misc.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-encode-href.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-cseuckr.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-csksc56011987.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-errors-han.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-errors-misc.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-iso-ir-149.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-korean.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-ks_c_5601-1987.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-ks_c_5601-1989.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-ksc5601.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-ksc_5601.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-windows-949.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-href-errors-han.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-href-errors-misc.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-href.html?1-1000
+encoding/legacy-mb-schinese/gb18030/gb18030-encoder.html
+encoding/legacy-mb-schinese/gbk/gbk-encoder.html
+encoding/legacy-mb-tchinese/big5/big5-encode-form-big5-hkscs.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form-cn-big5.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form-csbig5.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form-errors-extBa.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form-errors-extBb.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form-errors-han.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form-errors-hangul.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form-errors-misc.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form-errors-pua.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form-x-x-big5.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-form.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-href-errors-han.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-href-errors-hangul.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-href-errors-misc.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-encode-href.html?1-1000

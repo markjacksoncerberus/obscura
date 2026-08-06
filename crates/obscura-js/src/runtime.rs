@@ -89,6 +89,12 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().title = title.to_string();
     }
 
+    /// Record the encoding the document was decoded with (Encoding-Standard name,
+    /// e.g. "EUC-KR"). Read back by `document.characterSet`.
+    pub fn set_charset(&self, charset: &str) {
+        self.state.borrow_mut().charset = charset.to_string();
+    }
+
     pub fn set_blocked_urls(&self, patterns: Vec<String>) {
         self.state.borrow_mut().blocked_urls = patterns;
     }

@@ -4625,16 +4625,131 @@ const _makeTokenList = function(el, attr) {
 // fails is the raw value returned. Resolving here is what lets
 // `performance.getEntriesByName(img.src)` match the absolute entry name recorded
 // by `_loadElementResource`.
+// URL §"parse a URL", the DOCUMENT-relative form: the query component is
+// percent-encoded in the document's encoding rather than utf-8. Every other
+// component stays utf-8 — this asymmetry is deliberate in the URL standard,
+// because the query is the only part a legacy server parses with its own charset.
+//
+// The rewrite is done on the input STRING before the URL parser sees it: ASCII
+// (including any existing `%XX`) is left exactly as written so nothing is
+// double-encoded, and only the non-ASCII scalars between `?` and `#` change.
+// A fragment is never re-encoded — fragments are utf-8 in every document.
+// The cheap checks come FIRST and deliberately so: this runs on every `a.href`,
+// `img.src` and `link.href` READ. A URL with no query, or a query that is pure
+// ASCII, is the overwhelming majority of the web and must cost two string scans
+// and nothing else — no op call across the JS/Rust boundary, no encoding lookup.
+// On the machines this browser is for, a per-read op call is not free.
+function _encodeQueryInDocEncoding(input, doc) {
+  const s = String(input);
+  const q = s.indexOf('?');
+  if (q < 0) return s;
+  let end = s.indexOf('#', q + 1);
+  if (end < 0) end = s.length;
+  const query = s.slice(q + 1, end);
+  if (!query || !/[^\x00-\x7F]/.test(query)) return s;  // pure ASCII: nothing to re-encode
+  let enc;
+  try {
+    const cs = (doc || globalThis.document || {}).characterSet;
+    enc = cs && _getEncodingName(cs);
+  } catch (e) {}
+  if (!enc || enc === 'utf-8') return s;      // utf-8 is what the parser already does
+  // The special schemes escape `'` in a query as well; a non-special one leaves
+  // it literal. Read the scheme off the input when it has one, else off the base
+  // document (a relative href inherits the page's scheme).
+  const schemeM = /^[A-Za-z][A-Za-z0-9+.\-]*:/.exec(s);
+  let scheme = schemeM ? schemeM[0].slice(0, -1).toLowerCase() : '';
+  if (!scheme) {
+    try { scheme = new URL(_domParse("document_url") || 'about:blank').protocol.replace(':', ''); } catch (e) {}
+  }
+  const special = scheme === 'http' || scheme === 'https' || scheme === 'ws'
+    || scheme === 'wss' || scheme === 'ftp' || scheme === 'file';
+  let encoded;
+  try { encoded = Deno.core.ops.op_query_encode(enc, query, special); } catch (e) { return s; }
+  return s.slice(0, q + 1) + encoded + s.slice(end);
+}
+
 const _reflectURL = function (el, attr) {
   const v = el.getAttribute(attr);
   if (v == null) return "";
   let base;
   try { base = el.baseURI; } catch (e) {}
-  try { return new URL(v, base || undefined).href; } catch (e) { return v; }
+  const raw = _encodeQueryInDocEncoding(v, el.ownerDocument);
+  try { return new URL(raw, base || undefined).href; } catch (e) { return v; }
 };
+// The four elements that actually have a `target` IDL attribute (HTML): where a
+// navigation they start is allowed to land.
+const _TARGET_REFLECT = new Set(['a', 'area', 'base', 'form']);
+
+// HTML "pick an encoding for the form". `accept-charset` is a list of CANDIDATES
+// — the author naming which encodings their server can read — so we take the
+// first label in it that names a real encoding. With no usable candidate the form
+// submits in the document's own encoding, which is the rule that makes a legacy
+// page self-consistent: it was decoded as EUC-KR, so it answers in EUC-KR.
+//
+// utf-16be/utf-16le/replacement have no encoder; the spec's "get an output
+// encoding" maps them to utf-8, and `op_text_encode` applies that itself.
+function _pickFormEncoding(form) {
+  const attr = form.getAttribute && form.getAttribute('accept-charset');
+  if (attr) {
+    for (const label of String(attr).split(/[\t\n\f\r ]+/)) {
+      if (!label) continue;
+      const n = _getEncodingName(label);
+      if (n) return n;
+    }
+  }
+  const doc = (form.ownerDocument || globalThis.document);
+  const cs = doc && doc.characterSet;
+  return (cs && _getEncodingName(cs)) || 'utf-8';
+}
+
+// The urlencoded serialiser, over BYTES of the picked encoding. The percent-escape
+// rule is byte-wise and identical whatever the encoding — what changes is which
+// bytes a character turns into, and (crucially) that a character the encoding
+// CANNOT represent is replaced by its HTML numeric character reference before
+// escaping, so `€` in a EUC-KR form arrives as `%26%2318364%3B`. Losing it
+// silently instead would let a form claim to have sent what it did not.
+function _formEncodeIn(s, encName) {
+  let bytes;
+  if (!encName || encName === 'utf-8') {
+    bytes = new TextEncoder().encode(String(s));
+  } else {
+    try { bytes = Deno.core.ops.op_text_encode(encName, String(s)); }
+    catch (e) { bytes = new TextEncoder().encode(String(s)); }
+  }
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) {
+    const c = bytes[i];
+    if (c === 0x20) out += '+';
+    else if (c === 0x2A || c === 0x2D || c === 0x2E || c === 0x5F ||
+             (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A))
+      out += String.fromCharCode(c);
+    else out += '%' + c.toString(16).toUpperCase().padStart(2, '0');
+  }
+  return out;
+}
+
+// Resolve a form's `target` to an <iframe> in this document. HTML looks up a
+// browsing context by NAME; an id is not a browsing-context name, but the WPT
+// suites (and plenty of real pages) set both, and matching `name` first keeps
+// the spec order honest. The keywords never name a frame.
+function _frameForTarget(form, target) {
+  const t = (target == null ? '' : String(target)).trim();
+  if (!t || t.charAt(0) === '_') return null;
+  const doc = form.ownerDocument || globalThis.document;
+  if (!doc || typeof doc.querySelectorAll !== 'function') return null;
+  let frames;
+  try { frames = doc.querySelectorAll('iframe, frame'); } catch (e) { return null; }
+  for (let i = 0; i < frames.length; i++) {
+    if (frames[i].getAttribute('name') === t) return frames[i];
+  }
+  for (let i = 0; i < frames.length; i++) {
+    if (frames[i].getAttribute('id') === t) return frames[i];
+  }
+  return null;
+}
 // Elements whose `src`/`href` IDL attributes are URL-reflecting (resolve on get).
 // Scoped deliberately tight: every OTHER element keeps the raw-attribute getter,
-// so this change can't perturb non-URL `src`/`href` reads elsewhere.
+// so this can't perturb non-URL `src`/`href` reads elsewhere.
 const _URL_REFLECT_SRC = new Set(['img', 'script', 'iframe', 'audio', 'video', 'source', 'track', 'embed', 'input', 'frame']);
 const _URL_REFLECT_HREF = new Set(['a', 'area', 'link']);
 
@@ -5411,9 +5526,18 @@ class Element extends Node {
       // Don't clobber the current document or fire a stale load.
       if (_self._loadGen !== _gen) return;
       if (resp.ok || resp.type === 'opaque') {
-        const html = await resp.text();
+        // NOT `resp.text()`: fetch's text() always decodes utf-8, but this is a
+        // DOCUMENT load, and a document says what encoding it is in (HTML's
+        // encoding sniffing algorithm — BOM, then Content-Type, then <meta>).
+        // Decoding a Shift_JIS or EUC-KR frame as utf-8 turns every character
+        // into U+FFFD, which is how the entire legacy CJK web used to look here.
+        const _buf = new Uint8Array(await resp.arrayBuffer());
         if (_self._loadGen !== _gen) return; // re-check after the awaited body
-        el._iframeDoc = new _IframeDocument(html, fullUrl, el, undefined, _iframeDocKind(fullUrl, resp));
+        let _ct = null;
+        try { _ct = resp.headers.get('content-type'); } catch (e) {}
+        const _dec = _decodeDocumentBytes(_buf, _ct);
+        el._iframeDoc = new _IframeDocument(_dec.text, fullUrl, el, undefined, _iframeDocKind(fullUrl, resp));
+        el._iframeDoc._charset = _characterSetLabel(_dec.encoding);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl, null, el);
       } else {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
@@ -5487,6 +5611,23 @@ class Element extends Node {
   set action(v) { this.setAttribute("action", v); }
   get method() { return this.getAttribute("method") || "get"; }
   set method(v) { this.setAttribute("method", v); }
+  // `target` names the browsing context the submission lands in — a frame name,
+  // or one of the keywords (_self/_blank/_parent/_top). Without it, every form
+  // submitted into the top-level page and a framed app navigated itself away.
+  // Guarded by tag: `target` is only an IDL attribute of these four elements, and
+  // putting it on Element.prototype would make `'target' in div` wrongly true.
+  get target() {
+    if (!_TARGET_REFLECT.has(this.localName)) return undefined;
+    return this.getAttribute("target") || "";
+  }
+  set target(v) { if (_TARGET_REFLECT.has(this.localName)) this.setAttribute("target", String(v)); }
+  // accept-charset is a SPACE-SEPARATED LIST of candidate encodings, and it
+  // reflects the attribute's literal string (not a normalised encoding name).
+  get acceptCharset() {
+    if (this.localName !== 'form') return undefined;
+    return this.getAttribute("accept-charset") || "";
+  }
+  set acceptCharset(v) { if (this.localName === 'form') this.setAttribute("accept-charset", String(v)); }
   get form() {
     let p = this.parentNode;
     while (p && p.localName !== 'form') p = p.parentNode;
@@ -5539,9 +5680,15 @@ class Element extends Node {
       } else {
         val = f.value !== undefined ? f.value : (f.getAttribute('value') || '');
       }
-      const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/!/g, '%21');
-      pairs.push(enc(name) + '=' + enc(val));
+      pairs.push([name, val]);
     }
+
+    // The form is serialised in the DOCUMENT'S encoding, not utf-8 — see
+    // `_pickFormEncoding`. A page in Shift_JIS whose search box submits utf-8
+    // bytes is a search that silently returns nothing.
+    const formEnc = _pickFormEncoding(this);
+    const enc = (s) => _formEncodeIn(s, formEnc);
+    const encoded = pairs.map(([n, v]) => enc(n) + '=' + enc(v)).join('&');
 
     const action = this.getAttribute('action') || '';
     const method = (this.getAttribute('method') || 'GET').toUpperCase();
@@ -5549,12 +5696,22 @@ class Element extends Node {
     let targetUrl;
     try { targetUrl = new URL(action, baseUrl).href; } catch(e) { targetUrl = action; }
 
-    const encoded = pairs.join('&');
+    const getUrl = () => {
+      const sep = targetUrl.includes('?') ? '&' : '?';
+      return targetUrl + (encoded ? sep + encoded : '');
+    };
+
+    // `target` picks the browsing context to navigate. A named frame in this
+    // document takes the submission; only an absent/self target navigates the
+    // page itself. (POST into a frame still lands as a GET-shaped load here —
+    // the frame loader has no request-body channel yet; noted in the scroll.)
+    const frame = _frameForTarget(this, this.getAttribute('target'));
+    if (frame) { frame._loadIframeSrc(method === 'POST' ? targetUrl : getUrl()); return; }
+
     if (method === 'POST') {
       Deno.core.ops.op_navigate(targetUrl, 'POST', encoded);
     } else {
-      const sep = targetUrl.includes('?') ? '&' : '?';
-      Deno.core.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
+      Deno.core.ops.op_navigate(getUrl(), 'GET', '');
     }
   }
   reset() {
@@ -6487,7 +6644,14 @@ class Document extends Node {
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
   get compatMode() { return this._compatMode || "CSS1Compat"; }
-  get characterSet() { return "UTF-8"; }
+  // The encoding the page's bytes were REALLY decoded with, resolved by the
+  // navigation path (HTML's encoding sniffing algorithm) and handed over from
+  // Rust. A `_standalone` document was built in memory rather than loaded, so it
+  // has no bytes and no encoding of its own — utf-8 is its honest answer.
+  get characterSet() {
+    if (this._standalone) return "UTF-8";
+    return _domParse("document_charset") || "UTF-8";
+  }
   get charset() { return this.characterSet; }        // legacy alias of characterSet
   get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
   get contentType() { return this._standalone ? "application/xml" : "text/html"; }
@@ -9480,6 +9644,65 @@ function _prescanMetaCharset(bytes) {
   return enc;
 }
 
+// HTML §13.2.3.2 "encoding sniffing algorithm" — how a browser decides what
+// bytes a *document* is written in. This is NOT the same question fetch answers:
+// `Response.text()` is defined to always decode UTF-8, which is right for a data
+// response and catastrophically wrong for a page. Half the web written before
+// UTF-8 won says what it is in a `<meta charset>` or a Content-Type header, and a
+// browser that ignores both hands the reader a wall of U+FFFD. That is most of the
+// Korean, Japanese, Chinese and Taiwanese web from the 2000s — pages that are
+// still up, still linked, still someone's homework source.
+//
+// Confidence order (highest first):
+//   1. A BOM. Byte-level and unambiguous, so it beats every declaration.
+//   2. The transport charset (HTTP `Content-Type: …; charset=…`), used verbatim —
+//      unlike a meta declaration, a transport `utf-16le` really means utf-16le.
+//   3. A `<meta charset>` in the first 1024 bytes (see `_prescanMetaCharset`,
+//      which applies the algorithm's utf-16→utf-8 and x-user-defined→windows-1252
+//      corrections: a document claiming utf-16 in ASCII bytes has disproved itself).
+//   4. Fallback. The spec's default is locale-dependent (windows-1252 for en);
+//      we keep utf-8, which is what an undeclared modern page actually is and what
+//      the rest of the engine already assumes. Deviation noted honestly.
+function _documentEncodingFor(bytes, contentTypeHeader) {
+  if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) return 'utf-8';
+  if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) return 'utf-16be';
+  if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) return 'utf-16le';
+  if (contentTypeHeader != null) {
+    const rec = _parseMimeType(String(contentTypeHeader));
+    if (rec) {
+      const c = rec.params.find((p) => p[0] === 'charset');
+      if (c) { const n = _getEncodingName(c[1]); if (n) return n; }
+    }
+  }
+  const meta = _prescanMetaCharset(bytes);
+  if (meta) return meta;
+  return 'utf-8';
+}
+
+// Decode a navigated document's bytes. Returns `{text, encoding}` — the encoding
+// is kept because `document.characterSet` must report the one actually used, and
+// a form on that page submits in it (HTML "pick an encoding for the form").
+//
+// A label that resolves to the `replacement` encoding decodes the WHOLE document
+// to a single U+FFFD, on purpose: those labels (ISO-2022-CN, HZ-GB-2312, …) name
+// encodings in which ASCII-looking bytes can be re-interpreted as markup, so
+// honouring them is an XSS vector. Refusing to render is the secure answer.
+function _decodeDocumentBytes(bytes, contentTypeHeader) {
+  const enc = _documentEncodingFor(bytes, contentTypeHeader);
+  if (enc === 'replacement') return { text: '�', encoding: 'replacement' };
+  try { return { text: new TextDecoder(enc).decode(bytes), encoding: enc }; }
+  catch (e) {
+    try { return { text: new TextDecoder('utf-8').decode(bytes), encoding: 'utf-8' }; }
+    catch (e2) { return { text: '', encoding: 'utf-8' }; }
+  }
+}
+
+// The canonical Encoding-Standard name, upper-cased the way `document.characterSet`
+// reports it ("UTF-8", "EUC-KR", "Shift_JIS" — the spec's own casing, not lowercase).
+function _characterSetLabel(name) {
+  return _ENCODING_DISPLAY_NAMES[name] || String(name || 'utf-8').toUpperCase();
+}
+
 // §"text response" — decode the received bytes to xhr.responseText. The default
 // ("") responseType additionally sniffs an XML-ish response's declared encoding;
 // the explicit "text" type never does.
@@ -10565,6 +10788,20 @@ const _getEncodingName = function(label) {
   const s = String(label).replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '')
     .replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
   return _LABEL_TO_NAME[s] || null;
+};
+// The Encoding Standard's canonical NAMES, which are not simply the upper-cased
+// labels — `document.characterSet` reports "Shift_JIS", "windows-1252", "Big5",
+// "gb18030" and "macintosh" exactly as written here, and a page that compares
+// against that string (plenty do, to decide whether to re-encode a form) needs
+// the same spelling every other browser produces. Only the entries whose casing
+// is NOT plain upper-case need listing; the rest fall through to toUpperCase().
+const _ENCODING_DISPLAY_NAMES = {
+  'windows-874': 'windows-874', 'windows-1250': 'windows-1250', 'windows-1251': 'windows-1251',
+  'windows-1252': 'windows-1252', 'windows-1253': 'windows-1253', 'windows-1254': 'windows-1254',
+  'windows-1255': 'windows-1255', 'windows-1256': 'windows-1256', 'windows-1257': 'windows-1257',
+  'windows-1258': 'windows-1258', 'macintosh': 'macintosh', 'x-mac-cyrillic': 'x-mac-cyrillic',
+  'x-user-defined': 'x-user-defined', 'gb18030': 'gb18030', 'big5': 'Big5',
+  'shift_jis': 'Shift_JIS', 'replacement': 'replacement',
 };
 // windows-1252 bytes 0x80-0x9F -> code point (0x00-0x7F and 0xA0-0xFF are identity).
 const _WIN1252 = [0x20AC,0x81,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,0x02C6,0x2030,0x0160,0x2039,0x0152,0x8D,0x017D,0x8F,0x90,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,0x02DC,0x2122,0x0161,0x203A,0x0153,0x9D,0x017E,0x0178];
@@ -40602,6 +40839,53 @@ Object.defineProperty(_sp('SVGAElement'), 'relList', { enumerable: true, configu
   set: _named('set', 'relList', function(v) { if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation"); (this._svgRelList ??= _makeTokenList(this, 'rel')).value = v; }) });
 _svgInstallHyperlinkUtils(_sp('SVGAElement'));
 
+// ── HTMLHyperlinkElementUtils on <a> and <area> ──
+// A link is a URL, and the platform lets you read it apart: `a.hostname` is how
+// a page tells its own links from outbound ones, `a.search` how it reads a query
+// back. None of these existed here, so `link.protocol` was undefined and the
+// idiom `a.href = x; a.search` — the standard way to normalise a URL without a
+// URL object — threw. They resolve through the element's `href` attribute against
+// its base, so a relative href decomposes like the absolute URL it becomes.
+//
+// The query is parsed in the DOCUMENT'S encoding (see `_encodeQueryInDocEncoding`):
+// on a Shift_JIS page `a.href = "?" + kanji` really does give back Shift_JIS bytes,
+// which is what the server behind that link is waiting for.
+{
+  const _hrefURL = (el) => {
+    try {
+      const h = el.getAttribute('href');
+      if (h == null) return null;
+      const raw = _encodeQueryInDocEncoding(h, el.ownerDocument);
+      let base;
+      try { base = el.baseURI; } catch (e) {}
+      return new URL(raw, base || undefined);
+    } catch (e) { return null; }
+  };
+  // Writing a component writes the whole re-serialised URL back to the content
+  // attribute — the attribute is the storage, so a component setter that only
+  // updated a cached URL would be lost on the next read.
+  const _parts = ['protocol', 'username', 'password', 'host', 'hostname', 'port',
+                  'pathname', 'search', 'hash'];
+  for (const name of ['HTMLAnchorElement', 'HTMLAreaElement']) {
+    const proto = globalThis[name] && globalThis[name].prototype;
+    if (!proto) continue;
+    Object.defineProperty(proto, 'origin', { enumerable: true, configurable: true,
+      get: _named('get', 'origin', function() { const u = _hrefURL(this); return u ? u.origin : ''; }) });
+    for (const comp of _parts) {
+      Object.defineProperty(proto, comp, { enumerable: true, configurable: true,
+        get: _named('get', comp, function() { const u = _hrefURL(this); return u ? u[comp] : ''; }),
+        set: _named('set', comp, function(v) {
+          const u = _hrefURL(this);
+          if (!u) return;
+          try { u[comp] = String(v); this.setAttribute('href', u.href); } catch (e) {}
+        }) });
+    }
+    // `<a>` and `<area>` stringify to their href (HTMLHyperlinkElementUtils).
+    Object.defineProperty(proto, 'toString', { enumerable: true, configurable: true, writable: true,
+      value: _named('', 'toString', function() { return _reflectURL(this, 'href'); }) });
+  }
+}
+
 // ── filter effects: SVGFilterElement + the fe* primitive family (filter-effects.idl) ──
 // Each fe* element reflects its animated attributes; most include the
 // SVGFilterPrimitiveStandardAttributes mixin (x/y/width/height + result). The constant
@@ -42253,7 +42537,10 @@ class _IframeDocument extends DetachedDocument {
   get ownerDocument() { return null; }
   get compatMode() { return this._compatMode || 'CSS1Compat'; }
   get contentType() { return this._contentType || 'text/html'; }
-  get characterSet() { return 'UTF-8'; }
+  // The encoding this frame's bytes were ACTUALLY decoded with (set by the
+  // navigation path from HTML's encoding sniffing algorithm) — not a constant.
+  // A form in this document submits in it, so guessing here mis-encodes uploads.
+  get characterSet() { return this._charset || 'UTF-8'; }
   get charset() { return this.characterSet; }        // legacy alias of characterSet
   get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
   get readyState() { return 'complete'; }

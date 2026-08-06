@@ -69,6 +69,22 @@ faster than full rebuilds for diagnosing *why* something fails.
   long-lived servers via your tool's background mode, not a bare shell `&` (it may not
   survive the shell-snapshot eval wrapper). Kill ALL `obscura serve` — duplicates on
   :9222 wedge each other.
+- **A realm reporting NO SCORE is not a realm scoring badly.** Five separate times
+  now a "0%" or "tiny" region turned out to be invisible instead: a missing
+  `test_driver` bridge (`cookies`), a missing global (`WebCryptoAPI`), a denominator
+  that SHRANK because the subtests did not exist (`wrapKey_unwrapKey`), a survey list
+  that sampled 0.07% of a realm (`selection`), and **a test whose own form submission
+  navigated the page away, taking the harness with it** (`encoding` — Quest #476).
+  Always read the harness column, not just the ratio.
+- **Get the file list AND a Chrome baseline in one request** — the can't-404 method:
+  `curl "https://wpt.fyi/api/runs?label=master&product=chrome&max-count=1"` →
+  `results_url` → `{"/path": {"s": status, "c": [pass, total]}}`. Aggregating that by
+  realm is what found `encoding` (1,152,339 subtests, the largest on the platform)
+  hiding behind a scoreboard row that made it look already-held.
+- **`Response.text()` is the wrong tool for a DOCUMENT.** It is specified to always
+  decode utf-8 — correct for fetch, catastrophic for a navigation, because a document
+  declares its own encoding (HTML §13.2.3.2). It returns a string and never throws, so
+  every "did it load" test passes; only looking at a *character* reveals it.
 - **JS numbers are f64.** In Rust unit tests assert `result.as_f64() == Some(7.0)`,
   not `json!(7)`.
 - **Rebuild after ANY `bootstrap.js` edit** (it's embedded). Restart the server after

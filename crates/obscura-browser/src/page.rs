@@ -154,6 +154,11 @@ pub struct Page {
     /// feeds the PerformanceNavigationTiming entry's encoded/decoded/transfer
     /// body sizes. `None` until the first document loads.
     document_body_size: Option<(usize, usize)>,
+    /// The encoding the last main-document response was decoded with, as its
+    /// Encoding-Standard name ("UTF-8", "EUC-KR", "Shift_JIS"). Reported by
+    /// `document.characterSet` and used to serialise forms and link queries —
+    /// a page decoded as EUC-KR must also ANSWER in EUC-KR.
+    document_charset: String,
     /// Cached resolved layout/paint, keyed by a hash of the last snapshot.
     /// `None` until the first render in `on-demand`/`always` mode.
     #[cfg(feature = "render")]
@@ -221,6 +226,7 @@ impl Page {
             intercept_tx: None,
             viewport,
             document_body_size: None,
+            document_charset: "UTF-8".to_string(),
             #[cfg(feature = "render")]
             render_cache: None,
             #[cfg(feature = "stealth")]
@@ -284,6 +290,7 @@ impl Page {
         );
         rt.set_url(&self.url_string());
         rt.set_title(&self.title);
+        rt.set_charset(&self.document_charset);
 
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
@@ -850,6 +857,9 @@ impl Page {
         // in the first 1KB → UTF-8 fallback. Without this, every non-UTF-8
         // page (GBK, Big5, Shift-JIS, Windows-125x, EUC-KR, ISO-8859-x)
         // came through as replacement characters.
+        let (doc_encoding, _src) =
+            obscura_net::detect_encoding(&response.body, response.content_type());
+        self.document_charset = doc_encoding.name().to_string();
         let body_text = obscura_net::decode_response(&response.body, response.content_type());
         // Encoded = the bytes received over the wire (content-decoded by the HTTP
         // client); decoded = after charset decoding. Feeds PerformanceNavigationTiming.

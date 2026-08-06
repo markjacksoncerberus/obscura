@@ -1,0 +1,44 @@
+# The DECODE half of `encoding/legacy-mb-*` — one variant per distinct file.
+# Built from Chrome's own run summary (the can't-404 method), so every path here
+# is real and carries a Chrome baseline. The realm's 389 variant files are these
+# 38 documents sharded into 1000-subtest slices by subset-tests.js; measuring one
+# slice per document covers every distinct code path at ~1/10th the wall clock.
+# Quest #475 took these from ~0% to 29,402/29,402.
+encoding/legacy-mb-japanese/euc-jp/eucjp-decode-cseucpkdfmtjapanese.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-decode-errors.html
+encoding/legacy-mb-japanese/euc-jp/eucjp-decode-x-euc-jp.html?1-1000
+encoding/legacy-mb-japanese/euc-jp/eucjp-decode.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-decode-csiso2022jp.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-decode-errors.html
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-decode.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-decode-csshiftjis.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-decode-errors.html
+encoding/legacy-mb-japanese/shift_jis/sjis-decode-ms932.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-decode-ms_kanji.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-decode-shift-jis.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-decode-sjis.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-decode-windows-31j.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-decode-x-sjis.html?1-1000
+encoding/legacy-mb-japanese/shift_jis/sjis-decode.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode-cseuckr.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode-csksc56011987.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode-errors.html
+encoding/legacy-mb-korean/euc-kr/euckr-decode-iso-ir-149.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode-korean.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode-ks_c_5601-1987.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode-ks_c_5601-1989.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode-ksc5601.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode-ksc_5601.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode-windows-949.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-decode.html?1-1000
+encoding/legacy-mb-schinese/gb18030/gb18030-decoder.any.html
+encoding/legacy-mb-schinese/gb18030/gb18030-decoder.any.worker.html
+encoding/legacy-mb-schinese/gbk/gbk-decoder.any.html
+encoding/legacy-mb-schinese/gbk/gbk-decoder.any.worker.html
+encoding/legacy-mb-tchinese/big5/big5-decode-big5-hkscs.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-decode-cn-big5.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-decode-csbig5.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-decode-errors.html
+encoding/legacy-mb-tchinese/big5/big5-decode-extra.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-decode-x-x-big5.html?1-1000
+encoding/legacy-mb-tchinese/big5/big5-decode.html?1-1000

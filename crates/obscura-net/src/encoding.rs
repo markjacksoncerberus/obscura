@@ -43,6 +43,19 @@ pub fn detect_encoding<'a>(
     bytes: &'a [u8],
     content_type_header: Option<&str>,
 ) -> (&'static Encoding, &'static str) {
+    // A BOM outranks every declaration: it is the bytes themselves saying what
+    // they are, so a page whose header lies about its charset still renders. This
+    // must be checked here and not only inside `Encoding::decode` (which does its
+    // own BOM sniff), because `document.characterSet` reports what this returns.
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return (UTF_8, "bom");
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return (encoding_rs::UTF_16BE, "bom");
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return (encoding_rs::UTF_16LE, "bom");
+    }
     if let Some(charset) = content_type_header.and_then(charset_from_content_type) {
         if let Some(enc) = Encoding::for_label(charset.as_bytes()) {
             return (enc, "content-type");

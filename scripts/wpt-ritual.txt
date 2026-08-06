@@ -120,3 +120,15 @@ WebCryptoAPI/encrypt_decrypt/aes_ctr.https.any.html
 WebCryptoAPI/import_export/rsa_importKey.https.any.html
 WebCryptoAPI/sign_verify/rsa_pss.https.any.html
 WebCryptoAPI/wrapKey_unwrapKey/wrapKey_unwrapKey.https.any.html
+# ── The legacy-CJK web (Quests #475–#477). One decode file guards the document
+#    encoding sniffing algorithm (BOM → Content-Type → <meta> prescan) for frame
+#    navigation; the form file guards BOTH the form's encoding pick AND the
+#    target-frame routing that used to navigate the test page away; the href
+#    files guard the query percent-encode set, which is the rule that breaks
+#    quietly (an over-escaped ASCII trail byte still decodes to the right bytes).
+#    gbk-encoder is the smallest file that catches that specific drift.
+encoding/legacy-mb-korean/euc-kr/euckr-decode.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-decode.html?1-1000
+encoding/legacy-mb-korean/euc-kr/euckr-encode-form-korean.html?1-1000
+encoding/legacy-mb-japanese/iso-2022-jp/iso2022jp-encode-href.html?1-1000
+encoding/legacy-mb-schinese/gbk/gbk-encoder.html

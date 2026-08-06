@@ -42,6 +42,10 @@ pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
     pub title: String,
+    /// The encoding the current document's bytes were ACTUALLY decoded with, as
+    /// its Encoding-Standard name. `document.characterSet` reports it, and a form
+    /// or link in the document is serialised in it.
+    pub charset: String,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
@@ -57,6 +61,7 @@ impl ObscuraState {
             dom: None,
             url: "about:blank".to_string(),
             title: String::new(),
+            charset: "UTF-8".to_string(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
@@ -84,6 +89,7 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         "document_node_id" => dom.document().index().to_string(),
         "document_title" => serde_json::to_string(&gs.title).unwrap_or("\"\"".into()),
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "document_charset" => serde_json::to_string(&gs.charset).unwrap_or("\"UTF-8\"".into()),
         "document_element" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
@@ -1903,6 +1909,118 @@ fn op_text_decode(
     }
 }
 
+/// Encode text INTO a legacy encoding — the direction a form submission needs.
+///
+/// A page written in EUC-KR or Shift_JIS submits its forms in that same encoding
+/// (HTML "pick an encoding for the form"), so a search box on a Korean site from
+/// 2004 sends EUC-KR bytes and the server on the other end reads them back. Send
+/// UTF-8 instead and the server gets mojibake — the form silently fails for the
+/// user while looking like it worked.
+///
+/// `name` is the already-resolved WHATWG encoding name. Unmappable code points
+/// become an HTML numeric character reference (`&#1234;`) rather than an error,
+/// which is exactly what the URL-encoded serialiser requires: `encoding_rs`'s
+/// `encode()` implements that rule directly, and it also folds the encodings with
+/// no encoder (utf-16be/le, replacement) to their spec "output encoding", utf-8.
+#[op2]
+#[buffer]
+fn op_text_encode(
+    #[string] name: String,
+    #[string] text: String,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let enc = encoding_rs::Encoding::for_label(name.as_bytes())
+        .ok_or_else(|| deno_error::JsErrorBox::generic(format!("unknown encoding: {name}")))?;
+    let (bytes, _used, _had_unmappable) = enc.encode(&text);
+    Ok(bytes.into_owned())
+}
+
+/// URL §"percent-encode after encoding" for a QUERY, in a document's encoding.
+///
+/// The query is the one URL component that is NOT always UTF-8: a link in a
+/// Shift_JIS page carries its query in Shift_JIS, because the server that page
+/// came from reads it that way. Get this wrong and every search link on a legacy
+/// site goes to a results page for nothing.
+///
+/// ASCII passes through untouched — the `url` crate applies the query
+/// percent-encode set correctly on its own, and touching ASCII here would risk
+/// double-encoding an existing `%XX`. Every non-ASCII scalar becomes either the
+/// percent-escaped bytes of the encoding, or — when the encoding simply has no
+/// room for that character — the spec's literal escape hatch `%26%23<decimal>%3B`,
+/// i.e. a percent-encoded `&#1234;`. That is a lossy answer, but a *recoverable*
+/// one: the server sees which character was meant instead of a silent `?`.
+///
+/// Characters are fed through ONE encoder in sequence rather than encoded
+/// individually, because ISO-2022-JP is stateful — its mode escapes belong to the
+/// run, not the character, and a per-character encoder would re-announce the mode
+/// before every single character.
+/// The URL "query percent-encode set": C0 controls, everything above `~`, and
+/// space `"` `#` `<` `>`. A SPECIAL scheme (http/https/ws/wss/ftp/file) adds `'`.
+///
+/// This set is why the escaping cannot simply be applied to every byte a legacy
+/// encoding produces. A GBK character encodes to `81 40`, and `0x40` is `@` — a
+/// byte outside the set, so it must appear in the URL *literally*. Escaping it
+/// anyway gives `%81%40`, which a server decodes to the same bytes but which is
+/// not the string any other browser sends, and byte-comparing proxies notice.
+fn query_needs_escape(b: u8, special: bool) -> bool {
+    b < 0x20
+        || b > 0x7E
+        || b == b' '
+        || b == b'"'
+        || b == b'#'
+        || b == b'<'
+        || b == b'>'
+        || (special && b == b'\'')
+}
+
+#[op2]
+#[string]
+fn op_query_encode(
+    #[string] name: String,
+    #[string] text: String,
+    special: bool,
+) -> Result<String, deno_error::JsErrorBox> {
+    use std::fmt::Write as _;
+    let enc = encoding_rs::Encoding::for_label(name.as_bytes())
+        .ok_or_else(|| deno_error::JsErrorBox::generic(format!("unknown encoding: {name}")))?;
+    let mut encoder = enc.output_encoding().new_encoder();
+    let mut out = String::with_capacity(text.len());
+    let mut buf = [0u8; 32];
+    let mut chbuf = [0u8; 4];
+    let mut push = |out: &mut String, bytes: &[u8]| {
+        for &b in bytes {
+            if query_needs_escape(b, special) {
+                let _ = write!(out, "%{b:02X}");
+            } else {
+                out.push(b as char);
+            }
+        }
+    };
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+            continue;
+        }
+        let src = ch.encode_utf8(&mut chbuf);
+        let (_res, _read, written, had_unmappable) =
+            encoder.encode_from_utf8(src, &mut buf, false);
+        if had_unmappable {
+            // The standard's explicit escape hatch, and it is escaped in FULL —
+            // `&`, `#` and `;` are outside the percent-encode set, but writing
+            // them literally would let the reference be mistaken for real query
+            // syntax (`&` starts a new parameter) instead of one lost character.
+            let _ = write!(out, "%26%23{}%3B", ch as u32);
+        } else {
+            push(&mut out, &buf[..written]);
+        }
+    }
+    // Flush: a stateful encoder (ISO-2022-JP) owes the stream a return-to-ASCII
+    // escape once the run ends. Dropping it would leave the receiver in the wrong
+    // mode for whatever the server appends.
+    let (_res, _read, written, _had) = encoder.encode_from_utf8("", &mut buf, true);
+    push(&mut out, &buf[..written]);
+    Ok(out)
+}
+
 pub fn build_extension() -> Extension {
     Extension {
         name: "obscura_dom",
@@ -1921,6 +2039,8 @@ pub fn build_extension() -> Extension {
             op_url_parse(),
             op_url_set(),
             op_text_decode(),
+            op_text_encode(),
+            op_query_encode(),
             crate::crypto_ops::op_crypto_digest(),
             crate::crypto_ops::op_crypto_hmac(),
             crate::crypto_ops::op_crypto_random_bytes(),
