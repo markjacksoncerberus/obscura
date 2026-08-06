@@ -900,6 +900,12 @@ async fn op_fetch_url(
     #[string] body: String,
     #[string] origin: String,
     #[string] mode: String,
+    // A request body is a BYTE SEQUENCE, not text. `body` above is the ordinary
+    // text channel (kept because every existing caller uses it), but a file
+    // upload, an ArrayBuffer or a multipart part carrying a photo is not valid
+    // UTF-8 and re-encoding it silently corrupts what the reader chose to send.
+    // When this is non-empty it is the authority and `body` is ignored.
+    #[string] body_base64: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
 
@@ -1005,10 +1011,25 @@ async fn op_fetch_url(
     // The actual network round-trip lives in `perform_fetch_core` so the blocking
     // `op_fetch_url_sync` (synchronous XHR) can reuse it from a worker thread.
     perform_fetch_core(
-        url, method, headers_json, origin, mode, body, cookie_jar, in_flight, proxy_url,
+        url, method, headers_json, origin, mode, request_body_bytes(&body, &body_base64),
+        cookie_jar, in_flight, proxy_url,
     )
     .await
     .map_err(deno_error::JsErrorBox::generic)
+}
+
+/// Resolve the two request-body channels into the bytes that go on the wire.
+/// The base64 channel wins when present; a body that fails to decode is treated
+/// as absent rather than sent half-formed, because a truncated upload that the
+/// server accepts is worse than one that visibly fails.
+fn request_body_bytes(body: &str, body_base64: &str) -> Vec<u8> {
+    if !body_base64.is_empty() {
+        match BASE64.decode(body_base64) {
+            Ok(bytes) => return bytes,
+            Err(e) => tracing::warn!("request body base64 decode failed: {e}"),
+        }
+    }
+    body.as_bytes().to_vec()
 }
 
 /// The shared network core behind both `op_fetch_url` (async) and
@@ -1025,7 +1046,7 @@ async fn perform_fetch_core(
     headers_json: String,
     origin: String,
     mode: String,
-    body: String,
+    body: Vec<u8>,
     cookie_jar: Option<Arc<CookieJar>>,
     in_flight: Option<Arc<std::sync::atomic::AtomicU32>>,
     proxy_url: Option<String>,
@@ -1298,6 +1319,8 @@ fn op_fetch_url_sync(
     #[string] body: String,
     #[string] origin: String,
     #[string] mode: String,
+    // See `op_fetch_url`: the byte-exact channel, authoritative when non-empty.
+    #[string] body_base64: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     if let Ok(parsed_url) = url::Url::parse(&url) {
         if let Err(e) = validate_fetch_url(&parsed_url) {
@@ -1332,6 +1355,7 @@ fn op_fetch_url_sync(
     // Run the async network core to completion on a dedicated worker thread and
     // block the JS thread on the result. `SharedState` holds `Rc`s (not `Send`),
     // so we clone out only the `Send` pieces above before crossing the boundary.
+    let body_bytes = request_body_bytes(&body, &body_base64);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -1342,7 +1366,8 @@ fn op_fetch_url_sync(
             }
         };
         let res = rt.block_on(perform_fetch_core(
-            url, method, headers_json, origin, mode, body, cookie_jar, in_flight, proxy_url,
+            url, method, headers_json, origin, mode, body_bytes,
+            cookie_jar, in_flight, proxy_url,
         ));
         let _ = tx.send(res);
     });

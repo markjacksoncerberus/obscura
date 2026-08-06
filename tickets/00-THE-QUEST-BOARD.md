@@ -25,6 +25,9 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F14** | ✅ [The Uploaded Verdict](478-the-uploaded-verdict.md) | **`FileAPI/*`** — Blob, File, FileReader, and the upload path | **1415/1550 (91.3%)** — was 1057/1540 (68.6%) | ⚔️⚔️ | **SECURED (Quest #487, 2026-08-06).** ⭐⭐ `FormData.append` did `String(v)` and `fetch()` did `String(init.body)` — **a FormData could not hold a file**, so file upload was broken end to end with nothing to search for. `Request` had run the real "extract a body" since #459; `fetch()` never called it. ⚠️ **The realm was picked as UNTOUCHED and was 68.6% — measure before naming.** Caps: `send-file-form-*` (63) needs `DataTransfer` + a frame-POST body channel; `BlobURL/cross-partition*` needs partitioning. |
+| **F15** | ✅ [The Aborted Verdict](479-the-aborted-verdict.md) | **`IndexedDB`** — the abort rule + the `getAll` options family | `fire-*-event-exception` **0/29 → 29/29** · `getAllRecords` **9/54 → 52/54** | ⚔️ | **SECURED (Quest #488, 2026-08-06).** Both blocks had been banked twice. ⭐ A handler that THREW did not finish, so the transaction must ABORT — **beating `preventDefault()`**, and worst on `upgradeneeded` where a half-built schema is permanent. ⭐ `getAll`'s dictionary overload is unambiguous because **a dictionary is not a key**, and `direction` is the reason it exists. Cap: the `[EnforceRange]` count boundary, 1 subtest per file. |
+| **F16** | 🟡 [The Intercepted Verdict](480-the-intercepted-verdict.md) | **`service-workers/` — `fetch` INTERCEPTION** | capability works end to end; WPT **3/79 → 13/79** | ⚔️⚔️⚔️ | **PARTLY SECURED (Quest #489, 2026-08-06).** `FetchEvent` + `respondWith()` exist and a page is genuinely served from the Cache API for a URL with nothing behind it. ⚠️ **OPEN, and this is the next quest: interception must move into the NETWORK PATH.** Every test in the realm checks that an **iframe's own navigation and subresource loads** were intercepted; those are issued in Rust by the frame loader and never reach the JS `fetch()` this hooks. Pairs with **storage on disk**, now named by five quests. |
 | **F11** | ✅ [The Compressed Verdict](472-the-compressed-verdict.md) | **`compression/`** — `CompressionStream` / `DecompressionStream` | **676/676 (100%)** window + worker — was 4/338 / 0 | ⚔️⚔️ | **SECURED (Quest #481, 2026-08-06).** The interfaces did not exist. Pure-Rust DEFLATE + brotli; gzip framing written out. **146 subtests AHEAD of Chrome 151** on the same two variants. Caps: brotli quality fixed at 6; a stream abandoned without flush/cancel leaks its codec. |
 | **F12** | ✅ [The Routed Verdict](473-the-routed-verdict.md) | **`urlpattern/`** — the URL Pattern Standard | **1,584/1,584 (100%)** window + worker — was 17/795 / 0 | ⚔️⚔️⚔️ | **SECURED (Quest #482, 2026-08-06).** Was a four-line stub whose `test()` returned `false` — a router that silently matches nothing. Chrome 151: 756/815 (92.8%). Caps: the `v` regexp flag may reject a page regexp valid under `u`; no `URLPatternList`. |
 | **F13** | ✅ [The Registered Verdict](474-the-registered-verdict.md) | **`.any.serviceworker.html`** — the last worker variant family | see scroll — was **0 across 636 files / 8,930 subtests** | ⚔️⚔️ | **SECURED (Quest #483, 2026-08-06).** `register()` resolved `undefined`, so every file was a could-not-run. Real `ServiceWorkerGlobalScope` + the Client/container channel. **⚠️ Caps, and they are large: no `fetch` interception, no persistence, simplified lifecycle.** Also surfaced a pre-existing IndexedDB OOM that takes the whole engine down. |
@@ -315,6 +318,94 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-06 — Quests #487–#489, **The Uploaded, Aborted & Intercepted Arc** (`FileAPI` **1057/1540 → 1415/1550 (68.6% → 91.3%)** · IndexedDB `fire-*-event-exception` **0/29 → 29/29** + the `getAll` options family · service-worker **`fetch` interception exists**)
+
+*Scrolls: [`478-the-uploaded-verdict.md`](478-the-uploaded-verdict.md) · [`479-the-aborted-verdict.md`](479-the-aborted-verdict.md) · [`480-the-intercepted-verdict.md`](480-the-intercepted-verdict.md)*
+
+**A realm that did not look untouched, two blocks that had been banked twice, and
+the door onto the cupboard quest #485 built.**
+
+**⚠️ FIRST, A CORRECTION MADE IN PUBLIC.** `FileAPI` was picked as an *untouched*
+realm under the standing order — 92 files, 1,598 subtests, Chrome 99.3%, nine
+stale ledger rows. The measured baseline said **1057/1540 (68.6%)**, which is not
+untouched at all. The banner was kept because the *shape* was right — 153 of the
+missing subtests sat in one block, all at exactly zero — but the read was wrong
+and is recorded as wrong. *Measure the baseline before naming the realm, not
+after.*
+
+**#487 — ⭐⭐ `FormData` COULD NOT HOLD A FILE, AND `fetch()` STRINGIFIED EVERY
+BODY.** Two lines, one on each side of the same journey: `append(k, v)` did
+`String(v)`, so a `File` became `[object File]`; and `fetch()` did
+`String(init.body)`, so a `FormData` became `[object Object]`. **That is file
+upload, broken end to end, with nothing to search for** — no throw, no warning,
+a 200 back, and a fifteen-character label where the photo on a benefits claim or
+the scan a council office asked for should have been. `Request` had run the real
+"extract a body" algorithm since quest #459; **the `fetch()` entry point simply
+never called it.** *A realm can sit at 68% because one call site takes a shortcut
+past everything the rest of the engine already does properly.* Rebuilt `FormData`
+over one shared "create an entry"; wrote the multipart/form-data algorithm at the
+**byte level** (the old one did `TextDecoder().decode(file.bytes)` — a UTF-8 round
+trip over a photo); and added a **base64 request-body channel to `op_fetch_url`
+and `op_fetch_url_sync`** so nothing re-encodes what the reader chose to send.
+`send-file-formdata-{punctuation,controls,utf-8}` **0/45 → 45/45.**
+**🔍 `Blob.slice` takes `[Clamp] long long`, and `[Clamp]` rounds HALF TO EVEN** —
+0.5→0, 1.5→2, 2.5→2, 3.5→4; `Math.trunc` gets three of those four wrong
+(`Blob-slice` 144/150 → **150/150**). **🔍 The sequence conversion is LAZY and
+reads `@@iterator` ONCE**, and it must be driven by hand rather than with `for…of`,
+because `for…of` would call `@@iterator` *on the iterator the sequence just
+produced* — a custom one is free to return a bare `{next()}`, which is what an
+iterator IS. `_idlShape()` generalised quest #467's five-point WebIDL table and
+took the four `idlharness` files **166/383 → 351/383**; its new rule is that a
+**promise-returning operation REJECTS on a foreign `this`, it does not throw.**
+Also: `postMessage(buf, [buf])` now actually **detaches** (it was silently copying
+and leaving the sender a live handle to memory it believed it had given away);
+real `FileList` + `input.files` (there was no accessor at all, so the guard every
+upload page opens with *threw*); `FileReaderSync`; `Blob.textStream()`.
+**⚠️ AND A PLATFORM-WIDE PRIMITIVE THAT ALMOST BROKE THE PLATFORM: nothing had
+`@@toStringTag`** — `String(document.body)` was `[object Object]`, as was every
+element and every collection. Stamping every interface prototype is correct;
+stamping **`Object.prototype`** gives every object an inherited tag, so
+`Object.prototype.toString.call(fn)` answers `[object Object]` for a function, an
+array, an error — *the one property the whole brand-check idiom rests on.* The
+ECMAScript intrinsics are now an explicit deny list. It cost one measurement cycle
+to find, and the measurement is the only reason it was found.
+
+**#488 — a handler that threw did not finish, and `getAll` grew a `direction`.**
+DOM's inner invoke reports a listener's exception and carries on, but it also
+**records that it happened** (`legacyOutputDidListenersThrowFlag`) — and
+IndexedDB is the caller that must not treat the dispatch as fine. *Committing the
+half of the work a throwing handler managed is worse than committing none,
+because the page believes what it can see was saved.* **The abort takes precedence
+over `preventDefault()`**: the cancel says "I have handled this error", and an
+exception is the proof that it did not. Worst in the `upgradeneeded` case, where a
+half-built schema is **permanent** — the next open sees the new version number and
+skips the upgrade that never ran. `fire-{error,success,upgradeneeded}-event-exception`
+**0/29 → 29/29.** Then the `getAll` dictionary family: **overload resolution is
+unambiguous because a dictionary is not a key**, and **`direction` is why the
+dictionary exists** — reading the newest twenty messages used to mean stepping a
+`prev` cursor one round trip at a time. One shared walk for all six methods, whose
+ordering rule is that **uniqueness is decided in FORWARD key order and only then
+reversed**. **🔍 And a record is an INTERFACE, not a bag**: plain object literals
+scored 4/25 on `assert_class_string`; a real readonly `IDBRecord` took it to 24/25
+(`getAllRecords` **9/54 → 52/54**).
+
+**#489 — `FetchEvent`, the door onto the cupboard.** Four scrolls named this as the
+top of the leverage list. **⭐ `respondWith()` is not "return a response" — it is a
+CLAIM MADE DURING DISPATCH**, because by the time any promise settles the browser
+must already know whether to go to the network; so the flag is set synchronously
+and awaited afterwards. **A worker that claimed a request and then failed has
+produced a network error** — falling back would hand the page the very thing the
+worker meant to replace. **A worker must not intercept its own `fetch`**, or
+`caches.match(e.request) || fetch(e.request)` — the first line of every offline
+recipe — is an infinite loop. Verified end to end: a page registers a worker, and
+`fetch('/never-on-the-network-xyz')` is answered by the worker without leaving the
+device. **⚠️ BUT THE WPT NUMBER IS SMALL AND SAID SO: 3/79 → 13/79.** Every
+`service-workers/service-worker/*` test checks that an **iframe's own navigation
+and subresource loads** were intercepted, and those are issued in Rust by the
+frame loader — they never pass through the JS `fetch()` this hooks. *Interception
+has to move into the network path before that realm's numbers move.*
+
 
 ### 2026-08-06 — Quests #484–#486, **The Yielded, Cached & Locked Arc** (`IndexedDB` **879/1234 → 958/1339, engine deaths 4 → 0** · `cache-storage` **23/152 → 131/152** · `web-locks` **17/139 → 114/139** · `storage` **17/56 → 36/56**)
 

@@ -8128,7 +8128,18 @@ const _invokeListeners = function(struct, event, phase) {
             throw new TypeError("Failed to invoke event listener: 'handleEvent' is not a function");
           he.call(h, event);
         }
-      } catch (err) { _reportError(err); }
+      } catch (err) {
+        // DOM's "inner invoke" reports a listener's exception and carries on —
+        // one broken handler must not stop the others. But it also RECORDS that
+        // it happened (the spec's `legacyOutputDidListenersThrowFlag`), because
+        // some callers must not treat the dispatch as having gone fine.
+        // IndexedDB is the one that matters: a handler that threw did not finish
+        // whatever it was doing, so the transaction it was working inside must
+        // be ABORTED rather than committed. Half-applied work that the page
+        // believes was saved is the worst outcome a database can produce.
+        event._listenerThrew = true;
+        _reportError(err);
+      }
       event._inPassiveListener = false;
     }
   } finally {
@@ -8554,7 +8565,7 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
   const _useCors = !!(el && (el.crossOrigin === 'anonymous' || el.crossOrigin === 'use-credentials'));
   (async () => {
     try {
-      const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, _useCors ? "cors" : "no-cors");
+      const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, _useCors ? "cors" : "no-cors", "");
       if (el._resLoadGen !== gen) return; // superseded by a newer load
       const parsed = JSON.parse(raw);
       // Hard network failure (blocked / CORS) → no entry, fire error.
@@ -8965,11 +8976,14 @@ function _extractRequestBody(body) {
     const isHTML = ((body.contentType || '').toLowerCase() === 'text/html');
     return { text, type: isHTML ? 'text/html;charset=UTF-8' : 'application/xml;charset=UTF-8', kind: 'document' };
   }
-  // Blob/File: the blob's own type (none when the blob has no type).
+  // Blob/File: the blob's own type (none when the blob has no type). The bytes
+  // ride the `bytes` channel — a blob is a byte sequence by definition, and
+  // decoding it to a string to send it is what corrupts every non-text upload.
   if (typeof Blob !== 'undefined' && body instanceof Blob) {
+    const bytes = (body._bytes || new Uint8Array()).slice();
     let text = '';
-    try { text = new TextDecoder().decode(body._bytes || new Uint8Array()); } catch (e) {}
-    return { text, type: body.type ? body.type : null, kind: 'blob' };
+    try { text = new TextDecoder().decode(bytes); } catch (e) {}
+    return { text, bytes, type: body.type ? body.type : null, kind: 'blob' };
   }
   // BufferSource (ArrayBuffer or any ArrayBufferView): no Content-Type.
   if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
@@ -8978,19 +8992,18 @@ function _extractRequestBody(body) {
       : new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
     let text = '';
     try { text = new TextDecoder().decode(u8); } catch (e) {}
-    return { text, type: null, kind: 'buffersource' };
+    return { text, bytes: u8.slice(), type: null, kind: 'buffersource' };
   }
-  // FormData → multipart/form-data with a generated boundary.
+  // FormData → multipart/form-data with a generated boundary. Shares the ONE
+  // byte-level serializer with fetch, so an upload cannot mean two things
+  // depending on which API the page happened to use.
   if (typeof FormData !== 'undefined' && body instanceof FormData) {
     const boundary = '----ObscuraFormBoundary' + _uuidV4().replace(/-/g, '');
+    let bytes = new Uint8Array(0);
+    try { bytes = _multipartFormDataBytes(body, boundary); } catch (e) {}
     let text = '';
-    try {
-      for (const [k, v] of (body._d || [])) {
-        text += '--' + boundary + '\r\nContent-Disposition: form-data; name="' + k + '"\r\n\r\n' + v + '\r\n';
-      }
-      text += '--' + boundary + '--\r\n';
-    } catch (e) {}
-    return { text, type: 'multipart/form-data; boundary=' + boundary, kind: 'formdata' };
+    try { text = new TextDecoder().decode(bytes); } catch (e) {}
+    return { text, bytes, type: 'multipart/form-data; boundary=' + boundary, kind: 'formdata' };
   }
   // URLSearchParams → application/x-www-form-urlencoded.
   if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
@@ -9204,20 +9217,52 @@ globalThis.fetch = async (input, init = {}) => {
       url = new URL(url, base).href;
     } catch(e) { /* keep as-is if URL resolution fails */ }
   }
+  // ── The service worker gets first refusal ──────────────────────────────────
+  // Before anything touches the network. This is the single line that turns a
+  // registered worker from a background script into an offline site: the page
+  // asks for a URL, the worker is allowed to answer from a cache it filled
+  // earlier, and the request never leaves the device. On a metered or absent
+  // connection that is the difference between a page and a spinner.
+  if (typeof _swMaybeIntercept === 'function' && _swRegistrations && _swRegistrations.size > 0) {
+    const _swResp = await _swMaybeIntercept(url, init, input instanceof Request ? input : null);
+    if (_swResp !== null && _swResp !== undefined) return _swResp;
+  }
   const method = init.method || (input instanceof Request ? input.method : "GET");
   // Build a real header list even for a plain-object init: that is what VALIDATES
   // it. A value carrying a CR is not a header, it is a forged second request, and
   // `fetch()` must reject with a TypeError rather than hand it to the transport.
-  const hdrs = JSON.stringify(Object.fromEntries(_headersSortCombine(
+  let hdrs = JSON.stringify(Object.fromEntries(_headersSortCombine(
     (init.headers != null ? new Headers(init.headers) : (input instanceof Request ? input.headers : new Headers()))._list)));
-  // A body handed to `fetch(request)` lives on the REQUEST, not the init — before
-  // this, fetching a Request built with a body sent an empty one.
-  const body = init.body ? String(init.body)
-    : ((input instanceof Request && input._st.body) ? new TextDecoder().decode(input._st.body.bytes) : "");
+  // ⚠️ `fetch()` used to send `String(init.body)`, and that one call is why a
+  // FormData arrived at the server as the fifteen characters `[object Object]`,
+  // a Blob as `[object Blob]`, an ArrayBuffer as `[object ArrayBuffer]`. Only a
+  // string body was ever transmitted intact. Nothing threw; the upload
+  // "succeeded" and the far end received a label instead of a file. The Request
+  // class has run the real "extract a body" algorithm since quest #459 — this
+  // path simply never called it.
+  //
+  // A body handed to `fetch(request)` lives on the REQUEST, not the init.
+  const extracted = (init.body !== undefined && init.body !== null) ? _fetchExtractBody(init.body)
+    : ((input instanceof Request && input._st.body) ? input._st.body : null);
+  // A request body is BYTES. They travel base64 so the transport cannot re-encode
+  // them: a photo, a PDF or a zip is not UTF-8, and "decode it as text, send the
+  // text" is how an upload arrives corrupted with nothing to point at.
+  const body = "";
+  const bodyB64 = extracted ? _b64FromBytes(extracted.bytes || new Uint8Array(0)) : "";
+  // The body's implied Content-Type fills a GAP only — an author's explicit
+  // header always wins. Without this a multipart body went out with no boundary
+  // declared, which no server can parse.
+  if (extracted && extracted.type != null) {
+    const _hobj = JSON.parse(hdrs);
+    if (!Object.keys(_hobj).some((k) => k.toLowerCase() === 'content-type')) {
+      _hobj['Content-Type'] = extracted.type;
+      hdrs = JSON.stringify(_hobj);
+    }
+  }
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
   const _resStart = (globalThis.performance && performance.now) ? performance.now() : 0;
-  const _fetchPromise = Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
+  const _fetchPromise = Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, bodyB64);
   const raw = _signal
     ? await Promise.race([_fetchPromise, new Promise((_, reject) => { _signal.addEventListener('abort', () => { reject(_signal.reason !== undefined ? _signal.reason : _abortError('AbortError', 'The operation was aborted')); }); })])
     : await _fetchPromise;
@@ -9850,7 +9895,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     // GET/HEAD never carry a body (the spec discards send()'s argument).
     const _extracted = (this._method === 'GET' || this._method === 'HEAD') ? null : _extractRequestBody(body);
     _applyRequestContentType(this._headers, _extracted);
-    const _reqBody = _extracted ? _extracted.text : undefined;
+    // Hand `fetch` the exact BYTES, wrapped in a typeless Blob, rather than the
+    // original object. Re-extracting a FormData downstream would mint a SECOND
+    // boundary, and the Content-Type header this send() just wrote names the
+    // first one — a body no server could parse.
+    let _reqBody = _extracted ? _extracted.text : undefined;
+    if (_extracted && _extracted.bytes) { const _b = new Blob([]); _b._bytes = _extracted.bytes; _reqBody = _b; }
 
     // Carry an open()-time blob snapshot through to fetch via a Request.
     let _input = url;
@@ -9963,9 +10013,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
         // GET/HEAD never carry a body (the spec discards send()'s argument).
         const _extracted = (this._method === 'GET' || this._method === 'HEAD') ? null : _extractRequestBody(body);
         _applyRequestContentType(this._headers, _extracted);
-        const _reqBody = _extracted ? _extracted.text : "";
+        // Prefer the byte channel where the body HAS bytes (Blob/BufferSource/
+        // FormData): those are the bodies a text round-trip corrupts.
+        const _reqBody = (_extracted && !_extracted.bytes) ? _extracted.text : "";
+        const _reqBodyB64 = (_extracted && _extracted.bytes) ? _b64FromBytes(_extracted.bytes) : "";
         const pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
-        const raw = Deno.core.ops.op_fetch_url_sync(url, this._method, JSON.stringify(this._headers), _reqBody, pageOrigin, 'cors');
+        const raw = Deno.core.ops.op_fetch_url_sync(url, this._method, JSON.stringify(this._headers), _reqBody, pageOrigin, 'cors', _reqBodyB64);
         const p = JSON.parse(raw);
         if (p.blocked || p.corsBlocked || (p.status === 0 && p.error)) throw new Error(p.error || p.corsError || 'network error');
         status = p.status; statusText = ''; respHeaders = p.headers || {};
@@ -10233,25 +10286,12 @@ function _fetchExtractBody(body) {
   if (typeof Blob !== 'undefined' && body instanceof Blob)
     return { bytes: (body._bytes || new Uint8Array()).slice(), type: body.type ? body.type : null };
   if (typeof FormData !== 'undefined' && body instanceof FormData) {
-    // Multipart serialization. The boundary must not occur in any part; a fixed
-    // random-looking string is what every engine uses in practice.
+    // The boundary must not occur in any part; a long random token is what every
+    // engine uses in practice. Serialization is byte-level (`_multipartFormDataBytes`)
+    // — building it as a JS string first ran every file's bytes through a UTF-8
+    // round trip, which turns a photo into mojibake.
     const boundary = '----ObscuraFormBoundary' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-    let out = '';
-    for (const [name, value] of body) {
-      out += '--' + boundary + '\r\n';
-      const fname = (typeof File !== 'undefined' && value instanceof File) ? value.name : null;
-      out += 'Content-Disposition: form-data; name="' + String(name).replace(/"/g, '%22') + '"';
-      if (fname !== null) out += '; filename="' + String(fname).replace(/"/g, '%22') + '"';
-      out += '\r\n';
-      if (typeof Blob !== 'undefined' && value instanceof Blob) {
-        out += 'Content-Type: ' + (value.type || 'application/octet-stream') + '\r\n\r\n';
-        out += new TextDecoder().decode(value._bytes || new Uint8Array()) + '\r\n';
-      } else {
-        out += '\r\n' + String(value) + '\r\n';
-      }
-    }
-    out += '--' + boundary + '--\r\n';
-    return { bytes: new TextEncoder().encode(out), type: 'multipart/form-data; boundary=' + boundary };
+    return { bytes: _multipartFormDataBytes(body, boundary), type: 'multipart/form-data; boundary=' + boundary };
   }
   if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams)
     return { bytes: new TextEncoder().encode(String(body)), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
@@ -32939,15 +32979,72 @@ const _normalizeBlobType = function(t) {
   for (let i = 0; i < t.length; i++) { const c = t.charCodeAt(i); if (c < 0x20 || c > 0x7E) return ''; }
   return t.toLowerCase();
 };
+// WebIDL `[Clamp] long long`. Blob.slice's start/end carry [Clamp], and that is
+// not the same as truncation: [Clamp] rounds HALF TO EVEN, so 0.5→0, 1.5→2,
+// 2.5→2, 3.5→4. `Math.trunc` gets three of those four wrong, which is why
+// `blob.slice(1.5)` was handing back one byte too many — a fractional offset is
+// what you get from any arithmetic on a byte position, so this is not exotic.
+const _clampLongLong = function(v) {
+  const x = Number(v);
+  if (Number.isNaN(x)) return 0;
+  // The IDL range is [-2^63, 2^63-1]; the doubles below are those bounds.
+  if (x <= -9223372036854775808) return -9223372036854775808;
+  if (x >= 9223372036854775807) return 9223372036854775807;
+  const f = Math.floor(x), diff = x - f;
+  if (diff > 0.5) return f + 1;
+  if (diff < 0.5) return f;
+  return (f % 2 === 0) ? f : f + 1;
+};
+// WebIDL sequence conversion, done the way the spec orders it: step the iterator
+// and convert EACH element as it arrives. Collecting the whole list first (what
+// `Array.from` does) is observably different — a `toString` on element 0 that
+// mutates the array, or a getter on element 1 that throws, must see the world at
+// that moment, not after every element has already been read.
+//
+// A BufferSource's bytes are COPIED HERE, on the spot. That is the whole point:
+// a Blob is immutable, so writing to the array afterwards must not change what
+// the Blob holds — otherwise a blob queued for upload could be rewritten between
+// `new Blob(...)` and the request going out.
+const _blobPartsConvert = function(iterator) {
+  const out = [];
+  // Driven by hand rather than `for…of`, because `for…of` would call
+  // `@@iterator` on the ITERATOR the sequence just produced. A custom
+  // `@@iterator` is free to hand back a bare `{ next() }` — that is what an
+  // iterator IS — and demanding it be iterable itself rejects a valid one.
+  const next = iterator.next;
+  for (;;) {
+    const step = next.call(iterator);
+    if (Object(step) !== step) throw new TypeError("Failed to construct 'Blob': iterator result is not an object.");
+    if (step.done) break;
+    const part = step.value;
+    if (part instanceof Blob) out.push({ blob: part });
+    else if (ArrayBuffer.isView(part) || part instanceof ArrayBuffer) {
+      // A DETACHED buffer contributes NOTHING. Its bytes now belong to whoever it
+      // was transferred to; reading them back here would be reading memory this
+      // realm gave away — and `slice` on a detached buffer throws, so the check
+      // has to come first rather than being caught after the fact.
+      const buf = ArrayBuffer.isView(part) ? part.buffer : part;
+      if (buf.byteLength === 0 && part.byteLength === 0) out.push({ bytes: new Uint8Array(0) });
+      else if (ArrayBuffer.isView(part))
+        out.push({ bytes: new Uint8Array(buf.slice(part.byteOffset, part.byteOffset + part.byteLength)) });
+      else out.push({ bytes: new Uint8Array(part.slice(0)) });
+    }
+    else out.push({ str: String(part) });   // ToString runs NOW, in element order
+  }
+  return out;
+};
 const _blobPartsToBytes = function(parts, endings) {
   const chunks = [];
   let total = 0;
   for (const part of parts) {
     let chunk;
-    if (part instanceof Blob) chunk = part._bytes;
-    else if (ArrayBuffer.isView(part)) chunk = new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
-    else if (part instanceof ArrayBuffer) chunk = new Uint8Array(part.slice(0));
-    else { let s = String(part); if (endings === 'native') s = s.replace(/\r\n|\r|\n/g, _nativeEOL); chunk = new TextEncoder().encode(s); }
+    if (part.blob !== undefined) chunk = part.blob._bytes;
+    else if (part.bytes !== undefined) chunk = part.bytes;
+    else {
+      let s = part.str;
+      if (endings === 'native') s = s.replace(/\r\n|\r|\n/g, _nativeEOL);
+      chunk = new TextEncoder().encode(s);
+    }
     chunks.push(chunk); total += chunk.length;
   }
   const merged = new Uint8Array(total);
@@ -32961,11 +33058,20 @@ if (typeof Blob === "undefined") {
     constructor(...args) {
       let blobParts = args.length > 0 ? args[0] : undefined;
       const options = args[1];
-      if (blobParts === undefined) blobParts = [];
-      // WebIDL sequence: the value must be an Object (a primitive string is iterable
-      // but still rejected), and it must be iterable.
-      else if (Object(blobParts) !== blobParts || typeof blobParts[Symbol.iterator] !== 'function')
-        throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence.");
+      // WebIDL converts ARGUMENTS IN ORDER, so the sequence is walked before the
+      // options dictionary is even looked at — observable, because both sides can
+      // be author getters. `@@iterator` is read exactly ONCE: reading it to
+      // type-check and again to iterate is a second observable get.
+      let parts;
+      if (blobParts === undefined) parts = [];
+      else {
+        // WebIDL sequence: the value must be an Object (a primitive string is
+        // iterable but still rejected), and it must be iterable.
+        const iterFn = (Object(blobParts) === blobParts) ? blobParts[Symbol.iterator] : undefined;
+        if (typeof iterFn !== 'function')
+          throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence.");
+        parts = _blobPartsConvert(iterFn.call(blobParts));
+      }
       // WebIDL dictionary: a non-nullish, non-object options value is a TypeError.
       if (options !== undefined && options !== null && Object(options) !== options)
         throw new TypeError("Failed to construct 'Blob': The provided value is not of type 'BlobPropertyBag'.");
@@ -32973,7 +33079,7 @@ if (typeof Blob === "undefined") {
       let endings = opts.endings === undefined ? 'transparent' : String(opts.endings);
       if (endings !== 'transparent' && endings !== 'native')
         throw new TypeError("Failed to construct 'Blob': The provided value '" + endings + "' is not a valid enum value of type EndingType.");
-      this._bytes = _blobPartsToBytes(Array.from(blobParts), endings);
+      this._bytes = _blobPartsToBytes(parts, endings);
       this._type = _normalizeBlobType(opts.type);
     }
     get size() { return this._bytes.length; }
@@ -32981,8 +33087,8 @@ if (typeof Blob === "undefined") {
     get [Symbol.toStringTag]() { return 'Blob'; }
     slice(start, end, contentType) {
       const len = this._bytes.length;
-      let s = start === undefined ? 0 : Math.trunc(start) || 0;
-      let e = end === undefined ? len : Math.trunc(end) || 0;
+      let s = start === undefined ? 0 : _clampLongLong(start);
+      let e = end === undefined ? len : _clampLongLong(end);
       s = s < 0 ? Math.max(len + s, 0) : Math.min(s, len);
       e = e < 0 ? Math.max(len + e, 0) : Math.min(e, len);
       const out = new Blob([]);
@@ -32999,6 +33105,22 @@ if (typeof Blob === "undefined") {
         return new ReadableStream({ start(c) { if (bytes.length) c.enqueue(bytes.slice()); c.close(); } });
       }
       return undefined;
+    }
+    // textStream() decodes as UTF-8 and IGNORES the blob's `charset` parameter —
+    // deliberately, and it is the same rule `text()` follows. A blob's type is
+    // author-supplied metadata, not a decode instruction; honouring it would let
+    // a page's own label change what its bytes mean. (A DOCUMENT declares its
+    // encoding and is decoded accordingly — that is a different algorithm, and
+    // conflating the two is what quest #475 had to unpick.)
+    textStream() {
+      const bytes = this._bytes;
+      if (typeof ReadableStream !== 'function') return undefined;
+      return new ReadableStream({
+        start(c) {
+          if (bytes.length) c.enqueue(new TextDecoder('utf-8').decode(bytes));
+          c.close();
+        },
+      });
     }
   };
   _markNative(Blob); _markNative(Blob.prototype.slice); _markNative(Blob.prototype.text);
@@ -33022,7 +33144,325 @@ if (typeof File === "undefined") {
   };
   _markNative(File);
 }
-if (typeof FormData === "undefined") globalThis.FormData = class FormData { constructor(){this._d=[];} append(k,v){this._d.push([String(k),String(v)]);} get(k){const e=this._d.find(([a])=>a===String(k));return e?e[1]:null;} getAll(k){return this._d.filter(([a])=>a===String(k)).map(([,v])=>v);} has(k){return this._d.some(([a])=>a===String(k));} set(k,v){this.delete(k);this.append(k,v);} delete(k){this._d=this._d.filter(([a])=>a!==String(k));} keys(){return this._d.map(([k])=>k)[Symbol.iterator]();} values(){return this._d.map(([,v])=>v)[Symbol.iterator]();} entries(){return this._d.map(([k,v])=>[k,v])[Symbol.iterator]();} [Symbol.iterator](){return this.entries();} forEach(cb){this._d.forEach(([k,v])=>cb(v,k,this));} };
+// Give an ES class the shape WebIDL requires of an interface. Quest #467 wrote
+// this table out for the eight UI event interfaces and it is the same table for
+// every interface on the platform — five things a plain `class` gets wrong:
+//   1. attributes and operations must be ENUMERABLE accessors/props on the
+//      PROTOTYPE (class members are non-enumerable);
+//   2. every member must brand-throw TypeError on a foreign `this` — without it
+//      `Blob.prototype.slice.call({})` reports whatever domain error the body
+//      happens to hit, which sends a debugger after the wrong bug;
+//   3. @@toStringTag must be a DATA property (a `get [Symbol.toStringTag]()`
+//      accessor makes `String(x)` right but `Object.getOwnPropertyDescriptor`
+//      wrong, and idlharness reads the descriptor);
+//   4. the constructor's `length` counts REQUIRED arguments only;
+//   5. operations report their own `name` and `length`.
+// `arity` overrides an operation's argument count where optional arguments would
+// otherwise inflate it.
+function _idlShape(Ctor, opts) {
+  opts = opts || {};
+  const proto = Ctor.prototype;
+  const arity = opts.arity || {};
+  for (const k of Object.getOwnPropertyNames(proto)) {
+    if (k === 'constructor' || k.charCodeAt(0) === 95) continue;
+    const d = Object.getOwnPropertyDescriptor(proto, k);
+    if (d.get || d.set) {
+      if (d.get) { const g = d.get; d.get = _named('get', k, function () { if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation"); return g.call(this); }); _markNative(d.get); }
+      if (d.set) { const s = d.set; d.set = _named('set', k, function (v) { if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation"); return s.call(this, v); }); _markNative(d.set); }
+      d.enumerable = true;
+      Object.defineProperty(proto, k, d);
+      continue;
+    }
+    if (typeof d.value !== 'function') continue;
+    const inner = d.value;
+    // A PROMISE-RETURNING operation REJECTS on a foreign `this`; it does not
+    // throw. WebIDL is explicit about this and it is not pedantry: an author who
+    // wrote `.catch()` and nothing else would get an uncaught exception out of a
+    // call they had already promised to handle.
+    const isPromise = (opts.promiseOps || []).indexOf(k) >= 0;
+    d.value = isPromise
+      ? function (...args) {
+          if (!(this instanceof Ctor)) return Promise.reject(new TypeError("Illegal invocation"));
+          try { return inner.apply(this, args); } catch (e) { return Promise.reject(e); }
+        }
+      : function (...args) {
+          if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+          return inner.apply(this, args);
+        };
+    Object.defineProperty(d.value, 'name', { value: k, configurable: true });
+    Object.defineProperty(d.value, 'length', { value: (k in arity) ? arity[k] : inner.length, configurable: true });
+    _markNative(d.value);
+    d.enumerable = true;
+    Object.defineProperty(proto, k, d);
+  }
+  Object.defineProperty(proto, Symbol.toStringTag,
+    { value: opts.tag || Ctor.name, writable: false, enumerable: false, configurable: true });
+  if (opts.ctorLength !== undefined)
+    Object.defineProperty(Ctor, 'length', { value: opts.ctorLength, configurable: true });
+  _markNative(Ctor);
+  if (opts.expose !== false) _exposeIface(Ctor.name, Ctor);
+}
+// A `get [Symbol.toStringTag]()` accessor on the class body would survive as an
+// accessor and shadow the data property _idlShape installs; drop it first.
+delete Blob.prototype[Symbol.toStringTag];
+delete File.prototype[Symbol.toStringTag];
+// `slice` takes three optional arguments, so its length is 0; `Blob()` takes none.
+_idlShape(Blob, { ctorLength: 0, promiseOps: ['text', 'arrayBuffer', 'bytes'],
+  arity: { slice: 0, text: 0, arrayBuffer: 0, bytes: 0, stream: 0, textStream: 0 } });
+_idlShape(File, { ctorLength: 2 });
+
+// FileList — the object an `<input type=file>` hands back. It is a LEGACY
+// indexed collection, not an array: the numeric properties must be real own
+// properties (`files[0]`), `length` must be an accessor, and `item()` must answer
+// null past the end rather than undefined, because that is the difference a page
+// tests when it asks "did the reader pick a file?".
+if (typeof FileList === 'undefined' || !FileList.prototype || typeof FileList.prototype.item !== 'function') {
+  const _allowFileList = { on: false };
+  globalThis.FileList = class FileList {
+    constructor() {
+      if (!_allowFileList.on) throw new TypeError("Illegal constructor");
+      Object.defineProperty(this, '_files', { value: [], writable: true, configurable: true });
+    }
+    get length() { return this._files.length; }
+    item(index) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'item' on 'FileList': 1 argument required, but only 0 present.");
+      const i = Math.trunc(Number(index)) || 0;
+      return (i >= 0 && i < this._files.length) ? this._files[i] : null;
+    }
+    *[Symbol.iterator]() { for (let i = 0; i < this._files.length; i++) yield this._files[i]; }
+  };
+  _idlShape(FileList, { ctorLength: 0, arity: { item: 1 } });
+  // Internal constructor: a FileList is created by the engine when a file control
+  // gains files, never by page script.
+  globalThis._newFileList = function(files) {
+    _allowFileList.on = true;
+    let fl;
+    try { fl = new FileList(); } finally { _allowFileList.on = false; }
+    fl._files = Array.from(files || []);
+    for (let i = 0; i < fl._files.length; i++)
+      Object.defineProperty(fl, i, { value: fl._files[i], writable: false, enumerable: true, configurable: true });
+    return fl;
+  };
+}
+
+// FileReaderSync — [Exposed=(DedicatedWorker,SharedWorker)]. It exists because a
+// worker has no UI to block: the whole reason to move a file read off the page's
+// thread is to be allowed to wait for it. Deliberately NOT installed as a page
+// global — `_newWorkerScope` hands it to the scopes that are allowed to have it,
+// so `'FileReaderSync' in self` stays false on a Window and true in a worker.
+class FileReaderSync {
+  constructor() {}
+  readAsArrayBuffer(blob) { return _syncBlobBytes(blob, 'readAsArrayBuffer').buffer.slice(0); }
+  readAsBinaryString(blob) {
+    const b = _syncBlobBytes(blob, 'readAsBinaryString');
+    let s = '';
+    for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return s;
+  }
+  readAsText(blob, encoding) {
+    return _fileReadText(_syncBlobBytes(blob, 'readAsText'), blob.type || '', encoding);
+  }
+  readAsDataURL(blob) {
+    const b = _syncBlobBytes(blob, 'readAsDataURL');
+    return 'data:' + (blob.type || 'application/octet-stream') + ';base64,' + _b64FromBytes(b);
+  }
+}
+// FileAPI §"read a Blob as text": the encoding to use is the explicit argument,
+// else the blob type's `charset` parameter, else UTF-8 — and an unrecognised
+// label at either step falls through rather than failing. Shared by the async
+// FileReader and FileReaderSync so the two cannot answer differently about the
+// same bytes.
+function _fileReadText(bytes, type, encoding) {
+  let label = (encoding !== undefined && encoding !== null && String(encoding) !== '') ? String(encoding) : null;
+  if (label === null || !_getEncodingName(label)) {
+    label = null;
+    const m = /;\s*charset\s*=\s*"?([^";]*)"?/i.exec(type || '');
+    if (m && _getEncodingName(m[1].trim())) label = m[1].trim();
+  }
+  let dec;
+  try { dec = new TextDecoder(label || 'utf-8'); } catch (e) { dec = new TextDecoder('utf-8'); }
+  return dec.decode(bytes);
+}
+function _syncBlobBytes(blob, op) {
+  if (!(typeof Blob !== 'undefined' && blob instanceof Blob))
+    throw new TypeError("Failed to execute '" + op + "' on 'FileReaderSync': parameter 1 is not of type 'Blob'.");
+  return blob._bytes || new Uint8Array(0);
+}
+_idlShape(FileReaderSync, { ctorLength: 0, expose: false,
+  arity: { readAsArrayBuffer: 1, readAsBinaryString: 1, readAsText: 1, readAsDataURL: 1 } });
+// ── FormData (XHR §interface-formdata) ────────────────────────────────────────
+// The old implementation was one line, and the line that mattered was
+// `append(k, v) { this._d.push([String(k), String(v)]) }`. That is not a small
+// inaccuracy — it means **a FormData cannot hold a file**. Every file a page
+// tried to upload became the eleven characters `[object File]`: the attachment on
+// a job application, the photo on a benefits claim, the scan of a document a
+// council office asked for. It threw nothing and logged nothing; the upload
+// "succeeded" and the far end received a string. Everything below exists so the
+// bytes the reader chose are the bytes the server receives.
+//
+// A USVString: lone surrogates are not text, and a byte sequence built from one
+// is not something a server can decode. WebIDL folds them to U+FFFD rather than
+// letting an unpaired half through.
+const _fdScalar = function(s) { return String(s).replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/g,
+  (m) => (m.length === 2 ? m[0] + '�' : '�')); };
+// "create an entry" — the ONE place a value becomes an entry, so the Blob→File
+// promotion happens exactly once and `append`, `set` and form submission cannot
+// drift apart. A bare Blob has no name, and a multipart part without a filename
+// is a text field, not a file: the spec names it `blob` so the part is still a
+// file part. A File appended WITH a filename is re-wrapped, because the name the
+// caller passed at the call site is the name they meant to send.
+const _fdCreateEntry = function(name, value, filename, hasFilename) {
+  name = _fdScalar(name);
+  if (typeof Blob !== 'undefined' && value instanceof Blob) {
+    const isFile = (typeof File !== 'undefined' && value instanceof File);
+    if (!isFile || hasFilename) {
+      const fn = hasFilename ? _fdScalar(filename) : (isFile ? value.name : 'blob');
+      const opts = { type: value.type };
+      if (isFile) opts.lastModified = value.lastModified;
+      value = new File([value], fn, opts);
+    }
+  } else {
+    value = _fdScalar(value);
+  }
+  return [name, value];
+};
+if (typeof FormData === "undefined") {
+  globalThis.FormData = class FormData {
+    constructor(form, submitter) {
+      this._d = [];
+      // new FormData(form) collects the form's current controls. Our form model
+      // hands back name/value pairs; a file control contributes its File objects.
+      if (form != null) {
+        if (!(form && form.nodeType === 1 && String(form.tagName).toUpperCase() === 'FORM'))
+          throw new TypeError("Failed to construct 'FormData': parameter 1 is not of type 'HTMLFormElement'.");
+        try { for (const [k, v] of _formEntryList(form, submitter)) this._d.push(_fdCreateEntry(k, v, undefined, false)); }
+        catch (e) {}
+      }
+    }
+    append(name, value, filename) {
+      if (arguments.length < 2) throw new TypeError("Failed to execute 'append' on 'FormData': 2 arguments required, but only " + arguments.length + " present.");
+      // The 3-argument overload is Blob-only: `append(name, "text", "file.txt")`
+      // has no meaning, and silently accepting it would hide the author's bug.
+      if (arguments.length > 2 && !(typeof Blob !== 'undefined' && value instanceof Blob))
+        throw new TypeError("Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'.");
+      this._d.push(_fdCreateEntry(name, value, filename, arguments.length > 2));
+    }
+    set(name, value, filename) {
+      if (arguments.length < 2) throw new TypeError("Failed to execute 'set' on 'FormData': 2 arguments required, but only " + arguments.length + " present.");
+      if (arguments.length > 2 && !(typeof Blob !== 'undefined' && value instanceof Blob))
+        throw new TypeError("Failed to execute 'set' on 'FormData': parameter 2 is not of type 'Blob'.");
+      const entry = _fdCreateEntry(name, value, filename, arguments.length > 2);
+      // `set` REPLACES IN PLACE: the first match keeps its position and the rest
+      // go. Appending instead would silently reorder a form, and multipart order
+      // is what a server reads a form back in.
+      const i = this._d.findIndex(([k]) => k === entry[0]);
+      if (i < 0) { this._d.push(entry); return; }
+      this._d[i] = entry;
+      this._d = this._d.filter((e, j) => j <= i || e[0] !== entry[0]);
+    }
+    get(name) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'get' on 'FormData': 1 argument required, but only 0 present.");
+      const n = _fdScalar(name);
+      const e = this._d.find(([k]) => k === n);
+      return e ? e[1] : null;
+    }
+    getAll(name) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'getAll' on 'FormData': 1 argument required, but only 0 present.");
+      const n = _fdScalar(name);
+      return this._d.filter(([k]) => k === n).map(([, v]) => v);
+    }
+    has(name) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'has' on 'FormData': 1 argument required, but only 0 present.");
+      const n = _fdScalar(name);
+      return this._d.some(([k]) => k === n);
+    }
+    delete(name) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'delete' on 'FormData': 1 argument required, but only 0 present.");
+      const n = _fdScalar(name);
+      this._d = this._d.filter(([k]) => k !== n);
+    }
+    // The iterators walk a LIVE list: a delete during iteration must not resurrect
+    // a removed entry, which a snapshot copy would do.
+    *entries() { for (let i = 0; i < this._d.length; i++) yield [this._d[i][0], this._d[i][1]]; }
+    *keys() { for (let i = 0; i < this._d.length; i++) yield this._d[i][0]; }
+    *values() { for (let i = 0; i < this._d.length; i++) yield this._d[i][1]; }
+    forEach(cb, thisArg) {
+      if (typeof cb !== 'function') throw new TypeError("Failed to execute 'forEach' on 'FormData': parameter 1 is not of type 'Function'.");
+      for (let i = 0; i < this._d.length; i++) cb.call(thisArg, this._d[i][1], this._d[i][0], this);
+    }
+    get [Symbol.toStringTag]() { return 'FormData'; }
+  };
+  Object.defineProperty(FormData.prototype, Symbol.iterator,
+    { value: FormData.prototype.entries, writable: true, enumerable: false, configurable: true });
+  _markNative(FormData);
+  for (const m of ['append', 'set', 'get', 'getAll', 'has', 'delete', 'entries', 'keys', 'values', 'forEach'])
+    _markNative(FormData.prototype[m]);
+}
+// Best-effort entry list for `new FormData(form)`: the named, non-disabled
+// controls, with a file input contributing its selected File objects.
+function _formEntryList(form, submitter) {
+  const out = [];
+  const controls = form.querySelectorAll ? form.querySelectorAll('input,select,textarea,button') : [];
+  for (const el of controls) {
+    const name = el.getAttribute ? el.getAttribute('name') : null;
+    if (!name || el.disabled) continue;
+    const tag = String(el.tagName || '').toUpperCase();
+    const type = (tag === 'INPUT' ? String(el.type || 'text').toLowerCase() : '');
+    if (type === 'submit' || type === 'button' || type === 'image' || tag === 'BUTTON') {
+      if (el !== submitter) continue;
+    }
+    if ((type === 'checkbox' || type === 'radio') && !el.checked) continue;
+    if (type === 'file') {
+      const files = el.files || [];
+      // A file control with nothing chosen still contributes ONE empty part —
+      // otherwise the server cannot tell "no file" from "field absent".
+      if (files.length === 0) out.push([name, new File([], '', { type: 'application/octet-stream' })]);
+      else for (const f of files) out.push([name, f]);
+      continue;
+    }
+    out.push([name, el.value != null ? el.value : '']);
+  }
+  return out;
+}
+// The multipart/form-data encoding algorithm (HTML §multipart-form-data), at the
+// BYTE level. Two rules the old string-concatenating version got wrong, and both
+// corrupt real uploads:
+//   • newlines in a NAME or a string VALUE are normalized to CRLF, but a
+//     FILENAME is not — a filename is a name, not a line of text;
+//   • `"`, CR and LF are escaped to %22/%0D/%0A in the name and filename only.
+//     An unescaped `"` ends the quoted string early, which is how a crafted
+//     filename smuggles a second header into someone else's request.
+const _mpNormalizeNewlines = (s) => String(s).replace(/\r(?!\n)|(?<!\r)\n/g, '\r\n');
+const _mpEscape = (s) => String(s).replace(/"/g, '%22').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+function _multipartFormDataBytes(fd, boundary) {
+  const enc = new TextEncoder();
+  const chunks = [];
+  const push = (s) => chunks.push(enc.encode(s));
+  for (const [rawName, value] of (fd._d || [])) {
+    const name = _mpEscape(_mpNormalizeNewlines(rawName));
+    push('--' + boundary + '\r\n');
+    if (typeof Blob !== 'undefined' && value instanceof Blob) {
+      const filename = _mpEscape((typeof File !== 'undefined' && value instanceof File) ? value.name : 'blob');
+      push('Content-Disposition: form-data; name="' + name + '"; filename="' + filename + '"\r\n');
+      push('Content-Type: ' + (value.type || 'application/octet-stream') + '\r\n\r\n');
+      // The file's bytes go through VERBATIM. Decoding them to a string first is
+      // what turns a PNG into mojibake for anything that is not valid UTF-8.
+      chunks.push((value._bytes || new Uint8Array(0)).slice());
+      push('\r\n');
+    } else {
+      push('Content-Disposition: form-data; name="' + name + '"\r\n\r\n');
+      push(_mpNormalizeNewlines(value));
+      push('\r\n');
+    }
+  }
+  push('--' + boundary + '--\r\n');
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
 // decodeURIComponent throws on a malformed % sequence; WHATWG form/percent
 // decoding keeps invalid sequences literal. Best-effort + never throws.
 const _safeDecodeURIComponent = function(s) {
@@ -39017,6 +39457,24 @@ function _cvReflLong(proto, prop, attr) {
   for (const P of [Input, Textarea]) { _cvReflBool(P, "readOnly", "readonly"); _cvReflLong(P, "maxLength", "maxlength"); _cvReflLong(P, "minLength", "minlength"); }
   _cvReflBool(Input, "multiple", "multiple");
   _cvReflBool(Select, "multiple", "multiple");
+  // `input.files` — a real FileList for a file control, null for every other
+  // type. There was no accessor at all, so `input.files` read `undefined`, and
+  // the guard every upload page opens with (`if (input.files.length)`) threw
+  // instead of reporting "nothing chosen". The list is EMPTY, not absent: this
+  // engine cannot open a file picker, but "no file selected yet" is the honest
+  // state of a control nobody has touched, and it is the state pages branch on.
+  Object.defineProperty(Input, 'files', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'files', function () {
+      if (String(this.type || '').toLowerCase() !== 'file') return null;
+      if (!this.__files) Object.defineProperty(this, '__files', { value: _newFileList([]), writable: true, configurable: true });
+      return this.__files;
+    }),
+    set: _named('set', 'files', function (v) {
+      if (String(this.type || '').toLowerCase() !== 'file') return;
+      Object.defineProperty(this, '__files', { value: (v == null ? _newFileList([]) : v), writable: true, configurable: true });
+    }),
+  });
   _cvReflStr(Input, "pattern", "pattern");
   _cvReflStr(Input, "min", "min");
   _cvReflStr(Input, "max", "max");
@@ -43890,10 +44348,18 @@ function _idbHandlerProp(proto, name) {
   });
 }
 // Fire an event at an IDB object and report whether it went uncancelled.
+// `_idbFireThrew` carries the spec's `legacyOutputDidListenersThrowFlag` back to
+// the caller — IDB §"fire a success event"/"fire an error event" both end with
+// "if that flag is true, abort the transaction with an AbortError", and it is
+// the ONE piece of information a boolean return cannot carry.
+let _idbFireThrew = false;
+const _idbAbortError = () => new DOMException("The transaction was aborted, so the request cannot be fulfilled.", "AbortError");
 function _idbFire(target, type, bubbles, cancelable, ctor, init) {
   const ev = ctor ? new ctor(type, init) : new Event(type, { bubbles: !!bubbles, cancelable: !!cancelable });
   ev._isTrusted = true;
-  return _dispatchSpec(target, ev, false);
+  const notCanceled = _dispatchSpec(target, ev, false);
+  _idbFireThrew = !!ev._listenerThrew;
+  return notCanceled;
 }
 
 class IDBVersionChangeEvent extends Event {
@@ -44137,13 +44603,20 @@ function _idbRunTx(tx) {
       // An `error` event that nobody cancels aborts the transaction — that
       // default action is the whole safety net of IDB.
       const notCanceled = _idbFire(req, 'error', true, true);
+      const threw = _idbFireThrew;
       if (tx._state === 'finished') return;
+      // A handler that THREW aborts even when it called preventDefault() first —
+      // the cancel says "I have handled this error", and an exception is the
+      // proof that it did not.
+      if (threw) { _idbAbortTx(tx, _idbAbortError()); return; }
       if (notCanceled) { _idbAbortTx(tx, req._error); return; }
     } else {
       req._result = result;
       req._error = null;
       _idbFire(req, 'success', false, false);
+      const threw = _idbFireThrew;
       if (tx._state === 'finished') return;
+      if (threw) { _idbAbortTx(tx, _idbAbortError()); return; }
     }
   }
   // Nothing queued — but a promise continuation may still be on its way to
@@ -44437,31 +44910,26 @@ class IDBObjectStore {
   }
   getAll(query, count) {
     const store = _idbCheckRead(this);
-    const range = _idbToRange(query, true);
-    const n = _idbCount(count);
-    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
-      const out = [];
-      for (const r of store.records) {
-        if (!_idbInRange(range, r.key)) continue;
-        out.push(_idbCloneOut(r.value));
-        if (out.length >= n) break;
-      }
-      return out;
-    });
+    const args = _idbGetAllArgs(query, count);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () =>
+      _idbCollect(store.records, args, (r) => r.key, (r) => _idbCloneOut(r.value)));
   }
   getAllKeys(query, count) {
     const store = _idbCheckRead(this);
-    const range = _idbToRange(query, true);
-    const n = _idbCount(count);
-    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () => {
-      const out = [];
-      for (const r of store.records) {
-        if (!_idbInRange(range, r.key)) continue;
-        out.push(_idbKeyValue(r.key));
-        if (out.length >= n) break;
-      }
-      return out;
-    });
+    const args = _idbGetAllArgs(query, count);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () =>
+      _idbCollect(store.records, args, (r) => r.key, (r) => _idbKeyValue(r.key)));
+  }
+  // getAllRecords() answers key + primaryKey + value in ONE request. On an object
+  // store those first two are the same, but the shape is what matters: reading
+  // keys and values used to mean two passes over the same rows, and the pair
+  // could disagree if anything wrote between them.
+  getAllRecords(options) {
+    const store = _idbCheckRead(this);
+    const args = _idbGetAllArgs(options, undefined);
+    return _idbEnqueue(this._tx, _mkRequest(this, this._tx), () =>
+      _idbCollect(store.records, args, (r) => r.key,
+        (r) => _mkIDBRecord(_idbKeyValue(r.key), _idbKeyValue(r.key), _idbCloneOut(r.value))));
   }
   count(query) {
     const store = _idbCheckRead(this);
@@ -44559,6 +45027,91 @@ function _idbCount(count) {
   if (!Number.isFinite(n) || n < 0) return Infinity;
   const u = n >>> 0;
   return u === 0 ? Infinity : u;
+}
+
+// ---- IDBGetAllOptions ------------------------------------------------------
+// `getAll()`/`getAllKeys()` grew a dictionary overload, and `getAllRecords()` is
+// dictionary-only. Overload resolution is unambiguous because a DICTIONARY IS
+// NOT A KEY: the valid key types are number, string, Date, ArrayBuffer,
+// ArrayBufferView and Array, so an ordinary object can only ever have been meant
+// as the options bag.
+//
+// `direction` is why the dictionary exists. Reading the last N rows used to mean
+// opening a `prev` cursor and stepping it one round trip at a time; `getAll`
+// could only ever read forward from the start. On a slow machine that is the
+// difference between a chat log that opens and one that spins — you want the
+// newest twenty messages, not the oldest twenty thousand.
+// A record is a real interface, not a bag — `key`, `primaryKey` and `value` are
+// readonly, because a record is a report of what is stored, and a page that
+// rewrote `record.key` would be describing a row that does not exist.
+let _allowIDBRecordCtor = false;
+class IDBRecord {
+  constructor() { if (!_allowIDBRecordCtor) throw new TypeError("Illegal constructor"); }
+  get key() { if (!(this instanceof IDBRecord)) throw new TypeError("Illegal invocation"); return this._key; }
+  get primaryKey() { if (!(this instanceof IDBRecord)) throw new TypeError("Illegal invocation"); return this._primaryKey; }
+  get value() { if (!(this instanceof IDBRecord)) throw new TypeError("Illegal invocation"); return this._value; }
+  get [Symbol.toStringTag]() { return 'IDBRecord'; }
+}
+_enumAccessors(IDBRecord.prototype, 'key', 'primaryKey', 'value');
+Object.defineProperty(IDBRecord.prototype, Symbol.toStringTag,
+  { value: 'IDBRecord', writable: false, enumerable: false, configurable: true });
+_exposeIface('IDBRecord', IDBRecord);
+function _mkIDBRecord(key, primaryKey, value) {
+  _allowIDBRecordCtor = true;
+  let r;
+  try { r = new IDBRecord(); } finally { _allowIDBRecordCtor = false; }
+  Object.defineProperty(r, '_key', { value: key, configurable: true });
+  Object.defineProperty(r, '_primaryKey', { value: primaryKey, configurable: true });
+  Object.defineProperty(r, '_value', { value: value, configurable: true });
+  return r;
+}
+function _idbIsOptionsDict(v) {
+  if (v === null || typeof v !== 'object') return false;
+  if (v instanceof IDBKeyRange) return false;
+  if (v instanceof Date || Array.isArray(v)) return false;
+  if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) return false;
+  return true;
+}
+// Returns { range, count, direction }. `queryOrOptions` is either the legacy
+// positional query or the dictionary; `count` is only read in the legacy form,
+// because a dictionary that also took a positional count would have two places
+// to say the same thing.
+function _idbGetAllArgs(queryOrOptions, count) {
+  if (_idbIsOptionsDict(queryOrOptions)) {
+    const o = queryOrOptions;
+    let direction = (o.direction === undefined) ? 'next' : String(o.direction);
+    if (_IDB_DIRECTIONS.indexOf(direction) < 0)
+      throw new TypeError("Failed to read the 'direction' property from 'IDBGetAllOptions': The provided value '" +
+        direction + "' is not a valid enum value of type IDBCursorDirection.");
+    return { range: _idbToRange(o.query, true), count: _idbCount(o.count), direction };
+  }
+  return { range: _idbToRange(queryOrOptions, true), count: _idbCount(count), direction: 'next' };
+}
+// Walk a sorted record list under a direction, calling `emit` per surviving
+// record until `count` are collected. `unique` skips runs of equal KEYS — which
+// on an index is what makes "one row per distinct value" a single request.
+function _idbCollect(records, { range, count, direction }, keyOf, emit) {
+  const reverse = (direction === 'prev' || direction === 'prevunique');
+  const unique = (direction === 'nextunique' || direction === 'prevunique');
+  const out = [];
+  // Uniqueness is decided in FORWARD key order and only then reversed — the
+  // first record of each key run is the one a `nextunique` cursor would stop
+  // at, and `prevunique` visits those same records backwards.
+  const matched = [];
+  let lastKey;
+  for (const r of records) {
+    const k = keyOf(r);
+    if (!_idbInRange(range, k)) continue;
+    if (unique && matched.length && _idbCmp(lastKey, k) === 0) continue;
+    lastKey = k;
+    matched.push(r);
+  }
+  if (reverse) matched.reverse();
+  for (const r of matched) {
+    out.push(emit(r));
+    if (out.length >= count) break;
+  }
+  return out;
 }
 function _idbCheckRead(os) {
   if (os._store.deleted) throw new DOMException("The object store has been deleted.", "InvalidStateError");
@@ -44672,31 +45225,27 @@ class IDBIndex {
   }
   getAll(query, count) {
     const ix = _idbCheckIndex(this);
-    const range = _idbToRange(query, true);
-    const n = _idbCount(count);
-    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () => {
-      const out = [];
-      for (const r of ix.records) {
-        if (!_idbInRange(range, r.key)) continue;
-        out.push(_idbCloneOut(_idbLookup(ix.store, r.primaryKey)));
-        if (out.length >= n) break;
-      }
-      return out;
-    });
+    const args = _idbGetAllArgs(query, count);
+    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () =>
+      _idbCollect(ix.records, args, (r) => r.key, (r) => _idbCloneOut(_idbLookup(ix.store, r.primaryKey))));
+  }
+  // On an INDEX the three fields genuinely differ: `key` is the indexed value,
+  // `primaryKey` identifies the row, `value` is the row. That is exactly the
+  // triple a "sort by column, show the rows" screen needs, and it is why this
+  // method exists at all.
+  getAllRecords(options) {
+    const ix = _idbCheckIndex(this);
+    const args = _idbGetAllArgs(options, undefined);
+    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () =>
+      _idbCollect(ix.records, args, (r) => r.key,
+        (r) => _mkIDBRecord(_idbKeyValue(r.key), _idbKeyValue(r.primaryKey),
+                            _idbCloneOut(_idbLookup(ix.store, r.primaryKey)))));
   }
   getAllKeys(query, count) {
     const ix = _idbCheckIndex(this);
-    const range = _idbToRange(query, true);
-    const n = _idbCount(count);
-    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () => {
-      const out = [];
-      for (const r of ix.records) {
-        if (!_idbInRange(range, r.key)) continue;
-        out.push(_idbKeyValue(r.primaryKey));
-        if (out.length >= n) break;
-      }
-      return out;
-    });
+    const args = _idbGetAllArgs(query, count);
+    return _idbEnqueue(this._os._tx, _mkRequest(this, this._os._tx), () =>
+      _idbCollect(ix.records, args, (r) => r.key, (r) => _idbKeyValue(r.primaryKey)));
   }
   count(query) {
     const ix = _idbCheckIndex(this);
@@ -45020,6 +45569,11 @@ function _idbRunOpen(req, name, requested) {
     // handler still gets a live transaction (see _idbAfterCheckpoint).
     tx._state = 'active';
     _idbFire(req, 'upgradeneeded', false, false, IDBVersionChangeEvent, { oldVersion, newVersion: version });
+    // An `upgradeneeded` handler that threw did not finish building the schema.
+    // Committing a half-built one is worse than not upgrading at all: the next
+    // open sees the new version number and skips the upgrade that never ran, so
+    // the database is permanently missing a store nothing will ever create.
+    if (_idbFireThrew) { _idbAbortTx(tx, _idbAbortError()); return; }
     _idbScheduleTx(tx);
   };
   if (blocked) {
@@ -45992,6 +46546,10 @@ const _newWorkerScope = function(Ctor, url, name) {
   def(Ctor.name, Ctor);
   def('WorkerLocation', WorkerLocation);
   def('WorkerNavigator', WorkerNavigator);
+  // [Exposed=(DedicatedWorker,SharedWorker)] — handed to the scope rather than
+  // left on the page global, so `'FileReaderSync' in self` answers honestly on
+  // both sides. A ServiceWorker does NOT get it: it must never block.
+  if (Ctor !== ServiceWorkerGlobalScope) def('FileReaderSync', FileReaderSync);
   Object.defineProperty(scope, '_location', { value: loc, enumerable: false, configurable: true });
   Object.defineProperty(scope, '_navigator', { value: nav, enumerable: false, configurable: true });
   Object.defineProperty(scope, '_wname', { value: name || '', enumerable: false, configurable: true });
@@ -46065,7 +46623,7 @@ const _workerFetchScriptSync = function(url) {
   let p;
   try {
     const pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
-    p = JSON.parse(Deno.core.ops.op_fetch_url_sync(url, 'GET', '{}', "", pageOrigin, 'cors'));
+    p = JSON.parse(Deno.core.ops.op_fetch_url_sync(url, 'GET', '{}', "", pageOrigin, 'cors', ""));
   } catch (e) {
     throw new DOMException("Failed to load worker script: " + url, 'NetworkError');
   }
@@ -46288,10 +46846,21 @@ class MessagePort extends EventTarget {
     if (arguments.length < 1)
       throw new TypeError("Failed to execute 'postMessage' on 'MessagePort': 1 argument required, but only 0 present.");
     const m = this._mp;
-    // A disentangled port silently discards — postMessage into nowhere is not an
-    // error, it is a no-op (HTML §message-port-post-message-steps step 7).
+    // The second argument is either a transfer LIST or an options dict holding
+    // one. Both spellings are in the wild and `postMessage(buf, [buf])` is the
+    // older, more common one — ignoring it meant the buffer was silently COPIED
+    // and left attached, so the sender kept a live handle to memory it believed
+    // it had given away. Two owners of one buffer is the bug transfer exists to
+    // prevent.
+    const transfer = Array.isArray(transferOrOptions) ? transferOrOptions
+      : (transferOrOptions && transferOrOptions.transfer) || [];
+    // The transfer happens even when there is nobody listening: `postMessage`
+    // into a disentangled port is a no-op for DELIVERY (HTML
+    // §message-port-post-message-steps step 7), but the sender's buffer is gone
+    // either way — that is what it asked for.
+    const cloned = structuredClone(message, { transfer });
     if (m.closed || !m.peer) return;
-    _portEnqueue(m.peer, structuredClone(message));
+    _portEnqueue(m.peer, cloned);
   }
   start() {
     if (!(this instanceof MessagePort)) throw new TypeError("Illegal invocation");
@@ -46466,11 +47035,14 @@ _markNative(MessagePort.prototype.close); _markNative(SharedWorkerGlobalScope.pr
 // page listens on `navigator.serviceWorker`, not on any worker object. Getting
 // that pair of directions right is the whole of the plumbing below.
 //
-// HONESTLY NOT HERE, and named in the scroll: `fetch` event interception (the
-// offline story itself), the install/waiting/activate lifecycle's real ordering
-// rules, and persistence across page loads. A page that registers a worker and
-// talks to it gets the real thing; a page that expects to serve a cached
-// response from one does not, yet.
+// `fetch` event interception IS here now (see FetchEvent below) — a worker can
+// answer its page's requests from the Cache API, which is the offline story.
+// HONESTLY NOT HERE, and named in the scroll: PERSISTENCE (a registration and
+// its caches live only as long as the page's JS realm, so the second visit —
+// the one offline mode is FOR — starts empty); the install/waiting/activate
+// lifecycle's real ordering rules including `skipWaiting`/`clients.claim`; and
+// interception of SUBRESOURCE and NAVIGATION loads, which are issued in Rust and
+// never pass through the JS `fetch()` this hooks.
 let _allowSWCtor = false;
 const _swOrigin = function() {
   try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ''; }
@@ -46491,6 +47063,122 @@ class ExtendableEvent extends Event {
   get [Symbol.toStringTag]() { return 'ExtendableEvent'; }
 }
 _enumAccessors(ExtendableEvent.prototype, 'waitUntil');
+
+// ── FetchEvent — the offline story itself ────────────────────────────────────
+// This is the event that lets a page answer its own requests. Without it a
+// service worker is a background script with a message channel; with it, a site
+// keeps working on a train, in a blackout, on a prepaid connection that ran out
+// — because the page it needs was already on the device and something was
+// allowed to say so.
+//
+// ⭐ `respondWith()` is not "return a response" — it is a CLAIM MADE DURING
+// DISPATCH. The worker must stake it while the event is being handled, because
+// by the time any promise it returns settles, the browser has to already know
+// whether to go to the network. So the flag is set synchronously and the promise
+// is awaited afterwards; calling it twice, or after the handler has returned, is
+// an InvalidStateError rather than a silent second answer.
+class FetchEvent extends ExtendableEvent {
+  constructor(type, init) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'FetchEvent': 1 argument required, but only 0 present.");
+    const o = (init == null) ? {} : init;
+    super(type, o);
+    if (o.request === undefined)
+      throw new TypeError("Failed to construct 'FetchEvent': required member request is undefined.");
+    Object.defineProperty(this, '_request', { value: o.request, configurable: true });
+    Object.defineProperty(this, '_clientId', { value: o.clientId === undefined ? '' : String(o.clientId), configurable: true });
+    Object.defineProperty(this, '_resultingClientId', { value: o.resultingClientId === undefined ? '' : String(o.resultingClientId), configurable: true });
+    Object.defineProperty(this, '_replacesClientId', { value: o.replacesClientId === undefined ? '' : String(o.replacesClientId), configurable: true });
+    // `_respondPromise` is what the network path awaits; `_dispatchDone` closes
+    // the window in which respondWith() may still be called.
+    Object.defineProperty(this, '_respondPromise', { value: null, writable: true, configurable: true });
+    Object.defineProperty(this, '_dispatchDone', { value: false, writable: true, configurable: true });
+    Object.defineProperty(this, '_handledResolve', { value: null, writable: true, configurable: true });
+    Object.defineProperty(this, '_handledReject', { value: null, writable: true, configurable: true });
+    Object.defineProperty(this, '_handled', { value: new Promise((res, rej) => { this._handledResolve = res; this._handledReject = rej; }), configurable: true });
+    // Nobody may be listening for `handled`; an unobserved rejection is not an
+    // error the page made.
+    this._handled.catch(() => {});
+  }
+  get request() { if (!(this instanceof FetchEvent)) throw new TypeError("Illegal invocation"); return this._request; }
+  get clientId() { if (!(this instanceof FetchEvent)) throw new TypeError("Illegal invocation"); return this._clientId; }
+  get resultingClientId() { if (!(this instanceof FetchEvent)) throw new TypeError("Illegal invocation"); return this._resultingClientId; }
+  get replacesClientId() { if (!(this instanceof FetchEvent)) throw new TypeError("Illegal invocation"); return this._replacesClientId; }
+  get handled() { if (!(this instanceof FetchEvent)) throw new TypeError("Illegal invocation"); return this._handled; }
+  // A navigation preload we do not perform: the honest answer is "no preloaded
+  // response", which is `undefined` — not a rejection, because the worker's
+  // `event.preloadResponse || fetch(event.request)` fallback is the idiom.
+  get preloadResponse() { if (!(this instanceof FetchEvent)) throw new TypeError("Illegal invocation"); return Promise.resolve(undefined); }
+  respondWith(r) {
+    if (!(this instanceof FetchEvent)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'respondWith' on 'FetchEvent': 1 argument required, but only 0 present.");
+    if (this._dispatchDone || this._respondPromise !== null)
+      throw new DOMException("The event handler is already finished, or respondWith() was already called.", "InvalidStateError");
+    this.preventDefault();   // the default action IS "go to the network"
+    this._respondPromise = Promise.resolve(r);
+  }
+  get [Symbol.toStringTag]() { return 'FetchEvent'; }
+}
+_enumAccessors(FetchEvent.prototype, 'request', 'clientId', 'resultingClientId',
+  'replacesClientId', 'handled', 'preloadResponse', 'respondWith');
+_exposeIface('FetchEvent', FetchEvent);
+
+// The registration that would CONTROL a request for `url`: activated, same
+// origin, and the LONGEST matching scope — a worker registered for `/app/` must
+// not answer for `/`, and the longest-prefix rule is what keeps two workers on
+// one origin from fighting over each other's pages.
+function _swControllerFor(url) {
+  let best = null;
+  for (const rec of _swRegistrations.values()) {
+    if (rec.terminated || !rec.active || !rec.scope) continue;
+    if (!String(url).startsWith(rec.scopeURL)) continue;
+    if (!best || rec.scopeURL.length > best.scopeURL.length) best = rec;
+  }
+  return best;
+}
+// Guard against a worker intercepting its OWN fetch. A worker's `fetch()` is how
+// it reaches the network at all, so routing it back through the fetch handler
+// would be an infinite loop on the very line every offline recipe is built on
+// (`caches.match(e.request) || fetch(e.request)`).
+let _swInFetchHandler = 0;
+// Ask the controlling service worker to answer this request. Resolves to a
+// Response when the worker claimed it, or null to mean "go to the network".
+async function _swMaybeIntercept(url, init, request) {
+  if (_swInFetchHandler > 0) return null;
+  const rec = _swControllerFor(url);
+  if (!rec) return null;
+  let ev;
+  try {
+    ev = new FetchEvent('fetch', {
+      request: request || new Request(url, init || {}),
+      clientId: (rec.client && rec.client._cid) || '',
+    });
+  } catch (e) { return null; }
+  _swInFetchHandler++;
+  try { _dispatchSpec(rec.scope, ev); }
+  catch (e) { /* a throwing handler falls through to the network */ }
+  finally { _swInFetchHandler--; }
+  ev._dispatchDone = true;
+  if (ev._respondPromise === null) { if (ev._handledResolve) ev._handledResolve(undefined); return null; }
+  let resp;
+  try { resp = await ev._respondPromise; }
+  catch (e) {
+    // A worker that CLAIMED the request and then failed has produced a network
+    // error. Falling back to the network here would be worse than useless: the
+    // page would silently get the very thing the worker meant to replace.
+    const err = new TypeError('Failed to fetch: the service worker responded with an error');
+    if (ev._handledReject) ev._handledReject(err);
+    throw err;
+  }
+  if (!(typeof Response !== 'undefined' && resp instanceof Response)) {
+    const err = new TypeError("Failed to fetch: respondWith() did not resolve with a Response");
+    if (ev._handledReject) ev._handledReject(err);
+    throw err;
+  }
+  if (ev._handledResolve) ev._handledResolve(undefined);
+  return resp;
+}
 
 class ServiceWorkerGlobalScope extends WorkerGlobalScope {
   constructor() { super(); }
@@ -46689,7 +47377,14 @@ class ServiceWorkerContainer extends EventTarget {
     if (!_allowSWCtor) throw new TypeError("Illegal constructor");
     super(undefined);
   }
-  get controller() { if (!(this instanceof ServiceWorkerContainer)) throw new TypeError("Illegal invocation"); return null; }
+  // The worker that is answering THIS page's requests, or null. A page reads
+  // this to decide whether it is being served by a worker at all — `controller`
+  // being null after a first load is exactly why every recipe reloads once.
+  get controller() {
+    if (!(this instanceof ServiceWorkerContainer)) throw new TypeError("Illegal invocation");
+    const rec = _swControllerFor(_domParse("document_url") || "about:blank");
+    return rec ? rec.active : null;
+  }
   get ready() {
     if (!(this instanceof ServiceWorkerContainer)) throw new TypeError("Illegal invocation");
     // Resolves with the first registration that reaches "activated". A page that
@@ -54544,11 +55239,15 @@ if (typeof Audio === 'undefined') {
 if (typeof FileReader === 'undefined') {
   globalThis.FileReader = class FileReader {
     constructor() {
-      this.result = null; this.readyState = 0; this.error = null;
+      // `result`, `readyState` and `error` are READONLY IDL attributes, held in
+      // private fields behind prototype accessors. As own writable properties a
+      // page could do `reader.result = "…"`, and a reader's result is a report of
+      // what was read — not a setting. (Accessors are installed after the class
+      // body, below, so the internal writes here stay ordinary field writes.)
+      this._result = null; this._readyState = 0; this._error = null;
       this._evtKey = _nextSyntheticKey();
       this._aborted = false;
     }
-    get [Symbol.toStringTag]() { return 'FileReader'; }
     addEventListener(t, h, o) { _addListenerByKey(this._evtKey, String(t), h, o); }
     removeEventListener(t, h, o) { _removeListenerByKey(this._evtKey, String(t), h, o); }
     dispatchEvent(ev) { return _dispatchPublic(this, ev); }
@@ -54560,9 +55259,9 @@ if (typeof FileReader === 'undefined') {
       _dispatchSpec(this, ev);
     }
     _read(blob, kind, encoding) {
-      if (this.readyState === 1) throw new DOMException("The object is already busy reading Blobs.", "InvalidStateError");
+      if (this._readyState === 1) throw new DOMException("The object is already busy reading Blobs.", "InvalidStateError");
       if (!(blob instanceof Blob)) throw new TypeError("Failed to execute 'read' on 'FileReader': parameter 1 is not of type 'Blob'.");
-      this.readyState = 1; this.result = null; this.error = null; this._aborted = false;
+      this._readyState = 1; this._result = null; this._error = null; this._aborted = false;
       const bytes = blob._bytes ? blob._bytes.slice() : new Uint8Array(0);
       const type = blob.type || '';
       const self = this;
@@ -54575,14 +55274,18 @@ if (typeof FileReader === 'undefined') {
         () => {
           try {
             let result;
-            if (kind === 'text') result = new TextDecoder(encoding && _getEncodingName(encoding) ? encoding : 'utf-8').decode(bytes);
+            // FileAPI §readAsText: the encoding argument first, then the blob's
+            // own `charset` parameter, then UTF-8. The middle step was missing —
+            // so a text/plain;charset=windows-1252 note read back as U+FFFD for
+            // every accented character, which for a legacy file is the whole file.
+            if (kind === 'text') result = _fileReadText(bytes, type, encoding);
             else if (kind === 'arraybuffer') result = bytes.buffer.slice(0);
             else if (kind === 'binary') { let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); result = s; }
             else if (kind === 'dataurl') result = 'data:' + (type || 'application/octet-stream') + ';base64,' + _b64FromBytes(bytes);
-            self.result = result; self.readyState = 2;
+            self._result = result; self._readyState = 2;
             self._fire('load');
           } catch (e) {
-            self.result = null; self.error = e; self.readyState = 2;
+            self._result = null; self._error = e; self._readyState = 2;
             self._fire('error');
           }
         },
@@ -54602,14 +55305,32 @@ if (typeof FileReader === 'undefined') {
     readAsDataURL(blob) { this._read(blob, 'dataurl'); }
     abort() {
       // EMPTY or DONE: clear result, leave readyState unchanged.
-      if (this.readyState === 0 || this.readyState === 2) { this.result = null; return; }
+      if (this._readyState === 0 || this._readyState === 2) { this._result = null; return; }
       // LOADING: terminate the read, then fire abort + loadend.
-      this._aborted = true; this.result = null; this.readyState = 2;
+      this._aborted = true; this._result = null; this._readyState = 2;
       this._fire('abort'); this._fire('loadend');
     }
   };
-  FileReader.EMPTY = 0; FileReader.LOADING = 1; FileReader.DONE = 2;
-  FileReader.prototype.EMPTY = 0; FileReader.prototype.LOADING = 1; FileReader.prototype.DONE = 2;
+  // The three readonly IDL attributes, as enumerable prototype accessors over
+  // the private fields.
+  for (const _a of ['result', 'readyState', 'error']) {
+    Object.defineProperty(FileReader.prototype, _a, {
+      configurable: true, enumerable: true,
+      get: _named('get', _a, function () {
+        if (!(this instanceof FileReader)) throw new TypeError("Illegal invocation");
+        return this['_' + _a];
+      }),
+    });
+  }
+  // WebIDL CONSTANTS are `{ writable: false, enumerable: true, configurable: false }`
+  // on BOTH the interface object and the prototype. A writable `FileReader.DONE`
+  // is a constant that a page can redefine underneath every `=== FileReader.DONE`
+  // comparison in every library it loaded.
+  for (const [_k, _v] of [['EMPTY', 0], ['LOADING', 1], ['DONE', 2]]) {
+    const desc = { value: _v, writable: false, enumerable: true, configurable: false };
+    Object.defineProperty(FileReader, _k, desc);
+    Object.defineProperty(FileReader.prototype, _k, desc);
+  }
   // Event-handler IDL attributes (onload, onerror, …) registered as listeners so
   // they participate in dispatch like any other listener.
   for (const h of ['loadstart', 'progress', 'load', 'abort', 'error', 'loadend']) {
@@ -54624,8 +55345,12 @@ if (typeof FileReader === 'undefined') {
       },
     });
   }
-  _markNative(FileReader); _markNative(FileReader.prototype.readAsText); _markNative(FileReader.prototype.readAsArrayBuffer);
-  _markNative(FileReader.prototype.readAsDataURL); _markNative(FileReader.prototype.readAsBinaryString); _markNative(FileReader.prototype.abort);
+  // Operations enumerable + brand-checked, @@toStringTag as a data property, and
+  // the interface object re-exposed NON-enumerably (`globalThis.X = class` makes
+  // an enumerable global, which no interface object is).
+  _idlShape(FileReader, { ctorLength: 0,
+    arity: { readAsArrayBuffer: 1, readAsBinaryString: 1, readAsText: 1, readAsDataURL: 1,
+             abort: 0, addEventListener: 2, removeEventListener: 2, dispatchEvent: 1 } });
 }
 
 if (typeof EventSource === 'undefined') {
@@ -56947,6 +57672,49 @@ globalThis.__obscura_init = function() {
       const nav = new PerformanceNavigationTiming(navUrl);
       globalThis.performance._navEntry = nav;
       globalThis.performance._entries.push(nav);
+    }
+  } catch (e) {}
+
+  // WebIDL: every interface prototype object carries an @@toStringTag data
+  // property naming the interface. Without it `String(document.body)` is
+  // `[object Object]` — every element on the platform, every Node, every
+  // collection, indistinguishable from a plain object. That is the string a
+  // developer reads in a console and a log file, and it is what a library uses
+  // to tell a DOM node from a config bag; answering "Object" for all of them is
+  // an answer, and it is the wrong one.
+  //
+  // Stamped LAST, so every interface exists, and only where ABSENT — a class
+  // that defined its own tag (Blob, MessagePort, the event interfaces) already
+  // said what it is, and this must not overwrite that.
+  //
+  // ⚠️ The ECMAScript intrinsics are EXCLUDED, and the reason is not cosmetic:
+  // stamping `Object.prototype` gives EVERY object an inherited tag, so
+  // `Object.prototype.toString.call(f)` answers `[object Object]` for a
+  // function, an array, an error — the one property the whole brand-check idiom
+  // rests on. These are the built-ins the language deliberately leaves untagged;
+  // the ones that do have a tag (Map, Promise, ArrayBuffer, …) already own it and
+  // are skipped by the hasOwnProperty check below.
+  const _ES_UNTAGGED = new Set(['Object', 'Function', 'Array', 'String', 'Number',
+    'Boolean', 'Date', 'RegExp', 'Error', 'EvalError', 'RangeError', 'ReferenceError',
+    'SyntaxError', 'TypeError', 'URIError', 'AggregateError', 'Proxy']);
+  try {
+    for (const name of Object.getOwnPropertyNames(globalThis)) {
+      // Interface objects only: a constructor with a prototype, named like an
+      // interface (initial capital). `_`/`$` internals and plain values are not.
+      if (!/^[A-Z]/.test(name) || _ES_UNTAGGED.has(name)) continue;
+      let ctor;
+      try { ctor = globalThis[name]; } catch (e) { continue; }
+      if (typeof ctor !== 'function') continue;
+      const proto = ctor.prototype;
+      if (!proto || typeof proto !== 'object') continue;
+      // `name` is the GLOBAL's name, which is the interface's name — except
+      // where one interface is exposed under an alias (EventTarget === Node
+      // here). Use the constructor's own name so the alias does not rename it.
+      if (Object.prototype.hasOwnProperty.call(proto, Symbol.toStringTag)) continue;
+      try {
+        Object.defineProperty(proto, Symbol.toStringTag,
+          { value: ctor.name || name, writable: false, enumerable: false, configurable: true });
+      } catch (e) {}
     }
   } catch (e) {}
 

@@ -1,0 +1,15 @@
+# IndexedDB getAll-options / getAllRecords / fire-*-event-exception window.
+# Chrome 1040/1040 over 52 files.  NO trailing # comments on test lines.
+IndexedDB/idbindex_getAll-options.any.html
+IndexedDB/idbindex_getAllKeys-options.any.html
+IndexedDB/idbindex_getAllRecords.any.html
+IndexedDB/idbobjectstore_getAllRecords.any.html
+IndexedDB/idbobjectstore_getAll-options.any.html
+IndexedDB/idbobjectstore_getAllKeys-options.any.html
+IndexedDB/idbindex_getAll.any.html
+IndexedDB/idbindex_getAllKeys.any.html
+IndexedDB/idbobjectstore_getAll.any.html
+IndexedDB/fire-error-event-exception.any.html
+IndexedDB/idbobjectstore_getAllKeys.any.html
+IndexedDB/fire-success-event-exception.any.html
+IndexedDB/fire-upgradeneeded-event-exception.any.html

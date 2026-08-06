@@ -200,3 +200,14 @@ service-workers/cache-storage/cache-storage.https.any.html
 web-locks/signal.https.any.html
 web-locks/steal.https.any.html
 storage/idlharness.https.any.html
+# --- Quests #487–#489 guards (the uploaded, aborted & intercepted arc) ---
+# FileAPI: the FormData/file-upload block, the WebIDL shape, and [Clamp] slice.
+FileAPI/file/send-file-formdata-punctuation.any.html
+FileAPI/blob/Blob-slice.any.html
+FileAPI/idlharness.any.html
+FileAPI/file/File-constructor.any.html
+FileAPI/filelist-section/filelist.html
+# IndexedDB: the abort-on-uncaught-exception rule, and the getAll options family.
+IndexedDB/fire-error-event-exception.any.html
+IndexedDB/idbindex_getAllRecords.any.html
+IndexedDB/idbobjectstore_getAll-options.any.html
