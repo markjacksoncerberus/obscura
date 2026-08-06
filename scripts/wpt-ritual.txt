@@ -181,3 +181,22 @@ compression/compression-bad-chunks.any.worker.html
 urlpattern/urlpattern.any.html
 urlpattern/urlpattern-compare.tentative.any.html
 urlpattern/urlpattern.any.serviceworker.html
+# ── Quests #484–#486 guards (2026-08-06).
+#      * event-dispatch-active-flag is the CRASH canary: its keep_alive() helper
+#        re-arms a get() from its own onsuccess forever and stops only on a
+#        setTimeout. If _idbRunTx ever drains greedily again, this file does not
+#        fail — it takes the whole browser down at ~1.4 GB. A could-not-run here
+#        with "Target page, context or browser has been closed" is THAT bug.
+#      * cache-put / cache-match guard the Cache API's two halves: what may be
+#        stored (scheme, method, 206, Vary:*, disturbed body) and how it is found
+#        again (URL key + Vary). cache-storage guards the named-store handles.
+#      * web-locks signal + steal are the two ORDERING guards — both regressed
+#        into timeouts once during this quest and neither was visible in the code.
+#      * storage/idlharness guards navigator.storage's shape.
+IndexedDB/event-dispatch-active-flag.any.html
+service-workers/cache-storage/cache-put.https.any.html
+service-workers/cache-storage/cache-match.https.any.html
+service-workers/cache-storage/cache-storage.https.any.html
+web-locks/signal.https.any.html
+web-locks/steal.https.any.html
+storage/idlharness.https.any.html

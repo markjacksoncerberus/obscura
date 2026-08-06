@@ -316,6 +316,108 @@ over namespace-aware Rust attribute storage — the field stands thus:
 
 ## 📜 Lands already secured this campaign (for the chronicles)
 
+### 2026-08-06 — Quests #484–#486, **The Yielded, Cached & Locked Arc** (`IndexedDB` **879/1234 → 958/1339, engine deaths 4 → 0** · `cache-storage` **23/152 → 131/152** · `web-locks` **17/139 → 114/139** · `storage` **17/56 → 36/56**)
+
+*Scrolls: [`475-the-yielded-verdict.md`](475-the-yielded-verdict.md) · [`476-the-cached-verdict.md`](476-the-cached-verdict.md) · [`477-the-locked-verdict.md`](477-the-locked-verdict.md)*
+
+**The browser that died on a page, the cupboard that lied, and the two APIs that
+were simply not there.** Took the previous arc's leverage list in its own order:
+the crash first, because *a browser that dies on a page is worse than one that
+scores badly on it*.
+
+**#484 — `IndexedDB` KILLED THE ENGINE, AND NOT ON ONE FILE.** The previous arc
+left a warning rather than a score. Reproduced first thing: `Fatal JavaScript out
+of memory` at 1.4 GB in eighteen seconds, and `curl /json/version` answering
+**DEAD** — not the page, the browser. Then the whole realm was swept with a
+runner that restarts the engine when it stops answering, and the real shape came
+out: **4 server deaths, 5 could-not-run, and 20 more files that produced no
+output at all — 24 of 143 crashing or hanging.**
+
+One word caused it. `_idbRunTx` drained its queue with `while (tx._queue.length)`.
+But IndexedDB fires a request's event from a **task** — *"queue a task to fire a
+success event at request"* — so a `success` handler that issues another request
+has queued work for a **later** task, not for the tail of the loop currently
+running. A greedy loop lets a handler **feed the loop it is running inside**, and
+then control never returns to the event loop: no timer fires, no microtask is
+checkpointed, no paint happens. WPT's `keep_alive()` helper is the most ordinary
+thing imaginable — re-arm `store.get(0)` from its own `onsuccess`, stop when a
+`setTimeout` says so — and against that loop the timer could never run, so the
+undrained microtask queue grew until V8 gave up.
+
+Fixed by shifting exactly the requests pending when the task began; work issued
+together still lands together, a chain of dependent requests costs one task per
+link, which is what it costs in every other browser. **879/1234 over 123 files →
+958/1339 over 142 files, 84 at 100%, engine deaths 4 → 0, 0 rows lost, 0 down.**
+Every subtest gained was one that had never been measured.
+
+**⭐ AND THE LESSON THAT GENERALISES:** *a file that produces no output is not a
+file that fails — it is a file that was never asked.* The recorded finding named
+one crashing file. Counting the rows found twenty-four.
+
+**#485 — the Cache API was five methods that all lied.** `caches.open()` handed
+back a bag whose `put()` **resolved** and whose `match()` always said nothing was
+there. That is the sixth time this campaign has met *a feature that answers, and
+answers wrong* — and here it costs exactly the reader this browser is for: a page
+doing the most ordinary offline thing (cache the shell, the stylesheet, the
+offline page) was told every write had succeeded, then found the cupboard bare on
+the next load with **no error anywhere to search for**. Real `Cache`/`CacheStorage`
+(~330 lines) over the real `Request`/`Response`/`Headers` from Quests #457–#459:
+**23/152 → 131/152.**
+
+**⭐ `Vary` is the server saying "this answer depended on that request header".**
+Honouring it is not pedantry — serving a cached English page to a request that
+asked for French is not a cache hit, it is a **wrong answer**, and it is the bug
+users experience as *"the site is stuck in the wrong language"*. It is also why
+`put()` must refuse a response carrying `Vary: *`: there is no key under which
+that entry could ever be correctly re-served. **⭐ Reading the body through
+`response.body` rather than the internal byte field** drains a stream-backed
+response *and* leaves the stream locked, which is what makes the spec's
+"`getReader()` after `put` throws" true for the right reason. And a put
+**replaces** what it would have matched — otherwise the cache grows a second copy
+on every refresh and `match` keeps handing back the stalest one.
+
+**#486 — `navigator.locks` and `navigator.storage` did not exist at all.**
+An absence is quieter than a lying stub and costs the same in the end: without
+Web Locks, a page with two tabs open has no way to say *"only one of us may touch
+this at a time"*, so on a flaky connection the two of them do not merely delay a
+save — they can **lose** one. **`web-locks` 17/139 → 114/139, every behavioural
+file at 100%; `storage` (non-bucket) 17/56 → 36/56.**
+
+**⭐ Granting is DEFERRED even when the lock is free.** WPT requests a lock and
+calls `controller.abort()` on the very next line, and asserts the callback never
+ran — so the grant is a microtask, not an inline call. Granting synchronously
+would make `request()` a function you cannot safely cancel, which is the entire
+reason the `signal` option exists. **⭐ The fairness half of "grantable"** — *no
+request queued **before** this one with a conflicting mode* — is what stops a
+steady stream of shared readers from starving the one writer, and a sync pass
+that never runs is a sync pass that loses data. And the name is a **DOMString**
+on purpose: USVString conversion would fold a lone surrogate to U+FFFD and
+silently merge two names the page kept distinct.
+
+**⚠️ TWO ORDERING BUGS THE MEASUREMENT CAUGHT AND THE CODE COULD NOT SHOW.**
+With one shared pump, `steal` found **nothing held** — the holder, the waiter and
+the stealer had all merely queued — so it stole from nobody, took the lock,
+released it, and handed it straight to a holder whose promise never settles;
+`steal` sat at 2/5 TIMEOUT until each request joined the queue in **its own
+microtask, in call order** (→ **5/5**). And `query()` snapshotted `_lockHeld`
+synchronously, so `request(…); await query()` reported the world as it was
+*before the line above it* (`signal` 11/13 → **13/13**).
+
+**ZERO REGRESSIONS, MEASURED PER FILE — all 87 ritual files came back
+23,711/23,897, 186 fails: byte-identical to the previous commit's recorded
+post-measurement, with `CHANGED: 0` and `LOST: 0` on the per-file diff.** Seven
+guards added (now **94 files**, 23,821/24,014) — and the denominator moves by
+exactly +117, which is the seven new files' totals summed.
+
+**⚠️ CAPS NAMED HONESTLY:** no cache **persistence** and no service-worker
+**`fetch` interception** — the cupboard is real now, the door is not, and that is
+the largest remaining piece of the offline story. Storage **Buckets** untouched
+at 17/84 (tentative spec). `clientId` is the same for every context because our
+workers share one JS context — the lock *queue* is genuinely shared, the ids are
+not distinct. In IndexedDB, **29 subtests wait on one rule** (an uncaught
+exception in an event handler must abort the transaction) and **158 on one
+additive family** (`getAll` options / `getAllRecords`).
+
 ### 2026-08-06 — Quests #481–#483, **The Compressed, Routed & Registered Arc** (`compression` **4/338 → 676/676** · `urlpattern` **17/795 → 1,584/1,584** · the `.any.serviceworker.html` family **0 → measured**)
 
 *Scrolls: [`472-the-compressed-verdict.md`](472-the-compressed-verdict.md) · [`473-the-routed-verdict.md`](473-the-routed-verdict.md) · [`474-the-registered-verdict.md`](474-the-registered-verdict.md)*

@@ -1,0 +1,10 @@
+https://wpt.live/storage/buckets/bucket_names.tentative.https.any.html
+https://wpt.live/storage/buckets/buckets_basic.tentative.https.any.html
+https://wpt.live/storage/buckets/idlharness-worker.https.any.html
+https://wpt.live/storage/buckets/opaque-origin.https.window.html
+https://wpt.live/storage/buckets/storage_bucket_object.tentative.https.any.html
+https://wpt.live/storage/estimate-usage-details-indexeddb.https.tentative.any.html
+https://wpt.live/storage/idlharness.https.any.html
+https://wpt.live/storage/opaque-origin.https.window.html
+https://wpt.live/storage/persisted.https.any.html
+https://wpt.live/storage/storagemanager-estimate.https.any.html

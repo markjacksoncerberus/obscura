@@ -1,0 +1,13 @@
+https://wpt.live/service-workers/cache-storage/cache-abort.https.any.html
+https://wpt.live/service-workers/cache-storage/cache-add.https.any.html
+https://wpt.live/service-workers/cache-storage/cache-delete.https.any.html
+https://wpt.live/service-workers/cache-storage/cache-keys-attributes-for-service-worker.https.html
+https://wpt.live/service-workers/cache-storage/cache-keys.https.any.html
+https://wpt.live/service-workers/cache-storage/cache-match.https.any.html
+https://wpt.live/service-workers/cache-storage/cache-matchAll.https.any.html
+https://wpt.live/service-workers/cache-storage/cache-put.https.any.html
+https://wpt.live/service-workers/cache-storage/cache-storage-buckets.https.any.html
+https://wpt.live/service-workers/cache-storage/cache-storage-match.https.any.html
+https://wpt.live/service-workers/cache-storage/cache-storage.https.any.html
+https://wpt.live/service-workers/cache-storage/cross-partition.https.tentative.html
+https://wpt.live/service-workers/cache-storage/sandboxed-iframes.https.html

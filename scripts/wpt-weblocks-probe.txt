@@ -1,0 +1,17 @@
+https://wpt.live/web-locks/acquire.https.any.html
+https://wpt.live/web-locks/frames.https.html
+https://wpt.live/web-locks/held.https.any.html
+https://wpt.live/web-locks/idlharness.https.any.html
+https://wpt.live/web-locks/ifAvailable.https.any.html
+https://wpt.live/web-locks/lock-attributes.https.any.html
+https://wpt.live/web-locks/mode-exclusive.https.any.html
+https://wpt.live/web-locks/mode-mixed.https.any.html
+https://wpt.live/web-locks/mode-shared.https.any.html
+https://wpt.live/web-locks/non-fully-active.https.html
+https://wpt.live/web-locks/opaque-origin.https.html
+https://wpt.live/web-locks/partitioned-web-locks.tentative.https.html
+https://wpt.live/web-locks/query.https.any.html
+https://wpt.live/web-locks/resource-names.https.any.html
+https://wpt.live/web-locks/signal.https.any.html
+https://wpt.live/web-locks/steal.https.any.html
+https://wpt.live/web-locks/workers.https.html

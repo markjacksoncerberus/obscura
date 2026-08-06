@@ -44098,7 +44098,32 @@ function _idbAfterCheckpoint(fn) {
 // work), then — only once the microtask queue has drained — commit.
 function _idbRunTx(tx) {
   if (tx._state === 'finished') return;
-  while (tx._queue.length) {
+  // ⚠️ ONE GENERATION PER TASK — this bound is not an optimisation, it is the
+  // difference between a browser and a corpse.
+  //
+  // A request's success/error event is fired from a QUEUED TASK (IDB: "queue a
+  // task to fire a success event at request"). So a handler that issues another
+  // request has issued work for a LATER task, not for the tail of this loop.
+  // Draining greedily — `while (tx._queue.length)` — means a handler can feed
+  // the loop it is running inside, and then control NEVER returns to the event
+  // loop: no timer fires, no microtask is checkpointed, no paint happens.
+  //
+  // That is exactly what `IndexedDB/event-dispatch-active-flag` measures. Its
+  // `keep_alive()` helper re-issues `store.get(0)` from its own `onsuccess`
+  // forever, and stops only when a `setTimeout` sets a flag — a perfectly
+  // ordinary "hold this transaction open" idiom. Against the greedy loop that
+  // timer could never run, the undrained microtask queue grew without bound,
+  // and the engine died with `Fatal JavaScript out of memory` at 1.4 GB after
+  // eighteen seconds — taking the whole browser, and every other page in it,
+  // down with the one that asked.
+  //
+  // So: shift exactly the requests that were pending when this task began, and
+  // leave whatever the handlers add for the next task. Requests issued together
+  // (the bulk write, the upgrade that seeds a store) still land together, which
+  // is the shape that has to stay fast; a chain of dependent requests costs one
+  // task per link, which is what it costs in every other browser too.
+  let generation = tx._queue.length;
+  while (generation-- > 0 && tx._queue.length) {
     const req = tx._queue.shift();
     let result, error = null;
     tx._state = 'active';
@@ -45043,13 +45068,644 @@ function _idbRunDelete(req, name) {
 
 globalThis.indexedDB = Object.create(IDBFactory.prototype);
 
-globalThis.caches = {
-  open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },
-  match() { return Promise.resolve(undefined); },
-  has() { return Promise.resolve(false); },
-  delete() { return Promise.resolve(false); },
-  keys() { return Promise.resolve([]); },
+// ══════════════════════════════════════════════════════════════════════════════
+// The Cache API — CacheStorage and Cache
+//   https://w3c.github.io/ServiceWorker/#cache-interface
+// ══════════════════════════════════════════════════════════════════════════════
+// What stood here was five methods that all politely said "nothing to see":
+//
+//     open() { return Promise.resolve({ match() { return Promise.resolve(undefined); },
+//                                       put()   { return Promise.resolve(); }, … }); }
+//
+// `put()` RESOLVED. That is the worst answer a cache can give, and it is the
+// same shape this campaign has now found six times over: not a missing feature
+// but a feature that ANSWERS, AND ANSWERS WRONG. A page doing the most ordinary
+// offline thing there is — cache the shell, the stylesheet, the offline page —
+// was told every write had succeeded, and then found the cupboard bare on the
+// next load, with no error anywhere to search for.
+//
+// And the reader who pays for that is exactly the one this browser exists for:
+// the person on a metered, slow or intermittent connection, for whom "works
+// offline" is not a nicety but the difference between a page they can read and
+// a page they cannot afford to load a second time.
+//
+// The whole store lives in this realm's memory. Persistence across page loads
+// is NOT here and is named honestly in the scroll — it is the same missing
+// piece `webstorage` and `IndexedDB` are waiting on (one profile directory,
+// one follow-up), not a hole in the algorithms below.
+const _cacheStore = new Map();      // cache name → array of entries, in creation order
+let _allowCacheCtor = false;
+
+// A cache entry is a REQUEST KEY plus a fully-read response. The body is copied
+// out at `put()` time on purpose: a cache holding a live stream would hand the
+// second reader an already-drained one, which is the failure mode where a page
+// works on first load and renders blank ever after.
+const _cacheScheme = (href) => {
+  try { return new URL(href).protocol.replace(/:$/, ''); } catch (e) { return ''; }
 };
+const _cacheUrlKey = (href, ignoreSearch) => {
+  let u;
+  try { u = new URL(href); } catch (e) { return href; }
+  u.hash = '';                       // a fragment never reaches the server, so it never keys a cache
+  if (ignoreSearch) u.search = '';
+  return u.href;
+};
+
+// `Vary` is the server saying "this answer depended on that request header".
+// Honouring it is not pedantry: serving a cached English page to a request that
+// asked for French is not a cache hit, it is a WRONG ANSWER — and it is exactly
+// the bug users experience as "the site is stuck in the wrong language".
+const _cacheVaryMatches = (queryReq, entry) => {
+  const vary = entry.response._headers.get('vary');
+  if (vary === null) return true;
+  for (const raw of vary.split(',')) {
+    const field = raw.trim();
+    if (field === '') continue;
+    if (field === '*') return false;           // "depends on everything" can never be re-served
+    if (queryReq._headers.get(field) !== entry.request._headers.get(field)) return false;
+  }
+  return true;
+};
+
+// Query Cache — the one algorithm `match`, `matchAll`, `delete` and `keys` all run.
+const _cacheQuery = (entries, request, options, requireRequest) => {
+  const o = (options === undefined || options === null) ? {} : options;
+  if (request === undefined) return requireRequest ? [] : entries.slice();
+  const rq = (request instanceof Request) ? request : new Request(String(request));
+  // A cache is keyed by things that are safe to replay. Unless the caller has
+  // explicitly said `ignoreMethod`, a POST simply has no cache key.
+  if (!o.ignoreMethod && rq._st.method !== 'GET' && rq._st.method !== 'HEAD') return [];
+  const key = _cacheUrlKey(rq._st.url, !!o.ignoreSearch);
+  const out = [];
+  for (const e of entries) {
+    if (_cacheUrlKey(e.request._st.url, !!o.ignoreSearch) !== key) continue;
+    if (!o.ignoreVary && !_cacheVaryMatches(rq, e)) continue;
+    out.push(e);
+  }
+  return out;
+};
+
+// The stored request key: a copy with NO body and no signal. `put()` must not
+// disturb the caller's request — WPT asserts `request.bodyUsed === false` on
+// both sides of the call — and a stored key holding a live AbortSignal would
+// keep the aborter alive for as long as the cache entry.
+const _cacheCopyRequest = (req) => {
+  const s = req._st;
+  const r = Object.create(Request.prototype);
+  Object.defineProperty(r, '_st', { value: {
+    url: s.url, method: s.method, mode: s.mode, credentials: s.credentials, cache: s.cache,
+    redirect: s.redirect, referrer: s.referrer, referrerPolicy: s.referrerPolicy,
+    integrity: s.integrity, keepalive: false, signal: null, body: null,
+  } });
+  Object.defineProperty(r, '_headers', {
+    value: _newHeaders(req._headers._list.map((e) => [e[0], e[1]]), 'request', true) });
+  Object.defineProperty(r, '_bodyUsed', { value: false, writable: true });
+  Object.defineProperty(r, '_bodyStream', { value: null, writable: true });
+  return r;
+};
+
+// Read a response's body all the way out, and leave the original DISTURBED.
+// Reading through `response.body` rather than the internal bytes is deliberate:
+// it is the one path that also drains a response built over a ReadableStream,
+// and it leaves the stream LOCKED, which is what makes the spec's
+// "getReader() after Cache.put throws" true for the right reason.
+const _cacheDrainResponse = (response) => {
+  const st = response._st;
+  if (st.body === null) return Promise.resolve(null);
+  let reader;
+  try { reader = response.body.getReader(); }
+  catch (e) { return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': Response body is already used")); }
+  response._bodyUsed = true;
+  const chunks = [];
+  let total = 0;
+  const pump = () => reader.read().then((r) => {
+    if (r.done) return;
+    if (r.value && r.value.length) { chunks.push(r.value); total += r.value.length; }
+    return pump();
+  });
+  return pump().then(() => {
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const c of chunks) { out.set(c, at); at += c.length; }
+    return out;
+  });
+};
+
+const _cacheStoreResponse = (response, bytes) => {
+  const st = response._st;
+  const stored = _makeResponse(bytes, {
+    status: st.status, statusText: st.statusText, type: st.type, url: st.url,
+    redirected: st.redirected, headers: response._headers, guard: response._headers._guard,
+  });
+  if (bytes !== null && st.body) stored._st.body.type = st.body.type;
+  return stored;
+};
+
+const _cacheVaryStar = (response) => {
+  const vary = response._headers.get('vary');
+  if (vary === null) return false;
+  return vary.split(',').some((f) => f.trim() === '*');
+};
+
+class Cache {
+  constructor() { if (!_allowCacheCtor) throw new TypeError("Illegal constructor"); }
+
+  match(request, options) {
+    if (!(this instanceof Cache)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'match' on 'Cache': 1 argument required, but only 0 present."));
+    return this.matchAll(request, options).then((all) => all[0]);
+  }
+
+  matchAll(request, options) {
+    if (!(this instanceof Cache)) return Promise.reject(new TypeError("Illegal invocation"));
+    let hits;
+    try { hits = _cacheQuery(this._entries, request, options, false); }
+    catch (e) { return Promise.reject(e); }
+    // Each caller gets its OWN copy of the body. Handing back the stored
+    // response would let the first reader drain the cache entry itself.
+    return Promise.resolve(Object.freeze(hits.map((e) => e.response.clone())));
+  }
+
+  add(request) {
+    if (!(this instanceof Cache)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'add' on 'Cache': 1 argument required, but only 0 present."));
+    return this.addAll([request]);
+  }
+
+  addAll(requests) {
+    if (!(this instanceof Cache)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'addAll' on 'Cache': 1 argument required, but only 0 present."));
+    const self = this;
+    let list;
+    try {
+      list = Array.from(requests).map((input) => {
+        const rq = (input instanceof Request) ? input : new Request(String(input));
+        const scheme = _cacheScheme(rq._st.url);
+        if (scheme !== 'http' && scheme !== 'https')
+          throw new TypeError("Failed to execute 'addAll' on 'Cache': Request scheme '" + scheme + "' is unsupported");
+        if (rq._st.method !== 'GET')
+          throw new TypeError("Failed to execute 'addAll' on 'Cache': Request method '" + rq._st.method + "' is unsupported");
+        return rq;
+      });
+    } catch (e) { return Promise.reject(e); }
+    // Two identical keys in ONE batch is a caller bug, not a race — the spec
+    // makes it an InvalidStateError so it cannot silently become "last wins".
+    const seen = new Set();
+    for (const rq of list) {
+      const k = _cacheUrlKey(rq._st.url, false);
+      if (seen.has(k))
+        return Promise.reject(new DOMException("Failed to execute 'addAll' on 'Cache': duplicate requests", "InvalidStateError"));
+      seen.add(k);
+    }
+    return Promise.all(list.map((rq) => fetch(rq).then((resp) => {
+      // A cache that stores errors serves errors. `opaque` is the one exception:
+      // its status is unreadable by design, so "not ok" cannot be asserted.
+      if (resp._st.type === 'error' || (resp._st.type !== 'opaque' && !(resp._st.status >= 200 && resp._st.status <= 299)))
+        throw new TypeError("Failed to execute 'addAll' on 'Cache': Request failed");
+      return { rq, resp };
+    }))).then((pairs) => Promise.all(pairs.map((p) => self.put(p.rq, p.resp)))).then(() => undefined);
+  }
+
+  put(request, response) {
+    if (!(this instanceof Cache)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 2)
+      return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': 2 arguments required, but only " + arguments.length + " present."));
+    let rq;
+    try { rq = (request instanceof Request) ? request : new Request(String(request)); }
+    catch (e) { return Promise.reject(e); }
+    if (!(response instanceof Response))
+      return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': parameter 2 is not of type 'Response'."));
+    // Only what a browser could have fetched may be replayed as if it had:
+    // a `file:` or `data:` entry in a cache is a page inventing provenance.
+    const scheme = _cacheScheme(rq._st.url);
+    if (scheme !== 'http' && scheme !== 'https')
+      return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': Request scheme '" + scheme + "' is unsupported"));
+    if (rq._st.method !== 'GET')
+      return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': Request method '" + rq._st.method + "' is unsupported"));
+    // 206 is a FRAGMENT of a resource. Storing it under the resource's own key
+    // would later serve the middle of a file as though it were the whole file.
+    if (response._st.status === 206)
+      return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': Partial response (status code 206) is unsupported"));
+    // `Vary: *` means "no two requests for this are alike" — there is no key
+    // under which the entry could ever be correctly re-served. (An `opaque`
+    // response is exempt: script cannot read its headers, so it cannot have
+    // been the one to promise anything about them.)
+    if (response._st.type !== 'opaque' && _cacheVaryStar(response))
+      return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': Vary header contains *"));
+    if (_bodyUnusable(response))
+      return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': Response body is already used"));
+    const entries = this._entries;
+    const key = _cacheCopyRequest(rq);
+    return _cacheDrainResponse(response).then((bytes) => {
+      const stored = _cacheStoreResponse(response, bytes);
+      // A put REPLACES every entry this request would have matched — otherwise
+      // the cache grows a second copy each refresh and `match` keeps handing
+      // back the stalest one.
+      const doomed = _cacheQuery(entries, key, undefined, true);
+      for (const d of doomed) { const i = entries.indexOf(d); if (i !== -1) entries.splice(i, 1); }
+      entries.push({ request: key, response: stored });
+      return undefined;
+    });
+  }
+
+  delete(request, options) {
+    if (!(this instanceof Cache)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'delete' on 'Cache': 1 argument required, but only 0 present."));
+    const entries = this._entries;
+    let hits;
+    try { hits = _cacheQuery(entries, request, options, true); }
+    catch (e) { return Promise.reject(e); }
+    for (const h of hits) { const i = entries.indexOf(h); if (i !== -1) entries.splice(i, 1); }
+    return Promise.resolve(hits.length > 0);
+  }
+
+  keys(request, options) {
+    if (!(this instanceof Cache)) return Promise.reject(new TypeError("Illegal invocation"));
+    let hits;
+    try { hits = _cacheQuery(this._entries, request, options, false); }
+    catch (e) { return Promise.reject(e); }
+    return Promise.resolve(Object.freeze(hits.map((e) => _cacheCopyRequest(e.request))));
+  }
+
+  get [Symbol.toStringTag]() { return 'Cache'; }
+}
+_enumAccessors(Cache.prototype, 'match', 'matchAll', 'add', 'addAll', 'put', 'delete', 'keys');
+
+class CacheStorage {
+  constructor() { if (!_allowCacheCtor) throw new TypeError("Illegal constructor"); }
+
+  // Iterating in CREATION order is the contract that makes a versioned cache
+  // work: `caches.match()` finds the oldest matching entry first, so a page
+  // that opened `v1` then `v2` still answers from `v1` until it deletes it.
+  match(request, options) {
+    if (!(this instanceof CacheStorage)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'match' on 'CacheStorage': 1 argument required, but only 0 present."));
+    const o = (options === undefined || options === null) ? {} : options;
+    // A named cache that does not exist is simply a MISS, not an error: asking
+    // "is it in the v3 cache?" before v3 has been created is the ordinary first
+    // run of a versioned cache, and rejecting there would make every upgrade
+    // path start with a caught exception.
+    const names = (o.cacheName !== undefined && o.cacheName !== null)
+      ? (_cacheStore.has(String(o.cacheName)) ? [String(o.cacheName)] : [])
+      : [..._cacheStore.keys()];
+    let chain = Promise.resolve(undefined);
+    for (const n of names) {
+      chain = chain.then((found) => {
+        if (found !== undefined) return found;
+        const entries = _cacheStore.get(n);
+        if (!entries) return undefined;
+        let hits;
+        try { hits = _cacheQuery(entries, request, o, false); } catch (e) { return undefined; }
+        return hits.length ? hits[0].response.clone() : undefined;
+      });
+    }
+    return chain;
+  }
+
+  has(cacheName) {
+    if (!(this instanceof CacheStorage)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'has' on 'CacheStorage': 1 argument required, but only 0 present."));
+    return Promise.resolve(_cacheStore.has(String(cacheName)));
+  }
+
+  open(cacheName) {
+    if (!(this instanceof CacheStorage)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'open' on 'CacheStorage': 1 argument required, but only 0 present."));
+    const name = String(cacheName);
+    if (!_cacheStore.has(name)) _cacheStore.set(name, []);
+    return Promise.resolve(_newCache(_cacheStore.get(name)));
+  }
+
+  delete(cacheName) {
+    if (!(this instanceof CacheStorage)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'delete' on 'CacheStorage': 1 argument required, but only 0 present."));
+    return Promise.resolve(_cacheStore.delete(String(cacheName)));
+  }
+
+  keys() {
+    if (!(this instanceof CacheStorage)) return Promise.reject(new TypeError("Illegal invocation"));
+    return Promise.resolve([..._cacheStore.keys()]);
+  }
+
+  get [Symbol.toStringTag]() { return 'CacheStorage'; }
+}
+_enumAccessors(CacheStorage.prototype, 'match', 'has', 'open', 'delete', 'keys');
+
+// A `Cache` is a HANDLE onto a named store, not the store itself: two `open()`
+// calls for one name must see each other's writes, or a page that opens the
+// cache in two places quietly keeps two half-filled ones.
+const _newCache = function(entries) {
+  _allowCacheCtor = true;
+  let c;
+  try { c = new Cache(); } finally { _allowCacheCtor = false; }
+  Object.defineProperty(c, '_entries', { value: entries });
+  return c;
+};
+
+_allowCacheCtor = true;
+globalThis.caches = new CacheStorage();
+_allowCacheCtor = false;
+_exposeIface('Cache', Cache);
+_exposeIface('CacheStorage', CacheStorage);
+_markNative(Cache); _markNative(CacheStorage);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// The Web Locks API — LockManager / Lock  (https://w3c.github.io/web-locks/)
+// ══════════════════════════════════════════════════════════════════════════════
+// `navigator.locks` did not exist at all. That absence is quieter than a lying
+// stub but it costs the same thing in the end: a page with two tabs open, or a
+// page and its worker, has no way to say "only one of us may touch this at a
+// time", so the two of them write over each other's changes. Web Locks is the
+// primitive every offline-first app uses to serialise its sync pass — without
+// it a flaky connection does not just delay a save, it can LOSE one.
+//
+// The whole manager lives in this realm. That is not merely a shortcut here:
+// Obscura runs its workers inside the same JS context, so a page and its
+// workers genuinely share this queue — the coordination they ask for is real.
+// The honest cap is `clientId`: every context in this realm reports the SAME
+// id, so the two `query()` subtests that assert two contexts have DIFFERENT
+// ids cannot pass yet. Named in the scroll, not papered over.
+const _LOCK_MODES = new Set(['exclusive', 'shared']);
+// Minted lazily: `_uuidV4` is defined further down this file, and a top-level
+// call here would hit its temporal dead zone and take the whole prelude with it.
+let _lockClientIdValue = null;
+const _lockClientId = () => (_lockClientIdValue !== null ? _lockClientIdValue : (_lockClientIdValue = _uuidV4()));
+const _lockHeld = [];        // granted locks, in grant order
+const _lockQueue = [];       // pending requests, in request order
+let _lockPumpScheduled = false;
+let _allowLockCtor = false;
+
+class Lock {
+  constructor() { if (!_allowLockCtor) throw new TypeError("Illegal constructor"); }
+  get name() { if (!(this instanceof Lock)) throw new TypeError("Illegal invocation"); return this._lname; }
+  get mode() { if (!(this instanceof Lock)) throw new TypeError("Illegal invocation"); return this._lmode; }
+  get [Symbol.toStringTag]() { return 'Lock'; }
+}
+_enumAccessors(Lock.prototype, 'name', 'mode');
+
+const _newLock = function(name, mode) {
+  _allowLockCtor = true;
+  let l;
+  try { l = new Lock(); } finally { _allowLockCtor = false; }
+  Object.defineProperty(l, '_lname', { value: name });
+  Object.defineProperty(l, '_lmode', { value: mode });
+  return l;
+};
+
+// Grantable, per spec. The second half — "no request queued BEFORE this one
+// with a conflicting mode" — is the fairness rule, and it is what stops a
+// steady stream of readers from starving a writer forever. Without it a sync
+// pass that needs the exclusive lock can wait out the whole session.
+const _lockGrantableAt = (rec, idx) => {
+  for (const h of _lockHeld) {
+    if (h.name !== rec.name) continue;
+    if (rec.mode === 'exclusive' || h.mode === 'exclusive') return false;
+  }
+  for (let i = 0; i < idx; i++) {
+    const q = _lockQueue[i];
+    if (q.name !== rec.name) continue;
+    if (rec.mode === 'exclusive' || q.mode === 'exclusive') return false;
+  }
+  return true;
+};
+
+const _lockReleaseHeld = (held) => {
+  const i = _lockHeld.indexOf(held);
+  if (i !== -1) _lockHeld.splice(i, 1);
+  _lockSchedulePump();
+};
+
+const _lockGrantRec = (rec) => {
+  if (rec.settled) return;
+  rec.settled = true;
+  if (rec.signal && rec.onAbort) rec.signal.removeEventListener('abort', rec.onAbort);
+  const held = { name: rec.name, mode: rec.mode, clientId: rec.clientId, rec, broken: false };
+  _lockHeld.push(held);
+  let result;
+  try { result = rec.callback(_newLock(rec.name, rec.mode)); }
+  catch (e) { _lockReleaseHeld(held); rec.reject(e); return; }
+  // The lock is held until the callback's result SETTLES — rejection releases
+  // it just as resolution does. A lock that outlived a failed operation would
+  // deadlock the next attempt to retry it, which is the worst possible moment.
+  Promise.resolve(result).then(
+    (v) => { if (!held.broken) { _lockReleaseHeld(held); rec.resolve(v); } },
+    (e) => { if (!held.broken) { _lockReleaseHeld(held); rec.reject(e); } });
+};
+
+const _lockPump = () => {
+  _lockPumpScheduled = false;
+  for (;;) {
+    let granted = false;
+    for (let i = 0; i < _lockQueue.length; i++) {
+      const rec = _lockQueue[i];
+      if (rec.settled) { _lockQueue.splice(i, 1); granted = true; break; }
+      if (_lockGrantableAt(rec, i)) { _lockQueue.splice(i, 1); _lockGrantRec(rec); granted = true; break; }
+    }
+    if (!granted) return;
+  }
+};
+// Granting is DEFERRED to a microtask even when the lock is free. WPT proves
+// this matters: a caller may `request()` and then `controller.abort()` on the
+// very next line, and the callback must never have run. Granting synchronously
+// would make an abort that has not yet been given a chance to arrive too late.
+const _lockSchedulePump = () => {
+  if (_lockPumpScheduled) return;
+  _lockPumpScheduled = true;
+  Promise.resolve().then(_lockPump);
+};
+
+class LockManager {
+  constructor() { if (!_allowLockCtor) throw new TypeError("Illegal constructor"); }
+
+  request(name, options, callback) {
+    if (!(this instanceof LockManager)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 2)
+      return Promise.reject(new TypeError("Failed to execute 'request' on 'LockManager': 2 arguments required, but only " + arguments.length + " present."));
+    // The IDL is overloaded: (name, callback) or (name, options, callback).
+    let opts;
+    if (arguments.length === 2) { callback = options; opts = {}; }
+    else opts = (options === undefined || options === null) ? {} : options;
+    if (typeof callback !== 'function')
+      return Promise.reject(new TypeError("Failed to execute 'request' on 'LockManager': parameter " + (arguments.length === 2 ? 2 : 3) + " is not of type 'Function'."));
+    if (typeof opts !== 'object')
+      return Promise.reject(new TypeError("Failed to execute 'request' on 'LockManager': parameter 2 is not of type 'LockOptions'."));
+
+    // DOMString, deliberately: a resource name is an opaque identifier the page
+    // chose, and USVString conversion would fold a lone surrogate into U+FFFD —
+    // silently merging two names the page kept distinct.
+    name = String(name);
+    const mode = (opts.mode === undefined) ? 'exclusive' : String(opts.mode);
+    if (!_LOCK_MODES.has(mode))
+      return Promise.reject(new TypeError("Failed to execute 'request' on 'LockManager': The provided value '" + mode + "' is not a valid enum value of type LockMode."));
+    const ifAvailable = !!opts.ifAvailable;
+    const steal = !!opts.steal;
+    let signal = opts.signal;
+    if (signal !== undefined && signal !== null && !(signal instanceof globalThis.AbortSignal))
+      return Promise.reject(new TypeError("Failed to execute 'request' on 'LockManager': member signal is not of type AbortSignal."));
+    if (signal === undefined || signal === null) signal = null;
+
+    // A leading "-" is reserved for the UA's own names — a page that could mint
+    // one could collide with a lock it was never meant to see.
+    if (name.charCodeAt(0) === 0x2d)
+      return Promise.reject(new DOMException("Failed to execute 'request' on 'LockManager': Names cannot start with '-'.", "NotSupportedError"));
+    if (steal && ifAvailable)
+      return Promise.reject(new DOMException("Failed to execute 'request' on 'LockManager': The 'steal' and 'ifAvailable' options cannot be used together.", "NotSupportedError"));
+    // Stealing a SHARED lock is incoherent: there is no single holder to take
+    // it from, so the request cannot say whom it is overriding.
+    if (steal && mode !== 'exclusive')
+      return Promise.reject(new DOMException("Failed to execute 'request' on 'LockManager': The 'steal' option may only be used with 'exclusive' locks.", "NotSupportedError"));
+    if (signal && (steal || ifAvailable))
+      return Promise.reject(new DOMException("Failed to execute 'request' on 'LockManager': The 'signal' option cannot be used with 'steal' or 'ifAvailable'.", "NotSupportedError"));
+    if (signal && signal.aborted)
+      return Promise.reject(signal.reason !== undefined ? signal.reason : _abortError('AbortError', 'The operation was aborted'));
+
+    return new Promise((resolve, reject) => {
+      const rec = { name, mode, clientId: _lockClientId(), callback, resolve, reject,
+                    signal, steal, ifAvailable, settled: false, onAbort: null };
+      // The signal is wired up SYNCHRONOUSLY so that an `abort()` on the very
+      // next line lands before this request has done anything at all.
+      if (signal) {
+        rec.onAbort = () => {
+          if (rec.settled) return;
+          rec.settled = true;
+          const i = _lockQueue.indexOf(rec);
+          if (i !== -1) _lockQueue.splice(i, 1);
+          reject(signal.reason !== undefined ? signal.reason : _abortError('AbortError', 'The operation was aborted'));
+          _lockSchedulePump();
+        };
+        signal.addEventListener('abort', rec.onAbort);
+      }
+      // ⚠️ EACH REQUEST JOINS THE QUEUE IN ITS OWN MICROTASK, IN CALL ORDER —
+      // one shared pump is not enough. A `steal` breaks whoever holds the lock
+      // AT THE MOMENT IT IS PROCESSED, and WPT's `steal.https.any.js` requests
+      // the holder and the stealer in the same synchronous block:
+      //
+      //     navigator.locks.request(res, lock => never_settled);          // holder
+      //     navigator.locks.request(res, lock => { granted = true; });    // waiter
+      //     await navigator.locks.request(res, {steal: true}, …);         // stealer
+      //
+      // If all three merely queued and one pump ran later, the stealer would
+      // find NOTHING held, steal from nobody, take the lock, release it — and
+      // then hand the lock straight to the never-settling holder, wedging the
+      // waiter forever. Enqueuing in per-call microtask order means the holder
+      // is genuinely holding by the time the steal is processed, which is the
+      // only ordering in which "take it from whoever has it" means anything.
+      Promise.resolve().then(() => {
+        if (rec.settled) return;
+        if (rec.steal) {
+          for (const h of _lockHeld.slice()) {
+            if (h.name !== name) continue;
+            h.broken = true;
+            const i = _lockHeld.indexOf(h);
+            if (i !== -1) _lockHeld.splice(i, 1);
+            // A stolen lock must TELL its holder it is no longer held, or the
+            // holder goes on believing it still has exclusive access.
+            h.rec.reject(new DOMException("The lock was stolen.", "AbortError"));
+          }
+          // Straight to the FRONT: a steal that joined the back would be granted
+          // after requests that were already waiting, which is not "take it now".
+          _lockQueue.unshift(rec);
+        } else if (rec.ifAvailable && !_lockGrantableAt(rec, _lockQueue.length)) {
+          // Not available. The callback still RUNS — with null — because the
+          // whole point of ifAvailable is "tell me now, either way".
+          rec.settled = true;
+          if (rec.onAbort) signal.removeEventListener('abort', rec.onAbort);
+          let r;
+          try { r = callback(null); } catch (e) { reject(e); return; }
+          Promise.resolve(r).then(resolve, reject);
+          return;
+        } else {
+          _lockQueue.push(rec);
+        }
+        _lockPump();
+      });
+    });
+  }
+
+  // The snapshot is taken LATER, not at call time. `query()` runs "in parallel"
+  // in the spec, and the requests it is being asked about run in parallel too —
+  // so the ordinary idiom
+  //
+  //     navigator.locks.request(res, …);            // ask for the lock
+  //     const state = await navigator.locks.query(); // now, what is held?
+  //
+  // must see the request it was written to observe. Snapshotting synchronously
+  // reports the world as it was *before* the very line above it, which is never
+  // what the caller meant.
+  query() {
+    if (!(this instanceof LockManager)) return Promise.reject(new TypeError("Illegal invocation"));
+    return Promise.resolve().then(() => Promise.resolve()).then(() => ({
+      held: _lockHeld.map((h) => ({ name: h.name, mode: h.mode, clientId: h.clientId })),
+      pending: _lockQueue.filter((q) => !q.settled).map((q) => ({ name: q.name, mode: q.mode, clientId: q.clientId })),
+    }));
+  }
+
+  get [Symbol.toStringTag]() { return 'LockManager'; }
+}
+_enumAccessors(LockManager.prototype, 'request', 'query');
+
+// ══════════════════════════════════════════════════════════════════════════════
+// The Storage API — navigator.storage  (https://storage.spec.whatwg.org/)
+// ══════════════════════════════════════════════════════════════════════════════
+// Also absent entirely. `estimate()` is how a page finds out whether it can
+// afford to cache the next chapter, and `persisted()` is how it finds out
+// whether what it already saved is safe from eviction. A page that cannot ask
+// either question has to guess — and a wrong guess on a small device means
+// either a wasted download or a cache the browser quietly threw away.
+//
+// We answer honestly rather than flatteringly: storage here is in-memory and is
+// NOT persistent, so `persisted()` says false and `persist()` refuses. Claiming
+// otherwise would invite a page to skip its own re-download safety net.
+class StorageManager {
+  constructor() { if (!_allowLockCtor) throw new TypeError("Illegal constructor"); }
+  persisted() {
+    if (!(this instanceof StorageManager)) return Promise.reject(new TypeError("Illegal invocation"));
+    return Promise.resolve(false);
+  }
+  persist() {
+    if (!(this instanceof StorageManager)) return Promise.reject(new TypeError("Illegal invocation"));
+    return Promise.resolve(false);
+  }
+  estimate() {
+    if (!(this instanceof StorageManager)) return Promise.reject(new TypeError("Illegal invocation"));
+    // A quota, not a promise of one: the numbers are a hint, and the spec is
+    // explicit that a UA may round them to resist storage-size fingerprinting.
+    return Promise.resolve({ usage: 0, quota: 2147483648, usageDetails: {} });
+  }
+  getDirectory() {
+    if (!(this instanceof StorageManager)) return Promise.reject(new TypeError("Illegal invocation"));
+    return Promise.reject(new DOMException("The origin private file system is not supported.", "SecurityError"));
+  }
+  get [Symbol.toStringTag]() { return 'StorageManager'; }
+}
+_enumAccessors(StorageManager.prototype, 'persisted', 'persist', 'estimate', 'getDirectory');
+
+// Both are [SameObject]: a page that grabs `navigator.locks` once and keeps it
+// must keep talking to the same manager.
+{
+  _allowLockCtor = true;
+  let _lockManager, _storageManager;
+  try { _lockManager = new LockManager(); _storageManager = new StorageManager(); }
+  finally { _allowLockCtor = false; }
+  Object.defineProperty(navigator, 'locks', {
+    get: _markNative(function locks() { return _lockManager; }), enumerable: true, configurable: true,
+  });
+  Object.defineProperty(navigator, 'storage', {
+    get: _markNative(function storage() { return _storageManager; }), enumerable: true, configurable: true,
+  });
+}
+_exposeIface('Lock', Lock);
+_exposeIface('LockManager', LockManager);
+_exposeIface('StorageManager', StorageManager);
+_markNative(Lock); _markNative(LockManager); _markNative(StorageManager);
 
 _markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);
