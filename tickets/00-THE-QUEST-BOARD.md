@@ -25,6 +25,9 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F11** | ✅ [The Compressed Verdict](472-the-compressed-verdict.md) | **`compression/`** — `CompressionStream` / `DecompressionStream` | **676/676 (100%)** window + worker — was 4/338 / 0 | ⚔️⚔️ | **SECURED (Quest #481, 2026-08-06).** The interfaces did not exist. Pure-Rust DEFLATE + brotli; gzip framing written out. **146 subtests AHEAD of Chrome 151** on the same two variants. Caps: brotli quality fixed at 6; a stream abandoned without flush/cancel leaks its codec. |
+| **F12** | ✅ [The Routed Verdict](473-the-routed-verdict.md) | **`urlpattern/`** — the URL Pattern Standard | **1,584/1,584 (100%)** window + worker — was 17/795 / 0 | ⚔️⚔️⚔️ | **SECURED (Quest #482, 2026-08-06).** Was a four-line stub whose `test()` returned `false` — a router that silently matches nothing. Chrome 151: 756/815 (92.8%). Caps: the `v` regexp flag may reject a page regexp valid under `u`; no `URLPatternList`. |
+| **F13** | ✅ [The Registered Verdict](474-the-registered-verdict.md) | **`.any.serviceworker.html`** — the last worker variant family | see scroll — was **0 across 636 files / 8,930 subtests** | ⚔️⚔️ | **SECURED (Quest #483, 2026-08-06).** `register()` resolved `undefined`, so every file was a could-not-run. Real `ServiceWorkerGlobalScope` + the Client/container channel. **⚠️ Caps, and they are large: no `fetch` interception, no persistence, simplified lifecycle.** Also surfaced a pre-existing IndexedDB OOM that takes the whole engine down. |
 | **F1a** | ✅ [The Data Layer Verdict](455-the-data-layer-verdict.md) | **`fetch/api/{headers,request,response}/*`** — the fetch OBJECT MODEL | **527/598 (88.1%)** — was 130/566 (23.0%) | ⚔️⚔️ | **SECURED (Quests #457–#459, 2026-08-03).** 27 of 32 files to 100%, two more at exact Chrome parity. `Headers`/`Request`/`Response` were stubs wearing the name of a class. **Also killed a HANG**: `request-bad-port` 0/83 TIMEOUT → 83/83 (fetch's 83 blocked ports, in Rust). **Still open in `fetch`:** `fetch/api/basic/*` and `fetch/api/cors/*` — network BEHAVIOUR rather than object model, spot-checked and scoreable (`basic/request-headers` 1/25, `basic/response-url` 0/4). |
 | **F1b** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **`streams/*`** — what sits underneath `response.body` | **1390/1474 (94.3%)** — was 181/1211 (14.9%) | ⚔️⚔️ | **SECURED (Quests #460–#462, 2026-08-04).** 61 of 71 files to 100%. The old `ReadableStream` was 25 lines and its `tee()` returned two **empty** streams. Built the whole standard: readable + BYOB byte streams, writable, `pipeTo`/`pipeThrough`, `TransformStream`, both tees, queuing strategies. **Excluding `streams/transferable/` (a transfer capability we do not have) we lead Chrome 1390/1398 to 1344/1398 on the identical files.** **And found the platform bug underneath it: `setTimeout(fn, 0)` was a MICROTASK** — see F8. |
 | **F8** | ✅ [The Streaming Verdict](456-the-streaming-verdict.md) | **The event loop — a task is not a microtask** | **FIXED (Quest #461, 2026-08-04)** | ⚔️ | `setTimeout(fn, 0)` was `Promise.resolve().then(fn)`. HTML runs one TASK then drains the ENTIRE microtask queue; a zero-delay timer scheduled as a microtask INTERLEAVES with the promise jobs already queued. Measured: **3 of 500** chained promise jobs had run when a 0ms timer fired (now 500/500). Every `await delay(0)` on the platform — including WPT's own `flushAsyncEvents` — was looking at a half-finished world. Fixed by pumping real tasks through `op_sleep(0)`, one at a time, in insertion order. Swept before/after on 56 timer-heavy files (`scripts/wpt-eventloop-sweep.txt`). |
@@ -312,6 +315,69 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-06 — Quests #481–#483, **The Compressed, Routed & Registered Arc** (`compression` **4/338 → 676/676** · `urlpattern` **17/795 → 1,584/1,584** · the `.any.serviceworker.html` family **0 → measured**)
+
+*Scrolls: [`472-the-compressed-verdict.md`](472-the-compressed-verdict.md) · [`473-the-routed-verdict.md`](473-the-routed-verdict.md) · [`474-the-registered-verdict.md`](474-the-registered-verdict.md)*
+
+**Two whole realms that did not exist, and the last of the four worker variants.**
+The worker arc's leverage list named three things and this arc took all three.
+
+**#481 — `CompressionStream`/`DecompressionStream` were ABSENT, not stubbed.**
+Nineteen files, four formats, and the only rows scoring were four `idlharness`
+subtests that pass for any missing interface. New `crates/obscura-js/src/compress_ops.rs`
+over `flate2` with the **pure-Rust `miniz_oxide` backend** (the browser still
+builds with no C toolchain) plus the `brotli` crate — both already in the lock
+file via `reqwest`, so the whole realm cost two lines of `Cargo.toml`. **gzip's
+RFC 1952 framing is written out by hand**, because `flate2`'s own gzip helpers
+need a C zlib, and that turned out to be the better position: `decompression-corrupt-input`
+walks every header field and asserts exactly which mutations are fatal, and with
+the parser in our hands each answer is one visible line. **⭐ THE PRIMITIVE: a
+chunk can be BOTH PRODUCTIVE AND FATAL** — a valid stream with one pad byte
+decodes completely and *then* errors, and WPT asserts the payload arrives on the
+**first** `read()` and the error on the second. A `Result`-returning push cannot
+express that, so `op_compress_push` never fails: it returns what it produced and
+*records* the error. The JS must enqueue **before** it throws, because a reader
+already waiting is fulfilled directly while erroring first would `ResetQueue` the
+chunk away. **676/676 across window + worker; Chrome 151 scores 265/338 on each —
+we are 146 ahead, because brotli works here and does not there.**
+
+**#482 — `URLPattern` was four lines whose `test()` returned `false`.** The worst
+shape a stub can take: not a missing feature but **a feature that answers, and
+answers wrong** — a router built on it does not throw, it silently matches
+nothing, and every route on the page quietly misses. Full spec implementation
+(~900 lines): tokenizer → part list → two generators (the `RegExp` we match with
+and the canonical pattern string the getters return), a token-level state machine
+for constructor strings, per-component canonicalization, plus `compareComponent`
+and `generate()` at 26/26 and 20/20 first try. **⭐⭐ THE ONE THAT COST TWO CYCLES:
+hostname state is NOT host state.** `bad\hostname` is the host `bad` (`\`
+terminates); `bad@hostname` and `bad:hostname` are **errors** (`@` and `:` are
+forbidden — a colon in *hostname* state never introduces a port); and **none of
+that applies inside `[…]`**, where every colon belongs to the IPv6 literal. Three
+attempts, each fixing one and breaking another. Also **⭐ the port encoding
+callback takes NO protocol** — passing it elided the literal `443` out of the
+pattern `443*` and, because the default protocol pattern is `*` and
+`new URL("*://…")` is not a URL, made **every** port pattern throw at
+construction. **1,584/1,584 across window + worker; Chrome 151: 756/815 (92.8%).**
+
+**#483 — the `.any.serviceworker.html` family, 636 files / 8,930 subtests, at
+zero.** The fifth time this campaign has met "invisible, not failing" and the
+fifth time it was the biggest thing on the map. `navigator.serviceWorker.register()`
+resolved with `undefined`, so `reg.installing` threw, the page's async bootstrap
+rejected into nothing, and the harness sat there loaded and waiting. **⭐ THE
+PRIMITIVE: a service worker has no handle, so it answers its CLIENT.** A
+dedicated worker is born holding a channel and a shared worker hands you a port;
+a service worker has neither — it was registered against a *scope* and outlives
+the page. So the two directions are asymmetric: page → worker fires `message`
+with **`source` set to a `Client`**, and worker → page fires `message` on
+**`navigator.serviceWorker`**, which must therefore be an `EventTarget` and must
+be **the same object on every access**. The other load-bearing detail: the
+worker's script runs **synchronously inside `register()`**, before its promise
+resolves, because the page posts `{type:"connect"}` in the very next microtask —
+while the *lifecycle* runs on a later task, so the registration handed back still
+has `installing` set. **⚠️ Found by this sweep and NOT caused by it:
+`IndexedDB/event-dispatch-active-flag.any.html` crashes the engine with a V8
+out-of-memory, verified identical on the window variant.**
 
 ### 2026-08-05 — Quests #478–#480, **The Worker Arc** (the `.any.worker.html` family **0 / could-not-run** → `encoding` **11,648/11,796** + `WebCryptoAPI` **29,383/29,506** + the sharedworker probe **1,477/2,537**)
 

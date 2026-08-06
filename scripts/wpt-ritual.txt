@@ -155,3 +155,29 @@ encoding/api-invalid-label.any.worker.html?1-1000
 dom/idlharness.any.worker.html
 workers/importscripts_mime_local.any.worker.html
 streams/idlharness.any.sharedworker.html
+
+# ── Compression / URLPattern / service workers (Quests #481–#483). Six guards:
+#      * compression-corrupt-input — the gzip framing written out by hand. Every
+#        header field, the FHCRC check and the CRC-32/ISIZE trailer, each with
+#        WPT's own verdict on which mutations are survivable. If the framing
+#        drifts, this is the file that says so.
+#      * decompression-extra-input — the "a chunk can be both productive and
+#        fatal" contract: the payload must arrive on the FIRST read and the error
+#        on the second. It goes to 0 the moment push() starts failing outright.
+#      * compression-bad-chunks.any.worker — the same codecs reached through the
+#        worker scope, so a regression in either half is caught.
+#      * urlpattern.any — the whole pattern engine (tokenizer, parser, both
+#        generators, all eight components) in one 370-subtest file.
+#      * urlpattern-compare.tentative — the part list itself, which the regexp
+#        alone cannot check: two patterns can compile to the same matcher and
+#        still be ordered differently.
+#      * urlpattern.any.serviceworker — the service-worker path end to end. It
+#        only scores if a registration was made, a real ServiceWorkerGlobalScope
+#        was built, the script ran, and the Client/container channel carried the
+#        results back. Any break in that chain reads as could-not-run.
+compression/decompression-corrupt-input.any.html
+compression/decompression-extra-input.any.html
+compression/compression-bad-chunks.any.worker.html
+urlpattern/urlpattern.any.html
+urlpattern/urlpattern-compare.tentative.any.html
+urlpattern/urlpattern.any.serviceworker.html

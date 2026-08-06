@@ -5,6 +5,7 @@ pub mod module_loader;
 pub mod runtime;
 pub mod ops;
 pub mod aes_ops;
+pub mod compress_ops;
 pub mod crypto_ops;
 pub mod rsa_ops;
 pub mod ec_ops;

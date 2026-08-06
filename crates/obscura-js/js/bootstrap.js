@@ -45793,6 +45793,340 @@ _markNative(SharedWorkerGlobalScope); _markNative(globalThis.SharedWorker);
 _markNative(MessagePort.prototype.postMessage); _markNative(MessagePort.prototype.start);
 _markNative(MessagePort.prototype.close); _markNative(SharedWorkerGlobalScope.prototype.close);
 
+
+// ═══════════════════════════ Service workers ═════════════════════════════════
+// The third worker front door, and the only one a page can keep. A service
+// worker is registered against a SCOPE rather than opened by a handle, and it
+// outlives the page that installed it — which is how a site keeps working when
+// the network does not. On an unreliable or metered connection that is not a
+// progressive nicety; it is the difference between a page that opens and a page
+// that does not.
+//
+// This builds on the machinery the dedicated and shared workers already use:
+// the same real global scope, the same blocking `importScripts`, the same
+// top-level-declaration mirror. What is genuinely new is the shape of the
+// conversation. A dedicated worker talks back down the handle you opened it
+// with; a service worker has no such handle, so it answers its CLIENT — and the
+// page listens on `navigator.serviceWorker`, not on any worker object. Getting
+// that pair of directions right is the whole of the plumbing below.
+//
+// HONESTLY NOT HERE, and named in the scroll: `fetch` event interception (the
+// offline story itself), the install/waiting/activate lifecycle's real ordering
+// rules, and persistence across page loads. A page that registers a worker and
+// talks to it gets the real thing; a page that expects to serve a cached
+// response from one does not, yet.
+let _allowSWCtor = false;
+const _swOrigin = function() {
+  try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ''; }
+};
+
+// An ExtendableEvent's `waitUntil` is the promise that says "the install is not
+// finished until this settles". We run the lifecycle synchronously, so it has
+// nothing to extend — but a worker that calls it must not crash, and a worker
+// that reads `event.waitUntil` to feature-detect must find it.
+class ExtendableEvent extends Event {
+  constructor(type, init) { super(type, init); }
+  waitUntil(promise) {
+    if (!(this instanceof ExtendableEvent)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'waitUntil' on 'ExtendableEvent': 1 argument required, but only 0 present.");
+    try { Promise.resolve(promise).catch(() => {}); } catch (e) {}
+  }
+  get [Symbol.toStringTag]() { return 'ExtendableEvent'; }
+}
+_enumAccessors(ExtendableEvent.prototype, 'waitUntil');
+
+class ServiceWorkerGlobalScope extends WorkerGlobalScope {
+  constructor() { super(); }
+  get registration() {
+    if (!(this instanceof ServiceWorkerGlobalScope)) throw new TypeError("Illegal invocation");
+    return this._swreg;
+  }
+  get serviceWorker() {
+    if (!(this instanceof ServiceWorkerGlobalScope)) throw new TypeError("Illegal invocation");
+    return this._swself;
+  }
+  get clients() {
+    if (!(this instanceof ServiceWorkerGlobalScope)) throw new TypeError("Illegal invocation");
+    return this._swclients;
+  }
+  skipWaiting() {
+    if (!(this instanceof ServiceWorkerGlobalScope)) throw new TypeError("Illegal invocation");
+    return Promise.resolve(undefined);
+  }
+  get [Symbol.toStringTag]() { return 'ServiceWorkerGlobalScope'; }
+}
+_workerEventHandlers(ServiceWorkerGlobalScope.prototype, ServiceWorkerGlobalScope,
+  ['onmessage', 'onmessageerror', 'oninstall', 'onactivate', 'onfetch']);
+_enumAccessors(ServiceWorkerGlobalScope.prototype, 'registration', 'serviceWorker', 'clients', 'skipWaiting');
+
+// The page, as the worker sees it. `postMessage` here travels UP: it fires a
+// `message` event on the page's ServiceWorkerContainer, which is where a page
+// listens for its worker — there is no worker object on that side to hear it.
+class Client {
+  constructor() {
+    if (!_allowSWCtor) throw new TypeError("Illegal constructor");
+  }
+  get id() { if (!(this instanceof Client)) throw new TypeError("Illegal invocation"); return this._cid; }
+  get url() { if (!(this instanceof Client)) throw new TypeError("Illegal invocation"); return this._curl; }
+  get type() { if (!(this instanceof Client)) throw new TypeError("Illegal invocation"); return 'window'; }
+  get frameType() { if (!(this instanceof Client)) throw new TypeError("Illegal invocation"); return 'top-level'; }
+  postMessage(message, transferOrOptions) {
+    if (!(this instanceof Client)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'postMessage' on 'Client': 1 argument required, but only 0 present.");
+    const rec = this._crec;
+    const cloned = structuredClone(message);
+    setTimeout(() => {
+      if (rec.terminated) return;
+      _dispatchSpec(_serviceWorkerContainer,
+        new MessageEvent('message', { data: cloned, origin: _swOrigin(), source: rec.worker }));
+    }, 0);
+  }
+  get [Symbol.toStringTag]() { return 'Client'; }
+}
+_enumAccessors(Client.prototype, 'id', 'url', 'type', 'frameType', 'postMessage');
+
+class Clients {
+  constructor() { if (!_allowSWCtor) throw new TypeError("Illegal constructor"); }
+  matchAll(options) {
+    if (!(this instanceof Clients)) throw new TypeError("Illegal invocation");
+    return Promise.resolve([this._crec.client]);
+  }
+  get(id) {
+    if (!(this instanceof Clients)) throw new TypeError("Illegal invocation");
+    const c = this._crec.client;
+    return Promise.resolve(c && c.id === String(id) ? c : undefined);
+  }
+  claim() {
+    if (!(this instanceof Clients)) throw new TypeError("Illegal invocation");
+    return Promise.resolve(undefined);
+  }
+  openWindow(url) {
+    if (!(this instanceof Clients)) throw new TypeError("Illegal invocation");
+    return Promise.resolve(null);
+  }
+  get [Symbol.toStringTag]() { return 'Clients'; }
+}
+_enumAccessors(Clients.prototype, 'matchAll', 'get', 'claim', 'openWindow');
+
+// The worker, as the page sees it.
+class ServiceWorker extends EventTarget {
+  constructor() {
+    if (!_allowSWCtor) throw new TypeError("Illegal constructor");
+    super(undefined);
+  }
+  get scriptURL() { if (!(this instanceof ServiceWorker)) throw new TypeError("Illegal invocation"); return this._srec.url; }
+  get state() { if (!(this instanceof ServiceWorker)) throw new TypeError("Illegal invocation"); return this._srec.state; }
+  postMessage(message, transferOrOptions) {
+    if (!(this instanceof ServiceWorker)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'postMessage' on 'ServiceWorker': 1 argument required, but only 0 present.");
+    const rec = this._srec;
+    if (rec.terminated) return;
+    const cloned = structuredClone(message);
+    // `source` is the CLIENT, not a port — that is what a service worker gets
+    // instead of the implicit channel a dedicated worker is born with, and it
+    // is the object testharness reaches for to answer this page in particular.
+    const deliver = () => {
+      if (rec.terminated || !rec.scope) return;
+      _dispatchSpec(rec.scope, new MessageEvent('message',
+        { data: cloned, origin: _swOrigin(), source: rec.client, ports: Object.freeze([]) }));
+    };
+    if (rec.started) setTimeout(deliver, 0);
+    else rec.queue.push(deliver);
+  }
+  get [Symbol.toStringTag]() { return 'ServiceWorker'; }
+}
+_workerEventHandlers(ServiceWorker.prototype, ServiceWorker, ['onstatechange', 'onerror']);
+_enumAccessors(ServiceWorker.prototype, 'scriptURL', 'state', 'postMessage');
+
+class ServiceWorkerRegistration extends EventTarget {
+  constructor() {
+    if (!_allowSWCtor) throw new TypeError("Illegal constructor");
+    super(undefined);
+  }
+  get scope() { if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation"); return this._rrec.scopeURL; }
+  get installing() { if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation"); return this._rrec.installing; }
+  get waiting() { if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation"); return this._rrec.waiting; }
+  get active() { if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation"); return this._rrec.active; }
+  get updateViaCache() { if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation"); return this._rrec.updateViaCache; }
+  update() {
+    if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
+    return Promise.resolve(this);
+  }
+  unregister() {
+    if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
+    const rec = this._rrec;
+    const existed = _swRegistrations.get(rec.scopeURL) === rec;
+    if (existed) _swRegistrations.delete(rec.scopeURL);
+    rec.terminated = true;
+    return Promise.resolve(existed);
+  }
+  get [Symbol.toStringTag]() { return 'ServiceWorkerRegistration'; }
+}
+_workerEventHandlers(ServiceWorkerRegistration.prototype, ServiceWorkerRegistration, ['onupdatefound']);
+_enumAccessors(ServiceWorkerRegistration.prototype,
+  'scope', 'installing', 'waiting', 'active', 'updateViaCache', 'update', 'unregister');
+
+const _swRegistrations = new Map();
+
+const _swSetState = function(rec, state) {
+  rec.state = state;
+  if (rec.worker) _dispatchSpec(rec.worker, new Event('statechange'));
+};
+
+// Start the worker: fetch and run its script in a real ServiceWorkerGlobalScope,
+// then walk it through the lifecycle. The script runs BEFORE `register()`'s
+// promise resolves, so a page that posts a message the instant it has the
+// registration finds a listener already installed.
+const _swStart = function(rec) {
+  const code = _workerFetchScriptSync(rec.url);   // throws → register() rejects
+  _allowSWCtor = true;
+  let scope, worker, registration, client, clients;
+  try {
+    scope = _newWorkerScope(ServiceWorkerGlobalScope, rec.url, '');
+    worker = new ServiceWorker();
+    registration = new ServiceWorkerRegistration();
+    client = new Client();
+    clients = new Clients();
+  } finally { _allowSWCtor = false; }
+  const hide = (o, k, v) => Object.defineProperty(o, k, { value: v, enumerable: false, configurable: true });
+  hide(worker, '_srec', rec);
+  hide(registration, '_rrec', rec);
+  hide(client, '_crec', rec);
+  hide(client, '_cid', _uuidV4());
+  hide(client, '_curl', _domParse("document_url") || "about:blank");
+  hide(clients, '_crec', rec);
+  hide(scope, '_wk', rec);
+  hide(scope, '_swreg', registration);
+  hide(scope, '_swself', worker);
+  hide(scope, '_swclients', clients);
+  rec.scope = scope;
+  rec.worker = worker;
+  rec.registration = registration;
+  rec.client = client;
+  rec.installing = worker;
+  rec.state = 'installing';
+  rec.started = true;
+  try { _workerEvalScript(scope, code, rec.url); }
+  catch (e) { _workerFireError(rec, e, rec.url); }
+  const pending = rec.queue.splice(0, rec.queue.length);
+  for (const deliver of pending) setTimeout(deliver, 0);
+  // The lifecycle runs on a later task, so the registration a caller is handed
+  // still has `installing` set — which is what a page grabs to talk to a worker
+  // it has only just installed.
+  setTimeout(() => {
+    if (rec.terminated) return;
+    _dispatchSpec(scope, new ExtendableEvent('install'));
+    rec.installing = null; rec.waiting = worker;
+    _swSetState(rec, 'installed');
+    _dispatchSpec(scope, new ExtendableEvent('activate'));
+    rec.waiting = null; rec.active = worker;
+    _swSetState(rec, 'activated');
+  }, 0);
+  return registration;
+};
+
+class ServiceWorkerContainer extends EventTarget {
+  constructor() {
+    if (!_allowSWCtor) throw new TypeError("Illegal constructor");
+    super(undefined);
+  }
+  get controller() { if (!(this instanceof ServiceWorkerContainer)) throw new TypeError("Illegal invocation"); return null; }
+  get ready() {
+    if (!(this instanceof ServiceWorkerContainer)) throw new TypeError("Illegal invocation");
+    // Resolves with the first registration that reaches "activated". A page that
+    // awaits this before doing anything must not be left waiting forever, so a
+    // registration that already exists resolves it immediately.
+    for (const rec of _swRegistrations.values()) if (rec.active) return Promise.resolve(rec.registration);
+    return new Promise((resolve) => { _swReadyWaiters.push(resolve); });
+  }
+  register(scriptURL, options) {
+    if (!(this instanceof ServiceWorkerContainer)) throw new TypeError("Illegal invocation");
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'register' on 'ServiceWorkerContainer': 1 argument required, but only 0 present."));
+    const base = _domParse("document_url") || "about:blank";
+    let url, scopeURL;
+    const opts = (options == null) ? {} : options;
+    try { url = new URL(String(scriptURL), base).href; }
+    catch (e) { return Promise.reject(new TypeError("Failed to register a ServiceWorker: the script URL is invalid.")); }
+    try {
+      scopeURL = opts.scope == null
+        ? new URL('./', url).href
+        : new URL(String(opts.scope), base).href;
+    } catch (e) { return Promise.reject(new TypeError("Failed to register a ServiceWorker: the scope URL is invalid.")); }
+    const existing = _swRegistrations.get(scopeURL);
+    if (existing && existing.url === url && !existing.terminated) return Promise.resolve(existing.registration);
+    const rec = { url: url, scopeURL: scopeURL, updateViaCache: String(opts.updateViaCache || 'imports'),
+                  scope: null, worker: null, registration: null, client: null,
+                  installing: null, waiting: null, active: null, state: 'parsed',
+                  started: false, terminated: false, queue: [] };
+    let registration;
+    try { registration = _swStart(rec); }
+    catch (e) { return Promise.reject(new TypeError("Failed to register a ServiceWorker: " + ((e && e.message) || e))); }
+    _swRegistrations.set(scopeURL, rec);
+    setTimeout(() => {
+      const waiters = _swReadyWaiters.splice(0, _swReadyWaiters.length);
+      for (const w of waiters) w(registration);
+    }, 0);
+    return Promise.resolve(registration);
+  }
+  getRegistration(clientURL) {
+    if (!(this instanceof ServiceWorkerContainer)) throw new TypeError("Illegal invocation");
+    const base = _domParse("document_url") || "about:blank";
+    let target;
+    try { target = new URL(clientURL == null ? '' : String(clientURL), base).href; }
+    catch (e) { return Promise.reject(new TypeError('Invalid URL')); }
+    // The longest scope that is a prefix of the URL wins — a registration for
+    // `/app/` must not answer for `/`.
+    let best = null;
+    for (const rec of _swRegistrations.values()) {
+      if (rec.terminated) continue;
+      if (target.startsWith(rec.scopeURL) && (!best || rec.scopeURL.length > best.scopeURL.length)) best = rec;
+    }
+    return Promise.resolve(best ? best.registration : undefined);
+  }
+  getRegistrations() {
+    if (!(this instanceof ServiceWorkerContainer)) throw new TypeError("Illegal invocation");
+    const out = [];
+    for (const rec of _swRegistrations.values()) if (!rec.terminated) out.push(rec.registration);
+    return Promise.resolve(out);
+  }
+  startMessages() {
+    if (!(this instanceof ServiceWorkerContainer)) throw new TypeError("Illegal invocation");
+  }
+  get [Symbol.toStringTag]() { return 'ServiceWorkerContainer'; }
+}
+_workerEventHandlers(ServiceWorkerContainer.prototype, ServiceWorkerContainer,
+  ['oncontrollerchange', 'onmessage', 'onmessageerror', 'onerror']);
+_enumAccessors(ServiceWorkerContainer.prototype,
+  'controller', 'ready', 'register', 'getRegistration', 'getRegistrations', 'startMessages');
+
+const _swReadyWaiters = [];
+_allowSWCtor = true;
+const _serviceWorkerContainer = new ServiceWorkerContainer();
+_allowSWCtor = false;
+// `navigator.serviceWorker` must be the SAME object on every access: a page adds
+// its message listener to it once and expects to keep hearing.
+try {
+  Object.defineProperty(navigator, 'serviceWorker', {
+    get: _named('get', 'serviceWorker', function() { return _serviceWorkerContainer; }),
+    enumerable: true, configurable: true,
+  });
+} catch (e) {}
+
+_exposeIface('ServiceWorker', ServiceWorker);
+_exposeIface('ServiceWorkerRegistration', ServiceWorkerRegistration);
+_exposeIface('ServiceWorkerContainer', ServiceWorkerContainer);
+_exposeIface('ServiceWorkerGlobalScope', ServiceWorkerGlobalScope);
+_exposeIface('ExtendableEvent', ExtendableEvent);
+_exposeIface('Client', Client);
+_exposeIface('Clients', Clients);
+_markNative(ServiceWorker); _markNative(ServiceWorkerRegistration);
+_markNative(ServiceWorkerContainer); _markNative(ServiceWorkerGlobalScope);
+_markNative(ExtendableEvent); _markNative(Client); _markNative(Clients);
+
 const __blobStore = {};
 const __blobTypes = {};
 // A v4 UUID (8-4-4-4-12 with version nibble 4 and the 8/9/a/b variant) — the
@@ -48730,6 +49064,140 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   expose('WritableStreamDefaultController', WritableStreamDefaultController);
   expose('TransformStream', TransformStream);
   expose('TransformStreamDefaultController', TransformStreamDefaultController);
+})(globalThis);
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Compression Standard — https://compression.spec.whatwg.org/
+// CompressionStream / DecompressionStream.
+//
+// A page that can compress before it uploads, and decompress what it caches,
+// moves a fraction of the bytes. On a metered connection that is not a nicety —
+// it decides whether the page is affordable at all. The codecs themselves live
+// in Rust (`crates/obscura-js/src/compress_ops.rs`); everything here is the
+// Web-facing shape: the format enum, what a bad chunk does to the stream, and
+// when the answer is a TypeError.
+//
+// Both classes are the same machine with one bit flipped, so they are built by
+// one factory. Neither one *is* a TransformStream — the IDL says they `include
+// GenericTransformStream`, i.e. they own one and expose its two ends — which is
+// why the readable/writable pair below are prototype getters over a private map
+// rather than inherited properties.
+// ═════════════════════════════════════════════════════════════════════════════
+(function (global) {
+  'use strict';
+  const _ops = Deno.core.ops;
+  const TransformStream = global.TransformStream;
+  if (typeof TransformStream !== 'function') return;
+
+  // The `CompressionFormat` enum. `deflate` is the confusing one: it means
+  // DEFLATE wrapped in zlib (RFC 1950), and the *unwrapped* form is the one
+  // spelled out as `deflate-raw`.
+  const FORMATS = ['deflate', 'deflate-raw', 'gzip', 'brotli'];
+
+  // Every failure the standard defines is the same TypeError. That is not
+  // laziness in the spec: telling a page *how* its input was malformed tells
+  // anyone who can feed it input a little about what is on the other side.
+  const bad = () => new TypeError('The compressed data was not valid.');
+
+  // The chunk must be a BufferSource, and a SharedArrayBuffer is not one — its
+  // contents can change under the codec mid-read, so the standard excludes it
+  // rather than let a race decide what got compressed. `view.buffer instanceof
+  // ArrayBuffer` is the whole test: a shared buffer answers false.
+  function toBytes(chunk) {
+    if (ArrayBuffer.isView(chunk)) {
+      if (!(chunk.buffer instanceof ArrayBuffer)) throw new TypeError('Chunk cannot be a SharedArrayBuffer view');
+      return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    }
+    if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+    throw new TypeError('Chunk is not a BufferSource');
+  }
+
+  // The private half of GenericTransformStream, and the brand check with it: an
+  // object that never went through our constructor is not in the map, so
+  // `CompressionStream.prototype.readable` called on anything else throws
+  // rather than reading a field off a stranger.
+  const _inner = new WeakMap();
+  function branded(o, name, what) {
+    const ts = _inner.get(o);
+    if (ts === undefined) throw new TypeError(`Illegal invocation: ${what}.prototype.${name} called on a non-${what}`);
+    return ts;
+  }
+
+  function makeStream(format, decompress, what) {
+    if (FORMATS.indexOf(format) === -1) {
+      throw new TypeError(`Failed to construct '${what}': Unsupported compression format: '${format}'`);
+    }
+    const id = _ops.op_compress_new(format, decompress);
+    // The codec is Rust-side state, so it has to be released explicitly on
+    // every way out — flushed, errored, or cancelled — or a page that opens one
+    // per request slowly accumulates them.
+    let freed = false;
+    const free = () => { if (!freed) { freed = true; _ops.op_compress_free(id); } };
+
+    return new TransformStream({
+      transform(chunk, controller) {
+        let bytes;
+        try { bytes = toBytes(chunk); }
+        catch (e) { free(); throw e; }
+        // Copied into Rust synchronously, before control returns to the page.
+        // That ordering is the whole of `compression-with-detach`: the test
+        // detaches the input buffer from a `then` getter, which can only run at
+        // an await boundary — so a codec that reads the bytes first cannot be
+        // handed an emptied buffer, and one that awaits first can.
+        const out = _ops.op_compress_push(id, bytes);
+        if (out.byteLength > 0) controller.enqueue(out);
+        // A chunk can be both productive and fatal — a valid stream with a byte
+        // of padding after it decodes completely and *then* is invalid — so the
+        // output is enqueued before the error is raised. A reader already
+        // waiting receives it directly; erroring first would drop it.
+        if (_ops.op_compress_errored(id)) { free(); throw bad(); }
+      },
+      flush(controller) {
+        const out = _ops.op_compress_finish(id);
+        const failed = _ops.op_compress_errored(id);
+        free();
+        if (failed) throw bad();
+        // "If buffer is empty, return" — an empty tail is not a chunk. A page
+        // reading this stream must see `done`, not a zero-length Uint8Array.
+        if (out.byteLength > 0) controller.enqueue(out);
+      },
+      cancel() { free(); },
+    });
+  }
+
+  class CompressionStream {
+    constructor(format) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to construct 'CompressionStream': 1 argument required, but only 0 present.");
+      }
+      // WebIDL converts to a string *before* it checks the enum, so a value
+      // whose `toString` throws propagates that error rather than a TypeError
+      // about the format — the page's own failure, reported as its own.
+      _inner.set(this, makeStream(String(format), false, 'CompressionStream'));
+    }
+    get readable() { return branded(this, 'readable', 'CompressionStream').readable; }
+    get writable() { return branded(this, 'writable', 'CompressionStream').writable; }
+  }
+
+  class DecompressionStream {
+    constructor(format) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to construct 'DecompressionStream': 1 argument required, but only 0 present.");
+      }
+      _inner.set(this, makeStream(String(format), true, 'DecompressionStream'));
+    }
+    get readable() { return branded(this, 'readable', 'DecompressionStream').readable; }
+    get writable() { return branded(this, 'writable', 'DecompressionStream').writable; }
+  }
+
+  for (const C of [CompressionStream, DecompressionStream]) {
+    // WebIDL attributes are enumerable on the prototype; class accessors are
+    // not, so both need restating.
+    Object.defineProperties(C.prototype, { readable: { enumerable: true }, writable: { enumerable: true } });
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: C.name, configurable: true });
+    Object.defineProperty(global, C.name, { value: C, writable: true, enumerable: false, configurable: true });
+  }
 })(globalThis);
 
 
@@ -53598,11 +54066,1054 @@ if (typeof ServiceWorkerContainer === 'undefined') {
   globalThis.ServiceWorkerContainer = class { register(){return Promise.resolve();} getRegistrations(){return Promise.resolve([]);} };
 }
 
-if (typeof URLPattern === 'undefined') {
-  globalThis.URLPattern = class URLPattern {
-    constructor(pattern){this._pattern=pattern||{};} test(){return false;} exec(){return null;}
+// ═════════════════════════════════════════════════════════════════════════════
+// URL Pattern Standard — https://urlpattern.spec.whatwg.org/
+//
+// A URLPattern is how a page says "this URL, or one shaped like it" — the thing
+// every router, every service worker cache rule and every `navigate` handler
+// needs and that, without it, each site ships its own hand-rolled regexp for.
+// Ours was a four-line stub whose `test()` returned false, so every route on
+// such a page silently missed.
+//
+// The implementation is the spec's, in the spec's order: a TOKENIZER over the
+// pattern syntax, a PARSER turning tokens into a part list, and two generators
+// over that part list — one producing the RegExp we match with, one producing
+// the canonical pattern string the component getters return. Each of the eight
+// URL components is compiled separately, with its own delimiter, its own prefix
+// character and its own canonicalization, because `/` means something in a path
+// that it does not mean in a hostname.
+// ═════════════════════════════════════════════════════════════════════════════
+(function (global) {
+  'use strict';
+
+  // ── Canonicalization ───────────────────────────────────────────────────────
+  // Every literal piece of a pattern is run through the URL parser for the
+  // component it belongs to, so that `/foo bar` and `/foo%20bar` are the same
+  // pattern. Doing this at COMPILE time is what lets matching be a plain string
+  // comparison later — and it is why a pattern with an unparseable host is an
+  // error at construction rather than a route that quietly never fires.
+
+  const SPECIAL_PORTS = { 'http:': '80', 'https:': '443', 'ws:': '80', 'wss:': '443', 'ftp:': '21', 'file:': '' };
+  const SPECIAL_SCHEMES = ['http', 'https', 'ws', 'wss', 'ftp', 'file'];
+
+  const isSpecialScheme = (s) => SPECIAL_SCHEMES.indexOf(s) !== -1;
+
+  function canonProtocol(value) {
+    if (value === '') return value;
+    let u;
+    try { u = new URL(value + '://dummy.test'); }
+    catch (e) { throw new TypeError(`Invalid protocol '${value}'`); }
+    const p = u.protocol;
+    return p.charAt(p.length - 1) === ':' ? p.substring(0, p.length - 1) : p;
+  }
+
+  function canonUsername(value) {
+    if (value === '') return value;
+    const u = new URL('fake://dummy.test');
+    u.username = value;
+    return u.username;
+  }
+
+  function canonPassword(value) {
+    if (value === '') return value;
+    const u = new URL('fake://dummy.test');
+    u.password = value;
+    return u.password;
+  }
+
+  // A hostname is canonicalized by parsing it as the host of a real URL, which
+  // is what gives us IDNA for free: `café.com` becomes `xn--caf-dma.com`, so a
+  // pattern written in the reader's own script matches the URL their browser
+  // actually requests. A host the parser rejects throws — a pattern with an
+  // unparseable host is a route that could never fire.
+  // Forbidden host code points that are NOT terminators. `/`, `\`, `?` and `#`
+  // END a host — `bad\hostname` really is the host `bad` — but `@`, a space or
+  // a `:` inside one is not a shorter host, it is a broken one. The `:` is the
+  // one that surprises: this is HOSTNAME state, not host state, so a colon here
+  // never introduces a port, it is simply illegal.
+  const FORBIDDEN_HOST = /[\u0000-\u001f\u007f <>@:[\]^|]/;
+  function canonHostname(value) {
+    if (value === '') return value;
+    let host = value.replace(/[\t\n\r]/g, '');
+    // …except inside `[…]`, where every colon belongs to the IPv6 literal.
+    if (host.charAt(0) !== '[') {
+      const terminator = host.search(/[/\\?#]/);
+      if (terminator >= 0) host = host.substring(0, terminator);
+      if (FORBIDDEN_HOST.test(host)) throw new TypeError(`Invalid hostname pattern '${value}'`);
+    }
+    let u;
+    try { u = new URL('http://' + host + '/'); }
+    catch (e) { throw new TypeError(`Invalid hostname pattern '${value}'`); }
+    return u.hostname;
+  }
+
+  // WebIDL USVString: a lone surrogate is not a Unicode scalar value, so it
+  // becomes U+FFFD rather than travelling on as half a character.
+  function toUSV(value) {
+    const s = String(value);
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff) {
+        const n = i + 1 < s.length ? s.charCodeAt(i + 1) : 0;
+        if (n >= 0xdc00 && n <= 0xdfff) { out += s[i] + s[i + 1]; i += 1; continue; }
+        out += '\ufffd';
+        continue;
+      }
+      if (c >= 0xdc00 && c <= 0xdfff) { out += '\ufffd'; continue; }
+      out += s[i];
+    }
+    return out;
+  }
+
+  // An IPv6 literal is canonicalized by hand rather than by the URL parser,
+  // because a *pattern* may hold a group in the middle of the address — the
+  // parser would reject `[::${rest}]` outright, and refusing to compile it would
+  // make IPv6 the one host family patterns cannot describe.
+  function canonIPv6Hostname(value) {
+    let out = '';
+    for (const cp of value) {
+      if (!/^[0-9a-fA-F\[\]:]$/.test(cp)) throw new TypeError(`Invalid IPv6 hostname pattern '${value}'`);
+      out += cp.toLowerCase();
+    }
+    return out;
+  }
+
+  // "Port state, with state override" is a small enough algorithm to write out,
+  // and writing it out is the only way to get its two surprises right: it stops
+  // at the FIRST non-digit and keeps what it has (so `80x` is port 80, and a
+  // trailing space is not an error), and the only way it can fail is a value
+  // above 65535. Reaching for the URL parser instead made every port pattern an
+  // error, because `*://…` — the default protocol pattern — is not a URL.
+  function canonPort(portValue, protocolValue) {
+    if (portValue === '') return portValue;
+    let digits = '';
+    for (const ch of portValue.replace(/[\t\n\r]/g, '')) {
+      if (ch < '0' || ch > '9') break;
+      digits += ch;
+    }
+    // Digits that never started are not a port at all. A caller matching a URL
+    // whose port is `invalid80` must be told so, not handed an empty string
+    // that a `*` pattern would happily match.
+    if (digits === '') throw new TypeError(`Invalid port '${portValue}'`);
+    const n = Number(digits);
+    if (n > 65535) throw new TypeError(`Invalid port '${portValue}'`);
+    const s = String(n);
+    // The default port of a scheme is elided, because a URL carrying it
+    // serializes without it — but only when a scheme was actually supplied.
+    if (protocolValue && SPECIAL_PORTS[protocolValue + ':'] === s) return '';
+    return s;
+  }
+
+  function canonPathname(value) {
+    if (value === '') return value;
+    const leadingSlash = value.charAt(0) === '/';
+    const modified = leadingSlash ? value : '/-' + value;
+    const u = new URL('fake://fake-url');
+    u.pathname = modified;
+    const result = u.pathname;
+    return leadingSlash ? result : result.substring(2);
+  }
+
+  function percentEncodeCodePoint(cp) {
+    let out = '';
+    for (const b of new TextEncoder().encode(cp)) out += '%' + b.toString(16).toUpperCase().padStart(2, '0');
+    return out;
+  }
+
+  // An opaque path — the part after `mailto:` or `javascript:` — is not a path
+  // of segments and is not normalized; only C0 controls and non-ASCII are
+  // escaped. Running it through a whole URL parse instead would ALSO strip
+  // leading and trailing spaces, which is a rule about parsing a URL string and
+  // not about this component: `/ ` is a legal opaque path and must survive.
+  function canonOpaquePathname(value) {
+    if (value === '') return value;
+    let out = '';
+    for (const cp of value) {
+      const c = cp.codePointAt(0);
+      out += (c <= 0x1f || c > 0x7e) ? percentEncodeCodePoint(cp) : cp;
+    }
+    return out;
+  }
+
+  function canonSearch(value) {
+    if (value === '') return value;
+    const u = new URL('fake://fake-url');
+    u.search = value;
+    const s = u.search;
+    return s.charAt(0) === '?' ? s.substring(1) : s;
+  }
+
+  function canonHash(value) {
+    if (value === '') return value;
+    const u = new URL('fake://fake-url');
+    u.hash = value;
+    const h = u.hash;
+    return h.charAt(0) === '#' ? h.substring(1) : h;
+  }
+
+  // ── Escaping ───────────────────────────────────────────────────────────────
+
+  const REGEXP_SPECIALS = '.+*?^${}()[]|/\\';
+  function escapeRegexpString(input) {
+    let out = '';
+    for (const cp of input) {
+      if (REGEXP_SPECIALS.indexOf(cp) !== -1) out += '\\';
+      out += cp;
+    }
+    return out;
+  }
+
+  const PATTERN_SPECIALS = '+*?:{}()\\';
+  function escapePatternString(input) {
+    let out = '';
+    for (const cp of input) {
+      if (PATTERN_SPECIALS.indexOf(cp) !== -1) out += '\\';
+      out += cp;
+    }
+    return out;
+  }
+
+  // ── Tokenizer ──────────────────────────────────────────────────────────────
+  // Two policies. "strict" throws the moment the pattern is malformed — that is
+  // what a component pattern gets, because a broken pattern should be an error
+  // at the constructor and not a route that never matches. "lenient" records the
+  // trouble as an `invalid-char` token and carries on; the constructor-string
+  // splitter uses it, since at that stage we are only looking for the `/`, `?`
+  // and `#` that divide one component from the next.
+
+  const NAME_START = /[$_\p{ID_Start}]/u;
+  const NAME_CONTINUE = /[$_\u200C\u200D\p{ID_Continue}]/u;
+
+  function tokenize(input, policy) {
+    const cps = Array.from(input);
+    const tokens = [];
+    const sub = (a, b) => cps.slice(a, b).join('');
+    const push = (type, index, nextIndex, valueIndex) => {
+      tokens.push({ type, index, value: sub(valueIndex === undefined ? index : valueIndex, nextIndex) });
+    };
+    const fail = (index, nextIndex, message) => {
+      if (policy === 'strict') throw new TypeError(`Invalid pattern '${input}': ${message}`);
+      push('invalid-char', index, nextIndex);
+      return nextIndex;
+    };
+
+    let i = 0;
+    while (i < cps.length) {
+      const c = cps[i];
+      if (c === '*') { push('asterisk', i, i + 1); i += 1; continue; }
+      if (c === '+' || c === '?') { push('other-modifier', i, i + 1); i += 1; continue; }
+      if (c === '\\') {
+        if (i === cps.length - 1) { i = fail(i, i + 1, 'trailing escape'); continue; }
+        // The value is the escaped character alone — the backslash has done its
+        // job by the time the parser sees this.
+        push('escaped-char', i, i + 2, i + 1);
+        i += 2;
+        continue;
+      }
+      if (c === '{') { push('open', i, i + 1); i += 1; continue; }
+      if (c === '}') { push('close', i, i + 1); i += 1; continue; }
+      if (c === ':') {
+        let n = i + 1;
+        while (n < cps.length) {
+          const nc = cps[n];
+          const ok = (n === i + 1) ? NAME_START.test(nc) : NAME_CONTINUE.test(nc);
+          if (!ok) break;
+          n += 1;
+        }
+        if (n === i + 1) { i = fail(i, n, 'missing group name'); continue; }
+        push('name', i, n, i + 1);
+        i = n;
+        continue;
+      }
+      if (c === '(') {
+        let depth = 1;
+        let j = i + 1;
+        let error = false;
+        while (j < cps.length) {
+          const rc = cps[j];
+          if (!/^[\x00-\x7f]$/.test(rc)) { error = true; break; }
+          if (j === i + 1 && rc === '?') { error = true; break; }
+          if (rc === '\\') {
+            if (j === cps.length - 1) { error = true; break; }
+            if (!/^[\x00-\x7f]$/.test(cps[j + 1])) { error = true; break; }
+            j += 2;
+            continue;
+          }
+          if (rc === ')') {
+            depth -= 1;
+            if (depth === 0) { j += 1; break; }
+          } else if (rc === '(') {
+            depth += 1;
+            if (j === cps.length - 1) { error = true; break; }
+            // A capturing group inside a pattern would renumber every group the
+            // caller was promised, so only non-capturing `(?…)` forms are legal.
+            if (cps[j + 1] !== '?') { error = true; break; }
+          }
+          j += 1;
+        }
+        if (error || depth || j - i - 2 === 0) { i = fail(i, j, 'invalid regexp group'); continue; }
+        push('regexp', i, j, i + 1);
+        // The value must exclude the closing paren too.
+        tokens[tokens.length - 1].value = sub(i + 1, j - 1);
+        i = j;
+        continue;
+      }
+      push('char', i, i + 1);
+      i += 1;
+    }
+    tokens.push({ type: 'end', index: cps.length, value: '' });
+    return tokens;
+  }
+
+  // ── Parser: tokens → part list ─────────────────────────────────────────────
+
+  const FULL_WILDCARD_REGEXP = '.*';
+  const segmentWildcardRegexp = (options) => `[^${escapeRegexpString(options.delimiter)}]+?`;
+
+  function parsePatternString(input, options, encodingCallback) {
+    const tokens = tokenize(input, 'strict');
+    const parts = [];
+    let index = 0;
+    let nextNumericName = 0;
+    let pendingFixed = '';
+
+    const tryConsume = (type) => (tokens[index].type === type ? tokens[index++] : null);
+    const tryConsumeModifier = () => tryConsume('other-modifier') || tryConsume('asterisk');
+    const tryConsumeRegexpOrWildcard = (nameToken) => {
+      const t = tryConsume('regexp');
+      if (t) return t;
+      return nameToken ? null : tryConsume('asterisk');
+    };
+    const consumeText = () => {
+      let result = '';
+      for (;;) {
+        const t = tryConsume('char') || tryConsume('escaped-char');
+        if (!t) break;
+        result += t.value;
+      }
+      return result;
+    };
+    const consumeRequired = (type) => {
+      const t = tryConsume(type);
+      if (!t) throw new TypeError(`Invalid pattern '${input}': expected ${type}`);
+      return t;
+    };
+    const flushPendingFixed = () => {
+      if (pendingFixed === '') return;
+      const value = encodingCallback(pendingFixed);
+      pendingFixed = '';
+      parts.push({ type: 'fixed-text', value, modifier: 'none', name: '', prefix: '', suffix: '' });
+    };
+
+    const addPart = (prefix, nameToken, regexpOrWildcardToken, suffix, modifierToken) => {
+      let modifier = 'none';
+      if (modifierToken) {
+        if (modifierToken.value === '?') modifier = 'optional';
+        else if (modifierToken.value === '*') modifier = 'zero-or-more';
+        else if (modifierToken.value === '+') modifier = 'one-or-more';
+      }
+      if (!nameToken && !regexpOrWildcardToken && modifier === 'none') { pendingFixed += prefix; return; }
+      flushPendingFixed();
+      if (!nameToken && !regexpOrWildcardToken) {
+        if (prefix === '') return;
+        parts.push({ type: 'fixed-text', value: encodingCallback(prefix), modifier, name: '', prefix: '', suffix: '' });
+        return;
+      }
+      let regexpValue;
+      if (!regexpOrWildcardToken) regexpValue = segmentWildcardRegexp(options);
+      else if (regexpOrWildcardToken.type === 'asterisk') regexpValue = FULL_WILDCARD_REGEXP;
+      else regexpValue = regexpOrWildcardToken.value;
+      let type = 'regexp';
+      if (regexpValue === segmentWildcardRegexp(options)) { type = 'segment-wildcard'; regexpValue = ''; }
+      else if (regexpValue === FULL_WILDCARD_REGEXP) { type = 'full-wildcard'; regexpValue = ''; }
+      let name = '';
+      if (nameToken) name = nameToken.value;
+      else if (regexpOrWildcardToken) name = String(nextNumericName++);
+      // A duplicate name would make one of the two groups unreachable in the
+      // result map — silently, at match time. Refuse it at compile time.
+      if (parts.some((p) => p.name === name)) throw new TypeError(`Duplicate group name '${name}' in '${input}'`);
+      parts.push({
+        type, value: regexpValue, modifier, name,
+        prefix: encodingCallback(prefix), suffix: encodingCallback(suffix),
+      });
+    };
+
+    while (index < tokens.length) {
+      const charToken = tryConsume('char');
+      const nameToken = tryConsume('name');
+      let regexpOrWildcardToken = tryConsumeRegexpOrWildcard(nameToken);
+      if (nameToken || regexpOrWildcardToken) {
+        let prefix = charToken ? charToken.value : '';
+        // Only the component's own prefix character (`/` in a path, nothing in
+        // a hostname) is allowed to attach to a group; anything else stays
+        // fixed text, so `a:b` does not swallow the `a`.
+        if (prefix !== '' && prefix !== options.prefix) { pendingFixed += prefix; prefix = ''; }
+        flushPendingFixed();
+        addPart(prefix, nameToken, regexpOrWildcardToken, '', tryConsumeModifier());
+        continue;
+      }
+      const fixedToken = charToken || tryConsume('escaped-char');
+      if (fixedToken) { pendingFixed += fixedToken.value; continue; }
+      const openToken = tryConsume('open');
+      if (openToken) {
+        const prefix = consumeText();
+        const innerName = tryConsume('name');
+        const innerRegexp = tryConsumeRegexpOrWildcard(innerName);
+        const suffix = consumeText();
+        consumeRequired('close');
+        addPart(prefix, innerName, innerRegexp, suffix, tryConsumeModifier());
+        continue;
+      }
+      flushPendingFixed();
+      consumeRequired('end');
+    }
+    return parts;
+  }
+
+  // ── Part list → RegExp ─────────────────────────────────────────────────────
+
+  const modifierString = (m) =>
+    m === 'zero-or-more' ? '*' : m === 'optional' ? '?' : m === 'one-or-more' ? '+' : '';
+
+  function generateRegexpAndNameList(parts, options) {
+    let result = '^';
+    const names = [];
+    for (const part of parts) {
+      if (part.type === 'fixed-text') {
+        if (part.modifier === 'none') result += escapeRegexpString(part.value);
+        else result += `(?:${escapeRegexpString(part.value)})${modifierString(part.modifier)}`;
+        continue;
+      }
+      names.push(part.name);
+      let regexpValue = part.value;
+      if (part.type === 'segment-wildcard') regexpValue = segmentWildcardRegexp(options);
+      else if (part.type === 'full-wildcard') regexpValue = FULL_WILDCARD_REGEXP;
+      if (part.prefix === '' && part.suffix === '') {
+        if (part.modifier === 'none' || part.modifier === 'optional') {
+          result += `(${regexpValue})${modifierString(part.modifier)}`;
+        } else {
+          result += `((?:${regexpValue})${modifierString(part.modifier)})`;
+        }
+        continue;
+      }
+      if (part.modifier === 'none' || part.modifier === 'optional') {
+        result += `(?:${escapeRegexpString(part.prefix)}(${regexpValue})${escapeRegexpString(part.suffix)})${modifierString(part.modifier)}`;
+        continue;
+      }
+      // A repeated group with a prefix or suffix repeats the SEPARATOR too —
+      // `/a/b/c` from `/:x+` is one group holding `a/b/c`, not three matches —
+      // so the repetition is written out with the separator between copies.
+      result += `(?:${escapeRegexpString(part.prefix)}((?:${regexpValue})(?:${escapeRegexpString(part.suffix)}${escapeRegexpString(part.prefix)}(?:${regexpValue}))*)${escapeRegexpString(part.suffix)})`;
+      if (part.modifier === 'zero-or-more') result += '?';
+    }
+    result += '$';
+    return { regexp: result, names };
+  }
+
+  // ── Part list → canonical pattern string ───────────────────────────────────
+  // This is what `pattern.pathname` returns. It is not the input echoed back:
+  // the input has been canonicalized and re-serialized, so two spellings of the
+  // same pattern compare equal here.
+
+  function generatePatternString(parts, options) {
+    let result = '';
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const previousPart = i > 0 ? parts[i - 1] : null;
+      const nextPart = i < parts.length - 1 ? parts[i + 1] : null;
+      if (part.type === 'fixed-text') {
+        if (part.modifier === 'none') { result += escapePatternString(part.value); continue; }
+        result += `{${escapePatternString(part.value)}}${modifierString(part.modifier)}`;
+        continue;
+      }
+      const customName = !/^[0-9]/.test(part.name);
+      let needsGrouping = false;
+      if (part.suffix !== '' || (part.prefix !== '' && part.prefix !== options.prefix)) needsGrouping = true;
+      // `:foo` followed by `bar` would read back as the single name `:foobar`,
+      // and `:foo` followed by an unnamed group as `:foo0`. Both need braces to
+      // survive the round trip through the pattern string.
+      if (!needsGrouping && customName && part.type === 'segment-wildcard' && part.modifier === 'none' &&
+          nextPart && nextPart.prefix === '' && nextPart.suffix === '') {
+        if (nextPart.type === 'fixed-text') needsGrouping = NAME_CONTINUE.test(nextPart.value.charAt(0));
+        else needsGrouping = /^[0-9]/.test(nextPart.name);
+      }
+      if (!needsGrouping && part.prefix === '' && previousPart && previousPart.type === 'fixed-text' &&
+          previousPart.value.charAt(previousPart.value.length - 1) === options.prefix) {
+        needsGrouping = true;
+      }
+      if (needsGrouping) result += '{';
+      result += escapePatternString(part.prefix);
+      if (customName) result += `:${part.name}`;
+      if (part.type === 'regexp') result += `(${part.value})`;
+      else if (part.type === 'segment-wildcard') {
+        if (!customName) result += `(${segmentWildcardRegexp(options)})`;
+      } else if (part.type === 'full-wildcard') {
+        if (!customName && (!previousPart || previousPart.type === 'fixed-text' ||
+            previousPart.modifier !== 'none' || needsGrouping || part.prefix !== '')) {
+          result += '*';
+        } else {
+          result += `(${FULL_WILDCARD_REGEXP})`;
+        }
+      }
+      // `:foo` followed by a letter would read as a longer name, so the suffix
+      // has to be escaped back apart.
+      if (part.type === 'segment-wildcard' && customName && part.suffix !== '' &&
+          NAME_CONTINUE.test(part.suffix.charAt(0))) {
+        result += '\\';
+      }
+      result += escapePatternString(part.suffix);
+      if (needsGrouping) result += '}';
+      result += modifierString(part.modifier);
+    }
+    return result;
+  }
+
+  // ── Compiling one component ────────────────────────────────────────────────
+
+  const DEFAULT_OPTIONS = { delimiter: '', prefix: '', ignoreCase: false };
+  const HOSTNAME_OPTIONS = { delimiter: '.', prefix: '', ignoreCase: false };
+  const PATHNAME_OPTIONS = { delimiter: '/', prefix: '/', ignoreCase: false };
+  const withIgnoreCase = (o, ignoreCase) => ({ delimiter: o.delimiter, prefix: o.prefix, ignoreCase: !!ignoreCase });
+
+  function compileComponent(input, encodingCallback, options) {
+    const parts = parsePatternString(input === undefined ? '*' : input, options, encodingCallback);
+    const { regexp, names } = generateRegexpAndNameList(parts, options);
+    let re;
+    try { re = new RegExp(regexp, options.ignoreCase ? 'vi' : 'v'); }
+    catch (e) { throw new TypeError(`Invalid pattern '${input}': ${e && e.message}`); }
+    return {
+      patternString: generatePatternString(parts, options),
+      regexp: re,
+      names,
+      parts,
+      encodingCallback,
+      hasRegexpGroups: parts.some((p) => p.type === 'regexp'),
+    };
+  }
+
+  const protocolComponentMatchesSpecialScheme = (component) =>
+    SPECIAL_SCHEMES.some((s) => component.regexp.test(s));
+
+  // ── URLPatternInit processing ──────────────────────────────────────────────
+
+  const COMPONENTS = ['protocol', 'username', 'password', 'hostname', 'port', 'pathname', 'search', 'hash'];
+
+  const processBaseURLString = (input, type) => (type !== 'pattern' ? input : escapePatternString(input));
+
+  function isAbsolutePathname(input, type) {
+    if (input === '') return false;
+    if (input.charAt(0) === '/') return true;
+    if (type === 'url') return false;
+    if (input.length < 2) return false;
+    // In a *pattern* an absolute path may be hidden behind an escape or a group
+    // open, so `\/foo` and `{/foo}` are absolute too.
+    if (input.charAt(0) === '\\' && input.charAt(1) === '/') return true;
+    if (input.charAt(0) === '{' && input.charAt(1) === '/') return true;
+    return false;
+  }
+
+  function processInit(init, type, defaults) {
+    const result = {};
+    if (defaults) for (const c of COMPONENTS) if (defaults[c] !== undefined) result[c] = defaults[c];
+    const has = (k) => init[k] !== undefined;
+
+    let baseURL = null;
+    if (has('baseURL')) {
+      try { baseURL = new URL(init.baseURL); }
+      catch (e) { throw new TypeError(`Invalid baseURL '${init.baseURL}'`); }
+      const proto = baseURL.protocol.substring(0, baseURL.protocol.length - 1);
+      if (!has('protocol')) result.protocol = processBaseURLString(proto, type);
+      if (type !== 'pattern' && !has('protocol') && !has('hostname') && !has('port') && !has('username')) {
+        result.username = processBaseURLString(baseURL.username, type);
+      }
+      if (type !== 'pattern' && !has('protocol') && !has('hostname') && !has('port') && !has('username') && !has('password')) {
+        result.password = processBaseURLString(baseURL.password, type);
+      }
+      if (!has('protocol') && !has('hostname')) result.hostname = processBaseURLString(baseURL.hostname, type);
+      if (!has('protocol') && !has('hostname') && !has('port')) result.port = processBaseURLString(baseURL.port, type);
+      if (!has('protocol') && !has('hostname') && !has('port') && !has('pathname')) {
+        result.pathname = processBaseURLString(baseURL.pathname, type);
+      }
+      if (!has('protocol') && !has('hostname') && !has('port') && !has('pathname') && !has('search')) {
+        result.search = processBaseURLString(baseURL.search.replace(/^\?/, ''), type);
+      }
+      if (!has('protocol') && !has('hostname') && !has('port') && !has('pathname') && !has('search') && !has('hash')) {
+        result.hash = processBaseURLString(baseURL.hash.replace(/^#/, ''), type);
+      }
+    }
+
+    if (has('protocol')) {
+      const stripped = init.protocol.replace(/:$/, '');
+      result.protocol = type === 'pattern' ? stripped : canonProtocol(stripped);
+    }
+    if (has('username')) result.username = type === 'pattern' ? init.username : canonUsername(init.username);
+    if (has('password')) result.password = type === 'pattern' ? init.password : canonPassword(init.password);
+    if (has('hostname')) result.hostname = type === 'pattern' ? init.hostname : canonHostname(init.hostname);
+    if (has('port')) result.port = type === 'pattern' ? init.port : canonPort(init.port, result.protocol);
+    if (has('pathname')) {
+      result.pathname = init.pathname;
+      // A relative pathname pattern is resolved against the base URL's
+      // DIRECTORY, the same way a relative href is — which is what lets
+      // `new URLPattern({pathname: 'bar'}, 'https://x/foo/')` mean `/foo/bar`.
+      if (baseURL && !isAbsolutePathname(result.pathname, type)) {
+        const opaque = baseURL.pathname.charAt(0) !== '/';
+        if (!opaque) {
+          const baseURLPath = processBaseURLString(baseURL.pathname, type);
+          const slashIndex = baseURLPath.lastIndexOf('/');
+          if (slashIndex >= 0) result.pathname = baseURLPath.substring(0, slashIndex + 1) + result.pathname;
+        }
+      }
+      if (type !== 'pattern') {
+        const proto = result.protocol;
+        result.pathname = (proto === undefined || proto === '' || isSpecialScheme(proto))
+          ? canonPathname(result.pathname) : canonOpaquePathname(result.pathname);
+      }
+    }
+    if (has('search')) {
+      const stripped = init.search.replace(/^\?/, '');
+      result.search = type === 'pattern' ? stripped : canonSearch(stripped);
+    }
+    if (has('hash')) {
+      const stripped = init.hash.replace(/^#/, '');
+      result.hash = type === 'pattern' ? stripped : canonHash(stripped);
+    }
+    return result;
+  }
+
+  // ── The constructor-string parser ──────────────────────────────────────────
+  // Splitting `https://example.com/:id?q#h` into components cannot be done with
+  // a URL parser, because the string is not a URL — any part of it may be a
+  // group. So this walks the TOKEN list looking only for the separators, and
+  // ignores everything inside `{…}`, which is why a `/` inside a group does not
+  // start the pathname.
+
+  function parseConstructorString(input) {
+    const tokens = tokenize(input, 'lenient');
+    const parser = {
+      state: 'init', tokenIndex: 0, tokenIncrement: 1, componentStart: 0,
+      groupDepth: 0, hostnameIPv6BracketDepth: 0, protocolMatchesSpecialScheme: false,
+      result: {},
+    };
+    const safeToken = (i) => (i < tokens.length ? tokens[i] : tokens[tokens.length - 1]);
+    const isNonSpecialPatternChar = (i, value) => {
+      const t = safeToken(i);
+      if (t.value !== value) return false;
+      return t.type === 'char' || t.type === 'escaped-char' || t.type === 'invalid-char';
+    };
+    const isProtocolSuffix = () => isNonSpecialPatternChar(parser.tokenIndex, ':');
+    const nextIsAuthoritySlashes = () =>
+      isNonSpecialPatternChar(parser.tokenIndex + 1, '/') && isNonSpecialPatternChar(parser.tokenIndex + 2, '/');
+    const isIdentityTerminator = () => isNonSpecialPatternChar(parser.tokenIndex, '@');
+    const isPasswordPrefix = () => isNonSpecialPatternChar(parser.tokenIndex, ':');
+    const isPortPrefix = () => isNonSpecialPatternChar(parser.tokenIndex, ':');
+    const isPathnameStart = () => isNonSpecialPatternChar(parser.tokenIndex, '/');
+    const isHashPrefix = () => isNonSpecialPatternChar(parser.tokenIndex, '#');
+    const isIPv6Open = () => isNonSpecialPatternChar(parser.tokenIndex, '[');
+    const isIPv6Close = () => isNonSpecialPatternChar(parser.tokenIndex, ']');
+    const isSearchPrefix = () => {
+      if (isNonSpecialPatternChar(parser.tokenIndex, '?')) return true;
+      if (tokens[parser.tokenIndex].value !== '?') return false;
+      const previousIndex = parser.tokenIndex - 1;
+      if (previousIndex < 0) return true;
+      // A bare `?` right after a group is that group's MODIFIER, not the start
+      // of a query — `{/x}?` is an optional path segment.
+      const prev = safeToken(previousIndex);
+      return !(prev.type === 'name' || prev.type === 'regexp' || prev.type === 'close' || prev.type === 'asterisk');
+    };
+    const makeComponentString = () => {
+      const token = tokens[parser.tokenIndex];
+      const startToken = safeToken(parser.componentStart);
+      return Array.from(input).slice(startToken.index, token.index).join('');
+    };
+    const rewind = () => { parser.tokenIndex = parser.componentStart; parser.tokenIncrement = 0; };
+    const rewindAndSetState = (s) => { rewind(); parser.state = s; };
+    const changeState = (newState, skip) => {
+      if (parser.state !== 'init' && parser.state !== 'authority' && parser.state !== 'done') {
+        parser.result[parser.state] = makeComponentString();
+      }
+      if (parser.state !== 'init' && newState !== 'done') {
+        // Skipping a component means it was never written, and "never written"
+        // must not be confused with "inherit from the base URL": once a LATER
+        // component has been given explicitly, the earlier ones default to
+        // empty rather than to whatever a base URL would have supplied.
+        const early = ['protocol', 'authority', 'username', 'password'];
+        if (early.indexOf(parser.state) !== -1 &&
+            ['port', 'pathname', 'search', 'hash'].indexOf(newState) !== -1 &&
+            parser.result.hostname === undefined) {
+          parser.result.hostname = '';
+        }
+        const upToPort = ['protocol', 'authority', 'username', 'password', 'hostname', 'port'];
+        if (upToPort.indexOf(parser.state) !== -1 && ['search', 'hash'].indexOf(newState) !== -1 &&
+            parser.result.pathname === undefined) {
+          parser.result.pathname = parser.protocolMatchesSpecialScheme ? '/' : '';
+        }
+        const upToPathname = upToPort.concat(['pathname']);
+        if (upToPathname.indexOf(parser.state) !== -1 && newState === 'hash' &&
+            parser.result.search === undefined) {
+          parser.result.search = '';
+        }
+      }
+      parser.state = newState;
+      parser.tokenIndex += skip;
+      parser.componentStart = parser.tokenIndex;
+      parser.tokenIncrement = 0;
+    };
+    const computeProtocolMatchesSpecialScheme = () => {
+      const protocolString = makeComponentString();
+      const component = compileComponent(protocolString, canonProtocol, DEFAULT_OPTIONS);
+      if (protocolComponentMatchesSpecialScheme(component)) parser.protocolMatchesSpecialScheme = true;
+    };
+
+    while (parser.tokenIndex < tokens.length) {
+      parser.tokenIncrement = 1;
+      if (tokens[parser.tokenIndex].type === 'end') {
+        if (parser.state === 'init') {
+          // Nothing looked like a protocol, so this string is a bare relative
+          // pattern. Which component it starts in depends on its first char.
+          rewind();
+          if (isHashPrefix()) changeState('hash', 1);
+          else if (isSearchPrefix()) { changeState('search', 1); }
+          else changeState('pathname', 0);
+          parser.tokenIndex += parser.tokenIncrement;
+          continue;
+        }
+        if (parser.state === 'authority') { rewindAndSetState('hostname'); parser.tokenIndex += parser.tokenIncrement; continue; }
+        changeState('done', 0);
+        break;
+      }
+      if (tokens[parser.tokenIndex].type === 'open') {
+        parser.groupDepth += 1;
+        parser.tokenIndex += parser.tokenIncrement;
+        continue;
+      }
+      if (parser.groupDepth > 0) {
+        if (tokens[parser.tokenIndex].type === 'close') parser.groupDepth -= 1;
+        else { parser.tokenIndex += parser.tokenIncrement; continue; }
+      }
+      switch (parser.state) {
+        case 'init':
+          if (isProtocolSuffix()) rewindAndSetState('protocol');
+          break;
+        case 'protocol':
+          if (isProtocolSuffix()) {
+            computeProtocolMatchesSpecialScheme();
+            let nextState = 'pathname';
+            let skip = 1;
+            if (nextIsAuthoritySlashes()) { nextState = 'authority'; skip = 3; }
+            else if (parser.protocolMatchesSpecialScheme) nextState = 'authority';
+            changeState(nextState, skip);
+          }
+          break;
+        case 'authority':
+          if (isIdentityTerminator()) rewindAndSetState('username');
+          else if (isPathnameStart() || isSearchPrefix() || isHashPrefix()) rewindAndSetState('hostname');
+          break;
+        case 'username':
+          if (isPasswordPrefix()) changeState('password', 1);
+          else if (isIdentityTerminator()) changeState('hostname', 1);
+          break;
+        case 'password':
+          if (isIdentityTerminator()) changeState('hostname', 1);
+          break;
+        case 'hostname':
+          // A `:` inside `[…]` is part of an IPv6 literal, not a port marker.
+          if (isIPv6Open()) parser.hostnameIPv6BracketDepth += 1;
+          else if (isIPv6Close()) parser.hostnameIPv6BracketDepth -= 1;
+          else if (isPortPrefix() && parser.hostnameIPv6BracketDepth === 0) changeState('port', 1);
+          else if (isPathnameStart()) changeState('pathname', 0);
+          else if (isSearchPrefix()) changeState('search', 1);
+          else if (isHashPrefix()) changeState('hash', 1);
+          break;
+        case 'port':
+          if (isPathnameStart()) changeState('pathname', 0);
+          else if (isSearchPrefix()) changeState('search', 1);
+          else if (isHashPrefix()) changeState('hash', 1);
+          break;
+        case 'pathname':
+          if (isSearchPrefix()) changeState('search', 1);
+          else if (isHashPrefix()) changeState('hash', 1);
+          break;
+        case 'search':
+          if (isHashPrefix()) changeState('hash', 1);
+          break;
+        case 'hash':
+          break;
+        default:
+          break;
+      }
+      parser.tokenIndex += parser.tokenIncrement;
+    }
+    if (parser.result.hostname !== undefined && parser.result.port === undefined) parser.result.port = '';
+    return parser.result;
+  }
+
+  // ── WebIDL conversion ──────────────────────────────────────────────────────
+  // Dictionary members are read in lexicographic order, once each — a getter on
+  // the init object must be called exactly when the spec says it is.
+
+  const INIT_MEMBERS = ['baseURL', 'hash', 'hostname', 'password', 'pathname', 'port', 'protocol', 'search', 'username'];
+  function convertInit(value, context) {
+    if (value === null || (typeof value !== 'object' && typeof value !== 'function')) {
+      throw new TypeError(`${context} is not an object.`);
+    }
+    const out = {};
+    for (const m of INIT_MEMBERS) {
+      const v = value[m];
+      if (v !== undefined) out[m] = toUSV(v);
+    }
+    return out;
+  }
+
+  const _state = new WeakMap();
+  function internals(o, member) {
+    const s = _state.get(o);
+    if (s === undefined) throw new TypeError(`Illegal invocation: URLPattern.prototype.${member} called on a non-URLPattern`);
+    return s;
+  }
+
+  class URLPattern {
+    constructor(input, arg2, arg3) {
+      // Two overloads — (pattern, baseURL, options) and (input, options) — told
+      // apart the way WebIDL tells them apart: by argument COUNT first, then by
+      // whether the second argument is object-like. A third argument can only
+      // belong to the first overload, which is why passing options in slot two
+      // and a base URL in slot three is an error rather than a reordering.
+      const argc = arguments.length;
+      let baseURL;
+      let options = {};
+      if (argc >= 3) {
+        baseURL = toUSV(arg2);
+        if (arg3 !== undefined && arg3 !== null) options = arg3;
+      } else if (argc === 2 && arg2 !== undefined && arg2 !== null && typeof arg2 !== 'object') {
+        baseURL = toUSV(arg2);
+      } else if (argc === 2 && arg2 !== undefined && arg2 !== null) {
+        options = arg2;
+      }
+      if (input === undefined) input = {};
+      let init;
+      if (typeof input === 'string') {
+        init = parseConstructorString(toUSV(input));
+        if (baseURL !== undefined) init.baseURL = baseURL;
+        else if (init.protocol === undefined) {
+          throw new TypeError(`Relative pattern '${input}' must be given a base URL`);
+        }
+      } else {
+        // The first overload takes a URLPatternInput, not a string — so an init
+        // reaches this branch WITH a base URL argument, and that combination is
+        // an error: the init already says which components it means, and a base
+        // URL belongs in its own `baseURL` member.
+        if (baseURL !== undefined) {
+          throw new TypeError("Failed to construct 'URLPattern': a base URL may not be given with a URLPatternInit");
+        }
+        init = convertInit(input, "Failed to construct 'URLPattern': parameter 1");
+      }
+      const ignoreCase = !!(options && options.ignoreCase);
+
+      const processed = processInit(init, 'pattern', null);
+      for (const c of COMPONENTS) if (processed[c] === undefined) processed[c] = '*';
+
+      // A pattern naming a scheme's own default port is the same pattern
+      // without it, because a URL carrying that port serializes without it.
+      if (isSpecialScheme(processed.protocol) && SPECIAL_PORTS[processed.protocol + ':'] === processed.port) {
+        processed.port = '';
+      }
+
+      const c = {};
+      c.protocol = compileComponent(processed.protocol, canonProtocol, DEFAULT_OPTIONS);
+      c.username = compileComponent(processed.username, canonUsername, DEFAULT_OPTIONS);
+      c.password = compileComponent(processed.password, canonPassword, DEFAULT_OPTIONS);
+      c.hostname = hostnamePatternIsIPv6(processed.hostname)
+        ? compileComponent(processed.hostname, canonIPv6Hostname, HOSTNAME_OPTIONS)
+        : compileComponent(processed.hostname, canonHostname, HOSTNAME_OPTIONS);
+      c.port = compileComponent(processed.port, (v) => canonPort(v), DEFAULT_OPTIONS);
+      const compileOptions = withIgnoreCase(DEFAULT_OPTIONS, ignoreCase);
+      if (protocolComponentMatchesSpecialScheme(c.protocol)) {
+        c.pathname = compileComponent(processed.pathname, canonPathname, withIgnoreCase(PATHNAME_OPTIONS, ignoreCase));
+      } else {
+        c.pathname = compileComponent(processed.pathname, canonOpaquePathname, compileOptions);
+      }
+      c.search = compileComponent(processed.search, canonSearch, compileOptions);
+      c.hash = compileComponent(processed.hash, canonHash, compileOptions);
+      _state.set(this, c);
+    }
+
+    test(input, baseURL) {
+      return match(internals(this, 'test'), input, baseURL, false) !== null;
+    }
+
+    exec(input, baseURL) {
+      return match(internals(this, 'exec'), input, baseURL, true);
+    }
+
+    get protocol() { return internals(this, 'protocol').protocol.patternString; }
+    get username() { return internals(this, 'username').username.patternString; }
+    get password() { return internals(this, 'password').password.patternString; }
+    get hostname() { return internals(this, 'hostname').hostname.patternString; }
+    get port() { return internals(this, 'port').port.patternString; }
+    get pathname() { return internals(this, 'pathname').pathname.patternString; }
+    get search() { return internals(this, 'search').search.patternString; }
+    get hash() { return internals(this, 'hash').hash.patternString; }
+    get hasRegExpGroups() {
+      const s = internals(this, 'hasRegExpGroups');
+      return COMPONENTS.some((k) => s[k].hasRegexpGroups);
+    }
+  }
+
+  function hostnamePatternIsIPv6(input) {
+    if (input.length < 2) return false;
+    if (input.charAt(0) === '[') return true;
+    if ((input.charAt(0) === '{' || input.charAt(0) === '\\') && input.charAt(1) === '[') return true;
+    return false;
+  }
+
+  function match(components, input, baseURLString, wantResult) {
+    let protocol = '', username = '', password = '', hostname = '', port = '', pathname = '', search = '', hash = '';
+    if (input === undefined) input = {};
+    const inputs = [input];
+    if (input !== null && typeof input === 'object') {
+      if (baseURLString !== undefined) {
+        throw new TypeError('A base URL may not be given when matching a URLPatternInit');
+      }
+      let applied;
+      // A malformed init is NOT an exception here — it is simply a URL this
+      // pattern does not describe. Throwing would make `test()` unusable on
+      // anything the caller had not already validated.
+      try {
+        applied = processInit(convertInit(input, 'parameter 1'), 'url', {
+          protocol: '', username: '', password: '', hostname: '', port: '', pathname: '', search: '', hash: '',
+        });
+      } catch (e) { return null; }
+      protocol = applied.protocol; username = applied.username; password = applied.password;
+      hostname = applied.hostname; port = applied.port; pathname = applied.pathname;
+      search = applied.search; hash = applied.hash;
+    } else {
+      let baseURL = null;
+      if (baseURLString !== undefined) {
+        try { baseURL = new URL(toUSV(baseURLString)); } catch (e) { return null; }
+        inputs.push(toUSV(baseURLString));
+      }
+      let url;
+      try { url = baseURL ? new URL(toUSV(input), baseURL) : new URL(toUSV(input)); } catch (e) { return null; }
+      protocol = url.protocol.substring(0, url.protocol.length - 1);
+      username = url.username;
+      password = url.password;
+      hostname = url.hostname;
+      port = url.port;
+      pathname = url.pathname;
+      search = url.search.replace(/^\?/, '');
+      hash = url.hash.replace(/^#/, '');
+    }
+    const values = { protocol, username, password, hostname, port, pathname, search, hash };
+    const execs = {};
+    for (const k of COMPONENTS) {
+      const r = components[k].regexp.exec(values[k]);
+      if (r === null) return null;
+      execs[k] = r;
+    }
+    if (!wantResult) return {};
+    const result = { inputs };
+    for (const k of COMPONENTS) {
+      const groups = {};
+      const names = components[k].names;
+      // A page's own regexp may hold `(?<x>…)` groups of its own. Those belong
+      // to the page, not to the pattern, so only the pattern's declared groups
+      // are named here — the extras would otherwise land under `undefined`.
+      const count = Math.min(execs[k].length - 1, names.length);
+      for (let i = 1; i <= count; i++) groups[names[i - 1]] = execs[k][i];
+      result[k] = { input: values[k], groups };
+    }
+    return result;
+  }
+
+  // ── Ordering two patterns (URLPattern.compareComponent) ──────────────────
+  // Routers need a stable, most-specific-first order, and "most specific" is a
+  // property of the PART LIST, not of the pattern text: `/foo/bar` beats
+  // `/foo/:bar` beats `/foo/*` because a literal is narrower than a segment and
+  // a segment is narrower than everything. Group NAMES are deliberately not
+  // compared — `/foo/:a` and `/foo/:b` describe exactly the same set of URLs,
+  // and a router that ordered them by name would sort on something the pattern
+  // does not actually say.
+  const TYPE_RANK = { 'full-wildcard': 0, 'segment-wildcard': 1, 'regexp': 2, 'fixed-text': 3 };
+  const MODIFIER_RANK = { 'zero-or-more': 0, 'optional': 1, 'one-or-more': 2, 'none': 3 };
+  const EMPTY_PART = { type: 'fixed-text', value: '', modifier: 'none', name: '', prefix: '', suffix: '' };
+  const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+  function comparePart(left, right) {
+    return cmp(TYPE_RANK[left.type], TYPE_RANK[right.type])
+        || cmp(left.value, right.value)
+        || cmp(MODIFIER_RANK[left.modifier], MODIFIER_RANK[right.modifier])
+        || cmp(left.prefix, right.prefix)
+        || cmp(left.suffix, right.suffix);
+  }
+
+  function comparePartList(left, right) {
+    // A list that ran out is compared as an empty fixed part, so the SHORTER
+    // pattern is not automatically the smaller one — `*` and `*/foo` differ by
+    // what follows the wildcard, and that is exactly what decides them.
+    for (let i = 0; i < Math.max(left.length, right.length); i++) {
+      const r = comparePart(i < left.length ? left[i] : EMPTY_PART, i < right.length ? right[i] : EMPTY_PART);
+      if (r !== 0) return r;
+    }
+    return 0;
+  }
+
+  // ── Building a URL back out of a pattern (generate) ──────────────────────
+  // The inverse of exec: given the group values, produce the component string.
+  // It succeeds only for patterns that describe exactly one shape per input —
+  // a wildcard, a regexp or a repeated group has no single answer, so those are
+  // an error rather than a guess.
+  function generateComponent(component, groups) {
+    let result = '';
+    for (const part of component.parts) {
+      if (part.modifier !== 'none') {
+        throw new TypeError(`generate(): a '${part.modifier}' group has no single value`);
+      }
+      if (part.type === 'fixed-text') { result += part.value; continue; }
+      if (part.type !== 'segment-wildcard') {
+        throw new TypeError(`generate(): a '${part.type}' group cannot be generated`);
+      }
+      const value = groups ? groups[part.name] : undefined;
+      if (value === undefined || value === null) {
+        throw new TypeError(`generate(): no value given for group '${part.name}'`);
+      }
+      result += part.prefix + component.encodingCallback(toUSV(value)) + part.suffix;
+    }
+    // The answer must be something this very pattern would match. A value
+    // carrying the component's own delimiter — `bar/baz` into a path segment —
+    // would otherwise produce a URL that silently means something else.
+    if (!component.regexp.test(result)) {
+      throw new TypeError('generate(): the generated value does not match the pattern');
+    }
+    return result;
+  }
+
+  URLPattern.compareComponent = function compareComponent(component, left, right) {
+    const name = String(component);
+    if (COMPONENTS.indexOf(name) === -1) throw new TypeError(`Invalid component '${name}'`);
+    const l = internals(left, 'compareComponent');
+    const r = internals(right, 'compareComponent');
+    return comparePartList(l[name].parts, r[name].parts);
   };
-}
+  Object.defineProperty(URLPattern, 'compareComponent', { enumerable: true });
+
+  URLPattern.prototype.generate = function generate(component, groups) {
+    const s = internals(this, 'generate');
+    const name = String(component);
+    if (COMPONENTS.indexOf(name) === -1) throw new TypeError(`Invalid component '${name}'`);
+    return generateComponent(s[name], groups);
+  };
+
+  Object.defineProperties(URLPattern.prototype, {
+    generate: { enumerable: true },
+    test: { enumerable: true }, exec: { enumerable: true },
+    protocol: { enumerable: true }, username: { enumerable: true }, password: { enumerable: true },
+    hostname: { enumerable: true }, port: { enumerable: true }, pathname: { enumerable: true },
+    search: { enumerable: true }, hash: { enumerable: true }, hasRegExpGroups: { enumerable: true },
+  });
+  Object.defineProperty(URLPattern.prototype, Symbol.toStringTag, { value: 'URLPattern', configurable: true });
+  Object.defineProperty(global, 'URLPattern', { value: URLPattern, writable: true, enumerable: false, configurable: true });
+})(globalThis);
 
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   // Clone `node` INTO this document, so the copy's ownerDocument (and tagName
