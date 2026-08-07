@@ -32,6 +32,22 @@ Almost everything is one of two files:
   IPC between JS and the Rust DOM). Add ops here when JS needs real tree/data access.
 - The Rust DOM itself is **`crates/obscura-dom/src/tree.rs`** (+ `selector.rs`,
   `serialize.rs`). Attributes carry a full `QualName` (ns/prefix/local).
+- **`crates/obscura-js/src/layout.rs`** — the **layout bridge** (Quests #505–#507).
+  `op_layout('boxes', …)` serializes the live DOM, runs it through the same
+  Blitz/Taffy engine the screenshot path uses, and returns **every** element's box
+  in one reply. `getBoundingClientRect`, `offset*`, `client*`, `scroll*`,
+  `offsetParent`, `checkVisibility` and `elementFromPoint` all read it.
+  - JS side: the block between `// ===== LAYOUT-BRIDGE-BEGIN/END =====` in
+    `bootstrap.js`. `_layoutResolve(el)` returns **a box**, the string `'none'`
+    (laid out, generates no box → all zeros), or `null` (no layout available →
+    fall back to the old synthetic grid). All three cases matter.
+  - ⚠️ **Layout is NOT incremental.** Every mutate-then-measure pair re-parses and
+    re-lays-out the whole document (~11 ms for 400 elements). Reads between
+    mutations are cached three deep (`_treeGen`/`_styleGen` stamp → snapshot-hash
+    `key` → the resolved document) and cost nothing.
+  - ⚠️ **Anything JS sets must reach the Rust DOM or layout will not see it.** This
+    is why the inline-style writeback (`Element#_styleWriteback`) is unconditional:
+    the snapshot handed to Blitz is serialized from the *Rust* tree.
 
 **The loop:**
 ```sh

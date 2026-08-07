@@ -817,6 +817,60 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
     }
 }
 
+/// Lay out the current DOM and hand every element's box back to JS.
+///
+/// `viewport` is `"<width>,<height>,<deviceScaleFactor>"` as the JS realm sees
+/// it. Returns `"null"` when there is no layout to give — no DOM, or a build
+/// without the renderer — which is the signal for the JS side to fall back to
+/// its synthetic boxes rather than reporting a whole page of zeros.
+#[op2]
+#[string]
+fn op_layout(state: &OpState, #[string] cmd: String, #[string] viewport: String) -> String {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+
+    #[cfg(feature = "render")]
+    {
+        match cmd.as_str() {
+            "boxes" => {
+                let Some(dom) = gs.dom.as_ref() else {
+                    return "null".to_string();
+                };
+                let mut parts = viewport.split(',');
+                let vw = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1280);
+                let vh = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(720);
+                let dsf = parts.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                let last = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                crate::layout::layout_boxes(
+                    dom,
+                    &gs.url,
+                    gs.http_client.as_ref(),
+                    &gs.blocked_urls,
+                    vw.clamp(1, 16384),
+                    vh.clamp(1, 16384),
+                    if dsf.is_finite() && dsf > 0.0 { dsf } else { 1.0 },
+                    last,
+                )
+            }
+            "invalidate" => {
+                crate::layout::invalidate();
+                "null".to_string()
+            }
+            _ => "null".to_string(),
+        }
+    }
+
+    // A build with no renderer answers "off" rather than "null": the JS side
+    // must be able to tell "no layout engine, use your fallback forever" from
+    // "no document yet, ask again", and a page that got those two confused would
+    // either measure zeros or re-ask on every read.
+    #[cfg(not(feature = "render"))]
+    {
+        let _ = (&gs, cmd, viewport);
+        "off".to_string()
+    }
+}
+
 #[op2(fast)]
 fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     let _ = state;
@@ -2051,6 +2105,7 @@ pub fn build_extension() -> Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(vec![
             op_dom(),
+            op_layout(),
             op_console_msg(),
             op_fetch_url(),
             op_fetch_url_sync(),

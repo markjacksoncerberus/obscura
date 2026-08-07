@@ -26,10 +26,12 @@
 mod document;
 mod engine;
 mod fonts;
+mod http;
 mod net;
 
-pub use document::{LayoutRect, ResolvedDoc, Size};
+pub use document::{LayoutRect, NodeBox, ResolvedDoc, Size};
 pub use engine::{RenderEngine, RenderInput};
+pub use http::{decode_data_uri, ObscuraNetProvider};
 pub use net::{NoOpNetProvider, ResourceProvider};
 
 // Re-export the Blitz/`anyrender` types embedders need to build a [`RenderInput`]

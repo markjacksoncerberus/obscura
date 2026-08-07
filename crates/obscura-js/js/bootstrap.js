@@ -5202,6 +5202,187 @@ function __datasetKeyToAttr(k) {
   return "data-" + out;
 }
 
+// ===== LAYOUT-BRIDGE-BEGIN =====
+// The page's window onto the real box tree.
+//
+// `op_layout('boxes', …)` serializes the live DOM, runs it through the same
+// Blitz/Taffy engine the screenshot path uses, and returns EVERY element's box
+// in one reply. One layout per read, not one per element — because layout here
+// is not incremental, so a per-element op would re-lay-out the whole document
+// each time. An `IntersectionObserver` frame over 200 targets costs one call.
+//
+// Three layers of caching, cheapest first:
+//   1. `_treeGen`/`_styleGen` — if neither has moved since the last read, the
+//      DOM cannot have changed, so we don't even call the op.
+//   2. the op echoes back a `key` hashed from the snapshot; when it matches
+//      what we already hold it replies `{same:1}` and we reuse our parsed data.
+//   3. the Rust side keeps the resolved document itself for that same key.
+//
+// If the binary was built without the renderer the op answers `"off"` and every
+// getter below falls back to the synthetic grid it used before — a browser
+// without layout still has to let Playwright tell two elements apart.
+let _layoutData = null;      // last parsed payload: {key, cw, ch, nids, boxes, off}
+let _layoutGen = -1;         // the _treeGen+_styleGen stamp `_layoutData` was read at
+let _layoutOff = false;      // latched true when this build has no renderer at all
+const _LAYOUT_STRIDE = 18;   // numbers per element in the flat `boxes` array
+
+// Flags packed into slot 16 of each element's run.
+const _LB_HAS_BOX = 1, _LB_POSITIONED = 2, _LB_VIS_HIDDEN = 4, _LB_FIXED = 8, _LB_INLINE = 16, _LB_PE_NONE = 32;
+
+function _layoutStamp() { return _treeGen * 4194304 + _styleGen; }
+
+// Fetch (or reuse) the whole document's geometry. Returns null when there is no
+// layout to be had, which is the caller's cue to fall back — distinct from "the
+// document laid out and your element wasn't in it", which is a real zero box.
+function _layoutRefresh() {
+  if (_layoutOff) return null;
+  const stamp = _layoutStamp();
+  if (_layoutData !== null && _layoutGen === stamp) return _layoutData;
+  let raw;
+  try {
+    raw = Deno.core.ops.op_layout('boxes',
+      (Number(globalThis.innerWidth) | 0) + ',' +
+      (Number(globalThis.innerHeight) | 0) + ',' +
+      (Number(globalThis.devicePixelRatio) || 1) + ',' +
+      (_layoutData ? _layoutData.key : 0));
+  } catch (e) { _layoutOff = true; return null; }
+  if (raw === 'off') { _layoutOff = true; return null; }
+  // "null" means there is no document to lay out *yet* — never latch on it, or
+  // a query made before the first parse would blind the page for its lifetime.
+  if (!raw || raw === 'null') return null;
+  let d;
+  try { d = JSON.parse(raw); } catch (e) { return null; }
+  if (d.same && _layoutData) { _layoutGen = stamp; return _layoutData; }
+  if (!d.nids) return null;
+  const off = new Map();
+  for (let i = 0; i < d.nids.length; i++) off.set(d.nids[i], i * _LAYOUT_STRIDE);
+  d.off = off;
+  _layoutData = d;
+  _layoutGen = stamp;
+  return d;
+}
+
+// The box for one element, or null if we have no layout / it isn't in it.
+function _layoutBoxOf(el) {
+  if (!el || typeof el._nid !== 'number') return null;
+  const d = _layoutRefresh();
+  if (!d) return null;
+  const i = d.off.get(el._nid);
+  if (i === undefined) return null;
+  const b = d.boxes;
+  return {
+    x: b[i], y: b[i + 1], width: b[i + 2], height: b[i + 3],
+    bt: b[i + 4], br: b[i + 5], bb: b[i + 6], bl: b[i + 7],
+    pt: b[i + 8], pr: b[i + 9], pb: b[i + 10], pl: b[i + 11],
+    scrollWidth: b[i + 12], scrollHeight: b[i + 13],
+    scrollLeft: b[i + 14], scrollTop: b[i + 15],
+    flags: b[i + 16], opacity: b[i + 17],
+    hasBox: (b[i + 16] & _LB_HAS_BOX) !== 0,
+    positioned: (b[i + 16] & _LB_POSITIONED) !== 0,
+    visHidden: (b[i + 16] & _LB_VIS_HIDDEN) !== 0,
+    fixed: (b[i + 16] & _LB_FIXED) !== 0,
+    inline: (b[i + 16] & _LB_INLINE) !== 0,
+    peNone: (b[i + 16] & _LB_PE_NONE) !== 0,
+  };
+}
+
+// CSSOM View rounds every integer metric (`offsetWidth`, `clientHeight`, the
+// `scroll*` pair). Only `getBoundingClientRect` keeps subpixels — which is the
+// whole reason it exists alongside them.
+const _lbRound = (v) => { const n = Math.round(v); return Number.isFinite(n) ? n : 0; };
+
+// The layout viewport, in CSS pixels. `clientWidth` on the root element is
+// defined to report THIS rather than the root's own box, which is why a page
+// measuring `document.documentElement.clientWidth` gets the window and not the
+// (often much taller) document.
+function _lbViewport() {
+  return { w: Number(globalThis.innerWidth) || 0, h: Number(globalThis.innerHeight) || 0 };
+}
+
+// Does `el` answer the client*/scroll* families for the VIEWPORT instead of for
+// its own box? CSSOM View: the root element does, unless the document is in
+// quirks mode — in which case `<body>` does instead. That swap is not a
+// curiosity; it is why a quirks-mode page's `document.body.clientHeight` is the
+// window height and a standards-mode page's is the content height, and layout
+// code written for one silently breaks on the other.
+function _lbIsViewportProxy(el) {
+  const doc = el && el.ownerDocument;
+  if (!doc) return false;
+  // ⚠️ ONLY for THIS realm's document. `innerWidth` is this window's, and an
+  // element belonging to an iframe document (or a `createDocument()` one) that
+  // we never laid out would otherwise be handed the PARENT window's width —
+  // which is not merely wrong, it is confidently wrong, and it is how a 300px
+  // iframe came to report a clientWidth of 3840.
+  if (doc !== globalThis.document) return false;
+  const quirks = doc.compatMode === 'BackCompat';
+  return quirks ? (el === doc.body) : (el === doc.documentElement);
+}
+
+// ── The scroll position (CSSOM View §"scrolling area origin") ────────────────
+// The box tree is a static snapshot and cannot scroll, but the scroll POSITION
+// is state, not geometry — a number the page sets and reads back — and with a
+// real scrolling area we can finally hold it correctly instead of pinning it to
+// zero. What we still cannot do is move the descendants, so this is honest
+// about being a position and nothing more.
+//
+// ⭐ The range is not always [0, max]. The scrolling origin sits at the
+// block-start/inline-start corner, so when writing-mode or direction puts that
+// corner on the right (or the bottom), the offsets run NEGATIVE. `scrollLeft`
+// on an `rtl` scroller goes 0 → −150, not 0 → 150; a page that clamps to
+// positive numbers scrolls Arabic and Hebrew content to the wrong end.
+function _lbScrollRange(el, axis) {
+  const b = _layoutResolve(el);
+  if (!b || b === 'none') return { min: 0, max: 0 };
+  const extent = axis === 'x'
+    ? Math.max(0, b.scrollWidth - (b.width - b.bl - b.br))
+    : Math.max(0, b.scrollHeight - (b.height - b.bt - b.bb));
+  let cs = null;
+  try { cs = globalThis.getComputedStyle(el); } catch (e) { cs = null; }
+  const wm = (cs && cs.writingMode) || 'horizontal-tb';
+  const rtl = !!(cs && cs.direction === 'rtl');
+  const vertical = wm.startsWith('vertical') || wm.startsWith('sideways');
+  // Which physical edge the origin sits on, per axis.
+  const negative = axis === 'x'
+    ? (vertical ? wm.indexOf('-rl') >= 0 : rtl)   // block direction if vertical, else inline
+    : (vertical ? rtl : false);                   // inline direction if vertical, else always top-down
+  return negative ? { min: -extent, max: 0 } : { min: 0, max: extent };
+}
+function _lbGetScroll(el, axis) {
+  const stored = axis === 'x' ? el._scrollLeftPos : el._scrollTopPos;
+  if (stored === undefined) {
+    // Nothing set yet: report what the box tree says, which is 0 for a snapshot.
+    const b = _layoutResolve(el);
+    return (b && b !== 'none') ? (axis === 'x' ? b.scrollLeft : b.scrollTop) : 0;
+  }
+  const r = _lbScrollRange(el, axis);
+  return Math.min(r.max, Math.max(r.min, stored));
+}
+function _lbSetScroll(el, axis, v) {
+  const n = Number(v);
+  if (!isFinite(n)) return;                      // a non-finite scroll is a no-op
+  const r = _lbScrollRange(el, axis);
+  const clamped = Math.min(r.max, Math.max(r.min, n));
+  if (axis === 'x') el._scrollLeftPos = clamped; else el._scrollTopPos = clamped;
+}
+
+// Resolve an element to one of three answers, which the getters below all need
+// to distinguish:
+//   a box            — real layout, use it
+//   'none'           — laid out, but generates no box (display:none): all zeros
+//   null             — no layout available for this element; use the fallback
+// The middle case is why `hasBox` exists at all: "zero-sized" and "not rendered"
+// look identical in a rect and could not be less alike to `offsetParent`.
+function _layoutResolve(el) {
+  const b = _layoutBoxOf(el);
+  if (b) return b.hasBox ? b : 'none';
+  // Present in the document but missing from the box tree means the renderer
+  // never saw it — a shadow-tree child today, since shadow roots live only in
+  // the JS realm. Keep the old synthetic box there rather than claiming zero.
+  if (_layoutRefresh() && el && el.isConnected === false) return 'none';
+  return null;
+}
+// ===== LAYOUT-BRIDGE-END =====
+
 class Element extends Node {
   constructor(nid) {
     super(nid);
@@ -5221,16 +5402,21 @@ class Element extends Node {
   // the setAttribute style-sync hook, and (b) never materializes an empty style=""
   // for a rejected / no-op CSSOM write.
   //
-  // GATED on there being a custom-element definition anywhere: the only spec-
-  // observable consequence of reflecting a per-property CSSOM mutation is a
-  // [CEReactions] attributeChanged, which only fires for custom elements. Keeping
-  // it inert otherwise (a) costs non-custom pages nothing and (b) avoids exposing
-  // our lenient CSSOM value storage — real browsers reject `width: -100px` /
-  // unknown properties at parse time; we store them, and an always-on writeback
-  // would leak those as spurious style attributes / mutation records. The whole-
-  // declaration `.style =`/`.cssText` attribute reflect stays unconditional below.
+  // UNCONDITIONAL since the layout bridge landed, and it always should have been.
+  // CSSOM says the `style` content attribute IS the serialization of the inline
+  // declaration; every browser reflects `el.style.width = '5px'` into it, and
+  // `getAttribute('style')` / `outerHTML` were both wrong here without it.
+  //
+  // It used to be gated on a custom-element definition existing, on the reasoning
+  // that a [CEReactions] attributeChanged was the only observable consequence.
+  // That reasoning had a hole big enough to hide a layout engine in: the Rust DOM
+  // is what gets serialized and handed to the renderer, so a style the JS realm
+  // never wrote back is a style the LAYOUT NEVER SEES. `el.style.width='100px'`
+  // followed by `getBoundingClientRect()` — which is most of CSSOM View, and most
+  // of what a real page does — would have measured a box that never got the width.
+  // A value the engine keeps privately is a value that does not exist.
   _styleWriteback() {
-    if (this._styleSyncing || _ceGlobalDefCount === 0) return;
+    if (this._styleSyncing) return;
     const text = this._style.cssText;
     const cur = this.getAttribute('style');
     if (cur === text) return;                 // no change to reflect
@@ -6275,15 +6461,30 @@ class Element extends Node {
       },
     });
   }
+  // The box-metric families (offset*/client*/scroll*) are REDEFINED further down,
+  // in the CSSOM View partial block, where they read the real layout. These
+  // placeholders exist only so the class shape is complete before that runs.
   get offsetWidth() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 100; }
   get offsetHeight() { return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 20; }
   get offsetTop() { return 0; } get offsetLeft() { return 0; }
   get clientWidth() { return 100; } get clientHeight() { return 20; }
   get scrollWidth() { return 100; } get scrollHeight() { return 20; }
-  get scrollTop() { return 0; } set scrollTop(v) {}
-  get scrollLeft() { return 0; } set scrollLeft(v) {}
+  get scrollTop() { return _lbGetScroll(this, 'y'); } set scrollTop(v) { _lbSetScroll(this, 'y', v); }
+  get scrollLeft() { return _lbGetScroll(this, 'x'); } set scrollLeft(v) { _lbSetScroll(this, 'x', v); }
   getBoundingClientRect() {
     __obscura_click_target = this;
+    // Real layout first. The box comes back in document coordinates, so the
+    // viewport scroll offset comes off here — `getBoundingClientRect` is
+    // defined relative to the viewport, which is the one thing the layout
+    // engine (working on a static snapshot) cannot know about.
+    const lb = _layoutResolve(this);
+    if (lb === 'none') return new globalThis.DOMRect(0, 0, 0, 0);
+    if (lb) {
+      return new globalThis.DOMRect(
+        lb.x - (Number(globalThis.scrollX) || 0),
+        lb.y - (Number(globalThis.scrollY) || 0),
+        lb.width, lb.height);
+    }
     // A display:none element (self or ancestor) generates no box: an all-zero rect.
     // Gated on _popoverEverUsed so non-popover pages keep the deterministic grid.
     // The IDL return type is `[NewObject] DOMRect` — a real one, so `getClientRects()`
@@ -6305,10 +6506,17 @@ class Element extends Node {
     const y = 10 + row * GY;
     return new globalThis.DOMRect(x, y, CW, CH);
   }
-  getClientRects() { return globalThis._newDomRectList((_popoverBoxCheck(this) && !_renderedHasBox(this)) ? [] : [this.getBoundingClientRect()]); }
-  // No layout engine: a stub that always returns true unblocks Playwright's
-  // actionability polling. With a real layout we'd check display, visibility,
-  // opacity and rect dimensions per spec.
+  // An element that generates no box has NO client rects — an empty list, not a
+  // list holding a zero rect. `getClientRects().length` is how a page asks "is
+  // this thing rendered at all", and the two answers are not interchangeable.
+  getClientRects() {
+    const lb = _layoutResolve(this);
+    if (lb === 'none') return globalThis._newDomRectList([]);
+    if (lb) return globalThis._newDomRectList([this.getBoundingClientRect()]);
+    return globalThis._newDomRectList((_popoverBoxCheck(this) && !_renderedHasBox(this)) ? [] : [this.getBoundingClientRect()]);
+  }
+  // checkVisibility is REDEFINED in the CSSOM View partial block below, where it
+  // can consult both computed style and the real box tree.
   checkVisibility(opts) { return true; }
   // ARIAMixin reflection properties are defined on Element.prototype just after
   // this class (see __ariaReflectedAttrs) — a table-driven loop covers the full
@@ -45169,6 +45377,19 @@ class _IframeDocument extends DetachedDocument {
       }
       return;
     }
+    // ⚠️ THE SAME TRAP QUEST #500 FOUND IN `document.write()`, one path over.
+    // Everything below parses the markup into a SYNTHETIC <html>/<head>/<body>
+    // scaffold, which discards the doctype — so by the time the tree exists
+    // there is nothing left to ask, and `_docCompatFrom` (which reads
+    // `doc.doctype`) concludes BackCompat for every frame ever loaded, including
+    // the ones that opened with `<!DOCTYPE html>`. Sniff the mode from the
+    // markup while the doctype is still in it.
+    //
+    // XHTML is excluded on purpose: quirks mode is a property of the HTML
+    // PARSER, and no HTML parser runs over an XHTML document.
+    if (kind !== 'xhtml') {
+      this._compatMode = _docModeForMarkup(String(html || '')) === 'quirks' ? 'BackCompat' : 'CSS1Compat';
+    }
     // The strip below is a NAIVE regex over the whole markup, so it would also eat
     // `<body>`/`<head>`/`<html>` tags that appear as literal TEXT inside a raw-text
     // element (`<script>`/`<style>`/`<textarea>`/`<title>`) — e.g. a WPT frame whose
@@ -53446,14 +53667,56 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
       get: _named('get', name, function() { if (!_isViewNode(this)) throw new TypeError("Illegal invocation"); return get.call(this); }),
       set: _named('set', name, function(v) { if (!_isViewNode(this)) throw new TypeError("Illegal invocation"); if (set) set.call(this, v); }) });
   };
-  _defNodeRW(Element.prototype, 'scrollTop', function() { return 0; }, function() {});
-  _defNodeRW(Element.prototype, 'scrollLeft', function() { return 0; }, function() {});
-  _defNodeRO(Element.prototype, 'scrollWidth', function() { return 100; });
-  _defNodeRO(Element.prototype, 'scrollHeight', function() { return 20; });
-  _defNodeRO(Element.prototype, 'clientWidth', function() { return 100; });
-  _defNodeRO(Element.prototype, 'clientHeight', function() { return 20; });
-  _defNodeRO(Element.prototype, 'clientTop', function() { return 0; });
-  _defNodeRO(Element.prototype, 'clientLeft', function() { return 0; });
+  // Every metric below reads the SAME layout snapshot `getBoundingClientRect`
+  // does; the families differ only in which edge of the box they measure to:
+  //   offset* → the BORDER box     client* → the PADDING box
+  //   scroll* → the padding box, unioned with everything overflowing it
+  // That is why one cannot be derived from another after the fact, and why the
+  // bridge hands back border and padding widths alongside the rect.
+  // With no renderer compiled in, `_layoutResolve` returns null and each getter
+  // falls back to the constant it always returned, so automation keeps working.
+  _defNodeRW(Element.prototype, 'scrollTop',
+    function() { return _lbGetScroll(this, 'y'); },
+    function(v) { _lbSetScroll(this, 'y', v); });
+  _defNodeRW(Element.prototype, 'scrollLeft',
+    function() { return _lbGetScroll(this, 'x'); },
+    function(v) { _lbSetScroll(this, 'x', v); });
+  _defNodeRO(Element.prototype, 'scrollWidth', function() {
+    const b = _layoutResolve(this);
+    if (b === 'none') return 0;
+    if (!b) return 100;
+    return _lbRound(_lbIsViewportProxy(this) ? Math.max(b.scrollWidth, _lbViewport().w) : b.scrollWidth);
+  });
+  _defNodeRO(Element.prototype, 'scrollHeight', function() {
+    const b = _layoutResolve(this);
+    if (b === 'none') return 0;
+    if (!b) return 20;
+    return _lbRound(_lbIsViewportProxy(this) ? Math.max(b.scrollHeight, _lbViewport().h) : b.scrollHeight);
+  });
+  _defNodeRO(Element.prototype, 'clientWidth', function() {
+    if (_lbIsViewportProxy(this)) return _lbRound(_lbViewport().w);
+    const b = _layoutResolve(this);
+    if (b === 'none') return 0;
+    if (!b) return 100;
+    // An inline-level box has no padding box to report — only a chain of line
+    // fragments — so CSSOM View defines this as zero however far the text runs.
+    return b.inline ? 0 : _lbRound(b.width - b.bl - b.br);
+  });
+  _defNodeRO(Element.prototype, 'clientHeight', function() {
+    if (_lbIsViewportProxy(this)) return _lbRound(_lbViewport().h);
+    const b = _layoutResolve(this);
+    if (b === 'none') return 0;
+    if (!b) return 20;
+    return b.inline ? 0 : _lbRound(b.height - b.bt - b.bb);
+  });
+  _defNodeRO(Element.prototype, 'clientTop', function() {
+    const b = _layoutResolve(this);
+    return (b && b !== 'none' && !b.inline) ? _lbRound(b.bt) : 0;
+  });
+  _defNodeRO(Element.prototype, 'clientLeft', function() {
+    const b = _layoutResolve(this);
+    return (b && b !== 'none' && !b.inline) ? _lbRound(b.bl) : 0;
+  });
   _defNodeRO(Element.prototype, 'currentCSSZoom', function() { return 1; });
   // offset* belong to HTMLElement in the IDL, and idlharness reads the property
   // DESCRIPTOR off HTMLElement.prototype (assert_own_property) — inheriting them
@@ -53463,18 +53726,66 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   // is a style change event, and therefore where `elem.offsetWidth` (the reflow
   // idiom every transition test in WPT is written around) starts transitions.
   const _csTouch = () => { if (globalThis._csFlush) globalThis._csFlush(); };
+  // offsetTop/Left are measured from the offsetParent's PADDING edge — not its
+  // border edge, and not the viewport. With no offsetParent the origin is the
+  // document itself.
+  const _offsetDelta = (el, axis) => {
+    const b = _layoutResolve(el);
+    if (b === 'none' || !b) return 0;
+    const p = (typeof el.offsetParent !== 'undefined') ? el.offsetParent : null;
+    if (!p) return _lbRound(axis === 'y' ? b.y : b.x);
+    const pb = _layoutBoxOf(p);
+    if (!pb) return _lbRound(axis === 'y' ? b.y : b.x);
+    return _lbRound(axis === 'y' ? (b.y - pb.y - pb.bt) : (b.x - pb.x - pb.bl));
+  };
   const _offsetMembers = {
-    offsetTop: function() { _csTouch(); return 0; },
-    offsetLeft: function() { _csTouch(); return 0; },
-    offsetWidth: function() { _csTouch(); return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 100; },
-    offsetHeight: function() { _csTouch(); return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 20; },
+    offsetTop: function() { _csTouch(); return _offsetDelta(this, 'y'); },
+    offsetLeft: function() { _csTouch(); return _offsetDelta(this, 'x'); },
+    offsetWidth: function() {
+      _csTouch();
+      const b = _layoutResolve(this);
+      if (b === 'none') return 0;
+      if (b) return _lbRound(b.width);
+      return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 100;
+    },
+    offsetHeight: function() {
+      _csTouch();
+      const b = _layoutResolve(this);
+      if (b === 'none') return 0;
+      if (b) return _lbRound(b.height);
+      return (_popoverBoxCheck(this) && !_renderedHasBox(this)) ? 0 : 20;
+    },
   };
   for (const nm of Object.keys(_offsetMembers)) _defNodeRO(Element.prototype, nm, _offsetMembers[nm]);
   // offsetParent / scrollParent are HTMLElement-only; both are nullable Element and
   // return null without a layout tree.
   if (typeof HTMLElement !== 'undefined') {
     for (const nm of Object.keys(_offsetMembers)) _defNodeRO(HTMLElement.prototype, nm, _offsetMembers[nm]);
-    _defNodeRO(HTMLElement.prototype, 'offsetParent', function() { return null; });
+    // CSSOM View "offsetParent": the nearest ancestor an absolutely positioned
+    // child would be laid out against. Null for the root, for the body, for
+    // anything unrendered, and for `position: fixed` — which is laid out against
+    // the viewport, and the viewport is not an element.
+    _defNodeRO(HTMLElement.prototype, 'offsetParent', function() {
+      const b = _layoutResolve(this);
+      if (b === 'none' || !b) return null;
+      const doc = this.ownerDocument;
+      if (!doc || this === doc.documentElement || this === doc.body) return null;
+      if (b.fixed) return null;
+      const selfStatic = !b.positioned;
+      for (let a = this.parentElement, guard = 0; a && guard++ < 4096; a = a.parentElement) {
+        if (a === doc.body) return a;
+        const ab = _layoutBoxOf(a);
+        if (ab && ab.positioned) return a;
+        // A *statically* positioned element still takes a table cell as its
+        // offsetParent — the one place the old table-layout world leaks into
+        // the modern API, and only when the element itself is static.
+        if (selfStatic) {
+          const n = a.localName;
+          if (n === 'td' || n === 'th' || n === 'table') return a;
+        }
+      }
+      return doc.body || null;
+    });
     _defNodeRO(HTMLElement.prototype, 'scrollParent', function() { return null; });
   }
   // Define an operation as an enumerable own prototype method with an exact WebIDL
@@ -53515,6 +53826,10 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
     const checkOpacity = !!(o.checkOpacity ?? o.opacityProperty);
     const checkCSS = !!(o.checkVisibilityCSS ?? o.visibilityProperty);
     const gcs = (el) => { try { return globalThis.getComputedStyle(el); } catch (e) { return null; } };
+    // The box tree is the authority on whether a box exists at all: it accounts
+    // for reasons computed style alone cannot see (an ancestor `display:none`
+    // inherited through a construct the cascade walk here would miss).
+    if (_layoutResolve(this) === 'none') return false;
     const own = gcs(this);
     if (!own) return false;
     // `display:contents` generates no box for the element itself.
@@ -59995,6 +60310,13 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || typeof el.getBoundingClientRect !== 'function') continue;
+      // Two ways to be present and yet untouchable, and the hit test has to
+      // honour both or a page's own overlays start swallowing its clicks:
+      //   visibility:hidden — painted nowhere, so nothing to hit
+      //   pointer-events:none — painted, but deliberately transparent to the
+      //   pointer, which is how a decorative overlay stays out of the way.
+      var lb = _layoutBoxOf(el);
+      if (lb && (!lb.hasBox || lb.visHidden || lb.peNone)) continue;
       var r;
       try { r = el.getBoundingClientRect(); } catch (e) { continue; }
       if (!r || (r.width === 0 && r.height === 0)) continue;  // no generated box
@@ -60013,24 +60335,75 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     if (t == null || typeof t._nid !== 'number') throw new TypeError("Illegal invocation");
     if (got < need) throw new TypeError("Failed to execute '" + op + "' on 'Document': " + need + " arguments required, but only " + got + " present.");
   };
+  // WebIDL `double` (as opposed to `unrestricted double`) REJECTS a non-finite
+  // value with a TypeError. Answering `null` for `elementFromPoint(NaN, 0)`
+  // would be indistinguishable from "nothing is there", which hides the
+  // caller's arithmetic bug instead of reporting it.
+  const _docViewCoord = function(v, op) {
+    const n = Number(v);
+    if (!isFinite(n)) throw new TypeError("Failed to execute '" + op + "' on 'Document': The provided double value is non-finite.");
+    return n;
+  };
   Document.prototype.elementFromPoint = function elementFromPoint(x, y) {
     _docViewBrand(this, 'elementFromPoint', 2, arguments.length);
+    x = _docViewCoord(x, 'elementFromPoint'); y = _docViewCoord(y, 'elementFromPoint');
     var m = _hitTestFromPoint(this, x, y);
     if (m === null) return null;
     return m.length ? m[0] : (this.body || this.documentElement || null);
   };
   Document.prototype.elementsFromPoint = function elementsFromPoint(x, y) {
     _docViewBrand(this, 'elementsFromPoint', 2, arguments.length);
+    x = _docViewCoord(x, 'elementsFromPoint'); y = _docViewCoord(y, 'elementsFromPoint');
     var m = _hitTestFromPoint(this, x, y);
     return m === null ? [] : m;
   };
-  // CSSOM View: scrollingElement (the document's root scrolling element → the
-  // document element) + caretPositionFromPoint (layout-less → a CaretPosition anchored
-  // at the body/root, offset 0; nullable, but a live object greens the add_objects
-  // "must inherit" checks). `options` is defaulted so the WebIDL .length is 2, not 3.
+  // CSSOM View: scrollingElement — which element `document.scrollingElement.scrollTop`
+  // actually moves. In standards mode it is the root element; in QUIRKS mode it is
+  // `<body>`, and that swap is the whole reason the property exists: before it, every
+  // page shipped `document.documentElement.scrollTop || document.body.scrollTop`
+  // because there was no way to ask which one the browser would honour.
+  //
+  // The quirks answer is null when `<body>` is itself "potentially scrollable" — an
+  // overflow other than visible/clip on the body, with the root not hiding its own
+  // overflow. In that case the body scrolls its OWN content and the viewport scroll
+  // belongs to nobody, so returning the body would move the wrong thing.
+  //
+  // caretPositionFromPoint stays layout-less: a CaretPosition anchored at the
+  // body/root, offset 0. `options` is defaulted so the WebIDL .length is 2, not 3.
+  const _bodyElementOf = (doc) => {
+    // NOT `doc.body`, which already implements the HTML rule; the spec's own
+    // "body element" concept is the first html-namespace body/frameset child of
+    // the root, and the test appends a `foobarNS` <body> expecting it to count
+    // for nothing.
+    const root = doc.documentElement;
+    if (!root) return null;
+    for (let c = root.firstElementChild; c; c = c.nextElementSibling) {
+      if ((c.localName === 'body' || c.localName === 'frameset') && c.namespaceURI === _HTML_NS) return c;
+    }
+    return null;
+  };
+  const _potentiallyScrollable = (el) => {
+    const doc = el.ownerDocument;
+    const root = doc && doc.documentElement;
+    const ov = (n) => { try { const cs = globalThis.getComputedStyle(n); return cs ? (cs.overflow || 'visible') : 'visible'; } catch (e) { return 'visible'; } };
+    // "has an associated box" — an unrendered body cannot scroll anything.
+    if (_layoutResolve(el) === 'none') return false;
+    // The root hiding its overflow takes the viewport scroll away from the body.
+    if (root && root !== el) {
+      const ro = ov(root);
+      if (ro !== 'visible' && ro !== 'clip') return false;
+    }
+    const bo = ov(el);
+    return bo !== 'visible' && bo !== 'clip';
+  };
   Object.defineProperty(Document.prototype, 'scrollingElement', { configurable: true, enumerable: true,
     get: _named('get', 'scrollingElement', function() {
       if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+      if (this.compatMode === 'BackCompat') {
+        const body = _bodyElementOf(this);
+        if (!body) return null;
+        return _potentiallyScrollable(body) ? null : body;
+      }
       return this.documentElement || null;
     }) });
   Document.prototype.caretPositionFromPoint = function caretPositionFromPoint(x, y, options = undefined) {

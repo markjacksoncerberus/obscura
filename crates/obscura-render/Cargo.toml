@@ -24,6 +24,11 @@ description = "Headless HTML/CSS rendering for Obscura, backed by the Blitz engi
 # versions the fork's workspace pins.
 blitz-dom = { version = "=0.3.0-alpha.5", default-features = false, features = ["svg", "woff"] }
 blitz-html = "=0.3.0-alpha.5"
+# Stylo's computed-value types, so geometry queries can read `display`,
+# `position`, `visibility` and `opacity` off a laid-out node. Blitz already
+# pulls this exact version, so naming it here costs no extra compilation — it
+# just lets us name the enums instead of round-tripping them through strings.
+style = { version = "0.18.0", package = "stylo", default-features = false }
 blitz-paint = "=0.3.0-alpha.5"
 blitz-traits = "=0.3.0-alpha.5"
 anyrender = "0.11"
@@ -43,6 +48,12 @@ kurbo = "0.13"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico", "bmp"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# Sub-resource fetching for layout/paint goes through Obscura's own HTTP client
+# so a stylesheet is fetched with the same cookies, proxy and blocking rules as
+# the page that linked it (see `http.rs`).
+obscura-net = { workspace = true }
+tokio = { workspace = true }
+base64 = { workspace = true }
 
 [features]
 # AVIF image decoding (e.g. Next.js `<Image>`, which serves `image/avif` by

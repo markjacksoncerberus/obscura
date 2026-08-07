@@ -6,9 +6,18 @@ edition.workspace = true
 [build-dependencies]
 deno_core = "0.350"
 
+[features]
+default = []
+# Give the JS realm a real layout model: `getBoundingClientRect` & friends
+# answer from the Blitz box tree instead of a synthetic grid. Off by default
+# because it pulls the whole renderer (Stylo, Taffy, Parley); `obscura-browser`
+# turns it on as part of its own `render` feature.
+render = ["dep:obscura-render"]
+
 [dependencies]
 obscura-dom = { workspace = true }
 obscura-net = { workspace = true }
+obscura-render = { workspace = true, optional = true }
 deno_core = "0.350"
 tokio = { workspace = true }
 serde = { workspace = true }

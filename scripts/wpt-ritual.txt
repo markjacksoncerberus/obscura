@@ -295,3 +295,21 @@ webaudio/the-audio-api/the-analysernode-interface/ctor-analyser.html
 webaudio/the-audio-api/the-audioparam-interface/event-insertion.html
 webaudio/the-audio-api/the-biquadfilternode-interface/biquad-getFrequencyResponse.html
 webaudio/the-audio-api/the-audioparam-interface/k-rate-constant-source.html
+
+# --- the layout bridge (Quests #505-#507, the measured/boxed/located arc) ---
+# `getBoundingClientRect` and every box metric now read a REAL Blitz/Taffy box
+# tree instead of a synthetic 100x20 grid. This is the most shared primitive in
+# the engine — if any row here moves, the layout bridge moved with it.
+# ⚠️ Two of these were scoring PERFECT by comparing our own constants to each
+# other (`assert_equals(scrollHeight, clientHeight)` when both were `20`). They
+# are in the ritual precisely so that can never happen unnoticed again.
+# The wider probe is `scripts/wpt-layout-probe.txt` (69 files).
+css/cssom-view/scrollWidthHeight-overflow-visible-margin-collapsing.html
+css/cssom-view/scrollWidthHeight-contain-layout.html
+css/cssom-view/scrollLeftTop.html
+css/cssom-view/table-offset-props.html
+css/cssom-view/elementFromPosition.html
+css/cssom-view/elementFromPoint-parameters.html
+css/cssom-view/scrollingElement.html
+css/cssom-view/checkVisibility.html
+resize-observer/observe-001.html

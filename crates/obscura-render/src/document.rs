@@ -37,6 +37,99 @@ pub struct Size {
     pub height: f64,
 }
 
+/// Everything CSSOM View needs to know about one laid-out element, in CSS
+/// pixels, read straight off the box the layout engine computed.
+///
+/// The rect is the **border box** in document coordinates — the same box
+/// `getBoundingClientRect()` reports (minus the scroll offset, which the caller
+/// applies). The border/padding edges come along separately because the
+/// `client*` and `offset*` families measure to *different* edges of the same
+/// box, and reconstructing one from the other is impossible after the fact.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NodeBox {
+    /// Border-box position and size in document coordinates.
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    /// Border widths (`clientTop` is `border_top`, and `clientWidth` subtracts
+    /// `border_left + border_right` from `width`).
+    pub border_top: f64,
+    pub border_right: f64,
+    pub border_bottom: f64,
+    pub border_left: f64,
+    /// Padding widths, kept so a caller can derive the content box.
+    pub padding_top: f64,
+    pub padding_right: f64,
+    pub padding_bottom: f64,
+    pub padding_left: f64,
+    /// Union of the border box and everything overflowing it — the basis for
+    /// `scrollWidth`/`scrollHeight`.
+    pub scroll_width: f64,
+    pub scroll_height: f64,
+    /// How far this box is currently scrolled.
+    pub scroll_left: f64,
+    pub scroll_top: f64,
+    /// False when the element generates no box at all (`display: none`, or an
+    /// ancestor is). Such an element must report an all-zero rect *and* be
+    /// invisible to hit-testing — a zero-sized box that still exists is a
+    /// different thing, so the two cases cannot share a representation.
+    pub has_box: bool,
+    /// True when this element establishes a containing block for absolutely
+    /// positioned descendants (`position` is not `static`), which is what
+    /// `offsetParent` walks the tree looking for.
+    pub positioned: bool,
+    /// True for `visibility: hidden` / `collapse` — laid out, occupying space,
+    /// but not painted and not hit-testable. `checkVisibility()` asks this.
+    pub visibility_hidden: bool,
+    /// Resolved `opacity`, so `checkVisibility({opacityProperty: true})` can
+    /// answer without a second round trip.
+    pub opacity: f64,
+    /// `position: fixed`. Kept apart from `positioned` because `offsetParent`
+    /// treats the two oppositely: a positioned ancestor is what the walk is
+    /// looking FOR, and a fixed element is one the walk refuses to start from.
+    pub fixed: bool,
+    /// `display: inline` EXACTLY — not merely inline-*level*.
+    ///
+    /// CSSOM View zeroes `clientWidth`/`clientHeight` for a non-replaced inline
+    /// box, which has no single padding box to report (only a chain of line
+    /// fragments). `inline-block`, `inline-flex` and `inline-grid` are
+    /// inline-level but each has a perfectly ordinary padding box, so lumping
+    /// them in reports zero for elements that are plainly boxes.
+    pub inline_level: bool,
+    /// `pointer-events: none` — the element is painted but transparent to hit
+    /// testing, so `elementFromPoint` must look straight through it. An overlay
+    /// that decorates without intercepting is the whole point of the property.
+    pub pointer_events_none: bool,
+}
+
+/// What an element that generates no box reports: all zeros, `has_box: false`.
+const EMPTY_BOX: NodeBox = NodeBox {
+    x: 0.0,
+    y: 0.0,
+    width: 0.0,
+    height: 0.0,
+    border_top: 0.0,
+    border_right: 0.0,
+    border_bottom: 0.0,
+    border_left: 0.0,
+    padding_top: 0.0,
+    padding_right: 0.0,
+    padding_bottom: 0.0,
+    padding_left: 0.0,
+    scroll_width: 0.0,
+    scroll_height: 0.0,
+    scroll_left: 0.0,
+    scroll_top: 0.0,
+    has_box: false,
+    positioned: false,
+    visibility_hidden: false,
+    opacity: 1.0,
+    fixed: false,
+    inline_level: false,
+    pointer_events_none: false,
+};
+
 /// A styled, laid-out document. Hold one of these to take multiple screenshots
 /// or answer many geometry queries without re-resolving.
 pub struct ResolvedDoc {
@@ -88,6 +181,115 @@ impl ResolvedDoc {
     /// The Obscura-node-id → Blitz-node-id map for this document.
     pub fn nid_map(&self) -> &HashMap<u64, usize> {
         &self.nid_map
+    }
+
+    /// The full CSSOM-View box for `obscura_nid`, or `None` if the element
+    /// wasn't in the snapshot at all.
+    ///
+    /// An element that *is* in the snapshot but generates no box (`display:
+    /// none`, or a descendant of one) comes back with `has_box: false` and zero
+    /// geometry — deliberately distinct from `None`, because "not rendered" and
+    /// "not here" are different answers to `getBoundingClientRect()` only in
+    /// how they arise, but very different to `offsetParent` and hit-testing.
+    pub fn node_box(&self, obscura_nid: u64) -> Option<NodeBox> {
+        let &blitz_id = self.nid_map.get(&obscura_nid)?;
+        Some(self.box_for_blitz_id(blitz_id).unwrap_or(EMPTY_BOX))
+    }
+
+    /// Every laid-out element in the document, in tree order, as
+    /// `(obscura_nid, box)`. One call answers a whole page's worth of geometry,
+    /// which is what makes an `IntersectionObserver` frame affordable: the
+    /// alternative is one round trip per observed element per frame.
+    pub fn all_boxes(&self) -> Vec<(u64, NodeBox)> {
+        let mut out = Vec::with_capacity(self.nid_map.len());
+        let mut stack = vec![self.doc.root_node().id];
+        // Reverse-push so children come out in document order; hit-testing and
+        // `elementsFromPoint` both depend on that ordering being real.
+        while let Some(id) = stack.pop() {
+            let Some(node) = self.doc.get_node(id) else {
+                continue;
+            };
+            if let Some(element) = node.element_data() {
+                if let Some(attr) = element
+                    .attrs()
+                    .iter()
+                    .find(|a| a.name.local.as_ref() == NID_ATTR)
+                {
+                    if let Ok(nid) = attr.value.parse::<u64>() {
+                        out.push((nid, self.box_for_blitz_id(id).unwrap_or(EMPTY_BOX)));
+                    }
+                }
+            }
+            stack.extend(node.children.iter().rev().copied());
+        }
+        out
+    }
+
+    fn box_for_blitz_id(&self, blitz_id: usize) -> Option<NodeBox> {
+        use style::computed_values::visibility::T as Visibility;
+        use style::values::specified::box_::{DisplayInside, DisplayOutside};
+
+        let node = self.doc.get_node(blitz_id)?;
+        let styles = node.primary_styles();
+
+        // No primary style means Stylo never generated a box for this element:
+        // it is `display: none`, or it is inside something that is. Blitz still
+        // keeps the node in the tree (the DOM is not the box tree), so this is
+        // the only reliable tell.
+        let Some(styles) = styles.as_ref() else {
+            return Some(EMPTY_BOX);
+        };
+        let display = styles.clone_display();
+        if display.outside() == DisplayOutside::None {
+            return Some(EMPTY_BOX);
+        }
+
+        let l = &node.final_layout;
+        let pos = node.absolute_position(0.0, 0.0);
+        // `scroll_offset` is subtracted by `absolute_position` on the way up, so
+        // this box is already in the same coordinate space the spec calls
+        // "viewport-relative before the viewport's own scroll is applied".
+        Some(NodeBox {
+            x: pos.x as f64,
+            y: pos.y as f64,
+            width: l.size.width as f64,
+            height: l.size.height as f64,
+            border_top: l.border.top as f64,
+            border_right: l.border.right as f64,
+            border_bottom: l.border.bottom as f64,
+            border_left: l.border.left as f64,
+            padding_top: l.padding.top as f64,
+            padding_right: l.padding.right as f64,
+            padding_bottom: l.padding.bottom as f64,
+            padding_left: l.padding.left as f64,
+            // ⚠️ Taffy measures `content_size` from the BORDER-box origin, but
+            // CSSOM View defines the scrolling area against the PADDING box —
+            // so the leading border has to come off before the two can be
+            // compared. Skip that subtraction and every bordered element
+            // reports a scrollHeight one border-width taller than its own
+            // clientHeight, i.e. claims to overflow when it does not.
+            scroll_width: (l.content_size.width as f64 - l.border.left as f64)
+                .max(l.size.width as f64 - l.border.left as f64 - l.border.right as f64),
+            scroll_height: (l.content_size.height as f64 - l.border.top as f64)
+                .max(l.size.height as f64 - l.border.top as f64 - l.border.bottom as f64),
+            scroll_left: node.scroll_offset.x,
+            scroll_top: node.scroll_offset.y,
+            has_box: true,
+            positioned: !matches!(
+                styles.clone_position(),
+                style::computed_values::position::T::Static
+            ),
+            visibility_hidden: styles.clone_visibility() != Visibility::Visible,
+            opacity: styles.clone_opacity() as f64,
+            fixed: matches!(
+                styles.clone_position(),
+                style::computed_values::position::T::Fixed
+            ),
+            inline_level: display.outside() == DisplayOutside::Inline
+                && display.inside() == DisplayInside::Flow,
+            pointer_events_none: styles.clone_pointer_events()
+                == style::computed_values::pointer_events::T::None,
+        })
     }
 
     /// Paint the document and encode it per `opts`. The painted buffer always

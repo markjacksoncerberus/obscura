@@ -2855,6 +2855,7 @@ dependencies = [
  "html5ever 0.29.1",
  "obscura-dom",
  "obscura-net",
+ "obscura-render",
  "p256",
  "p384",
  "p521",
@@ -2912,14 +2913,18 @@ version = "0.1.0"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
+ "base64",
  "blitz-dom",
  "blitz-html",
  "blitz-paint",
  "blitz-traits",
  "image",
  "kurbo",
+ "obscura-net",
  "peniko",
+ "stylo",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

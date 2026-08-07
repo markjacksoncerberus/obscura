@@ -4,6 +4,9 @@ extern crate html5ever;
 pub mod module_loader;
 pub mod runtime;
 pub mod ops;
+/// The Blitz-backed layout bridge — only compiled with the renderer.
+#[cfg(feature = "render")]
+pub mod layout;
 pub mod aes_ops;
 pub mod compress_ops;
 pub mod crypto_ops;
