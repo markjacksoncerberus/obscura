@@ -244,3 +244,26 @@ fs/idlharness.https.any.html
 fs/FileSystemDirectoryHandle-getFileHandle.https.any.html
 fs/FileSystemDirectoryHandle-iteration.https.any.html
 fs/FileSystemWritableFileStream-piped.https.any.html
+
+# ── Quests #496–#498 (2026-08-07): the observed, resized & permitted verdicts ─
+# The two geometry observers, rebuilt. These four idlharness rows are the guard
+# on the object model; the behavioural rows guard the frame-tail delivery loop
+# and the depth bound. ⚠️ `requestAnimationFrame` became a real FRAME QUEUE in
+# this arc (it was `setTimeout(fn, 0)`), which is a shared primitive — if
+# anything in this file ever moves, suspect that first.
+intersection-observer/idlharness.window.html
+intersection-observer/observer-attributes.html
+intersection-observer/observer-exceptions.html
+intersection-observer/disconnect.html
+resize-observer/idlharness.window.html
+resize-observer/calculate-depth-for-node.html
+resize-observer/ordering.html
+# `permissions` + `clipboard-apis`. `clipboard-item` is the object-model guard;
+# `event-model` also guards the test_driver `set_permission` bridge, which must
+# apply the change on a TASK and must read the PACKED {descriptor, state} form.
+permissions/idlharness.any.html
+permissions/all-permissions.html
+permissions/event-model.https.html
+clipboard-apis/idlharness.https.window.html
+clipboard-apis/clipboard-item.https.html
+clipboard-apis/async-navigator-clipboard-basics.https.html

@@ -346,6 +346,38 @@ TESTDRIVER_BRIDGE_JS = r"""
     };
     impl.get_all_cookies = function() { return Promise.resolve([]); };
     impl.get_named_cookie = function() { return Promise.resolve(null); };
+    // Permissions. `set_permission` plays the part of the human who says yes or
+    // no — the one thing a page can NEVER do for itself, which is the whole point
+    // of permissions. Without it, every test of the change-event model sits
+    // waiting for a transition that can only come from outside the page, and
+    // reads as a timeout rather than as the missing driver it is. The engine
+    // exposes exactly one entry point for this (`__obscuraSetPermission`), and
+    // nothing reachable from page script can call it.
+    // testdriver.js's public `set_permission(descriptor, state)` packs both into
+    // ONE object before it reaches the backend: `{descriptor, state}`, with the
+    // second backend argument being the browsing context. Reading it as
+    // (descriptor, state) gets `state === null` on every call — and a null state
+    // is not a state, so every transition test fails with a type error rather
+    // than a wrong answer. Accept the packed form, and the flat one too.
+    impl.set_permission = function(params, context) {
+      try {
+        var descriptor = (params && params.descriptor !== undefined) ? params.descriptor : params;
+        var state = (params && params.state !== undefined) ? params.state : context;
+        var name = (descriptor && descriptor.name !== undefined) ? descriptor.name : descriptor;
+        // Applied on a TASK, not synchronously. A real driver call is a round
+        // trip out of the page and back, so any promise the page has in flight
+        // settles first — including the `await permissions.query()` whose whole
+        // job is to get a listener attached before the transition arrives.
+        // Firing synchronously delivers the change to a page that has not
+        // finished subscribing, which reads as a hang rather than as a race.
+        return new Promise(function(resolve, reject) {
+          setTimeout(function() {
+            try { window.__obscuraSetPermission(name, state); resolve(); }
+            catch (e) { reject(e); }
+          }, 0);
+        });
+      } catch (e) { return Promise.reject(e); }
+    };
     // Single-window runner: the "test context" is always this window.
     impl.set_test_context = function() {};
   }

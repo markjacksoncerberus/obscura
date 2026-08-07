@@ -798,8 +798,55 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
 };
 
 globalThis.clearInterval = (id) => { _intervals.delete(id); _clearedTimers.add(id); };
-globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
-globalThis.cancelAnimationFrame = globalThis.clearTimeout;
+// ── requestAnimationFrame is a FRAME, not a timer ────────────────────────────
+// It used to be `setTimeout(fn, 0)`, which gets the delay about right and the
+// STRUCTURE wrong. HTML collects every callback registered before a frame begins
+// and runs them all inside ONE frame, in registration order; a callback that asks
+// for another frame is served by the NEXT one. That is what makes `rAF(() =>
+// rAF(f))` mean "two frames from now" rather than "two tasks from now", and it is
+// what an animation loop is counting on when it measures elapsed time.
+//
+// It also gives the frame a TAIL. The rendering steps have a defined end: after
+// the frame's callbacks have run and layout has settled, the observers that
+// report geometry take their readings and queue their notifications. With one
+// task per callback there was no "after the frame" to hook — and no frame to hook
+// it to. `_frameTailSteps` is that hook; a realm with no observers registers
+// nothing and pays nothing.
+const _rafCallbacks = new Map();      // handle -> callback, iterated in insertion order
+let _rafFrameScheduled = false;
+const _frameTailSteps = [];
+const _runAnimationFrame = () => {
+  _rafFrameScheduled = false;
+  // Snapshot and clear BEFORE invoking: a callback that calls
+  // requestAnimationFrame again belongs to the next frame, and re-entering it
+  // into this one is how a self-rescheduling animation becomes an infinite loop
+  // that never yields — on a low-end device, a locked-up tab.
+  const due = Array.from(_rafCallbacks.values());
+  _rafCallbacks.clear();
+  const now = (typeof performance !== "undefined" && performance && performance.now)
+    ? performance.now() : Date.now();
+  for (const fn of due) {
+    try { fn(now); } catch (e) { try { _reportError(e); } catch (e2) {} }
+  }
+  for (const step of _frameTailSteps) {
+    try { step(now); } catch (e) { try { _reportError(e); } catch (e2) {} }
+  }
+};
+// Handles come from the shared `_tid` counter so a frame handle can never
+// collide with a timer id — page code that hands one to the wrong canceller
+// cancels nothing instead of cancelling somebody else's timer.
+const _requestFrame = () => {
+  if (_rafFrameScheduled) return;
+  _rafFrameScheduled = true;
+  _scheduleAfter(0, _runAnimationFrame);
+};
+globalThis.requestAnimationFrame = (fn) => {
+  const handle = ++_tid;
+  _rafCallbacks.set(handle, fn);
+  _requestFrame();
+  return handle;
+};
+globalThis.cancelAnimationFrame = (handle) => { _rafCallbacks.delete(handle); };
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
 // MessageChannel / MessagePort are defined with the Web Workers block further
@@ -8968,11 +9015,9 @@ globalThis.navigator = {
     getDisplayMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
     addEventListener(){}, removeEventListener(){},
   },
-  clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
-  permissions: { query(params){
-    if (params?.name === 'notifications') return Promise.resolve({state:"prompt",onchange:null});
-    return Promise.resolve({state:"granted"});
-  } },
+  // `clipboard` and `permissions` are installed as [SameObject] properties in the
+  // Permissions/Clipboard section further down — they were object literals here,
+  // and both of them lied.
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
   sendBeacon() { return true; },
@@ -11152,21 +11197,9 @@ if (!('isConnected' in Node.prototype)) {
   });
 }
 
-globalThis.ResizeObserver = class ResizeObserver {
-  constructor(callback) { this._callback = callback; this._targets = []; }
-  observe(el) {
-    this._targets.push(el);
-    Promise.resolve().then(() => {
-      this._callback([{
-        target: el, contentRect: { x:0, y:0, width:100, height:20, top:0, left:0, bottom:20, right:100 },
-        borderBoxSize: [{ blockSize: 20, inlineSize: 100 }],
-        contentBoxSize: [{ blockSize: 20, inlineSize: 100 }],
-      }], this);
-    });
-  }
-  unobserve(el) { this._targets = this._targets.filter(t => t !== el); }
-  disconnect() { this._targets = []; }
-};
+// (ResizeObserver used to be defined here — and again, differently, 21,000 lines
+// further down, where a pure no-op overwrote it. Both are gone; the real one
+// lives with IntersectionObserver in the observers section.)
 
 // ---- Encoding API (TextEncoder / TextDecoder) ----
 // WHATWG encoding label table (canonical name -> labels), straight from
@@ -32590,24 +32623,8 @@ globalThis.NodeFilter = {
   FILTER_REJECT: 2,
   FILTER_SKIP: 3,
 };
-globalThis.ResizeObserver = class { constructor(){} observe(){} unobserve(){} disconnect(){} };
-globalThis.IntersectionObserver = class {
-  constructor(callback) { this._callback = callback; }
-  observe(el) {
-    Promise.resolve().then(() => {
-      this._callback([{
-        target: el,
-        isIntersecting: true,
-        intersectionRatio: 1,
-        boundingClientRect: el.getBoundingClientRect ? el.getBoundingClientRect() : {x:0,y:0,width:100,height:20},
-        intersectionRect: el.getBoundingClientRect ? el.getBoundingClientRect() : {x:0,y:0,width:100,height:20},
-        rootBounds: {x:0,y:0,width:1280,height:720},
-      }], this);
-    });
-  }
-  unobserve() {}
-  disconnect() {}
-};
+// IntersectionObserver / ResizeObserver — the real implementations live in the
+// observers section further down (they need `_idlShape` and `DOMRectReadOnly`).
 // PerformanceObserver — the real implementation lives just after the `Performance`
 // class + `globalThis.performance` are defined (it needs the entry buffer to read
 // buffered entries and to be notified on mark()/measure()).
@@ -33127,7 +33144,10 @@ _enumAccessors(TransitionEvent.prototype, 'propertyName', 'elapsedTime', 'pseudo
 globalThis.PopStateEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.state=o.state??null; } };
 globalThis.HashChangeEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.oldURL=o.oldURL||""; this.newURL=o.newURL||""; } };
 globalThis.MessageEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o);this.data=o.data??null;this.origin=o.origin||"";this.lastEventId=o.lastEventId||"";this.source=o.source??null;this.ports=o.ports||[]; } };
-globalThis.ClipboardEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.clipboardData=o.clipboardData??null; } };
+// (ClipboardEvent / ClipboardChangeEvent are defined with the Clipboard section
+// further down — the old one-liner here was an ANONYMOUS class, so its `.name`
+// was the empty string, and it carried `clipboardData` as a writable own data
+// property where the IDL wants a readonly prototype accessor.)
 globalThis.SubmitEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.submitter=o.submitter??null; } };
 // ProgressEvent — the shape of "how far along is this?". All three members are
 // READONLY: a progress bar that can be written to by whoever holds the event is a
@@ -34150,6 +34170,906 @@ function _syncBlobBytes(blob, op) {
 }
 _idlShape(FileReaderSync, { ctorLength: 0, expose: false,
   arity: { readAsArrayBuffer: 1, readAsBinaryString: 1, readAsText: 1, readAsDataURL: 1 } });
+
+// ════════════════════════════════════════════════════════════════════════════
+// THE GEOMETRY OBSERVERS — IntersectionObserver and ResizeObserver
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Both of these existed before this quest, and both of them LIED.
+//
+// `IntersectionObserver` reported `isIntersecting: true` for every target, on
+// the first microtask, forever. That is not a stub that fails — it is a stub
+// that answers, and answers wrong, and the wrong answer is the expensive one.
+// The entire purpose of this API is to NOT fetch things nobody has scrolled to:
+// it is how a gallery of two hundred photographs downloads the four you can
+// actually see. Told that everything is visible, every `loading="lazy"` polyfill,
+// every infinite-scroll list, every ad-viewability shim fires all of its work at
+// once — and the person on a metered connection pays for all two hundred images
+// to answer a question they never asked. The API that exists to save someone's
+// data was spending it.
+//
+// `ResizeObserver` was worse in a quieter way: it was declared TWICE, eleven
+// thousand lines apart, and the second declaration was
+// `class { constructor(){} observe(){} unobserve(){} disconnect(){} }` — a total
+// no-op that silently replaced the first. A component that re-lays-itself-out on
+// resize simply never did, and nothing anywhere reported a problem.
+//
+// What we can and cannot do here, said plainly: Obscura has no layout engine, so
+// `getBoundingClientRect` returns a stable synthetic box per element (see
+// `Element.prototype.getBoundingClientRect`). Everything structural below — the
+// object model, the option parsing and validation, the threshold algorithm, the
+// registration bookkeeping, the queue, the frame-tail delivery and its ordering —
+// is real and spec-exact. The PIXEL VALUES are as good as the boxes underneath
+// them, which is to say: not real yet. That is one cap, named once, and it is the
+// layout-engine cap the campaign has been carrying for a while — not an
+// observer bug.
+
+// A CSS number, serialized the CSS way: no trailing ".0", no exponent for the
+// magnitudes a margin can hold.
+const _cssNum = (n) => {
+  if (!isFinite(n)) return "0";
+  const r = Math.round(n * 1e6) / 1e6;
+  return Object.is(r, -0) ? "0" : String(r);
+};
+// Absolute length units, in CSS pixels. `em`/`rem`/`vh`/… are deliberately absent:
+// they are not absolute, and "parse a margin" accepts only absolute lengths and
+// percentages. Bare `1` is absent too — a number token is not a dimension token,
+// which is why `rootMargin: "1"` is a SyntaxError and not one pixel.
+const _ABS_LENGTH_PX = { px: 1, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6,
+                         in: 96, pt: 96 / 72, pc: 16 };
+// "Parse a margin", §2.2 — returns four {value, unit} components (top, right,
+// bottom, left) or null for failure. The one-, two- and three-component forms
+// expand exactly as CSS `margin` does.
+const _parseObserverMargin = function(input) {
+  const tokens = String(input).trim().split(/\s+/).filter((s) => s.length > 0);
+  if (tokens.length > 4) return null;
+  // Zero components is not an error, it is "0px" — which is what makes
+  // `rootMargin: " "` legal and equal to the default.
+  if (tokens.length === 0) tokens.push("0px");
+  const parsed = [];
+  for (const tok of tokens) {
+    const m = /^([+-]?(?:\d+\.?\d*|\.\d+))(%|[a-zA-Z]+)$/.exec(tok);
+    if (!m) return null;
+    const value = parseFloat(m[1]);
+    if (!isFinite(value)) return null;
+    const unit = m[2].toLowerCase();
+    if (unit === "%") { parsed.push({ value, unit: "%" }); continue; }
+    const scale = _ABS_LENGTH_PX[unit];
+    if (scale === undefined) return null;   // em, vh, ch, … — not absolute
+    parsed.push({ value: value * scale, unit: "px" });
+  }
+  if (parsed.length === 1) parsed.push(parsed[0], parsed[0], parsed[0]);
+  else if (parsed.length === 2) parsed.push(parsed[0], parsed[1]);
+  else if (parsed.length === 3) parsed.push(parsed[1]);
+  return parsed;
+};
+const _serializeObserverMargin = (m) => m.map((c) => _cssNum(c.value) + c.unit).join(" ");
+// WebIDL `long` is ToInt32: truncate toward zero, then wrap modulo 2^32 into the
+// signed range — which `| 0` performs exactly, including for NaN and Infinity.
+const _toLong = (v) => Number(v) | 0;
+
+// ── IntersectionObserverEntry ────────────────────────────────────────────────
+const _ioRect = function(init, allowNull) {
+  if (init == null) { if (allowNull) return null; init = {}; }
+  const R = globalThis.DOMRectReadOnly;
+  return new R(Number(init.x) || 0, Number(init.y) || 0,
+               Number(init.width) || 0, Number(init.height) || 0);
+};
+class IntersectionObserverEntry {
+  constructor(init) {
+    if (arguments.length < 1 || init == null || typeof init !== "object")
+      throw new TypeError("Failed to construct 'IntersectionObserverEntry': 1 argument required.");
+    // Every member of IntersectionObserverEntryInit is `required` — including
+    // `rootBounds`, which is required AND nullable, two different things.
+    for (const k of ["time", "rootBounds", "boundingClientRect", "intersectionRect",
+                     "isIntersecting", "isVisible", "intersectionRatio", "target"]) {
+      if (!(k in init))
+        throw new TypeError("Failed to construct 'IntersectionObserverEntry': required member " + k + " is undefined.");
+    }
+    this._time = Number(init.time) || 0;
+    this._rootBounds = _ioRect(init.rootBounds, true);
+    this._boundingClientRect = _ioRect(init.boundingClientRect, false);
+    this._intersectionRect = _ioRect(init.intersectionRect, false);
+    this._isIntersecting = !!init.isIntersecting;
+    this._isVisible = !!init.isVisible;
+    this._intersectionRatio = Number(init.intersectionRatio) || 0;
+    this._target = init.target;
+  }
+  get time() { return this._time; }
+  get rootBounds() { return this._rootBounds; }
+  get boundingClientRect() { return this._boundingClientRect; }
+  get intersectionRect() { return this._intersectionRect; }
+  get isIntersecting() { return this._isIntersecting; }
+  get isVisible() { return this._isVisible; }
+  get intersectionRatio() { return this._intersectionRatio; }
+  get target() { return this._target; }
+}
+
+// ── IntersectionObserver ─────────────────────────────────────────────────────
+// Every live observer with at least one target. The frame tail walks this list.
+const _ioObservers = [];
+let _ioNotifyQueued = false;
+// "Notify intersection observers" — one task drains every observer's queue, and
+// the flag is cleared FIRST so an entry queued from inside a callback schedules a
+// fresh task instead of being swallowed by the one already running.
+const _ioNotify = function() {
+  _ioNotifyQueued = false;
+  for (const observer of _ioObservers.slice()) {
+    if (!observer._queued.length) continue;
+    const queue = observer._queued;
+    observer._queued = [];
+    try { observer._callback.call(observer, queue, observer); } catch (e) { _reportError(e); }
+  }
+};
+const _ioQueueTask = function() {
+  if (_ioNotifyQueued) return;
+  _ioNotifyQueued = true;
+  _queueTask(_ioNotify);
+};
+const _rectArea = (r) => Math.max(0, r.width) * Math.max(0, r.height);
+// Intersect two rects. Edge-adjacency counts as intersecting even though the
+// resulting area is zero — the spec is explicit, and it is what lets a
+// zero-height target at the exact top of the viewport report as visible.
+const _rectIntersect = function(a, b) {
+  const left = Math.max(a.left, b.left), right = Math.min(a.right, b.right);
+  const top = Math.max(a.top, b.top), bottom = Math.min(a.bottom, b.bottom);
+  if (right < left || bottom < top) return null;
+  return { left, top, right, bottom, width: right - left, height: bottom - top,
+           x: left, y: top };
+};
+const _plainRect = function(r) {
+  return { left: r.left, top: r.top, right: r.right, bottom: r.bottom,
+           width: r.width, height: r.height, x: r.x, y: r.y };
+};
+const _zeroRect = { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 };
+// Dilate a rect by four margin components (top, right, bottom, left). Percentages
+// resolve against the WIDTH of the undilated rect — for every edge, including the
+// horizontal ones. That is surprising and it is what the spec says.
+const _dilateRect = function(r, margin) {
+  const basis = r.width;
+  const px = (c) => (c.unit === "%" ? (c.value / 100) * basis : c.value);
+  const top = r.top - px(margin[0]), right = r.right + px(margin[1]);
+  const bottom = r.bottom + px(margin[2]), left = r.left - px(margin[3]);
+  return { left, top, right, bottom, width: right - left, height: bottom - top,
+           x: left, y: top };
+};
+
+class IntersectionObserver {
+  constructor(callback, options) {
+    if (typeof callback !== "function")
+      throw new TypeError("Failed to construct 'IntersectionObserver': parameter 1 is not of type 'IntersectionObserverCallback'.");
+    const opts = (options == null) ? {} : options;
+    const root = (opts.root == null) ? null : opts.root;
+    if (root !== null && !(root instanceof globalThis.Element) &&
+        !(globalThis.Document && root instanceof globalThis.Document))
+      throw new TypeError("Failed to construct 'IntersectionObserver': member root is not of type (Element or Document)?.");
+    const rootMargin = _parseObserverMargin(opts.rootMargin === undefined ? "0px" : opts.rootMargin);
+    if (rootMargin === null)
+      throw new DOMException("Failed to construct 'IntersectionObserver': rootMargin must be specified in pixels or percent.", "SyntaxError");
+    const scrollMargin = _parseObserverMargin(opts.scrollMargin === undefined ? "0px" : opts.scrollMargin);
+    if (scrollMargin === null)
+      throw new DOMException("Failed to construct 'IntersectionObserver': scrollMargin must be specified in pixels or percent.", "SyntaxError");
+    // `(double or sequence<double>)`: a sequence is an OBJECT with an iterator.
+    // A string is not an object, so it takes the `double` branch and
+    // `threshold: "foo"` becomes NaN — a TypeError, per WebIDL's `double`, which
+    // (unlike `unrestricted double`) admits no NaN and no Infinity.
+    const rawThreshold = opts.threshold === undefined ? 0 : opts.threshold;
+    const list = (rawThreshold !== null && typeof rawThreshold === "object" &&
+                  typeof rawThreshold[Symbol.iterator] === "function")
+      ? Array.from(rawThreshold) : [rawThreshold];
+    const thresholds = [];
+    for (const raw of list) {
+      const t = Number(raw);
+      if (!isFinite(t))
+        throw new TypeError("Failed to construct 'IntersectionObserver': The provided double value is non-finite.");
+      // Range is checked AFTER conversion, so `["foo"]` is a TypeError and
+      // `[1.1]` is a RangeError — two different complaints about two different
+      // mistakes, which is the difference between "that isn't a number" and
+      // "a ratio above 1 cannot happen".
+      if (t < 0 || t > 1)
+        throw new RangeError("Failed to construct 'IntersectionObserver': Threshold values must be numbers between 0 and 1");
+      thresholds.push(t);
+    }
+    thresholds.sort((a, b) => a - b);
+    if (thresholds.length === 0) thresholds.push(0);
+    let delay = _toLong(opts.delay === undefined ? 0 : opts.delay);
+    const trackVisibility = !!opts.trackVisibility;
+    // Visibility tracking is expensive to compute honestly, so the spec sets a
+    // floor rather than throwing: asking to track visibility silently buys you a
+    // minimum 100 ms between notifications.
+    if (trackVisibility && delay < 100) delay = 100;
+
+    this._callback = callback;
+    this._root = root;
+    this._rootMargin = rootMargin;
+    this._scrollMargin = scrollMargin;
+    this._thresholds = Object.freeze(thresholds);
+    this._delay = delay;
+    this._trackVisibility = trackVisibility;
+    this._targets = [];          // in observe() order — the spec requires it
+    this._registrations = new Map();   // target -> {thresholdIndex, isIntersecting, isVisible, lastUpdateTime}
+    this._queued = [];
+  }
+  get root() { return this._root; }
+  get rootMargin() { return _serializeObserverMargin(this._rootMargin); }
+  get scrollMargin() { return _serializeObserverMargin(this._scrollMargin); }
+  get thresholds() { return this._thresholds; }
+  get delay() { return this._delay; }
+  get trackVisibility() { return this._trackVisibility; }
+  observe(target) {
+    if (!(target instanceof globalThis.Element))
+      throw new TypeError("Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'.");
+    if (this._registrations.has(target)) return;
+    this._registrations.set(target, {
+      // -1, not 0: "never observed" has to be distinguishable from "observed and
+      // below the first threshold", or the very first notification — the one that
+      // tells a page what is on screen at load — never fires.
+      thresholdIndex: -1, isIntersecting: false, isVisible: false, lastUpdateTime: -Infinity,
+    });
+    this._targets.push(target);
+    if (_ioObservers.indexOf(this) < 0) _ioObservers.push(this);
+    _requestFrame();
+  }
+  unobserve(target) {
+    if (!(target instanceof globalThis.Element))
+      throw new TypeError("Failed to execute 'unobserve' on 'IntersectionObserver': parameter 1 is not of type 'Element'.");
+    this._registrations.delete(target);
+    const i = this._targets.indexOf(target);
+    if (i >= 0) this._targets.splice(i, 1);
+    if (!this._targets.length) {
+      const j = _ioObservers.indexOf(this);
+      if (j >= 0) _ioObservers.splice(j, 1);
+    }
+  }
+  disconnect() {
+    this._targets = [];
+    this._registrations = new Map();
+    // Pending entries die with the connection. A page that disconnects an
+    // observer has said it no longer cares, and delivering a reading it took
+    // before that is delivering an answer to a withdrawn question.
+    this._queued = [];
+    const i = _ioObservers.indexOf(this);
+    if (i >= 0) _ioObservers.splice(i, 1);
+  }
+  takeRecords() {
+    const records = this._queued;
+    this._queued = [];
+    return records;
+  }
+  // The root intersection rectangle: the viewport for an implicit root, the
+  // element's box otherwise — then dilated by rootMargin.
+  _rootRect() {
+    let base;
+    if (this._root === null || (globalThis.Document && this._root instanceof globalThis.Document)) {
+      const w = (typeof window !== "undefined" && window.innerWidth) || 0;
+      const h = (typeof window !== "undefined" && window.innerHeight) || 0;
+      base = { left: 0, top: 0, right: w, bottom: h, width: w, height: h, x: 0, y: 0 };
+    } else {
+      base = _plainRect(this._root.getBoundingClientRect());
+    }
+    return _dilateRect(base, this._rootMargin);
+  }
+  _update(time) {
+    const rootBounds = this._rootRect();
+    for (const target of this._targets.slice()) {
+      const reg = this._registrations.get(target);
+      if (!reg) continue;
+      if (time - reg.lastUpdateTime < this._delay) continue;
+      reg.lastUpdateTime = time;
+      let targetRect = _zeroRect, intersectionRect = _zeroRect;
+      let isIntersecting = false, intersectionRatio = 0;
+      // A target that has left the tree is not intersecting anything — and
+      // saying so is the whole point of `remove-element`: the page gets told the
+      // thing it was watching went away, rather than being left believing it is
+      // still on screen.
+      const rooted = target.isConnected !== false;
+      const inRoot = (this._root === null) ||
+                     (globalThis.Document && this._root instanceof globalThis.Document) ||
+                     (this._root.contains && this._root.contains(target));
+      if (rooted && inRoot) {
+        targetRect = _plainRect(target.getBoundingClientRect());
+        const hit = _rectIntersect(targetRect, rootBounds);
+        isIntersecting = hit !== null;
+        intersectionRect = hit || _zeroRect;
+        const targetArea = _rectArea(targetRect);
+        intersectionRatio = targetArea > 0
+          ? _rectArea(intersectionRect) / targetArea
+          : (isIntersecting ? 1 : 0);
+      }
+      // The index of the first threshold ABOVE the ratio — so crossing a
+      // threshold moves the index, and only a move is worth waking the page for.
+      let thresholdIndex = 0;
+      while (thresholdIndex < this._thresholds.length &&
+             this._thresholds[thresholdIndex] <= intersectionRatio) thresholdIndex++;
+      const isVisible = this._trackVisibility ? isIntersecting : false;
+      if (thresholdIndex !== reg.thresholdIndex ||
+          isIntersecting !== reg.isIntersecting ||
+          isVisible !== reg.isVisible) {
+        this._queued.push(new IntersectionObserverEntry({
+          time, rootBounds, boundingClientRect: targetRect, intersectionRect,
+          isIntersecting, isVisible, intersectionRatio, target,
+        }));
+        _ioQueueTask();
+      }
+      reg.thresholdIndex = thresholdIndex;
+      reg.isIntersecting = isIntersecting;
+      reg.isVisible = isVisible;
+    }
+  }
+}
+// The frame tail, §3.4.1: "run the update intersection observations steps" comes
+// AFTER the frame's animation callbacks, which is why a page that moves something
+// inside a rAF callback is told about it in the same frame rather than the next.
+// ⚠️ `getBoundingClientRect()` sets `__obscura_click_target` as a SIDE EFFECT
+// (it is how hit-testing knows which element a synthetic click resolved to), and
+// the observers now read boxes on every frame. Without this save/restore, a
+// single observed element would silently retarget the next click on the page —
+// an observer changing where a click lands. `elementFromPoint` guards the same
+// global for the same reason.
+const _withPreservedClickTarget = function(fn) {
+  const saved = globalThis.__obscura_click_target;
+  try { fn(); } finally { globalThis.__obscura_click_target = saved; }
+};
+_frameTailSteps.push(function(time) {
+  _withPreservedClickTarget(() => {
+    for (const observer of _ioObservers.slice()) observer._update(time);
+  });
+});
+_idlShape(IntersectionObserverEntry, { ctorLength: 1 });
+_idlShape(IntersectionObserver, { ctorLength: 1, arity: { observe: 1, unobserve: 1, disconnect: 0, takeRecords: 0 } });
+
+// ── ResizeObserverSize / ResizeObserverEntry ─────────────────────────────────
+// `unrestricted double`, so NaN and Infinity are legal values here — unlike
+// IntersectionObserver's thresholds. A size is a measurement, and a measurement
+// of something with no box is allowed to be strange.
+// Neither interface declares a constructor, so `new ResizeObserverSize()` from a
+// page must be a TypeError — the engine builds them, nobody else does.
+let _roInternalConstruct = false;
+const _roNoConstruct = function(name) {
+  if (!_roInternalConstruct)
+    throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
+};
+class ResizeObserverSize {
+  constructor(inlineSize, blockSize) {
+    _roNoConstruct('ResizeObserverSize');
+    this._inline = inlineSize; this._block = blockSize;
+  }
+  get inlineSize() { return this._inline; }
+  get blockSize() { return this._block; }
+}
+class ResizeObserverEntry {
+  constructor(target, borderBox, contentBox, devicePixelContentBox, contentRect) {
+    _roNoConstruct('ResizeObserverEntry');
+    this._target = target;
+    // FrozenArray: the same frozen array object must come back on every read, or
+    // `entry.contentBoxSize === entry.contentBoxSize` is false and a page that
+    // caches it is comparing two different objects for the rest of its life.
+    this._borderBoxSize = Object.freeze([borderBox]);
+    this._contentBoxSize = Object.freeze([contentBox]);
+    this._devicePixelContentBoxSize = Object.freeze([devicePixelContentBox]);
+    this._contentRect = contentRect;
+  }
+  get target() { return this._target; }
+  get contentRect() { return this._contentRect; }
+  get borderBoxSize() { return this._borderBoxSize; }
+  get contentBoxSize() { return this._contentBoxSize; }
+  get devicePixelContentBoxSize() { return this._devicePixelContentBoxSize; }
+}
+
+const _RO_BOXES = ["border-box", "content-box", "device-pixel-content-box"];
+// "Calculate box size". Obscura has no layout, so border and content boxes are
+// both the element's synthetic box; the shape of the answer is right, the pixels
+// wait on a layout engine.
+const _roBoxSize = function(target, box) {
+  let w = 0, h = 0;
+  try {
+    const r = target.getBoundingClientRect();
+    w = r.width; h = r.height;
+  } catch (e) { /* an element with no box measures zero */ }
+  if (box === "device-pixel-content-box") {
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+    w = Math.round(w * dpr); h = Math.round(h * dpr);
+  }
+  _roInternalConstruct = true;
+  try { return new ResizeObserverSize(w, h); } finally { _roInternalConstruct = false; }
+};
+// "Calculate depth for node" — over the FLATTENED tree, which is why a slot's
+// assigned node counts from where it is rendered rather than where it is written.
+// Getting this wrong is not cosmetic: the delivery loop uses depth to decide
+// whether a resize a callback caused is deeper (deliverable, next pass) or not
+// (skipped, and the page gets a loop error it did nothing to deserve).
+const _roDepth = function(node) {
+  let depth = 0, n = node;
+  while (n) {
+    let parent = n.parentNode;
+    if (!parent && globalThis.ShadowRoot && n instanceof globalThis.ShadowRoot) parent = n.host;
+    if (!parent && n.host) parent = n.host;
+    if (!parent) break;
+    depth++;
+    n = parent;
+  }
+  return depth;
+};
+const _roObservers = [];
+class ResizeObserver {
+  constructor(callback) {
+    if (typeof callback !== "function")
+      throw new TypeError("Failed to construct 'ResizeObserver': parameter 1 is not of type 'ResizeObserverCallback'.");
+    this._callback = callback;
+    this._observations = [];   // {target, box, lastInline, lastBlock}
+    this._active = [];
+    this._skipped = [];
+    // NOT added to the live list here. The spec registers every observer with the
+    // Document at construction; we register only while it is actually watching
+    // something, so an observer a page built and never used costs nothing per
+    // frame — the same answer, without the per-frame walk over dead entries.
+  }
+  observe(target, options) {
+    if (!(target instanceof globalThis.Element))
+      throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': parameter 1 is not of type 'Element'.");
+    const opts = (options == null) ? {} : options;
+    const box = (opts.box === undefined) ? "content-box" : String(opts.box);
+    if (_RO_BOXES.indexOf(box) < 0)
+      throw new TypeError("Failed to execute 'observe' on 'ResizeObserver': The provided value '" + box +
+                          "' is not a valid enum value of type ResizeObserverBoxOptions.");
+    // Re-observing an already-observed target UNOBSERVES it first, which resets
+    // the last-reported size — so `observe()` on something already being watched
+    // is a deliberate way to ask for a fresh reading, not a no-op.
+    this.unobserve(target);
+    this._observations.push({
+      target, box,
+      // (-1, -1) is not a size any box can have, which is what guarantees the
+      // FIRST observation always fires — including for a 0×0 element, whose
+      // appearance is exactly the event a page is waiting for.
+      lastInline: -1, lastBlock: -1,
+    });
+    if (_roObservers.indexOf(this) < 0) _roObservers.push(this);
+    _requestFrame();
+  }
+  unobserve(target) {
+    if (!(target instanceof globalThis.Element))
+      throw new TypeError("Failed to execute 'unobserve' on 'ResizeObserver': parameter 1 is not of type 'Element'.");
+    const i = this._observations.findIndex((o) => o.target === target);
+    if (i >= 0) this._observations.splice(i, 1);
+    if (!this._observations.length) this._unregister();
+  }
+  disconnect() {
+    this._observations = [];
+    this._active = [];
+    this._skipped = [];
+    this._unregister();
+  }
+  _unregister() {
+    const i = _roObservers.indexOf(this);
+    if (i >= 0) _roObservers.splice(i, 1);
+  }
+  _gather(depth) {
+    this._active = [];
+    this._skipped = [];
+    for (const obs of this._observations) {
+      const size = _roBoxSize(obs.target, obs.box);
+      if (size.inlineSize === obs.lastInline && size.blockSize === obs.lastBlock) continue;
+      if (_roDepth(obs.target) > depth) this._active.push(obs);
+      else this._skipped.push(obs);
+    }
+  }
+  _broadcast() {
+    if (!this._active.length) return Infinity;
+    let shallowest = Infinity;
+    const entries = [];
+    for (const obs of this._active) {
+      const border = _roBoxSize(obs.target, "border-box");
+      const content = _roBoxSize(obs.target, "content-box");
+      const device = _roBoxSize(obs.target, "device-pixel-content-box");
+      const matching = obs.box === "border-box" ? border
+                     : obs.box === "device-pixel-content-box" ? device : content;
+      obs.lastInline = matching.inlineSize;
+      obs.lastBlock = matching.blockSize;
+      // The content rect is positioned at the PADDING edge, not the origin —
+      // it is meant to be usable directly for absolutely positioning a child.
+      const rect = new globalThis.DOMRectReadOnly(0, 0, content.inlineSize, content.blockSize);
+      _roInternalConstruct = true;
+      try { entries.push(new ResizeObserverEntry(obs.target, border, content, device, rect)); }
+      finally { _roInternalConstruct = false; }
+      const d = _roDepth(obs.target);
+      if (d < shallowest) shallowest = d;
+    }
+    this._active = [];
+    try { this._callback.call(this, entries, this); } catch (e) { _reportError(e); }
+    return shallowest;
+  }
+}
+_idlShape(ResizeObserverSize, { ctorLength: 0 });
+_idlShape(ResizeObserverEntry, { ctorLength: 0 });
+_idlShape(ResizeObserver, { ctorLength: 1, arity: { observe: 1, unobserve: 1, disconnect: 0 } });
+
+// The delivery loop, §3.4.5. A callback is allowed to resize things, so delivery
+// repeats — but only ever DOWNWARD, at strictly increasing depth. That bound is
+// what stops two elements resizing each other from spinning the main thread
+// forever; anything still pending when the depth runs out is reported once, as
+// "ResizeObserver loop completed with undelivered notifications", and dropped.
+// Without the bound this is an infinite loop in the rendering steps, which on a
+// slow device is not a warning in a console — it is a frozen tab.
+_frameTailSteps.push(function() {
+  if (!_roObservers.length) return;
+  _withPreservedClickTarget(_roDeliverFrame);   // see the note above the IO tail step
+});
+const _roDeliverFrame = function() {
+  const anyActive = () => _roObservers.some((o) => o._active.length > 0);
+  let depth = 0;
+  for (const o of _roObservers) o._gather(depth);
+  // The cap is a backstop, not the mechanism: real termination comes from depth
+  // strictly increasing. It exists so a pathological page degrades instead of hanging.
+  let guard = 0;
+  while (anyActive() && guard++ < 64) {
+    let shallowest = Infinity;
+    for (const o of _roObservers.slice()) {
+      const d = o._broadcast();
+      if (d < shallowest) shallowest = d;
+    }
+    depth = shallowest;
+    for (const o of _roObservers) o._gather(depth);
+  }
+  if (_roObservers.some((o) => o._skipped.length > 0)) {
+    for (const o of _roObservers) o._skipped = [];
+    _reportError(new Error("ResizeObserver loop completed with undelivered notifications."));
+  }
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// PERMISSIONS — the answer that was always "yes"
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `navigator.permissions.query()` used to be five lines that returned
+// `{state: "granted"}` for every name anyone ever asked about, wrapped in a bare
+// object literal — no `PermissionStatus`, no `EventTarget`, no `name`, no way to
+// hear about a change.
+//
+// "Granted" is the single worst answer to give, because it is the one a page
+// ACTS on. The whole point of querying is to decide what to do *without*
+// interrupting anyone: a well-written page checks first, and only shows the
+// "we'd like to use your camera, here's why" explainer when the answer is
+// "prompt". Told "granted", it skips the explainer, calls `getUserMedia()` —
+// which this engine rejects with `NotAllowedError` — and the person is left
+// looking at a broken feature and no explanation of what went wrong.
+//
+// So the rule this table follows is one sentence: A PERMISSION'S STATE MUST
+// AGREE WITH WHAT THE CORRESPONDING API ACTUALLY DOES HERE. "denied" where the
+// API refuses, "prompt" where there is genuinely nobody to ask, "granted" only
+// where the thing really works.
+const _PERMISSION_DEFAULTS = {
+  // The API exists and refuses — `getUserMedia`/`getDisplayMedia` reject with
+  // NotAllowedError, so "denied" is the same answer told earlier and cheaper.
+  "camera": "denied", "microphone": "denied", "display-capture": "denied",
+  "speaker-selection": "denied",
+  // Hardware Obscura has no access to. Claiming "granted" would send a fitness
+  // app or a compass into a code path that then receives no readings at all.
+  "accelerometer": "denied", "ambient-light-sensor": "denied",
+  "gyroscope": "denied", "magnetometer": "denied",
+  "bluetooth": "denied", "nfc": "denied", "xr-spatial-tracking": "denied",
+  "midi": "denied",
+  // Real, and genuinely available: the clipboard write path is an in-page store
+  // that works, so a copy button may take the fast path honestly.
+  "clipboard-write": "granted",
+  // Everything else: there is no UI in which to ask a human, and "nobody has
+  // decided yet" is exactly what "prompt" means. A page that handles "prompt"
+  // correctly shows its own explainer, which is the behaviour we want.
+  "clipboard-read": "prompt", "geolocation": "prompt", "notifications": "prompt",
+  "push": "prompt", "persistent-storage": "prompt", "background-fetch": "prompt",
+  "background-sync": "prompt", "periodic-background-sync": "prompt",
+  "screen-wake-lock": "prompt", "idle-detection": "prompt",
+  "window-management": "prompt", "local-fonts": "prompt",
+  "payment-handler": "prompt", "storage-access": "prompt",
+  "top-level-storage-access": "prompt", "captured-surface-control": "prompt",
+};
+const _permissionStates = new Map();
+// Every live PermissionStatus, so a state change reaches all of them. The spec
+// requires it explicitly: two `query()` calls for the same name produce two
+// objects and BOTH must hear about the transition, including one whose only
+// reference is the listener it registered.
+const _permissionStatuses = [];
+const _permissionState = (name) =>
+  _permissionStates.has(name) ? _permissionStates.get(name) : (_PERMISSION_DEFAULTS[name] || "prompt");
+
+let _allowPermissionStatus = false;
+class PermissionStatus extends Node {
+  constructor() {
+    if (!_allowPermissionStatus) throw new TypeError("Illegal constructor");
+    super(undefined);
+    this._name = "";
+  }
+  get name() { return this._name; }
+  get state() { return _permissionState(this._name); }
+}
+PermissionStatus.prototype._noEventParent = true;
+// The `onchange` EventHandler attribute. It is not decoration: `onchange` is how
+// a page notices that someone went into settings and revoked the camera, and
+// stops pretending it still has one. (Installed by hand rather than via
+// `_ehDefineOnObjProto` — that helper is block-scoped further down the file.)
+const _ehOnAttr = function(proto, Ctor, names) {
+  for (const name of names) {
+    Object.defineProperty(proto, name, { configurable: true, enumerable: true,
+      get: _named('get', name, function() {
+        if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+        return _ehCurrentValue(this, name);
+      }),
+      set: _named('set', name, function(v) {
+        if (!(this instanceof Ctor)) throw new TypeError("Illegal invocation");
+        // A non-callable object is stored (it may become callable later); anything
+        // else clears the slot without deactivating the installed listener, so a
+        // handler re-set after a null keeps its original firing order.
+        if (typeof v === 'function' || (v !== null && typeof v === 'object')) {
+          this['__eh_' + name] = v; _ehActivate(this, name);
+        } else { this['__eh_' + name] = null; }
+      }),
+    });
+  }
+};
+_ehOnAttr(PermissionStatus.prototype, PermissionStatus, ['onchange']);
+
+class Permissions {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  query(descriptor) {
+    // Everything here rejects rather than throws: `query()` returns a promise, and
+    // a page that wrote only `.catch()` must not get a synchronous throw out of it.
+    if (descriptor === null || typeof descriptor !== "object")
+      return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': parameter 1 is not of type 'object'."));
+    if (descriptor.name === undefined)
+      return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': required member name is undefined."));
+    const name = String(descriptor.name);
+    // An unknown name is a TypeError, not a "denied". A browser that quietly
+    // answered "denied" to a permission it had never heard of would be
+    // indistinguishable from one that had heard of it and refused — and a page
+    // feature-detecting a new API would silently take the no-support path forever.
+    if (!Object.prototype.hasOwnProperty.call(_PERMISSION_DEFAULTS, name))
+      return Promise.reject(new TypeError("Failed to execute 'query' on 'Permissions': Failed to read the 'name' property " +
+        "from 'PermissionDescriptor': The provided value '" + name + "' is not a valid enum value of type PermissionName."));
+    _allowPermissionStatus = true;
+    let status;
+    try { status = new PermissionStatus(); } finally { _allowPermissionStatus = false; }
+    status._name = name;
+    _permissionStatuses.push(status);
+    return Promise.resolve(status);
+  }
+}
+_idlShape(PermissionStatus, { ctorLength: 0 });
+_idlShape(Permissions, { ctorLength: 0, promiseOps: ['query'], arity: { query: 1 } });
+const _permissionsInstance = Object.create(Permissions.prototype);
+// Set a permission's state and tell everyone watching. Nothing on the page can
+// reach this — a page changing its own permissions is the thing permissions
+// exist to prevent. It is here for the WPT driver bridge (`set_permission`),
+// which is how the harness plays the part of the human who says yes or no; the
+// same role `delete_all_cookies` plays for the cookie realm.
+globalThis.__obscuraSetPermission = function(name, state) {
+  const key = String(name);
+  if (["granted", "denied", "prompt"].indexOf(String(state)) < 0)
+    throw new TypeError("Invalid permission state: " + state);
+  const before = _permissionState(key);
+  _permissionStates.set(key, String(state));
+  if (before === String(state)) return;
+  // Every status object's `state` reads through the map, so they are ALL already
+  // reporting the new value before the first listener runs. A handler that looks
+  // at a sibling status must not see a half-applied world.
+  for (const status of _permissionStatuses.slice()) {
+    if (status._name !== key) continue;
+    try { status.dispatchEvent(new globalThis.Event("change")); } catch (e) { _reportError(e); }
+  }
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// THE CLIPBOARD — "Copied!" (nothing was)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// `navigator.clipboard` was two functions: `writeText()` returned a resolved
+// promise and dropped the string on the floor, `readText()` returned "". Both
+// SUCCEEDED. So every copy button on every page reported success, turned green,
+// said "Copied!" — and the person pasted nothing, or worse, pasted whatever was
+// there before. A share link, a wallet address, a 2FA backup code, an error
+// message someone was told to send to support. The failure is invisible at
+// exactly the moment the person stops paying attention, which is what makes it
+// worse than an error.
+//
+// Below is a real clipboard: a store with typed entries, `ClipboardItem`,
+// promise-valued data, and the type validation that decides what may go in.
+const _clipboardStore = [];       // [{ type, blob }] — most recent write wins
+// A MIME type, loosely: type/subtype with optional parameters. Deliberately not
+// the full mimesniff parser — the constructor accepts anything parsable (it
+// stores bytes), while `supports()` below is the strict list.
+const _CLIP_TYPE_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+(;.*)?$/;
+// The formats a browser promises to interoperate on. Everything else round-trips
+// as opaque bytes but is not something another application can be expected to read.
+const _CLIP_SUPPORTED = ["text/plain", "text/html", "image/png", "text/uri-list", "image/svg+xml"];
+const _clipValidType = (t) => {
+  const s = String(t);
+  // The `web ` prefix is a custom format: bytes this browser will not touch,
+  // sanitize or reinterpret. The space is part of it and the case is fixed —
+  // `weB ` is not the prefix, it is a type name starting with "weB".
+  if (s.indexOf("web ") === 0) return _CLIP_TYPE_RE.test(s.slice(4));
+  return _CLIP_TYPE_RE.test(s);
+};
+let _allowClipboardCtor = false;
+class ClipboardItem {
+  constructor(items, options) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'ClipboardItem': 1 argument required, but only 0 present.");
+    if (items === null || typeof items !== "object")
+      throw new TypeError("Failed to construct 'ClipboardItem': The provided value is not of type 'record<USVString, ClipboardItemData>'.");
+    const entries = [];
+    for (const key of Object.keys(items)) {
+      if (!_clipValidType(key))
+        throw new TypeError("Failed to construct 'ClipboardItem': Type " + key + " is not supported");
+      entries.push([key, items[key]]);
+    }
+    // A `record<>` of no entries is not an empty clipboard item, it is a mistake:
+    // there is no format to paste, so nothing could ever read it back.
+    if (!entries.length)
+      throw new TypeError("Failed to construct 'ClipboardItem': Empty dictionary argument");
+    const opts = (options == null) ? {} : options;
+    const style = (opts.presentationStyle === undefined) ? "unspecified" : String(opts.presentationStyle);
+    if (["unspecified", "inline", "attachment"].indexOf(style) < 0)
+      throw new TypeError("Failed to construct 'ClipboardItem': The provided value '" + style +
+                          "' is not a valid enum value of type PresentationStyle.");
+    this._entries = entries;
+    this._presentationStyle = style;
+    this._types = Object.freeze(entries.map((e) => e[0]));
+  }
+  get presentationStyle() { return this._presentationStyle; }
+  get types() { return this._types; }
+  getType(type) {
+    const t = String(type);
+    if (!_clipValidType(t))
+      return Promise.reject(new TypeError("Failed to execute 'getType' on 'ClipboardItem': Type " + t + " is not supported"));
+    const entry = this._entries.find((e) => e[0] === t);
+    if (!entry)
+      return Promise.reject(new DOMException("Failed to execute 'getType' on 'ClipboardItem': The type " + t +
+                                             " was not found", "NotFoundError"));
+    // ClipboardItemData is `Promise<(DOMString or Blob)>`, so the value may be a
+    // bare string, a Blob, or a promise for either — a page that fetches an image
+    // hands over the promise, not the bytes, and must not have to await it first.
+    return Promise.resolve(entry[1]).then((data) => {
+      // A Blob comes back UNCHANGED, keeping its own MIME type even where that
+      // disagrees with the key it was filed under: the key says how the page
+      // labelled it, the blob says what it actually is, and rewriting the second
+      // to match the first would be inventing a fact.
+      if (typeof Blob !== "undefined" && data instanceof Blob) return data;
+      return new Blob([String(data)], { type: t });
+    });
+  }
+  static supports(type) {
+    const s = String(type);
+    if (s.indexOf("web ") === 0) {
+      const rest = s.slice(4);
+      // A custom format carries no parameters — `web foo/bar;x=1` is two
+      // different formats' worth of ambiguity for whoever pastes it.
+      return rest.indexOf(";") < 0 && _CLIP_TYPE_RE.test(rest);
+    }
+    return _CLIP_SUPPORTED.indexOf(s) >= 0;
+  }
+}
+class Clipboard extends Node {
+  constructor() {
+    if (!_allowClipboardCtor) throw new TypeError("Illegal constructor");
+    super(undefined);
+  }
+  read() {
+    if (!_clipboardStore.length) return Promise.resolve([]);
+    const record = {};
+    for (const e of _clipboardStore) record[e.type] = e.blob;
+    return Promise.resolve([new ClipboardItem(record)]);
+  }
+  readText() {
+    const entry = _clipboardStore.find((e) => e.type === "text/plain");
+    if (!entry) return Promise.resolve("");
+    return entry.blob.text();
+  }
+  write(data) {
+    if (data === null || data === undefined || typeof data[Symbol.iterator] !== "function")
+      return Promise.reject(new TypeError("Failed to execute 'write' on 'Clipboard': parameter 1 is not of type 'sequence<ClipboardItem>'."));
+    let items;
+    try { items = Array.from(data); }
+    catch (e) { return Promise.reject(new TypeError("Failed to execute 'write' on 'Clipboard': parameter 1 is not iterable.")); }
+    for (const item of items) {
+      if (!(item instanceof ClipboardItem))
+        return Promise.reject(new TypeError("Failed to execute 'write' on 'Clipboard': element is not of type 'ClipboardItem'."));
+    }
+    // The system clipboard holds ONE thing. Handing it several items and hoping
+    // is how a paste becomes a coin-flip, so the platform refuses rather than
+    // silently picking one.
+    if (items.length > 1)
+      return Promise.reject(new DOMException("Support for multiple ClipboardItems is not implemented.", "NotAllowedError"));
+    if (!items.length) { _clipboardStore.length = 0; return Promise.resolve(); }
+    const item = items[0];
+    return Promise.all(item._entries.map(([type, value]) =>
+      Promise.resolve(value).then((resolved) => {
+        const isBlob = (typeof Blob !== "undefined" && resolved instanceof Blob);
+        // An image format must arrive as bytes. A DOMString filed as `image/png`
+        // is not an image that failed to decode, it is text wearing an image's
+        // label — and putting it on the clipboard means the next application to
+        // paste gets something it cannot render and cannot explain.
+        // (What we CANNOT do yet is verify that a Blob claiming to be a PNG
+        // decodes as one; a real engine re-encodes it. Named, not hidden.)
+        if (!isBlob && /^image\//.test(type))
+          throw new TypeError("Failed to execute 'write' on 'Clipboard': Failed to read or decode " + type);
+        return { type, blob: isBlob ? resolved : new Blob([String(resolved)], { type }) };
+      })
+    )).then((written) => {
+      _clipboardStore.length = 0;
+      for (const w of written) _clipboardStore.push(w);
+    });
+  }
+  writeText(data) {
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError("Failed to execute 'writeText' on 'Clipboard': 1 argument required, but only 0 present."));
+    const text = String(data);
+    _clipboardStore.length = 0;
+    _clipboardStore.push({ type: "text/plain", blob: new Blob([text], { type: "text/plain" }) });
+    return Promise.resolve();
+  }
+}
+Clipboard.prototype._noEventParent = true;
+
+// ── The clipboard events ─────────────────────────────────────────────────────
+// `copy`/`cut`/`paste` carry a DataTransfer; `clipboardchange` tells a page the
+// system clipboard now holds something else, so a paste button can enable itself
+// without POLLING the clipboard — which is both a battery cost and a privacy
+// leak, since polling means reading everything a person ever copies.
+class ClipboardEvent extends globalThis.Event {
+  constructor(type, init) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'ClipboardEvent': 1 argument required, but only 0 present.");
+    const o = (init == null) ? {} : init;
+    super(type, o);
+    this._clipboardData = (o.clipboardData === undefined) ? null : o.clipboardData;
+  }
+  get clipboardData() { return this._clipboardData; }
+}
+class ClipboardChangeEvent extends globalThis.Event {
+  constructor(type, init) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'ClipboardChangeEvent': 1 argument required, but only 0 present.");
+    const o = (init == null) ? {} : init;
+    super(type, o);
+    this._types = Object.freeze(o.types === undefined ? [] : Array.from(o.types, String));
+    // `bigint`, not a number: a change counter that a long-lived page compares
+    // must not silently stop increasing at 2^53.
+    this._changeId = (o.changeId === undefined) ? BigInt(0) : BigInt(o.changeId);
+  }
+  get types() { return this._types; }
+  get changeId() { return this._changeId; }
+}
+_idlShape(ClipboardEvent, { ctorLength: 1 });
+_idlShape(ClipboardChangeEvent, { ctorLength: 1 });
+
+_idlShape(ClipboardItem, { ctorLength: 1, promiseOps: ['getType'], arity: { getType: 1 } });
+Object.defineProperty(ClipboardItem, 'supports',
+  { value: _markNative(ClipboardItem.supports), writable: true, enumerable: true, configurable: true });
+_idlShape(Clipboard, { ctorLength: 0, promiseOps: ['read', 'readText', 'write', 'writeText'],
+  arity: { read: 0, readText: 0, write: 1, writeText: 1 } });
+_allowClipboardCtor = true;
+const _clipboardInstance = new Clipboard();
+_allowClipboardCtor = false;
+
+// Replace the two object literals that used to sit on `navigator`. Both are
+// [SameObject]: a page may hold onto `navigator.clipboard` across a session and
+// compare it, and two different objects would break both the comparison and any
+// listener registered on the first one.
+// They go on Navigator.PROTOTYPE, not on the `navigator` object. Most of this
+// engine's navigator members are own properties (moving them all is a large,
+// risky reshuffle — see the note at the Navigator class), but these two are new,
+// so they can start out in the right place: WebIDL attributes live on the
+// interface prototype, and `'clipboard' in Navigator.prototype` is how a great
+// deal of real feature-detection code is written.
+{
+  const _sameObject = (name, value) => Object.defineProperty(_Navigator.prototype, name, {
+    enumerable: true, configurable: true,
+    get: _named('get', name, function() {
+      if (!(this instanceof _Navigator)) throw new TypeError("Illegal invocation");
+      return value;
+    }),
+  });
+  _sameObject('permissions', _permissionsInstance);
+  _sameObject('clipboard', _clipboardInstance);
+}
 // ── FormData (XHR §interface-formdata) ────────────────────────────────────────
 // The old implementation was one line, and the line that mattered was
 // `append(k, v) { this._d.push([String(k), String(v)]) }`. That is not a small

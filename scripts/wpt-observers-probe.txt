@@ -1,0 +1,24 @@
+# IntersectionObserver + ResizeObserver — the scout window (Quests #496/#497).
+intersection-observer/idlharness.window.html
+intersection-observer/observer-attributes.html
+intersection-observer/observer-callback-arguments.html
+intersection-observer/observer-exceptions.html
+intersection-observer/disconnect.html
+intersection-observer/remove-element.html
+intersection-observer/timestamp.html
+intersection-observer/display-none.html
+intersection-observer/multiple-targets.html
+intersection-observer/multiple-thresholds.html
+intersection-observer/root-margin.html
+intersection-observer/same-document-no-root.html
+intersection-observer/client-rect.html
+intersection-observer/edge-inclusive-intersection.html
+resize-observer/idlharness.window.html
+resize-observer/notify.html
+resize-observer/observe-001.html
+resize-observer/observe-002.html
+resize-observer/observe-003.html
+resize-observer/calculate-depth-for-node.html
+resize-observer/ordering.html
+resize-observer/change-layout-in-error.html
+resize-observer/svg.html
