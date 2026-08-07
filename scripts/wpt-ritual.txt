@@ -211,3 +211,17 @@ FileAPI/filelist-section/filelist.html
 IndexedDB/fire-error-event-exception.any.html
 IndexedDB/idbindex_getAllRecords.any.html
 IndexedDB/idbobjectstore_getAll-options.any.html
+# --- Quest #490 guards: Trusted Types (the realm did not exist before this) ---
+trusted-types/set-attributes-require-trusted-types-no-default-policy.html
+trusted-types/trusted-types-event-handlers.html
+trusted-types/idlharness.window.html
+# --- Quest #491 guards: WebSocket (was a 7-line stub) ---
+websockets/constructor/004.html
+websockets/Create-blocked-port.any.html
+websockets/idlharness.any.html
+# --- Quest #492 guards: WebSocketStream + the MIME-type cap that must NOT be
+# "fixed" (see tickets/483-the-streamed-verdict.md — 712/1898 is Chrome parity
+# and winning it breaks Blob-slice, File-constructor and response-consume) ---
+websockets/stream/tentative/websocket-error.any.html
+FileAPI/blob/Blob-slice.any.html
+fetch/api/response/response-consume.html

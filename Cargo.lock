@@ -2848,6 +2848,7 @@ dependencies = [
  "ed25519-dalek",
  "encoding_rs",
  "flate2",
+ "futures-util",
  "getrandom 0.2.17",
  "ghash",
  "hmac",
@@ -2867,6 +2868,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "url",
  "x25519-dalek",
@@ -4780,7 +4782,9 @@ checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
 dependencies = [
  "futures-util",
  "log",
+ "native-tls",
  "tokio",
+ "tokio-native-tls",
  "tungstenite",
 ]
 
@@ -4973,6 +4977,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.9.4",
  "sha1 0.10.6",
  "thiserror",

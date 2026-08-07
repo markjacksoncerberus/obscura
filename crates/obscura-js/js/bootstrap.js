@@ -766,7 +766,11 @@ const _runTimerHandler = (fn, code, args) => {
   } catch (e) { _reportError(e); }
 };
 
+// Trusted Types: the string form of setTimeout/setInterval compiles its argument
+// — `setTimeout("doThing(" + userInput + ")")` is eval with a delay — so the
+// string overload is a TrustedScript sink while the function overload is not.
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
+  if (typeof fn !== "function") { const _tt = _ttSink('TrustedScript', fn, 'Window setTimeout'); if (_tt !== null) fn = _tt; }
   const code = (typeof fn === "function") ? null : String(fn);
   const id = ++_tid;
   _scheduleAfter(delay, () => {
@@ -779,6 +783,7 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
 globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
+  if (typeof fn !== "function") { const _tt = _ttSink('TrustedScript', fn, 'Window setInterval'); if (_tt !== null) fn = _tt; }
   const code = (typeof fn === "function") ? null : String(fn);
   const id = ++_tid;
   _intervals.add(id);
@@ -3344,6 +3349,13 @@ class Node {
   set textContent(v) {
     const _watching = __mutationObservers?.length;
     const t = this.nodeType;
+    // Trusted Types: on a <script>, textContent IS the script body — the sink is
+    // not the markup parser but the compiler, so it wants TrustedScript.
+    if (t === 1 && _ttOn() && this.localName === 'script' &&
+        this.namespaceURI === 'http://www.w3.org/1999/xhtml') {
+      const _tt = _ttSink('TrustedScript', v, 'HTMLScriptElement textContent');
+      if (_tt !== null) v = _tt;
+    }
     if (t === 9 || t === 10) return; // no-op for Document / DocumentType
     if (t === 3 || t === 4 || t === 7 || t === 8) {
       // Character data node: setting textContent replaces its data.
@@ -4214,7 +4226,13 @@ globalThis.Attr = class Attr {
   }
   set value(v) {
     v = (v == null) ? "" : String(v);
-    if (this._ownerEl) this._ownerEl._rawSetNS(this._ns, this._prefix, this._local, v);
+    if (this._ownerEl) {
+      // Trusted Types: an ATTACHED Attr is a live handle on its element's
+      // attribute, so writing through it is writing to the sink. (A detached Attr
+      // belongs to nobody yet — the check happens when it is attached.)
+      const _tt = _ttAttrSink(this._ownerEl, this._local, this._ns, v);
+      this._ownerEl._rawSetNS(this._ns, this._prefix, this._local, _tt !== null ? _tt : v);
+    }
     else this._detachedValue = v;
   }
   get nodeValue() { return this.value; }
@@ -4842,6 +4860,9 @@ class Element extends Node {
   }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
+    // Trusted Types: the archetypal DOM-XSS sink. Checked before the template
+    // delegation so `<template>.innerHTML` is guarded too.
+    { const _tt = _ttSink('TrustedHTML', v, 'Element innerHTML'); if (_tt !== null) v = _tt; }
     if (this.localName === 'template') {
       this.content.innerHTML = v;
       return;
@@ -4878,6 +4899,9 @@ class Element extends Node {
   // a MutationObserver sees ONE childList record (removed = this, added = the
   // parsed nodes) per the atomic-batching path.
   set outerHTML(v) {
+    // Trusted Types. The check comes FIRST — before the no-parent early return —
+    // because a refusal must not depend on where the element happens to sit.
+    { const _tt = _ttSink('TrustedHTML', v, 'Element outerHTML'); if (_tt !== null) v = _tt; }
     const parent = this.parentNode;
     if (!parent) return;
     if (parent.nodeType === 9)
@@ -4887,14 +4911,47 @@ class Element extends Node {
     const tmp = doc.createElement(parent.nodeType === 1 ? (parent.localName || 'div') : 'div');
     // [LegacyNullToEmptyString]: null → "", every other value via ToString (so
     // `outerHTML = undefined` parses the text "undefined", not "").
-    tmp.innerHTML = (v === null ? "" : String(v));
+    _ttUnchecked(() => { tmp.innerHTML = (v === null ? "" : String(v)); });
     const frag = doc.createDocumentFragment();
     const kids = Array.prototype.slice.call(tmp.childNodes);
     for (const k of kids) frag.appendChild(k);
     parent.replaceChild(frag, this);
   }
   get innerText() { return this.textContent; }
-  set innerText(v) { this.textContent = v; }
+  set innerText(v) {
+    // `script.innerText` and `script.text` are separate sinks from
+    // `script.textContent` — same effect, different names, and the sink NAME is
+    // what a default policy is told, so it must be the one the author used.
+    if (_ttOn() && this.localName === 'script' &&
+        this.namespaceURI === 'http://www.w3.org/1999/xhtml') {
+      const _tt = _ttSink('TrustedScript', v, 'HTMLScriptElement innerText');
+      if (_tt !== null) v = _tt;
+      _ttUnchecked(() => { this.textContent = v; });
+      return;
+    }
+    this.textContent = v;
+  }
+  // `text` is a [CEReactions] DOMString on five interfaces and means two
+  // different things: on <body> it is the legacy text-COLOUR content attribute,
+  // and on <a>/<script>/<title>/<option> it is the element's child text content.
+  // (`__IFACE_MEMBERS` prunes this accessor to exactly those interfaces, so
+  // `div.text` stays undefined.)
+  get text() {
+    if (this.localName === 'body') return this.getAttribute('text') || '';
+    return this.textContent;
+  }
+  set text(v) {
+    if (this.localName === 'body') { this.setAttribute('text', v); return; }
+    // Trusted Types: `script.text` is the fourth door into the compiler, and it
+    // is its own sink name.
+    if (this.localName === 'script' && this.namespaceURI === 'http://www.w3.org/1999/xhtml') {
+      const _tt = _ttSink('TrustedScript', v, 'HTMLScriptElement text');
+      if (_tt !== null) v = _tt;
+      _ttUnchecked(() => { this.textContent = v; });
+      return;
+    }
+    this.textContent = v;
+  }
   // outerText getter mirrors innerText (rendered text ≈ textContent for us). The
   // setter replaces the element itself with a "rendered text fragment" (newlines
   // become <br>); an empty value therefore just removes the element (which is
@@ -5032,6 +5089,11 @@ class Element extends Node {
     qname = String(qname);
     _validateAttrName(qname);
     if (this._htmlAttr) qname = _asciiLower(qname);
+    // Trusted Types: `setAttribute` takes `(TrustedType or DOMString)` in IDL, so
+    // a trusted value arrives here INTACT and passes; a plain string reaches the
+    // default policy or is refused. Runs before the write, so a refused value
+    // never touches the tree.
+    { const _tt = _ttAttrSink(this, qname, null, v); if (_tt !== null) v = _tt; }
     const _ceOld = this._ceState === "custom" ? _domParse("get_attribute", this._nid, qname) : undefined;
     // Capture the popover attribute's OLD value before the write — a type change
     // while the popover is showing must hide it (popover attribute change steps).
@@ -5075,10 +5137,25 @@ class Element extends Node {
     // lazily) and installs the handler listener at this — its first — registration point.
     if (_isBodyWinReflect(this, qname)) _bodyWinSetContentAttr(this, qname, String(v));
     else if (_EH_ATTR_SET.has(qname)) _ehSetContentAttr(this, qname, String(v));
+    // Writing `http-equiv` or `content` may be building a Content Security Policy
+    // element: a page can turn Trusted Types ON at runtime by creating a <meta>,
+    // filling it in and appending it, and the cached policy has to notice. Marked
+    // AFTER the sink check above, which is what re-reads it. Two string compares
+    // and (only for those two names) one regexp — no bridge call, which is why
+    // this sits here rather than on the insertion path, where asking an element
+    // for its localName costs a round trip. The mark is STICKY until a scan
+    // actually finds a policy, because the attributes are written BEFORE the
+    // element is appended and a scan in between would find nothing and clear it.
+    if ((qname === 'http-equiv' || qname === 'content') && _TT_CSP_HINT_RE.test(String(v)))
+      _ttMarkCSPDirty();
   }
   setAttributeNS(namespace, qname, v) {
     const { namespace: ns, prefix, local } = _validateAndExtract(namespace, qname);
-    this._rawSetNS(ns, prefix, local, String(v));
+    // Trusted Types, as in setAttribute: this API accepts a trusted value in its
+    // IDL, and the check keys off the attribute's LOCAL name and namespace — a
+    // qualified `xlink:href` is not the same sink as (xlink, href).
+    const _tt = _ttAttrSink(this, local, ns, v);
+    this._rawSetNS(ns, prefix, local, _tt !== null ? _tt : String(v));
     if (ns === null && local === 'id' && v) __defineNamedGlobal(String(v));
   }
   toggleAttribute(qname, force) {
@@ -5165,7 +5242,14 @@ class Element extends Node {
     const oldAttr = this.getAttributeNodeNS(attr._ns, attr._local);
     if (oldAttr === attr) return attr; // replacing an attr by itself
     const oldVal = oldAttr ? oldAttr.value : null;
-    this._rawSetNS(attr._ns, attr._prefix, attr._local, attr.value);
+    // Trusted Types. Unlike setAttribute(NS), the attr-node APIs
+    // (setAttributeNode(NS), NamedNodeMap.setNamedItem(NS)) carry a plain
+    // DOMString — an Attr's value was stringified when it was set — so a trusted
+    // value handed to THIS door has already lost its trust and must be refused.
+    // That asymmetry is not an oversight in the spec: it is what stops a page
+    // laundering an untrusted string through an Attr node.
+    const _ttv = _ttAttrSink(this, attr._local, attr._ns, attr.value);
+    this._rawSetNS(attr._ns, attr._prefix, attr._local, _ttv !== null ? _ttv : attr.value);
     if (oldAttr) { oldAttr._ownerEl = null; oldAttr._detachedValue = oldVal; }
     attr._ownerEl = this;
     this._attrNodes.set((attr._ns || '') + '|' + attr._local, attr);
@@ -5232,6 +5316,9 @@ class Element extends Node {
   // any parsing/insertion: an unknown position → SyntaxError; beforebegin/afterend
   // with no parent or a Document parent → NoModificationAllowedError.
   insertAdjacentHTML(position, html) {
+    // Trusted Types. Per spec the compliant-string step runs BEFORE `position` is
+    // validated, so a refused value fails the same way from every call site.
+    { const _tt = _ttSink('TrustedHTML', html, 'Element insertAdjacentHTML'); if (_tt !== null) html = _tt; }
     const pos = String(position).replace(/[A-Z]/g, c => c.toLowerCase());
     let context;
     switch (pos) {
@@ -5467,7 +5554,11 @@ class Element extends Node {
   set rel(v) { this.setAttribute("rel", v); }
   // iframe srcdoc reflects the attribute; setting it reprocesses via setAttribute.
   get srcdoc() { return this.getAttribute("srcdoc") || ""; }
-  set srcdoc(v) { this.setAttribute("srcdoc", v == null ? "" : String(v)); }
+  // Pass a TrustedHTML through UNSTRINGIFIED: this IDL accepts one, and
+  // setAttribute — which runs the Trusted Types check and stringifies afterwards
+  // — is the single place that decides. Stringifying here would strip the trust
+  // off a value the page had properly vouched for and then refuse it.
+  set srcdoc(v) { this.setAttribute("srcdoc", v == null ? "" : v); }
   get src() {
     if (_URL_REFLECT_SRC.has(this.localName)) return _reflectURL(this, "src");
     return this.getAttribute("src") || "";
@@ -6988,23 +7079,34 @@ class Document extends Node {
     Deno.core.ops.op_set_cookie(v);
   }
   write(...args) {
+    // Trusted Types: document.write joins its arguments and parses the result as
+    // markup, so the CONCATENATION is the sink — checking each fragment would let
+    // a page smuggle a tag across two "safe" halves.
     var html = args.join('');
+    { const _tt = _ttSink('TrustedHTML', html, 'Document write'); if (_tt !== null) html = _tt; }
+    this._writeChecked(html);
+  }
+  writeln(...args) {
+    var html = args.join('');
+    { const _tt = _ttSink('TrustedHTML', html, 'Document writeln'); if (_tt !== null) html = _tt; }
+    this._writeChecked(html + '\n');
+  }
+  // document.write's body, past the Trusted Types check — writeln has already run
+  // its own (under its own sink name) and must not run write's a second time.
+  _writeChecked(html) {
     if (!html) return;
     var body = this.body;
     if (!body) return;
     var temp = this.createElement('div');
-    temp.innerHTML = html;
+    _ttUnchecked(() => { temp.innerHTML = html; });
     var children = temp.childNodes;
-    for (var i = 0; i < children.length; i++) {
-      body.appendChild(children[i]);
-    }
-  }
-  writeln(...args) {
-    this.write(args.join('') + '\n');
+    for (var i = 0; i < children.length; i++) body.appendChild(children[i]);
   }
   open() {
+    // Emptying the document is not an injection sink — nothing authored reaches
+    // the parser — so the internal clear must not consult a default policy.
     var body = this.body;
-    if (body) body.innerHTML = '';
+    if (body) _ttUnchecked(() => { body.innerHTML = ''; });
     return this;
   }
   close() {
@@ -9045,7 +9147,12 @@ function _parseMimeType(input) {
   subtype = subtype.replace(/[ \t\n\r]+$/, '');
   if (subtype === '' || !_isHTTPToken(subtype)) return null;
   const rec = { type: type.toLowerCase(), subtype: subtype.toLowerCase(), params: [] };
-  const isQSChar = (c) => { const x = c.charCodeAt(0); return x === 0x09 || (x >= 0x20 && x <= 0x7e) || x >= 0x80; };
+  // An HTTP quoted-string token code point is TAB, U+0020–U+007E, or
+  // U+0080–U+00FF — and that upper bound is REAL. A header is a byte sequence, so
+  // a parameter value has to be expressible in one byte per code point; anything
+  // above U+00FF (a U+FFFD from a bad decode, say) could not have come off the
+  // wire and must not be allowed to travel back onto it.
+  const isQSChar = (c) => { const x = c.charCodeAt(0); return x === 0x09 || (x >= 0x20 && x <= 0x7e) || (x >= 0x80 && x <= 0xff); };
   while (i < s.length) {
     i++; // ';'
     while (i < s.length && /[ \t\n\r]/.test(s[i])) i++;
@@ -9056,7 +9163,16 @@ function _parseMimeType(input) {
     if (i >= s.length) break;
     i++; // '='
     let value = '';
+    // Whether the value arrived inside quotes decides whether an EMPTY value is
+    // kept. `charset=` (nothing after the sign) is a parameter the sender failed
+    // to fill in and is skipped, so a later `charset=GBK` can still win. But
+    // `charset=""` is a sender saying "explicitly nothing", and it OCCUPIES the
+    // slot — `text/html;charset="";charset=GBK` really does serialize back as
+    // `charset=""`. The difference is deliberate in the standard and it is the
+    // difference between "unset" and "set to empty".
+    let quoted = false;
     if (s[i] === '"') {
+      quoted = true;
       i++;
       while (i < s.length) {
         if (s[i] === '\\') { if (i + 1 < s.length) { value += s[i + 1]; i += 2; } else { value += '\\'; i++; } continue; }
@@ -9068,7 +9184,7 @@ function _parseMimeType(input) {
       while (i < s.length && s[i] !== ';') value += s[i++];
       value = value.replace(/[ \t\n\r]+$/, '');
     }
-    if (name !== '' && _isHTTPToken(name) && value !== '' &&
+    if (name !== '' && _isHTTPToken(name) && (quoted || value !== '') &&
         [...value].every(isQSChar) && !rec.params.some(p => p[0] === name)) {
       rec.params.push([name, value]);
     }
@@ -10207,8 +10323,15 @@ if (typeof URL === 'undefined' || !URL.prototype) {
     constructor(url, base) {
       // Real WHATWG parsing via the Rust `url` crate (op), not a regex. Throws
       // TypeError on invalid input (with the given base), matching the spec.
+      // ⚠️ `url` is a required USVString, so `null` converts to the four-character
+      // string "null" — it does NOT mean "no URL". Folding it to "" made
+      // `new URL(null, base)` answer the BASE, which is the one answer a caller
+      // could mistake for success: a relative path built from a null variable
+      // would silently resolve to the current page instead of failing or
+      // resolving to `/null`. `base`, being genuinely optional, keeps its
+      // absent-when-nullish reading.
       const res = JSON.parse(Deno.core.ops.op_url_parse(
-        url == null ? '' : String(url),
+        url === undefined && arguments.length < 1 ? '' : String(url),
         base == null ? '' : String(base)
       ));
       if (!res.valid) throw new TypeError("Failed to construct 'URL': Invalid URL");
@@ -10650,7 +10773,11 @@ const _defineBodyMixin = (Proto) => {
   Proto.json = _markNative(function json() { return _bodyConsume(this).then((b) => JSON.parse(_utf8DecodeBOM(b))); });
   Proto.blob = _markNative(function blob() {
     // The blob's type is the body's Content-Type — including when that header is
-    // present and EMPTY, which means "no type", not "guess one".
+    // present and EMPTY, which means "no type", not "guess one". Normalized by
+    // FileAPI's rule, not by a MIME parse — see the long note on
+    // `_normalizeBlobType`; WPT's `response-consume` asserts
+    // `blob.type === header.toLowerCase()`, which a serializer can never produce
+    // because it drops the space after the semicolon.
     const ct = this._headers.get('content-type');
     return _bodyConsume(this).then((b) => {
       const bl = new Blob([]);
@@ -32973,6 +33100,30 @@ const _b64FromBytes = function(b) {
 const _nativeEOL = (typeof navigator !== 'undefined' && navigator.platform && String(navigator.platform).startsWith('Win')) ? '\r\n' : '\n';
 // A blob/file type string is normalized: blanked if it contains a non-printable-ASCII
 // char, then ASCII-lowercased.
+// ⚠️⚠️ A BLOB'S `type` IS **NOT** A PARSED MIME TYPE, AND THIS COMMENT EXISTS SO
+// THE NEXT KNIGHT DOES NOT "FIX" IT AGAIN.
+//
+// The rule below looks crude — if the string holds any character outside
+// U+0020–U+007E give up entirely, otherwise ASCII-lowercase the WHOLE thing — and
+// it plainly accepts strings that are not MIME types (`"nonparsable"` survives)
+// while folding a parameter value that is not case-insensitive
+// (`charset=UTF-8` → `charset=utf-8`). It is nevertheless **exactly what FileAPI
+// specifies**, in the same words, for the `Blob()` constructor, the `File()`
+// constructor, and `slice()`'s `contentType`. Fetch's `Response.blob()` is
+// measured against the same expectation by WPT.
+//
+// `mimesniff/mime-types/parsing.any.js` disagrees: 955 inputs asserting the full
+// PARSE-and-SERIALIZE answer through both the Blob door and the Request/Response
+// door. Adopting it costs 21 subtests in `FileAPI/blob/Blob-slice`, 2 in
+// `FileAPI/file/File-constructor` and 2 in `fetch/api/response/response-consume`
+// — three files whose expectations are the normative text. **Chrome 153 scores
+// 712/1898 on that mimesniff file for precisely this reason.** The engine follows
+// the specification the other three tests encode; the cost is named in
+// `tickets/483-the-typed-verdict.md` rather than hidden.
+//
+// (`_parseMimeType`/`_serializeMimeType` next door ARE the real algorithm, and
+// are used everywhere a genuine MIME type is wanted — `formData()`'s boundary,
+// XHR's charset adjustment, Fetch's Content-Type handling.)
 const _normalizeBlobType = function(t) {
   if (t === undefined) return '';
   t = String(t);
@@ -33244,6 +33395,398 @@ if (typeof FileList === 'undefined' || !FileList.prototype || typeof FileList.pr
     return fl;
   };
 }
+
+// ============================================================================
+// Trusted Types — https://w3c.github.io/trusted-types/dist/spec/
+//
+// DOM XSS is one bug written a thousand times: a string the application did not
+// author reaches a place that turns strings into code — `el.innerHTML = …`,
+// `script.src = …`, `eval(…)`. Trusted Types removes the CLASS of bug rather
+// than its instances. With `require-trusted-types-for 'script'` in the page's
+// Content Security Policy every such sink refuses a plain string outright, and
+// the only way through is a named policy the application wrote on purpose: one
+// auditable place per application instead of one per assignment.
+//
+// It is also the rare defence that costs the DEVICE nothing — no scanner, no
+// extension, no background process, no megabytes. The browser simply refuses.
+// That is the kind of protection that actually reaches the reader on a
+// second-hand laptop: the person with the most to lose from a stolen session and
+// the least room to run anything extra to prevent it.
+// ============================================================================
+
+// A trusted object's data lives OFF the instance, in a WeakMap. That IS the
+// security property, not an implementation taste: `TrustedHTML` then has no own
+// property to overwrite and no prototype path to forge, so a value arriving at a
+// sink is a value some policy really produced. An own field would still be
+// forgeable with `Object.create(TrustedHTML.prototype)`, and a forged trusted
+// value is worse than no Trusted Types at all — it is a guarantee that is not.
+const _ttData = new WeakMap();
+const _ttPolicyRec = new WeakMap();   // TrustedTypePolicy -> { name, options }
+// None of the trusted classes has a constructor a page may call. The engine
+// opens this gate for exactly one `new`, so a page's ONLY route to a trusted
+// value is through a policy it (or its CSP) allowed to exist.
+const _ttGate = { on: false };
+function _ttMint(Ctor, str) {
+  _ttGate.on = true;
+  let o;
+  try { o = new Ctor(); } finally { _ttGate.on = false; }
+  _ttData.set(o, str);
+  return o;
+}
+
+class TrustedHTML {
+  constructor() { if (!_ttGate.on) throw new TypeError("Illegal constructor"); }
+  toString() { return _ttData.get(this); }
+  toJSON() { return _ttData.get(this); }
+}
+class TrustedScript {
+  constructor() { if (!_ttGate.on) throw new TypeError("Illegal constructor"); }
+  toString() { return _ttData.get(this); }
+  toJSON() { return _ttData.get(this); }
+}
+class TrustedScriptURL {
+  constructor() { if (!_ttGate.on) throw new TypeError("Illegal constructor"); }
+  toString() { return _ttData.get(this); }
+  toJSON() { return _ttData.get(this); }
+}
+_idlShape(TrustedHTML, { ctorLength: 0 });
+_idlShape(TrustedScript, { ctorLength: 0 });
+_idlShape(TrustedScriptURL, { ctorLength: 0 });
+
+const _TT_CTOR = { TrustedHTML, TrustedScript, TrustedScriptURL };
+const _TT_CREATE_FN = {
+  TrustedHTML: 'createHTML', TrustedScript: 'createScript', TrustedScriptURL: 'createScriptURL',
+};
+
+// Spec "Get policy value". The callback runs with `this` UNDEFINED: a policy
+// callback is application code being asked to sanitize, not a method of the
+// policy, and handing it the policy object would hand it the very authority it
+// is there to mediate.
+//
+// The null return has TWO different meanings and the distinction is the whole
+// difference between a convenience and a hole. From an explicit
+// `policy.createHTML(x)` a null means "I produce nothing here" and yields the
+// EMPTY string — safe in every sink. From the DEFAULT policy, invoked because a
+// plain string showed up at a sink, a null means "I decline to vouch for this",
+// and declining must BLOCK: `throwIfMissing` distinguishes the two callers.
+function _ttPolicyValue(policy, fnName, input, args, throwIfMissing) {
+  const rec = _ttPolicyRec.get(policy);
+  const fn = rec.options ? rec.options[fnName] : null;
+  if (fn === null || fn === undefined) {
+    if (!throwIfMissing) return null;
+    throw new TypeError("Failed to execute '" + fnName + "' on 'TrustedTypePolicy': Policy " +
+      rec.name + "'s TrustedTypePolicyOptions did not specify a '" + fnName + "' member.");
+  }
+  const v = fn.call(undefined, input, ...args);
+  if (v === null || v === undefined) return throwIfMissing ? "" : null;
+  return String(v);
+}
+
+class TrustedTypePolicy {
+  constructor() { if (!_ttGate.on) throw new TypeError("Illegal constructor"); }
+  get name() { return _ttPolicyRec.get(this).name; }
+  createHTML(input, ...args) {
+    return _ttMint(TrustedHTML, _ttPolicyValue(this, 'createHTML', String(input), args, true));
+  }
+  createScript(input, ...args) {
+    return _ttMint(TrustedScript, _ttPolicyValue(this, 'createScript', String(input), args, true));
+  }
+  createScriptURL(input, ...args) {
+    return _ttMint(TrustedScriptURL, _ttPolicyValue(this, 'createScriptURL', String(input), args, true));
+  }
+}
+_idlShape(TrustedTypePolicy, { ctorLength: 0, arity: { createHTML: 1, createScript: 1, createScriptURL: 1 } });
+
+// --- the sink tables -------------------------------------------------------
+const _TT_NS_HTML = 'http://www.w3.org/1999/xhtml';
+const _TT_NS_SVG = 'http://www.w3.org/2000/svg';
+const _TT_NS_MATHML = 'http://www.w3.org/1998/Math/MathML';
+const _TT_NS_XLINK = 'http://www.w3.org/1999/xlink';
+// Every event handler content attribute this engine actually implements: the
+// GlobalEventHandlers set, the Window-reflecting body/frameset set, plus the two
+// media and three SVG-animation handlers that live on their own interfaces. The
+// list must match what we EXPOSE, not what some other browser exposes — a name
+// we do not implement is not an event handler content attribute here, and
+// treating it as a sink would block a page for a handler that could never run.
+const _TT_EH_ATTRS = new Set([
+  ..._EH_ATTR_SET, ..._BODY_WIN_REFLECT_SET,
+  'onencrypted', 'onwaitingforkey',           // HTMLMediaElement
+  'onbegin', 'onend', 'onrepeat',             // SVGAnimationElement
+]);
+
+// Spec "Get Trusted Type data for attribute". Takes the element's namespace and
+// local name plus the ATTRIBUTE's local name and namespace — never a qualified
+// name, which is why `xlink:href` is not a sink while (xlink, href) is.
+function _ttAttrData(elementNs, elementLocal, attr, attrNs) {
+  if (attrNs === null) {
+    // An event handler content attribute is a sink on any HTML/SVG/MathML
+    // element — including one that does not implement that handler, because the
+    // string still gets compiled if the element is ever reinterpreted.
+    if (_TT_EH_ATTRS.has(attr) &&
+        (elementNs === _TT_NS_HTML || elementNs === _TT_NS_SVG || elementNs === _TT_NS_MATHML))
+      return { type: 'TrustedScript', sink: 'Element ' + attr };
+    if (elementNs === _TT_NS_HTML && elementLocal === 'iframe' && attr === 'srcdoc')
+      return { type: 'TrustedHTML', sink: 'HTMLIFrameElement srcdoc' };
+    if (elementNs === _TT_NS_HTML && elementLocal === 'script' && attr === 'src')
+      return { type: 'TrustedScriptURL', sink: 'HTMLScriptElement src' };
+  }
+  // SVG's script element takes its URL from `href` in either the null or the
+  // xlink namespace — the legacy spelling is still live on the real web.
+  if (elementNs === _TT_NS_SVG && elementLocal === 'script' && attr === 'href' &&
+      (attrNs === null || attrNs === _TT_NS_XLINK))
+    return { type: 'TrustedScriptURL', sink: 'SVGScriptElement href' };
+  return null;
+}
+
+// Spec "Get Trusted Type data for property". Property names are case-SENSITIVE
+// (they are IDL identifiers, not attribute names), and innerHTML/outerHTML are
+// sinks on every element in every namespace.
+function _ttPropData(elementNs, elementLocal, prop) {
+  if (prop === 'innerHTML') return { type: 'TrustedHTML', sink: 'Element innerHTML' };
+  if (prop === 'outerHTML') return { type: 'TrustedHTML', sink: 'Element outerHTML' };
+  if (elementNs !== _TT_NS_HTML) return null;
+  if (elementLocal === 'iframe' && prop === 'srcdoc')
+    return { type: 'TrustedHTML', sink: 'HTMLIFrameElement srcdoc' };
+  if (elementLocal === 'script') {
+    if (prop === 'src') return { type: 'TrustedScriptURL', sink: 'HTMLScriptElement src' };
+    if (prop === 'text' || prop === 'innerText' || prop === 'textContent')
+      return { type: 'TrustedScript', sink: 'HTMLScriptElement ' + prop };
+  }
+  return null;
+}
+
+// --- Content Security Policy ----------------------------------------------
+// We read the page's Trusted Types directives from its
+// <meta http-equiv="Content-Security-Policy"> elements. This engine parses the
+// whole document into the DOM before it runs the first script, so every meta is
+// already present the first time any sink is reached — the result is cached on
+// the document. (Header-delivered CSP is not yet plumbed into the JS realm; that
+// cap is named honestly in the scroll, and it is what the report-only tests
+// need.)
+function _ttParseCSPInto(text, csp) {
+  for (const raw of String(text).split(';')) {
+    const parts = raw.trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) continue;
+    const name = _asciiLower(parts[0]);
+    const values = parts.slice(1);
+    if (name === 'require-trusted-types-for') {
+      if (values.indexOf("'script'") >= 0) csp.require = true;
+    } else if (name === 'trusted-types') {
+      const d = { star: false, names: new Set(), allowDuplicates: false };
+      for (const v of values) {
+        if (v === '*') d.star = true;
+        else if (v === "'allow-duplicates'") d.allowDuplicates = true;
+        else if (v === "'none'") { /* an explicit "no policy at all" */ }
+        else d.names.add(v);
+      }
+      csp.directives.push(d);
+    }
+  }
+}
+// A page may INSERT a <meta http-equiv=Content-Security-Policy> at runtime and
+// switch Trusted Types on mid-life, so the scan cannot simply be done once. It
+// also cannot be redone on every sink — that is a selector query per
+// `setAttribute`. The resolution is that a policy is APPEND-ONLY: CSP3 says a
+// meta's content attribute is ignored after parsing and removing the element
+// does not withdraw the policy (otherwise an injected script could turn the
+// page's defences off by deleting a tag). So the cache re-scans only while
+// nothing is being enforced yet and something meta-shaped has moved; once
+// enforcement is on it is FINAL and never scanned again.
+// Only a value that could BE a policy sets the flag — so a page writing
+// `http-equiv="refresh"` does not condemn every later sink to a fresh selector
+// query.
+const _TT_CSP_HINT_RE = /content-security-policy|trusted-types/i;
+function _ttMarkCSPDirty() {
+  try { _ttEnv.cspDirty = true; } catch (e) { /* pre-bootstrap; nothing cached yet */ }
+}
+function _ttCSP() {
+  const doc = globalThis.document;
+  if (!doc) return { require: false, directives: [] };   // a worker scope has no document
+  const cached = doc.__ttCSP;
+  if (cached && (cached.require || !_ttEnv.cspDirty)) return cached;
+  const csp = { require: false, directives: [] };
+  let metas = [];
+  try { metas = doc.querySelectorAll('meta[http-equiv]'); } catch (e) { metas = []; }
+  for (const m of metas) {
+    let he = null, content = null;
+    try { he = m.getAttribute('http-equiv'); content = m.getAttribute('content'); } catch (e) {}
+    if (!he || _asciiLower(he) !== 'content-security-policy' || content == null) continue;
+    _ttParseCSPInto(content, csp);
+  }
+  // Policies only accumulate: a directive seen once is kept even if its element
+  // is gone by the next scan.
+  if (cached) {
+    if (cached.require) csp.require = true;
+    for (const d of cached.directives) csp.directives.push(d);
+  }
+  // Clear the dirty mark only once a scan has actually FOUND a policy. The
+  // attributes of a runtime-built <meta> are written before it is appended, so a
+  // scan in between finds nothing — and clearing there would throw away the only
+  // notice we get that a policy is on its way.
+  if (csp.require || csp.directives.length) _ttEnv.cspDirty = false;
+  try { Object.defineProperty(doc, '__ttCSP', { value: csp, configurable: true, writable: true }); } catch (e) {}
+  return csp;
+}
+
+const _ttEnv = { defaultPolicy: null, created: new Set(), factory: null, bypass: 0, cspDirty: false };
+
+// Engine-internal markup writes — document.write's staging div, outerHTML's
+// fragment-parsing context — go through the very DOM setters a page uses. They
+// must NOT be re-checked: the value was vouched for one frame up, and a second
+// pass would run the default policy twice for a single assignment (which the
+// page can see, because a default policy is allowed to have side effects).
+function _ttUnchecked(fn) {
+  _ttEnv.bypass++;
+  try { return fn(); } finally { _ttEnv.bypass--; }
+}
+
+// Spec "Should Trusted Type policy creation be blocked by Content Security
+// Policy?". With no `trusted-types` directive anything goes — Trusted Types is
+// opt-in and a page that has not opted in must not start failing. With one, the
+// name has to be listed (or `*`), and a REPEATED name is refused unless the page
+// said `'allow-duplicates'`: a second policy quietly taking a trusted name is
+// exactly how an injected script would grant itself the application's authority.
+function _ttCreatePolicyBlocked(name) {
+  const csp = _ttCSP();
+  if (!csp.directives.length) return false;
+  for (const d of csp.directives) {
+    if (!d.star && !d.names.has(name)) return true;
+    if (!d.allowDuplicates && _ttEnv.created.has(name)) return true;
+  }
+  return false;
+}
+
+class TrustedTypePolicyFactory {
+  constructor() { if (!_ttGate.on) throw new TypeError("Illegal constructor"); }
+  createPolicy(policyName, policyOptions) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': 1 argument required, but only 0 present.");
+    const name = String(policyName);
+    if (_ttCreatePolicyBlocked(name))
+      throw new TypeError("Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': Policy \"" +
+        name + "\" disallowed.");
+    // TrustedTypePolicyOptions is a dictionary of three optional callbacks.
+    // `null` is a perfectly good value for it and produces a policy that can
+    // create NOTHING — an explicitly inert policy, not an error.
+    const options = {};
+    if (policyOptions !== null && policyOptions !== undefined) {
+      if (Object(policyOptions) !== policyOptions)
+        throw new TypeError("Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': The provided value is not of type 'TrustedTypePolicyOptions'.");
+      for (const k of ['createHTML', 'createScript', 'createScriptURL']) {
+        const v = policyOptions[k];
+        if (v === undefined || v === null) continue;
+        if (typeof v !== 'function')
+          throw new TypeError("Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': Failed to read the '" +
+            k + "' property from 'TrustedTypePolicyOptions': The provided value is not a function.");
+        options[k] = v;
+      }
+    }
+    _ttGate.on = true;
+    let p;
+    try { p = new TrustedTypePolicy(); } finally { _ttGate.on = false; }
+    _ttPolicyRec.set(p, { name, options });
+    _ttEnv.created.add(name);
+    // The policy literally named "default" is the one the browser reaches for
+    // when a plain string turns up at a sink. It is registered by NAME, not by
+    // an argument, so a page cannot install one by accident.
+    if (name === 'default') _ttEnv.defaultPolicy = p;
+    return p;
+  }
+  isHTML(value) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'isHTML' on 'TrustedTypePolicyFactory': 1 argument required, but only 0 present.");
+    return _ttData.has(value) && value instanceof TrustedHTML;
+  }
+  isScript(value) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'isScript' on 'TrustedTypePolicyFactory': 1 argument required, but only 0 present.");
+    return _ttData.has(value) && value instanceof TrustedScript;
+  }
+  isScriptURL(value) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'isScriptURL' on 'TrustedTypePolicyFactory': 1 argument required, but only 0 present.");
+    return _ttData.has(value) && value instanceof TrustedScriptURL;
+  }
+  // The two empty values are the escape hatch a sanitizer needs: "clear this
+  // sink" must not require inventing a policy. Cached, so identity holds.
+  get emptyHTML() { return this.__emptyHTML || (this.__emptyHTML = _ttMint(TrustedHTML, "")); }
+  get emptyScript() { return this.__emptyScript || (this.__emptyScript = _ttMint(TrustedScript, "")); }
+  getAttributeType(tagName, attribute, elementNs, attrNs) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'getAttributeType' on 'TrustedTypePolicyFactory': 2 arguments required, but only " + arguments.length + " present.");
+    const local = _asciiLower(String(tagName));
+    const attr = _asciiLower(String(attribute));
+    const ens = (elementNs === undefined || elementNs === null || elementNs === '') ? _TT_NS_HTML : String(elementNs);
+    const ans = (attrNs === undefined || attrNs === null || attrNs === '') ? null : String(attrNs);
+    const d = _ttAttrData(ens, local, attr, ans);
+    return d ? d.type : null;
+  }
+  getPropertyType(tagName, property, elementNs) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'getPropertyType' on 'TrustedTypePolicyFactory': 2 arguments required, but only " + arguments.length + " present.");
+    const local = _asciiLower(String(tagName));
+    const ens = (elementNs === undefined || elementNs === null || elementNs === '') ? _TT_NS_HTML : String(elementNs);
+    const d = _ttPropData(ens, local, String(property));
+    return d ? d.type : null;
+  }
+  get defaultPolicy() { return _ttEnv.defaultPolicy; }
+}
+_idlShape(TrustedTypePolicyFactory, { ctorLength: 0,
+  arity: { createPolicy: 1, isHTML: 1, isScript: 1, isScriptURL: 1, getAttributeType: 2, getPropertyType: 2 } });
+
+// --- the sink checks the DOM calls into -----------------------------------
+// Spec "Get Trusted Types-compliant string". The order matters: enforcement off
+// is the fast path and must behave exactly as before; an already-trusted value
+// of the RIGHT type passes untouched (and does NOT wake the default policy —
+// vouching for a value that has already been vouched for would let a default
+// policy see, and rewrite, values it was never asked about); only a plain string
+// reaches the default policy, and with no default policy there is nothing left
+// to do but refuse.
+function _ttCompliant(typeName, input, sink) {
+  const Ctor = _TT_CTOR[typeName];
+  if (input instanceof Ctor && _ttData.has(input)) return _ttData.get(input);
+  const str = String(input);
+  const def = _ttEnv.defaultPolicy;
+  if (def !== null) {
+    const v = _ttPolicyValue(def, _TT_CREATE_FN[typeName], str, [typeName, sink], false);
+    if (v !== null) return v;
+  }
+  throw new TypeError("Failed to set the '" + sink + "' sink: This document requires '" +
+    typeName + "' assignment.");
+}
+// Is Trusted Types being enforced in this realm at all? Answered before anything
+// else on every sink, so an ordinary page pays one property read.
+function _ttOn() {
+  // `_ttEnv` is a lexical binding declared in this section, while the DOM sinks
+  // that call in are defined thousands of lines EARLIER in the same script. If
+  // bootstrap's own evaluation touches one of those setters before we get here,
+  // the binding is still in its temporal dead zone — answer "off" rather than
+  // letting a ReferenceError out of `setAttribute`.
+  let env;
+  try { env = _ttEnv; } catch (e) { return false; }
+  if (!env.factory || env.bypass) return false;
+  return _ttCSP().require;
+}
+// Attribute sink hook. Returns the string to write, or null when this attribute
+// is not a sink (the caller then keeps its own conversion). Called from
+// setAttribute / setAttributeNS / the attr-node setters.
+function _ttAttrSink(el, attrLocal, attrNs, value) {
+  if (!_ttOn()) return null;
+  let ens;
+  try { ens = el.namespaceURI; } catch (e) { return null; }
+  const d = _ttAttrData(ens || _TT_NS_HTML, el.localName, attrLocal, attrNs === undefined ? null : attrNs);
+  if (!d) return null;
+  return _ttCompliant(d.type, value, d.sink);
+}
+// Property/operation sink hook (innerHTML, document.write, eval, …). Returns the
+// string to use; throws TypeError when the value is refused.
+function _ttSink(typeName, value, sink) {
+  if (!_ttOn()) return null;
+  return _ttCompliant(typeName, value, sink);
+}
+
+// `trustedTypes` is the page's single factory — the same object on every access,
+// because `defaultPolicy` and the created-name set are realm state, not
+// per-lookup state.
+_ttGate.on = true;
+try { _ttEnv.factory = new TrustedTypePolicyFactory(); } finally { _ttGate.on = false; }
+Object.defineProperty(globalThis, 'trustedTypes',
+  { value: _ttEnv.factory, writable: false, enumerable: true, configurable: true });
 
 // FileReaderSync — [Exposed=(DedicatedWorker,SharedWorker)]. It exists because a
 // worker has no UI to block: the whole reason to move a file read off the page's
@@ -42374,6 +42917,9 @@ globalThis.Range = class Range {
   // fragment is not connected — so an inline `<x-foo id>` logs constructed +
   // attributeChanged before it is ever inserted.
   createContextualFragment(markup) {
+    // Trusted Types: this parses markup, so it is an injection sink like
+    // innerHTML — and a quieter one, which is exactly why it needs the guard.
+    { const _tt = _ttSink('TrustedHTML', markup, 'Range createContextualFragment'); if (_tt !== null) markup = _tt; }
     markup = String(markup);
     const node = this._sc;
     const doc = (node && node.nodeType === 9) ? node : ((node && node.ownerDocument) || globalThis.document);
@@ -42381,7 +42927,7 @@ globalThis.Range = class Range {
     // A null context, or an <html> element in an HTML document, parses in a body context.
     if (element && element.localName === 'html' && doc._isHTMLDoc !== false) element = null;
     const tmp = doc.createElement(element ? (element.localName || 'body') : 'body');
-    tmp.innerHTML = markup;                        // fragment parsing algorithm (detached → no upgrade yet)
+    _ttUnchecked(() => { tmp.innerHTML = markup; }); // fragment parsing algorithm (detached → no upgrade yet)
     const frag = doc.createDocumentFragment();
     while (tmp.firstChild) frag.appendChild(tmp.firstChild);
     // Upgrade the whole parsed subtree in tree order (createContextualFragment
@@ -46362,7 +46908,10 @@ const _WORKER_HIDDEN = new Set([
   'Image', 'Option', 'Audio', 'XSLTProcessor', 'FileList', 'DataTransfer',
   'DataTransferItem', 'DataTransferItemList', 'Selection', 'AbortPaymentEvent',
   'VideoFrame', 'MediaList', 'StyleSheet', 'StyleSheetList', 'FontFace', 'FontFaceSet',
-  'FontFaceSetLoadEvent', 'CaretPosition', 'TrustedTypePolicyFactory', 'trustedTypes',
+  // (Trusted Types is NOT here: `trustedTypes` and its interfaces are
+  // [Exposed=*] — a worker builds markup and script URLs too, and a defence that
+  // stops at the window boundary is a defence with a door in it.)
+  'FontFaceSetLoadEvent', 'CaretPosition',
   // Events that only a window can receive.
   'UIEvent', 'MouseEvent', 'PointerEvent', 'KeyboardEvent', 'WheelEvent', 'InputEvent',
   'CompositionEvent', 'FocusEvent', 'TouchEvent', 'Touch', 'TouchList', 'DragEvent',
@@ -55362,14 +55911,550 @@ if (typeof EventSource === 'undefined') {
   };
 }
 
-if (typeof WebSocket === 'undefined') {
-  globalThis.WebSocket = class WebSocket {
-    constructor(url, protocols) { this.url = url; this.readyState = 0; this.bufferedAmount = 0; this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null; this.protocol = ''; }
-    send(data) {} close(code, reason) { this.readyState = 3; if (this.onclose) this.onclose({code:code||1000,reason:reason||'',wasClean:true}); }
-    addEventListener() {} removeEventListener() {}
-    static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
-  };
+// ============================================================================
+// WebSocket — https://websockets.spec.whatwg.org/
+//
+// HTTP is a question-and-answer protocol: the page asks, the server answers, the
+// exchange ends. Anything that must arrive WITHOUT being asked for — the next
+// message in a chat, the bus that is four minutes away, a place in a clinic
+// queue, someone else's cursor in a shared document — is either a WebSocket or it
+// is polling, and polling is the same page fetched again and again, forever.
+//
+// On a metered connection that is the difference between a few kilobytes and a
+// data bundle spent on nothing; on a slow CPU it is the difference between an
+// idle tab and one that never stops working. A browser without WebSocket does not
+// fail to show those sites — it shows them, expensively, and drains the battery
+// of the person least able to replace it.
+//
+// What was here before was seven lines that accepted every URL, sent nothing,
+// received nothing, and reported a clean close: the "answers, and answers wrong"
+// shape this campaign has now met seven times.
+// ============================================================================
+
+// Fetch's "bad port" list. These are ports where a protocol that is NOT HTTP
+// lives, and the reason to refuse them is cross-protocol attack: a browser can be
+// talked into opening a socket to, say, an SMTP server and sending lines that the
+// server reads as commands. Port 0 is included because it is never a real
+// destination.
+const _WS_BAD_PORTS = new Set([
+  0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79,
+  87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137,
+  139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526, 530, 531, 532, 540,
+  548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049,
+  3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679,
+  6697, 10080,
+]);
+// An HTTP token: what a subprotocol name is allowed to be. Anything else could
+// break out of the `Sec-WebSocket-Protocol` header it is about to be written into.
+const _WS_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+// CloseEvent carries the ONE thing a reconnecting page needs to know: whether the
+// connection ended on purpose. `wasClean` false means retry; true with code 1000
+// means stop.
+class CloseEvent extends Event {
+  constructor(type, init) {
+    if (arguments.length < 1) throw new TypeError("Failed to construct 'CloseEvent': 1 argument required, but only 0 present.");
+    init = (init == null) ? {} : init;
+    super(String(type), init);
+    this._wasClean = !!init.wasClean;
+    this._code = init.code === undefined ? 0 : (Number(init.code) >>> 0) & 0xffff;
+    this._reason = init.reason === undefined ? "" : String(init.reason);
+  }
+  get wasClean() { return this._wasClean; }
+  get code() { return this._code; }
+  get reason() { return this._reason; }
 }
+_idlShape(CloseEvent, { ctorLength: 1 });
+
+globalThis.WebSocket = class WebSocket {
+  constructor(url, protocols) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
+    // Step 1: parse against the page's base URL. A relative string like "#test"
+    // is a URL — it just is not a WebSocket one, which is why the fragment and
+    // scheme checks come after parsing rather than instead of it.
+    let u;
+    try { u = new URL(String(url), _documentBaseURL(globalThis.document)); }
+    catch (e) { throw new DOMException("Failed to construct 'WebSocket': The URL '" + url + "' is invalid.", "SyntaxError"); }
+    // http/https are accepted and UPGRADED — the two schemes mean the same origin
+    // and the same transport, and a page that computed its socket URL from
+    // location.protocol should not have to rewrite it. Re-parsed rather than
+    // assigned through `.protocol`, so the answer does not depend on whether the
+    // URL object's scheme setter handles a special-to-special change.
+    if (u.protocol === 'http:' || u.protocol === 'https:') {
+      const scheme = (u.protocol === 'http:') ? 'ws:' : 'wss:';
+      try { u = new URL(scheme + u.href.slice(u.protocol.length)); } catch (e) { /* keep the original */ }
+    }
+    if (u.protocol !== 'ws:' && u.protocol !== 'wss:')
+      throw new DOMException("Failed to construct 'WebSocket': The URL's scheme must be either 'ws' or 'wss'. '" +
+        u.protocol.replace(/:$/, '') + "' is not allowed.", "SyntaxError");
+    // A fragment is meaningless to a server — it is never sent — so a URL that
+    // carries one was built by mistake, and silently dropping it would hide the
+    // mistake rather than fix it.
+    //
+    // ⚠️ The test is "fragment is NON-NULL", not "fragment is non-empty", and
+    // `.hash` cannot tell those apart: a URL ending in a bare `#` has an EMPTY
+    // fragment and reports `hash === ""`, exactly like a URL with no fragment at
+    // all. The serialization keeps the `#`, so that is what to look at.
+    if (u.href.indexOf('#') >= 0)
+      throw new DOMException("Failed to construct 'WebSocket': The URL contains a fragment identifier ('" +
+        u.hash.slice(1) + "'). Fragment identifiers are not allowed in WebSocket URLs.", "SyntaxError");
+
+    // Step 2: the subprotocol list. A bare string is a one-element list.
+    let list;
+    if (protocols === undefined) list = [];
+    else if (typeof protocols === 'string') list = [protocols];
+    else if (protocols === null) list = [];
+    else if (typeof protocols[Symbol.iterator] === 'function') list = Array.from(protocols, String);
+    else list = [String(protocols)];
+    const seen = new Set();
+    for (const p of list) {
+      if (!_WS_TOKEN_RE.test(p))
+        throw new DOMException("Failed to construct 'WebSocket': The subprotocol '" + p + "' is invalid.", "SyntaxError");
+      const key = _asciiLower(p);
+      // Duplicates are refused case-INSENSITIVELY because the server matches that
+      // way; offering the same protocol twice asks it an ambiguous question.
+      if (seen.has(key))
+        throw new DOMException("Failed to construct 'WebSocket': The subprotocol '" + p + "' is duplicated.", "SyntaxError");
+      seen.add(key);
+    }
+
+    this._url = u.href;
+    this._readyState = 0;              // CONNECTING
+    this._bufferedAmount = 0;
+    this._protocol = "";
+    this._extensions = "";
+    this._binaryType = "blob";
+    this._handle = 0;
+    this._evtKey = _nextSyntheticKey();
+
+    // A blocked port does NOT throw. The spec says "fail the WebSocket
+    // connection", which is an asynchronous error+close — the same shape a page
+    // already handles for a server that is down, so a page needs no special case
+    // for it.
+    const port = u.port ? Number(u.port) : (u.protocol === 'wss:' ? 443 : 80);
+    if (_WS_BAD_PORTS.has(port)) { this._failAsync(); return; }
+
+    const self = this;
+    const proto = list.join(', ');
+    Deno.core.ops.op_ws_connect(this._url, proto).then((json) => {
+      let info;
+      try { info = JSON.parse(json); } catch (e) { if (!self._abandoned) self._failNow(); return; }
+      self._handle = info.id;
+      // The page gave up before the handshake finished: hang up on a connection
+      // it has already been told is closed, and say nothing more to it.
+      if (self._abandoned || self._readyState === 2 || self._readyState === 3) {
+        self._sendClose(0, "");
+        try { Deno.core.ops.op_ws_forget(self._handle); } catch (e) {}
+        self._handle = 0;
+        return;
+      }
+      self._protocol = info.protocol || "";
+      self._extensions = info.extensions || "";
+      self._readyState = 1;                             // OPEN
+      self._fire(new Event('open'));
+      self._pump();
+    }).catch(() => { if (!self._abandoned) self._failNow(); });
+  }
+
+  addEventListener(t, h, o) { _addListenerByKey(this._evtKey, String(t), h, o); }
+  removeEventListener(t, h, o) { _removeListenerByKey(this._evtKey, String(t), h, o); }
+  dispatchEvent(ev) { return _dispatchPublic(this, ev); }
+
+  get url() { return this._url; }
+  get readyState() { return this._readyState; }
+  get bufferedAmount() { return this._bufferedAmount; }
+  get protocol() { return this._protocol; }
+  get extensions() { return this._extensions; }
+  get binaryType() { return this._binaryType; }
+  // An unknown value is IGNORED, not an error: `binaryType` is a WebIDL enum
+  // attribute, and the enum's job is to keep the value legal, not to punish.
+  set binaryType(v) { v = String(v); if (v === 'blob' || v === 'arraybuffer') this._binaryType = v; }
+
+  send(data) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'send' on 'WebSocket': 1 argument required, but only 0 present.");
+    // Sending before the handshake finished is a PROGRAMMING error — the page has
+    // not been told it may speak yet — so it throws. Sending after close is not:
+    // the socket may have gone away between the check and the call, and every
+    // page would have to guard every send. That one is silently discarded.
+    if (this._readyState === 0)
+      throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", "InvalidStateError");
+    if (this._readyState !== 1) {
+      this._bufferedAmount += _wsByteLength(data);
+      return;
+    }
+    const self = this;
+    const done = () => { self._bufferedAmount = Math.max(0, self._bufferedAmount - n); };
+    const n = _wsByteLength(data);
+    this._bufferedAmount += n;
+    if (typeof data === 'string') {
+      Deno.core.ops.op_ws_send_text(this._handle, data).then(done, done);
+      return;
+    }
+    let bytes = null;
+    if (data instanceof ArrayBuffer) bytes = new Uint8Array(data.slice(0));
+    else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+    else if (typeof Blob !== 'undefined' && data instanceof Blob) bytes = data._bytes ? data._bytes.slice() : new Uint8Array(0);
+    else { Deno.core.ops.op_ws_send_text(this._handle, String(data)).then(done, done); return; }
+    Deno.core.ops.op_ws_send_binary(this._handle, bytes).then(done, done);
+  }
+
+  close(code, reason) {
+    // 1000 means "I am done"; 3000–4999 is the range reserved for applications.
+    // Every other code belongs to the protocol itself, and a page inventing one
+    // would be telling the server something the server is entitled to believe.
+    //
+    // ⚠️ Only `undefined` means "argument absent". `null` is a VALUE here — the
+    // IDL is `optional [Clamp] unsigned short code`, with no [TreatNullAs], so
+    // `close(null)` converts to 0 and is refused. And [Clamp] CLAMPS: 65536+1000
+    // becomes 65535, it does not wrap round to 1000. Wrapping would turn a
+    // nonsense code into the one code that means "clean shutdown".
+    if (code !== undefined) {
+      code = _wsClampUShort(code);
+      if (code !== 1000 && !(code >= 3000 && code <= 4999))
+        throw new DOMException("Failed to execute 'close' on 'WebSocket': The close code must be either 1000, or between 3000 and 4999. " +
+          code + " is neither.", "InvalidAccessError");
+    } else code = 0;
+    let r = (reason === undefined || reason === null) ? "" : String(reason);
+    // The close frame's payload is 125 bytes, two of which are the code — so the
+    // reason gets 123, measured in UTF-8 BYTES, not characters.
+    if (_wsUtf8Length(r) > 123)
+      throw new DOMException("Failed to execute 'close' on 'WebSocket': The message must not be greater than 123 bytes.", "SyntaxError");
+    if (this._readyState === 2 || this._readyState === 3) return;
+    if (this._readyState === 0) {
+      // ⭐ Closing while still handshaking is "FAIL the WebSocket connection", not
+      // "close it politely" — there is no established connection to send a close
+      // frame on. So the state goes to CLOSING now and the close event reports
+      // `wasClean: false`, promptly, WITHOUT waiting for a handshake that may
+      // take another ten seconds. A page that gave up on a connection needs to be
+      // told it is gone while it still cares.
+      this._readyState = 2;
+      this._abandoned = true;
+      const self = this;
+      globalThis.setTimeout(() => { self._closeWith(1006, "", false); }, 0);
+      return;
+    }
+    this._readyState = 2;                                // CLOSING
+    this._sendClose(code, r);
+  }
+
+  _sendClose(code, reason) {
+    if (!this._handle) return;
+    Deno.core.ops.op_ws_close(this._handle, code || 0, reason || "").catch(() => {});
+  }
+
+  // Read messages until the conversation ends. One awaited op per message: the
+  // wait IS the feature, and it costs nothing while nothing is happening.
+  async _pump() {
+    const self = this;
+    for (;;) {
+      let json;
+      try { json = await Deno.core.ops.op_ws_recv(self._handle); }
+      catch (e) { self._closeWith(1006, "", false); return; }
+      let m;
+      try { m = JSON.parse(json); } catch (e) { self._closeWith(1006, "", false); return; }
+      if (m.type === 'skip') continue;
+      if (m.type === 'text') {
+        if (self._readyState === 1) self._fire(new MessageEvent('message', { data: m.data, origin: _wsOrigin(self._url) }));
+        continue;
+      }
+      if (m.type === 'binary') {
+        if (self._readyState !== 1) continue;
+        const bytes = _wsBytesFromB64(m.data);
+        const data = (self._binaryType === 'arraybuffer')
+          ? bytes.buffer.slice(0)
+          : new Blob([bytes]);
+        self._fire(new MessageEvent('message', { data, origin: _wsOrigin(self._url) }));
+        continue;
+      }
+      if (m.type === 'error') { self._fire(new Event('error')); self._closeWith(1006, "", false); return; }
+      self._closeWith(m.code, m.reason || "", !!m.clean);
+      return;
+    }
+  }
+
+  _fire(ev) { ev.isTrusted = true; _dispatchSpec(this, ev); }
+
+  _closeWith(code, reason, clean) {
+    if (this._readyState === 3) return;
+    this._readyState = 3;                                // CLOSED
+    if (this._handle) { try { Deno.core.ops.op_ws_forget(this._handle); } catch (e) {} this._handle = 0; }
+    this._fire(new CloseEvent('close', { wasClean: clean, code: code || 1006, reason }));
+  }
+
+  // "Fail the WebSocket connection": an error event, then a close that is NOT
+  // clean. Deferred to a task so a listener attached on the next line still sees
+  // it — the whole reason a blocked port is asynchronous rather than a throw.
+  _failAsync() {
+    const self = this;
+    globalThis.setTimeout(() => { self._failNow(); }, 0);
+  }
+  _failNow() {
+    if (this._readyState === 3) return;
+    this._fire(new Event('error'));
+    this._closeWith(1006, "", false);
+  }
+};
+
+// Bytes a send() will actually put on the wire — what `bufferedAmount` counts, so
+// a page can tell whether the network is keeping up before it queues more.
+function _wsByteLength(data) {
+  if (typeof data === 'string') return _wsUtf8Length(data);
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  if (ArrayBuffer.isView(data)) return data.byteLength;
+  if (typeof Blob !== 'undefined' && data instanceof Blob) return data.size;
+  return _wsUtf8Length(String(data));
+}
+// WebIDL `[Clamp] unsigned short`: NaN and anything below 0 become 0, anything
+// above 65535 becomes 65535, and a fractional value rounds HALF TO EVEN (the same
+// rule quest #487 met on `Blob.slice`).
+function _wsClampUShort(v) {
+  let n = Number(v);
+  if (Number.isNaN(n)) return 0;
+  if (n <= 0) return 0;
+  if (n >= 65535) return 65535;
+  const f = Math.floor(n);
+  if (n - f === 0.5) return (f % 2 === 0) ? f : f + 1;
+  return Math.round(n);
+}
+function _wsUtf8Length(s) {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) n += 1;
+    else if (c < 0x800) n += 2;
+    else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) { n += 4; i++; }
+    else n += 3;
+  }
+  return n;
+}
+function _wsOrigin(href) {
+  try { const u = new URL(href); return (u.protocol === 'wss:' ? 'https://' : 'http://') + u.host; }
+  catch (e) { return ""; }
+}
+function _wsBytesFromB64(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+// WebIDL constants live on BOTH the interface object and the prototype, and are
+// non-writable: a page that can redefine `WebSocket.OPEN` has broken every
+// `readyState === WebSocket.OPEN` comparison in every library it loaded.
+for (const [_k, _v] of [['CONNECTING', 0], ['OPEN', 1], ['CLOSING', 2], ['CLOSED', 3]]) {
+  const desc = { value: _v, writable: false, enumerable: true, configurable: false };
+  Object.defineProperty(WebSocket, _k, desc);
+  Object.defineProperty(WebSocket.prototype, _k, desc);
+}
+for (const h of ['open', 'message', 'error', 'close']) {
+  Object.defineProperty(WebSocket.prototype, 'on' + h, {
+    configurable: true, enumerable: true,
+    get() { return this['_on' + h] || null; },
+    set(fn) {
+      const cur = this['_on' + h];
+      if (cur) this.removeEventListener(h, cur);
+      this['_on' + h] = (typeof fn === 'function') ? fn : null;
+      if (this['_on' + h]) this.addEventListener(h, this['_on' + h]);
+    },
+  });
+}
+_idlShape(WebSocket, { ctorLength: 1,
+  arity: { send: 1, close: 0, addEventListener: 2, removeEventListener: 2, dispatchEvent: 1 } });
+
+// ============================================================================
+// WebSocketStream — the socket as a pair of streams
+// ============================================================================
+// The event-based `WebSocket` above has no way to say "stop, I cannot keep up".
+// A page that receives faster than it can render just grows a queue until the tab
+// dies, and on a low-memory machine that is not a slowdown, it is the OS killing
+// the tab. `WebSocketStream` hands the same connection over as a `ReadableStream`
+// and a `WritableStream`, which is to say: **with backpressure**. The reader asks
+// for the next message when it is ready for one.
+//
+// It is still a tentative standard, so it lives here labelled as such — but the
+// transport underneath it is the same real socket, and the shape is the one every
+// other stream on this platform already has.
+
+// The close code shared by `WebSocketStream.close()` and `WebSocketError`:
+// 1000 ("going away cleanly") or the 3000–4999 application range, and nothing
+// else — every other value belongs to the protocol.
+function _wssCheckCloseInfo(info, allowUnset) {
+  if (info === null || info === undefined) info = {};
+  if (Object(info) !== info)
+    throw new TypeError("The provided value is not of type 'WebSocketCloseInfo'.");
+  let code = info.closeCode;
+  let reason = (info.reason === undefined || info.reason === null) ? "" : String(info.reason);
+  if (code === undefined || code === null) {
+    // A non-empty reason with no code means 1000: a reason needs a code to
+    // travel in, and "I am done" is the only one the page is entitled to invent.
+    code = (allowUnset && reason === "") ? null : 1000;
+  } else {
+    code = _wsClampUShort(code);
+  }
+  if (code !== null && code !== 1000 && !(code >= 3000 && code <= 4999))
+    throw new DOMException("The close code must be either 1000, or between 3000 and 4999. " +
+      code + " is neither.", "InvalidAccessError");
+  if (_wsUtf8Length(reason) > 123)
+    throw new DOMException("The close reason must not be greater than 123 bytes.", "SyntaxError");
+  return { code, reason };
+}
+
+// A `WebSocketError` is a DOMException that also carries WHY the socket closed —
+// which is the difference between "something went wrong" and "the server said
+// 4001, go and re-authenticate".
+class WebSocketError extends DOMException {
+  constructor(message = "", init = {}) {
+    super(String(message === undefined ? "" : message), "WebSocketError");
+    const { code, reason } = _wssCheckCloseInfo(init, true);
+    Object.defineProperty(this, '_wseCode', { value: code, configurable: true });
+    Object.defineProperty(this, '_wseReason', { value: reason, configurable: true });
+  }
+  get closeCode() { return this._wseCode; }
+  get reason() { return this._wseReason; }
+}
+_idlShape(WebSocketError, { ctorLength: 0 });
+// The engine's own way to raise one. The public constructor validates the close
+// code — a PAGE may only say 1000 or 3000–4999 — but the codes the engine has to
+// REPORT include the protocol's own (1006 "closed abnormally" above all, which is
+// the one a reconnecting page actually keys on). Validation belongs on what a
+// page asserts, not on what the network did.
+function _wssError(code, reason) {
+  const e = new WebSocketError("", {});
+  Object.defineProperty(e, '_wseCode', { value: (code === undefined ? null : code), configurable: true });
+  Object.defineProperty(e, '_wseReason', { value: reason || "", configurable: true });
+  return e;
+}
+
+globalThis.WebSocketStream = class WebSocketStream {
+  constructor(url, options) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'WebSocketStream': 1 argument required, but only 0 present.");
+    if (options !== undefined && options !== null && Object(options) !== options)
+      throw new TypeError("Failed to construct 'WebSocketStream': The provided value is not of type 'WebSocketStreamOptions'.");
+    const opts = (options === undefined || options === null) ? {} : options;
+    // `protocols` is a `sequence<USVString>`, and WebIDL converts a sequence only
+    // from an Object — a bare string is refused even though it is iterable,
+    // because `{protocols: 'chat'}` almost always means the author forgot the
+    // brackets and iterating it would offer one protocol per CHARACTER.
+    let protocols = [];
+    if (opts.protocols !== undefined && opts.protocols !== null) {
+      if (typeof opts.protocols === 'string' || Object(opts.protocols) !== opts.protocols ||
+          typeof opts.protocols[Symbol.iterator] !== 'function')
+        throw new TypeError("Failed to construct 'WebSocketStream': Failed to read the 'protocols' property from 'WebSocketStreamOptions': The provided value cannot be converted to a sequence.");
+      protocols = Array.from(opts.protocols, String);
+    }
+
+    const self = this;
+    let openResolve, openReject, closedResolve, closedReject;
+    this._opened = new Promise((res, rej) => { openResolve = res; openReject = rej; });
+    this._closed = new Promise((res, rej) => { closedResolve = res; closedReject = rej; });
+    // Both promises are handed to the page and either may go unread — an
+    // unhandled rejection on a socket the page deliberately ignored is noise, not
+    // news.
+    this._opened.catch(() => {});
+    this._closed.catch(() => {});
+    this._settled = false;
+
+    // The WebSocket constructor is the one place the URL and protocol rules live;
+    // reuse it so the two APIs cannot disagree about what a legal socket is.
+    const ws = new WebSocket(url, protocols);
+    ws.binaryType = 'arraybuffer';
+    this._ws = ws;
+    this._url = ws.url;
+
+    let readCtl = null;
+    const readable = new ReadableStream({
+      start(c) { readCtl = c; },
+      // The reader gave up: hang up rather than keep receiving into nothing. If
+      // it gave up WITH a `WebSocketError`, that error is not decoration — it is
+      // the close code and reason the server should be told, which is how a page
+      // says "4001, my token expired" instead of just vanishing.
+      cancel(reason) { return self._hangUp(reason); },
+    });
+    const writable = new WritableStream({
+      write(chunk) { ws.send(chunk); },
+      // `close()` must not resolve until the closing HANDSHAKE completes —
+      // resolving early would tell the page its last message was delivered when
+      // it may still be in flight.
+      close() { return self._hangUp(); },
+      abort(reason) { return self._hangUp(reason); },
+    });
+
+    ws.addEventListener('open', () => {
+      openResolve({ readable, writable, protocol: ws.protocol, extensions: ws.extensions });
+    });
+    ws.addEventListener('message', (e) => {
+      if (!readCtl) return;
+      // A binary frame arrives as bytes. The stream hands out a `Uint8Array`
+      // rather than an ArrayBuffer because a stream chunk is a VIEW of data — the
+      // reader wants to look at it, not own a buffer.
+      const d = (e.data instanceof ArrayBuffer) ? new Uint8Array(e.data) : e.data;
+      try { readCtl.enqueue(d); } catch (err) { /* already closed */ }
+    });
+    ws.addEventListener('close', (e) => {
+      if (self._settled) return;
+      self._settled = true;
+      if (e.wasClean) {
+        // 1005 is "no status was actually present" and is exactly what a page
+        // needs to distinguish "closed with no code" from "closed with 1000".
+        try { if (readCtl) readCtl.close(); } catch (err) {}
+        openResolve({ readable, writable, protocol: ws.protocol, extensions: ws.extensions });
+        closedResolve({ closeCode: e.code, reason: e.reason });
+      } else {
+        const err = _wssError(e.code || 1006, e.reason || "");
+        try { if (readCtl) readCtl.error(err); } catch (e2) {}
+        openReject(err);
+        closedReject(err);
+      }
+    });
+
+    // `signal` aborts the connection attempt — the same reason `AbortSignal`
+    // exists everywhere else: a page that navigated away should not be holding a
+    // socket open for a view nobody is looking at.
+    // An abort is not a close: it rejects both promises with an **AbortError**,
+    // not a `WebSocketError`. The distinction is the whole point — a
+    // `WebSocketError` says the connection ended and how, while an AbortError
+    // says *this side stopped caring*, and a page that retries on connection
+    // failure must not retry a socket it deliberately cancelled.
+    const signal = opts.signal;
+    const abortNow = () => {
+      if (self._settled) return;
+      self._settled = true;
+      const err = new DOMException("The operation was aborted.", "AbortError");
+      try { if (readCtl) readCtl.error(err); } catch (e) {}
+      openReject(err);
+      closedReject(err);
+      try { ws.close(); } catch (e) {}
+    };
+    if (signal) {
+      if (signal.aborted) abortNow();
+      else signal.addEventListener('abort', abortNow);
+    }
+  }
+  get url() { return this._url; }
+  get opened() { return this._opened; }
+  get closed() { return this._closed; }
+  close(closeInfo) {
+    const { code, reason } = _wssCheckCloseInfo(closeInfo, true);
+    if (code === null) this._ws.close();
+    else this._ws.close(code, reason);
+  }
+  // Close the socket, carrying a `WebSocketError`'s code and reason onto the wire
+  // if one was given, and answer a promise that settles when the handshake has
+  // actually finished.
+  _hangUp(reason) {
+    let code = null, r = "";
+    if (reason && globalThis.WebSocketError && reason instanceof globalThis.WebSocketError) {
+      code = reason.closeCode; r = reason.reason || "";
+      if (code === null || code === undefined) code = (r === "") ? null : 1000;
+    }
+    try { if (code === null) this._ws.close(); else this._ws.close(code, r); } catch (e) {}
+    return this._closed.then(() => undefined, () => undefined);
+  }
+};
+_idlShape(WebSocketStream, { ctorLength: 1, arity: { close: 0 } });
 
 if (typeof BroadcastChannel === 'undefined') {
   globalThis.BroadcastChannel = class BroadcastChannel {
@@ -56686,7 +57771,9 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     reversed:   'HTMLOListElement',
     size:       'HTMLHRElement',
     start:      'HTMLOListElement',
-    text:       'HTMLBodyElement',
+    // `text` means the legacy colour attribute on <body> and the child text
+    // content on the other four (HTMLOptionElement keeps its own override).
+    text:       'HTMLAnchorElement HTMLBodyElement HTMLOptionElement HTMLScriptElement HTMLTitleElement',
     vLink:      'HTMLBodyElement',
     version:    'HTMLHtmlElement',
     width:      'HTMLEmbedElement HTMLHRElement HTMLIFrameElement HTMLMarqueeElement ' +

@@ -85,6 +85,35 @@ faster than full rebuilds for diagnosing *why* something fails.
   decode utf-8 — correct for fetch, catastrophic for a navigation, because a document
   declares its own encoding (HTML §13.2.3.2). It returns a string and never throws, so
   every "did it load" test passes; only looking at a *character* reveals it.
+- **⭐ If a realm is a PURE FUNCTION of its input, test it offline first.**
+  `mimesniff/mime-types/parsing.any.js` is 955 input strings and their exact
+  expected serializations, in two JSON files. Lifting the parser and serializer
+  out of `bootstrap.js` into a standalone Node script and running them against
+  WPT's own `mime-types.json` + `generated-mime-types.json` took **under a
+  second** and pinned both remaining bugs. A 20-second-per-file CDP sweep is the
+  wrong tool for a string algorithm.
+- **⚠️⚠️ A BIG GREEN NUMBER IS NOT EVIDENCE ON ITS OWN — WPT CONTAINS FILES THAT
+  CONTRADICT EACH OTHER.** Quest #492 took
+  `mimesniff/mime-types/parsing.any.html` from 712/1898 to **1898/1898** by making
+  `Blob.type` parse-and-serialize, and **broke three other files doing it**
+  (`FileAPI/blob/Blob-slice` −21, `FileAPI/file/File-constructor` −2,
+  `fetch/api/response/response-consume` −2). FileAPI's normative text mandates the
+  crude lowercase-the-lot rule, in the same words, for `Blob()`, `File()` *and*
+  `slice()` — and Chrome scores 712 there for exactly that reason. **When two WPT
+  files disagree, fetch and read the SPEC; do not let the bigger number decide.**
+  The zero-regression ritual is what caught it, one build before the commit.
+- **⚠️ THE RUNNER'S SCHEME IS PART OF SOME TESTS' INPUT.**
+  `websockets/Create-non-absolute-url.any.html` reads **0/5 on `--base
+  https://wpt.live` and 5/5 on `--base http://wpt.live`**: it forces
+  `url.protocol = "ws"` on a URL built from `location`, so on an https page its
+  own expectation disagrees with a correct implementation. Before chasing a
+  plausible-looking failure in a URL/scheme-sensitive realm, try the other scheme.
+  (Same family as scroll 465's `.https.html` trap.)
+- **⭐ Before writing code for a realm that scores zero, check whether the
+  algorithm is already in the engine.** Quest #487's whole root cause was that
+  `fetch()` never called the "extract a body" algorithm `Request` had been running
+  since #459. *A realm can sit at zero not because the engine cannot do the thing,
+  but because one call site does it the easy way.*
 - **JS numbers are f64.** In Rust unit tests assert `result.as_f64() == Some(7.0)`,
   not `json!(7)`.
 - **Rebuild after ANY `bootstrap.js` edit** (it's embedded). Restart the server after

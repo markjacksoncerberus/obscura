@@ -25,6 +25,9 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F17** | ✅ [The Trusted Verdict](481-the-trusted-verdict.md) | **`trusted-types/*`** — the API that removes DOM XSS as a CLASS | **1917/2461 (77.9%)** over a 60-file window — was **21/429, with 21 of 28 files could-not-run** | ⚔️⚔️ | **SECURED (Quest #490, 2026-08-06).** The realm did not exist: `window.trustedTypes` was `undefined`, so the shared helper threw on line 1 and testharness never got a subtest — **invisible, not failing, for the seventh time.** ⭐⭐ Trusted data lives OFF the instance in a `WeakMap` (an own field is forgeable via `Object.create(proto)`, and *a forged trusted value is worse than none*). ⭐⭐ A default-policy `null` must BLOCK where an explicit `createHTML()`'s `null` yields `""`. ⭐ CSP is **append-only**, which is what makes a cheap cache correct. **Caps, all named: `eval`/`Function` need V8's `ModifyCodeGenerationFromStrings` hook (~110 subtests); dynamically inserted `<script>` never executes (130); header-CSP + `SecurityPolicyViolation` are unplumbed (~17 files).** |
+| **F18** | ✅ [The Connected Verdict](482-the-connected-verdict.md) | **`websockets/*`** — the only way a page learns something it did not ask for | **450/485 (92.8%)** over a 76-file window — was a **7-line stub** (`idlharness` 10/62, `constructor/004` 0/161) | ⚔️⚔️ | **SECURED (Quest #491, 2026-08-06).** The stub's `close()` reported **`wasClean: true` for a connection that never existed** — the eighth *answers, and answers wrong*. New `crates/obscura-js/src/ws_ops.rs` over `tokio-tungstenite` (already in the lockfile). ⭐ Sink and stream stored separately, or a pending read blocks every `send()`. ⭐ A blocked port **fails asynchronously**, it does not throw. ⭐ `[Clamp]` clamps — 66536 → 65535, never 1000. Verified against live `ws://wpt.live:8001`. **Caps: no cookies on the handshake (9 files), `websockets/stream/*` (WebSocketStream, ~370) untouched, worker variants of two files.** |
+| **F19** | ✅ [The Streamed Verdict](483-the-streamed-verdict.md) | **`websockets/stream/*`** — `WebSocketStream`, the socket with backpressure | `websocket-error` **10/10** · `constructor` **8/8** · `close` **22/27** — was **0, the interface did not exist** | ⚔️ | **SECURED (Quest #492, 2026-08-06).** The event-based `WebSocket` cannot say *"stop, I cannot keep up"* — a page receiving faster than it renders grows a queue until the tab dies, and on a low-memory device that is the OS killing the tab. ⭐ `protocols` is a `sequence`, so a bare string is REFUSED though a string is iterable. ⭐ **An abort is not a close**: `signal` rejects with `AbortError`, never `WebSocketError`. ⭐ Cancelling the readable with a `WebSocketError` sends its code ON THE WIRE. **⚠️ This quest began as `mimesniff/mime-types/parsing.any` (1,898 subtests, Chrome 712) and the fix that won it BROKE THREE OTHER FILES — see the scroll; the 712 cap is correct and must not be "fixed".** |
 | **F14** | ✅ [The Uploaded Verdict](478-the-uploaded-verdict.md) | **`FileAPI/*`** — Blob, File, FileReader, and the upload path | **1415/1550 (91.3%)** — was 1057/1540 (68.6%) | ⚔️⚔️ | **SECURED (Quest #487, 2026-08-06).** ⭐⭐ `FormData.append` did `String(v)` and `fetch()` did `String(init.body)` — **a FormData could not hold a file**, so file upload was broken end to end with nothing to search for. `Request` had run the real "extract a body" since #459; `fetch()` never called it. ⚠️ **The realm was picked as UNTOUCHED and was 68.6% — measure before naming.** Caps: `send-file-form-*` (63) needs `DataTransfer` + a frame-POST body channel; `BlobURL/cross-partition*` needs partitioning. |
 | **F15** | ✅ [The Aborted Verdict](479-the-aborted-verdict.md) | **`IndexedDB`** — the abort rule + the `getAll` options family | `fire-*-event-exception` **0/29 → 29/29** · `getAllRecords` **9/54 → 52/54** | ⚔️ | **SECURED (Quest #488, 2026-08-06).** Both blocks had been banked twice. ⭐ A handler that THREW did not finish, so the transaction must ABORT — **beating `preventDefault()`**, and worst on `upgradeneeded` where a half-built schema is permanent. ⭐ `getAll`'s dictionary overload is unambiguous because **a dictionary is not a key**, and `direction` is the reason it exists. Cap: the `[EnforceRange]` count boundary, 1 subtest per file. |
 | **F16** | 🟡 [The Intercepted Verdict](480-the-intercepted-verdict.md) | **`service-workers/` — `fetch` INTERCEPTION** | capability works end to end; WPT **3/79 → 13/79** | ⚔️⚔️⚔️ | **PARTLY SECURED (Quest #489, 2026-08-06).** `FetchEvent` + `respondWith()` exist and a page is genuinely served from the Cache API for a URL with nothing behind it. ⚠️ **OPEN, and this is the next quest: interception must move into the NETWORK PATH.** Every test in the realm checks that an **iframe's own navigation and subresource loads** were intercepted; those are issued in Rust by the frame loader and never reach the JS `fetch()` this hooks. Pairs with **storage on disk**, now named by five quests. |
@@ -318,6 +321,115 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-06 — Quests #490–#492, **The Trusted, Connected & Streamed Arc** (`trusted-types` **~21/429 → 1917/2461 (77.9%)** · `websockets` **7-line stub → 450/485 (92.8%)** · `WebSocketStream` **0 → 44/52 on its four behavioural files**)
+
+*Scrolls: [`481-the-trusted-verdict.md`](481-the-trusted-verdict.md) · [`482-the-connected-verdict.md`](482-the-connected-verdict.md) · [`483-the-streamed-verdict.md`](483-the-streamed-verdict.md)*
+
+**Three realms chosen by measuring four candidates first, not by following the
+previous arc's ⭐.** The outgoing leverage list pointed at service-worker network
+interception and storage-on-disk — both real, both blocked on engine architecture.
+The standing order says prefer the untouched realm, so `trusted-types`,
+`websockets`, `xhr` and `mimesniff` were each baselined before anything was
+chosen. The scoreboard picked the order.
+
+**#490 — the realm did not exist, and that made it INVISIBLE, not failing (the
+seventh time).** `window.trustedTypes` was `undefined`, so 21 of the 28 baselined
+files threw on the first line of `support/helper.sub.js` and testharness never
+received a subtest. Baseline **21/429**. Trusted Types is the API that removes DOM
+XSS as a *class*: with `require-trusted-types-for 'script'` every injection sink
+refuses a plain string, and the only way through is a policy the application wrote
+on purpose. **It is also the rare defence that costs the device nothing** — no
+scanner, no extension, no megabytes; the browser simply refuses. ⭐⭐ **The trusted
+value's data lives OFF the instance in a WeakMap**, because an own field — even a
+non-writable one — is still forgeable with `Object.create(TrustedHTML.prototype)`,
+and *a forged trusted value is worse than no Trusted Types at all: it is a
+guarantee that isn't one.* ⭐⭐ **A policy callback returning `null` means two
+different things**: from `policy.createHTML(x)` it means "I produce nothing here"
+and yields the empty string; from the DEFAULT policy it means "I decline to vouch
+for this" and must BLOCK. ⭐ **The nine attribute-setting APIs split in two, and
+the split is deliberate**: `setAttribute`/`setAttributeNS` accept a trusted value
+in IDL, while `setAttributeNode`, `setNamedItem`, `Attr.value`, `nodeValue` and
+`textContent` carry a plain `DOMString` and must therefore REFUSE one — that
+asymmetry is what stops a page laundering an untrusted string through an `Attr`
+node. ⭐ **CSP is APPEND-ONLY**, which is what makes a cheap cache correct: a page
+may insert a `<meta>` and become enforcing mid-life, but removing the element does
+not withdraw the policy (otherwise an injected script could switch the defences
+off by deleting a tag) — so the scan repeats only while nothing is enforced yet,
+and never again after. Also landed: `Element.text` (five interfaces, two different
+meanings — the legacy colour attribute on `<body>`, child text content on the rest)
+and `trustedTypes` un-hidden from workers.
+
+**#491 — `WebSocket` was seven lines, and its `close()` reported `wasClean: true`
+for a connection that never existed.** The eighth *answers, and answers wrong*.
+HTTP is question-and-answer; anything that must arrive **without being asked for**
+is either a WebSocket or it is polling, and polling on a metered connection is a
+data bundle spent on nothing. New `crates/obscura-js/src/ws_ops.rs` over
+`tokio-tungstenite` (already in the lockfile — the CDP server *accepts* sockets;
+this is the first code that opens one). ⭐ **The sink and the stream are stored
+separately**: a read is a long await by design, and if it held the whole
+connection `send()` could not run until the server happened to speak first. ⭐ **A
+blocked port does NOT throw** — the spec says "fail the connection", i.e. an
+asynchronous `error`, which is the same shape a page already handles for a server
+that is down (84/84, and the list exists because a browser talked into opening a
+socket to an SMTP port can be talked into sending it commands). ⭐ **The fragment
+test is "non-NULL", and `.hash` cannot express it** — `ws://h/#` has an EMPTY
+fragment and reports `""`, exactly like no fragment at all. ⭐ **In `close(code)`
+only `undefined` means absent; `null` is a value, and `[Clamp]` CLAMPS** — 66536
+becomes 65535, it does not wrap to 1000, which is the one code meaning "clean
+shutdown". ⭐ **Closing while CONNECTING is FAIL, not close**: `wasClean: false`,
+fired promptly, without waiting out a handshake that may take ten more seconds.
+Verified end to end against live `ws://wpt.live:8001`.
+
+**#492 — THE QUEST THAT BEGAN AS A 1,898-SUBTEST WIN AND ENDED AS A CORRECTION.**
+`mimesniff/mime-types/parsing.any.js` is 1,898 subtests in one file, a pure string
+algorithm, Chrome scoring only 712. Making `Blob.type` parse-and-serialize took it
+to **1898/1898** — **and then the ritual sweep found two regressions, and
+following them found a third**: `Blob-slice` 150→129, `File-constructor` 51→49,
+`response-consume` 24→22. The FileAPI text, fetched and read rather than guessed
+at, is unambiguous: the `Blob()` constructor, the `File()` constructor **and**
+`slice()`'s `contentType` all say, in the same words, *"if t contains any
+characters outside U+0020–U+007E set t to the empty string… convert every
+character in t to ASCII lowercase."* Crude on purpose — it keeps `"nonparsable"`
+and folds `charset=UTF-8` — and `File-constructor` asserts both of those exact
+cases, while `response-consume` asserts `blob.type === header.toLowerCase()`,
+which a serializer can never produce because serializing drops the space after the
+semicolon. **Three WPT files and the normative text on one side, `mimesniff/parsing`
+on the other; Chrome 153 scores 712 there for the same reason.** Reverted — we now
+sit at **712/1898, bit-for-bit Chrome parity** — and `_normalizeBlobType` carries
+a long comment written for the next knight who reaches for the obvious fix.
+**⚠️ THE LESSON: A BIG GREEN NUMBER IS NOT EVIDENCE ON ITS OWN.** A real WPT file
+testing a real standard, implemented correctly, broke three other real WPT files
+testing other real standards. *The ritual caught it in my own work, one build
+before the commit.* **What the corpus DID pay for: two genuine `_parseMimeType`
+bugs**, found by lifting the parser into a Node script and running WPT's own
+corpus **offline in under a second** (954/955 → **955/955**). ⭐ An empty QUOTED
+parameter value is kept and an empty bare one is not — ignoring that lets a
+crafted header's second `charset` override one the page pinned. ⭐ The
+quoted-string range stops at **U+00FF**, because a header is a byte sequence.
+`charset-parameter.window.html` **38/41 → 39/41**.
+
+**The quest that replaced it — `WebSocketStream`, cheap once #491 landed the
+transport, and the half of the realm that matters most on a small machine.** The
+event-based `WebSocket` has no way to say *"stop, I cannot keep up"*: a page
+receiving faster than it renders just grows a queue until the tab dies. ⭐
+`protocols` is a `sequence<USVString>` and a bare string is REFUSED even though a
+string is iterable — `{protocols:'chat'}` would otherwise offer one subprotocol
+per CHARACTER. ⭐ **An abort is not a close**: `signal` rejects with `AbortError`,
+never `WebSocketError`, because a page that retries on connection failure must not
+retry a socket it deliberately cancelled. ⭐ Cancelling the readable with a
+`WebSocketError` sends its code and reason ON THE WIRE. ⭐ The writable's `close()`
+must not resolve until the closing HANDSHAKE completes. ⭐ The public
+`WebSocketError` constructor validates the close code; the engine's internal
+factory does not — *validation belongs on what a page asserts, not on what the
+network did.* From a baseline of 0: `websocket-error` **10/10**, `constructor`
+**8/8**, `close` **22/27**, `remote-close` 4/7.
+
+**Also found and fixed, in a different realm: `new URL(null, base)` returned the
+BASE.** `url` is a required `USVString`, so `null` is the four-character string
+`"null"` — folding it to `""` produced the one wrong answer a caller could mistake
+for success, silently resolving a relative path built from a null variable to the
+current page.
 
 ### 2026-08-06 — Quests #487–#489, **The Uploaded, Aborted & Intercepted Arc** (`FileAPI` **1057/1540 → 1415/1550 (68.6% → 91.3%)** · IndexedDB `fire-*-event-exception` **0/29 → 29/29** + the `getAll` options family · service-worker **`fetch` interception exists**)
 

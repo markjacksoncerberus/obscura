@@ -26,6 +26,11 @@ encoding_rs = "0.8"
 # the DEFLATE engine, so the browser still builds with no C toolchain present.
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 brotli = { version = "8", default-features = false, features = ["std"] }
+# WebSocket transport. `native-tls-vendored` matches what reqwest already pulls
+# in, so `wss://` costs no new system dependency and the browser still builds on
+# a machine with no OpenSSL headers installed.
+tokio-tungstenite = { version = "0.26", features = ["native-tls-vendored"] }
+futures-util = "0.3"
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
