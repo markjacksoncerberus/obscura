@@ -25,6 +25,9 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F30** | ✅ [The Sounded Verdict](103-the-sounded-verdict.md) | **`webaudio/*` — the graph & the IDL** — the biggest untouched realm on the platform | **`idlharness` 1162/1163** — was **49/1163**; every `ctor-*` file 100% | ⚔️⚔️⚔️ | **SECURED (Quest #502, 2026-08-07).** 5,763 subtests, 333 files, Chrome 99%+, zero ledger rows — and **the largest instance of the campaign's most dangerous failure mode**. `webaudio` was not missing, it was wearing a **fingerprinting costume**: `createGain()` returned `{gain:{value:1,setValueAtTime(){}},connect(){}}`. **A realm that ANSWERS wrong is worse than one that is MISSING** — no feature detection sees it, no `catch` catches it, and the page has no path to a fallback. Why it matters: Web Audio is how a page makes sound **without shipping audio** — kilobytes instead of megabytes, which on a metered connection is the whole difference. ⭐⭐ An enumeration **argument** throws while an enumeration **attribute** is silently ignored (WebIDL §3.7.10). ⭐⭐ An accessor's `name` is `'get x'`/`'set x'` and idlharness checks every one (≈110 subtests). ⭐⭐ A Promise-returning operation **rejects**, it does not throw. ⭐ Rounding *position* is load-bearing (`40·log10f(FLT_MAX)`, `fround` **inside**). ⚠️ The anti-fingerprint jitter had to move off `DynamicsCompressorNode.threshold` — **a declared parameter is the wrong place to hide.** **⛔ Cap: no audio decoder (`decodeAudioData` REJECTS rather than resolving with silence) and no real-time device.** |
+| **F31** | ✅ [The Rendered Verdict](104-the-rendered-verdict.md) | **`webaudio/*` — the offline renderer** — making the graph actually sound | **`audionode-channel-rules` 178/178** — stub **175/178**, then **6/178** once the graph was real | ⚔️⚔️⚔️ | **SECURED (Quest #503, 2026-08-07).** #502 built every node correctly and it was still a **diagram** — `startRendering()` walked nothing. ⭐⭐⭐ **And the stub's 175/178 was SILENCE COMPARED TO SILENCE**: the old `createBuffer().getChannelData()` handed back **a new zero array every call**, so the test's own source data was discarded, its *expected* result computed as all-zero, and compared to an all-zero render — 175 assertions of `0 === 0`. Making the graph real dropped the score by **169**. **A score that FALLS when you make something correct proves the number was never measuring the thing.** A real render loop in the spec's fixed **128-frame quanta** (observable, not an implementation detail). ⭐⭐ Connections are stored **forward**; rendering pulls **backward**. ⭐⭐ Channel mixing is where a graph stops being a diagram — 6→2 folds centre and surrounds at `√½` so power is preserved, and the **discrete** fallback is what stops an odd channel count producing silence. ⭐⭐ A connection to an AudioParam is **summed onto** it, not substituted — that one word is what makes an LFO two nodes instead of a `setInterval`. ⭐⭐ A cycle is **legal**; the topological walk skips it rather than failing. ⭐⭐ `OfflineAudioContext.suspend()` had to become real — the render loop is `async` and **re-reads the graph on resume**. ⭐ A pass-through beats a silence: in a graph, a silencing node takes everything downstream with it. **⛔ Cap: ideal (not band-limited) oscillator waveforms; the compressor passes through; equal-power panning only.** |
+| **F32** | ✅ [The Automated Verdict](105-the-automated-verdict.md) | **`webaudio/*` — the AudioParam timeline** — every fade and envelope on the web | **`event-insertion` 67/67** — stub **9/15**, **44/67** with the renderer; arc probe **642/2096 → 3002/3021** | ⚔️⚔️ | **SECURED (Quest #504, 2026-08-07).** An `AudioParam` is not a number, it is a **function of time** — and computing it in the engine rather than on the page is not a nicety: the alternative is a `setInterval` writing `gain.value` a hundred times a second, which on a hand-me-down laptop is *both* audibly steppy **and** the thing that makes the tab stutter. ⭐⭐ A ramp is the only event type that reaches **backwards**. ⭐⭐ An exponential ramp is a **ratio**, so it cannot start at or cross zero (and must hold, not emit `NaN` — one NaN poisons everything downstream). ⭐⭐ `param.value` reads the **timeline**, not the stored number. ⭐⭐ `cancelAndHoldAtTime` **truncates** the automation in flight rather than deleting it — deleting snaps the value back to where the envelope started, an audible click, and avoiding that click is the only reason the method exists. ⭐⭐ A curve **owns its start instant but not its end**, and the rule is **asymmetric** between new-curve-vs-old-event and new-event-vs-old-curve. **⛔ Cap: `cancel-and-hold` 94/106, and every test comparing against captured reference audio.** |
 | **F27** | ✅ [The Named Verdict](100-the-named-verdict.md) | **`domxpath/*`** — how you NAME a node you cannot see | **1143/1149 (99.5%)** over 21 files — was **2/1145**, `document.evaluate` was `undefined` | ⚔️⚔️⚔️ | **SECURED (Quest #499, 2026-08-07).** The realm was not failing, it was **invisible**: harness OK, 1,024 subtests registered, every one throwing on line 1. XPath goes **up** and **backward** where CSS cannot — `//td[contains(., "Total")]/following-sibling::td[1]` is "the cell after the one that says Total", and it is the query language of nearly every scraper and automation tool ever written, which is a large slice of what a browser for AI agents is asked to run. A whole XPath 1.0 engine. ⭐⭐ **It is a PURE FUNCTION, so `scripts/xpath_offline_test.mjs` runs WPT's 1,024-case corpus in Node in 367 ms** — and found the bug that was all 1,024 failures (an axis and its `::` lex as ONE token, so `following-sibling::*` was parsing `*` as MULTIPLY). ⭐⭐ **The context node's document decides the HTML-vs-XML rules, not the expression's** — one line, two files 4/8 → 8/8. ⭐ The empty string is a valid namespace; only `null`/`undefined` are unresolvable. **⛔ Cap: the last 11 need WebIDL's report-then-throw; Chrome scores 8/10 and 4/6 on those same files.** |
 | **F28** | ✅ [The Old Web Verdict](101-the-old-web-verdict.md) | **`quirks/*`** — the old web, which is most of the web on a hand-me-down laptop | **6867/6978 (98.4%)** over 13 files — was **4362/6978** | ⚔️⚔️ | **SECURED (Quest #500, 2026-08-07).** `compatMode` was hardcoded `CSS1Compat`, so Obscura **had never once been in quirks mode** — and a quirks page renders with every unitless length and hashless colour dropped, so the table collapses and the text turns black and it looks like *the site* is broken. ⚠️ `document.write()` had to sniff the doctype from the markup, because this engine parses through `innerHTML`, which discards it. ⚠️⚠️ **The bigger find: these properties had NO VALIDATION AT ALL** — `border-spacing: a` computed to `a`, `color: aaaaa` to `aaaaa` — which is why the files failed in **no-quirks** mode too. Real grammars added for eight property families plus `<color>` in stylesheet rules. ⭐⭐ `calc(1)` is a `<number>`, not a `<length>`. ⭐⭐ **A comment separates tokens, it does not join them** (`+/**/1` was being spliced into `+1`). **⛔ Cap: the 79 left are the four LAYOUT quirks — F26, named now by a sixth realm.** |
 | **F29** | ✅ [The Vouched Verdict](102-the-vouched-verdict.md) | **`sanitizer-api/*`** — XSS defence that costs the device nothing | **431/581 (74.2%)** over 18 files — was **47/394**; `Sanitizer` and `setHTML` did not exist | ⚔️⚔️ | **SECURED (Quest #501, 2026-08-07).** The companion to #490's Trusted Types: that one says a string may not reach a sink unless somebody vouched for it, **this is how you vouch**. And it costs the device nothing — the alternative is shipping DOMPurify on every page that displays a comment. ⭐⭐ **Sanitizing the LIVE tree is sanitizing nothing**: parse into the target first and every `<img onerror>` has already fired by the time you delete it. Now parsed into an **inert detached clone of the target's own tag** (keeping fragment-parsing context), sanitized there, then moved across. ⭐⭐ **The canonical config answers each question exactly one way** — allow-list *or* remove-list; "neither" is the empty remove-list (0/9 → 8/9). ⭐ An attribute's default namespace is null, an element's is HTML — backwards, and the config silently matches nothing. **⛔ Cap: `sanitizer-svg-animate` 0/22 and `sanitizer-inert-document` 1/4 TIMEOUT on ENGINE gaps (no SMIL, no image load events), not on the sanitizer.** |
@@ -331,6 +334,91 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-07 — Quests #502–#504, **The Sounded, Rendered & Automated Arc** (`webaudio`: the 49-file probe **642/2096 → 3002/3021**, `idlharness` **49/1163 → 1162/1163**, `audionode-channel-rules` **→ 178/178**)
+
+*Scrolls: [`103-the-sounded-verdict.md`](103-the-sounded-verdict.md) · [`104-the-rendered-verdict.md`](104-the-rendered-verdict.md) · [`105-the-automated-verdict.md`](105-the-automated-verdict.md)*
+
+**One realm, three quests, because `webaudio` is the biggest untouched realm on
+the platform** — 5,763 subtests across 333 files, Chrome at 99%+, and not one row
+in the ledger. Chosen under the standing order from the same Chrome-run bucketing
+the last arc used, re-run and re-diffed.
+
+**And it was the largest instance of the campaign's most dangerous failure mode
+that we have found.** `webaudio` was not missing. It was wearing a **costume**: a
+fingerprinting stub of two dozen object literals shaped like Web Audio, so a
+script asking `createDynamicsCompressor().threshold.value` got a plausible number
+back. `createGain()` returned `{gain:{value:1,setValueAtTime(){}},connect(){}}` —
+a gain you could set that nothing read, a connection to nowhere, a
+`startRendering()` that resolved with silence. 5,763 subtests; **64 passed**.
+
+> **⭐⭐ A realm that ANSWERS wrong is worse than a realm that is MISSING.** A
+> realm that throws is loud — `domxpath` was found in one probe. A realm that
+> answers is invisible: the page asks "is Web Audio available?", is told yes,
+> builds its graph, calls `start()`, and has **no way whatsoever** to discover
+> that nothing happened. No feature detection sees it. No `catch` catches it.
+
+Why this realm, for the people we build for: **Web Audio is how a page makes
+sound WITHOUT shipping audio** — a language lesson synthesising its own tones, a
+metronome, a screen reader's earcons, a game's soundtrack, in kilobytes instead
+of megabytes. On a metered connection that is the whole difference between a page
+that loads and one that does not. And `OfflineAudioContext` is the *cheap* path:
+faster than real time, on the CPU we already have, with no audio device, no
+driver and no latency budget.
+
+**#502 the graph** — the full IDL surface, and `idlharness` **49/1163 →
+1162/1163**, which is **ten subtests ahead of the Chrome run this arc was scoped
+from**. Every `ctor-*` file to 100%. ⭐⭐ An enumeration **argument** throws while
+an enumeration **attribute** is silently ignored (WebIDL §3.7.10) — same string,
+two behaviours, decided purely by where it appears. ⭐⭐ An accessor's `name` is
+`'get x'`/`'set x'` and idlharness checks every one (≈110 subtests, each failing
+twice). ⭐⭐ A Promise-returning operation **rejects**, it does not throw. ⭐
+Rounding *position* is load-bearing: the biquad gain limit is `40·log10f(FLT_MAX)`
+with the `fround` **inside**. ⚠️ The anti-fingerprinting jitter had to move off
+`DynamicsCompressorNode.threshold`, because `-24` is *specified* — **a declared
+parameter is the wrong place to hide.**
+
+**#503 the render** — `audionode-channel-rules` **→ 178/178**, the densest file in
+the realm after `idlharness`. ⭐⭐⭐ **And its baseline is the best lesson in the
+arc: the STUB scored 175/178, by comparing SILENCE TO SILENCE.** The old
+`createBuffer().getChannelData()` returned **a new zero array on every call**, so
+the test wrote its source data into a discarded buffer, read it back as zeros,
+computed an all-zero *expected* from it, and compared that to an all-zero render.
+Making the graph real dropped the score **by 169** before the renderer put it at
+178/178. **A score that FALLS when you make something correct is the strongest
+possible evidence that the number was never measuring the thing** — read the
+denominators, and distrust a high score in a realm you know is fake. (Across the
+probe the totals went 642/2096 → 3002/3021: nearly a thousand subtests existed
+all along and were never reached, because the audit runner aborts a task at its
+first thrown exception.) ⭐⭐ Connections are stored **forward** and
+rendering pulls **backward**. ⭐⭐ Channel mixing is where a graph stops being a
+diagram: 6→2 folds centre and surrounds at `√½` so power is preserved, and the
+**discrete** fallback is what stops an odd channel count producing silence. ⭐⭐ A
+connection to an AudioParam is **summed onto** it, not substituted — that one word
+is what makes an LFO two nodes instead of a `setInterval`. ⭐⭐ A cycle is **legal**
+and the topological walk must skip it, not fail. ⭐⭐ `OfflineAudioContext.suspend()`
+had to become real (the render loop is now `async` and **re-reads the graph on
+resume**). ⭐ A pass-through beats a silence — in a graph, a silencing node takes
+everything downstream with it.
+
+**#504 the timeline** — `event-insertion` **9/15 (stub) → 44/67 (renderer) → 67/67**, every
+ramp/target/curve file 100%. ⭐⭐ A ramp is the only event type that reaches
+**backwards**. ⭐⭐ An exponential ramp is a **ratio**, so it cannot start at or
+cross zero. ⭐⭐ `param.value` reads the **timeline**, not the stored number. ⭐⭐
+`cancelAndHoldAtTime` **truncates** the automation in flight rather than deleting
+it — deleting the ramp snaps the value back to where the envelope started, an
+audible click, and avoiding that click is the only reason the method exists. ⭐⭐
+A curve **owns its start instant but not its end**, and the rule is **asymmetric**
+between "new curve vs old event" and "new event vs old curve" — that asymmetry
+cost two measurement cycles.
+
+⛔ **Honest caps:** the oscillator waveforms are ideal rather than band-limited,
+the compressor passes through, the panner is equal-power only, and
+`decodeAudioData()` **rejects** rather than resolving with silence — because a
+promise that resolves with zeros is the same lie the stub told, and a page cannot
+tell it from a genuinely silent file. Every test that compares against **captured
+reference audio** is out of reach without shipping the same wavetables and impulse
+responses, which would be a poor trade for a low-spec device.
 
 ### 2026-08-07 — Quests #499–#501, **The Named, Old-Web & Vouched Arc** (`domxpath` **2/1145 → 1143/1149** · `quirks` **4362/6978 → 6867/6978** · `sanitizer-api` **→ 431/581**)
 

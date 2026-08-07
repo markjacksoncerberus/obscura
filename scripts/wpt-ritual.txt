@@ -282,3 +282,16 @@ quirks/hashless-hex-color/quirks.html
 quirks/hashless-hex-color/no-quirks.html
 sanitizer-api/sanitizer-basic-filtering.html
 sanitizer-api/sethtml-tree-construction.html
+
+# --- webaudio (Quests #502-#504, the sounded/rendered/automated arc) ---
+# The whole realm was a fingerprinting stub before this arc. These are the
+# densest files: the IDL surface, the channel-mixing table, and the automation
+# timeline. If any of them moves, the renderer moved with it.
+webaudio/idlharness.https.window.html
+webaudio/the-audio-api/the-audioparam-interface/audioparam-nominal-range.html
+webaudio/the-audio-api/the-audionode-interface/audionode-channel-rules.html
+webaudio/the-audio-api/the-pannernode-interface/ctor-panner.html
+webaudio/the-audio-api/the-analysernode-interface/ctor-analyser.html
+webaudio/the-audio-api/the-audioparam-interface/event-insertion.html
+webaudio/the-audio-api/the-biquadfilternode-interface/biquad-getFrequencyResponse.html
+webaudio/the-audio-api/the-audioparam-interface/k-rate-constant-source.html

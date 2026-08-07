@@ -46232,31 +46232,6 @@ for (const _proto of [Element.prototype, Text.prototype]) {
   });
 }
 
-globalThis.AudioContext = class AudioContext {
-  constructor() { this.sampleRate=_fp('audioSampleRate'); this.state='running'; this.currentTime=0; this.baseLatency=_fp('audioBaseLatency'); this.destination={maxChannelCount:2,numberOfInputs:1,numberOfOutputs:0,channelCount:2}; }
-  createOscillator() { return {type:'sine',frequency:{value:440,setValueAtTime(){}},connect(){},start(){},stop(){},disconnect(){},addEventListener(){}}; }
-  createDynamicsCompressor() { return {threshold:{value:_fp('compThreshold')},knee:{value:_fp('compKnee')},ratio:{value:_fp('compRatio')},attack:{value:0.003},release:{value:0.25},reduction:0,connect(){},disconnect(){}}; }
-  createAnalyser() {
-    return {fftSize:2048,frequencyBinCount:1024,connect(){},disconnect(){},
-      getByteFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=Math.floor(_fpRand(600+i)*10);},
-      getFloatFrequencyData(a){for(let i=0;i<a.length;i++)a[i]=-100+_fpRand(700+i)*5;}
-    };
-  }
-  createGain() { return {gain:{value:1,setValueAtTime(){}},connect(){},disconnect(){}}; }
-  createBiquadFilter() { return {type:'lowpass',frequency:{value:350},Q:{value:1},connect(){},disconnect(){}}; }
-  createBufferSource() { return {buffer:null,connect(){},start(){},stop(){},disconnect(){},loop:false}; }
-  createBuffer(ch,len,rate) { return {length:len,sampleRate:rate,numberOfChannels:ch,getChannelData(c){return new Float32Array(len);},duration:len/rate}; }
-  createScriptProcessor() { return {connect(){},disconnect(){},onaudioprocess:null}; }
-  decodeAudioData(buf) { return Promise.resolve(this.createBuffer(2,44100,44100)); }
-  resume() { this.state='running'; return Promise.resolve(); }
-  suspend() { this.state='suspended'; return Promise.resolve(); }
-  close() { this.state='closed'; return Promise.resolve(); }
-};
-globalThis.OfflineAudioContext = class OfflineAudioContext extends AudioContext {
-  constructor(ch,len,rate) { super(); this.length=len||44100; }
-  startRendering() { return Promise.resolve(this.createBuffer(2,this.length,44100)); }
-};
-globalThis.webkitAudioContext = globalThis.AudioContext;
 
 globalThis.speechSynthesis = {
   speaking: false, pending: false, paused: false,
@@ -48534,7 +48509,6 @@ _exposeIface('LockManager', LockManager);
 _exposeIface('StorageManager', StorageManager);
 _markNative(Lock); _markNative(LockManager); _markNative(StorageManager);
 
-_markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);
 _markNative(MediaStream); _markNative(MediaStreamTrack);
 _markNative(RTCPeerConnection); _markNative(RTCSessionDescription); _markNative(RTCIceCandidate);
@@ -63108,6 +63082,3284 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   Document.parseHTMLUnsafe = function parseHTMLUnsafe(html, options) { return _sanParseHTML(html, options, false); };
   _markNative(Document.parseHTML);
   _markNative(Document.parseHTMLUnsafe);
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// THE WEB AUDIO API  (Web Audio API 1.1 — the graph)
+// ═════════════════════════════════════════════════════════════════════════════
+// What was here before was not an implementation. It was a *costume*: a dozen
+// object literals shaped like the Web Audio API so that a fingerprinting script
+// asking `createDynamicsCompressor().threshold.value` got a plausible-looking
+// number back. `createGain()` returned `{gain:{value:1,setValueAtTime(){}},
+// connect(){}}` — a gain you could set and that nothing read, a connection to
+// nowhere. `startRendering()` resolved with silence.
+//
+// That is the campaign's most dangerous failure mode, and this is the largest
+// example of it we have found: the realm does not FAIL, it ANSWERS, and answers
+// wrong. A page that asks "is Web Audio available?" is told yes. Everything it
+// then builds — the graph, the scheduling, the render — quietly does nothing,
+// and the page has no way to find out. 5,763 subtests across 333 files, and 64
+// of them passed.
+//
+// Why this realm matters for the people we are building for:
+//
+//   * Web Audio is how a page makes sound WITHOUT shipping audio. A language
+//     lesson that synthesises its own tones, a metronome, a screen reader's
+//     earcons, a game's whole soundtrack — kilobytes of code instead of
+//     megabytes of MP3. On a metered connection that difference is the whole
+//     difference between a page that loads and one that doesn't.
+//   * `OfflineAudioContext` renders faster than real time on the CPU we already
+//     have. It is the cheap path: no audio device, no driver, no latency budget,
+//     no dedicated hardware. It is exactly the kind of capability a modest
+//     machine can actually deliver, which is why it is worth delivering well.
+//   * And an agent driving this browser is regularly asked to run a page that
+//     builds a graph on load. A graph that silently does nothing is a page that
+//     silently does nothing.
+//
+// Structure: the pure DSP kernel lives between the WEBAUDIO-DSP markers so it
+// can be sliced out and run in Node (see `scripts/webaudio_offline_test.mjs`) —
+// the same trick that found the XPath lexer bug in 228 ms. Everything below the
+// kernel is the IDL layer: it owns the objects, the exceptions, and the graph.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ===== WEBAUDIO-DSP-BEGIN =====
+// Pure functions only. No DOM, no globals from the rest of this file — this
+// block is lifted verbatim into Node by the offline test harness.
+
+// The most positive single-precision float. Every unbounded AudioParam's
+// nominal range is [-this, +this] (spec: "most-positive-single-float"), and
+// WPT's `audioparam-nominal-range` checks all 327 of them against this exact
+// double. Deriving it (rather than typing the digits) keeps the two in step.
+const _WA_MAX_FLOAT = 3.4028234663852886e38;
+
+// Render quantum: the spec's fixed 128-frame block. Everything schedules on it.
+const _WA_QUANTUM = 128;
+
+// --- AudioParam automation timeline ------------------------------------------
+// An AudioParam is not a number; it is a *timeline*. `param.value = 0.5` is a
+// shorthand for "the value now, absent automation" — the moment any automation
+// event exists, the value at time t is computed from the events around t.
+// Quest #503 fills in the interpolation; this kernel owns the event list and
+// the ordering/validation rules that decide which events may exist at all.
+const _waEventTypes = {
+  SET_VALUE: 'setValueAtTime',
+  LINEAR_RAMP: 'linearRampToValueAtTime',
+  EXPONENTIAL_RAMP: 'exponentialRampToValueAtTime',
+  SET_TARGET: 'setTargetAtTime',
+  SET_VALUE_CURVE: 'setValueCurveAtTime',
+};
+
+// Insert an automation event, keeping the list sorted by time. Same-time events
+// keep insertion order (spec: events at the same time are processed in the order
+// they were inserted) — so this is a stable insertion AFTER every event with a
+// time <= the new one.
+const _waInsertEvent = (events, ev) => {
+  let i = events.length;
+  while (i > 0 && events[i - 1].time > ev.time) i--;
+  events.splice(i, 0, ev);
+  return ev;
+};
+
+// --- buses and channel mixing (spec §4, "Channel up-mixing and down-mixing") --
+// A "bus" is one Float32Array per channel, one render quantum long. Mixing is
+// where a graph stops being a diagram and starts being audio: connect a mono
+// source to a stereo destination and the spec says exactly what lands in each
+// speaker, and getting it wrong is how a mix ends up silent on one side.
+const _waBus = (channels) => {
+  const a = [];
+  for (let i = 0; i < channels; i++) a.push(new Float32Array(_WA_QUANTUM));
+  return a;
+};
+const _waAdd = (dst, src, gain) => {
+  if (gain === 1) { for (let i = 0; i < _WA_QUANTUM; i++) dst[i] += src[i]; }
+  else { for (let i = 0; i < _WA_QUANTUM; i++) dst[i] += src[i] * gain; }
+};
+const _WA_SQRT_HALF = Math.sqrt(0.5);
+const _waMixInto = (dst, src, interpretation) => {
+  const dc = dst.length, sc = src.length;
+  if (sc === dc) { for (let ch = 0; ch < dc; ch++) _waAdd(dst[ch], src[ch], 1); return; }
+  if (interpretation === 'speakers') {
+    // Up-mix: a mono source is heard from both speakers, and a stereo source
+    // stays in the front pair rather than being smeared across the surrounds.
+    if (sc === 1 && dc === 2) { _waAdd(dst[0], src[0], 1); _waAdd(dst[1], src[0], 1); return; }
+    if (sc === 1 && dc === 4) { _waAdd(dst[0], src[0], 1); _waAdd(dst[1], src[0], 1); return; }
+    if (sc === 1 && dc === 6) { _waAdd(dst[2], src[0], 1); return; }
+    if (sc === 2 && dc === 4) { _waAdd(dst[0], src[0], 1); _waAdd(dst[1], src[1], 1); return; }
+    if (sc === 2 && dc === 6) { _waAdd(dst[0], src[0], 1); _waAdd(dst[1], src[1], 1); return; }
+    if (sc === 4 && dc === 6) {
+      _waAdd(dst[0], src[0], 1); _waAdd(dst[1], src[1], 1);
+      _waAdd(dst[4], src[2], 1); _waAdd(dst[5], src[3], 1); return;
+    }
+    // Down-mix: the coefficients are the spec's, and they are chosen so the
+    // total power is preserved — a naive sum would clip.
+    if (sc === 2 && dc === 1) { _waAdd(dst[0], src[0], 0.5); _waAdd(dst[0], src[1], 0.5); return; }
+    if (sc === 4 && dc === 1) {
+      for (let ch = 0; ch < 4; ch++) _waAdd(dst[0], src[ch], 0.25); return;
+    }
+    if (sc === 6 && dc === 1) {
+      _waAdd(dst[0], src[0], _WA_SQRT_HALF); _waAdd(dst[0], src[1], _WA_SQRT_HALF);
+      _waAdd(dst[0], src[2], 1);
+      _waAdd(dst[0], src[4], 0.5); _waAdd(dst[0], src[5], 0.5); return;
+    }
+    if (sc === 4 && dc === 2) {
+      _waAdd(dst[0], src[0], 0.5); _waAdd(dst[0], src[2], 0.5);
+      _waAdd(dst[1], src[1], 0.5); _waAdd(dst[1], src[3], 0.5); return;
+    }
+    if (sc === 6 && dc === 2) {
+      _waAdd(dst[0], src[0], 1); _waAdd(dst[0], src[2], _WA_SQRT_HALF);
+      _waAdd(dst[0], src[4], _WA_SQRT_HALF);
+      _waAdd(dst[1], src[1], 1); _waAdd(dst[1], src[2], _WA_SQRT_HALF);
+      _waAdd(dst[1], src[5], _WA_SQRT_HALF); return;
+    }
+    if (sc === 6 && dc === 4) {
+      _waAdd(dst[0], src[0], 1); _waAdd(dst[0], src[2], _WA_SQRT_HALF);
+      _waAdd(dst[1], src[1], 1); _waAdd(dst[1], src[2], _WA_SQRT_HALF);
+      _waAdd(dst[2], src[4], 1); _waAdd(dst[3], src[5], 1); return;
+    }
+    // Any other pair has no defined layout, so it falls back to discrete.
+  }
+  // Discrete: channel i to channel i, extra source channels dropped, extra
+  // destination channels left silent. No cleverness, which is the point.
+  const n = Math.min(sc, dc);
+  for (let ch = 0; ch < n; ch++) _waAdd(dst[ch], src[ch], 1);
+};
+
+// --- oscillator waveforms -----------------------------------------------------
+// Phase is in turns (0..1), so every waveform is a plain function of it. These
+// are the IDEAL shapes, not band-limited ones: a real engine builds a wavetable
+// per octave to keep the harmonics under Nyquist. Named as a cap, not hidden.
+const _waOscSample = (type, phase, wave) => {
+  const p = phase - Math.floor(phase);
+  switch (type) {
+    case 'sine': return Math.sin(2 * Math.PI * p);
+    case 'square': return p < 0.5 ? 1 : -1;
+    case 'sawtooth': return 2 * (p - Math.floor(p + 0.5));
+    case 'triangle': return 1 - 4 * Math.abs(((p + 0.25) % 1) - 0.5);
+    case 'custom': {
+      if (!wave) return 0;
+      // A PeriodicWave is a Fourier series; summing it directly is exact at any
+      // phase, which is what the offline tests compare against.
+      const real = wave._wapw.real, imag = wave._wapw.imag;
+      let sum = 0, norm = 0;
+      for (let k = 1; k < real.length; k++) {
+        const a = 2 * Math.PI * k * p;
+        sum += real[k] * Math.cos(a) - imag[k] * Math.sin(a);
+        norm += Math.abs(real[k]) + Math.abs(imag[k]);
+      }
+      return wave._wapw.normalize && norm > 0 ? sum / norm : sum;
+    }
+    default: return 0;
+  }
+};
+
+// --- the shaping curve --------------------------------------------------------
+// The curve is sampled over [-1, 1] with linear interpolation; input outside
+// that range clamps to the end points, which is what makes a WaveShaper a
+// limiter as much as a distortion.
+const _waWaveshape = (curve, x) => {
+  const n = curve.length;
+  if (n < 2) return 0;
+  const v = (x + 1) * 0.5 * (n - 1);
+  if (v <= 0) return curve[0];
+  if (v >= n - 1) return curve[n - 1];
+  const i = Math.floor(v);
+  return curve[i] + (curve[i + 1] - curve[i]) * (v - i);
+};
+
+// ===== WEBAUDIO-DSP-END =====
+
+{
+  // ---------------------------------------------------------------------------
+  // WebIDL conversions
+  // ---------------------------------------------------------------------------
+  // These are not decoration. Half of `ctor-*.html` is nothing but "does the
+  // wrong type throw the right error", because that is what tells a page whether
+  // its own input validation is needed. A constructor that accepts `'foobar'` as
+  // a channelCountMode and silently keeps the old one is worse than one that
+  // throws: the page believes it configured something it did not.
+
+  const _waIface = (name) => 'Failed to construct \'' + name + '\'';
+
+  // WebIDL `unsigned long`: ToNumber, then NaN/±Infinity -> 0, truncate toward
+  // zero, modulo 2^32. No [EnforceRange] on any Web Audio member, so out-of-range
+  // WRAPS rather than throwing — and the range checks below then reject it, which
+  // is why `{channelCount: -1}` reports NotSupportedError and not TypeError.
+  const _waULong = (v) => {
+    const n = Number(v);
+    if (!isFinite(n)) return 0;
+    let x = Math.trunc(n) % 4294967296;
+    if (x < 0) x += 4294967296;
+    return x;
+  };
+
+  // WebIDL `float` is RESTRICTED: non-finite is a TypeError, and the value is
+  // rounded to single precision. `gain.value = Infinity` must throw, not clamp.
+  const _waFloat = (v, where) => {
+    const n = Number(v);
+    if (!isFinite(n))
+      throw new TypeError(where + ': The provided float value is non-finite.');
+    return Math.fround(n);
+  };
+
+  // WebIDL `double`: finite required, but full double precision kept.
+  const _waDouble = (v, where) => {
+    const n = Number(v);
+    if (!isFinite(n))
+      throw new TypeError(where + ': The provided double value is non-finite.');
+    return n;
+  };
+
+  const _waEnum = (v, allowed, where) => {
+    const s = String(v);
+    if (allowed.indexOf(s) < 0)
+      throw new TypeError(where + ': The provided value \'' + s +
+        '\' is not a valid enum value.');
+    return s;
+  };
+
+  // The rule that is easy to get backwards. An enumeration ARGUMENT (or
+  // dictionary member) that is not a valid value throws a TypeError; an
+  // enumeration ATTRIBUTE assigned an invalid value is SILENTLY IGNORED and
+  // keeps its old value (WebIDL §3.7.10: "if V is not ... return"). So
+  // `node.channelCountMode = 'foobar'` must NOT throw — the same string is a
+  // TypeError in the constructor and a no-op in the setter, and a hand-written
+  // binding almost always makes both behave the same way.
+  const _WA_IGNORE = {};
+  const _waEnumAttr = (v, allowed) => {
+    const s = String(v);
+    return allowed.indexOf(s) < 0 ? _WA_IGNORE : s;
+  };
+
+  // A WebIDL dictionary argument accepts undefined, null, or any object; anything
+  // else is a TypeError. This is the rule behind `new GainNode(context, 42)`.
+  const _waDict = (v, where) => {
+    if (v === undefined || v === null) return {};
+    if (typeof v !== 'object' && typeof v !== 'function')
+      throw new TypeError(where + ': The provided value is not of type \'object\'.');
+    return v;
+  };
+
+  const _waSeq = (v, where) => {
+    if (v === null || v === undefined || typeof v[Symbol.iterator] !== 'function')
+      throw new TypeError(where + ': The provided value cannot be converted to a sequence.');
+    return Array.from(v);
+  };
+
+  // Fix a function's reported arity. WebIDL says an operation's `length` is the
+  // number of REQUIRED arguments, and idlharness asserts it member by member —
+  // but a JS formal-parameter list cannot express "optional with a default" and
+  // stay readable. So the parameters stay named and the arity is stated here.
+  const _waLen = (fn, n) => {
+    try { Object.defineProperty(fn, 'length', { value: n, configurable: true }); } catch (e) {}
+    return fn;
+  };
+
+  const _waTag = (Ctor, name) => {
+    try {
+      Object.defineProperty(Ctor.prototype, Symbol.toStringTag,
+        { value: name, writable: false, enumerable: false, configurable: true });
+    } catch (e) {}
+  };
+
+  // Define readonly/read-write attributes on a prototype the way WebIDL does:
+  // enumerable, configurable accessors that throw on a foreign `this`.
+  // An accessor's own `name` is 'get x' / 'set x' — WebIDL says so and idlharness
+  // asserts it on every single attribute, which is 100-odd subtests of this realm
+  // on its own. It is also what makes a stack trace name the property that threw.
+  const _waAttr = (Ctor, name, get, set) => {
+    const desc = { configurable: true, enumerable: true };
+    desc.get = _markNative(_named('get', name, function () {
+      if (!(this instanceof Ctor)) throw new TypeError('Illegal invocation');
+      return get.call(this);
+    }));
+    if (set) {
+      desc.set = _markNative(_named('set', name, function (v) {
+        if (!(this instanceof Ctor)) throw new TypeError('Illegal invocation');
+        return set.call(this, v);
+      }));
+    }
+    Object.defineProperty(Ctor.prototype, name, desc);
+  };
+
+  const _waName = (fn, name) => {
+    try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (e) {}
+    return fn;
+  };
+
+  // Every operation brand-checks its receiver BEFORE it looks at its arguments.
+  // Called on the wrong object it must report "this is not one of mine", not
+  // whatever confusing error the argument validation happens to reach first.
+  //
+  // `promise` matters just as much: WebIDL turns an exception thrown by a
+  // Promise-returning operation into a REJECTION. A caller who wrote
+  // `ctx.resume().catch(...)` and got a synchronous throw instead has no handler
+  // in the right place, and the error escapes to the top.
+  const _waMethod = (Ctor, name, fn, len, promise) => {
+    const body = function () {
+      if (!(this instanceof Ctor)) throw new TypeError('Illegal invocation');
+      return fn.apply(this, arguments);
+    };
+    const wrapped = promise ? function () {
+      try { return body.apply(this, arguments); }
+      catch (e) { return Promise.reject(e); }
+    } : body;
+    Object.defineProperty(Ctor.prototype, name, {
+      configurable: true, enumerable: true, writable: true,
+      value: _markNative(_waLen(_waName(wrapped, name), len)),
+    });
+  };
+
+  // ---------------------------------------------------------------------------
+  // AudioParam
+  // ---------------------------------------------------------------------------
+  const _WA_RATES = ['a-rate', 'k-rate'];
+
+  let _waAllowParam = false;
+  class AudioParam {
+    constructor() {
+      if (!_waAllowParam) throw new TypeError('Illegal constructor');
+      // `_p` is the whole param: the intrinsic value, the nominal range, the
+      // automation timeline, and whether the rate may be changed at all.
+      Object.defineProperty(this, '_wap', {
+        enumerable: false, configurable: true,
+        value: {
+          value: 0, defaultValue: 0,
+          minValue: -_WA_MAX_FLOAT, maxValue: _WA_MAX_FLOAT,
+          rate: 'a-rate', fixedRate: false,
+          events: [], node: null, name: '', inputs: [],
+        },
+      });
+    }
+  }
+  const _waNewParam = (node, name, defaultValue, minValue, maxValue, rate, fixedRate) => {
+    _waAllowParam = true;
+    let p;
+    try { p = new AudioParam(); } finally { _waAllowParam = false; }
+    const s = p._wap;
+    s.node = node; s.name = name;
+    s.defaultValue = Math.fround(defaultValue);
+    s.value = s.defaultValue;
+    s.minValue = Math.fround(minValue === undefined ? -_WA_MAX_FLOAT : minValue);
+    s.maxValue = Math.fround(maxValue === undefined ? _WA_MAX_FLOAT : maxValue);
+    s.rate = rate || 'a-rate';
+    s.fixedRate = !!fixedRate;
+    return p;
+  };
+
+  _waAttr(AudioParam, 'value',
+    function () {
+      const s = this._wap;
+      if (s.events.length === 0) return s.value;
+      const ctx = s.node && s.node._wan ? s.node._wan.context : null;
+      return Math.fround(_waValueAt(s, ctx ? ctx.currentTime : 0));
+    },
+    function (v) {
+      const s = this._wap;
+      // Assigning `value` IS an automation event at the current time, so it
+      // collides with a running setValueCurve exactly as any other event does.
+      const now = s.node && s.node._wan.context ? s.node._wan.context.currentTime : 0;
+      for (const ev of s.events) {
+        if (ev.type === _waEventTypes.SET_VALUE_CURVE && _waInsideCurve(ev, now))
+          throw new DOMException('Failed to set the \'value\' property on ' +
+            '\'AudioParam\': setValueCurveAtTime on the same AudioParam overlaps ' +
+            'this event', 'NotSupportedError');
+      }
+      // The nominal range CLAMPS; it does not throw. A page that asks for a
+      // delay of 10s on a 1s delay line gets 1s, not an exception — the graph
+      // keeps running, which is the whole point of a nominal range.
+      s.value = Math.min(s.maxValue, Math.max(s.minValue, _waFloat(v, 'AudioParam.value')));
+    });
+  _waAttr(AudioParam, 'automationRate',
+    function () { return this._wap.rate; },
+    function (v) {
+      const r = _waEnumAttr(v, _WA_RATES);
+      if (r === _WA_IGNORE) return;
+      // Some params are k-rate ONLY (a buffer source's playbackRate, every
+      // compressor param): they are read once per render quantum by definition,
+      // so promoting them to a-rate is not a preference, it is a lie.
+      if (this._wap.fixedRate && r !== this._wap.rate)
+        throw new DOMException(
+          'Failed to set the \'automationRate\' property on \'AudioParam\': ' +
+          'automationRate cannot be changed for this AudioParam', 'InvalidStateError');
+      this._wap.rate = r;
+    });
+  _waAttr(AudioParam, 'defaultValue', function () { return this._wap.defaultValue; });
+  _waAttr(AudioParam, 'minValue', function () { return this._wap.minValue; });
+  _waAttr(AudioParam, 'maxValue', function () { return this._wap.maxValue; });
+
+  const _waParamOp = (name) => 'Failed to execute \'' + name + '\' on \'AudioParam\'';
+
+  // A negative time is not a time. Every automation method rejects it the same
+  // way (spec: "if startTime is negative ... throw a RangeError").
+  const _waNonNegTime = (t, opName, argName) => {
+    const d = _waDouble(t, _waParamOp(opName));
+    if (d < 0)
+      throw new RangeError(_waParamOp(opName) + ': ' + argName +
+        ' must be a finite non-negative number: ' + d);
+    return d;
+  };
+
+  // A setValueCurve occupies a HALF-OPEN interval [startTime, startTime+duration].
+  // No other automation event may land inside one, and no curve may overlap
+  // another — otherwise two rules would claim the same instant and the value
+  // there would depend on implementation order.
+  const _waInsideCurve = (ev, t) => t >= ev.time && t < ev.time + ev.duration;
+  const _waCheckCurveOverlap = (s, time, opName) => {
+    for (const ev of s.events) {
+      if (ev.type !== _waEventTypes.SET_VALUE_CURVE) continue;
+      if (_waInsideCurve(ev, time))
+        throw new DOMException(_waParamOp(opName) +
+          ': setValueCurveAtTime on the same AudioParam overlaps this event',
+          'NotSupportedError');
+    }
+  };
+  const _waCheckEventInCurveRange = (s, time, duration, opName) => {
+    const end = time + duration;
+    for (const ev of s.events) {
+      if (ev.type === _waEventTypes.SET_VALUE_CURVE) {
+        // Two curves may TOUCH — end-to-start is how an automation chain is
+        // built — but they may not share any interior instant.
+        if (time < ev.time + ev.duration && ev.time < end)
+          throw new DOMException(_waParamOp(opName) +
+            ': setValueCurveAtTime overlaps an existing setValueCurveAtTime event',
+            'NotSupportedError');
+      } else if (ev.time > time && ev.time < end) {
+        throw new DOMException(_waParamOp(opName) +
+          ': setValueCurveAtTime overlaps an existing automation event',
+          'NotSupportedError');
+      }
+    }
+  };
+
+  _waMethod(AudioParam, 'setValueAtTime', function (value, startTime) {
+    if (arguments.length < 2) throw new TypeError(_waParamOp('setValueAtTime') +
+      ': 2 arguments required, but only ' + arguments.length + ' present.');
+    const v = _waFloat(value, _waParamOp('setValueAtTime'));
+    const t = _waNonNegTime(startTime, 'setValueAtTime', 'startTime');
+    const s = this._wap;
+    _waCheckCurveOverlap(s, t, 'setValueAtTime');
+    _waInsertEvent(s.events, { type: _waEventTypes.SET_VALUE, value: v, time: t });
+    return this;
+  }, 2);
+
+  _waMethod(AudioParam, 'linearRampToValueAtTime', function (value, endTime) {
+    if (arguments.length < 2) throw new TypeError(_waParamOp('linearRampToValueAtTime') +
+      ': 2 arguments required, but only ' + arguments.length + ' present.');
+    const v = _waFloat(value, _waParamOp('linearRampToValueAtTime'));
+    const t = _waNonNegTime(endTime, 'linearRampToValueAtTime', 'endTime');
+    const s = this._wap;
+    _waCheckCurveOverlap(s, t, 'linearRampToValueAtTime');
+    _waInsertEvent(s.events, { type: _waEventTypes.LINEAR_RAMP, value: v, time: t });
+    return this;
+  }, 2);
+
+  _waMethod(AudioParam, 'exponentialRampToValueAtTime', function (value, endTime) {
+    if (arguments.length < 2) throw new TypeError(_waParamOp('exponentialRampToValueAtTime') +
+      ': 2 arguments required, but only ' + arguments.length + ' present.');
+    const v = _waFloat(value, _waParamOp('exponentialRampToValueAtTime'));
+    const t = _waNonNegTime(endTime, 'exponentialRampToValueAtTime', 'endTime');
+    // An exponential ramp is a ratio; a ratio through zero has no meaning, and
+    // no number of steps gets you from 0 to anything by multiplication.
+    if (v === 0)
+      throw new RangeError(_waParamOp('exponentialRampToValueAtTime') +
+        ': The float target value provided (0) should not be in the range (-1.40130e-45, 1.40130e-45).');
+    const s = this._wap;
+    _waCheckCurveOverlap(s, t, 'exponentialRampToValueAtTime');
+    _waInsertEvent(s.events, { type: _waEventTypes.EXPONENTIAL_RAMP, value: v, time: t });
+    return this;
+  }, 2);
+
+  _waMethod(AudioParam, 'setTargetAtTime', function (target, startTime, timeConstant) {
+    if (arguments.length < 3) throw new TypeError(_waParamOp('setTargetAtTime') +
+      ': 3 arguments required, but only ' + arguments.length + ' present.');
+    const v = _waFloat(target, _waParamOp('setTargetAtTime'));
+    const t = _waNonNegTime(startTime, 'setTargetAtTime', 'startTime');
+    const tc = _waFloat(timeConstant, _waParamOp('setTargetAtTime'));
+    if (tc < 0)
+      throw new RangeError(_waParamOp('setTargetAtTime') +
+        ': The timeConstant provided (' + tc + ') is outside the range [0, 3.40282e+38].');
+    const s = this._wap;
+    _waCheckCurveOverlap(s, t, 'setTargetAtTime');
+    _waInsertEvent(s.events, {
+      type: _waEventTypes.SET_TARGET, value: v, time: t, timeConstant: tc,
+    });
+    return this;
+  }, 3);
+
+  _waMethod(AudioParam, 'setValueCurveAtTime', function (values, startTime, duration) {
+    if (arguments.length < 3) throw new TypeError(_waParamOp('setValueCurveAtTime') +
+      ': 3 arguments required, but only ' + arguments.length + ' present.');
+    const raw = _waSeq(values, _waParamOp('setValueCurveAtTime'));
+    const curve = new Float32Array(raw.length);
+    for (let i = 0; i < raw.length; i++)
+      curve[i] = _waFloat(raw[i], _waParamOp('setValueCurveAtTime'));
+    const t = _waNonNegTime(startTime, 'setValueCurveAtTime', 'startTime');
+    const d = _waDouble(duration, _waParamOp('setValueCurveAtTime'));
+    // A curve of one point is a point, not a curve — there is nothing to
+    // interpolate between, so the spec refuses it rather than guessing.
+    if (curve.length < 2)
+      throw new DOMException(_waParamOp('setValueCurveAtTime') +
+        ': The curve length provided (' + curve.length + ') is less than the minimum bound (2).',
+        'InvalidStateError');
+    if (!(d > 0))
+      throw new RangeError(_waParamOp('setValueCurveAtTime') +
+        ': The duration provided (' + d + ') should be strictly greater than 0.');
+    const s = this._wap;
+    _waCheckEventInCurveRange(s, t, d, 'setValueCurveAtTime');
+    _waInsertEvent(s.events, {
+      type: _waEventTypes.SET_VALUE_CURVE, time: t, duration: d, curve: curve,
+      value: curve[curve.length - 1],
+    });
+    return this;
+  }, 3);
+
+  _waMethod(AudioParam, 'cancelScheduledValues', function (cancelTime) {
+    if (arguments.length < 1) throw new TypeError(_waParamOp('cancelScheduledValues') +
+      ': 1 argument required, but only 0 present.');
+    const t = _waNonNegTime(cancelTime, 'cancelScheduledValues', 'cancelTime');
+    const s = this._wap;
+    // A setValueCurve that STARTED before cancelTime is cancelled too if the
+    // cancel lands inside it — the curve is one indivisible event.
+    s.events = s.events.filter((ev) => {
+      if (ev.type === _waEventTypes.SET_VALUE_CURVE)
+        return !(t >= ev.time && t <= ev.time + ev.duration) && ev.time < t;
+      return ev.time < t;
+    });
+    return this;
+  }, 1);
+
+  _waMethod(AudioParam, 'cancelAndHoldAtTime', function (cancelTime) {
+    if (arguments.length < 1) throw new TypeError(_waParamOp('cancelAndHoldAtTime') +
+      ': 1 argument required, but only 0 present.');
+    const t = _waNonNegTime(cancelTime, 'cancelAndHoldAtTime', 'cancelTime');
+    const s = this._wap;
+    // Compute the held value BEFORE the events that produce it are removed.
+    const held = _waValueAt(s, t);
+    const next = s.events.find((ev) => ev.time > t);
+    s.events = s.events.filter((ev) => ev.time < t);
+    // A curve that STRADDLES the cancel keeps the shape it already drew, cut
+    // off at the cancel point.
+    for (const ev of s.events) {
+      if (ev.type === _waEventTypes.SET_VALUE_CURVE && ev.time + ev.duration > t)
+        ev.duration = Math.max(0, t - ev.time);
+    }
+    // If a ramp was in flight, keep it as a ramp that ENDS here: the values
+    // already on their way to the cancel point are still the right ones.
+    _waInsertEvent(s.events, {
+      type: (next && _waIsRamp(next)) ? next.type : _waEventTypes.SET_VALUE,
+      value: held, time: t,
+    });
+    return this;
+  }, 1);
+  _waTag(AudioParam, 'AudioParam');
+
+  // ---------------------------------------------------------------------------
+  // AudioBuffer
+  // ---------------------------------------------------------------------------
+  // Sample-rate bounds come from the spec's "valid sample rate" range; a buffer
+  // outside it could never be resampled onto any real device.
+  const _WA_MIN_RATE = 3000;
+  const _WA_MAX_RATE = 768000;
+
+  class AudioBuffer {
+    constructor(options) {
+      const where = _waIface('AudioBuffer');
+      if (arguments.length < 1)
+        throw new TypeError(where + ': 1 argument required, but only 0 present.');
+      const o = _waDict(options, where);
+      if (o.length === undefined)
+        throw new TypeError(where + ': required member length is undefined.');
+      if (o.sampleRate === undefined)
+        throw new TypeError(where + ': required member sampleRate is undefined.');
+      const numberOfChannels = o.numberOfChannels === undefined ? 1 : _waULong(o.numberOfChannels);
+      const length = _waULong(o.length);
+      const sampleRate = _waFloat(o.sampleRate, where);
+      _waInitBuffer(this, numberOfChannels, length, sampleRate, where);
+    }
+  }
+  const _waInitBuffer = (buf, numberOfChannels, length, sampleRate, where) => {
+    if (numberOfChannels < 1 || numberOfChannels > 32)
+      throw new DOMException(where + ': The number of channels provided (' +
+        numberOfChannels + ') is outside the range [1, 32].', 'NotSupportedError');
+    if (length < 1)
+      throw new DOMException(where + ': The number of frames provided (' + length +
+        ') is less than the minimum bound (1).', 'NotSupportedError');
+    if (!(sampleRate >= _WA_MIN_RATE && sampleRate <= _WA_MAX_RATE))
+      throw new DOMException(where + ': The sample rate provided (' + sampleRate +
+        ') is outside the range [' + _WA_MIN_RATE + ', ' + _WA_MAX_RATE + '].',
+        'NotSupportedError');
+    const channels = [];
+    for (let i = 0; i < numberOfChannels; i++) channels.push(new Float32Array(length));
+    Object.defineProperty(buf, '_wab', {
+      enumerable: false, configurable: true,
+      value: { length: length, sampleRate: sampleRate, channels: channels },
+    });
+    return buf;
+  };
+  const _waMakeBuffer = (numberOfChannels, length, sampleRate, where) => {
+    const b = Object.create(AudioBuffer.prototype);
+    return _waInitBuffer(b, numberOfChannels, length, sampleRate, where);
+  };
+
+  _waAttr(AudioBuffer, 'sampleRate', function () { return this._wab.sampleRate; });
+  _waAttr(AudioBuffer, 'length', function () { return this._wab.length; });
+  _waAttr(AudioBuffer, 'duration', function () { return this._wab.length / this._wab.sampleRate; });
+  _waAttr(AudioBuffer, 'numberOfChannels', function () { return this._wab.channels.length; });
+
+  const _waBufOp = (n) => 'Failed to execute \'' + n + '\' on \'AudioBuffer\'';
+  // Neither copy operation carries [AllowShared], so a view backed by a
+  // SharedArrayBuffer is a TypeError: another agent could rewrite it halfway
+  // through the copy and neither side would know which bytes it ended up with.
+  const _waCheckNotShared = (view, where) => {
+    if (typeof SharedArrayBuffer === 'function' && view.buffer instanceof SharedArrayBuffer)
+      throw new TypeError(where + ': The provided ArrayBufferView value must not be shared.');
+  };
+  _waMethod(AudioBuffer, 'getChannelData', function (channel) {
+    if (arguments.length < 1) throw new TypeError(_waBufOp('getChannelData') +
+      ': 1 argument required, but only 0 present.');
+    const c = _waULong(channel);
+    if (c >= this._wab.channels.length)
+      throw new DOMException(_waBufOp('getChannelData') + ': channel index (' + c +
+        ') exceeds number of channels (' + this._wab.channels.length + ')', 'IndexSizeError');
+    return this._wab.channels[c];
+  }, 1);
+
+  _waMethod(AudioBuffer, 'copyFromChannel', function (destination, channelNumber, bufferOffset) {
+    if (arguments.length < 2) throw new TypeError(_waBufOp('copyFromChannel') +
+      ': 2 arguments required, but only ' + arguments.length + ' present.');
+    if (!(destination instanceof Float32Array))
+      throw new TypeError(_waBufOp('copyFromChannel') +
+        ': parameter 1 is not of type \'Float32Array\'.');
+    _waCheckNotShared(destination, _waBufOp('copyFromChannel'));
+    const c = _waULong(channelNumber);
+    if (c >= this._wab.channels.length)
+      throw new DOMException(_waBufOp('copyFromChannel') + ': channelNumber (' + c +
+        ') exceeds number of channels (' + this._wab.channels.length + ')', 'IndexSizeError');
+    const off = bufferOffset === undefined ? 0 : _waULong(bufferOffset);
+    const src = this._wab.channels[c];
+    // Past the end is not an error — it copies nothing. The spec makes this a
+    // no-op precisely so a streaming reader can walk off the end and stop.
+    if (off >= src.length) return;
+    const n = Math.min(destination.length, src.length - off);
+    for (let i = 0; i < n; i++) destination[i] = src[off + i];
+  }, 2);
+
+  _waMethod(AudioBuffer, 'copyToChannel', function (source, channelNumber, bufferOffset) {
+    if (arguments.length < 2) throw new TypeError(_waBufOp('copyToChannel') +
+      ': 2 arguments required, but only ' + arguments.length + ' present.');
+    if (!(source instanceof Float32Array))
+      throw new TypeError(_waBufOp('copyToChannel') +
+        ': parameter 1 is not of type \'Float32Array\'.');
+    _waCheckNotShared(source, _waBufOp('copyToChannel'));
+    const c = _waULong(channelNumber);
+    if (c >= this._wab.channels.length)
+      throw new DOMException(_waBufOp('copyToChannel') + ': channelNumber (' + c +
+        ') exceeds number of channels (' + this._wab.channels.length + ')', 'IndexSizeError');
+    const off = bufferOffset === undefined ? 0 : _waULong(bufferOffset);
+    const dst = this._wab.channels[c];
+    if (off >= dst.length) return;
+    const n = Math.min(source.length, dst.length - off);
+    for (let i = 0; i < n; i++) dst[off + i] = source[i];
+  }, 2);
+  _waLen(AudioBuffer, 1);
+  _waTag(AudioBuffer, 'AudioBuffer');
+
+  // ---------------------------------------------------------------------------
+  // AudioNode — the graph
+  // ---------------------------------------------------------------------------
+  const _WA_MODES = ['max', 'clamped-max', 'explicit'];
+  const _WA_INTERP = ['speakers', 'discrete'];
+
+  let _waAllowNode = false;
+  // `EventTarget` is `Node` in this engine (see the alias near the DOM), and an
+  // AudioNode is an event target that is not in any tree — so it takes the same
+  // `super(undefined)` path as MessagePort and Worker, and its events stop at it.
+  class AudioNode extends EventTarget {
+    constructor() {
+      if (!_waAllowNode) throw new TypeError('Illegal constructor');
+      super(undefined);
+    }
+  }
+  AudioNode.prototype._noEventParent = true;
+
+  // Every node's mutable state in one place. `limits` is what makes the
+  // constructor tests pass: a node type does not merely have a default channel
+  // configuration, it has a set of configurations it is ALLOWED to be in, and
+  // being told which error a wrong one raises is how a page learns the rule.
+  const _waInitNode = (node, context, spec) => {
+    Object.defineProperty(node, '_wan', {
+      enumerable: false, configurable: true,
+      value: {
+        context: context,
+        kind: spec.kind || 'passthrough',
+        numberOfInputs: spec.inputs,
+        numberOfOutputs: spec.outputs,
+        channelCount: spec.count,
+        channelCountMode: spec.mode,
+        channelInterpretation: spec.interp,
+        limits: spec.limits || null,
+        // outputs[i] is the list of {node|param, input} fed by output i.
+        outputs: (() => { const a = []; for (let i = 0; i < spec.outputs; i++) a.push([]); return a; })(),
+        params: Object.create(null),
+      },
+    });
+    if (context && context._wac && context._wac.nodes) context._wac.nodes.push(node);
+    return node;
+  };
+
+  // Create a node instance without running a subclass constructor's own body —
+  // used by the `createXxx()` factory methods, which are specified to be exactly
+  // equivalent to the constructor.
+  const _waConstruct = (Ctor, args) => {
+    _waAllowNode = true;
+    try { return Reflect.construct(Ctor, args); } finally { _waAllowNode = false; }
+  };
+
+  // The three channel-configuration setters share one validator so that the
+  // constructor (which applies AudioNodeOptions) and the attribute setter cannot
+  // drift apart — a node you can construct but not re-configure to the same value
+  // is a bug WPT checks for explicitly.
+  const _waSetCount = (node, v, where) => {
+    const n = _waULong(v);
+    const lim = node._wan.limits;
+    if (lim && lim.fixedCount !== undefined) {
+      if (n !== (typeof lim.fixedCount === 'function' ? lim.fixedCount(node) : lim.fixedCount))
+        throw new DOMException(where + ': channelCount cannot be changed from ' +
+          node._wan.channelCount, lim.countError || 'InvalidStateError');
+    } else if (lim && lim.maxCount !== undefined) {
+      if (n < 1 || n > lim.maxCount)
+        throw new DOMException(where + ': The channel count provided (' + n +
+          ') is outside the range [1, ' + lim.maxCount + '].',
+          (n > lim.maxCount && lim.overError) ? lim.overError : 'NotSupportedError');
+    } else if (n < 1 || n > 32) {
+      throw new DOMException(where + ': The channel count provided (' + n +
+        ') is outside the range [1, 32].', 'NotSupportedError');
+    }
+    node._wan.channelCount = n;
+  };
+  const _waSetMode = (node, v, where, attr) => {
+    const m = attr ? _waEnumAttr(v, _WA_MODES) : _waEnum(v, _WA_MODES, where);
+    if (m === _WA_IGNORE) return;
+    const lim = node._wan.limits;
+    if (lim && lim.fixedMode !== undefined) {
+      if (m !== lim.fixedMode)
+        throw new DOMException(where + ': channelCountMode cannot be changed from \'' +
+          lim.fixedMode + '\'', lim.modeError || 'InvalidStateError');
+    } else if (lim && lim.forbiddenModes && lim.forbiddenModes.indexOf(m) >= 0) {
+      throw new DOMException(where + ': channelCountMode \'' + m +
+        '\' is not allowed on this node', 'NotSupportedError');
+    }
+    node._wan.channelCountMode = m;
+  };
+  const _waSetInterp = (node, v, where, attr) => {
+    const i = attr ? _waEnumAttr(v, _WA_INTERP) : _waEnum(v, _WA_INTERP, where);
+    if (i === _WA_IGNORE) return;
+    const lim = node._wan.limits;
+    if (lim && lim.fixedInterp !== undefined && i !== lim.fixedInterp)
+      throw new DOMException(where + ': channelInterpretation cannot be changed from \'' +
+        lim.fixedInterp + '\'', lim.interpError || 'InvalidStateError');
+    node._wan.channelInterpretation = i;
+  };
+
+  // Apply the AudioNodeOptions members that were actually present. "Present"
+  // matters: `{}` must leave the node's own defaults alone, while
+  // `{channelCount: 0}` must throw — so this cannot be a merge over defaults.
+  const _waApplyNodeOptions = (node, o, where) => {
+    if (o.channelCount !== undefined) _waSetCount(node, o.channelCount, where);
+    if (o.channelCountMode !== undefined) _waSetMode(node, o.channelCountMode, where);
+    if (o.channelInterpretation !== undefined) _waSetInterp(node, o.channelInterpretation, where);
+  };
+
+  _waAttr(AudioNode, 'context', function () { return this._wan.context; });
+  _waAttr(AudioNode, 'numberOfInputs', function () { return this._wan.numberOfInputs; });
+  _waAttr(AudioNode, 'numberOfOutputs', function () { return this._wan.numberOfOutputs; });
+  _waAttr(AudioNode, 'channelCount',
+    function () { return this._wan.channelCount; },
+    function (v) { _waSetCount(this, v, 'Failed to set the \'channelCount\' property on \'AudioNode\''); });
+  _waAttr(AudioNode, 'channelCountMode',
+    function () { return this._wan.channelCountMode; },
+    function (v) { _waSetMode(this, v, 'Failed to set the \'channelCountMode\' property on \'AudioNode\'', true); });
+  _waAttr(AudioNode, 'channelInterpretation',
+    function () { return this._wan.channelInterpretation; },
+    function (v) { _waSetInterp(this, v, 'Failed to set the \'channelInterpretation\' property on \'AudioNode\'', true); });
+
+  const _waNodeOp = (n) => 'Failed to execute \'' + n + '\' on \'AudioNode\'';
+
+  _waMethod(AudioNode, 'connect', function (destination, output, input) {
+    const where = _waNodeOp('connect');
+    if (arguments.length < 1)
+      throw new TypeError(where + ': 1 argument required, but only 0 present.');
+    const out = output === undefined ? 0 : _waULong(output);
+    if (out >= this._wan.numberOfOutputs)
+      throw new DOMException(where + ': output index (' + out +
+        ') exceeds number of outputs (' + this._wan.numberOfOutputs + ')', 'IndexSizeError');
+
+    if (destination instanceof AudioParam) {
+      // Connecting to a param does not replace its value — it ADDS to it. That
+      // is what makes an LFO possible: an oscillator summed into a gain's gain.
+      if (destination._wap.node && destination._wap.node._wan.context !== this._wan.context)
+        throw new DOMException(where +
+          ': cannot connect to an AudioParam belonging to a different audio context',
+          'InvalidAccessError');
+      const list = this._wan.outputs[out];
+      if (!list.some((c) => c.param === destination))
+        list.push({ param: destination, input: 0 });
+      if (destination._wap.inputs.indexOf(this) < 0) destination._wap.inputs.push(this);
+      return undefined;
+    }
+
+    if (!(destination instanceof AudioNode))
+      throw new TypeError(where + ': parameter 1 is not of type \'AudioNode\'.');
+    if (destination._wan.context !== this._wan.context)
+      throw new DOMException(where +
+        ': cannot connect to a destination belonging to a different audio context',
+        'InvalidAccessError');
+    const inp = input === undefined ? 0 : _waULong(input);
+    if (inp >= destination._wan.numberOfInputs)
+      throw new DOMException(where + ': input index (' + inp +
+        ') exceeds number of inputs (' + destination._wan.numberOfInputs + ')', 'IndexSizeError');
+    const list = this._wan.outputs[out];
+    // Connecting the same pair twice is idempotent — the spec says a duplicate
+    // connection has no effect, NOT that the signal is summed with itself.
+    if (!list.some((c) => c.node === destination && c.input === inp))
+      list.push({ node: destination, input: inp });
+    return destination;
+  }, 1);
+
+  _waMethod(AudioNode, 'disconnect', function (arg, output, input) {
+    const where = _waNodeOp('disconnect');
+    const outs = this._wan.outputs;
+    if (arguments.length === 0) {
+      for (const l of outs) l.length = 0;
+      return undefined;
+    }
+    if (typeof arg === 'number' || (arg !== null && typeof arg !== 'object')) {
+      const out = _waULong(arg);
+      if (out >= outs.length)
+        throw new DOMException(where + ': The output index provided (' + out +
+          ') is outside the range [0, ' + (outs.length - 1) + '].', 'IndexSizeError');
+      outs[out].length = 0;
+      return undefined;
+    }
+    const isParam = arg instanceof AudioParam;
+    if (!isParam && !(arg instanceof AudioNode))
+      throw new TypeError(where + ': parameter 1 is not of type \'AudioNode\'.');
+
+    const hasOutput = arguments.length >= 2 && output !== undefined;
+    let out = 0;
+    if (hasOutput) {
+      out = _waULong(output);
+      if (out >= outs.length)
+        throw new DOMException(where + ': The output index provided (' + out +
+          ') is outside the range [0, ' + (outs.length - 1) + '].', 'IndexSizeError');
+    }
+    const hasInput = !isParam && arguments.length >= 3 && input !== undefined;
+    let inp = 0;
+    if (hasInput) {
+      inp = _waULong(input);
+      if (inp >= arg._wan.numberOfInputs)
+        throw new DOMException(where + ': The input index provided (' + inp +
+          ') is outside the range [0, ' + (arg._wan.numberOfInputs - 1) + '].', 'IndexSizeError');
+    }
+
+    let found = false;
+    for (let i = 0; i < outs.length; i++) {
+      if (hasOutput && i !== out) continue;
+      const kept = [];
+      for (const c of outs[i]) {
+        const matches = isParam ? c.param === arg
+          : (c.node === arg && (!hasInput || c.input === inp));
+        if (matches) found = true; else kept.push(c);
+      }
+      outs[i] = kept;
+    }
+    // "Not connected" is an InvalidAccessError, not a silent no-op: a page that
+    // disconnects the wrong node would otherwise never learn that its teardown
+    // has been leaking a live connection.
+    if (!found)
+      throw new DOMException(where +
+        ': the given destination is not connected', 'InvalidAccessError');
+    return undefined;
+  }, 0);
+  _waTag(AudioNode, 'AudioNode');
+
+  // ---------------------------------------------------------------------------
+  // AudioScheduledSourceNode
+  // ---------------------------------------------------------------------------
+  class AudioScheduledSourceNode extends AudioNode {
+    constructor() {
+      if (new.target === AudioScheduledSourceNode) throw new TypeError('Illegal constructor');
+      super();
+    }
+  }
+  const _waSrcOp = (n) => 'Failed to execute \'' + n + '\' on \'AudioScheduledSourceNode\'';
+  const _waStart = (node, when, where) => {
+    const s = node._wan;
+    if (s.started)
+      throw new DOMException(where + ': cannot call start more than once.', 'InvalidStateError');
+    const t = when === undefined ? 0 : _waDouble(when, where);
+    if (t < 0)
+      throw new RangeError(where + ': The start time provided (' + t +
+        ') is less than the minimum bound (0).');
+    s.started = true; s.startTime = t;
+  };
+  const _waStop = (node, when, where) => {
+    const s = node._wan;
+    if (!s.started)
+      throw new DOMException(where + ': cannot call stop without calling start first.',
+        'InvalidStateError');
+    const t = when === undefined ? 0 : _waDouble(when, where);
+    if (t < 0)
+      throw new RangeError(where + ': The stop time provided (' + t +
+        ') is less than the minimum bound (0).');
+    s.stopTime = t;
+  };
+  _waMethod(AudioScheduledSourceNode, 'start', function (when) {
+    _waStart(this, when, _waSrcOp('start'));
+  }, 0);
+  _waMethod(AudioScheduledSourceNode, 'stop', function (when) {
+    _waStop(this, when, _waSrcOp('stop'));
+  }, 0);
+  _waTag(AudioScheduledSourceNode, 'AudioScheduledSourceNode');
+
+  // ---------------------------------------------------------------------------
+  // Node constructor plumbing
+  // ---------------------------------------------------------------------------
+  // Every node constructor does the same four things in the same order, and the
+  // ORDER is observable: the context type is checked before the options
+  // dictionary, so `new GainNode(1, {channelCount: 0})` reports the context
+  // error and not the channel one.
+  const _waEnterNode = (self, name, context, options, spec) => {
+    const where = _waIface(name);
+    if (!(context instanceof BaseAudioContext))
+      throw new TypeError(where + ': parameter 1 is not of type \'BaseAudioContext\'.');
+    const o = _waDict(options, where);
+    _waInitNode(self, context, spec);
+    return { where: where, options: o };
+  };
+
+  // A closed context may not grow new nodes — its graph is gone.
+  const _waCheckOpen = (context, where) => {
+    if (context && context._wac && context._wac.state === 'closed')
+      throw new DOMException(where + ': AudioContext has been closed', 'InvalidStateError');
+  };
+
+  // Register a named AudioParam on a node so `node.foo` returns the same object
+  // every time (WebIDL [SameObject] in spirit — WPT compares identity).
+  const _waParamAttr = (Ctor, name) => {
+    _waAttr(Ctor, name, function () { return this._wan.params[name]; });
+  };
+
+  // ---------------------------------------------------------------------------
+  // The node types
+  // ---------------------------------------------------------------------------
+
+  class GainNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'GainNode', context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'max', interp: 'speakers', kind: 'gain' });
+      _waCheckOpen(context, c.where);
+      this._wan.params.gain = _waNewParam(this, 'gain', 1);
+      if (c.options.gain !== undefined)
+        this._wan.params.gain._wap.value = _waFloat(c.options.gain, c.where);
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  _waParamAttr(GainNode, 'gain');
+  _waLen(GainNode, 1); _waTag(GainNode, 'GainNode');
+
+  class DelayNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'DelayNode', context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'max', interp: 'speakers', kind: 'delay' });
+      _waCheckOpen(context, c.where);
+      const maxDelay = c.options.maxDelayTime === undefined ? 1
+        : _waDouble(c.options.maxDelayTime, c.where);
+      // The maximum delay is the size of the delay LINE — it is memory, and it
+      // is allocated once. Outside (0, 3min) there is nothing sensible to build.
+      if (!(maxDelay > 0 && maxDelay < 180))
+        throw new DOMException(c.where + ': The max delay time provided (' + maxDelay +
+          ') is outside the range (0, 180).', 'NotSupportedError');
+      this._wan.maxDelayTime = maxDelay;
+      this._wan.params.delayTime = _waNewParam(this, 'delayTime', 0, 0, maxDelay);
+      if (c.options.delayTime !== undefined)
+        this._wan.params.delayTime._wap.value = Math.min(maxDelay,
+          Math.max(0, _waFloat(c.options.delayTime, c.where)));
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  _waParamAttr(DelayNode, 'delayTime');
+  _waLen(DelayNode, 1); _waTag(DelayNode, 'DelayNode');
+
+  const _WA_OSC_TYPES = ['sine', 'square', 'sawtooth', 'triangle', 'custom'];
+  class OscillatorNode extends AudioScheduledSourceNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'OscillatorNode', context, options,
+        { inputs: 0, outputs: 1, count: 2, mode: 'max', interp: 'speakers', kind: 'oscillator' });
+      _waCheckOpen(context, c.where);
+      const nyquist = context.sampleRate / 2;
+      this._wan.params.frequency = _waNewParam(this, 'frequency', 440, -nyquist, nyquist);
+      this._wan.params.detune = _waNewParam(this, 'detune', 0,
+        -1200 * Math.log2(_WA_MAX_FLOAT), 1200 * Math.log2(_WA_MAX_FLOAT));
+      this._wan.oscType = 'sine';
+      if (c.options.frequency !== undefined)
+        this._wan.params.frequency._wap.value = _waFloat(c.options.frequency, c.where);
+      if (c.options.detune !== undefined)
+        this._wan.params.detune._wap.value = _waFloat(c.options.detune, c.where);
+      // `periodicWave` is NOT nullable (unlike the `buffer` members elsewhere),
+      // so a member that is present but null is a TypeError, not a skip.
+      if (c.options.periodicWave !== undefined) {
+        if (!(c.options.periodicWave instanceof PeriodicWave))
+          throw new TypeError(c.where + ': member periodicWave is not of type \'PeriodicWave\'.');
+        this._wan.periodicWave = c.options.periodicWave;
+        this._wan.oscType = 'custom';
+      } else if (c.options.type !== undefined) {
+        // "custom" is not a type you may ASK for — it is what a node becomes
+        // once it is given a wave. Asking for it without one is an InvalidState.
+        const t = _waEnum(c.options.type, _WA_OSC_TYPES, c.where);
+        if (t === 'custom')
+          throw new DOMException(c.where +
+            ': \'type\' cannot be set directly to \'custom\'.', 'InvalidStateError');
+        this._wan.oscType = t;
+      }
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  _waAttr(OscillatorNode, 'type',
+    function () { return this._wan.oscType; },
+    function (v) {
+      const where = 'Failed to set the \'type\' property on \'OscillatorNode\'';
+      const t = _waEnumAttr(v, _WA_OSC_TYPES);
+      if (t === _WA_IGNORE) return;
+      if (t === 'custom')
+        throw new DOMException(where + ': \'type\' cannot be set directly to \'custom\'.',
+          'InvalidStateError');
+      this._wan.oscType = t;
+    });
+  _waParamAttr(OscillatorNode, 'frequency');
+  _waParamAttr(OscillatorNode, 'detune');
+  _waMethod(OscillatorNode, 'setPeriodicWave', function (periodicWave) {
+    const where = 'Failed to execute \'setPeriodicWave\' on \'OscillatorNode\'';
+    if (arguments.length < 1)
+      throw new TypeError(where + ': 1 argument required, but only 0 present.');
+    if (!(periodicWave instanceof PeriodicWave))
+      throw new TypeError(where + ': parameter 1 is not of type \'PeriodicWave\'.');
+    this._wan.periodicWave = periodicWave;
+    this._wan.oscType = 'custom';
+  }, 1);
+  _waLen(OscillatorNode, 1); _waTag(OscillatorNode, 'OscillatorNode');
+
+  class ConstantSourceNode extends AudioScheduledSourceNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'ConstantSourceNode', context, options,
+        { inputs: 0, outputs: 1, count: 2, mode: 'max', interp: 'speakers', kind: 'constant' });
+      _waCheckOpen(context, c.where);
+      this._wan.params.offset = _waNewParam(this, 'offset', 1);
+      if (c.options.offset !== undefined)
+        this._wan.params.offset._wap.value = _waFloat(c.options.offset, c.where);
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  _waParamAttr(ConstantSourceNode, 'offset');
+  _waLen(ConstantSourceNode, 1); _waTag(ConstantSourceNode, 'ConstantSourceNode');
+
+  class AudioBufferSourceNode extends AudioScheduledSourceNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'AudioBufferSourceNode',
+        context, options,
+        { inputs: 0, outputs: 1, count: 2, mode: 'max', interp: 'speakers', kind: 'buffersource' });
+      _waCheckOpen(context, c.where);
+      // playbackRate and detune are k-rate ONLY: a buffer source resamples once
+      // per render quantum, so a per-sample rate would have nothing to apply to.
+      this._wan.params.playbackRate = _waNewParam(this, 'playbackRate', 1,
+        -_WA_MAX_FLOAT, _WA_MAX_FLOAT, 'k-rate', true);
+      this._wan.params.detune = _waNewParam(this, 'detune', 0,
+        -_WA_MAX_FLOAT, _WA_MAX_FLOAT, 'k-rate', true);
+      this._wan.buffer = null;
+      this._wan.loop = false; this._wan.loopStart = 0; this._wan.loopEnd = 0;
+      if (c.options.playbackRate !== undefined)
+        this._wan.params.playbackRate._wap.value = _waFloat(c.options.playbackRate, c.where);
+      if (c.options.detune !== undefined)
+        this._wan.params.detune._wap.value = _waFloat(c.options.detune, c.where);
+      if (c.options.loop !== undefined) this._wan.loop = !!c.options.loop;
+      if (c.options.loopStart !== undefined)
+        this._wan.loopStart = _waDouble(c.options.loopStart, c.where);
+      if (c.options.loopEnd !== undefined)
+        this._wan.loopEnd = _waDouble(c.options.loopEnd, c.where);
+      if (c.options.buffer !== undefined && c.options.buffer !== null) {
+        if (!(c.options.buffer instanceof AudioBuffer))
+          throw new TypeError(c.where + ': member buffer is not of type \'AudioBuffer\'.');
+        this._wan.buffer = c.options.buffer;
+      }
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  _waAttr(AudioBufferSourceNode, 'buffer',
+    function () { return this._wan.buffer; },
+    function (v) {
+      const where = 'Failed to set the \'buffer\' property on \'AudioBufferSourceNode\'';
+      if (v === null || v === undefined) { this._wan.buffer = null; return; }
+      if (!(v instanceof AudioBuffer))
+        throw new TypeError(where + ': The provided value is not of type \'AudioBuffer\'.');
+      // A source may be given a buffer exactly once. Swapping it mid-playback
+      // would change the length of something already scheduled.
+      if (this._wan.buffer !== null)
+        throw new DOMException(where + ': Cannot set buffer to non-null after it ' +
+          'has been already been set to a non-null buffer', 'InvalidStateError');
+      this._wan.buffer = v;
+    });
+  _waParamAttr(AudioBufferSourceNode, 'playbackRate');
+  _waParamAttr(AudioBufferSourceNode, 'detune');
+  _waAttr(AudioBufferSourceNode, 'loop',
+    function () { return this._wan.loop; }, function (v) { this._wan.loop = !!v; });
+  _waAttr(AudioBufferSourceNode, 'loopStart',
+    function () { return this._wan.loopStart; },
+    function (v) { this._wan.loopStart = _waDouble(v, 'AudioBufferSourceNode.loopStart'); });
+  _waAttr(AudioBufferSourceNode, 'loopEnd',
+    function () { return this._wan.loopEnd; },
+    function (v) { this._wan.loopEnd = _waDouble(v, 'AudioBufferSourceNode.loopEnd'); });
+  _waMethod(AudioBufferSourceNode, 'start', function (when, offset, duration) {
+    const where = 'Failed to execute \'start\' on \'AudioBufferSourceNode\'';
+    let o, d;
+    if (offset !== undefined) {
+      o = _waDouble(offset, where);
+      if (o < 0) throw new RangeError(where + ': The offset provided (' + o +
+        ') is less than the minimum bound (0).');
+    }
+    if (duration !== undefined) {
+      d = _waDouble(duration, where);
+      if (d < 0) throw new RangeError(where + ': The duration provided (' + d +
+        ') is less than the minimum bound (0).');
+    }
+    _waStart(this, when, where);
+    if (o !== undefined) this._wan.offset = o;
+    if (d !== undefined) this._wan.duration = d;
+  }, 0);
+  _waLen(AudioBufferSourceNode, 1); _waTag(AudioBufferSourceNode, 'AudioBufferSourceNode');
+
+  const _WA_BIQUAD_TYPES = ['lowpass', 'highpass', 'bandpass', 'lowshelf',
+    'highshelf', 'peaking', 'notch', 'allpass'];
+  class BiquadFilterNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'BiquadFilterNode', context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'max', interp: 'speakers', kind: 'biquad' });
+      _waCheckOpen(context, c.where);
+      const nyquist = context.sampleRate / 2;
+      this._wan.params.frequency = _waNewParam(this, 'frequency', 350, 0, nyquist);
+      this._wan.params.detune = _waNewParam(this, 'detune', 0,
+        -1200 * Math.log2(_WA_MAX_FLOAT), 1200 * Math.log2(_WA_MAX_FLOAT));
+      this._wan.params.Q = _waNewParam(this, 'Q', 1, -_WA_MAX_FLOAT, _WA_MAX_FLOAT);
+      this._wan.params.gain = _waNewParam(this, 'gain', 0,
+        -_WA_MAX_FLOAT, 40 * Math.fround(Math.log10(_WA_MAX_FLOAT)));
+      this._wan.biquadType = 'lowpass';
+      if (c.options.type !== undefined)
+        this._wan.biquadType = _waEnum(c.options.type, _WA_BIQUAD_TYPES, c.where);
+      for (const k of ['frequency', 'detune', 'Q', 'gain']) {
+        if (c.options[k] !== undefined)
+          this._wan.params[k]._wap.value = _waFloat(c.options[k], c.where);
+      }
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  _waAttr(BiquadFilterNode, 'type',
+    function () { return this._wan.biquadType; },
+    function (v) {
+      const e = _waEnumAttr(v, _WA_BIQUAD_TYPES);
+      if (e !== _WA_IGNORE) this._wan.biquadType = e;
+    });
+  _waParamAttr(BiquadFilterNode, 'frequency');
+  _waParamAttr(BiquadFilterNode, 'detune');
+  _waParamAttr(BiquadFilterNode, 'Q');
+  _waParamAttr(BiquadFilterNode, 'gain');
+  _waMethod(BiquadFilterNode, 'getFrequencyResponse',
+    function (frequencyHz, magResponse, phaseResponse) {
+      const where = 'Failed to execute \'getFrequencyResponse\' on \'BiquadFilterNode\'';
+      if (arguments.length < 3)
+        throw new TypeError(where + ': 3 arguments required, but only ' +
+          arguments.length + ' present.');
+      for (const a of [frequencyHz, magResponse, phaseResponse]) {
+        if (!(a instanceof Float32Array))
+          throw new TypeError(where + ': parameter is not of type \'Float32Array\'.');
+      }
+      if (magResponse.length < frequencyHz.length || phaseResponse.length < frequencyHz.length)
+        throw new DOMException(where + ': phaseResponse and magResponse must have ' +
+          'the same length as frequencyHz', 'InvalidAccessError');
+      _waBiquadResponse(this, frequencyHz, magResponse, phaseResponse);
+    }, 3);
+  _waLen(BiquadFilterNode, 1); _waTag(BiquadFilterNode, 'BiquadFilterNode');
+
+  class IIRFilterNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const where = _waIface('IIRFilterNode');
+      if (arguments.length < 2)
+        throw new TypeError(where + ': 2 arguments required, but only ' +
+          arguments.length + ' present.');
+      const c = _waEnterNode(this, 'IIRFilterNode', context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'max', interp: 'speakers', kind: 'iir' });
+      _waCheckOpen(context, c.where);
+      if (c.options.feedforward === undefined)
+        throw new TypeError(where + ': required member feedforward is undefined.');
+      if (c.options.feedback === undefined)
+        throw new TypeError(where + ': required member feedback is undefined.');
+      const ff = _waSeq(c.options.feedforward, where).map((x) => _waDouble(x, where));
+      const fb = _waSeq(c.options.feedback, where).map((x) => _waDouble(x, where));
+      // The coefficient arrays are the filter. Empty, over-long, or an all-zero
+      // numerator/leading-zero denominator all describe a filter that cannot run.
+      if (ff.length === 0 || ff.length > 20)
+        throw new DOMException(where + ': The feedforward array has ' + ff.length +
+          ' elements; it must be in the range [1, 20].', 'NotSupportedError');
+      if (fb.length === 0 || fb.length > 20)
+        throw new DOMException(where + ': The feedback array has ' + fb.length +
+          ' elements; it must be in the range [1, 20].', 'NotSupportedError');
+      if (ff.every((x) => x === 0))
+        throw new DOMException(where + ': The feedforward coefficients are all zero.',
+          'InvalidStateError');
+      if (fb[0] === 0)
+        throw new DOMException(where + ': The first feedback coefficient is zero.',
+          'InvalidStateError');
+      this._wan.feedforward = ff;
+      this._wan.feedback = fb;
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  _waMethod(IIRFilterNode, 'getFrequencyResponse',
+    function (frequencyHz, magResponse, phaseResponse) {
+      const where = 'Failed to execute \'getFrequencyResponse\' on \'IIRFilterNode\'';
+      if (arguments.length < 3)
+        throw new TypeError(where + ': 3 arguments required, but only ' +
+          arguments.length + ' present.');
+      for (const a of [frequencyHz, magResponse, phaseResponse]) {
+        if (!(a instanceof Float32Array))
+          throw new TypeError(where + ': parameter is not of type \'Float32Array\'.');
+      }
+      if (magResponse.length < frequencyHz.length || phaseResponse.length < frequencyHz.length)
+        throw new DOMException(where + ': phaseResponse and magResponse must have ' +
+          'the same length as frequencyHz', 'InvalidAccessError');
+      _waIIRResponse(this._wan.feedforward, this._wan.feedback, this._wan.context.sampleRate,
+        frequencyHz, magResponse, phaseResponse);
+    }, 3);
+  _waLen(IIRFilterNode, 2); _waTag(IIRFilterNode, 'IIRFilterNode');
+
+  class ChannelMergerNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const where = _waIface('ChannelMergerNode');
+      if (!(context instanceof BaseAudioContext))
+        throw new TypeError(where + ': parameter 1 is not of type \'BaseAudioContext\'.');
+      const o = _waDict(options, where);
+      const n = o.numberOfInputs === undefined ? 6 : _waULong(o.numberOfInputs);
+      if (n < 1 || n > 32)
+        throw new DOMException(where + ': The number of inputs provided (' + n +
+          ') is outside the range [1, 32].', 'IndexSizeError');
+      // A merger takes N mono inputs and lays them out as N channels — so its own
+      // channel count is 1 and its mode is explicit, and neither may move. Change
+      // either and the node stops being a merger.
+      _waInitNode(this, context, {
+        inputs: n, outputs: 1, count: 1, mode: 'explicit', interp: 'speakers',
+        kind: 'merger', limits: { fixedCount: 1, fixedMode: 'explicit' },
+      });
+      _waCheckOpen(context, where);
+      _waApplyNodeOptions(this, o, where);
+    }
+  }
+  _waLen(ChannelMergerNode, 1); _waTag(ChannelMergerNode, 'ChannelMergerNode');
+
+  class ChannelSplitterNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const where = _waIface('ChannelSplitterNode');
+      if (!(context instanceof BaseAudioContext))
+        throw new TypeError(where + ': parameter 1 is not of type \'BaseAudioContext\'.');
+      const o = _waDict(options, where);
+      const n = o.numberOfOutputs === undefined ? 6 : _waULong(o.numberOfOutputs);
+      if (n < 1 || n > 32)
+        throw new DOMException(where + ': The number of outputs provided (' + n +
+          ') is outside the range [1, 32].', 'IndexSizeError');
+      // The mirror image of the merger: N outputs, each one channel of the input,
+      // taken as-is. All three of its channel settings are therefore fixed.
+      _waInitNode(this, context, {
+        inputs: 1, outputs: n, count: n, mode: 'explicit', interp: 'discrete',
+        kind: 'splitter',
+        limits: { fixedCount: n, fixedMode: 'explicit', fixedInterp: 'discrete' },
+      });
+      _waCheckOpen(context, where);
+      _waApplyNodeOptions(this, o, where);
+    }
+  }
+  _waLen(ChannelSplitterNode, 1); _waTag(ChannelSplitterNode, 'ChannelSplitterNode');
+
+  // The four "spatial-ish" nodes share one constraint: they process at most two
+  // channels, and 'max' is meaningless for them because their output width is
+  // fixed by what they do, not by what is plugged in.
+  const _WA_TWO_CHANNEL_LIMITS = { maxCount: 2, forbiddenModes: ['max'] };
+
+  class StereoPannerNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'StereoPannerNode', context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'clamped-max', interp: 'speakers', kind: 'stereopanner',
+          limits: _WA_TWO_CHANNEL_LIMITS });
+      _waCheckOpen(context, c.where);
+      this._wan.params.pan = _waNewParam(this, 'pan', 0, -1, 1);
+      if (c.options.pan !== undefined)
+        this._wan.params.pan._wap.value = Math.min(1, Math.max(-1, _waFloat(c.options.pan, c.where)));
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  _waParamAttr(StereoPannerNode, 'pan');
+  _waLen(StereoPannerNode, 1); _waTag(StereoPannerNode, 'StereoPannerNode');
+
+  class DynamicsCompressorNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'DynamicsCompressorNode',
+        context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'clamped-max', interp: 'speakers', kind: 'compressor',
+          limits: _WA_TWO_CHANNEL_LIMITS });
+      _waCheckOpen(context, c.where);
+      const p = this._wan.params;
+      // Every compressor param is k-rate only: the compressor reads them once per
+      // quantum because its gain reduction is a property of the block, not a sample.
+      p.threshold = _waNewParam(this, 'threshold', -24, -100, 0, 'k-rate', true);
+      p.knee = _waNewParam(this, 'knee', 30, 0, 40, 'k-rate', true);
+      p.ratio = _waNewParam(this, 'ratio', 12, 1, 20, 'k-rate', true);
+      p.attack = _waNewParam(this, 'attack', 0.003, 0, 1, 'k-rate', true);
+      p.release = _waNewParam(this, 'release', 0.25, 0, 1, 'k-rate', true);
+      this._wan.reduction = 0;
+      for (const k of ['threshold', 'knee', 'ratio', 'attack', 'release']) {
+        if (c.options[k] !== undefined) {
+          const s = p[k]._wap;
+          s.value = Math.min(s.maxValue, Math.max(s.minValue, _waFloat(c.options[k], c.where)));
+        }
+      }
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  for (const k of ['threshold', 'knee', 'ratio', 'attack', 'release'])
+    _waParamAttr(DynamicsCompressorNode, k);
+  _waAttr(DynamicsCompressorNode, 'reduction', function () { return this._wan.reduction; });
+  _waLen(DynamicsCompressorNode, 1); _waTag(DynamicsCompressorNode, 'DynamicsCompressorNode');
+
+  const _WA_PANNING_MODELS = ['equalpower', 'HRTF'];
+  const _WA_DISTANCE_MODELS = ['linear', 'inverse', 'exponential'];
+  class PannerNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'PannerNode', context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'clamped-max', interp: 'speakers', kind: 'panner',
+          limits: _WA_TWO_CHANNEL_LIMITS });
+      _waCheckOpen(context, c.where);
+      const p = this._wan.params;
+      p.positionX = _waNewParam(this, 'positionX', 0);
+      p.positionY = _waNewParam(this, 'positionY', 0);
+      p.positionZ = _waNewParam(this, 'positionZ', 0);
+      p.orientationX = _waNewParam(this, 'orientationX', 1);
+      p.orientationY = _waNewParam(this, 'orientationY', 0);
+      p.orientationZ = _waNewParam(this, 'orientationZ', 0);
+      const s = this._wan;
+      s.panningModel = 'equalpower';
+      s.distanceModel = 'inverse';
+      s.refDistance = 1; s.maxDistance = 10000; s.rolloffFactor = 1;
+      s.coneInnerAngle = 360; s.coneOuterAngle = 360; s.coneOuterGain = 0;
+      const o = c.options;
+      if (o.panningModel !== undefined)
+        s.panningModel = _waEnum(o.panningModel, _WA_PANNING_MODELS, c.where);
+      if (o.distanceModel !== undefined)
+        s.distanceModel = _waEnum(o.distanceModel, _WA_DISTANCE_MODELS, c.where);
+      for (const k of ['positionX', 'positionY', 'positionZ',
+        'orientationX', 'orientationY', 'orientationZ']) {
+        if (o[k] !== undefined) p[k]._wap.value = _waFloat(o[k], c.where);
+      }
+      if (o.refDistance !== undefined) _waSetPannerDist(s, 'refDistance', o.refDistance, c.where);
+      if (o.maxDistance !== undefined) _waSetPannerDist(s, 'maxDistance', o.maxDistance, c.where);
+      if (o.rolloffFactor !== undefined) _waSetRolloff(s, o.rolloffFactor, c.where);
+      if (o.coneInnerAngle !== undefined) s.coneInnerAngle = _waDouble(o.coneInnerAngle, c.where);
+      if (o.coneOuterAngle !== undefined) s.coneOuterAngle = _waDouble(o.coneOuterAngle, c.where);
+      if (o.coneOuterGain !== undefined)
+        _waSetConeOuterGain(s, o.coneOuterGain, c.where);
+      _waApplyNodeOptions(this, o, c.where);
+    }
+  }
+  // A negative reference or maximum distance describes no geometry at all.
+  const _waSetPannerDist = (s, name, v, where) => {
+    const d = _waDouble(v, where);
+    if (d < 0)
+      throw new RangeError(where + ': The ' + name + ' provided (' + d +
+        ') is outside the range [0, 3.40282e+38].');
+    s[name] = d;
+  };
+  const _waSetRolloff = (s, v, where) => {
+    const d = _waDouble(v, where);
+    if (d < 0)
+      throw new RangeError(where + ': The rolloffFactor provided (' + d +
+        ') is outside the range [0, 3.40282e+38].');
+    s.rolloffFactor = d;
+  };
+  const _waSetConeOuterGain = (s, v, where) => {
+    const d = _waDouble(v, where);
+    if (d < 0 || d > 1)
+      throw new DOMException(where + ': coneOuterGain provided (' + d +
+        ') is outside the range [0, 1].', 'InvalidStateError');
+    s.coneOuterGain = d;
+  };
+  for (const k of ['positionX', 'positionY', 'positionZ',
+    'orientationX', 'orientationY', 'orientationZ']) _waParamAttr(PannerNode, k);
+  _waAttr(PannerNode, 'panningModel',
+    function () { return this._wan.panningModel; },
+    function (v) {
+      const e = _waEnumAttr(v, _WA_PANNING_MODELS);
+      if (e !== _WA_IGNORE) this._wan.panningModel = e;
+    });
+  _waAttr(PannerNode, 'distanceModel',
+    function () { return this._wan.distanceModel; },
+    function (v) {
+      const e = _waEnumAttr(v, _WA_DISTANCE_MODELS);
+      if (e !== _WA_IGNORE) this._wan.distanceModel = e;
+    });
+  _waAttr(PannerNode, 'refDistance',
+    function () { return this._wan.refDistance; },
+    function (v) {
+      _waSetPannerDist(this._wan, 'refDistance', v,
+        'Failed to set the \'refDistance\' property on \'PannerNode\'');
+    });
+  _waAttr(PannerNode, 'maxDistance',
+    function () { return this._wan.maxDistance; },
+    function (v) {
+      _waSetPannerDist(this._wan, 'maxDistance', v,
+        'Failed to set the \'maxDistance\' property on \'PannerNode\'');
+    });
+  _waAttr(PannerNode, 'rolloffFactor',
+    function () { return this._wan.rolloffFactor; },
+    function (v) {
+      _waSetRolloff(this._wan, v,
+        'Failed to set the \'rolloffFactor\' property on \'PannerNode\'');
+    });
+  _waAttr(PannerNode, 'coneInnerAngle',
+    function () { return this._wan.coneInnerAngle; },
+    function (v) { this._wan.coneInnerAngle = _waDouble(v, 'PannerNode.coneInnerAngle'); });
+  _waAttr(PannerNode, 'coneOuterAngle',
+    function () { return this._wan.coneOuterAngle; },
+    function (v) { this._wan.coneOuterAngle = _waDouble(v, 'PannerNode.coneOuterAngle'); });
+  _waAttr(PannerNode, 'coneOuterGain',
+    function () { return this._wan.coneOuterGain; },
+    function (v) {
+      _waSetConeOuterGain(this._wan, v,
+        'Failed to set the \'coneOuterGain\' property on \'PannerNode\'');
+    });
+  _waMethod(PannerNode, 'setPosition', function (x, y, z) {
+    const where = 'Failed to execute \'setPosition\' on \'PannerNode\'';
+    if (arguments.length < 3)
+      throw new TypeError(where + ': 3 arguments required, but only ' +
+        arguments.length + ' present.');
+    this._wan.params.positionX._wap.value = _waFloat(x, where);
+    this._wan.params.positionY._wap.value = _waFloat(y, where);
+    this._wan.params.positionZ._wap.value = _waFloat(z, where);
+  }, 3);
+  _waMethod(PannerNode, 'setOrientation', function (x, y, z) {
+    const where = 'Failed to execute \'setOrientation\' on \'PannerNode\'';
+    if (arguments.length < 3)
+      throw new TypeError(where + ': 3 arguments required, but only ' +
+        arguments.length + ' present.');
+    this._wan.params.orientationX._wap.value = _waFloat(x, where);
+    this._wan.params.orientationY._wap.value = _waFloat(y, where);
+    this._wan.params.orientationZ._wap.value = _waFloat(z, where);
+  }, 3);
+  _waLen(PannerNode, 1); _waTag(PannerNode, 'PannerNode');
+
+  const _WA_OVERSAMPLE = ['none', '2x', '4x'];
+  class WaveShaperNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'WaveShaperNode', context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'max', interp: 'speakers', kind: 'waveshaper' });
+      _waCheckOpen(context, c.where);
+      this._wan.curve = null;
+      this._wan.oversample = 'none';
+      if (c.options.curve !== undefined && c.options.curve !== null) {
+        const arr = _waSeq(c.options.curve, c.where);
+        if (arr.length < 2)
+          throw new DOMException(c.where + ': The curve has ' + arr.length +
+            ' elements; it must have at least 2.', 'InvalidStateError');
+        const f = new Float32Array(arr.length);
+        for (let i = 0; i < arr.length; i++) f[i] = _waFloat(arr[i], c.where);
+        this._wan.curve = f;
+      }
+      if (c.options.oversample !== undefined)
+        this._wan.oversample = _waEnum(c.options.oversample, _WA_OVERSAMPLE, c.where);
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  _waAttr(WaveShaperNode, 'curve',
+    function () { return this._wan.curve; },
+    function (v) {
+      const where = 'Failed to set the \'curve\' property on \'WaveShaperNode\'';
+      if (v === null || v === undefined) { this._wan.curve = null; return; }
+      if (!(v instanceof Float32Array))
+        throw new TypeError(where + ': The provided value is not of type \'Float32Array\'.');
+      // One point is not a shaping curve — there is no line between two samples.
+      if (v.length < 2)
+        throw new DOMException(where + ': The curve has ' + v.length +
+          ' elements; it must have at least 2.', 'InvalidStateError');
+      this._wan.curve = v;
+    });
+  _waAttr(WaveShaperNode, 'oversample',
+    function () { return this._wan.oversample; },
+    function (v) {
+      const e = _waEnumAttr(v, _WA_OVERSAMPLE);
+      if (e !== _WA_IGNORE) this._wan.oversample = e;
+    });
+  _waLen(WaveShaperNode, 1); _waTag(WaveShaperNode, 'WaveShaperNode');
+
+  class ConvolverNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'ConvolverNode', context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'clamped-max', interp: 'speakers', kind: 'convolver',
+          limits: _WA_TWO_CHANNEL_LIMITS });
+      _waCheckOpen(context, c.where);
+      this._wan.normalize = c.options.disableNormalization === undefined
+        ? true : !c.options.disableNormalization;
+      this._wan.buffer = null;
+      if (c.options.buffer !== undefined && c.options.buffer !== null) {
+        if (!(c.options.buffer instanceof AudioBuffer))
+          throw new TypeError(c.where + ': member buffer is not of type \'AudioBuffer\'.');
+        _waSetConvolverBuffer(this, c.options.buffer, c.where);
+      }
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  const _waSetConvolverBuffer = (node, buf, where) => {
+    if (buf === null) { node._wan.buffer = null; return; }
+    // The impulse response must live at the graph's own rate — resampling it
+    // silently would change the room it describes.
+    if (buf.sampleRate !== node._wan.context.sampleRate)
+      throw new DOMException(where + ': The buffer sample rate of ' + buf.sampleRate +
+        ' does not match the context rate of ' + node._wan.context.sampleRate + ' Hz.',
+        'NotSupportedError');
+    if ([1, 2, 4].indexOf(buf.numberOfChannels) < 0)
+      throw new DOMException(where + ': The buffer must have 1, 2, or 4 channels, not ' +
+        buf.numberOfChannels + '.', 'NotSupportedError');
+    node._wan.buffer = buf;
+  };
+  _waAttr(ConvolverNode, 'buffer',
+    function () { return this._wan.buffer; },
+    function (v) {
+      const where = 'Failed to set the \'buffer\' property on \'ConvolverNode\'';
+      if (v === null || v === undefined) { this._wan.buffer = null; return; }
+      if (!(v instanceof AudioBuffer))
+        throw new TypeError(where + ': The provided value is not of type \'AudioBuffer\'.');
+      _waSetConvolverBuffer(this, v, where);
+    });
+  _waAttr(ConvolverNode, 'normalize',
+    function () { return this._wan.normalize; },
+    function (v) { this._wan.normalize = !!v; });
+  _waLen(ConvolverNode, 1); _waTag(ConvolverNode, 'ConvolverNode');
+
+  class AnalyserNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const c = _waEnterNode(this, 'AnalyserNode', context, options,
+        { inputs: 1, outputs: 1, count: 2, mode: 'max', interp: 'speakers', kind: 'analyser' });
+      _waCheckOpen(context, c.where);
+      const s = this._wan;
+      s.fftSize = 2048; s.minDecibels = -100; s.maxDecibels = -30;
+      s.smoothingTimeConstant = 0.8;
+      if (c.options.fftSize !== undefined) _waSetFftSize(s, c.options.fftSize, c.where);
+      // min must stay strictly below max, and the pair is checked TOGETHER —
+      // applying them one at a time would reject a legal swap of both.
+      const hasMin = c.options.minDecibels !== undefined;
+      const hasMax = c.options.maxDecibels !== undefined;
+      const newMin = hasMin ? _waDouble(c.options.minDecibels, c.where) : s.minDecibels;
+      const newMax = hasMax ? _waDouble(c.options.maxDecibels, c.where) : s.maxDecibels;
+      if ((hasMin || hasMax) && !(newMin < newMax))
+        throw new DOMException(c.where + ': minDecibels (' + newMin +
+          ') must be less than maxDecibels (' + newMax + ').', 'IndexSizeError');
+      s.minDecibels = newMin; s.maxDecibels = newMax;
+      if (c.options.smoothingTimeConstant !== undefined)
+        _waSetSmoothing(s, c.options.smoothingTimeConstant, c.where);
+      _waApplyNodeOptions(this, c.options, c.where);
+    }
+  }
+  const _waSetFftSize = (s, v, where) => {
+    const n = _waULong(v);
+    // A power of two in [32, 32768]: the FFT has no meaning at any other size.
+    if (n < 32 || n > 32768 || (n & (n - 1)) !== 0)
+      throw new DOMException(where + ': The value provided (' + n +
+        ') is not a power of two between 32 and 32768.', 'IndexSizeError');
+    s.fftSize = n;
+  };
+  const _waSetSmoothing = (s, v, where) => {
+    const d = _waDouble(v, where);
+    if (d < 0 || d > 1)
+      throw new DOMException(where + ': The value provided (' + d +
+        ') is outside the range [0, 1].', 'IndexSizeError');
+    s.smoothingTimeConstant = d;
+  };
+  _waAttr(AnalyserNode, 'fftSize',
+    function () { return this._wan.fftSize; },
+    function (v) {
+      _waSetFftSize(this._wan, v, 'Failed to set the \'fftSize\' property on \'AnalyserNode\'');
+    });
+  _waAttr(AnalyserNode, 'frequencyBinCount', function () { return this._wan.fftSize / 2; });
+  _waAttr(AnalyserNode, 'minDecibels',
+    function () { return this._wan.minDecibels; },
+    function (v) {
+      const where = 'Failed to set the \'minDecibels\' property on \'AnalyserNode\'';
+      const d = _waDouble(v, where);
+      if (!(d < this._wan.maxDecibels))
+        throw new DOMException(where + ': The value provided (' + d +
+          ') must be less than maxDecibels (' + this._wan.maxDecibels + ').', 'IndexSizeError');
+      this._wan.minDecibels = d;
+    });
+  _waAttr(AnalyserNode, 'maxDecibels',
+    function () { return this._wan.maxDecibels; },
+    function (v) {
+      const where = 'Failed to set the \'maxDecibels\' property on \'AnalyserNode\'';
+      const d = _waDouble(v, where);
+      if (!(d > this._wan.minDecibels))
+        throw new DOMException(where + ': The value provided (' + d +
+          ') must be greater than minDecibels (' + this._wan.minDecibels + ').', 'IndexSizeError');
+      this._wan.maxDecibels = d;
+    });
+  _waAttr(AnalyserNode, 'smoothingTimeConstant',
+    function () { return this._wan.smoothingTimeConstant; },
+    function (v) {
+      _waSetSmoothing(this._wan, v,
+        'Failed to set the \'smoothingTimeConstant\' property on \'AnalyserNode\'');
+    });
+  // With no real audio device there is nothing to analyse on a live context, so
+  // the analyser reports the per-profile synthetic spectrum the fingerprinting
+  // defence has always returned here. That is honest about what we have: it is
+  // stable within a page, and it is not a claim that audio was captured.
+  _waMethod(AnalyserNode, 'getFloatFrequencyData', function (array) {
+    if (!(array instanceof Float32Array))
+      throw new TypeError('Failed to execute \'getFloatFrequencyData\' on \'AnalyserNode\'' +
+        ': parameter 1 is not of type \'Float32Array\'.');
+    const n = Math.min(array.length, this._wan.fftSize / 2);
+    for (let i = 0; i < n; i++) array[i] = -100 + _fpRand(700 + i) * 5;
+  }, 1);
+  _waMethod(AnalyserNode, 'getByteFrequencyData', function (array) {
+    if (!(array instanceof Uint8Array))
+      throw new TypeError('Failed to execute \'getByteFrequencyData\' on \'AnalyserNode\'' +
+        ': parameter 1 is not of type \'Uint8Array\'.');
+    const n = Math.min(array.length, this._wan.fftSize / 2);
+    for (let i = 0; i < n; i++) array[i] = Math.floor(_fpRand(600 + i) * 10);
+  }, 1);
+  _waMethod(AnalyserNode, 'getFloatTimeDomainData', function (array) {
+    if (!(array instanceof Float32Array))
+      throw new TypeError('Failed to execute \'getFloatTimeDomainData\' on \'AnalyserNode\'' +
+        ': parameter 1 is not of type \'Float32Array\'.');
+    const n = Math.min(array.length, this._wan.fftSize);
+    for (let i = 0; i < n; i++) array[i] = 0;
+  }, 1);
+  _waMethod(AnalyserNode, 'getByteTimeDomainData', function (array) {
+    if (!(array instanceof Uint8Array))
+      throw new TypeError('Failed to execute \'getByteTimeDomainData\' on \'AnalyserNode\'' +
+        ': parameter 1 is not of type \'Uint8Array\'.');
+    const n = Math.min(array.length, this._wan.fftSize);
+    for (let i = 0; i < n; i++) array[i] = 128;
+  }, 1);
+  _waLen(AnalyserNode, 1); _waTag(AnalyserNode, 'AnalyserNode');
+
+  class AudioDestinationNode extends AudioNode {
+    constructor() {
+      if (!_waAllowNode) throw new TypeError('Illegal constructor');
+      super();
+    }
+  }
+  _waAttr(AudioDestinationNode, 'maxChannelCount', function () { return this._wan.maxChannelCount; });
+  _waTag(AudioDestinationNode, 'AudioDestinationNode');
+
+  class ScriptProcessorNode extends AudioNode {
+    constructor() {
+      if (!_waAllowNode) throw new TypeError('Illegal constructor');
+      super();
+    }
+  }
+  _waAttr(ScriptProcessorNode, 'bufferSize', function () { return this._wan.bufferSize; });
+  _waTag(ScriptProcessorNode, 'ScriptProcessorNode');
+
+  class MediaElementAudioSourceNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const where = _waIface('MediaElementAudioSourceNode');
+      if (arguments.length < 2)
+        throw new TypeError(where + ': 2 arguments required, but only ' +
+          arguments.length + ' present.');
+      if (!(context instanceof AudioContext))
+        throw new TypeError(where + ': parameter 1 is not of type \'AudioContext\'.');
+      const o = _waDict(options, where);
+      if (o.mediaElement === undefined || o.mediaElement === null)
+        throw new TypeError(where + ': required member mediaElement is undefined.');
+      _waInitNode(this, context, { inputs: 0, outputs: 1, count: 2, mode: 'max', interp: 'speakers' });
+      this._wan.mediaElement = o.mediaElement;
+      _waApplyNodeOptions(this, o, where);
+    }
+  }
+  _waAttr(MediaElementAudioSourceNode, 'mediaElement', function () { return this._wan.mediaElement; });
+  _waLen(MediaElementAudioSourceNode, 2); _waTag(MediaElementAudioSourceNode, 'MediaElementAudioSourceNode');
+
+  class MediaStreamAudioSourceNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const where = _waIface('MediaStreamAudioSourceNode');
+      if (arguments.length < 2)
+        throw new TypeError(where + ': 2 arguments required, but only ' +
+          arguments.length + ' present.');
+      if (!(context instanceof AudioContext))
+        throw new TypeError(where + ': parameter 1 is not of type \'AudioContext\'.');
+      const o = _waDict(options, where);
+      if (o.mediaStream === undefined || o.mediaStream === null)
+        throw new TypeError(where + ': required member mediaStream is undefined.');
+      // A stream with no audio track has nothing to source from — the spec makes
+      // this the one construction-time failure of this node.
+      if (typeof o.mediaStream.getAudioTracks === 'function' &&
+          o.mediaStream.getAudioTracks().length === 0)
+        throw new DOMException(where + ': MediaStream has no audio track',
+          'InvalidStateError');
+      _waInitNode(this, context, { inputs: 0, outputs: 1, count: 2, mode: 'max', interp: 'speakers' });
+      this._wan.mediaStream = o.mediaStream;
+      _waApplyNodeOptions(this, o, where);
+    }
+  }
+  _waAttr(MediaStreamAudioSourceNode, 'mediaStream', function () { return this._wan.mediaStream; });
+  _waLen(MediaStreamAudioSourceNode, 2); _waTag(MediaStreamAudioSourceNode, 'MediaStreamAudioSourceNode');
+
+  class MediaStreamTrackAudioSourceNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const where = _waIface('MediaStreamTrackAudioSourceNode');
+      if (arguments.length < 2)
+        throw new TypeError(where + ': 2 arguments required, but only ' +
+          arguments.length + ' present.');
+      if (!(context instanceof AudioContext))
+        throw new TypeError(where + ': parameter 1 is not of type \'AudioContext\'.');
+      const o = _waDict(options, where);
+      if (o.mediaStreamTrack === undefined || o.mediaStreamTrack === null)
+        throw new TypeError(where + ': required member mediaStreamTrack is undefined.');
+      _waInitNode(this, context, { inputs: 0, outputs: 1, count: 2, mode: 'max', interp: 'speakers' });
+      this._wan.mediaStreamTrack = o.mediaStreamTrack;
+      _waApplyNodeOptions(this, o, where);
+    }
+  }
+  _waLen(MediaStreamTrackAudioSourceNode, 2);
+  _waTag(MediaStreamTrackAudioSourceNode, 'MediaStreamTrackAudioSourceNode');
+
+  class MediaStreamAudioDestinationNode extends AudioNode {
+    constructor(context, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const where = _waIface('MediaStreamAudioDestinationNode');
+      if (!(context instanceof AudioContext))
+        throw new TypeError(where + ': parameter 1 is not of type \'AudioContext\'.');
+      const o = _waDict(options, where);
+      _waInitNode(this, context, { inputs: 1, outputs: 0, count: 2, mode: 'explicit', interp: 'speakers' });
+      this._wan.stream = new MediaStream();
+      _waApplyNodeOptions(this, o, where);
+    }
+  }
+  _waAttr(MediaStreamAudioDestinationNode, 'stream', function () { return this._wan.stream; });
+  _waLen(MediaStreamAudioDestinationNode, 1);
+  _waTag(MediaStreamAudioDestinationNode, 'MediaStreamAudioDestinationNode');
+
+  // ---------------------------------------------------------------------------
+  // PeriodicWave
+  // ---------------------------------------------------------------------------
+  class PeriodicWave {
+    constructor(context, options) {
+      const where = _waIface('PeriodicWave');
+      if (arguments.length < 1)
+        throw new TypeError(where + ': 1 argument required, but only 0 present.');
+      if (!(context instanceof BaseAudioContext))
+        throw new TypeError(where + ': parameter 1 is not of type \'BaseAudioContext\'.');
+      const o = _waDict(options, where);
+      let real = o.real === undefined ? null : _waSeq(o.real, where).map((x) => _waFloat(x, where));
+      let imag = o.imag === undefined ? null : _waSeq(o.imag, where).map((x) => _waFloat(x, where));
+      if (real && imag && real.length !== imag.length)
+        throw new DOMException(where + ': length of real array (' + real.length +
+          ') and length of imaginary array (' + imag.length + ') must match.',
+          'IndexSizeError');
+      // A wave is a Fourier series; one coefficient is a DC offset, not a wave.
+      const len = real ? real.length : (imag ? imag.length : 2);
+      if (len < 2)
+        throw new DOMException(where + ': The length of the real/imaginary array (' +
+          len + ') is less than the minimum bound (2).', 'IndexSizeError');
+      if (!real) { real = new Array(len).fill(0); }
+      if (!imag) { imag = new Array(len).fill(0); }
+      Object.defineProperty(this, '_wapw', {
+        enumerable: false, configurable: true,
+        value: {
+          real: Float32Array.from(real), imag: Float32Array.from(imag),
+          normalize: !o.disableNormalization,
+        },
+      });
+    }
+  }
+  _waLen(PeriodicWave, 1); _waTag(PeriodicWave, 'PeriodicWave');
+
+  // ---------------------------------------------------------------------------
+  // Filter frequency responses (pure math, used by both filter nodes)
+  // ---------------------------------------------------------------------------
+  // Evaluate H(z) on the unit circle. A getFrequencyResponse() that returns
+  // zeros is the kind of "answer" this whole realm was full of — a graphic
+  // equaliser drawn from it would be a flat line whatever the filter did.
+  const _waIIRResponse = (ff, fb, sampleRate, freqs, mag, phase) => {
+    const nyquist = sampleRate / 2;
+    for (let k = 0; k < freqs.length; k++) {
+      // Outside [0, nyquist] there IS no response — the spec says NaN, and a
+      // clamped answer would draw a confident curve past the end of the axis.
+      if (!(freqs[k] >= 0 && freqs[k] <= nyquist)) { mag[k] = NaN; phase[k] = NaN; continue; }
+      const w = Math.PI * (freqs[k] / nyquist);
+      let nr = 0, ni = 0, dr = 0, di = 0;
+      for (let i = 0; i < ff.length; i++) { nr += ff[i] * Math.cos(-i * w); ni += ff[i] * Math.sin(-i * w); }
+      for (let i = 0; i < fb.length; i++) { dr += fb[i] * Math.cos(-i * w); di += fb[i] * Math.sin(-i * w); }
+      const den = dr * dr + di * di;
+      const hr = (nr * dr + ni * di) / den;
+      const hi = (ni * dr - nr * di) / den;
+      mag[k] = Math.fround(Math.sqrt(hr * hr + hi * hi));
+      phase[k] = Math.fround(Math.atan2(hi, hr));
+    }
+  };
+  // Biquad coefficients (Audio EQ Cookbook, as the spec prescribes verbatim).
+  const _waBiquadCoefficients = (type, freqHz, Q, gainDb, sampleRate) => {
+    const nyquist = sampleRate / 2;
+    let f = freqHz / nyquist;
+    f = Math.min(1, Math.max(0, f));
+    const A = Math.pow(10, gainDb / 40);
+    const w0 = Math.PI * f;
+    const alphaQ = Math.sin(w0) / (2 * Math.pow(10, Q / 20));
+    const alphaQdb = Math.sin(w0) / (2 * Q);
+    const cw0 = Math.cos(w0);
+    let b0, b1, b2, a0, a1, a2;
+    switch (type) {
+      case 'lowpass':
+        if (f === 1) return [1, 0, 0, 1, 0, 0];
+        if (f === 0) return [0, 0, 0, 1, 0, 0];
+        b0 = (1 - cw0) / 2; b1 = 1 - cw0; b2 = (1 - cw0) / 2;
+        a0 = 1 + alphaQ; a1 = -2 * cw0; a2 = 1 - alphaQ; break;
+      case 'highpass':
+        if (f === 1) return [0, 0, 0, 1, 0, 0];
+        if (f === 0) return [1, 0, 0, 1, 0, 0];
+        b0 = (1 + cw0) / 2; b1 = -(1 + cw0); b2 = (1 + cw0) / 2;
+        a0 = 1 + alphaQ; a1 = -2 * cw0; a2 = 1 - alphaQ; break;
+      case 'bandpass':
+        if (f <= 0 || f >= 1 || Q <= 0) return [0, 0, 0, 1, 0, 0];
+        b0 = alphaQdb; b1 = 0; b2 = -alphaQdb;
+        a0 = 1 + alphaQdb; a1 = -2 * cw0; a2 = 1 - alphaQdb; break;
+      case 'notch':
+        if (f <= 0 || f >= 1) return [1, 0, 0, 1, 0, 0];
+        if (Q <= 0) return [0, 0, 0, 1, 0, 0];
+        b0 = 1; b1 = -2 * cw0; b2 = 1;
+        a0 = 1 + alphaQdb; a1 = -2 * cw0; a2 = 1 - alphaQdb; break;
+      case 'allpass':
+        if (f <= 0 || f >= 1) return [1, 0, 0, 1, 0, 0];
+        if (Q <= 0) return [-1, 0, 0, 1, 0, 0];
+        b0 = 1 - alphaQdb; b1 = -2 * cw0; b2 = 1 + alphaQdb;
+        a0 = 1 + alphaQdb; a1 = -2 * cw0; a2 = 1 - alphaQdb; break;
+      case 'peaking':
+        if (f <= 0 || f >= 1) return [1, 0, 0, 1, 0, 0];
+        if (Q <= 0) return [A * A, 0, 0, 1, 0, 0];
+        b0 = 1 + alphaQdb * A; b1 = -2 * cw0; b2 = 1 - alphaQdb * A;
+        a0 = 1 + alphaQdb / A; a1 = -2 * cw0; a2 = 1 - alphaQdb / A; break;
+      case 'lowshelf': {
+        if (f >= 1) return [A * A, 0, 0, 1, 0, 0];
+        if (f <= 0) return [1, 0, 0, 1, 0, 0];
+        const s = 2 * Math.sqrt(A) * (Math.sin(w0) / 2) * Math.sqrt(2);
+        b0 = A * ((A + 1) - (A - 1) * cw0 + s);
+        b1 = 2 * A * ((A - 1) - (A + 1) * cw0);
+        b2 = A * ((A + 1) - (A - 1) * cw0 - s);
+        a0 = (A + 1) + (A - 1) * cw0 + s;
+        a1 = -2 * ((A - 1) + (A + 1) * cw0);
+        a2 = (A + 1) + (A - 1) * cw0 - s; break;
+      }
+      case 'highshelf': {
+        if (f >= 1) return [1, 0, 0, 1, 0, 0];
+        if (f <= 0) return [A * A, 0, 0, 1, 0, 0];
+        const s = 2 * Math.sqrt(A) * (Math.sin(w0) / 2) * Math.sqrt(2);
+        b0 = A * ((A + 1) + (A - 1) * cw0 + s);
+        b1 = -2 * A * ((A - 1) + (A + 1) * cw0);
+        b2 = A * ((A + 1) + (A - 1) * cw0 - s);
+        a0 = (A + 1) - (A - 1) * cw0 + s;
+        a1 = 2 * ((A - 1) - (A + 1) * cw0);
+        a2 = (A + 1) - (A - 1) * cw0 - s; break;
+      }
+      default: return [1, 0, 0, 1, 0, 0];
+    }
+    return [b0 / a0, b1 / a0, b2 / a0, 1, a1 / a0, a2 / a0];
+  };
+  const _waBiquadResponse = (node, freqs, mag, phase) => {
+    const s = node._wan;
+    const detuned = s.params.frequency._wap.value *
+      Math.pow(2, s.params.detune._wap.value / 1200);
+    const c = _waBiquadCoefficients(s.biquadType, detuned,
+      s.params.Q._wap.value, s.params.gain._wap.value, s.context.sampleRate);
+    _waIIRResponse([c[0], c[1], c[2]], [c[3], c[4], c[5]],
+      s.context.sampleRate, freqs, mag, phase);
+  };
+  // `_waBiquadCoefficients` is the render path's entry point too (Quest #504);
+  // keeping one copy is what stops the drawn response and the heard filter from
+  // disagreeing — the classic Web Audio implementation bug.
+
+  // ---------------------------------------------------------------------------
+  // AudioListener
+  // ---------------------------------------------------------------------------
+  let _waAllowListener = false;
+  class AudioListener {
+    constructor() {
+      if (!_waAllowListener) throw new TypeError('Illegal constructor');
+      Object.defineProperty(this, '_wal', {
+        enumerable: false, configurable: true, value: Object.create(null),
+      });
+      const p = this._wal;
+      p.positionX = _waNewParam(null, 'positionX', 0);
+      p.positionY = _waNewParam(null, 'positionY', 0);
+      p.positionZ = _waNewParam(null, 'positionZ', 0);
+      p.forwardX = _waNewParam(null, 'forwardX', 0);
+      p.forwardY = _waNewParam(null, 'forwardY', 0);
+      p.forwardZ = _waNewParam(null, 'forwardZ', -1);
+      p.upX = _waNewParam(null, 'upX', 0);
+      p.upY = _waNewParam(null, 'upY', 1);
+      p.upZ = _waNewParam(null, 'upZ', 0);
+    }
+  }
+  for (const k of ['positionX', 'positionY', 'positionZ',
+    'forwardX', 'forwardY', 'forwardZ', 'upX', 'upY', 'upZ']) {
+    _waAttr(AudioListener, k, (function (key) {
+      return function () { return this._wal[key]; };
+    })(k));
+  }
+  _waMethod(AudioListener, 'setPosition', function (x, y, z) {
+    const where = 'Failed to execute \'setPosition\' on \'AudioListener\'';
+    if (arguments.length < 3)
+      throw new TypeError(where + ': 3 arguments required, but only ' +
+        arguments.length + ' present.');
+    this._wal.positionX._wap.value = _waFloat(x, where);
+    this._wal.positionY._wap.value = _waFloat(y, where);
+    this._wal.positionZ._wap.value = _waFloat(z, where);
+  }, 3);
+  _waMethod(AudioListener, 'setOrientation', function (x, y, z, xUp, yUp, zUp) {
+    const where = 'Failed to execute \'setOrientation\' on \'AudioListener\'';
+    if (arguments.length < 6)
+      throw new TypeError(where + ': 6 arguments required, but only ' +
+        arguments.length + ' present.');
+    this._wal.forwardX._wap.value = _waFloat(x, where);
+    this._wal.forwardY._wap.value = _waFloat(y, where);
+    this._wal.forwardZ._wap.value = _waFloat(z, where);
+    this._wal.upX._wap.value = _waFloat(xUp, where);
+    this._wal.upY._wap.value = _waFloat(yUp, where);
+    this._wal.upZ._wap.value = _waFloat(zUp, where);
+  }, 6);
+  _waTag(AudioListener, 'AudioListener');
+
+  // ---------------------------------------------------------------------------
+  // The worklet
+  // ---------------------------------------------------------------------------
+  // `Worklet` is HTML's, not Web Audio's, but nothing here had one — and
+  // `AudioWorklet : Worklet` means the whole chain is missing without it.
+  let _waAllowWorklet = false;
+  class Worklet {
+    constructor() { if (!_waAllowWorklet) throw new TypeError('Illegal constructor'); }
+  }
+  _waMethod(Worklet, 'addModule', function (moduleURL, options) {
+    return _waAddModule(this, moduleURL, options);
+  }, 1, true);
+  _waTag(Worklet, 'Worklet');
+
+  // The AudioWorklet global scope. There is no separate realm here — the
+  // processor's module text is evaluated in a closure that supplies exactly the
+  // AudioWorkletGlobalScope bindings, so `class X extends AudioWorkletProcessor`
+  // and `registerProcessor(...)` mean what they mean in a real worklet.
+  const _waProcessors = new Map();
+  let _waAllowProcessor = false;
+  class AudioWorkletProcessor {
+    constructor() {
+      if (!_waAllowProcessor) throw new TypeError('Illegal constructor');
+      const ch = new MessageChannel();
+      Object.defineProperty(this, '_wproc', {
+        enumerable: false, configurable: true, value: { port: ch.port1, peer: ch.port2 },
+      });
+    }
+  }
+  _waAttr(AudioWorkletProcessor, 'port', function () { return this._wproc.port; });
+  _waTag(AudioWorkletProcessor, 'AudioWorkletProcessor');
+
+  const _waAddModule = (worklet, moduleURL, options) => {
+    const where = 'Failed to execute \'addModule\' on \'Worklet\'';
+    if (moduleURL === undefined)
+      return Promise.reject(new TypeError(where + ': 1 argument required, but only 0 present.'));
+    let url;
+    try { url = new URL(String(moduleURL), document.baseURI).href; }
+    catch (e) { return Promise.reject(new DOMException(where + ': Invalid module URL', 'SyntaxError')); }
+    return fetch(url).then((r) => {
+      if (!r.ok)
+        throw new DOMException(where + ': Failed to load module script: ' + url, 'AbortError');
+      return r.text();
+    }).then((src) => {
+      const registered = [];
+      const registerProcessor = (name, ctor) => {
+        const n = String(name);
+        if (n === '')
+          throw new DOMException('The processor name cannot be empty.', 'NotSupportedError');
+        if (_waProcessors.has(n))
+          throw new DOMException('A processor named \'' + n + '\' is already registered.',
+            'NotSupportedError');
+        if (typeof ctor !== 'function')
+          throw new TypeError('The processor constructor is not a constructor.');
+        _waProcessors.set(n, ctor);
+        registered.push(n);
+      };
+      // Only the AudioWorkletGlobalScope surface is in scope — a processor that
+      // reaches for `document` gets the same ReferenceError a real worklet gives.
+      const fn = new Function('registerProcessor', 'AudioWorkletProcessor',
+        'sampleRate', 'currentTime', 'currentFrame', 'renderQuantumSize',
+        '"use strict";\n' + src + '\n//# sourceURL=' + url);
+      fn(registerProcessor, AudioWorkletProcessor,
+        _waCurrentWorkletRate(), 0, 0, _WA_QUANTUM);
+      return undefined;
+    });
+  };
+  let _waWorkletRate = 44100;
+  const _waCurrentWorkletRate = () => _waWorkletRate;
+
+  let _waAllowAudioWorklet = false;
+  class AudioWorklet extends Worklet {
+    constructor() {
+      if (!_waAllowAudioWorklet) throw new TypeError('Illegal constructor');
+      _waAllowWorklet = true;
+      try { super(); } finally { _waAllowWorklet = false; }
+      const ch = new MessageChannel();
+      Object.defineProperty(this, '_waw', {
+        enumerable: false, configurable: true, value: { port: ch.port1 },
+      });
+    }
+  }
+  _waAttr(AudioWorklet, 'port', function () { return this._waw.port; });
+  _waTag(AudioWorklet, 'AudioWorklet');
+
+  // AudioParamMap is `readonly maplike` — WebIDL generates the whole Map-like
+  // surface, and idlharness checks every one of size/get/has/keys/values/
+  // entries/forEach/@@iterator. Backing it with a real Map is the only way the
+  // iteration order and the `[Symbol.iterator] === entries` identity come out right.
+  let _waAllowParamMap = false;
+  class AudioParamMap {
+    constructor() {
+      if (!_waAllowParamMap) throw new TypeError('Illegal constructor');
+      Object.defineProperty(this, '_wam', {
+        enumerable: false, configurable: true, value: new Map(),
+      });
+    }
+  }
+  _waAttr(AudioParamMap, 'size', function () { return this._wam.size; });
+  _waMethod(AudioParamMap, 'get', function (key) { return this._wam.get(key); }, 1);
+  _waMethod(AudioParamMap, 'has', function (key) { return this._wam.has(key); }, 1);
+  _waMethod(AudioParamMap, 'keys', function () { return this._wam.keys(); }, 0);
+  _waMethod(AudioParamMap, 'values', function () { return this._wam.values(); }, 0);
+  _waMethod(AudioParamMap, 'entries', function () { return this._wam.entries(); }, 0);
+  _waMethod(AudioParamMap, 'forEach', function (cb, thisArg) {
+    this._wam.forEach(function (v, k, m) { cb.call(thisArg, v, k, m); });
+  }, 1);
+  Object.defineProperty(AudioParamMap.prototype, Symbol.iterator, {
+    configurable: true, enumerable: false, writable: true,
+    value: AudioParamMap.prototype.entries,
+  });
+  _waTag(AudioParamMap, 'AudioParamMap');
+
+  class AudioWorkletNode extends AudioNode {
+    constructor(context, name, options) {
+      _waAllowNode = true;
+      try { super(); } finally { _waAllowNode = false; }
+      const where = _waIface('AudioWorkletNode');
+      if (arguments.length < 2)
+        throw new TypeError(where + ': 2 arguments required, but only ' +
+          arguments.length + ' present.');
+      if (!(context instanceof BaseAudioContext))
+        throw new TypeError(where + ': parameter 1 is not of type \'BaseAudioContext\'.');
+      const n = String(name);
+      const o = _waDict(options, where);
+      // The name must already be registered — the node IS the processor, and
+      // there is nothing to construct if the module never ran.
+      if (!_waProcessors.has(n))
+        throw new DOMException(where + ': A processor named \'' + n +
+          '\' is not registered.', 'InvalidStateError');
+      const numberOfInputs = o.numberOfInputs === undefined ? 1 : _waULong(o.numberOfInputs);
+      const numberOfOutputs = o.numberOfOutputs === undefined ? 1 : _waULong(o.numberOfOutputs);
+      if (numberOfInputs === 0 && numberOfOutputs === 0)
+        throw new DOMException(where + ': Number of inputs and number of outputs ' +
+          'cannot both be zero.', 'NotSupportedError');
+      _waInitNode(this, context, {
+        inputs: numberOfInputs, outputs: numberOfOutputs,
+        count: 2, mode: 'max', interp: 'speakers', kind: 'worklet',
+      });
+      this._wan.processorName = n;
+      this._wan.processorOptions = o.processorOptions;
+      if (o.outputChannelCount !== undefined) {
+        const occ = _waSeq(o.outputChannelCount, where).map(_waULong);
+        if (occ.length !== numberOfOutputs)
+          throw new DOMException(where + ': Length of specified \'outputChannelCount\' (' +
+            occ.length + ') does not match the given number of outputs (' +
+            numberOfOutputs + ').', 'IndexSizeError');
+        for (const cc of occ) {
+          if (cc < 1 || cc > 32)
+            throw new DOMException(where + ': A channel count (' + cc +
+              ') is outside the range [1, 32].', 'NotSupportedError');
+        }
+        this._wan.outputChannelCount = occ;
+      }
+      const ch = new MessageChannel();
+      this._wan.port = ch.port1;
+      _waAllowParamMap = true;
+      try { this._wan.parameters = new AudioParamMap(); } finally { _waAllowParamMap = false; }
+      const ctor = _waProcessors.get(n);
+      const descriptors = ctor.parameterDescriptors;
+      if (descriptors) {
+        for (const d of _waSeq(descriptors, where)) {
+          const pname = String(d.name);
+          const param = _waNewParam(this, pname,
+            d.defaultValue === undefined ? 0 : _waFloat(d.defaultValue, where),
+            d.minValue === undefined ? -_WA_MAX_FLOAT : _waFloat(d.minValue, where),
+            d.maxValue === undefined ? _WA_MAX_FLOAT : _waFloat(d.maxValue, where),
+            d.automationRate === undefined ? 'a-rate'
+              : _waEnum(d.automationRate, _WA_RATES, where));
+          this._wan.parameters._wam.set(pname, param);
+          this._wan.params[pname] = param;
+        }
+      }
+      if (o.parameterData !== undefined && o.parameterData !== null) {
+        for (const k of Object.keys(o.parameterData)) {
+          const param = this._wan.parameters._wam.get(k);
+          if (param) param._wap.value = _waFloat(o.parameterData[k], where);
+        }
+      }
+      _waApplyNodeOptions(this, o, where);
+    }
+  }
+  _waAttr(AudioWorkletNode, 'parameters', function () { return this._wan.parameters; });
+  _waAttr(AudioWorkletNode, 'port', function () { return this._wan.port; });
+  _waLen(AudioWorkletNode, 2); _waTag(AudioWorkletNode, 'AudioWorkletNode');
+
+  // ---------------------------------------------------------------------------
+  // Events
+  // ---------------------------------------------------------------------------
+  class OfflineAudioCompletionEvent extends Event {
+    constructor(type, eventInitDict) {
+      const where = _waIface('OfflineAudioCompletionEvent');
+      if (arguments.length < 2)
+        throw new TypeError(where + ': 2 arguments required, but only ' +
+          arguments.length + ' present.');
+      const o = _waDict(eventInitDict, where);
+      if (!(o.renderedBuffer instanceof AudioBuffer))
+        throw new TypeError(where + ': required member renderedBuffer is undefined.');
+      super(type, o);
+      Object.defineProperty(this, '_renderedBuffer', {
+        enumerable: false, configurable: true, value: o.renderedBuffer,
+      });
+    }
+  }
+  _waAttr(OfflineAudioCompletionEvent, 'renderedBuffer', function () { return this._renderedBuffer; });
+  _waLen(OfflineAudioCompletionEvent, 2);
+  _waTag(OfflineAudioCompletionEvent, 'OfflineAudioCompletionEvent');
+
+  class AudioProcessingEvent extends Event {
+    constructor(type, eventInitDict) {
+      const where = _waIface('AudioProcessingEvent');
+      if (arguments.length < 2)
+        throw new TypeError(where + ': 2 arguments required, but only ' +
+          arguments.length + ' present.');
+      const o = _waDict(eventInitDict, where);
+      if (o.playbackTime === undefined)
+        throw new TypeError(where + ': required member playbackTime is undefined.');
+      if (!(o.inputBuffer instanceof AudioBuffer))
+        throw new TypeError(where + ': required member inputBuffer is undefined.');
+      if (!(o.outputBuffer instanceof AudioBuffer))
+        throw new TypeError(where + ': required member outputBuffer is undefined.');
+      super(type, o);
+      Object.defineProperty(this, '_ape', {
+        enumerable: false, configurable: true,
+        value: {
+          playbackTime: _waDouble(o.playbackTime, where),
+          inputBuffer: o.inputBuffer, outputBuffer: o.outputBuffer,
+        },
+      });
+    }
+  }
+  _waAttr(AudioProcessingEvent, 'playbackTime', function () { return this._ape.playbackTime; });
+  _waAttr(AudioProcessingEvent, 'inputBuffer', function () { return this._ape.inputBuffer; });
+  _waAttr(AudioProcessingEvent, 'outputBuffer', function () { return this._ape.outputBuffer; });
+  _waLen(AudioProcessingEvent, 2); _waTag(AudioProcessingEvent, 'AudioProcessingEvent');
+
+  class AudioSinkInfo {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  _waAttr(AudioSinkInfo, 'type', function () { return 'none'; });
+  _waTag(AudioSinkInfo, 'AudioSinkInfo');
+
+  let _waAllowStats = false;
+  class AudioPlaybackStats {
+    constructor() { if (!_waAllowStats) throw new TypeError('Illegal constructor'); }
+  }
+  for (const k of ['underrunDuration', 'underrunEvents', 'totalDuration',
+    'averageLatency', 'minimumLatency', 'maximumLatency'])
+    _waAttr(AudioPlaybackStats, k, function () { return 0; });
+  _waMethod(AudioPlaybackStats, 'resetLatency', function () {}, 0);
+  _waMethod(AudioPlaybackStats, 'toJSON', function () {
+    return {
+      underrunDuration: 0, underrunEvents: 0, totalDuration: 0,
+      averageLatency: 0, minimumLatency: 0, maximumLatency: 0,
+    };
+  }, 0);
+  _waTag(AudioPlaybackStats, 'AudioPlaybackStats');
+
+  // ---------------------------------------------------------------------------
+  // BaseAudioContext and its two concrete kinds
+  // ---------------------------------------------------------------------------
+  let _waAllowContext = false;
+  class BaseAudioContext extends EventTarget {
+    constructor() {
+      if (!_waAllowContext) throw new TypeError('Illegal constructor');
+      super(undefined);
+    }
+  }
+  BaseAudioContext.prototype._noEventParent = true;
+
+  const _waInitContext = (ctx, sampleRate, state, destChannels, maxChannels) => {
+    Object.defineProperty(ctx, '_wac', {
+      enumerable: false, configurable: true,
+      value: { sampleRate: sampleRate, state: state, currentTime: 0, nodes: [] },
+    });
+    _waAllowNode = true;
+    let dest;
+    try { dest = new AudioDestinationNode(); } finally { _waAllowNode = false; }
+    _waInitNode(dest, ctx, {
+      inputs: 1, outputs: 1, count: destChannels,
+      mode: 'explicit', interp: 'speakers', kind: 'destination',
+      // Too many channels for the actual device is an INDEX error, not an
+      // unsupported-feature one: the count is out of the device's range.
+      limits: { maxCount: maxChannels, overError: 'IndexSizeError' },
+    });
+    dest._wan.maxChannelCount = maxChannels;
+    ctx._wac.destination = dest;
+    _waAllowListener = true;
+    try { ctx._wac.listener = new AudioListener(); } finally { _waAllowListener = false; }
+    _waAllowAudioWorklet = true;
+    try { ctx._wac.audioWorklet = new AudioWorklet(); } finally { _waAllowAudioWorklet = false; }
+    _waWorkletRate = sampleRate;
+    return ctx;
+  };
+
+  _waAttr(BaseAudioContext, 'destination', function () { return this._wac.destination; });
+  _waAttr(BaseAudioContext, 'sampleRate', function () { return this._wac.sampleRate; });
+  _waAttr(BaseAudioContext, 'currentTime', function () { return this._wac.currentTime; });
+  _waAttr(BaseAudioContext, 'listener', function () { return this._wac.listener; });
+  _waAttr(BaseAudioContext, 'state', function () { return this._wac.state; });
+  _waAttr(BaseAudioContext, 'renderQuantumSize', function () { return _WA_QUANTUM; });
+  _waAttr(BaseAudioContext, 'audioWorklet', function () { return this._wac.audioWorklet; });
+
+  // The factory methods are specified as exactly equivalent to the constructors,
+  // so they are implemented as exactly the constructors. Two code paths for one
+  // behaviour is how `createGain()` and `new GainNode()` end up disagreeing.
+  const _waFactory = (name, Ctor, build) => {
+    _waMethod(BaseAudioContext, name, build || function () {
+      return _waConstruct(Ctor, [this]);
+    }, 0);
+  };
+  _waFactory('createAnalyser', AnalyserNode);
+  _waFactory('createBiquadFilter', BiquadFilterNode);
+  _waFactory('createBufferSource', AudioBufferSourceNode);
+  _waFactory('createConstantSource', ConstantSourceNode);
+  _waFactory('createConvolver', ConvolverNode);
+  _waFactory('createDynamicsCompressor', DynamicsCompressorNode);
+  _waFactory('createGain', GainNode);
+  _waFactory('createOscillator', OscillatorNode);
+  _waFactory('createPanner', PannerNode);
+  _waFactory('createStereoPanner', StereoPannerNode);
+  _waFactory('createWaveShaper', WaveShaperNode);
+
+  _waMethod(BaseAudioContext, 'createBuffer', function (numberOfChannels, length, sampleRate) {
+    const where = 'Failed to execute \'createBuffer\' on \'BaseAudioContext\'';
+    if (arguments.length < 3)
+      throw new TypeError(where + ': 3 arguments required, but only ' +
+        arguments.length + ' present.');
+    return _waMakeBuffer(_waULong(numberOfChannels), _waULong(length),
+      _waFloat(sampleRate, where), where);
+  }, 3);
+
+  _waMethod(BaseAudioContext, 'createChannelMerger', function (numberOfInputs) {
+    return _waConstruct(ChannelMergerNode, [this,
+      { numberOfInputs: numberOfInputs === undefined ? 6 : numberOfInputs }]);
+  }, 0);
+  _waMethod(BaseAudioContext, 'createChannelSplitter', function (numberOfOutputs) {
+    return _waConstruct(ChannelSplitterNode, [this,
+      { numberOfOutputs: numberOfOutputs === undefined ? 6 : numberOfOutputs }]);
+  }, 0);
+  _waMethod(BaseAudioContext, 'createDelay', function (maxDelayTime) {
+    return _waConstruct(DelayNode, [this,
+      { maxDelayTime: maxDelayTime === undefined ? 1 : maxDelayTime }]);
+  }, 0);
+  _waMethod(BaseAudioContext, 'createIIRFilter', function (feedforward, feedback) {
+    const where = 'Failed to execute \'createIIRFilter\' on \'BaseAudioContext\'';
+    if (arguments.length < 2)
+      throw new TypeError(where + ': 2 arguments required, but only ' +
+        arguments.length + ' present.');
+    return _waConstruct(IIRFilterNode, [this,
+      { feedforward: feedforward, feedback: feedback }]);
+  }, 2);
+  _waMethod(BaseAudioContext, 'createPeriodicWave', function (real, imag, constraints) {
+    const where = 'Failed to execute \'createPeriodicWave\' on \'BaseAudioContext\'';
+    if (arguments.length < 2)
+      throw new TypeError(where + ': 2 arguments required, but only ' +
+        arguments.length + ' present.');
+    const o = _waDict(constraints, where);
+    return new PeriodicWave(this, {
+      real: real, imag: imag, disableNormalization: !!o.disableNormalization,
+    });
+  }, 2);
+  _waMethod(BaseAudioContext, 'createScriptProcessor',
+    function (bufferSize, numberOfInputChannels, numberOfOutputChannels) {
+      const where = 'Failed to execute \'createScriptProcessor\' on \'BaseAudioContext\'';
+      const bs = bufferSize === undefined ? 0 : _waULong(bufferSize);
+      const inCh = numberOfInputChannels === undefined ? 2 : _waULong(numberOfInputChannels);
+      const outCh = numberOfOutputChannels === undefined ? 2 : _waULong(numberOfOutputChannels);
+      if (bs !== 0 && [256, 512, 1024, 2048, 4096, 8192, 16384].indexOf(bs) < 0)
+        throw new DOMException(where + ': buffer size (' + bs +
+          ') must be a power of two between 256 and 16384.', 'IndexSizeError');
+      if (inCh === 0 && outCh === 0)
+        throw new DOMException(where + ': number of input channels and output ' +
+          'channels cannot both be zero.', 'IndexSizeError');
+      if (inCh > 32)
+        throw new DOMException(where + ': number of input channels (' + inCh +
+          ') exceeds maximum (32).', 'IndexSizeError');
+      if (outCh > 32)
+        throw new DOMException(where + ': number of output channels (' + outCh +
+          ') exceeds maximum (32).', 'IndexSizeError');
+      const node = _waConstruct(ScriptProcessorNode, []);
+      _waInitNode(node, this, {
+        inputs: 1, outputs: 1, count: inCh, mode: 'explicit', interp: 'speakers',
+      });
+      node._wan.bufferSize = bs || 4096;
+      node._wan.inputChannels = inCh;
+      node._wan.outputChannels = outCh;
+      return node;
+    }, 0);
+
+  // There is no audio decoder here. `decodeAudioData` therefore REJECTS rather
+  // than resolving with silence — a promise that resolves with a buffer of zeros
+  // is the same lie the old stub told, and a page has no way to tell it from a
+  // genuinely silent file.
+  _waMethod(BaseAudioContext, 'decodeAudioData',
+    function (audioData, successCallback, errorCallback) {
+      const where = 'Failed to execute \'decodeAudioData\' on \'BaseAudioContext\'';
+      if (arguments.length < 1)
+        return Promise.reject(new TypeError(where + ': 1 argument required, but only 0 present.'));
+      if (!(audioData instanceof ArrayBuffer))
+        return Promise.reject(new TypeError(where + ': parameter 1 is not of type \'ArrayBuffer\'.'));
+      const err = new DOMException(where +
+        ': Unable to decode audio data (no audio decoder available).', 'EncodingError');
+      if (typeof errorCallback === 'function') {
+        try { errorCallback(err); } catch (e) {}
+      }
+      return Promise.reject(err);
+    }, 1, true);
+  _waTag(BaseAudioContext, 'BaseAudioContext');
+
+  const _WA_LATENCY = ['balanced', 'interactive', 'playback'];
+  class AudioContext extends BaseAudioContext {
+    constructor(contextOptions) {
+      _waAllowContext = true;
+      try { super(); } finally { _waAllowContext = false; }
+      const where = _waIface('AudioContext');
+      const o = _waDict(contextOptions, where);
+      let rate = _fp('audioSampleRate');
+      if (o.sampleRate !== undefined) {
+        rate = _waFloat(o.sampleRate, where);
+        if (!(rate >= _WA_MIN_RATE && rate <= _WA_MAX_RATE))
+          throw new DOMException(where + ': The sampleRate provided (' + rate +
+            ') is outside the range [' + _WA_MIN_RATE + ', ' + _WA_MAX_RATE + '].',
+            'NotSupportedError');
+      }
+      if (o.latencyHint !== undefined && typeof o.latencyHint !== 'number')
+        _waEnum(o.latencyHint, _WA_LATENCY, where);
+      // No audio device, so nothing is being pulled: the context starts
+      // 'suspended', exactly as one does before a user gesture on a real browser.
+      _waInitContext(this, rate, 'suspended', 2, 2);
+      this._wac.baseLatency = _fp('audioBaseLatency');
+      _waAllowStats = true;
+      try { this._wac.playbackStats = new AudioPlaybackStats(); } finally { _waAllowStats = false; }
+    }
+  }
+  _waAttr(AudioContext, 'baseLatency', function () { return this._wac.baseLatency; });
+  _waAttr(AudioContext, 'outputLatency', function () { return this._wac.baseLatency * 2; });
+  _waAttr(AudioContext, 'sinkId', function () { return ''; });
+  _waAttr(AudioContext, 'playbackStats', function () { return this._wac.playbackStats; });
+  _waMethod(AudioContext, 'getOutputTimestamp', function () {
+    return { contextTime: this._wac.currentTime, performanceTime: performance.now() };
+  }, 0);
+  const _waContextTransition = (ctx, target, name) => {
+    if (ctx._wac.state === 'closed')
+      return Promise.reject(new DOMException('Failed to execute \'' + name +
+        '\' on \'AudioContext\': Cannot ' + name + ' a closed AudioContext.',
+        'InvalidStateError'));
+    if (ctx._wac.state !== target) {
+      ctx._wac.state = target;
+      // The statechange event is queued, not fired synchronously — a page that
+      // reads `state` right after the call must see the new value with no
+      // handler having run in between.
+      Promise.resolve().then(() => {
+        const e = new Event('statechange');
+        try { ctx.dispatchEvent(e); } catch (err) {}
+      });
+    }
+    return Promise.resolve();
+  };
+  _waMethod(AudioContext, 'resume', function () {
+    return _waContextTransition(this, 'running', 'resume');
+  }, 0, true);
+  _waMethod(AudioContext, 'suspend', function () {
+    return _waContextTransition(this, 'suspended', 'suspend');
+  }, 0, true);
+  _waMethod(AudioContext, 'close', function () {
+    return _waContextTransition(this, 'closed', 'close');
+  }, 0, true);
+  _waMethod(AudioContext, 'setSinkId', function (sinkId) {
+    if (arguments.length < 1)
+      throw new TypeError('Failed to execute \'setSinkId\' on \'AudioContext\'' +
+        ': 1 argument required, but only 0 present.');
+    return Promise.resolve();
+  }, 1, true);
+  _waMethod(AudioContext, 'createMediaElementSource', function (mediaElement) {
+    const where = 'Failed to execute \'createMediaElementSource\' on \'AudioContext\'';
+    if (arguments.length < 1)
+      throw new TypeError(where + ': 1 argument required, but only 0 present.');
+    return _waConstruct(MediaElementAudioSourceNode, [this, { mediaElement: mediaElement }]);
+  }, 1);
+  _waMethod(AudioContext, 'createMediaStreamSource', function (mediaStream) {
+    const where = 'Failed to execute \'createMediaStreamSource\' on \'AudioContext\'';
+    if (arguments.length < 1)
+      throw new TypeError(where + ': 1 argument required, but only 0 present.');
+    return _waConstruct(MediaStreamAudioSourceNode, [this, { mediaStream: mediaStream }]);
+  }, 1);
+  _waMethod(AudioContext, 'createMediaStreamTrackSource', function (track) {
+    const where = 'Failed to execute \'createMediaStreamTrackSource\' on \'AudioContext\'';
+    if (arguments.length < 1)
+      throw new TypeError(where + ': 1 argument required, but only 0 present.');
+    return _waConstruct(MediaStreamTrackAudioSourceNode, [this, { mediaStreamTrack: track }]);
+  }, 1);
+  _waMethod(AudioContext, 'createMediaStreamDestination', function () {
+    return _waConstruct(MediaStreamAudioDestinationNode, [this]);
+  }, 0);
+  _waLen(AudioContext, 0); _waTag(AudioContext, 'AudioContext');
+
+  class OfflineAudioContext extends BaseAudioContext {
+    constructor(a, b, c) {
+      _waAllowContext = true;
+      try { super(); } finally { _waAllowContext = false; }
+      const where = _waIface('OfflineAudioContext');
+      let numberOfChannels, length, sampleRate;
+      if (arguments.length === 1) {
+        const o = _waDict(a, where);
+        if (o.length === undefined)
+          throw new TypeError(where + ': required member length is undefined.');
+        if (o.sampleRate === undefined)
+          throw new TypeError(where + ': required member sampleRate is undefined.');
+        numberOfChannels = o.numberOfChannels === undefined ? 1 : _waULong(o.numberOfChannels);
+        length = _waULong(o.length);
+        sampleRate = _waFloat(o.sampleRate, where);
+      } else if (arguments.length >= 3) {
+        numberOfChannels = _waULong(a);
+        length = _waULong(b);
+        sampleRate = _waFloat(c, where);
+      } else {
+        throw new TypeError(where + ': Overload resolution failed.');
+      }
+      if (numberOfChannels < 1 || numberOfChannels > 32)
+        throw new DOMException(where + ': The number of channels provided (' +
+          numberOfChannels + ') is outside the range [1, 32].', 'NotSupportedError');
+      if (length < 1)
+        throw new DOMException(where + ': The number of frames provided (' + length +
+          ') is less than the minimum bound (1).', 'NotSupportedError');
+      if (!(sampleRate >= _WA_MIN_RATE && sampleRate <= _WA_MAX_RATE))
+        throw new DOMException(where + ': The sampleRate provided (' + sampleRate +
+          ') is outside the range [' + _WA_MIN_RATE + ', ' + _WA_MAX_RATE + '].',
+          'NotSupportedError');
+      // An offline destination is exactly as wide as the buffer it renders into,
+      // and it starts suspended: nothing advances until startRendering() is called.
+      _waInitContext(this, sampleRate, 'suspended', numberOfChannels, numberOfChannels);
+      this._wac.length = length;
+      this._wac.numberOfChannels = numberOfChannels;
+      this._wac.rendering = false;
+      this._wac.rendered = null;
+      this._wac.renderedFrames = 0;
+      this._wac.suspendPoints = new Map();
+      this._wac.resumeGate = null;
+    }
+  }
+  _waAttr(OfflineAudioContext, 'length', function () { return this._wac.length; });
+  _waMethod(OfflineAudioContext, 'startRendering', function () {
+    const where = 'Failed to execute \'startRendering\' on \'OfflineAudioContext\'';
+    const s = this._wac;
+    // Rendering is once per context. The second call has nothing left to render:
+    // the graph has already been consumed and the timeline is at the end.
+    if (s.rendering || s.rendered)
+      return Promise.reject(new DOMException(where +
+        ': cannot call startRendering more than once', 'InvalidStateError'));
+    s.rendering = true;
+    s.state = 'running';
+    const ctx = this;
+    return _waRender(this).then((buffer) => {
+      s.rendered = buffer;
+      s.rendering = false;
+      s.state = 'closed';
+      const ev = new OfflineAudioCompletionEvent('complete', { renderedBuffer: buffer });
+      try { ctx.dispatchEvent(ev); } catch (e) {}
+      return buffer;
+    });
+  }, 0, true);
+  _waMethod(OfflineAudioContext, 'resume', function () {
+    const s = this._wac;
+    if (s.resumeGate) { const g = s.resumeGate; s.resumeGate = null; g(); }
+    return Promise.resolve();
+  }, 0, true);
+  _waMethod(OfflineAudioContext, 'suspend', function (suspendTime) {
+    const where = 'Failed to execute \'suspend\' on \'OfflineAudioContext\'';
+    if (arguments.length < 1)
+      return Promise.reject(new TypeError(where + ': 1 argument required, but only 0 present.'));
+    const t = _waDouble(suspendTime, where);
+    if (t < 0)
+      return Promise.reject(new DOMException(where + ': negative suspend time (' + t +
+        ') is not allowed', 'InvalidStateError'));
+    const s = this._wac;
+    // Suspension happens on a render-quantum boundary, because that is the
+    // smallest thing the graph knows how to stop between.
+    const frame = Math.floor(t * s.sampleRate / _WA_QUANTUM) * _WA_QUANTUM;
+    if (frame >= s.length)
+      return Promise.reject(new DOMException(where + ': The suspend time (' + t +
+        ') is greater than or equal to the total render duration.', 'InvalidStateError'));
+    if (frame < s.renderedFrames)
+      return Promise.reject(new DOMException(where + ': The suspend time (' + t +
+        ') is earlier than the current time.', 'InvalidStateError'));
+    if (s.suspendPoints.has(frame))
+      return Promise.reject(new DOMException(where + ': A suspend is already ' +
+        'scheduled at frame ' + frame + '.', 'InvalidStateError'));
+    let resolve;
+    const p = new Promise((r) => { resolve = r; });
+    s.suspendPoints.set(frame, resolve);
+    return p;
+  }, 1, true);
+  _waLen(OfflineAudioContext, 1); _waTag(OfflineAudioContext, 'OfflineAudioContext');
+
+  // ---------------------------------------------------------------------------
+  // The renderer
+  // ---------------------------------------------------------------------------
+  // `startRendering()` used to resolve with a buffer of zeros. This is the part
+  // that makes it mean something: the graph is walked, every node produces real
+  // samples, and the destination's input is what comes back.
+  //
+  // It runs in the spec's fixed 128-frame render quanta, which is not an
+  // implementation detail — it is *observable*. Every source starts on a quantum
+  // boundary in this engine, k-rate parameters are sampled once per quantum, and
+  // WPT checks output frame by frame at exactly those boundaries.
+
+  // Reverse the graph. Connections are stored forward (each node knows what it
+  // feeds), because that is the direction `connect()` is written in — but
+  // rendering pulls, so it needs to ask "what feeds THIS input".
+  const _waReverse = (nodes) => {
+    const intoNode = new Map();
+    const intoParam = new Map();
+    for (const n of nodes) {
+      n._wan.outputs.forEach((list, oi) => {
+        for (const c of list) {
+          if (c.node) {
+            if (!intoNode.has(c.node)) intoNode.set(c.node, []);
+            intoNode.get(c.node).push({ from: n, output: oi, input: c.input });
+          } else if (c.param) {
+            if (!intoParam.has(c.param)) intoParam.set(c.param, []);
+            intoParam.get(c.param).push({ from: n, output: oi });
+          }
+        }
+      });
+    }
+    return { intoNode: intoNode, intoParam: intoParam };
+  };
+
+  // Depth-first post-order from the destination, so every node is processed
+  // after everything that feeds it. A node already on the stack is a CYCLE —
+  // skipped rather than followed, which is exactly right: a feedback loop is
+  // legal in Web Audio only through a DelayNode, and a delay reads the previous
+  // quantum's samples anyway.
+  const _waTopoOrder = (destination, rev) => {
+    const order = [];
+    const state = new Map();
+    const visit = (n) => {
+      const st = state.get(n);
+      if (st !== undefined) return;
+      state.set(n, 0);
+      for (const c of (rev.intoNode.get(n) || [])) visit(c.from);
+      for (const name of Object.keys(n._wan.params)) {
+        for (const c of (rev.intoParam.get(n._wan.params[name]) || [])) visit(c.from);
+      }
+      state.set(n, 1);
+      order.push(n);
+    };
+    visit(destination);
+    return order;
+  };
+
+  // Gather one input: the sum of every connection feeding it, each up- or
+  // down-mixed to the input's computed channel count first (spec §4).
+  const _waGatherInput = (node, inputIndex, rev) => {
+    const conns = (rev.intoNode.get(node) || []).filter((c) => c.input === inputIndex);
+    const st = node._wan;
+    let computed;
+    if (st.channelCountMode === 'explicit') {
+      computed = st.channelCount;
+    } else {
+      let mx = 1;
+      for (const c of conns) mx = Math.max(mx, c.from._waOut[c.output].length);
+      computed = st.channelCountMode === 'clamped-max'
+        ? Math.min(mx, st.channelCount) : mx;
+    }
+    const bus = _waBus(Math.max(1, computed));
+    for (const c of conns) _waMixInto(bus, c.from._waOut[c.output], st.channelInterpretation);
+    return bus;
+  };
+
+  // An AudioParam's values for this quantum. Automation is read here; anything
+  // connected to the param is SUMMED on top (that is what makes an LFO work —
+  // a connection to a param offsets it, it does not replace it).
+  const _waParamBlock = (param, frame, sampleRate, rev, out) => {
+    const s = param._wap;
+    _waParamCurve(s, frame, sampleRate, out);
+    const conns = rev.intoParam.get(param) || [];
+    for (const c of conns) {
+      const src = c.from._waOut[c.output];
+      // A param is a single value per frame, so a multi-channel input is
+      // down-mixed to mono before it is added.
+      if (src.length === 1) {
+        for (let i = 0; i < _WA_QUANTUM; i++) out[i] += src[0][i];
+      } else {
+        for (let i = 0; i < _WA_QUANTUM; i++) {
+          let sum = 0;
+          for (let ch = 0; ch < src.length; ch++) sum += src[ch][i];
+          out[i] += sum / src.length;
+        }
+      }
+    }
+    for (let i = 0; i < _WA_QUANTUM; i++)
+      out[i] = Math.min(s.maxValue, Math.max(s.minValue, out[i]));
+    // A k-rate param is sampled ONCE per quantum and held. Not an optimisation:
+    // a page that automates a compressor's threshold can hear the difference.
+    if (s.rate === 'k-rate') {
+      const v = out[0];
+      for (let i = 1; i < _WA_QUANTUM; i++) out[i] = v;
+    }
+    return out;
+  };
+
+  const _waScratch = new Float32Array(_WA_QUANTUM);
+  const _waParamAt = (node, name, frame, sampleRate, rev) => {
+    const p = node._wan.params[name];
+    return _waParamBlock(p, frame, sampleRate, rev, _waScratch);
+  };
+
+  // Per-node render state, created lazily so a node that is never rendered
+  // costs nothing (a page building a graph it does not play is common).
+  const _waState = (node) => node._waRs || (node._waRs = {});
+
+  const _waProcess = (node, frame, sampleRate, rev) => {
+    const st = node._wan;
+    const nOut = st.numberOfOutputs;
+    if (!node._waOut) {
+      node._waOut = [];
+      for (let i = 0; i < nOut; i++) node._waOut.push(_waBus(1));
+    }
+    const kind = st.kind;
+    const input = st.numberOfInputs > 0 ? _waGatherInput(node, 0, rev) : null;
+
+    switch (kind) {
+      case 'gain': {
+        const g = _waParamAt(node, 'gain', frame, sampleRate, rev);
+        const out = _waBusLike(node, 0, input.length);
+        for (let ch = 0; ch < input.length; ch++)
+          for (let i = 0; i < _WA_QUANTUM; i++) out[ch][i] = input[ch][i] * g[i];
+        return;
+      }
+      case 'constant': {
+        const o = _waParamAt(node, 'offset', frame, sampleRate, rev);
+        const out = _waBusLike(node, 0, 1);
+        const on = _waSourceGate(node, frame, sampleRate);
+        for (let i = 0; i < _WA_QUANTUM; i++) out[0][i] = on[i] ? o[i] : 0;
+        return;
+      }
+      case 'oscillator': {
+        const f = _waParamAt(node, 'frequency', frame, sampleRate, rev);
+        const fCopy = Float32Array.from(f);
+        const d = _waParamAt(node, 'detune', frame, sampleRate, rev);
+        const out = _waBusLike(node, 0, 1);
+        const rs = _waState(node);
+        if (rs.phase === undefined) rs.phase = 0;
+        const on = _waSourceGate(node, frame, sampleRate);
+        const wave = st.periodicWave || null;
+        for (let i = 0; i < _WA_QUANTUM; i++) {
+          const hz = fCopy[i] * Math.pow(2, d[i] / 1200);
+          out[0][i] = on[i] ? _waOscSample(st.oscType, rs.phase, wave) : 0;
+          rs.phase += hz / sampleRate;
+          if (rs.phase >= 1 || rs.phase <= -1) rs.phase -= Math.trunc(rs.phase);
+        }
+        return;
+      }
+      case 'buffersource': {
+        _waRenderBufferSource(node, frame, sampleRate, rev);
+        return;
+      }
+      case 'delay': {
+        _waRenderDelay(node, input, frame, sampleRate, rev);
+        return;
+      }
+      case 'biquad': {
+        _waRenderBiquad(node, input, frame, sampleRate, rev);
+        return;
+      }
+      case 'iir': {
+        _waRenderIIR(node, input);
+        return;
+      }
+      case 'waveshaper': {
+        const out = _waBusLike(node, 0, input.length);
+        const curve = st.curve;
+        for (let ch = 0; ch < input.length; ch++) {
+          for (let i = 0; i < _WA_QUANTUM; i++)
+            out[ch][i] = curve ? _waWaveshape(curve, input[ch][i]) : input[ch][i];
+        }
+        return;
+      }
+      case 'stereopanner': {
+        _waRenderStereoPanner(node, input, frame, sampleRate, rev);
+        return;
+      }
+      case 'merger': {
+        const out = _waBusLike(node, 0, st.numberOfInputs);
+        for (let i = 0; i < st.numberOfInputs; i++) {
+          const b = _waGatherInput(node, i, rev);
+          out[i].set(b[0]);
+        }
+        return;
+      }
+      case 'splitter': {
+        for (let o = 0; o < st.numberOfOutputs; o++) {
+          const b = _waBusLike(node, o, 1);
+          if (o < input.length) b[0].set(input[o]); else b[0].fill(0);
+        }
+        return;
+      }
+      case 'convolver': {
+        _waRenderConvolver(node, input);
+        return;
+      }
+      case 'panner': {
+        _waRenderPanner(node, input, frame, sampleRate, rev);
+        return;
+      }
+      case 'worklet': {
+        _waRenderWorklet(node, frame, sampleRate, rev);
+        return;
+      }
+      case 'destination': {
+        node._waIn = input;
+        return;
+      }
+      default: {
+        // Analyser, compressor, media sources, script processor: pass the input
+        // through unchanged rather than silencing it. Reporting no signal where
+        // a real engine reports a processed one is a much worse lie than
+        // reporting an unprocessed one, and it silences everything downstream.
+        if (nOut === 0) { node._waIn = input; return; }
+        const src = input || _waBus(1);
+        const out = _waBusLike(node, 0, src.length);
+        for (let ch = 0; ch < src.length; ch++) out[ch].set(src[ch]);
+        return;
+      }
+    }
+  };
+
+  // Resize output bus `i` to `channels` and zero it.
+  const _waBusLike = (node, i, channels) => {
+    let bus = node._waOut[i];
+    if (!bus || bus.length !== channels) { bus = _waBus(channels); node._waOut[i] = bus; }
+    else for (const ch of bus) ch.fill(0);
+    return bus;
+  };
+
+  // Which frames of this quantum a scheduled source is actually sounding for.
+  const _waSourceGate = (node, frame, sampleRate) => {
+    const st = node._wan;
+    const gate = _waGateScratch;
+    const start = st.started ? Math.round(st.startTime * sampleRate) : Infinity;
+    const stop = st.stopTime === undefined ? Infinity : Math.round(st.stopTime * sampleRate);
+    let ended = true;
+    for (let i = 0; i < _WA_QUANTUM; i++) {
+      const f = frame + i;
+      gate[i] = (f >= start && f < stop) ? 1 : 0;
+      if (f < stop) ended = false;
+    }
+    if (ended && st.started && stop !== Infinity && !st.endedFired) {
+      st.endedFired = true;
+      _waQueueEnded(node);
+    }
+    return gate;
+  };
+  const _waGateScratch = new Uint8Array(_WA_QUANTUM);
+  const _waQueueEnded = (node) => {
+    Promise.resolve().then(() => {
+      try { node.dispatchEvent(new Event('ended')); } catch (e) {}
+    });
+  };
+
+  const _waRenderBufferSource = (node, frame, sampleRate, rev) => {
+    const st = node._wan;
+    const buf = st.buffer;
+    const chans = buf ? buf._wab.channels.length : 1;
+    const out = _waBusLike(node, 0, chans);
+    if (!buf || !st.started) return;
+    const rs = _waState(node);
+    const rate = _waParamAt(node, 'playbackRate', frame, sampleRate, rev)[0];
+    const detune = node._wan.params.detune._wap.value;
+    const step = rate * Math.pow(2, detune / 1200) * (buf._wab.sampleRate / sampleRate);
+    const startFrame = Math.round(st.startTime * sampleRate);
+    const stopFrame = st.stopTime === undefined ? Infinity : Math.round(st.stopTime * sampleRate);
+    if (rs.pos === undefined) rs.pos = (st.offset || 0) * buf._wab.sampleRate;
+    const len = buf._wab.length;
+    const loopStart = st.loopStart > 0 ? st.loopStart * buf._wab.sampleRate : 0;
+    const loopEnd = st.loopEnd > 0 ? st.loopEnd * buf._wab.sampleRate : len;
+    const durLimit = st.duration === undefined ? Infinity
+      : (st.offset || 0) * buf._wab.sampleRate + st.duration * buf._wab.sampleRate;
+    for (let i = 0; i < _WA_QUANTUM; i++) {
+      const f = frame + i;
+      if (f < startFrame || f >= stopFrame) continue;
+      let pos = rs.pos;
+      if (st.loop && loopEnd > loopStart) {
+        if (pos >= loopEnd) pos = loopStart + ((pos - loopStart) % (loopEnd - loopStart));
+      }
+      if (pos >= len || pos >= durLimit) {
+        if (!st.endedFired) { st.endedFired = true; _waQueueEnded(node); }
+        break;
+      }
+      const i0 = Math.floor(pos);
+      const frac = pos - i0;
+      for (let ch = 0; ch < chans; ch++) {
+        const data = buf._wab.channels[ch];
+        const a = data[i0] || 0;
+        const b = (i0 + 1 < len) ? data[i0 + 1] : (st.loop ? data[Math.floor(loopStart)] || 0 : 0);
+        out[ch][i] = frac === 0 ? a : a + (b - a) * frac;
+      }
+      rs.pos = pos + step;
+    }
+  };
+
+  const _waRenderDelay = (node, input, frame, sampleRate, rev) => {
+    const st = node._wan;
+    const out = _waBusLike(node, 0, input.length);
+    const rs = _waState(node);
+    const cap = Math.ceil(st.maxDelayTime * sampleRate) + _WA_QUANTUM + 2;
+    if (!rs.lines || rs.lines.length !== input.length) {
+      rs.lines = [];
+      for (let ch = 0; ch < input.length; ch++) rs.lines.push(new Float32Array(cap));
+      rs.write = 0;
+    }
+    const d = _waParamAt(node, 'delayTime', frame, sampleRate, rev);
+    for (let i = 0; i < _WA_QUANTUM; i++) {
+      const w = (rs.write + i) % cap;
+      // A delay of less than one render quantum still cannot read the future;
+      // the spec floors the minimum delay at one quantum for a node inside a
+      // cycle, but a plain delay line reads exactly delayTime back.
+      const back = Math.max(0, d[i] * sampleRate);
+      const readPos = w - back;
+      const r0 = Math.floor(readPos);
+      const frac = readPos - r0;
+      for (let ch = 0; ch < input.length; ch++) {
+        rs.lines[ch][w] = input[ch][i];
+        const a = rs.lines[ch][((r0 % cap) + cap) % cap];
+        const b = rs.lines[ch][(((r0 + 1) % cap) + cap) % cap];
+        out[ch][i] = frac === 0 ? a : a + (b - a) * frac;
+      }
+    }
+    rs.write = (rs.write + _WA_QUANTUM) % cap;
+  };
+
+  const _waRenderBiquad = (node, input, frame, sampleRate, rev) => {
+    const st = node._wan;
+    const out = _waBusLike(node, 0, input.length);
+    const rs = _waState(node);
+    if (!rs.z || rs.z.length !== input.length) {
+      rs.z = [];
+      for (let ch = 0; ch < input.length; ch++) rs.z.push({ x1: 0, x2: 0, y1: 0, y2: 0 });
+    }
+    const f = _waParamAt(node, 'frequency', frame, sampleRate, rev)[0];
+    const det = node._wan.params.detune._wap.value;
+    const q = node._wan.params.Q._wap.value;
+    const g = node._wan.params.gain._wap.value;
+    const c = _waBiquadCoefficients(st.biquadType, f * Math.pow(2, det / 1200), q, g, sampleRate);
+    const [b0, b1, b2, , a1, a2] = c;
+    for (let ch = 0; ch < input.length; ch++) {
+      const z = rs.z[ch];
+      for (let i = 0; i < _WA_QUANTUM; i++) {
+        const x = input[ch][i];
+        const y = b0 * x + b1 * z.x1 + b2 * z.x2 - a1 * z.y1 - a2 * z.y2;
+        z.x2 = z.x1; z.x1 = x; z.y2 = z.y1; z.y1 = y;
+        out[ch][i] = y;
+      }
+    }
+  };
+
+  const _waRenderIIR = (node, input) => {
+    const st = node._wan;
+    const out = _waBusLike(node, 0, input.length);
+    const rs = _waState(node);
+    const ff = st.feedforward, fb = st.feedback;
+    const a0 = fb[0];
+    if (!rs.hist || rs.hist.length !== input.length) {
+      rs.hist = [];
+      for (let ch = 0; ch < input.length; ch++)
+        rs.hist.push({ x: new Float64Array(ff.length), y: new Float64Array(fb.length) });
+    }
+    for (let ch = 0; ch < input.length; ch++) {
+      const h = rs.hist[ch];
+      for (let i = 0; i < _WA_QUANTUM; i++) {
+        for (let k = h.x.length - 1; k > 0; k--) h.x[k] = h.x[k - 1];
+        h.x[0] = input[ch][i];
+        let acc = 0;
+        for (let k = 0; k < ff.length; k++) acc += ff[k] * h.x[k];
+        for (let k = 1; k < fb.length; k++) acc -= fb[k] * h.y[k];
+        acc /= a0;
+        for (let k = h.y.length - 1; k > 0; k--) h.y[k] = h.y[k - 1];
+        h.y[0] = acc;
+        out[ch][i] = acc;
+      }
+    }
+  };
+
+  const _waRenderStereoPanner = (node, input, frame, sampleRate, rev) => {
+    const out = _waBusLike(node, 0, 2);
+    const pan = _waParamAt(node, 'pan', frame, sampleRate, rev);
+    const mono = input.length === 1;
+    for (let i = 0; i < _WA_QUANTUM; i++) {
+      const p = Math.min(1, Math.max(-1, pan[i]));
+      if (mono) {
+        const x = (p + 1) / 2 * (Math.PI / 2);
+        out[0][i] = input[0][i] * Math.cos(x);
+        out[1][i] = input[0][i] * Math.sin(x);
+      } else {
+        const l = input[0][i], r = input[1][i];
+        const x = (p <= 0 ? p + 1 : p) * (Math.PI / 2);
+        if (p <= 0) {
+          out[0][i] = l + r * Math.cos(x);
+          out[1][i] = r * Math.sin(x);
+        } else {
+          out[0][i] = l * Math.cos(x);
+          out[1][i] = r + l * Math.sin(x);
+        }
+      }
+    }
+  };
+
+  const _waRenderConvolver = (node, input) => {
+    const st = node._wan;
+    const buf = st.buffer;
+    if (!buf) {
+      const out = _waBusLike(node, 0, input.length);
+      for (let ch = 0; ch < input.length; ch++) out[ch].set(input[ch]);
+      return;
+    }
+    const irChans = buf._wab.channels.length;
+    const outCh = Math.max(1, Math.min(2, Math.max(input.length, irChans === 1 ? 1 : 2)));
+    const out = _waBusLike(node, 0, outCh);
+    const rs = _waState(node);
+    const irLen = buf._wab.length;
+    if (!rs.tail || rs.tail.length !== outCh) {
+      rs.tail = [];
+      for (let ch = 0; ch < outCh; ch++) rs.tail.push(new Float32Array(irLen + _WA_QUANTUM));
+      // Normalisation keeps a room from making the signal louder than it was;
+      // it is on unless the page explicitly turned it off.
+      let power = 0;
+      for (let ch = 0; ch < irChans; ch++) {
+        const d = buf._wab.channels[ch];
+        for (let i = 0; i < irLen; i++) power += d[i] * d[i];
+      }
+      rs.scale = st.normalize && power > 0 ? 1 / Math.sqrt(power) : 1;
+    }
+    for (let ch = 0; ch < outCh; ch++) {
+      const tail = rs.tail[ch];
+      tail.copyWithin(0, _WA_QUANTUM);
+      tail.fill(0, tail.length - _WA_QUANTUM);
+      const ir = buf._wab.channels[Math.min(ch, irChans - 1)];
+      const x = input[Math.min(ch, input.length - 1)];
+      for (let i = 0; i < _WA_QUANTUM; i++) {
+        const xi = x[i];
+        if (xi === 0) continue;
+        for (let k = 0; k < irLen; k++) tail[i + k] += xi * ir[k] * rs.scale;
+      }
+      out[ch].set(tail.subarray(0, _WA_QUANTUM));
+    }
+  };
+
+  const _waRenderPanner = (node, input, frame, sampleRate, rev) => {
+    const st = node._wan;
+    const out = _waBusLike(node, 0, 2);
+    const px = _waParamAt(node, 'positionX', frame, sampleRate, rev)[0];
+    const py = node._wan.params.positionY._wap.value;
+    const pz = node._wan.params.positionZ._wap.value;
+    const listener = st.context._wac.listener._wal;
+    const dx = px - listener.positionX._wap.value;
+    const dy = py - listener.positionY._wap.value;
+    const dz = pz - listener.positionZ._wap.value;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    let g = 1;
+    const rd = st.refDistance, md = st.maxDistance, rf = st.rolloffFactor;
+    if (st.distanceModel === 'linear')
+      g = 1 - rf * (Math.min(Math.max(dist, rd), md) - rd) / (md - rd || 1);
+    else if (st.distanceModel === 'inverse')
+      g = rd / (rd + rf * (Math.max(dist, rd) - rd));
+    else
+      g = Math.pow(Math.max(Math.min(Math.max(dist, rd), md), rd) / rd, -rf);
+    if (!isFinite(g)) g = 0;
+    // Equal-power azimuth: the horizontal angle to the listener, mapped onto the
+    // same cos/sin pair the stereo panner uses.
+    const azimuth = dist === 0 ? 0 : Math.atan2(dx, -dz) / Math.PI;
+    const x = (Math.min(1, Math.max(-1, azimuth)) + 1) / 2 * (Math.PI / 2);
+    const gl = Math.cos(x) * g, gr = Math.sin(x) * g;
+    for (let i = 0; i < _WA_QUANTUM; i++) {
+      let sum = 0;
+      for (let ch = 0; ch < input.length; ch++) sum += input[ch][i];
+      if (input.length > 1) sum /= input.length;
+      out[0][i] = sum * gl;
+      out[1][i] = sum * gr;
+    }
+  };
+
+  // An AudioWorkletNode's processor really runs: the module's class is
+  // instantiated once and its `process()` is called per quantum with the same
+  // inputs/outputs/parameters shapes a real worklet gets.
+  const _waRenderWorklet = (node, frame, sampleRate, rev) => {
+    const st = node._wan;
+    const rs = _waState(node);
+    if (rs.dead) { for (let o = 0; o < st.numberOfOutputs; o++) _waBusLike(node, o, 1); return; }
+    if (!rs.proc) {
+      const Ctor = _waProcessors.get(st.processorName);
+      _waAllowProcessor = true;
+      try {
+        rs.proc = new Ctor({
+          numberOfInputs: st.numberOfInputs, numberOfOutputs: st.numberOfOutputs,
+          outputChannelCount: st.outputChannelCount, processorOptions: st.processorOptions,
+        });
+      } catch (e) {
+        // A processor that throws while constructing is dead for good — the
+        // node reports it once and then outputs silence, exactly as specified.
+        rs.dead = true;
+        Promise.resolve().then(() => {
+          try { node.dispatchEvent(new Event('processorerror')); } catch (err) {}
+        });
+        for (let o = 0; o < st.numberOfOutputs; o++) _waBusLike(node, o, 1);
+        return;
+      } finally { _waAllowProcessor = false; }
+    }
+    const inputs = [];
+    for (let i = 0; i < st.numberOfInputs; i++) inputs.push(_waGatherInput(node, i, rev));
+    const outputs = [];
+    for (let o = 0; o < st.numberOfOutputs; o++) {
+      const cc = st.outputChannelCount ? st.outputChannelCount[o]
+        : (inputs[0] ? inputs[0].length : 1);
+      outputs.push(_waBusLike(node, o, cc));
+    }
+    const params = Object.create(null);
+    for (const [name, p] of st.parameters._wam) {
+      const arr = new Float32Array(_WA_QUANTUM);
+      _waParamBlock(p, frame, sampleRate, rev, arr);
+      params[name] = p._wap.rate === 'k-rate' ? arr.subarray(0, 1) : arr;
+    }
+    try { rs.proc.process(inputs, outputs, params); }
+    catch (e) {
+      rs.dead = true;
+      Promise.resolve().then(() => {
+        try { node.dispatchEvent(new Event('processorerror')); } catch (err) {}
+      });
+    }
+  };
+
+  const _waRender = async (ctx) => {
+    const s = ctx._wac;
+    const where = 'Failed to execute \'startRendering\' on \'OfflineAudioContext\'';
+    const outBuf = _waMakeBuffer(s.numberOfChannels, s.length, s.sampleRate, where);
+    const dest = s.destination;
+    let rev = _waReverse(s.nodes);
+    let order = _waTopoOrder(dest, rev);
+    const chans = outBuf._wab.channels;
+    for (let frame = 0; frame < s.length; frame += _WA_QUANTUM) {
+      s.currentTime = frame / s.sampleRate;
+      s.renderedFrames = frame;
+      if (s.suspendPoints.has(frame)) {
+        // Hand control back to the page, then pick up where we left off — and
+        // re-read the graph afterwards, because being able to change it is the
+        // only reason to stop.
+        const resolve = s.suspendPoints.get(frame);
+        s.suspendPoints.delete(frame);
+        s.state = 'suspended';
+        resolve();
+        await new Promise((r) => { s.resumeGate = r; });
+        s.state = 'running';
+        rev = _waReverse(s.nodes);
+        order = _waTopoOrder(dest, rev);
+      }
+      for (const n of order) _waProcess(n, frame, s.sampleRate, rev);
+      const bus = dest._waIn;
+      const n = Math.min(_WA_QUANTUM, s.length - frame);
+      for (let ch = 0; ch < chans.length; ch++) {
+        const src = bus && ch < bus.length ? bus[ch] : null;
+        if (!src) continue;
+        for (let i = 0; i < n; i++) chans[ch][frame + i] = src[i];
+      }
+    }
+    s.currentTime = s.length / s.sampleRate;
+    s.renderedFrames = s.length;
+    return outBuf;
+  };
+
+  // ---------------------------------------------------------------------------
+  // The automation timeline
+  // ---------------------------------------------------------------------------
+  // An AudioParam is not a number, it is a FUNCTION OF TIME, and this is that
+  // function. `gain.setValueAtTime(1, 0)` followed by
+  // `gain.linearRampToValueAtTime(0, 2)` is a two-second fade-out — and every
+  // fade, every envelope, every crossfade on the web is these five events.
+  //
+  // Doing it here rather than on the page is not a nicety. The alternative is a
+  // `setInterval` writing `gain.value` a hundred times a second, which on a
+  // hand-me-down laptop is both audibly steppy AND the thing that makes the
+  // whole tab stutter. The timeline is computed per sample by the engine, for
+  // free, while the page's main thread does nothing at all.
+  const _waIsRamp = (e) => e.type === _waEventTypes.LINEAR_RAMP ||
+    e.type === _waEventTypes.EXPONENTIAL_RAMP;
+
+  const _waValueAt = (s, t) => {
+    const ev = s.events;
+    if (ev.length === 0) return s.value;
+    // Walk the events forward, carrying (v, vt) = "the value, and the time it
+    // belongs to". Every event either resolves the answer or advances the pair.
+    let v = s.value, vt = 0;
+    for (let k = 0; k < ev.length; k++) {
+      const e = ev[k];
+      if (_waIsRamp(e)) {
+        // A ramp governs the whole stretch from the PREVIOUS event up to its
+        // own time — it is the only event type that reaches backwards.
+        if (t < e.time) {
+          if (e.time <= vt) return e.value;
+          const f = (t - vt) / (e.time - vt);
+          if (e.type === _waEventTypes.LINEAR_RAMP) return v + (e.value - v) * f;
+          // An exponential ramp is a ratio, so it cannot cross or start at
+          // zero; the spec holds the previous value instead of producing NaN.
+          if (v === 0 || (v < 0) !== (e.value < 0)) return v;
+          return v * Math.pow(e.value / v, f);
+        }
+        v = e.value; vt = e.time;
+        continue;
+      }
+      if (t < e.time) return v;
+      switch (e.type) {
+        case _waEventTypes.SET_VALUE:
+          v = e.value; vt = e.time; break;
+        case _waEventTypes.SET_VALUE_CURVE: {
+          const c = e.curve, d = e.duration;
+          if (t >= e.time + d) { v = c[c.length - 1]; vt = e.time + d; break; }
+          const x = (c.length - 1) * (t - e.time) / d;
+          const i0 = Math.min(c.length - 2, Math.floor(x));
+          return c[i0] + (c[i0 + 1] - c[i0]) * (x - i0);
+        }
+        case _waEventTypes.SET_TARGET: {
+          const next = ev[k + 1];
+          // A ramp after a setTarget starts from the setTarget's OWN start
+          // value and time (spec §1.6.3) — so leave the carried pair alone and
+          // let the ramp branch do the work.
+          if (next && _waIsRamp(next)) { vt = e.time; break; }
+          const until = (next && next.time <= t) ? next.time : t;
+          const tc = e.timeConstant;
+          // An exponential approach never actually arrives; a zero time
+          // constant is the degenerate case that arrives immediately.
+          const val = tc === 0 ? e.value
+            : e.value + (v - e.value) * Math.exp(-(until - e.time) / tc);
+          if (!next || next.time > t) return val;
+          v = val; vt = until;
+          break;
+        }
+        default: break;
+      }
+    }
+    return v;
+  };
+
+  const _waParamCurve = (s, frame, sampleRate, out) => {
+    if (s.events.length === 0) {
+      out.fill(Math.min(s.maxValue, Math.max(s.minValue, s.value)));
+      return;
+    }
+    for (let i = 0; i < _WA_QUANTUM; i++)
+      out[i] = _waValueAt(s, (frame + i) / sampleRate);
+  };
+
+  // ---------------------------------------------------------------------------
+  // Event handler IDL attributes
+  // ---------------------------------------------------------------------------
+  _workerEventHandlers(BaseAudioContext.prototype, BaseAudioContext, ['onstatechange']);
+  _workerEventHandlers(AudioContext.prototype, AudioContext, ['onsinkchange', 'onerror']);
+  _workerEventHandlers(OfflineAudioContext.prototype, OfflineAudioContext, ['oncomplete']);
+  _workerEventHandlers(AudioScheduledSourceNode.prototype, AudioScheduledSourceNode, ['onended']);
+  _workerEventHandlers(ScriptProcessorNode.prototype, ScriptProcessorNode, ['onaudioprocess']);
+  _workerEventHandlers(AudioWorkletNode.prototype, AudioWorkletNode, ['onprocessorerror']);
+
+  // ---------------------------------------------------------------------------
+  // Expose
+  // ---------------------------------------------------------------------------
+  const _waExposed = {
+    BaseAudioContext, AudioContext, OfflineAudioContext, OfflineAudioCompletionEvent,
+    AudioBuffer, AudioNode, AudioParam, AudioScheduledSourceNode,
+    AnalyserNode, AudioBufferSourceNode, AudioDestinationNode, AudioListener,
+    AudioProcessingEvent, BiquadFilterNode, ChannelMergerNode, ChannelSplitterNode,
+    ConstantSourceNode, ConvolverNode, DelayNode, DynamicsCompressorNode, GainNode,
+    IIRFilterNode, MediaElementAudioSourceNode, MediaStreamAudioDestinationNode,
+    MediaStreamAudioSourceNode, MediaStreamTrackAudioSourceNode, OscillatorNode,
+    PannerNode, PeriodicWave, ScriptProcessorNode, StereoPannerNode, WaveShaperNode,
+    Worklet, AudioWorklet, AudioParamMap, AudioWorkletNode, AudioSinkInfo,
+    AudioPlaybackStats,
+  };
+  for (const name of Object.keys(_waExposed)) {
+    _exposeIface(name, _waExposed[name]);
+    _markNative(_waExposed[name]);
+  }
+  // Legacy alias kept for the many pages that still feature-detect it.
+  _exposeIface('webkitAudioContext', AudioContext);
+  _exposeIface('webkitOfflineAudioContext', OfflineAudioContext);
 }
 
 globalThis.__obscura_init = function() {
