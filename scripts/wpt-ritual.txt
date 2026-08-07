@@ -223,7 +223,6 @@ websockets/idlharness.any.html
 # "fixed" (see tickets/483-the-streamed-verdict.md — 712/1898 is Chrome parity
 # and winning it breaks Blob-slice, File-constructor and response-consume) ---
 websockets/stream/tentative/websocket-error.any.html
-FileAPI/blob/Blob-slice.any.html
 fetch/api/response/response-consume.html
 
 # ── Quests #493–#495 (2026-08-07): the requested, told & kept verdicts ────────
@@ -267,3 +266,19 @@ permissions/event-model.https.html
 clipboard-apis/idlharness.https.window.html
 clipboard-apis/clipboard-item.https.html
 clipboard-apis/async-navigator-clipboard-basics.https.html
+
+# ── Quests #499–#501 (2026-08-07): domxpath / quirks / sanitizer-api ─────────
+# The XPath engine, the two CSS quirks + the <length>/<color> grammars they
+# forced, and the Sanitizer. The quirks work touched SHARED CSS declaration
+# parsing, so these guard it. NOTE: `node scripts/xpath_offline_test.mjs` runs
+# WPT's own 1,024-case XPath corpus in under a second — run that FIRST.
+domxpath/xml_xpath_runner.html
+domxpath/text-html-attributes.html
+domxpath/text-html-elements.html
+domxpath/expression-different-document.tentative.html
+quirks/unitless-length/quirks.html
+quirks/unitless-length/no-quirks.html
+quirks/hashless-hex-color/quirks.html
+quirks/hashless-hex-color/no-quirks.html
+sanitizer-api/sanitizer-basic-filtering.html
+sanitizer-api/sethtml-tree-construction.html

@@ -7,3 +7,4 @@ shots/
 out/__pycache__/
 out/
 scripts/__pycache__/
+scripts/.xpath-corpus.xml

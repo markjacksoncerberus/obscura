@@ -149,6 +149,17 @@ Function.prototype.toString = function() {
 const _markNative = function(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; };
 _nativeFns.add(Function.prototype.toString);
 
+// A monotonically increasing count of tree mutations, bumped by the mutation
+// primitives below (appendChild / insertBefore / removeChild / replaceChild and
+// the two markup setters). It exists for XPath: a node-set ITERATOR result must
+// start throwing InvalidStateError the moment the document changes under it,
+// because the alternative — walking a list of nodes that are no longer where the
+// page thinks they are — hands back plausible wrong answers instead of an error.
+// One integer increment on the mutation path is the cheapest honest signal;
+// MutationObserver's records cannot serve, since they only exist when somebody
+// has registered an observer.
+let __xpDomVersion = 0;
+
 // WHATWG DOMException — a real standard global (was previously undefined, so any
 // `throw new DOMException(...)` raised a ReferenceError instead of the right error).
 class DOMException extends Error {
@@ -1223,6 +1234,330 @@ const _canonFontFaceDescriptor = (name, value) =>
   name === 'src' ? _canonFontSrc(value)
   : name === 'size-adjust' ? _canonFontPct(value, false)
   : _canonFontPct(value, true);   // ascent-override / descent-override / line-gap-override
+// ── The two CSS parsing quirks (Quirks Mode §3.1, §3.2) ──────────────────────
+// These are the whole reason `compatMode` had to become real. Both are strictly
+// PERMISSIVE — they let a quirks-mode document say something a standards-mode
+// document may not — and both are limited on purpose to a fixed list of
+// properties, so the quirk cannot leak into `background`, into `calc()`, or into
+// any property invented since.
+//
+// Why they matter here more than the subtest count suggests: a page written in
+// 1998 sets `width=350` and `bgcolor=00ff00` and their stylesheet equivalents.
+// Refuse those and the page does not degrade gracefully — the table collapses to
+// nothing and the text turns black on black. The people still reading those
+// pages are the people this browser is for.
+
+// <quirky-length> — CSS Values 4 §C. Note what is NOT here: `outline-width`,
+// `line-height`, and every shorthand that merely CONTAINS one of these
+// (`border`, `background`, `font`, `outline`). `margin`/`padding`/`border-width`
+// ARE here, because the spec lists them by name.
+const _QUIRKY_LENGTH_PROPS = new Set([
+  'background-position', 'border-spacing',
+  'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
+  'border-width', 'bottom', 'clip', 'font-size', 'height', 'left', 'letter-spacing',
+  'margin-right', 'margin-left', 'margin-top', 'margin-bottom', 'margin',
+  'max-height', 'max-width', 'min-height', 'min-width',
+  'padding-top', 'padding-right', 'padding-bottom', 'padding-left', 'padding',
+  'right', 'text-indent', 'top', 'vertical-align', 'width', 'word-spacing',
+]);
+// <quirky-color> — CSS Color 4 §B. Seven properties, and deliberately not the
+// `background` shorthand: `background: 112233` stays invalid even in quirks mode.
+const _QUIRKY_COLOR_PROPS = new Set([
+  'background-color', 'border-color', 'border-top-color', 'border-right-color',
+  'border-bottom-color', 'border-left-color', 'color',
+]);
+// `border-color` is on that list AND is a 1–4 value shorthand, so the quirk is
+// applied to each component rather than to the value as a whole.
+
+// Split a value into top-level component values, respecting nesting and strings.
+const _qmSplitTop = (s) => {
+  const out = [];
+  let depth = 0, quote = null, cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) { cur += c; if (c === '\\') { cur += s[++i] || ''; } else if (c === quote) quote = null; continue; }
+    if (c === '"' || c === "'") { quote = c; cur += c; continue; }
+    if (c === '\\') { cur += c + (s[++i] || ''); continue; }
+    if (c === '(') depth++;
+    if (c === ')') depth--;
+    if (depth === 0 && (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === ',')) {
+      if (cur !== '') out.push(cur);
+      out.push(c);                       // separators are kept so the value re-joins byte-for-byte
+      cur = '';
+      continue;
+    }
+    cur += c;
+  }
+  if (cur !== '') out.push(cur);
+  return out;
+};
+
+// A CSS escape: `\` + 1–6 hex digits + one optional whitespace, or `\` + any
+// single non-newline character. Returns [decodedChar, nextIndex] or null.
+const _qmEscape = (s, i) => {
+  if (s[i] !== '\\') return null;
+  const m = /^([0-9a-fA-F]{1,6})[ \t\n\r\f]?/.exec(s.slice(i + 1));
+  if (m) {
+    const cp = parseInt(m[1], 16);
+    return [(cp === 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) ? '�' : String.fromCodePoint(cp),
+            i + 1 + m[0].length];
+  }
+  const c = s[i + 1];
+  if (c === undefined || c === '\n' || c === '\r' || c === '\f') return null;
+  return [c, i + 2];
+};
+// Consume a CSS name (the body of an ident, or a dimension's unit), returning its
+// DECODED value. `\31 23` decodes to the three characters `123` — which is why the
+// hashless quirk has to decode rather than pattern-match the source text.
+const _qmName = (s, i) => {
+  let out = '';
+  while (i < s.length) {
+    const c = s[i];
+    if (/[-_a-zA-Z0-9]/.test(c) || c.charCodeAt(0) > 0x7F) { out += c; i++; continue; }
+    const e = _qmEscape(s, i);
+    if (!e) break;
+    out += e[0]; i = e[1];
+  }
+  return [out, i];
+};
+
+// Classify a single component value. Returns null unless the WHOLE string is
+// exactly one <number-token>, <dimension-token> or <ident-token>.
+const _qmClassify = (raw) => {
+  const s = raw;
+  if (s === '') return null;
+  // <number-token> / <dimension-token>
+  const nm = /^[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?/.exec(s);
+  if (nm && /^[+-]?[.\d]/.test(s)) {
+    const numText = nm[0];
+    const isInteger = /^[+-]?\d+$/.test(numText);
+    let i = numText.length;
+    if (i === s.length) return { kind: 'number', numText, isInteger };
+    // A unit turns it into a dimension; anything else and it is not one token.
+    const startsName = /[-_a-zA-Z]/.test(s[i]) || s.charCodeAt(i) > 0x7F || s[i] === '\\';
+    if (!startsName) return null;
+    const [unit, end] = _qmName(s, i);
+    if (end !== s.length || unit === '') return null;
+    return { kind: 'dimension', numText, isInteger, unit };
+  }
+  // <ident-token>
+  let i = 0;
+  if (s[0] === '-') i = 1;
+  const first = s[i];
+  const okStart = first !== undefined &&
+    (/[_a-zA-Z]/.test(first) || s.charCodeAt(i) > 0x7F || first === '\\' || first === '-');
+  if (!okStart) return null;
+  const [value, end] = _qmName(s, 0);
+  if (end !== s.length || value === '') return null;
+  return { kind: 'ident', value };
+};
+
+// <quirky-length>: "syntactically identical to a <number-token>, interpreted as a
+// px length with the same value". Note it is the NUMBER TOKEN, not the integer —
+// `1.5` is 1.5px and `-1` is -1px, while `\31 ` (an ident that decodes to "1") is
+// not a number token at all and stays invalid. WPT tests every one of those.
+const _qmQuirkyLength = (comp) => {
+  const t = _qmClassify(comp);
+  return t && t.kind === 'number' ? comp + 'px' : null;
+};
+
+// <quirky-color>: CSS Color 4 §B, transcribed. The three branches differ in one
+// telling way — an IDENT keeps its text and must already be 3 or 6 hex digits,
+// while a NUMBER or DIMENSION is re-SERIALIZED from its integer value first. That
+// is what makes `023` become `000023` (the integer 23, zero-padded) rather than
+// `000023`'s look-alike `023000`, and what makes `-1` invalid: serializing −1
+// gives "-1", and no amount of zero-padding makes a minus sign a hex digit.
+const _qmQuirkyColor = (comp) => {
+  const t = _qmClassify(comp);
+  if (!t) return null;
+  let text;
+  if (t.kind === 'ident') {
+    if (t.value.length !== 3 && t.value.length !== 6) return null;
+    text = t.value;
+  } else {
+    if (!t.isInteger) return null;
+    text = String(parseInt(t.numText, 10));
+    if (t.kind === 'dimension') text += t.unit;
+    if (text.length < 6) text = '0'.repeat(6 - text.length) + text;
+  }
+  if (!/^[0-9a-fA-F]{3}$|^[0-9a-fA-F]{6}$/.test(text)) return null;
+  return '#' + text;
+};
+
+// Apply the length quirk across a whole declaration value. Only TOP-LEVEL
+// components are eligible — `calc(1)` must stay invalid — with one exception the
+// spec calls out by name: `rect()` in `clip`, whose arguments are quirk-eligible.
+const _qmApplyLengthQuirk = (name, value) => {
+  const parts = _qmSplitTop(value);
+  let changed = false;
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (p === ' ' || p === ',' || p === '\t' || p === '\n' || p === '\r' || p === '\f') continue;
+    const q = _qmQuirkyLength(p);
+    if (q !== null) { parts[i] = q; changed = true; continue; }
+    if (name === 'clip') {
+      const m = /^rect\(([\s\S]*)\)$/i.exec(p);
+      if (m) {
+        const inner = _qmSplitTop(m[1]);
+        let innerChanged = false;
+        for (let j = 0; j < inner.length; j++) {
+          const iq = _qmQuirkyLength(inner[j]);
+          if (iq !== null) { inner[j] = iq; innerChanged = true; }
+        }
+        if (innerChanged) { parts[i] = 'rect(' + inner.join('') + ')'; changed = true; }
+      }
+    }
+  }
+  return changed ? parts.join('') : value;
+};
+
+// The colour quirk takes the WHOLE value, not per-component: these seven
+// properties each take exactly one <color>, and `color: 11 22` is not two colours.
+const _qmApplyColorQuirk = (value) => {
+  const parts = _qmSplitTop(value.trim());
+  let changed = false;
+  for (let i = 0; i < parts.length; i++) {
+    if (/^[\s,]$/.test(parts[i])) continue;
+    const q = _qmQuirkyColor(parts[i]);
+    if (q !== null) { parts[i] = q; changed = true; }
+  }
+  return changed ? parts.join('') : value;
+};
+
+// The one entry point the declaration parser calls.
+const _qmApplyQuirks = (name, value) => {
+  if (_QUIRKY_LENGTH_PROPS.has(name)) return _qmApplyLengthQuirk(name, value);
+  if (_QUIRKY_COLOR_PROPS.has(name)) return _qmApplyColorQuirk(value);
+  return value;
+};
+
+// ── <length> validation for the properties that had none ─────────────────────
+// Found by the quirks realm, and much bigger than the quirks: `letter-spacing`,
+// `word-spacing`, `text-indent`, `font-size`, `border-spacing` and the
+// `border-*-width` longhands accepted ANY string and handed it back as the
+// computed value. `letter-spacing: "1"` computed to `"1"`.
+//
+// That is not a cosmetic gap. A declaration the UA cannot understand must be
+// DROPPED, so the cascade falls back to the value below it — the author's own
+// earlier rule, the inherited value, or the initial. Keeping the garbage means
+// one typo in one rule silently wins over the correct declaration underneath it,
+// and the page has no way to recover. It is also why `quirks/unitless-length`
+// fails in NO-QUIRKS mode, where nothing quirky is involved at all.
+const _QM_LEN_UNITS = 'px|r?em|r?ex|r?ch|r?ic|r?cap|r?lh|in|cm|mm|q|pt|pc|' +
+  '[sld]?v(?:w|h|i|b|min|max)|cq(?:w|h|i|b|min|max)';
+const _QM_NUM = '[+-]?(?:\\d+\\.\\d*|\\.\\d+|\\d+)(?:[eE][+-]?\\d+)?';
+const _QM_LEN_RE = new RegExp('^' + _QM_NUM + '(?:' + _QM_LEN_UNITS + ')$', 'i');
+const _QM_PCT_RE = new RegExp('^' + _QM_NUM + '%$');
+const _QM_ZERO_RE = new RegExp('^[+-]?(?:0+\\.?0*|\\.0+)(?:[eE][+-]?\\d+)?$');
+// A component this engine must not judge: a var()/env() substitution or an
+// attr(). These are resolved later (or never), so refusing them here would break
+// valid CSS — permissive on purpose.
+const _qmDeferred = (t) => _TF_VAR_RE.test(t) || /^attr\(/i.test(t);
+// ⚠️ A math function is NOT automatically a length. `calc(1)` is a <number> and
+// is invalid wherever a <length> is required — CSS Values is explicit that the
+// unitless-length quirk does not reach inside calc(). The engine already has a
+// full math TYPE system (`_mt` over `_parseCalcTree`), so ask it rather than
+// pattern-matching: `calc(2 * 2px)` is a length, `calc(1)` is not, and
+// `calc(1px / 1px)` is not either.
+const _qmMathType = (t) => {
+  let root = null;
+  try { root = _parseCalcTree(t); } catch (e) { return 'unknown'; }
+  if (!root) return 'unknown';
+  try { const ty = _mt(root, 'length'); return ty == null ? 'unknown' : ty; }
+  catch (e) { return 'unknown'; }
+};
+const _qmIsLength = (t) => {
+  if (_QM_LEN_RE.test(t) || _QM_ZERO_RE.test(t) || _qmDeferred(t)) return true;
+  if (_MATHFN_NAME_RE.test(t)) { const ty = _qmMathType(t); return ty === 'length' || ty === 'unknown'; }
+  return false;
+};
+const _qmIsLengthPct = (t) => {
+  if (_QM_PCT_RE.test(t)) return true;
+  if (_MATHFN_NAME_RE.test(t) && !_qmDeferred(t)) {
+    const ty = _qmMathType(t);
+    return ty === 'length' || ty === 'percentage' || ty === 'unknown';
+  }
+  return _qmIsLength(t);
+};
+const _qmIsLineWidth = (t) => /^(?:thin|medium|thick)$/i.test(t) || _qmIsLength(t);
+const _QM_ABS_SIZE = /^(?:xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large|larger|smaller|math|-webkit-xxx-large)$/i;
+
+// Top-level components with the separators dropped.
+const _qmWords = (v) => _qmSplitTop(v).filter((x) => !/^[\s,]$/.test(x));
+
+// Validators, one per property family. Each returns true when the value is
+// something this engine is willing to stand behind.
+const _QM_VALIDATE = {
+  'letter-spacing': (w) => w.length === 1 && (/^normal$/i.test(w[0]) || _qmIsLength(w[0])),
+  'word-spacing':   (w) => w.length === 1 && (/^normal$/i.test(w[0]) || _qmIsLength(w[0])),
+  'font-size':      (w) => w.length === 1 && (_QM_ABS_SIZE.test(w[0]) || _qmIsLengthPct(w[0])),
+  // css-text `text-indent: <length-percentage> && hanging? && each-line?`
+  'text-indent': (w) => {
+    let seenLen = false, hanging = false, eachLine = false;
+    for (const t of w) {
+      if (/^hanging$/i.test(t)) { if (hanging) return false; hanging = true; continue; }
+      if (/^each-line$/i.test(t)) { if (eachLine) return false; eachLine = true; continue; }
+      if (!seenLen && _qmIsLengthPct(t)) { seenLen = true; continue; }
+      return false;
+    }
+    return seenLen;
+  },
+  // css-tables `border-spacing: <length> <length>?` (a percentage is NOT allowed)
+  'border-spacing': (w) => (w.length === 1 || w.length === 2) && w.every(_qmIsLength),
+};
+for (const side of ['top', 'right', 'bottom', 'left']) {
+  _QM_VALIDATE['border-' + side + '-width'] = (w) => w.length === 1 && _qmIsLineWidth(w[0]);
+}
+for (const side of ['block-start', 'block-end', 'inline-start', 'inline-end']) {
+  _QM_VALIDATE['border-' + side + '-width'] = (w) => w.length === 1 && _qmIsLineWidth(w[0]);
+}
+// The 1–4 value box shorthands and their longhands. `padding` is non-negative
+// and `margin` additionally takes `auto`; both take <length-percentage>.
+const _qmIsMarginPart = (t) => /^auto$/i.test(t) || _qmIsLengthPct(t);
+for (const q of ['padding', 'padding-block', 'padding-inline']) {
+  const max = q === 'padding' ? 4 : 2;
+  _QM_VALIDATE[q] = (w) => w.length >= 1 && w.length <= max && w.every(_qmIsLengthPct);
+}
+for (const q of ['margin', 'margin-block', 'margin-inline']) {
+  const max = q === 'margin' ? 4 : 2;
+  _QM_VALIDATE[q] = (w) => w.length >= 1 && w.length <= max && w.every(_qmIsMarginPart);
+}
+for (const side of ['top', 'right', 'bottom', 'left', 'block-start', 'block-end',
+                    'inline-start', 'inline-end']) {
+  _QM_VALIDATE['padding-' + side] = (w) => w.length === 1 && _qmIsLengthPct(w[0]);
+  _QM_VALIDATE['margin-' + side] = (w) => w.length === 1 && _qmIsMarginPart(w[0]);
+}
+// <bg-position> — only enough to close the hole the quirks realm found: a bare
+// number is not a position. Keywords, lengths and percentages all pass, and a
+// comma-separated layer list is checked layer by layer.
+const _QM_POS_KW = /^(?:left|right|top|bottom|center)$/i;
+_QM_VALIDATE['background-position'] = (w) =>
+  w.length >= 1 && w.length <= 4 && w.every((t) => _QM_POS_KW.test(t) || _qmIsLengthPct(t));
+
+// The 1–4 value shorthands.
+_QM_VALIDATE['border-width'] = (w) => w.length >= 1 && w.length <= 4 && w.every(_qmIsLineWidth);
+_QM_VALIDATE['border-block-width'] = (w) => w.length >= 1 && w.length <= 2 && w.every(_qmIsLineWidth);
+_QM_VALIDATE['border-inline-width'] = (w) => w.length >= 1 && w.length <= 2 && w.every(_qmIsLineWidth);
+
+// → true to KEEP the declaration, false to drop it. Anything not in the table is
+// kept untouched, so this cannot affect a property it was not written for.
+const _qmDeclValid = (name, value) => {
+  const fn = _QM_VALIDATE[name];
+  if (!fn) return true;
+  const v = String(value).trim();
+  if (_CSS_WIDE.has(v.toLowerCase())) return true;      // initial/inherit/unset/revert
+  if (_TF_VAR_RE.test(v)) return true;                  // var()/env() — resolved at computed time
+  try {
+    // A comma-separated value is a LAYER LIST (background-position); each layer is
+    // validated on its own, and one bad layer invalidates the declaration.
+    for (const layer of _splitCommasTopLevel(v)) {
+      const w = _qmWords(layer);
+      if (!w.length || !fn(w)) return false;
+    }
+    return true;
+  } catch (e) { return true; }
+};
+
 const _parseStyleDecls = (text, opts) => {
   const out = [];
   for (const part of _splitDeclParts(text)) {
@@ -1262,6 +1597,12 @@ const _parseStyleDecls = (text, opts) => {
       value = value.trim();
       if (value === '') continue;
       value = _canonStandardValue(value);
+      // The quirks run BEFORE every per-property validator, so a rewritten value
+      // is then validated exactly like an author-written one. Doing it the other
+      // way round would mean `width:1` is rejected as invalid before anything
+      // could turn it into `1px`.
+      if (opts && opts.quirks) value = _qmApplyQuirks(name, value);
+      if (!_qmDeclValid(name, value)) continue;           // unparseable <length> → drop
       if (_POSITION_PROPS.has(name)) {
         if (_STRICT_POSITION_PROPS.has(name) && !_isValidStrictPosition(value, _STRICT_POSITION_PROPS.get(name))) continue; // invalid strict <position> → drop
         if (_BG_POSITION_PROPS.has(name) && !_isValidBgPosition(value)) continue;      // invalid <bg-position> → drop
@@ -1326,9 +1667,32 @@ const _parseStyleDecls = (text, opts) => {
         value = _canonImageSet(_canonGradients(value, null, false));
       } else if (_COLOR_PROPS.has(name)) {
         if (_hasImageFunc(value)) continue;                // image() is not a <color> → drop
-        if (/^(?:alpha|contrast-color)\(/i.test(value.trim()) && !_isValidColor(value)) continue;  // invalid alpha()/contrast-color() → drop
+        // ⚠️ Gate the full <color> grammar here, exactly as the setProperty path
+        // does. Without it a <style> rule kept `color: aaaaa` and served the raw
+        // string as the computed colour, while `el.style.color = 'aaaaa'` correctly
+        // refused it — one declaration, two answers. A colour the UA cannot parse
+        // must be dropped so the INHERITED colour still applies; keeping it is how
+        // a page ends up rendering text in a colour that is not a colour.
+        {
+          const _clow = value.toLowerCase();
+          if (!_CSS_WIDE.has(_clow) && !_TF_VAR_RE.test(value)
+              && !(name === 'caret-color' && _clow === 'auto')
+              && !(name === 'outline-color' && _clow === 'invert')   // css-ui's own keyword
+              && !_isValidColor(value)) continue;          // invalid <color> → drop
+        }
         value = _canonColorSpecified(value);
       } else if (_COLOR_SHORTHAND_PROPS.has(name)) {
+        // `border-color: aaaaa` was kept and served as a computed colour, for the
+        // same reason the longhands were: this branch canonicalized without ever
+        // asking whether the value was a colour. 1–4 <color>s, each of which must
+        // parse; otherwise the whole declaration is dropped.
+        {
+          const _clow = value.toLowerCase();
+          if (!_CSS_WIDE.has(_clow) && !_TF_VAR_RE.test(value)) {
+            const parts = _qmWords(value);
+            if (!parts.length || parts.length > 4 || !parts.every((c) => _isValidColor(c))) continue;
+          }
+        }
         value = _canonColorShorthand(value);
       } else if (name === 'filter' || name === 'backdrop-filter') {
         if (!_isValidFilter(value)) continue;              // invalid <filter-value-list> → drop
@@ -3394,6 +3758,7 @@ class Node {
     return _domParse("text_content", this._nid) ?? "";
   }
   set textContent(v) {
+    __xpDomVersion++;
     const _watching = __mutationObservers?.length;
     const t = this.nodeType;
     // Trusted Types: on a <script>, textContent IS the script body — the sink is
@@ -3464,6 +3829,7 @@ class Node {
   get nextSibling() { return _wrap(+_dom("next_sibling", this._nid)); }
   get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
   appendChild(c) {
+    __xpDomVersion++;
     // WebIDL: the argument must be a Node — null/undefined/plain objects throw
     // TypeError. A Node has either a tree id (_nid) or a numeric nodeType
     // (synthetic Document wrappers like an iframe's contentDocument).
@@ -3573,6 +3939,7 @@ class Node {
     return c;
   }
   removeChild(c) {
+    __xpDomVersion++;
     if (!c) return c;
     __obscura_runNodeIteratorPreRemove(c);
     // DOM "remove" live-range steps, before the node leaves the tree.
@@ -3597,6 +3964,7 @@ class Node {
   }
   // DOM "replace" (§4.2.3): replace `child` with `node`, returning `child`.
   replaceChild(node, child) {
+    __xpDomVersion++;
     const _isNode = (x) => x != null && typeof x === 'object' && (typeof x._nid === 'number' || typeof x.nodeType === 'number');
     if (!_isNode(node)) throw new TypeError("Failed to execute 'replaceChild': parameter 1 is not of type 'Node'");
     if (!_isNode(child)) throw new TypeError("Failed to execute 'replaceChild': parameter 2 is not of type 'Node'");
@@ -3687,6 +4055,7 @@ class Node {
     return child;
   }
   insertBefore(n, ref) {
+    __xpDomVersion++;
     // WebIDL: the node must be a Node (the reference child may be null).
     if (n == null || typeof n !== 'object' || (typeof n._nid !== 'number' && typeof n.nodeType !== 'number'))
       throw new TypeError("Failed to execute 'insertBefore': parameter 1 is not of type 'Node'");
@@ -4907,6 +5276,7 @@ class Element extends Node {
   }
   get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
   set innerHTML(v) {
+    __xpDomVersion++;
     // Trusted Types: the archetypal DOM-XSS sink. Checked before the template
     // delegation so `<template>.innerHTML` is guarded too.
     { const _tt = _ttSink('TrustedHTML', v, 'Element innerHTML'); if (_tt !== null) v = _tt; }
@@ -6665,6 +7035,94 @@ function _documentSetBody(doc, newBody) {
   de.appendChild(newBody);
 }
 
+// ── Quirks mode (HTML §13.2.6.4.1 "the initial insertion mode") ───────────────
+// Which rendering mode a document is in is not decoration: in QUIRKS mode the CSS
+// parser accepts two things it otherwise rejects — a length written without a
+// unit (`width: 350`) and a hex colour written without its `#` (`bgcolor` style
+// `color: 00ff00`) — and those two spellings are all over the pre-2000 web. A
+// browser that reports CSS1Compat for a page with no doctype renders that page
+// with every such declaration DROPPED: the layout collapses, the colours go
+// black, and it looks like the site is broken rather than the browser.
+//
+// That is the old web, which is most of the web still reachable on a
+// hand-me-down laptop — school intranets, library catalogues, government forms,
+// the parts of the internet nobody has been paid to rewrite. Obscura reported
+// CSS1Compat for EVERY document, so it never applied either quirk.
+//
+// The public-identifier table below is the well-known subset, not all ~60 entries
+// of HTML's list. It is honest about what it covers: the cases that decide the
+// mode in practice are (a) no doctype at all → quirks, (b) `<!DOCTYPE html>` →
+// no-quirks, and (c) the HTML 4.01 Frameset/Transitional doctypes, which are
+// limited-quirks WITH a system identifier and quirks without one.
+const _QUIRKS_PUBLIC_PREFIXES = [
+  '+//silmaril//dtd html', '-//as//dtd html', '-//advasoft ltd//dtd html',
+  '-//ietf//dtd html', '-//metrius//dtd html', '-//microsoft//dtd internet explorer',
+  '-//netscape comm. corp.//dtd html', '-//netscape comm. corp.//dtd strict html',
+  '-//o\'reilly and associates//dtd html', '-//sq//dtd html',
+  '-//softquad software//dtd html', '-//softquad//dtd html',
+  '-//spyglass//dtd html', '-//sun microsystems corp.//dtd hotjava',
+  '-//w3c//dtd html 3', '-//w3c//dtd w3 html', '-//w3o//dtd w3 html',
+  '-//webtechs//dtd mozilla html', '-//w3c//dtd html 4.0 frameset//',
+  '-//w3c//dtd html 4.0 transitional//',
+];
+const _LIMITED_QUIRKS_PUBLIC = [
+  '-//w3c//dtd xhtml 1.0 frameset//', '-//w3c//dtd xhtml 1.0 transitional//',
+];
+// The two that flip on whether a SYSTEM identifier is present.
+const _QUIRKS_IF_NO_SYSTEM_ID = [
+  '-//w3c//dtd html 4.01 frameset//', '-//w3c//dtd html 4.01 transitional//',
+];
+// → 'quirks' | 'limited-quirks' | 'no-quirks'
+const _docModeFor = (name, publicId, systemId) => {
+  if (name == null) return 'quirks';                    // no doctype at all
+  const pub = String(publicId || '').toLowerCase();
+  const sys = String(systemId || '').toLowerCase();
+  if (String(name).toLowerCase() !== 'html') return 'quirks';
+  if (sys === 'http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd') return 'quirks';
+  for (const p of _QUIRKS_PUBLIC_PREFIXES) if (pub.startsWith(p)) return 'quirks';
+  for (const p of _QUIRKS_IF_NO_SYSTEM_ID) {
+    if (pub.startsWith(p)) return sys ? 'limited-quirks' : 'quirks';
+  }
+  for (const p of _LIMITED_QUIRKS_PUBLIC) if (pub.startsWith(p)) return 'limited-quirks';
+  if (!pub && !sys) return 'no-quirks';                 // plain <!DOCTYPE html>
+  return 'no-quirks';
+};
+// Sniff the mode from a run of markup — used by document.write(), which in this
+// engine parses through innerHTML and therefore DISCARDS the doctype before
+// anything can look at it.
+const _docModeForMarkup = (str) => {
+  const m = /^[\uFEFF\s]*<!doctype\s+([^\s>]+)([^>]*)>/i.exec(String(str || ''));
+  if (!m) return 'quirks';
+  const rest = m[2] || '';
+  let publicId = '', systemId = '';
+  const pub = rest.match(/PUBLIC\s+("[^"]*"|'[^']*')(?:\s+("[^"]*"|'[^']*'))?/i);
+  const sys = rest.match(/SYSTEM\s+("[^"]*"|'[^']*')/i);
+  if (pub) { publicId = pub[1].slice(1, -1); if (pub[2]) systemId = pub[2].slice(1, -1); }
+  else if (sys) { systemId = sys[1].slice(1, -1); }
+  return _docModeFor(m[1], publicId, systemId);
+};
+// `compatMode` only distinguishes quirks from everything else, but the CSS quirks
+// need the three-way answer, so both are derived from one function. A document
+// with no doctype node IS in quirks mode — that is the whole point.
+const _docCompatFrom = (doc) => {
+  // ⚠️ Quirks mode is a property of the HTML PARSER, not of "a document with no
+  // doctype". An XML document — `createDocument()`, `new Document()`,
+  // `responseXML` — has no doctype and is nonetheless always no-quirks, because
+  // no HTML parser ever ran over it. Answering BackCompat for those broke
+  // `Node-cloneNode.html`, and the ritual caught it.
+  let ct = '';
+  try { ct = String((doc && doc.contentType) || ''); } catch (e) { ct = ''; }
+  if (ct !== 'text/html') return 'CSS1Compat';
+  let dt = null;
+  try { dt = doc.doctype; } catch (e) { dt = null; }
+  if (!dt) return 'BackCompat';
+  return _docModeFor(dt.name, dt.publicId, dt.systemId) === 'quirks' ? 'BackCompat' : 'CSS1Compat';
+};
+// The one predicate the CSS parser asks. Kept cheap: a property read and a compare.
+const _docIsQuirks = (doc) => {
+  try { return !!doc && doc.compatMode === 'BackCompat'; } catch (e) { return false; }
+};
+
 class Document extends Node {
   // `new Document(nid)` (numeric) wraps a real document node (the main document,
   // or a node-type-9 node from the tree). `new Document()` with NO id is the DOM
@@ -6770,7 +7228,7 @@ class Document extends Node {
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
-  get compatMode() { return this._compatMode || "CSS1Compat"; }
+  get compatMode() { return this._compatMode || _docCompatFrom(this); }
   // The encoding the page's bytes were REALLY decoded with, resolved by the
   // navigation path (HTML's encoding sniffing algorithm) and handed over from
   // Rust. A `_standalone` document was built in memory rather than loaded, so it
@@ -7142,6 +7600,12 @@ class Document extends Node {
   // its own (under its own sink name) and must not run write's a second time.
   _writeChecked(html) {
     if (!html) return;
+    // See the frame document's write(): the doctype is consumed by the fragment
+    // parse, so the mode is sniffed from the markup on the way in.
+    if (this._sawWrite !== true) {
+      this._sawWrite = true;
+      this._compatMode = _docModeForMarkup(html) === 'quirks' ? 'BackCompat' : 'CSS1Compat';
+    }
     var body = this.body;
     if (!body) return;
     var temp = this.createElement('div');
@@ -7154,6 +7618,7 @@ class Document extends Node {
     // the parser — so the internal clear must not consult a default policy.
     var body = this.body;
     if (body) _ttUnchecked(() => { body.innerHTML = ''; });
+    this._sawWrite = false;
     return this;
   }
   close() {
@@ -7306,7 +7771,7 @@ class DetachedDocument extends Document {
   get ownerDocument() { return null; }
   get contentType() { return this._contentType || (this._kind === 'html' ? "text/html" : "application/xml"); }
   get _isHTMLDoc() { return this._kind === 'html'; }
-  get compatMode() { return this._compatMode || "CSS1Compat"; }
+  get compatMode() { return this._compatMode || _docCompatFrom(this); }
   get characterSet() { return "UTF-8"; }
   get charset() { return this.characterSet; }        // legacy alias of characterSet
   get inputEncoding() { return this.characterSet; }  // legacy alias of characterSet
@@ -12482,7 +12947,7 @@ const _serializeDeclList = (decl) => {
   return out;
 };
 const _serializeDeclBlock = (decl) => _serializeDeclList(decl).join(' ');
-const _cssParseDecls = (body) => {
+const _cssParseDecls = (body, quirks) => {
   // The CASCADE-shape view of a declaration block (the inside of a `{ … }` rule,
   // or a `style=""` attribute): `{ name: {value, important} }` with shorthands
   // expanded into their longhands, which is what `_buildCascade` /
@@ -12497,12 +12962,20 @@ const _cssParseDecls = (body) => {
   // computed value disagreeing with the very `cssText` that produced it.
   // `_parseStyleDecls` also canonicalizes, so both views agree on the value too.
   const out = {};
-  for (const d of _parseStyleDecls(body)) _expandDeclInto(out, d.name, d.value, d.important);
+  for (const d of _parseStyleDecls(body, quirks ? { quirks: true } : undefined)) {
+    _expandDeclInto(out, d.name, d.value, d.important);
+  }
   return out;
 };
-const _cssSplitRules = (cssText) => {
+const _cssSplitRules = (cssText, quirks) => {
   // Returns [{ selectorText, decls }]; skips at-rules (and their nested blocks).
-  const css = String(cssText).replace(/\/\*[\s\S]*?\*\//g, '');
+  // ⚠️ A comment is replaced by a SPACE, not by nothing. CSS Syntax consumes a
+  // comment and emits no token, so `+/**/1` is two tokens (a `+` delimiter and
+  // the number 1) and is invalid wherever one number token is required. Deleting
+  // the comment outright splices them into the single token `+1` — which this
+  // engine then accepted as a length. A space cannot fuse two tokens together,
+  // so it is the safe substitution.
+  const css = String(cssText).replace(/\/\*[\s\S]*?\*\//g, ' ');
   const rules = [];
   let i = 0;
   const n = css.length;
@@ -12527,7 +13000,7 @@ const _cssSplitRules = (cssText) => {
     const body = css.slice(j + 1, k - 1);
     i = k;
     if (!prelude || prelude[0] === '@') continue; // skip @media/@supports/etc.
-    rules.push({ selectorText: prelude, decls: _cssParseDecls(body) });
+    rules.push({ selectorText: prelude, decls: _cssParseDecls(body, quirks) });
   }
   return rules;
 };
@@ -12552,10 +13025,14 @@ const _styleSheetRules = (styleEl) => {
         .map((r) => ({ selectorText: r._selectorSource, decls: r._cascadeDecls }));
     }
   } catch (e) {}
+  // A stylesheet is parsed in the mode of the document it belongs to — a quirks
+  // document's `width:1` is a length, a standards document's is a typo.
+  let quirks = false;
+  try { quirks = _docIsQuirks(styleEl.ownerDocument); } catch (e) { quirks = false; }
   const cached = _sheetRuleCache.get(styleEl);
-  if (cached && cached.text === text) return cached.rules;
-  const rules = _cssSplitRules(text);
-  _sheetRuleCache.set(styleEl, { text, rules });
+  if (cached && cached.text === text && cached.quirks === quirks) return cached.rules;
+  const rules = _cssSplitRules(text, quirks);
+  _sheetRuleCache.set(styleEl, { text, rules, quirks });
   return rules;
 };
 // Computed-value serialization for <color> properties: named/hex/rgb()/rgba()
@@ -26309,7 +26786,7 @@ const _buildCascadeUncached = (el) => {
       try { inlineText = el.getAttribute && el.getAttribute('style'); } catch { inlineText = ''; }
     }
     if (inlineText) {
-      const decls = _cssParseDecls(inlineText);
+      const decls = _cssParseDecls(inlineText, _docIsQuirks(doc));
       // @page (and other at-rule-only) descriptors are invalid as element properties:
       // an inline `style="page-orientation:…"` must not reach the computed value.
       for (const dn of _DESCRIPTOR_ONLY) delete decls[dn];
@@ -35725,9 +36202,10 @@ globalThis.DOMParser = class DOMParser {
           doc.insertBefore(dtNode, doc.documentElement);
         }
       } catch (e) {}
-      // Quirks: no-quirks (CSS1Compat) iff a `<!DOCTYPE html>` leads the input,
-      // else quirks (BackCompat). (Full quirks-mode table is out of scope here.)
-      doc._compatMode = /^[﻿\s]*<!doctype\s+html\s*>/i.test(str) ? 'CSS1Compat' : 'BackCompat';
+      // Quirks mode, from the shared HTML doctype table (_docModeForMarkup) rather
+      // than a local "is it exactly <!DOCTYPE html>" test — a legacy HTML 4.01
+      // doctype is limited-quirks or quirks depending on its system identifier.
+      doc._compatMode = _docModeForMarkup(str) === 'quirks' ? 'BackCompat' : 'CSS1Compat';
       return doc;
     }
     if (XML_TYPES.includes(type)) {
@@ -44775,7 +45253,7 @@ class _IframeDocument extends DetachedDocument {
   get location() { return this._iframeEl ? (this._iframeEl.contentWindow?.location ?? null) : null; }
   get defaultView() { return this._iframeEl?.contentWindow || null; }
   get ownerDocument() { return null; }
-  get compatMode() { return this._compatMode || 'CSS1Compat'; }
+  get compatMode() { return this._compatMode || _docCompatFrom(this); }
   get contentType() { return this._contentType || 'text/html'; }
   // The encoding this frame's bytes were ACTUALLY decoded with (set by the
   // navigation path from HTML's encoding sniffing algorithm) — not a constant.
@@ -44825,6 +45303,15 @@ class _IframeDocument extends DetachedDocument {
   // nothing. An explicit open() sets the "write session" flag so subsequent write()s
   // append to the freshly-emptied body instead of re-clearing it.
   write(html) {
+    // ⚠️ The FIRST write of a session decides the document's mode, and it has to
+    // be read here: this engine parses written markup through innerHTML, which
+    // drops the doctype, so by the time the tree exists there is nothing left to
+    // ask. `document.open(); document.write('<div>')` really is a quirks-mode
+    // document, and that is how every one of WPT's quirks tests is built.
+    if (this._sawWrite !== true) {
+      this._sawWrite = true;
+      this._compatMode = _docModeForMarkup(html) === 'quirks' ? 'BackCompat' : 'CSS1Compat';
+    }
     if (!this._writeOpen) this.open();     // implicit open on a loaded document
     const b = this.body;
     if (!b) return;
@@ -44835,7 +45322,7 @@ class _IframeDocument extends DetachedDocument {
     while (tmp.firstChild) b.appendChild(tmp.firstChild);
   }
   writeln(html) { this.write(html + '\n'); }
-  open() { const b = this.body; if (b) b.innerHTML = ''; this._writeOpen = true; return this; }
+  open() { const b = this.body; if (b) b.innerHTML = ''; this._writeOpen = true; this._sawWrite = false; return this; }
   close() { this._writeOpen = false; }
 }
 
@@ -60576,6 +61063,2051 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     configurable: true, enumerable: true,
     get() { return _computedLabel(this); },
   });
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// XPATH  (XML Path Language 1.0 · DOM §XPath — `document.evaluate`)
+// ═════════════════════════════════════════════════════════════════════════════
+// The whole of this — the lexer, the parser, the evaluator, the thirty core
+// functions — did not exist. `document.evaluate` was `undefined`, so the realm
+// was not failing, it was INVISIBLE: a page that asked for it got a TypeError on
+// the first line and took its `catch` branch forever.
+//
+// XPath is how you NAME a node you cannot see. CSS selectors go downward and
+// sideways; XPath also goes UP, and BACKWARD, and can ask arithmetic and string
+// questions about what it finds — `//td[contains(., "Total")]/following-sibling::td[1]`
+// is "the cell after the one that says Total", and there is no CSS selector for
+// that. That matters here more than most places:
+//
+//   * It is the query language of nearly every scraper, test harness and
+//     automation tool ever written, which is a large slice of what a browser
+//     built for AI agents is asked to run.
+//   * It is what an assistive tool uses to point at a specific cell of a table
+//     that has no ids, no classes and no structure worth the name — which is
+//     most tables on the old web.
+//
+// Written against the XPath 1.0 Recommendation (1999) and cross-checked against
+// the DOM Standard's XPath section for the HTML-document rules, which are NOT in
+// XPath 1.0 and are the part everyone gets wrong (see _xpNameTestMatches).
+//
+// ⚠️ For the next comrade: this is a PURE FUNCTION of (expression, tree), which
+// is why `scripts/xpath_offline_test.mjs` can run WPT's own 1,024-case corpus
+// against it in Node in under a second, with no browser and no CDP. If you change
+// anything here, run that FIRST. It found real bugs before a single build.
+// ===== XPATH-ENGINE-BEGIN =====
+{
+  const _XP_XML_NS   = 'http://www.w3.org/XML/1998/namespace';
+  const _XP_XMLNS_NS = 'http://www.w3.org/2000/xmlns/';
+  const _XP_HTML_NS  = 'http://www.w3.org/1999/xhtml';
+
+  const _xpSyntaxError = (msg) =>
+    new DOMException('Failed to parse XPath expression: ' + msg, 'SyntaxError');
+
+  // ── ASCII-only case folding ────────────────────────────────────────────────
+  // Deliberately ASCII-only, and it is load-bearing rather than lazy. The HTML
+  // parser lowercases only ASCII letters, so an element written `<dØdd>` keeps
+  // its Ø. Folding with toLowerCase() would make `//dødd` match it — a different
+  // element, silently selected. WPT asserts that exact non-match.
+  const _xpAsciiLower = (s) => s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+
+  // ── Lexer ──────────────────────────────────────────────────────────────────
+  // XML NCName character classes. Spelled out as code-point ranges rather than a
+  // regexp with \w because the boundaries are exactly what `lexical-structure.html`
+  // probes: U+3000 (ideographic space) sits one below the 3001–D7FF range and must
+  // be a SyntaxError, not a name; U+2019 (a curly quote) is not a name character
+  // and not a string delimiter either.
+  function _xpIsNameStart(c) {
+    return (c >= 0x41 && c <= 0x5A) || c === 0x5F || (c >= 0x61 && c <= 0x7A) ||
+      (c >= 0xC0 && c <= 0xD6) || (c >= 0xD8 && c <= 0xF6) || (c >= 0xF8 && c <= 0x2FF) ||
+      (c >= 0x370 && c <= 0x37D) || (c >= 0x37F && c <= 0x1FFF) ||
+      (c >= 0x200C && c <= 0x200D) || (c >= 0x2070 && c <= 0x218F) ||
+      (c >= 0x2C00 && c <= 0x2FEF) || (c >= 0x3001 && c <= 0xD7FF) ||
+      (c >= 0xF900 && c <= 0xFDCF) || (c >= 0xFDF0 && c <= 0xFFFD) ||
+      (c >= 0x10000 && c <= 0xEFFFF);
+  }
+  function _xpIsNameChar(c) {
+    return _xpIsNameStart(c) || c === 0x2D || c === 0x2E || (c >= 0x30 && c <= 0x39) ||
+      c === 0xB7 || (c >= 0x300 && c <= 0x36F) || (c >= 0x203F && c <= 0x2040);
+  }
+  // ExprWhitespace is EXACTLY these four. Not \s — U+000B, U+000C and U+2029 are
+  // whitespace to a JS regexp and are errors here.
+  const _xpIsWs = (c) => c === 0x20 || c === 0x9 || c === 0xD || c === 0xA;
+
+  const _XP_NODETYPES = new Set(['comment', 'text', 'processing-instruction', 'node']);
+  const _XP_AXES = new Set(['ancestor', 'ancestor-or-self', 'attribute', 'child',
+    'descendant', 'descendant-or-self', 'following', 'following-sibling', 'namespace',
+    'parent', 'preceding', 'preceding-sibling', 'self']);
+  const _XP_OPNAMES = new Set(['and', 'or', 'mod', 'div']);
+
+  // Token kinds: '(' ')' '[' ']' '.' '..' '@' ',' '::' 'op' 'num' 'str' 'var'
+  //              'name' 'nodetype' 'axis' 'func'
+  function _xpTokenize(src) {
+    const toks = [];
+    let i = 0;
+    const n = src.length;
+
+    // XPath 1.0 §3.7's disambiguation hinges on ONE question: could an operator
+    // legally appear here? If the previous token is an operator, or one of
+    // `@ :: ( [ ,`, or there is no previous token, then `*` is a wildcard and
+    // `div` is an element name; otherwise `*` is multiply and `div` is division.
+    // This is why `//div/div` and `4 div 2` can both be written at all.
+    //
+    // ⚠️ `axis` counts as `::` here. An AxisName and its `::` are lexed as ONE
+    // token below, so without this line the `*` in `following-sibling::*` sees an
+    // axis behind it, decides an operator is legal, and becomes MULTIPLY — which
+    // is a parse error one token later and was 1,024 failures in one go.
+    const opCtx = () => {
+      if (!toks.length) return false;
+      const p = toks[toks.length - 1];
+      return !(p.t === 'op' || p.t === '@' || p.t === '::' || p.t === 'axis' ||
+               p.t === '(' || p.t === '[' || p.t === ',');
+    };
+    // Peek past ExprWhitespace without consuming, for the two lookahead rules.
+    const peekPast = (from) => {
+      let j = from;
+      while (j < n && _xpIsWs(src.charCodeAt(j))) j++;
+      return j;
+    };
+    const readNCName = () => {
+      const start = i;
+      if (i >= n || !_xpIsNameStart(src.codePointAt(i))) return null;
+      i += String.fromCodePoint(src.codePointAt(i)).length;
+      while (i < n && _xpIsNameChar(src.codePointAt(i))) {
+        i += String.fromCodePoint(src.codePointAt(i)).length;
+      }
+      return src.slice(start, i);
+    };
+
+    while (i < n) {
+      const c = src.charCodeAt(i);
+      if (_xpIsWs(c)) { i++; continue; }
+      const ch = src[i];
+
+      if (ch === '(' || ch === ')' || ch === '[' || ch === ']' || ch === ',' || ch === '@') {
+        toks.push({ t: ch }); i++; continue;
+      }
+      if (ch === ':' && src[i + 1] === ':') { toks.push({ t: '::' }); i += 2; continue; }
+      if (ch === '/') {
+        if (src[i + 1] === '/') { toks.push({ t: 'op', v: '//' }); i += 2; }
+        else { toks.push({ t: 'op', v: '/' }); i++; }
+        continue;
+      }
+      if (ch === '|' || ch === '+' || ch === '=') { toks.push({ t: 'op', v: ch }); i++; continue; }
+      if (ch === '-') { toks.push({ t: 'op', v: '-' }); i++; continue; }
+      if (ch === '!' && src[i + 1] === '=') { toks.push({ t: 'op', v: '!=' }); i += 2; continue; }
+      if (ch === '<' || ch === '>') {
+        if (src[i + 1] === '=') { toks.push({ t: 'op', v: ch + '=' }); i += 2; }
+        else { toks.push({ t: 'op', v: ch }); i++; }
+        continue;
+      }
+      if (ch === '*') {
+        // The §3.7 rule, in its entirety.
+        toks.push(opCtx() ? { t: 'op', v: '*' } : { t: 'name', v: '*', prefix: null, local: '*' });
+        i++; continue;
+      }
+      if (ch === '"' || ch === "'") {
+        // Only ' and " delimit a Literal. A typographic quote is a lex error.
+        const end = src.indexOf(ch, i + 1);
+        if (end < 0) throw _xpSyntaxError('unterminated string literal');
+        toks.push({ t: 'str', v: src.slice(i + 1, end) });
+        i = end + 1; continue;
+      }
+      if ((c >= 0x30 && c <= 0x39) || (ch === '.' && src.charCodeAt(i + 1) >= 0x30 && src.charCodeAt(i + 1) <= 0x39)) {
+        const start = i;
+        while (i < n && src.charCodeAt(i) >= 0x30 && src.charCodeAt(i) <= 0x39) i++;
+        if (src[i] === '.') { i++; while (i < n && src.charCodeAt(i) >= 0x30 && src.charCodeAt(i) <= 0x39) i++; }
+        toks.push({ t: 'num', v: parseFloat(src.slice(start, i)) });
+        continue;
+      }
+      if (ch === '.') {
+        if (src[i + 1] === '.') { toks.push({ t: '..' }); i += 2; }
+        else { toks.push({ t: '.' }); i++; }
+        continue;
+      }
+      if (ch === '$') {
+        i++;
+        const nm = readNCName();
+        if (nm === null) throw _xpSyntaxError('expected a name after $');
+        let full = nm;
+        if (src[i] === ':' && src[i + 1] !== ':') {
+          i++;
+          const loc = readNCName();
+          if (loc === null) throw _xpSyntaxError('expected a local name after :');
+          full = nm + ':' + loc;
+        }
+        toks.push({ t: 'var', v: full });
+        continue;
+      }
+      if (_xpIsNameStart(src.codePointAt(i))) {
+        const nm = readNCName();
+        // OperatorName, but only where an operator could stand.
+        if (opCtx() && _XP_OPNAMES.has(nm)) { toks.push({ t: 'op', v: nm }); continue; }
+        const after = peekPast(i);
+        if (src[after] === ':' && src[after + 1] === ':') {
+          if (!_XP_AXES.has(nm)) throw _xpSyntaxError('unknown axis "' + nm + '"');
+          i = after + 2;
+          toks.push({ t: 'axis', v: nm });
+          continue;
+        }
+        // `pre:local` / `pre:*` — a single colon, never `::`.
+        if (src[after] === ':' && src[after + 1] !== ':') {
+          i = after + 1;
+          if (src[i] === '*') { i++; toks.push({ t: 'name', v: nm + ':*', prefix: nm, local: '*' }); continue; }
+          const loc = readNCName();
+          if (loc === null) throw _xpSyntaxError('expected a local name after ":"');
+          const after2 = peekPast(i);
+          if (src[after2] === '(') { i = after2; toks.push({ t: 'func', v: nm + ':' + loc, prefix: nm, local: loc }); continue; }
+          toks.push({ t: 'name', v: nm + ':' + loc, prefix: nm, local: loc });
+          continue;
+        }
+        if (src[after] === '(') {
+          i = after;
+          if (_XP_NODETYPES.has(nm)) toks.push({ t: 'nodetype', v: nm });
+          else toks.push({ t: 'func', v: nm, prefix: null, local: nm });
+          continue;
+        }
+        toks.push({ t: 'name', v: nm, prefix: null, local: nm });
+        continue;
+      }
+      throw _xpSyntaxError('unexpected character ' +
+        JSON.stringify(src[i]) + ' at position ' + i);
+    }
+    toks.push({ t: 'eof' });
+    return toks;
+  }
+
+  // ── Parser ─────────────────────────────────────────────────────────────────
+  // Straight recursive descent over the 1.0 grammar. Node kinds:
+  //   or/and/eq/rel/add/mul  binary     {k, op, l, r}
+  //   neg                    unary      {k, e}
+  //   union                  binary     {k, l, r}
+  //   path                   {k, root: null|'/'|expr, steps: [...]}
+  //   step                   {k, axis, test, preds: []}
+  //   num/str/var/fn/filter
+  function _xpParse(src) {
+    const toks = _xpTokenize(src);
+    let p = 0;
+    const peek = () => toks[p];
+    const isOp = (v) => toks[p].t === 'op' && toks[p].v === v;
+    const eat = (t, v) => {
+      const tk = toks[p];
+      if (tk.t !== t || (v !== undefined && tk.v !== v)) {
+        throw _xpSyntaxError('expected ' + (v || t) + ' but found ' + (tk.v || tk.t));
+      }
+      p++; return tk;
+    };
+
+    function parseExpr() { return parseOr(); }
+
+    function parseOr() {
+      let l = parseAnd();
+      while (isOp('or')) { p++; l = { k: 'or', l, r: parseAnd() }; }
+      return l;
+    }
+    function parseAnd() {
+      let l = parseEquality();
+      while (isOp('and')) { p++; l = { k: 'and', l, r: parseEquality() }; }
+      return l;
+    }
+    function parseEquality() {
+      let l = parseRelational();
+      while (isOp('=') || isOp('!=')) { const op = toks[p++].v; l = { k: 'eq', op, l, r: parseRelational() }; }
+      return l;
+    }
+    function parseRelational() {
+      let l = parseAdditive();
+      while (isOp('<') || isOp('<=') || isOp('>') || isOp('>=')) {
+        const op = toks[p++].v; l = { k: 'rel', op, l, r: parseAdditive() };
+      }
+      return l;
+    }
+    function parseAdditive() {
+      let l = parseMultiplicative();
+      while (isOp('+') || isOp('-')) { const op = toks[p++].v; l = { k: 'add', op, l, r: parseMultiplicative() }; }
+      return l;
+    }
+    function parseMultiplicative() {
+      let l = parseUnary();
+      while (isOp('*') || isOp('div') || isOp('mod')) { const op = toks[p++].v; l = { k: 'mul', op, l, r: parseUnary() }; }
+      return l;
+    }
+    function parseUnary() {
+      if (isOp('-')) { p++; return { k: 'neg', e: parseUnary() }; }
+      return parseUnion();
+    }
+    function parseUnion() {
+      let l = parsePath();
+      while (isOp('|')) { p++; l = { k: 'union', l, r: parsePath() }; }
+      return l;
+    }
+
+    // A step can start here iff the next token could begin a NodeTest.
+    const startsStep = () => {
+      const t = peek();
+      return t.t === 'name' || t.t === 'nodetype' || t.t === 'axis' || t.t === '@' ||
+             t.t === '.' || t.t === '..';
+    };
+
+    function parsePath() {
+      // AbsoluteLocationPath — `/` alone is the root; `//x` is root + descendants.
+      if (isOp('/') || isOp('//')) {
+        const dbl = toks[p].v === '//';
+        p++;
+        const steps = [];
+        if (dbl) {
+          steps.push({ k: 'step', axis: 'descendant-or-self', test: { k: 'node' }, preds: [] });
+          steps.push(...parseRelativeSteps());
+        } else if (startsStep()) {
+          steps.push(...parseRelativeSteps());
+        }
+        return { k: 'path', root: '/', steps };
+      }
+      // A step, or a FilterExpr that may be followed by a path.
+      if (startsStep()) return { k: 'path', root: null, steps: parseRelativeSteps() };
+      const filter = parseFilter();
+      if (isOp('/') || isOp('//')) {
+        const dbl = toks[p].v === '//';
+        p++;
+        const steps = [];
+        if (dbl) steps.push({ k: 'step', axis: 'descendant-or-self', test: { k: 'node' }, preds: [] });
+        steps.push(...parseRelativeSteps());
+        return { k: 'path', root: filter, steps };
+      }
+      return filter;
+    }
+
+    function parseRelativeSteps() {
+      const steps = [parseStep()];
+      while (isOp('/') || isOp('//')) {
+        const dbl = toks[p].v === '//';
+        p++;
+        if (dbl) steps.push({ k: 'step', axis: 'descendant-or-self', test: { k: 'node' }, preds: [] });
+        steps.push(parseStep());
+      }
+      return steps;
+    }
+
+    function parseStep() {
+      const t = peek();
+      if (t.t === '.') { p++; return { k: 'step', axis: 'self', test: { k: 'node' }, preds: [] }; }
+      if (t.t === '..') { p++; return { k: 'step', axis: 'parent', test: { k: 'node' }, preds: [] }; }
+      let axis = 'child';
+      if (t.t === '@') { p++; axis = 'attribute'; }
+      else if (t.t === 'axis') { p++; axis = t.v; }
+      const test = parseNodeTest();
+      const preds = [];
+      while (peek().t === '[') { p++; preds.push(parseExpr()); eat(']'); }
+      return { k: 'step', axis, test, preds };
+    }
+
+    function parseNodeTest() {
+      const t = peek();
+      if (t.t === 'nodetype') {
+        p++; eat('(');
+        if (t.v === 'processing-instruction') {
+          let target = null;
+          if (peek().t === 'str') target = toks[p++].v;
+          eat(')');
+          return { k: 'pi', target };
+        }
+        eat(')');
+        return { k: t.v === 'node' ? 'node' : t.v };
+      }
+      if (t.t === 'name') { p++; return { k: 'name', prefix: t.prefix, local: t.local }; }
+      throw _xpSyntaxError('expected a node test but found ' + (t.v || t.t));
+    }
+
+    function parseFilter() {
+      let e = parsePrimary();
+      const preds = [];
+      while (peek().t === '[') { p++; preds.push(parseExpr()); eat(']'); }
+      return preds.length ? { k: 'filter', e, preds } : e;
+    }
+
+    function parsePrimary() {
+      const t = peek();
+      if (t.t === 'var') { p++; return { k: 'var', name: t.v }; }
+      if (t.t === '(') { p++; const e = parseExpr(); eat(')'); return e; }
+      if (t.t === 'str') { p++; return { k: 'str', v: t.v }; }
+      if (t.t === 'num') { p++; return { k: 'num', v: t.v }; }
+      if (t.t === 'func') {
+        p++; eat('(');
+        const args = [];
+        if (peek().t !== ')') {
+          args.push(parseExpr());
+          while (peek().t === ',') { p++; args.push(parseExpr()); }
+        }
+        eat(')');
+        return { k: 'fn', name: t.v, prefix: t.prefix, local: t.local, args };
+      }
+      throw _xpSyntaxError('unexpected ' + (t.v !== undefined ? t.v : t.t));
+    }
+
+    const ast = parseExpr();
+    if (peek().t !== 'eof') throw _xpSyntaxError('unexpected trailing ' + (peek().v || peek().t));
+    return ast;
+  }
+
+  // ── The data model ─────────────────────────────────────────────────────────
+  // XPath's tree is not quite the DOM's. Two differences carry real weight:
+  //   * An attribute's PARENT is its element, but an attribute is not one of its
+  //     element's CHILDREN. `@foo/parent::*` finds the element; `node()` on the
+  //     element does not find the attribute. WPT tests exactly this pair.
+  //   * Namespace declarations are not attributes at all — they are namespace
+  //     nodes on a separate axis, and must never be selected by `@*`.
+
+  // A namespace node has no DOM counterpart, so it is synthesised on demand.
+  // Kept deliberately small: nothing in the corpus navigates away from one, and
+  // inventing a full Node here would be a lie about what the engine can do.
+  class _XPathNamespace {
+    constructor(ownerElement, prefix, uri) {
+      this.ownerElement = ownerElement;
+      this.nodeType = 13;              // XPathNamespace.XPATH_NAMESPACE_NODE
+      this.localName = prefix;
+      this.prefix = null;
+      this.namespaceURI = null;
+      this.nodeName = prefix;
+      this.nodeValue = uri;
+      this.value = uri;
+    }
+  }
+
+  // Per-evaluation caches. Every child/attribute read in this engine crosses the
+  // JS↔Rust op bridge, and an expression like `//x[following-sibling::*]` re-reads
+  // the same sibling lists once per candidate. Caching them for the life of one
+  // evaluate() call turns a quadratic pile of IPC into a linear one; it is safe
+  // because a single evaluation is synchronous and cannot observe a mutation.
+  class _XPathCtx {
+    constructor(doc, resolver, vars) {
+      this.doc = doc;
+      this.resolver = resolver;
+      this.vars = vars || null;
+      this._kids = new Map();
+      this._attrs = new Map();
+      this._key = new Map();
+      // The DOM Standard's HTML rules apply to HTML documents only. An XML
+      // document — which is what `createDocument()` and `responseXML` give you —
+      // stays case-sensitive and null-namespace, as XPath 1.0 wrote it.
+      let ct = '';
+      try { ct = String(doc && doc.contentType || ''); } catch (e) {}
+      this.htmlDoc = ct === 'text/html';
+    }
+    kids(node) {
+      let a = this._kids.get(node);
+      if (a) return a;
+      a = [];
+      for (let c = node.firstChild; c; c = c.nextSibling) a.push(c);
+      this._kids.set(node, a);
+      return a;
+    }
+    attrs(node) {
+      let a = this._attrs.get(node);
+      if (a) return a;
+      a = [];
+      const nn = node.attributes;
+      if (nn) {
+        for (let i = 0; i < nn.length; i++) {
+          const at = nn[i];
+          // Namespace DECLARATIONS are namespace nodes, not attributes. Letting
+          // `@*` see them would make every namespaced document report attributes
+          // its author never wrote.
+          if (at.namespaceURI === _XP_XMLNS_NS || at.name === 'xmlns') continue;
+          a.push(at);
+        }
+      }
+      this._attrs.set(node, a);
+      return a;
+    }
+    // Document order key: the chain of child indices from the root. Attributes
+    // get index −1 plus their own position, which places them after their element
+    // and before its children — the order XPath requires (element, then its
+    // attributes, then its descendants).
+    key(node) {
+      let k = this._key.get(node);
+      if (k) return k;
+      let owner = null, tail = null;
+      if (node.nodeType === 2) { owner = node.ownerElement; tail = [-1, this.attrs(owner).indexOf(node)]; }
+      else if (node.nodeType === 13) { owner = node.ownerElement; tail = [-2, 0]; }
+      if (owner) {
+        k = this.key(owner).concat(tail);
+      } else {
+        const parent = node.parentNode;
+        if (!parent) k = [];
+        else k = this.key(parent).concat([this.kids(parent).indexOf(node)]);
+      }
+      this._key.set(node, k);
+      return k;
+    }
+    cmp(a, b) {
+      if (a === b) return 0;
+      const ka = this.key(a), kb = this.key(b);
+      const n = Math.min(ka.length, kb.length);
+      for (let i = 0; i < n; i++) if (ka[i] !== kb[i]) return ka[i] - kb[i];
+      return ka.length - kb.length;
+    }
+    sort(nodes) { nodes.sort((a, b) => this.cmp(a, b)); return nodes; }
+    // The root of an XPath tree is the document, or — for a detached subtree —
+    // the topmost node reachable by parentNode.
+    root(node) {
+      let n = node;
+      if (n.nodeType === 2 || n.nodeType === 13) n = n.ownerElement;
+      while (n && n.parentNode) n = n.parentNode;
+      return n;
+    }
+  }
+
+  // ── Node string-value (XPath 1.0 §5) ───────────────────────────────────────
+  function _xpStringValue(node) {
+    switch (node.nodeType) {
+      case 2:  return node.value;                       // attribute
+      case 13: return node.nodeValue;                   // namespace
+      case 3: case 4: case 8: return node.data;         // text, CDATA, comment
+      case 7:  return node.data;                        // processing instruction
+      default: {
+        // Root and element: the concatenation of all DESCENDANT text, which is
+        // not the same as nodeValue and not the same as innerText.
+        let out = '';
+        const walk = (n) => {
+          for (let c = n.firstChild; c; c = c.nextSibling) {
+            if (c.nodeType === 3 || c.nodeType === 4) out += c.data;
+            else if (c.nodeType === 1 || c.nodeType === 11) walk(c);
+          }
+        };
+        walk(node);
+        return out;
+      }
+    }
+  }
+
+  // ── Type conversions (XPath 1.0 §3.2, §4.2, §4.3) ──────────────────────────
+  const _xpIsNodeSet = (v) => Array.isArray(v);
+
+  function _xpToBoolean(v) {
+    if (_xpIsNodeSet(v)) return v.length > 0;
+    if (typeof v === 'number') return v !== 0 && !Number.isNaN(v);
+    if (typeof v === 'string') return v.length > 0;
+    return !!v;
+  }
+  function _xpToString(v) {
+    if (_xpIsNodeSet(v)) return v.length ? _xpStringValue(v[0]) : '';
+    if (typeof v === 'number') return _xpNumberToString(v);
+    if (typeof v === 'boolean') return v ? 'true' : 'false';
+    return String(v);
+  }
+  function _xpToNumber(v) {
+    if (_xpIsNodeSet(v)) return _xpStringToNumber(_xpToString(v));
+    if (typeof v === 'string') return _xpStringToNumber(v);
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    return v;
+  }
+  // XPath's string→number is stricter than JS's: leading/trailing ExprWhitespace
+  // is allowed and NOTHING else is. `Number("0x10")` is 16 and `Number("")` is 0;
+  // both are NaN here, which is what stops `@width="0x10"` quietly becoming a
+  // number in an arithmetic comparison.
+  function _xpStringToNumber(s) {
+    const t = String(s).replace(/^[\x20\x09\x0D\x0A]+|[\x20\x09\x0D\x0A]+$/g, '');
+    if (!/^-?(\d+(\.\d*)?|\.\d+)$/.test(t)) return NaN;
+    return parseFloat(t);
+  }
+  // XPath number→string never uses exponential notation, and -0 is "0".
+  function _xpNumberToString(n) {
+    if (Number.isNaN(n)) return 'NaN';
+    if (n === Infinity) return 'Infinity';
+    if (n === -Infinity) return '-Infinity';
+    if (n === 0) return '0';
+    if (Number.isInteger(n) && Math.abs(n) < 1e21) return String(n);
+    const s = String(n);
+    if (s.indexOf('e') < 0 && s.indexOf('E') < 0) return s;
+    // Expand the exponent by hand — String(1e21) is "1e+21" and XPath wants the
+    // twenty-two digits written out.
+    return n.toFixed(20).replace(/0+$/, '').replace(/\.$/, '');
+  }
+
+  // ── Name tests, and the HTML-document rules ────────────────────────────────
+  // XPath 1.0 alone would make `//div` never match anything in an HTML page,
+  // because HTML elements live in the XHTML namespace and a bare name test asks
+  // for the null namespace. The DOM Standard patches this, and the patch has
+  // three parts that WPT checks one by one:
+  //   1. In an HTML document, a prefix-less name test matches HTML-namespace
+  //      elements — and ONLY those. It does not match null-namespace elements
+  //      (so `//path` does not find an SVG <path>), which reads as backwards
+  //      until you see it is what keeps `//div` from matching foreign content.
+  //   2. The comparison is ASCII case-INSENSITIVE for HTML elements, so `//DiV`
+  //      works — matching how HTML itself treats tag names.
+  //   3. Everything else — SVG, MathML, any XML document — stays exactly
+  //      case-sensitive. `//svg:PatH` finds nothing, and should not.
+  function _xpNameTestMatches(node, test, axis, ctx) {
+    const principal = axis === 'attribute' ? 2 : (axis === 'namespace' ? 13 : 1);
+    if (node.nodeType !== principal) return false;
+
+    const nodeNS = node.namespaceURI == null ? null : node.namespaceURI;
+    // Already bound (and already vetted) by _xpBindPrefixes, once per evaluation.
+    const wantNS = test.prefix != null ? _xpResolvePrefix(ctx, test.prefix) : null;
+
+    if (test.local === '*') {
+      // A bare `*` matches any namespace; `pre:*` matches exactly one.
+      return test.prefix == null ? true : nodeNS === wantNS;
+    }
+
+    // The element that decides whether case folds — for an attribute that is the
+    // element it hangs on, which is why `@Id` finds an HTML `id` but not an SVG one.
+    const owner = node.nodeType === 2 ? node.ownerElement : node;
+    let ownerNS = null;
+    try { ownerNS = owner ? (owner.namespaceURI == null ? null : owner.namespaceURI) : null; } catch (e) {}
+
+    if (test.prefix != null) {
+      if (nodeNS !== wantNS) return false;
+    } else if (node.nodeType === 2) {
+      // An unprefixed attribute name test asks for the null namespace, in every
+      // kind of document. (`xlink:href` needs its prefix, and WPT checks that.)
+      if (nodeNS !== null) return false;
+    } else if (ctx.htmlDoc) {
+      if (nodeNS !== _XP_HTML_NS) return false;
+    } else if (nodeNS !== null) {
+      return false;
+    }
+
+    const fold = ctx.htmlDoc && ownerNS === _XP_HTML_NS;
+    const local = node.localName;
+    return fold ? _xpAsciiLower(local) === _xpAsciiLower(test.local) : local === test.local;
+  }
+
+  function _xpNodeTestMatches(node, test, axis, ctx) {
+    switch (test.k) {
+      case 'node': return true;
+      case 'text': return node.nodeType === 3 || node.nodeType === 4;
+      case 'comment': return node.nodeType === 8;
+      case 'pi': return node.nodeType === 7 && (test.target == null || node.target === test.target);
+      case 'name': return _xpNameTestMatches(node, test, axis, ctx);
+      default: return false;
+    }
+  }
+
+  // ── Prefix resolution ──────────────────────────────────────────────────────
+  // The resolver is a WebIDL callback interface, which means three shapes are
+  // legal and they are distinguished in a specific order: a callable is CALLED
+  // (and its `lookupNamespaceURI` property must never even be read — WPT counts
+  // the gets), otherwise the property is fetched FRESH on every call (never
+  // cached, so a resolver may legitimately change its mind) and must be callable.
+  function _xpCallResolver(resolver, prefix) {
+    if (resolver == null) return null;
+    if (typeof resolver === 'function') return resolver(prefix);
+    const fn = resolver.lookupNamespaceURI;
+    if (!fn) throw new TypeError("The provided value is not of type 'XPathNSResolver'.");
+    if (typeof fn !== 'function') {
+      throw new TypeError("Failed to execute 'evaluate': " +
+        "The provided value's 'lookupNamespaceURI' property is not a function.");
+    }
+    return fn.call(resolver, prefix);
+  }
+
+  // ⚠️ Prefixes are resolved ONCE PER EVALUATION, up front — never per candidate
+  // node. Resolving lazily inside the name test looks equivalent and is not: the
+  // resolver is author code, it is allowed to count its calls and to have side
+  // effects, and `/foo:bar` over a document with forty children would call it
+  // forty times. WPT asserts the count is exactly one.
+  function _xpCollectPrefixes(ast, out) {
+    if (!ast || typeof ast !== 'object') return out;
+    if (ast.k === 'step') {
+      if (ast.test && ast.test.k === 'name' && ast.test.prefix != null && !out.includes(ast.test.prefix)) {
+        out.push(ast.test.prefix);
+      }
+      for (const p of ast.preds) _xpCollectPrefixes(p, out);
+      return out;
+    }
+    for (const key of ['l', 'r', 'e', 'root']) if (ast[key]) _xpCollectPrefixes(ast[key], out);
+    if (ast.steps) for (const s of ast.steps) _xpCollectPrefixes(s, out);
+    if (ast.preds) for (const p of ast.preds) _xpCollectPrefixes(p, out);
+    if (ast.args) for (const a of ast.args) _xpCollectPrefixes(a, out);
+    return out;
+  }
+
+  function _xpResolvePrefix(ctx, prefix) {
+    const v = ctx.prefixes ? ctx.prefixes.get(prefix) : null;
+    return v === undefined ? null : v;
+  }
+
+  // Bind every prefix in the expression to a namespace, or refuse the whole
+  // expression. An unresolvable prefix is a NamespaceError and not an empty
+  // result, because "I cannot tell what you meant" and "nothing matched" are
+  // different answers and a page needs to be able to tell them apart.
+  function _xpBindPrefixes(ctx, ast) {
+    ctx.prefixes = new Map();
+    for (const prefix of _xpCollectPrefixes(ast, [])) {
+      const raw = _xpCallResolver(ctx.resolver, prefix);
+      // ⚠️ ONLY null and undefined mean "I cannot resolve that". Everything else
+      // is converted to a DOMString and believed — `0` becomes the namespace
+      // "0", and the EMPTY STRING is a legitimate answer meaning "no namespace",
+      // not a failure. Treating "" as unresolvable is the difference between
+      // 10/10 and 0/10 on resolver-callback-interface.html, because a resolver
+      // that returns "" is the simplest one anybody writes.
+      if (raw === null || raw === undefined) {
+        throw new DOMException(
+          'The string "' + prefix + '" could not be resolved to a namespace.',
+          'NamespaceError');
+      }
+      // String() may itself throw — a Symbol is a TypeError, and an object whose
+      // toString() throws propagates that. WPT asserts both, and asserts that
+      // valueOf() is never reached (ToString tries toString first).
+      const uri = String(raw);
+      ctx.prefixes.set(prefix, uri === '' ? null : uri);
+    }
+    return ctx;
+  }
+
+  // ── Axes ───────────────────────────────────────────────────────────────────
+  // Each returns nodes in the axis's own order. `preceding` and the two
+  // `*-sibling` axes are REVERSE axes, where position 1 is the nearest node, not
+  // the first in the document — getting that wrong makes `preceding-sibling::*[1]`
+  // silently return the wrong element, and the corpus leans on it heavily.
+  const _XP_REVERSE = new Set(['ancestor', 'ancestor-or-self', 'preceding', 'preceding-sibling']);
+
+  function _xpAxisNodes(node, axis, ctx) {
+    const out = [];
+    switch (axis) {
+      case 'self': out.push(node); break;
+      case 'child':
+        if (node.nodeType === 2 || node.nodeType === 13) break;
+        out.push(...ctx.kids(node));
+        break;
+      case 'parent': {
+        const p = (node.nodeType === 2 || node.nodeType === 13) ? node.ownerElement : node.parentNode;
+        if (p) out.push(p);
+        break;
+      }
+      case 'attribute':
+        if (node.nodeType === 1) out.push(...ctx.attrs(node));
+        break;
+      case 'namespace':
+        if (node.nodeType === 1) out.push(..._xpNamespaceNodes(node, ctx));
+        break;
+      case 'descendant':
+        _xpCollectDescendants(node, ctx, out);
+        break;
+      case 'descendant-or-self':
+        out.push(node);
+        _xpCollectDescendants(node, ctx, out);
+        break;
+      case 'ancestor': case 'ancestor-or-self': {
+        let n = node;
+        if (axis === 'ancestor-or-self') out.push(n);
+        if (n.nodeType === 2 || n.nodeType === 13) { n = n.ownerElement; if (n) out.push(n); }
+        while (n && n.parentNode) { n = n.parentNode; out.push(n); }
+        break;
+      }
+      case 'following-sibling': case 'preceding-sibling': {
+        if (node.nodeType === 2 || node.nodeType === 13) break;
+        const p = node.parentNode;
+        if (!p) break;
+        const sibs = ctx.kids(p);
+        const idx = sibs.indexOf(node);
+        if (idx < 0) break;
+        if (axis === 'following-sibling') for (let i = idx + 1; i < sibs.length; i++) out.push(sibs[i]);
+        else for (let i = idx - 1; i >= 0; i--) out.push(sibs[i]);   // nearest first
+        break;
+      }
+      case 'following': {
+        // Everything after the context node in document order, minus its own
+        // descendants (and never attributes or namespace nodes).
+        let n = node;
+        if (n.nodeType === 2 || n.nodeType === 13) n = n.ownerElement;
+        for (let cur = n; cur; cur = cur.parentNode) {
+          for (let s = cur.nextSibling; s; s = s.nextSibling) {
+            out.push(s);
+            _xpCollectDescendants(s, ctx, out);
+          }
+        }
+        break;
+      }
+      case 'preceding': {
+        // Everything before it, minus its ancestors. Reverse document order.
+        let n = node;
+        if (n.nodeType === 2 || n.nodeType === 13) n = n.ownerElement;
+        for (let cur = n; cur; cur = cur.parentNode) {
+          for (let s = cur.previousSibling; s; s = s.previousSibling) {
+            const sub = [];
+            sub.push(s);
+            _xpCollectDescendants(s, ctx, sub);
+            for (let i = sub.length - 1; i >= 0; i--) out.push(sub[i]);
+          }
+        }
+        break;
+      }
+    }
+    return out;
+  }
+
+  function _xpCollectDescendants(node, ctx, out) {
+    if (node.nodeType === 2 || node.nodeType === 13) return;
+    const kids = ctx.kids(node);
+    for (let i = 0; i < kids.length; i++) {
+      out.push(kids[i]);
+      _xpCollectDescendants(kids[i], ctx, out);
+    }
+  }
+
+  // In-scope namespaces of an element: every declaration on it or an ancestor,
+  // nearest wins, plus the implicit `xml` binding that is always in scope.
+  function _xpNamespaceNodes(el, ctx) {
+    const seen = new Map();
+    for (let n = el; n && n.nodeType === 1; n = n.parentNode) {
+      const nn = n.attributes;
+      if (!nn) continue;
+      for (let i = 0; i < nn.length; i++) {
+        const at = nn[i];
+        let prefix = null;
+        if (at.name === 'xmlns') prefix = '';
+        else if (at.prefix === 'xmlns') prefix = at.localName;
+        else continue;
+        if (!seen.has(prefix)) seen.set(prefix, at.value);
+      }
+    }
+    if (!seen.has('xml')) seen.set('xml', _XP_XML_NS);
+    const out = [];
+    for (const [prefix, uri] of seen) {
+      if (uri === '') continue;              // an undeclaration removes the node
+      out.push(new _XPathNamespace(el, prefix, uri));
+    }
+    return out;
+  }
+
+  // ── Evaluation ─────────────────────────────────────────────────────────────
+  function _xpEval(ast, node, pos, size, ctx) {
+    switch (ast.k) {
+      case 'num': return ast.v;
+      case 'str': return ast.v;
+      case 'var': {
+        if (!ctx.vars || !(ast.name in ctx.vars)) {
+          throw _xpSyntaxError('undefined variable $' + ast.name);
+        }
+        return ctx.vars[ast.name];
+      }
+      case 'or':  return _xpToBoolean(_xpEval(ast.l, node, pos, size, ctx)) ||
+                         _xpToBoolean(_xpEval(ast.r, node, pos, size, ctx));
+      case 'and': return _xpToBoolean(_xpEval(ast.l, node, pos, size, ctx)) &&
+                         _xpToBoolean(_xpEval(ast.r, node, pos, size, ctx));
+      case 'eq':  return _xpCompareEq(ast.op, _xpEval(ast.l, node, pos, size, ctx),
+                                              _xpEval(ast.r, node, pos, size, ctx));
+      case 'rel': return _xpCompareRel(ast.op, _xpEval(ast.l, node, pos, size, ctx),
+                                               _xpEval(ast.r, node, pos, size, ctx));
+      case 'add': {
+        const a = _xpToNumber(_xpEval(ast.l, node, pos, size, ctx));
+        const b = _xpToNumber(_xpEval(ast.r, node, pos, size, ctx));
+        return ast.op === '+' ? a + b : a - b;
+      }
+      case 'mul': {
+        const a = _xpToNumber(_xpEval(ast.l, node, pos, size, ctx));
+        const b = _xpToNumber(_xpEval(ast.r, node, pos, size, ctx));
+        if (ast.op === '*') return a * b;
+        if (ast.op === 'div') return a / b;
+        return a % b;                        // XPath `mod` is JS `%` (truncating)
+      }
+      case 'neg': return -_xpToNumber(_xpEval(ast.e, node, pos, size, ctx));
+      case 'union': {
+        const l = _xpEval(ast.l, node, pos, size, ctx);
+        const r = _xpEval(ast.r, node, pos, size, ctx);
+        if (!_xpIsNodeSet(l) || !_xpIsNodeSet(r)) {
+          throw new TypeError('The | operator requires node-sets on both sides.');
+        }
+        // Deduplicate, then restore document order. A union that leaves its
+        // result unsorted makes `(./p | ./span)[last()]` pick the wrong element —
+        // which is precisely what node-set-tree-order.html catches.
+        const set = new Set(l);
+        const out = l.slice();
+        for (const n of r) if (!set.has(n)) { set.add(n); out.push(n); }
+        return ctx.sort(out);
+      }
+      case 'filter': {
+        let nodes = _xpEval(ast.e, node, pos, size, ctx);
+        if (!_xpIsNodeSet(nodes)) throw new TypeError('A predicate requires a node-set.');
+        for (const pred of ast.preds) nodes = _xpApplyPredicate(nodes, pred, ctx, false);
+        return nodes;
+      }
+      case 'fn': return _xpCallFunction(ast, node, pos, size, ctx);
+      case 'path': return _xpEvalPath(ast, node, pos, size, ctx);
+      case 'step': return _xpEvalPath({ k: 'path', root: null, steps: [ast] }, node, pos, size, ctx);
+      default: throw _xpSyntaxError('unknown expression node ' + ast.k);
+    }
+  }
+
+  function _xpEvalPath(ast, node, pos, size, ctx) {
+    let current;
+    if (ast.root === '/') {
+      const r = ctx.root(node);
+      current = r ? [r] : [];
+    } else if (ast.root == null) {
+      current = [node];
+    } else {
+      const v = _xpEval(ast.root, node, pos, size, ctx);
+      if (!_xpIsNodeSet(v)) throw new TypeError('A path step requires a node-set on its left.');
+      current = v;
+    }
+
+    for (const step of ast.steps) {
+      const out = [];
+      const seen = new Set();
+      for (const ctxNode of current) {
+        let cand = _xpAxisNodes(ctxNode, step.axis, ctx)
+          .filter((n) => _xpNodeTestMatches(n, step.test, step.axis, ctx));
+        const reverse = _XP_REVERSE.has(step.axis);
+        for (const pred of step.preds) cand = _xpApplyPredicate(cand, pred, ctx, reverse);
+        for (const n of cand) if (!seen.has(n)) { seen.add(n); out.push(n); }
+      }
+      // A step's result is a node-set, and a node-set is unordered — but every
+      // consumer downstream (position(), last(), the caller's snapshot) reads it
+      // in document order, so it is normalised here once per step.
+      current = ctx.sort(out);
+    }
+    return current;
+  }
+
+  // A numeric predicate means position(), and on a reverse axis position counts
+  // from the context node outwards.
+  function _xpApplyPredicate(nodes, pred, ctx, reverse) {
+    const out = [];
+    const size = nodes.length;
+    for (let i = 0; i < size; i++) {
+      const position = reverse ? size - i : i + 1;
+      const v = _xpEval(pred, nodes[i], position, size, ctx);
+      const keep = typeof v === 'number' ? v === position : _xpToBoolean(v);
+      if (keep) out.push(nodes[i]);
+    }
+    return out;
+  }
+
+  // ── Comparisons (XPath 1.0 §3.4) ───────────────────────────────────────────
+  // Node-sets compare EXISTENTIALLY: `@a = "x"` is true if ANY attribute equals
+  // "x". A node-set against a boolean converts the node-set to a boolean; against
+  // a number, each node's string-value becomes a number. This asymmetry is the
+  // single most surprising corner of XPath and the corpus uses it constantly.
+  function _xpCompareEq(op, a, b) {
+    const eq = op === '=';
+    if (_xpIsNodeSet(a) && _xpIsNodeSet(b)) {
+      const bs = b.map(_xpStringValue);
+      for (const n of a) {
+        const s = _xpStringValue(n);
+        for (const t of bs) if ((s === t) === eq) return true;
+      }
+      return false;
+    }
+    if (_xpIsNodeSet(a) || _xpIsNodeSet(b)) {
+      const set = _xpIsNodeSet(a) ? a : b;
+      const other = _xpIsNodeSet(a) ? b : a;
+      if (typeof other === 'boolean') {
+        return (_xpToBoolean(set) === other) === eq;
+      }
+      if (typeof other === 'number') {
+        for (const n of set) if ((_xpStringToNumber(_xpStringValue(n)) === other) === eq) return true;
+        return false;
+      }
+      const s = _xpToString(other);
+      for (const n of set) if ((_xpStringValue(n) === s) === eq) return true;
+      return false;
+    }
+    if (typeof a === 'boolean' || typeof b === 'boolean') return (_xpToBoolean(a) === _xpToBoolean(b)) === eq;
+    if (typeof a === 'number' || typeof b === 'number') return (_xpToNumber(a) === _xpToNumber(b)) === eq;
+    return (_xpToString(a) === _xpToString(b)) === eq;
+  }
+
+  function _xpCompareRel(op, a, b) {
+    const test = (x, y) => op === '<' ? x < y : op === '<=' ? x <= y : op === '>' ? x > y : x >= y;
+    if (_xpIsNodeSet(a) || _xpIsNodeSet(b)) {
+      const as = _xpIsNodeSet(a) ? a.map((n) => _xpStringToNumber(_xpStringValue(n))) : [_xpToNumber(a)];
+      const bs = _xpIsNodeSet(b) ? b.map((n) => _xpStringToNumber(_xpStringValue(n))) : [_xpToNumber(b)];
+      for (const x of as) for (const y of bs) if (test(x, y)) return true;
+      return false;
+    }
+    return test(_xpToNumber(a), _xpToNumber(b));
+  }
+
+  // ── The core function library (XPath 1.0 §4) ───────────────────────────────
+  // Arity is checked, because a mistyped `substring(x)` should be a parse-time
+  // complaint rather than a silent empty string three screens later.
+  const _XP_FUNCS = {
+    // Node-set functions
+    'last':   { min: 0, max: 0, fn: (c) => c.size },
+    'position': { min: 0, max: 0, fn: (c) => c.pos },
+    'count':  { min: 1, max: 1, fn: (c, a) => {
+      if (!_xpIsNodeSet(a[0])) throw new TypeError('count() requires a node-set.');
+      return a[0].length;
+    } },
+    'id':     { min: 1, max: 1, fn: (c, a) => {
+      // The argument may be a node-set, in which case EACH node's string-value is
+      // a whitespace-separated id list of its own.
+      let tokens = [];
+      if (_xpIsNodeSet(a[0])) for (const n of a[0]) tokens.push(..._xpStringValue(n).split(/[\x20\x09\x0D\x0A]+/));
+      else tokens = _xpToString(a[0]).split(/[\x20\x09\x0D\x0A]+/);
+      const out = [];
+      const seen = new Set();
+      for (const t of tokens) {
+        if (!t) continue;
+        const el = _xpFindById(c.ctx, t);
+        if (el && !seen.has(el)) { seen.add(el); out.push(el); }
+      }
+      return c.ctx.sort(out);
+    } },
+    'local-name': { min: 0, max: 1, fn: (c, a) => {
+      const n = _xpFirstOrContext(c, a);
+      if (!n) return '';
+      if (n.nodeType === 7) return n.target;
+      return n.localName || '';
+    } },
+    'namespace-uri': { min: 0, max: 1, fn: (c, a) => {
+      const n = _xpFirstOrContext(c, a);
+      return (n && n.namespaceURI) || '';
+    } },
+    'name': { min: 0, max: 1, fn: (c, a) => {
+      const n = _xpFirstOrContext(c, a);
+      if (!n) return '';
+      if (n.nodeType === 7) return n.target;
+      if (n.nodeType === 13) return n.localName || '';
+      if (n.nodeType !== 1 && n.nodeType !== 2) return '';
+      return n.nodeName || '';
+    } },
+
+    // String functions
+    'string': { min: 0, max: 1, fn: (c, a) => a.length ? _xpToString(a[0]) : _xpStringValue(c.node) },
+    'concat': { min: 2, max: Infinity, fn: (c, a) => a.map(_xpToString).join('') },
+    'starts-with': { min: 2, max: 2, fn: (c, a) => _xpToString(a[0]).startsWith(_xpToString(a[1])) },
+    'contains': { min: 2, max: 2, fn: (c, a) => _xpToString(a[0]).indexOf(_xpToString(a[1])) >= 0 },
+    'substring-before': { min: 2, max: 2, fn: (c, a) => {
+      const s = _xpToString(a[0]), t = _xpToString(a[1]);
+      const i = s.indexOf(t);
+      return i < 0 ? '' : s.slice(0, i);
+    } },
+    'substring-after': { min: 2, max: 2, fn: (c, a) => {
+      const s = _xpToString(a[0]), t = _xpToString(a[1]);
+      const i = s.indexOf(t);
+      return i < 0 ? '' : s.slice(i + t.length);
+    } },
+    'substring': { min: 2, max: 3, fn: (c, a) => {
+      // 1-based, and the arguments are ROUNDED before use — `substring(s, 1.5, 2.6)`
+      // is characters 2 through 4. Rounding after slicing gives a different string.
+      const s = _xpToString(a[0]);
+      const start = _xpRound(_xpToNumber(a[1]));
+      if (Number.isNaN(start)) return '';
+      if (a.length < 3) {
+        if (start === -Infinity) return s;
+        return s.slice(Math.max(0, start - 1));
+      }
+      const len = _xpRound(_xpToNumber(a[2]));
+      if (Number.isNaN(len)) return '';
+      const end = start + len;               // exclusive, 1-based
+      if (Number.isNaN(end)) return '';
+      const from = Math.max(1, start);
+      if (end <= from) return '';
+      return s.slice(from - 1, end === Infinity ? undefined : end - 1);
+    } },
+    'string-length': { min: 0, max: 1, fn: (c, a) =>
+      (a.length ? _xpToString(a[0]) : _xpStringValue(c.node)).length },
+    'normalize-space': { min: 0, max: 1, fn: (c, a) =>
+      (a.length ? _xpToString(a[0]) : _xpStringValue(c.node))
+        .replace(/[\x20\x09\x0D\x0A]+/g, ' ')
+        .replace(/^ | $/g, '') },
+    'translate': { min: 3, max: 3, fn: (c, a) => {
+      const s = _xpToString(a[0]), from = _xpToString(a[1]), to = _xpToString(a[2]);
+      let out = '';
+      for (const ch of s) {
+        const i = from.indexOf(ch);
+        if (i < 0) out += ch;
+        else if (i < to.length) out += to[i];
+        // else: no replacement character, so the character is REMOVED
+      }
+      return out;
+    } },
+
+    // Boolean functions
+    'boolean': { min: 1, max: 1, fn: (c, a) => _xpToBoolean(a[0]) },
+    'not':     { min: 1, max: 1, fn: (c, a) => !_xpToBoolean(a[0]) },
+    'true':    { min: 0, max: 0, fn: () => true },
+    'false':   { min: 0, max: 0, fn: () => false },
+    'lang':    { min: 1, max: 1, fn: (c, a) => {
+      // The nearest ancestor-or-self with an xml:lang, matched case-insensitively,
+      // and matching also when the attribute has a longer `-` suffix: xml:lang="en-GB"
+      // answers true to lang("en"). Note it is the ATTRIBUTE that may be longer, not
+      // the argument — lang("en-GB") against xml:lang="en" is false.
+      const want = _xpAsciiLower(_xpToString(a[0]));
+      let n = c.node;
+      if (n && (n.nodeType === 2 || n.nodeType === 13)) n = n.ownerElement;
+      for (; n; n = n.parentNode) {
+        if (n.nodeType !== 1 || !n.getAttributeNS) continue;
+        let v = null;
+        try { v = n.getAttributeNS(_XP_XML_NS, 'lang'); } catch (e) {}
+        if (v == null) continue;
+        const have = _xpAsciiLower(v);
+        return have === want || (have.startsWith(want) && have[want.length] === '-');
+      }
+      return false;
+    } },
+
+    // Number functions
+    'number': { min: 0, max: 1, fn: (c, a) =>
+      a.length ? _xpToNumber(a[0]) : _xpStringToNumber(_xpStringValue(c.node)) },
+    'sum': { min: 1, max: 1, fn: (c, a) => {
+      if (!_xpIsNodeSet(a[0])) throw new TypeError('sum() requires a node-set.');
+      let t = 0;
+      for (const n of a[0]) t += _xpStringToNumber(_xpStringValue(n));
+      return t;
+    } },
+    'floor':   { min: 1, max: 1, fn: (c, a) => Math.floor(_xpToNumber(a[0])) },
+    'ceiling': { min: 1, max: 1, fn: (c, a) => Math.ceil(_xpToNumber(a[0])) },
+    'round':   { min: 1, max: 1, fn: (c, a) => _xpRound(_xpToNumber(a[0])) },
+  };
+
+  // XPath rounds half towards POSITIVE infinity, so round(-0.5) is -0 and not -1.
+  function _xpRound(n) {
+    if (Number.isNaN(n) || n === Infinity || n === -Infinity) return n;
+    return Math.round(n);
+  }
+
+  function _xpFirstOrContext(c, a) {
+    if (!a.length) return c.node;
+    if (!_xpIsNodeSet(a[0])) throw new TypeError('This function requires a node-set.');
+    return a[0].length ? c.ctx.sort(a[0].slice())[0] : null;
+  }
+
+  function _xpFindById(ctx, id) {
+    const doc = ctx.doc;
+    if (doc && typeof doc.getElementById === 'function') {
+      try {
+        const el = doc.getElementById(id);
+        if (el) return el;
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function _xpCallFunction(ast, node, pos, size, ctx) {
+    // XPath 1.0 has no namespaced functions of its own; a prefixed name would be
+    // an extension function, and there are none.
+    if (ast.prefix != null) throw _xpSyntaxError('unknown function ' + ast.name);
+    const def = _XP_FUNCS[ast.local];
+    if (!def) throw _xpSyntaxError('unknown function ' + ast.name + '()');
+    if (ast.args.length < def.min || ast.args.length > def.max) {
+      throw _xpSyntaxError(ast.name + '() takes ' + def.min +
+        (def.max === def.min ? '' : '–' + (def.max === Infinity ? 'many' : def.max)) +
+        ' argument(s), got ' + ast.args.length);
+    }
+    const args = ast.args.map((a) => _xpEval(a, node, pos, size, ctx));
+    return def.fn({ node, pos, size, ctx }, args);
+  }
+
+  // ── The DOM interfaces ─────────────────────────────────────────────────────
+
+  const _XP_RESULT_TYPES = {
+    ANY_TYPE: 0, NUMBER_TYPE: 1, STRING_TYPE: 2, BOOLEAN_TYPE: 3,
+    UNORDERED_NODE_ITERATOR_TYPE: 4, ORDERED_NODE_ITERATOR_TYPE: 5,
+    UNORDERED_NODE_SNAPSHOT_TYPE: 6, ORDERED_NODE_SNAPSHOT_TYPE: 7,
+    ANY_UNORDERED_NODE_TYPE: 8, FIRST_ORDERED_NODE_TYPE: 9,
+  };
+
+  const _xpInvalidType = () =>
+    new DOMException('The result is not of the requested type.', 'TypeError');
+
+  class XPathResult {
+    constructor() {
+      throw new TypeError('Illegal constructor');
+    }
+    get resultType() { return _xpGuts(this).type; }
+    get numberValue() {
+      const g = _xpGuts(this);
+      if (g.type !== 1) throw _xpInvalidType();
+      return g.value;
+    }
+    get stringValue() {
+      const g = _xpGuts(this);
+      if (g.type !== 2) throw _xpInvalidType();
+      return g.value;
+    }
+    get booleanValue() {
+      const g = _xpGuts(this);
+      if (g.type !== 3) throw _xpInvalidType();
+      return g.value;
+    }
+    get singleNodeValue() {
+      const g = _xpGuts(this);
+      if (g.type !== 8 && g.type !== 9) throw _xpInvalidType();
+      return g.value;
+    }
+    get invalidIteratorState() {
+      const g = _xpGuts(this);
+      if (g.type !== 4 && g.type !== 5) return false;
+      return g.version !== _xpDomVersion();
+    }
+    get snapshotLength() {
+      const g = _xpGuts(this);
+      if (g.type !== 6 && g.type !== 7) throw _xpInvalidType();
+      return g.nodes.length;
+    }
+    iterateNext() {
+      const g = _xpGuts(this);
+      // A non-iterator result throws a plain TypeError, NOT a DOMException — and
+      // it does so whether or not the document has since changed.
+      if (g.type !== 4 && g.type !== 5) throw new TypeError('The result is not an iterator.');
+      if (g.version !== _xpDomVersion()) {
+        throw new DOMException('The document has been mutated since the result was returned.',
+                               'InvalidStateError');
+      }
+      if (g.index >= g.nodes.length) return null;
+      return g.nodes[g.index++];
+    }
+    snapshotItem(index) {
+      const g = _xpGuts(this);
+      if (g.type !== 6 && g.type !== 7) throw _xpInvalidType();
+      const i = index >>> 0;
+      return i < g.nodes.length ? g.nodes[i] : null;
+    }
+  }
+  for (const [k, v] of Object.entries(_XP_RESULT_TYPES)) {
+    Object.defineProperty(XPathResult, k, { value: v, enumerable: true });
+    Object.defineProperty(XPathResult.prototype, k, { value: v, enumerable: true });
+  }
+
+  // The result's data lives off the instance so a page cannot forge one by
+  // Object.create()-ing the prototype — the same reasoning as TrustedHTML.
+  const _xpResultGuts = new WeakMap();
+  function _xpGuts(o) {
+    const g = _xpResultGuts.get(o);
+    if (!g) throw new TypeError('Illegal invocation');
+    return g;
+  }
+  function _xpMakeResult(g) {
+    const r = Object.create(XPathResult.prototype);
+    _xpResultGuts.set(r, g);
+    return r;
+  }
+
+  class XPathExpression {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    evaluate(contextNode, type, result) {
+      const g = _xpExprGuts.get(this);
+      if (!g) throw new TypeError('Illegal invocation');
+      return _xpRunEvaluate(g.ast, contextNode, g.resolver, type, result, g.doc);
+    }
+    evaluateWithContext(contextNode, position, size, type, result) {
+      // Not in the DOM Standard; present because XPathExpression's IDL in the
+      // legacy DOM L3 XPath spec named it. Kept off the prototype's enumerable
+      // surface would be wrong (idlharness reads it), so it simply forwards.
+      const g = _xpExprGuts.get(this);
+      if (!g) throw new TypeError('Illegal invocation');
+      return _xpRunEvaluate(g.ast, contextNode, g.resolver, type, result, g.doc);
+    }
+  }
+  const _xpExprGuts = new WeakMap();
+
+  // ── DOM-mutation versioning, for iterator invalidation ─────────────────────
+  // A node-iterator result must throw InvalidStateError once the document has
+  // changed under it. There is no cheaper honest signal than a counter bumped by
+  // the tree primitives, so `__xpBumpDomVersion` is called from those (see the
+  // Node mutation methods); reading it here is a single integer load.
+  function _xpDomVersion() {
+    return typeof __xpDomVersion === 'number' ? __xpDomVersion : 0;
+  }
+
+  function _xpRunEvaluate(ast, contextNode, resolver, type, result, doc) {
+    if (contextNode == null || typeof contextNode !== 'object' || typeof contextNode.nodeType !== 'number') {
+      throw new TypeError("Failed to execute 'evaluate': parameter 1 is not of type 'Node'.");
+    }
+    // ⚠️ The document that decides the HTML-vs-XML rules is the CONTEXT NODE's,
+    // never the one the expression was created from. An expression is a compiled
+    // string, not a promise about which tree it will be pointed at: WPT builds
+    // `xmlDoc.createExpression("//html")` and evaluates it against an HTML
+    // document, and expects it to find the <html> element — because at that
+    // moment it is asking a question about an HTML document. Preferring the
+    // creating document instead scores exactly half of both `*-different-document`
+    // files, which is how this was found.
+    const ownerDoc = contextNode.ownerDocument || contextNode;
+    const ctx = _xpBindPrefixes(new _XPathCtx(ownerDoc, resolver, null), ast);
+    const value = _xpEval(ast, contextNode, 1, 1, ctx);
+
+    let t = type === undefined || type === null ? 0 : (type >>> 0);
+    if (t === 0) {
+      t = _xpIsNodeSet(value) ? 4 : typeof value === 'number' ? 1 : typeof value === 'string' ? 2 : 3;
+    }
+    switch (t) {
+      case 1: return _xpMakeResult({ type: 1, value: _xpToNumber(value) });
+      case 2: return _xpMakeResult({ type: 2, value: _xpToString(value) });
+      case 3: return _xpMakeResult({ type: 3, value: _xpToBoolean(value) });
+      case 4: case 5: case 6: case 7: case 8: case 9: {
+        if (!_xpIsNodeSet(value)) throw _xpInvalidType();
+        const nodes = value;
+        if (t === 8 || t === 9) {
+          return _xpMakeResult({ type: t, value: nodes.length ? nodes[0] : null });
+        }
+        return _xpMakeResult({
+          type: t, nodes: nodes.slice(), index: 0, version: _xpDomVersion(),
+        });
+      }
+      default:
+        throw new TypeError('Invalid XPathResult type ' + type);
+    }
+  }
+
+  // The evaluator's three methods are shared verbatim by Document (which is an
+  // XPathEvaluatorBase) and by a standalone XPathEvaluator.
+  function _xpCreateExpression(doc, expression, resolver) {
+    const ast = _xpParse(String(expression));
+    const e = Object.create(XPathExpression.prototype);
+    _xpExprGuts.set(e, { ast, resolver: _xpNormalizeResolver(resolver), doc });
+    return e;
+  }
+  // createNSResolver is now the identity function: the spec folded XPathNSResolver
+  // into "a Node, or anything with lookupNamespaceURI, or a callable", so there is
+  // nothing left to wrap. WPT asserts the argument comes back UNCHANGED, and also
+  // that the returned object gains no magic `xml` handling of its own.
+  function _xpCreateNSResolver(nodeResolver) {
+    return nodeResolver;
+  }
+  function _xpNormalizeResolver(resolver) {
+    if (resolver === undefined || resolver === null) return null;
+    if (typeof resolver === 'function') return resolver;
+    if (typeof resolver === 'object') return resolver;
+    throw new TypeError("The provided value is not of type 'XPathNSResolver'.");
+  }
+  function _xpEvaluate(doc, expression, contextNode, resolver, type, result) {
+    const ast = _xpParse(String(expression));
+    return _xpRunEvaluate(ast, contextNode, _xpNormalizeResolver(resolver), type, result, doc);
+  }
+
+  class XPathEvaluator {
+    constructor() {}
+    createExpression(expression, resolver) {
+      return _xpCreateExpression(null, expression, resolver);
+    }
+    createNSResolver(nodeResolver) { return _xpCreateNSResolver(nodeResolver); }
+    evaluate(expression, contextNode, resolver, type, result) {
+      return _xpEvaluate(null, expression, contextNode, resolver, type, result);
+    }
+  }
+
+  globalThis.XPathResult = XPathResult;
+  globalThis.XPathExpression = XPathExpression;
+  globalThis.XPathEvaluator = XPathEvaluator;
+  globalThis.XPathNSResolver = undefined;      // folded away by the DOM Standard
+
+  // XPathEvaluatorBase is mixed into Document.
+  Document.prototype.createExpression = function createExpression(expression, resolver) {
+    return _xpCreateExpression(this, expression, resolver);
+  };
+  Document.prototype.createNSResolver = function createNSResolver(nodeResolver) {
+    return _xpCreateNSResolver(nodeResolver);
+  };
+  Document.prototype.evaluate = function evaluate(expression, contextNode, resolver, type, result) {
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to execute 'evaluate' on 'Document': 2 arguments required.");
+    }
+    return _xpEvaluate(this, expression, contextNode, resolver, type, result);
+  };
+
+  // Exposed for `scripts/xpath_offline_test.mjs`, which runs WPT's 1,024-case
+  // corpus against the parser+evaluator in Node with a mini-DOM. Hidden from the
+  // page by the global-scrubbing pass at the end of this file.
+  globalThis.__xpathInternals = { parse: _xpParse, tokenize: _xpTokenize, Ctx: _XPathCtx,
+    eval: _xpEval, bindPrefixes: _xpBindPrefixes, toString: _xpToString, toNumber: _xpToNumber,
+    toBoolean: _xpToBoolean, stringValue: _xpStringValue };
+}
+// ===== XPATH-ENGINE-END =====
+
+// ═════════════════════════════════════════════════════════════════════════════
+// THE SANITIZER  (Sanitizer API · `Element.setHTML`)
+// ═════════════════════════════════════════════════════════════════════════════
+// `Sanitizer` did not exist, and neither did `setHTML`. Only `setHTMLUnsafe` was
+// here — which, as its name says, parses markup and asks no questions.
+//
+// This is the companion to Quest #490's Trusted Types, and it answers the other
+// half of the same problem. Trusted Types says "a string may not reach a sink
+// unless somebody vouched for it". The Sanitizer is *how you vouch*: it takes
+// untrusted markup and returns the same markup with everything that could run
+// script taken out — no `<script>`, no `onclick=`, no `href="javascript:…"`.
+//
+// Why it belongs in THIS browser in particular:
+//
+//   * It costs the device NOTHING. The alternative is shipping a sanitizer
+//     library — DOMPurify and friends are tens of kilobytes of JavaScript,
+//     downloaded and parsed and run on every page that displays a comment, a
+//     forum post, an email. On a metered connection that is a real price, paid
+//     over and over, for something the browser can do for free. Every page that
+//     can use `setHTML` is a page that does not have to download a sanitizer.
+//
+//   * A hand-rolled sanitizer is where XSS bugs live. Filtering markup with
+//     regexes over a string is a losing game against a parser; the browser's
+//     sanitizer works on the *parsed tree*, after the parser has already
+//     resolved every trick the string could play. That is not a small
+//     difference — it is the whole difference.
+//
+// Written against the WICG Sanitizer API draft. The default allow-list, the safe
+// baseline and the two URL-attribute tables are transcribed from that spec.
+{
+  const _SAN_HTML_NS = 'http://www.w3.org/1999/xhtml';
+  const _SAN_SVG_NS = 'http://www.w3.org/2000/svg';
+  const _SAN_MATHML_NS = 'http://www.w3.org/1998/Math/MathML';
+  const _SAN_XLINK_NS = 'http://www.w3.org/1999/xlink';
+
+  // The built-in safe default configuration (spec §"default configuration"),
+  // stored compactly: an element with no `namespace` is in the HTML namespace and
+  // an attribute written as a bare string is in the null namespace, which is by
+  // far the common case. Parsed once, lazily — a page that never calls setHTML
+  // pays nothing for it.
+  const _SAN_DEFAULT_JSON = '{"elements":[{"name":"math","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"merror","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mfrac","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mi","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mmultiscripts","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mn","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mo","namespace":"http://www.w3.org/1998/Math/MathML","attributes":["fence","form","largeop","lspace","maxsize","minsize","movablelimits","rspace","separator","stretchy","symmetric"]},{"name":"mover","namespace":"http://www.w3.org/1998/Math/MathML","attributes":["accent"]},{"name":"mpadded","namespace":"http://www.w3.org/1998/Math/MathML","attributes":["depth","height","lspace","voffset","width"]},{"name":"mphantom","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mprescripts","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mroot","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mrow","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"ms","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mspace","namespace":"http://www.w3.org/1998/Math/MathML","attributes":["depth","height","width"]},{"name":"msqrt","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mstyle","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"msub","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"msubsup","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"msup","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mtable","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mtd","namespace":"http://www.w3.org/1998/Math/MathML","attributes":["columnspan","rowspan"]},{"name":"mtext","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"mtr","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"munder","namespace":"http://www.w3.org/1998/Math/MathML","attributes":["accentunder"]},{"name":"munderover","namespace":"http://www.w3.org/1998/Math/MathML","attributes":["accent","accentunder"]},{"name":"semantics","namespace":"http://www.w3.org/1998/Math/MathML"},{"name":"a","attributes":["href","hreflang","type"]},{"name":"abbr"},{"name":"address"},{"name":"article"},{"name":"aside"},{"name":"b"},{"name":"bdi"},{"name":"bdo"},{"name":"blockquote","attributes":["cite"]},{"name":"body"},{"name":"br"},{"name":"caption"},{"name":"cite"},{"name":"code"},{"name":"col","attributes":["span"]},{"name":"colgroup","attributes":["span"]},{"name":"data","attributes":["value"]},{"name":"dd"},{"name":"del","attributes":["cite","datetime"]},{"name":"dfn"},{"name":"div"},{"name":"dl"},{"name":"dt"},{"name":"em"},{"name":"figcaption"},{"name":"figure"},{"name":"footer"},{"name":"h1"},{"name":"h2"},{"name":"h3"},{"name":"h4"},{"name":"h5"},{"name":"h6"},{"name":"head"},{"name":"header"},{"name":"hgroup"},{"name":"hr"},{"name":"html"},{"name":"i"},{"name":"ins","attributes":["cite","datetime"]},{"name":"kbd"},{"name":"li","attributes":["value"]},{"name":"main"},{"name":"mark"},{"name":"menu"},{"name":"nav"},{"name":"ol","attributes":["reversed","start","type"]},{"name":"p"},{"name":"pre"},{"name":"q"},{"name":"rp"},{"name":"rt"},{"name":"ruby"},{"name":"s"},{"name":"samp"},{"name":"search"},{"name":"section"},{"name":"small"},{"name":"span"},{"name":"strong"},{"name":"sub"},{"name":"sup"},{"name":"table"},{"name":"tbody"},{"name":"td","attributes":["colspan","headers","rowspan"]},{"name":"tfoot"},{"name":"th","attributes":["abbr","colspan","headers","rowspan","scope"]},{"name":"thead"},{"name":"time","attributes":["datetime"]},{"name":"title"},{"name":"tr"},{"name":"u"},{"name":"ul"},{"name":"var"},{"name":"wbr"},{"name":"a","namespace":"http://www.w3.org/2000/svg","attributes":["href","hreflang","type"]},{"name":"circle","namespace":"http://www.w3.org/2000/svg","attributes":["cx","cy","pathLength","r"]},{"name":"defs","namespace":"http://www.w3.org/2000/svg"},{"name":"desc","namespace":"http://www.w3.org/2000/svg"},{"name":"ellipse","namespace":"http://www.w3.org/2000/svg","attributes":["cx","cy","pathLength","rx","ry"]},{"name":"foreignObject","namespace":"http://www.w3.org/2000/svg","attributes":["height","width","x","y"]},{"name":"g","namespace":"http://www.w3.org/2000/svg"},{"name":"line","namespace":"http://www.w3.org/2000/svg","attributes":["pathLength","x1","x2","y1","y2"]},{"name":"marker","namespace":"http://www.w3.org/2000/svg","attributes":["markerHeight","markerUnits","markerWidth","orient","preserveAspectRatio","refX","refY","viewBox"]},{"name":"metadata","namespace":"http://www.w3.org/2000/svg"},{"name":"path","namespace":"http://www.w3.org/2000/svg","attributes":["d","pathLength"]},{"name":"polygon","namespace":"http://www.w3.org/2000/svg","attributes":["pathLength","points"]},{"name":"polyline","namespace":"http://www.w3.org/2000/svg","attributes":["pathLength","points"]},{"name":"rect","namespace":"http://www.w3.org/2000/svg","attributes":["height","pathLength","rx","ry","width","x","y"]},{"name":"svg","namespace":"http://www.w3.org/2000/svg","attributes":["height","preserveAspectRatio","viewBox","width","x","y"]},{"name":"text","namespace":"http://www.w3.org/2000/svg","attributes":["dx","dy","lengthAdjust","rotate","textLength","x","y"]},{"name":"textPath","namespace":"http://www.w3.org/2000/svg","attributes":["lengthAdjust","method","path","side","spacing","startOffset","textLength"]},{"name":"title","namespace":"http://www.w3.org/2000/svg"},{"name":"tspan","namespace":"http://www.w3.org/2000/svg","attributes":["dx","dy","lengthAdjust","rotate","textLength","x","y"]}],"attributes":["alignment-baseline","baseline-shift","clip-path","clip-rule","color","color-interpolation","cursor","dir","direction","display","displaystyle","dominant-baseline","fill","fill-opacity","fill-rule","font-family","font-size","font-size-adjust","font-stretch","font-style","font-variant","font-weight","lang","letter-spacing","marker-end","marker-mid","marker-start","mathbackground","mathcolor","mathsize","opacity","paint-order","pointer-events","scriptlevel","shape-rendering","stop-color","stop-opacity","stroke","stroke-dasharray","stroke-dashoffset","stroke-linecap","stroke-linejoin","stroke-miterlimit","stroke-opacity","stroke-width","text-anchor","text-decoration","text-overflow","text-rendering","title","transform","transform-origin","unicode-bidi","vector-effect","visibility","white-space","word-spacing","writing-mode"],"comments":false,"dataAttributes":false}';
+  let _sanDefaultConfig = null;
+
+  // The safe baseline (spec §"built-in safe baseline configuration"): the markup
+  // that runs script no matter what else the configuration says. `svg:use` is on
+  // the list for a reason that is easy to miss — it can reference an external
+  // document, and that document's script comes with it.
+  const _SAN_UNSAFE_ELEMENTS = [
+    { name: 'embed', namespace: _SAN_HTML_NS },
+    { name: 'frame', namespace: _SAN_HTML_NS },
+    { name: 'iframe', namespace: _SAN_HTML_NS },
+    { name: 'object', namespace: _SAN_HTML_NS },
+    { name: 'script', namespace: _SAN_HTML_NS },
+    { name: 'script', namespace: _SAN_SVG_NS },
+    { name: 'use', namespace: _SAN_SVG_NS },
+  ];
+
+  // Every event handler content attribute in HTML. These are the `on*` attributes
+  // — the single most common XSS payload after `<script>` itself — and the safe
+  // path removes all of them regardless of configuration.
+  const _SAN_EVENT_HANDLER_ATTRS = ('onabort onafterprint onauxclick onbeforeinput onbeforematch ' +
+    'onbeforeprint onbeforetoggle onbeforeunload onblur oncancel oncanplay oncanplaythrough ' +
+    'onchange onclick onclose oncommand oncontextlost oncontextmenu oncontextrestored oncopy ' +
+    'oncuechange oncut ondblclick ondrag ondragend ondragenter ondragleave ondragover ondragstart ' +
+    'ondrop ondurationchange onemptied onended onerror onfocus onformdata onhashchange oninput ' +
+    'oninvalid onkeydown onkeypress onkeyup onlanguagechange onload onloadeddata onloadedmetadata ' +
+    'onloadstart onmessage onmessageerror onmousedown onmouseenter onmouseleave onmousemove ' +
+    'onmouseout onmouseover onmouseup onoffline ononline onpagehide onpagereveal onpageshow ' +
+    'onpageswap onpaste onpause onplay onplaying onpopstate onprogress onratechange onrejectionhandled ' +
+    'onreset onresize onscroll onscrollend onsecuritypolicyviolation onseeked onseeking onselect ' +
+    'onslotchange onstalled onstorage onsubmit onsuspend ontimeupdate ontoggle onunhandledrejection ' +
+    'onunload onvolumechange onwaiting onwheel').split(' ');
+
+  // Attributes that NAVIGATE. A `javascript:` URL in one of these executes on
+  // click, so the safe path strips the attribute — note it strips the attribute
+  // and not the element, so the link stays visible and simply does nothing.
+  const _SAN_NAVIGATING_URL_ATTRS = [
+    { el: { name: 'a', namespace: _SAN_HTML_NS }, at: { name: 'href', namespace: null } },
+    { el: { name: 'a', namespace: _SAN_SVG_NS }, at: { name: 'href', namespace: null } },
+    { el: { name: 'a', namespace: _SAN_SVG_NS }, at: { name: 'href', namespace: _SAN_XLINK_NS } },
+    { el: { name: 'form', namespace: _SAN_HTML_NS }, at: { name: 'action', namespace: null } },
+    { el: { name: 'input', namespace: _SAN_HTML_NS }, at: { name: 'formaction', namespace: null } },
+    { el: { name: 'button', namespace: _SAN_HTML_NS }, at: { name: 'formaction', namespace: null } },
+  ];
+  // SVG animation can WRITE an href on its target, so the sanitizer cannot know
+  // where the value will land and refuses the animation of href outright.
+  const _SAN_ANIMATING_ELEMENTS = ['animate', 'animateMotion', 'animateTransform', 'set'];
+
+  // ── Canonicalization ───────────────────────────────────────────────────────
+  // A configuration may be written the short way (`"div"`) or the long way
+  // (`{name:"div", namespace:"…"}`), and the two must compare equal. Everything
+  // is canonicalized on the way in, once, so every later comparison is a plain
+  // string match on `namespace + '|' + name`.
+  const _sanKey = (o) => (o.namespace === null || o.namespace === undefined ? ' ' : o.namespace) + '|' + o.name;
+
+  const _sanCanonElement = (v) => {
+    if (typeof v === 'string') return { name: v, namespace: _SAN_HTML_NS };
+    if (v === null || typeof v !== 'object') throw new TypeError('Invalid Sanitizer element');
+    if (!('name' in v)) throw new TypeError("Sanitizer element requires a 'name'");
+    const ns = ('namespace' in v) ? (v.namespace === null || v.namespace === undefined ? null : String(v.namespace)) : _SAN_HTML_NS;
+    return { name: String(v.name), namespace: ns };
+  };
+  // ⚠️ An ATTRIBUTE's default namespace is null, not the HTML namespace. That
+  // asymmetry is the spec's, and it is right: in HTML content the parser puts
+  // every attribute in the null namespace — `<p xlink:href>` really does produce
+  // an attribute literally named "xlink:href" with no namespace — while in
+  // foreign content (`<svg xlink:href>`) it produces `href` in the XLink
+  // namespace. Getting this backwards makes a config silently match nothing.
+  const _sanCanonAttr = (v) => {
+    if (typeof v === 'string') return { name: v, namespace: null };
+    if (v === null || typeof v !== 'object') throw new TypeError('Invalid Sanitizer attribute');
+    if (!('name' in v)) throw new TypeError("Sanitizer attribute requires a 'name'");
+    const ns = ('namespace' in v) ? (v.namespace === null || v.namespace === undefined ? null : String(v.namespace)) : null;
+    return { name: String(v.name), namespace: ns };
+  };
+  const _sanCanonPI = (v) => {
+    if (typeof v === 'string') return { target: v };
+    if (v === null || typeof v !== 'object' || !('target' in v)) {
+      throw new TypeError("Sanitizer processing instruction requires a 'target'");
+    }
+    return { target: String(v.target) };
+  };
+
+  // The sort `get()` exposes: namespace first (null before any URL), then name.
+  // Outside get() the order is unobservable, so this exists purely so that two
+  // equivalent configurations SERIALIZE the same — which is what makes a
+  // configuration diffable, storable and comparable by a developer.
+  const _sanCmpNamed = (a, b) => {
+    const an = a.namespace === null || a.namespace === undefined ? '' : a.namespace;
+    const bn = b.namespace === null || b.namespace === undefined ? '' : b.namespace;
+    const aNull = a.namespace === null || a.namespace === undefined;
+    const bNull = b.namespace === null || b.namespace === undefined;
+    if (aNull !== bNull) return aNull ? -1 : 1;
+    if (an !== bn) return an < bn ? -1 : 1;
+    return a.name === b.name ? 0 : (a.name < b.name ? -1 : 1);
+  };
+  const _sanCmpPI = (a, b) => (a.target === b.target ? 0 : (a.target < b.target ? -1 : 1));
+
+  const _sanDedupe = (list, keyOf) => {
+    const seen = new Set();
+    const out = [];
+    for (const item of list) {
+      const k = keyOf(item);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(item);
+    }
+    return out;
+  };
+
+  // Build the canonical internal configuration. A key that is ABSENT and a key
+  // that is present-but-empty mean different things throughout this API — an
+  // absent `elements` means "no allow-list, consult the remove-list", an empty
+  // one means "allow nothing" — so absence is preserved exactly.
+  const _sanCanonConfig = (input, allowCommentsPIsAndDataAttributes) => {
+    if (input === null || input === undefined) input = {};
+    if (typeof input !== 'object') throw new TypeError('Invalid Sanitizer configuration');
+    const cfg = {};
+    const has = (k) => input[k] !== undefined && input[k] !== null;
+
+    if (has('elements')) {
+      cfg.elements = _sanDedupe(Array.from(input.elements, (e) => {
+        const base = _sanCanonElement(e);
+        if (e && typeof e === 'object') {
+          if (e.attributes !== undefined && e.attributes !== null) {
+            base.attributes = _sanDedupe(Array.from(e.attributes, _sanCanonAttr), _sanKey).sort(_sanCmpNamed);
+          }
+          if (e.removeAttributes !== undefined && e.removeAttributes !== null) {
+            base.removeAttributes = _sanDedupe(Array.from(e.removeAttributes, _sanCanonAttr), _sanKey).sort(_sanCmpNamed);
+          }
+        }
+        return base;
+      }), _sanKey).sort(_sanCmpNamed);
+    }
+    for (const k of ['removeElements', 'replaceWithChildrenElements']) {
+      if (has(k)) cfg[k] = _sanDedupe(Array.from(input[k], _sanCanonElement), _sanKey).sort(_sanCmpNamed);
+    }
+    for (const k of ['attributes', 'removeAttributes']) {
+      if (has(k)) cfg[k] = _sanDedupe(Array.from(input[k], _sanCanonAttr), _sanKey).sort(_sanCmpNamed);
+    }
+    for (const k of ['processingInstructions', 'removeProcessingInstructions']) {
+      if (has(k)) cfg[k] = _sanDedupe(Array.from(input[k], _sanCanonPI), (p) => p.target).sort(_sanCmpPI);
+    }
+    if (input.comments !== undefined) cfg.comments = !!input.comments;
+    if (input.dataAttributes !== undefined) cfg.dataAttributes = !!input.dataAttributes;
+    if (!allowCommentsPIsAndDataAttributes) {
+      delete cfg.comments;
+      delete cfg.processingInstructions;
+      delete cfg.removeProcessingInstructions;
+      delete cfg.dataAttributes;
+    }
+    // ⚠️ Contradictions are refused BEFORE the fill-in below, because after it
+    // every pair has exactly one side and the contradiction is no longer visible.
+    if ((cfg.elements && cfg.removeElements) ||
+        (cfg.attributes && cfg.removeAttributes) ||
+        (cfg.processingInstructions && cfg.removeProcessingInstructions)) {
+      cfg.__contradictory = true;
+      return cfg;
+    }
+    // The canonical form always states each of the three questions ONE way: an
+    // allow-list, or a remove-list. "Neither" is not a third answer — it is the
+    // empty remove-list, i.e. "remove nothing". Saying so explicitly is what lets
+    // a developer read a config back with get(), edit it, and hand it to a new
+    // Sanitizer without the meaning shifting underneath them.
+    if (!cfg.elements && !cfg.removeElements) cfg.removeElements = [];
+    if (!cfg.attributes && !cfg.removeAttributes) cfg.removeAttributes = [];
+    if (allowCommentsPIsAndDataAttributes) {
+      if (!cfg.processingInstructions && !cfg.removeProcessingInstructions) {
+        cfg.removeProcessingInstructions = [];
+      }
+      if (cfg.comments === undefined) cfg.comments = false;
+      // `dataAttributes` is meaningful only alongside an attribute ALLOW-list —
+      // with a remove-list, every attribute not named is already allowed, so
+      // "also allow data-*" says nothing. It exists exactly when `attributes` does.
+      if (cfg.attributes) { if (cfg.dataAttributes === undefined) cfg.dataAttributes = false; }
+      else delete cfg.dataAttributes;
+    }
+    // Redundancy removal. A locally-allowed attribute that is already globally
+    // allowed adds nothing; a locally-removed one that was never globally allowed
+    // removes nothing. Both are dropped so equivalent configurations compare equal.
+    if (cfg.elements) {
+      const globalAllow = cfg.attributes ? new Set(cfg.attributes.map(_sanKey)) : null;
+      const globalRemove = cfg.removeAttributes ? new Set(cfg.removeAttributes.map(_sanKey)) : null;
+      for (const e of cfg.elements) {
+        if (globalAllow) {
+          if (e.attributes) e.attributes = e.attributes.filter((a) => !globalAllow.has(_sanKey(a)));
+          if (e.removeAttributes) e.removeAttributes = e.removeAttributes.filter((a) => globalAllow.has(_sanKey(a)));
+        } else if (globalRemove) {
+          if (e.attributes) e.attributes = e.attributes.filter((a) => !globalRemove.has(_sanKey(a)));
+          if (e.removeAttributes) e.removeAttributes = e.removeAttributes.filter((a) => !globalRemove.has(_sanKey(a)));
+        }
+        if (cfg.dataAttributes === true && e.attributes) {
+          e.attributes = e.attributes.filter((a) => !(a.namespace === null && a.name.startsWith('data-')));
+        }
+      }
+      if (cfg.dataAttributes === true && cfg.attributes) {
+        cfg.attributes = cfg.attributes.filter((a) => !(a.namespace === null && a.name.startsWith('data-')));
+      }
+    }
+    return cfg;
+  };
+
+  // A configuration must not contradict itself. Saying both "allow only these
+  // elements" and "remove these elements" is not a stricter filter, it is an
+  // ambiguous one — and an ambiguous security configuration is a bug waiting to
+  // be exploited in whichever direction the implementation happened to resolve
+  // it. The spec refuses the whole configuration rather than pick a winner.
+  const _sanConfigValid = (cfg) => {
+    if (cfg.__contradictory) return false;
+    // replaceWithChildrenElements must not also be allowed or removed — an element
+    // cannot both be kept and be dissolved into its children.
+    if (cfg.replaceWithChildrenElements) {
+      const other = new Set((cfg.elements || cfg.removeElements || []).map(_sanKey));
+      for (const e of cfg.replaceWithChildrenElements) if (other.has(_sanKey(e))) return false;
+    }
+    if (cfg.elements && !cfg.attributes) {
+      // With no global attribute allow-list, an element may say which attributes
+      // it allows OR which it removes, but not both — the two together have no
+      // agreed meaning, and a security config must not have an ambiguous one.
+      for (const e of cfg.elements) if (e.attributes && e.removeAttributes) return false;
+    }
+    return true;
+  };
+
+  // The dictionary `get()` hands back: a plain object, deeply copied, with the
+  // same absent/present distinction the internal form keeps.
+  const _sanConfigToDict = (cfg) => {
+    const out = {};
+    if (cfg.elements) {
+      out.elements = cfg.elements.map((e) => {
+        const o = { name: e.name, namespace: e.namespace };
+        if (e.attributes) o.attributes = e.attributes.map((a) => ({ name: a.name, namespace: a.namespace }));
+        if (e.removeAttributes) o.removeAttributes = e.removeAttributes.map((a) => ({ name: a.name, namespace: a.namespace }));
+        return o;
+      });
+    }
+    for (const k of ['removeElements', 'replaceWithChildrenElements']) {
+      if (cfg[k]) out[k] = cfg[k].map((e) => ({ name: e.name, namespace: e.namespace }));
+    }
+    for (const k of ['attributes', 'removeAttributes']) {
+      if (cfg[k]) out[k] = cfg[k].map((a) => ({ name: a.name, namespace: a.namespace }));
+    }
+    for (const k of ['processingInstructions', 'removeProcessingInstructions']) {
+      if (cfg[k]) out[k] = cfg[k].map((p) => ({ target: p.target }));
+    }
+    if (cfg.comments !== undefined) out.comments = cfg.comments;
+    if (cfg.dataAttributes !== undefined) out.dataAttributes = cfg.dataAttributes;
+    return out;
+  };
+
+  const _sanGetDefaultConfig = () => {
+    if (_sanDefaultConfig) return _sanDefaultConfig;
+    const raw = JSON.parse(_SAN_DEFAULT_JSON);
+    _sanDefaultConfig = _sanCanonConfig(raw, true);
+    return _sanDefaultConfig;
+  };
+  const _sanCloneConfig = (cfg) => _sanCanonConfig(_sanConfigToDict(cfg), true);
+
+  // ── remove unsafe ──────────────────────────────────────────────────────────
+  // Applied to a COPY of the configuration every time a `safe` method runs, so a
+  // Sanitizer can be reused for both `setHTML` and `setHTMLUnsafe` and mean
+  // different things in each — which is the point of having two methods.
+  const _sanRemoveElementFrom = (cfg, el) => {
+    let modified = false;
+    if (cfg.replaceWithChildrenElements) {
+      const before = cfg.replaceWithChildrenElements.length;
+      cfg.replaceWithChildrenElements = cfg.replaceWithChildrenElements.filter((x) => _sanKey(x) !== _sanKey(el));
+      if (cfg.replaceWithChildrenElements.length !== before) modified = true;
+    }
+    if (cfg.elements) {
+      const before = cfg.elements.length;
+      cfg.elements = cfg.elements.filter((x) => _sanKey(x) !== _sanKey(el));
+      if (cfg.elements.length !== before) modified = true;
+      return modified;
+    }
+    if (!cfg.removeElements) cfg.removeElements = [];
+    if (!cfg.removeElements.some((x) => _sanKey(x) === _sanKey(el))) {
+      cfg.removeElements.push(el);
+      cfg.removeElements.sort(_sanCmpNamed);
+      modified = true;
+    }
+    return modified;
+  };
+  const _sanRemoveAttrFrom = (cfg, at) => {
+    let modified = false;
+    if (cfg.elements) {
+      for (const e of cfg.elements) {
+        if (e.attributes) {
+          const before = e.attributes.length;
+          e.attributes = e.attributes.filter((x) => _sanKey(x) !== _sanKey(at));
+          if (e.attributes.length !== before) modified = true;
+        }
+      }
+    }
+    if (cfg.attributes) {
+      const before = cfg.attributes.length;
+      cfg.attributes = cfg.attributes.filter((x) => _sanKey(x) !== _sanKey(at));
+      if (cfg.attributes.length !== before) modified = true;
+      return modified;
+    }
+    if (!cfg.removeAttributes) cfg.removeAttributes = [];
+    if (!cfg.removeAttributes.some((x) => _sanKey(x) === _sanKey(at))) {
+      cfg.removeAttributes.push(at);
+      cfg.removeAttributes.sort(_sanCmpNamed);
+      modified = true;
+    }
+    return modified;
+  };
+  const _sanRemoveUnsafe = (cfg) => {
+    let modified = false;
+    for (const el of _SAN_UNSAFE_ELEMENTS) if (_sanRemoveElementFrom(cfg, el)) modified = true;
+    for (const name of _SAN_EVENT_HANDLER_ATTRS) {
+      if (_sanRemoveAttrFrom(cfg, { name, namespace: null })) modified = true;
+    }
+    return modified;
+  };
+
+  // ── The sanitize algorithm ─────────────────────────────────────────────────
+  const _sanIsJavascriptUrl = (value) => {
+    try {
+      // A URL parser, not a string match: `java\nscript:alert(1)` and
+      // `  JaVaScRiPt:…` are the same URL, and only a parser knows that.
+      return new URL(String(value), 'about:blank').protocol === 'javascript:';
+    } catch (e) { return false; }
+  };
+
+  const _sanAttrAllowed = (cfg, attrName, elementName, localEl) => {
+    if (localEl && localEl.removeAttributes &&
+        localEl.removeAttributes.some((x) => _sanKey(x) === _sanKey(attrName))) return false;
+    if (cfg.attributes) {
+      const globallyAllowed = cfg.attributes.some((x) => _sanKey(x) === _sanKey(attrName));
+      const locallyAllowed = !!(localEl && localEl.attributes &&
+        localEl.attributes.some((x) => _sanKey(x) === _sanKey(attrName)));
+      const isDataAttr = cfg.dataAttributes === true &&
+        attrName.namespace === null && attrName.name.startsWith('data-');
+      if (!globallyAllowed && !locallyAllowed && !isDataAttr) return false;
+      return true;
+    }
+    if (localEl && localEl.attributes &&
+        !localEl.attributes.some((x) => _sanKey(x) === _sanKey(attrName))) return false;
+    if (cfg.removeAttributes && cfg.removeAttributes.some((x) => _sanKey(x) === _sanKey(attrName))) return false;
+    return true;
+  };
+
+  const _sanCore = (node, cfg, handleJsUrls) => {
+    const elementsByKey = cfg.__elMap || (cfg.__elMap = (() => {
+      const m = new Map();
+      if (cfg.elements) for (const e of cfg.elements) m.set(_sanKey(e), e);
+      return m;
+    })());
+    const removeSet = cfg.__rmSet || (cfg.__rmSet = new Set((cfg.removeElements || []).map(_sanKey)));
+    const replaceSet = cfg.__rpSet || (cfg.__rpSet = new Set((cfg.replaceWithChildrenElements || []).map(_sanKey)));
+
+    // Snapshot the children: the loop removes and replaces nodes as it goes, and
+    // iterating a live child list while mutating it skips siblings — which for a
+    // sanitizer means silently leaving markup UNFILTERED.
+    const kids = [];
+    for (let c = node.firstChild; c; c = c.nextSibling) kids.push(c);
+
+    for (const child of kids) {
+      const nt = child.nodeType;
+      if (nt === 10 || nt === 3 || nt === 4) continue;              // DocumentType, Text, CDATA
+      if (nt === 8) {                                              // Comment
+        if (cfg.comments !== true) child.remove();
+        continue;
+      }
+      if (nt === 7) {                                              // ProcessingInstruction
+        const target = child.target;
+        if (cfg.processingInstructions) {
+          if (!cfg.processingInstructions.some((p) => p.target === target)) child.remove();
+        } else if (cfg.removeProcessingInstructions &&
+                   cfg.removeProcessingInstructions.some((p) => p.target === target)) {
+          child.remove();
+        }
+        continue;
+      }
+      if (nt !== 1) continue;
+
+      const elementName = { name: child.localName, namespace: child.namespaceURI || null };
+      const elKey = _sanKey(elementName);
+
+      if (replaceSet.has(elKey)) {
+        // Keep the children, drop the element. Recurse FIRST, so the children are
+        // themselves sanitized before they are lifted into the parent.
+        _sanCore(child, cfg, handleJsUrls);
+        const frag = child.ownerDocument.createDocumentFragment();
+        while (child.firstChild) frag.appendChild(child.firstChild);
+        child.parentNode.replaceChild(frag, child);
+        continue;
+      }
+      if (cfg.elements) {
+        if (!elementsByKey.has(elKey)) { child.remove(); continue; }
+      } else if (removeSet.has(elKey)) {
+        child.remove(); continue;
+      }
+
+      const localEl = elementsByKey.get(elKey) || null;
+
+      // A <template>'s content is a separate document fragment; unsanitized
+      // markup parked there would come back the moment the template was used.
+      if (elementName.name === 'template' && elementName.namespace === _SAN_HTML_NS && child.content) {
+        _sanCore(child.content, cfg, handleJsUrls);
+      }
+      if (child.shadowRoot) _sanCore(child.shadowRoot, cfg, handleJsUrls);
+
+      const attrs = [];
+      const nn = child.attributes;
+      for (let i = 0; i < nn.length; i++) attrs.push(nn[i]);
+      for (const attr of attrs) {
+        const attrName = { name: attr.localName, namespace: attr.namespaceURI || null };
+        if (!_sanAttrAllowed(cfg, attrName, elementName, localEl)) {
+          child.removeAttributeNS(attr.namespaceURI, attr.localName);
+          continue;
+        }
+        if (!handleJsUrls) continue;
+        let drop = false;
+        for (const entry of _SAN_NAVIGATING_URL_ATTRS) {
+          if (_sanKey(entry.el) === elKey && _sanKey(entry.at) === _sanKey(attrName) &&
+              _sanIsJavascriptUrl(attr.value)) { drop = true; break; }
+        }
+        // MathML lets ANY element be an anchor, so there is no element/attribute
+        // pair to enumerate — the rule is about the namespace.
+        if (!drop && elementName.namespace === _SAN_MATHML_NS && attrName.name === 'href' &&
+            (attrName.namespace === null || attrName.namespace === _SAN_XLINK_NS) &&
+            _sanIsJavascriptUrl(attr.value)) drop = true;
+        // SVG animation: the sanitizer cannot know what the animation will
+        // eventually target, so animating an href at all is refused.
+        if (!drop && elementName.namespace === _SAN_SVG_NS &&
+            _SAN_ANIMATING_ELEMENTS.indexOf(elementName.name) >= 0 &&
+            attrName.name === 'attributeName' &&
+            (attr.value === 'href' || attr.value === 'xlink:href')) drop = true;
+        if (drop) child.removeAttributeNS(attr.namespaceURI, attr.localName);
+      }
+      _sanCore(child, cfg, handleJsUrls);
+    }
+  };
+
+  // ── The Sanitizer interface ────────────────────────────────────────────────
+  // The configuration lives in a WeakMap, off the instance — the same reasoning
+  // as TrustedHTML in Quest #490. A security object whose state is an own
+  // property can be forged with Object.create(), and a forged Sanitizer is worse
+  // than no Sanitizer, because the calling code believes it sanitized.
+  const _sanGuts = new WeakMap();
+  const _sanConfigOf = (o) => {
+    const g = _sanGuts.get(o);
+    if (!g) throw new TypeError('Illegal invocation');
+    return g;
+  };
+
+  class Sanitizer {
+    constructor(configuration) {
+      let cfg;
+      if (typeof configuration === 'string') {
+        if (configuration !== 'default') {
+          throw new TypeError("Failed to construct 'Sanitizer': '" + configuration +
+            "' is not a valid SanitizerPresets value.");
+        }
+        cfg = _sanCloneConfig(_sanGetDefaultConfig());
+      } else {
+        cfg = _sanCanonConfig(configuration, true);
+      }
+      if (!_sanConfigValid(cfg)) {
+        throw new TypeError("Failed to construct 'Sanitizer': the configuration is not valid.");
+      }
+      _sanGuts.set(this, cfg);
+    }
+    get() { return _sanConfigToDict(_sanConfigOf(this)); }
+
+    allowElement(element) {
+      const cfg = _sanConfigOf(this);
+      const el = _sanCanonElement(element);
+      _sanInvalidateCaches(cfg);
+      let modified = false;
+      if (cfg.replaceWithChildrenElements) {
+        const before = cfg.replaceWithChildrenElements.length;
+        cfg.replaceWithChildrenElements = cfg.replaceWithChildrenElements.filter((x) => _sanKey(x) !== _sanKey(el));
+        if (cfg.replaceWithChildrenElements.length !== before) modified = true;
+      }
+      if (cfg.elements) {
+        const idx = cfg.elements.findIndex((x) => _sanKey(x) === _sanKey(el));
+        if (idx >= 0) { cfg.elements[idx] = el; return true; }
+        cfg.elements.push(el);
+        cfg.elements.sort(_sanCmpNamed);
+        return true;
+      }
+      if (cfg.removeElements) {
+        const before = cfg.removeElements.length;
+        cfg.removeElements = cfg.removeElements.filter((x) => _sanKey(x) !== _sanKey(el));
+        if (cfg.removeElements.length !== before) modified = true;
+      }
+      return modified;
+    }
+    removeElement(element) {
+      const cfg = _sanConfigOf(this);
+      _sanInvalidateCaches(cfg);
+      return _sanRemoveElementFrom(cfg, _sanCanonElement(element));
+    }
+    replaceElementWithChildren(element) {
+      const cfg = _sanConfigOf(this);
+      const el = _sanCanonElement(element);
+      _sanInvalidateCaches(cfg);
+      let modified = false;
+      if (cfg.elements) {
+        const before = cfg.elements.length;
+        cfg.elements = cfg.elements.filter((x) => _sanKey(x) !== _sanKey(el));
+        if (cfg.elements.length !== before) modified = true;
+      }
+      if (cfg.removeElements) {
+        const before = cfg.removeElements.length;
+        cfg.removeElements = cfg.removeElements.filter((x) => _sanKey(x) !== _sanKey(el));
+        if (cfg.removeElements.length !== before) modified = true;
+      }
+      if (!cfg.replaceWithChildrenElements) cfg.replaceWithChildrenElements = [];
+      if (!cfg.replaceWithChildrenElements.some((x) => _sanKey(x) === _sanKey(el))) {
+        cfg.replaceWithChildrenElements.push(el);
+        cfg.replaceWithChildrenElements.sort(_sanCmpNamed);
+        modified = true;
+      }
+      return modified;
+    }
+    allowAttribute(attribute) {
+      const cfg = _sanConfigOf(this);
+      const at = _sanCanonAttr(attribute);
+      _sanInvalidateCaches(cfg);
+      if (cfg.attributes) {
+        if (cfg.attributes.some((x) => _sanKey(x) === _sanKey(at))) return false;
+        cfg.attributes.push(at);
+        cfg.attributes.sort(_sanCmpNamed);
+        return true;
+      }
+      if (!cfg.removeAttributes) return false;
+      const before = cfg.removeAttributes.length;
+      cfg.removeAttributes = cfg.removeAttributes.filter((x) => _sanKey(x) !== _sanKey(at));
+      return cfg.removeAttributes.length !== before;
+    }
+    removeAttribute(attribute) {
+      const cfg = _sanConfigOf(this);
+      _sanInvalidateCaches(cfg);
+      return _sanRemoveAttrFrom(cfg, _sanCanonAttr(attribute));
+    }
+    setComments(allow) {
+      const cfg = _sanConfigOf(this);
+      allow = !!allow;
+      if (cfg.comments === allow) return false;
+      cfg.comments = allow;
+      _sanInvalidateCaches(cfg);
+      return true;
+    }
+    setDataAttributes(allow) {
+      const cfg = _sanConfigOf(this);
+      allow = !!allow;
+      if (!cfg.attributes) return false;
+      if (cfg.dataAttributes === allow) return false;
+      if (allow) {
+        const notData = (a) => !(a.namespace === null && a.name.startsWith('data-'));
+        cfg.attributes = cfg.attributes.filter(notData);
+        if (cfg.elements) {
+          for (const e of cfg.elements) if (e.attributes) e.attributes = e.attributes.filter(notData);
+        }
+      }
+      cfg.dataAttributes = allow;
+      _sanInvalidateCaches(cfg);
+      return true;
+    }
+    removeUnsafe() {
+      const cfg = _sanConfigOf(this);
+      _sanInvalidateCaches(cfg);
+      return _sanRemoveUnsafe(cfg);
+    }
+  }
+  // The lookup caches are derived state; any configuration edit drops them.
+  const _sanInvalidateCaches = (cfg) => { delete cfg.__elMap; delete cfg.__rmSet; delete cfg.__rpSet; };
+
+  globalThis.Sanitizer = Sanitizer;
+
+  // ── The entry points ───────────────────────────────────────────────────────
+  // `options.sanitizer` may be a Sanitizer, a configuration dictionary, or the
+  // string "default"; a missing one means the safe default for the safe methods
+  // and "allow everything" for the unsafe ones. That difference IS the API: the
+  // safe method's default has to be safe, because the default is what a hurried
+  // developer gets.
+  const _sanResolve = (options, safe) => {
+    const raw = options && typeof options === 'object' ? options.sanitizer : undefined;
+    let cfg;
+    if (raw instanceof Sanitizer) cfg = _sanCloneConfig(_sanConfigOf(raw));
+    else if (typeof raw === 'string') {
+      if (raw !== 'default') throw new TypeError("'" + raw + "' is not a valid SanitizerPresets value.");
+      cfg = _sanCloneConfig(_sanGetDefaultConfig());
+    } else if (raw === undefined || raw === null) {
+      cfg = safe ? _sanCloneConfig(_sanGetDefaultConfig()) : {};
+    } else {
+      cfg = _sanCanonConfig(raw, true);
+      if (!_sanConfigValid(cfg)) throw new TypeError('The sanitizer configuration is not valid.');
+    }
+    if (safe) _sanRemoveUnsafe(cfg);
+    _sanInvalidateCaches(cfg);
+    return cfg;
+  };
+
+  const _sanSetHTML = (target, html, options, safe) => {
+    const cfg = _sanResolve(options, safe);
+    const src = (html === null || html === undefined) ? '' : String(html);
+    // ⚠️ Parse into an INERT element and sanitize THERE, then move the survivors
+    // across. Parsing into the live target first — which is what the obvious
+    // implementation does — means every `<img src=…>` in the untrusted markup has
+    // already hit the network and every `onerror` has already run by the time the
+    // sanitizer gets to delete them. The sanitizing would be perfectly correct and
+    // completely pointless: the payload fired during the parse.
+    //
+    // The inert element is a detached clone of the TARGET's own tag, so fragment
+    // parsing keeps its context — `<td>` inside a `<tr>` still parses as a cell.
+    const doc = target.ownerDocument || document;
+    let inert;
+    try {
+      const ns = target.namespaceURI;
+      const local = target.localName;
+      inert = (ns && local) ? doc.createElementNS(ns, local) : doc.createElement('div');
+    } catch (e) { inert = doc.createElement('div'); }
+    _ttUnchecked(() => { inert.innerHTML = src; });
+    _processDeclarativeShadowRoots(inert, true);
+    _sanCore(inert, cfg, safe);
+    // A <template>'s children live in its content fragment, not under the element.
+    const from = inert.content || inert;
+    const to = target.content || target;
+    while (to.firstChild) to.removeChild(to.firstChild);
+    while (from.firstChild) to.appendChild(from.firstChild);
+  };
+
+  Element.prototype.setHTML = function setHTML(html, options) {
+    _sanSetHTML(this, html, options, true);
+  };
+  _markNative(Element.prototype.setHTML);
+  ShadowRoot.prototype.setHTML = function setHTML(html, options) {
+    _sanSetHTML(this, html, options, true);
+  };
+  _markNative(ShadowRoot.prototype.setHTML);
+
+  // setHTMLUnsafe keeps its existing meaning and gains the optional config: with
+  // no sanitizer it is exactly what it was, so nothing that already calls it
+  // changes behaviour.
+  Element.prototype.setHTMLUnsafe = function setHTMLUnsafe(html, options) {
+    _sanSetHTML(this, html, options, false);
+  };
+  _markNative(Element.prototype.setHTMLUnsafe);
+  ShadowRoot.prototype.setHTMLUnsafe = function setHTMLUnsafe(html, options) {
+    _sanSetHTML(this, html, options, false);
+  };
+  _markNative(ShadowRoot.prototype.setHTMLUnsafe);
+
+  const _sanParseHTML = (html, options, safe) => {
+    const cfg = _sanResolve(options, safe);
+    const doc = new DOMParser().parseFromString(
+      (html === null || html === undefined) ? '' : String(html), 'text/html');
+    _sanCore(doc, cfg, safe);
+    return doc;
+  };
+  Document.parseHTML = function parseHTML(html, options) { return _sanParseHTML(html, options, true); };
+  Document.parseHTMLUnsafe = function parseHTMLUnsafe(html, options) { return _sanParseHTML(html, options, false); };
+  _markNative(Document.parseHTML);
+  _markNative(Document.parseHTMLUnsafe);
 }
 
 globalThis.__obscura_init = function() {

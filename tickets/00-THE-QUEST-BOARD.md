@@ -25,6 +25,9 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F27** | ✅ [The Named Verdict](100-the-named-verdict.md) | **`domxpath/*`** — how you NAME a node you cannot see | **1143/1149 (99.5%)** over 21 files — was **2/1145**, `document.evaluate` was `undefined` | ⚔️⚔️⚔️ | **SECURED (Quest #499, 2026-08-07).** The realm was not failing, it was **invisible**: harness OK, 1,024 subtests registered, every one throwing on line 1. XPath goes **up** and **backward** where CSS cannot — `//td[contains(., "Total")]/following-sibling::td[1]` is "the cell after the one that says Total", and it is the query language of nearly every scraper and automation tool ever written, which is a large slice of what a browser for AI agents is asked to run. A whole XPath 1.0 engine. ⭐⭐ **It is a PURE FUNCTION, so `scripts/xpath_offline_test.mjs` runs WPT's 1,024-case corpus in Node in 367 ms** — and found the bug that was all 1,024 failures (an axis and its `::` lex as ONE token, so `following-sibling::*` was parsing `*` as MULTIPLY). ⭐⭐ **The context node's document decides the HTML-vs-XML rules, not the expression's** — one line, two files 4/8 → 8/8. ⭐ The empty string is a valid namespace; only `null`/`undefined` are unresolvable. **⛔ Cap: the last 11 need WebIDL's report-then-throw; Chrome scores 8/10 and 4/6 on those same files.** |
+| **F28** | ✅ [The Old Web Verdict](101-the-old-web-verdict.md) | **`quirks/*`** — the old web, which is most of the web on a hand-me-down laptop | **6867/6978 (98.4%)** over 13 files — was **4362/6978** | ⚔️⚔️ | **SECURED (Quest #500, 2026-08-07).** `compatMode` was hardcoded `CSS1Compat`, so Obscura **had never once been in quirks mode** — and a quirks page renders with every unitless length and hashless colour dropped, so the table collapses and the text turns black and it looks like *the site* is broken. ⚠️ `document.write()` had to sniff the doctype from the markup, because this engine parses through `innerHTML`, which discards it. ⚠️⚠️ **The bigger find: these properties had NO VALIDATION AT ALL** — `border-spacing: a` computed to `a`, `color: aaaaa` to `aaaaa` — which is why the files failed in **no-quirks** mode too. Real grammars added for eight property families plus `<color>` in stylesheet rules. ⭐⭐ `calc(1)` is a `<number>`, not a `<length>`. ⭐⭐ **A comment separates tokens, it does not join them** (`+/**/1` was being spliced into `+1`). **⛔ Cap: the 79 left are the four LAYOUT quirks — F26, named now by a sixth realm.** |
+| **F29** | ✅ [The Vouched Verdict](102-the-vouched-verdict.md) | **`sanitizer-api/*`** — XSS defence that costs the device nothing | **431/581 (74.2%)** over 18 files — was **47/394**; `Sanitizer` and `setHTML` did not exist | ⚔️⚔️ | **SECURED (Quest #501, 2026-08-07).** The companion to #490's Trusted Types: that one says a string may not reach a sink unless somebody vouched for it, **this is how you vouch**. And it costs the device nothing — the alternative is shipping DOMPurify on every page that displays a comment. ⭐⭐ **Sanitizing the LIVE tree is sanitizing nothing**: parse into the target first and every `<img onerror>` has already fired by the time you delete it. Now parsed into an **inert detached clone of the target's own tag** (keeping fragment-parsing context), sanitized there, then moved across. ⭐⭐ **The canonical config answers each question exactly one way** — allow-list *or* remove-list; "neither" is the empty remove-list (0/9 → 8/9). ⭐ An attribute's default namespace is null, an element's is HTML — backwards, and the config silently matches nothing. **⛔ Cap: `sanitizer-svg-animate` 0/22 and `sanitizer-inert-document` 1/4 TIMEOUT on ENGINE gaps (no SMIL, no image load events), not on the sanitizer.** |
 | **F23** | ✅ [The Observed Verdict](487-the-observed-verdict.md) | **`intersection-observer/*`** — the API that exists TO NOT SPEND SOMEBODY'S DATA | **83/120** over 14 files — was **18/80**, with a 12-line stub reporting `isIntersecting: true` for EVERY target | ⚔️⚔️ | **SECURED (Quest #496, 2026-08-07).** The tenth *answers, and answers wrong*: one notification on the first microtask claiming full visibility, ratio 1, then silence — and `unobserve()`/`disconnect()` were no-ops so it could not even be switched off. This is the machinery under `loading="lazy"`: a gallery of 200 photographs should download the 4 you can see, and told everything is visible it downloads 200, on a connection paid for by the megabyte. ⭐⭐ **`requestAnimationFrame` was `setTimeout(fn, 0)`** — right delay, wrong structure, and no *tail* to the frame for the geometry observers to read in; now a real frame queue. ⭐ `previousThresholdIndex` starts at **−1** or the first notification never fires. ⭐ `["foo"]`→TypeError, `[1.1]`→RangeError. ⭐ `rootMargin: "1"` is a SyntaxError, `" "` is the default. **⛔ Cap: every remaining failure is a rect assertion — F26.** |
 | **F24** | ✅ [The Resized Verdict](488-the-resized-verdict.md) | **`resize-observer/*`** — the responsive web without the polling | **55/72** over 9 files — was **16/62**, declared TWICE with a no-op winning | ⚔️⚔️ | **SECURED (Quest #497, 2026-08-07).** `class { constructor(){} observe(){} unobserve(){} disconnect(){} }`, 21,000 lines after the real one, silently replaced it — so a component that re-lays-itself-out on resize never did, and the implementation somebody wrote on purpose had been dead code. Before this API the only option was a `setInterval` measuring an element forever: a battery cost paid continuously to answer "nothing changed". ⭐⭐ **The depth bound is what stops the tab freezing** — delivery repeats only DOWNWARD at strictly increasing depth. ⭐ **"Calculate depth for node" is over the FLATTENED tree** — a naive `parentNode` walk makes a shadow-root child look shallow, and the page gets a loop error it did not earn. ⭐ Last-reported size starts at `(-1,-1)`. **⛔ Cap: F26 again.** |
 | **F25** | ✅ [The Permitted Verdict](489-the-permitted-verdict.md) | **`permissions/*` + `clipboard-apis/*`** — consent, and the reader's own data | **188/189** over 10 files — was **41/189** | ⚔️ | **SECURED (Quest #498, 2026-08-07).** `query()` answered `"granted"` to everything — the worst possible answer, because it is the one a page ACTS on: it skips its own "here's why we need the camera" explainer, calls `getUserMedia()` (**which this engine rejects**) and the reader gets a broken feature and no explanation. And `writeText()` resolved having stored nothing, so **every copy button said "Copied!" and nothing was** — a share link, a wallet address, a 2FA backup code. ⭐ **A permission's state must AGREE WITH WHAT THE API ACTUALLY DOES HERE.** ⭐ An unknown name is a TypeError, not a "denied". ⭐ A Blob comes back from `getType()` unchanged, keeping its own MIME type. ⭐ **testdriver.js PACKS `set_permission`'s two arguments into one object**, and the change must be applied on a TASK. **⛔ `permissions/worker.https.html` is unwinnable — the WPT source awaits an undeclared `messagePromise`.** |
@@ -328,6 +331,96 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-07 — Quests #499–#501, **The Named, Old-Web & Vouched Arc** (`domxpath` **2/1145 → 1143/1149** · `quirks` **4362/6978 → 6867/6978** · `sanitizer-api` **→ 431/581**)
+
+*Scrolls: [`100-the-named-verdict.md`](100-the-named-verdict.md) · [`101-the-old-web-verdict.md`](101-the-old-web-verdict.md) · [`102-the-vouched-verdict.md`](102-the-vouched-verdict.md)*
+
+**Three untouched realms, chosen under the standing order by re-surveying the
+whole platform first** — a fresh Chrome run summary bucketed by realm and diffed
+against the ledger, which is what surfaced `domxpath` (1,143 subtests, 21 files,
+Chrome 99.4%, never touched) and `quirks` (6,978 subtests in **thirteen files**,
+Chrome 100%, never touched). All three turned out to be **pure algorithms with no
+layout dependency** — which is why all three could be finished in one arc.
+
+**#499 — `document.evaluate` WAS `undefined`, so the realm was INVISIBLE rather
+than failing.** Harness **OK**, 1,024 subtests registered, every one throwing on
+line one. XPath is how you **name a node you cannot see**: CSS selectors go
+downward and sideways, XPath also goes **up** and **backward**, and
+`//td[contains(., "Total")]/following-sibling::td[1]` — *"the cell after the one
+that says Total"* — has no CSS equivalent. That is the query language of nearly
+every scraper, test harness and automation tool ever written, which is a large
+slice of what a browser built for **AI agents to drive** is actually asked to
+run; and it is how an assistive tool points at one cell of a table that has no
+ids and no classes, which is most tables on the old web. A complete XPath 1.0
+engine — lexer, parser, evaluator, thirteen axes, the full core function library.
+**⭐⭐ It is a PURE FUNCTION, so it was verified OFFLINE first:
+`scripts/xpath_offline_test.mjs` slices the engine out of `bootstrap.js` between
+two markers and runs WPT's own 1,024-case corpus in Node in 367 ms.** Its very
+first run found the single bug that was all 1,024 failures, in 228 milliseconds:
+**an AxisName and its `::` are lexed as ONE token, so `axis` must count as `::`
+in XPath §3.7's operator-context rule** — otherwise the `*` in
+`following-sibling::*` sees an axis behind it and becomes MULTIPLY. **⭐⭐ The
+DOM Standard's HTML rules are the part everyone gets wrong**: a prefix-less name
+test matches HTML-namespace elements *and only those* (so `//path` does not find
+an SVG `<path>`), ASCII-case-insensitively — and ASCII-only is load-bearing,
+because `//dødd` must NOT match `<dØdd>` while `//DØDD` must. **⭐⭐ The CONTEXT
+NODE's document decides, not the expression's** — one line took both
+`*-different-document` files from 4/8 to 8/8.
+
+**#500 — `compatMode` WAS HARDCODED `CSS1Compat`, SO THE ENGINE HAD NEVER ONCE
+BEEN IN QUIRKS MODE.** In quirks mode the CSS parser accepts a length with no
+unit (`width: 350`) and a hex colour with no `#` (`color: 00ff00`), and those two
+spellings are all over the pre-2000 web. Refuse them and the page does not
+degrade gracefully — the table collapses to nothing and the text turns black on
+black, and it looks like *the site* is broken rather than the browser. That is
+the old web: school intranets, library catalogues, government forms, the parts of
+the internet nobody has been paid to rewrite, and most of what is still reachable
+from a hand-me-down laptop. **⚠️⚠️ But the bigger find was that six property
+families had NO VALIDATION AT ALL** — `border-spacing: a` computed to `a`,
+`letter-spacing: "1"` to `"1"`, `color: aaaaa` to `aaaaa` — which is why
+`quirks/unitless-length` was failing in **no-quirks mode**, where nothing quirky
+is involved. *A declaration the UA cannot understand must be dropped so the
+cascade falls back to what is underneath it; keeping the garbage lets one typo
+silently beat the correct rule below it.* It also meant the engine disagreed with
+itself: `el.style.color = 'aaaaa'` was refused while `<style>` kept it. **⭐⭐
+`calc(1)` is a `<number>`, not a `<length>`** — the engine's own math type system
+now decides. **⭐⭐ A comment SEPARATES tokens, it does not join them** —
+stripping `/**/` to nothing spliced `+/**/1` into the single token `+1`.
+
+**#501 — THE SANITIZER, AND THE OTHER HALF OF TRUSTED TYPES.** Quest #490 said a
+string may not reach a sink unless somebody vouched for it; **this is how you
+vouch**. And it **costs the device nothing**: the alternative is shipping
+DOMPurify — tens of kilobytes of JavaScript downloaded, parsed and run on every
+page that displays a comment, a forum post, an email — a real price on a metered
+connection, paid over and over, for something the browser can do for free.
+**⭐⭐ The find: sanitizing the LIVE tree is sanitizing nothing.** Parse into the
+target first and every `<img src=… onerror=…>` has already hit the network and
+already run by the time the sanitizer deletes it; the sanitizing is perfectly
+correct and completely pointless. Now parsed into an **inert detached clone of
+the target's own tag** — which keeps fragment-parsing context, so `<td>` inside a
+`<tr>` still parses as a cell — sanitized there, then moved across. *A security
+check that runs after the effect is not a security check.*
+
+**⚠️ ZERO REGRESSIONS, AND THIS IS THE STRONG PROOF: STASH → REBUILD → RUN →
+POP → REBUILD → RUN over the 135-file ritual list, diffed PER FILE with
+`scripts/wpt_batch_diff.py`.** Both passes: **25,416/25,648**, 0 could-not-run,
+and all 134 matched rows **identical** — 0 down, 0 up, 0 appeared, 0 vanished.
+**⚠️⚠️ AND THE FIRST PASS CAUGHT TWO REAL REGRESSIONS IN MY OWN WORK**, which is
+exactly what it is for: the new `<color>` gate dropped **`outline-color: invert`**
+(css-ui's own keyword, not a `<color>`), and deriving quirks mode from "has no
+doctype" made **`createDocument()` report `BackCompat`** — because *quirks mode
+is a property of the HTML parser, not of a missing doctype*, and an XML document
+is always no-quirks. Three other rows that moved (`rsa_importKey`,
+`document-cookie.non-secure`, `timer-nesting-not-inherited-in-microtask`) all
+came back at **full marks on a fresh server** — the documented late-run
+degradation, re-verified. Ritual list now **135 files**.
+
+**⛔ AND F26 WAS NAMED BY A SIXTH REALM.** The 79 subtests left in `quirks` are
+`line-height-calculation`, `percentage-height-calculation`,
+`blocks-ignore-line-height` and the last `table-cell-width-calculation` row —
+every one of them asking how tall a line box is or how a percentage height
+resolves. A synthetic `getBoundingClientRect` grid cannot answer those.
 
 ### 2026-08-07 — Quests #496–#498, **The Observed, Resized & Permitted Arc** (`intersection-observer` **18/80 → 83/120** · `resize-observer` **16/62 → 55/72** · `permissions` + `clipboard-apis` **41/189 → 188/189**)
 
