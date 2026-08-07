@@ -1420,7 +1420,7 @@ fn is_blocked_port(url: &url::Url) -> Option<u16> {
     BLOCKED_PORTS.binary_search(&port).ok().map(|_| port)
 }
 
-fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
+pub(crate) fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(format!(
@@ -2066,6 +2066,9 @@ pub fn build_extension() -> Extension {
             op_text_decode(),
             op_text_encode(),
             op_query_encode(),
+            crate::sse_ops::op_sse_connect(),
+            crate::sse_ops::op_sse_read(),
+            crate::sse_ops::op_sse_close(),
             crate::ws_ops::op_ws_connect(),
             crate::ws_ops::op_ws_recv(),
             crate::ws_ops::op_ws_send_text(),

@@ -8168,6 +8168,11 @@ const _getEventParent = (node, event, firstIT) => {
   // catches a failed put — so those objects name their own event parent and
   // ride the same spec dispatcher as the DOM.
   if (node && typeof node._idbEventParent === 'function') return node._idbEventParent();
+  // The other half of that idea: an EventTarget that is not a node and has NO
+  // propagation path at all (XMLHttpRequest and its upload object) says so here.
+  // Without it the tree walk below would ask Rust for the parent of a node id
+  // this object does not have — a question with no honest answer.
+  if (node && node._noEventParent === true) return null;
   const slot = _assignedSlotOf(node);
   if (slot) return slot;
   if (_isSR(node)) {
@@ -9870,40 +9875,199 @@ function _xhrResponseText(xhr) {
   return _xhrDecode(bytes, charset);
 }
 
-globalThis.XMLHttpRequest = class XMLHttpRequest {
-  static UNSENT = 0;
-  static OPENED = 1;
-  static HEADERS_RECEIVED = 2;
-  static LOADING = 3;
-  static DONE = 4;
-  UNSENT = 0; OPENED = 1; HEADERS_RECEIVED = 2; LOADING = 3; DONE = 4;
+// ============================================================================
+// XMLHttpRequest — https://xhr.spec.whatwg.org/
+//
+// XHR is the oldest way a page asks for something after it has loaded, and it is
+// still the one an enormous amount of the working web is built on: the form that
+// checks a postcode, the page of search results that appears without a reload,
+// the upload progress bar on a benefits claim or a job application. `fetch()` is
+// newer and nicer, but a library written in 2013 and never touched since is XHR,
+// and the sites least likely to have been rewritten are exactly the ones a person
+// on an old machine is most likely to be sent to by a government letter.
+//
+// What was here before was ONE object pretending to be four. It was not an
+// EventTarget — it kept a private `{type: [fn]}` bag and called the functions
+// itself — so `xhr.addEventListener('load', h, {once: true})` ignored the
+// options, `dispatchEvent` did not exist, `xhr instanceof EventTarget` was false,
+// and a `readystatechange` "event" was an object literal with three properties.
+// Every attribute was a WRITABLE OWN DATA PROPERTY, so `xhr.status = 200` worked
+// and `Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'status')` was
+// undefined. `upload` was the literal `{addEventListener(){}, removeEventListener(){}}`
+// — an upload progress bar wired to it received nothing, forever, silently. And
+// `timeout` was stored and never read: a request to a server that had gone away
+// hung until the tab was closed, which on a flaky connection is most of them.
+//
+// The shape of this file follows the spec's own division:
+//   XMLHttpRequestEventTarget  — the seven progress handlers, shared by both ends
+//     ├ XMLHttpRequestUpload   — the request side (what YOU are sending)
+//     └ XMLHttpRequest         — the response side (+ readyState, the response)
+// ============================================================================
 
+// (`setRequestHeader()` shares Fetch's forbidden-request-header rule with
+// `Headers` — `_isForbiddenRequestHeader`, defined above. It does NOT throw on
+// one: it silently ignores it. These are headers the USER AGENT owns, and a page
+// that could set `Host` or `Cookie` could impersonate another page; throwing
+// would additionally hand a page a way to enumerate exactly what is guarded.)
+
+// §fire a progress event. `lengthComputable` is `length !== 0` — not "did the
+// server send a Content-Length", but the same thing said in the one way a
+// progress bar can act on: a total of 0 means "I cannot tell you how far along
+// this is", and a bar that renders 0/0 as 100% is worse than one that spins.
+const _xhrFireProgress = function (target, type, transmitted, length) {
+  const ev = new ProgressEvent(type, {
+    lengthComputable: length !== 0, loaded: transmitted, total: length,
+  });
+  // The engine generated this, so it is TRUSTED — dispatched through the spec
+  // path directly rather than through the public `dispatchEvent`, which is
+  // required to mark whatever it is handed as untrusted.
+  ev.isTrusted = true;
+  _dispatchSpec(target, ev);
+};
+
+// Does the upload object have ANY registered listener? Read once, at send(), and
+// remembered for the whole request — that is the spec's "upload listener flag",
+// and it exists because upload progress notifications are only generated for a
+// page that asked for them. (A page that adds the listener mid-flight does not
+// retroactively get the events it missed.)
+const _xhrHasListeners = function (target) {
+  const reg = _eventRegistry[_evtRegKey(target)];
+  if (reg) { for (const t in reg) { if (reg[t] && reg[t].length) return true; } }
+  return false;
+};
+
+// The seven shared progress handlers live on XMLHttpRequestEventTarget, so BOTH
+// `xhr.onprogress` and `xhr.upload.onprogress` come from one definition — which
+// is the point of the interface existing at all.
+const _xhrDefEventHandlers = function (proto, Ctor, names) {
+  for (const name of names) {
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true,
+      get: _named('get', name, function () {
+        if (!(this instanceof Ctor)) throw new TypeError('Illegal invocation');
+        return _ehCurrentValue(this, name);
+      }),
+      set: _named('set', name, function (v) {
+        if (!(this instanceof Ctor)) throw new TypeError('Illegal invocation');
+        if (typeof v === 'function' || (v !== null && typeof v === 'object')) {
+          this['__eh_' + name] = v; _ehActivate(this, name);
+        } else { this['__eh_' + name] = null; }
+      }),
+    });
+  }
+};
+
+// WebIDL `unsigned long` (ToUint32): NaN, Infinity and negatives all fold the way
+// `>>> 0` folds them, so `xhr.timeout = -1` is 4294967295, not "no timeout".
+const _toUnsignedLong = (v) => Number(v) >>> 0;
+
+// ⚠️ In this engine a worker shares the page's V8 context (see `_newWorkerScope`):
+// worker scripts run inside a `with (scopeProxy)`, so `globalThis` here is the
+// page's global whichever side called us. There is therefore nothing to inspect,
+// and this answers "no" — the Window rules (a synchronous request may carry
+// neither a timeout nor a responseType) apply everywhere. That is STRICTER than
+// the spec inside a worker, where both are legal because a worker blocking itself
+// harms nobody else. Named in the scroll; no WPT file measures the difference.
+const _isWorkerScope = () => false;
+
+// `EventTarget` is `Node` in this engine, and the `globalThis.EventTarget` alias
+// is not installed until far later in this file — so the base class is named
+// directly here. `super(undefined)` (no node id) is how every other non-tree event
+// target here — MessagePort, Worker, ServiceWorker — joins the one dispatch path.
+class XMLHttpRequestEventTarget extends Node {
   constructor() {
-    this.readyState = 0;
-    this.status = 0;
-    this.statusText = "";
-    this._responseText = "";
-    this.responseURL = "";
-    this.responseType = "";
-    this.response = null;
-    this.timeout = 0;
-    this.withCredentials = false;
-    this.upload = { addEventListener(){}, removeEventListener(){} };
-    this._method = "GET";
-    this._url = "";
+    // Abstract: `new XMLHttpRequestEventTarget()` is not a thing a page may do,
+    // but a subclass calling super() must get through.
+    if (new.target === XMLHttpRequestEventTarget) throw new TypeError('Illegal constructor');
+    super(undefined);
+  }
+}
+// An XHR event goes to the object it happened to and stops. See _getEventParent.
+XMLHttpRequestEventTarget.prototype._noEventParent = true;
+
+// The upload object is minted by the XMLHttpRequest constructor and by nothing
+// else; `new XMLHttpRequestUpload()` throws.
+const _allowXhrUpload = { on: false };
+class XMLHttpRequestUpload extends XMLHttpRequestEventTarget {
+  constructor() {
+    if (!_allowXhrUpload.on) throw new TypeError('Illegal constructor');
+    super();
+  }
+}
+
+globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarget {
+  constructor() {
+    super();
+    // All observable state lives in own UNDERSCORED slots; every web-facing name
+    // is a prototype accessor installed below, so `xhr.status = 200` is a no-op
+    // on a readonly attribute rather than a lie a later reader believes.
+    this._readyState = 0;
+    this._status = 0;
+    this._statusText = '';
+    this._responseText = '';
+    this._responseURL = '';
+    this._responseType = '';
+    this._response = null;
+    this._timeout = 0;
+    this._withCredentials = false;
+    this._async = true;
+    this._sendFlag = false;
+    this._uploadComplete = true;
+    this._uploadListener = false;
+    this._method = 'GET';
+    this._url = '';
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
-    this._listeners = {};
-    this.onreadystatechange = null;
-    this.onload = null;
-    this.onerror = null;
-    this.onabort = null;
-    this.onprogress = null;
-    this.ontimeout = null;
-    this.onloadstart = null;
-    this.onloadend = null;
+    this._timeoutTimer = 0;
+    // Each send() gets a token; a response (or a timer) whose token is stale
+    // belongs to a request that was aborted or re-opened and must be dropped. An
+    // in-flight fetch cannot be recalled, so this is what "terminate" means here.
+    this._gen = 0;
+    _allowXhrUpload.on = true;
+    try { this._upload = new XMLHttpRequestUpload(); }
+    finally { _allowXhrUpload.on = false; }
   }
+
+  get upload() { return this._upload; }
+  get readyState() { return this._readyState; }
+  get status() { return this._status; }
+  get statusText() { return this._statusText; }
+  get responseURL() { return this._responseURL; }
+
+  get timeout() { return this._timeout; }
+  set timeout(v) {
+    // A synchronous request in a Window cannot carry a timeout: the whole point
+    // of the timeout is to give control back, and a sync send has already taken
+    // it away.
+    if (!_isWorkerScope() && this._async === false)
+      throw new DOMException('Timeouts cannot be set for synchronous requests made from a document.', 'InvalidAccessError');
+    this._timeout = _toUnsignedLong(v);
+  }
+
+  get withCredentials() { return this._withCredentials; }
+  set withCredentials(v) {
+    if (this._readyState !== 0 && this._readyState !== 1)
+      throw new DOMException("The object's state must be UNSENT or OPENED.", 'InvalidStateError');
+    if (this._sendFlag)
+      throw new DOMException('The send flag is set.', 'InvalidStateError');
+    this._withCredentials = !!v;
+  }
+
+  get responseType() { return this._responseType; }
+  set responseType(v) {
+    if (this._readyState === 3 || this._readyState === 4)
+      throw new DOMException("The response type cannot be changed when loading or done.", 'InvalidStateError');
+    if (!_isWorkerScope() && this._async === false)
+      throw new DOMException("The response type cannot be changed for synchronous requests made from a document.", 'InvalidAccessError');
+    // WebIDL: assigning a value outside the enumeration to an enum attribute is
+    // a silent no-op, not a throw.
+    const s = String(v);
+    if (s === '' || s === 'arraybuffer' || s === 'blob' || s === 'document' ||
+        s === 'json' || s === 'text') this._responseType = s;
+  }
+
+  get response() { return this._response; }
 
   open(method, url, async_) {
     // §open: method is a ByteString. Coerce (>0xFF → TypeError), validate it is
@@ -9941,10 +10105,19 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     this._headers = {};
     this._responseHeaders = {};
     this._aborted = false;
-    this.status = 0;
-    this.statusText = "";
+    this._status = 0;
+    this._statusText = "";
     this._responseText = "";
-    this.response = null;
+    this._response = null;
+    this._responseURL = "";
+    this._overrideMime = undefined;
+    this._uploadComplete = true;
+    this._uploadListener = false;
+    // §open step 11 "terminate this's fetch controller": an in-flight response
+    // cannot be recalled here, so bump the generation and let the old one's
+    // handlers see that they no longer speak for this object.
+    this._gen++;
+    if (this._timeoutTimer) { clearTimeout(this._timeoutTimer); this._timeoutTimer = 0; }
     // Invalidate any cached "document response" + raw bytes from a previous cycle.
     this._responseDocComputed = false;
     this._responseDocCache = null;
@@ -9952,8 +10125,8 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     // open() moves the object to OPENED; per spec readystatechange only fires
     // when the state actually changes, so a redundant open() on an
     // already-OPENED object is silent (open-open-sync-send).
-    if (this.readyState !== 1) { this._setReadyState(1); }
-    else { this.readyState = 1; }
+    if (this._readyState !== 1) { this._setReadyState(1); }
+    else { this._readyState = 1; }
   }
 
   setRequestHeader(name, value) {
@@ -9961,10 +10134,14 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     if (arguments.length < 2) throw new TypeError("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': 2 arguments required.");
     name = _toByteString(name, "name");
     value = _toByteString(value, "value");
-    if (this.readyState !== 1) throw new DOMException("The object's state must be OPENED.", 'InvalidStateError');
+    if (this._readyState !== 1) throw new DOMException("The object's state must be OPENED.", 'InvalidStateError');
     if (this._sendFlag) throw new DOMException("The object is in the wrong state.", 'InvalidStateError');
     value = _normalizeHeaderValue(value);
     if (!_isHTTPToken(name) || !_isHeaderValue(value)) throw new DOMException("Invalid header name or value.", 'SyntaxError');
+    // A forbidden header name is IGNORED, not refused — and silently, after the
+    // syntax checks above, so a page cannot use the presence or absence of a
+    // throw to enumerate what the browser guards.
+    if (_isForbiddenRequestHeader(name, value)) return;
     // Combine with any existing value for a case-insensitive name match.
     const lower = name.toLowerCase();
     for (const k of Object.keys(this._headers)) {
@@ -9974,30 +10151,65 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
   }
 
   getResponseHeader(name) {
-    const lower = name.toLowerCase();
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'getResponseHeader' on 'XMLHttpRequest': 1 argument required, but only 0 present.");
+    const lower = _bLower(_toByteString(name, 'name'));
     for (const [k, v] of Object.entries(this._responseHeaders)) {
-      if (k.toLowerCase() === lower) return v;
+      if (_bLower(k) === lower) return v;
     }
     return null;
   }
 
   getAllResponseHeaders() {
-    return Object.entries(this._responseHeaders)
-      .map(([k, v]) => k + ': ' + v)
-      .join('\r\n');
+    // §get all response headers: names byte-LOWERCASED, sorted byte-wise, each
+    // line terminated by CRLF — including the last. The sort is not cosmetic: it
+    // is what makes the output a stable string a page can compare against, and
+    // the lowercasing is what stops the same header reading differently depending
+    // on which proxy happened to rewrite its capitalisation.
+    const rows = Object.entries(this._responseHeaders).map(([k, v]) => [_bLower(k), v]);
+    rows.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    let out = '';
+    for (const [k, v] of rows) out += k + ': ' + v + '\r\n';
+    return out;
   }
 
-  overrideMimeType(mime) { this._overrideMime = mime; }
+  overrideMimeType(mime) {
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'overrideMimeType' on 'XMLHttpRequest': 1 argument required, but only 0 present.");
+    // Overriding the type after the body has started arriving would change how
+    // bytes already decoded should have been decoded, so it is refused.
+    if (this._readyState === 3 || this._readyState === 4)
+      throw new DOMException("MimeType cannot be overridden when the state is LOADING or DONE.", 'InvalidStateError');
+    // ⚠️ A MIME type that will not parse does NOT throw here — it becomes
+    // `application/octet-stream`. That distinction is the whole of WPT's
+    // `overridemimetype-invalid-mime-type`, and it is not pedantry: an override
+    // of "bogus" must still OVERRIDE (so an XML response stops being parsed as a
+    // document) while carrying no charset of its own (so the response's own
+    // `charset=windows-1252` still decodes the bytes). Throwing, or ignoring the
+    // call, each gets one of those two halves wrong.
+    const parsed = _parseMimeType(String(mime));
+    // Stored SERIALIZED rather than raw, because `_xhrFinalMimeRec` and
+    // `_xhrFinalEncoding` both re-parse this field and must see the substitution.
+    this._overrideMime = parsed ? _serializeMimeType(parsed) : 'application/octet-stream';
+  }
 
   send(body) {
-    if (this.readyState !== 1) return;
-    if (this._aborted) return;
+    // §send steps 1–2. The old code returned silently here, which meant a
+    // double-send or a send() on an unopened object simply did nothing — the
+    // caller's request vanished with no way to find out.
+    if (this._readyState !== 1)
+      throw new DOMException("The object's state must be OPENED.", 'InvalidStateError');
+    if (this._sendFlag)
+      throw new DOMException("The object's state must be OPENED.", 'InvalidStateError');
 
     // Synchronous mode (`open(..., false)`) blocks until the response arrives.
     if (this._async === false) { this._sendSync(body); return; }
 
     const xhr = this;
-    this._fireEvent('loadstart');
+    this._sendFlag = true;
+    this._aborted = false;
+    const gen = ++this._gen;
+    // The upload listener flag is read ONCE, here: upload progress notifications
+    // are generated only for a page that asked for them before sending.
+    this._uploadListener = _xhrHasListeners(this._upload);
 
     let url = this._url;
     if (url && !url.includes('://')) {
@@ -10017,6 +10229,38 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     // first one — a body no server could parse.
     let _reqBody = _extracted ? _extracted.text : undefined;
     if (_extracted && _extracted.bytes) { const _b = new Blob([]); _b._bytes = _extracted.bytes; _reqBody = _b; }
+    // How many bytes the upload side is reporting. `_extracted.bytes` is the real
+    // byte sequence where one exists; a text body is measured in UTF-8 bytes, not
+    // code units, because that is what actually goes on the wire.
+    const _reqLen = _extracted
+      ? (_extracted.bytes ? _extracted.bytes.length
+         : (typeof _extracted.text === 'string' ? new TextEncoder().encode(_extracted.text).length : 0))
+      : 0;
+    this._uploadComplete = (_extracted === null);
+
+    // §send step 11: fire loadstart at the object, then — only if there is a body
+    // AND somebody is listening — at the upload object.
+    _xhrFireProgress(this, 'loadstart', 0, 0);
+    // ⚠️ The gap between these two lines is a real one. WPT's `abort-event-order`
+    // calls abort() from inside the `loadstart` handler and asserts that
+    // `upload.loadstart` NEVER FIRES — an upload cannot start after the request
+    // it belongs to has already ended.
+    if (gen !== this._gen || this._readyState !== 1) return;
+    if (!this._uploadComplete && this._uploadListener)
+      _xhrFireProgress(this._upload, 'loadstart', 0, _reqLen);
+    if (gen !== this._gen || this._readyState !== 1) return;
+
+    // The timeout is the promise that control comes back. Without it a request to
+    // a server that has silently gone away — a captive portal, a dropped mobile
+    // connection, a host that accepts the TCP connection and then says nothing —
+    // never ends, and neither does the spinner the page is showing.
+    if (this._timeout > 0) {
+      this._timeoutTimer = setTimeout(function () {
+        if (gen !== xhr._gen) return;
+        xhr._timeoutTimer = 0;
+        xhr._requestError('timeout');
+      }, this._timeout);
+    }
 
     // Carry an open()-time blob snapshot through to fetch via a Request.
     let _input = url;
@@ -10028,17 +10272,37 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       mode: 'cors',
       _initiatorType: 'xmlhttprequest',
     }).then(async (resp) => {
-      if (xhr._aborted) return;
+      // A response for a request this object has already abandoned (abort(),
+      // open(), or a timeout that already fired) is not ours to report.
+      if (gen !== xhr._gen || xhr._aborted) return;
+      if (xhr._timeoutTimer) { clearTimeout(xhr._timeoutTimer); xhr._timeoutTimer = 0; }
 
-      xhr.status = resp.status;
-      xhr.statusText = resp.statusText || '';
-      xhr.responseURL = resp.url || url;
+      // The response arriving is the first moment we can honestly say the request
+      // body finished going out: this transport sends the whole body and waits.
+      // So the upload's completion events belong HERE, before the response's own
+      // state transitions — which is exactly the order WPT's event-order tests
+      // assert, and exactly why a request that TIMES OUT never reports
+      // `upload.load` (see _requestError).
+      if (!xhr._uploadComplete) {
+        xhr._uploadComplete = true;
+        if (xhr._uploadListener) {
+          _xhrFireProgress(xhr._upload, 'progress', _reqLen, _reqLen);
+          _xhrFireProgress(xhr._upload, 'load', _reqLen, _reqLen);
+          _xhrFireProgress(xhr._upload, 'loadend', _reqLen, _reqLen);
+        }
+        if (gen !== xhr._gen) return;
+      }
+
+      xhr._status = resp.status;
+      xhr._statusText = resp.statusText || '';
+      xhr._responseURL = (resp.url || url || '').split('#')[0];
 
       if (resp.headers) {
         resp.headers.forEach((v, k) => { xhr._responseHeaders[k] = v; });
       }
 
       xhr._setReadyState(2); // HEADERS_RECEIVED
+      if (gen !== xhr._gen || xhr._readyState !== 2) return;
 
       // Charset-aware decoding works off the RAW response bytes, not resp.text()
       // (which is utf-8-only) — see _xhrResponseText / _getDocumentResponse. Read
@@ -10046,55 +10310,94 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       // not disturb a body it is only decoding.
       const bytes = (resp._st && resp._st.body && resp._st.body.bytes instanceof Uint8Array)
         ? resp._st.body.bytes : new Uint8Array();
-      if (xhr._aborted) return;
+      if (gen !== xhr._gen || xhr._aborted) return;
 
       xhr._responseBytes = bytes;
-      const _text = _xhrResponseText(xhr);
-      xhr._responseText = _text;
-      xhr._setReadyState(3); // LOADING
-
-      switch (xhr.responseType) {
-        case 'json':
-          try { xhr.response = JSON.parse(new TextDecoder().decode(bytes)); } catch(e) { xhr.response = null; }
-          break;
-        case 'text':
-        case '':
-          xhr.response = _text;
-          break;
-        case 'arraybuffer':
-          xhr.response = bytes.slice().buffer;
-          break;
-        case 'blob':
-          xhr.response = new Blob([bytes]);
-          break;
-        case 'document':
-          // §"document response": parse the body per its final MIME type into a
-          // Document (or null). Cached so `.response` and `.responseXML` return
-          // the SAME object (responsexml-get-twice).
-          xhr.response = xhr._getDocumentResponse();
-          break;
-        default:
-          xhr.response = _text;
+      xhr._responseText = _xhrResponseText(xhr);
+      // ⚠️ LOADING is entered by the arrival of a body CHUNK, so a response with
+      // an EMPTY body goes HEADERS_RECEIVED → DONE and readyState 3 never
+      // happens. WPT tests both sides of this: `send-response-event-order`
+      // expects `2, 3, progress, 4` for a 12-byte body and
+      // `send-no-response-event-order` expects `2, progress, 4` for none.
+      if (bytes.length > 0) {
+        xhr._setReadyState(3); // LOADING
+        if (gen !== xhr._gen || xhr._readyState !== 3) return;
       }
 
+      xhr._computeResponse(bytes);
+
+      // §handle response end-of-body: one progress event before DONE. `length` is
+      // the declared Content-Length — 0 when the server did not say, which is
+      // what makes `lengthComputable` false rather than a made-up total.
+      const _cl = Number(xhr.getResponseHeader('content-length'));
+      const _len = Number.isFinite(_cl) && _cl >= 0 ? _cl : 0;
+      _xhrFireProgress(xhr, 'progress', bytes.length, _len);
+      if (gen !== xhr._gen) return;
+
+      xhr._sendFlag = false;
       xhr._setReadyState(4); // DONE
-      xhr._fireEvent('load');
-      xhr._fireEvent('loadend');
+      if (gen !== xhr._gen) return;
+      _xhrFireProgress(xhr, 'load', bytes.length, _len);
+      _xhrFireProgress(xhr, 'loadend', bytes.length, _len);
     }).catch((err) => {
-      if (xhr._aborted) return;
-      xhr.status = 0;
-      xhr._setReadyState(4); // sets readyState + fires readystatechange AND onreadystatechange
-      if (err && err.__aborted) {
-        xhr._aborted = true;
-        xhr._fireEvent('abort');
-        xhr._fireEvent('loadend');
-        if (xhr.onabort) xhr.onabort(err);
-      } else {
-        xhr._fireEvent('error');
-        xhr._fireEvent('loadend');
-        if (xhr.onerror) xhr.onerror(err);
-      }
+      if (gen !== xhr._gen || xhr._aborted) return;
+      if (xhr._timeoutTimer) { clearTimeout(xhr._timeoutTimer); xhr._timeoutTimer = 0; }
+      xhr._requestError((err && err.__aborted) ? 'abort' : 'error');
     });
+  }
+
+  // §request error steps. One shared path for abort, timeout and network error,
+  // because the three differ only in the event NAME — and getting that shared
+  // shape right is what makes `loadend` a reliable place to clean up: it fires
+  // exactly once, for every ending, successful or not.
+  _requestError(name) {
+    this._readyState = 4;
+    this._sendFlag = false;
+    this._aborted = true;
+    this._status = 0;
+    this._statusText = '';
+    this._responseText = '';
+    this._response = null;
+    this._responseBytes = null;
+    this._responseDocComputed = false;
+    this._responseDocCache = null;
+    this._fireEvent('readystatechange');
+    // An upload that never finished reports the ending it got — and NOT
+    // `progress`/`load`, which would claim bytes arrived that did not.
+    if (!this._uploadComplete) {
+      this._uploadComplete = true;
+      if (this._uploadListener) {
+        _xhrFireProgress(this._upload, name, 0, 0);
+        _xhrFireProgress(this._upload, 'loadend', 0, 0);
+      }
+    }
+    _xhrFireProgress(this, name, 0, 0);
+    _xhrFireProgress(this, 'loadend', 0, 0);
+  }
+
+  // §"response" — the shape the page asked for, built once per response.
+  _computeResponse(bytes) {
+    switch (this._responseType) {
+      case 'json':
+        try { this._response = JSON.parse(new TextDecoder().decode(bytes)); } catch (e) { this._response = null; }
+        break;
+      case 'arraybuffer':
+        this._response = bytes.slice().buffer;
+        break;
+      case 'blob':
+        this._response = new Blob([bytes]);
+        break;
+      case 'document':
+        // §"document response": parse the body per its final MIME type into a
+        // Document (or null). Cached so `.response` and `.responseXML` return
+        // the SAME object (responsexml-get-twice).
+        this._response = this._getDocumentResponse();
+        break;
+      case 'text':
+      case '':
+      default:
+        this._response = this._responseText;
+    }
   }
 
   _sendSync(body) {
@@ -10144,29 +10447,22 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
       }
     } catch (err) {
       this._sendFlag = false;
-      this.status = 0; this.statusText = '';
-      this._responseText = ''; this.response = null;
+      this._status = 0; this._statusText = '';
+      this._responseText = ''; this._response = null;
       this._setReadyState(4);
       throw new DOMException('Network request failed', 'NetworkError');
     }
-    this.status = status;
-    this.statusText = statusText || '';
-    this.responseURL = (typeof finalUrl === 'string' ? finalUrl.split('#')[0] : '') || '';
+    this._status = status;
+    this._statusText = statusText || '';
+    this._responseURL = (typeof finalUrl === 'string' ? finalUrl.split('#')[0] : '') || '';
     this._responseHeaders = {};
     for (const [k, v] of Object.entries(respHeaders || {})) this._responseHeaders[k] = v;
     // Charset-aware decoding works off the raw response bytes (utf-8-decoded
     // p.body is only a fallback when the envelope carried no base64 body).
     this._responseBytes = (respBytes != null) ? respBytes
       : (respText != null ? new TextEncoder().encode(respText) : new Uint8Array());
-    const text = _xhrResponseText(this);
-    this._responseText = text;
-    switch (this.responseType) {
-      case 'json': try { this.response = JSON.parse(new TextDecoder().decode(this._responseBytes)); } catch (e) { this.response = null; } break;
-      case 'arraybuffer': this.response = this._responseBytes.slice().buffer; break;
-      case 'blob': this.response = new Blob([this._responseBytes]); break;
-      case 'document': this.response = this._getDocumentResponse(); break;
-      case 'text': case '': default: this.response = text;
-    }
+    this._responseText = _xhrResponseText(this);
+    this._computeResponse(this._responseBytes);
     // Resource Timing: a synchronous XHR records a completed "resource" entry
     // on the performance timeline just like the async path (fetch()). WPT's
     // buffer-full suite drives the buffer purely through load.xhr_sync().
@@ -10175,14 +10471,18 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
         const _sz = (respBytes && (respBytes.byteLength != null ? respBytes.byteLength : respBytes.length))
           || (respText ? respText.length : 0) || 0;
         const _pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
-        const _ct = _entryContentType(this.responseURL || finalUrl || url, respHeaders, _pageOrigin);
-        performance._addResourceEntry(this.responseURL || finalUrl || url, 'xmlhttprequest', _resStart, performance.now(), { enc: _sz, dec: _sz, status: status, contentType: _ct });
+        const _ct = _entryContentType(this._responseURL || finalUrl || url, respHeaders, _pageOrigin);
+        performance._addResourceEntry(this._responseURL || finalUrl || url, 'xmlhttprequest', _resStart, performance.now(), { enc: _sz, dec: _sz, status: status, contentType: _ct });
       }
     } catch (e) {}
     this._sendFlag = false;
     this._setReadyState(4);
-    this._fireEvent('load');
-    this._fireEvent('loadend');
+    // §send: a SYNCHRONOUS request fires no loadstart and no progress — there is
+    // nothing to report progress to, because nothing else can run while it waits.
+    // Only the two events that say "it is over" are fired.
+    const _len = this._responseBytes ? this._responseBytes.length : 0;
+    _xhrFireProgress(this, 'load', _len, _len);
+    _xhrFireProgress(this, 'loadend', _len, _len);
   }
 
   // §the responseText attribute. Only valid for responseType "" or "text"
@@ -10190,18 +10490,18 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
   // decoded text response (responsexml-non-document-types). Backed by
   // `_responseText` — the send paths assign that field, not this getter.
   get responseText() {
-    if (this.responseType !== '' && this.responseType !== 'text')
+    if (this._responseType !== '' && this._responseType !== 'text')
       throw new DOMException("responseText is only available if responseType is '' or 'text'.", 'InvalidStateError');
-    if (this.readyState !== 3 && this.readyState !== 4) return '';
+    if (this._readyState !== 3 && this._readyState !== 4) return '';
     return this._responseText || '';
   }
 
   // §the responseXML attribute. Only valid for responseType "" or "document";
   // returns null until DONE, then the (cached) document response.
   get responseXML() {
-    if (this.responseType !== '' && this.responseType !== 'document')
+    if (this._responseType !== '' && this._responseType !== 'document')
       throw new DOMException("responseXML is only available if responseType is '' or 'document'.", 'InvalidStateError');
-    if (this.readyState !== 4) return null;
+    if (this._readyState !== 4) return null;
     return this._getDocumentResponse();
   }
 
@@ -10230,7 +10530,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     // If the final MIME type is neither HTML nor XML, return (→ null). And the
     // default ("") responseType never parses HTML — only an explicit "document".
     if (!isHTML && !isXML) return null;
-    if (this.responseType === '' && isHTML) return null;
+    if (this._responseType === '' && isHTML) return null;
 
     // Decode the bytes for the DOCUMENT (distinct from §text response): the
     // override/Content-Type charset wins; otherwise an HTML response is meta-
@@ -10241,7 +10541,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
     const text = _xhrDecode(bytes, docCharset);
     if (text === '') return null;
 
-    const pageURL = this.responseURL || (_domParse('document_url') || 'about:blank');
+    const pageURL = this._responseURL || (_domParse('document_url') || 'about:blank');
     let doc = null;
     try {
       if (isHTML) {
@@ -10261,62 +10561,47 @@ globalThis.XMLHttpRequest = class XMLHttpRequest {
   }
 
   abort() {
+    this._gen++;                                     // terminate the fetch controller
+    if (this._timeoutTimer) { clearTimeout(this._timeoutTimer); this._timeoutTimer = 0; }
+    // Only a request that was actually in flight reports an abort. An abort() on
+    // a fresh or already-finished object is silent — firing `abort` there would
+    // tell a page a request was cancelled that never existed.
+    const s = this._readyState;
+    if ((s === 1 && this._sendFlag) || s === 2 || s === 3) this._requestError('abort');
+    // ⚠️ And then, WITHOUT firing readystatechange, back to UNSENT. That silence
+    // is deliberate and it is tested: a handler that reacted to state 0 here
+    // would be reacting to a request nobody made.
+    if (this._readyState === 4) {
+      this._readyState = 0;
+      this._status = 0; this._statusText = '';
+      this._responseText = ''; this._response = null; this._responseBytes = null;
+      this._responseDocComputed = false; this._responseDocCache = null;
+    }
     this._aborted = true;
-    if (this.readyState > 0 && this.readyState < 4) {
-      this._setReadyState(4);
-      this._fireEvent('abort');
-      this._fireEvent('loadend');
-    }
-    this.readyState = 0;
   }
 
-  addEventListener(type, handler) {
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(handler);
-  }
-
-  removeEventListener(type, handler) {
-    if (this._listeners[type]) {
-      this._listeners[type] = this._listeners[type].filter(h => h !== handler);
-    }
+  // Fire a plain (non-progress) Event at this object through the real dispatch
+  // path — so `once`, `capture`, `signal`, `stopPropagation` and `dispatchEvent`
+  // all behave, which is the entire reason XMLHttpRequest is an EventTarget.
+  _fireEvent(type) {
+    const ev = new Event(type);
+    ev.isTrusted = true;
+    _dispatchSpec(this, ev);
   }
 
   _setReadyState(state) {
-    this.readyState = state;
+    this._readyState = state;
     this._fireEvent('readystatechange');
-    if (this.onreadystatechange) {
-      try { this.onreadystatechange(); } catch(e) {}
-    }
-  }
-
-  _fireEvent(type) {
-    // readystatechange is a plain Event; the rest (loadstart/progress/load/
-    // loadend/error/abort/timeout) are ProgressEvents, so handlers that test
-    // `e instanceof ProgressEvent` see the right type.
-    let event;
-    if (type === 'readystatechange') {
-      event = { type, target: this, currentTarget: this, bubbles: false };
-    } else {
-      try { event = new ProgressEvent(type, { lengthComputable: false, loaded: 0, total: 0 }); }
-      catch (e) { event = { type, target: this, currentTarget: this, bubbles: false }; }
-      try { Object.defineProperty(event, 'target', { value: this, configurable: true }); } catch (e) {}
-      try { Object.defineProperty(event, 'currentTarget', { value: this, configurable: true }); } catch (e) {}
-    }
-    const handlers = this._listeners[type] || [];
-    for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
-    const prop = 'on' + type;
-    if (type !== 'readystatechange' && typeof this[prop] === 'function') {
-      try { this[prop](event); } catch(e) {}
-    }
   }
 };
-_markNative(XMLHttpRequest);
-_markNative(XMLHttpRequest.prototype.open);
-_markNative(XMLHttpRequest.prototype.send);
-_markNative(XMLHttpRequest.prototype.abort);
-_markNative(XMLHttpRequest.prototype.setRequestHeader);
-_markNative(XMLHttpRequest.prototype.getResponseHeader);
-_markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
+
+// ⚠️ The IDL shaping of these three interfaces — the event-handler attributes,
+// the readyState constants, and `_idlShape`'s enumerable brand-checked accessors
+// — is NOT here. It happens in one block much further down (search
+// "XMLHttpRequest's IDL shape", next to FileReader's), because `_idlShape` and the
+// `_named` helper it calls are `const`s declared below this point: invoking them
+// here would hit the temporal dead zone at startup and take the whole prelude
+// with it.
 
 if (typeof URL === 'undefined' || !URL.prototype) {
   globalThis.URL = class URL {
@@ -32844,7 +33129,39 @@ globalThis.HashChangeEvent = class extends Event { constructor(t,o) { o = (o == 
 globalThis.MessageEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o);this.data=o.data??null;this.origin=o.origin||"";this.lastEventId=o.lastEventId||"";this.source=o.source??null;this.ports=o.ports||[]; } };
 globalThis.ClipboardEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.clipboardData=o.clipboardData??null; } };
 globalThis.SubmitEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.submitter=o.submitter??null; } };
-globalThis.ProgressEvent = class ProgressEvent extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.lengthComputable=!!o.lengthComputable; this.loaded=o.loaded??0; this.total=o.total??0; } };
+// ProgressEvent — the shape of "how far along is this?". All three members are
+// READONLY: a progress bar that can be written to by whoever holds the event is a
+// progress bar that can lie.
+//
+// ⚠️ `loaded` and `total` are `double`, NOT `unsigned long long`. They were
+// unsigned integers once, and assuming so is a live trap: WPT asserts that
+// `{loaded: 1.5, total: 3.5}` comes back as 1.5 and 3.5 and that `{loaded: -1}`
+// comes back as -1. Truncating or clamping them looks harmless and silently
+// breaks three subtests — which is exactly how this arrived here the first time.
+globalThis.ProgressEvent = class ProgressEvent extends Event {
+  constructor(t, o) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'ProgressEvent': 1 argument required, but only 0 present.");
+    o = (o == null) ? {} : o;
+    super(t, o);
+    // WebIDL `double`: coerced with ToNumber (so the string "2" really is 2), and
+    // a non-finite value is a TypeError rather than a quietly substituted 0.
+    const _dbl = (v, name) => {
+      if (v === undefined) return 0;
+      const n = Number(v);
+      if (!Number.isFinite(n))
+        throw new TypeError("Failed to construct 'ProgressEvent': The provided double value for '" + name + "' is non-finite.");
+      return n;
+    };
+    this._lengthComputable = !!o.lengthComputable;
+    this._loaded = _dbl(o.loaded, 'loaded');
+    this._total = _dbl(o.total, 'total');
+  }
+};
+// The `_<name>` private-slot convention is what `_idlEventAttrs` reads, so the
+// three members become enumerable, brand-checked, readonly prototype accessors
+// like every other event interface here.
+_idlEventAttrs(ProgressEvent, ['lengthComputable', 'loaded', 'total']);
 // ToggleEvent (HTML popover / <details>): oldState/newState are DOMStrings coerced
 // via ToString (so null→"null", []→"", numbers stringified); both readonly, default
 // "". `source` is an Element? default null. `relatedTarget` is deliberately NOT
@@ -46782,7 +47099,10 @@ class StorageManager {
   }
   getDirectory() {
     if (!(this instanceof StorageManager)) return Promise.reject(new TypeError("Illegal invocation"));
-    return Promise.reject(new DOMException("The origin private file system is not supported.", "SecurityError"));
+    // The Origin Private File System — see its section further down. This used to
+    // reject with SecurityError, which a page's `catch { fallBackToMemory() }`
+    // took forever and silently.
+    return globalThis._fsGetDirectory();
   }
   get [Symbol.toStringTag]() { return 'StorageManager'; }
 }
@@ -55902,13 +56222,696 @@ if (typeof FileReader === 'undefined') {
              abort: 0, addEventListener: 2, removeEventListener: 2, dispatchEvent: 1 } });
 }
 
-if (typeof EventSource === 'undefined') {
-  globalThis.EventSource = class EventSource {
-    constructor(url) { this.url = url; this.readyState = 0; this.onopen = null; this.onmessage = null; this.onerror = null; }
-    close() { this.readyState = 2; }
-    addEventListener() {} removeEventListener() {}
-    static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
+// ============================================================================
+// The Origin Private File System — https://fs.spec.whatwg.org/
+//
+// This is the only place a web page can keep real FILES: not a string in
+// localStorage, not a row in IndexedDB, but a byte range it can seek into,
+// append to, and hand to `fetch()` as a body without ever loading the whole
+// thing into memory. It is what lets a document editor keep your work while the
+// signal is gone, a photo uploader queue five pictures until there is Wi-Fi, a
+// mapping app keep the tiles for one city instead of re-downloading them every
+// time you open it.
+//
+// For the reader this campaign is for, that is the difference between an app
+// that costs a data bundle every session and one that costs it once. And the
+// reason it is called PRIVATE is the other half: nothing here is the user's real
+// filesystem, no picker appears, no permission is asked and none is needed —
+// the page gets a sandbox of its own and cannot see out of it.
+//
+// What was here before: `navigator.storage.getDirectory()` REJECTED with
+// `SecurityError`, and not one of the interfaces existed. A page's
+// `catch (e) { fallbackToMemory() }` took that branch forever, silently.
+//
+// ⚠️ CAP, NAMED HONESTLY: this store lives in the JS realm and dies with it.
+// Every WPT `fs/` test runs inside one page lifetime, so they pass — but the
+// second visit, the one offline mode is FOR, starts empty. Putting this on disk
+// is the same missing piece six earlier quests have named, and it is the ONE
+// change that would turn this from an API into a feature.
+// ============================================================================
+{
+  // ── The store ──────────────────────────────────────────────────────────────
+  // A node is either a directory (a Map of name → node) or a file (bytes). The
+  // root is minted once: `getDirectory()` must hand back the SAME filesystem
+  // every time or two parts of one page would write into two different worlds.
+  const _fsNewDir = () => ({ kind: 'directory', children: new Map() });
+  const _fsNewFile = () => ({ kind: 'file', bytes: new Uint8Array(0), lastModified: Date.now() });
+  let _fsRoot = null;
+
+  // A name is invalid if it is empty, "." or "..", or contains a path separator.
+  // This is the sandbox wall: without the `..` and `/` checks a page could walk
+  // out of its own directory by ASKING FOR A FILE, which is the whole threat the
+  // "private" in Origin Private File System is guarding against.
+  const _fsValidName = (name) =>
+    name !== '' && name !== '.' && name !== '..' &&
+    name.indexOf('/') < 0 && name.indexOf('\\') < 0;
+
+  const _fsBadName = (op, name) => new TypeError(
+    "Failed to execute '" + op + "' on 'FileSystemDirectoryHandle': Name is not allowed: '" + name + "'.");
+
+  // Handles are compared by their PATH, not by object identity: two separate
+  // `getFileHandle('a.txt')` calls return two objects that name one file, and
+  // `isSameEntry` has to say so.
+  const _fsPathKey = (path) => JSON.stringify(path);
+
+  // Walk a path to its node, or null. Every lookup re-walks from the root rather
+  // than caching a node pointer, because a handle stays valid in NAME only: if
+  // the directory it lived in was removed, the handle must start failing.
+  const _fsResolveNode = (path) => {
+    let node = _fsRoot;
+    for (const part of path) {
+      if (!node || node.kind !== 'directory') return null;
+      node = node.children.get(part) || null;
+    }
+    return node;
   };
+
+  const _fsNotFound = (name) => new DOMException(
+    "A requested file or directory could not be found at the time an operation was processed.", 'NotFoundError');
+
+  // ── FileSystemHandle ───────────────────────────────────────────────────────
+  const _allowFsHandle = { on: false };
+  class FileSystemHandle {
+    constructor(kind, path) {
+      if (!_allowFsHandle.on) throw new TypeError('Illegal constructor');
+      this._kind = kind;
+      this._path = path;              // array of names from the root; [] is the root
+    }
+    get kind() { return this._kind; }
+    get name() { return this._path.length ? this._path[this._path.length - 1] : ''; }
+    isSameEntry(other) {
+      if (!(other instanceof FileSystemHandle)) return Promise.resolve(false);
+      return Promise.resolve(this._kind === other._kind &&
+        _fsPathKey(this._path) === _fsPathKey(other._path));
+    }
+    // §remove(). A handle can delete the thing it names — including, for a
+    // directory, everything under it when `recursive` is asked for.
+    remove(options) {
+      const self = this;
+      return (async function () {
+        const opts = options || {};
+        if (self._path.length === 0)
+          throw new DOMException("The root directory cannot be removed.", 'InvalidModificationError');
+        const parent = _fsResolveNode(self._path.slice(0, -1));
+        const name = self.name;
+        if (!parent || parent.kind !== 'directory' || !parent.children.has(name)) throw _fsNotFound(name);
+        const node = parent.children.get(name);
+        if (node.kind === 'directory' && node.children.size > 0 && !opts.recursive)
+          throw new DOMException("The object can not be modified in this way.", 'InvalidModificationError');
+        parent.children.delete(name);
+      })();
+    }
+  }
+
+  const _fsMake = (Ctor, kind, path) => {
+    _allowFsHandle.on = true;
+    try { return new Ctor(kind, path); } finally { _allowFsHandle.on = false; }
+  };
+
+  // ── FileSystemFileHandle ───────────────────────────────────────────────────
+  class FileSystemFileHandle extends FileSystemHandle {
+    getFile() {
+      const self = this;
+      return (async function () {
+        const node = _fsResolveNode(self._path);
+        if (!node || node.kind !== 'file') throw _fsNotFound(self.name);
+        // A snapshot, deliberately: the returned File is the bytes as they are
+        // NOW. A later write must not change a File the page is still reading,
+        // or `new Response(file).text()` would race the writer.
+        const f = new File([node.bytes.slice()], self.name, { lastModified: node.lastModified });
+        return f;
+      })();
+    }
+    createWritable(options) {
+      const self = this;
+      return (async function () {
+        const opts = options || {};
+        const node = _fsResolveNode(self._path);
+        if (!node || node.kind !== 'file') throw _fsNotFound(self.name);
+        // §createWritable builds a SWAP FILE: writes land in a copy and only
+        // become visible when the stream is closed. That is what makes a crash
+        // halfway through a save leave the old file intact rather than a
+        // half-written one — the single most valuable property of this API for
+        // someone whose device runs out of battery mid-edit.
+        const start = opts.keepExistingData ? node.bytes.slice() : new Uint8Array(0);
+        return _fsNewWritable(self._path, start);
+      })();
+    }
+    // §move(). One operation, two spellings: move(name) renames in place,
+    // move(dir, name?) relocates.
+    move(destOrName, maybeName) {
+      const self = this;
+      return (async function () {
+        let destPath, newName;
+        if (typeof destOrName === 'string') {
+          newName = destOrName;
+          destPath = self._path.slice(0, -1);
+        } else if (destOrName instanceof FileSystemDirectoryHandle) {
+          destPath = destOrName._path.slice();
+          newName = (maybeName === undefined) ? self.name : String(maybeName);
+        } else {
+          throw new TypeError("Failed to execute 'move' on 'FileSystemFileHandle': parameter 1 is not of type 'FileSystemDirectoryHandle'.");
+        }
+        if (!_fsValidName(newName)) throw _fsBadName('move', newName);
+        const parent = _fsResolveNode(self._path.slice(0, -1));
+        const dest = _fsResolveNode(destPath);
+        if (!parent || !dest || dest.kind !== 'directory') throw _fsNotFound(newName);
+        const node = parent.children.get(self.name);
+        if (!node) throw _fsNotFound(self.name);
+        parent.children.delete(self.name);
+        dest.children.set(newName, node);
+        // The handle FOLLOWS the file. A page that moved a file and kept writing
+        // through the old handle must be writing to the file it moved, not to a
+        // ghost at the old path.
+        self._path = destPath.concat([newName]);
+      })();
+    }
+  }
+
+  // ── FileSystemDirectoryHandle ──────────────────────────────────────────────
+  class FileSystemDirectoryHandle extends FileSystemHandle {
+    getFileHandle(name, options) {
+      const self = this;
+      return (async function () {
+        const n = String(name);
+        if (!_fsValidName(n)) throw _fsBadName('getFileHandle', n);
+        const dir = _fsResolveNode(self._path);
+        if (!dir || dir.kind !== 'directory') throw _fsNotFound(self.name);
+        let node = dir.children.get(n);
+        if (!node) {
+          if (!(options && options.create)) throw _fsNotFound(n);
+          node = _fsNewFile();
+          dir.children.set(n, node);
+        } else if (node.kind !== 'file') {
+          // Asking for a file and finding a directory is its OWN error, not
+          // "not found": the name is taken, and by something the caller must not
+          // silently overwrite.
+          throw new DOMException("The path supplied exists, but was not an entry of requested type.", 'TypeMismatchError');
+        }
+        return _fsMake(FileSystemFileHandle, 'file', self._path.concat([n]));
+      })();
+    }
+    getDirectoryHandle(name, options) {
+      const self = this;
+      return (async function () {
+        const n = String(name);
+        if (!_fsValidName(n)) throw _fsBadName('getDirectoryHandle', n);
+        const dir = _fsResolveNode(self._path);
+        if (!dir || dir.kind !== 'directory') throw _fsNotFound(self.name);
+        let node = dir.children.get(n);
+        if (!node) {
+          if (!(options && options.create)) throw _fsNotFound(n);
+          node = _fsNewDir();
+          dir.children.set(n, node);
+        } else if (node.kind !== 'directory') {
+          throw new DOMException("The path supplied exists, but was not an entry of requested type.", 'TypeMismatchError');
+        }
+        return _fsMake(FileSystemDirectoryHandle, 'directory', self._path.concat([n]));
+      })();
+    }
+    removeEntry(name, options) {
+      const self = this;
+      return (async function () {
+        const n = String(name);
+        if (!_fsValidName(n)) throw _fsBadName('removeEntry', n);
+        const dir = _fsResolveNode(self._path);
+        if (!dir || dir.kind !== 'directory') throw _fsNotFound(self.name);
+        const node = dir.children.get(n);
+        if (!node) throw _fsNotFound(n);
+        // Deleting a directory that still has things in it requires SAYING SO.
+        // The default refusal is the guard between "remove this folder" and
+        // "remove this folder and the nine hundred photos in it".
+        if (node.kind === 'directory' && node.children.size > 0 && !(options && options.recursive))
+          throw new DOMException("The object can not be modified in this way.", 'InvalidModificationError');
+        dir.children.delete(n);
+      })();
+    }
+    // §resolve(): the path components from this directory down to `descendant`,
+    // or null if it is not below us. `[]` for the directory itself.
+    resolve(descendant) {
+      const self = this;
+      return (async function () {
+        if (!(descendant instanceof FileSystemHandle)) return null;
+        const a = self._path, b = descendant._path;
+        if (b.length < a.length) return null;
+        for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return null;
+        return b.slice(a.length);
+      })();
+    }
+    // Iteration. `entries()` is the real one; keys/values/@@asyncIterator are
+    // views onto it. The list is SNAPSHOTTED before the first yield so a loop
+    // that deletes as it goes does not skip entries.
+    entries() { return _fsDirIterator(this, 'entries'); }
+    keys() { return _fsDirIterator(this, 'keys'); }
+    values() { return _fsDirIterator(this, 'values'); }
+  }
+  FileSystemDirectoryHandle.prototype[Symbol.asyncIterator] =
+    function () { return _fsDirIterator(this, 'entries'); };
+
+  function _fsDirIterator(handle, kind) {
+    const dir = _fsResolveNode(handle._path);
+    const names = (dir && dir.kind === 'directory') ? Array.from(dir.children.keys()) : [];
+    let i = 0;
+    const it = {
+      next() {
+        return (async function () {
+          for (;;) {
+            if (i >= names.length) return { value: undefined, done: true };
+            const name = names[i++];
+            const node = _fsResolveNode(handle._path.concat([name]));
+            if (!node) continue;                 // removed while we were iterating
+            const h = _fsMake(node.kind === 'directory' ? FileSystemDirectoryHandle : FileSystemFileHandle,
+              node.kind, handle._path.concat([name]));
+            if (kind === 'keys') return { value: name, done: false };
+            if (kind === 'values') return { value: h, done: false };
+            return { value: [name, h], done: false };
+          }
+        })();
+      },
+    };
+    it[Symbol.asyncIterator] = function () { return this; };
+    return it;
+  }
+
+  // ── FileSystemWritableFileStream ───────────────────────────────────────────
+  // A real WritableStream whose sink is the swap buffer. `write()` accepts raw
+  // data OR a command object ({type:'write'|'seek'|'truncate'}), which is how a
+  // page can seek without holding the whole file in memory.
+  class FileSystemWritableFileStream extends globalThis.WritableStream {
+    constructor() {
+      throw new TypeError('Illegal constructor');
+    }
+    write(data) {
+      const w = this.getWriter();
+      // The writer is released whichever way the write goes: leaving a stream
+      // locked after a failed write makes every later write fail for a reason
+      // that has nothing to do with the second caller.
+      return w.write(data).then(
+        (v) => { w.releaseLock(); return v; },
+        (e) => { w.releaseLock(); throw e; });
+    }
+    seek(position) { return this.write({ type: 'seek', position }); }
+    truncate(size) { return this.write({ type: 'truncate', size }); }
+  }
+
+  function _fsNewWritable(path, initialBytes) {
+    const state = { bytes: initialBytes, pos: 0 };
+    const toBytes = async (chunk) => {
+      if (chunk instanceof Blob) return new Uint8Array(await chunk.arrayBuffer());
+      if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk.slice(0));
+      if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+      return new TextEncoder().encode(String(chunk));
+    };
+    const put = (bytes, at) => {
+      const end = at + bytes.length;
+      if (end > state.bytes.length) {
+        // Writing past the end GROWS the file, and the gap is zero-filled —
+        // that is what makes `seek(1000); write('x')` a sparse write rather
+        // than an error, which is how a downloader writes chunks out of order.
+        const grown = new Uint8Array(end);
+        grown.set(state.bytes, 0);
+        state.bytes = grown;
+      }
+      state.bytes.set(bytes, at);
+      state.pos = end;
+    };
+    const sink = {
+      async write(chunk) {
+        if (chunk && typeof chunk === 'object' && typeof chunk.type === 'string' &&
+            (chunk.type === 'write' || chunk.type === 'seek' || chunk.type === 'truncate')) {
+          if (chunk.type === 'seek') {
+            if (chunk.position === undefined || chunk.position === null)
+              throw new DOMException("Invalid params passed. position is required.", 'SyntaxError');
+            state.pos = Number(chunk.position);
+            return;
+          }
+          if (chunk.type === 'truncate') {
+            if (chunk.size === undefined || chunk.size === null)
+              throw new DOMException("Invalid params passed. size is required.", 'SyntaxError');
+            const size = Number(chunk.size);
+            const next = new Uint8Array(size);
+            next.set(state.bytes.subarray(0, Math.min(size, state.bytes.length)), 0);
+            state.bytes = next;
+            if (state.pos > size) state.pos = size;
+            return;
+          }
+          if (chunk.data === undefined || chunk.data === null)
+            throw new DOMException("Invalid params passed. data is required.", 'SyntaxError');
+          const at = (chunk.position === undefined || chunk.position === null) ? state.pos : Number(chunk.position);
+          put(await toBytes(chunk.data), at);
+          return;
+        }
+        put(await toBytes(chunk), state.pos);
+      },
+      async close() {
+        // The commit. Until this runs the real file is untouched.
+        const node = _fsResolveNode(path);
+        if (!node || node.kind !== 'file') throw _fsNotFound(path[path.length - 1]);
+        node.bytes = state.bytes;
+        node.lastModified = Date.now();
+      },
+      async abort() { /* the swap buffer is simply dropped — the file is unchanged */ },
+    };
+    // Built by reaching past the subclass's throwing constructor: the stream is
+    // engine-minted, and `new FileSystemWritableFileStream()` is not a thing a
+    // page may do.
+    const stream = Reflect.construct(globalThis.WritableStream, [sink],
+      FileSystemWritableFileStream);
+    return stream;
+  }
+
+  // ── Wiring ─────────────────────────────────────────────────────────────────
+  globalThis.FileSystemHandle = FileSystemHandle;
+  globalThis.FileSystemFileHandle = FileSystemFileHandle;
+  globalThis.FileSystemDirectoryHandle = FileSystemDirectoryHandle;
+  globalThis.FileSystemWritableFileStream = FileSystemWritableFileStream;
+
+  _idlShape(FileSystemHandle, { ctorLength: 0, promiseOps: ['isSameEntry', 'remove'],
+    arity: { isSameEntry: 1, remove: 0 } });
+  _idlShape(FileSystemFileHandle, { ctorLength: 0,
+    promiseOps: ['getFile', 'createWritable', 'move'],
+    arity: { getFile: 0, createWritable: 0, move: 1 } });
+  _idlShape(FileSystemDirectoryHandle, { ctorLength: 0,
+    promiseOps: ['getFileHandle', 'getDirectoryHandle', 'removeEntry', 'resolve'],
+    arity: { getFileHandle: 1, getDirectoryHandle: 1, removeEntry: 1, resolve: 1,
+             entries: 0, keys: 0, values: 0 } });
+  _idlShape(FileSystemWritableFileStream, { ctorLength: 0,
+    promiseOps: ['write', 'seek', 'truncate'],
+    arity: { write: 1, seek: 1, truncate: 1 } });
+
+  // The one door in. [SameObject]-ish: the same filesystem every call, because
+  // two roots would be two filesystems.
+  globalThis._fsGetDirectory = function () {
+    if (!_fsRoot) _fsRoot = _fsNewDir();
+    return Promise.resolve(_fsMake(FileSystemDirectoryHandle, 'directory', []));
+  };
+}
+
+// ---- XMLHttpRequest's IDL shape (deferred from its definition; see the note there)
+{
+  // The seven progress handlers are declared ONCE, on XMLHttpRequestEventTarget,
+  // which is why `xhr.onprogress` and `xhr.upload.onprogress` are the same code.
+  _xhrDefEventHandlers(XMLHttpRequestEventTarget.prototype, XMLHttpRequestEventTarget,
+    ['onloadstart', 'onprogress', 'onabort', 'onerror', 'onload', 'ontimeout', 'onloadend']);
+  _xhrDefEventHandlers(XMLHttpRequest.prototype, XMLHttpRequest, ['onreadystatechange']);
+
+  // WebIDL constants live on the interface object AND the prototype, non-writable:
+  // `XMLHttpRequest.DONE` and `xhr.DONE` are the same 4, and a page cannot have
+  // either reassigned out from under the comparison it is about to make.
+  for (const [k, v] of Object.entries({ UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 })) {
+    const d = { value: v, writable: false, enumerable: true, configurable: false };
+    Object.defineProperty(XMLHttpRequest, k, d);
+    Object.defineProperty(XMLHttpRequest.prototype, k, d);
+  }
+
+  _idlShape(XMLHttpRequestEventTarget, { ctorLength: 0 });
+  _idlShape(XMLHttpRequestUpload, { ctorLength: 0 });
+  _idlShape(XMLHttpRequest, { ctorLength: 0,
+    arity: { open: 2, setRequestHeader: 2, send: 0, abort: 0, getResponseHeader: 1,
+             getAllResponseHeaders: 0, overrideMimeType: 1 } });
+}
+
+// ============================================================================
+// EventSource — https://html.spec.whatwg.org/multipage/server-sent-events.html
+//
+// Server-Sent Events is the cheapest way a page can be TOLD something. One
+// ordinary HTTP GET that the server never finishes, carrying lines of text: the
+// bus that is four minutes away, a place in a clinic queue, an exam result, a
+// delivery that has left the depot. The alternative is polling — the same
+// request re-sent every few seconds, forever — which on a metered connection is
+// a data bundle spent on nothing, on a slow CPU is a tab that never goes idle,
+// and on a phone is a battery that dies before the bus arrives.
+//
+// WebSocket does more, and #491 built it. SSE is the SMALLER tool, and small is
+// the point: no upgrade handshake, no framing layer, no keepalive ping, no
+// second protocol for a proxy or a corporate firewall to mishandle — and it
+// reconnects BY ITSELF, with the browser remembering where it got to via
+// `Last-Event-ID`. On a connection that drops every few minutes that difference
+// is the whole feature.
+//
+// What was here before was six lines: a constructor that stored the URL, a
+// `close()` that set a number, and an `addEventListener` that was `{}`. So a
+// page that did `es.addEventListener('update', render)` registered nothing, got
+// nothing, and reported no error — the eighth time this campaign has met a
+// feature that ANSWERS, and answers wrong. The transport is `sse_ops.rs`.
+// ============================================================================
+{
+  // How long to wait before reconnecting when the server has not said otherwise.
+  // The spec leaves this to the implementation; 3s is what other browsers use,
+  // and it is the right order of magnitude: short enough that a reader does not
+  // notice a blip, long enough that a server that has fallen over is not
+  // hammered by every open tab at once.
+  const _SSE_DEFAULT_RETRY = 3000;
+
+  const _sseOrigin = (u) => { try { return new URL(u).origin; } catch (e) { return ''; } };
+
+  globalThis.EventSource = class EventSource extends Node {
+    constructor(url, eventSourceInitDict) {
+      super(undefined);
+      if (arguments.length < 1)
+        throw new TypeError("Failed to construct 'EventSource': 1 argument required, but only 0 present.");
+      let u;
+      try { u = new URL(String(url), _documentBaseURL(globalThis.document)); }
+      catch (e) {
+        throw new DOMException("Failed to construct 'EventSource': Cannot open an EventSource to '" +
+          url + "'. The URL is invalid.", 'SyntaxError');
+      }
+      const init = (eventSourceInitDict == null) ? {} : eventSourceInitDict;
+      this._url = u.href;
+      this._origin = u.origin;
+      this._withCredentials = !!init.withCredentials;
+      this._readyState = 0;                        // CONNECTING
+      this._handle = 0;
+      this._gen = 0;
+      this._retry = _SSE_DEFAULT_RETRY;
+      // ⚠️ TWO fields, and the difference is load-bearing. `_lastEventIdBuf` is
+      // what an `id:` LINE writes. `_lastEventId` — the spec's "last event ID
+      // string" — is only ever copied from it when an event is actually
+      // DISPATCHED, and it is what both `event.lastEventId` and the
+      // `Last-Event-ID` header on the next reconnect report. So an id that
+      // arrived in a block the connection cut off never becomes the resume
+      // point: on reconnect we ask for the events after the last one we
+      // DELIVERED, not after the last one we glimpsed. Collapsing these two into
+      // one variable silently loses an event on every dropped connection.
+      this._lastEventIdBuf = '';
+      this._lastEventId = '';
+      // Parser state, carried ACROSS chunk boundaries — which is the whole
+      // difficulty of a streaming format. A `data:` line can arrive in three
+      // pieces and it is still one line.
+      this._buf = '';
+      this._dataBuf = '';
+      this._eventType = '';
+      this._sawFirstChunk = false;
+      // One decoder for the whole connection: a chunk boundary can fall in the
+      // middle of a multi-byte character, and decoding each chunk on its own
+      // turns one 'é' into two replacement characters.
+      this._decoder = new TextDecoder('utf-8');
+      this._connect();
+    }
+
+    get url() { return this._url; }
+    get withCredentials() { return this._withCredentials; }
+    get readyState() { return this._readyState; }
+
+    close() {
+      // Closing must be FINAL — no reconnect, no late event. A page that closed
+      // the stream (a component unmounting, a tab going to the background) has
+      // said it is done paying for it.
+      this._readyState = 2;                        // CLOSED
+      this._gen++;
+      if (this._handle) { try { Deno.core.ops.op_sse_close(this._handle); } catch (e) {} this._handle = 0; }
+    }
+
+    _fire(ev) { ev.isTrusted = true; _dispatchSpec(this, ev); }
+
+    // §"fail the connection": permanent. The server said something that will not
+    // become right by asking again (a 404, an HTML error page), so retrying
+    // would be an infinite loop against a server that is already unhappy.
+    _fail() {
+      if (this._readyState === 2) return;
+      this.close();
+      this._fire(new Event('error'));
+    }
+
+    // §"reestablish the connection": the connection ENDED, which for a stream
+    // that is supposed to be endless means it dropped. Tell the page (so it can
+    // show "reconnecting…"), then try again after the server's own retry
+    // interval, resuming from the last id we saw.
+    _reconnect() {
+      if (this._readyState === 2) return;
+      this._readyState = 0;                        // CONNECTING
+      if (this._handle) { try { Deno.core.ops.op_sse_close(this._handle); } catch (e) {} this._handle = 0; }
+      this._fire(new Event('error'));
+      const gen = ++this._gen;
+      const self = this;
+      setTimeout(function () {
+        if (self._readyState !== 0 || gen !== self._gen) return;
+        self._connect();
+      }, this._retry);
+    }
+
+    async _connect() {
+      const gen = this._gen;
+      const self = this;
+      let info;
+      try {
+        info = JSON.parse(await Deno.core.ops.op_sse_connect(
+          this._url, this._lastEventId, _sseOrigin(_domParse('document_url') || ''), this._withCredentials));
+      } catch (e) {
+        // A transport failure (DNS, refused, TLS) is exactly the case
+        // reconnection exists for: the network moved, not the server's mind.
+        if (gen === this._gen) this._reconnect();
+        return;
+      }
+      if (gen !== this._gen || this._readyState === 2) {
+        try { Deno.core.ops.op_sse_close(info.id); } catch (e) {}
+        return;
+      }
+      // The two things that must be right before a single byte is believed: the
+      // status, and the type. A `text/html` body served 200 is a login page or a
+      // captive portal, and parsing it as events would silently produce nothing
+      // while looking connected.
+      const essence = String(info.contentType || '').split(';')[0].trim().toLowerCase();
+      if (info.status !== 200 || essence !== 'text/event-stream') {
+        try { Deno.core.ops.op_sse_close(info.id); } catch (e) {}
+        this._fail();
+        return;
+      }
+      this._handle = info.id;
+      // Each connection re-arms the BOM strip and starts a fresh decoder: a new
+      // response is a new byte stream.
+      this._sawFirstChunk = false;
+      this._decoder = new TextDecoder('utf-8');
+      this._buf = ''; this._dataBuf = ''; this._eventType = '';
+      // The id buffer restarts from the last id we actually DELIVERED — see the
+      // two-field note in the constructor.
+      this._lastEventIdBuf = this._lastEventId;
+      this._readyState = 1;                        // OPEN
+      this._fire(new Event('open'));
+
+      // The read pump.
+      for (;;) {
+        let raw;
+        try { raw = await Deno.core.ops.op_sse_read(self._handle); }
+        catch (e) { if (gen === self._gen) self._reconnect(); return; }
+        if (gen !== self._gen || self._readyState === 2) return;
+        let m;
+        try { m = JSON.parse(raw); } catch (e) { self._reconnect(); return; }
+        if (m.done || m.error) { self._feedEnd(); if (gen === self._gen) self._reconnect(); return; }
+        self._feed(_base64ToUint8Array(m.data));
+        if (gen !== self._gen) return;
+      }
+    }
+
+    // Decode one chunk and run the line parser over whatever complete lines it
+    // completes.
+    _feed(bytes) {
+      let text = this._decoder.decode(bytes, { stream: true });
+      if (!this._sawFirstChunk) {
+        this._sawFirstChunk = true;
+        // ⚠️ A BOM is stripped ONCE, at the very start of the stream — a U+FEFF
+        // that turns up later is DATA, and a `﻿data:` line is not a `data`
+        // field at all. WPT asserts exactly that (the second event never fires).
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+      }
+      this._buf += text;
+      // Lines end with CRLF, LF or CR. A trailing lone CR is held back: it may
+      // be the first half of a CRLF whose LF is in the next chunk, and treating
+      // it as a line terminator now would split one line into two.
+      for (;;) {
+        const m = /\r\n|\n|\r/.exec(this._buf);
+        if (!m) break;
+        if (m[0] === '\r' && m.index === this._buf.length - 1) break;
+        const line = this._buf.slice(0, m.index);
+        this._buf = this._buf.slice(m.index + m[0].length);
+        this._line(line);
+        if (this._readyState === 2) return;
+      }
+    }
+
+    // The stream ended. Flush the decoder and resolve the HELD trailing CR: while
+    // the connection is live a lone CR at the end of a chunk might be the first
+    // half of a CRLF, so it waits — but nothing more is coming now, so it IS a
+    // line terminator. Without this a server whose last blank line ends in a bare
+    // CR loses its final event on every connection.
+    _feedEnd() {
+      try { this._buf += this._decoder.decode(); } catch (e) {}
+      for (;;) {
+        const m = /\r\n|\n|\r/.exec(this._buf);
+        if (!m) break;
+        const line = this._buf.slice(0, m.index);
+        this._buf = this._buf.slice(m.index + m[0].length);
+        this._line(line);
+        if (this._readyState === 2) return;
+      }
+      // Whatever is left is an UNTERMINATED line, and the spec does not process
+      // one — a half-arrived `data:` is not data, it is a guess.
+      this._buf = '';
+    }
+
+    _line(line) {
+      if (line === '') { this._dispatch(); return; }
+      // A line beginning with a colon is a comment. It exists so a server can
+      // send SOMETHING through an idle proxy that would otherwise time the
+      // connection out — a keepalive that costs one byte.
+      if (line.charCodeAt(0) === 0x3A) return;
+      const i = line.indexOf(':');
+      let field, value;
+      if (i < 0) { field = line; value = ''; }
+      else {
+        field = line.slice(0, i);
+        value = line.slice(i + 1);
+        if (value.charCodeAt(0) === 0x20) value = value.slice(1);  // exactly ONE space
+      }
+      switch (field) {
+        case 'event': this._eventType = value; break;
+        case 'data': this._dataBuf += value + '\n'; break;
+        case 'id':
+          // ⚠️ An id containing U+0000 is DROPPED, silently — the buffer keeps its
+          // previous value. That is not fussiness: the id goes back out as a
+          // `Last-Event-ID` REQUEST HEADER on the next reconnect, and a NUL in a
+          // header is where header injection starts.
+          if (value.indexOf('\u0000') < 0) this._lastEventIdBuf = value;
+          break;
+        case 'retry':
+          // Digits only, base TEN. `03000` is three thousand milliseconds, not
+          // 1536: a leading zero is not an octal prefix here, and reading it as
+          // one would make a server's polite "wait 3 seconds" into half a second
+          // of hammering.
+          if (/^[0-9]+$/.test(value)) this._retry = parseInt(value, 10);
+          break;
+        default: break;                             // an unknown field is ignored
+      }
+    }
+
+    // §"dispatch the event".
+    _dispatch() {
+      // Step 1, and it happens BEFORE the empty-data check: a block carrying only
+      // an `id:` is a server saying "you are up to here" with nothing to report,
+      // which is what it sends when nothing has happened. That still moves the
+      // resume point.
+      this._lastEventId = this._lastEventIdBuf;
+      if (this._dataBuf === '') { this._eventType = ''; return; }
+      let data = this._dataBuf;
+      if (data.endsWith('\n')) data = data.slice(0, -1);
+      const type = this._eventType || 'message';
+      this._dataBuf = ''; this._eventType = '';
+      if (this._readyState === 2) return;
+      this._fire(new MessageEvent(type, {
+        data, origin: this._origin, lastEventId: this._lastEventId,
+      }));
+    }
+  };
+  // An EventSource event goes to the object and stops (see _getEventParent).
+  EventSource.prototype._noEventParent = true;
+
+  _xhrDefEventHandlers(EventSource.prototype, EventSource, ['onopen', 'onmessage', 'onerror']);
+  for (const [k, v] of Object.entries({ CONNECTING: 0, OPEN: 1, CLOSED: 2 })) {
+    const d = { value: v, writable: false, enumerable: true, configurable: false };
+    Object.defineProperty(EventSource, k, d);
+    Object.defineProperty(EventSource.prototype, k, d);
+  }
+  _idlShape(EventSource, { ctorLength: 1, arity: { close: 0 } });
 }
 
 // ============================================================================

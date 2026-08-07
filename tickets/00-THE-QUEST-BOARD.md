@@ -28,6 +28,9 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 | **F17** | ✅ [The Trusted Verdict](481-the-trusted-verdict.md) | **`trusted-types/*`** — the API that removes DOM XSS as a CLASS | **1917/2461 (77.9%)** over a 60-file window — was **21/429, with 21 of 28 files could-not-run** | ⚔️⚔️ | **SECURED (Quest #490, 2026-08-06).** The realm did not exist: `window.trustedTypes` was `undefined`, so the shared helper threw on line 1 and testharness never got a subtest — **invisible, not failing, for the seventh time.** ⭐⭐ Trusted data lives OFF the instance in a `WeakMap` (an own field is forgeable via `Object.create(proto)`, and *a forged trusted value is worse than none*). ⭐⭐ A default-policy `null` must BLOCK where an explicit `createHTML()`'s `null` yields `""`. ⭐ CSP is **append-only**, which is what makes a cheap cache correct. **Caps, all named: `eval`/`Function` need V8's `ModifyCodeGenerationFromStrings` hook (~110 subtests); dynamically inserted `<script>` never executes (130); header-CSP + `SecurityPolicyViolation` are unplumbed (~17 files).** |
 | **F18** | ✅ [The Connected Verdict](482-the-connected-verdict.md) | **`websockets/*`** — the only way a page learns something it did not ask for | **450/485 (92.8%)** over a 76-file window — was a **7-line stub** (`idlharness` 10/62, `constructor/004` 0/161) | ⚔️⚔️ | **SECURED (Quest #491, 2026-08-06).** The stub's `close()` reported **`wasClean: true` for a connection that never existed** — the eighth *answers, and answers wrong*. New `crates/obscura-js/src/ws_ops.rs` over `tokio-tungstenite` (already in the lockfile). ⭐ Sink and stream stored separately, or a pending read blocks every `send()`. ⭐ A blocked port **fails asynchronously**, it does not throw. ⭐ `[Clamp]` clamps — 66536 → 65535, never 1000. Verified against live `ws://wpt.live:8001`. **Caps: no cookies on the handshake (9 files), `websockets/stream/*` (WebSocketStream, ~370) untouched, worker variants of two files.** |
 | **F19** | ✅ [The Streamed Verdict](483-the-streamed-verdict.md) | **`websockets/stream/*`** — `WebSocketStream`, the socket with backpressure | `websocket-error` **10/10** · `constructor` **8/8** · `close` **22/27** — was **0, the interface did not exist** | ⚔️ | **SECURED (Quest #492, 2026-08-06).** The event-based `WebSocket` cannot say *"stop, I cannot keep up"* — a page receiving faster than it renders grows a queue until the tab dies, and on a low-memory device that is the OS killing the tab. ⭐ `protocols` is a `sequence`, so a bare string is REFUSED though a string is iterable. ⭐ **An abort is not a close**: `signal` rejects with `AbortError`, never `WebSocketError`. ⭐ Cancelling the readable with a `WebSocketError` sends its code ON THE WIRE. **⚠️ This quest began as `mimesniff/mime-types/parsing.any` (1,898 subtests, Chrome 712) and the fix that won it BROKE THREE OTHER FILES — see the scroll; the 712 cap is correct and must not be "fixed".** |
+| **F20** | ✅ [The Requested Verdict](484-the-requested-verdict.md) | **`xhr/*`** — the oldest way a page asks for something after it has loaded | **229/283** over a 30-file window — was **120/283**, and one file KILLED THE BROWSER | ⚔️⚔️ | **SECURED (Quest #493, 2026-08-07).** `XMLHttpRequest` was **one object pretending to be four**: not an `EventTarget` (a private `{type:[fn]}` bag — `{once:true}` ignored, no `dispatchEvent`), every attribute a writable OWN DATA property, `upload` the literal `{addEventListener(){},removeEventListener(){}}`, and **`timeout` stored and never read**. Rebuilt on the spec's `XMLHttpRequestEventTarget` → `XMLHttpRequestUpload`/`XMLHttpRequest` split; `idlharness.any` **92/196 → 183/196**. ⚠️⚠️ **`setrequestheader-header-forbidden.htm` wedged the WHOLE BROWSER** (forged `Host`/`Transfer-Encoding` + a synchronous `send()`, with Fetch's forbidden-header rule simply absent) — **and that is what had been poisoning every long sweep in this campaign**. ⚠️ The ritual caught TWO regressions in my own work (`overrideMimeType` must not throw; `ProgressEvent.loaded` is a `double`). **Next in-realm: `status-async` 0/27, the cheapest thing left.** |
+| **F21** | ✅ [The Told Verdict](485-the-told-verdict.md) | **`eventsource/*`** — Server-Sent Events, the cheapest way a page is TOLD something | **10/15 over 9 files, every TIMEOUT gone** — was **0/15** from a 6-line stub | ⚔️⚔️ | **SECURED (Quest #494, 2026-08-07).** One HTTP GET the server never finishes: no upgrade handshake, no framing, no keepalive, and it **reconnects by itself** via `Last-Event-ID`. New `crates/obscura-js/src/sse_ops.rs` keeps a `reqwest` response OPEN — the first code in the engine that does — with redirects followed BY HAND and SSRF re-validated per hop. ⭐⭐ **The parser was verified OFFLINE first (36 assertions, under a second, `scripts/sse_parse_test.mjs`), each input fed whole AND one byte at a time — which found both real bugs before a single CDP cycle.** ⭐⭐ The last-event-ID BUFFER vs STRING split. ⭐ `retry: 03000` is 3000 ms, not octal. **35 of the realm's 44 files are UNMEASURED, not passing.** |
+| **F22** | ✅ [The Kept Verdict](486-the-kept-verdict.md) | **`fs/*`** — the Origin Private File System, the only place a page keeps real FILES | **155/175 (88.6%)** over 13 files — was **6/175**, `getDirectory()` REJECTED | ⚔️⚔️ | **SECURED (Quest #495, 2026-08-07).** A document editor's work while the signal is gone; five photos queued until there is Wi-Fi. Full `FileSystemHandle`/`FileSystemFileHandle`/`FileSystemDirectoryHandle`/`FileSystemWritableFileStream` over the real `WritableStream`, ~420 lines, entirely ADDITIVE. `idlharness.https.any` **6/43 → 43/43**. ⭐⭐ `createWritable()` builds a **SWAP FILE** — a crash mid-save leaves the old file intact. ⭐ The invalid-name rule IS the sandbox wall. ⚠️⚠️ **CAP: the store dies with the JS realm; the second visit — the one offline mode is FOR — starts empty. Seven quests have now named storage-on-disk, and this one hands it a fully-built consumer.** |
 | **F14** | ✅ [The Uploaded Verdict](478-the-uploaded-verdict.md) | **`FileAPI/*`** — Blob, File, FileReader, and the upload path | **1415/1550 (91.3%)** — was 1057/1540 (68.6%) | ⚔️⚔️ | **SECURED (Quest #487, 2026-08-06).** ⭐⭐ `FormData.append` did `String(v)` and `fetch()` did `String(init.body)` — **a FormData could not hold a file**, so file upload was broken end to end with nothing to search for. `Request` had run the real "extract a body" since #459; `fetch()` never called it. ⚠️ **The realm was picked as UNTOUCHED and was 68.6% — measure before naming.** Caps: `send-file-form-*` (63) needs `DataTransfer` + a frame-POST body channel; `BlobURL/cross-partition*` needs partitioning. |
 | **F15** | ✅ [The Aborted Verdict](479-the-aborted-verdict.md) | **`IndexedDB`** — the abort rule + the `getAll` options family | `fire-*-event-exception` **0/29 → 29/29** · `getAllRecords` **9/54 → 52/54** | ⚔️ | **SECURED (Quest #488, 2026-08-06).** Both blocks had been banked twice. ⭐ A handler that THREW did not finish, so the transaction must ABORT — **beating `preventDefault()`**, and worst on `upgradeneeded` where a half-built schema is permanent. ⭐ `getAll`'s dictionary overload is unambiguous because **a dictionary is not a key**, and `direction` is the reason it exists. Cap: the `[EnforceRange]` count boundary, 1 subtest per file. |
 | **F16** | 🟡 [The Intercepted Verdict](480-the-intercepted-verdict.md) | **`service-workers/` — `fetch` INTERCEPTION** | capability works end to end; WPT **3/79 → 13/79** | ⚔️⚔️⚔️ | **PARTLY SECURED (Quest #489, 2026-08-06).** `FetchEvent` + `respondWith()` exist and a page is genuinely served from the Cache API for a URL with nothing behind it. ⚠️ **OPEN, and this is the next quest: interception must move into the NETWORK PATH.** Every test in the realm checks that an **iframe's own navigation and subresource loads** were intercepted; those are issued in Rust by the frame loader and never reach the JS `fetch()` this hooks. Pairs with **storage on disk**, now named by five quests. |
@@ -321,6 +324,102 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-08-07 — Quests #493–#495, **The Requested, Told & Kept Arc** (`xhr` **120/283 → 229/283** · `eventsource` **0/15 → 10/15, a 6-line stub → real Server-Sent Events** · `fs` (OPFS) **6/175 → 155/175 (88.6%)**)
+
+*Scrolls: [`484-the-requested-verdict.md`](484-the-requested-verdict.md) · [`485-the-told-verdict.md`](485-the-told-verdict.md) · [`486-the-kept-verdict.md`](486-the-kept-verdict.md)*
+
+**⚠️⚠️ THE FIND OF THE ARC IS NOT A SUBTEST COUNT: THREE LINES OF `XMLHttpRequest`
+COULD KILL THE WHOLE BROWSER.** `setRequestHeader("Host", …)` /
+`("Transfer-Encoding", …)` / `("Content-Length", …)` followed by a *synchronous*
+`send()` wedged the engine thread. `setRequestHeader` had **no forbidden-header
+rule at all**, so it handed every one of them to the HTTP client on the blocking
+path — and because the request is synchronous it took the browser down, not just
+the page. `xhr/setrequestheader-header-forbidden.htm` went from **unmeasurable
+after twelve minutes** to running in thirty seconds. **And that is what had been
+poisoning every long measurement in this campaign**: once one file wedges the
+server, every file below it reads as `nav-error`, which is indistinguishable from
+a regression if you only read the table. A single `xhr` sweep managed **five files
+in twenty-five minutes**; the same first file on a fresh server takes **ten
+seconds**. New tool **`scripts/wpt_batch.sh`** runs a probe list in small chunks,
+each against a freshly started server, so no one file can invalidate the rows
+below it. *Every measurement in this arc was taken that way.*
+
+**#493 — `XMLHttpRequest` was one object pretending to be four.** Not an
+`EventTarget` (a private `{type:[fn]}` bag, so `{once:true}` was ignored and
+`dispatchEvent` did not exist); every attribute a **writable own data property**;
+`upload` the literal `{addEventListener(){}, removeEventListener(){}}`, so an
+upload progress bar wired to it received nothing, forever, silently; and
+**`timeout` stored and never read**, so a request to a server that had gone away
+hung until the tab closed. Rebuilt on the spec's split —
+`XMLHttpRequestEventTarget` → `XMLHttpRequestUpload` / `XMLHttpRequest`, with the
+seven progress handlers declared **once** so `xhr.onprogress` and
+`xhr.upload.onprogress` are the same code. `idlharness.any` **92/196 → 183/196**.
+⭐ An upload's completion events fire when the **response** arrives — which is why
+a request that TIMES OUT never reports `upload.load`. ⭐ `LOADING` is entered by a
+body **chunk**, so an empty response never reaches readyState 3. ⭐ `abort()`
+returns to `UNSENT` **without** firing `readystatechange`, and WPT asserts the
+silence. **⚠️ The ritual caught two regressions in my own work**:
+`overrideMimeType` does **not** throw on an unparseable type (it substitutes
+`application/octet-stream`, which must still *override* while carrying no charset
+of its own), and `ProgressEvent.loaded`/`total` are **`double`, not unsigned long
+long** — `{loaded: 1.5}` must come back as 1.5. Both fixed and both now above
+baseline.
+
+**#494 — Server-Sent Events, the cheapest way a page can be TOLD something.**
+`EventSource` was six lines whose `addEventListener` was `{}` — the eighth time
+this campaign has met *a feature that answers, and answers wrong*. New
+**`crates/obscura-js/src/sse_ops.rs`** keeps a `reqwest` response **open** (the
+first code in the engine that does), with redirects followed **by hand** and every
+hop re-validated against the SSRF policy — a new transport must not quietly
+reopen the door `op_fetch_url` closed. **⭐⭐ VERIFY A PURE ALGORITHM OFFLINE
+FIRST: the stream parser was lifted into a Node script and run against WPT's own
+inputs — 36 assertions in under a second, each input fed whole AND one byte at a
+time — and that found two real bugs before a single CDP cycle.** ⭐⭐ The
+last-event-ID **buffer** and **string** are two different things: an `id:` inside a
+block the connection cut off must never become the resume point, or every dropped
+connection silently loses one event. ⭐ A held trailing `\r` must be flushed at
+end of stream. ⭐ `retry: 03000` is 3000 ms, **not octal 1536**. ⭐ A BOM is
+stripped **once**, at the very start — a later U+FEFF is data, and WPT asserts the
+**absence** of the event that follows it.
+
+**#495 — the Origin Private File System: the only place a page can keep real
+FILES.** `navigator.storage.getDirectory()` **rejected with `SecurityError`** and
+not one interface existed, so every page's `catch { fallBackToMemory() }` took
+that branch forever. ~420 lines, entirely **additive** — which is why it was the
+right third quest to run against a single ritual pass. ⭐⭐ `createWritable()`
+builds a **swap file**: writes only become visible on `close()`, so a crash
+halfway through a save leaves the old file intact — for someone whose device runs
+out of battery mid-edit that is the most valuable property the API has. ⭐ The
+invalid-name rule (`''`, `.`, `..`, separators) **is the sandbox wall**. ⭐ Asking
+for a file and finding a directory is `TypeMismatchError`, not `NotFoundError` —
+the name is taken, by something the caller must not silently overwrite. ⭐
+Removing a non-empty directory requires **saying so**. `idlharness.https.any`
+**6/43 → 43/43**. ⚠️ **CAP: the store dies with the JS realm — the second visit,
+the one offline mode is FOR, starts empty.** Seven quests have now named
+storage-on-disk, and this one hands it a fully-built consumer.
+
+
+**⚠️ THE ZERO-REGRESSION PROOF, AND EXACTLY HOW STRONG IT IS.** One ritual pass on
+the shipping build: **all 111 files ran, 0 could-not-run, harness `OK` on every
+one, 24,834/25,052 (99.13%), 218 fails.** ⚠️ **The totals are NOT comparable
+against the previously recorded 23,875/24,070** — the denominator moved by 982
+subtests, which is `wpt.live` drifting under the ledger, exactly as the campaign
+warned after the #481–#483 arc. What *is* checkable, and was checked: every one
+of the 19 imperfect files is one the campaign has already recorded as a cap or as
+already-imperfect (`response-consume` 24/40 — the correct FileAPI cap;
+`dom/idlharness.any.worker` 149/219; the `[EnforceRange]` boundary in each
+`getAll*`; the `idlharness` rows resting on `EventTarget === Node`), **and none of
+them is in a realm this arc touched.** The one genuinely SHARED surface changed
+here is `ProgressEvent`, whose other consumer is `FileReader` — measured
+separately at **17/17** across `filereader_result`, `filereader_events` and
+`filereader_abort`, with `Blob-slice` 150/150, `File-constructor` 51/51 and
+`filelist` 7/7 unchanged in the ritual. *This is a single-pass proof, not the
+stash → build → run → pop → build → run double pass; it is named as such because
+the comrade chose three quests over the stronger proof, and that trade should be
+visible rather than implied.* Ritual list grown to **122 files** (11 new guards,
+two of which — the two `progressevent` files — exist because the sweep caught me
+regressing them).
 
 ### 2026-08-06 — Quests #490–#492, **The Trusted, Connected & Streamed Arc** (`trusted-types` **~21/429 → 1917/2461 (77.9%)** · `websockets` **7-line stub → 450/485 (92.8%)** · `WebSocketStream` **0 → 44/52 on its four behavioural files**)
 

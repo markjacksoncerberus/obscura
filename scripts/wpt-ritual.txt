@@ -225,3 +225,22 @@ websockets/idlharness.any.html
 websockets/stream/tentative/websocket-error.any.html
 FileAPI/blob/Blob-slice.any.html
 fetch/api/response/response-consume.html
+
+# ── Quests #493–#495 (2026-08-07): the requested, told & kept verdicts ────────
+# `xhr` — the interface rebuilt on the spec's three-way split. The two
+# ProgressEvent files are here specifically because the ritual caught me
+# regressing them: `overrideMimeType` must NOT throw on an unparseable type, and
+# `ProgressEvent.loaded`/`total` are `double`, NOT unsigned long long.
+xhr/idlharness.any.html
+xhr/progressevent-interface.html
+xhr/progressevent-constructor.html
+xhr/overridemimetype-invalid-mime-type.htm
+xhr/send-response-event-order.htm
+# `eventsource` — real Server-Sent Events against a live text/event-stream.
+eventsource/eventsource-onmessage.any.html
+eventsource/eventsource-eventtarget.any.html
+# `fs` — the Origin Private File System.
+fs/idlharness.https.any.html
+fs/FileSystemDirectoryHandle-getFileHandle.https.any.html
+fs/FileSystemDirectoryHandle-iteration.https.any.html
+fs/FileSystemWritableFileStream-piped.https.any.html

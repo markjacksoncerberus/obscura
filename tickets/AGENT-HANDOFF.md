@@ -59,6 +59,36 @@ faster than full rebuilds for diagnosing *why* something fails.
 
 ## 3. Hard-won gotchas (these will save you hours)
 
+- **⚠️⚠️ THE SERVER DEGRADES AFTER A HANDFUL OF CDP SESSIONS — MEASURED, 2026-08-07.
+  Use `scripts/wpt_batch.sh`, not one long sweep.** A 30-file `xhr` sweep managed
+  **five files in twenty-five minutes**; the same first file against a *fresh*
+  server takes **ten seconds**. Worse, the degradation is CONTAGIOUS and silent:
+  once one file wedges the server, every row below it reads `nav-error` or
+  `testharness did not load`, which is indistinguishable from a regression if you
+  only read the table. Two whole measurement cycles were lost to this before it
+  was understood.
+  ```sh
+  scripts/wpt_batch.sh <tests-file> <out-file> [chunk-size=5] [timeout=20]
+  ```
+  It splits the list, restarts the server per chunk, and recomputes the totals
+  from the collected rows so the summary cannot drift from them. A chunk size of
+  **2** is what the recent arcs used. `scripts/wpt_sweep.sh` is the single-shot
+  version for one file.
+- **A synchronous XHR blocks the ENGINE THREAD, including CDP.** That is spec-correct
+  for the page, but it means one bad sync request takes the whole browser with it —
+  and it was doing exactly that until Quest #493 added Fetch's forbidden-header
+  rule. If a sweep goes quiet, look for sync XHR in the test before suspecting your
+  own change.
+- **The bash tool caps a foreground command at 10 minutes.** Anything longer must
+  run in background mode. And a waiter written as
+  `until ! pgrep -f "wpt_run.py …"` **matches its own command line** and therefore
+  never fires — wait on a recorded PID (`while kill -0 $PID`) instead.
+- **⭐⭐ If a realm is a pure function of its input, lift the function out and test
+  it in Node.** `scripts/sse_parse_test.mjs` runs 36 assertions over WPT's own
+  EventSource inputs in under a second — each input fed whole AND one byte at a
+  time — and found two real bugs before a single CDP cycle. `mimesniff` (Quest
+  #492) and `eventsource` (Quest #494) both paid for this twice over.
+
 - **Read the REAL WPT source before fixing.** `curl` the test's `.html`/`.js` from
   `https://wpt.live/...`. Guessed repros give false greens. Several tests use *stub*
   productions (e.g. `attributes.html`'s `productions.js`) that differ wildly from spec.

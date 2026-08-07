@@ -1,0 +1,13 @@
+fs/idlharness.https.any.html
+fs/FileSystemDirectoryHandle-getFileHandle.https.any.html
+fs/FileSystemDirectoryHandle-getDirectoryHandle.https.any.html
+fs/FileSystemDirectoryHandle-removeEntry.https.any.html
+fs/FileSystemDirectoryHandle-resolve.https.any.html
+fs/FileSystemDirectoryHandle-iteration.https.any.html
+fs/FileSystemFileHandle-getFile.https.any.html
+fs/FileSystemFileHandle-move.https.any.html
+fs/FileSystemBaseHandle-isSameEntry.https.any.html
+fs/FileSystemBaseHandle-remove.https.any.html
+fs/FileSystemWritableFileStream.https.any.html
+fs/FileSystemWritableFileStream-write.https.any.html
+fs/FileSystemWritableFileStream-piped.https.any.html

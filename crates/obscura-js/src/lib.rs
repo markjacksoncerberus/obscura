@@ -9,6 +9,7 @@ pub mod compress_ops;
 pub mod crypto_ops;
 pub mod rsa_ops;
 pub mod ec_ops;
+pub mod sse_ops;
 pub mod ws_ops;
 pub mod v8_flags;
 pub mod markdown;
