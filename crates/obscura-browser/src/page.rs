@@ -159,6 +159,12 @@ pub struct Page {
     /// `document.characterSet` and used to serialise forms and link queries —
     /// a page decoded as EUC-KR must also ANSWER in EUC-KR.
     document_charset: String,
+    /// The `Content-Security-Policy` / `-Report-Only` headers of the last main
+    /// document response, as (disposition, serialized-list) pairs. A policy
+    /// delivered by header is the one an attacker cannot touch — it never
+    /// appears in the markup they are injecting into — so it has to survive the
+    /// trip from the response into the JS realm, which is what this carries.
+    csp_headers: Vec<(&'static str, String)>,
     /// Cached resolved layout/paint, keyed by a hash of the last snapshot.
     /// `None` until the first render in `on-demand`/`always` mode.
     #[cfg(feature = "render")]
@@ -227,6 +233,7 @@ impl Page {
             viewport,
             document_body_size: None,
             document_charset: "UTF-8".to_string(),
+            csp_headers: Vec::new(),
             #[cfg(feature = "render")]
             render_cache: None,
             #[cfg(feature = "stealth")]
@@ -338,6 +345,22 @@ impl Page {
             "execute_scripts called, js runtime exists: {}",
             self.js.is_some()
         );
+
+        // Install the header-delivered policies first. Order matters and is not
+        // cosmetic: a policy that arrives after the script it was meant to stop
+        // has stopped nothing.
+        if !self.csp_headers.is_empty() {
+            if let Some(js) = &mut self.js {
+                for (disposition, value) in self.csp_headers.clone() {
+                    let escaped = value.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', " ").replace('\r', " ");
+                    let code = format!(
+                        "try {{ globalThis.__obscuraAddCSP('{}', '{}', 'http'); }} catch (e) {{}}",
+                        escaped, disposition
+                    );
+                    let _ = js.execute_script("<csp-header>", &code);
+                }
+            }
+        }
 
         #[derive(Debug)]
         struct ScriptInfo {
@@ -559,6 +582,22 @@ impl Page {
                             elapsed_ms, url, resp.body.len(), code.len(), resp.status
                         );
                         let _ = js.execute_script("<resource-timing>", &rt);
+                        // The same gate as an inline script, asked of the URL. A
+                        // nonce on the element authorises it regardless of host —
+                        // that is what makes a nonce-based policy work at all, and
+                        // it is why `__cspAllowsScriptURL` needs the node id too.
+                        let url_esc = url.replace('\\', "\\\\").replace('\'', "\\'");
+                        let allowed = js
+                            .evaluate(&format!(
+                                "globalThis.__cspAllowsScriptURL({}, '{}')",
+                                script.nid, url_esc
+                            ))
+                            .ok()
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        if !allowed {
+                            continue;
+                        }
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
                             Self::report_script_error(js, &e);
@@ -567,9 +606,21 @@ impl Page {
                 }
             } else if !script.inline.is_empty() {
                 if let Some(js) = &mut self.js {
-                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
-                        tracing::warn!("Inline script error: {}", e);
-                        Self::report_script_error(js, &e);
+                    // ⭐ ASK THE POLICY BEFORE RUNNING THE STRING, NOT AFTER. This is
+                    // the one gate that matters: an inline <script> is exactly what an
+                    // injection produces, and "we ran it and then noticed" is not a
+                    // security control. The answer needs the element (for its nonce),
+                    // so the question is asked by node id.
+                    let allowed = js
+                        .evaluate(&format!("globalThis.__cspAllowsInlineScript({})", script.nid))
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if allowed {
+                        if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
+                            tracing::warn!("Inline script error: {}", e);
+                            Self::report_script_error(js, &e);
+                        }
                     }
                 }
             }
@@ -851,6 +902,19 @@ impl Page {
 
         if !response.redirected_from.is_empty() {
             self.url = Some(response.url.clone());
+        }
+
+        // Header-delivered CSP. Collected here, applied in `execute_scripts` —
+        // the policy has to be in the JS realm BEFORE the first script runs, and
+        // the JS realm does not exist yet at this point in the navigation.
+        self.csp_headers.clear();
+        for (name, value) in response.headers.iter() {
+            let lname = name.to_ascii_lowercase();
+            if lname == "content-security-policy" {
+                self.csp_headers.push(("enforce", value.clone()));
+            } else if lname == "content-security-policy-report-only" {
+                self.csp_headers.push(("report", value.clone()));
+            }
         }
 
         // Honor the response charset: HTTP Content-Type → <meta charset> sniff

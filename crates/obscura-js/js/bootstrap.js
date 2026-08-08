@@ -471,6 +471,17 @@ const _ehCurrentValue = function(target, name) {
   const slot = '__eh_' + name;
   const v = target[slot];
   if (v instanceof _RawHandler) {
+    // ⭐ A CONTENT-ATTRIBUTE HANDLER IS A STRING FROM THE MARKUP, so CSP's
+    // `script-src-attr` decides whether it may become code. This is the gate that
+    // stops `<img src=x onerror=…>` — the most common XSS payload there is,
+    // because it needs no `<script>` tag and survives most naive sanitisers.
+    // Blocked handlers compile to null, exactly as if the attribute were absent:
+    // the listener stays installed so a later scripted assignment still works.
+    if (typeof globalThis.__cspAllowsInline === 'function'
+        && !globalThis.__cspAllowsInline('script-attribute', target, v.source)) {
+      target[slot] = null;
+      return null;
+    }
     let fn = null;
     try { fn = _ehCompile(target, name, v.source); }
     catch (e) { _reportError(e); fn = null; }
@@ -784,7 +795,14 @@ const _scheduleAfter = (delay, fn) => {
 // console.error, so window.onerror never saw it).
 const _runTimerHandler = (fn, code, args) => {
   try {
-    if (code !== null) (0, eval)(code); else fn(...args);
+    if (code !== null) {
+      // ⭐ `setTimeout("...")` IS `eval` WITH A DELAY, and CSP treats it as one:
+      // it turns a string into code at runtime, which is exactly the step an
+      // injection needs. Without `'unsafe-eval'` the string form does nothing —
+      // silently, because the timer has no caller left to throw at.
+      if (typeof globalThis.__cspAllowsEval === 'function' && !globalThis.__cspAllowsEval()) return;
+      (0, eval)(code);
+    } else fn(...args);
   } catch (e) { _reportError(e); }
 };
 
@@ -9417,7 +9435,17 @@ const _fireIframeElementLoad = function(el) {
   // An IDL/JS-set onload already fired as an installed listener during dispatch. A
   // markup `onload` content attribute that was never activated as a listener still
   // runs once here, via its source.
-  if (!el['__ehon_onload']) { const a = el.getAttribute && el.getAttribute('onload'); if (a) { try { (0, eval)(a); } catch (e) {} } }
+  // ⚠️ This fallback compiles the attribute SOURCE directly, so it has to ask
+  // CSP the same question `_ehCurrentValue` does — otherwise `script-src-attr`
+  // stops every handler except the one on the element that failed to load,
+  // which is precisely the `<img src=x onerror=…>` payload it exists to stop.
+  if (!el['__ehon_onload']) {
+    const a = el.getAttribute && el.getAttribute('onload');
+    if (a && (typeof globalThis.__cspAllowsInline !== 'function'
+              || globalThis.__cspAllowsInline('script-attribute', el, a))) {
+      try { (0, eval)(a); } catch (e) {}
+    }
+  }
 };
 
 // Fire a trusted `error` event on an element whose subresource failed to load.
@@ -9429,7 +9457,17 @@ const _fireElementError = function(el) {
   ev.target = el;
   try { _dispatchSpec(el, ev); } catch (e) {}
   // See _fireIframeElementLoad: an un-activated markup `onerror` still runs once.
-  if (!el['__ehon_onerror']) { const a = el.getAttribute && el.getAttribute('onerror'); if (a) { try { (0, eval)(a); } catch (e) {} } }
+  // ⚠️ This fallback compiles the attribute SOURCE directly, so it has to ask
+  // CSP the same question `_ehCurrentValue` does — otherwise `script-src-attr`
+  // stops every handler except the one on the element that failed to load,
+  // which is precisely the `<img src=x onerror=…>` payload it exists to stop.
+  if (!el['__ehon_onerror']) {
+    const a = el.getAttribute && el.getAttribute('onerror');
+    if (a && (typeof globalThis.__cspAllowsInline !== 'function'
+              || globalThis.__cspAllowsInline('script-attribute', el, a))) {
+      try { (0, eval)(a); } catch (e) {}
+    }
+  }
 };
 
 // Fire the input-element activation events: a trusted, bubbling, non-cancelable
@@ -9600,6 +9638,16 @@ const _imgUpdateImageData = function (el) {
   _imgResetRequest(el);
   const sel = _imgSelectSource(el);
   if (!sel || !sel.url) return;                  // nothing to load; stays unavailable
+  // ⭐ `img-src` — and a BLOCKED image fires `error`, not silence. The page has
+  // to be able to tell, because the whole point of an `onerror` fallback is to
+  // put something in the hole. A blocked image that fires nothing leaves a
+  // permanently empty box and an alt text nobody wrote.
+  if (typeof globalThis.__cspAllowsURL === 'function'
+      && !globalThis.__cspAllowsURL('img-src', sel.url, el)) {
+    _imgMarkBroken(el);
+    _queueTask(() => { try { _fireElementError(el); } catch (e) {} });
+    return;
+  }
   const req = _imgRequest(el);
   req.density = sel.density > 0 ? sel.density : 1;
   _loadElementResource(el, sel.url, 'img');
@@ -40655,6 +40703,11 @@ globalThis._performFocus = function(el) {
   globalThis._syncRustFocus(el);
   try { el.dispatchEvent(new Event('focus', { bubbles: false })); } catch (e) {}
   try { el.dispatchEvent(new Event('focusin', { bubbles: true })); } catch (e) {}
+  // Focusing an editing host puts the caret in it (HTML's focusing steps for an
+  // editable region). Every editing command is defined over the selection, so
+  // without this a freshly focused contenteditable is a box that has focus, shows
+  // a caret to nobody, and refuses every command in silence.
+  try { globalThis._edFocusEditingHost && globalThis._edFocusEditingHost(el); } catch (e) {}
 };
 
 // HTML "focus fixup rule": when the currently focused element stops being a focusable
@@ -46193,6 +46246,540 @@ Object.defineProperty(Selection.prototype, Symbol.toStringTag,
 }
 
 
+// ===== CSP-BEGIN =====
+// Content Security Policy — CSP Level 3.
+//
+// WHY THIS MATTERS. A CSP is a site telling the browser, in advance, which code
+// it is willing to run and where it is willing to fetch from. It is the single
+// most effective defence a site has against cross-site scripting: the attacker
+// gets their string into the page, and the browser declines to execute it anyway.
+//
+// This engine had NONE of it. Not a partial implementation — `grep` for
+// "content-security-policy" across the whole Rust tree returned nothing, and the
+// only thing in the JS realm was a reader that picked the Trusted Types
+// directives out of a <meta> and ignored every other word. So every site that
+// ships a policy — every bank, every webmail, every government service, every
+// well-run forum — was being read here with its defences silently switched off.
+//
+// ⭐ AND THE FAILURE IS INVISIBLE FROM BOTH SIDES. The site cannot tell: it sent
+// the header, it got a 200, no report arrived (no report arrives when nothing is
+// blocked, either). The reader cannot tell: the page looks right, because a page
+// with its protection removed looks EXACTLY like a page with its protection
+// working — until the day it doesn't. That is the twelfth "feature that answers,
+// and answers wrong" this campaign has found, and it is the worst kind, because
+// the wrong answer is "yes, run it".
+//
+// It is also *free*. CSP costs the device nothing: no download, no script, no
+// frame of work. It is protection you get by parsing a header — which is exactly
+// the kind of protection that should reach a second-hand phone on a metered
+// connection first, not last.
+
+// The fetch directives and what each falls back to when absent (CSP3 §6.1). The
+// chain is the whole design: an author writes `default-src 'self'` and gets a
+// policy for a dozen kinds of fetch they have never heard of, which is how a
+// policy stays correct as the platform grows new ways to load things.
+const _CSP_FALLBACK = {
+  'script-src-elem': ['script-src', 'default-src'],
+  'script-src-attr': ['script-src', 'default-src'],
+  'script-src': ['default-src'],
+  'style-src-elem': ['style-src', 'default-src'],
+  'style-src-attr': ['style-src', 'default-src'],
+  'style-src': ['default-src'],
+  'worker-src': ['child-src', 'script-src', 'default-src'],
+  'frame-src': ['child-src', 'default-src'],
+  'child-src': ['default-src'],
+  'connect-src': ['default-src'],
+  'font-src': ['default-src'],
+  'img-src': ['default-src'],
+  'manifest-src': ['default-src'],
+  'media-src': ['default-src'],
+  'object-src': ['default-src'],
+  'prefetch-src': ['default-src'],
+  'default-src': [],
+};
+// Directives that take a source list. Anything else (report-uri, sandbox,
+// upgrade-insecure-requests, require-trusted-types-for, …) is parsed and kept but
+// is not a source list, and must not be treated as one.
+const _CSP_SOURCE_DIRECTIVES = Object.keys(_CSP_FALLBACK).concat([
+  'base-uri', 'form-action', 'frame-ancestors',
+]);
+const _CSP_KEYWORDS = ["'none'", "'self'", "'unsafe-inline'", "'unsafe-eval'",
+  "'unsafe-hashes'", "'strict-dynamic'", "'report-sample'", "'wasm-unsafe-eval'",
+  "'unsafe-allow-redirects'", "'inline-speculation-rules'"];
+const _CSP_HASH_RE = /^'(sha256|sha384|sha512)-([A-Za-z0-9+/\-_]+={0,2})'$/i;
+const _CSP_NONCE_RE = /^'nonce-([A-Za-z0-9+/\-_]+={0,2})'$/i;
+// A serialized policy LIST is comma-separated, which is also what two separate
+// `Content-Security-Policy` headers collapse to when a header map joins them —
+// so splitting on commas reproduces multi-header delivery exactly.
+const _cspSplitList = (text) => String(text).split(',');
+
+const _cspState = { policies: [], reported: 0 };
+
+// Parse one serialized policy. ⚠️ A directive named twice is IGNORED the second
+// time (CSP3 §"parse a serialized CSP"), and that is a security rule, not a
+// tidiness one: if the later copy won, an injected `<meta>` could weaken a policy
+// the server sent by repeating one of its directives with a looser value.
+const _cspParseOne = (serialized, disposition, source) => {
+  const policy = {
+    disposition: disposition, source: source, text: String(serialized).trim(),
+    directives: Object.create(null), reportEndpoints: [], reportTo: null,
+  };
+  for (const token of policy.text.split(';')) {
+    const parts = token.trim().split(/[ \t\n\f\r]+/).filter(Boolean);
+    if (!parts.length) continue;
+    const name = _asciiLower(parts[0]);
+    if (name in policy.directives) continue;                 // first one wins
+    const values = parts.slice(1);
+    policy.directives[name] = values;
+    if (name === 'report-uri') policy.reportEndpoints = values.slice();
+    else if (name === 'report-to') policy.reportTo = values[0] || null;
+  }
+  return policy;
+};
+// A policy that arrived in a <meta> may not carry the directives that only make
+// sense before the document existed. `frame-ancestors` decides whether this
+// document may be framed AT ALL — a decision the framing parent already acted on
+// long before any markup was parsed — and `report-uri`/`sandbox` likewise.
+// Honouring them from markup would let a policy claim retroactive authority it
+// never had.
+const _CSP_META_IGNORED = ['frame-ancestors', 'report-uri', 'sandbox'];
+globalThis.__obscuraAddCSP = (text, disposition, source) => {
+  try {
+    for (const part of _cspSplitList(text)) {
+      if (!String(part).trim()) continue;
+      const p = _cspParseOne(part, disposition === 'report' ? 'report' : 'enforce', source || 'http');
+      if (source === 'meta') {
+        for (const d of _CSP_META_IGNORED) delete p.directives[d];
+        p.reportEndpoints = [];
+      }
+      _cspState.policies.push(p);
+    }
+  } catch (e) { /* a policy we cannot parse must not take the page down with it */ }
+};
+
+// ── Source expression matching (CSP3 §6.6.2.6) ──────────────────────────────
+const _cspParsedURL = (u) => { try { return new URL(u, globalThis.location && location.href); } catch (e) { return null; } };
+const _cspDefaultPort = (scheme) => ({ 'http:': '80', 'https:': '443', 'ws:': '80', 'wss:': '443', 'ftp:': '21' })[scheme] || '';
+// "Scheme part match": http also matches https, ws also matches wss. The
+// asymmetry is deliberate — a policy that permits the insecure scheme permits the
+// secure one, never the other way round, so tightening transport never breaks a
+// page and loosening it never silently passes.
+const _cspSchemeMatches = (exprScheme, urlScheme) => {
+  const a = _asciiLower(exprScheme).replace(/:$/, '');
+  const b = _asciiLower(urlScheme).replace(/:$/, '');
+  if (a === b) return true;
+  if (a === 'http' && b === 'https') return true;
+  if (a === 'ws' && (b === 'wss' || b === 'http' || b === 'https')) return true;
+  if (a === 'https' && b === 'wss') return true;
+  return false;
+};
+const _cspHostMatches = (exprHost, urlHost) => {
+  const eh = _asciiLower(exprHost), uh = _asciiLower(urlHost);
+  if (eh === '*') return true;
+  if (eh.startsWith('*.')) {
+    const rest = eh.slice(1);                       // ".example.com"
+    return uh.length > rest.length && uh.endsWith(rest);
+  }
+  return eh === uh;
+};
+const _cspMatchesSource = (expr, url, selfOrigin) => {
+  const e = String(expr);
+  if (e === '*') {
+    // `*` is a wildcard over NETWORK schemes only. It does not cover `data:`,
+    // `blob:` or `filesystem:` — those carry their payload inside the URL, so
+    // permitting them by wildcard would permit arbitrary inline content through a
+    // door marked "any host".
+    return ['http:', 'https:', 'ws:', 'wss:', 'ftp:'].indexOf(url.protocol) !== -1;
+  }
+  if (_asciiLower(e) === "'self'") {
+    if (!selfOrigin) return false;
+    if (url.origin === selfOrigin.origin) return true;
+    // 'self' also permits the same host upgraded to a secure scheme.
+    return url.hostname === selfOrigin.hostname
+      && (url.protocol === 'https:' || url.protocol === 'wss:')
+      && (selfOrigin.protocol === 'http:' || selfOrigin.protocol === 'https:');
+  }
+  // scheme-source: "https:", "data:"
+  if (/^[a-zA-Z][a-zA-Z0-9+\-.]*:$/.test(e)) return _cspSchemeMatches(e, url.protocol);
+  // host-source: [scheme "://"] host [":" port] [path]
+  const m = /^(?:([a-zA-Z][a-zA-Z0-9+\-.]*):\/\/)?(\*|(?:\*\.)?[^\s/:]+)(?::(\d+|\*))?(\/[^\s]*)?$/.exec(e);
+  if (!m) return false;
+  const [, scheme, host, port, path] = m;
+  if (scheme) { if (!_cspSchemeMatches(scheme, url.protocol)) return false; }
+  else if (selfOrigin) {
+    // No scheme in the expression: the document's own scheme is implied, and an
+    // https document does NOT reach out to http by writing a bare hostname.
+    if (selfOrigin.protocol === 'http:') { if (url.protocol !== 'http:' && url.protocol !== 'https:') return false; }
+    else if (!_cspSchemeMatches(selfOrigin.protocol, url.protocol)) return false;
+  }
+  if (!_cspHostMatches(host, url.hostname)) return false;
+  if (port && port !== '*') {
+    const up = url.port || _cspDefaultPort(url.protocol);
+    // ⭐ THE UPGRADE ALLOWANCE, IN PORT FORM. An author who wrote
+    // `http://cdn.example:80` before their site moved to https must not have to
+    // rewrite their policy — CSP already lets `http` match `https`, and the port
+    // has to follow or the scheme allowance is dead letter. It only ever goes
+    // one way: 80 permits 443, never the reverse.
+    if (up !== port
+        && !(port === '80' && (url.protocol === 'https:' || url.protocol === 'wss:') && up === '443')) return false;
+  } else if (!port) {
+    const up = url.port || _cspDefaultPort(url.protocol);
+    const dp = scheme ? _cspDefaultPort(_asciiLower(scheme) + ':') : (selfOrigin ? _cspDefaultPort(selfOrigin.protocol) : '');
+    if (up !== dp && !(dp === '80' && up === '443')) return false;
+  }
+  if (path && path !== '/') {
+    // A path ending in "/" is a prefix; anything else must match exactly. That is
+    // what stops `https://cdn/lib/` from also permitting `https://cdn/library-evil`.
+    const up = decodeURI(url.pathname);
+    const ep = decodeURI(path);
+    if (ep.endsWith('/')) { if (!up.startsWith(ep)) return false; }
+    else if (up !== ep) return false;
+  }
+  return true;
+};
+
+// The source list that actually governs a directive for this policy, walking the
+// fallback chain. `null` means "this policy says nothing about it", which is not
+// the same as "this policy forbids it".
+const _cspGoverning = (policy, directive) => {
+  if (policy.directives[directive]) return { name: directive, list: policy.directives[directive] };
+  for (const f of (_CSP_FALLBACK[directive] || [])) {
+    if (policy.directives[f]) return { name: f, list: policy.directives[f] };
+  }
+  return null;
+};
+
+// ── Violation reporting ─────────────────────────────────────────────────────
+globalThis.SecurityPolicyViolationEvent = class SecurityPolicyViolationEvent extends Event {
+  constructor(type, init) {
+    init = (init == null) ? {} : init;
+    super(type, init);
+    this._documentURI = String(init.documentURI == null ? '' : init.documentURI);
+    this._referrer = String(init.referrer == null ? '' : init.referrer);
+    this._blockedURI = String(init.blockedURI == null ? '' : init.blockedURI);
+    this._effectiveDirective = String(init.effectiveDirective == null ? '' : init.effectiveDirective);
+    this._violatedDirective = String(init.violatedDirective == null ? '' : init.violatedDirective);
+    this._originalPolicy = String(init.originalPolicy == null ? '' : init.originalPolicy);
+    this._sourceFile = String(init.sourceFile == null ? '' : init.sourceFile);
+    this._sample = String(init.sample == null ? '' : init.sample);
+    this._disposition = init.disposition === 'report' ? 'report' : 'enforce';
+    this._statusCode = init.statusCode >>> 0;
+    this._lineNumber = init.lineNumber >>> 0;
+    this._columnNumber = init.columnNumber >>> 0;
+  }
+  get [Symbol.toStringTag]() { return 'SecurityPolicyViolationEvent'; }
+};
+_idlEventAttrs(globalThis.SecurityPolicyViolationEvent, ['documentURI', 'referrer',
+  'blockedURI', 'effectiveDirective', 'violatedDirective', 'originalPolicy',
+  'sourceFile', 'sample', 'disposition', 'statusCode', 'lineNumber', 'columnNumber']);
+
+// "Report a violation" (CSP3 §5.3). The event goes to the ELEMENT that caused it
+// when there is one, and bubbles — a page can watch one listener on `document`
+// and still learn which `<img>` or `<script>` tripped it, which is the difference
+// between a usable report and a line in a log nobody reads.
+const _cspReport = (policy, effectiveDirective, violatedDirective, blockedURI, element, sample) => {
+  let docURI = '';
+  try { docURI = (location.href || '').split('#')[0]; } catch (e) {}
+  const init = {
+    bubbles: true, cancelable: false, composed: true,
+    documentURI: docURI,
+    referrer: (globalThis.document && document.referrer) || '',
+    blockedURI: blockedURI || '',
+    effectiveDirective: effectiveDirective,
+    violatedDirective: violatedDirective || effectiveDirective,
+    originalPolicy: policy.text,
+    sourceFile: '',
+    sample: sample || '',
+    disposition: policy.disposition,
+    statusCode: 200,
+    lineNumber: 0, columnNumber: 0,
+  };
+  let ev = null;
+  try { ev = new globalThis.SecurityPolicyViolationEvent('securitypolicyviolation', init); }
+  catch (e) { return; }
+  ev.isTrusted = true;
+  const target = (element && element.isConnected !== false) ? element : (globalThis.document || null);
+  if (!target) return;
+  ev.target = target;
+  try { _dispatchSpec(target, ev); } catch (e) {}
+  _cspState.reported++;
+  _cspSendReport(policy, init);
+};
+// `report-uri` posts a JSON body of type `application/csp-report`. It is
+// best-effort and deliberately unobservable to the page: a policy that reported
+// its own failures back into the page it is protecting would be handing the
+// attacker a channel.
+const _cspSendReport = (policy, init) => {
+  if (!policy.reportEndpoints || !policy.reportEndpoints.length) return;
+  const body = JSON.stringify({
+    'csp-report': {
+      'document-uri': init.documentURI,
+      'referrer': init.referrer,
+      'violated-directive': init.violatedDirective,
+      'effective-directive': init.effectiveDirective,
+      'original-policy': init.originalPolicy,
+      'disposition': init.disposition,
+      'blocked-uri': init.blockedURI,
+      'status-code': init.statusCode,
+      'script-sample': init.sample,
+    },
+  });
+  for (const ep of policy.reportEndpoints) {
+    let url = ep;
+    try { url = new URL(ep, location.href).href; } catch (e) { continue; }
+    try {
+      if (typeof fetch === 'function') {
+        fetch(url, { method: 'POST', body: body, headers: { 'Content-Type': 'application/csp-report' }, mode: 'no-cors' })
+          .catch(() => {});
+      }
+    } catch (e) {}
+  }
+};
+
+// ── The two questions a policy answers ──────────────────────────────────────
+const _cspSelfOrigin = () => { try { return new URL(location.href); } catch (e) { return null; } };
+const _cspB64 = (bytes) => {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  try { return btoa(s); } catch (e) { return ''; }
+};
+const _cspDigest = (alg, text) => {
+  try {
+    const bytes = new TextEncoder().encode(String(text));
+    return _cspB64(Deno.core.ops.op_crypto_digest(alg, bytes));
+  } catch (e) { return null; }
+};
+// Base64url and base64 are the same bytes spelled two ways, and a policy is free
+// to use either. Comparing the SPELLING rather than the bytes is how a correct
+// hash gets rejected for containing a "-".
+const _cspB64Norm = (s) => String(s).replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+
+// "Should element's inline behavior be blocked by policy" (CSP3 §6.7.3.2).
+// `type` is 'script' | 'script-attribute' | 'style' | 'style-attribute'.
+const _CSP_INLINE_DIRECTIVE = {
+  'script': 'script-src-elem', 'script-attribute': 'script-src-attr',
+  'style': 'style-src-elem', 'style-attribute': 'style-src-attr',
+};
+const _cspInlineAllowed = (type, element, source) => {
+  if (!_cspState.policies.length) return true;
+  const directive = _CSP_INLINE_DIRECTIVE[type] || 'script-src-elem';
+  const isAttr = type.indexOf('attribute') !== -1;
+  let allowed = true;
+  for (const policy of _cspState.policies) {
+    const gov = _cspGoverning(policy, directive);
+    if (!gov) continue;
+    const list = gov.list;
+    const nonces = list.filter((s) => _CSP_NONCE_RE.test(s));
+    const hashes = list.filter((s) => _CSP_HASH_RE.test(s));
+    let ok = false;
+    // ⭐⭐ A NONCE OR A HASH IN THE LIST TURNS `'unsafe-inline'` OFF. That looks
+    // like a contradiction and is the most important line in the whole spec: it
+    // is how a site ships ONE policy that both old browsers and new ones read
+    // correctly. An old browser that does not understand nonces sees
+    // `'unsafe-inline'` and at least runs the page; a new one ignores it and
+    // enforces the nonce. Honouring both would enforce neither.
+    if (list.some((s) => _asciiLower(s) === "'unsafe-inline'") && !nonces.length && !hashes.length) ok = true;
+    if (!ok && !isAttr && nonces.length && element) {
+      let n = null;
+      try { n = element.nonce || element.getAttribute('nonce'); } catch (e) { n = null; }
+      if (n) for (const ns of nonces) {
+        const m = _CSP_NONCE_RE.exec(ns);
+        if (m && m[1] === n) { ok = true; break; }
+      }
+    }
+    // ⭐ A HASH CAN AUTHORISE AN ATTRIBUTE ONLY WITH `'unsafe-hashes'`. An
+    // `onclick=` handler is a string the author can hash, but hashes are matched
+    // against content the author *wrote*, and an event handler runs with the
+    // element as its subject — so the spec makes you say out loud that you meant
+    // to allow that, and the keyword is named to be uncomfortable to type.
+    if (!ok && hashes.length && (!isAttr || list.some((s) => _asciiLower(s) === "'unsafe-hashes'"))) {
+      for (const hs of hashes) {
+        const m = _CSP_HASH_RE.exec(hs);
+        if (!m) continue;
+        const alg = 'SHA-' + m[1].slice(3);
+        const got = _cspDigest(alg, source == null ? '' : source);
+        if (got !== null && _cspB64Norm(got) === _cspB64Norm(m[2])) { ok = true; break; }
+      }
+    }
+    if (ok) continue;
+    _cspReport(policy, directive, gov.name, 'inline', element,
+      String(source == null ? '' : source).slice(0, 40));
+    if (policy.disposition === 'enforce') allowed = false;
+  }
+  return allowed;
+};
+
+// "Should request be blocked by policy" for a URL-bearing fetch.
+const _cspURLAllowed = (directive, urlText, element) => {
+  if (!_cspState.policies.length) return true;
+  const url = _cspParsedURL(urlText);
+  if (!url) return true;                       // an unparseable URL is not ours to judge
+  const self = _cspSelfOrigin();
+  let allowed = true;
+  for (const policy of _cspState.policies) {
+    const gov = _cspGoverning(policy, directive);
+    if (!gov) continue;
+    const list = gov.list;
+    if (_cspHasStrictDynamic(list)) continue;   // see _cspHasStrictDynamic: a named cap
+    // A list of exactly 'none' forbids everything; nonces and hashes never match
+    // a URL, so a list made only of those forbids everything too.
+    let ok = false;
+    for (const expr of list) {
+      const le = _asciiLower(expr);
+      if (le === "'none'") { ok = false; break; }
+      // ⚠️ `'self'` IS A URL MATCHER even though it is quoted like a keyword.
+      // Skipping every quoted token skips the single most common source
+      // expression on the web — and the failure looks nothing like a bug in the
+      // matcher: the page simply cannot load its own scripts.
+      if (le[0] === "'" && le !== "'self'") continue;   // keywords/nonces/hashes match no URL
+      if (_cspMatchesSource(expr, url, self)) { ok = true; break; }
+    }
+    if (ok) continue;
+    _cspReport(policy, directive, gov.name, url.href, element, '');
+    if (policy.disposition === 'enforce') allowed = false;
+  }
+  return allowed;
+};
+// `eval`, `new Function`, and the string forms of setTimeout/setInterval all ask
+// the same question, and it is a different one from "may this script run": these
+// turn DATA into CODE at runtime, which is the exact step an injection needs.
+const _cspEvalAllowed = () => {
+  if (!_cspState.policies.length) return true;
+  let allowed = true;
+  for (const policy of _cspState.policies) {
+    const gov = _cspGoverning(policy, 'script-src');
+    if (!gov) continue;
+    if (gov.list.some((s) => _asciiLower(s) === "'unsafe-eval'")) continue;
+    _cspReport(policy, 'script-src', gov.name, 'eval', null, '');
+    if (policy.disposition === 'enforce') allowed = false;
+  }
+  return allowed;
+};
+
+// ── Meta delivery ───────────────────────────────────────────────────────────
+// A <meta http-equiv="Content-Security-Policy"> is honoured when the parser
+// reaches it, and the policy it adds is FINAL: CSP3 says a later change to the
+// element's content attribute is ignored and removing the element does not
+// withdraw the policy. Both rules exist for the same reason — otherwise the first
+// thing an injected script would do is delete the tag that stops it.
+globalThis.__obscuraScanMetaCSP = () => {
+  try {
+    const doc = globalThis.document;
+    if (!doc) return;
+    const metas = doc.querySelectorAll('meta[http-equiv]');
+    for (const m of metas) {
+      if (m.__cspApplied) continue;
+      const he = _asciiLower(m.getAttribute('http-equiv') || '');
+      const content = m.getAttribute('content');
+      if (content == null) continue;
+      if (he !== 'content-security-policy' && he !== 'content-security-policy-report-only') continue;
+      // ⭐ THE META MUST BE A CHILD OF <head>. Not a style rule — a security one.
+      // `<head>` is the part of the document that has finished before any of the
+      // content it governs exists; a policy found lower down would be arriving
+      // after some of the page it claims to protect had already run, and a policy
+      // that is sometimes too late is worse than none, because the page believes
+      // it is covered. So a policy that turns up in `<body>` is not honoured at
+      // all — which is also why an injected one cannot pretend to be a policy.
+      m.__cspApplied = true;
+      const parent = m.parentNode;
+      if (!parent || parent.nodeType !== 1 || _asciiLower(parent.localName || '') !== 'head') continue;
+      const before = _cspState.policies.length;
+      globalThis.__obscuraAddCSP(content,
+        he === 'content-security-policy-report-only' ? 'report' : 'enforce', 'meta');
+      for (let i = before; i < _cspState.policies.length; i++) _cspState.policies[i].metaElement = m;
+    }
+  } catch (e) {}
+};
+
+// ⭐⭐ A <meta> POLICY GOVERNS ONLY WHAT COMES AFTER IT. In a streaming parser
+// that is automatic — the scripts above the tag have already run by the time the
+// parser reaches it. This engine parses the WHOLE document before it runs the
+// first script, so without this check a meta near the bottom of <head> would
+// retroactively block the scripts above it, which no real browser does and which
+// silently breaks every page that declares its policy after loading a library.
+// The rule is document order, and it is a rule about time, not about markup.
+const _cspPoliciesGoverning = (element) => {
+  if (!element) return _cspState.policies;
+  return _cspState.policies.filter((p) => {
+    if (!p.metaElement) return true;                 // header policies govern everything
+    try {
+      const rel = element.compareDocumentPosition(p.metaElement);
+      return !!(rel & 2 /* DOCUMENT_POSITION_PRECEDING */);
+    } catch (e) { return true; }
+  });
+};
+// `'strict-dynamic'` changes the meaning of every other expression in the list —
+// host sources and `'self'` stop counting entirely and only nonces, hashes and
+// scripts inserted BY already-trusted script are allowed. That propagation is not
+// implemented here, and rather than approximate it we decline to block on the
+// URL at all when it is present. ⛔ Named honestly as a cap: this errs toward
+// letting something load, which is the status quo, never toward breaking a page
+// that a correct implementation would have allowed.
+const _cspHasStrictDynamic = (list) => list.some((x) => _asciiLower(x) === "'strict-dynamic'");
+
+// ── The entry points the rest of the engine (and Rust) call ─────────────────
+// Rust asks before it executes each inline <script>. The answer needs the
+// element, because the element carries the nonce.
+globalThis.__cspAllowsInlineScript = (nid) => {
+  try {
+    globalThis.__obscuraScanMetaCSP();
+    if (!_cspState.policies.length) return true;
+    const el = (typeof _wrap === 'function') ? _wrap(nid) : null;
+    let src = '';
+    try { src = el ? el.textContent : ''; } catch (e) { src = ''; }
+    const saved = _cspState.policies;
+    _cspState.policies = _cspPoliciesGoverning(el);
+    try { return _cspInlineAllowed('script', el, src); }
+    finally { _cspState.policies = saved; }
+  } catch (e) { return true; }
+};
+globalThis.__cspAllowsScriptURL = (nid, url) => {
+  try {
+    globalThis.__obscuraScanMetaCSP();
+    if (!_cspState.policies.length) return true;
+    const el = (typeof _wrap === 'function') ? _wrap(nid) : null;
+    // A nonce authorises an EXTERNAL script too — that is the whole point of
+    // nonce-based policies, which never have to enumerate hosts at all.
+    for (const policy of _cspState.policies) {
+      const gov = _cspGoverning(policy, 'script-src-elem');
+      if (!gov) continue;
+      let n = null;
+      try { n = el ? (el.nonce || el.getAttribute('nonce')) : null; } catch (e) { n = null; }
+      if (!n) continue;
+      for (const ns of gov.list) {
+        const m = _CSP_NONCE_RE.exec(ns);
+        if (m && m[1] === n) { policy.__nonceOK = true; break; }
+      }
+    }
+    const kept = _cspPoliciesGoverning(el).filter((p) => {
+      if (p.__nonceOK) return false;
+      const gov = _cspGoverning(p, 'script-src-elem');
+      if (!gov) return true;
+      // ⛔ A hash source can authorise an EXTERNAL script, by matching the
+      // `integrity` attribute rather than the URL (CSP3 + SRI). We do not check
+      // integrity metadata yet, so a list containing hashes is one we cannot
+      // decide — and an undecided policy must not block. Named as a cap.
+      if (gov.list.some((x) => _CSP_HASH_RE.test(x))) return false;
+      return !_cspHasStrictDynamic(gov.list);
+    });
+    const saved = _cspState.policies;
+    _cspState.policies = kept;
+    let out = true;
+    try { out = _cspURLAllowed('script-src-elem', url, el); }
+    finally { _cspState.policies = saved; for (const p of saved) delete p.__nonceOK; }
+    return out;
+  } catch (e) { return true; }
+};
+globalThis.__cspAllowsURL = (directive, url, element) => {
+  try { return _cspURLAllowed(directive, url, element || null); } catch (e) { return true; }
+};
+globalThis.__cspAllowsInline = (type, element, source) => {
+  try { return _cspInlineAllowed(type, element || null, source); } catch (e) { return true; }
+};
+globalThis.__cspAllowsEval = () => { try { return _cspEvalAllowed(); } catch (e) { return true; } };
+globalThis.__cspHasPolicies = () => _cspState.policies.length > 0;
+// ===== CSP-END =====
+
 // ===== EDITING-ENGINE-BEGIN =====
 // document.execCommand and friends — the HTML Editing APIs.
 //
@@ -46851,10 +47438,46 @@ const _edState = (doc) => {
   }
   return s;
 };
+// Put the caret at the very start of an editing host, descending to the first
+// text node so the position is a place a character can actually go.
+const _edCollapseToStartOf = (doc, host) => {
+  let n = host, guard = 0;
+  while (n && n.firstChild && n.nodeType === 1 && guard++ < 1000) {
+    const f = n.firstChild;
+    if (f.nodeType !== 1 && f.nodeType !== 3) break;
+    n = f;
+  }
+  try {
+    const sel = doc.getSelection();
+    const r = doc.createRange();
+    r.setStart(n, 0); r.setEnd(n, 0);
+    sel.removeAllRanges(); sel.addRange(r);
+  } catch (e) {}
+};
+const _edFocusedEditingHost = (doc) => {
+  let a = null;
+  try { a = doc.activeElement; } catch (e) { return null; }
+  if (!a || a.nodeType !== 1) return null;
+  if (_edIsEditingHost(a) || _edIsEditable(a)) return a;
+  return null;
+};
 const _edActiveRange = (doc) => {
   let sel = null;
   try { sel = doc.getSelection(); } catch (e) { return null; }
-  if (!sel || !sel.rangeCount) return null;
+  if (!sel) return null;
+  // ⭐ A FOCUSED EDITABLE BOX ALWAYS HAS A CARET. The selection object can lose
+  // its range without the box losing focus — an `innerHTML` write replaces every
+  // node the range pointed at, and the range goes with them. A real browser puts
+  // the caret back; this engine used to return "no selection", which made every
+  // editing command silently unavailable in a box the user was actively typing
+  // into. That was five whole families of execCommand failing for a reason that
+  // had nothing to do with any of them.
+  if (!sel.rangeCount) {
+    const host = _edFocusedEditingHost(doc);
+    if (!host) return null;
+    _edCollapseToStartOf(doc, host);
+    if (!sel.rangeCount) return null;
+  }
   let r = null;
   try { r = sel.getRangeAt(0); } catch (e) { return null; }
   if (!r) return null;
@@ -46880,6 +47503,28 @@ const _edResetOverrides = (doc) => {
     s.valueOverrides = Object.create(null);
     s.storedRange = { sc: r.startContainer, so: r.startOffset, ec: r.endContainer, eo: r.endOffset };
   }
+};
+// A caret whose node has been REMOVED from the document is not a caret either.
+// `el.innerHTML = '…'` leaves the Selection holding a range into a detached
+// subtree: `rangeCount` is still 1 and every boundary point in it is meaningless,
+// so the box the user is typing into reports that it has no selection and refuses
+// every command.
+//
+// ⚠️ This check is DELIBERATELY NOT inside `_edActiveRange`. `isConnected` walks
+// `parentNode` to the root and each hop is a round trip into the Rust DOM, while
+// `_edActiveRange` is called hundreds of times inside a single editing command —
+// putting it there made the two largest WPT files in this realm time out. It
+// belongs where a USER ACTION begins, which is once per keystroke or per
+// execCommand, not once per algorithm step.
+const _edRecoverCaret = (doc) => {
+  let sel = null;
+  try { sel = doc.getSelection(); } catch (e) { return; }
+  if (!sel || !sel.rangeCount) return;
+  let sc = null;
+  try { sc = sel.getRangeAt(0).startContainer; } catch (e) { return; }
+  if (!sc || sc.isConnected !== false) return;
+  const host = _edFocusedEditingHost(doc);
+  if (host) _edCollapseToStartOf(doc, host);
 };
 const _edGetStateOverride = (doc, command) => { _edResetOverrides(doc); return _edState(doc).stateOverrides[command]; };
 const _edSetStateOverride = (doc, command, v) => { _edResetOverrides(doc); _edState(doc).stateOverrides[command] = v; };
@@ -49501,12 +50146,337 @@ _EDIT_COMMANDS.forwarddelete.action = _edPreserveOverrides((value, doc) => {
   return true;
 });
 
+// ===== INPUT-EVENTS-BEGIN =====
+// ── beforeinput / input: telling the page what just happened ────────────────
+//
+// WHY THIS MATTERS. Quest #516 taught this engine to EDIT. Nothing told the page.
+// `InputEvent` was already here in full — a constructor, four attributes and
+// `getTargetRanges()` — and not one line in the whole browser ever dispatched it.
+// That is the *interface built, the wire never connected*: `new InputEvent(...)`
+// works, feature detection says yes, and the event never comes.
+//
+// Every rich editor written since about 2018 — ProseMirror, Slate, Quill, Lexical,
+// CKEditor 5, TinyMCE 6, and the comment box on most forums and school portals —
+// is a `beforeinput` listener over a contenteditable. It lets the UA describe the
+// edit it is about to perform, then either allows it or cancels it and does its
+// own. Told nothing, those editors do nothing at all: the box takes focus, the
+// caret blinks, and every keystroke vanishes. That is not a degraded experience,
+// it is a dead one — and it is exactly the homework portal and the library
+// catalogue and the benefits form, because those are the sites that cannot afford
+// to rewrite their editor every two years.
+//
+// TWO EVENTS, TWO JOBS, AND THE SPLIT IS THE ENTIRE DESIGN:
+//   `beforeinput` fires BEFORE the change, is CANCELABLE, and carries
+//      `getTargetRanges()` — the ranges the edit is about to replace. This is the
+//      editor's veto, and the ranges are what it needs to implement the edit
+//      itself instead.
+//   `input` fires AFTER, is NOT cancelable, and its `getTargetRanges()` is EMPTY.
+//      Not an oversight: the ranges it would describe have already stopped
+//      existing. Reporting them would be reporting a document that is gone.
+//
+// The ranges are StaticRanges, and that is load-bearing too — a live Range would
+// be moved by the very edit the handler is being warned about, so by the time the
+// handler looked at it, it would be describing the aftermath.
+
+// The DataTransfer family. Listed in the worker-exposure table as window-only —
+// i.e. the engine already claimed to have it — and never actually defined, so
+// `new DataTransfer()` threw. It is needed here because an `insertFromPaste`
+// input event carries what was pasted, and a page that cannot read that cannot
+// implement paste sanitisation, which is the single most common XSS hole in a
+// comment box.
+//
+// A DataTransfer has a MODE, and it is the mode that makes it safe: the object
+// handed to a paste listener is *read-only*, so `setData` and `clearData` on it
+// are silent no-ops rather than errors. Silent, because a listener that tries to
+// scribble on the clipboard record it was merely shown should not have its whole
+// handler torn down by an exception.
+{
+  const _dtItems = new WeakMap();     // DataTransfer -> [{type, kind, data}]
+  const _dtMode = new WeakMap();      // DataTransfer -> 'readwrite' | 'readonly' | 'protected'
+  // HTML's "convert to a media type": two legacy short names, then lowercase.
+  const _dtNormalizeType = (t) => {
+    const s = _asciiLower(String(t));
+    if (s === 'text') return 'text/plain';
+    if (s === 'url') return 'text/uri-list';
+    return s;
+  };
+  globalThis.DataTransferItem = class DataTransferItem {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get kind() { return this._e ? this._e.kind : ''; }
+    get type() { return this._e ? this._e.type : ''; }
+    getAsString(callback) {
+      if (typeof callback !== 'function') return undefined;
+      if (!this._e || this._e.kind !== 'string') { queueMicrotask(() => { try { callback(''); } catch (e) {} }); return undefined; }
+      const v = this._e.data;
+      queueMicrotask(() => { try { callback(v); } catch (e) {} });
+      return undefined;
+    }
+    getAsFile() { return this._e && this._e.file ? this._e.file : null; }
+    get [Symbol.toStringTag]() { return 'DataTransferItem'; }
+  };
+  const _newItem = (dt, entry) => {
+    const it = Object.create(globalThis.DataTransferItem.prototype);
+    it._dt = dt; it._e = entry;
+    return it;
+  };
+  globalThis.DataTransferItemList = class DataTransferItemList {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get length() { const l = _dtItems.get(this._dt); return l ? l.length : 0; }
+    add(data, type) {
+      if (_dtMode.get(this._dt) !== 'readwrite') return null;
+      const l = _dtItems.get(this._dt);
+      if (arguments.length < 2) {                       // add(File)
+        if (!data || typeof data !== 'object') throw new TypeError("Failed to execute 'add' on 'DataTransferItemList': 2 arguments required.");
+        const e = { kind: 'file', type: _asciiLower(String(data.type || '')), data: '', file: data };
+        l.push(e); return _newItem(this._dt, e);
+      }
+      const t = _dtNormalizeType(type);
+      if (l.some((e) => e.kind === 'string' && e.type === t))
+        throw new DOMException("Failed to execute 'add' on 'DataTransferItemList': An item already exists for type '" + t + "'.", 'NotSupportedError');
+      const e = { kind: 'string', type: t, data: String(data), file: null };
+      l.push(e); return _newItem(this._dt, e);
+    }
+    remove(index) {
+      if (_dtMode.get(this._dt) !== 'readwrite')
+        throw new DOMException("Failed to execute 'remove' on 'DataTransferItemList': The list is not writable.", 'InvalidStateError');
+      const l = _dtItems.get(this._dt);
+      if (index >>> 0 < l.length) l.splice(index >>> 0, 1);
+    }
+    clear() { if (_dtMode.get(this._dt) === 'readwrite') _dtItems.get(this._dt).length = 0; }
+    get [Symbol.toStringTag]() { return 'DataTransferItemList'; }
+  };
+  globalThis.DataTransfer = class DataTransfer {
+    constructor() {
+      _dtItems.set(this, []);
+      _dtMode.set(this, 'readwrite');
+      this._dropEffect = 'none';
+      this._effectAllowed = 'none';
+      const list = Object.create(globalThis.DataTransferItemList.prototype);
+      list._dt = this;
+      this._items = list;
+    }
+    get dropEffect() { return this._dropEffect; }
+    set dropEffect(v) { v = String(v); if (['none', 'copy', 'link', 'move'].indexOf(v) !== -1) this._dropEffect = v; }
+    get effectAllowed() { return this._effectAllowed; }
+    set effectAllowed(v) {
+      v = String(v);
+      if (['none', 'copy', 'copyLink', 'copyMove', 'link', 'linkMove', 'move', 'all', 'uninitialized'].indexOf(v) !== -1)
+        this._effectAllowed = v;
+    }
+    get items() { return this._items; }
+    get types() {
+      const l = _dtItems.get(this) || [];
+      const out = [];
+      for (const e of l) if (e.kind === 'string' && out.indexOf(e.type) === -1) out.push(e.type);
+      if (l.some((e) => e.kind === 'file')) out.push('Files');
+      return Object.freeze(out);
+    }
+    get files() {
+      const l = _dtItems.get(this) || [];
+      return _newFileList(l.filter((e) => e.kind === 'file').map((e) => e.file));
+    }
+    setData(format, data) {
+      if (arguments.length < 2) throw new TypeError("Failed to execute 'setData' on 'DataTransfer': 2 arguments required, but only " + arguments.length + " present.");
+      if (_dtMode.get(this) !== 'readwrite') return undefined;   // read-only: a no-op, not a throw
+      const t = _dtNormalizeType(format), l = _dtItems.get(this);
+      for (let i = 0; i < l.length; i++) if (l[i].kind === 'string' && l[i].type === t) { l.splice(i, 1); break; }
+      l.push({ kind: 'string', type: t, data: String(data), file: null });
+      return undefined;
+    }
+    getData(format) {
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'getData' on 'DataTransfer': 1 argument required, but only 0 present.");
+      if (_dtMode.get(this) === 'protected') return '';
+      const t = _dtNormalizeType(format), l = _dtItems.get(this) || [];
+      // "text/uri-list" asked for as the legacy "URL" yields only the first
+      // non-comment line — the legacy name means "one URL", not "the list".
+      for (const e of l) if (e.kind === 'string' && e.type === t) {
+        if (_asciiLower(String(format)) === 'url' && t === 'text/uri-list') {
+          for (const line of e.data.split(/\r\n|\r|\n/)) if (line && line[0] !== '#') return line;
+          return '';
+        }
+        return e.data;
+      }
+      return '';
+    }
+    clearData(format) {
+      if (_dtMode.get(this) !== 'readwrite') return undefined;   // read-only: a no-op, not a throw
+      const l = _dtItems.get(this);
+      if (format === undefined) { for (let i = l.length - 1; i >= 0; i--) if (l[i].kind === 'string') l.splice(i, 1); return undefined; }
+      const t = _dtNormalizeType(format);
+      for (let i = l.length - 1; i >= 0; i--) if (l[i].kind === 'string' && l[i].type === t) l.splice(i, 1);
+      return undefined;
+    }
+    setDragImage(image, x, y) { /* no compositor to hand a drag image to */ }
+    get [Symbol.toStringTag]() { return 'DataTransfer'; }
+  };
+  _exposeIface('DataTransfer', globalThis.DataTransfer);
+  _exposeIface('DataTransferItem', globalThis.DataTransferItem);
+  _exposeIface('DataTransferItemList', globalThis.DataTransferItemList);
+  _enumAccessors(globalThis.DataTransfer.prototype, 'dropEffect', 'effectAllowed', 'items', 'types', 'files');
+  _enumAccessors(globalThis.DataTransferItemList.prototype, 'length');
+  _enumAccessors(globalThis.DataTransferItem.prototype, 'kind', 'type');
+  // Mint the read-only DataTransfer an `insertFromPaste` event carries.
+  globalThis.__obscura_newReadOnlyDataTransfer = (entries) => {
+    const dt = new globalThis.DataTransfer();
+    for (const e of entries) dt.setData(e.type, e.data);
+    _dtMode.set(dt, 'readonly');
+    return dt;
+  };
+}
+
+// The command -> inputType table (input-events §The `inputType` attribute).
+// A command that is ABSENT here fires no `input` event at all — `copy` changes
+// nothing in the document, and `styleWithCSS` only changes how the NEXT command
+// will write. An entry present but EMPTY (`unlink`) fires the event with an empty
+// inputType, which is what every engine does: the edit happened, the spec never
+// named it.
+const _ED_INPUT_TYPES = {
+  inserttext: 'insertText',
+  insertlinebreak: 'insertLineBreak',
+  insertparagraph: 'insertParagraph',
+  inserthorizontalrule: 'insertHorizontalRule',
+  insertorderedlist: 'insertOrderedList',
+  insertunorderedlist: 'insertUnorderedList',
+  insertimage: 'insertImage',
+  inserthtml: 'insertHTML',
+  createlink: 'insertLink',
+  unlink: '',
+  delete: 'deleteContentBackward',
+  forwarddelete: 'deleteContentForward',
+  cut: 'deleteByCut',
+  paste: 'insertFromPaste',
+  bold: 'formatBold',
+  italic: 'formatItalic',
+  underline: 'formatUnderline',
+  strikethrough: 'formatStrikeThrough',
+  superscript: 'formatSuperscript',
+  subscript: 'formatSubscript',
+  backcolor: 'formatBackColor',
+  hilitecolor: 'formatBackColor',
+  forecolor: 'formatFontColor',
+  fontname: 'formatFontName',
+  fontsize: 'formatFontSize',
+  justifycenter: 'formatJustifyCenter',
+  justifyfull: 'formatJustifyFull',
+  justifyleft: 'formatJustifyLeft',
+  justifyright: 'formatJustifyRight',
+  removeformat: 'formatRemove',
+  indent: 'formatIndent',
+  outdent: 'formatOutdent',
+};
+// The CSS-wide (and editing-legacy) keywords a colour command passes through as
+// a lowercased keyword rather than a resolved colour. `reset` is not a CSS-wide
+// keyword at all — it is execCommand's own, and it survives here because the
+// commands it belongs to are older than the keyword list.
+const _ED_COLOR_KEYWORDS = ['inherit', 'initial', 'reset', 'currentcolor', 'unset', 'revert'];
+// The `data` an execCommand-originated input event carries. Most commands carry
+// none: "make this bold" has no payload beyond its own name. The ones that do are
+// the ones that took a value, and the value is reported AS THE ENGINE UNDERSTOOD
+// IT — `#FF0000` comes back `rgb(255, 0, 0)` — except when the engine understood
+// nothing, in which case it comes back verbatim rather than as a guess.
+const _edInputData = (command, value) => {
+  if (value === undefined || value === null) return null;
+  switch (command) {
+    case 'inserttext': case 'createlink': case 'fontname': case 'insertimage':
+    case 'fontsize':
+      return String(value);
+    case 'backcolor': case 'hilitecolor': case 'forecolor': {
+      const v = String(value);
+      const lower = _asciiLower(v);
+      if (_ED_COLOR_KEYWORDS.indexOf(lower) !== -1) return lower;
+      return _edNormalizeColor(v) || v;
+    }
+    default: return null;
+  }
+};
+// The event's target is the editing host — the element the author marked
+// editable — not the text node the caret happens to sit in. That is what lets one
+// listener on the box hear every edit inside it.
+const _edInputEventTarget = (doc) => {
+  const r = _edActiveRange(doc);
+  if (r) {
+    const host = _edEditingHostOf(r.startContainer);
+    if (host) return host;
+    if (_edIsEditingHost(r.startContainer)) return r.startContainer;
+  }
+  let a = null;
+  try { a = doc.activeElement; } catch (e) {}
+  return a || doc.body || doc.documentElement;
+};
+const _edStaticRangeFrom = (sc, so, ec, eo) => {
+  try { return new StaticRange({ startContainer: sc, startOffset: so, endContainer: ec, endOffset: eo }); }
+  catch (e) { return null; }
+};
+// Fire one InputEvent. Returns false only when a `beforeinput` was canceled —
+// the one answer a caller has to act on.
+const _edFireInputEvent = (type, target, init) => {
+  if (!target) return true;
+  let ev = null;
+  try {
+    ev = new InputEvent(type, {
+      bubbles: true,
+      cancelable: type === 'beforeinput',
+      composed: true,
+      inputType: init.inputType || '',
+      data: init.data === undefined ? null : init.data,
+      dataTransfer: init.dataTransfer || null,
+      isComposing: false,
+      targetRanges: init.targetRanges || [],
+    });
+  } catch (e) { return true; }
+  ev.isTrusted = true;
+  ev.target = target;
+  try { return _dispatchSpec(target, ev); } catch (e) { return true; }
+};
+
+// The clipboard execCommand sees. Quest #498 built a page-local clipboard store
+// for `navigator.clipboard`, but its entries are Blobs — asynchronous by
+// construction — and `execCommand('paste')` has to answer within one synchronous
+// call. So the cut/copy pair keeps a synchronous mirror. It is the SAME clipboard
+// in the sense that matters (writing with one API is visible to the other); it is
+// not an OS clipboard, and that cap is unchanged.
+const _edClipboard = { text: '', html: '' };
+globalThis.__obscura_setEditClipboardText = (t) => { _edClipboard.text = String(t); _edClipboard.html = ''; };
+const _edCopySelection = (doc) => {
+  const r = _edActiveRange(doc);
+  if (!r) return false;
+  let text = '';
+  try { text = String(r); } catch (e) { text = ''; }
+  let html = '';
+  try {
+    const frag = r.cloneContents();
+    const holder = doc.createElement('div');
+    holder.appendChild(frag);
+    html = holder.innerHTML;
+  } catch (e) { html = ''; }
+  _edClipboard.text = text;
+  _edClipboard.html = html;
+  return true;
+};
+_EDIT_COMMANDS.copy.action = (value, doc) => _edCopySelection(doc);
+_EDIT_COMMANDS.cut.action = _edPreserveOverrides((value, doc) => {
+  const r = _edActiveRange(doc);
+  if (!r || r.collapsed) return false;
+  _edCopySelection(doc);
+  _edDeleteSelection(doc);
+  return true;
+});
+_EDIT_COMMANDS.paste.action = _edPreserveOverrides((value, doc) => {
+  if (!_edClipboard.text && !_edClipboard.html) return false;
+  // Plain text, deliberately. Pasting the stored HTML would mean re-parsing
+  // markup from a store any script on the page can write to, and dropping it
+  // into an editable region — which is the exact shape of a self-XSS. Plain text
+  // is what the one thing we can be sure of is worth.
+  return _EDIT_COMMANDS.inserttext.action(_edClipboard.text, doc);
+});
+
 // ── The five methods ────────────────────────────────────────────────────────
 const _ED_ALWAYS_ENABLED = ['copy', 'defaultparagraphseparator', 'selectall',
   'stylewithcss', 'usecss'];
 const _edQueryEnabled = (doc, command) => {
   if (!(command in _EDIT_COMMANDS)) return false;
   if (_ED_ALWAYS_ENABLED.indexOf(command) !== -1) return true;
+  _edRecoverCaret(doc);
   const r = _edActiveRange(doc);
   // Everything else needs a selection that lives inside ONE editing host. Both
   // ends, and a common ancestor that is a host — a selection running from inside
@@ -49522,7 +50492,33 @@ const _edExecCommand = (doc, command, showUi, value) => {
   const cmd = _EDIT_COMMANDS[command];
   if (!cmd || !_edQueryEnabled(doc, command)) return false;
   if (!cmd.action) return false;                            // supported, not yet implemented here
+  // The target is read BEFORE the command runs. A command may leave the caret
+  // somewhere else entirely (a delete that merges two blocks, an outdent that
+  // lifts content out of a list), and the element that should hear about the edit
+  // is the one that OWNED it, not whichever host the caret ended up in.
+  const host = _edInputEventTarget(doc);
   const ret = cmd.action(value, doc);
+  // ⭐ execCommand fires `input` and NEVER `beforeinput`. That is not an
+  // omission — `beforeinput` exists so a page can VETO input, and this edit IS
+  // the page. There is nobody for it to ask, and firing a cancelable event the
+  // page would have to cancel to stop its own call is a loop with no purpose.
+  if (Object.prototype.hasOwnProperty.call(_ED_INPUT_TYPES, command)) {
+    let dt = null;
+    if (command === 'paste') {
+      try {
+        dt = globalThis.__obscura_newReadOnlyDataTransfer(
+          [{ type: 'text/plain', data: _edClipboard.text }]
+            .concat(_edClipboard.html ? [{ type: 'text/html', data: _edClipboard.html }] : []));
+      } catch (e) { dt = null; }
+    }
+    const target = (host && (host.isConnected !== false)) ? host : _edInputEventTarget(doc);
+    _edFireInputEvent('input', target, {
+      inputType: _ED_INPUT_TYPES[command],
+      data: _edInputData(command, value),
+      dataTransfer: dt,
+      targetRanges: [],
+    });
+  }
   return ret === true;
 };
 const _edQueryIndeterm = (doc, command) => {
@@ -49586,6 +50582,413 @@ const _edQueryValue = (doc, command) => {
   });
   define('queryCommandValue', 1, function (command) { return _edQueryValue(this, command); });
 }
+
+// ── The keyboard: what a key MEANS inside an editable box ───────────────────
+//
+// Until now a keystroke inside a `contenteditable` did nothing whatsoever. The
+// engine dispatched `keydown` and `keyup` faithfully and then stopped, because
+// the UA half — the DEFAULT ACTION of a key inside an editing host — had never
+// been written. A page could hear the key and could not see the letter, which is
+// worse than either alone: an editor that implements its own handling works, and
+// one that relies on the browser gets an empty box that looks like it is working.
+//
+// This is where `beforeinput` earns its keep. The sequence is exactly:
+//   keydown → beforeinput (cancelable, carries getTargetRanges) → the edit →
+//   input (not cancelable, no ranges) → keyup
+// and cancelling `beforeinput` stops the edit while leaving the keydown alone,
+// which is the whole point: the page said "not that edit", not "not that key".
+
+// Is this leaf something a reader can actually see? A text node of collapsed
+// whitespace is not — and Backspace must delete a CHARACTER, not the invisible
+// space between two tags that the author never typed.
+const _edIsVisibleLeaf = (n) => {
+  if (!n) return false;
+  if (n.nodeType === 3) return n.data.length > 0 && !_edIsCollapsedWhitespaceNode(n);
+  if (n.nodeType !== 1) return false;
+  if (_edIsHtmlEl(n, ['br', 'img', 'hr', 'input', 'textarea', 'select', 'video', 'audio', 'object', 'embed', 'iframe', 'canvas', 'svg', 'math', 'button'])) return true;
+  return false;
+};
+const _edDeepestLast = (n) => { while (n && n.lastChild) n = n.lastChild; return n; };
+const _edDeepestFirst = (n) => { while (n && n.firstChild) n = n.firstChild; return n; };
+// The last visible leaf strictly BEFORE a boundary point, without leaving the
+// editing host. Returns null when there is nothing there — and null is an answer
+// the caller must honour by firing NO events at all: Backspace at the very start
+// of a box has not "deleted nothing", it has not been an edit.
+// ⚠️ `_edPreviousNode` ALREADY DESCENDS to the deepest last descendant — it is
+// "the previous node in tree order", not "the previous sibling". Descending again
+// after calling it walks straight back to where you started, which is a loop that
+// terminates only on the guard and reports "there is nothing before this caret"
+// for the single most common case there is: the start of a paragraph that has
+// another paragraph above it.
+const _edLeafBefore = (node, offset, host) => {
+  let cur;
+  if (node.nodeType === 3 && offset > 0) return node;
+  if (node.nodeType === 1 && offset > 0) cur = _edDeepestLast(node.childNodes[offset - 1]);
+  else cur = _edPreviousNode(node);
+  let guard = 0;
+  while (cur && guard++ < 5000) {
+    if (cur !== host && !_edIsDescendant(cur, host)) return null;
+    if (cur !== node && _edIsVisibleLeaf(cur)) return cur;
+    cur = _edPreviousNode(cur);
+  }
+  return null;
+};
+const _edLeafAfter = (node, offset, host) => {
+  let cur;
+  if (node.nodeType === 3 && offset < node.data.length) return node;
+  if (node.nodeType === 1 && offset < node.childNodes.length) cur = _edDeepestFirst(node.childNodes[offset]);
+  else cur = _edNextNodeDescendants(node);
+  let guard = 0;
+  while (cur && guard++ < 5000) {
+    if (cur !== host && !_edIsDescendant(cur, host)) return null;
+    if (cur !== node && _edIsVisibleLeaf(cur)) return cur;
+    cur = _edNextNode(cur);
+  }
+  return null;
+};
+// ⭐⭐ DELETING THE LAST CHARACTER OF A WRAPPER DELETES THE WRAPPER. `<span>b</span>`
+// with the `b` gone is not an empty span the reader can see — it is nothing, and
+// leaving it behind is how a document accumulates a thousand empty tags over a
+// week of editing (the "why is this email 2 MB" bug, one keystroke at a time).
+// So the target range grows outward over every INLINE ancestor the deletion would
+// empty. The END is grown FIRST and the START measured against the grown end,
+// because each step of the start's growth has to ask "is the rest of this element
+// inside the range?" — and after the end has moved, more of it is.
+const _edGrowOverEmptied = (sc, so, ec, eo, host) => {
+  let guard = 0;
+  while (guard++ < 200) {
+    if (ec === host || _edIsBlock(ec) || !ec.parentNode || !_edIsDescendant(ec, host)) break;
+    if (eo !== _edNodeLength(ec)) break;
+    const idx = _edNodeIndex(ec);
+    ec = ec.parentNode; eo = idx + 1;
+  }
+  guard = 0;
+  while (guard++ < 200) {
+    if (sc === host || _edIsBlock(sc) || !sc.parentNode || !_edIsDescendant(sc, host)) break;
+    if (so !== 0) break;
+    const pos = _edGetPosition(ec, eo, sc, _edNodeLength(sc));
+    if (pos !== 'after' && pos !== 'equal') break;    // the rest of it survives
+    const idx = _edNodeIndex(sc);
+    sc = sc.parentNode; so = idx;
+  }
+  return [sc, so, ec, eo];
+};
+// A leaf's own two edges, as boundary points: a text node is measured in
+// characters, everything else in its parent's child list.
+const _edLeafStartPoint = (n) => n.nodeType === 3 ? [n, 0] : [n.parentNode, _edNodeIndex(n)];
+const _edLeafEndPoint = (n) => n.nodeType === 3 ? [n, n.data.length] : [n.parentNode, _edNodeIndex(n) + 1];
+// ⭐⭐ THE TARGET RANGE OF A DELETION IS NOT ALWAYS A CHARACTER. Three shapes,
+// and the third is the one everybody forgets:
+//   1. a selection      -> itself, verbatim
+//   2. a character      -> one code point, combining marks and surrogate halves
+//                          travelling with the character they belong to
+//   3. a BLOCK BOUNDARY -> the empty span between the end of one block and the
+//                          start of the next. Nothing is inside it. Deleting it
+//                          is a MERGE, and the range says so by being empty of
+//                          content while spanning two different parents.
+// ⭐⭐ A SELECTION IS NOT ALWAYS ONE TARGET RANGE. Drag across a widget the author
+// marked `contenteditable="false"` — an embedded map, a mention chip, a signature
+// block — and the selection spans it, but the deletion CANNOT: that island is not
+// yours to remove. What is about to be deleted is the editable text on either
+// side, which is TWO ranges with a hole in the middle, and saying so is the only
+// way an editor can reproduce the edit itself. Reporting the whole selection
+// would be telling the page the widget is about to be destroyed when it is not.
+const _edEditableSubRanges = (r) => {
+  const out = [];
+  const stop = _edNextNodeDescendants(r.endContainer);
+  let guard = 0;
+  for (let n = r.startContainer; n && n !== stop && guard++ < 20000; n = _edNextNode(n)) {
+    if (n.nodeType !== 3 || !_edIsEditable(n)) continue;
+    const s = (n === r.startContainer) ? r.startOffset : 0;
+    const e = (n === r.endContainer) ? r.endOffset : n.data.length;
+    if (e <= s) continue;
+    if (_edGetPosition(n, e, r.startContainer, r.startOffset) === 'before') continue;
+    const host = _edEditingHostOf(n);
+    const last = out.length ? out[out.length - 1] : null;
+    // Runs inside ONE editing host are one range; a new host starts a new one.
+    if (last && last.host === host) { last.ec = n; last.eo = e; }
+    else out.push({ host: host, sc: n, so: s, ec: n, eo: e });
+  }
+  return out;
+};
+const _edDeletionTargetRange = (doc, forward) => {
+  const r = _edActiveRange(doc);
+  if (!r) return null;
+  if (!r.collapsed) return [r.startContainer, r.startOffset, r.endContainer, r.endOffset];
+  const node = r.startContainer, offset = r.startOffset;
+  const host = _edEditingHostOf(node) || (_edIsEditingHost(node) ? node : null);
+  if (!host) return null;
+  if (!forward) {
+    if (node.nodeType === 3 && offset > 0) {
+      const d = node.data;
+      let start = offset - 1;
+      const lo = d.charCodeAt(start);
+      if (start > 0 && lo >= 0xDC00 && lo <= 0xDFFF) {
+        const hi = d.charCodeAt(start - 1);
+        if (hi >= 0xD800 && hi <= 0xDBFF) start--;
+      }
+      while (start > 0 && _ED_COMBINING_MARK.test(d[start])) start--;
+      return _edGrowOverEmptied(node, start, node, offset, host);
+    }
+    const prev = _edLeafBefore(node, offset, host);
+    if (!prev) return null;
+    const sameBlock = _edBlockAncestorFor(prev) === _edBlockAncestorFor(node);
+    if (!sameBlock) {
+      // A block merge. What gets removed is the boundary between the two blocks —
+      // unless the block above ends in a <br>, in which case the <br> is what the
+      // keystroke actually eats, so the range starts BEFORE it, not after.
+      const p = _edIsHtmlEl(prev, 'br')
+        ? [prev.parentNode, _edNodeIndex(prev)]
+        : _edLeafEndPoint(prev);
+      return _edGrowOverEmptied(p[0], p[1], node, offset, host);
+    }
+    if (prev.nodeType === 3) {
+      const d = prev.data;
+      let start = d.length - 1;
+      const lo = d.charCodeAt(start);
+      if (start > 0 && lo >= 0xDC00 && lo <= 0xDFFF) {
+        const hi = d.charCodeAt(start - 1);
+        if (hi >= 0xD800 && hi <= 0xDBFF) start--;
+      }
+      while (start > 0 && _ED_COMBINING_MARK.test(d[start])) start--;
+      return _edGrowOverEmptied(prev, start, node.nodeType === 3 && offset === 0 ? node : prev,
+        node.nodeType === 3 && offset === 0 ? offset : d.length, host);
+    }
+    return _edGrowOverEmptied(prev.parentNode, _edNodeIndex(prev), prev.parentNode, _edNodeIndex(prev) + 1, host);
+  }
+  if (node.nodeType === 3 && offset < node.data.length) {
+    const d = node.data;
+    let end = offset + 1;
+    const hi = d.charCodeAt(offset);
+    if (end < d.length && hi >= 0xD800 && hi <= 0xDBFF) {
+      const lo = d.charCodeAt(end);
+      if (lo >= 0xDC00 && lo <= 0xDFFF) end++;
+    }
+    while (end < d.length && _ED_COMBINING_MARK.test(d[end])) end++;
+    return _edGrowOverEmptied(node, offset, node, end, host);
+  }
+  const next = _edLeafAfter(node, offset, host);
+  if (!next) return null;
+  const sameBlock = _edBlockAncestorFor(next) === _edBlockAncestorFor(node);
+  if (!sameBlock) {
+    const p = _edIsHtmlEl(next, 'br')
+      ? [next.parentNode, _edNodeIndex(next) + 1]
+      : _edLeafStartPoint(next);
+    return _edGrowOverEmptied(node, offset, p[0], p[1], host);
+  }
+  if (next.nodeType === 3) {
+    const d = next.data;
+    let end = 1;
+    const hi = d.charCodeAt(0);
+    if (end < d.length && hi >= 0xD800 && hi <= 0xDBFF) {
+      const lo = d.charCodeAt(end);
+      if (lo >= 0xDC00 && lo <= 0xDFFF) end++;
+    }
+    while (end < d.length && _ED_COMBINING_MARK.test(d[end])) end++;
+    return _edGrowOverEmptied(node.nodeType === 3 && offset === node.data.length ? node : next,
+      node.nodeType === 3 && offset === node.data.length ? offset : 0, next, end, host);
+  }
+  return _edGrowOverEmptied(next.parentNode, _edNodeIndex(next), next.parentNode, _edNodeIndex(next) + 1, host);
+};
+
+// A key that a modifier turns into a bigger deletion. The names are the
+// input-events spec's; the WORK is still one delete, because "delete the word"
+// and "delete the character" differ in how much they take, not in what they are.
+// ⭐ A MODIFIER ONLY CHANGES THE GRANULARITY WHEN THERE IS NOTHING SELECTED.
+// Ctrl+Backspace means "delete the word behind the caret" — but if text is
+// already selected, the selection has said exactly what to delete and there is no
+// word to reach for. Reporting `deleteWordBackward` there would tell the page a
+// different edit than the one about to happen.
+const _edDeleteInputType = (forward, e, collapsed) => {
+  if (collapsed) {
+    if (e.ctrlKey || e.altKey) return forward ? 'deleteWordForward' : 'deleteWordBackward';
+    if (e.metaKey) return forward ? 'deleteSoftLineForward' : 'deleteSoftLineBackward';
+  }
+  return forward ? 'deleteContentForward' : 'deleteContentBackward';
+};
+// Run one key's worth of editing on a rich (contenteditable) host.
+const _edRichKey = (doc, e) => {
+  const key = e.key;
+  const host = _edInputEventTarget(doc);
+  if (!host) return;
+  let command = null, inputType = null, data = null, ranges = [];
+  const active = _edActiveRange(doc);
+  if (!active) return;
+  if (key === 'Backspace' || key === 'Delete') {
+    const forward = key === 'Delete';
+    // ⭐ A DELETION KEY WITH NOTHING TO DELETE STILL ANNOUNCES ITSELF. Backspace
+    // at the very start of a box is a real keystroke with a real intent, and the
+    // page is entitled to hear it and act on it (that is how a comment box merges
+    // itself into the one above, or refuses to). What it gets is a beforeinput
+    // carrying the COLLAPSED caret — an empty range, which says precisely "this is
+    // where you are and there is nothing behind you". The `input` event afterwards
+    // is the one that must not lie: it fires only if the document actually changed.
+    command = forward ? 'forwarddelete' : 'delete';
+    inputType = _edDeleteInputType(forward, e, active.collapsed);
+    if (!active.collapsed && !_edInSameEditingHost(active.startContainer, active.endContainer)) {
+      // The selection leaves the host it started in: report the editable pieces.
+      // ⭐ And the input type becomes `deleteContent` — WITHOUT a direction. The
+      // direction of a Backspace describes where the caret was going; once the
+      // deletion is "these islands of editable text, wherever they are", there is
+      // no direction left to describe, and claiming one would be inventing it.
+      inputType = 'deleteContent';
+      for (const sub of _edEditableSubRanges(active)) {
+        const sr2 = _edStaticRangeFrom(sub.sc, sub.so, sub.ec, sub.eo);
+        if (sr2) ranges.push(sr2);
+      }
+    } else {
+      const t = _edDeletionTargetRange(doc, forward);
+      const sr = t ? _edStaticRangeFrom(t[0], t[1], t[2], t[3])
+                   : _edStaticRangeFrom(active.startContainer, active.startOffset,
+                                        active.startContainer, active.startOffset);
+      if (sr) ranges = [sr];
+    }
+  } else if (key === 'Enter') {
+    command = e.shiftKey ? 'insertlinebreak' : 'insertparagraph';
+    inputType = e.shiftKey ? 'insertLineBreak' : 'insertParagraph';
+    const sr = _edStaticRangeFrom(active.startContainer, active.startOffset, active.endContainer, active.endOffset);
+    if (sr) ranges = [sr];
+  } else if (key && key.length === 1 && !e.ctrlKey && !e.metaKey) {
+    // `key.length === 1` is the honest test for "this key produced a character":
+    // every named key ("Shift", "ArrowLeft", "F5") is longer, and every character
+    // in the Basic Multilingual Plane is exactly one UTF-16 unit.
+    command = 'inserttext'; inputType = 'insertText'; data = key;
+    const sr = _edStaticRangeFrom(active.startContainer, active.startOffset, active.endContainer, active.endOffset);
+    if (sr) ranges = [sr];
+  } else {
+    return;
+  }
+  if (!_edFireInputEvent('beforeinput', host, { inputType: inputType, data: data, targetRanges: ranges }))
+    return;                                // the page vetoed this edit; the key still happened
+  // ⭐ `input` MEANS THE DOCUMENT CHANGED, so the only honest test is to look. A
+  // command's return value says "I ran", not "I altered something" — Backspace at
+  // a boundary runs the whole algorithm and correctly does nothing — and a page
+  // told its content changed will re-serialise, re-validate, mark itself dirty
+  // and enable its Save button over a keystroke that moved not one character.
+  let before = null;
+  try { before = host.innerHTML; } catch (err) { before = null; }
+  try { _EDIT_COMMANDS[command].action(data === null ? '' : data, doc); }
+  catch (err) { /* a failed command is not an edit */ }
+  let after = null;
+  try { after = host.innerHTML; } catch (err) { after = null; }
+  if (before === null || after === null || before === after) return;
+  _edFireInputEvent('input', host, { inputType: inputType, data: data, targetRanges: [] });
+};
+
+// ── The same keys in a plain text control ───────────────────────────────────
+// `<input>` and `<textarea>` are not editing hosts and have no DOM inside them,
+// so none of the above applies — but they fire the SAME two events, because a
+// page listening for `input` on a form field must not have to care which kind of
+// box it is watching. This is a value string and a caret, and that is all.
+const _EDIT_TEXTCONTROL_TYPES = ['text', 'search', 'tel', 'url', 'password', 'email', 'number'];
+const _edIsTextControl = (el) => {
+  if (!el || el.nodeType !== 1) return false;
+  const ln = _asciiLower(el.localName || '');
+  if (ln === 'textarea') return true;
+  if (ln !== 'input') return false;
+  const t = _asciiLower(el.getAttribute('type') || 'text');
+  return _EDIT_TEXTCONTROL_TYPES.indexOf(t) !== -1;
+};
+const _edTextControlKey = (el, e) => {
+  const key = e.key;
+  const isArea = _asciiLower(el.localName || '') === 'textarea';
+  let value = '';
+  try { value = String(el.value == null ? '' : el.value); } catch (err) { return; }
+  // Not every text control exposes the selection API (`number` and `email` are
+  // excluded by HTML on purpose). Where it is absent the caret is the end of the
+  // value, which is where a freshly focused field puts it anyway.
+  let start = null, end = null;
+  try { start = el.selectionStart; end = el.selectionEnd; } catch (err) { start = null; }
+  if (typeof start !== 'number') { start = value.length; end = value.length; }
+  if (typeof end !== 'number') end = start;
+  let inputType = null, data = null, nextValue = null, caret = start;
+  if (key === 'Backspace') {
+    if (start !== end) { nextValue = value.slice(0, start) + value.slice(end); caret = start; }
+    else if (start > 0) { nextValue = value.slice(0, start - 1) + value.slice(start); caret = start - 1; }
+    else return;
+    inputType = _edDeleteInputType(false, e, start === end);
+  } else if (key === 'Delete') {
+    if (start !== end) { nextValue = value.slice(0, start) + value.slice(end); caret = start; }
+    else if (start < value.length) { nextValue = value.slice(0, start) + value.slice(start + 1); caret = start; }
+    else return;
+    inputType = _edDeleteInputType(true, e, start === end);
+  } else if (key === 'Enter') {
+    // A single-line field has nowhere to put a newline — Enter there submits the
+    // form, which is not an edit and must not claim to be one.
+    if (!isArea) return;
+    nextValue = value.slice(0, start) + '\n' + value.slice(end);
+    caret = start + 1; inputType = 'insertLineBreak';
+  } else if (key && key.length === 1 && !e.ctrlKey && !e.metaKey) {
+    nextValue = value.slice(0, start) + key + value.slice(end);
+    caret = start + key.length; inputType = 'insertText'; data = key;
+  } else {
+    return;
+  }
+  const sr = _edStaticRangeFrom(el, 0, el, 0);
+  if (!_edFireInputEvent('beforeinput', el, { inputType: inputType, data: data, targetRanges: sr ? [sr] : [] }))
+    return;
+  try { el.value = nextValue; } catch (err) { return; }
+  try { if (typeof el.setSelectionRange === 'function') el.setSelectionRange(caret, caret); } catch (err) {}
+  _edFireInputEvent('input', el, { inputType: inputType, data: data, targetRanges: [] });
+};
+
+// Insert a run of text at the caret exactly as typing it would — the entry point
+// for CDP's `Input.dispatchKeyEvent` with type `char`, and for anything else that
+// knows WHAT was typed but not WHICH KEY produced it (an IME commit, a paste from
+// a driver, a virtual keyboard). One implementation, so text lands at the caret
+// and fires the same two events no matter how it arrived.
+globalThis.__obscuraTypeText = (text) => {
+  const s = String(text == null ? '' : text);
+  if (!s) return;
+  let doc = null;
+  try { doc = document; } catch (e) { return; }
+  if (!doc) return;
+  let el = null;
+  try { el = doc.activeElement; } catch (e) { el = null; }
+  const fake = { key: '', ctrlKey: false, metaKey: false, altKey: false, shiftKey: false };
+  if (_edIsTextControl(el)) { for (const ch of s) _edTextControlKey(el, { ...fake, key: ch }); return; }
+  if (!_edStartIsEditable(doc)) return;
+  for (const ch of s) _edRichKey(doc, { ...fake, key: ch });
+};
+
+globalThis._edFocusEditingHost = (el) => {
+  if (!el || el.nodeType !== 1) return;
+  if (!(_edIsEditingHost(el) || _edIsEditable(el))) return;
+  const doc = el.ownerDocument;
+  if (!doc) return;
+  let sel = null;
+  try { sel = doc.getSelection(); } catch (e) { return; }
+  if (!sel) return;
+  // A selection ALREADY inside the box is left exactly where it is — the user
+  // clicked there on purpose, and moving it to the start would undo the click.
+  if (sel.rangeCount) {
+    let r = null;
+    try { r = sel.getRangeAt(0); } catch (e) { r = null; }
+    if (r && r.startContainer && (r.startContainer === el || _edIsDescendant(r.startContainer, el))) return;
+  }
+  _edCollapseToStartOf(doc, el);
+};
+
+// The one entry point, installed as a bubble-phase document listener so it runs
+// AFTER every listener the page registered on the target — which is what makes
+// `event.preventDefault()` in a page handler actually prevent the edit.
+globalThis._installEditingKeys = () => {
+  try {
+    document.addEventListener('keydown', (e) => {
+      if (!e || !(e.isTrusted || globalThis.__obscura_trusted_input)) return;
+      if (e.defaultPrevented) return;
+      let doc = null;
+      try { doc = (e.target && e.target.ownerDocument) || document; } catch (err) { doc = document; }
+      if (!doc) return;
+      let el = null;
+      try { el = doc.activeElement; } catch (err) { el = null; }
+      if (_edIsTextControl(el)) { _edTextControlKey(el, e); return; }
+      _edRecoverCaret(doc);
+      if (_edStartIsEditable(doc)) _edRichKey(doc, e);
+    }, false);
+  } catch (e) {}
+};
+// ===== INPUT-EVENTS-END =====
 // ===== EDITING-ENGINE-END =====
 
 // AbstractRange / StaticRange (DOM). A StaticRange is a range that does NOT move
@@ -73947,6 +75350,7 @@ globalThis.__obscura_init = function() {
   try { globalThis._installPopoverLightDismiss && globalThis._installPopoverLightDismiss(); } catch (e) {}
   try { globalThis._installInvokerActivation && globalThis._installInvokerActivation(); } catch (e) {}
   try { globalThis._installClickFocus && globalThis._installClickFocus(); } catch (e) {}
+  try { globalThis._installEditingKeys && globalThis._installEditingKeys(); } catch (e) {}
 
   const scr = _fp('screen');
   const sw = scr[0], sh = scr[1];

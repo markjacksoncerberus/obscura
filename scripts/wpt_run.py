@@ -220,8 +220,16 @@ TESTDRIVER_BRIDGE_JS = r"""
       shiftKey: _kbdMods.shiftKey, ctrlKey: _kbdMods.ctrlKey,
       altKey: _kbdMods.altKey, metaKey: _kbdMods.metaKey}); }
     catch (e) { return; }
+    // Mark injected keys as trusted for the dispatch's duration, exactly as the
+    // mouse path does. A real WebDriver key produces an isTrusted event, and the
+    // UA behaviour gated on trust — the editing default action that turns a
+    // keystroke into a character — must fire. Without this the engine dispatches
+    // the key faithfully and then declines to act on it, which reads as "typing
+    // does nothing" and is indistinguishable from a missing feature.
+    var _pt = globalThis.__obscura_trusted_input; globalThis.__obscura_trusted_input = true;
     var notPrevented = true;
     try { notPrevented = target.dispatchEvent(ev); } catch (e) {}
+    globalThis.__obscura_trusted_input = _pt;
     if (type !== 'keydown' || !notPrevented) return;
     // A trusted Escape keydown is a "close request": run the UA algorithm unless a
     // listener (e.g. a focused text field) cancels it. Mirrors the CDP Input path.

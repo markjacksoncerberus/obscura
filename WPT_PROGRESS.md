@@ -62,6 +62,35 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **THE INTENDED, DECLARED & REPORTED ARC — Quests #517–#519 (2026-08-08): TWO untouched realms opened** | — | — | ✅ | #517–#519 |
+| **`input-events` — Quest #517, whole realm, 33 probe entries** | **180/3,240** | **1,805/2,978 — 17 files improved, 0 regressions** | ✅ realm opened | #517 · [`tickets/118-the-intended-verdict.md`](tickets/118-the-intended-verdict.md) |
+| `input-events/input-events-exec-command.html` | 123/195 | **290/305** | ✅ | #517 |
+| `input-events/input-events-delete-selection.html` | 0/6 | **6/6** | ✅ | #517 |
+| `input-events/…get-target-ranges-during-and-after-dispatch.tentative` | 0/3 | **3/3** | ✅ | #517 |
+| `input-events/…get-target-ranges-backspace.tentative` | 16/161 | **99/161** | 🟡 | #517 |
+| `input-events/…get-target-ranges-forwarddelete.tentative` | 20/176 | **74/158** | 🟡 TIMEOUT (layout not incremental) | #517 |
+| `input-events/…joining-dl-elements.tentative?Backspace` | 0/440 | **177/340** | 🟡 | #517 |
+| `input-events/…joining-dl-elements.tentative?Delete` | 0/440 | **195/338** | 🟡 | #517 |
+| `input-events/…joining-dl-element-and-another-list.tentative?Backspace` | 0/144 | **100/144** | 🟡 | #517 |
+| `input-events/…joining-dl-element-and-another-list.tentative?Delete` | 0/152 | **128/152** | 🟡 | #517 |
+| `input-events/…deleting-in-list-items.tentative?Backspace,ul` | 0/316 | **151/286** | 🟡 | #517 |
+| `input-events/…deleting-in-list-items.tentative?Backspace,ol` | 0/316 | **148/284** | 🟡 | #517 |
+| `input-events/…deleting-in-list-items.tentative?Delete,ul` | 0/316 | **128/269** | 🟡 | #517 |
+| `input-events/…deleting-in-list-items.tentative?Delete,ol` | 0/316 | **132/273** | 🟡 | #517 |
+| `input-events/…non-collapsed-selection.tentative?Backspace` | 1/70 | **52/70** | 🟡 | #517 |
+| `input-events/…non-collapsed-selection.tentative?Delete` | 1/70 | **52/70** | 🟡 | #517 |
+| `input-events/…non-collapsed-selection.tentative?TypingA` | 1/70 | **49/70** | 🟡 | #517 |
+| `input-events/input-events-typing.html` | 0/13 | **4/13** | 🟡 elementFromPoint on inline (issue #63) | #517 |
+| **`content-security-policy` — Quests #518–#519, 106-file probe** | **88/219** | **141/279 — 26 files improved, could-not-run 19 → 3, 0 regressions** | ✅ realm opened | #518–#519 · [`tickets/119-the-declared-verdict.md`](tickets/119-the-declared-verdict.md) · [`tickets/120-the-reported-verdict.md`](tickets/120-the-reported-verdict.md) |
+| `content-security-policy/securitypolicyviolation/constructor-required-fields.html` | 0/14 | **13/14** | ✅ | #519 |
+| `content-security-policy/script-src-attr-elem/script-src-elem-allowed-attr-blocked.html` | could-not-run | **2/2** | ✅ | #518 |
+| `content-security-policy/script-src-attr-elem/script-src-elem-blocked-attr-allowed.html` | could-not-run | **2/2** | ✅ | #518 |
+| `content-security-policy/generic/inline-style-allowed-while-cloning-objects.sub.html` | could-not-run | **19/25** | 🟡 | #518 |
+| `content-security-policy/img-src/img-src-none-blocks-data-uri.html` | 0/1 | **1/1** | ✅ | #519 |
+| `content-security-policy/img-src/img-src-full-host-wildcard-blocked.sub.html` | 0/1 | **1/1** | ✅ | #519 |
+| `content-security-policy/meta/meta-img-src.html` | 0/1 | **1/1** | ✅ | #519 |
+| `content-security-policy/meta/meta-modified.html` | 0/1 | **1/1** | ✅ | #518 |
+| `content-security-policy/script-src/script-src-1_1.html` | 0/3 | **2/3** | 🟡 | #518 |
 | **THE EDITING ARC — Quests #514–#516 (2026-08-08), whole realm, 43 files** | **7,538/96,682** | **94,468/96,682 (97.7%) — every file improved, 0 regressions** | ✅ | #514–#516 |
 | **the commanded — Quest #514 (2026-08-08)** | `execCommand(){return false}`; the five `queryCommand*` methods **did not exist**; **`getComputedStyle(x).display` was `block` for EVERY element** | a real UA stylesheet + the editing engine's read paths | ✅ realm opened | #514 · [`tickets/115-the-commanded-verdict.md`](tickets/115-the-commanded-verdict.md) |
 | `editing/run/*` — after #514 (read paths) | 7,538/96,682 | **77,803/96,682** | ✅ | #514 |

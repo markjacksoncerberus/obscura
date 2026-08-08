@@ -341,50 +341,56 @@ pub async fn handle(
                         page.evaluate(js);
                     }
                     "keyDown" | "rawKeyDown" => {
+                        // ⭐ THE KEY IS DISPATCHED TRUSTED AND THE ENGINE DOES THE EDITING.
+                        //
+                        // This block used to do its own: it appended `text` to the end of
+                        // an <input>/<textarea>'s value and made Backspace chop the LAST
+                        // character off — both ignoring the caret and any selection
+                        // entirely, so an agent filling a form typed at the end of the
+                        // field no matter where the caret was, and every correction
+                        // deleted the wrong character. It fired a bare `Event('input')`,
+                        // so `e.inputType` was undefined and `e instanceof InputEvent`
+                        // false; it fired even when the page had preventDefault()ed the
+                        // keydown; and it did nothing at all inside a contenteditable.
+                        //
+                        // All of that now lives in one place — the engine's editing
+                        // default action, the same one WPT's key bridge reaches — and the
+                        // trusted-input flag is what lets it run. One implementation, so a
+                        // key means the same thing however it arrived.
+                        let key_js = if key.is_empty() && text.chars().count() == 1 {
+                            text.to_string()
+                        } else {
+                            key.to_string()
+                        };
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:'{key}',code:'{code}'}});\
-                                target.dispatchEvent(evt);\
+                                var evt = new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,composed:true,key:'{key}',code:'{code}'}});\
+                                var _pt = globalThis.__obscura_trusted_input;\
+                                globalThis.__obscura_trusted_input = true;\
+                                var notPrevented = true;\
+                                try {{ notPrevented = target.dispatchEvent(evt); }} catch (e) {{}}\
+                                globalThis.__obscura_trusted_input = _pt;\
+                                return notPrevented;\
                             }})()",
-                            key = key.replace('\'', "\\'"),
-                            code = code.replace('\'', "\\'"),
+                            key = key_js.replace('\\', "\\\\").replace('\'', "\\'"),
+                            code = code.replace('\\', "\\\\").replace('\'', "\\'"),
                         );
                         page.evaluate(&js);
 
-                        if !text.is_empty() && text != "\r" && text != "\n" {
-                            let js = format!(
-                                "(function() {{\
-                                    var target = document.activeElement;\
-                                    if (target && (target.localName === 'input' || target.localName === 'textarea')) {{\
-                                        target.value = (target.value || '') + '{text}';\
-                                        target.dispatchEvent(new Event('input', {{bubbles:true}}));\
-                                    }}\
-                                }})()",
-                                text = text.replace('\'', "\\'").replace('\\', "\\\\"),
-                            );
-                            page.evaluate(&js);
-                        }
-
                         if key == "Enter" {
+                            // Enter's OTHER default action: implicit form submission. A
+                            // <textarea> and an editing host both consume Enter as a line
+                            // break, so submitting there would throw away what the person
+                            // was writing.
                             let js = "(function() {\
                                 var target = document.activeElement;\
-                                if (target) {\
-                                    target.dispatchEvent(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'}));\
-                                    var form = target.form || target.closest && target.closest('form');\
-                                    if (form && typeof form.submit === 'function') form.submit();\
-                                }\
-                            })()";
-                            page.evaluate(js);
-                        }
-
-                        if key == "Backspace" {
-                            let js = "(function() {\
-                                var target = document.activeElement;\
-                                if (target && (target.localName === 'input' || target.localName === 'textarea')) {\
-                                    target.value = target.value.slice(0, -1);\
-                                    target.dispatchEvent(new Event('input', {bubbles:true}));\
-                                }\
+                                if (!target) return;\
+                                target.dispatchEvent(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter'}));\
+                                if (target.localName === 'textarea') return;\
+                                if (target.isContentEditable) return;\
+                                var form = target.form || (target.closest && target.closest('form'));\
+                                if (form && typeof form.submit === 'function') form.submit();\
                             })()";
                             page.evaluate(js);
                         }
@@ -402,16 +408,21 @@ pub async fn handle(
                         page.evaluate(&js);
                     }
                     "char" => {
+                        // A `char` event says "this text was typed" without naming a key.
+                        // It goes through the same insertion the engine uses for a
+                        // keystroke, so it lands AT THE CARET, replaces the selection, and
+                        // fires beforeinput/input like everything else.
                         if !text.is_empty() {
                             let js = format!(
                                 "(function() {{\
-                                    var target = document.activeElement;\
-                                    if (target && (target.localName === 'input' || target.localName === 'textarea')) {{\
-                                        target.value = (target.value || '') + '{text}';\
-                                        target.dispatchEvent(new Event('input', {{bubbles:true}}));\
-                                    }}\
+                                    if (typeof globalThis.__obscuraTypeText === 'function')\
+                                        globalThis.__obscuraTypeText('{text}');\
                                 }})()",
-                                text = text.replace('\'', "\\'").replace('\\', "\\\\"),
+                                text = text
+                                    .replace('\\', "\\\\")
+                                    .replace('\'', "\\'")
+                                    .replace('\n', "\\n")
+                                    .replace('\r', "\\r"),
                             );
                             page.evaluate(&js);
                         }

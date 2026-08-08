@@ -384,3 +384,17 @@ editing/run/misc.html
 editing/run/outdent.html
 editing/run/removeformat.html
 editing/run/unlink.html
+
+# --- Quests #517-#519 guards (input-events + content-security-policy) ---
+# input-events: the two that complete fast and cover both the execCommand path
+# and the key-driven path. The big get-target-ranges files are DELIBERATELY not
+# here — they time out on the layout cap and would make every ritual pass lie.
+/input-events/input-events-exec-command.html
+/input-events/input-events-delete-selection.html
+/input-events/idlharness.window.html
+# CSP: one file per enforcement surface, so a regression names its own gate.
+/content-security-policy/script-src/script-src-1_1.html
+/content-security-policy/script-src-attr-elem/script-src-elem-allowed-attr-blocked.html
+/content-security-policy/img-src/img-src-none-blocks-data-uri.html
+/content-security-policy/meta/meta-outside-head.sub.html
+/content-security-policy/securitypolicyviolation/constructor-required-fields.html

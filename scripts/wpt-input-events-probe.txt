@@ -1,0 +1,38 @@
+# input-events realm probe (quest #517).
+# ⚠️ Four files carry <meta name="variant">; wptrunner runs each variant as its
+# own test and the page THROWS "Unhandled variant" without the query string, so
+# the bare path scores 0 for a reason that has nothing to do with the engine.
+# scripts/wpt_run.py does not expand variants — the expansion is written out here.
+/input-events/contenteditable-insertfrompaste-type-inputevent-data.html
+/input-events/input-events-arrow-key-on-number-input-delete-document.html
+/input-events/input-events-arrow-key-on-number-input-prevent-default.html
+/input-events/input-events-arrow-key-on-number-input.html
+/input-events/input-events-cut-paste.html
+/input-events/input-events-delete-selection.html
+/input-events/input-events-exec-command.html
+/input-events/input-events-get-target-ranges-backspace.tentative.html
+/input-events/input-events-get-target-ranges-deleting-in-list-items.tentative.html?Backspace,ul
+/input-events/input-events-get-target-ranges-deleting-in-list-items.tentative.html?Backspace,ol
+/input-events/input-events-get-target-ranges-deleting-in-list-items.tentative.html?Delete,ul
+/input-events/input-events-get-target-ranges-deleting-in-list-items.tentative.html?Delete,ol
+/input-events/input-events-get-target-ranges-deleting-range-across-editing-host-boundaries.tentative.html
+/input-events/input-events-get-target-ranges-during-and-after-dispatch.tentative.html
+/input-events/input-events-get-target-ranges-forwarddelete.tentative.html
+/input-events/input-events-get-target-ranges-joining-dl-element-and-another-list.tentative.html?Backspace
+/input-events/input-events-get-target-ranges-joining-dl-element-and-another-list.tentative.html?Delete
+/input-events/input-events-get-target-ranges-joining-dl-elements.tentative.html?Backspace
+/input-events/input-events-get-target-ranges-joining-dl-elements.tentative.html?Delete
+/input-events/input-events-get-target-ranges-non-collapsed-selection.tentative.html?Backspace
+/input-events/input-events-get-target-ranges-non-collapsed-selection.tentative.html?Delete
+/input-events/input-events-get-target-ranges-non-collapsed-selection.tentative.html?TypingA
+/input-events/input-events-get-target-ranges.html
+/input-events/input-events-range-exceptions.tentative.html
+/input-events/input-events-spin-button-click-on-number-input-delete-document.html
+/input-events/input-events-spin-button-click-on-number-input-prevent-default.html
+/input-events/input-events-spin-button-click-on-number-input.html
+/input-events/input-events-typing.html
+/input-events/select-event-drag-remove.html
+/input-events/textarea-insertfrompaste-type-inputevent-data-withnewline-atend.html
+/input-events/textarea-insertfrompaste-type-inputevent-data-withnewline-atstart.html
+/input-events/textarea-insertfrompaste-type-inputevent-data.html
+/input-events/idlharness.window.html
