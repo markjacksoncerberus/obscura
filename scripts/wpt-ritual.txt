@@ -313,3 +313,29 @@ css/cssom-view/elementFromPoint-parameters.html
 css/cssom-view/scrollingElement.html
 css/cssom-view/checkVisibility.html
 resize-observer/observe-001.html
+
+# --- html/canvas (added 2026-08-07, quests #508-#510) -------------------------
+# The load-bearing canvas rows. `2d.strokeRect.nonfinite` is here for a specific
+# reason: before #510 it HUNG THE ENGINE FOREVER (`for (px = 0; px < Infinity;
+# px++)`), so it is the guard against a whole-browser DoS coming back, not just
+# a conformance row. The rest cover one thing each that a green row could
+# otherwise fake: a transform actually applying, a winding rule, a stroke union,
+# a hit test against a transform, a composite operator that must sweep beyond
+# the shape, and the premultiplied round-trip through getImageData.
+html/canvas/element/drawing-rectangles-to-the-canvas/2d.strokeRect.nonfinite.html
+html/canvas/element/drawing-rectangles-to-the-canvas/2d.fillRect.transform.html
+html/canvas/element/drawing-rectangles-to-the-canvas/2d.fillRect.clip.html
+html/canvas/element/transformations/2d.transformation.order.html
+html/canvas/element/the-canvas-state/2d.state.saverestore.transformation.html
+html/canvas/element/path-objects/2d.path.fill.winding.evenodd.1.html
+html/canvas/element/path-objects/2d.path.stroke.overlap.html
+html/canvas/element/path-objects/2d.path.isPointInPath.transform.1.html
+html/canvas/element/path-objects/2d.path.arc.shape.3.html
+html/canvas/element/line-styles/2d.line.cap.round.html
+html/canvas/element/line-styles/2d.line.width.transformed.html
+html/canvas/element/compositing/2d.composite.uncovered.fill.copy.html
+html/canvas/element/compositing/2d.composite.solid.xor.html
+html/canvas/element/pixel-manipulation/2d.imageData.get.basic.html
+html/canvas/element/pixel-manipulation/2d.imageData.get.nonfinite.html
+html/canvas/element/canvas-context/2d.canvas.context.prototype.html
+html/canvas/element/conformance-requirements/2d.conformance.requirements.missingargs.html

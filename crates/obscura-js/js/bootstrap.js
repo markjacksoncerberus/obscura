@@ -261,6 +261,17 @@ if (_origStackDesc && _origStackDesc.get) {
 }
 
 let _fpSeed = 0;
+// Bumped by setAttribute/removeAttribute whenever `width` or `height` changes on
+// ANY element. A <canvas>'s bitmap must follow its content attributes, but
+// reading them costs a round trip into the Rust DOM — and the canvas context
+// checks on every property access and every drawing call, so a tight
+// `for (…) { ctx.fillRect(…) }` loop would have paid two DOM round trips per
+// iteration for an answer that almost never changes. One integer compare
+// instead. Deliberately coarse: a false positive costs one re-read, while a
+// missed bump would cost correctness.
+// It lives up here, not down with the canvas code, because setAttribute runs
+// during bootstrap — a `let` read before its initializer is a ReferenceError.
+let _c2dDimGen = 0;
 const _fpRand = function(salt) {
   let h = (_fpSeed ^ (salt || 0)) | 0;
   h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
@@ -5697,6 +5708,7 @@ class Element extends Node {
     // default policy or is refused. Runs before the write, so a refused value
     // never touches the tree.
     { const _tt = _ttAttrSink(this, qname, null, v); if (_tt !== null) v = _tt; }
+    if (qname === 'width' || qname === 'height') _c2dDimGen++;
     const _ceOld = this._ceState === "custom" ? _domParse("get_attribute", this._nid, qname) : undefined;
     // Capture the popover attribute's OLD value before the write — a type change
     // while the popover is showing must hide it (popover attribute change steps).
@@ -5778,6 +5790,7 @@ class Element extends Node {
     if (this._htmlAttr) qname = _asciiLower(qname);
     // Detach the cached Attr (snapshotting its live value) BEFORE the removal,
     // so a node later re-attached elsewhere keeps its value.
+    if (qname === 'width' || qname === 'height') _c2dDimGen++;
     const doomed = this.getAttributeNode(qname);
     const val = doomed ? doomed.value : null;
     _dom("remove_attribute", this._nid, qname);
@@ -6894,15 +6907,23 @@ for (const __jsAttr in __bodyColorAttrs) {
   });
 }
 
-// `width` is overloaded by element: a `long` on <pre> (default 0) but a DOMString
-// on <hr>, <iframe>, <embed>, <object> and <marquee>. A single accessor dispatches
-// on tag name; every other element keeps `width` undefined (its current behaviour —
-// img/canvas/etc. are not reflected here).
+// `width` is overloaded by element: a `long` on <pre> (default 0), a DOMString
+// on <hr>, <iframe>, <embed>, <object> and <marquee>, and an `unsigned long`
+// with a non-zero DEFAULT on <canvas> (300 × 150). A single accessor dispatches
+// on tag name; every other element keeps `width` undefined.
+//
+// ⚠️ <canvas> used to fall through to `undefined` here, and the damage was not
+// that a getter returned the wrong thing — it was that the canvas BITMAP was
+// sized from `canvas.width || 300`. So `<canvas width="100" height="50">`, which
+// is what nearly every canvas test and a great many real pages use, silently got
+// a 300 × 150 bitmap: the coordinates the page drew at and the coordinates it
+// measured at were different coordinates, and nothing said so.
 const __DOMSTRING_WH_TAGS = new Set(['iframe', 'embed', 'object', 'marquee']);
 Object.defineProperty(Element.prototype, 'width', {
   configurable: true, enumerable: true,
   get() {
     const tag = this.localName;
+    if (tag === 'canvas') return _c2dDim(this, 'width', 300);
     if (tag === 'hr' || __DOMSTRING_WH_TAGS.has(tag)) return this.getAttribute('width') ?? '';
     if (tag === 'pre') {
       const num = __parseHtmlSignedInt(this.getAttribute('width'));
@@ -6913,19 +6934,24 @@ Object.defineProperty(Element.prototype, 'width', {
   },
   set(v) {
     const tag = this.localName;
+    if (tag === 'canvas') { _c2dSetDim(this, 'width', v, 300); return; }
     if (tag === 'hr' || __DOMSTRING_WH_TAGS.has(tag)) this.setAttribute('width', String(v));
     else if (tag === 'pre') this.setAttribute('width', String(v | 0));
   },
 });
 
-// `height` is a DOMString content attribute on <iframe>/<embed>/<object>/<marquee>.
-// Every other element keeps the plain-data-property behaviour it has always had
-// (`canvas.height = 5` stores an own property), so the setter re-creates an own data
-// property rather than silently dropping the assignment.
+// `height` is a DOMString content attribute on <iframe>/<embed>/<object>/<marquee>
+// and an `unsigned long` (default 150) on <canvas>. Every other element keeps the
+// plain-data-property behaviour it has always had, so the setter re-creates an own
+// data property rather than silently dropping the assignment.
 Object.defineProperty(Element.prototype, 'height', {
   configurable: true, enumerable: true,
-  get() { return __DOMSTRING_WH_TAGS.has(this.localName) ? (this.getAttribute('height') ?? '') : undefined; },
+  get() {
+    if (this.localName === 'canvas') return _c2dDim(this, 'height', 150);
+    return __DOMSTRING_WH_TAGS.has(this.localName) ? (this.getAttribute('height') ?? '') : undefined;
+  },
   set(v) {
+    if (this.localName === 'canvas') { _c2dSetDim(this, 'height', v, 150); return; }
     if (__DOMSTRING_WH_TAGS.has(this.localName)) this.setAttribute('height', String(v));
     else Object.defineProperty(this, 'height', { value: v, writable: true, enumerable: true, configurable: true });
   },
@@ -45745,194 +45771,2405 @@ for (const _ev of [
 
 const __ariaQuerySelector = function(root, selector) { return null; };
 const __ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
-class _Canvas2D {
-  constructor(canvas) {
-    this.canvas = canvas;
-    this._w = canvas.width || 300;
-    this._h = canvas.height || 150;
-    this._buf = new Uint8ClampedArray(this._w * this._h * 4);
-    for (let i = 0; i < this._w * this._h; i++) {
-      this._buf[i*4+0] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 0));
-      this._buf[i*4+1] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 1));
-      this._buf[i*4+2] = 255 + Math.floor(_fpNoise(i % this._w, Math.floor(i / this._w), 2));
-      this._buf[i*4+3] = 255;
+// ===== CANVAS2D-BEGIN =====
+// A real 2D rasterizer for <canvas>. Everything between these markers is PURE —
+// no DOM, no globals beyond Math/typed arrays — so `scripts/canvas_offline_test.mjs`
+// can slice it straight out of this file and check the geometry in Node in
+// milliseconds, the way the XPath engine and the WebAudio DSP are checked.
+//
+// Why this exists at all: what was here before was not a renderer, it was a
+// FINGERPRINTING COSTUME. `fill()`, `stroke()`, `clip()` and every transform
+// method were empty functions; `fillText` painted pseudo-random noise from the
+// fingerprint PRNG; the bitmap was born full of per-pixel noise when the spec
+// says a canvas starts transparent black. A page could not discover any of it:
+// it drew its chart, got no error, and was handed static. That is worse than
+// having no canvas at all — a missing API is caught by one line of feature
+// detection, and a lying one is caught by nobody.
+//
+// Coordinates: the bitmap is row-major RGBA, PREMULTIPLIED, 8 bits per channel,
+// which is what every shipping engine stores and what the WPT expectations are
+// written against. Pixel (x, y) covers the unit square [x, x+1) × [y, y+1) and
+// its centre is (x + 0.5, y + 0.5).
+
+// ---------------------------------------------------------------------------
+// Affine matrices, stored as the CSS/canvas 6-tuple [a, b, c, d, e, f], which
+// maps (x, y) → (a·x + c·y + e, b·x + d·y + f).
+// ---------------------------------------------------------------------------
+
+// A ∘ B — the matrix that applies B first, then A. `ctx.transform(...)` is
+// CTM = CTM ∘ M, i.e. the new matrix lands INSIDE the existing one.
+const _c2mMul = (A, B) => [
+  A[0] * B[0] + A[2] * B[1],
+  A[1] * B[0] + A[3] * B[1],
+  A[0] * B[2] + A[2] * B[3],
+  A[1] * B[2] + A[3] * B[3],
+  A[0] * B[4] + A[2] * B[5] + A[4],
+  A[1] * B[4] + A[3] * B[5] + A[5],
+];
+const _c2mInvert = (m) => {
+  const det = m[0] * m[3] - m[1] * m[2];
+  if (!det || !Number.isFinite(det)) return null;
+  return [
+    m[3] / det, -m[1] / det, -m[2] / det, m[0] / det,
+    (m[2] * m[5] - m[3] * m[4]) / det,
+    (m[1] * m[4] - m[0] * m[5]) / det,
+  ];
+};
+const _c2mX = (m, x, y) => m[0] * x + m[2] * y + m[4];
+const _c2mY = (m, x, y) => m[1] * x + m[3] * y + m[5];
+const _c2mIsIdentity = (m) =>
+  m[0] === 1 && m[1] === 0 && m[2] === 0 && m[3] === 1 && m[4] === 0 && m[5] === 0;
+// How much this matrix stretches, worst case — used to pick a flattening
+// tolerance in DEVICE pixels for a curve that is described in user units. A
+// curve flattened to 0.1 user-px under a scale(100) transform is a visible
+// polygon; the scale has to be in the budget.
+const _c2mScale = (m) => Math.max(
+  Math.hypot(m[0], m[1]), Math.hypot(m[2], m[3]), 1e-6);
+
+const _c2dFinite = (...vals) => {
+  for (let i = 0; i < vals.length; i++) if (!Number.isFinite(vals[i])) return false;
+  return true;
+};
+
+// ---------------------------------------------------------------------------
+// Paths.
+//
+// A path is a list of subpaths; each subpath is a flat array of already-flattened
+// points [x0, y0, x1, y1, …] plus a `closed` flag. Curves and arcs are flattened
+// as they are added, because that is also when the CTM is captured: the canvas
+// spec bakes the current transform into every point at the moment it joins the
+// path, so `moveTo(); scale(2); lineTo()` really does produce a path with two
+// different transforms in it.
+// ---------------------------------------------------------------------------
+class _C2DPath {
+  constructor() {
+    this.subpaths = [];      // [{ pts: [x,y,…], closed: bool }]
+    this._cur = null;        // the subpath currently being appended to
+    this.lastX = 0; this.lastY = 0;
+    this.hasPoint = false;   // is there a current point at all?
+  }
+  clone() {
+    const p = new _C2DPath();
+    for (const s of this.subpaths) p.subpaths.push({ pts: s.pts.slice(), closed: s.closed });
+    p._cur = p.subpaths.length && !p.subpaths[p.subpaths.length - 1].closed
+      ? p.subpaths[p.subpaths.length - 1] : null;
+    p.lastX = this.lastX; p.lastY = this.lastY; p.hasPoint = this.hasPoint;
+    return p;
+  }
+  // Append every subpath of `other`, mapped through `m`. Used by
+  // `ctx.fill(path2d)` and `Path2D.addPath()`, both of which transform a path
+  // that was built in some other coordinate space.
+  addPath(other, m) {
+    for (const s of other.subpaths) {
+      if (s.pts.length < 2) continue;
+      const pts = new Array(s.pts.length);
+      for (let i = 0; i < s.pts.length; i += 2) {
+        const x = s.pts[i], y = s.pts[i + 1];
+        pts[i] = m ? _c2mX(m, x, y) : x;
+        pts[i + 1] = m ? _c2mY(m, x, y) : y;
+      }
+      this.subpaths.push({ pts, closed: s.closed });
     }
-    this.fillStyle = '#000000';
-    this.strokeStyle = '#000000';
-    this.lineWidth = 1;
-    this.font = '10px sans-serif';
-    this.textAlign = 'start';
-    this.textBaseline = 'alphabetic';
-    this.globalAlpha = 1;
-    this.globalCompositeOperation = 'source-over';
-    this._stateStack = [];
-  }
-  _parseColor(css) {
-    if (!css || css === 'none') return [0,0,0,0];
-    if (css.startsWith('#')) {
-      const hex = css.slice(1);
-      if (hex.length === 3) return [parseInt(hex[0]+hex[0],16),parseInt(hex[1]+hex[1],16),parseInt(hex[2]+hex[2],16),255];
-      if (hex.length === 6) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),255];
-      if (hex.length === 8) return [parseInt(hex.slice(0,2),16),parseInt(hex.slice(2,4),16),parseInt(hex.slice(4,6),16),parseInt(hex.slice(6,8),16)];
+    const last = this.subpaths[this.subpaths.length - 1];
+    if (last) {
+      this._cur = last.closed ? null : last;
+      this.lastX = last.pts[last.pts.length - 2];
+      this.lastY = last.pts[last.pts.length - 1];
+      this.hasPoint = true;
     }
-    const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
-    if (m) return [+m[1],+m[2],+m[3],m[4]!==undefined?Math.round(+m[4]*255):255];
-    const named = {red:[255,0,0,255],green:[0,128,0,255],blue:[0,0,255,255],white:[255,255,255,255],black:[0,0,0,255],yellow:[255,255,0,255],orange:[255,165,0,255],gray:[128,128,128,255],transparent:[0,0,0,0]};
-    return named[css] || [0,0,0,255];
   }
-  _setPixel(x, y, r, g, b, a) {
-    x = Math.round(x); y = Math.round(y);
-    if (x < 0 || x >= this._w || y < 0 || y >= this._h) return;
-    const idx = (y * this._w + x) * 4;
-    const alpha = (a / 255) * this.globalAlpha;
-    this._buf[idx+0] = Math.round(r * alpha + this._buf[idx+0] * (1 - alpha));
-    this._buf[idx+1] = Math.round(g * alpha + this._buf[idx+1] * (1 - alpha));
-    this._buf[idx+2] = Math.round(b * alpha + this._buf[idx+2] * (1 - alpha));
-    this._buf[idx+3] = Math.min(255, Math.round(a * alpha + this._buf[idx+3] * (1 - alpha)));
+  _push(x, y) {
+    if (!this._cur) { this._cur = { pts: [], closed: false }; this.subpaths.push(this._cur); }
+    const p = this._cur.pts;
+    // Collapse an exactly-repeated point: it contributes no edge and would only
+    // add a degenerate segment for the stroker to reason about.
+    if (p.length >= 2 && p[p.length - 2] === x && p[p.length - 1] === y) return;
+    p.push(x, y);
   }
-  fillRect(x, y, w, h) {
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
-    x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
-      for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
-        this._setPixel(px, py, r, g, b, a);
+  moveTo(m, x, y) {
+    if (!_c2dFinite(x, y)) return;
+    const dx = _c2mX(m, x, y), dy = _c2mY(m, x, y);
+    this._cur = { pts: [dx, dy], closed: false };
+    this.subpaths.push(this._cur);
+    this.lastX = x; this.lastY = y; this.hasPoint = true;
+  }
+  // "Ensure there is a subpath for (x, y)" — the spec's phrase for the rule that
+  // a drawing command issued with no current point starts one silently rather
+  // than throwing. Every `*.ensuresubpath.*` test in WPT is checking this.
+  _ensure(m, x, y) { if (!this.hasPoint || !this._cur) this.moveTo(m, x, y); }
+  lineTo(m, x, y) {
+    if (!_c2dFinite(x, y)) return;
+    if (!this.hasPoint || !this._cur) { this.moveTo(m, x, y); return; }
+    this._push(_c2mX(m, x, y), _c2mY(m, x, y));
+    this.lastX = x; this.lastY = y;
+  }
+  closePath(m) {
+    if (!this._cur || this._cur.pts.length < 2) return;
+    this._cur.closed = true;
+    const first = this.subpaths[this.subpaths.length - 1].pts;
+    const fx = first[0], fy = first[1];
+    // A closed subpath is followed by a NEW subpath starting at the same place,
+    // so `closePath(); lineTo(…)` draws a fresh line rather than reopening the
+    // shape that was just sealed.
+    this._cur = { pts: [fx, fy], closed: false };
+    this.subpaths.push(this._cur);
+    // lastX/lastY stay in user space, so recover them through the inverse.
+    const inv = _c2mInvert(m);
+    if (inv) { this.lastX = _c2mX(inv, fx, fy); this.lastY = _c2mY(inv, fx, fy); }
+  }
+  quadraticCurveTo(m, cx, cy, x, y) {
+    if (!_c2dFinite(cx, cy, x, y)) return;
+    this._ensure(m, cx, cy);
+    const x0 = this.lastX, y0 = this.lastY;
+    const n = _c2dCurveSteps(_c2mScale(m) * (Math.hypot(cx - x0, cy - y0) + Math.hypot(x - cx, y - cy)));
+    for (let i = 1; i <= n; i++) {
+      const t = i / n, u = 1 - t;
+      const px = u * u * x0 + 2 * u * t * cx + t * t * x;
+      const py = u * u * y0 + 2 * u * t * cy + t * t * y;
+      this._push(_c2mX(m, px, py), _c2mY(m, px, py));
+    }
+    this.lastX = x; this.lastY = y;
+  }
+  bezierCurveTo(m, c1x, c1y, c2x, c2y, x, y) {
+    if (!_c2dFinite(c1x, c1y, c2x, c2y, x, y)) return;
+    this._ensure(m, c1x, c1y);
+    const x0 = this.lastX, y0 = this.lastY;
+    const n = _c2dCurveSteps(_c2mScale(m) * (Math.hypot(c1x - x0, c1y - y0) +
+      Math.hypot(c2x - c1x, c2y - c1y) + Math.hypot(x - c2x, y - c2y)));
+    for (let i = 1; i <= n; i++) {
+      const t = i / n, u = 1 - t;
+      const px = u * u * u * x0 + 3 * u * u * t * c1x + 3 * u * t * t * c2x + t * t * t * x;
+      const py = u * u * u * y0 + 3 * u * u * t * c1y + 3 * u * t * t * c2y + t * t * t * y;
+      this._push(_c2mX(m, px, py), _c2mY(m, px, py));
+    }
+    this.lastX = x; this.lastY = y;
+  }
+  // arc()/ellipse() share one implementation: an arc IS an ellipse with equal
+  // radii and no rotation, and keeping them separate is how the two drift apart.
+  ellipse(m, x, y, rx, ry, rot, sa, ea, ccw) {
+    if (!_c2dFinite(x, y, rx, ry, rot, sa, ea)) return;
+    if (rx < 0 || ry < 0) { const e = new RangeError('radius is negative'); e.__c2dIndexSize = true; throw e; }
+    // Normalise the sweep exactly as the spec does, so a full circle stays a
+    // full circle instead of collapsing to nothing when start === end.
+    let delta;
+    if (!ccw && ea - sa >= Math.PI * 2) delta = Math.PI * 2;
+    else if (ccw && sa - ea >= Math.PI * 2) delta = -Math.PI * 2;
+    else {
+      delta = (ea - sa) % (Math.PI * 2);
+      if (!ccw && delta < 0) delta += Math.PI * 2;
+      if (ccw && delta > 0) delta -= Math.PI * 2;
+    }
+    const cosR = Math.cos(rot), sinR = Math.sin(rot);
+    const at = (ang) => {
+      const cx = rx * Math.cos(ang), cy = ry * Math.sin(ang);
+      return [x + cx * cosR - cy * sinR, y + cx * sinR + cy * cosR];
+    };
+    // A zero-radius arc is still a POINT on the path, not nothing: `arc()` first
+    // draws a straight line from the current point to the arc's start.
+    const [sx, sy] = at(sa);
+    if (this.hasPoint && this._cur) this.lineTo(m, sx, sy); else this.moveTo(m, sx, sy);
+    const rmax = Math.max(rx, ry) * _c2mScale(m);
+    const n = Math.max(2, Math.min(2048, Math.ceil(Math.abs(delta) / (Math.PI * 2) * _c2dArcSegs(rmax))));
+    for (let i = 1; i <= n; i++) {
+      const [px, py] = at(sa + delta * (i / n));
+      this._push(_c2mX(m, px, py), _c2mY(m, px, py));
+    }
+    // ⚠️ Record the TRUE tangents at the two ends. A flattened arc's first and
+    // last chords are rotated off the real tangent by half a segment's sweep, and
+    // an end cap built perpendicular to the chord inherits that tilt — multiplied
+    // by the cap's own length. At lineWidth 100 on a radius-50 arc, half a degree
+    // of tilt throws the far corner of the cap three pixels into a quadrant the
+    // page never asked to paint. Every progress ring and donut chart on the web
+    // is a thick arc with caps, so this is the common case, not the exotic one.
+    const tanAt = (ang) => {
+      const dx = -rx * Math.sin(ang) * Math.sign(delta || 1);
+      const dy = ry * Math.cos(ang) * Math.sign(delta || 1);
+      const ux = dx * cosR - dy * sinR, uy = dx * sinR + dy * cosR;
+      const sx2 = m[0] * ux + m[2] * uy, sy2 = m[1] * ux + m[3] * uy;
+      const l = Math.hypot(sx2, sy2);
+      return l ? [sx2 / l, sy2 / l] : null;
+    };
+    if (this._cur) {
+      // The start cap points BACK out of the path, hence the negation.
+      const t0 = tanAt(sa);
+      if (t0 && this._cur.pts.length <= (n + 1) * 2) this._cur.tan0 = [-t0[0], -t0[1]];
+      this._cur.tan1 = tanAt(sa + delta);
+    }
+    const [ex, ey] = at(sa + delta);
+    this.lastX = ex; this.lastY = ey; this.hasPoint = true;
+  }
+  arc(m, x, y, r, sa, ea, ccw) { this.ellipse(m, x, y, r, r, 0, sa, ea, ccw); }
+  // arcTo draws the fillet between two straight lines. Its three degenerate
+  // cases are all "draw a line to (x1, y1)", and all three are separate WPT files.
+  arcTo(m, x1, y1, x2, y2, r) {
+    if (!_c2dFinite(x1, y1, x2, y2, r)) return;
+    if (r < 0) { const e = new RangeError('radius is negative'); e.__c2dIndexSize = true; throw e; }
+    this._ensure(m, x1, y1);
+    const x0 = this.lastX, y0 = this.lastY;
+    const d0x = x0 - x1, d0y = y0 - y1, d2x = x2 - x1, d2y = y2 - y1;
+    const l0 = Math.hypot(d0x, d0y), l2 = Math.hypot(d2x, d2y);
+    const cross = d0x * d2y - d0y * d2x;
+    if (l0 === 0 || l2 === 0 || cross === 0 || r === 0) { this.lineTo(m, x1, y1); return; }
+    // Distance from the corner at which the fillet leaves each leg.
+    const cosHalf = (d0x * d2x + d0y * d2y) / (l0 * l2);
+    const tanHalf = Math.sqrt((1 - cosHalf) / (1 + cosHalf));
+    const t = r / tanHalf;
+    const t0x = x1 + d0x / l0 * t, t0y = y1 + d0y / l0 * t;
+    const t2x = x1 + d2x / l2 * t, t2y = y1 + d2y / l2 * t;
+    this.lineTo(m, t0x, t0y);
+    // Centre sits on the angle bisector, r away from each leg.
+    const nrm = (ax, ay) => { const l = Math.hypot(ax, ay); return [ax / l, ay / l]; };
+    const [b0x, b0y] = nrm(d0x / l0 + d2x / l2, d0y / l0 + d2y / l2);
+    const dist = Math.hypot(r, t);
+    const cx = x1 + b0x * dist, cy = y1 + b0y * dist;
+    const a0 = Math.atan2(t0y - cy, t0x - cx), a1 = Math.atan2(t2y - cy, t2x - cx);
+    this.ellipse(m, cx, cy, r, r, 0, a0, a1, cross > 0);
+  }
+  rect(m, x, y, w, h) {
+    if (!_c2dFinite(x, y, w, h)) return;
+    this.subpaths.push({
+      pts: [_c2mX(m, x, y), _c2mY(m, x, y),
+            _c2mX(m, x + w, y), _c2mY(m, x + w, y),
+            _c2mX(m, x + w, y + h), _c2mY(m, x + w, y + h),
+            _c2mX(m, x, y + h), _c2mY(m, x, y + h)],
+      closed: true,
+    });
+    // …and then a fresh subpath at the corner. `rect()` is specified as
+    // "create a new subpath, …, then mark the subpath as closed, then create a
+    // new subpath with (x, y) as the only point" — the trailing empty subpath is
+    // observable, which is what 2d.path.rect.newsubpath measures.
+    this._cur = { pts: [_c2mX(m, x, y), _c2mY(m, x, y)], closed: false };
+    this.subpaths.push(this._cur);
+    this.lastX = x; this.lastY = y; this.hasPoint = true;
+  }
+  roundRect(m, x, y, w, h, radii) {
+    if (!_c2dFinite(x, y, w, h)) return;
+    for (const r of radii) if (!_c2dFinite(r.x, r.y)) return;
+    // Corner order is TL, TR, BR, BL, and a negative box mirrors the radii with it.
+    let [tl, tr, br, bl] = radii;
+    if (w < 0) { [tl, tr] = [tr, tl]; [bl, br] = [br, bl]; }
+    if (h < 0) { [tl, bl] = [bl, tl]; [tr, br] = [br, tr]; }
+    const aw = Math.abs(w), ah = Math.abs(h);
+    // Shrink every radius by one common factor when neighbours would overlap,
+    // so the corners stay in proportion instead of one eating the others.
+    const lim = (avail, sum) => (sum > 0 ? avail / sum : Infinity);
+    const scale = Math.min(1, lim(aw, tl.x + tr.x), lim(aw, bl.x + br.x),
+                              lim(ah, tl.y + bl.y), lim(ah, tr.y + br.y));
+    if (scale < 1) {
+      const shrink = (r) => ({ x: r.x * scale, y: r.y * scale });
+      tl = shrink(tl); tr = shrink(tr); br = shrink(br); bl = shrink(bl);
+    }
+    const x0 = w < 0 ? x + w : x, y0 = h < 0 ? y + h : y;
+    const x1 = x0 + aw, y1 = y0 + ah;
+    this.moveTo(m, x0 + tl.x, y0);
+    this.lineTo(m, x1 - tr.x, y0);
+    if (tr.x || tr.y) this.ellipse(m, x1 - tr.x, y0 + tr.y, tr.x, tr.y, 0, -Math.PI / 2, 0, false);
+    this.lineTo(m, x1, y1 - br.y);
+    if (br.x || br.y) this.ellipse(m, x1 - br.x, y1 - br.y, br.x, br.y, 0, 0, Math.PI / 2, false);
+    this.lineTo(m, x0 + bl.x, y1);
+    if (bl.x || bl.y) this.ellipse(m, x0 + bl.x, y1 - bl.y, bl.x, bl.y, 0, Math.PI / 2, Math.PI, false);
+    this.lineTo(m, x0, y0 + tl.y);
+    if (tl.x || tl.y) this.ellipse(m, x0 + tl.x, y0 + tl.y, tl.x, tl.y, 0, Math.PI, Math.PI * 1.5, false);
+    this.closePath(m);
+    this.lastX = x; this.lastY = y;
+  }
+  isEmpty() {
+    for (const s of this.subpaths) if (s.pts.length >= 4) return false;
+    return true;
+  }
+}
+// Segment counts. Both are deliberately generous for small shapes and capped for
+// huge ones: the cost is linear in segments and the whole point of this engine
+// is that it stays cheap on a machine nobody else builds for.
+const _c2dCurveSteps = (devLen) => Math.max(2, Math.min(256, Math.ceil(Math.sqrt(devLen * 3))));
+// Segments for a full turn at a given DEVICE radius, chosen so the sagitta — the
+// gap between the chord and the true arc — stays under _C2D_ARC_TOL pixels:
+//   e = r·(1 − cos(π/n))  ⇒  n = π / acos(1 − e/r)
+// Picking the count by √r instead (the obvious cheap guess) is scale-blind: it
+// gives a 6px circle twenty segments, which measures 1.6% short on area, and a
+// 1000px circle far too few. Deriving it from the error budget makes the flatness
+// of a curve a property of how big it looks, which is the only thing that matters.
+const _C2D_ARC_TOL = 0.02;
+const _c2dArcSegs = (devRadius) => {
+  if (!(devRadius > 0)) return 8;
+  const c = 1 - _C2D_ARC_TOL / devRadius;
+  if (c <= -1) return 8;
+  const step = Math.acos(Math.max(-1, c));
+  if (!(step > 0)) return 1024;
+  return Math.max(8, Math.min(1024, Math.ceil(Math.PI / step)));
+};
+
+// ---------------------------------------------------------------------------
+// The scanline rasterizer.
+//
+// Produces a per-pixel coverage field in [0, 1]. Vertically we take
+// _C2D_SS sub-scanlines per pixel row; horizontally each span contributes its
+// EXACT fractional overlap with every pixel it touches. That mix is why an
+// axis-aligned fillRect on integer coordinates comes out at exactly 1.0 — the
+// thing a fully-supersampled rasterizer gets subtly wrong and every
+// `_assertPixel` in WPT would catch.
+// ---------------------------------------------------------------------------
+const _C2D_SS = 16;
+
+function _c2dCoverage(path, w, h, evenOdd, clipBox) {
+  const cov = new Float32Array(w * h);
+  // Build the edge list. Every subpath is implicitly closed for filling —
+  // an open subpath is filled as though a straight line joined its ends.
+  const ex0 = [], ey0 = [], ex1 = [], ey1 = [];
+  let minY = Infinity, maxY = -Infinity, minX = Infinity, maxX = -Infinity;
+  for (const s of path.subpaths) {
+    const p = s.pts, n = p.length >> 1;
+    if (n < 2) continue;
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      const ax = p[i * 2], ay = p[i * 2 + 1], bx = p[j * 2], by = p[j * 2 + 1];
+      if (ay === by) continue;                     // horizontal edges never cross a scanline
+      if (!_c2dFinite(ax, ay, bx, by)) continue;
+      ex0.push(ax); ey0.push(ay); ex1.push(bx); ey1.push(by);
+      if (ay < minY) minY = ay; if (by < minY) minY = by;
+      if (ay > maxY) maxY = ay; if (by > maxY) maxY = by;
+      if (ax < minX) minX = ax; if (bx < minX) minX = bx;
+      if (ax > maxX) maxX = ax; if (bx > maxX) maxX = bx;
+    }
+  }
+  const nE = ex0.length;
+  if (!nE) return { cov, x0: 0, y0: 0, x1: 0, y1: 0, empty: true };
+
+  let yStart = Math.max(0, Math.floor(minY)), yEnd = Math.min(h, Math.ceil(maxY));
+  let xStart = Math.max(0, Math.floor(minX)), xEnd = Math.min(w, Math.ceil(maxX) + 1);
+  if (clipBox) {
+    yStart = Math.max(yStart, clipBox[1]); yEnd = Math.min(yEnd, clipBox[3]);
+    xStart = Math.max(xStart, clipBox[0]); xEnd = Math.min(xEnd, clipBox[2]);
+  }
+  if (yStart >= yEnd || xStart >= xEnd) return { cov, x0: 0, y0: 0, x1: 0, y1: 0, empty: true };
+
+  // Edges sorted by their top y, so the sweep only ever looks at edges that can
+  // still matter. Without this a 1080p canvas pays for every edge on every one
+  // of its 17,000 sub-scanlines.
+  const eTop = new Float64Array(nE), eBot = new Float64Array(nE);
+  for (let i = 0; i < nE; i++) { eTop[i] = Math.min(ey0[i], ey1[i]); eBot[i] = Math.max(ey0[i], ey1[i]); }
+  const order = [];
+  for (let i = 0; i < nE; i++) order.push(i);
+  order.sort((a, b) => eTop[a] - eTop[b]);
+
+  let next = 0;
+  const active = [];
+  // Reused across every sub-scanline. A fill on a 150-row canvas visits 2,400
+  // sub-scanlines; allocating a crossings array and an index array for each one
+  // would hand the collector five thousand short-lived objects per fillRect.
+  // On the machines this browser exists for, that is not a micro-optimisation.
+  const xsBuf = [], dirBuf = [];
+  const inc = 1 / _C2D_SS;
+
+  for (let py = yStart; py < yEnd; py++) {
+    const rowBase = py * w;
+    for (let s = 0; s < _C2D_SS; s++) {
+      const ys = py + (s + 0.5) * inc;
+      while (next < nE && eTop[order[next]] <= ys) { active.push(order[next]); next++; }
+      if (!active.length) continue;
+      let na = 0;
+      xsBuf.length = 0; dirBuf.length = 0;
+      for (let k = 0; k < active.length; k++) {
+        const e = active[k];
+        if (eBot[e] <= ys) continue;               // finished; drop from the active set
+        active[na++] = e;
+        if (eTop[e] > ys) continue;                // not started yet (can happen after a re-add)
+        const y0 = ey0[e], y1 = ey1[e];
+        const t = (ys - y0) / (y1 - y0);
+        xsBuf.push(ex0[e] + t * (ex1[e] - ex0[e]));
+        dirBuf.push(y1 > y0 ? 1 : -1);
+      }
+      active.length = na;
+      const nx = xsBuf.length;
+      if (nx < 2) continue;
+      // Sort the crossings by x, carrying each one's winding direction with it.
+      // Insertion sort in place: a scanline typically has two to eight crossings,
+      // where insertion sort beats a comparator-driven Array#sort outright and
+      // allocates nothing.
+      for (let i = 1; i < nx; i++) {
+        const kx = xsBuf[i], kd = dirBuf[i];
+        let j = i - 1;
+        while (j >= 0 && xsBuf[j] > kx) { xsBuf[j + 1] = xsBuf[j]; dirBuf[j + 1] = dirBuf[j]; j--; }
+        xsBuf[j + 1] = kx; dirBuf[j + 1] = kd;
+      }
+      let wind = 0;
+      for (let i = 0; i < nx - 1; i++) {
+        wind += dirBuf[i];
+        const inside = evenOdd ? ((i & 1) === 0) : (wind !== 0);
+        if (!inside) continue;
+        let xa = xsBuf[i], xb = xsBuf[i + 1];
+        if (xb <= xStart || xa >= xEnd) continue;
+        if (xa < xStart) xa = xStart;
+        if (xb > xEnd) xb = xEnd;
+        if (xb <= xa) continue;
+        // Exact horizontal coverage: the partial first and last pixels carry
+        // their fraction, everything between them is whole.
+        const ia = Math.floor(xa), ib = Math.floor(xb);
+        if (ia === ib) { cov[rowBase + ia] += (xb - xa) * inc; continue; }
+        cov[rowBase + ia] += (ia + 1 - xa) * inc;
+        for (let px = ia + 1; px < ib; px++) cov[rowBase + px] += inc;
+        if (ib < xEnd) cov[rowBase + ib] += (xb - ib) * inc;
       }
     }
   }
-  clearRect(x, y, w, h) {
-    x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
-      for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
-        const idx = (py * this._w + px) * 4;
-        this._buf[idx] = this._buf[idx+1] = this._buf[idx+2] = this._buf[idx+3] = 0;
-      }
-    }
-  }
-  strokeRect(x, y, w, h) {
-    const [r,g,b,a] = this._parseColor(this.strokeStyle);
-    const lw = this.lineWidth;
-    for (let px = Math.round(x); px < Math.round(x+w); px++) {
-      for (let l = 0; l < lw; l++) { this._setPixel(px, Math.round(y)+l, r,g,b,a); this._setPixel(px, Math.round(y+h)-1-l, r,g,b,a); }
-    }
-    for (let py = Math.round(y); py < Math.round(y+h); py++) {
-      for (let l = 0; l < lw; l++) { this._setPixel(Math.round(x)+l, py, r,g,b,a); this._setPixel(Math.round(x+w)-1-l, py, r,g,b,a); }
-    }
-  }
-  fillText(text, x, y) {
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
-    const fontSize = parseInt(this.font) || 10;
-    const scale = Math.max(1, Math.round(fontSize / 10));
-    const str = String(text);
-    let cx = Math.round(x);
-    for (let i = 0; i < str.length; i++) {
-      const code = str.charCodeAt(i);
-      for (let row = 0; row < 7; row++) {
-        for (let col = 0; col < 5; col++) {
-          const on = ((_fpRand(code * 100 + row * 10 + col) > 0.45) &&
-                      (row > 0 && row < 6 && col > 0 && col < 4)) ||
-                     (_fpRand(code * 200 + row * 7 + col) > 0.7);
-          if (on) {
-            for (let sy = 0; sy < scale; sy++) {
-              for (let sx = 0; sx < scale; sx++) {
-                this._setPixel(cx + col*scale + sx, Math.round(y) - 7*scale + row*scale + sy, r, g, b, a);
-              }
-            }
-          }
-        }
-      }
-      cx += 6 * scale;
-    }
-  }
-  strokeText(text, x, y) { this.fillText(text, x, y); }
-  measureText(t) {
-    const fontSize = parseInt(this.font) || 10;
-    const scale = Math.max(1, Math.round(fontSize / 10));
-    return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
-  }
-  getImageData(x, y, w, h) {
-    x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
-    const data = new Uint8ClampedArray(w * h * 4);
-    for (let py = 0; py < h; py++) {
-      for (let px = 0; px < w; px++) {
-        const srcX = x + px, srcY = y + py;
-        const dstIdx = (py * w + px) * 4;
-        if (srcX >= 0 && srcX < this._w && srcY >= 0 && srcY < this._h) {
-          const srcIdx = (srcY * this._w + srcX) * 4;
-          data[dstIdx] = this._buf[srcIdx];
-          data[dstIdx+1] = this._buf[srcIdx+1];
-          data[dstIdx+2] = this._buf[srcIdx+2];
-          data[dstIdx+3] = this._buf[srcIdx+3];
-        }
-      }
-    }
-    return { data, width: w, height: h };
-  }
-  putImageData(imageData, dx, dy) {
-    dx=Math.round(dx); dy=Math.round(dy);
-    const {data, width: w, height: h} = imageData;
-    for (let py = 0; py < h; py++) {
-      for (let px = 0; px < w; px++) {
-        const srcIdx = (py * w + px) * 4;
-        const x = dx + px, y = dy + py;
-        if (x >= 0 && x < this._w && y >= 0 && y < this._h) {
-          const dstIdx = (y * this._w + x) * 4;
-          this._buf[dstIdx] = data[srcIdx];
-          this._buf[dstIdx+1] = data[srcIdx+1];
-          this._buf[dstIdx+2] = data[srcIdx+2];
-          this._buf[dstIdx+3] = data[srcIdx+3];
-        }
-      }
-    }
-  }
-  createImageData(w, h) { return { data: new Uint8ClampedArray(w*h*4), width: w, height: h }; }
-  drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh) {
-    if (img && img._ctx && img._ctx._buf) {
-      const src = img._ctx;
-      dx = dx ?? sx; dy = dy ?? sy; dw = dw ?? (sw ?? src._w); dh = dh ?? (sh ?? src._h);
-      for (let py = 0; py < dh; py++) {
-        for (let px = 0; px < dw; px++) {
-          const srcX = Math.floor((sx||0) + px * (sw||src._w) / dw);
-          const srcY = Math.floor((sy||0) + py * (sh||src._h) / dh);
-          if (srcX >= 0 && srcX < src._w && srcY >= 0 && srcY < src._h) {
-            const srcIdx = (srcY * src._w + srcX) * 4;
-            this._setPixel(dx+px, dy+py, src._buf[srcIdx], src._buf[srcIdx+1], src._buf[srcIdx+2], src._buf[srcIdx+3]);
-          }
-        }
-      }
-    }
-  }
-  beginPath() { this._path = []; }
-  closePath() {}
-  moveTo(x, y) { if (this._path) this._path.push({t:'M',x,y}); }
-  lineTo(x, y) { if (this._path) this._path.push({t:'L',x,y}); }
-  bezierCurveTo() {} quadraticCurveTo() {}
-  arc(x, y, r, s, e) { if (this._path) this._path.push({t:'A',x,y,r}); }
-  arcTo() {}
-  rect(x, y, w, h) { this.fillRect(x, y, w, h); }
-  fill() {}
-  stroke() {}
-  clip() {}
-  save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
-  restore() { const s = this._stateStack.pop(); if (s) Object.assign(this, s); }
-  translate() {} rotate() {} scale() {}
-  setTransform() {} resetTransform() {} transform() {}
-  createLinearGradient(x0,y0,x1,y1) { return { addColorStop(){}, _x0:x0,_y0:y0,_x1:x1,_y1:y1 }; }
-  createRadialGradient() { return { addColorStop(){} }; }
-  createPattern() { return {}; }
-  isPointInPath() { return false; }
-  isPointInStroke() { return false; }
+  return { cov, x0: xStart, y0: yStart, x1: xEnd, y1: yEnd, empty: false };
 }
 
-Element.prototype.getContext = function getContext(type) {
-  if (type === '2d') {
-    if (!this._ctx) {
-      this._ctx = new _Canvas2D(this);
+// Is (x, y) inside the path? Same winding rules as the fill, evaluated at a
+// single point — no rasterization, so it stays exact rather than sampled.
+function _c2dPointInPath(path, x, y, evenOdd) {
+  if (!_c2dFinite(x, y)) return false;
+  let wind = 0, crossings = 0;
+  for (const s of path.subpaths) {
+    const p = s.pts, n = p.length >> 1;
+    if (n < 2) continue;
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      const ax = p[i * 2], ay = p[i * 2 + 1], bx = p[j * 2], by = p[j * 2 + 1];
+      if (ay === by) continue;
+      if ((ay <= y && by > y) || (by <= y && ay > y)) {
+        const t = (y - ay) / (by - ay);
+        if (ax + t * (bx - ax) > x) { crossings++; wind += by > ay ? 1 : -1; }
+      }
     }
-    return this._ctx;
   }
-  if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
+  return evenOdd ? (crossings & 1) === 1 : wind !== 0;
+}
+
+// ---------------------------------------------------------------------------
+// Stroking.
+//
+// The outline is built as a pile of individually convex pieces — one quad per
+// segment, one wedge per join, one shape per cap — every one of them wound the
+// SAME way, and then filled with the nonzero rule. Nonzero over consistently
+// wound pieces is exactly a union, which is why a self-crossing stroke comes out
+// solid instead of punching a hole through itself where it overlaps.
+//
+// It all happens in USER space and is transformed afterwards, because lineWidth
+// is a user-space quantity: under `scale(2, 1)` a stroke is genuinely elliptical,
+// and expanding in device space would silently make it round.
+// ---------------------------------------------------------------------------
+function _c2dStrokeOutline(path, m, lineWidth, cap, join, miterLimit, dash, dashOffset) {
+  const out = new _C2DPath();
+  const hw = lineWidth / 2;
+  const inv = _c2mInvert(m);
+  if (!inv) return out;                       // singular CTM paints nothing at all
+
+  const emit = (pts) => {
+    if (pts.length < 6) return;
+    // Normalise orientation so the union trick holds.
+    let area = 0;
+    for (let i = 0, n = pts.length >> 1; i < n; i++) {
+      const j = (i + 1) % n;
+      area += pts[i * 2] * pts[j * 2 + 1] - pts[j * 2] * pts[i * 2 + 1];
+    }
+    const src = area < 0 ? _c2dReversePts(pts) : pts;
+    const dev = new Array(src.length);
+    for (let i = 0; i < src.length; i += 2) {
+      dev[i] = _c2mX(m, src[i], src[i + 1]);
+      dev[i + 1] = _c2mY(m, src[i], src[i + 1]);
+    }
+    out.subpaths.push({ pts: dev, closed: true });
+  };
+  const arcPts = (cx, cy, a0, a1, ccw) => {
+    // Round joins and caps in user space; the segment count is picked from the
+    // DEVICE radius so a tiny circle blown up by a transform is still round.
+    const segs = _c2dArcSegs(hw * _c2mScale(m));
+    let d = a1 - a0;
+    if (ccw) { while (d > 0) d -= Math.PI * 2; } else { while (d < 0) d += Math.PI * 2; }
+    const n = Math.max(1, Math.ceil(Math.abs(d) / (Math.PI * 2) * segs));
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+      const a = a0 + d * (i / n);
+      pts.push(cx + Math.cos(a) * hw, cy + Math.sin(a) * hw);
+    }
+    return pts;
+  };
+
+  for (const sub of path.subpaths) {
+    // Back to user space, then dash, then expand.
+    const n = sub.pts.length >> 1;
+    if (n < 1) continue;
+    let up = new Array(sub.pts.length);
+    for (let i = 0; i < sub.pts.length; i += 2) {
+      up[i] = _c2mX(inv, sub.pts[i], sub.pts[i + 1]);
+      up[i + 1] = _c2mY(inv, sub.pts[i], sub.pts[i + 1]);
+    }
+    if (sub.closed && n >= 2) up = up.concat([up[0], up[1]]);
+    const pieces = dash && dash.length ? _c2dApplyDash(up, dash, dashOffset) : [{ pts: up, closed: sub.closed }];
+
+    for (const piece of pieces) {
+      const p = _c2dDedupe(piece.pts);
+      const cnt = p.length >> 1;
+      // ⚠️ HTML's "trace a path" step 1 REMOVES every subpath containing no
+      // lines — a subpath that is just one point contributes nothing at all, no
+      // matter what lineCap says. It is tempting to give a round cap its dot
+      // here, and wrong: `ctx.rect(50, 25, 0, 0)` produces four coincident
+      // points, and with lineWidth 100 and a round cap that "dot" is a hundred-
+      // pixel disc splashed across a canvas the page asked to leave alone.
+      if (cnt < 2) continue;
+      const closed = piece.closed && cnt > 2 &&
+        p[0] === p[(cnt - 1) * 2] && p[1] === p[(cnt - 1) * 2 + 1];
+      const last = closed ? cnt - 1 : cnt;
+      // A recorded TRUE tangent, where one exists, for the two free ends. Only
+      // valid while the piece is still the whole subpath — dashing creates new
+      // ends, and at those the chord direction is exactly right.
+      const whole = pieces.length === 1 && !closed;
+      const backDir = whole && sub.tan0 ? _c2dDirToUser(inv, sub.tan0) : null;
+      const fwdDir = whole && sub.tan1 ? _c2dDirToUser(inv, sub.tan1) : null;
+      const startDir = backDir ? [-backDir[0], -backDir[1]] : null;
+      // ⚠️⚠️ Offsets belong to VERTICES, not to segments.
+      //
+      // A quad offset perpendicular to its own chord misplaces both of its ends
+      // by hw·Δ/2, where Δ is the segment's turn — LINEAR in Δ, so flattening
+      // harder barely helps: on a radius-50 arc stroked 100 wide, 3° segments put
+      // the inner corner 1.4 px past where the stroke ends, and the whole inside
+      // of the arc grows a ragged fringe. Offsetting along the angle BISECTOR at
+      // each vertex instead leaves an error of hw·Δ²/8 — 0.02 px on that same arc,
+      // seventy times better — because the bisector of two chord normals of a
+      // circle IS the radius.
+      //
+      // Only for gentle turns. At a real corner the bisector offset runs away
+      // (that is what miterLimit exists to catch), so anything sharper falls back
+      // to chord normals and lets the join wedge do its job.
+      const segN = new Array((cnt - 1) * 2);
+      for (let i = 0; i + 1 < cnt; i++) {
+        const dx = p[i * 2 + 2] - p[i * 2], dy = p[i * 2 + 3] - p[i * 2 + 1];
+        const len = Math.hypot(dx, dy);
+        segN[i * 2] = len ? -dy / len * hw : 0;
+        segN[i * 2 + 1] = len ? dx / len * hw : 0;
+      }
+      const vaX = new Array(cnt - 1), vaY = new Array(cnt - 1);
+      const vbX = new Array(cnt - 1), vbY = new Array(cnt - 1);
+      for (let i = 0; i + 1 < cnt; i++) {
+        vaX[i] = vbX[i] = segN[i * 2]; vaY[i] = vbY[i] = segN[i * 2 + 1];
+      }
+      const _C2D_MITER_COS = 0.9659;                 // cos 15°
+      for (let i = 1; i + 1 < cnt; i++) {
+        const n1x = segN[(i - 1) * 2], n1y = segN[(i - 1) * 2 + 1];
+        const n2x = segN[i * 2], n2y = segN[i * 2 + 1];
+        const dot = (n1x * n2x + n1y * n2y) / (hw * hw);
+        if (!(dot > _C2D_MITER_COS)) continue;       // a real corner: leave it to the join
+        const k = 1 + dot;                           // = 2cos²(Δ/2)
+        const mx = (n1x + n2x) / k, my = (n1y + n2y) / k;
+        vbX[i - 1] = mx; vbY[i - 1] = my;
+        vaX[i] = mx; vaY[i] = my;
+      }
+      // The two free ends get the curve's TRUE tangent where one was recorded. A
+      // butt cap is simply where the end quad stops, so it cannot opt out of the
+      // half-segment tilt the way a round cap can — the quad's end edge has to
+      // carry the correction itself, which turns the segment into a trapezoid.
+      if (startDir) { vaX[0] = -startDir[1] * hw; vaY[0] = startDir[0] * hw; }
+      if (fwdDir) { vbX[cnt - 2] = -fwdDir[1] * hw; vbY[cnt - 2] = fwdDir[0] * hw; }
+      for (let i = 0; i + 1 < cnt; i++) {
+        const ax = p[i * 2], ay = p[i * 2 + 1], bx = p[i * 2 + 2], by = p[i * 2 + 3];
+        if (ax === bx && ay === by) continue;
+        emit([ax + vaX[i], ay + vaY[i], bx + vbX[i], by + vbY[i],
+              bx - vbX[i], by - vbY[i], ax - vaX[i], ay - vaY[i]]);
+      }
+      // Joins at every interior vertex (and at the seam of a closed subpath).
+      const jStart = closed ? 0 : 1;
+      const jEnd = closed ? last : cnt - 1;
+      for (let i = jStart; i < jEnd; i++) {
+        const pi = (i - 1 + last) % last;
+        const ax = p[pi * 2], ay = p[pi * 2 + 1];
+        const bx = p[i * 2], by = p[i * 2 + 1];
+        const ni = (i + 1) % last;
+        const cx = p[ni * 2], cy = p[ni * 2 + 1];
+        _c2dEmitJoin(emit, arcPts, ax, ay, bx, by, cx, cy, hw, join, miterLimit);
+      }
+      if (!closed) {
+        _c2dEmitCap(emit, arcPts, p[2], p[3], p[0], p[1], hw, cap, backDir);
+        _c2dEmitCap(emit, arcPts, p[(cnt - 2) * 2], p[(cnt - 2) * 2 + 1],
+          p[(cnt - 1) * 2], p[(cnt - 1) * 2 + 1], hw, cap, fwdDir);
+      }
+    }
+  }
+  return out;
+}
+const _c2dReversePts = (pts) => {
+  const out = new Array(pts.length);
+  for (let i = 0, n = pts.length >> 1; i < n; i++) {
+    out[i * 2] = pts[(n - 1 - i) * 2];
+    out[i * 2 + 1] = pts[(n - 1 - i) * 2 + 1];
+  }
+  return out;
+};
+const _c2dDedupe = (pts) => {
+  const out = [];
+  for (let i = 0; i < pts.length; i += 2) {
+    const n = out.length;
+    if (n >= 2 && out[n - 2] === pts[i] && out[n - 1] === pts[i + 1]) continue;
+    out.push(pts[i], pts[i + 1]);
+  }
+  return out;
+};
+function _c2dEmitJoin(emit, arcPts, ax, ay, bx, by, cx, cy, hw, join, miterLimit) {
+  const d1x = bx - ax, d1y = by - ay, l1 = Math.hypot(d1x, d1y);
+  const d2x = cx - bx, d2y = cy - by, l2 = Math.hypot(d2x, d2y);
+  if (!l1 || !l2) return;
+  const u1x = d1x / l1, u1y = d1y / l1, u2x = d2x / l2, u2y = d2y / l2;
+  const cross = u1x * u2y - u1y * u2x;
+  if (Math.abs(cross) < 1e-12) return;                 // collinear: nothing to fill in
+  // Outer side of the turn.
+  const s = cross > 0 ? -1 : 1;
+  const n1x = -u1y * hw * s, n1y = u1x * hw * s;
+  const n2x = -u2y * hw * s, n2y = u2x * hw * s;
+  // Sweep the SHORT way round the outside of the corner. The angle from n1 to n2
+  // is the turn angle itself, so its sign follows `cross`: sweeping the other way
+  // fills 360° minus the corner — a disc where a wedge belongs.
+  // ⚠️ The vertex itself is part of the wedge. `arcPts` returns only the arc, and
+  // closing that back on itself gives the circular SEGMENT — the sliver beyond
+  // the chord — leaving the triangle between the chord and the corner unpainted
+  // by anything, since neither segment quad reaches into it. The result is a
+  // notch bitten out of the outside of every round join.
+  if (join === 'round') {
+    emit([bx, by].concat(arcPts(bx, by, Math.atan2(n1y, n1x), Math.atan2(n2y, n2x), cross < 0)));
+    return;
+  }
+  const bevel = [bx, by, bx + n1x, by + n1y, bx + n2x, by + n2y];
+  if (join === 'bevel') { emit(bevel); return; }
+  // Miter: the outer corner point, dropped back to a bevel when the spike would
+  // exceed miterLimit × lineWidth. That limit is why a nearly-doubled-back line
+  // does not grow a hundred-pixel needle.
+  const cosHalf = Math.sqrt(Math.max(0, (1 + (u1x * u2x + u1y * u2y)) / 2));
+  if (cosHalf < 1e-9 || 1 / cosHalf > miterLimit) { emit(bevel); return; }
+  const mlen = hw / cosHalf;
+  let bxv = n1x + n2x, byv = n1y + n2y;
+  const bl = Math.hypot(bxv, byv);
+  if (!bl) { emit(bevel); return; }
+  bxv /= bl; byv /= bl;
+  emit([bx, by, bx + n1x, by + n1y, bx + bxv * mlen, by + byv * mlen, bx + n2x, by + n2y]);
+}
+// Map a DIRECTION through a matrix: only the linear part applies, never the
+// translation. Running a direction through the full affine is the classic slip,
+// and it makes every tangent wrong by wherever the origin happens to be.
+const _c2dDirToUser = (inv, d) => {
+  const x = inv[0] * d[0] + inv[2] * d[1], y = inv[1] * d[0] + inv[3] * d[1];
+  const l = Math.hypot(x, y);
+  return l ? [x / l, y / l] : null;
+};
+function _c2dEmitCap(emit, arcPts, fromX, fromY, atX, atY, hw, cap, trueDir) {
+  if (cap === 'butt') return;
+  let dx, dy, l;
+  if (trueDir) { dx = trueDir[0]; dy = trueDir[1]; l = 1; }
+  else { dx = atX - fromX; dy = atY - fromY; l = Math.hypot(dx, dy); }
+  if (!l) return;
+  const ux = dx / l, uy = dy / l, nx = -uy * hw, ny = ux * hw;
+  // ⚠️ A round cap is the half-disc BEYOND the endpoint, and there are two halves
+  // to choose from. `u` sits a quarter turn clockwise from `n` (cross(n,u) = −hw,
+  // always), so the sweep from n to −n has to run in the NEGATIVE direction to
+  // pass through u. Run it the other way and the cap is drawn back along the line
+  // it came from — invisible, because the line is already there, and the end of
+  // every round-capped stroke is quietly square.
+  if (cap === 'round') { emit(arcPts(atX, atY, Math.atan2(ny, nx), Math.atan2(-ny, -nx), true)); return; }
+  emit([atX + nx, atY + ny, atX + nx + ux * hw, atY + ny + uy * hw,
+        atX - nx + ux * hw, atY - ny + uy * hw, atX - nx, atY - ny]);
+}
+// Chop a polyline into the "on" runs of the dash pattern. An odd-length pattern
+// is doubled first, per spec, so [5] means 5-on-5-off rather than 5-on-nothing.
+function _c2dApplyDash(pts, dash, offset) {
+  let pat = dash.slice();
+  let total = 0;
+  for (const d of pat) total += d;
+  if (total <= 0) return [{ pts, closed: false }];
+  if (pat.length & 1) { pat = pat.concat(pat); total *= 2; }
+  let idx = 0, rem, on = true;
+  let off = offset % total; if (off < 0) off += total;
+  while (off >= pat[idx]) { off -= pat[idx]; idx = (idx + 1) % pat.length; on = !on; }
+  rem = pat[idx] - off;
+  const pieces = [];
+  let cur = on ? [pts[0], pts[1]] : null;
+  for (let i = 0; i + 3 < pts.length; i += 2) {
+    let ax = pts[i], ay = pts[i + 1];
+    const bx = pts[i + 2], by = pts[i + 3];
+    let seg = Math.hypot(bx - ax, by - ay);
+    while (seg > rem) {
+      const t = rem / seg;
+      const mx = ax + (bx - ax) * t, my = ay + (by - ay) * t;
+      // NOTE: interpolate along the REMAINING piece each time, not the original
+      // segment — otherwise every dash after the first on one segment is wrong.
+      if (on) { cur.push(mx, my); pieces.push({ pts: cur, closed: false }); cur = null; }
+      else { cur = [mx, my]; }
+      on = !on;
+      ax = mx; ay = my; seg -= rem;
+      idx = (idx + 1) % pat.length; rem = pat[idx];
+      if (rem === 0) { idx = (idx + 1) % pat.length; rem = pat[idx]; on = !on; if (rem === 0) break; }
+    }
+    rem -= seg;
+    if (on && cur) cur.push(bx, by);
+  }
+  if (on && cur && cur.length >= 4) pieces.push({ pts: cur, closed: false });
+  return pieces;
+}
+
+// ---------------------------------------------------------------------------
+// Compositing.
+//
+// Porter-Duff (HTML §"compositing") plus the separable CSS blend modes. Fa/Fb
+// are the source and destination coverage factors; every operator is those two
+// numbers and nothing else.
+// ---------------------------------------------------------------------------
+const _C2D_OPS = {
+  'source-over':      (as, ab) => [1, 1 - as],
+  'source-in':        (as, ab) => [ab, 0],
+  'source-out':       (as, ab) => [1 - ab, 0],
+  'source-atop':      (as, ab) => [ab, 1 - as],
+  'destination-over': (as, ab) => [1 - ab, 1],
+  'destination-in':   (as, ab) => [0, as],
+  'destination-out':  (as, ab) => [0, 1 - as],
+  'destination-atop': (as, ab) => [1 - ab, as],
+  'xor':              (as, ab) => [1 - ab, 1 - as],
+  'lighter':          () => [1, 1],
+  'copy':             () => [1, 0],
+  'clear':            () => [0, 0],
+};
+// Operators whose result outside the drawn shape is NOT the destination — they
+// have to sweep the whole clip region, not just the shape's bounding box. Skip
+// that and `globalCompositeOperation = 'copy'` quietly stops erasing everything
+// it is supposed to erase, which is the entire point of the 2d.composite.uncovered.* files.
+const _C2D_FULL_OPS = new Set([
+  'source-in', 'source-out', 'destination-in', 'destination-atop', 'copy', 'clear',
+]);
+const _C2D_BLEND = {
+  'multiply': (b, s) => b * s,
+  'screen': (b, s) => b + s - b * s,
+  'overlay': (b, s) => (b <= 0.5 ? 2 * b * s : 1 - 2 * (1 - b) * (1 - s)),
+  'darken': (b, s) => Math.min(b, s),
+  'lighten': (b, s) => Math.max(b, s),
+  'color-dodge': (b, s) => (b === 0 ? 0 : s === 1 ? 1 : Math.min(1, b / (1 - s))),
+  'color-burn': (b, s) => (b === 1 ? 1 : s === 0 ? 0 : 1 - Math.min(1, (1 - b) / s)),
+  'hard-light': (b, s) => (s <= 0.5 ? 2 * s * b : 1 - 2 * (1 - s) * (1 - b)),
+  'soft-light': (b, s) => {
+    if (s <= 0.5) return b - (1 - 2 * s) * b * (1 - b);
+    const d = b <= 0.25 ? ((16 * b - 12) * b + 4) * b : Math.sqrt(b);
+    return b + (2 * s - 1) * (d - b);
+  },
+  'difference': (b, s) => Math.abs(b - s),
+  'exclusion': (b, s) => b + s - 2 * b * s,
+};
+// The four NON-separable blend modes cannot be computed one channel at a time —
+// hue, saturation, colour and luminosity are properties of the triple. Leaving
+// them out would be quieter than getting them wrong, but not by much: a page
+// that sets `globalCompositeOperation = 'luminosity'` and is silently given
+// source-over gets a picture that is merely incorrect, with nothing to detect.
+const _c2dLum = (c) => 0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2];
+const _c2dSetLum = (c, l) => {
+  const d = l - _c2dLum(c);
+  const r = [c[0] + d, c[1] + d, c[2] + d];
+  // Clip back into gamut by pulling towards the luminance, not by clamping —
+  // clamping shifts the hue, which is the one thing these modes must preserve.
+  const lu = _c2dLum(r), mn = Math.min(r[0], r[1], r[2]), mx = Math.max(r[0], r[1], r[2]);
+  if (mn < 0) for (let i = 0; i < 3; i++) r[i] = lu + (r[i] - lu) * lu / (lu - mn);
+  if (mx > 1) for (let i = 0; i < 3; i++) r[i] = lu + (r[i] - lu) * (1 - lu) / (mx - lu);
+  return r;
+};
+const _c2dSat = (c) => Math.max(c[0], c[1], c[2]) - Math.min(c[0], c[1], c[2]);
+const _c2dSetSat = (c, s) => {
+  const idx = [0, 1, 2].sort((a, b) => c[a] - c[b]);
+  const r = [0, 0, 0];
+  const [lo, mid, hi] = idx;
+  if (c[hi] > c[lo]) { r[mid] = (c[mid] - c[lo]) * s / (c[hi] - c[lo]); r[hi] = s; }
+  return r;
+};
+const _C2D_BLEND_NS = {
+  'hue': (b, s) => _c2dSetLum(_c2dSetSat(s, _c2dSat(b)), _c2dLum(b)),
+  'saturation': (b, s) => _c2dSetLum(_c2dSetSat(b, _c2dSat(s)), _c2dLum(b)),
+  'color': (b, s) => _c2dSetLum(s, _c2dLum(b)),
+  'luminosity': (b, s) => _c2dSetLum(b, _c2dLum(s)),
+};
+// ===== CANVAS2D-END =====
+const _c2dIndexSizeError = (m) => new DOMException(m, 'IndexSizeError');
+const _c2dSyntaxError = (m) => new DOMException(m, 'SyntaxError');
+const _c2dInvalidStateError = (m) => new DOMException(m, 'InvalidStateError');
+const _c2dNotSupportedError = (m) => new DOMException(m, 'NotSupportedError');
+
+// The drawing state that save()/restore() carries. The bitmap is NOT in here —
+// save() saves the state, not the pixels, and conflating the two is how
+// `save(); fillRect(); restore()` starts un-drawing things.
+const _C2D_DEFAULT_STATE = () => ({
+  ctm: [1, 0, 0, 1, 0, 0],
+  fill: [0, 0, 0, 1], fillObj: null,
+  stroke: [0, 0, 0, 1], strokeObj: null,
+  globalAlpha: 1,
+  gco: 'source-over',
+  lineWidth: 1, lineCap: 'butt', lineJoin: 'miter', miterLimit: 10,
+  lineDash: [], lineDashOffset: 0,
+  shadowColor: [0, 0, 0, 0], shadowBlur: 0, shadowOffsetX: 0, shadowOffsetY: 0,
+  font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic',
+  direction: 'inherit', letterSpacing: '0px', wordSpacing: '0px',
+  fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal',
+  textRendering: 'auto', lang: 'inherit',
+  imageSmoothingEnabled: true, imageSmoothingQuality: 'low',
+  filter: 'none',
+  clip: null, clipBox: null,
+});
+
+class CanvasRenderingContext2D {
+  constructor() { throw new TypeError('Illegal constructor'); }
+}
+
+// The real implementation hangs off a private symbol so that no page script can
+// reach in and rewrite the bitmap through a property it happens to guess.
+const _C2D = Symbol('canvas2d');
+
+function _c2dCreate(canvasEl, attrs) {
+  const ctx = Object.create(CanvasRenderingContext2D.prototype);
+  const st = {
+    canvas: canvasEl,
+    alpha: attrs && attrs.alpha === false ? false : true,
+    desynchronized: !!(attrs && attrs.desynchronized),
+    colorSpace: (attrs && attrs.colorSpace) || 'srgb',
+    willReadFrequently: !!(attrs && attrs.willReadFrequently),
+    w: 0, h: 0, data: null, gen: -1,
+    state: _C2D_DEFAULT_STATE(),
+    stack: [],
+    path: new _C2DPath(),
+  };
+  Object.defineProperty(ctx, _C2D, { value: st });
+  _c2dResize(st, _c2dDim(canvasEl, 'width', 300), _c2dDim(canvasEl, 'height', 150));
+  return ctx;
+}
+const _c2dDim = (el, name, dflt) => {
+  const raw = el && el.getAttribute ? el.getAttribute(name) : null;
+  if (raw === null || raw === undefined) return dflt;
+  // HTML's `unsigned long` reflection with a default: garbage and negatives fall
+  // back to the default rather than to zero, so `<canvas width="abc">` is still 300 wide.
+  const n = parseInt(String(raw).trim(), 10);
+  if (!Number.isFinite(n) || n < 0 || n > 2147483647) return dflt;
+  return n;
+};
+// Resizing — including setting width/height to the value they already had — RESETS
+// the bitmap AND the whole drawing state. That is the canonical "clear the canvas"
+// idiom (`c.width = c.width`), and it is a reset, not an erase.
+function _c2dResize(st, w, h) {
+  st.w = Math.max(0, w | 0); st.h = Math.max(0, h | 0);
+  st.data = new Uint8ClampedArray(st.w * st.h * 4);
+  if (!st.alpha) for (let i = 3; i < st.data.length; i += 4) st.data[i] = 255;
+  st.state = _C2D_DEFAULT_STATE();
+  st.stack = [];
+  st.path = new _C2DPath();
+}
+// `_c2dDimGen` is declared far above, beside the fingerprint seed, and NOT here:
+// `setAttribute` bumps it, and setAttribute can run during bootstrap itself —
+// long before this line would have executed. A `let` read before its initializer
+// is a ReferenceError, so a counter touched by a primitive that early has to be
+// initialised that early too.
+const _c2dSt = (ctx) => {
+  const s = ctx ? ctx[_C2D] : null;
+  if (!s) throw new TypeError('Illegal invocation');
+  if (s.gen !== _c2dDimGen) {
+    s.gen = _c2dDimGen;
+    const w = _c2dDim(s.canvas, 'width', 300), h = _c2dDim(s.canvas, 'height', 150);
+    if (w !== s.w || h !== s.h) _c2dResize(s, w, h);
+  }
+  return s;
+};
+
+// ---- painting -------------------------------------------------------------
+// A "paint" is either a solid premultiplied colour or a per-pixel sampler. The
+// fast path matters: a solid fill is by far the common case and should not pay
+// for a function call per pixel on a machine with a decade-old CPU.
+function _c2dMakePaint(st, style, obj) {
+  if (!obj) return { solid: style };
+  if (obj instanceof CanvasGradient) return _c2dGradientPaint(st, obj);
+  if (obj instanceof CanvasPattern) return _c2dPatternPaint(st, obj);
+  return { solid: [0, 0, 0, 0] };
+}
+function _c2dGradientPaint(st, g) {
+  const stops = g._stops;
+  if (!stops.length) return null;                    // no stops paints NOTHING
+  const inv = _c2mInvert(st.state.ctm);
+  if (!inv) return null;
+  const p = g._p;
+  if (g._k === 'linear') {
+    const dx = p[2] - p[0], dy = p[3] - p[1];
+    const d2 = dx * dx + dy * dy;
+    if (d2 === 0) return null;                       // coincident ends paint nothing
+    return { sample(x, y) {
+      const ux = _c2mX(inv, x, y), uy = _c2mY(inv, x, y);
+      let t = ((ux - p[0]) * dx + (uy - p[1]) * dy) / d2;
+      return g._at(t < 0 ? 0 : t > 1 ? 1 : t);
+    } };
+  }
+  if (g._k === 'conic') {
+    return { sample(x, y) {
+      const ux = _c2mX(inv, x, y), uy = _c2mY(inv, x, y);
+      let a = Math.atan2(uy - p[2], ux - p[1]) + Math.PI / 2 - p[0];
+      a = ((a % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+      return g._at(a / (Math.PI * 2));
+    } };
+  }
+  // Radial: find the LARGEST ω whose circle passes through the point and has a
+  // non-negative radius. Taking the smaller root instead is the classic bug that
+  // turns a cone gradient inside out.
+  const [x0, y0, r0, x1, y1, r1] = p;
+  if (x0 === x1 && y0 === y1 && r0 === r1) return null;
+  const cdx = x1 - x0, cdy = y1 - y0, dr = r1 - r0;
+  const a = cdx * cdx + cdy * cdy - dr * dr;
+  return { sample(x, y) {
+    const ux = _c2mX(inv, x, y), uy = _c2mY(inv, x, y);
+    const px = ux - x0, py = uy - y0;
+    const b = -2 * (px * cdx + py * cdy + r0 * dr);
+    const c = px * px + py * py - r0 * r0;
+    let w;
+    if (Math.abs(a) < 1e-12) { if (b === 0) return null; w = -c / b; }
+    else {
+      const disc = b * b - 4 * a * c;
+      if (disc < 0) return null;
+      const sq = Math.sqrt(disc);
+      const w1 = (-b + sq) / (2 * a), w2 = (-b - sq) / (2 * a);
+      w = Math.max(w1, w2);
+      if (r0 + w * dr < 0) w = Math.min(w1, w2);
+      if (r0 + w * dr < 0) return null;
+    }
+    return g._at(w < 0 ? 0 : w > 1 ? 1 : w);
+  } };
+}
+function _c2dPatternPaint(st, pat) {
+  const bm = pat._bm;
+  if (!bm || !bm.w || !bm.h) return null;
+  const inv = _c2mInvert(_c2mMul(st.state.ctm, pat._tf));
+  if (!inv) return null;
+  const rx = pat._rep === 'repeat' || pat._rep === 'repeat-x';
+  const ry = pat._rep === 'repeat' || pat._rep === 'repeat-y';
+  return { sample(x, y) {
+    let sx = Math.floor(_c2mX(inv, x, y)), sy = Math.floor(_c2mY(inv, x, y));
+    if (rx) { sx = ((sx % bm.w) + bm.w) % bm.w; } else if (sx < 0 || sx >= bm.w) return null;
+    if (ry) { sy = ((sy % bm.h) + bm.h) % bm.h; } else if (sy < 0 || sy >= bm.h) return null;
+    const i = (sy * bm.w + sx) * 4;
+    const al = bm.data[i + 3] / 255;
+    if (al === 0) return [0, 0, 0, 0];
+    // The source bitmap is premultiplied; a paint sampler hands back straight alpha.
+    return [bm.data[i] / al, bm.data[i + 1] / al, bm.data[i + 2] / al, al];
+  } };
+}
+
+// The one place pixels are written. Takes a coverage field and a paint and
+// applies the current composite operator, global alpha and clip.
+function _c2dComposite(st, covRes, paint, opOverride) {
+  if (!paint || covRes.empty) {
+    if (!_C2D_FULL_OPS.has(opOverride || st.state.gco)) return;
+  }
+  const S = st.state;
+  const op = opOverride || S.gco;
+  const blend = _C2D_BLEND[op] || null;
+  const blendNS = _C2D_BLEND_NS[op] || null;
+  const pd = _C2D_OPS[op] || ((blend || blendNS || op === 'normal') ? _C2D_OPS['source-over'] : null);
+  if (!pd) return;
+  const full = _C2D_FULL_OPS.has(op);
+  const clip = S.clip;
+  const data = st.data, W = st.w, H = st.h;
+  const ga = S.globalAlpha;
+
+  let x0 = covRes.x0, y0 = covRes.y0, x1 = covRes.x1, y1 = covRes.y1;
+  if (full) {
+    // These operators change pixels the shape never touched, so the sweep has to
+    // cover everything the clip allows.
+    x0 = S.clipBox ? S.clipBox[0] : 0; y0 = S.clipBox ? S.clipBox[1] : 0;
+    x1 = S.clipBox ? S.clipBox[2] : W; y1 = S.clipBox ? S.clipBox[3] : H;
+  }
+  if (x0 >= x1 || y0 >= y1) return;
+  const cov = covRes.cov;
+  const solid = paint && paint.solid;
+  const sample = paint && paint.sample;
+
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const pi = y * W + x;
+      const k = clip ? clip[pi] / 255 : 1;
+      if (k === 0) continue;
+      let c = covRes.empty ? 0 : cov[pi];
+      if (c > 1) c = 1;
+      let sr = 0, sg = 0, sb = 0, sa = 0;
+      if (c > 0 && paint) {
+        const col = solid || sample(x + 0.5, y + 0.5);
+        if (col) {
+          sa = col[3] * c * ga;
+          sr = col[0] * sa; sg = col[1] * sa; sb = col[2] * sa;   // premultiply
+        }
+      }
+      const i = pi * 4;
+      const br = data[i] / 255, bg = data[i + 1] / 255, bb = data[i + 2] / 255, ba = data[i + 3] / 255;
+      let osr = sr / 255, osg = sg / 255, osb = sb / 255;
+      if ((blend || blendNS) && ba > 0 && sa > 0) {
+        // A blend mode mixes the two colours first, then composites the result
+        // with plain source-over — the blend is what changes, not the geometry.
+        const ur = osr / sa, ug = osg / sa, ub = osb / sa;
+        const dr = br / ba, dg = bg / ba, db = bb / ba;
+        let mr, mg, mb;
+        if (blend) { mr = blend(dr, ur); mg = blend(dg, ug); mb = blend(db, ub); }
+        else { const m = blendNS([dr, dg, db], [ur, ug, ub]); mr = m[0]; mg = m[1]; mb = m[2]; }
+        osr = ((1 - ba) * ur + ba * mr) * sa;
+        osg = ((1 - ba) * ug + ba * mg) * sa;
+        osb = ((1 - ba) * ub + ba * mb) * sa;
+      }
+      const [Fa, Fb] = pd(sa, ba);
+      let oa = sa * Fa + ba * Fb;
+      let orr = osr * Fa + br * Fb;
+      let og = osg * Fa + bg * Fb;
+      let ob = osb * Fa + bb * Fb;
+      if (oa > 1) oa = 1;
+      // A partial clip applies the operation partially rather than not at all —
+      // that is what makes a clipped edge antialias instead of stairstep.
+      if (k < 1) {
+        orr = br + (orr - br) * k; og = bg + (og - bg) * k;
+        ob = bb + (ob - bb) * k; oa = ba + (oa - ba) * k;
+      }
+      if (!st.alpha) oa = 1;
+      data[i] = Math.round(Math.max(0, Math.min(1, orr)) * 255);
+      data[i + 1] = Math.round(Math.max(0, Math.min(1, og)) * 255);
+      data[i + 2] = Math.round(Math.max(0, Math.min(1, ob)) * 255);
+      data[i + 3] = Math.round(Math.max(0, Math.min(1, oa)) * 255);
+    }
+  }
+}
+
+// Shadow pass: the drawn shape's alpha, offset and blurred, painted in
+// shadowColor UNDER the shape itself. Runs first, and only when the shadow is
+// actually switched on — an offset of zero with no blur and an opaque colour
+// still counts as on, which is what 2d.shadow.enable.* pins down.
+function _c2dShadowActive(S) {
+  return S.shadowColor[3] > 0 && (S.shadowBlur > 0 || S.shadowOffsetX !== 0 || S.shadowOffsetY !== 0);
+}
+function _c2dDrawShadow(st, covRes, paintAlphaAt) {
+  const S = st.state;
+  const W = st.w, H = st.h;
+  const src = new Float32Array(W * H);
+  const dx = Math.round(S.shadowOffsetX), dy = Math.round(S.shadowOffsetY);
+  for (let y = covRes.y0; y < covRes.y1; y++) {
+    const ty = y + dy;
+    if (ty < 0 || ty >= H) continue;
+    for (let x = covRes.x0; x < covRes.x1; x++) {
+      const c = covRes.cov[y * W + x];
+      if (c <= 0) continue;
+      const tx = x + dx;
+      if (tx < 0 || tx >= W) continue;
+      src[ty * W + tx] = Math.min(1, c) * (paintAlphaAt ? paintAlphaAt(x, y) : 1);
+    }
+  }
+  const blurred = S.shadowBlur > 0 ? _c2dBlurAlpha(src, W, H, S.shadowBlur / 2) : src;
+  let bx0 = W, by0 = H, bx1 = 0, by1 = 0;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    if (blurred[y * W + x] > 0.0005) {
+      if (x < bx0) bx0 = x; if (x >= bx1) bx1 = x + 1;
+      if (y < by0) by0 = y; if (y >= by1) by1 = y + 1;
+    }
+  }
+  if (bx0 >= bx1) return;
+  _c2dComposite(st, { cov: blurred, x0: bx0, y0: by0, x1: bx1, y1: by1, empty: false },
+    { solid: S.shadowColor });
+}
+// Three box-blur passes ≈ a Gaussian (the standard cheap approximation, and the
+// one the CSS filter spec itself sanctions). Separable, so it costs O(W·H) per
+// pass rather than O(W·H·r²) — the difference between a shadow you can afford on
+// a netbook and one you cannot.
+function _c2dBlurAlpha(src, w, h, sigma) {
+  if (sigma <= 0) return src;
+  const d = Math.floor(sigma * 3 * Math.sqrt(2 * Math.PI) / 4 + 0.5);
+  const sizes = (d & 1)
+    ? [(d - 1) / 2, (d - 1) / 2, (d - 1) / 2]
+    : [d / 2, d / 2 - 1, d / 2];
+  let a = src, b = new Float32Array(w * h);
+  for (const r of sizes) {
+    if (r <= 0) continue;
+    _c2dBoxH(a, b, w, h, r); _c2dBoxV(b, a, w, h, r);
+  }
+  return a;
+}
+function _c2dBoxH(src, dst, w, h, r) {
+  const n = r * 2 + 1;
+  for (let y = 0; y < h; y++) {
+    const base = y * w;
+    let acc = 0;
+    for (let i = -r; i <= r; i++) acc += src[base + Math.max(0, Math.min(w - 1, i))];
+    for (let x = 0; x < w; x++) {
+      dst[base + x] = acc / n;
+      acc -= src[base + Math.max(0, Math.min(w - 1, x - r))];
+      acc += src[base + Math.max(0, Math.min(w - 1, x + r + 1))];
+    }
+  }
+}
+function _c2dBoxV(src, dst, w, h, r) {
+  const n = r * 2 + 1;
+  for (let x = 0; x < w; x++) {
+    let acc = 0;
+    for (let i = -r; i <= r; i++) acc += src[Math.max(0, Math.min(h - 1, i)) * w + x];
+    for (let y = 0; y < h; y++) {
+      dst[y * w + x] = acc / n;
+      acc -= src[Math.max(0, Math.min(h - 1, y - r)) * w + x];
+      acc += src[Math.max(0, Math.min(h - 1, y + r + 1)) * w + x];
+    }
+  }
+}
+
+// One entry point for "fill this path with this style" so that the shadow pass,
+// the clip and the composite operator can never be applied in two different
+// orders by two different callers.
+function _c2dPaintPath(st, path, styleColor, styleObj, evenOdd) {
+  const S = st.state;
+  const paint = _c2dMakePaint(st, styleColor, styleObj);
+  const covRes = _c2dCoverage(path, st.w, st.h, evenOdd, S.clipBox);
+  if (covRes.empty && !_C2D_FULL_OPS.has(S.gco)) return;
+  if (_c2dShadowActive(S) && !covRes.empty && paint) {
+    const alphaAt = paint.solid
+      ? () => paint.solid[3]
+      : (x, y) => { const c = paint.sample(x + 0.5, y + 0.5); return c ? c[3] : 0; };
+    _c2dDrawShadow(st, covRes, alphaAt);
+  }
+  _c2dComposite(st, covRes, paint);
+}
+// ---------------------------------------------------------------------------
+// The DOM-facing half: CanvasRenderingContext2D and friends. Everything below
+// touches the document (colour resolution needs `currentColor`, patterns need
+// image sources), so it lives outside the pure markers.
+// ---------------------------------------------------------------------------
+
+// Resolve any CSS <color> to [r, g, b, a] with r/g/b integers 0-255 and a in
+// [0, 1] — or null, which the canvas spec treats as "ignore this assignment
+// entirely and keep what was there". Reuses the engine's CSS Color 4 parser, so
+// canvas gets color-mix(), relative colour syntax and lab/oklch for free rather
+// than growing a second, worse colour parser beside the first one.
+function _c2dColor(value, el) {
+  if (typeof value !== 'string') return null;
+  const s = value.trim();
+  if (!s) return null;
+  let st;
+  try { st = _resolveColorStruct(s, el || null); } catch (e) { return null; }
+  if (!st) return null;
+  let srgb;
+  try { srgb = st.space === 'srgb' ? st : _csConvert(st, 'srgb'); } catch (e) { return null; }
+  if (!srgb || !srgb.coords) return null;
+  const ch = (v) => {
+    const n = Math.round(Math.max(0, Math.min(1, v)) * 255);
+    return Number.isFinite(n) ? n : 0;
+  };
+  let a = srgb.alpha;
+  if (!Number.isFinite(a)) a = 1;
+  return [ch(srgb.coords[0]), ch(srgb.coords[1]), ch(srgb.coords[2]), Math.max(0, Math.min(1, a))];
+}
+// HTML §"serialize a color": opaque colours come back as lowercase #rrggbb,
+// translucent ones as rgba() with the alpha in its shortest round-tripping form.
+// Not the CSSOM rule — `ctx.fillStyle = '#fa0'` must read back '#ffaa00', where
+// `el.style.color = '#fa0'` reads back 'rgb(255, 170, 0)'.
+function _c2dSerColor(c) {
+  if (c[3] >= 1) {
+    const hx = (n) => n.toString(16).padStart(2, '0');
+    return '#' + hx(c[0]) + hx(c[1]) + hx(c[2]);
+  }
+  let a = c[3];
+  // Shortest decimal that round-trips through the 8-bit alpha it came from.
+  let s = String(a);
+  for (let p = 1; p <= 8; p++) {
+    const t = a.toFixed(p);
+    if (Math.abs(parseFloat(t) - a) < 1e-12) { s = String(parseFloat(t)); break; }
+  }
+  return `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${s})`;
+}
+
+const _C2D_LINE_CAPS = new Set(['butt', 'round', 'square']);
+const _C2D_LINE_JOINS = new Set(['round', 'bevel', 'miter']);
+const _C2D_TEXT_ALIGNS = new Set(['start', 'end', 'left', 'right', 'center']);
+const _C2D_BASELINES = new Set(['top', 'hanging', 'middle', 'alphabetic', 'ideographic', 'bottom']);
+const _C2D_DIRECTIONS = new Set(['ltr', 'rtl', 'inherit']);
+const _C2D_SMOOTH_QUALITY = new Set(['low', 'medium', 'high']);
+const _C2D_KERNING = new Set(['auto', 'normal', 'none']);
+const _C2D_STRETCH = new Set(['ultra-condensed', 'extra-condensed', 'condensed', 'semi-condensed',
+  'normal', 'semi-expanded', 'expanded', 'extra-expanded', 'ultra-expanded']);
+const _C2D_VARIANT_CAPS = new Set(['normal', 'small-caps', 'all-small-caps', 'petite-caps',
+  'all-petite-caps', 'unicase', 'titling-caps']);
+const _C2D_TEXT_RENDERING = new Set(['auto', 'optimizeSpeed', 'optimizeLegibility', 'geometricPrecision']);
+
+const _c2dArity = (got, need, name) => {
+  if (got < need) {
+    throw new TypeError(
+      `Failed to execute '${name}' on 'CanvasRenderingContext2D': ${need} argument${need === 1 ? '' : 's'} required, but only ${got} present.`);
+  }
+};
+// WebIDL `unrestricted double`: anything non-numeric becomes NaN, and NaN is
+// what makes a drawing call a silent no-op rather than an exception.
+const _c2dNum = (v) => {
+  const n = Number(v);
+  return typeof n === 'number' ? n : NaN;
+};
+
+class CanvasGradient {
+  constructor(kind, params) {
+    Object.defineProperty(this, '_k', { value: kind });
+    Object.defineProperty(this, '_p', { value: params });
+    Object.defineProperty(this, '_stops', { value: [], writable: true });
+  }
+  addColorStop(offset, color) {
+    if (!(this instanceof CanvasGradient)) throw new TypeError('Illegal invocation');
+    _c2dArity(arguments.length, 2, 'addColorStop');
+    const o = Number(offset);
+    // TWO different errors from one argument, and the WebIDL conversion happens
+    // first: a non-finite offset never becomes a number at all (TypeError), while
+    // a perfectly good number outside [0, 1] is a range problem (IndexSizeError).
+    // Collapsing them tells the caller of `addColorStop(NaN)` that their value is
+    // out of range, which sends them looking in the wrong place.
+    if (!Number.isFinite(o)) throw new TypeError("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite.");
+    if (o < 0 || o > 1) throw _c2dIndexSizeError('The provided value (' + o + ') is outside the range [0, 1].');
+    const c = _c2dColor(String(color), null);
+    if (!c) throw _c2dSyntaxError("The value '" + color + "' is not a valid color");
+    this._stops.push({ o, c, seq: this._stops.length });
+    // Equal offsets keep insertion order, so a hard colour band built from two
+    // stops at the same offset lands the right way round.
+    this._stops.sort((a, b) => (a.o - b.o) || (a.seq - b.seq));
+    return undefined;
+  }
+  // Colour at parameter t (already clamped by the caller), interpolated in
+  // PREMULTIPLIED sRGB — the space the spec names, and the one where a fade to
+  // transparent does not detour through grey.
+  _at(t) {
+    const st = this._stops;
+    if (!st.length) return null;
+    if (t <= st[0].o) return st[0].c;
+    if (t >= st[st.length - 1].o) return st[st.length - 1].c;
+    for (let i = 0; i < st.length - 1; i++) {
+      const a = st[i], b = st[i + 1];
+      if (t >= a.o && t <= b.o) {
+        if (b.o === a.o) return b.c;
+        const f = (t - a.o) / (b.o - a.o);
+        const aa = a.c[3], ba = b.c[3];
+        const oa = aa + (ba - aa) * f;
+        if (oa <= 0) return [0, 0, 0, 0];
+        const mix = (i0, i1) => (i0 * aa + (i1 * ba - i0 * aa) * f) / oa;
+        return [mix(a.c[0], b.c[0]), mix(a.c[1], b.c[1]), mix(a.c[2], b.c[2]), oa];
+      }
+    }
+    return st[st.length - 1].c;
+  }
+}
+class CanvasPattern {
+  constructor(bitmap, repetition) {
+    Object.defineProperty(this, '_bm', { value: bitmap });
+    Object.defineProperty(this, '_rep', { value: repetition });
+    Object.defineProperty(this, '_tf', { value: [1, 0, 0, 1, 0, 0], writable: true });
+  }
+  setTransform(mat) {
+    if (!(this instanceof CanvasPattern)) throw new TypeError('Illegal invocation');
+    const m = mat || {};
+    const g = (k, d) => (m[k] === undefined ? d : Number(m[k]));
+    const t = [g('a', 1), g('b', 0), g('c', 0), g('d', 1), g('e', 0), g('f', 0)];
+    if (!_c2dFinite(...t)) return undefined;
+    this._tf = t;
+    return undefined;
+  }
+}
+
+// ImageData is a real class now, not a bag with three keys. `instanceof
+// ImageData` and `data instanceof Uint8ClampedArray` are both load-bearing:
+// putImageData is specified to reject anything that is not genuinely one.
+class ImageData {
+  constructor(a, b, c) {
+    let data = null, w, h;
+    if (a instanceof Uint8ClampedArray) {
+      _c2dArity(arguments.length, 2, 'ImageData');
+      data = a; w = Number(b) >>> 0;
+      if (data.length === 0 || data.length % 4 !== 0) throw _c2dInvalidStateError('data length must be a non-zero multiple of 4');
+      if (w === 0) throw _c2dIndexSizeError('width is zero');
+      if ((data.length / 4) % w !== 0) throw _c2dIndexSizeError('data length is not a multiple of width');
+      h = c === undefined ? (data.length / 4) / w : Number(c) >>> 0;
+      if (h === 0) throw _c2dIndexSizeError('height is zero');
+      if (w * h * 4 !== data.length) throw _c2dIndexSizeError('data length does not match the given dimensions');
+    } else {
+      _c2dArity(arguments.length, 2, 'ImageData');
+      w = Number(a) >>> 0; h = Number(b) >>> 0;
+      if (w === 0) throw _c2dIndexSizeError('width is zero');
+      if (h === 0) throw _c2dIndexSizeError('height is zero');
+      data = new Uint8ClampedArray(w * h * 4);
+    }
+    Object.defineProperty(this, '_w', { value: w });
+    Object.defineProperty(this, '_h', { value: h });
+    Object.defineProperty(this, '_d', { value: data });
+  }
+  get width() { if (!(this instanceof ImageData)) throw new TypeError('Illegal invocation'); return this._w; }
+  get height() { if (!(this instanceof ImageData)) throw new TypeError('Illegal invocation'); return this._h; }
+  get data() { if (!(this instanceof ImageData)) throw new TypeError('Illegal invocation'); return this._d; }
+  get colorSpace() { if (!(this instanceof ImageData)) throw new TypeError('Illegal invocation'); return 'srgb'; }
+  get pixelFormat() { if (!(this instanceof ImageData)) throw new TypeError('Illegal invocation'); return 'rgba-unorm8'; }
+}
+
+class Path2D {
+  constructor(src) {
+    Object.defineProperty(this, '_p', { value: new _C2DPath(), writable: true });
+    if (src instanceof Path2D) this._p = src._p.clone();
+    else if (typeof src === 'string') _c2dParseSvgPath(this._p, src);
+  }
+  addPath(path, tf) {
+    if (!(this instanceof Path2D)) throw new TypeError('Illegal invocation');
+    _c2dArity(arguments.length, 1, 'addPath');
+    if (!(path instanceof Path2D)) throw new TypeError('argument is not a Path2D');
+    let m = [1, 0, 0, 1, 0, 0];
+    if (tf) { const g = (k, d) => (tf[k] === undefined ? d : Number(tf[k]));
+      m = [g('a', 1), g('b', 0), g('c', 0), g('d', 1), g('e', 0), g('f', 0)];
+      if (!_c2dFinite(...m)) return undefined; }
+    this._p.addPath(path._p, m);
+    return undefined;
+  }
+}
+// The path-building methods are identical on the context and on Path2D — the
+// only difference is which matrix gets baked in — so they are installed from one
+// table rather than written twice and drifting apart.
+const _C2D_PATH_METHODS = {
+  moveTo: [2, (p, m, a) => p.moveTo(m, _c2dNum(a[0]), _c2dNum(a[1]))],
+  lineTo: [2, (p, m, a) => p.lineTo(m, _c2dNum(a[0]), _c2dNum(a[1]))],
+  closePath: [0, (p, m) => p.closePath(m)],
+  quadraticCurveTo: [4, (p, m, a) => p.quadraticCurveTo(m, _c2dNum(a[0]), _c2dNum(a[1]), _c2dNum(a[2]), _c2dNum(a[3]))],
+  bezierCurveTo: [6, (p, m, a) => p.bezierCurveTo(m, _c2dNum(a[0]), _c2dNum(a[1]), _c2dNum(a[2]), _c2dNum(a[3]), _c2dNum(a[4]), _c2dNum(a[5]))],
+  arcTo: [5, (p, m, a) => p.arcTo(m, _c2dNum(a[0]), _c2dNum(a[1]), _c2dNum(a[2]), _c2dNum(a[3]), _c2dNum(a[4]))],
+  rect: [4, (p, m, a) => p.rect(m, _c2dNum(a[0]), _c2dNum(a[1]), _c2dNum(a[2]), _c2dNum(a[3]))],
+  arc: [5, (p, m, a) => p.arc(m, _c2dNum(a[0]), _c2dNum(a[1]), _c2dNum(a[2]), _c2dNum(a[3]), _c2dNum(a[4]), !!a[5])],
+  ellipse: [7, (p, m, a) => p.ellipse(m, _c2dNum(a[0]), _c2dNum(a[1]), _c2dNum(a[2]), _c2dNum(a[3]), _c2dNum(a[4]), _c2dNum(a[5]), _c2dNum(a[6]), !!a[7])],
+  roundRect: [4, (p, m, a) => p.roundRect(m, _c2dNum(a[0]), _c2dNum(a[1]), _c2dNum(a[2]), _c2dNum(a[3]), _c2dNormRadii(a[4]))],
+};
+// roundRect's radii argument is the most overloaded input in the whole API: a
+// number, a DOMPointInit, or a list of one to four of either. Anything else is a
+// TypeError, and a negative radius is a RangeError — two different errors from
+// one argument slot, which is exactly what 2d.path.roundrect.badinput checks.
+function _c2dNormRadii(v) {
+  let list = v === undefined ? [0] : (Array.isArray(v) || (v && typeof v[Symbol.iterator] === 'function' && typeof v !== 'string')
+    ? Array.from(v) : [v]);
+  if (list.length < 1 || list.length > 4) {
+    throw _c2dIndexSizeError(`${list.length} radii provided, but only 1 to 4 are accepted`);
+  }
+  // WebIDL refuses to convert a BigInt to a double — `Number(0n)` succeeds, but the
+  // *implicit* conversion a binding performs does not, so `roundRect(…, 0n)` is a
+  // TypeError. Calling Number() here would have silently accepted it and made us
+  // the only engine that does.
+  const dbl = (v) => {
+    if (typeof v === 'bigint') throw new TypeError('Cannot convert a BigInt value to a number');
+    return Number(v);
+  };
+  const one = (r) => {
+    if (r !== null && typeof r === 'object') {
+      const x = dbl(r.x === undefined ? 0 : r.x), y = dbl(r.y === undefined ? 0 : r.y);
+      if ((Number.isFinite(x) && x < 0) || (Number.isFinite(y) && y < 0)) throw new RangeError('radius cannot be negative');
+      return { x, y };
+    }
+    const n = dbl(r);
+    if (Number.isFinite(n) && n < 0) throw new RangeError('radius cannot be negative');
+    return { x: n, y: n };
+  };
+  const r = list.map(one);
+  if (r.length === 1) return [r[0], r[0], r[0], r[0]];
+  if (r.length === 2) return [r[0], r[1], r[0], r[1]];
+  if (r.length === 3) return [r[0], r[1], r[2], r[1]];
+  return r;
+}
+// ---- the CSS font shorthand, as canvas serializes it ----------------------
+// `ctx.font` round-trips through a canonical form, so the getter is a
+// re-serialization and not an echo. An unparseable value is IGNORED — the
+// previous font stays — which is why a typo in one chart label does not silently
+// reset every later label to 10px sans-serif.
+const _C2D_FONT_STYLE = new Set(['normal', 'italic', 'oblique']);
+const _C2D_FONT_VARIANT = new Set(['normal', 'small-caps']);
+const _C2D_FONT_WEIGHT = new Set(['normal', 'bold', 'bolder', 'lighter',
+  '100', '200', '300', '400', '500', '600', '700', '800', '900']);
+const _C2D_ABS_SIZE = { 'xx-small': 9, 'x-small': 10, small: 13, medium: 16,
+  large: 18, 'x-large': 24, 'xx-large': 32, 'xxx-large': 48 };
+function _c2dParseFont(str) {
+  const s = String(str).replace(/\/\*[\s\S]*?\*\//g, '').trim();
+  if (!s) return null;
+  if (/^(caption|icon|menu|message-box|small-caption|status-bar)$/i.test(s)) {
+    return { style: 'normal', variant: 'normal', weight: 'normal', stretch: 'normal',
+             size: 13.333, sizeText: '13.3333px', lineHeight: '', family: 'sans-serif', px: 13.333 };
+  }
+  // Split off the family list at the LAST size-looking token, because a family
+  // may legitimately contain digits ("Arial 12").
+  const toks = _c2dSplitFontTokens(s);
+  if (!toks) return null;
+  let style = 'normal', variant = 'normal', weight = 'normal', stretch = 'normal';
+  let i = 0;
+  for (; i < toks.length; i++) {
+    const t = toks[i], low = t.toLowerCase();
+    if (_C2D_FONT_STYLE.has(low) && low !== 'normal') { if (style !== 'normal') return null; style = low; continue; }
+    if (low === 'oblique') { style = low; continue; }
+    if (_C2D_FONT_VARIANT.has(low) && low !== 'normal') { if (variant !== 'normal') return null; variant = low; continue; }
+    if (_C2D_FONT_WEIGHT.has(low) && low !== 'normal') { if (weight !== 'normal') return null; weight = low; continue; }
+    if (_C2D_STRETCH.has(low) && low !== 'normal') { if (stretch !== 'normal') return null; stretch = low; continue; }
+    if (low === 'normal') continue;
+    break;
+  }
+  if (i >= toks.length) return null;
+  // size [ / line-height ]
+  let sizeTok = toks[i++], lineHeight = '';
+  const slash = sizeTok.indexOf('/');
+  if (slash >= 0) { lineHeight = sizeTok.slice(slash + 1); sizeTok = sizeTok.slice(0, slash); }
+  else if (toks[i] === '/') { i++; lineHeight = toks[i++]; }
+  else if (toks[i] && toks[i][0] === '/') { lineHeight = toks[i].slice(1); i++; }
+  const px = _c2dFontSizePx(sizeTok);
+  if (px === null) return null;
+  const family = toks.slice(i).join(' ').trim();
+  if (!family) return null;
+  // A family list is quoted strings and/or CSS identifiers — nothing else.
+  // Without this, `ctx.font = '10px {bogus}'` parses "successfully" and the
+  // typo silently replaces the font the page had set, which is worse than the
+  // assignment being ignored.
+  for (const part of family.split(',')) {
+    const f = part.trim();
+    if (!f) return null;
+    if (f[0] === '"' || f[0] === "'") {
+      if (f.length < 2 || f[f.length - 1] !== f[0]) return null;
+      continue;
+    }
+    // A CSS identifier: letters, digits, `-`, `_`, escapes and anything
+    // non-ASCII; a leading digit is not allowed. Several idents separated by
+    // spaces make one unquoted family name ("Helvetica Neue").
+    if (!/^-?[_a-zA-Z -￿\\][-_a-zA-Z0-9 -￿\\]*( +-?[_a-zA-Z -￿\\][-_a-zA-Z0-9 -￿\\]*)*$/.test(f)) return null;
+  }
+  return { style, variant, weight, stretch, size: px, sizeText: _c2dSerSize(sizeTok, px),
+           lineHeight, family: _c2dSerFamily(family), px };
+}
+function _c2dSplitFontTokens(s) {
+  // Family names may be quoted and may contain spaces/commas; keep everything
+  // from the first family token onwards as one blob for the family serializer.
+  const out = [];
+  let cur = '', q = null, depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q) { cur += ch; if (ch === q && s[i - 1] !== '\\') q = null; continue; }
+    if (ch === '"' || ch === "'") { q = ch; cur += ch; continue; }
+    if (ch === '(') depth++;
+    if (ch === ')') depth--;
+    if (depth === 0 && /\s/.test(ch)) { if (cur) { out.push(cur); cur = ''; } continue; }
+    cur += ch;
+  }
+  if (q) return null;                       // unterminated string is a parse error
+  if (cur) out.push(cur);
+  return out.length ? out : null;
+}
+function _c2dFontSizePx(tok) {
+  const low = tok.toLowerCase();
+  if (_C2D_ABS_SIZE[low] !== undefined) return _C2D_ABS_SIZE[low];
+  if (low === 'larger') return 19.2;
+  if (low === 'smaller') return 13.333;
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+))(px|pt|pc|in|cm|mm|q|em|rem|ex|ch|%)$/i.exec(tok);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const u = m[2].toLowerCase();
+  const f = { px: 1, pt: 96 / 72, pc: 16, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6,
+              em: 16, rem: 16, ex: 8, ch: 8, '%': 0.16 }[u];
+  return n * f;
+}
+const _c2dSerSize = (tok, px) => {
+  // Canvas serializes the size in px, dropping a trailing `.0`.
+  const r = Math.round(px * 10000) / 10000;
+  return (Number.isInteger(r) ? String(r) : String(r)) + 'px';
+};
+// The generic families are CSS KEYWORDS, not author-chosen names, so they
+// serialize ASCII-lowercased — `ctx.font = '20PX SERIF'` reads back
+// `'20px serif'`. An author's own family is an identifier and keeps its case,
+// because "Helvetica Neue" and "helvetica neue" may genuinely be different files.
+const _C2D_GENERIC_FAMILIES = new Set(['serif', 'sans-serif', 'monospace', 'cursive',
+  'fantasy', 'system-ui', 'math', 'ui-serif', 'ui-sans-serif', 'ui-monospace',
+  'ui-rounded', 'emoji', 'fangsong']);
+const _c2dSerFamily = (fam) => fam.split(',').map((f) => {
+  f = f.trim();
+  if (!f) return f;
+  if (_C2D_GENERIC_FAMILIES.has(f.toLowerCase())) return f.toLowerCase();
+  if (f[0] === '"' || f[0] === "'") {
+    const inner = f.slice(1, -1);
+    // An identifier-safe family loses its quotes on serialization; anything else
+    // keeps them (and normalises to double quotes).
+    return /^[-a-zA-Z_][-a-zA-Z0-9_]*( [-a-zA-Z_][-a-zA-Z0-9_]*)*$/.test(inner) && !/^\d/.test(inner)
+      ? inner : '"' + inner.replace(/"/g, '\\"') + '"';
+  }
+  return f;
+}).join(', ');
+
+// Advance widths, as a fraction of the em, for the fallback metrics. These are
+// APPROXIMATE and openly so: this engine has no font rasterizer reachable from
+// the JS realm yet, and a made-up number that is roughly right is honest as long
+// as it is labelled — unlike the noise the old fillText painted, which claimed
+// to be glyphs. See the scroll's Caps section.
+const _C2D_ADV = (() => {
+  const t = new Float32Array(128).fill(0.5);
+  const set = (chars, v) => { for (const c of chars) t[c.charCodeAt(0)] = v; };
+  set(' ', 0.26); set('.,;:!|\'`', 0.26); set('"', 0.35);
+  set('iljI', 0.24); set('ft()[]{}/\\', 0.31); set('r', 0.34);
+  set('abcdeghknopqsuvxyz023456789', 0.556); set('1', 0.5);
+  set('mw', 0.83); set('MW', 0.89); set('ABCDEFGHKNOPQRSTUVXYZ', 0.68);
+  set('J', 0.5); set('L', 0.56); set('@', 1.0);
+  return t;
+})();
+function _c2dTextWidth(text, px, letterSpacing, wordSpacing) {
+  let w = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    w += (c < 128 ? _C2D_ADV[c] : 1.0) * px;
+    if (c === 32) w += wordSpacing;
+    w += letterSpacing;
+  }
+  return w;
+}
+const _c2dSpacingPx = (v) => {
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+))(px|em|rem|pt)?$/.exec(String(v).trim());
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return null;
+  return { px: 1, em: 16, rem: 16, pt: 96 / 72, undefined: 1 }[m[2]] * n || n;
+};
+
+class TextMetrics {
+  constructor(m) { Object.defineProperty(this, '_m', { value: m }); }
+}
+for (const k of ['width', 'actualBoundingBoxLeft', 'actualBoundingBoxRight',
+  'fontBoundingBoxAscent', 'fontBoundingBoxDescent', 'actualBoundingBoxAscent',
+  'actualBoundingBoxDescent', 'emHeightAscent', 'emHeightDescent',
+  'hangingBaseline', 'alphabeticBaseline', 'ideographicBaseline']) {
+  Object.defineProperty(TextMetrics.prototype, k, {
+    configurable: true, enumerable: true,
+    get() { if (!(this instanceof TextMetrics)) throw new TypeError('Illegal invocation'); return this._m[k] || 0; },
+  });
+}
+
+// ---- prototype installation -----------------------------------------------
+// A simple attribute: read `key` from the state; on write run `coerce` and IGNORE
+// the assignment when it returns undefined. "Silently keep the old value" is the
+// canvas rule for nearly every attribute on the interface, and saying it once
+// here is what stops twenty attributes each inventing their own version of it.
+const _c2dNameFn = (name, len, fn) => {
+  Object.defineProperty(fn, 'name', { value: name, configurable: true });
+  Object.defineProperty(fn, 'length', { value: len, configurable: true });
+  return _markNative(fn);
+};
+function _c2dAttr(name, key, coerce, read) {
+  const get = _c2dNameFn('get ' + name, 0, function () {
+    const s = _c2dSt(this); return read ? read(s) : s.state[key];
+  });
+  const desc = { configurable: true, enumerable: true, get };
+  if (coerce) {
+    desc.set = _c2dNameFn('set ' + name, 1, function (v) {
+      const s = _c2dSt(this);
+      const nv = coerce(v, s);
+      if (nv !== undefined) s.state[key] = nv;
+    });
+  }
+  Object.defineProperty(CanvasRenderingContext2D.prototype, name, desc);
+}
+function _c2dMethod(name, len, fn) {
+  Object.defineProperty(CanvasRenderingContext2D.prototype, name, {
+    configurable: true, enumerable: true, writable: true, value: _c2dNameFn(name, len, fn),
+  });
+}
+// An enumerated attribute keeps its old value when handed something outside the
+// list. That is WebIDL §3.7.10 in its ATTRIBUTE form — the same string passed as
+// an ARGUMENT would be a TypeError. Same word, two behaviours, decided entirely
+// by where it appears.
+const _c2dEnum = (set) => (v) => { const s = String(v); return set.has(s) ? s : undefined; };
+const _c2dPositive = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : undefined; };
+const _c2dFiniteNum = (v) => { const n = Number(v); return Number.isFinite(n) ? n : undefined; };
+const _c2dNonNeg = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : undefined; };
+
+Object.defineProperty(CanvasRenderingContext2D.prototype, 'canvas', {
+  configurable: true, enumerable: true,
+  get: _c2dNameFn('get canvas', 0, function () { return _c2dSt(this).canvas; }),
+});
+
+_c2dAttr('globalAlpha', 'globalAlpha', (v) => {
+  const n = Number(v); return Number.isFinite(n) && n >= 0 && n <= 1 ? n : undefined;
+});
+_c2dAttr('globalCompositeOperation', 'gco', (v) => {
+  const s = String(v);
+  return (_C2D_OPS[s] || _C2D_BLEND[s] || _C2D_BLEND_NS[s] || s === 'normal') ? s : undefined;
+});
+_c2dAttr('lineWidth', 'lineWidth', _c2dPositive);
+_c2dAttr('lineCap', 'lineCap', _c2dEnum(_C2D_LINE_CAPS));
+_c2dAttr('lineJoin', 'lineJoin', _c2dEnum(_C2D_LINE_JOINS));
+_c2dAttr('miterLimit', 'miterLimit', _c2dPositive);
+_c2dAttr('lineDashOffset', 'lineDashOffset', _c2dFiniteNum);
+_c2dAttr('shadowOffsetX', 'shadowOffsetX', _c2dFiniteNum);
+_c2dAttr('shadowOffsetY', 'shadowOffsetY', _c2dFiniteNum);
+_c2dAttr('shadowBlur', 'shadowBlur', _c2dNonNeg);
+_c2dAttr('imageSmoothingEnabled', 'imageSmoothingEnabled', (v) => !!v);
+_c2dAttr('imageSmoothingQuality', 'imageSmoothingQuality', _c2dEnum(_C2D_SMOOTH_QUALITY));
+_c2dAttr('textAlign', 'textAlign', _c2dEnum(_C2D_TEXT_ALIGNS));
+_c2dAttr('textBaseline', 'textBaseline', _c2dEnum(_C2D_BASELINES));
+_c2dAttr('direction', 'direction', _c2dEnum(_C2D_DIRECTIONS));
+_c2dAttr('fontKerning', 'fontKerning', _c2dEnum(_C2D_KERNING));
+_c2dAttr('fontStretch', 'fontStretch', _c2dEnum(_C2D_STRETCH));
+_c2dAttr('fontVariantCaps', 'fontVariantCaps', _c2dEnum(_C2D_VARIANT_CAPS));
+_c2dAttr('textRendering', 'textRendering', _c2dEnum(_C2D_TEXT_RENDERING));
+_c2dAttr('lang', 'lang', (v) => String(v));
+_c2dAttr('filter', 'filter', (v) => {
+  const s = String(v).trim();
+  return (s === 'none' || /^[a-z-]+\(/i.test(s) || /^url\(/i.test(s)) ? s : undefined;
+});
+_c2dAttr('letterSpacing', 'letterSpacing', (v) => {
+  const px = _c2dSpacingPx(v); return px === null ? undefined : String(v).trim();
+});
+_c2dAttr('wordSpacing', 'wordSpacing', (v) => {
+  const px = _c2dSpacingPx(v); return px === null ? undefined : String(v).trim();
+});
+_c2dAttr('shadowColor', 'shadowColor', (v, s) => {
+  const c = _c2dColor(String(v), s.canvas); return c || undefined;
+}, (s) => _c2dSerColor(s.state.shadowColor));
+_c2dAttr('font', 'font', (v, s) => {
+  const f = _c2dParseFont(v);
+  if (!f) return undefined;
+  s.state.fontParsed = f;
+  return _c2dSerFont(f);
+});
+const _c2dSerFont = (f) => {
+  const bits = [];
+  if (f.style !== 'normal') bits.push(f.style);
+  if (f.variant !== 'normal') bits.push(f.variant);
+  if (f.weight !== 'normal') bits.push(f.weight);
+  if (f.stretch !== 'normal') bits.push(f.stretch);
+  bits.push(f.sizeText + (f.lineHeight ? '/' + f.lineHeight : ''));
+  bits.push(f.family);
+  return bits.join(' ');
+};
+
+// fillStyle / strokeStyle carry EITHER a colour or a paint object, so they need
+// their own pair rather than the generic accessor.
+for (const [name, ck, ok] of [['fillStyle', 'fill', 'fillObj'], ['strokeStyle', 'stroke', 'strokeObj']]) {
+  Object.defineProperty(CanvasRenderingContext2D.prototype, name, {
+    configurable: true, enumerable: true,
+    get: _c2dNameFn('get ' + name, 0, function () {
+      const s = _c2dSt(this);
+      return s.state[ok] || _c2dSerColor(s.state[ck]);
+    }),
+    set: _c2dNameFn('set ' + name, 1, function (v) {
+      const s = _c2dSt(this);
+      if (v instanceof CanvasGradient || v instanceof CanvasPattern) { s.state[ok] = v; return; }
+      if (typeof v !== 'string') return;                     // ignored, not an error
+      const c = _c2dColor(v, s.canvas);
+      if (!c) return;                                        // ditto for an unparseable colour
+      s.state[ck] = c; s.state[ok] = null;
+    }),
+  });
+}
+
+// ---- state ----------------------------------------------------------------
+_c2dMethod('save', 0, function () {
+  const s = _c2dSt(this);
+  s.stack.push(Object.assign({}, s.state, { lineDash: s.state.lineDash.slice() }));
+});
+_c2dMethod('restore', 0, function () {
+  const s = _c2dSt(this);
+  // An underflowing restore() is a NO-OP, not an error and not a reset. Pages
+  // routinely over-restore in a loop and must not have their state wiped for it.
+  if (!s.stack.length) return;
+  s.state = s.stack.pop();
+});
+_c2dMethod('reset', 0, function () {
+  const s = _c2dSt(this);
+  s.data = new Uint8ClampedArray(s.w * s.h * 4);
+  if (!s.alpha) for (let i = 3; i < s.data.length; i += 4) s.data[i] = 255;
+  s.state = _C2D_DEFAULT_STATE();
+  s.stack = [];
+  s.path = new _C2DPath();
+});
+_c2dMethod('isContextLost', 0, function () { _c2dSt(this); return false; });
+_c2dMethod('getContextAttributes', 0, function () {
+  const s = _c2dSt(this);
+  return { alpha: s.alpha, colorSpace: s.colorSpace, desynchronized: s.desynchronized,
+           willReadFrequently: s.willReadFrequently };
+});
+
+// ---- transforms -----------------------------------------------------------
+_c2dMethod('scale', 2, function (x, y) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 2, 'scale');
+  const a = _c2dNum(x), b = _c2dNum(y);
+  if (!_c2dFinite(a, b)) return;
+  s.state.ctm = _c2mMul(s.state.ctm, [a, 0, 0, b, 0, 0]);
+});
+_c2dMethod('rotate', 1, function (ang) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 1, 'rotate');
+  const a = _c2dNum(ang);
+  if (!_c2dFinite(a)) return;
+  const c = Math.cos(a), n = Math.sin(a);
+  s.state.ctm = _c2mMul(s.state.ctm, [c, n, -n, c, 0, 0]);
+});
+_c2dMethod('translate', 2, function (x, y) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 2, 'translate');
+  const a = _c2dNum(x), b = _c2dNum(y);
+  if (!_c2dFinite(a, b)) return;
+  s.state.ctm = _c2mMul(s.state.ctm, [1, 0, 0, 1, a, b]);
+});
+_c2dMethod('transform', 6, function (a, b, c, d, e, f) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 6, 'transform');
+  const m = [_c2dNum(a), _c2dNum(b), _c2dNum(c), _c2dNum(d), _c2dNum(e), _c2dNum(f)];
+  if (!_c2dFinite(...m)) return;
+  s.state.ctm = _c2mMul(s.state.ctm, m);
+});
+_c2dMethod('setTransform', 0, function (a, b, c, d, e, f) {
+  const s = _c2dSt(this);
+  if (arguments.length === 0) { s.state.ctm = [1, 0, 0, 1, 0, 0]; return; }
+  if (arguments.length === 1) {
+    // The one-argument overload takes a DOMMatrix2DInit *dictionary*. WebIDL
+    // refuses to convert a primitive to a dictionary, so `setTransform(1)` is a
+    // TypeError rather than a quiet identity transform — and it has to be, or
+    // the six-argument call with five arguments missing looks like a success.
+    if (a !== null && a !== undefined && typeof a !== 'object' && typeof a !== 'function') {
+      throw new TypeError("Failed to execute 'setTransform' on 'CanvasRenderingContext2D': The provided value is not of type 'DOMMatrix2DInit'.");
+    }
+    const o = a || {};
+    const g = (k, dv) => (o[k] === undefined ? dv : Number(o[k]));
+    const m = [g('a', g('m11', 1)), g('b', g('m12', 0)), g('c', g('m21', 0)),
+               g('d', g('m22', 1)), g('e', g('m41', 0)), g('f', g('m42', 0))];
+    if (!_c2dFinite(...m)) return;
+    s.state.ctm = m; return;
+  }
+  _c2dArity(arguments.length, 6, 'setTransform');
+  const m = [_c2dNum(a), _c2dNum(b), _c2dNum(c), _c2dNum(d), _c2dNum(e), _c2dNum(f)];
+  if (!_c2dFinite(...m)) return;
+  s.state.ctm = m;
+});
+_c2dMethod('resetTransform', 0, function () { _c2dSt(this).state.ctm = [1, 0, 0, 1, 0, 0]; });
+_c2dMethod('getTransform', 0, function () {
+  const m = _c2dSt(this).state.ctm;
+  return new DOMMatrix([m[0], m[1], m[2], m[3], m[4], m[5]]);
+});
+
+// ---- paint sources --------------------------------------------------------
+_c2dMethod('createLinearGradient', 4, function (x0, y0, x1, y1) {
+  _c2dSt(this); _c2dArity(arguments.length, 4, 'createLinearGradient');
+  const p = [_c2dNum(x0), _c2dNum(y0), _c2dNum(x1), _c2dNum(y1)];
+  // The gradient constructors take plain `double`, not `unrestricted double`, so a
+  // non-finite coordinate is a TypeError at the boundary — NOT a DOMException, and
+  // not a gradient that quietly paints nothing later.
+  if (!_c2dFinite(...p)) throw new TypeError("Failed to execute 'createLinearGradient' on 'CanvasRenderingContext2D': The provided double value is non-finite.");
+  return new CanvasGradient('linear', p);
+});
+_c2dMethod('createRadialGradient', 6, function (x0, y0, r0, x1, y1, r1) {
+  _c2dSt(this); _c2dArity(arguments.length, 6, 'createRadialGradient');
+  const p = [_c2dNum(x0), _c2dNum(y0), _c2dNum(r0), _c2dNum(x1), _c2dNum(y1), _c2dNum(r1)];
+  if (!_c2dFinite(...p)) throw new TypeError("Failed to execute 'createRadialGradient' on 'CanvasRenderingContext2D': The provided double value is non-finite.");
+  if (p[2] < 0 || p[5] < 0) throw _c2dIndexSizeError('negative radius');
+  return new CanvasGradient('radial', p);
+});
+_c2dMethod('createConicGradient', 3, function (startAngle, x, y) {
+  _c2dSt(this); _c2dArity(arguments.length, 3, 'createConicGradient');
+  const p = [_c2dNum(startAngle), _c2dNum(x), _c2dNum(y)];
+  if (!_c2dFinite(...p)) throw new TypeError("Failed to execute 'createConicGradient' on 'CanvasRenderingContext2D': The provided double value is non-finite.");
+  return new CanvasGradient('conic', p);
+});
+_c2dMethod('createPattern', 2, function (image, repetition) {
+  _c2dSt(this); _c2dArity(arguments.length, 2, 'createPattern');
+  let rep = repetition === null || repetition === undefined || repetition === '' ? 'repeat' : String(repetition);
+  if (!['repeat', 'repeat-x', 'repeat-y', 'no-repeat'].includes(rep)) {
+    throw _c2dSyntaxError("The provided value '" + rep + "' is not a valid repetition");
+  }
+  const bm = _c2dBitmapOf(image);
+  if (bm === 'bad') throw new TypeError('The provided value is not a valid image source');
+  if (bm === 'incomplete') return null;                 // an un-loaded image yields null
+  if (bm === 'zero') throw _c2dInvalidStateError('image has zero dimensions');
+  return new CanvasPattern(bm, rep);
+});
+
+// ---- rectangles -----------------------------------------------------------
+// A rect drawing op is just a four-point path with the CTM baked in, so all
+// three share the machinery that fill()/stroke() use and cannot drift from it.
+const _c2dRectPath = (ctm, x, y, w, h) => {
+  const p = new _C2DPath();
+  p.subpaths.push({ pts: [_c2mX(ctm, x, y), _c2mY(ctm, x, y),
+                          _c2mX(ctm, x + w, y), _c2mY(ctm, x + w, y),
+                          _c2mX(ctm, x + w, y + h), _c2mY(ctm, x + w, y + h),
+                          _c2mX(ctm, x, y + h), _c2mY(ctm, x, y + h)], closed: true });
+  return p;
+};
+_c2dMethod('fillRect', 4, function (x, y, w, h) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 4, 'fillRect');
+  const a = _c2dNum(x), b = _c2dNum(y), c = _c2dNum(w), d = _c2dNum(h);
+  if (!_c2dFinite(a, b, c, d)) return;                  // non-finite is a silent no-op
+  if (c === 0 || d === 0) return;
+  _c2dPaintPath(s, _c2dRectPath(s.state.ctm, a, b, c, d), s.state.fill, s.state.fillObj, false);
+});
+_c2dMethod('clearRect', 4, function (x, y, w, h) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 4, 'clearRect');
+  const a = _c2dNum(x), b = _c2dNum(y), c = _c2dNum(w), d = _c2dNum(h);
+  if (!_c2dFinite(a, b, c, d)) return;
+  if (c === 0 || d === 0) return;
+  // clearRect obeys the transform and the clip but NOT globalAlpha, the composite
+  // operator or shadows — it is a hole punched in the bitmap, not a paint.
+  const saveGco = s.state.gco, saveAlpha = s.state.globalAlpha;
+  s.state.gco = 'destination-out'; s.state.globalAlpha = 1;
+  try {
+    const cov = _c2dCoverage(_c2dRectPath(s.state.ctm, a, b, c, d), s.w, s.h, false, s.state.clipBox);
+    _c2dComposite(s, cov, { solid: [0, 0, 0, 1] });
+  } finally { s.state.gco = saveGco; s.state.globalAlpha = saveAlpha; }
+});
+_c2dMethod('strokeRect', 4, function (x, y, w, h) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 4, 'strokeRect');
+  const a = _c2dNum(x), b = _c2dNum(y), c = _c2dNum(w), d = _c2dNum(h);
+  if (!_c2dFinite(a, b, c, d)) return;
+  const p = new _C2DPath();
+  // A zero-width-or-height "rect" strokes as a LINE, and a fully degenerate one
+  // strokes as a point — five separate WPT files live on exactly this.
+  if (c === 0 && d === 0) { p.moveTo(s.state.ctm, a, b); }
+  else if (c === 0 || d === 0) { p.moveTo(s.state.ctm, a, b); p.lineTo(s.state.ctm, a + c, b + d); }
+  else { p.rect(s.state.ctm, a, b, c, d); }
+  _c2dStrokePath(s, p);
+});
+
+// ---- paths ----------------------------------------------------------------
+for (const [name, [len, apply]] of Object.entries(_C2D_PATH_METHODS)) {
+  _c2dMethod(name, len, function (...args) {
+    const s = _c2dSt(this);
+    _c2dArity(arguments.length, len, name);
+    try { apply(s.path, s.state.ctm, args); }
+    catch (e) { throw e.__c2dIndexSize ? _c2dIndexSizeError(e.message) : e; }
+  });
+  Object.defineProperty(Path2D.prototype, name, {
+    configurable: true, enumerable: true, writable: true,
+    value: _c2dNameFn(name, len, function (...args) {
+      if (!(this instanceof Path2D)) throw new TypeError('Illegal invocation');
+      _c2dArity(arguments.length, len, name);
+      try { apply(this._p, [1, 0, 0, 1, 0, 0], args); }
+      catch (e) { throw e.__c2dIndexSize ? _c2dIndexSizeError(e.message) : e; }
+    }),
+  });
+}
+_c2dMethod('beginPath', 0, function () { _c2dSt(this).path = new _C2DPath(); });
+// fill/stroke/clip/isPointIn* all take an optional leading Path2D followed by an
+// optional winding rule, so one argument reader serves all of them.
+const _c2dPathArg = (s, args, wantRule) => {
+  let i = 0, path = s.path, rule = 'nonzero';
+  if (args[0] instanceof Path2D) { path = _c2dTransformed(args[0]._p, s.state.ctm); i = 1; }
+  if (wantRule && args[i] !== undefined) {
+    const r = String(args[i]);
+    if (r !== 'nonzero' && r !== 'evenodd') throw new TypeError("'" + r + "' is not a valid fill rule");
+    rule = r;
+  }
+  return { path, evenOdd: rule === 'evenodd', consumed: i };
+};
+const _c2dTransformed = (p, m) => { const out = new _C2DPath(); out.addPath(p, m); return out; };
+_c2dMethod('fill', 0, function (...args) {
+  const s = _c2dSt(this);
+  const { path, evenOdd } = _c2dPathArg(s, args, true);
+  _c2dPaintPath(s, path, s.state.fill, s.state.fillObj, evenOdd);
+});
+_c2dMethod('stroke', 0, function (...args) {
+  const s = _c2dSt(this);
+  const { path } = _c2dPathArg(s, args, false);
+  _c2dStrokePath(s, path);
+});
+function _c2dStrokePath(s, path) {
+  const S = s.state;
+  const outline = _c2dStrokeOutline(path, S.ctm, S.lineWidth, S.lineCap, S.lineJoin,
+    S.miterLimit, S.lineDash, S.lineDashOffset);
+  _c2dPaintPath(s, outline, S.stroke, S.strokeObj, false);
+}
+_c2dMethod('clip', 0, function (...args) {
+  const s = _c2dSt(this);
+  const { path, evenOdd } = _c2dPathArg(s, args, true);
+  const cov = _c2dCoverage(path, s.w, s.h, evenOdd, null);
+  const next = new Uint8Array(s.w * s.h);
+  const prev = s.state.clip;
+  let x0 = s.w, y0 = s.h, x1 = 0, y1 = 0;
+  for (let y = cov.y0; y < cov.y1; y++) {
+    for (let x = cov.x0; x < cov.x1; x++) {
+      const i = y * s.w + x;
+      const c = Math.min(1, cov.cov[i]);
+      if (c <= 0) continue;
+      const v = Math.round(c * (prev ? prev[i] : 255));
+      if (!v) continue;
+      next[i] = v;
+      if (x < x0) x0 = x; if (x >= x1) x1 = x + 1;
+      if (y < y0) y0 = y; if (y >= y1) y1 = y + 1;
+    }
+  }
+  s.state.clip = next;
+  // Intersecting a clip only ever SHRINKS it, so a bounding box is worth
+  // carrying: it is what keeps a 'copy' composite from sweeping the whole
+  // bitmap when the clip is a 10-pixel square.
+  s.state.clipBox = x0 < x1 ? [x0, y0, x1, y1] : [0, 0, 0, 0];
+});
+_c2dMethod('isPointInPath', 2, function (...args) {
+  const s = _c2dSt(this);
+  let i = 0, path = s.path;
+  if (args[0] instanceof Path2D) { path = _c2dTransformed(args[0]._p, s.state.ctm); i = 1; }
+  _c2dArity(args.length - i, 2, 'isPointInPath');
+  const x = _c2dNum(args[i]), y = _c2dNum(args[i + 1]);
+  let rule = args[i + 2] === undefined ? 'nonzero' : String(args[i + 2]);
+  if (rule !== 'nonzero' && rule !== 'evenodd') throw new TypeError("'" + rule + "' is not a valid fill rule");
+  if (!_c2dFinite(x, y)) return false;
+  // ⚠️ The point is ALREADY in the canvas coordinate space and must NOT be run
+  // through the CTM. The path's points went through the transform when they were
+  // added; the query point never does. Transforming it too applies the same
+  // translation twice, and `translate(50,0); rect(0,0,20,20)` then reports the
+  // rectangle sitting at 100 instead of 50 — a hit test that is wrong by exactly
+  // the transform, which is the hardest kind of wrong to see.
+  return _c2dPointInPath(path, x, y, rule === 'evenodd');
+});
+_c2dMethod('isPointInStroke', 2, function (...args) {
+  const s = _c2dSt(this);
+  let i = 0, path = s.path;
+  if (args[0] instanceof Path2D) { path = _c2dTransformed(args[0]._p, s.state.ctm); i = 1; }
+  _c2dArity(args.length - i, 2, 'isPointInStroke');
+  const x = _c2dNum(args[i]), y = _c2dNum(args[i + 1]);
+  if (!_c2dFinite(x, y)) return false;
+  const S = s.state;
+  const outline = _c2dStrokeOutline(path, S.ctm, S.lineWidth, S.lineCap, S.lineJoin,
+    S.miterLimit, S.lineDash, S.lineDashOffset);
+  return _c2dPointInPath(outline, x, y, false);   // canvas space; see isPointInPath
+});
+_c2dMethod('setLineDash', 1, function (segments) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 1, 'setLineDash');
+  const arr = Array.from(segments || []).map(Number);
+  // A pattern containing a negative or non-finite entry is REJECTED WHOLE — a
+  // half-applied dash pattern would be worse than none.
+  for (const n of arr) if (!Number.isFinite(n) || n < 0) return;
+  s.state.lineDash = arr;
+});
+_c2dMethod('getLineDash', 0, function () {
+  const d = _c2dSt(this).state.lineDash;
+  // An odd-length pattern reads back DOUBLED, because that is what it means.
+  return d.length & 1 ? d.concat(d) : d.slice();
+});
+_c2dMethod('drawFocusIfNeeded', 1, function () { _c2dSt(this); });
+
+// ---- pixels ---------------------------------------------------------------
+// The pixel-manipulation methods take `[EnforceRange] long`, and EnforceRange is
+// the whole difference here: a plain `long` would silently fold Infinity to 0 and
+// then report a ZERO-WIDTH rectangle, blaming the caller for a mistake they did
+// not make. EnforceRange throws a TypeError at the boundary instead, naming the
+// argument that was actually wrong. `valueOf` is honoured, so an object standing
+// in for a number is converted first and judged after.
+const _c2dEnforceLong = (v, method, argName) => {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < -2147483648 || n > 2147483647) {
+    throw new TypeError(`Failed to execute '${method}' on 'CanvasRenderingContext2D': The provided ${argName} is not a finite long value.`);
+  }
+  return n < 0 ? Math.ceil(n) : Math.floor(n);
+};
+_c2dMethod('createImageData', 2, function (a, b) {
+  const s = _c2dSt(this);
+  if (a instanceof ImageData) return new ImageData(a.width, a.height);
+  _c2dArity(arguments.length, 2, 'createImageData');
+  const w = Math.abs(_c2dEnforceLong(a, 'createImageData', 'width')),
+        h = Math.abs(_c2dEnforceLong(b, 'createImageData', 'height'));
+  if (w === 0 || h === 0) throw _c2dIndexSizeError('dimensions cannot be zero');
+  return new ImageData(w, h);
+});
+_c2dMethod('getImageData', 4, function (sx, sy, sw, sh) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 4, 'getImageData');
+  let x = _c2dEnforceLong(sx, 'getImageData', 'sx'), y = _c2dEnforceLong(sy, 'getImageData', 'sy'),
+      w = _c2dEnforceLong(sw, 'getImageData', 'sw'), h = _c2dEnforceLong(sh, 'getImageData', 'sh');
+  if (w === 0 || h === 0) throw _c2dIndexSizeError('width and height cannot be zero');
+  if (w < 0) { x += w; w = -w; }
+  if (h < 0) { y += h; h = -h; }
+  const out = new ImageData(w, h);
+  const d = out.data, src = s.data, W = s.w, H = s.h;
+  for (let j = 0; j < h; j++) {
+    const sy2 = y + j;
+    if (sy2 < 0 || sy2 >= H) continue;
+    for (let i = 0; i < w; i++) {
+      const sx2 = x + i;
+      if (sx2 < 0 || sx2 >= W) continue;     // outside the bitmap reads transparent black
+      const si = (sy2 * W + sx2) * 4, di = (j * w + i) * 4;
+      const al = src[si + 3];
+      if (al === 0) continue;
+      // Storage is premultiplied; ImageData is NOT. Undoing the multiply is
+      // lossy for low alphas, and every engine has the same loss — that is why
+      // the spec's round-trip tests are written the way they are.
+      if (al === 255) { d[di] = src[si]; d[di + 1] = src[si + 1]; d[di + 2] = src[si + 2]; }
+      else {
+        d[di] = Math.round(src[si] * 255 / al);
+        d[di + 1] = Math.round(src[si + 1] * 255 / al);
+        d[di + 2] = Math.round(src[si + 2] * 255 / al);
+      }
+      d[di + 3] = al;
+    }
+  }
+  return out;
+});
+_c2dMethod('putImageData', 3, function (img, dx, dy, dirtyX, dirtyY, dirtyW, dirtyH) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 3, 'putImageData');
+  if (!(img instanceof ImageData)) throw new TypeError('parameter 1 is not of type ImageData');
+  const x = _c2dEnforceLong(dx, 'putImageData', 'dx'), y = _c2dEnforceLong(dy, 'putImageData', 'dy');
+  const iw = img.width, ih = img.height, sd = img.data;
+  let rx = 0, ry = 0, rw = iw, rh = ih;
+  if (arguments.length >= 7) {
+    rx = _c2dEnforceLong(dirtyX, 'putImageData', 'dirtyX'); ry = _c2dEnforceLong(dirtyY, 'putImageData', 'dirtyY');
+    rw = _c2dEnforceLong(dirtyW, 'putImageData', 'dirtyWidth'); rh = _c2dEnforceLong(dirtyH, 'putImageData', 'dirtyHeight');
+    if (rw < 0) { rx += rw; rw = -rw; }
+    if (rh < 0) { ry += rh; rh = -rh; }
+    if (rx < 0) { rw += rx; rx = 0; }
+    if (ry < 0) { rh += ry; ry = 0; }
+    if (rx + rw > iw) rw = iw - rx;
+    if (ry + rh > ih) rh = ih - ry;
+    if (rw <= 0 || rh <= 0) return;
+  }
+  // putImageData writes RAW pixels: no transform, no clip, no globalAlpha, no
+  // composite operator. It is the escape hatch out of the drawing model, and
+  // routing it through the compositor would quietly break every image editor.
+  const dst = s.data, W = s.w, H = s.h;
+  for (let j = 0; j < rh; j++) {
+    const ty = y + ry + j;
+    if (ty < 0 || ty >= H) continue;
+    for (let i = 0; i < rw; i++) {
+      const tx = x + rx + i;
+      if (tx < 0 || tx >= W) continue;
+      const si = ((ry + j) * iw + (rx + i)) * 4, di = (ty * W + tx) * 4;
+      const a = sd[si + 3];
+      dst[di] = Math.round(sd[si] * a / 255);
+      dst[di + 1] = Math.round(sd[si + 1] * a / 255);
+      dst[di + 2] = Math.round(sd[si + 2] * a / 255);
+      dst[di + 3] = s.alpha ? a : 255;
+    }
+  }
+});
+
+// ---- images ---------------------------------------------------------------
+// Everything that can be drawn hands back the same shape: a premultiplied RGBA
+// bitmap, or one of three sentinels the callers must tell apart — a bad type is
+// a TypeError, an unfinished image is a silent no-op, and a zero-sized one is an
+// InvalidStateError. Collapsing those three into "return null" is how a broken
+// <img> ends up indistinguishable from a programming mistake.
+function _c2dBitmapOf(src) {
+  if (!src || typeof src !== 'object') return 'bad';
+  if (src[_C2D]) { const st = src[_C2D]; return st.w && st.h ? st : 'zero'; }
+  const tag = src.localName;
+  if (tag === 'canvas') {
+    const ctx = src.__c2dCtx;
+    if (ctx && ctx[_C2D]) { const st = _c2dSt(ctx); return st.w && st.h ? st : 'zero'; }
+    const w = _c2dDim(src, 'width', 300), h = _c2dDim(src, 'height', 150);
+    if (!w || !h) return 'zero';
+    return { w, h, data: new Uint8ClampedArray(w * h * 4) };
+  }
+  // NOTE: ImageData is deliberately NOT a CanvasImageSource. It looks like one
+  // and it is the thing authors reach for first, but the spec's union does not
+  // include it — accepting it here would make us the only engine where
+  // `drawImage(imageData, 0, 0)` works, which teaches people to write code that
+  // breaks everywhere else.
+  // `ImageBitmap` is checked by NAME rather than by identity because the class is
+  // installed late, in the `typeof X === 'undefined'` block near the end of this
+  // file, and is not in scope here.
+  const isBitmap = typeof globalThis.ImageBitmap === 'function' && src instanceof globalThis.ImageBitmap;
+  if (tag === 'img' || tag === 'image' || tag === 'video' || tag === 'svg' ||
+      src.__isImageBitmap || isBitmap ||
+      (typeof globalThis.VideoFrame === 'function' && src instanceof globalThis.VideoFrame)) {
+    // A valid CanvasImageSource that we cannot yet turn into pixels: no image
+    // decoder is reachable from the JS realm (see the scroll's Caps). "Not yet
+    // usable" is the honest answer AND the one the spec gives for an image that
+    // has not finished loading — draw nothing, quietly.
+    //
+    // ⚠️ It must be THIS answer and not "bad type". Falling through to a
+    // TypeError here regressed 2d.drawImage.nonfinite, which draws from an
+    // ImageBitmap purely to check that non-finite coordinates are ignored: an
+    // engine that throws on the source never reaches the question being asked.
+    return 'incomplete';
+  }
+  return 'bad';
+}
+_c2dMethod('drawImage', 3, function (image, a1, a2, a3, a4, a5, a6, a7, a8) {
+  const s = _c2dSt(this);
+  const n = arguments.length;
+  // Three overloads, three arities. Anything else resolves to no overload at
+  // all, which in WebIDL is a TypeError — not a best-effort guess at what the
+  // caller meant.
+  if (n !== 3 && n !== 5 && n !== 9) {
+    throw new TypeError(
+      `Failed to execute 'drawImage' on 'CanvasRenderingContext2D': Valid arities are 3, 5 or 9, but ${n} arguments provided.`);
+  }
+  const bm = _c2dBitmapOf(image);
+  if (bm === 'bad') throw new TypeError('The provided value is not a valid image source');
+  if (bm === 'incomplete') return;
+  if (bm === 'zero') throw _c2dInvalidStateError('image has zero dimensions');
+  let sx = 0, sy = 0, sw = bm.w, sh = bm.h, dx, dy, dw, dh;
+  if (n === 3) { dx = _c2dNum(a1); dy = _c2dNum(a2); dw = bm.w; dh = bm.h; }
+  else if (n === 5) { dx = _c2dNum(a1); dy = _c2dNum(a2); dw = _c2dNum(a3); dh = _c2dNum(a4); }
+  else {
+    sx = _c2dNum(a1); sy = _c2dNum(a2); sw = _c2dNum(a3); sh = _c2dNum(a4);
+    dx = _c2dNum(a5); dy = _c2dNum(a6); dw = _c2dNum(a7); dh = _c2dNum(a8);
+  }
+  if (!_c2dFinite(sx, sy, sw, sh, dx, dy, dw, dh)) return;
+  if (sw === 0 || sh === 0 || dw === 0 || dh === 0) return;
+  // A negative source or destination size MIRRORS; normalising both and keeping
+  // the flip in the mapping is what makes negativedir work.
+  const flipX = (sw < 0) !== (dw < 0), flipY = (sh < 0) !== (dh < 0);
+  if (sw < 0) { sx += sw; sw = -sw; }
+  if (sh < 0) { sy += sh; sh = -sh; }
+  if (dw < 0) { dx += dw; dw = -dw; }
+  if (dh < 0) { dy += dh; dh = -dh; }
+  const inv = _c2mInvert(s.state.ctm);
+  if (!inv) return;
+  const kx = sw / dw, ky = sh / dh;
+  const paint = { sample(px, py) {
+    const ux = _c2mX(inv, px, py), uy = _c2mY(inv, px, py);
+    let fx = (ux - dx) * kx, fy = (uy - dy) * ky;
+    if (flipX) fx = sw - fx;
+    if (flipY) fy = sh - fy;
+    const ix = Math.floor(sx + fx), iy = Math.floor(sy + fy);
+    if (ix < 0 || ix >= bm.w || iy < 0 || iy >= bm.h) return null;
+    const i = (iy * bm.w + ix) * 4;
+    const al = bm.data[i + 3] / 255;
+    if (al === 0) return [0, 0, 0, 0];
+    return [bm.data[i] / al, bm.data[i + 1] / al, bm.data[i + 2] / al, al];
+  } };
+  const covRes = _c2dCoverage(_c2dRectPath(s.state.ctm, dx, dy, dw, dh), s.w, s.h, false, s.state.clipBox);
+  if (_c2dShadowActive(s.state) && !covRes.empty) {
+    _c2dDrawShadow(s, covRes, (x, y) => { const c = paint.sample(x + 0.5, y + 0.5); return c ? c[3] : 0; });
+  }
+  _c2dComposite(s, covRes, paint);
+});
+
+// ---- text -----------------------------------------------------------------
+_c2dMethod('measureText', 1, function (text) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 1, 'measureText');
+  const str = String(text);
+  const f = s.state.fontParsed || _c2dParseFont(s.state.font) || { px: 10 };
+  const ls = _c2dSpacingPx(s.state.letterSpacing) || 0;
+  const ws = _c2dSpacingPx(s.state.wordSpacing) || 0;
+  const w = _c2dTextWidth(str, f.px, ls, ws);
+  const asc = f.px * 0.8, desc = f.px * 0.2;
+  const off = _c2dTextOffset(s.state, w);
+  return new TextMetrics({
+    width: w,
+    actualBoundingBoxLeft: off, actualBoundingBoxRight: w - off,
+    fontBoundingBoxAscent: f.px * 1.0, fontBoundingBoxDescent: f.px * 0.25,
+    actualBoundingBoxAscent: str ? asc : 0, actualBoundingBoxDescent: str ? desc : 0,
+    emHeightAscent: f.px * 0.8, emHeightDescent: f.px * 0.2,
+    hangingBaseline: f.px * 0.8, alphabeticBaseline: 0, ideographicBaseline: -f.px * 0.2,
+  });
+});
+const _c2dTextOffset = (S, width) => {
+  const rtl = S.direction === 'rtl';
+  switch (S.textAlign) {
+    case 'left': return 0;
+    case 'right': return width;
+    case 'center': return width / 2;
+    case 'end': return rtl ? 0 : width;
+    default: return rtl ? width : 0;             // 'start'
+  }
+};
+// fillText/strokeText: the geometry is right (position, alignment, baseline,
+// maxWidth) but there are NO GLYPH OUTLINES — this engine has no font
+// rasterizer reachable from the JS realm. What was here before painted
+// pseudo-random noise and called it text; that is strictly worse than painting
+// nothing, because noise cannot be told apart from a font that failed to load,
+// while an empty box can. See the scroll: bridging parley from obscura-render is
+// the named next step.
+_c2dMethod('fillText', 3, function (text, x, y, maxWidth) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 3, 'fillText');
+  _c2dNum(x); _c2dNum(y); String(text);
+});
+_c2dMethod('strokeText', 3, function (text, x, y, maxWidth) {
+  const s = _c2dSt(this); _c2dArity(arguments.length, 3, 'strokeText');
+  _c2dNum(x); _c2dNum(y); String(text);
+});
+// ---- SVG path data, for `new Path2D('M0 0 L10 10 Z')` ---------------------
+// Every icon library on the web ships its shapes as this string. Refusing to
+// parse it means a page has an icon set it cannot draw.
+function _c2dParseSvgPath(p, d) {
+  const I = [1, 0, 0, 1, 0, 0];
+  const toks = String(d).match(/[MmZzLlHhVvCcSsQqTtAa]|[+-]?(?:\d*\.\d+|\d+\.?)(?:[eE][+-]?\d+)?/g);
+  if (!toks) return;
+  let i = 0, cmd = '', cx = 0, cy = 0, startX = 0, startY = 0;
+  let lastC = null, lastQ = null;
+  const num = () => parseFloat(toks[i++]);
+  while (i < toks.length) {
+    if (/[A-Za-z]/.test(toks[i])) cmd = toks[i++];
+    const rel = cmd === cmd.toLowerCase();
+    const base = rel ? [cx, cy] : [0, 0];
+    switch (cmd.toUpperCase()) {
+      case 'M': {
+        const x = num() + base[0], y = num() + base[1];
+        p.moveTo(I, x, y); cx = x; cy = y; startX = x; startY = y;
+        cmd = rel ? 'l' : 'L';                       // extra pairs after M are implicit lineTos
+        lastC = lastQ = null; break;
+      }
+      case 'L': { const x = num() + base[0], y = num() + base[1]; p.lineTo(I, x, y); cx = x; cy = y; lastC = lastQ = null; break; }
+      case 'H': { const x = num() + (rel ? cx : 0); p.lineTo(I, x, cy); cx = x; lastC = lastQ = null; break; }
+      case 'V': { const y = num() + (rel ? cy : 0); p.lineTo(I, cx, y); cy = y; lastC = lastQ = null; break; }
+      case 'C': {
+        const x1 = num() + base[0], y1 = num() + base[1], x2 = num() + base[0], y2 = num() + base[1];
+        const x = num() + base[0], y = num() + base[1];
+        p.bezierCurveTo(I, x1, y1, x2, y2, x, y); lastC = [x2, y2]; lastQ = null; cx = x; cy = y; break;
+      }
+      case 'S': {
+        const x2 = num() + base[0], y2 = num() + base[1], x = num() + base[0], y = num() + base[1];
+        const r = lastC ? [2 * cx - lastC[0], 2 * cy - lastC[1]] : [cx, cy];
+        p.bezierCurveTo(I, r[0], r[1], x2, y2, x, y); lastC = [x2, y2]; lastQ = null; cx = x; cy = y; break;
+      }
+      case 'Q': {
+        const x1 = num() + base[0], y1 = num() + base[1], x = num() + base[0], y = num() + base[1];
+        p.quadraticCurveTo(I, x1, y1, x, y); lastQ = [x1, y1]; lastC = null; cx = x; cy = y; break;
+      }
+      case 'T': {
+        const x = num() + base[0], y = num() + base[1];
+        const r = lastQ ? [2 * cx - lastQ[0], 2 * cy - lastQ[1]] : [cx, cy];
+        p.quadraticCurveTo(I, r[0], r[1], x, y); lastQ = r; lastC = null; cx = x; cy = y; break;
+      }
+      case 'A': {
+        const rx = num(), ry = num(), rot = num() * Math.PI / 180;
+        const laf = num(), sf = num();
+        const x = num() + base[0], y = num() + base[1];
+        _c2dSvgArc(p, cx, cy, rx, ry, rot, laf, sf, x, y);
+        cx = x; cy = y; lastC = lastQ = null; break;
+      }
+      case 'Z': { p.closePath(I); cx = startX; cy = startY; lastC = lastQ = null; break; }
+      default: return;
+    }
+  }
+}
+// SVG's endpoint arc parameterisation → the centre form our ellipse() speaks.
+function _c2dSvgArc(p, x1, y1, rx, ry, rot, laf, sf, x2, y2) {
+  if (!rx || !ry) { p.lineTo([1, 0, 0, 1, 0, 0], x2, y2); return; }
+  rx = Math.abs(rx); ry = Math.abs(ry);
+  const cosR = Math.cos(rot), sinR = Math.sin(rot);
+  const dx2 = (x1 - x2) / 2, dy2 = (y1 - y2) / 2;
+  const x1p = cosR * dx2 + sinR * dy2, y1p = -sinR * dx2 + cosR * dy2;
+  let lam = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry);
+  if (lam > 1) { const s = Math.sqrt(lam); rx *= s; ry *= s; }
+  const sign = (laf !== 0) === (sf !== 0) ? -1 : 1;
+  const num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+  const den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+  const co = sign * Math.sqrt(Math.max(0, num / den));
+  const cxp = co * rx * y1p / ry, cyp = -co * ry * x1p / rx;
+  const cx = cosR * cxp - sinR * cyp + (x1 + x2) / 2;
+  const cy = sinR * cxp + cosR * cyp + (y1 + y2) / 2;
+  const ang = (ux, uy, vx, vy) => {
+    const d = (ux * vx + uy * vy) / (Math.hypot(ux, uy) * Math.hypot(vx, vy));
+    const a = Math.acos(Math.max(-1, Math.min(1, d)));
+    return (ux * vy - uy * vx < 0) ? -a : a;
+  };
+  const t1 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+  let dt = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+  if (!sf && dt > 0) dt -= Math.PI * 2;
+  if (sf && dt < 0) dt += Math.PI * 2;
+  p.ellipse([1, 0, 0, 1, 0, 0], cx, cy, rx, ry, rot, t1, t1 + dt, dt < 0);
+}
+
+// ---- a real PNG, at last --------------------------------------------------
+// `toDataURL()` used to return a hand-assembled base64 string with a PNG
+// signature glued on the front and NO IMAGE BEHIND IT. Anyone who tried to save
+// a chart, POST a signature, or set that data: URL as an <img> src got a broken
+// image — and got it silently. This writes a genuine PNG: uncompressed
+// (zlib "stored") deflate blocks, so the encoder is fifty lines and needs no
+// compressor, at the cost of a larger file. For a browser aimed at slow links
+// that is the wrong trade in general, but a data: URL never crosses the network —
+// it is handed straight back to the page that asked for it.
+const _c2dCrcTable = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+const _c2dCrc32 = (buf, start, end) => {
+  let c = 0xFFFFFFFF;
+  for (let i = start; i < end; i++) c = _c2dCrcTable[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+};
+function _c2dEncodePng(w, h, rgba) {
+  // Raw scanlines, each prefixed with filter type 0.
+  const raw = new Uint8Array((w * 4 + 1) * h);
+  for (let y = 0; y < h; y++) {
+    raw[y * (w * 4 + 1)] = 0;
+    raw.set(rgba.subarray(y * w * 4, (y + 1) * w * 4), y * (w * 4 + 1) + 1);
+  }
+  // zlib stream: 0x78 0x01, then stored deflate blocks of ≤65535 bytes, adler32.
+  const blocks = Math.max(1, Math.ceil(raw.length / 65535));
+  const z = new Uint8Array(2 + blocks * 5 + raw.length + 4);
+  let zi = 0;
+  z[zi++] = 0x78; z[zi++] = 0x01;
+  for (let b = 0; b < blocks; b++) {
+    const off = b * 65535, len = Math.min(65535, raw.length - off);
+    z[zi++] = b === blocks - 1 ? 1 : 0;
+    z[zi++] = len & 0xFF; z[zi++] = (len >> 8) & 0xFF;
+    z[zi++] = (~len) & 0xFF; z[zi++] = ((~len) >> 8) & 0xFF;
+    z.set(raw.subarray(off, off + len), zi); zi += len;
+  }
+  let a = 1, bsum = 0;
+  for (let i = 0; i < raw.length; i++) { a = (a + raw[i]) % 65521; bsum = (bsum + a) % 65521; }
+  z[zi++] = (bsum >> 8) & 0xFF; z[zi++] = bsum & 0xFF; z[zi++] = (a >> 8) & 0xFF; z[zi++] = a & 0xFF;
+
+  const chunks = [];
+  const chunk = (type, data) => {
+    const c = new Uint8Array(12 + data.length);
+    const dv = new DataView(c.buffer);
+    dv.setUint32(0, data.length);
+    for (let i = 0; i < 4; i++) c[4 + i] = type.charCodeAt(i);
+    c.set(data, 8);
+    dv.setUint32(8 + data.length, _c2dCrc32(c, 4, 8 + data.length));
+    chunks.push(c);
+  };
+  const ihdr = new Uint8Array(13);
+  new DataView(ihdr.buffer).setUint32(0, w);
+  new DataView(ihdr.buffer).setUint32(4, h);
+  ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;   // 8-bit RGBA
+  chunk('IHDR', ihdr);
+  chunk('IDAT', z.subarray(0, zi));
+  chunk('IEND', new Uint8Array(0));
+  let total = 8;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  out.set([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], 0);
+  let o = 8;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+const _c2dB64 = (bytes) => {
+  const T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+    s += T[b0 >> 2];
+    s += T[((b0 & 3) << 4) | ((b1 === undefined ? 0 : b1) >> 4)];
+    s += b1 === undefined ? '=' : T[((b1 & 15) << 2) | ((b2 === undefined ? 0 : b2) >> 6)];
+    s += b2 === undefined ? '=' : T[b2 & 63];
+  }
+  return s;
+};
+// Un-premultiply the whole bitmap for export, and apply the anti-fingerprint
+// jitter HERE — at the sink a fingerprinter actually reads — instead of in the
+// bitmap, where the spec pins every value and the page's own code has to live
+// with whatever we did. The WebAudio arc learned this the hard way on
+// DynamicsCompressor.threshold: a DECLARED value is the wrong place to hide.
+function _c2dExportRgba(st, jitter) {
+  const out = new Uint8ClampedArray(st.w * st.h * 4);
+  for (let i = 0; i < out.length; i += 4) {
+    const a = st.data[i + 3];
+    if (a === 0) continue;
+    out[i] = a === 255 ? st.data[i] : Math.round(st.data[i] * 255 / a);
+    out[i + 1] = a === 255 ? st.data[i + 1] : Math.round(st.data[i + 1] * 255 / a);
+    out[i + 2] = a === 255 ? st.data[i + 2] : Math.round(st.data[i + 2] * 255 / a);
+    out[i + 3] = a;
+    if (jitter) {
+      const px = (i / 4) % st.w, py = Math.floor((i / 4) / st.w);
+      out[i] += _fpNoise(px, py, 0); out[i + 1] += _fpNoise(px, py, 1); out[i + 2] += _fpNoise(px, py, 2);
+    }
+  }
+  return out;
+}
+
+// ---- element plumbing -----------------------------------------------------
+// `canvas.width` / `canvas.height` reflect the content attributes as unsigned
+// longs defaulting to 300 × 150. Before this they were plain expando slots
+// returning undefined — so `<canvas width="100" height="50">` had a 300 × 150
+// bitmap, every test that read `canvas.width` got `undefined`, and the numbers
+// the page drew with and the numbers it measured with were different numbers.
+function _c2dSetDim(el, name, v, dflt) {
+  let n = Number(v);
+  n = Number.isFinite(n) ? Math.trunc(n) : 0;
+  // WebIDL `unsigned long`: out of range wraps to the default rather than
+  // throwing, and a negative is out of range.
+  if (n < 0 || n > 2147483647) n = dflt;
+  el.setAttribute(name, String(n >>> 0));
+  const ctx = el.__c2dCtx;
+  // Assigning either dimension — even the value it already had — resets the
+  // bitmap AND the drawing state. `c.width = c.width` is the canonical clear,
+  // and it is a RESET, not an erase: the transform, the clip and the styles all
+  // go back to their defaults with the pixels.
+  if (ctx && ctx[_C2D]) {
+    _c2dResize(ctx[_C2D], _c2dDim(el, 'width', 300), _c2dDim(el, 'height', 150));
+  }
+}
+// The WebGL surface is still a stub — kept exactly as it was, and honestly
+// named as one. It exists so a page's feature detection gets a truthful-shaped
+// answer and its fallback path runs, not so anything gets drawn.
+function _c2dWebGLStub(canvas) {
     return {
-      canvas: this,
+      canvas: canvas,
       getExtension(name) {
         if (name === 'WEBGL_debug_renderer_info') return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
         return null;
@@ -45965,32 +48202,78 @@ Element.prototype.getContext = function getContext(type) {
       TRIANGLES: 0x0004, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
       TEXTURE_2D: 0x0DE1, RGBA: 0x1908, UNSIGNED_BYTE: 0x1401,
     };
+}
+Element.prototype.getContext = function getContext(contextId) {
+  if (arguments.length < 1) {
+    throw new TypeError("Failed to execute 'getContext' on 'HTMLCanvasElement': 1 argument required, but only 0 present.");
   }
+  if (this.localName !== 'canvas') throw new TypeError('Illegal invocation');
+  const id = String(contextId);
+  if (id === '2d') {
+    // One context per canvas, forever: a second getContext('2d') must hand back
+    // the SAME object, or `ctx === canvas.getContext('2d')` fails and every
+    // library that re-fetches the context starts drawing into a second bitmap.
+    if (!this.__c2dCtx) {
+      const ctx = _c2dCreate(this, arguments.length > 1 ? arguments[1] : null);
+      Object.defineProperty(this, '__c2dCtx', { value: ctx, configurable: true });
+    }
+    return this.__c2dCtx;
+  }
+  if (id === 'webgl' || id === 'experimental-webgl' || id === 'webgl2') return _c2dWebGLStub(this);
+  // Anything else — including '2D', '2d\0' and '2ｄ' — is not a context id.
+  // Matching loosely here is how a feature-detect for a context we do not have
+  // gets a yes.
   return null;
 };
-Element.prototype.toDataURL = function(type) {
-  if (this._ctx && this._ctx._buf) {
-    const ctx = this._ctx;
-    const w = ctx._w, h = ctx._h, buf = ctx._buf;
-    let hash = _fpSeed;
-    for (let i = 0; i < buf.length; i += 37) {
-      hash = ((hash << 5) - hash + buf[i]) | 0;
-    }
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    let b64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg';
-    for (let i = 0; i < 60; i++) {
-      hash = ((hash << 5) - hash + i) | 0;
-      b64 += chars[(hash >>> 0) % 64];
-    }
-    return b64 + '==';
-  }
-  return _fp('canvasFingerprint');
+Element.prototype.toDataURL = function toDataURL(type, quality) {
+  if (this.localName !== 'canvas') throw new TypeError('Illegal invocation');
+  const w = _c2dDim(this, 'width', 300), h = _c2dDim(this, 'height', 150);
+  if (!w || !h) return 'data:,';
+  const ctx = this.__c2dCtx;
+  const st = ctx ? _c2dSt(ctx) : { w, h, data: new Uint8ClampedArray(w * h * 4) };
+  const png = _c2dEncodePng(st.w, st.h, _c2dExportRgba(st, true));
+  return 'data:image/png;base64,' + _c2dB64(png);
 };
-Element.prototype.toBlob = function(cb, type, q) { cb(new Blob([''])); };
-
+Element.prototype.toBlob = function toBlob(callback, type, quality) {
+  if (this.localName !== 'canvas') throw new TypeError('Illegal invocation');
+  if (typeof callback !== 'function') {
+    throw new TypeError("Failed to execute 'toBlob' on 'HTMLCanvasElement': parameter 1 is not of type 'Function'.");
+  }
+  const w = _c2dDim(this, 'width', 300), h = _c2dDim(this, 'height', 150);
+  const ctx = this.__c2dCtx;
+  const st = ctx ? _c2dSt(ctx) : { w, h, data: new Uint8ClampedArray(w * h * 4) };
+  const png = (!w || !h) ? null : _c2dEncodePng(st.w, st.h, _c2dExportRgba(st, true));
+  // toBlob is asynchronous by specification — a page is entitled to finish its
+  // current task before the callback lands.
+  Promise.resolve().then(() => callback(png ? new Blob([png], { type: 'image/png' }) : null));
+};
 _markNative(Element.prototype.getContext);
 _markNative(Element.prototype.toDataURL);
 _markNative(Element.prototype.toBlob);
+
+_exposeIface('CanvasRenderingContext2D', CanvasRenderingContext2D);
+_exposeIface('CanvasGradient', CanvasGradient);
+_exposeIface('CanvasPattern', CanvasPattern);
+_exposeIface('ImageData', ImageData);
+_exposeIface('Path2D', Path2D);
+_exposeIface('TextMetrics', TextMetrics);
+for (const C of [CanvasRenderingContext2D, CanvasGradient, CanvasPattern, ImageData, Path2D, TextMetrics]) {
+  _markNative(C);
+  // CanvasRenderingContext2D.prototype must inherit straight from Object.prototype
+  // (it has no parent interface); a class expression already gives that, but the
+  // members installed by hand need stamping enumerable to match WebIDL.
+  for (const k of Object.getOwnPropertyNames(C.prototype)) {
+    if (k === 'constructor') continue;
+    const d = Object.getOwnPropertyDescriptor(C.prototype, k);
+    if (d && !d.enumerable) { d.enumerable = true; Object.defineProperty(C.prototype, k, d); }
+    if (d && typeof d.value === 'function') _markNative(d.value);
+    if (d && d.get) _markNative(d.get);
+    if (d && d.set) _markNative(d.set);
+  }
+}
+Object.defineProperty(CanvasGradient.prototype, Symbol.toStringTag, { value: 'CanvasGradient', configurable: true });
+Object.defineProperty(CanvasPattern.prototype, Symbol.toStringTag, { value: 'CanvasPattern', configurable: true });
+Object.defineProperty(CanvasRenderingContext2D.prototype, Symbol.toStringTag, { value: 'CanvasRenderingContext2D', configurable: true });
 
 // DOM §4.9 "attach a shadow root". Elements that may host a shadow tree: a
 // safelisted HTML-namespace name, or a valid custom element name (contains "-").
