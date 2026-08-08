@@ -7927,7 +7927,6 @@ class Document extends Node {
     return;
   }
   hasFocus() { return true; }
-  execCommand() { return false; }
 }
 
 class DocumentFragment extends Node {
@@ -12861,7 +12860,10 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
 // layout). NOT a layout engine — used/computed values that need layout (auto
 // widths, percentage resolution) still fall back to the defaults table.
 const _GCS_DEFAULTS = {
-  display: 'block', visibility: 'visible', opacity: '1',
+  // CSS's initial `display` is `inline`. `block` is a UA STYLESHEET rule and
+  // now lives there (_UA_DISPLAY); leaving it here made every element on every
+  // page — <span>, <b>, <a> — report `display: block`.
+  display: 'inline', visibility: 'visible', opacity: '1',
   position: 'static', overflow: 'visible',
   transform: 'none', transition: 'none', animation: 'none',
   scale: 'none', rotate: 'none', translate: 'none',
@@ -27560,6 +27562,113 @@ const _substituteVars = (el, value, guard) => {
   return out.trim();
 };
 const _GCS_INLINE_SPEC = Number.MAX_SAFE_INTEGER;
+// ===== UA-STYLESHEET-BEGIN =====
+// The UA stylesheet (HTML Standard §15 "Rendering"), as a table rather than as
+// CSS text — every rule below is a bare type selector, so matching is one map
+// lookup on the local name and we never pay the selector engine for it.
+//
+// ⚠️ WHY THIS EXISTS AT ALL. Until now `getComputedStyle(el).display` answered
+// `block` for EVERY element, because the defaults table doubles as the initial-
+// values table and somebody reasonably wrote down the value most elements end
+// up with. But CSS's initial `display` is `inline`; `block` is a UA RULE. With
+// no UA stylesheet and `block` as the initial value, a <span>, a <b>, an <a>
+// and a <sub> all reported `display: block` — the engine was telling every page
+// that its inline content was a stack of blocks. Anything asking "is this
+// inline?" got `no`, always, and could not find out otherwise.
+//
+// The same gap made <b> compute `font-weight: 400`, <i> compute `font-style:
+// normal` and <u> compute `text-decoration: none` — an element whose ENTIRE
+// PURPOSE is to carry that one declaration reported that it did not carry it.
+//
+// SCOPE, NAMED HONESTLY: this covers `display` and the typographic declarations
+// (weight, style, decoration, vertical-align, font-size/family, text-align,
+// background/colour). It deliberately does NOT ship the UA's margins, paddings
+// or borders — those are box geometry, the Rust renderer has its own UA sheet
+// for them, and a margin invented here would disagree with the one laid out
+// there. A computed style that disagrees with the layout is worse than one that
+// admits it does not know.
+const _UA_DISPLAY = (() => {
+  const m = Object.create(null);
+  const put = (value, names) => { for (const n of names.split(' ')) m[n] = value; };
+  put('block', 'html body address blockquote center dialog div figure figcaption footer form header hr legend listing main p plaintext pre xmp search article aside h1 h2 h3 h4 h5 h6 hgroup nav section dir dd dl dt menu ol ul fieldset optgroup option details');
+  put('list-item', 'li summary');
+  put('table', 'table');
+  put('inline-table', '');
+  put('table-row-group', 'tbody');
+  put('table-header-group', 'thead');
+  put('table-footer-group', 'tfoot');
+  put('table-row', 'tr');
+  put('table-cell', 'td th');
+  put('table-column', 'col');
+  put('table-column-group', 'colgroup');
+  put('table-caption', 'caption');
+  put('inline-block', 'button input select textarea meter progress marquee');
+  // `display: none` in the UA sheet is what makes metadata content invisible.
+  // It is NOT the same as the `hidden` attribute and NOT overridable by it —
+  // but an author rule still wins, which is how `head { display: block }`
+  // debugging tricks work.
+  put('none', 'area base basefont datalist head link meta noembed noframes param rp script style template title source track');
+  delete m[''];
+  return m;
+})();
+// Per-element declarations. Values are already in computed form where that is
+// unambiguous, so nothing here needs a second resolution pass.
+const _UA_DECLS = (() => {
+  const m = Object.create(null);
+  const put = (names, decls) => {
+    for (const n of names.split(' ')) m[n] = Object.assign(m[n] || {}, decls);
+  };
+  put('b strong h1 h2 h3 h4 h5 h6 th', { 'font-weight': 'bold' });
+  put('i cite em var address dfn', { 'font-style': 'italic' });
+  // text-decoration does NOT inherit: a <span> inside a <u> computes `none` and
+  // is still drawn underlined, because decoration PROPAGATES to the line box
+  // rather than to the computed style. Every algorithm that wants "is this text
+  // underlined" has to walk the ancestors itself, which is exactly what the
+  // editing spec does — so setting the line on the element alone is correct.
+  put('u ins', { 'text-decoration-line': 'underline' });
+  put('s strike del', { 'text-decoration-line': 'line-through' });
+  put('sub', { 'vertical-align': 'sub', 'font-size': 'smaller' });
+  put('sup', { 'vertical-align': 'super', 'font-size': 'smaller' });
+  put('small', { 'font-size': 'smaller' });
+  put('big', { 'font-size': 'larger' });
+  put('h1', { 'font-size': '2em' });
+  put('h2', { 'font-size': '1.5em' });
+  put('h3', { 'font-size': '1.17em' });
+  put('h5', { 'font-size': '0.83em' });
+  put('h6', { 'font-size': '0.67em' });
+  put('center', { 'text-align': 'center' });
+  put('th', { 'text-align': 'center' });
+  put('pre xmp plaintext listing', { 'white-space': 'pre', 'font-family': 'monospace' });
+  put('code kbd samp tt', { 'font-family': 'monospace' });
+  put('nobr', { 'white-space': 'nowrap' });
+  put('mark', { 'background-color': 'rgb(255, 255, 0)', color: 'rgb(0, 0, 0)' });
+  return m;
+})();
+// The one UA rule that is not a bare type selector: `:any-link`. It is worth the
+// special case because a link's blue-and-underlined is the single most load-
+// bearing default on the web, and because the editing spec reads exactly these
+// two properties off an <a> ancestor when deciding what a selection's colour and
+// underline already are.
+const _UA_LINK_DECLS = { color: 'rgb(0, 0, 238)', 'text-decoration-line': 'underline' };
+const _uaDecls = (el) => {
+  let ln;
+  try { ln = el.localName; } catch (e) { return null; }
+  // HTML-namespace only: an SVG <a> or a MathML <style> is not this <a>/<style>.
+  try { if (el.namespaceURI && el.namespaceURI !== 'http://www.w3.org/1999/xhtml') return null; } catch (e) {}
+  const disp = _UA_DISPLAY[ln];
+  const own = _UA_DECLS[ln];
+  let link = null;
+  if (ln === 'a' || ln === 'area') {
+    try { if (el.hasAttribute && el.hasAttribute('href')) link = _UA_LINK_DECLS; } catch (e) {}
+  }
+  if (!disp && !own && !link) return null;
+  const decls = {};
+  if (disp) _expandDeclInto(decls, 'display', disp, false);
+  if (own) for (const k in own) _expandDeclInto(decls, k, own[k], false);
+  if (link) for (const k in link) _expandDeclInto(decls, k, link[k], false);
+  return decls;
+};
+// ===== UA-STYLESHEET-END =====
 // HTML presentational hints — legacy attributes that map to CSS at the very
 // bottom of the author cascade: they lose to every author rule (even a `*`
 // selector) but win over the UA/initial value. Currently only <font size>,
@@ -27582,17 +27691,79 @@ const _parseLegacyFontSize = (raw) => {
   if (n < 1) n = 1; else if (n > 7) n = 7;                 // clamp to 1..7
   return _LEGACY_FONT_SIZE_KW[n - 1];
 };
+// HTML's "rules for parsing a legacy colour value" — the algorithm behind
+// `<font color=...>` and `bgcolor`. It is deliberately, famously permissive:
+// it exists to render the old web, where colours were typed by hand and often
+// typed wrong, and where refusing the value means the page goes black-on-black
+// rather than merely off-hue. `chucknorris` really is a colour (#C00000).
+//
+// The rule that makes it work: pad or truncate to a multiple of three, then
+// take the leading digits of each third. Nothing here can fail except the two
+// explicit rejections, so a page never loses its colours to a typo.
+const _parseLegacyColor = (raw) => {
+  let s = String(raw);
+  if (s === '') return null;
+  // "transparent" is rejected — the ONE keyword this algorithm refuses, because
+  // an invisible <body text> would be a page with no text at all.
+  if (s.trim().toLowerCase() === 'transparent') return null;
+  s = s.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+  if (s === '') return null;
+  if (s.toLowerCase() === 'flavor') return 'rgb(0, 0, 0)';   // Netscape's easter egg, kept by the spec
+  // A named colour or a well-formed hex wins outright.
+  const named = _computeColor ? _computeColor(s) : null;
+  if (named && /^rgba?\(/.test(named) && !/^#/.test(s)) return named;
+  if (/^#[0-9a-fA-F]{3}$/.test(s) || /^#[0-9a-fA-F]{6}$/.test(s)) return _computeColor(s) || null;
+  // Otherwise: drop a leading '#', replace every non-hex character with '0',
+  // then pad to a multiple of three.
+  let t = s[0] === '#' ? s.slice(1) : s;
+  t = Array.from(t, (c) => (/[0-9a-fA-F]/.test(c) ? c : '0')).join('');
+  if (t === '') t = '0';
+  while (t.length === 0 || t.length % 3 !== 0) t += '0';
+  let len = t.length / 3;
+  let r = t.slice(0, len), g = t.slice(len, len * 2), b = t.slice(len * 2);
+  if (len > 8) { r = r.slice(-8); g = g.slice(-8); b = b.slice(-8); len = 8; }
+  while (len > 2 && r[0] === '0' && g[0] === '0' && b[0] === '0') {
+    r = r.slice(1); g = g.slice(1); b = b.slice(1); len--;
+  }
+  if (len > 2) { r = r.slice(0, 2); g = g.slice(0, 2); b = b.slice(0, 2); }
+  const v = (h) => parseInt(h.padStart(2, '0').slice(0, 2), 16) || 0;
+  return 'rgb(' + v(r) + ', ' + v(g) + ', ' + v(b) + ')';
+};
 const _presHintDecls = (el) => {
   // Returns a decls map { name: {value, important} } of presentational-hint
   // declarations for `el`, or null when the element contributes none.
   let decls = null;
+  const set = (name, value) => { if (!decls) decls = {}; _expandDeclInto(decls, name, value, false); };
   try {
     if (el.localName === 'font') {
       const sz = el.getAttribute('size');
       if (sz != null && sz !== '') {
         const kw = _parseLegacyFontSize(sz);
-        if (kw) { decls = {}; _expandDeclInto(decls, 'font-size', kw, false); }
+        if (kw) set('font-size', kw);
       }
+      // <font color> / <font face>. These are the two hints the editing spec
+      // names by hand — `<font color="red">` IS how execCommand("foreColor")
+      // has spelled its result since Netscape, so an engine that ignores the
+      // attribute cannot read back the formatting it just wrote.
+      const col = el.getAttribute('color');
+      if (col != null && col !== '') { const c = _parseLegacyColor(col); if (c) set('color', c); }
+      const face = el.getAttribute('face');
+      if (face != null && face !== '') set('font-family', face);
+    }
+    // The `align` attribute maps to text-align, with two legacy spellings that
+    // are NOT CSS keywords: `align=middle` means centre, and `align=char` maps
+    // to nothing at all.
+    const al = el.hasAttribute && el.hasAttribute('align') ? String(el.getAttribute('align')).toLowerCase() : '';
+    if (al === 'center' || al === 'middle') set('text-align', 'center');
+    else if (al === 'left' || al === 'right' || al === 'justify') set('text-align', al);
+    if (el.localName === 'body' || el.localName === 'table' || el.localName === 'td'
+        || el.localName === 'th' || el.localName === 'tr') {
+      const bg = el.getAttribute('bgcolor');
+      if (bg != null && bg !== '') { const c = _parseLegacyColor(bg); if (c) set('background-color', c); }
+    }
+    if (el.localName === 'body') {
+      const tx = el.getAttribute('text');
+      if (tx != null && tx !== '') { const c = _parseLegacyColor(tx); if (c) set('color', c); }
     }
   } catch (e) {}
   return decls;
@@ -27635,6 +27806,13 @@ const _buildCascadeUncached = (el) => {
     // preceding the first author rule (order 0), so any author declaration of the
     // same property wins the same-specificity tie, while the hint still overrides
     // the UA/initial when nothing else sets the property.
+    // The UA origin sits below EVERYTHING an author can write, presentational
+    // hints included: order -2 loses every same-specificity tie, and any author
+    // rule with real specificity wins outright. (No UA declaration is
+    // `!important`, so the importance-first ordering never lifts one above an
+    // author rule — which is the whole point of an origin.)
+    const uaDecls = _uaDecls(el);
+    if (uaDecls) sources.push({ spec: 0, order: -2, decls: uaDecls });
     const hintDecls = _presHintDecls(el);
     if (hintDecls) sources.push({ spec: 0, order: -1, decls: hintDecls });
     let order = 0;
@@ -46013,6 +46191,3402 @@ Object.defineProperty(Selection.prototype, Symbol.toStringTag,
     writable: true, enumerable: true, configurable: true,
   });
 }
+
+
+// ===== EDITING-ENGINE-BEGIN =====
+// document.execCommand and friends — the HTML Editing APIs.
+//
+// WHY THIS MATTERS. `execCommand` is the engine underneath every rich-text box
+// on the web: the comment field, the CMS, the webmail composer, the bug tracker,
+// the school assignment form. It is a 2001 API that every modern editor still
+// falls back to, and until now this engine's entire answer was
+//
+//     execCommand() { return false; }
+//
+// A page asks "please make this bold" and is told "no", with no way to find out
+// why. Every editor that trusts the return value shows a dead toolbar; every one
+// that does not shows a toolbar whose buttons do nothing. This is the largest
+// realm on the whole of WPT — 116,600 subtests — and it was a single line.
+//
+// The algorithms below are the "HTML Editing APIs" spec's, which is unusually
+// operational for a spec: it defines editing as a sequence of DOM edits rather
+// than as an intention. That is deliberate. Editing has no natural right answer
+// — there are a dozen defensible DOMs for "bold this" — so the spec picks one
+// and writes it down move by move, and the value is in every engine picking the
+// SAME one, because that is what makes a document authored in one browser open
+// correctly in another.
+const _ED_HTMLNS = 'http://www.w3.org/1999/xhtml';
+const _edIsHtmlNs = (ns) => ns === null || ns === undefined || ns === _ED_HTMLNS;
+// isHtmlElement(node) / isHtmlElement(node, 'br') / isHtmlElement(node, ['ol','ul'])
+const _edIsHtmlEl = (node, tags) => {
+  if (!node || node.nodeType !== 1 || !_edIsHtmlNs(node.namespaceURI)) return false;
+  if (tags === undefined) return true;
+  const ln = node.localName;
+  return typeof tags === 'string' ? ln === tags : tags.indexOf(ln) !== -1;
+};
+// A "prohibited paragraph child" is anything a <p> may not contain. The list is
+// the reason `formatBlock` cannot simply wrap a selection: putting a <div> in a
+// <p> closes the <p> at parse time, so a DOM the algorithm builds naively would
+// not survive a round trip through innerHTML.
+const _ED_PROHIBITED_P_CHILDREN = ['address', 'article', 'aside', 'blockquote',
+  'caption', 'center', 'col', 'colgroup', 'dd', 'details', 'dir', 'div', 'dl',
+  'dt', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3',
+  'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'li', 'listing', 'menu', 'nav',
+  'ol', 'p', 'plaintext', 'pre', 'section', 'summary', 'table', 'tbody', 'td',
+  'tfoot', 'th', 'thead', 'tr', 'ul', 'xmp'];
+const _ED_INLINE_CONTENT_NAMES = ['a', 'abbr', 'b', 'bdi', 'bdo', 'cite', 'code',
+  'dfn', 'em', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'i', 'kbd', 'mark', 'p',
+  'pre', 'q', 'rp', 'rt', 'ruby', 's', 'samp', 'small', 'span', 'strong', 'sub',
+  'sup', 'u', 'var', 'acronym', 'listing', 'strike', 'xmp', 'big', 'blink',
+  'font', 'marquee', 'nobr', 'tt'];
+const _ED_FORMATTABLE_BLOCK_NAMES = ['address', 'dd', 'div', 'dt', 'h1', 'h2',
+  'h3', 'h4', 'h5', 'h6', 'p', 'pre'];
+const _edIsProhibitedParagraphChild = (node) => _edIsHtmlEl(node, _ED_PROHIBITED_P_CHILDREN);
+const _edIsElementWithInlineContents = (node) => _edIsHtmlEl(node, _ED_INLINE_CONTENT_NAMES);
+// Reading a computed property without going through the getComputedStyle proxy.
+// These predicates run over every node in a selection on every keystroke's worth
+// of work, and the proxy allocates.
+const _edStyle = (node, kebab) => {
+  if (!node || node.nodeType !== 1) return '';
+  try { return String(_computedPropOf(node, kebab, 0) || ''); } catch (e) { return ''; }
+};
+// "A block node is either an Element whose display is not inline, inline-block,
+// inline-table or none, or a Document, or a DocumentFragment."
+//
+// ⚠️ This single predicate is why the UA stylesheet above had to be written
+// first. It asks the one question the engine could not previously answer — until
+// this arc, `display` was `block` for EVERY element, so `_edIsInline` was false
+// for every node in the document and not one algorithm below could have worked.
+const _ED_INLINE_DISPLAYS = ['inline', 'inline-block', 'inline-table', 'none'];
+const _edIsBlock = (node) => !!node && ((node.nodeType === 1
+    && _ED_INLINE_DISPLAYS.indexOf(_edStyle(node, 'display')) === -1)
+  || node.nodeType === 9 || node.nodeType === 11);
+const _edIsInline = (node) => !!node && !_edIsBlock(node);
+// "An editing host is an HTML element with contenteditable in the true state, or
+// the HTML element child of a Document whose designMode is enabled."
+const _edIsEditingHost = (node) => !!node && _edIsHtmlEl(node)
+  && (node.contentEditable === 'true'
+    || (node.parentNode && node.parentNode.nodeType === 9 && node.parentNode.designMode === 'on'));
+// "Something is editable if it is a node; it is not an editing host; it does not
+// have contenteditable in the false state; its parent is an editing host or
+// editable; and either it is an HTML element, or it is an svg or math element,
+// or it is not an Element and its parent is an HTML element."
+//
+// Note the shape: editability is inherited DOWNWARD from a host, and the host
+// itself is deliberately NOT editable. That asymmetry is load-bearing — it is
+// what stops an algorithm from deleting the editing host out of the document
+// while "editing" inside it.
+const _edIsEditable = (node) => {
+  if (!node) return false;
+  if (_edIsEditingHost(node)) return false;
+  if (node.nodeType === 1 && node.contentEditable === 'false') return false;
+  const p = node.parentNode;
+  if (!(_edIsEditingHost(p) || _edIsEditable(p))) return false;
+  if (_edIsHtmlEl(node)) return true;
+  if (node.nodeType === 1 && node.namespaceURI === 'http://www.w3.org/2000/svg' && node.localName === 'svg') return true;
+  if (node.nodeType === 1 && node.namespaceURI === 'http://www.w3.org/1998/Math/MathML' && node.localName === 'math') return true;
+  return node.nodeType !== 1 && _edIsHtmlEl(p);
+};
+const _edEditingHostOf = (node) => {
+  while (node && !_edIsEditingHost(node)) {
+    if (!_edIsEditable(node)) return null;
+    node = node.parentNode;
+  }
+  return node || null;
+};
+const _edInSameEditingHost = (a, b) => {
+  const ha = _edEditingHostOf(a);
+  return !!ha && ha === _edEditingHostOf(b);
+};
+
+// ── Tree walking ────────────────────────────────────────────────────────────
+const _edNodeIndex = (node) => {
+  let i = 0;
+  while ((node = node.previousSibling)) i++;
+  return i;
+};
+// A Text/Comment/PI node's length is its data length; anything else counts
+// children. Getting this wrong by using childNodes.length everywhere is the
+// classic way to lose half a text node.
+const _edNodeLength = (node) => {
+  if (!node) return 0;
+  if (node.nodeType === 10) return 0;                       // DocumentType
+  if (node.nodeType === 3 || node.nodeType === 8 || node.nodeType === 7) return node.data.length;
+  return node.childNodes.length;
+};
+const _edNextNode = (node) => {
+  if (node.hasChildNodes()) return node.firstChild;
+  return _edNextNodeDescendants(node);
+};
+const _edNextNodeDescendants = (node) => {
+  while (node && !node.nextSibling) node = node.parentNode;
+  return node ? node.nextSibling : null;
+};
+const _edPreviousNode = (node) => {
+  if (node.previousSibling) {
+    node = node.previousSibling;
+    while (node.hasChildNodes()) node = node.lastChild;
+    return node;
+  }
+  return node.parentNode || null;
+};
+const _edIsDescendant = (descendant, ancestor) => {
+  if (!ancestor || !descendant) return false;
+  let n = descendant.parentNode;
+  while (n && n !== ancestor) n = n.parentNode;
+  return n === ancestor;
+};
+const _edGetAncestors = (node) => {
+  const out = [];
+  for (let n = node.parentNode; n; n = n.parentNode) out.unshift(n);
+  return out;
+};
+const _edGetInclusiveAncestors = (node) => _edGetAncestors(node).concat([node]);
+const _edGetDescendants = (node) => {
+  const out = [];
+  const stop = _edNextNodeDescendants(node);
+  for (let n = _edNextNode(node); n && n !== stop; n = _edNextNode(n)) out.push(n);
+  return out;
+};
+const _edGetInclusiveDescendants = (node) => [node].concat(_edGetDescendants(node));
+// Document-order comparison of two boundary points, without leaning on
+// compareBoundaryPoints (which needs a Range and would allocate one per call in
+// the hottest loop in the whole engine).
+const _edGetPosition = (nodeA, offsetA, nodeB, offsetB) => {
+  if (nodeA === nodeB) {
+    return offsetA === offsetB ? 'equal' : (offsetA < offsetB ? 'before' : 'after');
+  }
+  if (_edIsDescendant(nodeB, nodeA)) {
+    // B is inside A: compare A's offset against the index of B's ancestor that
+    // is A's child.
+    let child = nodeB;
+    while (child.parentNode !== nodeA) child = child.parentNode;
+    return _edNodeIndex(child) < offsetA ? 'after' : 'before';
+  }
+  if (_edIsDescendant(nodeA, nodeB)) {
+    const flipped = _edGetPosition(nodeB, offsetB, nodeA, offsetA);
+    return flipped === 'before' ? 'after' : (flipped === 'after' ? 'before' : 'equal');
+  }
+  // Disjoint: walk up to the common ancestor and compare child indices.
+  const ancA = _edGetInclusiveAncestors(nodeA);
+  const ancB = _edGetInclusiveAncestors(nodeB);
+  let i = 0;
+  while (i < ancA.length && i < ancB.length && ancA[i] === ancB[i]) i++;
+  if (i === 0) return 'before';                             // different trees; arbitrary but stable
+  const ca = ancA[i], cb = ancB[i];
+  if (!ca || !cb) return 'before';
+  return _edNodeIndex(ca) < _edNodeIndex(cb) ? 'before' : 'after';
+};
+const _edIsBefore = (a, b) => _edGetPosition(a, 0, b, 0) === 'before';
+// "node is contained in range if node's parent is not null, the start of
+// (node, 0) is after range's start, and the end of (node, length) is before
+// range's end." Note it is the PARENT that must exist — a node with no parent
+// is never contained, however the offsets fall.
+const _edIsContained = (node, range) => {
+  if (!node.parentNode) return false;
+  const startPos = _edGetPosition(node, 0, range.startContainer, range.startOffset);
+  const endPos = _edGetPosition(node, _edNodeLength(node), range.endContainer, range.endOffset);
+  return (startPos === 'after' || startPos === 'equal')
+    && (endPos === 'before' || endPos === 'equal');
+};
+// Where a containment walk begins. The middle branch is the one that is easy to
+// miss and expensive to lose: a start point in the MIDDLE of a childless node
+// (halfway through a text node) means that node itself cannot be contained, but
+// the node after it can — so the walk starts at the next node, not past the
+// whole subtree.
+const _edContainedStart = (range) => {
+  const node = range.startContainer;
+  if (node.hasChildNodes() && range.startOffset < node.childNodes.length) {
+    return node.childNodes[range.startOffset];
+  }
+  if (range.startOffset === _edNodeLength(node)) return _edNextNodeDescendants(node);
+  return _edNextNode(node);
+};
+const _edGetContainedNodes = (range, condition) => {
+  const cond = condition || (() => true);
+  let node = _edContainedStart(range);
+  let stop = range.endContainer;
+  if (stop.hasChildNodes() && range.endOffset < stop.childNodes.length) {
+    stop = stop.childNodes[range.endOffset];
+  } else {
+    stop = _edNextNodeDescendants(stop);
+  }
+  const out = [];
+  while (node && (!stop || _edIsBefore(node, stop))) {
+    if (_edIsContained(node, range) && cond(node)) {
+      out.push(node);
+      node = _edNextNodeDescendants(node);              // do not descend into a match
+      continue;
+    }
+    node = _edNextNode(node);
+  }
+  return out;
+};
+const _edGetAllContainedNodes = (range, condition) => {
+  const cond = condition || (() => true);
+  let node = _edContainedStart(range);
+  let stop = range.endContainer;
+  if (stop.hasChildNodes() && range.endOffset < stop.childNodes.length) {
+    stop = stop.childNodes[range.endOffset];
+  } else {
+    stop = _edNextNodeDescendants(stop);
+  }
+  const out = [];
+  while (node && (!stop || _edIsBefore(node, stop))) {
+    if (_edIsContained(node, range) && cond(node)) out.push(node);
+    node = _edNextNode(node);
+  }
+  return out;
+};
+// "Effectively contained" is the looser notion editing actually needs: a Text
+// node the range only PARTIALLY covers is still effectively contained, because
+// bolding half a word has to touch that node. Plain containment would skip it
+// and the half-selection would silently do nothing.
+const _edIsEffectivelyContained = (node, range) => {
+  if (range.collapsed) return false;
+  if (_edIsContained(node, range)) return true;
+  if (node === range.startContainer && node.nodeType === 3
+      && _edNodeLength(node) !== range.startOffset) return true;
+  if (node === range.endContainer && node.nodeType === 3 && range.endOffset !== 0) return true;
+  if (node.hasChildNodes()
+      && Array.prototype.every.call(node.childNodes, (c) => _edIsEffectivelyContained(c, range))
+      && (!_edIsDescendant(range.startContainer, node) || range.startContainer.nodeType !== 3 || range.startOffset === 0)
+      && (!_edIsDescendant(range.endContainer, node) || range.endContainer.nodeType !== 3
+        || range.endOffset === _edNodeLength(range.endContainer))) return true;
+  return false;
+};
+const _edEffContainedFrom = (range) => {
+  let node = range.startContainer;
+  while (node.parentNode && _edIsEffectivelyContained(node.parentNode, range)) node = node.parentNode;
+  return node;
+};
+const _edGetEffectivelyContainedNodes = (range, condition) => {
+  const cond = condition || (() => true);
+  let node = _edEffContainedFrom(range);
+  const stop = _edNextNodeDescendants(range.endContainer);
+  const out = [];
+  while (node && (!stop || _edIsBefore(node, stop))) {
+    if (_edIsEffectivelyContained(node, range) && cond(node)) {
+      out.push(node);
+      node = _edNextNodeDescendants(node);
+      continue;
+    }
+    node = _edNextNode(node);
+  }
+  return out;
+};
+const _edGetAllEffectivelyContainedNodes = (range, condition) => {
+  const cond = condition || (() => true);
+  let node = _edEffContainedFrom(range);
+  const stop = _edNextNodeDescendants(range.endContainer);
+  const out = [];
+  while (node && (!stop || _edIsBefore(node, stop))) {
+    if (_edIsEffectivelyContained(node, range) && cond(node)) out.push(node);
+    node = _edNextNode(node);
+  }
+  return out;
+};
+
+// ── Visibility ──────────────────────────────────────────────────────────────
+// Editing cares about what the READER can see, not about what is in the tree:
+// a run of whitespace that collapses away is not a thing you can put your cursor
+// in, and a <br> at the end of a block draws nothing. Every algorithm below
+// filters by these, which is why "delete" does not leave the caret stranded in
+// an invisible node.
+const _edIsWhitespaceNode = (node) => {
+  if (!node || node.nodeType !== 3) return false;
+  if (node.data === '') return true;
+  const p = node.parentNode;
+  if (!p || p.nodeType !== 1) return false;
+  const ws = _edStyle(p, 'white-space');
+  if (/^[\t\n\r ]+$/.test(node.data) && (ws === 'normal' || ws === 'nowrap')) return true;
+  return /^[\t\r ]+$/.test(node.data) && ws === 'pre-line';
+};
+const _edIsCollapsedWhitespaceNode = (node) => {
+  if (!_edIsWhitespaceNode(node)) return false;
+  if (node.data === '') return true;
+  let ancestor = node.parentNode;
+  if (!ancestor) return true;
+  if (_edGetAncestors(node).some((a) => a.nodeType === 1 && _edStyle(a, 'display') === 'none')) return true;
+  while (!_edIsBlock(ancestor) && ancestor.parentNode) ancestor = ancestor.parentNode;
+  // Look backwards then forwards for the nearest thing that would make this
+  // whitespace render. A block edge or a <br> on either side collapses it.
+  let ref = node;
+  while (ref && ref !== ancestor) {
+    ref = _edPreviousNode(ref);
+    if (!ref) break;
+    if (_edIsBlock(ref) || _edIsHtmlEl(ref, 'br')) return true;
+    if ((ref.nodeType === 3 && !_edIsWhitespaceNode(ref)) || _edIsHtmlEl(ref, 'img')) break;
+  }
+  ref = node;
+  const stop = _edNextNodeDescendants(ancestor);
+  while (ref && ref !== stop) {
+    ref = _edNextNode(ref);
+    if (!ref) break;
+    if (_edIsBlock(ref) || _edIsHtmlEl(ref, 'br')) return true;
+    if ((ref.nodeType === 3 && !_edIsWhitespaceNode(ref)) || _edIsHtmlEl(ref, 'img')) break;
+  }
+  return false;
+};
+// "An extraneous line break is a br that has no visual effect" — except a br
+// that is an li's only child, which holds the bullet's line open.
+//
+// The spec has no structural definition here; it is defined by its EFFECT, so
+// the honest test is to remove it and see whether the block gets shorter. We can
+// do that: the layout bridge (quest #505) makes offsetHeight real. It costs a
+// reflow, which is why every caller filters down to <br> elements first.
+const _edBlockAncestorFor = (node) => {
+  let ref = node.parentNode;
+  while (ref && _edStyle(ref, 'display') === 'inline') ref = ref.parentNode;
+  return ref;
+};
+const _edIsExtraneousLineBreak = (br) => {
+  if (!_edIsHtmlEl(br, 'br')) return false;
+  if (_edIsHtmlEl(br.parentNode, 'li') && br.parentNode.childNodes.length === 1) return false;
+  const ref = _edBlockAncestorFor(br);
+  if (!ref || ref.nodeType !== 1) return false;
+  const refStyle = ref.hasAttribute('style') ? ref.getAttribute('style') : null;
+  const brStyle = br.hasAttribute('style') ? br.getAttribute('style') : null;
+  try {
+    ref.style.height = 'auto'; ref.style.maxHeight = 'none'; ref.style.minHeight = '0';
+    const origHeight = ref.offsetHeight;
+    if (!origHeight) return false;                          // no layout to compare against
+    br.setAttribute('style', 'display:none');
+    return origHeight === ref.offsetHeight;
+  } catch (e) {
+    return false;
+  } finally {
+    if (refStyle === null) ref.removeAttribute('style'); else ref.setAttribute('style', refStyle);
+    if (brStyle === null) br.removeAttribute('style'); else br.setAttribute('style', brStyle);
+  }
+};
+const _edIsCollapsedLineBreak = (br) => {
+  if (!_edIsHtmlEl(br, 'br')) return false;
+  const ref = _edBlockAncestorFor(br);
+  if (!ref || ref.nodeType !== 1) return false;
+  const refStyle = ref.hasAttribute('style') ? ref.getAttribute('style') : null;
+  let space = null;
+  try {
+    ref.style.height = 'auto'; ref.style.maxHeight = 'none'; ref.style.minHeight = '0';
+    const origHeight = ref.offsetHeight;
+    if (!origHeight) return false;
+    space = br.ownerDocument.createTextNode('​');
+    br.parentNode.insertBefore(space, br.nextSibling);
+    // Leeway: the zwsp may only have made an existing line taller rather than
+    // starting a new one, which is not the same thing at all.
+    return origHeight < ref.offsetHeight - 5;
+  } catch (e) {
+    return false;
+  } finally {
+    if (space && space.parentNode) space.parentNode.removeChild(space);
+    if (refStyle === null) ref.removeAttribute('style'); else ref.setAttribute('style', refStyle);
+  }
+};
+const _edIsVisible = (node) => {
+  if (!node) return false;
+  if (_edGetInclusiveAncestors(node).some((n) => n.nodeType === 1 && _edStyle(n, 'display') === 'none')) return false;
+  if (_edIsBlock(node)
+      || (node.nodeType === 3 && !_edIsCollapsedWhitespaceNode(node))
+      || _edIsHtmlEl(node, 'img')
+      || (_edIsHtmlEl(node, 'br') && !_edIsExtraneousLineBreak(node))) return true;
+  for (let i = 0; i < node.childNodes.length; i++) {
+    if (_edIsVisible(node.childNodes[i])) return true;
+  }
+  return false;
+};
+const _edIsInvisible = (node) => !!node && !_edIsVisible(node);
+const _edIsFormattableNode = (node) => _edIsEditable(node) && _edIsVisible(node)
+  && (node.nodeType === 3 || _edIsHtmlEl(node, ['img', 'br']));
+
+// ── Block boundaries ────────────────────────────────────────────────────────
+const _edIsBlockStartPoint = (node, offset) => (!node.parentNode && offset === 0)
+  || (offset - 1 >= 0 && offset - 1 < node.childNodes.length
+    && _edIsVisible(node.childNodes[offset - 1])
+    && (_edIsBlock(node.childNodes[offset - 1]) || _edIsHtmlEl(node.childNodes[offset - 1], 'br')));
+const _edIsBlockEndPoint = (node, offset) => (!node.parentNode && offset === _edNodeLength(node))
+  || (offset < node.childNodes.length && _edIsVisible(node.childNodes[offset])
+    && _edIsBlock(node.childNodes[offset]));
+const _edIsBlockBoundaryPoint = (node, offset) => _edIsBlockStartPoint(node, offset)
+  || _edIsBlockEndPoint(node, offset);
+// "Block-extending" a range grows it outward to whole lines. Every block command
+// (indent, justify, formatBlock, the list commands) operates on lines, not on
+// characters — you cannot centre half a paragraph — so they all start here.
+const _edBlockExtend = (range) => {
+  let startNode = range.startContainer, startOffset = range.startOffset;
+  let endNode = range.endContainer, endOffset = range.endOffset;
+  // An <li> is the unit of a line even though it is not where the caret is, so
+  // the endpoints hop out to the list item's parent first.
+  const lastLi = (n) => {
+    const lis = _edGetInclusiveAncestors(n).filter((a) => _edIsHtmlEl(a, 'li'));
+    return lis.length ? lis[lis.length - 1] : null;
+  };
+  let li = lastLi(startNode);
+  if (li) { startOffset = _edNodeIndex(li); startNode = li.parentNode; }
+  if (!_edIsBlockStartPoint(startNode, startOffset)) {
+    do {
+      if (startOffset === 0) { startOffset = _edNodeIndex(startNode); startNode = startNode.parentNode; }
+      else startOffset--;
+    } while (startNode && !_edIsBlockBoundaryPoint(startNode, startOffset));
+  }
+  while (startOffset === 0 && startNode.parentNode) {
+    startOffset = _edNodeIndex(startNode); startNode = startNode.parentNode;
+  }
+  li = lastLi(endNode);
+  if (li) { endOffset = 1 + _edNodeIndex(li); endNode = li.parentNode; }
+  if (!_edIsBlockEndPoint(endNode, endOffset)) {
+    do {
+      if (endOffset === _edNodeLength(endNode)) { endOffset = 1 + _edNodeIndex(endNode); endNode = endNode.parentNode; }
+      else endOffset++;
+    } while (endNode && !_edIsBlockBoundaryPoint(endNode, endOffset));
+  }
+  while (endOffset === _edNodeLength(endNode) && endNode.parentNode) {
+    endOffset = 1 + _edNodeIndex(endNode); endNode = endNode.parentNode;
+  }
+  const out = (startNode.ownerDocument || document).createRange();
+  out.setStart(startNode, startOffset);
+  out.setEnd(endNode, endOffset);
+  return out;
+};
+const _edIsIndentationElement = (node) => {
+  if (!_edIsHtmlEl(node)) return false;
+  if (node.localName === 'blockquote') return true;
+  if (node.localName !== 'div') return false;
+  for (let i = 0; i < node.style.length; i++) {
+    if (/^(-[a-z]+-)?margin/.test(node.style[i])) return true;
+  }
+  return false;
+};
+const _edIsSimpleIndentationElement = (node) => {
+  if (!_edIsIndentationElement(node)) return false;
+  for (let i = 0; i < node.attributes.length; i++) {
+    const a = node.attributes[i];
+    if (!_edIsHtmlNs(a.namespaceURI) || ['style', 'dir'].indexOf(a.name) === -1) return false;
+  }
+  for (let i = 0; i < node.style.length; i++) {
+    if (!/^(-[a-z]+-)?(margin|border|padding)/.test(node.style[i])) return false;
+  }
+  return true;
+};
+const _edIsNonListSingleLineContainer = (node) => _edIsHtmlEl(node,
+  ['address', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'listing', 'p', 'pre', 'xmp']);
+const _edIsSingleLineContainer = (node) => _edIsNonListSingleLineContainer(node)
+  || _edIsHtmlEl(node, ['li', 'dt', 'dd']);
+const _edBlockNodeOf = (node) => {
+  while (_edIsInline(node)) node = node.parentNode;
+  return node;
+};
+const _edDirectionality = (element) => {
+  while (element) {
+    if (!_edIsHtmlEl(element)) return 'ltr';
+    const d = element.dir;
+    if (d === 'ltr' || d === 'rtl') return d;
+    if (!_edIsHtmlEl(element.parentNode)) return 'ltr';
+    element = element.parentNode;
+  }
+  return 'ltr';
+};
+const _edAlignmentValue = (node) => {
+  while (node && (node.nodeType !== 1
+      || ['inline', 'none'].indexOf(_edStyle(node, 'display')) !== -1)) {
+    node = node.parentNode;
+  }
+  if (!node || node.nodeType !== 1) return 'left';
+  const resolved = _edStyle(node, 'text-align').replace(/^-(moz|webkit)-/, '').replace(/^auto$/, 'start');
+  if (resolved === 'start') return _edDirectionality(node) === 'ltr' ? 'left' : 'right';
+  if (resolved === 'end') return _edDirectionality(node) === 'ltr' ? 'right' : 'left';
+  if (['center', 'justify', 'left', 'right'].indexOf(resolved) !== -1) return resolved;
+  return 'left';
+};
+// "Is `child` allowed inside `parent`?" — `child`/`parent` may each be a node or
+// a bare local name, because half the callers are asking about an element that
+// does not exist yet. This is the content model, hand-written: the editing
+// algorithms consult it before every move, which is what keeps them from
+// building a DOM the HTML parser would refuse to re-parse.
+const _edIsAllowedChild = (child, parent) => {
+  const parentIsName = typeof parent === 'string';
+  const parentNames = ['colgroup', 'table', 'tbody', 'tfoot', 'thead', 'tr'];
+  if ((parentIsName ? parentNames.indexOf(parent) !== -1 : _edIsHtmlEl(parent, parentNames))
+      && child && typeof child === 'object' && child.nodeType === 3
+      && !/^[ \t\n\f\r]*$/.test(child.data)) return false;
+  const textOnly = ['script', 'style', 'plaintext', 'xmp'];
+  if ((parentIsName ? textOnly.indexOf(parent) !== -1 : _edIsHtmlEl(parent, textOnly))
+      && (typeof child !== 'object' || !child || child.nodeType !== 3)) return false;
+  if (child && typeof child === 'object'
+      && (child.nodeType === 9 || child.nodeType === 11 || child.nodeType === 10)) return false;
+  if (_edIsHtmlEl(child)) child = child.localName;
+  if (typeof child !== 'string') return true;
+  if (_edIsHtmlEl(parent)) {
+    for (let a = parent; a; a = a.parentNode) {
+      if (child === 'a' && _edIsHtmlEl(a, 'a')) return false;
+      if (_ED_PROHIBITED_P_CHILDREN.indexOf(child) !== -1 && _edIsElementWithInlineContents(a)) return false;
+      if (/^h[1-6]$/.test(child) && _edIsHtmlEl(a) && /^h[1-6]$/.test(a.localName)) return false;
+    }
+    parent = parent.localName;
+  }
+  if (parent && typeof parent === 'object' && (parent.nodeType === 1 || parent.nodeType === 11)) return true;
+  if (typeof parent !== 'string') return false;
+  switch (parent) {
+    case 'colgroup': return child === 'col';
+    case 'table': return ['caption', 'col', 'colgroup', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr'].indexOf(child) !== -1;
+    case 'tbody': case 'thead': case 'tfoot': return ['td', 'th', 'tr'].indexOf(child) !== -1;
+    case 'tr': return ['td', 'th'].indexOf(child) !== -1;
+    case 'dl': return ['dt', 'dd'].indexOf(child) !== -1;
+    case 'dir': case 'ol': case 'ul': return ['dir', 'li', 'ol', 'ul'].indexOf(child) !== -1;
+    case 'hgroup': return /^h[1-6]$/.test(child);
+  }
+  if (['body', 'caption', 'col', 'colgroup', 'frame', 'frameset', 'head', 'html',
+    'tbody', 'td', 'tfoot', 'th', 'thead', 'tr'].indexOf(child) !== -1) return false;
+  if (['dd', 'dt'].indexOf(child) !== -1 && parent !== 'dl') return false;
+  if (child === 'li' && parent !== 'ol' && parent !== 'ul') return false;
+  const table = [
+    [['a'], ['a']],
+    [['dd', 'dt'], ['dd', 'dt']],
+    [['h1', 'h2', 'h3', 'h4', 'h5', 'h6'], ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']],
+    [['li'], ['li']],
+    [['nobr'], ['nobr']],
+    [_ED_INLINE_CONTENT_NAMES, _ED_PROHIBITED_P_CHILDREN],
+    [['td', 'th'], ['caption', 'col', 'colgroup', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr']],
+  ];
+  for (const [ps, cs] of table) {
+    if (ps.indexOf(parent) !== -1 && cs.indexOf(child) !== -1) return false;
+  }
+  return true;
+};
+
+// ── Colours and font sizes ──────────────────────────────────────────────────
+// The editing spec compares colours by VALUE, not by spelling: `#f00`, `red` and
+// `rgb(255,0,0)` are one colour, and an engine that compared strings would wrap
+// an extra <font> around text that was already the right colour every time the
+// page spelled it differently.
+const _edNormalizeColor = (color) => {
+  if (color === null || color === undefined) return null;
+  const s = String(color);
+  if (s.toLowerCase() === 'currentcolor') return null;
+  if (s === '') return null;
+  let out = null;
+  try { out = _computeColor(s); } catch (e) { out = null; }
+  if (!out) return null;
+  if (/^rgba\([0-9]+, [0-9]+, [0-9]+, 1\)$/.test(out)) return out.replace('rgba', 'rgb').replace(', 1)', ')');
+  if (out === 'transparent') return 'rgba(0, 0, 0, 0)';
+  return out;
+};
+const _edParseSimpleColor = (color) => {
+  const c = _edNormalizeColor(color);
+  const m = /^rgb\(([0-9]+), ([0-9]+), ([0-9]+)\)$/.exec(c || '');
+  if (!m) return null;
+  const hex = (n) => parseInt(n, 10).toString(16).padStart(2, '0');
+  return '#' + hex(m[1]) + hex(m[2]) + hex(m[3]);
+};
+const _ED_LEGACY_SIZES = ['x-small', 'small', 'medium', 'large', 'x-large', 'xx-large', 'xxx-large'];
+const _edCssSizeToLegacy = (v) => { const i = _ED_LEGACY_SIZES.indexOf(v); return i === -1 ? undefined : i + 1; };
+const _edLegacySizeToCss = (v) => _ED_LEGACY_SIZES[v - 1];
+const _edNormalizeFontSize = (value) => {
+  const v0 = String(value).trim();
+  if (!/^[-+]?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$/.test(v0)) return null;
+  let v = v0, mode = 'absolute';
+  if (v[0] === '+') { v = v.slice(1); mode = 'relative-plus'; }
+  else if (v[0] === '-') { v = v.slice(1); mode = 'relative-minus'; }
+  let num = parseInt(v, 10);
+  if (mode === 'relative-plus') num += 3;
+  if (mode === 'relative-minus') num = 3 - num;
+  if (num < 1) num = 1;
+  if (num > 7) num = 7;
+  return _edLegacySizeToCss(num);
+};
+// The px size each <font size=N> resolves to, measured through OUR OWN computed
+// style rather than hardcoded — so "which legacy bucket is 15px in?" is answered
+// against the sizes this engine actually renders, and stays right if they change.
+let _edFontSizePxCache = null;
+const _edFontSizePx = () => {
+  if (_edFontSizePxCache) return _edFontSizePxCache;
+  const out = [];
+  const doc = globalThis.document;
+  const host = doc && doc.body;
+  if (!host) return _ED_LEGACY_SIZES.map((_, i) => 10 + i * 5);   // no body yet: never used for a real answer
+  const font = doc.createElement('font');
+  host.appendChild(font);
+  for (let n = 1; n <= 7; n++) {
+    font.setAttribute('size', String(n));
+    out.push(parseInt(_edStyle(font, 'font-size'), 10) || 16);
+  }
+  host.removeChild(font);
+  _edFontSizePxCache = out;
+  return out;
+};
+const _edGetLegacyFontSize = (size) => {
+  if (size === null || size === undefined) return null;
+  const s = String(size);
+  const norm = _edNormalizeFontSize(s);
+  if (norm !== null) return String(_edCssSizeToLegacy(norm));
+  if (_ED_LEGACY_SIZES.indexOf(s) === -1 && !/^[0-9]+(\.[0-9]+)?(cm|mm|in|pt|pc|px)$/.test(s)) {
+    return null;                                            // no sensible legacy size for "2em"
+  }
+  const px = _ED_LEGACY_SIZES.indexOf(s) !== -1
+    ? _edFontSizePx()[_ED_LEGACY_SIZES.indexOf(s)]
+    : parseInt(s, 10);
+  const table = _edFontSizePx();
+  // The spec buckets by the MIDPOINT between adjacent legacy sizes, not by
+  // equality: a 15px run has to answer with some legacy size, and the nearest
+  // one is the only defensible choice.
+  for (let n = 1; n < 7; n++) {
+    if (px < (table[n - 1] + table[n]) / 2) return String(n);
+  }
+  return '7';
+};
+
+// ── Per-document editing state ──────────────────────────────────────────────
+// The CSS styling flag, the default paragraph separator, and the state/value
+// overrides all belong to the Document, not to the engine: two frames on one
+// page edit independently.
+const _edState = (doc) => {
+  let s = doc._editingState;
+  if (!s) {
+    s = doc._editingState = {
+      cssStylingFlag: false,
+      defaultSingleLineContainerName: 'div',
+      stateOverrides: Object.create(null),
+      valueOverrides: Object.create(null),
+      storedRange: null,
+    };
+  }
+  return s;
+};
+const _edActiveRange = (doc) => {
+  let sel = null;
+  try { sel = doc.getSelection(); } catch (e) { return null; }
+  if (!sel || !sel.rangeCount) return null;
+  let r = null;
+  try { r = sel.getRangeAt(0); } catch (e) { return null; }
+  if (!r) return null;
+  const ok = (n) => n && (n.nodeType === 3 || n.nodeType === 1);
+  if (!ok(r.startContainer) || !ok(r.endContainer)) return null;
+  return r;
+};
+// "Whenever a boundary point of the selection changes, the state override and
+// value override must be unset for every command."
+//
+// An override is the memory of a formatting choice made with NOTHING SELECTED —
+// you press Bold with a bare caret and then type. It has to survive until you
+// type, and it has to die the instant the caret moves, or the next word you type
+// three paragraphs away comes out bold for no reason the reader can see.
+const _edResetOverrides = (doc) => {
+  const s = _edState(doc);
+  const r = _edActiveRange(doc);
+  if (!r) { s.stateOverrides = Object.create(null); s.valueOverrides = Object.create(null); s.storedRange = null; return; }
+  const sr = s.storedRange;
+  if (!sr || sr.sc !== r.startContainer || sr.so !== r.startOffset
+      || sr.ec !== r.endContainer || sr.eo !== r.endOffset) {
+    s.stateOverrides = Object.create(null);
+    s.valueOverrides = Object.create(null);
+    s.storedRange = { sc: r.startContainer, so: r.startOffset, ec: r.endContainer, eo: r.endOffset };
+  }
+};
+const _edGetStateOverride = (doc, command) => { _edResetOverrides(doc); return _edState(doc).stateOverrides[command]; };
+const _edSetStateOverride = (doc, command, v) => { _edResetOverrides(doc); _edState(doc).stateOverrides[command] = v; };
+const _edUnsetStateOverride = (doc, command) => { _edResetOverrides(doc); delete _edState(doc).stateOverrides[command]; };
+const _edGetValueOverride = (doc, command) => { _edResetOverrides(doc); return _edState(doc).valueOverrides[command]; };
+// backColor and hiliteColor share one override — they are two names for one
+// command and always have been, so setting either must set both or a page that
+// spells it the other way reads back a stale answer.
+const _edSetValueOverride = (doc, command, v) => {
+  _edResetOverrides(doc);
+  const o = _edState(doc).valueOverrides;
+  o[command] = v;
+  if (command === 'backcolor') o.hilitecolor = v;
+  else if (command === 'hilitecolor') o.backcolor = v;
+};
+const _edUnsetValueOverride = (doc, command) => {
+  _edResetOverrides(doc);
+  const o = _edState(doc).valueOverrides;
+  delete o[command];
+  if (command === 'backcolor') delete o.hilitecolor;
+  else if (command === 'hilitecolor') delete o.backcolor;
+};
+
+// ── Command values ──────────────────────────────────────────────────────────
+// The effective value is "what does this node LOOK like" — computed style, walked
+// up the tree. The specified value is "what does this element itself SAY" — its
+// own style attribute or its own tag. The distinction is the whole game: you
+// remove formatting by editing what elements SAY, and you decide whether you need
+// to by looking at what they LOOK like.
+const _edEffectiveValue = (node, command) => {
+  if (!node) return null;
+  if (node.nodeType !== 1 && (!node.parentNode || node.parentNode.nodeType !== 1)) return null;
+  if (node.nodeType !== 1) return _edEffectiveValue(node.parentNode, command);
+  if (command === 'createlink' || command === 'unlink') {
+    while (node && (!_edIsHtmlEl(node) || node.localName !== 'a' || !node.hasAttribute('href'))) {
+      node = node.parentNode;
+    }
+    return node ? node.getAttribute('href') : null;
+  }
+  if (command === 'backcolor' || command === 'hilitecolor') {
+    // Walk up through anything fully transparent: a transparent background is
+    // not a background, it is a hole through which the ancestor's shows.
+    let bc = _edStyle(node, 'background-color');
+    while ((bc === 'rgba(0, 0, 0, 0)' || bc === '' || bc === 'transparent')
+        && node.parentNode && node.parentNode.nodeType === 1) {
+      node = node.parentNode;
+      bc = _edStyle(node, 'background-color');
+    }
+    return _edStyle(node, 'background-color');
+  }
+  if (command === 'subscript' || command === 'superscript') {
+    let sub = false, sup = false;
+    while (_edIsInline(node)) {
+      if (_edIsHtmlEl(node, 'sub')) sub = true;
+      else if (_edIsHtmlEl(node, 'sup')) sup = true;
+      node = node.parentNode;
+    }
+    // Both at once is a real state and needs its own name — <sub><sup>x</sup></sub>
+    // is neither, and answering "subscript" would let the toolbar toggle away a
+    // superscript it never showed.
+    if (sub && sup) return 'mixed';
+    if (sub) return 'subscript';
+    if (sup) return 'superscript';
+    return null;
+  }
+  if (command === 'strikethrough') {
+    do {
+      if (_edStyle(node, 'text-decoration-line').indexOf('line-through') !== -1) return 'line-through';
+      node = node.parentNode;
+    } while (node && node.nodeType === 1);
+    return null;
+  }
+  if (command === 'underline') {
+    do {
+      if (_edStyle(node, 'text-decoration-line').indexOf('underline') !== -1) return 'underline';
+      node = node.parentNode;
+    } while (node && node.nodeType === 1);
+    return null;
+  }
+  const prop = _EDIT_COMMANDS[command] && _EDIT_COMMANDS[command].relevantCssProperty;
+  if (!prop) return null;
+  return _edStyle(node, prop);
+};
+const _edSpecifiedValue = (element, command) => {
+  if ((command === 'backcolor' || command === 'hilitecolor')
+      && _edStyle(element, 'display') !== 'inline') return null;
+  if (command === 'createlink' || command === 'unlink') {
+    if (_edIsHtmlEl(element, 'a') && element.hasAttribute('href')) return element.getAttribute('href');
+    return null;
+  }
+  if (command === 'subscript' || command === 'superscript') {
+    if (_edIsHtmlEl(element, 'sup')) return 'superscript';
+    if (_edIsHtmlEl(element, 'sub')) return 'subscript';
+    return null;
+  }
+  const inlineDecoration = element.style ? element.style.textDecoration : '';
+  if (command === 'strikethrough' && inlineDecoration !== '') {
+    return inlineDecoration.indexOf('line-through') !== -1 ? 'line-through' : null;
+  }
+  if (command === 'strikethrough' && _edIsHtmlEl(element, ['s', 'strike'])) return 'line-through';
+  if (command === 'underline' && inlineDecoration !== '') {
+    return inlineDecoration.indexOf('underline') !== -1 ? 'underline' : null;
+  }
+  if (command === 'underline' && _edIsHtmlEl(element, 'u')) return 'underline';
+  const prop = _EDIT_COMMANDS[command] && _EDIT_COMMANDS[command].relevantCssProperty;
+  if (!prop) return null;
+  const camel = prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+  if (element.style && element.style[camel] !== '' && element.style[camel] !== undefined) {
+    return element.style[camel];
+  }
+  // <font color> / <font face> / <font size> are presentational hints, and the
+  // spec reads them here BY NAME — because they are what execCommand itself
+  // writes, so an engine that could not read them back could not tell that it
+  // had already applied the formatting being asked for.
+  if (_edIsHtmlEl(element, 'font')) {
+    if (prop === 'color' && element.hasAttribute('color')) return element.getAttribute('color');
+    if (prop === 'font-family' && element.hasAttribute('face')) return element.getAttribute('face');
+    if (prop === 'font-size' && element.hasAttribute('size')) {
+      let size = parseInt(element.getAttribute('size'), 10);
+      if (!(size >= 1)) size = 1;
+      if (size > 7) size = 7;
+      return _edLegacySizeToCss(size);
+    }
+  }
+  if (prop === 'font-weight' && _edIsHtmlEl(element, ['b', 'strong'])) return 'bold';
+  if (prop === 'font-style' && _edIsHtmlEl(element, ['i', 'em'])) return 'italic';
+  return null;
+};
+const _edEquivalentValues = (command, v1, v2) => {
+  if (v1 === null && v2 === null) return true;
+  const cmd = _EDIT_COMMANDS[command];
+  if (typeof v1 !== 'string' || typeof v2 !== 'string') return false;
+  if (cmd && cmd.equivalentValues) return cmd.equivalentValues(v1, v2);
+  return v1 === v2;
+};
+const _edLooselyEquivalentValues = (command, v1, v2) => {
+  if (_edEquivalentValues(command, v1, v2)) return true;
+  if (command !== 'fontsize' || typeof v1 !== 'string' || typeof v2 !== 'string') return false;
+  const table = _edFontSizePx();
+  const px = (v) => { const i = _ED_LEGACY_SIZES.indexOf(v); return i === -1 ? null : table[i] + 'px'; };
+  return v1 === px(v2) || v2 === px(v1);
+};
+
+// ── The list state ──────────────────────────────────────────────────────────
+const _edSelectionListState = (doc) => {
+  const active = _edActiveRange(doc);
+  if (!active) return 'none';
+  const newRange = _edBlockExtend(active);
+  const nodeList = _edGetContainedNodes(newRange, (node) => _edIsEditable(node)
+    && !_edIsIndentationElement(node)
+    && (_edIsHtmlEl(node, ['ol', 'ul']) || _edIsHtmlEl(node.parentNode, ['ol', 'ul'])
+      || _edIsAllowedChild(node, 'li')));
+  if (!nodeList.length) return 'none';
+  const inList = (node, tag) => _edIsHtmlEl(node, tag) || _edIsHtmlEl(node.parentNode, tag)
+    || (_edIsHtmlEl(node.parentNode, 'li') && _edIsHtmlEl(node.parentNode.parentNode, tag));
+  const contains = (node, tag) => 'querySelector' in node && node.querySelector(tag);
+  if (nodeList.every((n) => inList(n, 'ol'))
+      && !nodeList.some((n) => _edIsHtmlEl(n, 'ul') || contains(n, 'ul'))) return 'ol';
+  if (nodeList.every((n) => inList(n, 'ul'))
+      && !nodeList.some((n) => _edIsHtmlEl(n, 'ol') || contains(n, 'ol'))) return 'ul';
+  const hasOl = nodeList.some((n) => inList(n, 'ol') || contains(n, 'ol'));
+  const hasUl = nodeList.some((n) => inList(n, 'ul') || contains(n, 'ul'));
+  if (hasOl && hasUl) return 'mixed';
+  if (hasOl) return 'mixed ol';
+  if (hasUl) return 'mixed ul';
+  return 'none';
+};
+
+// ── The command table ───────────────────────────────────────────────────────
+// Each entry may define: action(value, doc) → boolean; state(doc); indeterm(doc);
+// value(doc); relevantCssProperty; inlineCommandActivatedValues;
+// standardInlineValueCommand; equivalentValues(a, b).
+//
+// Quest #514 ships every READ path — supported/enabled/state/indeterm/value —
+// plus the four always-enabled miscellaneous commands. The write paths land in
+// the two quests after it. That order is deliberate: half of what these tests
+// assert is what the engine BELIEVES about a document it has not touched, and
+// an engine that cannot read formatting correctly cannot possibly write it.
+const _EDIT_COMMANDS = Object.create(null);
+const _edDefine = (name, def) => { _EDIT_COMMANDS[name] = def; };
+
+_edDefine('backcolor', {
+  relevantCssProperty: 'background-color', standardInlineValueCommand: true,
+  equivalentValues: (a, b) => _edNormalizeColor(a) === _edNormalizeColor(b),
+  indeterm: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return false;
+    const vals = _edGetAllEffectivelyContainedNodes(r, (n) => _edIsEditable(n) && n.nodeType === 3)
+      .map((n) => _edEffectiveValue(n, 'backcolor'));
+    return vals.filter((v, i) => vals.slice(0, i).indexOf(v) === -1).length >= 2;
+  },
+});
+_edDefine('bold', {
+  relevantCssProperty: 'font-weight',
+  inlineCommandActivatedValues: ['bold', '600', '700', '800', '900'],
+  // A toolbar's Bold button is "on" for <b> and for font-weight:700 alike, and
+  // "off" for `normal` and for `400` alike. Comparing the strings would make the
+  // button flicker as the caret crossed between two spellings of one weight.
+  equivalentValues: (a, b) => a === b
+    || (a === 'bold' && b === '700') || (a === '700' && b === 'bold')
+    || (a === 'normal' && b === '400') || (a === '400' && b === 'normal'),
+});
+_edDefine('createlink', {});
+_edDefine('fontname', { relevantCssProperty: 'font-family', standardInlineValueCommand: true });
+_edDefine('fontsize', {
+  relevantCssProperty: 'font-size',
+  indeterm: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return false;
+    const vals = _edGetAllEffectivelyContainedNodes(r, _edIsFormattableNode)
+      .map((n) => _edEffectiveValue(n, 'fontsize'));
+    return vals.filter((v, i) => vals.slice(0, i).indexOf(v) === -1).length >= 2;
+  },
+  value: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return '';
+    let node = _edGetAllEffectivelyContainedNodes(r, _edIsFormattableNode)[0];
+    if (node === undefined) node = r.startContainer;
+    const legacy = _edGetLegacyFontSize(_edEffectiveValue(node, 'fontsize'));
+    return legacy === null ? '' : legacy;
+  },
+});
+_edDefine('forecolor', {
+  relevantCssProperty: 'color', standardInlineValueCommand: true,
+  equivalentValues: (a, b) => _edNormalizeColor(a) === _edNormalizeColor(b),
+});
+_edDefine('hilitecolor', {
+  relevantCssProperty: 'background-color', standardInlineValueCommand: true,
+  equivalentValues: (a, b) => _edNormalizeColor(a) === _edNormalizeColor(b),
+  indeterm: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return false;
+    const vals = _edGetAllEffectivelyContainedNodes(r, (n) => _edIsEditable(n) && n.nodeType === 3)
+      .map((n) => _edEffectiveValue(n, 'hilitecolor'));
+    return vals.filter((v, i) => vals.slice(0, i).indexOf(v) === -1).length >= 2;
+  },
+});
+_edDefine('italic', {
+  relevantCssProperty: 'font-style', inlineCommandActivatedValues: ['italic', 'oblique'],
+});
+_edDefine('removeformat', {});
+_edDefine('strikethrough', { inlineCommandActivatedValues: ['line-through'] });
+_edDefine('subscript', {
+  inlineCommandActivatedValues: ['subscript'],
+  indeterm: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return false;
+    const nodes = _edGetAllEffectivelyContainedNodes(r, _edIsFormattableNode);
+    return (nodes.some((n) => _edEffectiveValue(n, 'subscript') === 'subscript')
+        && nodes.some((n) => _edEffectiveValue(n, 'subscript') !== 'subscript'))
+      || nodes.some((n) => _edEffectiveValue(n, 'subscript') === 'mixed');
+  },
+});
+_edDefine('superscript', {
+  inlineCommandActivatedValues: ['superscript'],
+  indeterm: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return false;
+    const nodes = _edGetAllEffectivelyContainedNodes(r, _edIsFormattableNode);
+    return (nodes.some((n) => _edEffectiveValue(n, 'superscript') === 'superscript')
+        && nodes.some((n) => _edEffectiveValue(n, 'superscript') !== 'superscript'))
+      || nodes.some((n) => _edEffectiveValue(n, 'superscript') === 'mixed');
+  },
+});
+_edDefine('underline', { inlineCommandActivatedValues: ['underline'] });
+_edDefine('unlink', {});
+// Block commands. Their read paths all start by block-extending the range,
+// because a block command's unit is the line.
+const _edBlockAlignQuery = (alignment) => ({
+  indeterm: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return false;
+    const nodes = _edGetAllContainedNodes(_edBlockExtend(r), (n) => _edIsEditable(n)
+      && _edIsVisible(n) && !n.hasChildNodes());
+    return nodes.some((n) => _edAlignmentValue(n) === alignment)
+      && nodes.some((n) => _edAlignmentValue(n) !== alignment);
+  },
+  state: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return false;
+    const nodes = _edGetAllContainedNodes(_edBlockExtend(r), (n) => _edIsEditable(n)
+      && _edIsVisible(n) && !n.hasChildNodes());
+    return !!nodes.length && nodes.every((n) => _edAlignmentValue(n) === alignment);
+  },
+  value: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return '';
+    const nodes = _edGetAllContainedNodes(_edBlockExtend(r), (n) => _edIsEditable(n)
+      && _edIsVisible(n) && !n.hasChildNodes());
+    return nodes.length ? _edAlignmentValue(nodes[0]) : 'left';
+  },
+});
+_edDefine('justifycenter', _edBlockAlignQuery('center'));
+_edDefine('justifyfull', _edBlockAlignQuery('justify'));
+_edDefine('justifyleft', _edBlockAlignQuery('left'));
+_edDefine('justifyright', _edBlockAlignQuery('right'));
+// The type of block a selection is in — and, for `indeterm`, whether it is in
+// more than one type at once, which is what greys out a paragraph-style dropdown
+// instead of letting it lie about a mixed selection.
+const _edFormatBlockNodeOf = (node) => {
+  while (_edIsEditable(node.parentNode) && _edInSameEditingHost(node, node.parentNode)
+      && !_edIsHtmlEl(node, _ED_FORMATTABLE_BLOCK_NAMES)) {
+    node = node.parentNode;
+  }
+  return node;
+};
+_edDefine('formatblock', {
+  indeterm: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return false;
+    const nodeList = _edGetAllContainedNodes(_edBlockExtend(r),
+      (n) => _edIsVisible(n) && _edIsEditable(n) && !n.hasChildNodes());
+    if (!nodeList.length) return false;
+    let type = null;
+    for (const n0 of nodeList) {
+      const node = _edFormatBlockNodeOf(n0);
+      let currentType = '';
+      if (_edIsEditable(node) && _edIsHtmlEl(node, _ED_FORMATTABLE_BLOCK_NAMES)
+          && !_edGetDescendants(node).some(_edIsProhibitedParagraphChild)) {
+        currentType = node.localName;
+      }
+      if (type === null) type = currentType;
+      else if (type !== currentType) return true;
+    }
+    return false;
+  },
+  value: (doc) => {
+    const r = _edActiveRange(doc);
+    if (!r) return '';
+    const nodes = _edGetAllContainedNodes(_edBlockExtend(r),
+      (n) => _edIsVisible(n) && _edIsEditable(n) && !n.hasChildNodes());
+    if (!nodes.length) return '';
+    const node = _edFormatBlockNodeOf(nodes[0]);
+    if (_edIsEditable(node) && _edIsHtmlEl(node, _ED_FORMATTABLE_BLOCK_NAMES)
+        && !_edGetDescendants(node).some(_edIsProhibitedParagraphChild)) {
+      return node.localName;
+    }
+    return '';
+  },
+});
+_edDefine('indent', {});
+_edDefine('outdent', {});
+_edDefine('insertorderedlist', {
+  indeterm: (doc) => /^mixed( ol)?$/.test(_edSelectionListState(doc)),
+  state: (doc) => _edSelectionListState(doc) === 'ol',
+});
+_edDefine('insertunorderedlist', {
+  indeterm: (doc) => /^mixed( ul)?$/.test(_edSelectionListState(doc)),
+  state: (doc) => _edSelectionListState(doc) === 'ul',
+});
+_edDefine('delete', {});
+_edDefine('forwarddelete', {});
+_edDefine('inserthorizontalrule', {});
+_edDefine('inserthtml', {});
+_edDefine('insertimage', {});
+_edDefine('insertlinebreak', {});
+_edDefine('insertparagraph', {});
+_edDefine('inserttext', {});
+// The four always-enabled miscellaneous commands. They need no selection and no
+// editing host, which is exactly why they can be answered now.
+_edDefine('defaultparagraphseparator', {
+  action: (value, doc) => {
+    const v = String(value).toLowerCase();
+    if (v === 'p' || v === 'div') { _edState(doc).defaultSingleLineContainerName = v; return true; }
+    return false;
+  },
+  value: (doc) => _edState(doc).defaultSingleLineContainerName,
+});
+_edDefine('selectall', {
+  action: (value, doc) => {
+    const target = doc.body || doc.documentElement;
+    const sel = doc.getSelection();
+    if (!target) sel.removeAllRanges();
+    else sel.selectAllChildren(target);
+    return true;
+  },
+});
+// styleWithCSS and useCSS are the same switch wired backwards from each other —
+// "do I write <b> or style=font-weight:bold?". useCSS is the older spelling and
+// its sense is INVERTED, which is a genuine trap: passing "false" to one is
+// passing "true" to the other.
+_edDefine('stylewithcss', {
+  action: (value, doc) => { _edState(doc).cssStylingFlag = String(value).toLowerCase() !== 'false'; return true; },
+  state: (doc) => _edState(doc).cssStylingFlag,
+});
+_edDefine('usecss', {
+  action: (value, doc) => { _edState(doc).cssStylingFlag = String(value).toLowerCase() === 'false'; return true; },
+});
+_edDefine('copy', {});
+_edDefine('cut', {});
+_edDefine('paste', {});
+
+// Generic query behaviour derived from the table's declarations, exactly as the
+// spec derives it — so a command that declares `inlineCommandActivatedValues`
+// gets a correct state and indeterminacy for free and cannot drift from its
+// siblings.
+for (const name of Object.keys(_EDIT_COMMANDS)) {
+  const cmd = _EDIT_COMMANDS[name];
+  if (!('relevantCssProperty' in cmd)) cmd.relevantCssProperty = null;
+  if (cmd.inlineCommandActivatedValues && !cmd.indeterm) {
+    cmd.indeterm = (doc) => {
+      const r = _edActiveRange(doc);
+      if (!r) return false;
+      const values = _edGetAllEffectivelyContainedNodes(r, _edIsFormattableNode)
+        .map((n) => _edEffectiveValue(n, name));
+      const matching = values.filter((v) => cmd.inlineCommandActivatedValues.indexOf(v) !== -1);
+      return matching.length >= 1 && values.length - matching.length >= 1;
+    };
+  }
+  if (cmd.inlineCommandActivatedValues && !cmd.state) {
+    cmd.state = (doc) => {
+      const r = _edActiveRange(doc);
+      if (!r) return false;
+      const nodes = _edGetAllEffectivelyContainedNodes(r, _edIsFormattableNode);
+      // With nothing formattable selected — a bare caret — the answer comes from
+      // where the caret IS. That is what makes the Bold button light up correctly
+      // when you click into the middle of a bold word without selecting anything.
+      if (nodes.length === 0) {
+        return cmd.inlineCommandActivatedValues.indexOf(_edEffectiveValue(r.startContainer, name)) !== -1;
+      }
+      return nodes.every((n) => cmd.inlineCommandActivatedValues.indexOf(_edEffectiveValue(n, name)) !== -1);
+    };
+  }
+  if (cmd.standardInlineValueCommand) {
+    if (!cmd.indeterm) {
+      cmd.indeterm = (doc) => {
+        const r = _edActiveRange(doc);
+        if (!r) return false;
+        const values = _edGetAllEffectivelyContainedNodes(r, _edIsFormattableNode)
+          .map((n) => _edEffectiveValue(n, name));
+        for (let i = 1; i < values.length; i++) if (values[i] !== values[i - 1]) return true;
+        return false;
+      };
+    }
+    if (!cmd.value) {
+      cmd.value = (doc) => {
+        const r = _edActiveRange(doc);
+        if (!r) return '';
+        let ref = _edGetAllEffectivelyContainedNodes(r, _edIsFormattableNode)[0];
+        if (ref === undefined) ref = r.startContainer;
+        const out = _edEffectiveValue(ref, name);
+        return out === null ? '' : out;
+      };
+    }
+  }
+}
+
+
+// ── Quest #515: writing inline formatting ───────────────────────────────────
+// Everything above READS a document. Everything below CHANGES one, and the whole
+// of it funnels through a single algorithm — "set the selection's value" — which
+// bold, italic, underline, strikethrough, super/subscript, fontName, fontSize,
+// foreColor, backColor, hiliteColor, createLink and removeFormat all call. Twelve
+// commands, one algorithm; the commands differ only in what value they ask for.
+//
+// The algorithm's shape is worth stating once, because none of the four steps is
+// guessable and each exists to stop a specific kind of DOM rot:
+//
+//   CLEAR   strip the formatting the selected elements declare themselves,
+//   PUSH DOWN  take formatting the selection INHERITS from an ancestor and move
+//           it onto the ancestor's other children — so removing bold from one
+//           word does not un-bold its neighbours,
+//   FORCE   wrap what is left in the smallest element that carries the value,
+//           merging into an adjacent element that already carries it,
+//   REORDER keep nested wrappers in a canonical order.
+//
+// Skip PUSH DOWN and un-bolding one word in a bold sentence silently un-bolds the
+// sentence. Skip the merge in FORCE and every keystroke adds another <span>, so a
+// paragraph a user edited for ten minutes becomes tens of kilobytes of nested
+// wrappers — the classic "why is this email 2MB" bug, and a real cost to somebody
+// paying by the megabyte.
+
+// Ranges whose boundary points must survive a move. The active range is always in
+// here; block commands add more.
+let _edExtraRanges = [];
+// "Move a node, preserving ranges" — the DOM's own mutation rules move a boundary
+// point OUT of the way of a move, which is right for an observer and wrong for an
+// editor: the selection has to follow the text it is on. So the endpoints are
+// captured, transformed by hand, and put back.
+const _edMovePreservingRanges = (node, newParent, newIndex) => {
+  if (newIndex === -1) newIndex = newParent.childNodes.length;
+  const doc = node.ownerDocument || globalThis.document;
+  const oldParent = node.parentNode;
+  const oldIndex = oldParent ? _edNodeIndex(node) : 0;
+  const ranges = _edExtraRanges.slice();
+  let sel = null;
+  try { sel = doc.getSelection(); } catch (e) { sel = null; }
+  const selCount = sel ? sel.rangeCount : 0;
+  for (let i = 0; i < selCount; i++) ranges.push(sel.getRangeAt(i));
+  const bps = [];
+  for (const r of ranges) {
+    bps.push([r.startContainer, r.startOffset]);
+    bps.push([r.endContainer, r.endOffset]);
+  }
+  for (const bp of bps) {
+    // A boundary point inside the moved node needs no adjustment at all — it
+    // travels with it, which is the entire point.
+    if (bp[0] === newParent && bp[1] > newIndex) bp[1]++;
+    if (bp[0] === oldParent && (bp[1] === oldIndex || bp[1] === oldIndex + 1)) {
+      bp[0] = newParent;
+      bp[1] += newIndex - oldIndex;
+    }
+    if (bp[0] === oldParent && bp[1] > oldIndex + 1) bp[1]--;
+  }
+  if (newParent.childNodes.length === newIndex) newParent.appendChild(node);
+  else newParent.insertBefore(node, newParent.childNodes[newIndex]);
+  const setSafe = (r, sc, so, ec, eo) => {
+    try { r.setStart(sc, Math.min(so, _edNodeLength(sc))); r.setEnd(ec, Math.min(eo, _edNodeLength(ec))); } catch (e) {}
+  };
+  for (let i = 0; i < _edExtraRanges.length; i++) {
+    setSafe(_edExtraRanges[i], bps[2 * i][0], bps[2 * i][1], bps[2 * i + 1][0], bps[2 * i + 1][1]);
+  }
+  if (sel && selCount) {
+    sel.removeAllRanges();
+    for (let i = _edExtraRanges.length; i < ranges.length; i++) {
+      const nr = doc.createRange();
+      setSafe(nr, bps[2 * i][0], bps[2 * i][1], bps[2 * i + 1][0], bps[2 * i + 1][1]);
+      try { sel.addRange(nr); } catch (e) {}
+    }
+  }
+};
+// Rename an element in place, keeping its attributes, its children and every
+// range that pointed into it. There is no DOM method for this — you cannot rename
+// a node — so it is a create/move/remove dance, and doing it naively drops the
+// selection on the floor.
+const _edSetTagName = (element, newName) => {
+  if (_edIsHtmlEl(element, newName)) return element;
+  if (!element.parentNode) return element;
+  const doc = element.ownerDocument;
+  const replacement = doc.createElement(newName);
+  element.parentNode.insertBefore(replacement, element);
+  for (let i = 0; i < element.attributes.length; i++) {
+    const a = element.attributes[i];
+    replacement.setAttributeNS(a.namespaceURI, a.name, a.value);
+  }
+  while (element.childNodes.length) {
+    _edMovePreservingRanges(element.firstChild, replacement, replacement.childNodes.length);
+  }
+  element.parentNode.removeChild(element);
+  return replacement;
+};
+const _edFollowsLineBreak = (node) => {
+  let offset = 0;
+  while (!_edIsBlockBoundaryPoint(node, offset)) {
+    if (offset - 1 >= 0 && offset - 1 < node.childNodes.length
+        && _edIsVisible(node.childNodes[offset - 1])) return false;
+    if (offset === 0 || !node.hasChildNodes()) {
+      offset = _edNodeIndex(node); node = node.parentNode;
+      if (!node) return true;
+    } else {
+      node = node.childNodes[offset - 1]; offset = _edNodeLength(node);
+    }
+  }
+  return true;
+};
+const _edPrecedesLineBreak = (node) => {
+  let offset = _edNodeLength(node);
+  while (!_edIsBlockBoundaryPoint(node, offset)) {
+    if (offset < node.childNodes.length && _edIsVisible(node.childNodes[offset])) return false;
+    if (offset === _edNodeLength(node) || !node.hasChildNodes()) {
+      offset = 1 + _edNodeIndex(node); node = node.parentNode;
+      if (!node) return true;
+    } else {
+      node = node.childNodes[offset]; offset = 0;
+    }
+  }
+  return true;
+};
+const _edRemoveExtraneousLineBreaksBefore = (node) => {
+  let ref = node.previousSibling;
+  if (!ref) return;
+  while (ref.hasChildNodes()) ref = ref.lastChild;
+  while (ref && _edIsInvisible(ref) && !_edIsExtraneousLineBreak(ref) && ref !== node.parentNode) {
+    ref = _edPreviousNode(ref);
+  }
+  if (ref && _edIsEditable(ref) && _edIsExtraneousLineBreak(ref)) ref.parentNode.removeChild(ref);
+};
+const _edRemoveExtraneousLineBreaksAtTheEndOf = (node) => {
+  let ref = node;
+  while (ref.hasChildNodes()) ref = ref.lastChild;
+  while (ref && _edIsInvisible(ref) && !_edIsExtraneousLineBreak(ref) && ref !== node) {
+    ref = _edPreviousNode(ref);
+  }
+  if (ref && _edIsEditable(ref) && _edIsExtraneousLineBreak(ref)) {
+    while (_edIsEditable(ref.parentNode) && _edIsInvisible(ref.parentNode)) ref = ref.parentNode;
+    if (ref.parentNode) ref.parentNode.removeChild(ref);
+  }
+};
+const _edRemoveExtraneousLineBreaksFrom = (node) => {
+  _edRemoveExtraneousLineBreaksBefore(node);
+  _edRemoveExtraneousLineBreaksAtTheEndOf(node);
+};
+// Wrap a run of siblings in a new parent — but MERGE into an adjacent element
+// that already qualifies, in preference to making a new one. That preference is
+// the whole reason a document edited for an hour does not turn into a thousand
+// nested spans.
+const _edWrap = (nodeList, siblingCriteria, newParentInstructions) => {
+  const crit = siblingCriteria || (() => false);
+  const mk = newParentInstructions || (() => null);
+  if (!nodeList.length) return null;
+  if (nodeList.every(_edIsInvisible) && !nodeList.some((n) => _edIsHtmlEl(n, 'br'))) return null;
+  if (!nodeList[0].parentNode) return null;
+  const last = () => nodeList[nodeList.length - 1];
+  if (_edIsInline(last()) && !_edIsHtmlEl(last(), 'br') && _edIsHtmlEl(last().nextSibling, 'br')) {
+    nodeList.push(last().nextSibling);
+  }
+  while (nodeList[0].previousSibling && _edIsInvisible(nodeList[0].previousSibling)) {
+    nodeList.unshift(nodeList[0].previousSibling);
+  }
+  while (last().nextSibling && _edIsInvisible(last().nextSibling)) nodeList.push(last().nextSibling);
+  let newParent;
+  if (_edIsEditable(nodeList[0].previousSibling) && crit(nodeList[0].previousSibling)) {
+    newParent = nodeList[0].previousSibling;
+  } else if (_edIsEditable(last().nextSibling) && crit(last().nextSibling)) {
+    newParent = last().nextSibling;
+  } else {
+    newParent = mk();
+  }
+  if (!newParent) return null;
+  const doc = nodeList[0].ownerDocument || globalThis.document;
+  if (!newParent.parentNode) {
+    nodeList[0].parentNode.insertBefore(newParent, nodeList[0]);
+    // A boundary point sitting exactly where the new parent was inserted must
+    // move past it, or the selection ends up outside the element it just asked
+    // to be wrapped in.
+    const npIndex = _edNodeIndex(newParent);
+    for (const r of _edAllTrackedRanges(doc)) {
+      if (r.startContainer === newParent.parentNode && r.startOffset === npIndex) {
+        try { r.setStart(r.startContainer, r.startOffset + 1); } catch (e) {}
+      }
+      if (r.endContainer === newParent.parentNode && r.endOffset === npIndex) {
+        try { r.setEnd(r.endContainer, r.endOffset + 1); } catch (e) {}
+      }
+    }
+  }
+  const originalParent = nodeList[0].parentNode;
+  const visible = (arr) => arr.filter(_edIsVisible);
+  if (_edIsBefore(newParent, nodeList[0])) {
+    const lastVisChild = visible(Array.prototype.slice.call(newParent.childNodes)).slice(-1)[0];
+    if (!_edIsInline(newParent) && _edIsInline(lastVisChild) && _edIsInline(visible(nodeList)[0])
+        && !_edIsHtmlEl(newParent.lastChild, 'br')) {
+      newParent.appendChild(doc.createElement('br'));
+    }
+    for (const n of nodeList) _edMovePreservingRanges(n, newParent, -1);
+  } else {
+    const firstVisChild = visible(Array.prototype.slice.call(newParent.childNodes))[0];
+    if (!_edIsInline(newParent) && _edIsInline(firstVisChild) && _edIsInline(visible(nodeList).slice(-1)[0])
+        && !_edIsHtmlEl(last(), 'br')) {
+      newParent.insertBefore(doc.createElement('br'), newParent.firstChild);
+    }
+    for (let i = nodeList.length - 1; i >= 0; i--) _edMovePreservingRanges(nodeList[i], newParent, 0);
+  }
+  if (_edIsEditable(originalParent) && !originalParent.hasChildNodes()) {
+    originalParent.parentNode.removeChild(originalParent);
+  }
+  if (_edIsEditable(newParent.nextSibling) && crit(newParent.nextSibling)) {
+    if (!_edIsInline(newParent) && _edIsInline(newParent.lastChild)
+        && _edIsInline(newParent.nextSibling.firstChild) && !_edIsHtmlEl(newParent.lastChild, 'br')) {
+      newParent.appendChild(doc.createElement('br'));
+    }
+    while (newParent.nextSibling.hasChildNodes()) {
+      _edMovePreservingRanges(newParent.nextSibling.firstChild, newParent, -1);
+    }
+    newParent.parentNode.removeChild(newParent.nextSibling);
+  }
+  _edRemoveExtraneousLineBreaksFrom(newParent);
+  return newParent;
+};
+const _edAllTrackedRanges = (doc) => {
+  const out = _edExtraRanges.slice();
+  try {
+    const sel = doc.getSelection();
+    for (let i = 0; i < sel.rangeCount; i++) out.push(sel.getRangeAt(i));
+  } catch (e) {}
+  return out;
+};
+
+// ── Modifiable elements ─────────────────────────────────────────────────────
+// "Modifiable" means: this element exists only to carry formatting, so the
+// algorithm may rewrite or delete it without losing anything the author meant.
+// An element with an id, a class or an event handler is NOT modifiable — the
+// page is using it for something, and quietly dissolving it would break a script
+// that was there first.
+const _ED_MODIFIABLE_TAGS = ['b', 'em', 'i', 's', 'span', 'strike', 'strong', 'sub', 'sup', 'u'];
+const _edIsModifiableElement = (node) => {
+  if (!_edIsHtmlEl(node)) return false;
+  const ln = node.localName;
+  if (_ED_MODIFIABLE_TAGS.indexOf(ln) !== -1) {
+    if (node.attributes.length === 0) return true;
+    if (node.attributes.length === 1 && node.hasAttribute('style')) return true;
+  }
+  if (ln === 'font' || ln === 'a') {
+    let n = node.attributes.length;
+    if (node.hasAttribute('style')) n--;
+    if (ln === 'font') {
+      if (node.hasAttribute('color')) n--;
+      if (node.hasAttribute('face')) n--;
+      if (node.hasAttribute('size')) n--;
+    }
+    if (ln === 'a' && node.hasAttribute('href')) n--;
+    if (n === 0) return true;
+  }
+  return false;
+};
+// "Simple modifiable" is stricter still: the element carries EXACTLY ONE piece
+// of formatting, so unwrapping it loses exactly that one thing. Only these can be
+// merged into or dissolved wholesale.
+const _ED_SIMPLE_TAGS = ['a', 'b', 'em', 'font', 'i', 's', 'span', 'strike', 'strong', 'sub', 'sup', 'u'];
+const _edIsSimpleModifiableElement = (node) => {
+  if (!_edIsHtmlEl(node)) return false;
+  const ln = node.localName;
+  if (_ED_SIMPLE_TAGS.indexOf(ln) === -1) return false;
+  if (node.attributes.length === 0) return true;
+  if (node.attributes.length > 1) return false;
+  const st = node.style;
+  if (node.hasAttribute('style') && st.length === 0) return true;
+  if (ln === 'a' && node.hasAttribute('href')) return true;
+  if (ln === 'font' && (node.hasAttribute('color') || node.hasAttribute('face') || node.hasAttribute('size'))) return true;
+  if ((ln === 'b' || ln === 'strong') && node.hasAttribute('style') && st.length === 1 && st.fontWeight !== '') return true;
+  if ((ln === 'i' || ln === 'em') && node.hasAttribute('style') && st.length === 1 && st.fontStyle !== '') return true;
+  if ((ln === 'a' || ln === 'font' || ln === 'span') && node.hasAttribute('style')
+      && st.length === 1 && st.textDecoration === '') return true;
+  if (['a', 'font', 's', 'span', 'strike', 'u'].indexOf(ln) !== -1 && node.hasAttribute('style')
+      && st.length === 1
+      && ['line-through', 'underline', 'overline', 'none'].indexOf(st.textDecoration) !== -1) return true;
+  return false;
+};
+// Nested wrappers get a canonical order, so <b><i>x</i></b> and <i><b>x</b></i>
+// do not both exist in one document. Without it, two identically-formatted runs
+// compare unequal and refuse to merge, and the wrapper count grows forever.
+const _edReorderModifiableDescendants = (node, command, newValue) => {
+  if (!node) return;
+  let candidate = node;
+  while (_edIsModifiableElement(candidate) && candidate.childNodes.length === 1
+      && _edIsModifiableElement(candidate.firstChild)
+      && (!_edIsSimpleModifiableElement(candidate)
+        || !_edEquivalentValues(command, _edSpecifiedValue(candidate, command), newValue))) {
+    candidate = candidate.firstChild;
+  }
+  if (candidate === node || !_edIsSimpleModifiableElement(candidate)
+      || !_edEquivalentValues(command, _edSpecifiedValue(candidate, command), newValue)
+      || !_edLooselyEquivalentValues(command, _edEffectiveValue(candidate, command), newValue)) return;
+  while (candidate.hasChildNodes()) {
+    _edMovePreservingRanges(candidate.firstChild, candidate.parentNode, _edNodeIndex(candidate));
+  }
+  node.parentNode.insertBefore(candidate, node.nextSibling);
+  _edMovePreservingRanges(node, candidate, -1);
+};
+const _ED_RECORDED_COMMANDS = ['subscript', 'bold', 'fontname', 'fontsize',
+  'forecolor', 'hilitecolor', 'italic', 'strikethrough', 'underline'];
+const _edRecordValues = (nodeList) => {
+  const values = [];
+  for (const node of nodeList) {
+    for (const command of _ED_RECORDED_COMMANDS) {
+      let ancestor = node;
+      if (ancestor.nodeType !== 1) ancestor = ancestor.parentNode;
+      while (ancestor && ancestor.nodeType === 1 && _edSpecifiedValue(ancestor, command) === null) {
+        ancestor = ancestor.parentNode;
+      }
+      values.push([node, command, ancestor && ancestor.nodeType === 1
+        ? _edSpecifiedValue(ancestor, command) : null]);
+    }
+  }
+  return values;
+};
+const _edRestoreValues = (values) => {
+  for (const [node, command, value] of values) {
+    let ancestor = node;
+    if (!ancestor || ancestor.nodeType !== 1) ancestor = ancestor ? ancestor.parentNode : null;
+    while (ancestor && ancestor.nodeType === 1 && _edSpecifiedValue(ancestor, command) === null) {
+      ancestor = ancestor.parentNode;
+    }
+    if (value === null && ancestor && ancestor.nodeType === 1) {
+      _edPushDownValues(node, command, null);
+    } else if ((ancestor && ancestor.nodeType === 1
+        && !_edEquivalentValues(command, _edSpecifiedValue(ancestor, command), value))
+      || ((!ancestor || ancestor.nodeType !== 1) && value !== null)) {
+      _edForceValue(node, command, value);
+    }
+  }
+};
+// CLEAR: strip whatever formatting this element declares ITSELF for `command`.
+// Returns the nodes that took its place, because the caller has to keep working
+// on them and the element may no longer exist.
+const _edClearValue = (element, command) => {
+  if (!_edIsEditable(element)) return [];
+  if (_edSpecifiedValue(element, command) === null) return [];
+  if (_edIsSimpleModifiableElement(element)) {
+    const children = Array.prototype.slice.call(element.childNodes);
+    for (const child of children) {
+      _edMovePreservingRanges(child, element.parentNode, _edNodeIndex(element));
+    }
+    element.parentNode.removeChild(element);
+    return children;
+  }
+  const st = element.style;
+  const tidy = () => { if (element.getAttribute('style') === '') element.removeAttribute('style'); };
+  // text-decoration is a LIST, so removing underline from "underline line-through"
+  // must remove the one word, not the declaration.
+  if (command === 'strikethrough' && st.textDecoration.indexOf('line-through') !== -1) {
+    st.textDecoration = st.textDecoration === 'line-through'
+      ? '' : st.textDecoration.replace('line-through', '');
+    tidy();
+  }
+  if (command === 'underline' && st.textDecoration.indexOf('underline') !== -1) {
+    st.textDecoration = st.textDecoration === 'underline'
+      ? '' : st.textDecoration.replace('underline', '');
+    tidy();
+  }
+  const prop = _EDIT_COMMANDS[command].relevantCssProperty;
+  if (prop !== null) {
+    st[prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = '';
+    tidy();
+  }
+  if (_edIsHtmlEl(element, 'font')) {
+    if (command === 'forecolor') element.removeAttribute('color');
+    if (command === 'fontname') element.removeAttribute('face');
+    if (command === 'fontsize') element.removeAttribute('size');
+  }
+  if (_edIsHtmlEl(element, 'a') && (command === 'createlink' || command === 'unlink')) {
+    element.removeAttribute('href');
+  }
+  if (_edSpecifiedValue(element, command) === null) return [];
+  // Still carrying the value after all that (a <b> is bold by being a <b>), so
+  // the only way to clear it is to stop being that element.
+  return [_edSetTagName(element, 'span')];
+};
+// PUSH DOWN: the selection inherits this formatting from an ancestor. Remove it
+// from the ancestor and put it explicitly on the ancestor's OTHER children, so
+// that clearing it from the selection changes only the selection.
+//
+// This is the step whose absence is invisible until it is catastrophic: without
+// it, un-bolding one word un-bolds the entire paragraph it lives in.
+const _edPushDownValues = (node, command, newValue) => {
+  if (!node.parentNode || node.parentNode.nodeType !== 1) return;
+  if (_edLooselyEquivalentValues(command, _edEffectiveValue(node, command), newValue)) return;
+  let currentAncestor = node.parentNode;
+  const ancestorList = [];
+  while (_edIsEditable(currentAncestor) && currentAncestor.nodeType === 1
+      && !_edLooselyEquivalentValues(command, _edEffectiveValue(currentAncestor, command), newValue)) {
+    ancestorList.push(currentAncestor);
+    currentAncestor = currentAncestor.parentNode;
+  }
+  if (!ancestorList.length) return;
+  let propagatedValue = _edSpecifiedValue(ancestorList[ancestorList.length - 1], command);
+  if (propagatedValue === null && propagatedValue !== newValue) return;
+  if (newValue !== null && !_edLooselyEquivalentValues(command,
+      _edEffectiveValue(ancestorList[ancestorList.length - 1].parentNode, command), newValue)) return;
+  while (ancestorList.length) {
+    const ancestor = ancestorList.pop();
+    if (_edSpecifiedValue(ancestor, command) !== null) propagatedValue = _edSpecifiedValue(ancestor, command);
+    const children = Array.prototype.slice.call(ancestor.childNodes);
+    if (_edSpecifiedValue(ancestor, command) !== null) _edClearValue(ancestor, command);
+    for (const child of children) {
+      if (child === node) continue;
+      if (child.nodeType === 1 && _edSpecifiedValue(child, command) !== null
+          && !_edEquivalentValues(command, propagatedValue, _edSpecifiedValue(child, command))) continue;
+      if (child === ancestorList[ancestorList.length - 1]) continue;
+      _edForceValue(child, command, propagatedValue);
+    }
+  }
+};
+// FORCE: make this node actually have the value, by the smallest edit that will
+// do it — merging into a neighbouring wrapper if one already carries the value,
+// and only otherwise creating an element.
+const _edForceValue = (node, command, newValue) => {
+  if (!node.parentNode) return;
+  if (newValue === null) return;
+  const doc = node.ownerDocument || globalThis.document;
+  const cssFlag = _edState(doc).cssStylingFlag;
+  if (_edIsAllowedChild(node, 'span')) {
+    _edReorderModifiableDescendants(node.previousSibling, command, newValue);
+    _edReorderModifiableDescendants(node.nextSibling, command, newValue);
+    _edWrap([node], (n) => _edIsSimpleModifiableElement(n)
+      && _edEquivalentValues(command, _edSpecifiedValue(n, command), newValue)
+      && _edLooselyEquivalentValues(command, _edEffectiveValue(n, command), newValue),
+    () => null);
+  }
+  if (_edIsInvisible(node)) return;
+  if (_edLooselyEquivalentValues(command, _edEffectiveValue(node, command), newValue)) return;
+  const recurseIntoChildren = () => {
+    const children = [];
+    for (let i = 0; i < node.childNodes.length; i++) {
+      const c = node.childNodes[i];
+      if (c.nodeType === 1) {
+        const sv = _edSpecifiedValue(c, command);
+        if (sv !== null && !_edEquivalentValues(command, newValue, sv)) continue;
+      }
+      children.push(c);
+    }
+    for (const c of children) _edForceValue(c, command, newValue);
+  };
+  // A <span> cannot legally wrap a <p>, so a node that is not an allowed child
+  // of span is styled by styling its children instead.
+  if (!_edIsAllowedChild(node, 'span')) { recurseIntoChildren(); return; }
+  if (_edLooselyEquivalentValues(command, _edEffectiveValue(node, command), newValue)) return;
+  let newParent = null;
+  // With the CSS styling flag off, the presentational element is preferred —
+  // <b> rather than <span style="font-weight:bold">. It is smaller on the wire
+  // and it is what every legacy consumer of this API expects to read back.
+  if (!cssFlag) {
+    if (command === 'bold' && (newValue === 'bold' || newValue === '700')) newParent = doc.createElement('b');
+    if (command === 'italic' && newValue === 'italic') newParent = doc.createElement('i');
+    if (command === 'strikethrough' && newValue === 'line-through') newParent = doc.createElement('s');
+    if (command === 'underline' && newValue === 'underline') newParent = doc.createElement('u');
+    if (command === 'forecolor' && _edParseSimpleColor(newValue)) {
+      newParent = doc.createElement('font');
+      newParent.setAttribute('color', _edParseSimpleColor(newValue));
+    }
+    if (command === 'fontname') {
+      newParent = doc.createElement('font');
+      newParent.setAttribute('face', newValue);
+    }
+  }
+  if (command === 'createlink' || command === 'unlink') {
+    newParent = doc.createElement('a');
+    newParent.setAttribute('href', newValue);
+    // Nested <a> elements are not a thing HTML can express, so any ancestor
+    // link has to stop being one. Losing the outer href is the lesser evil
+    // against a DOM that cannot be serialized and re-parsed.
+    let ancestor = node.parentNode;
+    while (ancestor) {
+      if (_edIsHtmlEl(ancestor, 'a')) ancestor = _edSetTagName(ancestor, 'span');
+      ancestor = ancestor.parentNode;
+    }
+  }
+  // xxx-large has no CSS keyword an author would recognise, so <font size=7>
+  // wins even when the CSS styling flag is on.
+  if (command === 'fontsize' && _ED_LEGACY_SIZES.indexOf(newValue) !== -1
+      && (!cssFlag || newValue === 'xxx-large')) {
+    newParent = doc.createElement('font');
+    newParent.setAttribute('size', String(_edCssSizeToLegacy(newValue)));
+  }
+  if ((command === 'subscript' || command === 'superscript') && newValue === 'subscript') {
+    newParent = doc.createElement('sub');
+  }
+  if ((command === 'subscript' || command === 'superscript') && newValue === 'superscript') {
+    newParent = doc.createElement('sup');
+  }
+  if (!newParent) newParent = doc.createElement('span');
+  node.parentNode.insertBefore(newParent, node);
+  const prop = _EDIT_COMMANDS[command].relevantCssProperty;
+  if (prop !== null && !_edLooselyEquivalentValues(command, _edEffectiveValue(newParent, command), newValue)) {
+    try { newParent.style[prop.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = newValue; } catch (e) {}
+  }
+  if (command === 'strikethrough' && newValue === 'line-through'
+      && _edEffectiveValue(newParent, 'strikethrough') !== 'line-through') {
+    newParent.style.textDecoration = 'line-through';
+  }
+  if (command === 'underline' && newValue === 'underline'
+      && _edEffectiveValue(newParent, 'underline') !== 'underline') {
+    newParent.style.textDecoration = 'underline';
+  }
+  _edMovePreservingRanges(node, newParent, newParent.childNodes.length);
+  // The wrapper did not take — an element can refuse a value, e.g. a <font
+  // color> inside something with its own colour. Undo the wrap and go down.
+  if (node.nodeType === 1 && !_edEquivalentValues(command, _edEffectiveValue(node, command), newValue)) {
+    _edMovePreservingRanges(node, newParent.parentNode, _edNodeIndex(newParent));
+    newParent.parentNode.removeChild(newParent);
+    recurseIntoChildren();
+  }
+};
+// The one algorithm the twelve inline commands share.
+const _edSetSelectionValue = (doc, command, newValue) => {
+  const cmd = _EDIT_COMMANDS[command];
+  let active = _edActiveRange(doc);
+  if (!active) return;
+  if (!_edGetAllEffectivelyContainedNodes(active).some(_edIsFormattableNode)) {
+    // Nothing to format — a bare caret. Remember the choice as an OVERRIDE and
+    // apply it to whatever gets typed next. This is what makes "press Bold, then
+    // type" work, and it is the only part of editing that has to remember an
+    // intention rather than act on one.
+    if (cmd.inlineCommandActivatedValues) {
+      _edSetStateOverride(doc, command, cmd.inlineCommandActivatedValues.indexOf(newValue) !== -1);
+    }
+    if (command === 'subscript') _edUnsetStateOverride(doc, 'superscript');
+    if (command === 'superscript') _edUnsetStateOverride(doc, 'subscript');
+    if (newValue === null) _edUnsetValueOverride(doc, command);
+    else if (command === 'createlink' || cmd.value) _edSetValueOverride(doc, command, newValue);
+    return;
+  }
+  // Split the partially-covered text nodes at the selection edges, so that from
+  // here on every node is either wholly in or wholly out. Bolding "ell" of
+  // "hello" is three text nodes' worth of work and this is where they are made.
+  const sel = doc.getSelection();
+  active = _edActiveRange(doc);
+  if (_edIsEditable(active.startContainer) && active.startContainer.nodeType === 3
+      && active.startOffset !== 0 && active.startOffset !== _edNodeLength(active.startContainer)) {
+    const sameNode = active.startContainer === active.endContainer;
+    const newEndOffset = active.endOffset - active.startOffset;
+    const newNode = active.startContainer.splitText(active.startOffset);
+    const nr = doc.createRange();
+    nr.setStart(newNode, 0);
+    nr.setEnd(sameNode ? newNode : active.endContainer, sameNode ? newEndOffset : active.endOffset);
+    sel.removeAllRanges();
+    sel.addRange(nr);
+  }
+  active = _edActiveRange(doc);
+  if (!active) return;
+  if (_edIsEditable(active.endContainer) && active.endContainer.nodeType === 3
+      && active.endOffset !== 0 && active.endOffset !== _edNodeLength(active.endContainer)) {
+    const sc = active.startContainer, so = active.startOffset;
+    const ec = active.endContainer, eo = active.endOffset;
+    ec.splitText(eo);
+    const nr = doc.createRange();
+    nr.setStart(sc, so);
+    nr.setEnd(ec, eo);
+    sel.removeAllRanges();
+    sel.addRange(nr);
+  }
+  active = _edActiveRange(doc);
+  if (!active) return;
+  for (const el of _edGetAllEffectivelyContainedNodes(active,
+    (n) => _edIsEditable(n) && n.nodeType === 1)) {
+    _edClearValue(el, command);
+  }
+  active = _edActiveRange(doc);
+  if (!active) return;
+  for (const node of _edGetAllEffectivelyContainedNodes(active, _edIsEditable)) {
+    _edPushDownValues(node, command, newValue);
+    if (_edIsAllowedChild(node, 'span')) _edForceValue(node, command, newValue);
+  }
+};
+const _edSplitParent = (nodeList) => {
+  if (!nodeList.length) return;
+  const originalParent = nodeList[0].parentNode;
+  if (!_edIsEditable(originalParent) || !originalParent.parentNode) return;
+  const doc = originalParent.ownerDocument || globalThis.document;
+  const has = (n) => nodeList.indexOf(n) !== -1;
+  if (has(originalParent.firstChild)) _edRemoveExtraneousLineBreaksBefore(originalParent);
+  const followsLB = has(originalParent.firstChild) && _edFollowsLineBreak(originalParent);
+  const precedesLB = has(originalParent.lastChild) && _edPrecedesLineBreak(originalParent);
+  const last = () => nodeList[nodeList.length - 1];
+  if (!has(originalParent.firstChild) && has(originalParent.lastChild)) {
+    for (let i = nodeList.length - 1; i >= 0; i--) {
+      _edMovePreservingRanges(nodeList[i], originalParent.parentNode, 1 + _edNodeIndex(originalParent));
+    }
+    if (precedesLB && !_edPrecedesLineBreak(last())) {
+      last().parentNode.insertBefore(doc.createElement('br'), last().nextSibling);
+    }
+    _edRemoveExtraneousLineBreaksAtTheEndOf(originalParent);
+    return;
+  }
+  if (!has(originalParent.firstChild)) {
+    const clonedParent = originalParent.cloneNode(false);
+    // The id goes with the SECOND half. Two elements with one id is a document
+    // where getElementById answers a coin flip.
+    originalParent.removeAttribute('id');
+    originalParent.parentNode.insertBefore(clonedParent, originalParent);
+    while (nodeList[0].previousSibling) {
+      _edMovePreservingRanges(originalParent.firstChild, clonedParent, clonedParent.childNodes.length);
+    }
+  }
+  for (const n of nodeList) {
+    _edMovePreservingRanges(n, originalParent.parentNode, _edNodeIndex(originalParent));
+  }
+  if (followsLB && !_edFollowsLineBreak(nodeList[0])) {
+    nodeList[0].parentNode.insertBefore(doc.createElement('br'), nodeList[0]);
+  }
+  if (_edIsInline(last()) && !_edIsHtmlEl(last(), 'br')
+      && _edIsHtmlEl(originalParent.firstChild, 'br') && !_edIsInline(originalParent)) {
+    originalParent.removeChild(originalParent.firstChild);
+  }
+  if (!originalParent.hasChildNodes()) {
+    originalParent.parentNode.removeChild(originalParent);
+    if (precedesLB && !_edPrecedesLineBreak(last())) {
+      last().parentNode.insertBefore(doc.createElement('br'), last().nextSibling);
+    }
+  } else {
+    _edRemoveExtraneousLineBreaksBefore(originalParent);
+  }
+  if (!last().nextSibling && last().parentNode) {
+    _edRemoveExtraneousLineBreaksAtTheEndOf(last().parentNode);
+  }
+};
+const _edRemovePreservingDescendants = (node) => {
+  if (node.hasChildNodes()) _edSplitParent(Array.prototype.slice.call(node.childNodes));
+  else node.parentNode.removeChild(node);
+};
+
+// ── Overrides preserved across an action ────────────────────────────────────
+// A command that "preserves overrides" must not silently discard a pending
+// formatting choice. Press Bold with a bare caret, then press Justify: the bold
+// is still pending and the next thing typed must still come out bold.
+const _ED_OVERRIDE_STATE_CMDS = ['bold', 'italic', 'strikethrough', 'subscript', 'superscript', 'underline'];
+const _ED_OVERRIDE_VALUE_CMDS = ['fontname', 'fontsize', 'forecolor', 'hilitecolor'];
+const _edRecordCurrentOverrides = (doc) => {
+  const out = [];
+  if (_edGetValueOverride(doc, 'createlink') !== undefined) out.push(['createlink', _edGetValueOverride(doc, 'createlink')]);
+  for (const c of _ED_OVERRIDE_STATE_CMDS) {
+    if (_edGetStateOverride(doc, c) !== undefined) out.push([c, _edGetStateOverride(doc, c)]);
+  }
+  for (const c of _ED_OVERRIDE_VALUE_CMDS) {
+    if (_edGetValueOverride(doc, c) !== undefined) out.push([c, _edGetValueOverride(doc, c)]);
+  }
+  return out;
+};
+const _edRestoreStatesAndValues = (doc, overrides) => {
+  let node = _edGetAllEffectivelyContainedNodes(_edActiveRange(doc) || { collapsed: true,
+    startContainer: doc, startOffset: 0, endContainer: doc, endOffset: 0 }).filter(_edIsFormattableNode)[0];
+  if (!node) {
+    for (const [command, override] of overrides) {
+      if (typeof override === 'boolean') _edSetStateOverride(doc, command, override);
+      else if (typeof override === 'string') _edSetValueOverride(doc, command, override);
+    }
+    return;
+  }
+  for (const [command, override0] of overrides) {
+    let override = override0;
+    const cmd = _EDIT_COMMANDS[command];
+    if (typeof override === 'boolean' && _edQueryState(doc, command) !== override) {
+      cmd.action('', doc);
+    } else if (typeof override === 'string' && command !== 'createlink' && command !== 'fontsize'
+        && !_edEquivalentValues(command, _edQueryValue(doc, command), override)) {
+      cmd.action(override, doc);
+    } else if (typeof override === 'string' && command === 'createlink'
+        && ((_edGetValueOverride(doc, 'createlink') !== undefined
+            && _edGetValueOverride(doc, 'createlink') !== override)
+          || (_edGetValueOverride(doc, 'createlink') === undefined
+            && _edEffectiveValue(node, 'createlink') !== override))) {
+      _EDIT_COMMANDS.createlink.action(override, doc);
+    } else if (typeof override === 'string' && command === 'fontsize'
+        && ((_edGetValueOverride(doc, 'fontsize') !== undefined
+            && _edGetValueOverride(doc, 'fontsize') !== override)
+          || (_edGetValueOverride(doc, 'fontsize') === undefined
+            && !_edLooselyEquivalentValues(command, _edEffectiveValue(node, 'fontsize'), override)))) {
+      _EDIT_COMMANDS.fontsize.action(_edGetLegacyFontSize(override), doc);
+    } else {
+      continue;
+    }
+    const r = _edActiveRange(doc);
+    if (r) node = _edGetAllEffectivelyContainedNodes(r).filter(_edIsFormattableNode)[0] || node;
+  }
+};
+
+// ── The inline command actions ──────────────────────────────────────────────
+// A toggle: read the state, then set the value to the opposite. Reading FIRST is
+// load-bearing — the value written depends on what was there, and computing it
+// after the first edit reads a document that is already half changed.
+const _edToggle = (command, onValue) => (value, doc) => {
+  if (_edQueryState(doc, command)) _edSetSelectionValue(doc, command, command === 'bold' ? 'normal' : null);
+  else _edSetSelectionValue(doc, command, onValue);
+  return true;
+};
+_EDIT_COMMANDS.bold.action = _edToggle('bold', 'bold');
+_EDIT_COMMANDS.italic.action = _edToggle('italic', 'italic');
+_EDIT_COMMANDS.underline.action = _edToggle('underline', 'underline');
+_EDIT_COMMANDS.strikethrough.action = _edToggle('strikethrough', 'line-through');
+// sub/superscript are a three-way toggle, not two independent ones: turning one
+// on must turn the other off, because a run of text cannot be both.
+_EDIT_COMMANDS.subscript.action = (value, doc) => {
+  const state = _edQueryState(doc, 'subscript');
+  _edSetSelectionValue(doc, 'subscript', null);
+  if (!state) _edSetSelectionValue(doc, 'subscript', 'subscript');
+  return true;
+};
+_EDIT_COMMANDS.superscript.action = (value, doc) => {
+  const state = _edQueryState(doc, 'superscript');
+  _edSetSelectionValue(doc, 'superscript', null);
+  if (!state) _edSetSelectionValue(doc, 'superscript', 'superscript');
+  return true;
+};
+_EDIT_COMMANDS.fontname.action = (value, doc) => { _edSetSelectionValue(doc, 'fontname', value); return true; };
+_EDIT_COMMANDS.fontsize.action = (value, doc) => {
+  const v = _edNormalizeFontSize(value);
+  if (v === null) return false;
+  _edSetSelectionValue(doc, 'fontsize', v);
+  return true;
+};
+// The three colour commands share one validator. A colour execCommand cannot
+// parse must return false rather than guess — a page that gets `true` for a
+// colour that was never applied has no way to notice.
+const _edColorAction = (command) => (value, doc) => {
+  let v = String(value);
+  if (/^([0-9a-fA-F]{3}){1,2}$/.test(v)) v = '#' + v;
+  if (!/^(rgba?|hsla?)\(.*\)$/.test(v) && !_edParseSimpleColor(v) && v.toLowerCase() !== 'transparent') {
+    return false;
+  }
+  _edSetSelectionValue(doc, command, v);
+  return true;
+};
+_EDIT_COMMANDS.forecolor.action = _edColorAction('forecolor');
+_EDIT_COMMANDS.backcolor.action = _edColorAction('backcolor');
+_EDIT_COMMANDS.hilitecolor.action = _edColorAction('hilitecolor');
+_EDIT_COMMANDS.createlink.action = (value, doc) => {
+  if (value === '') return false;
+  const active = _edActiveRange(doc);
+  if (!active) return false;
+  // An <a> that ALREADY wraps part of the selection is retargeted rather than
+  // nested — the selection is inside it, so wrapping again would be illegal.
+  for (const node of _edGetAllEffectivelyContainedNodes(active)) {
+    for (const ancestor of _edGetAncestors(node)) {
+      if (_edIsEditable(ancestor) && _edIsHtmlEl(ancestor, 'a') && ancestor.hasAttribute('href')) {
+        ancestor.setAttribute('href', value);
+      }
+    }
+  }
+  _edSetSelectionValue(doc, 'createlink', value);
+  return true;
+};
+_EDIT_COMMANDS.unlink.action = (value, doc) => {
+  const range = _edActiveRange(doc);
+  if (!range) return false;
+  const hyperlinks = [];
+  // Ancestors first (outermost in), then the contained ones, so the list comes
+  // out in tree order — clearing them out of order re-parents nodes underneath
+  // links that are about to be cleared themselves.
+  for (let node = range.startContainer; node; node = node.parentNode) {
+    if (_edIsHtmlEl(node, 'a') && node.hasAttribute('href')) hyperlinks.unshift(node);
+  }
+  const stop = _edNextNodeDescendants(range.endContainer);
+  for (let node = range.startContainer; node && node !== stop; node = _edNextNode(node)) {
+    if (_edIsHtmlEl(node, 'a') && node.hasAttribute('href')
+        && (_edIsContained(node, range) || _edIsDescendant(range.endContainer, node)
+          || node === range.endContainer)) hyperlinks.push(node);
+  }
+  for (const a of hyperlinks) _edClearValue(a, 'unlink');
+  return true;
+};
+const _ED_REMOVEFORMAT_TAGS = ['abbr', 'acronym', 'b', 'bdi', 'bdo', 'big',
+  'blink', 'cite', 'code', 'dfn', 'em', 'font', 'i', 'ins', 'kbd', 'mark',
+  'nobr', 'q', 's', 'samp', 'small', 'span', 'strike', 'strong', 'sub', 'sup',
+  'tt', 'u', 'var'];
+_EDIT_COMMANDS.removeformat.action = (value, doc) => {
+  const isCandidate = (node) => _edIsEditable(node) && _edIsHtmlEl(node, _ED_REMOVEFORMAT_TAGS);
+  let active = _edActiveRange(doc);
+  if (!active) return false;
+  for (const element of _edGetAllEffectivelyContainedNodes(active, isCandidate)) {
+    while (element.hasChildNodes()) {
+      _edMovePreservingRanges(element.firstChild, element.parentNode, _edNodeIndex(element));
+    }
+    element.parentNode.removeChild(element);
+  }
+  const sel = doc.getSelection();
+  active = _edActiveRange(doc);
+  if (active && _edIsEditable(active.startContainer) && active.startContainer.nodeType === 3
+      && active.startOffset !== 0 && active.startOffset !== _edNodeLength(active.startContainer)) {
+    const sameNode = active.startContainer === active.endContainer;
+    const newEnd = active.endOffset - active.startOffset;
+    const newNode = active.startContainer.splitText(active.startOffset);
+    const nr = doc.createRange();
+    nr.setStart(newNode, 0);
+    nr.setEnd(sameNode ? newNode : active.endContainer, sameNode ? newEnd : active.endOffset);
+    sel.removeAllRanges(); sel.addRange(nr);
+  }
+  active = _edActiveRange(doc);
+  if (active && _edIsEditable(active.endContainer) && active.endContainer.nodeType === 3
+      && active.endOffset !== 0 && active.endOffset !== _edNodeLength(active.endContainer)) {
+    const sc = active.startContainer, so = active.startOffset;
+    const ec = active.endContainer, eo = active.endOffset;
+    ec.splitText(eo);
+    const nr = doc.createRange();
+    nr.setStart(sc, so); nr.setEnd(ec, eo);
+    sel.removeAllRanges(); sel.addRange(nr);
+  }
+  active = _edActiveRange(doc);
+  if (active) {
+    for (const node of _edGetAllEffectivelyContainedNodes(active, _edIsEditable)) {
+      while (isCandidate(node.parentNode) && _edInSameEditingHost(node.parentNode, node)) {
+        _edSplitParent([node]);
+      }
+    }
+  }
+  // Finally null out every inline value, in a fixed order — removeFormat is
+  // defined as "all of them", and the order matters because each pass reads the
+  // document the previous one left.
+  for (const command of _ED_RECORDED_COMMANDS) _edSetSelectionValue(doc, command, null);
+  return true;
+};
+
+
+// ── Quest #516: blocks, lists, insertion and deletion ───────────────────────
+// The inline commands change how text LOOKS. These change what the document IS
+// — where the paragraphs are, what is a list, what happens when you press
+// Backspace at the start of a line. This is the half of editing that a person
+// actually operates: nobody clicks the bold button as often as they press Enter.
+//
+// Everything here is downstream of two ideas the inline half did not need:
+//   * a LINE is the unit (blockExtend), because you cannot centre half a
+//     paragraph or make half a line a bullet; and
+//   * deletion is not "remove the selected nodes" — it is a merge. Deleting the
+//     boundary between two paragraphs has to decide which one survives, move the
+//     other's contents into it, and carry the formatting across, which is why
+//     `deleteSelection` is the longest algorithm in the spec and why every
+//     insertion command starts by calling it.
+
+// Where the caret can equivalently be said to be. (node, offset) at the end of a
+// text node and (parent, index+1) are the same place to a reader and different
+// places to the DOM; editing has to normalize or it deletes from the wrong side.
+const _edNextEquivalentPoint = (node, offset) => {
+  if (_edNodeLength(node) === 0) return null;
+  if (offset === _edNodeLength(node) && node.parentNode && _edIsInline(node)) {
+    return [node.parentNode, 1 + _edNodeIndex(node)];
+  }
+  if (offset >= 0 && offset < node.childNodes.length
+      && _edNodeLength(node.childNodes[offset]) !== 0 && _edIsInline(node.childNodes[offset])) {
+    return [node.childNodes[offset], 0];
+  }
+  return null;
+};
+const _edPreviousEquivalentPoint = (node, offset) => {
+  if (_edNodeLength(node) === 0) return null;
+  if (offset === 0 && node.parentNode && _edIsInline(node)) {
+    return [node.parentNode, _edNodeIndex(node)];
+  }
+  if (offset - 1 >= 0 && offset - 1 < node.childNodes.length
+      && _edNodeLength(node.childNodes[offset - 1]) !== 0 && _edIsInline(node.childNodes[offset - 1])) {
+    return [node.childNodes[offset - 1], _edNodeLength(node.childNodes[offset - 1])];
+  }
+  return null;
+};
+const _edFirstEquivalentPoint = (node, offset) => {
+  let p;
+  while ((p = _edPreviousEquivalentPoint(node, offset))) { node = p[0]; offset = p[1]; }
+  return [node, offset];
+};
+const _edLastEquivalentPoint = (node, offset) => {
+  let p;
+  while ((p = _edNextEquivalentPoint(node, offset))) { node = p[0]; offset = p[1]; }
+  return [node, offset];
+};
+// HTML collapses runs of spaces, so a document that stores what the user typed
+// renders something different from what they see. The fix, since 1996, is to
+// alternate normal and non-breaking spaces — and the sequence has to be
+// CANONICAL, or two editors produce different bytes for the same visible text
+// and every diff of an edited document is noise.
+const _ED_NBSP = '\u00a0';
+const _edCanonicalSpaceSequence = (n, nbStart, nbEnd) => {
+  const N = _ED_NBSP, S = ' ';
+  if (n === 0) return '';
+  if (n === 1 && !nbStart && !nbEnd) return S;
+  if (n === 1) return N;
+  let buffer = '';
+  const repeatedPair = nbStart ? N + S : S + N;
+  while (n > 3) { buffer += repeatedPair; n -= 2; }
+  if (n === 3) {
+    buffer += !nbStart && !nbEnd ? S + N + S
+      : nbStart && !nbEnd ? N + N + S
+        : !nbStart && nbEnd ? S + N + N : N + S + N;
+  } else {
+    buffer += !nbStart && !nbEnd ? N + S
+      : nbStart && !nbEnd ? N + S
+        : !nbStart && nbEnd ? S + N : N + N;
+  }
+  return buffer;
+};
+
+const _edCanonicalizeWhitespace = (node, offset, fixCollapsedSpace) => {
+  if (fixCollapsedSpace === undefined) fixCollapsedSpace = true;
+  if (!_edIsEditable(node) && !_edIsEditingHost(node)) return;
+  const preish = (n) => ['pre', 'pre-wrap'].indexOf(_edStyle(n.parentNode, 'white-space')) !== -1;
+  let startNode = node, startOffset = offset;
+  for (;;) {
+    if (startOffset - 1 >= 0 && startOffset - 1 < startNode.childNodes.length
+        && _edInSameEditingHost(startNode, startNode.childNodes[startOffset - 1])) {
+      startNode = startNode.childNodes[startOffset - 1];
+      startOffset = _edNodeLength(startNode);
+    } else if (startOffset === 0 && !_edFollowsLineBreak(startNode)
+        && _edInSameEditingHost(startNode, startNode.parentNode)) {
+      startOffset = _edNodeIndex(startNode); startNode = startNode.parentNode;
+    } else if (startNode.nodeType === 3 && !preish(startNode) && startOffset !== 0
+        && /[ \u00a0]/.test(startNode.data[startOffset - 1])) {
+      startOffset--;
+    } else break;
+  }
+  let endNode = startNode, endOffset = startOffset, length = 0;
+  let collapseSpaces = startOffset === 0 && _edFollowsLineBreak(startNode);
+  for (;;) {
+    if (endOffset < endNode.childNodes.length
+        && _edInSameEditingHost(endNode, endNode.childNodes[endOffset])) {
+      endNode = endNode.childNodes[endOffset]; endOffset = 0;
+    } else if (endOffset === _edNodeLength(endNode) && !_edPrecedesLineBreak(endNode)
+        && _edInSameEditingHost(endNode, endNode.parentNode)) {
+      endOffset = 1 + _edNodeIndex(endNode); endNode = endNode.parentNode;
+    } else if (endNode.nodeType === 3 && !preish(endNode)
+        && endOffset !== _edNodeLength(endNode) && /[ \u00a0]/.test(endNode.data[endOffset])) {
+      if (fixCollapsedSpace && collapseSpaces && endNode.data[endOffset] === ' ') {
+        endNode.deleteData(endOffset, 1);
+        continue;
+      }
+      collapseSpaces = endNode.data[endOffset] === ' ';
+      endOffset++; length++;
+    } else break;
+  }
+  if (fixCollapsedSpace) {
+    while (_edGetPosition(startNode, startOffset, endNode, endOffset) === 'before') {
+      if (endOffset - 1 >= 0 && endOffset - 1 < endNode.childNodes.length
+          && _edInSameEditingHost(endNode, endNode.childNodes[endOffset - 1])) {
+        endNode = endNode.childNodes[endOffset - 1]; endOffset = _edNodeLength(endNode);
+      } else if (endOffset === 0 && _edInSameEditingHost(endNode, endNode.parentNode)) {
+        endOffset = _edNodeIndex(endNode); endNode = endNode.parentNode;
+      } else if (endNode.nodeType === 3 && !preish(endNode)
+          && endOffset === _edNodeLength(endNode)
+          && endNode.data[endNode.data.length - 1] === ' ' && _edPrecedesLineBreak(endNode)) {
+        endOffset--; length--; endNode.deleteData(endOffset, 1);
+      } else break;
+    }
+  }
+  let replacement = _edCanonicalSpaceSequence(length,
+    startOffset === 0 && _edFollowsLineBreak(startNode),
+    endOffset === _edNodeLength(endNode) && _edPrecedesLineBreak(endNode));
+  while (_edGetPosition(startNode, startOffset, endNode, endOffset) === 'before') {
+    if (startOffset < startNode.childNodes.length) {
+      startNode = startNode.childNodes[startOffset]; startOffset = 0;
+    } else if (startNode.nodeType !== 3 || startOffset === _edNodeLength(startNode)) {
+      startOffset = 1 + _edNodeIndex(startNode); startNode = startNode.parentNode;
+      if (!startNode) return;
+    } else {
+      const el = replacement[0];
+      replacement = replacement.slice(1);
+      if (el !== startNode.data[startOffset]) {
+        startNode.insertData(startOffset, el);
+        startNode.deleteData(startOffset + 1, 1);
+      }
+      startOffset++;
+    }
+  }
+};
+const _edHasEditableDescendants = (node) => {
+  for (let i = 0; i < node.childNodes.length; i++) {
+    if (_edIsEditable(node.childNodes[i]) || _edHasEditableDescendants(node.childNodes[i])) return true;
+  }
+  return false;
+};
+// An element that has ended up somewhere HTML does not allow it — a <p> inside a
+// <p>, a <div> inside a <span> — is lifted out until it is legal. Without this,
+// editing produces trees that serialize to one thing and re-parse as another,
+// and the document silently changes shape every time it is saved and reopened.
+const _edFixDisallowedAncestors = (node) => {
+  if (!node || !_edIsEditable(node)) return;
+  const doc = node.ownerDocument || globalThis.document;
+  if (_edGetAncestors(node).every((a) => !_edInSameEditingHost(node, a) || !_edIsAllowedChild(node, a))) {
+    if (_edIsHtmlEl(node, ['dd', 'dt'])) {
+      _edWrap([node], (sib) => _edIsHtmlEl(sib, 'dl') && !sib.attributes.length,
+        () => doc.createElement('dl'));
+      return;
+    }
+    if (!_edIsAllowedChild('p', _edEditingHostOf(node))) return;
+    if (!_edIsProhibitedParagraphChild(node)) return;
+    node = _edSetTagName(node, _edState(doc).defaultSingleLineContainerName);
+    _edFixDisallowedAncestors(node);
+    const children = Array.prototype.slice.call(node.childNodes);
+    for (const child of children.filter(_edIsProhibitedParagraphChild)) {
+      const values = _edRecordValues([child]);
+      _edSplitParent([child]);
+      _edRestoreValues(values);
+    }
+    return;
+  }
+  const values = _edRecordValues([node]);
+  let guard = 0;
+  while (!_edIsAllowedChild(node, node.parentNode) && guard++ < 500) _edSplitParent([node]);
+  _edRestoreValues(values);
+};
+// A nested list authored as <li><ul>…</ul></li> and one authored as a sibling
+// <ul> mean the same thing to a reader and are different trees. Normalizing to
+// one shape is what lets indent/outdent be reversible.
+const _edNormalizeSublists = (item) => {
+  if (!_edIsHtmlEl(item, 'li') || !_edIsEditable(item) || !_edIsEditable(item.parentNode)) return;
+  let newItem = null;
+  let guard = 0;
+  while (Array.prototype.some.call(item.childNodes, (n) => _edIsHtmlEl(n, ['ol', 'ul'])) && guard++ < 500) {
+    const child = item.lastChild;
+    if (_edIsHtmlEl(child, ['ol', 'ul'])
+        || (!newItem && child.nodeType === 3 && /^[ \t\n\f\r]*$/.test(child.data))) {
+      newItem = null;
+      _edMovePreservingRanges(child, item.parentNode, 1 + _edNodeIndex(item));
+    } else {
+      if (!newItem) {
+        newItem = item.ownerDocument.createElement('li');
+        item.parentNode.insertBefore(newItem, item.nextSibling);
+      }
+      _edMovePreservingRanges(child, newItem, 0);
+    }
+  }
+};
+const _edRecordCurrentStatesAndValues = (doc) => {
+  const out = [];
+  const r = _edActiveRange(doc);
+  if (!r) return out;
+  const node = _edGetAllEffectivelyContainedNodes(r).filter(_edIsFormattableNode)[0];
+  if (!node) return out;
+  out.push(['createlink', _edEffectiveValue(node, 'createlink')]);
+  for (const c of _ED_OVERRIDE_STATE_CMDS) {
+    out.push([c, _EDIT_COMMANDS[c].inlineCommandActivatedValues.indexOf(_edEffectiveValue(node, c)) !== -1]);
+  }
+  for (const c of ['fontname', 'fontsize', 'forecolor', 'hilitecolor']) {
+    out.push([c, _EDIT_COMMANDS[c].value ? _EDIT_COMMANDS[c].value(doc) : '']);
+  }
+  out.push(['fontsize', _edEffectiveValue(node, 'fontsize')]);
+  return out;
+};
+// The merge. Deleting a selection that spans two blocks does not delete two
+// blocks — it deletes the text and JOINS what is left, and the joining is where
+// all the difficulty is: which block survives, what happens to the formatting
+// each half carried, and where the caret ends up so the next keystroke goes
+// somewhere the user expects.
+const _edDeleteSelection = (doc, flags) => {
+  flags = flags || {};
+  const blockMerging = 'blockMerging' in flags ? !!flags.blockMerging : true;
+  const stripWrappers = 'stripWrappers' in flags ? !!flags.stripWrappers : true;
+  const direction = 'direction' in flags ? flags.direction : 'forward';
+  const sel = doc.getSelection();
+  let active = _edActiveRange(doc);
+  if (!active) return;
+  const collapseSel = (toStart) => {
+    try { if (sel.rangeCount) { if (toStart) sel.collapseToStart(); else sel.collapseToEnd(); } } catch (e) {}
+  };
+  const setSel = (sc, so, ec, eo) => {
+    const nr = doc.createRange();
+    try { nr.setStart(sc, so); nr.setEnd(ec, eo); } catch (e) { return; }
+    sel.removeAllRanges(); sel.addRange(nr);
+  };
+  _edCanonicalizeWhitespace(active.startContainer, active.startOffset);
+  active = _edActiveRange(doc); if (!active) return;
+  _edCanonicalizeWhitespace(active.endContainer, active.endOffset);
+  active = _edActiveRange(doc); if (!active) return;
+  let [startNode, startOffset] = _edLastEquivalentPoint(active.startContainer, active.startOffset);
+  let [endNode, endOffset] = _edFirstEquivalentPoint(active.endContainer, active.endOffset);
+  if (_edGetPosition(endNode, endOffset, startNode, startOffset) !== 'after') {
+    collapseSel(direction === 'forward');
+    return;
+  }
+  if (startNode.nodeType === 3 && startOffset === 0) {
+    startOffset = _edNodeIndex(startNode); startNode = startNode.parentNode;
+  }
+  if (endNode.nodeType === 3 && endOffset === _edNodeLength(endNode)) {
+    endOffset = 1 + _edNodeIndex(endNode); endNode = endNode.parentNode;
+  }
+  setSel(startNode, startOffset, endNode, endOffset);
+  active = _edActiveRange(doc); if (!active) return;
+  // The two blocks whose contents will have to be joined. `null` means "there is
+  // nothing here that can absorb the other half" — a table cell, for instance,
+  // which must never swallow the paragraph after it.
+  const findBlock = (from) => {
+    let b = from;
+    while (_edInSameEditingHost(b, b.parentNode) && _edIsInline(b)) b = b.parentNode;
+    if ((!_edIsBlock(b) && !_edIsEditingHost(b)) || !_edIsAllowedChild('span', b)
+        || _edIsHtmlEl(b, ['td', 'th'])) return null;
+    return b;
+  };
+  let startBlock = findBlock(active.startContainer);
+  let endBlock = findBlock(active.endContainer);
+  const overrides = _edRecordCurrentStatesAndValues(doc);
+  if (startNode === endNode && _edIsEditable(startNode) && startNode.nodeType === 3) {
+    startNode.deleteData(startOffset, endOffset - startOffset);
+    _edCanonicalizeWhitespace(startNode, startOffset, false);
+    collapseSel(direction === 'forward');
+    _edRestoreStatesAndValues(doc, overrides);
+    return;
+  }
+  if (_edIsEditable(startNode) && startNode.nodeType === 3) {
+    startNode.deleteData(startOffset, _edNodeLength(startNode) - startOffset);
+  }
+  active = _edActiveRange(doc); if (!active) return;
+  const nodeList = _edGetContainedNodes(active, (n) => _edIsEditable(n)
+    && !_edIsHtmlEl(n, ['thead', 'tbody', 'tfoot', 'tr', 'th', 'td']));
+  for (const node of nodeList) {
+    let parent = node.parentNode;
+    if (!parent) continue;
+    parent.removeChild(node);
+    // A block emptied by the delete still has to be a place the caret can go, so
+    // it gets a <br>. Without it the line vanishes and the caret jumps.
+    const bn = _edBlockNodeOf(parent);
+    if (bn && !Array.prototype.some.call(bn.childNodes, _edIsVisible)
+        && (_edIsEditable(parent) || _edIsEditingHost(parent))) {
+      parent.appendChild(doc.createElement('br'));
+    }
+    if (stripWrappers || (!_edIsDescendant(startNode, parent) && parent !== startNode)) {
+      while (_edIsEditable(parent) && _edIsInline(parent) && _edNodeLength(parent) === 0) {
+        const grandparent = parent.parentNode;
+        grandparent.removeChild(parent);
+        parent = grandparent;
+      }
+    }
+  }
+  if (_edIsEditable(endNode) && endNode.nodeType === 3) endNode.deleteData(0, endOffset);
+  active = _edActiveRange(doc); if (!active) return;
+  _edCanonicalizeWhitespace(active.startContainer, active.startOffset, false);
+  active = _edActiveRange(doc); if (!active) return;
+  _edCanonicalizeWhitespace(active.endContainer, active.endOffset, false);
+  active = _edActiveRange(doc); if (!active) return;
+  if (!blockMerging || !startBlock || !endBlock || !_edInSameEditingHost(startBlock, endBlock)
+      || startBlock === endBlock) {
+    collapseSel(direction === 'forward');
+    _edRestoreStatesAndValues(doc, overrides);
+    return;
+  }
+  if (startBlock.children.length === 1 && _edIsCollapsedBlockProp(startBlock.firstChild)) {
+    startBlock.removeChild(startBlock.firstChild);
+  }
+  let values = [];
+  if (_edIsDescendant(endBlock, startBlock)) {
+    let referenceNode = endBlock;
+    while (referenceNode.parentNode !== startBlock) referenceNode = referenceNode.parentNode;
+    setSel(startBlock, _edNodeIndex(referenceNode), startBlock, _edNodeIndex(referenceNode));
+    if (!endBlock.hasChildNodes()) {
+      while (_edIsEditable(endBlock) && endBlock.parentNode
+          && endBlock.parentNode.childNodes.length === 1 && endBlock.parentNode !== startBlock) {
+        const parent = endBlock.parentNode;
+        parent.removeChild(endBlock);
+        endBlock = parent;
+      }
+      if (_edIsEditable(endBlock) && !_edIsInline(endBlock)
+          && _edIsInline(endBlock.previousSibling) && _edIsInline(endBlock.nextSibling)) {
+        endBlock.parentNode.insertBefore(doc.createElement('br'), endBlock.nextSibling);
+      }
+      if (_edIsEditable(endBlock)) endBlock.parentNode.removeChild(endBlock);
+      _edRestoreStatesAndValues(doc, overrides);
+      return;
+    }
+    if (!_edIsInline(endBlock.firstChild)) { _edRestoreStatesAndValues(doc, overrides); return; }
+    const children = [endBlock.firstChild];
+    while (!_edIsHtmlEl(children[children.length - 1], 'br')
+        && _edIsInline(children[children.length - 1].nextSibling)) {
+      children.push(children[children.length - 1].nextSibling);
+    }
+    values = _edRecordValues(children);
+    let guard = 0;
+    while (children[0].parentNode !== startBlock && guard++ < 500) _edSplitParent(children);
+    if (_edIsEditable(children[0].previousSibling) && _edIsHtmlEl(children[0].previousSibling, 'br')) {
+      children[0].parentNode.removeChild(children[0].previousSibling);
+    }
+  } else if (_edIsDescendant(startBlock, endBlock)) {
+    setSel(startBlock, _edNodeLength(startBlock), startBlock, _edNodeLength(startBlock));
+    let referenceNode = startBlock;
+    while (referenceNode.parentNode !== endBlock) referenceNode = referenceNode.parentNode;
+    if (_edIsInline(referenceNode.nextSibling) && _edIsHtmlEl(startBlock.lastChild, 'br')) {
+      startBlock.removeChild(startBlock.lastChild);
+    }
+    const nodesToMove = [];
+    if (referenceNode.nextSibling && !_edIsBlock(referenceNode.nextSibling)) {
+      nodesToMove.push(referenceNode.nextSibling);
+    }
+    if (nodesToMove.length && !_edIsHtmlEl(nodesToMove[nodesToMove.length - 1], 'br')
+        && nodesToMove[nodesToMove.length - 1].nextSibling
+        && !_edIsBlock(nodesToMove[nodesToMove.length - 1].nextSibling)) {
+      nodesToMove.push(nodesToMove[nodesToMove.length - 1].nextSibling);
+    }
+    values = _edRecordValues(nodesToMove);
+    for (const n of nodesToMove) _edMovePreservingRanges(n, startBlock, -1);
+  } else {
+    setSel(startBlock, _edNodeLength(startBlock), startBlock, _edNodeLength(startBlock));
+    if (_edIsInline(endBlock.firstChild) && _edIsHtmlEl(startBlock.lastChild, 'br')) {
+      startBlock.removeChild(startBlock.lastChild);
+    }
+    values = _edRecordValues(Array.prototype.slice.call(endBlock.childNodes));
+    while (endBlock.hasChildNodes()) _edMovePreservingRanges(endBlock.firstChild, startBlock, -1);
+    let guard = 0;
+    while (!endBlock.hasChildNodes() && endBlock.parentNode && guard++ < 500) {
+      const parent = endBlock.parentNode;
+      parent.removeChild(endBlock);
+      endBlock = parent;
+    }
+  }
+  // Two adjacent lists that used to be separated by the deleted content are now
+  // one list to the reader, and must become one list in the tree — otherwise the
+  // numbering restarts at 1 in the middle of what looks like one list.
+  let ancestor = startBlock;
+  let guard = 0;
+  const pairs = (n) => (_edIsHtmlEl(n, 'ol') && _edIsHtmlEl(n.nextSibling, 'ol'))
+    || (_edIsHtmlEl(n, 'ul') && _edIsHtmlEl(n.nextSibling, 'ul'));
+  while (guard++ < 200 && _edGetInclusiveAncestors(ancestor).some((n) => _edInSameEditingHost(ancestor, n)
+      && pairs(n) && _edInSameEditingHost(ancestor, n.nextSibling))) {
+    while (ancestor && !(pairs(ancestor) && _edInSameEditingHost(ancestor, ancestor.nextSibling))) {
+      ancestor = ancestor.parentNode;
+    }
+    if (!ancestor) break;
+    while (ancestor.nextSibling.hasChildNodes()) {
+      _edMovePreservingRanges(ancestor.nextSibling.firstChild, ancestor, -1);
+    }
+    ancestor.parentNode.removeChild(ancestor.nextSibling);
+  }
+  _edRestoreValues(values);
+  if (!startBlock.hasChildNodes()) startBlock.appendChild(doc.createElement('br'));
+  _edRemoveExtraneousLineBreaksAtTheEndOf(startBlock);
+  _edRestoreStatesAndValues(doc, overrides);
+};
+const _edIsCollapsedBlockProp = (node) => {
+  if (_edIsCollapsedLineBreak(node) && !_edIsExtraneousLineBreak(node)) return true;
+  if (!_edIsInline(node) || node.nodeType !== 1) return false;
+  let hasChild = false;
+  for (let i = 0; i < node.childNodes.length; i++) {
+    const c = node.childNodes[i];
+    if (!_edIsInvisible(c) && !_edIsCollapsedBlockProp(c)) return false;
+    if (_edIsCollapsedBlockProp(c)) hasChild = true;
+  }
+  return hasChild;
+};
+// ── Indenting ───────────────────────────────────────────────────────────────
+const _edIndentNodes = (nodeList) => {
+  if (!nodeList.length) return;
+  const firstNode = nodeList[0];
+  const doc = firstNode.ownerDocument || globalThis.document;
+  // Inside a list, "indent" means "one level deeper in the list", not "add a
+  // blockquote" — a bullet that turned into a quote when you pressed Tab would
+  // be an editor nobody could use.
+  if (_edIsHtmlEl(firstNode.parentNode, ['ol', 'ul'])) {
+    const tag = firstNode.parentNode.localName;
+    _edWrap(nodeList, (n) => _edIsHtmlEl(n, tag), () => doc.createElement(tag));
+    return;
+  }
+  const newParent = _edWrap(nodeList, (n) => _edIsSimpleIndentationElement(n),
+    () => doc.createElement('blockquote'));
+  _edFixDisallowedAncestors(newParent);
+};
+const _edOutdentNode = (node) => {
+  if (!_edIsEditable(node)) return;
+  if (_edIsSimpleIndentationElement(node)) { _edRemovePreservingDescendants(node); return; }
+  if (_edIsIndentationElement(node)) {
+    node.removeAttribute('dir');
+    node.style.margin = ''; node.style.padding = ''; node.style.border = '';
+    if (node.getAttribute('style') === '') node.removeAttribute('style');
+    _edSetTagName(node, 'div');
+    return;
+  }
+  let currentAncestor = node.parentNode;
+  let ancestorList = [];
+  while (_edIsEditable(currentAncestor) && currentAncestor.nodeType === 1
+      && !_edIsSimpleIndentationElement(currentAncestor) && !_edIsHtmlEl(currentAncestor, ['ol', 'ul'])) {
+    ancestorList.push(currentAncestor);
+    currentAncestor = currentAncestor.parentNode;
+  }
+  if (!_edIsEditable(currentAncestor) || !_edIsSimpleIndentationElement(currentAncestor)) {
+    currentAncestor = node.parentNode;
+    ancestorList = [];
+    while (_edIsEditable(currentAncestor) && currentAncestor.nodeType === 1
+        && !_edIsIndentationElement(currentAncestor) && !_edIsHtmlEl(currentAncestor, ['ol', 'ul'])) {
+      ancestorList.push(currentAncestor);
+      currentAncestor = currentAncestor.parentNode;
+    }
+  }
+  if (_edIsHtmlEl(node, ['ol', 'ul'])
+      && (!_edIsEditable(currentAncestor) || !_edIsIndentationElement(currentAncestor))) {
+    node.removeAttribute('reversed'); node.removeAttribute('start'); node.removeAttribute('type');
+    const children = Array.prototype.slice.call(node.childNodes);
+    if (node.attributes.length && !_edIsHtmlEl(node.parentNode, ['ol', 'ul'])) {
+      _edSetTagName(node, 'div');
+    } else {
+      const values = _edRecordValues(Array.prototype.slice.call(node.childNodes));
+      _edRemovePreservingDescendants(node);
+      _edRestoreValues(values);
+    }
+    for (const c of children) _edFixDisallowedAncestors(c);
+    return;
+  }
+  if (!_edIsEditable(currentAncestor) || !_edIsIndentationElement(currentAncestor)) return;
+  ancestorList.push(currentAncestor);
+  const originalAncestor = currentAncestor;
+  while (ancestorList.length) {
+    currentAncestor = ancestorList.pop();
+    const target = node.parentNode === currentAncestor ? node : ancestorList[ancestorList.length - 1];
+    if (!target) break;
+    if (_edIsInline(target) && !_edIsHtmlEl(target, 'br') && _edIsHtmlEl(target.nextSibling, 'br')) {
+      target.parentNode.removeChild(target.nextSibling);
+    }
+    const idx = _edNodeIndex(target);
+    const preceding = Array.prototype.slice.call(currentAncestor.childNodes, 0, idx);
+    const following = Array.prototype.slice.call(currentAncestor.childNodes, 1 + idx);
+    _edIndentNodes(preceding);
+    _edIndentNodes(following);
+  }
+  _edOutdentNode(originalAncestor);
+};
+// ── Lists ───────────────────────────────────────────────────────────────────
+const _edToggleLists = (doc, tagName) => {
+  const mode = _edSelectionListState(doc) === tagName ? 'disable' : 'enable';
+  const range = _edActiveRange(doc);
+  if (!range) return;
+  const otherTagName = tagName === 'ol' ? 'ul' : 'ol';
+  const items = [];
+  for (let a = range.endContainer; a && a !== range.commonAncestorContainer; a = a.parentNode) {
+    if (_edIsHtmlEl(a, 'li')) items.unshift(a);
+  }
+  for (let a = range.startContainer; a; a = a.parentNode) {
+    if (_edIsHtmlEl(a, 'li')) items.unshift(a);
+  }
+  items.forEach(_edNormalizeSublists);
+  let newRange = _edBlockExtend(_edActiveRange(doc) || range);
+  if (mode === 'enable') {
+    // An <ol> being turned into a <ul> next to an existing <ul> has to MERGE
+    // with it, not sit beside it — two adjacent lists of the same kind read as
+    // one list and must be one list.
+    for (const list of _edGetAllContainedNodes(newRange,
+      (n) => _edIsEditable(n) && _edIsHtmlEl(n, otherTagName))) {
+      if ((_edIsEditable(list.previousSibling) && _edIsHtmlEl(list.previousSibling, tagName))
+          || (_edIsEditable(list.nextSibling) && _edIsHtmlEl(list.nextSibling, tagName))) {
+        const children = Array.prototype.slice.call(list.childNodes);
+        const values = _edRecordValues(children);
+        _edSplitParent(children);
+        _edWrap(children, (n) => _edIsHtmlEl(n, tagName));
+        _edRestoreValues(values);
+      } else {
+        _edSetTagName(list, tagName);
+      }
+    }
+  }
+  newRange = _edBlockExtend(_edActiveRange(doc) || range);
+  let nodeList = _edGetContainedNodes(newRange, (n) => _edIsEditable(n)
+    && !_edIsIndentationElement(n)
+    && (_edIsHtmlEl(n, ['ol', 'ul']) || _edIsHtmlEl(n.parentNode, ['ol', 'ul'])
+      || _edIsAllowedChild(n, 'li')));
+  if (mode === 'enable') {
+    nodeList = nodeList.filter((n) => !_edIsHtmlEl(n, ['ol', 'ul'])
+      || _edIsHtmlEl(n.parentNode, ['ol', 'ul']));
+  }
+  let guard = 0;
+  if (mode === 'disable') {
+    while (nodeList.length && guard++ < 2000) {
+      const sublist = [nodeList.shift()];
+      if (_edIsHtmlEl(sublist[0], tagName)) { _edOutdentNode(sublist[0]); continue; }
+      while (nodeList.length && nodeList[0] === sublist[sublist.length - 1].nextSibling
+          && !_edIsHtmlEl(nodeList[0], tagName)) {
+        sublist.push(nodeList.shift());
+      }
+      const values = _edRecordValues(sublist);
+      _edSplitParent(sublist);
+      for (const n of sublist) _edFixDisallowedAncestors(n);
+      _edRestoreValues(values);
+    }
+    return;
+  }
+  while (nodeList.length && guard++ < 2000) {
+    const sublist = [];
+    let inner = 0;
+    while ((!sublist.length || (nodeList.length
+        && nodeList[0] === sublist[sublist.length - 1].nextSibling)) && inner++ < 2000) {
+      if (!nodeList.length) break;
+      // A <p> or <div> BECOMES the <li> rather than being wrapped in one — the
+      // paragraph and the list item are the same line, and wrapping would nest a
+      // block inside a bullet for no reason a reader could see.
+      if (_edIsHtmlEl(nodeList[0], ['p', 'div'])) {
+        sublist.push(_edSetTagName(nodeList[0], 'li'));
+        nodeList.shift();
+      } else if (_edIsHtmlEl(nodeList[0], ['li', 'ol', 'ul'])) {
+        sublist.push(nodeList.shift());
+      } else {
+        const nodesToWrap = [];
+        let g2 = 0;
+        while ((!nodesToWrap.length || (nodeList.length
+            && nodeList[0] === nodesToWrap[nodesToWrap.length - 1].nextSibling
+            && _edIsInline(nodeList[0]) && _edIsInline(nodesToWrap[nodesToWrap.length - 1])
+            && !_edIsHtmlEl(nodesToWrap[nodesToWrap.length - 1], 'br'))) && g2++ < 2000) {
+          if (!nodeList.length) break;
+          nodesToWrap.push(nodeList.shift());
+        }
+        if (!nodesToWrap.length) break;
+        const wrapped = _edWrap(nodesToWrap, undefined, () => doc.createElement('li'));
+        if (wrapped) sublist.push(wrapped); else break;
+      }
+    }
+    if (!sublist.length) break;
+    if (_edIsHtmlEl(sublist[0].parentNode, tagName)
+        || sublist.every((n) => _edIsHtmlEl(n, ['ol', 'ul']))) continue;
+    if (_edIsHtmlEl(sublist[0].parentNode, otherTagName)) {
+      const values = _edRecordValues(sublist);
+      _edSplitParent(sublist);
+      _edWrap(sublist, (n) => _edIsHtmlEl(n, tagName), () => doc.createElement(tagName));
+      _edRestoreValues(values);
+      continue;
+    }
+    _edFixDisallowedAncestors(_edWrap(sublist, (n) => _edIsHtmlEl(n, tagName), () => {
+      if (!_edIsEditable(sublist[0].parentNode) || !_edIsSimpleIndentationElement(sublist[0].parentNode)
+          || !_edIsEditable(sublist[0].parentNode.previousSibling)
+          || !_edIsHtmlEl(sublist[0].parentNode.previousSibling, tagName)) {
+        return doc.createElement(tagName);
+      }
+      const list = sublist[0].parentNode.previousSibling;
+      _edNormalizeSublists(list.lastChild);
+      if (!_edIsEditable(list.lastChild) || !_edIsHtmlEl(list.lastChild, tagName)) {
+        list.appendChild(doc.createElement(tagName));
+      }
+      return list.lastChild;
+    }));
+  }
+};
+// ── Justifying ──────────────────────────────────────────────────────────────
+const _edJustifySelection = (doc, alignment) => {
+  const active0 = _edActiveRange(doc);
+  if (!active0) return;
+  // Clear every EXISTING alignment first, including the <center> element and the
+  // legacy `align` attribute. Setting a new one on top would leave the old one
+  // to win by specificity in some documents and lose in others.
+  let newRange = _edBlockExtend(active0);
+  const elementList = _edGetAllContainedNodes(newRange, (n) => n.nodeType === 1 && _edIsEditable(n)
+    && (n.hasAttribute('align') || n.style.textAlign !== '' || _edIsHtmlEl(n, 'center')));
+  for (const element of elementList) {
+    element.removeAttribute('align');
+    element.style.textAlign = '';
+    if (element.getAttribute('style') === '') element.removeAttribute('style');
+    if (_edIsHtmlEl(element, ['div', 'span', 'center']) && !element.attributes.length) {
+      _edRemovePreservingDescendants(element);
+    }
+    if (_edIsHtmlEl(element, 'center') && element.attributes.length) _edSetTagName(element, 'div');
+  }
+  const active = _edActiveRange(doc);
+  if (!active) return;
+  newRange = _edBlockExtend(active);
+  const nodeList = _edGetContainedNodes(newRange, (n) => _edIsEditable(n)
+    && _edIsAllowedChild(n, 'div') && _edAlignmentValue(n) !== alignment);
+  let guard = 0;
+  while (nodeList.length && guard++ < 2000) {
+    const sublist = [nodeList.shift()];
+    while (nodeList.length && nodeList[0] === sublist[sublist.length - 1].nextSibling) {
+      sublist.push(nodeList.shift());
+    }
+    _edWrap(sublist, (n) => _edIsHtmlEl(n, 'div')
+      && Array.prototype.every.call(n.attributes, (attr) => (attr.name === 'align'
+        && attr.value.toLowerCase() === alignment)
+        || (attr.name === 'style' && n.style.length === 1 && n.style.textAlign === alignment)),
+    () => {
+      const p = doc.createElement('div');
+      p.setAttribute('style', 'text-align: ' + alignment);
+      return p;
+    });
+  }
+};
+// ── Automatic linking ───────────────────────────────────────────────────────
+// Typing a URL followed by a space turns it into a link. The trailing-character
+// exclusion is the part worth keeping: a sentence ending "see http://x.example."
+// must not put the full stop inside the href.
+const _ED_AUTOLINK_URL = '([a-zA-Z][a-zA-Z0-9+.-]*://|mailto:)[^ \t\n\f\r]*[^!"\'(),\\-.:;<>[\\]`{}]';
+const _ED_AUTOLINK_EMAIL = "[a-zA-Z0-9!#$%&'*+\\-/=?^_`{|}~.]+@[a-zA-Z0-9-]+(\\.[a-zA-Z0-9-]+)*";
+const _edAutolink = (doc, node, endOffset) => {
+  let p;
+  while ((p = _edPreviousEquivalentPoint(node, endOffset))) { node = p[0]; endOffset = p[1]; }
+  if (node.nodeType !== 3 || _edGetAncestors(node).some((a) => _edIsHtmlEl(a, 'a'))) return;
+  const search = /[^ \t\n\f\r]*$/.exec(node.substringData(0, endOffset))[0];
+  let startOffset, href;
+  if (new RegExp(_ED_AUTOLINK_URL).test(search)) {
+    while (endOffset > 0 && !(new RegExp(_ED_AUTOLINK_URL + '$').test(node.substringData(0, endOffset)))) endOffset--;
+    const m = new RegExp(_ED_AUTOLINK_URL + '$').exec(node.substringData(0, endOffset));
+    if (!m) return;
+    startOffset = m.index;
+    href = node.substringData(startOffset, endOffset - startOffset);
+  } else if (new RegExp(_ED_AUTOLINK_EMAIL).test(search)) {
+    while (endOffset > 0 && !(new RegExp(_ED_AUTOLINK_EMAIL + '$').test(node.substringData(0, endOffset)))) endOffset--;
+    const m = new RegExp(_ED_AUTOLINK_EMAIL + '$').exec(node.substringData(0, endOffset));
+    if (!m) return;
+    startOffset = m.index;
+    href = 'mailto:' + node.substringData(startOffset, endOffset - startOffset);
+  } else return;
+  const sel = doc.getSelection();
+  const original = _edActiveRange(doc);
+  const saved = original ? { sc: original.startContainer, so: original.startOffset,
+    ec: original.endContainer, eo: original.endOffset } : null;
+  const nr = doc.createRange();
+  try { nr.setStart(node, startOffset); nr.setEnd(node, endOffset); } catch (e) { return; }
+  sel.removeAllRanges(); sel.addRange(nr);
+  _EDIT_COMMANDS.createlink.action(href, doc);
+  if (saved) {
+    const back = doc.createRange();
+    try { back.setStart(saved.sc, saved.so); back.setEnd(saved.ec, saved.eo); sel.removeAllRanges(); sel.addRange(back); } catch (e) {}
+  }
+};
+
+// ── The block command actions ───────────────────────────────────────────────
+// A command that "preserves overrides" records the pending formatting choices,
+// acts, and puts them back when the selection ends up collapsed.
+const _edPreserveOverrides = (fn) => (value, doc) => {
+  const overrides = _edRecordCurrentOverrides(doc);
+  const ret = fn(value, doc);
+  const r = _edActiveRange(doc);
+  if (r && r.collapsed) _edRestoreStatesAndValues(doc, overrides);
+  return ret;
+};
+const _edLiAncestorsInOrder = (range) => {
+  const items = [];
+  for (let a = range.endContainer; a && a !== range.commonAncestorContainer; a = a.parentNode) {
+    if (_edIsHtmlEl(a, 'li')) items.unshift(a);
+  }
+  for (let a = range.startContainer; a; a = a.parentNode) {
+    if (_edIsHtmlEl(a, 'li')) items.unshift(a);
+  }
+  return items;
+};
+_EDIT_COMMANDS.formatblock.action = _edPreserveOverrides((value, doc) => {
+  let v = String(value);
+  // `<p>` and `p` are both accepted: the angle brackets are how every toolbar
+  // built against this API in 2004 spelled it, and refusing them breaks pages
+  // that are otherwise fine.
+  if (/^<.*>$/.test(v)) v = v.slice(1, -1);
+  v = v.toLowerCase();
+  if (_ED_FORMATTABLE_BLOCK_NAMES.indexOf(v) === -1) return false;
+  const active = _edActiveRange(doc);
+  if (!active) return false;
+  const newRange = _edBlockExtend(active);
+  const nodeList = _edGetContainedNodes(newRange, (n) => _edIsEditable(n)
+    && (_edIsNonListSingleLineContainer(n) || _edIsAllowedChild(n, 'p') || _edIsHtmlEl(n, ['dd', 'dt']))
+    && !_edGetDescendants(n).some(_edIsProhibitedParagraphChild));
+  let values = _edRecordValues(nodeList);
+  for (const node of nodeList) {
+    let guard = 0;
+    while (guard++ < 500 && _edGetAncestors(node).some((a) => _edIsEditable(a)
+        && _edInSameEditingHost(a, node) && _edIsHtmlEl(a, _ED_FORMATTABLE_BLOCK_NAMES)
+        && !_edGetDescendants(a).some(_edIsProhibitedParagraphChild))) {
+      _edSplitParent([node]);
+    }
+  }
+  _edRestoreValues(values);
+  let guard = 0;
+  while (nodeList.length && guard++ < 2000) {
+    let sublist;
+    if (_edIsSingleLineContainer(nodeList[0])) {
+      sublist = Array.prototype.slice.call(nodeList[0].childNodes);
+      values = _edRecordValues(sublist);
+      _edRemovePreservingDescendants(nodeList[0]);
+      _edRestoreValues(values);
+      nodeList.shift();
+    } else {
+      sublist = [nodeList.shift()];
+      while (nodeList.length && nodeList[0] === sublist[sublist.length - 1].nextSibling
+          && !_edIsSingleLineContainer(nodeList[0])
+          && !_edIsHtmlEl(sublist[sublist.length - 1], 'br')) {
+        sublist.push(nodeList.shift());
+      }
+    }
+    if (!sublist.length) continue;
+    // div and p never merge into an existing sibling; every other block name
+    // does. A run of <p>s that silently merged would lose the paragraph breaks
+    // that are the only reason they are separate elements.
+    _edFixDisallowedAncestors(_edWrap(sublist,
+      ['div', 'p'].indexOf(v) === -1 ? (n) => _edIsHtmlEl(n, v) && !n.attributes.length : () => false,
+      () => doc.createElement(v)));
+  }
+  return true;
+});
+_EDIT_COMMANDS.indent.action = _edPreserveOverrides((value, doc) => {
+  const active = _edActiveRange(doc);
+  if (!active) return false;
+  const items = _edLiAncestorsInOrder(active);
+  for (let a = active.commonAncestorContainer; a; a = a.parentNode) {
+    if (_edIsHtmlEl(a, 'li')) items.unshift(a);
+  }
+  items.forEach(_edNormalizeSublists);
+  const newRange = _edBlockExtend(_edActiveRange(doc) || active);
+  const nodeList = _edGetContainedNodes(newRange, (n) => _edIsEditable(n)
+    && (_edIsAllowedChild(n, 'div') || _edIsAllowedChild(n, 'ol')));
+  const firstVisible = nodeList.filter(_edIsVisible)[0];
+  if (_edIsHtmlEl(firstVisible, 'li') && _edIsHtmlEl(firstVisible.parentNode, ['ol', 'ul'])) {
+    let sibling = firstVisible.previousSibling;
+    while (sibling && _edIsInvisible(sibling)) sibling = sibling.previousSibling;
+    if (_edIsHtmlEl(sibling, 'li')) _edNormalizeSublists(sibling);
+  }
+  let guard = 0;
+  while (nodeList.length && guard++ < 2000) {
+    const sublist = [nodeList.shift()];
+    while (nodeList.length && nodeList[0] === sublist[sublist.length - 1].nextSibling) {
+      sublist.push(nodeList.shift());
+    }
+    _edIndentNodes(sublist);
+  }
+  return true;
+});
+_EDIT_COMMANDS.outdent.action = _edPreserveOverrides((value, doc) => {
+  const active = _edActiveRange(doc);
+  if (!active) return false;
+  _edLiAncestorsInOrder(active).forEach(_edNormalizeSublists);
+  const newRange = _edBlockExtend(_edActiveRange(doc) || active);
+  const nodeList = _edGetContainedNodes(newRange, (n) => _edIsEditable(n)
+    && (!_edGetDescendants(n).some(_edIsEditable) || _edIsHtmlEl(n, ['ol', 'ul'])
+      || (_edIsHtmlEl(n, 'li') && _edIsHtmlEl(n.parentNode, ['ol', 'ul']))));
+  let guard = 0;
+  while (nodeList.length && guard++ < 2000) {
+    while (nodeList.length && (_edIsHtmlEl(nodeList[0], ['ol', 'ul'])
+        || !_edIsHtmlEl(nodeList[0].parentNode, ['ol', 'ul']))) {
+      _edOutdentNode(nodeList.shift());
+    }
+    if (!nodeList.length) break;
+    const sublist = [nodeList.shift()];
+    while (nodeList.length && nodeList[0] === sublist[sublist.length - 1].nextSibling
+        && !_edIsHtmlEl(nodeList[0], ['ol', 'ul'])) {
+      sublist.push(nodeList.shift());
+    }
+    const values = _edRecordValues(sublist);
+    _edSplitParent(sublist);
+    sublist.forEach(_edFixDisallowedAncestors);
+    _edRestoreValues(values);
+  }
+  return true;
+});
+_EDIT_COMMANDS.insertorderedlist.action = _edPreserveOverrides((value, doc) => { _edToggleLists(doc, 'ol'); return true; });
+_EDIT_COMMANDS.insertunorderedlist.action = _edPreserveOverrides((value, doc) => { _edToggleLists(doc, 'ul'); return true; });
+_EDIT_COMMANDS.justifycenter.action = _edPreserveOverrides((value, doc) => { _edJustifySelection(doc, 'center'); return true; });
+_EDIT_COMMANDS.justifyfull.action = _edPreserveOverrides((value, doc) => { _edJustifySelection(doc, 'justify'); return true; });
+_EDIT_COMMANDS.justifyleft.action = _edPreserveOverrides((value, doc) => { _edJustifySelection(doc, 'left'); return true; });
+_EDIT_COMMANDS.justifyright.action = _edPreserveOverrides((value, doc) => { _edJustifySelection(doc, 'right'); return true; });
+const _edSetSel = (doc, sc, so, ec, eo) => {
+  const sel = doc.getSelection();
+  const nr = doc.createRange();
+  try { nr.setStart(sc, so); nr.setEnd(ec, eo); } catch (e) { return false; }
+  sel.removeAllRanges(); sel.addRange(nr);
+  return true;
+};
+const _edStartIsEditable = (doc) => {
+  const r = _edActiveRange(doc);
+  return !!r && (_edIsEditable(r.startContainer) || _edIsEditingHost(r.startContainer));
+};
+_EDIT_COMMANDS.inserthorizontalrule.action = _edPreserveOverrides((value, doc) => {
+  let active = _edActiveRange(doc);
+  if (!active) return false;
+  let startNode = active.startContainer, startOffset = active.startOffset;
+  let endNode = active.endContainer, endOffset = active.endOffset;
+  while (startOffset === 0 && startNode.parentNode) {
+    startOffset = _edNodeIndex(startNode); startNode = startNode.parentNode;
+  }
+  while (endOffset === _edNodeLength(endNode) && endNode.parentNode) {
+    endOffset = 1 + _edNodeIndex(endNode); endNode = endNode.parentNode;
+  }
+  _edSetSel(doc, startNode, startOffset, endNode, endOffset);
+  // Block merging OFF: an <hr> divides, so joining the blocks either side of it
+  // would undo the only thing the command is for.
+  _edDeleteSelection(doc, { blockMerging: false });
+  if (!_edStartIsEditable(doc)) return true;
+  active = _edActiveRange(doc);
+  if (active && active.startContainer.nodeType === 3 && active.startOffset === 0) {
+    _edSetSel(doc, active.startContainer.parentNode, _edNodeIndex(active.startContainer),
+      active.startContainer.parentNode, _edNodeIndex(active.startContainer));
+  }
+  active = _edActiveRange(doc);
+  if (active && active.startContainer.nodeType === 3
+      && active.startOffset === _edNodeLength(active.startContainer)) {
+    _edSetSel(doc, active.startContainer.parentNode, 1 + _edNodeIndex(active.startContainer),
+      active.startContainer.parentNode, 1 + _edNodeIndex(active.startContainer));
+  }
+  active = _edActiveRange(doc);
+  if (!active) return true;
+  const hr = doc.createElement('hr');
+  active.insertNode(hr);
+  _edFixDisallowedAncestors(hr);
+  _edSetSel(doc, hr.parentNode, 1 + _edNodeIndex(hr), hr.parentNode, 1 + _edNodeIndex(hr));
+  return true;
+});
+_EDIT_COMMANDS.inserthtml.action = _edPreserveOverrides((value, doc) => {
+  _edDeleteSelection(doc);
+  if (!_edStartIsEditable(doc)) return true;
+  let active = _edActiveRange(doc);
+  if (!active) return true;
+  // createContextualFragment parses in the CONTEXT of where it will land, so
+  // "<td>x</td>" inserted into a <tr> parses as a cell rather than being thrown
+  // away — which is what a plain innerHTML parse would do.
+  let frag;
+  try { frag = active.createContextualFragment(String(value)); } catch (e) { return true; }
+  const lastChild = frag.lastChild;
+  if (!lastChild) return true;
+  const descendants = _edGetDescendants(frag);
+  if (_edIsBlock(active.startContainer)) {
+    const startOffset = active.startOffset;
+    Array.prototype.filter.call(active.startContainer.childNodes, (n) => _edIsEditable(n)
+      && _edIsCollapsedBlockProp(n) && _edNodeIndex(n) >= startOffset)
+      .forEach((n) => n.parentNode.removeChild(n));
+  }
+  active = _edActiveRange(doc);
+  if (!active) return true;
+  active.insertNode(frag);
+  active = _edActiveRange(doc);
+  if (active && _edIsBlock(active.startContainer)
+      && !Array.prototype.some.call(active.startContainer.childNodes, _edIsVisible)) {
+    active.startContainer.appendChild(doc.createElement('br'));
+  }
+  if (lastChild.parentNode) {
+    _edSetSel(doc, lastChild.parentNode, 1 + _edNodeIndex(lastChild),
+      lastChild.parentNode, 1 + _edNodeIndex(lastChild));
+  }
+  for (const d of descendants) _edFixDisallowedAncestors(d);
+  return true;
+});
+_EDIT_COMMANDS.insertimage.action = _edPreserveOverrides((value, doc) => {
+  if (value === '') return false;
+  // stripWrappers false: an image dropped into a bold run stays bold, because
+  // the wrappers around the deleted selection are what carried that.
+  _edDeleteSelection(doc, { stripWrappers: false });
+  if (!_edStartIsEditable(doc)) return true;
+  const range = _edActiveRange(doc);
+  if (!range) return true;
+  if (_edIsBlock(range.startContainer) && range.startContainer.childNodes.length === 1
+      && _edIsHtmlEl(range.startContainer.firstChild, 'br') && range.startOffset === 0) {
+    range.startContainer.removeChild(range.startContainer.firstChild);
+  }
+  const img = doc.createElement('img');
+  img.setAttribute('src', String(value));
+  range.insertNode(img);
+  _edSetSel(doc, img.parentNode, 1 + _edNodeIndex(img), img.parentNode, 1 + _edNodeIndex(img));
+  return true;
+});
+_EDIT_COMMANDS.insertlinebreak.action = _edPreserveOverrides((value, doc) => {
+  _edDeleteSelection(doc, { stripWrappers: false });
+  if (!_edStartIsEditable(doc)) return true;
+  let active = _edActiveRange(doc);
+  if (!active) return true;
+  if (active.startContainer.nodeType === 1 && !_edIsAllowedChild('br', active.startContainer)) return true;
+  if (active.startContainer.nodeType !== 1 && !_edIsAllowedChild('br', active.startContainer.parentNode)) return true;
+  if (active.startContainer.nodeType === 3 && active.startOffset === 0) {
+    _edSetSel(doc, active.startContainer.parentNode, _edNodeIndex(active.startContainer),
+      active.startContainer.parentNode, _edNodeIndex(active.startContainer));
+  }
+  active = _edActiveRange(doc);
+  if (active && active.startContainer.nodeType === 3
+      && active.startOffset === _edNodeLength(active.startContainer)) {
+    _edSetSel(doc, active.startContainer.parentNode, 1 + _edNodeIndex(active.startContainer),
+      active.startContainer.parentNode, 1 + _edNodeIndex(active.startContainer));
+  }
+  active = _edActiveRange(doc);
+  if (!active) return true;
+  const br = doc.createElement('br');
+  active.insertNode(br);
+  _edSetSel(doc, br.parentNode, 1 + _edNodeIndex(br), br.parentNode, 1 + _edNodeIndex(br));
+  // A <br> at the very end of a block draws NOTHING — the line it would start
+  // does not exist yet. So a second one is needed for the caret to have a line
+  // to sit on, which is why every editor emits two and why deleting one of them
+  // appears to do nothing.
+  if (_edIsCollapsedLineBreak(br)) {
+    const a2 = _edActiveRange(doc);
+    if (a2) a2.insertNode(doc.createElement('br'));
+    _edSetSel(doc, br.parentNode, 1 + _edNodeIndex(br), br.parentNode, 1 + _edNodeIndex(br));
+  }
+  return true;
+});
+_EDIT_COMMANDS.insertparagraph.action = _edPreserveOverrides((value, doc) => {
+  _edDeleteSelection(doc);
+  if (!_edStartIsEditable(doc)) return true;
+  let active = _edActiveRange(doc);
+  if (!active) return true;
+  let node = active.startContainer, offset = active.startOffset;
+  if (node.nodeType === 3 && offset !== 0 && offset !== _edNodeLength(node)) node.splitText(offset);
+  if (node.nodeType === 3 && offset === _edNodeLength(node)) {
+    offset = 1 + _edNodeIndex(node); node = node.parentNode;
+  }
+  if (node.nodeType === 3 || node.nodeType === 8) { offset = _edNodeIndex(node); node = node.parentNode; }
+  _edSetSel(doc, node, offset, node, offset);
+  let container = node;
+  while (!_edIsSingleLineContainer(container) && _edIsEditable(container.parentNode)
+      && _edInSameEditingHost(node, container.parentNode)) {
+    container = container.parentNode;
+  }
+  // Pressing Enter inside a <p> that is itself inside an <li> splits the LIST
+  // ITEM, not the paragraph — otherwise one bullet quietly acquires two lines.
+  if (_edIsEditable(container) && _edIsSingleLineContainer(container)
+      && _edInSameEditingHost(node, container.parentNode)
+      && (container.localName === 'p' || container.localName === 'div')) {
+    let outer = container;
+    while (!_edIsHtmlEl(outer, ['dd', 'dt', 'li']) && _edIsEditable(outer.parentNode)) {
+      outer = outer.parentNode;
+    }
+    if (_edIsHtmlEl(outer, ['dd', 'dt', 'li'])) container = outer;
+  }
+  if (!_edIsEditable(container) || !_edInSameEditingHost(container, node)
+      || !_edIsSingleLineContainer(container)) {
+    const tag = _edState(doc).defaultSingleLineContainerName;
+    active = _edActiveRange(doc);
+    if (!active) return true;
+    const newRange = _edBlockExtend(active);
+    const nodeList = _edGetContainedNodes(newRange, (n) => _edIsAllowedChild(n, 'p')).slice(0, 1);
+    if (!nodeList.length) {
+      active = _edActiveRange(doc);
+      if (!active || !_edIsAllowedChild(tag, active.startContainer)) return true;
+      container = doc.createElement(tag);
+      active.insertNode(container);
+      container.appendChild(doc.createElement('br'));
+      _edSetSel(doc, container, 0, container, 0);
+      return true;
+    }
+    while (nodeList[nodeList.length - 1].nextSibling
+        && _edIsAllowedChild(nodeList[nodeList.length - 1].nextSibling, 'p')) {
+      nodeList.push(nodeList[nodeList.length - 1].nextSibling);
+    }
+    container = _edWrap(nodeList, () => false, () => doc.createElement(tag));
+    if (!container) return true;
+  }
+  // In <pre> and friends, Enter is a LINE BREAK, not a new block — the whole
+  // point of preformatted text is that its line structure is its own.
+  if (['address', 'listing', 'pre'].indexOf(container.localName) !== -1) {
+    active = _edActiveRange(doc);
+    if (!active) return true;
+    const br = doc.createElement('br');
+    active.insertNode(br);
+    _edSetSel(doc, node, offset + 1, node, offset + 1);
+    if (!_edIsDescendant(_edNextNode(br), container)) {
+      const a2 = _edActiveRange(doc);
+      if (a2) a2.insertNode(doc.createElement('br'));
+      _edSetSel(doc, node, offset + 1, node, offset + 1);
+    }
+    return true;
+  }
+  // Enter on an EMPTY list item ends the list — the second Enter that everyone
+  // uses to stop making bullets.
+  if (['li', 'dt', 'dd'].indexOf(container.localName) !== -1
+      && (!container.hasChildNodes()
+        || (container.childNodes.length === 1 && _edIsHtmlEl(container.firstChild, 'br')))) {
+    _edSplitParent([container]);
+    if (!container.hasChildNodes()) container.appendChild(doc.createElement('br'));
+    if (_edIsHtmlEl(container, ['dd', 'dt']) && _edGetAncestors(container)
+      .every((a) => !_edInSameEditingHost(container, a) || !_edIsAllowedChild(container, a))) {
+      container = _edSetTagName(container, _edState(doc).defaultSingleLineContainerName);
+    }
+    _edFixDisallowedAncestors(container);
+    return true;
+  }
+  active = _edActiveRange(doc);
+  if (!active) return true;
+  const newLineRange = doc.createRange();
+  try {
+    newLineRange.setStart(active.startContainer, active.startOffset);
+    newLineRange.setEnd(container, _edNodeLength(container));
+  } catch (e) { return true; }
+  while (newLineRange.startOffset === 0 && !_edIsProhibitedParagraphChild(newLineRange.startContainer)
+      && newLineRange.startContainer.parentNode) {
+    newLineRange.setStart(newLineRange.startContainer.parentNode, _edNodeIndex(newLineRange.startContainer));
+  }
+  while (newLineRange.startOffset === _edNodeLength(newLineRange.startContainer)
+      && !_edIsProhibitedParagraphChild(newLineRange.startContainer)
+      && newLineRange.startContainer.parentNode) {
+    newLineRange.setStart(newLineRange.startContainer.parentNode, 1 + _edNodeIndex(newLineRange.startContainer));
+  }
+  const containedInNewLine = _edGetContainedNodes(newLineRange);
+  const endOfLine = !containedInNewLine.length
+    || (containedInNewLine.length === 1 && _edIsHtmlEl(containedInNewLine[0], 'br'));
+  // Enter at the end of a HEADING starts a paragraph, not another heading —
+  // nobody wants the line after the title to be a title.
+  let newContainerName;
+  if (/^h[1-6]$/.test(container.localName) && endOfLine) {
+    newContainerName = _edState(doc).defaultSingleLineContainerName;
+  } else if (container.localName === 'dt' && endOfLine) newContainerName = 'dd';
+  else if (container.localName === 'dd' && endOfLine) newContainerName = 'dt';
+  else newContainerName = container.localName;
+  let newContainer = doc.createElement(newContainerName);
+  for (let i = 0; i < container.attributes.length; i++) {
+    const a = container.attributes[i];
+    newContainer.setAttributeNS(a.namespaceURI, a.name, a.value);
+  }
+  newContainer.removeAttribute('id');
+  container.parentNode.insertBefore(newContainer, container.nextSibling);
+  const containedNodes = _edGetAllContainedNodes(newLineRange);
+  const frag = newLineRange.extractContents();
+  for (const d of _edGetDescendants(frag)) {
+    if (d.nodeType === 1 && containedNodes.indexOf(d) === -1) d.removeAttribute('id');
+  }
+  newContainer.appendChild(frag);
+  while (_edIsProhibitedParagraphChild(container.lastChild)) container = container.lastChild;
+  while (_edIsProhibitedParagraphChild(newContainer.lastChild)) newContainer = newContainer.lastChild;
+  if (!Array.prototype.some.call(container.childNodes, _edIsVisible)) {
+    container.appendChild(doc.createElement('br'));
+  }
+  if (!Array.prototype.some.call(newContainer.childNodes, _edIsVisible)) {
+    newContainer.appendChild(doc.createElement('br'));
+  }
+  _edSetSel(doc, newContainer, 0, newContainer, 0);
+  return true;
+});
+_EDIT_COMMANDS.inserttext.action = (value, doc) => {
+  _edDeleteSelection(doc, { stripWrappers: false });
+  if (!_edStartIsEditable(doc)) return true;
+  const v = String(value);
+  // One character at a time — because each one can trigger whitespace
+  // canonicalization and autolinking, and doing the whole string at once would
+  // skip both for every character but the last.
+  if (v.length > 1) {
+    for (let i = 0; i < v.length; i++) _EDIT_COMMANDS.inserttext.action(v[i], doc);
+    return true;
+  }
+  if (v === '') return true;
+  if (v === '\n') { _EDIT_COMMANDS.insertparagraph.action('', doc); return true; }
+  let active = _edActiveRange(doc);
+  if (!active) return true;
+  let node = active.startContainer, offset = active.startOffset;
+  if (offset - 1 >= 0 && offset - 1 < node.childNodes.length
+      && node.childNodes[offset - 1].nodeType === 3) {
+    node = node.childNodes[offset - 1]; offset = _edNodeLength(node);
+  }
+  if (offset >= 0 && offset < node.childNodes.length && node.childNodes[offset].nodeType === 3) {
+    node = node.childNodes[offset]; offset = 0;
+  }
+  const overrides = _edRecordCurrentOverrides(doc);
+  _edSetSel(doc, node, offset, node, offset);
+  _edCanonicalizeWhitespace(node, offset);
+  active = _edActiveRange(doc);
+  if (!active) return true;
+  node = active.startContainer; offset = active.startOffset;
+  if (node.nodeType === 3) {
+    node.insertData(offset, v);
+    _edSetSel(doc, node, offset, node, offset + 1);
+  } else {
+    if (node.childNodes.length === 1 && _edIsCollapsedLineBreak(node.firstChild)) {
+      node.removeChild(node.firstChild);
+    }
+    const text = doc.createTextNode(v);
+    active = _edActiveRange(doc);
+    if (!active) return true;
+    active.insertNode(text);
+    _edSetSel(doc, text, 0, text, 1);
+  }
+  _edRestoreStatesAndValues(doc, overrides);
+  active = _edActiveRange(doc);
+  if (active) _edCanonicalizeWhitespace(active.startContainer, active.startOffset, false);
+  active = _edActiveRange(doc);
+  if (active) _edCanonicalizeWhitespace(active.endContainer, active.endOffset, false);
+  active = _edActiveRange(doc);
+  if (active && /^[ \t\n\f\r]$/.test(v)) _edAutolink(doc, active.startContainer, active.startOffset);
+  active = _edActiveRange(doc);
+  if (active) { try { doc.getSelection().collapseToEnd(); } catch (e) {} }
+  return true;
+};
+_EDIT_COMMANDS.delete.action = _edPreserveOverrides((value, doc) => {
+  let active = _edActiveRange(doc);
+  if (!active) return false;
+  if (!active.collapsed) { _edDeleteSelection(doc); return true; }
+  _edCanonicalizeWhitespace(active.startContainer, active.startOffset);
+  active = _edActiveRange(doc);
+  if (!active) return true;
+  let node = active.startContainer, offset = active.startOffset;
+  // Walk backwards past everything the reader cannot see, so Backspace deletes
+  // a CHARACTER rather than an empty <span> the user never knew was there.
+  let guard = 0;
+  for (;;) {
+    if (guard++ > 2000) break;
+    if (offset === 0 && _edIsEditable(node.previousSibling) && _edIsInvisible(node.previousSibling)) {
+      node.parentNode.removeChild(node.previousSibling);
+    } else if (offset - 1 >= 0 && offset - 1 < node.childNodes.length
+        && _edIsEditable(node.childNodes[offset - 1]) && _edIsInvisible(node.childNodes[offset - 1])) {
+      node.removeChild(node.childNodes[offset - 1]); offset--;
+    } else if ((offset === 0 && _edIsInline(node)) || _edIsInvisible(node)) {
+      if (!node.parentNode) break;
+      offset = _edNodeIndex(node); node = node.parentNode;
+    } else if (offset - 1 >= 0 && offset - 1 < node.childNodes.length
+        && _edIsEditable(node.childNodes[offset - 1]) && _edIsHtmlEl(node.childNodes[offset - 1], 'a')) {
+      _edRemovePreservingDescendants(node.childNodes[offset - 1]);
+      return true;
+    } else if (offset - 1 >= 0 && offset - 1 < node.childNodes.length
+        && !_edIsBlock(node.childNodes[offset - 1])
+        && !_edIsHtmlEl(node.childNodes[offset - 1], ['br', 'img'])) {
+      node = node.childNodes[offset - 1]; offset = _edNodeLength(node);
+    } else break;
+  }
+  if ((node.nodeType === 3 && offset !== 0)
+      || (_edIsBlock(node) && offset - 1 >= 0 && offset - 1 < node.childNodes.length
+        && _edIsHtmlEl(node.childNodes[offset - 1], ['br', 'hr', 'img']))) {
+    _edSetSel(doc, node, offset - 1, node, offset);
+    _edDeleteSelection(doc);
+    return true;
+  }
+  if (_edIsInline(node)) return true;
+  // Backspace at the very start of a list item lifts it out of the list.
+  if (_edIsHtmlEl(node, ['li', 'dt', 'dd']) && node === node.parentNode.firstChild && offset === 0) {
+    const items = [];
+    for (let a = node.parentNode; a; a = a.parentNode) if (_edIsHtmlEl(a, 'li')) items.unshift(a);
+    items.forEach(_edNormalizeSublists);
+    const values = _edRecordValues([node]);
+    _edSplitParent([node]);
+    _edRestoreValues(values);
+    if (_edIsHtmlEl(node, ['dd', 'dt']) && _edGetAncestors(node)
+      .every((a) => !_edInSameEditingHost(node, a) || !_edIsAllowedChild(node, a))) {
+      node = _edSetTagName(node, _edState(doc).defaultSingleLineContainerName);
+    }
+    _edFixDisallowedAncestors(node);
+    return true;
+  }
+  let startNode = node, startOffset = offset;
+  guard = 0;
+  for (;;) {
+    if (guard++ > 2000) break;
+    if (startOffset === 0) {
+      if (!startNode.parentNode) break;
+      startOffset = _edNodeIndex(startNode); startNode = startNode.parentNode;
+    } else if (startOffset - 1 >= 0 && startOffset - 1 < startNode.childNodes.length
+        && _edIsEditable(startNode.childNodes[startOffset - 1])
+        && _edIsInvisible(startNode.childNodes[startOffset - 1])) {
+      startNode.removeChild(startNode.childNodes[startOffset - 1]); startOffset--;
+    } else break;
+  }
+  if (offset === 0 && _edGetInclusiveAncestors(node).filter((a) => _edIsEditable(a)
+      && _edInSameEditingHost(a, node) && _edIsIndentationElement(a)).length) {
+    const nr = doc.createRange();
+    nr.setStart(node, 0); nr.setEnd(node, 0);
+    const newRange = _edBlockExtend(nr);
+    const nodeList = _edGetContainedNodes(newRange,
+      (n) => _edIsEditable(n) && !_edHasEditableDescendants(n));
+    for (const n of nodeList) _edOutdentNode(n);
+    return true;
+  }
+  // A table is never partially deleted by a keystroke: Backspace in front of one
+  // SELECTS it, so the next keystroke is a deliberate decision.
+  if (_edIsHtmlEl(startNode.childNodes[startOffset], 'table')) return true;
+  if (startOffset - 1 >= 0 && startOffset - 1 < startNode.childNodes.length
+      && _edIsHtmlEl(startNode.childNodes[startOffset - 1], 'table')) {
+    _edSetSel(doc, startNode, startOffset - 1, startNode, startOffset);
+    return true;
+  }
+  const prevChild = startNode.childNodes[startOffset - 1];
+  if (offset === 0 && (_edIsHtmlEl(prevChild, 'hr')
+      || (_edIsHtmlEl(prevChild, 'br')
+        && (_edIsHtmlEl(prevChild.previousSibling, 'br') || !_edIsInline(prevChild.previousSibling))))) {
+    _edSetSel(doc, startNode, startOffset - 1, startNode, startOffset);
+    _edDeleteSelection(doc);
+    _edSetSel(doc, node, offset, node, offset);
+    return true;
+  }
+  if (_edIsHtmlEl(startNode.childNodes[startOffset], ['li', 'dt', 'dd'])
+      && _edIsInline(startNode.childNodes[startOffset].firstChild) && startOffset !== 0) {
+    const previousItem = startNode.childNodes[startOffset - 1];
+    if (_edIsInline(previousItem.lastChild) && !_edIsHtmlEl(previousItem.lastChild, 'br')) {
+      previousItem.appendChild(doc.createElement('br'));
+    }
+    if (_edIsInline(previousItem.lastChild)) previousItem.appendChild(doc.createElement('br'));
+  }
+  if (_edIsHtmlEl(startNode.childNodes[startOffset], ['li', 'dt', 'dd'])
+      && _edIsHtmlEl(startNode.childNodes[startOffset].previousSibling, ['li', 'dt', 'dd'])) {
+    const active2 = _edActiveRange(doc);
+    const originalRange = active2 ? active2.cloneRange() : null;
+    if (originalRange) _edExtraRanges.push(originalRange);
+    startNode = startNode.childNodes[startOffset - 1];
+    startOffset = _edNodeLength(startNode);
+    node = startNode.nextSibling;
+    _edSetSel(doc, startNode, startOffset, node, 0);
+    _edDeleteSelection(doc);
+    if (originalRange) {
+      const sel = doc.getSelection();
+      sel.removeAllRanges();
+      try { sel.addRange(originalRange); } catch (e) {}
+      _edExtraRanges.pop();
+    }
+    return true;
+  }
+  guard = 0;
+  while (startOffset - 1 >= 0 && startOffset - 1 < startNode.childNodes.length && guard++ < 2000) {
+    if (_edIsEditable(startNode.childNodes[startOffset - 1])
+        && _edIsInvisible(startNode.childNodes[startOffset - 1])) {
+      startNode.removeChild(startNode.childNodes[startOffset - 1]); startOffset--;
+    } else {
+      startNode = startNode.childNodes[startOffset - 1]; startOffset = _edNodeLength(startNode);
+    }
+  }
+  _edSetSel(doc, startNode, startOffset, node, offset);
+  _edDeleteSelection(doc, { direction: 'backward' });
+  return true;
+});
+// Combining marks that must be deleted together with the character they sit on.
+// Latin diacritics plus a representative slice of Hebrew points — the full
+// Unicode general-category-M table is not worth shipping for this, and the
+// consequence of a miss is one extra keypress, not a wrong document.
+const _ED_COMBINING_MARK = /^[\u0300-\u036f\u0591-\u05bd\u05c1\u05c2]$/;
+_EDIT_COMMANDS.forwarddelete.action = _edPreserveOverrides((value, doc) => {
+  let active = _edActiveRange(doc);
+  if (!active) return false;
+  if (!active.collapsed) { _edDeleteSelection(doc); return true; }
+  _edCanonicalizeWhitespace(active.startContainer, active.startOffset);
+  active = _edActiveRange(doc);
+  if (!active) return true;
+  let node = active.startContainer, offset = active.startOffset;
+  let guard = 0;
+  for (;;) {
+    if (guard++ > 2000) break;
+    if (offset === _edNodeLength(node) && _edIsEditable(node.nextSibling) && _edIsInvisible(node.nextSibling)) {
+      node.parentNode.removeChild(node.nextSibling);
+    } else if (offset < node.childNodes.length && _edIsEditable(node.childNodes[offset])
+        && _edIsInvisible(node.childNodes[offset])) {
+      node.removeChild(node.childNodes[offset]);
+    } else if ((offset === _edNodeLength(node) && _edIsInline(node)) || _edIsInvisible(node)) {
+      if (!node.parentNode) break;
+      offset = 1 + _edNodeIndex(node); node = node.parentNode;
+    } else if (offset < node.childNodes.length && !_edIsBlock(node.childNodes[offset])
+        && !_edIsHtmlEl(node.childNodes[offset], ['br', 'img'])
+        && !_edIsCollapsedBlockProp(node.childNodes[offset])) {
+      node = node.childNodes[offset]; offset = 0;
+    } else break;
+  }
+  if (node.nodeType === 3 && offset !== _edNodeLength(node)) {
+    // Delete a whole GRAPHEME, not a code unit: a combining mark left behind
+    // after its base character renders as a stray accent on the next letter.
+    let endOffset = offset + 1;
+    while (endOffset !== node.length
+        && _ED_COMBINING_MARK.test(node.data[endOffset])) endOffset++;
+    _edSetSel(doc, node, offset, node, endOffset);
+    _edDeleteSelection(doc);
+    return true;
+  }
+  if (_edIsInline(node)) return true;
+  if (offset < node.childNodes.length && _edIsHtmlEl(node.childNodes[offset], ['br', 'hr', 'img'])
+      && !_edIsCollapsedBlockProp(node.childNodes[offset])) {
+    _edSetSel(doc, node, offset, node, offset + 1);
+    _edDeleteSelection(doc);
+    return true;
+  }
+  let endNode = node, endOffset = offset;
+  if (endOffset < endNode.childNodes.length && _edIsCollapsedBlockProp(endNode.childNodes[endOffset])) {
+    endOffset++;
+  }
+  guard = 0;
+  for (;;) {
+    if (guard++ > 2000) break;
+    if (endOffset === _edNodeLength(endNode)) {
+      if (!endNode.parentNode) break;
+      endOffset = 1 + _edNodeIndex(endNode); endNode = endNode.parentNode;
+    } else if (endOffset < endNode.childNodes.length && _edIsEditable(endNode.childNodes[endOffset])
+        && _edIsInvisible(endNode.childNodes[endOffset])) {
+      endNode.removeChild(endNode.childNodes[endOffset]);
+    } else break;
+  }
+  if (_edIsHtmlEl(endNode.childNodes[endOffset - 1], 'table')) return true;
+  if (_edIsHtmlEl(endNode.childNodes[endOffset], 'table')) {
+    _edSetSel(doc, endNode, endOffset, endNode, endOffset + 1);
+    return true;
+  }
+  if (offset === _edNodeLength(node) && _edIsHtmlEl(endNode.childNodes[endOffset], ['br', 'hr'])) {
+    _edSetSel(doc, endNode, endOffset, endNode, endOffset + 1);
+    _edDeleteSelection(doc);
+    _edSetSel(doc, node, offset, node, offset);
+    return true;
+  }
+  guard = 0;
+  while (endOffset < endNode.childNodes.length && guard++ < 2000) {
+    if (_edIsEditable(endNode.childNodes[endOffset]) && _edIsInvisible(endNode.childNodes[endOffset])) {
+      endNode.removeChild(endNode.childNodes[endOffset]);
+    } else {
+      endNode = endNode.childNodes[endOffset]; endOffset = 0;
+    }
+  }
+  _edSetSel(doc, node, offset, endNode, endOffset);
+  _edDeleteSelection(doc);
+  return true;
+});
+
+// ── The five methods ────────────────────────────────────────────────────────
+const _ED_ALWAYS_ENABLED = ['copy', 'defaultparagraphseparator', 'selectall',
+  'stylewithcss', 'usecss'];
+const _edQueryEnabled = (doc, command) => {
+  if (!(command in _EDIT_COMMANDS)) return false;
+  if (_ED_ALWAYS_ENABLED.indexOf(command) !== -1) return true;
+  const r = _edActiveRange(doc);
+  // Everything else needs a selection that lives inside ONE editing host. Both
+  // ends, and a common ancestor that is a host — a selection running from inside
+  // an editable box out into the page is not something a command can act on
+  // without editing content the author never made editable.
+  return !!r
+    && (_edIsEditable(r.startContainer) || _edIsEditingHost(r.startContainer))
+    && (_edIsEditable(r.endContainer) || _edIsEditingHost(r.endContainer))
+    && _edGetInclusiveAncestors(r.commonAncestorContainer).some(_edIsEditingHost);
+};
+const _edExecCommand = (doc, command, showUi, value) => {
+  command = String(command).toLowerCase();
+  const cmd = _EDIT_COMMANDS[command];
+  if (!cmd || !_edQueryEnabled(doc, command)) return false;
+  if (!cmd.action) return false;                            // supported, not yet implemented here
+  const ret = cmd.action(value, doc);
+  return ret === true;
+};
+const _edQueryIndeterm = (doc, command) => {
+  command = String(command).toLowerCase();
+  const cmd = _EDIT_COMMANDS[command];
+  if (!cmd || !cmd.indeterm) return false;
+  return !!cmd.indeterm(doc);
+};
+const _edQueryState = (doc, command) => {
+  command = String(command).toLowerCase();
+  const cmd = _EDIT_COMMANDS[command];
+  if (!cmd || !cmd.state) return false;
+  const override = _edGetStateOverride(doc, command);
+  if (typeof override !== 'undefined') return override;
+  return !!cmd.state(doc);
+};
+const _edQueryValue = (doc, command) => {
+  command = String(command).toLowerCase();
+  const cmd = _EDIT_COMMANDS[command];
+  if (!cmd || !cmd.value) return '';
+  // fontSize's override is stored as a CSS size but reported as a legacy 1–7 —
+  // the command's two faces, and the only place the conversion belongs.
+  if (command === 'fontsize') {
+    const o = _edGetValueOverride(doc, 'fontsize');
+    if (o !== undefined) { const l = _edGetLegacyFontSize(o); return l === null ? '' : l; }
+  }
+  const override = _edGetValueOverride(doc, command);
+  if (typeof override !== 'undefined') return override;
+  const out = cmd.value(doc);
+  return out === null || out === undefined ? '' : String(out);
+};
+{
+  const define = (name, len, fn) => {
+    const impl = _markNative(function (...args) {
+      if (!(this instanceof Document)) throw new TypeError('Illegal invocation');
+      return fn.call(this, ...args);
+    });
+    Object.defineProperty(impl, 'name', { value: name, configurable: true });
+    Object.defineProperty(impl, 'length', { value: len, configurable: true });
+    Object.defineProperty(Document.prototype, name, {
+      value: impl, writable: true, enumerable: true, configurable: true,
+    });
+  };
+  // execCommand(commandId, showUI = false, value = "") — the extra arguments are
+  // both optional and both, in practice, ignored by every engine: nothing here
+  // shows UI, and a command that takes no value ignores one.
+  define('execCommand', 1, function (command, showUi, value) {
+    return _edExecCommand(this, command, showUi === undefined ? false : showUi,
+      value === undefined ? '' : String(value));
+  });
+  define('queryCommandEnabled', 1, function (command) {
+    return _edQueryEnabled(this, String(command).toLowerCase());
+  });
+  define('queryCommandIndeterm', 1, function (command) { return _edQueryIndeterm(this, command); });
+  define('queryCommandState', 1, function (command) { return _edQueryState(this, command); });
+  // "supported" is the one query that asks nothing about the document — it is
+  // pure feature detection, and it is how an editor decides which buttons to draw
+  // at all. Answering it honestly is what lets a page degrade on purpose.
+  define('queryCommandSupported', 1, function (command) {
+    return String(command).toLowerCase() in _EDIT_COMMANDS;
+  });
+  define('queryCommandValue', 1, function (command) { return _edQueryValue(this, command); });
+}
+// ===== EDITING-ENGINE-END =====
 
 // AbstractRange / StaticRange (DOM). A StaticRange is a range that does NOT move
 // when the tree under it does — the opposite of a live Range, and the right shape

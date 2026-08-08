@@ -62,6 +62,27 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **THE EDITING ARC — Quests #514–#516 (2026-08-08), whole realm, 43 files** | **7,538/96,682** | **94,468/96,682 (97.7%) — every file improved, 0 regressions** | ✅ | #514–#516 |
+| **the commanded — Quest #514 (2026-08-08)** | `execCommand(){return false}`; the five `queryCommand*` methods **did not exist**; **`getComputedStyle(x).display` was `block` for EVERY element** | a real UA stylesheet + the editing engine's read paths | ✅ realm opened | #514 · [`tickets/115-the-commanded-verdict.md`](tickets/115-the-commanded-verdict.md) |
+| `editing/run/*` — after #514 (read paths) | 7,538/96,682 | **77,803/96,682** | ✅ | #514 |
+| **the styled — Quest #515 (2026-08-08)** | no inline command could change anything | *set the selection's value*: clear → push down → force → reorder | ✅ | #515 · [`tickets/116-the-styled-verdict.md`](tickets/116-the-styled-verdict.md) |
+| `editing/run/*` — after #515 (inline writes) | 77,803/96,682 | **82,962/96,682** | ✅ | #515 |
+| `editing/run/removeformat.html` | 172/1832 | **1831/1832** | ✅ | #515 |
+| `editing/run/bold.html` | 236/3048 | **3022/3048** | ✅ | #515 |
+| `editing/run/italic.html` | 141/2073 | **2018/2073** | ✅ | #515 |
+| **the typed — Quest #516 (2026-08-08)** | Enter, Backspace, lists, indent and justify all did nothing | `deleteSelection` + the block/insertion commands | ✅ | #516 · [`tickets/117-the-typed-verdict.md`](tickets/117-the-typed-verdict.md) |
+| `editing/run/*` — after #516 (block writes) | 82,962/96,682 | **94,468/96,682** | ✅ | #516 |
+| `editing/run/createlink.html` | 63/441 | **441/441** | ✅ | #516 |
+| `editing/run/inserthorizontalrule.html` | 114/1348 | **1347/1348** | ✅ | #516 |
+| `editing/run/justifyleft.html` | 203/2503 | **2500/2503** | ✅ | #516 |
+| `editing/run/outdent.html` | 181/2550 | **2540/2550** | ✅ | #516 |
+| `editing/run/insertparagraph.html` | 514/7195 | **7088/7195** | ✅ | #516 |
+| `editing/run/justifycenter.html` | 309/6203 | **6137/6203** | ✅ | #516 |
+| `editing/run/formatblock.html` | 473/5046 | **4885/5046** | ✅ | #516 |
+| `editing/run/delete.html` | 706/7842 | **7633/7842** (page's own harness timeout) | ⚠️ perf cap | #516 |
+| `editing/run/forwarddelete.html` | 673/7491 | **7273/7491** (page's own harness timeout) | ⚠️ perf cap | #516 |
+| `editing/run/multitest.html` | 660/10092 | **9753/10092** (page's own harness timeout) | ⚠️ perf cap | #516 |
+| `html/semantics/…/naturalWidth-naturalHeight-width-height` | 189/258 | **210/258** (UA stylesheet) | ✅ | #514 |
 | **THE IMAGE ARC — Quests #511–#513 (2026-08-08), 233-file probe** | **189/1036** | **601/1036 — 76 files improved, 0 regressions** | ✅ | #511–#513 |
 | **the decoder — Quest #511 the decoded verdict (2026-08-08)** | `createImageBitmap()` resolved with a **0×0 placeholder**; `drawImage` from an `<img>`/`ImageBitmap` drew nothing | new Rust op `op_image_decode` (png/jpeg/**gif**/**webp**/bmp/ico, under memory limits) + a real `ImageBitmap` | ✅ cap closed | #511 · [`tickets/112-the-decoded-verdict.md`](tickets/112-the-decoded-verdict.md) |
 | `html/canvas/element/drawing-images-to-the-canvas` (37 files) | 12/37 | **34/37** | ✅ | #511 |

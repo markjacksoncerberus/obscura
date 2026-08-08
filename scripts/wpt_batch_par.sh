@@ -26,6 +26,17 @@ LIST="$1"; OUT="$2"; SHARDS="${3:-3}"; CHUNK="${4:-4}"; TMO="${5:-25}"
 BIN="${6:-./target/release/obscura}"
 cd "$(dirname "$0")/.."
 
+# Pre-flight: refuse to start if any shard port is already listening. Cheaper to
+# fail here than to discover it in the results table — see the FATAL check below.
+for i in $(seq 0 $((SHARDS - 1))); do
+  p=$((9400 + i))
+  if curl -s --max-time 1 "http://127.0.0.1:$p/json/version" >/dev/null 2>&1; then
+    echo "[par] FATAL: port $p is already serving. A previous run left a server behind." >&2
+    echo "[par] Kill it first:  ss -ltnp | grep $p" >&2
+    exit 1
+  fi
+done
+
 WORK="$(mktemp -d)"
 grep -vE '^\s*(#|$)' "$LIST" > "$WORK/all.txt"
 TOTAL=$(wc -l < "$WORK/all.txt")
@@ -46,6 +57,19 @@ run_shard() {
       curl -s "http://127.0.0.1:$port/json/version" >/dev/null 2>&1 && break
       sleep 0.5
     done
+    # ⚠️⚠️ THE PORT MUST BE OURS. If a server from an EARLIER run is still bound
+    # to this port — orphaned by a killed parent shell, or by a chunk whose
+    # `kill` raced — then our server exits with "Address already in use", the
+    # ready-check curl above SUCCEEDS against the stale one, and this whole run
+    # silently measures the OLD BINARY. It does not error. It produces a
+    # complete, plausible, entirely wrong table, which is the worst failure a
+    # measurement tool can have. (This cost the editing arc one full probe pass:
+    # 43 files that all came back at exactly their pre-arc baselines.)
+    if ! kill -0 "$srv" 2>/dev/null; then
+      echo "[par] FATAL: server for port $port died (port already in use?) — see $sdir/server.log" >&2
+      echo "[par] FATAL: port $port was not ours; rows would have measured a STALE binary" >> "$out"
+      return 1
+    fi
     # ⚠️ A HARD wall-clock cap on the whole chunk, on top of wpt_run's per-test
     # timeout. The per-test timeout lives INSIDE the page: it cannot fire if the
     # engine itself has stopped answering. A single `ctx.strokeRect(0, 0,

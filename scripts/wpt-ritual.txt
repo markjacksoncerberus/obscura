@@ -367,3 +367,20 @@ html/semantics/embedded-content/the-img-element/naturalWidth-naturalHeight-width
 html/semantics/embedded-content/the-img-element/img.complete.html
 html/semantics/embedded-content/the-img-element/data-url.html
 html/semantics/embedded-content/the-img-element/natural-size-orientation.html
+# ── editing guards (quests #514-#516). A SUBSET on purpose: the realm is 43
+# files and three of them (delete, forwarddelete, multitest) each run for ten
+# minutes and time out on the page's own harness clock. These twelve cover the
+# read paths, the inline write path, the block write path and the content model
+# between them, and they run fast.
+editing/run/bold.html
+editing/run/createlink.html
+editing/run/indent.html
+editing/run/inserthorizontalrule.html
+editing/run/inserthtml.html
+editing/run/insertorderedlist.html
+editing/run/italic.html
+editing/run/justifyleft.html
+editing/run/misc.html
+editing/run/outdent.html
+editing/run/removeformat.html
+editing/run/unlink.html
