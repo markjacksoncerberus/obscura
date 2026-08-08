@@ -31,6 +31,16 @@ html5ever = { workspace = true }
 deno_error = "0.6"
 base64 = { workspace = true }
 encoding_rs = "0.8"
+# The image decoder behind `createImageBitmap()`, `<img>` load/error events and
+# `drawImage(img, …)` — see `image_ops.rs`. A DIRECT dependency rather than
+# something borrowed from the optional `render` feature, on purpose: every codec
+# listed here is pure Rust, so a build with no renderer still shows pictures, and
+# a page's image handling should not depend on how the browser was compiled.
+# Cargo unifies these features with the set `obscura-render` declares, so `gif`
+# and `webp` reach the paint path too — both are formats the real web is full of.
+# AVIF stays behind `obscura-render`'s optional `avif` feature, because its
+# decoder pulls a C library and a portable build matters more than one format.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico", "bmp", "gif", "webp"] }
 # CompressionStream / DecompressionStream. `rust_backend` keeps miniz_oxide as
 # the DEFLATE engine, so the browser still builds with no C toolchain present.
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }

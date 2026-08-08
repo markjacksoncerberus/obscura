@@ -5709,6 +5709,23 @@ class Element extends Node {
     // never touches the tree.
     { const _tt = _ttAttrSink(this, qname, null, v); if (_tt !== null) v = _tt; }
     if (qname === 'width' || qname === 'height') _c2dDimGen++;
+    // Changing an <img>'s src RESTARTS its current request, and the reset is
+    // visible immediately — `2d.drawImage.incomplete.emptysrc` assigns `""` and
+    // draws in the very next statement, asserting that the OLD image is gone.
+    // Keeping the previous pixels alive until a replacement arrives would paint
+    // the image the page just said it no longer wants.
+    if (qname === 'src' && this.localName === 'img') _imgResetRequest(this);
+    // `srcset`/`sizes` are inputs to the same choice as `src`, so a change to
+    // either re-runs source selection. Deferred to a task: a page that sets
+    // `srcset` and then `sizes` on the next line must not fetch twice.
+    if ((qname === 'srcset' || qname === 'sizes') && this.localName === 'img') {
+      const el = this;
+      _imgResetRequest(el);
+      if (!el.__imgReselectQueued) {
+        el.__imgReselectQueued = true;
+        _queueTask(() => { el.__imgReselectQueued = false; _imgUpdateImageData(el); });
+      }
+    }
     const _ceOld = this._ceState === "custom" ? _domParse("get_attribute", this._nid, qname) : undefined;
     // Capture the popover attribute's OLD value before the write — a type change
     // while the popover is showing must hide it (popover attribute change steps).
@@ -5791,6 +5808,8 @@ class Element extends Node {
     // Detach the cached Attr (snapshotting its live value) BEFORE the removal,
     // so a node later re-attached elsewhere keeps its value.
     if (qname === 'width' || qname === 'height') _c2dDimGen++;
+    // Removing src is the same restart as changing it — see setAttribute.
+    if (qname === 'src' && this.localName === 'img') _imgResetRequest(this);
     const doomed = this.getAttributeNode(qname);
     const val = doomed ? doomed.value : null;
     _dom("remove_attribute", this._nid, qname);
@@ -6184,7 +6203,19 @@ class Element extends Node {
     // <img>: setting src starts a fetch (whether or not the element is
     // connected) which records a Resource Timing entry and fires load/error.
     if (this.localName === 'img') {
-      if (v) _loadElementResource(this, v, 'img');
+      // Not `_loadElementResource(this, v)` — `src` is only ONE input to the
+      // choice. With a `srcset` present (or a `<picture>` parent) the element
+      // may well want a different file entirely, and jumping straight to the
+      // fetch here is how an engine downloads the desktop image it was told not
+      // to.  (setAttribute above has already reset the request.)
+      _imgUpdateImageData(this);
+      return;
+    }
+    // <video>/<audio>: kick off resource selection, which in this build always
+    // fails — see the HTMLMediaElement block. The point is that it fails OUT
+    // LOUD, on a task, so the page's fallback runs.
+    if (this.localName === 'video' || this.localName === 'audio') {
+      if (globalThis.__mediaSrcChanged) globalThis.__mediaSrcChanged(this);
       return;
     }
     if (this.localName === 'iframe') {
@@ -6924,6 +6955,7 @@ Object.defineProperty(Element.prototype, 'width', {
   get() {
     const tag = this.localName;
     if (tag === 'canvas') return _c2dDim(this, 'width', 300);
+    if (tag === 'img') return __imgIdlDim(this, 'width');
     if (tag === 'hr' || __DOMSTRING_WH_TAGS.has(tag)) return this.getAttribute('width') ?? '';
     if (tag === 'pre') {
       const num = __parseHtmlSignedInt(this.getAttribute('width'));
@@ -6935,10 +6967,44 @@ Object.defineProperty(Element.prototype, 'width', {
   set(v) {
     const tag = this.localName;
     if (tag === 'canvas') { _c2dSetDim(this, 'width', v, 300); return; }
+    if (tag === 'img') { this.setAttribute('width', String(__imgUlong(v))); return; }
     if (tag === 'hr' || __DOMSTRING_WH_TAGS.has(tag)) this.setAttribute('width', String(v));
     else if (tag === 'pre') this.setAttribute('width', String(v | 0));
   },
 });
+
+// `<img>.width` / `.height` are `unsigned long`, and the value they report is
+// NOT simply the content attribute: HTML says the rendered width if the element
+// is being rendered, the intrinsic width if it is not but the image is
+// available, and 0 otherwise. The intrinsic fallback is the one that matters in
+// practice — it is how `new Image(); img.onload = () => img.width` works at all,
+// and there is no attribute involved anywhere in that idiom.
+const __imgUlong = function (v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  const t = Math.trunc(n);
+  return t < 0 || t > 4294967295 ? 0 : (t >>> 0);
+};
+// The density-corrected natural width or height. `axis` is 'w' or 'h'.
+const __imgNatural = function (el, axis) {
+  const r = el[_IMG_REQ];
+  if (!r || r.state !== 'complete' || !r.bitmap) return 0;
+  const raw = axis === 'w' ? r.bitmap.w : r.bitmap.h;
+  // `intrinsic` names the axes whose value came out of the file. A raster image
+  // sets both; an SVG sets only the ones it actually declared.
+  const own = r.bitmap.intrinsic;
+  const correct = own ? own[axis] : true;
+  const d = r.density > 0 ? r.density : 1;
+  return correct ? Math.round(raw / d) : raw;
+};
+const __imgIdlDim = function (el, which) {
+  const attr = el.getAttribute(which);
+  if (attr != null && attr !== '') {
+    const n = __parseHtmlSignedInt(attr);
+    if (n !== null && n >= 0) return n;
+  }
+  return __imgNatural(el, which === 'width' ? 'w' : 'h');
+};
 
 // `height` is a DOMString content attribute on <iframe>/<embed>/<object>/<marquee>
 // and an `unsigned long` (default 150) on <canvas>. Every other element keeps the
@@ -6948,10 +7014,12 @@ Object.defineProperty(Element.prototype, 'height', {
   configurable: true, enumerable: true,
   get() {
     if (this.localName === 'canvas') return _c2dDim(this, 'height', 150);
+    if (this.localName === 'img') return __imgIdlDim(this, 'height');
     return __DOMSTRING_WH_TAGS.has(this.localName) ? (this.getAttribute('height') ?? '') : undefined;
   },
   set(v) {
     if (this.localName === 'canvas') { _c2dSetDim(this, 'height', v, 150); return; }
+    if (this.localName === 'img') { this.setAttribute('height', String(__imgUlong(v))); return; }
     if (__DOMSTRING_WH_TAGS.has(this.localName)) this.setAttribute('height', String(v));
     else Object.defineProperty(this, 'height', { value: v, writable: true, enumerable: true, configurable: true });
   },
@@ -9400,6 +9468,543 @@ const _entryContentType = function(resourceUrl, headers, pageOrigin) {
   return "";
 };
 
+// ===== IMAGE-DECODE-BEGIN =====
+// Encoded bytes → pixels. `op_image_decode` (crates/obscura-js/src/image_ops.rs)
+// runs PNG/JPEG/GIF/WebP/BMP/ICO through the `image` crate under explicit memory
+// limits and hands back straight-alpha RGBA behind a 16-byte header.
+//
+// Everything the JS realm can draw from funnels through here: `<img>` after its
+// fetch completes, `createImageBitmap(blob)`, and (later) `createPattern`. That
+// is deliberate — one decode path means one place where a malformed image is
+// decided to be broken, and one convention for what the pixels mean.
+
+// Straight (non-premultiplied) RGBA, or null when the bytes are not something
+// this build can decode.
+//
+// Null is the ONLY failure signal, and the decoder's message is deliberately
+// dropped. "unsupported color type: Rgb16" tells a page which codecs this binary
+// was compiled with, which is a fingerprinting surface and not a diagnostic the
+// page can act on — every caller's spec-defined behaviour for a failed decode is
+// the same regardless of why.
+const _imgDecodeBytes = function (bytes) {
+  if (!bytes || !bytes.length) return null;
+  let buf;
+  try { buf = Deno.core.ops.op_image_decode(bytes); } catch (e) { return null; }
+  if (!buf || buf.byteLength < 16) return null;
+  const hv = new DataView(buf.buffer, buf.byteOffset, 16);
+  const w = hv.getUint32(0, true), h = hv.getUint32(4, true), orientation = hv.getUint32(8, true);
+  if (!w || !h || buf.byteLength < 16 + w * h * 4) return null;
+  return { w, h, orientation, data: new Uint8ClampedArray(buf.buffer, buf.byteOffset + 16, w * h * 4) };
+};
+
+// The rasterizer stores PREMULTIPLIED RGBA (see the CANVAS2D header comment);
+// decoders and `ImageData` both use straight alpha. Converting once, at the
+// boundary, is what stops every sampling site having to remember which of the
+// two conventions the buffer in its hand is using — a confusion that shows up as
+// dark fringes around anti-aliased edges and is very hard to see in a unit test.
+const _imgPremultiply = function (src) {
+  const out = new Uint8ClampedArray(src.length);
+  for (let i = 0; i < src.length; i += 4) {
+    const a = src[i + 3];
+    if (a === 0) continue;                       // out is already transparent black
+    out[i + 3] = a;
+    if (a === 255) { out[i] = src[i]; out[i + 1] = src[i + 1]; out[i + 2] = src[i + 2]; continue; }
+    out[i] = Math.round(src[i] * a / 255);
+    out[i + 1] = Math.round(src[i + 1] * a / 255);
+    out[i + 2] = Math.round(src[i + 2] * a / 255);
+  }
+  return out;
+};
+// Apply an EXIF orientation tag (1–8) to a bitmap, returning a new one.
+//
+// Tags 5–8 transpose the image, so width and height SWAP — get that wrong and a
+// portrait photograph from a phone is drawn into a landscape box and squashed,
+// which is the single most common "why is my upload sideways" bug on the web.
+// The op reports the tag and applies nothing, because `imageOrientation: "none"`
+// (the default for `createImageBitmap`) means the caller wants the stored pixels.
+const _imgOrient = function (bm, tag) {
+  if (!tag || tag === 1) return bm;
+  const sw = bm.w, sh = bm.h, src = bm.data;
+  const swap = tag >= 5;
+  const dw = swap ? sh : sw, dh = swap ? sw : sh;
+  const out = new Uint8ClampedArray(dw * dh * 4);
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < sw; x++) {
+      let nx, ny;
+      switch (tag) {
+        case 2: nx = sw - 1 - x; ny = y; break;              // flip horizontal
+        case 3: nx = sw - 1 - x; ny = sh - 1 - y; break;     // rotate 180
+        case 4: nx = x; ny = sh - 1 - y; break;              // flip vertical
+        case 5: nx = y; ny = x; break;                       // transpose
+        case 6: nx = sh - 1 - y; ny = x; break;              // rotate 90° CW
+        case 7: nx = sh - 1 - y; ny = sw - 1 - x; break;     // transverse
+        case 8: nx = y; ny = sw - 1 - x; break;              // rotate 270° CW
+        default: nx = x; ny = y;
+      }
+      const si = (y * sw + x) * 4, di = (ny * dw + nx) * 4;
+      out[di] = src[si]; out[di + 1] = src[si + 1];
+      out[di + 2] = src[si + 2]; out[di + 3] = src[si + 3];
+    }
+  }
+  return { w: dw, h: dh, orientation: 1, data: out };
+};
+
+// ---- the <img> element's "current request" -------------------------------
+// HTML models an <img> as an element plus a *current request* with a state:
+// unavailable, partially available, completely available, or broken. Canvas,
+// `naturalWidth`, `complete` and `decode()` all ask the request, not the
+// element, and they give three different answers for the three states — so the
+// state has to be modelled explicitly rather than inferred from "do we have
+// pixels". An <img> that has never been given a src is `complete === true` with
+// no pixels; one still fetching is `complete === false`; one that 404'd is
+// `complete === true` and throws from `drawImage`. Collapse those and a page
+// either waits forever or draws a broken image.
+const _IMG_REQ = Symbol('imgCurrentRequest');
+const _imgRequest = function (el) {
+  let r = el[_IMG_REQ];
+  if (!r) r = el[_IMG_REQ] = { state: 'unavailable', bitmap: null, url: '', decoders: [] };
+  return r;
+};
+// Settle any pending `img.decode()` promises. The spec resolves them once the
+// image is decoded and rejects with an EncodingError once it is broken; a
+// promise left dangling is an `await` that never returns, which is worse than
+// either answer.
+const _imgSettleDecoders = function (req) {
+  const list = req.decoders;
+  if (!list || !list.length) return;
+  req.decoders = [];
+  for (const d of list) {
+    if (req.state === 'complete') d.resolve();
+    else d.reject(new DOMException('The source image cannot be decoded.', 'EncodingError'));
+  }
+};
+const _imgMarkBroken = function (el) {
+  const req = _imgRequest(el);
+  req.state = 'broken'; req.bitmap = null;
+  _imgSettleDecoders(req);
+};
+// Back to "nothing here yet". Called whenever the src attribute changes or is
+// removed; also bumps the load generation so an in-flight fetch for the OLD src
+// cannot land afterwards and resurrect it.
+const _imgResetRequest = function (el) {
+  const req = el[_IMG_REQ];
+  if (!req) return;
+  req.state = 'unavailable'; req.bitmap = null; req.url = ''; req.density = 1;
+  el._resLoadGen = (el._resLoadGen || 0) + 1;
+};
+
+// HTML's "update the image data": re-run source selection and start (or stop)
+// the fetch. This is the ONE entry point — the `src` setter, a `srcset` change,
+// a `sizes` change and the initial markup scan all come through here, so they
+// cannot disagree about which file the element wants.
+const _imgUpdateImageData = function (el) {
+  _imgResetRequest(el);
+  const sel = _imgSelectSource(el);
+  if (!sel || !sel.url) return;                  // nothing to load; stays unavailable
+  const req = _imgRequest(el);
+  req.density = sel.density > 0 ? sel.density : 1;
+  _loadElementResource(el, sel.url, 'img');
+};
+
+// Does this look like SVG? Cheap sniff over the first bytes, ignoring leading
+// whitespace and an XML declaration or doctype.
+//
+// Why it matters: this build has no vector rasterizer reachable from the JS
+// realm, so `_imgDecodeBytes` fails on every SVG. Reporting that as `error`
+// would be a LIE about the network — the file arrived, intact, and every other
+// browser fires `load`. A page listening for `error` to swap in a fallback would
+// swap out a perfectly good logo. So an SVG becomes a loaded image with NO
+// INTRINSIC SIZE, which is a real state HTML already defines: `load` fires,
+// `complete` is true, `naturalWidth` is 0, and canvas draws nothing rather than
+// throwing. That is the truthful shape of "we have it and cannot paint it".
+// ---- an SVG image's NATURAL SIZE, without rasterizing it ------------------
+// A vector image still has a size, and the size is written down in the file. We
+// cannot paint an SVG from the JS realm, but we can read its root element and
+// answer every sizing question a page asks — `naturalWidth`, the aspect ratio
+// layout needs to reserve a box, the intrinsic dimensions `object-fit` resolves
+// against.
+//
+// That matters more than it sounds: SVG is what logos, icons and charts are made
+// of now, and it is the format a slow connection most benefits from (a few
+// hundred bytes instead of three resolutions of PNG). An engine that reports 0×0
+// for every SVG makes the page reflow as each one arrives, or collapses the
+// header to nothing — the visible symptom of "the browser doesn't know how big
+// this is yet" that image sizing exists to prevent.
+
+// Absolute CSS units only. A percentage is explicitly NOT a natural dimension
+// (there is nothing to resolve it against), and font-relative units would need a
+// font we have not resolved — answering "no natural dimension" for those is the
+// same answer the default sizing algorithm already knows how to handle.
+const _SVG_UNIT_PX = { '': 1, px: 1, pt: 4 / 3, pc: 16, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6, in: 96 };
+const _svgLengthPx = function (v) {
+  if (v == null) return null;
+  const m = /^\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)\s*([a-z%]*)\s*$/.exec(String(v));
+  if (!m) return null;
+  const unit = m[2].toLowerCase();
+  if (unit === '%') return null;
+  const f = _SVG_UNIT_PX[unit];
+  if (f === undefined) return null;
+  const n = parseFloat(m[1]) * f;
+  // Negative is not a natural dimension; ZERO is. `width="0"` really does mean
+  // "this image is zero pixels wide", and the two must not be collapsed — one
+  // falls back to the default 300, the other does not.
+  if (!isFinite(n) || n < 0) return null;
+  return n;
+};
+// Attribute lookup on a raw start tag. SVG is XML, so the names are
+// CASE-SENSITIVE: `viewBox` is an attribute and `viewbox` is not one.
+const _svgAttrOf = function (tag, name) {
+  const re = new RegExp('(?:^|\\s)' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))');
+  const m = re.exec(tag);
+  if (!m) return null;
+  return m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : m[3];
+};
+// CSS Images §default-sizing-algorithm, with HTML's default object size of
+// 300×150 — the same numbers a `<canvas>` defaults to, and for the same reason.
+const _svgNaturalSize = function (text) {
+  const m = /<svg(?=[\s>/])[^>]*>/.exec(text);
+  if (!m) return null;
+  const tag = m[0];
+  const w = _svgLengthPx(_svgAttrOf(tag, 'width'));
+  const h = _svgLengthPx(_svgAttrOf(tag, 'height'));
+  let ratio = null;
+  const vb = _svgAttrOf(tag, 'viewBox');
+  if (vb) {
+    const p = String(vb).trim().split(/[\s,]+/).map(Number);
+    // A viewBox with a zero (or non-finite) extent gives NO aspect ratio — it is
+    // degenerate, not a 0:0 ratio, and it must leave the other rules untouched.
+    if (p.length === 4 && p.every((n) => isFinite(n)) && p[2] > 0 && p[3] > 0) ratio = p[2] / p[3];
+  }
+  const DW = 300, DH = 150;
+  // `intrinsic` records which axes are the IMAGE's own, as opposed to borrowed
+  // from the default object size. Only the former get density-corrected — see
+  // `__imgNatural`. A dimension derived from a declared one THROUGH the aspect
+  // ratio counts as the image's own, because the ratio is the image's own too.
+  if (w !== null && h !== null) return { w, h, intrinsic: { w: true, h: true } };
+  if (w !== null) return ratio !== null
+    ? { w, h: w / ratio, intrinsic: { w: true, h: true } }
+    : { w, h: DH, intrinsic: { w: true, h: false } };
+  if (h !== null) return ratio !== null
+    ? { w: h * ratio, h, intrinsic: { w: true, h: true } }
+    : { w: DW, h, intrinsic: { w: false, h: true } };
+  if (ratio !== null) {
+    // Neither dimension given: fit the ratio INSIDE the default object size,
+    // which is `contain`, not `cover` — a 3:1 image becomes 300×100, never
+    // 450×150 (which would be wider than the box it has to fit).
+    let cw = DW, ch = DW / ratio;
+    if (ch > DH) { ch = DH; cw = DH * ratio; }
+    // Both axes come from the default object size here — the ratio only chose
+    // how to fit inside it — so neither is density-corrected.
+    return { w: cw, h: ch, intrinsic: { w: false, h: false } };
+  }
+  return { w: DW, h: DH, intrinsic: { w: false, h: false } };
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RESPONSIVE IMAGES: srcset, sizes and <picture>
+// ═══════════════════════════════════════════════════════════════════════════
+// This is the single most important feature on the web for the people this
+// browser is FOR, and the engine ignored it completely.
+//
+// `srcset` is how a page says "here is the same picture at three sizes; take
+// the one that suits your screen." A phone with a 360-pixel-wide display and a
+// pay-per-megabyte connection is supposed to download the 360-pixel file. An
+// engine that reads only `src` downloads the 1600-pixel desktop original —
+// often ten times the bytes, for an image that will be scaled down and thrown
+// away. Every responsibly built site on the web already ships the small file.
+// We were declining to ask for it.
+//
+// It is also `<picture>`, which is how a page ships a modern format with a
+// fallback, and how it swaps a wide banner for a tall one on a narrow screen.
+//
+// Three algorithms from HTML §4.8.4, in order: parse a srcset attribute, update
+// the source set, select an image source.
+
+// "Parse a srcset attribute" — a URL, then at most one descriptor per axis.
+// Returns a list of `{ url, d, w, h }` with the unset descriptors left null.
+const _parseSrcset = function (input) {
+  const s = String(input);
+  const n = s.length;
+  let pos = 0;
+  const out = [];
+  const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f';
+  while (pos < n) {
+    while (pos < n && (isWs(s[pos]) || s[pos] === ',')) pos++;
+    if (pos >= n) break;
+    const urlStart = pos;
+    while (pos < n && !isWs(s[pos])) pos++;
+    let url = s.slice(urlStart, pos);
+    const descriptors = [];
+    if (url.endsWith(',')) {
+      // A URL that swallowed the separator has NO descriptors — the commas are
+      // the delimiter, not part of the token.
+      url = url.replace(/,+$/, '');
+    } else {
+      // Tokenize descriptors up to the next top-level comma, respecting
+      // parentheses so a `calc(1px, …)` cannot end the candidate early.
+      let cur = '', depth = 0, done = false;
+      while (pos < n && !done) {
+        const c = s[pos];
+        if (depth === 0 && c === ',') { pos++; done = true; }
+        else if (depth === 0 && isWs(c)) { if (cur) { descriptors.push(cur); cur = ''; } pos++; }
+        else {
+          if (c === '(') depth++;
+          else if (c === ')' && depth > 0) depth--;
+          cur += c; pos++;
+        }
+      }
+      if (cur) descriptors.push(cur);
+    }
+    if (!url) continue;
+    // Descriptor validation. Anything ambiguous drops the WHOLE candidate — a
+    // half-understood descriptor would make us pick the wrong file, which is
+    // exactly the mistake this feature exists to avoid.
+    let d = null, w = null, h = null, bad = false;
+    for (const desc of descriptors) {
+      const last = desc[desc.length - 1];
+      const num = desc.slice(0, -1);
+      if (last === 'w') {
+        if (w !== null || d !== null || !/^[0-9]+$/.test(num)) { bad = true; break; }
+        const v = parseInt(num, 10);
+        if (!(v > 0)) { bad = true; break; }
+        w = v;
+      } else if (last === 'x') {
+        if (d !== null || w !== null || h !== null || !/^[+]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(num)) { bad = true; break; }
+        const v = parseFloat(num);
+        if (!(v > 0)) { bad = true; break; }
+        d = v;
+      } else if (last === 'h') {
+        if (h !== null || d !== null || !/^[0-9]+$/.test(num)) { bad = true; break; }
+        const v = parseInt(num, 10);
+        if (!(v > 0)) { bad = true; break; }
+        h = v;
+      } else { bad = true; break; }
+    }
+    // A height descriptor is meaningless without a width descriptor to pair it
+    // with; the spec calls that a parse error for the candidate.
+    if (h !== null && w === null) bad = true;
+    if (bad) continue;
+    out.push({ url, d, w, h });
+  }
+  return out;
+};
+
+// "Parse a sizes attribute": the first entry whose media condition matches wins;
+// a bare length has no condition and always matches. Default is 100vw, which is
+// what makes a plain `srcset="… 800w"` behave sensibly with no `sizes` at all.
+const _parseSizes = function (input) {
+  const vw = (globalThis.innerWidth || 1280);
+  if (input == null) return vw;
+  // Split on top-level commas.
+  const parts = [];
+  let cur = '', depth = 0;
+  const s = String(input);
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(') depth++;
+    else if (c === ')' && depth > 0) depth--;
+    if (c === ',' && depth === 0) { parts.push(cur); cur = ''; } else cur += c;
+  }
+  parts.push(cur);
+  for (const raw of parts) {
+    const t = raw.trim();
+    if (!t) continue;
+    // The source-size-value is the LAST component; anything before it is the
+    // media condition.
+    const m = /(?:^|\s|\))\s*([^\s()]+)\s*$/.exec(t);
+    const lenTok = m ? m[1] : t;
+    const cond = t.slice(0, t.length - lenTok.length).trim();
+    if (cond) {
+      let matches = false;
+      try { matches = !!(globalThis.matchMedia && globalThis.matchMedia(cond).matches); } catch (e) { matches = false; }
+      if (!matches) continue;
+    }
+    const px = _imgSizeToPx(lenTok, vw);
+    if (px !== null && px >= 0) return px;
+  }
+  return vw;
+};
+const _imgSizeToPx = function (tok, vw) {
+  const m = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)([a-z%]*)$/i.exec(String(tok).trim());
+  if (!m) return null;
+  const v = parseFloat(m[1]);
+  if (!isFinite(v)) return null;
+  const vh = (globalThis.innerHeight || 720);
+  switch (m[2].toLowerCase()) {
+    case '': case 'px': return v;
+    case 'em': case 'rem': return v * 16;
+    case 'vw': return v * vw / 100;
+    case 'vh': return v * vh / 100;
+    case 'vmin': return v * Math.min(vw, vh) / 100;
+    case 'vmax': return v * Math.max(vw, vh) / 100;
+    case 'cm': return v * 96 / 2.54;
+    case 'mm': return v * 96 / 25.4;
+    case 'in': return v * 96;
+    case 'pt': return v * 4 / 3;
+    case 'pc': return v * 16;
+    default: return null;                        // percentages have nothing to resolve against
+  }
+};
+
+// Types we will claim to decode for a `<source type>`. Deliberately the list the
+// decoder ACTUALLY handles: claiming AVIF here would make a `<picture>` hand us
+// the AVIF and skip the JPEG fallback it carefully provided.
+const _IMG_SUPPORTED_TYPES = new Set([
+  'image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/bmp', 'image/webp',
+  'image/x-icon', 'image/vnd.microsoft.icon', 'image/svg+xml',
+]);
+
+// "Update the source set" (HTML §4.8.4.3). Returns `{ candidates, sourceSize }`.
+const _imgSourceSet = function (el) {
+  const empty = { candidates: [], sourceSize: 0 };
+  const parent = el.parentElement;
+  const inPicture = parent && parent.localName === 'picture';
+  const nodes = inPicture ? Array.prototype.slice.call(parent.children) : [el];
+  for (const child of nodes) {
+    if (child === el) {
+      let candidates = el.hasAttribute('srcset') ? _parseSrcset(el.getAttribute('srcset')) : [];
+      const sourceSize = _parseSizes(el.hasAttribute('sizes') ? el.getAttribute('sizes') : null);
+      const src = el.getAttribute('src');
+      // `src` is the last resort, and only when srcset has not already claimed
+      // the 1x slot: a page that wrote both means the srcset to win.
+      if (src && !candidates.some((c) => c.d === 1 || c.d === null || c.w !== null)) {
+        candidates = candidates.concat([{ url: src, d: 1, w: null, h: null }]);
+      } else if (src && candidates.length === 0) {
+        candidates = [{ url: src, d: 1, w: null, h: null }];
+      }
+      return { candidates, sourceSize };
+    }
+    if (child.localName !== 'source') continue;
+    // ⚠️ Namespace matters: an SVG `<source>` is not an HTML `<source>`, and the
+    // test suite really does put one inside an inline `<svg>` to check we do not
+    // pick it up.
+    if (child.namespaceURI && child.namespaceURI !== 'http://www.w3.org/1999/xhtml') continue;
+    if (!child.hasAttribute('srcset')) continue;
+    const candidates = _parseSrcset(child.getAttribute('srcset'));
+    if (!candidates.length) continue;
+    if (child.hasAttribute('media')) {
+      const q = child.getAttribute('media');
+      let matches = false;
+      // An EMPTY media attribute matches everything; an unparseable one matches
+      // nothing. `matchMedia('')` is the "all" query, so the distinction is the
+      // parser's, not ours.
+      try { matches = q === '' ? true : !!(globalThis.matchMedia && globalThis.matchMedia(q).matches); } catch (e) { matches = false; }
+      if (!matches) continue;
+    }
+    if (child.hasAttribute('type')) {
+      const t = String(child.getAttribute('type')).trim().toLowerCase();
+      if (t !== '' && !_IMG_SUPPORTED_TYPES.has(t.split(';')[0].trim())) continue;
+    }
+    const sourceSize = _parseSizes(child.hasAttribute('sizes') ? child.getAttribute('sizes') : null);
+    return { candidates, sourceSize };
+  }
+  return empty;
+};
+
+// "Select an image source": normalise every candidate to a DENSITY, then take
+// the smallest one that still covers the display, falling back to the largest
+// available. Ties go to the first candidate, which is what lets an author put
+// their preferred format first.
+//
+// Choosing the smallest sufficient density — rather than the largest, or the
+// last — is the whole point. On a 1× screen, `srcset="a.jpg 1x, a@3x.jpg 3x"`
+// must fetch `a.jpg`; fetching the 3× file wastes nine times the bytes to draw
+// exactly the same pixels.
+const _imgSelectSource = function (el) {
+  const { candidates, sourceSize } = _imgSourceSet(el);
+  if (!candidates.length) return null;
+  const dpr = globalThis.devicePixelRatio || 1;
+  let best = null;
+  for (const c of candidates) {
+    const density = c.w !== null ? (sourceSize > 0 ? c.w / sourceSize : Infinity) : (c.d === null ? 1 : c.d);
+    if (best === null) { best = { c, density }; continue; }
+    const bestOk = best.density >= dpr, thisOk = density >= dpr;
+    if (thisOk && !bestOk) best = { c, density };
+    else if (thisOk && bestOk && density < best.density) best = { c, density };
+    else if (!thisOk && !bestOk && density > best.density) best = { c, density };
+  }
+  return { url: best.c.url, density: best.density };
+};
+
+// Turn the bytes an <img> just received into its current request, and fire the
+// one event that follows. Shared by the network path and the data:-URL path,
+// because "did this become an image?" must be decided in exactly one place —
+// two copies of this decision is two different opinions about what `load` means.
+const _imgAdoptBytes = function (el, bytes, url, headers) {
+  const req = _imgRequest(el);
+  req.url = url || '';
+  const dec = (bytes && bytes.length) ? _imgDecodeBytes(bytes) : null;
+  if (!dec) {
+    if (bytes && bytes.length && _imgLooksLikeSvg(bytes, headers)) {
+      // Available, with a real natural size read out of the file, and no pixels
+      // — see `_imgLooksLikeSvg` for why this is `load` and not `error`, and
+      // `_svgNaturalSize` for where the numbers come from.
+      let size = null;
+      try { size = _svgNaturalSize(new TextDecoder('utf-8').decode(bytes)); } catch (e) {}
+      req.state = 'complete';
+      req.bitmap = { w: Math.round(size ? size.w : 0), h: Math.round(size ? size.h : 0),
+                     data: null, vector: true,
+                     intrinsic: (size && size.intrinsic) || { w: false, h: false } };
+      _imgSettleDecoders(req);
+      _fireIframeElementLoad(el);
+      return;
+    }
+    _imgMarkBroken(el);
+    _fireElementError(el);
+    return;
+  }
+  // Stored PREMULTIPLIED, in the rasterizer's convention, with the EXIF rotation
+  // already applied — unlike `createImageBitmap`, an <img> gives the page no way
+  // to ask for the unrotated pixels, so `from-image` is the only behaviour there
+  // is.
+  const oriented = _imgOrient(dec, dec.orientation);
+  req.state = 'complete';
+  req.bitmap = { w: oriented.w, h: oriented.h, data: _imgPremultiply(oriented.data) };
+  _imgSettleDecoders(req);
+  _fireIframeElementLoad(el);
+};
+
+// ---- `data:` URLs are not a fetch ----------------------------------------
+// A data URL carries its own bytes. Sending one through the HTTP client gets it
+// refused as a blocked scheme, which is how every inline `<img src="data:…">`
+// on the web was ending up broken here — and inline images are the ones a page
+// uses precisely because it does NOT want a round trip: placeholder avatars,
+// the low-quality blur a photo fades in from, an icon set on a metered
+// connection, and every SVG a build tool inlined to save a request.
+//
+// Returns `{ bytes, mime }` or null if this is not a parseable data URL.
+const _dataUrlBytes = function (url) {
+  const s = String(url);
+  if (!/^data:/i.test(s)) return null;
+  const comma = s.indexOf(',');
+  if (comma < 0) return null;
+  const meta = s.slice(5, comma);
+  const body = s.slice(comma + 1);
+  const isB64 = /;\s*base64\s*$/i.test(meta);
+  const mime = (isB64 ? meta.replace(/;\s*base64\s*$/i, '') : meta).split(';')[0].trim().toLowerCase()
+    || 'text/plain';
+  try {
+    if (isB64) return { bytes: _base64ToUint8Array(body.replace(/\s+/g, '')), mime };
+    // Not base64: percent-decoding, then UTF-8. `decodeURIComponent` throws on a
+    // stray `%` — which a hand-written data URL really does contain — so fall
+    // back to the raw text rather than declaring the image broken over one
+    // character.
+    let text;
+    try { text = decodeURIComponent(body); } catch (e) { text = body; }
+    return { bytes: new TextEncoder().encode(text), mime };
+  } catch (e) { return null; }
+};
+
+const _imgLooksLikeSvg = function (bytes, headers) {
+  const ct = String((headers && (headers['content-type'] || headers['Content-Type'])) || '').toLowerCase();
+  if (ct.indexOf('image/svg') !== -1) return true;
+  const n = Math.min(bytes.length, 256);
+  let s = '';
+  for (let i = 0; i < n; i++) s += String.fromCharCode(bytes[i]);
+  return /^\s*(<\?xml[^>]*\?>\s*)?(<!--[\s\S]*?-->\s*)*(<!DOCTYPE\s+svg[^>]*>\s*)?<svg[\s>]/i.test(s);
+};
+// ===== IMAGE-DECODE-END =====
+
 const _loadElementResource = function(el, url, initiatorType, opts) {
   opts = opts || {};
   if (!el || !url) return;
@@ -9410,19 +10015,48 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
   }
   const gen = (el._resLoadGen = (el._resLoadGen || 0) + 1);
   el._loadEventFired = false;
+  // Starting a fetch RESETS the current request to unavailable, and the reset is
+  // observable: `2d.drawImage.incomplete.reload` sets a new `src` on an <img>
+  // that has already loaded and then draws it in the same turn, asserting that
+  // NOTHING is painted. Keeping the old pixels around until the new ones arrive
+  // would draw the previous image — plausible, and wrong.
+  if (initiatorType === 'img') {
+    const req = _imgRequest(el);
+    req.state = 'unavailable'; req.bitmap = null;
+    // `currentSrc` is the URL the request IS FOR, not the URL that succeeded —
+    // it is set when the request is created and survives a 404. A page reading
+    // it inside `onerror` to report which file was missing needs it to still be
+    // there.
+    req.url = fullUrl;
+  }
   const start = (globalThis.performance && performance.now) ? performance.now() : 0;
   const pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
   // A crossorigin element (`img.crossOrigin = "anonymous"` etc.) makes a CORS
   // request; the response is then non-opaque when the access-control check passes,
   // which exposes contentType (Resource Timing) even cross-origin.
   const _useCors = !!(el && (el.crossOrigin === 'anonymous' || el.crossOrigin === 'use-credentials'));
+  // An <img> with a data: URL has its bytes already. Decode on a task — the load
+  // event must not fire before the caller has had a chance to attach a listener.
+  if (initiatorType === 'img' && /^data:/i.test(fullUrl)) {
+    const parsedData = _dataUrlBytes(fullUrl);
+    _queueTask(() => {
+      if (el._resLoadGen !== gen) return;
+      if (parsedData) _imgAdoptBytes(el, parsedData.bytes, fullUrl, { 'content-type': parsedData.mime });
+      else { _imgMarkBroken(el); _fireElementError(el); }
+    });
+    return;
+  }
   (async () => {
     try {
       const raw = await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, _useCors ? "cors" : "no-cors", "");
       if (el._resLoadGen !== gen) return; // superseded by a newer load
       const parsed = JSON.parse(raw);
       // Hard network failure (blocked / CORS) → no entry, fire error.
-      if (parsed.blocked || parsed.corsBlocked) { _fireElementError(el); return; }
+      if (parsed.blocked || parsed.corsBlocked) {
+        if (initiatorType === 'img') _imgMarkBroken(el);
+        _fireElementError(el);
+        return;
+      }
       // We got an HTTP response (any status): record a resource entry with the
       // honest body size from the response, then fire load (2xx/3xx) or error.
       const status = parsed.status || 0;
@@ -9440,10 +10074,26 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
       if (opts.eval && parsed.body) {
         try { (0, eval)(parsed.body); } catch (e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
       }
-      if (status === 0 || status >= 400) _fireElementError(el);
-      else _fireIframeElementLoad(el);
+      if (status === 0 || status >= 400) {
+        if (initiatorType === 'img') _imgMarkBroken(el);
+        _fireElementError(el);
+        return;
+      }
+      // An <img> is not loaded when the bytes arrive — it is loaded when the
+      // bytes turn out to be an image. HTML fires `error`, not `load`, for a
+      // 200 response carrying something undecodable, and that distinction is
+      // exactly what every `<img onerror="showPlaceholder()">` on the web is
+      // built on. Firing `load` for a corrupt body is how you get a page full
+      // of empty boxes and no fallback.
+      if (initiatorType === 'img') {
+        const bytes = parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : null;
+        _imgAdoptBytes(el, bytes, parsed.url || fullUrl, parsed.headers);
+        return;
+      }
+      _fireIframeElementLoad(el);
     } catch (e) {
       if (el._resLoadGen !== gen) return;
+      if (initiatorType === 'img') _imgMarkBroken(el);
       _fireElementError(el);
     }
   })();
@@ -9551,15 +10201,25 @@ globalThis.__startFrameLoads = function() {
 // Markup <script src> is handled separately by page.rs. Idempotent per element.
 globalThis.__startResourceLoads = function() {
   try {
-    const imgs = document.querySelectorAll('img[src]');
+    // Every <img>, not just `img[src]` — a responsive image may carry only a
+    // `srcset`, or get its URL from a `<picture><source>` sibling, and those are
+    // exactly the images a page went to the trouble of optimising.
+    const imgs = document.querySelectorAll('img');
     for (let i = 0; i < imgs.length; i++) {
       const el = imgs[i];
       if (el._resLoadGen) continue; // already loading (e.g. via the src setter)
-      const src = el.getAttribute('src');
-      if (src) { try { _loadElementResource(el, src, 'img'); } catch (e) {} }
+      try { _imgUpdateImageData(el); } catch (e) {}
     }
     const others = document.querySelectorAll('link, object');
     for (let i = 0; i < others.length; i++) { try { _connectResourceElement(others[i]); } catch (e) {} }
+    // Markup <video>/<audio> run resource selection too — a page whose player is
+    // written entirely in HTML (`<video src=… onerror=…>`) never touches the src
+    // setter, so without this it would sit on a spinner with no event either way.
+    const media = document.querySelectorAll('video[src], audio[src], video > source, audio > source');
+    for (let i = 0; i < media.length; i++) {
+      const el = media[i].localName === 'source' ? media[i].parentElement : media[i];
+      try { if (el && !el.__mediaStarted) { el.__mediaStarted = true; globalThis.__mediaSrcChanged(el); } } catch (e) {}
+    }
   } catch (e) {}
 };
 // Re-run the load process after a src/srcdoc attribute changes on an already-
@@ -39588,6 +40248,116 @@ const _defIface = (name, base) => {
 globalThis.HTMLAudioElement = class HTMLAudioElement extends globalThis.HTMLMediaElement {};
 globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMediaElement {};
 
+// ---------------------------------------------------------------------------
+// Media elements: an HONEST FAILURE instead of an eternal silence.
+//
+// This build has no media decoder. What `HTMLMediaElement` had before was an
+// empty class body — so `video.src = url` set an attribute and then nothing
+// ever happened again: no `loadedmetadata`, no `canplaythrough`, and, crucially,
+// NO `error`. A page waiting on a video waited forever.
+//
+// "Forever" is the expensive part. HTML gives a UA that cannot play a resource a
+// precise way to say so — fail the resource selection algorithm, set `error` to
+// a MediaError with MEDIA_ERR_SRC_NOT_SUPPORTED, and fire `error` — and every
+// player on the web is built to hear it: show the poster, offer the download
+// link, fall back to the transcript. Silence gets a spinner that never stops,
+// which is indistinguishable from a broken connection and blames the wrong thing.
+//
+// It is also why five WPT ImageBitmap files scored nothing: their shared helper
+// builds a `<video>`, awaits `canplaythrough`, and rejects on `error`. With no
+// event either way the promise never settled and the WHOLE FILE timed out —
+// including the dozens of subtests that had nothing to do with video. A promise
+// that never settles does not fail one thing; it stops everything behind it.
+{
+  const MP = globalThis.HTMLMediaElement.prototype;
+  const _MEDIA = Symbol('mediaState');
+  const _ms = (el) => el[_MEDIA] || (el[_MEDIA] = { error: null, network: 0, gen: 0 });
+
+  globalThis.MediaError = class MediaError {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get code() { return this._code; }
+    get message() { return this._message; }
+  };
+  for (const [k, v] of [['MEDIA_ERR_ABORTED', 1], ['MEDIA_ERR_NETWORK', 2],
+                        ['MEDIA_ERR_DECODE', 3], ['MEDIA_ERR_SRC_NOT_SUPPORTED', 4]]) {
+    Object.defineProperty(globalThis.MediaError, k, { value: v, enumerable: true });
+    Object.defineProperty(globalThis.MediaError.prototype, k, { value: v, enumerable: true });
+  }
+  const _newMediaError = (code, message) => {
+    const e = Object.create(globalThis.MediaError.prototype);
+    e._code = code; e._message = message;
+    return e;
+  };
+
+  // "Resource selection" for an engine with no codecs: whatever the source is,
+  // it is not supported. Runs on a TASK, never synchronously — a page is
+  // entitled to attach its `onerror` after setting `src`, which is how almost
+  // everyone writes it.
+  const _mediaFail = (el) => {
+    const st = _ms(el);
+    const gen = ++st.gen;
+    _queueTask(() => {
+      if (st.gen !== gen) return;                        // a newer src superseded us
+      st.error = _newMediaError(4, 'The media resource indicated by the src attribute was not suitable.');
+      st.network = 3;                                    // NETWORK_NO_SOURCE
+      const ev = new Event('error');
+      ev.isTrusted = true; ev.target = el;
+      try { _dispatchSpec(el, ev); } catch (e) {}
+      if (!el['__ehon_onerror']) {
+        const a = el.getAttribute && el.getAttribute('onerror');
+        if (a) { try { (0, eval)(a); } catch (e) {} }
+      }
+    });
+  };
+  globalThis.__mediaSrcChanged = (el) => {
+    const st = _ms(el);
+    st.error = null; st.network = 2;                     // NETWORK_LOADING
+    _mediaFail(el);
+  };
+
+  const ro = (name, get) => Object.defineProperty(MP, name, { configurable: true, enumerable: true, get });
+  for (const [k, v] of [['NETWORK_EMPTY', 0], ['NETWORK_IDLE', 1], ['NETWORK_LOADING', 2], ['NETWORK_NO_SOURCE', 3],
+                        ['HAVE_NOTHING', 0], ['HAVE_METADATA', 1], ['HAVE_CURRENT_DATA', 2],
+                        ['HAVE_FUTURE_DATA', 3], ['HAVE_ENOUGH_DATA', 4]]) {
+    Object.defineProperty(MP, k, { value: v, enumerable: true });
+    Object.defineProperty(globalThis.HTMLMediaElement, k, { value: v, enumerable: true });
+  }
+  ro('error', function () { return _ms(this).error; });
+  ro('networkState', function () { return _ms(this).network; });
+  // HAVE_NOTHING, always — and this is what `drawImage(video, …)` and
+  // `createImageBitmap(video)` read to decide there is no current frame.
+  ro('readyState', function () { return 0; });
+  ro('seeking', function () { return false; });
+  ro('ended', function () { return false; });
+  ro('duration', function () { return NaN; });
+  ro('paused', function () { return true; });
+  ro('videoWidth', function () { return 0; });
+  ro('videoHeight', function () { return 0; });
+  Object.defineProperty(MP, 'currentTime', { configurable: true, enumerable: true,
+    get() { return 0; }, set(v) { Number(v); } });
+  Object.defineProperty(MP, 'volume', { configurable: true, enumerable: true,
+    get() { return this.__vol === undefined ? 1 : this.__vol; },
+    set(v) {
+      const n = Number(v);
+      if (!(n >= 0 && n <= 1)) throw new DOMException('The volume provided is outside the range [0, 1].', 'IndexSizeError');
+      this.__vol = n;
+    } });
+  Object.defineProperty(MP, 'muted', { configurable: true, enumerable: true,
+    get() { return !!this.__muted; }, set(v) { this.__muted = !!v; } });
+  // `canPlayType` answers with the empty string: "no, and I am not going to
+  // pretend otherwise." Returning "maybe" for a format we cannot decode is how a
+  // player picks the source it will then fail on, instead of the one it might
+  // have succeeded with.
+  MP.canPlayType = _markNative(function canPlayType(type) { String(type); return ''; });
+  MP.load = _markNative(function load() { globalThis.__mediaSrcChanged(this); });
+  MP.pause = _markNative(function pause() {});
+  MP.play = _markNative(function play() {
+    return Promise.reject(new DOMException('The element has no supported sources.', 'NotSupportedError'));
+  });
+  MP.fastSeek = _markNative(function fastSeek(t) { Number(t); });
+  _markNative(globalThis.MediaError);
+}
+
 // The Window-reflecting body element event handler set (HTML): the reflecting on*
 // handlers on <body>/<frameset> forward get/set to the element's Window, not the
 // element. Installed here, now that both interfaces exist.
@@ -46726,6 +47496,23 @@ function _c2dGradientPaint(st, g) {
     return g._at(w < 0 ? 0 : w > 1 ? 1 : w);
   } };
 }
+// Byte index of pixel (ix, iy) in a bitmap, or −1 when there is nothing there.
+//
+// A bitmap is usually a dense `w × h` buffer, but it may also be WINDOWED: a
+// logical size with a smaller `data` covering only the rectangle
+// (`ox`, `oy`, `dw`, `dh`) and transparent black everywhere else. That exists
+// because a page is allowed to ask for `createImageBitmap(img, 10, 10, 4294967400, 10)`
+// — a crop 4.3 billion pixels wide off a 20-pixel image — and the answer must be
+// a 4294967400-wide bitmap that is almost entirely transparent, NOT 160 GB of
+// zeroes and not an exception. Storing only the part that has pixels in it is
+// the difference between answering and dying.
+const _bmIndex = (bm, ix, iy) => {
+  if (bm.ox === undefined) return (iy * bm.w + ix) * 4;
+  const x = ix - bm.ox, y = iy - bm.oy;
+  if (x < 0 || y < 0 || x >= bm.dw || y >= bm.dh) return -1;
+  return (y * bm.dw + x) * 4;
+};
+
 function _c2dPatternPaint(st, pat) {
   const bm = pat._bm;
   if (!bm || !bm.w || !bm.h) return null;
@@ -46737,7 +47524,8 @@ function _c2dPatternPaint(st, pat) {
     let sx = Math.floor(_c2mX(inv, x, y)), sy = Math.floor(_c2mY(inv, x, y));
     if (rx) { sx = ((sx % bm.w) + bm.w) % bm.w; } else if (sx < 0 || sx >= bm.w) return null;
     if (ry) { sy = ((sy % bm.h) + bm.h) % bm.h; } else if (sy < 0 || sy >= bm.h) return null;
-    const i = (sy * bm.w + sx) * 4;
+    const i = _bmIndex(bm, sx, sy);
+    if (i < 0) return [0, 0, 0, 0];
     const al = bm.data[i + 3] / 255;
     if (al === 0) return [0, 0, 0, 0];
     // The source bitmap is premultiplied; a paint sampler hands back straight alpha.
@@ -47090,6 +47878,340 @@ class ImageData {
   get colorSpace() { if (!(this instanceof ImageData)) throw new TypeError('Illegal invocation'); return 'srgb'; }
   get pixelFormat() { if (!(this instanceof ImageData)) throw new TypeError('Illegal invocation'); return 'rgba-unorm8'; }
 }
+
+// ---------------------------------------------------------------------------
+// ImageBitmap — a decoded picture the page holds directly.
+//
+// This is the object that makes images *usable* rather than merely displayable.
+// A page that wants to resize a photo before uploading it, read a QR code,
+// slice a sprite sheet, or draw map tiles does not want an `<img>` in the
+// document; it wants pixels it can hand to `drawImage`. Before the decoder
+// landed, `createImageBitmap` resolved with a 0×0 placeholder — so every one of
+// those pages ran to completion, produced nothing, and had no way to find out.
+// ---------------------------------------------------------------------------
+const _IB = Symbol('imageBitmapData');
+// Closed over by the class and by `_newImageBitmap`, NOT a static on the
+// constructor: a page that can flip the flag can forge an ImageBitmap, and a
+// forged bitmap is a `[_IB]`-less object every accessor then has to defend
+// against. Same reasoning as the Sanitizer's WeakMap in quest #501.
+let _ibAllowConstruct = false;
+// The bitmap that `createImageBitmap`'s own tests are written against is
+// premultiplied — same convention as the rasterizer — so an ImageBitmap can be
+// handed straight to `_c2dBitmapOf` with no conversion at the draw site.
+class ImageBitmap {
+  constructor() {
+    // Not constructible from a page. `new ImageBitmap()` is a TypeError in
+    // every engine, and the guard-flip is how the rest of this file does it:
+    // internal creation sets the flag for exactly one call.
+    if (!_ibAllowConstruct) throw new TypeError('Illegal constructor');
+    _ibAllowConstruct = false;
+  }
+  get width() {
+    const d = this[_IB]; if (!d) throw new TypeError('Illegal invocation');
+    return d.detached ? 0 : d.w;
+  }
+  get height() {
+    const d = this[_IB]; if (!d) throw new TypeError('Illegal invocation');
+    return d.detached ? 0 : d.h;
+  }
+  // `close()` releases the pixels. It exists because a 4000×3000 photograph is
+  // 48 MB and the GC cannot know the page is finished with it — on the devices
+  // this browser is for, holding ten of those is the whole session. A closed
+  // bitmap reports 0×0 and is "bad" everywhere, which is why detachment is a
+  // flag rather than just dropping the buffer.
+  close() {
+    const d = this[_IB]; if (!d) throw new TypeError('Illegal invocation');
+    d.detached = true; d.data = null;
+  }
+  get [Symbol.toStringTag]() { return 'ImageBitmap'; }
+}
+// `bitmap` is `{ w, h, data }`, optionally windowed (`ox`/`oy`/`dw`/`dh`) — see
+// `_bmIndex`. The pixels are premultiplied, the rasterizer's convention.
+const _newImageBitmap = function (bitmap) {
+  _ibAllowConstruct = true;
+  const bm = new ImageBitmap();
+  Object.defineProperty(bm, _IB, {
+    value: { w: bitmap.w, h: bitmap.h, data: bitmap.data, detached: false,
+             ox: bitmap.ox, oy: bitmap.oy, dw: bitmap.dw, dh: bitmap.dh } });
+  return bm;
+};
+
+// Expand a windowed bitmap into a dense `w × h` buffer. Only called once the
+// caller has checked the result fits the pixel budget.
+const _imgDensify = function (bm) {
+  if (bm.ox === undefined) return bm.data;
+  const out = new Uint8ClampedArray(bm.w * bm.h * 4);
+  for (let y = 0; y < bm.dh; y++) {
+    const dst = ((bm.oy + y) * bm.w + bm.ox) * 4;
+    out.set(bm.data.subarray(y * bm.dw * 4, (y + 1) * bm.dw * 4), dst);
+  }
+  return out;
+};
+
+// Nearest-neighbour and bilinear resampling for `resizeWidth`/`resizeHeight`.
+// `resizeQuality: "pixelated"` is a promise to the caller that no new colours
+// appear — it is what pixel-art scalers and QR decoders depend on — so it must
+// NOT be quietly upgraded to a smooth filter just because smooth looks nicer.
+const _imgResample = function (src, sw, sh, dw, dh, smooth) {
+  const out = new Uint8ClampedArray(dw * dh * 4);
+  const xr = sw / dw, yr = sh / dh;
+  for (let y = 0; y < dh; y++) {
+    for (let x = 0; x < dw; x++) {
+      const di = (y * dw + x) * 4;
+      if (!smooth) {
+        const sx = Math.min(sw - 1, Math.floor(x * xr));
+        const sy = Math.min(sh - 1, Math.floor(y * yr));
+        const si = (sy * sw + sx) * 4;
+        out[di] = src[si]; out[di + 1] = src[si + 1]; out[di + 2] = src[si + 2]; out[di + 3] = src[si + 3];
+        continue;
+      }
+      // Sample at the destination pixel's CENTRE mapped back into the source,
+      // minus a half-pixel — sampling at the corner shifts the whole image by
+      // half a texel, which is invisible on a photo and glaring on a grid.
+      const fx = Math.min(sw - 1, Math.max(0, (x + 0.5) * xr - 0.5));
+      const fy = Math.min(sh - 1, Math.max(0, (y + 0.5) * yr - 0.5));
+      const x0 = Math.floor(fx), y0 = Math.floor(fy);
+      const x1 = Math.min(sw - 1, x0 + 1), y1 = Math.min(sh - 1, y0 + 1);
+      const tx = fx - x0, ty = fy - y0;
+      for (let c = 0; c < 4; c++) {
+        const a = src[(y0 * sw + x0) * 4 + c], b = src[(y0 * sw + x1) * 4 + c];
+        const e = src[(y1 * sw + x0) * 4 + c], f = src[(y1 * sw + x1) * 4 + c];
+        out[di + c] = Math.round((a * (1 - tx) + b * tx) * (1 - ty) + (e * (1 - tx) + f * tx) * ty);
+      }
+    }
+  }
+  return out;
+};
+
+// Crop a rectangle out of a bitmap, materialising ONLY the part that overlaps
+// the source. The crop may hang off any edge — the area outside is transparent
+// black, not clamped, so a page cropping a 10-pixel border off a 5-pixel image
+// really does see through it.
+//
+// Returns a bitmap in the windowed form `_bmIndex` understands, so the cost is
+// the size of the OVERLAP rather than the size of the request.
+const _imgCropWindow = function (srcBm, sx, sy, cw, ch) {
+  const sw = srcBm.w, sh = srcBm.h;
+  const x0 = Math.max(0, sx), y0 = Math.max(0, sy);
+  const x1 = Math.min(sw, sx + cw), y1 = Math.min(sh, sy + ch);
+  const dw = Math.max(0, x1 - x0), dh = Math.max(0, y1 - y0);
+  if (dw === 0 || dh === 0) {
+    // Nothing overlaps: a fully transparent bitmap of the requested size, and
+    // not one byte allocated for it.
+    return { w: cw, h: ch, data: new Uint8ClampedArray(0), ox: 0, oy: 0, dw: 0, dh: 0 };
+  }
+  const out = new Uint8ClampedArray(dw * dh * 4);
+  for (let y = 0; y < dh; y++) {
+    for (let x = 0; x < dw; x++) {
+      const si = _bmIndex(srcBm, x0 + x, y0 + y);
+      const di = (y * dw + x) * 4;
+      if (si < 0) continue;
+      const s = srcBm.data;
+      out[di] = s[si]; out[di + 1] = s[si + 1]; out[di + 2] = s[si + 2]; out[di + 3] = s[si + 3];
+    }
+  }
+  const win = { w: cw, h: ch, data: out, ox: x0 - sx, oy: y0 - sy, dw, dh };
+  // A window that happens to cover everything is just a dense bitmap; dropping
+  // the window here keeps the common case on the fast index path.
+  if (win.ox === 0 && win.oy === 0 && dw === cw && dh === ch) return { w: cw, h: ch, data: out };
+  return win;
+};
+
+const _imgFlipY = function (src, w, h) {
+  const out = new Uint8ClampedArray(src.length);
+  const row = w * 4;
+  for (let y = 0; y < h; y++) out.set(src.subarray(y * row, y * row + row), (h - 1 - y) * row);
+  return out;
+};
+
+// Total pixels `createImageBitmap` will materialise. The same reasoning as the
+// decoder's cap in image_ops.rs, applied one layer up, because the crop and
+// resize arguments come straight from the page: `createImageBitmap(img, 0, 0,
+// 1e8, 1e8)` asks for 40 petabytes and WPT tests that we say no rather than die
+// trying. The spec has no wording for this; every engine imposes one, and the
+// test accepts either a success or an InvalidStateError.
+const _IB_MAX_PIXELS = 1 << 25;
+
+const _ibEnum = function (v, allowed, name) {
+  if (v === undefined) return allowed[0];
+  const s = String(v);
+  if (allowed.indexOf(s) === -1)
+    throw new TypeError("Failed to execute 'createImageBitmap' on 'Window': The provided value '" + s +
+      "' is not a valid enum value of type " + name + '.');
+  return s;
+};
+
+// Pull straight- or premultiplied-alpha pixels out of any CanvasImageSource, or
+// throw/return a sentinel. Distinct from `_c2dBitmapOf` because the two unions
+// genuinely differ: `createImageBitmap` accepts a Blob and an ImageData, and
+// `drawImage` accepts neither.
+//
+// Returns { w, h, data } premultiplied, or throws a DOMException/TypeError.
+const _ibSourceBitmap = function (image) {
+  if (image === null || image === undefined || typeof image !== 'object')
+    throw new TypeError('The provided value is not of type \'(HTMLImageElement or SVGImageElement or HTMLCanvasElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or VideoFrame or Blob or ImageData)\'.');
+
+  if (image instanceof ImageBitmap) {
+    const d = image[_IB];
+    if (!d || d.detached) throw _c2dInvalidStateError('The ImageBitmap has been detached.');
+    return { w: d.w, h: d.h, data: d.data, ox: d.ox, oy: d.oy, dw: d.dw, dh: d.dh };
+  }
+  if (image instanceof ImageData) {
+    // ImageData is straight alpha by definition; everything downstream here is
+    // premultiplied, so convert once at the boundary.
+    return { w: image.width, h: image.height, data: _imgPremultiply(image.data) };
+  }
+  if (typeof Blob === 'function' && image instanceof Blob) {
+    const dec = _imgDecodeBytes(image._bytes);
+    if (!dec) throw _c2dInvalidStateError('The source image could not be decoded.');
+    const or = _imgOrient(dec, dec.orientation);
+    return { w: or.w, h: or.h, data: _imgPremultiply(or.data), rawOrientation: dec.orientation, straight: dec };
+  }
+  const tag = image.localName;
+  if (tag === 'canvas' || (typeof OffscreenCanvas === 'function' && image instanceof OffscreenCanvas)) {
+    const bm = _c2dBitmapOf(image);
+    // A zero-sized canvas is "bad" per "check the usability of the image
+    // argument", and for canvas that means throwing rather than resolving.
+    if (typeof bm === 'string') throw _c2dInvalidStateError('The canvas has no pixels.');
+    return bm;
+  }
+  if (tag === 'img' || tag === 'image') {
+    const req = image[_IMG_REQ];
+    if (!req || req.state !== 'complete' || !req.bitmap || !req.bitmap.data)
+      throw _c2dInvalidStateError('The source image is not available.');
+    return req.bitmap;
+  }
+  if (tag === 'video') throw _c2dInvalidStateError('The source video has no current frame.');
+  if (typeof VideoFrame === 'function' && image instanceof VideoFrame)
+    throw _c2dInvalidStateError('The VideoFrame has been detached.');
+  throw new TypeError('The provided value is not a valid image source.');
+};
+
+const _createImageBitmap = function createImageBitmap(image, a, b, c, d, e) {
+  // The two overloads differ by arity: (image, options?) and
+  // (image, sx, sy, sw, sh, options?). Anything else is no overload at all.
+  let sx = 0, sy = 0, sw = null, sh = null, options;
+  const n = arguments.length;
+  if (n <= 2) options = a;
+  else if (n >= 5) { sx = a; sy = b; sw = c; sh = d; options = e; }
+  else return Promise.reject(new TypeError(
+    "Failed to execute 'createImageBitmap' on 'Window': Valid arities are 1, 2, 5 or 6, but " + n + ' arguments provided.'));
+
+  // Everything below is inside the promise: `createImageBitmap` returns a
+  // promise for EVERY failure — including the WebIDL type errors — so a caller
+  // that only wrote `.catch()` still hears about them. Throwing synchronously
+  // from half the failures and rejecting from the other half is the shape that
+  // makes people write two error paths and get one of them wrong.
+  return new Promise((resolve, reject) => {
+    const opts = (options == null) ? {} : options;
+    if (Object(opts) !== opts) throw new TypeError("The provided value is not of type 'ImageBitmapOptions'.");
+    const orientation = _ibEnum(opts.imageOrientation, ['from-image', 'flipY', 'none'], 'ImageOrientation');
+    const premul = _ibEnum(opts.premultiplyAlpha, ['default', 'premultiply', 'none'], 'PremultiplyAlpha');
+    _ibEnum(opts.colorSpaceConversion, ['default', 'none'], 'ColorSpaceConversion');
+    const quality = _ibEnum(opts.resizeQuality, ['low', 'pixelated', 'medium', 'high'], 'ResizeQuality');
+    const rw = opts.resizeWidth === undefined ? null : __imgUlong(opts.resizeWidth);
+    const rh = opts.resizeHeight === undefined ? null : __imgUlong(opts.resizeHeight);
+
+    // A zero-sized CROP is a RangeError (the caller asked for an impossible
+    // rectangle); a zero-sized RESIZE is an InvalidStateError (the caller asked
+    // for an impossible output). Two different mistakes, two different errors,
+    // and WPT checks each one separately.
+    if (sw !== null) {
+      sw = Math.trunc(Number(sw)) || 0; sh = Math.trunc(Number(sh)) || 0;
+      sx = Math.trunc(Number(sx)) || 0; sy = Math.trunc(Number(sy)) || 0;
+      if (sw === 0 || sh === 0)
+        throw new RangeError("Failed to execute 'createImageBitmap' on 'Window': The crop rect width or height is 0.");
+    }
+    if (rw === 0 || rh === 0) throw _c2dInvalidStateError('The resize dimensions are invalid.');
+
+    // ── Where the synchronous part ends. ───────────────────────────────────
+    // The spec splits this method in two and WPT tests the seam
+    // (`createImageBitmap-resolves-in-task`). Everything above rejects BEFORE
+    // the first microtask checkpoint, because those are argument mistakes the
+    // caller made and it should learn about them at the call site. Everything
+    // below runs on a TASK, because decoding an image is real work and a
+    // promise that resolves inside the current microtask drain means a page can
+    // never yield between "ask for the image" and "have the image" — which is
+    // how a gallery of 60 thumbnails freezes the tab for a second on a slow
+    // device instead of filling in progressively.
+    //
+    // A Blob's usability is decided by DECODING it, so it belongs on the task
+    // side ("Invalid Blob source should reject async"). Every other source can
+    // be checked synchronously, and the spec says to.
+    const isBlob = typeof Blob === 'function' && image instanceof Blob;
+    let src = null;
+    if (!isBlob) {
+      src = _ibSourceBitmap(image);
+      if (!src.w || !src.h) throw _c2dInvalidStateError('The source image has no pixels.');
+    }
+    _queueTask(() => {
+      try {
+        if (isBlob) {
+          src = _ibSourceBitmap(image);
+          if (!src.w || !src.h) throw _c2dInvalidStateError('The source image has no pixels.');
+        }
+        _ibBuild(src, sx, sy, sw, sh, rw, rh, quality, orientation, premul, resolve);
+      } catch (e) { reject(e); }
+    });
+  });
+};
+
+// The pixel work, split out so the synchronous argument checks above read as one
+// list rather than being buried inside a task callback.
+const _ibBuild = function (src, sx, sy, sw, sh, rw, rh, quality, orientation, premul, resolve) {
+    // Crop. A negative width or height names the same rectangle from the other
+    // corner — the same rule `drawImage` follows, and it does not mirror.
+    let out = src;
+    if (sw !== null) {
+      if (sw < 0) { sx += sw; sw = -sw; }
+      if (sh < 0) { sy += sh; sh = -sh; }
+      out = _imgCropWindow(src, sx, sy, sw, sh);
+    }
+
+    // Resize. Either dimension alone scales the other proportionally, which is
+    // what makes `{resizeWidth: 200}` a one-liner thumbnailer.
+    const cw = out.w, ch = out.h;
+    let ow = rw === null ? cw : rw, oh = rh === null ? ch : rh;
+    if (rw !== null && rh === null) oh = Math.max(1, Math.round(ch * rw / cw));
+    if (rh !== null && rw === null) ow = Math.max(1, Math.round(cw * rh / ch));
+    // The budget is checked HERE and not at the crop, because a crop costs only
+    // its overlap — but a resize or a flip has to materialise every output
+    // pixel. That split is exactly what `createImageBitmap-sizeOverflow` is
+    // testing: a 4294967295×64 CROP of a 20×20 image must succeed (it is almost
+    // entirely transparent), and then scaling that up must fail with an
+    // InvalidStateError rather than taking the tab with it.
+    const mustDensify = (ow !== cw || oh !== ch) || orientation === 'flipY';
+    if (mustDensify && ow * oh > _IB_MAX_PIXELS)
+      throw _c2dInvalidStateError('The resized bitmap is too large to allocate.');
+    let pixels = out.data;
+    if (ow !== cw || oh !== ch) {
+      // Resampling reads arbitrary source pixels, so a windowed source has to be
+      // filled out first. It is bounded by the cap just checked.
+      pixels = _imgResample(_imgDensify(out), cw, ch, ow, oh, quality !== 'pixelated');
+      out = { w: ow, h: oh, data: pixels };
+    }
+
+    if (orientation === 'flipY') {
+      out = { w: ow, h: oh, data: _imgFlipY(_imgDensify(out), ow, oh) };
+    }
+    if (out === src) out = { w: src.w, h: src.h, data: src.data.slice() };  // never alias the source
+
+    // `premultiplyAlpha` is VALIDATED above and then deliberately not acted on.
+    // It selects the bitmap's internal storage format, and the only consumer
+    // that can tell the difference is a `texImage2D` upload — WebGL, which this
+    // build does not have. Every path that CAN observe the bitmap here (drawing
+    // it, cropping it, reading it back) must produce the same colour whichever
+    // value was passed, and WPT's own `createImageBitmap-premultiplyAlpha` test
+    // asserts exactly that: nine combinations, one expected pixel.
+    //
+    // So the honest implementation is one storage format, and it is the
+    // rasterizer's: premultiplied. Storing straight alpha under the `"none"`
+    // flag and forgetting to tell `drawImage` would darken every semi-
+    // transparent image — a bug that is invisible on the opaque test images
+    // most suites use and glaring on a real photograph with a soft edge.
+    void premul;
+    resolve(_newImageBitmap(out));
+};
 
 class Path2D {
   constructor(src) {
@@ -47559,6 +48681,8 @@ _c2dMethod('createPattern', 2, function (image, repetition) {
   if (bm === 'bad') throw new TypeError('The provided value is not a valid image source');
   if (bm === 'incomplete') return null;                 // an un-loaded image yields null
   if (bm === 'zero') throw _c2dInvalidStateError('image has zero dimensions');
+  if (bm === 'broken') throw _c2dInvalidStateError('the image could not be loaded');
+  if (bm === 'detached') throw _c2dInvalidStateError('the ImageBitmap has been detached');
   return new CanvasPattern(bm, rep);
 });
 
@@ -47824,6 +48948,12 @@ _c2dMethod('putImageData', 3, function (img, dx, dy, dirtyX, dirtyY, dirtyW, dir
 // <img> ends up indistinguishable from a programming mistake.
 function _c2dBitmapOf(src) {
   if (!src || typeof src !== 'object') return 'bad';
+  // An OffscreenCanvas is a handle to a backing <canvas>; unwrap it so every
+  // rule below is written once, for one kind of canvas.
+  if (typeof OffscreenCanvas === 'function' && src instanceof OffscreenCanvas) {
+    if (!src._el) return 'zero';
+    src = src._el;
+  }
   if (src[_C2D]) { const st = src[_C2D]; return st.w && st.h ? st : 'zero'; }
   const tag = src.localName;
   if (tag === 'canvas') {
@@ -47838,17 +48968,41 @@ function _c2dBitmapOf(src) {
   // include it — accepting it here would make us the only engine where
   // `drawImage(imageData, 0, 0)` works, which teaches people to write code that
   // breaks everywhere else.
-  // `ImageBitmap` is checked by NAME rather than by identity because the class is
-  // installed late, in the `typeof X === 'undefined'` block near the end of this
-  // file, and is not in scope here.
-  const isBitmap = typeof globalThis.ImageBitmap === 'function' && src instanceof globalThis.ImageBitmap;
-  if (tag === 'img' || tag === 'image' || tag === 'video' || tag === 'svg' ||
-      src.__isImageBitmap || isBitmap ||
+  if (src instanceof ImageBitmap) {
+    const d = src[_IB];
+    // A CLOSED bitmap is the one image source whose failure is the page's own
+    // bug — it let go of the pixels and then drew them — so the spec makes it
+    // throw where every other unusable source is silent.
+    if (!d || d.detached) return 'detached';
+    return { w: d.w, h: d.h, data: d.data, ox: d.ox, oy: d.oy, dw: d.dw, dh: d.dh };
+  }
+  if (tag === 'img' || tag === 'image') {
+    const req = src[_IMG_REQ];
+    // HTML's "check the usability of the image argument" gives THREE different
+    // answers here and they are not interchangeable:
+    //   broken       → throw InvalidStateError   (the fetch failed or the bytes
+    //                  were not an image; the page asked for something absent)
+    //   not decoded  → draw nothing, silently    (it is still coming)
+    //   zero-sized   → draw nothing, silently    (it arrived and has no area)
+    // Collapsing the first into the second is how `2d.drawImage.nonexistent`
+    // passes for free while the engine has no opinion at all.
+    if (req && req.state === 'broken') return 'broken';
+    if (!req || req.state !== 'complete' || !req.bitmap) return 'incomplete';
+    const bm = req.bitmap;
+    if (!bm.w || !bm.h) return 'incomplete';
+    // A VECTOR image has an honest size and no pixels (no SVG rasterizer is
+    // reachable from the JS realm — see the scroll's Caps). "Not fully
+    // decodable" is exactly the spec's own wording for it: draw nothing, throw
+    // nothing. Reporting it as broken would be a lie — the file is fine.
+    if (!bm.data) return 'incomplete';
+    return bm;
+  }
+  if (tag === 'video' || tag === 'svg' || src.__isImageBitmap ||
       (typeof globalThis.VideoFrame === 'function' && src instanceof globalThis.VideoFrame)) {
-    // A valid CanvasImageSource that we cannot yet turn into pixels: no image
-    // decoder is reachable from the JS realm (see the scroll's Caps). "Not yet
-    // usable" is the honest answer AND the one the spec gives for an image that
-    // has not finished loading — draw nothing, quietly.
+    // A valid CanvasImageSource with no current frame: there is no video decoder
+    // and no SVG rasterizer reachable from the JS realm (see the scroll's Caps).
+    // "Not yet usable" is the honest answer AND the one the spec gives for a
+    // video whose readyState is HAVE_NOTHING — draw nothing, quietly.
     //
     // ⚠️ It must be THIS answer and not "bad type". Falling through to a
     // TypeError here regressed 2d.drawImage.nonfinite, which draws from an
@@ -47872,6 +49026,8 @@ _c2dMethod('drawImage', 3, function (image, a1, a2, a3, a4, a5, a6, a7, a8) {
   if (bm === 'bad') throw new TypeError('The provided value is not a valid image source');
   if (bm === 'incomplete') return;
   if (bm === 'zero') throw _c2dInvalidStateError('image has zero dimensions');
+  if (bm === 'broken') throw _c2dInvalidStateError('the image could not be loaded');
+  if (bm === 'detached') throw _c2dInvalidStateError('the ImageBitmap has been detached');
   let sx = 0, sy = 0, sw = bm.w, sh = bm.h, dx, dy, dw, dh;
   if (n === 3) { dx = _c2dNum(a1); dy = _c2dNum(a2); dw = bm.w; dh = bm.h; }
   else if (n === 5) { dx = _c2dNum(a1); dy = _c2dNum(a2); dw = _c2dNum(a3); dh = _c2dNum(a4); }
@@ -47881,9 +49037,19 @@ _c2dMethod('drawImage', 3, function (image, a1, a2, a3, a4, a5, a6, a7, a8) {
   }
   if (!_c2dFinite(sx, sy, sw, sh, dx, dy, dw, dh)) return;
   if (sw === 0 || sh === 0 || dw === 0 || dh === 0) return;
-  // A negative source or destination size MIRRORS; normalising both and keeping
-  // the flip in the mapping is what makes negativedir work.
-  const flipX = (sw < 0) !== (dw < 0), flipY = (sh < 0) !== (dh < 0);
+  // A negative width or height NAMES THE SAME RECTANGLE FROM THE OTHER CORNER —
+  // it does not mirror the image. The spec defines both rectangles by their four
+  // corners, so `(100, 78, -100, 50)` and `(0, 78, 100, 50)` are the same box,
+  // and `2d.drawImage.negativedir` exists to say so in its title: "Negative
+  // dimensions do not affect the direction of the image."
+  //
+  // ⚠️ This code used to flip when exactly one of the pair was negative, which
+  // is the intuitive reading and is wrong. Nothing caught it: with no image
+  // decoder there were no pixels to draw, so every test in this family scored
+  // 0/1 for a reason that had nothing to do with the bug underneath. A whole
+  // branch of a shipping method had never once been evaluated against a real
+  // expectation. (Third time this arc: see the scroll's "a green row proves the
+  // engine agreed with the test".)
   if (sw < 0) { sx += sw; sw = -sw; }
   if (sh < 0) { sy += sh; sh = -sh; }
   if (dw < 0) { dx += dw; dw = -dw; }
@@ -47893,12 +49059,11 @@ _c2dMethod('drawImage', 3, function (image, a1, a2, a3, a4, a5, a6, a7, a8) {
   const kx = sw / dw, ky = sh / dh;
   const paint = { sample(px, py) {
     const ux = _c2mX(inv, px, py), uy = _c2mY(inv, px, py);
-    let fx = (ux - dx) * kx, fy = (uy - dy) * ky;
-    if (flipX) fx = sw - fx;
-    if (flipY) fy = sh - fy;
+    const fx = (ux - dx) * kx, fy = (uy - dy) * ky;
     const ix = Math.floor(sx + fx), iy = Math.floor(sy + fy);
     if (ix < 0 || ix >= bm.w || iy < 0 || iy >= bm.h) return null;
-    const i = (iy * bm.w + ix) * 4;
+    const i = _bmIndex(bm, ix, iy);
+    if (i < 0) return [0, 0, 0, 0];
     const al = bm.data[i + 3] / 255;
     if (al === 0) return [0, 0, 0, 0];
     return [bm.data[i] / al, bm.data[i + 1] / al, bm.data[i + 2] / al, al];
@@ -48255,9 +49420,14 @@ _exposeIface('CanvasRenderingContext2D', CanvasRenderingContext2D);
 _exposeIface('CanvasGradient', CanvasGradient);
 _exposeIface('CanvasPattern', CanvasPattern);
 _exposeIface('ImageData', ImageData);
+_exposeIface('ImageBitmap', ImageBitmap);
 _exposeIface('Path2D', Path2D);
 _exposeIface('TextMetrics', TextMetrics);
-for (const C of [CanvasRenderingContext2D, CanvasGradient, CanvasPattern, ImageData, Path2D, TextMetrics]) {
+// `createImageBitmap` is a Window/WorkerGlobalScope method, not an interface —
+// writable, enumerable, configurable like every other operation on the global.
+Object.defineProperty(globalThis, 'createImageBitmap', {
+  value: _markNative(_createImageBitmap), writable: true, enumerable: true, configurable: true });
+for (const C of [CanvasRenderingContext2D, CanvasGradient, CanvasPattern, ImageData, ImageBitmap, Path2D, TextMetrics]) {
   _markNative(C);
   // CanvasRenderingContext2D.prototype must inherit straight from Object.prototype
   // (it has no parent interface); a class expression already gives that, but the
@@ -56212,6 +57382,66 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   if (typeof HTMLImageElement !== 'undefined') {
     _defNodeRO(HTMLImageElement.prototype, 'x', function() { return 0; });
     _defNodeRO(HTMLImageElement.prototype, 'y', function() { return 0; });
+
+    // ── The rest of the HTMLImageElement image surface. ─────────────────────
+    // These four are how a page finds out anything at all about a picture it
+    // asked for, and until the decoder landed there was nothing behind them.
+    //
+    // `naturalWidth`/`naturalHeight` are the image's OWN size, independent of
+    // any width attribute or CSS — it is what a lightbox measures to decide
+    // whether to scale down, what an upload form reads to reject a 20-megapixel
+    // photo before sending it, and what an `<img>`-based sprite sheet slices on.
+    // ⭐ DENSITY-CORRECTED. `srcset="photo@2x.jpg 2x"` means the file is twice as
+    // many pixels as the space it occupies, so a 640-pixel-wide file reports
+    // `naturalWidth === 320`: the size it will DRAW at, which is the number every
+    // layout decision needs. Reporting the raw pixel count instead makes a
+    // retina image lay out at double size — the classic "everything is huge on
+    // my phone" bug.
+    //
+    // ⚠️ Only dimensions that came from the FILE are corrected. An SVG that
+    // declares no width falls back to the default object size of 300×150, and
+    // those are not the image's own pixels — dividing them by the density would
+    // shrink a picture nobody ever measured.
+    _defNodeRO(HTMLImageElement.prototype, 'naturalWidth', function() {
+      return __imgNatural(this, 'w');
+    });
+    _defNodeRO(HTMLImageElement.prototype, 'naturalHeight', function() {
+      return __imgNatural(this, 'h');
+    });
+    // `complete` means "no longer in flight", NOT "succeeded" — an <img> with no
+    // src is complete, and so is one that 404'd. Code that treats it as success
+    // shows a broken image; code that treats a false as failure spins forever.
+    _defNodeRO(HTMLImageElement.prototype, 'complete', function() {
+      const src = this.getAttribute('src');
+      if (src == null || src === '') return true;
+      const r = this[_IMG_REQ];
+      return !!r && (r.state === 'complete' || r.state === 'broken');
+    });
+    // `currentSrc` is the URL actually fetched — after redirects and after
+    // srcset selection. Empty until something has been.
+    _defNodeRO(HTMLImageElement.prototype, 'currentSrc', function() {
+      const r = this[_IMG_REQ];
+      return (r && r.url) || '';
+    });
+    // `decode()` is the promise that lets a page pay the decode cost BEFORE the
+    // image is inserted, so a slow decode never lands inside a frame and janks
+    // the scroll — which is precisely the difference between smooth and unusable
+    // on a low-end device. Our decode is synchronous inside the fetch, so the
+    // promise settles as soon as the current request does.
+    Object.defineProperty(HTMLImageElement.prototype, 'decode', {
+      configurable: true, writable: true, enumerable: true,
+      value: _markNative(function decode() {
+        if (!_isViewNode(this)) throw new TypeError('Illegal invocation');
+        const src = this.getAttribute('src');
+        const r = _imgRequest(this);
+        if (r.state === 'complete') return Promise.resolve();
+        // No src at all is not "still loading" — nothing is coming, so an
+        // EncodingError now beats a promise that never settles.
+        if (r.state === 'broken' || src == null || src === '')
+          return Promise.reject(new DOMException('The source image cannot be decoded.', 'EncodingError'));
+        return new Promise((resolve, reject) => { r.decoders.push({ resolve, reject }); });
+      }),
+    });
   }
 
   // ── Window partial (CSSOM View): [Replaceable] viewport/client attributes as
@@ -61462,10 +62692,37 @@ if (typeof CanvasRenderingContext2D === 'undefined') {
 
 if (typeof OffscreenCanvas === 'undefined') {
   globalThis.OffscreenCanvas = class OffscreenCanvas {
-    constructor(w, h) { this.width = w; this.height = h; }
-    getContext(type) { return globalThis.document?.createElement('canvas')?.getContext(type) || null; }
-    convertToBlob() { return Promise.resolve(new Blob([''])); }
-    transferToImageBitmap() { return {}; }
+    // ONE backing <canvas>, created once and kept. The previous version built a
+    // fresh element on every `getContext` call, so a page could draw into an
+    // OffscreenCanvas and read back an empty one — every call handed out a
+    // different bitmap. That is the whole point of the object: something you can
+    // draw into off-screen and then transfer, which is how a worker prepares a
+    // frame without blocking the page that will show it.
+    constructor(w, h) {
+      const el = globalThis.document && globalThis.document.createElement('canvas');
+      Object.defineProperty(this, '_el', { value: el || null });
+      this.width = w; this.height = h;
+    }
+    get width() { return this._el ? this._el.width : this.__w | 0; }
+    set width(v) { if (this._el) this._el.width = v; else this.__w = v | 0; }
+    get height() { return this._el ? this._el.height : this.__h | 0; }
+    set height(v) { if (this._el) this._el.height = v; else this.__h = v | 0; }
+    getContext(type) { return this._el ? this._el.getContext(type) : null; }
+    convertToBlob(opts) {
+      return new Promise((resolve) => {
+        if (!this._el) { resolve(new Blob([])); return; }
+        this._el.toBlob((b) => resolve(b || new Blob([])), (opts && opts.type) || 'image/png');
+      });
+    }
+    // Transfer, per the name: the canvas is left blank afterwards.
+    transferToImageBitmap() {
+      const bm = _c2dBitmapOf(this._el);
+      if (typeof bm === 'string') throw _c2dInvalidStateError('the canvas has no pixels');
+      const out = _newImageBitmap({ w: bm.w, h: bm.h, data: bm.data.slice() });
+      if (this._el && this._el.__c2dCtx) this._el.__c2dCtx.clearRect(0, 0, bm.w, bm.h);
+      return out;
+    }
+    get [Symbol.toStringTag]() { return 'OffscreenCanvas'; }
   };
 }
 
@@ -61473,10 +62730,22 @@ if (typeof Path2D === 'undefined') {
   globalThis.Path2D = class Path2D { constructor(){} moveTo(){} lineTo(){} arc(){} rect(){} closePath(){} addPath(){} };
 }
 
-if (typeof ImageBitmap === 'undefined') {
-  globalThis.ImageBitmap = class ImageBitmap { constructor(){this.width=0;this.height=0;} close(){} };
-  globalThis.createImageBitmap = function() { return Promise.resolve(new ImageBitmap()); };
-}
+// The real `ImageBitmap` and `createImageBitmap` are defined beside the canvas
+// rasterizer (search `_newImageBitmap`); they are published here, where the rest
+// of the late globals are, so the ordering of this file stays one-way.
+//
+// What used to be here was `class ImageBitmap { width = 0; height = 0 }` and a
+// `createImageBitmap` that resolved with one. It is the same shape of lie the
+// campaign has now found eleven times: the page's `await` returned, its
+// `drawImage` threw nothing, and the picture it was trying to show simply was
+// not there — with no error anywhere for anyone to catch.
+// (`ImageBitmap` and `createImageBitmap` are published beside the canvas
+// rasterizer — see `_exposeIface('ImageBitmap', …)`. There is no fallback stub
+// here any more, on purpose. What used to be here was
+// `class ImageBitmap { width = 0; height = 0 }` plus a `createImageBitmap` that
+// resolved with one: the same shape of lie this campaign has now found eleven
+// times. The page's `await` returned, its `drawImage` threw nothing, and the
+// picture simply was not there — with no error anywhere for anyone to catch.)
 
 if (typeof NodeFilter === 'undefined') {
   globalThis.NodeFilter = { SHOW_ALL:0xFFFFFFFF, SHOW_ELEMENT:1, SHOW_TEXT:4, SHOW_COMMENT:128,
@@ -62805,7 +64074,18 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     color:      'HTMLFontElement HTMLHRElement',
     compact:    'HTMLDListElement HTMLDirectoryElement HTMLMenuElement HTMLOListElement ' +
                 'HTMLUListElement',
-    height:     'HTMLEmbedElement HTMLIFrameElement HTMLMarqueeElement HTMLObjectElement',
+    // ⚠️ `HTMLCanvasElement` and `HTMLImageElement` MUST be on the width/height
+    // lists. This loop DELETES the member from `Element.prototype` once it has
+    // rehomed it, so any interface left off the list loses the property
+    // altogether — and both of these have a real `unsigned long` width/height in
+    // their IDL. Quest #508 taught `Element.prototype.width` about <canvas>
+    // (before it, `canvas.width` was always 300 and every canvas was the wrong
+    // size); that fix was then deleted a few thousand lines later, in this loop,
+    // and nothing caught it because the canvas tests read the ATTRIBUTE through
+    // `_c2dDim` rather than the IDL property. A fix that does not survive to the
+    // end of the file is not a fix.
+    height:     'HTMLCanvasElement HTMLEmbedElement HTMLIFrameElement HTMLImageElement ' +
+                'HTMLMarqueeElement HTMLObjectElement',
     link:       'HTMLBodyElement',
     noShade:    'HTMLHRElement',
     reversed:   'HTMLOListElement',
@@ -62816,8 +64096,8 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     text:       'HTMLAnchorElement HTMLBodyElement HTMLOptionElement HTMLScriptElement HTMLTitleElement',
     vLink:      'HTMLBodyElement',
     version:    'HTMLHtmlElement',
-    width:      'HTMLEmbedElement HTMLHRElement HTMLIFrameElement HTMLMarqueeElement ' +
-                'HTMLObjectElement HTMLPreElement',
+    width:      'HTMLCanvasElement HTMLEmbedElement HTMLHRElement HTMLIFrameElement ' +
+                'HTMLImageElement HTMLMarqueeElement HTMLObjectElement HTMLPreElement',
   };
   for (const member in __IFACE_MEMBERS) {
     const desc = Object.getOwnPropertyDescriptor(Element.prototype, member);

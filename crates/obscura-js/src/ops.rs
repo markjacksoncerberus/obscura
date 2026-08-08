@@ -2121,6 +2121,7 @@ pub fn build_extension() -> Extension {
             op_text_decode(),
             op_text_encode(),
             op_query_encode(),
+            crate::image_ops::op_image_decode(),
             crate::sse_ops::op_sse_connect(),
             crate::sse_ops::op_sse_read(),
             crate::sse_ops::op_sse_close(),

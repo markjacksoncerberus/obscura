@@ -339,3 +339,31 @@ html/canvas/element/pixel-manipulation/2d.imageData.get.basic.html
 html/canvas/element/pixel-manipulation/2d.imageData.get.nonfinite.html
 html/canvas/element/canvas-context/2d.canvas.context.prototype.html
 html/canvas/element/conformance-requirements/2d.conformance.requirements.missingargs.html
+
+# ── Quests #511–#513: the image arc (2026-08-08) ────────────────────────────
+# The decoder, the <img> current request, and responsive images. Two of these
+# guard mistakes made and caught DURING the arc: `negativedir` is the mirroring
+# bug that had never been evaluated (no decoder → no pixels → 0/1 for an
+# unrelated reason), and `naturalWidth-…` guards the `Element.prototype.width`
+# rehoming loop that had silently DELETED `canvas.width` since quest #508.
+html/canvas/element/drawing-images-to-the-canvas/2d.drawImage.3arg.html
+html/canvas/element/drawing-images-to-the-canvas/2d.drawImage.9arg.sourcepos.html
+html/canvas/element/drawing-images-to-the-canvas/2d.drawImage.negativedir.html
+html/canvas/element/drawing-images-to-the-canvas/2d.drawImage.incomplete.reload.html
+html/canvas/element/drawing-images-to-the-canvas/2d.drawImage.nonexistent.html
+html/canvas/element/drawing-images-to-the-canvas/2d.drawImage.zerosource.image.html
+html/canvas/element/drawing-images-to-the-canvas/2d.drawImage.animated.gif.html
+html/canvas/element/compositing/2d.composite.image.source-over.html
+html/canvas/element/compositing/2d.composite.uncovered.image.copy.html
+html/canvas/element/fill-and-stroke-styles/2d.pattern.basic.image.html
+html/canvas/element/fill-and-stroke-styles/2d.pattern.image.zerowidth.html
+html/canvas/element/fill-and-stroke-styles/2d.pattern.paint.repeat.basic.html
+html/canvas/element/manual/imagebitmap/createImageBitmap-premultiplyAlpha.html
+html/canvas/element/manual/imagebitmap/createImageBitmap-sizeOverflow.html
+html/canvas/element/manual/imagebitmap/createImageBitmap-exif-orientation.html
+html/canvas/element/manual/imagebitmap/createImageBitmap-bounds.html
+html/semantics/embedded-content/the-img-element/update-the-source-set.html
+html/semantics/embedded-content/the-img-element/naturalWidth-naturalHeight-width-height.html
+html/semantics/embedded-content/the-img-element/img.complete.html
+html/semantics/embedded-content/the-img-element/data-url.html
+html/semantics/embedded-content/the-img-element/natural-size-orientation.html

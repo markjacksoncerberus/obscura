@@ -2853,6 +2853,7 @@ dependencies = [
  "ghash",
  "hmac",
  "html5ever 0.29.1",
+ "image",
  "obscura-dom",
  "obscura-net",
  "obscura-render",

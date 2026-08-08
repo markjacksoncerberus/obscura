@@ -62,6 +62,26 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **THE IMAGE ARC — Quests #511–#513 (2026-08-08), 233-file probe** | **189/1036** | **601/1036 — 76 files improved, 0 regressions** | ✅ | #511–#513 |
+| **the decoder — Quest #511 the decoded verdict (2026-08-08)** | `createImageBitmap()` resolved with a **0×0 placeholder**; `drawImage` from an `<img>`/`ImageBitmap` drew nothing | new Rust op `op_image_decode` (png/jpeg/**gif**/**webp**/bmp/ico, under memory limits) + a real `ImageBitmap` | ✅ cap closed | #511 · [`tickets/112-the-decoded-verdict.md`](tickets/112-the-decoded-verdict.md) |
+| `html/canvas/element/drawing-images-to-the-canvas` (37 files) | 12/37 | **34/37** | ✅ | #511 |
+| `html/canvas/element/compositing` — `2d.composite.image.*` + `.uncovered.image.*` (18 files) | 0/18 | **18/18** | ✅ | #511 |
+| `html/canvas/element/fill-and-stroke-styles` — `2d.pattern.*` (40 files) | 13/40 | **35/40** | ✅ | #511 |
+| `html/canvas/…/imagebitmap/createImageBitmap-premultiplyAlpha` | 0/12 | **12/12** | ✅ | #511 |
+| `html/canvas/…/imagebitmap/createImageBitmap-exif-orientation` | 0/7 | **7/7** | ✅ | #511 |
+| `html/canvas/…/imagebitmap/createImageBitmap-bounds` | 0/4 | **4/4** | ✅ | #511 |
+| `html/canvas/…/imagebitmap/createImageBitmap-sizeOverflow` | 5/7 (passing for free — the stub resolved with 0×0) | **7/7** | ✅ | #511 |
+| `html/canvas/…/imagebitmap/createImageBitmap-invalid-args` | 4/93 | **21/93** — ⛔ the rest need a video decoder | ⛔ capped | #511 |
+| **`the-img-element` — Quests #512–#513 (2026-08-08)** | **120/612** over an 86-file probe; **zero ledger rows before** — no `naturalWidth`, no `complete`, no `decode()`, no `currentSrc`, and `img.width`/`canvas.width` were **`undefined`** | **~400/612** | ✅ realm opened | #512 · #513 · [`tickets/113-the-loaded-verdict.md`](tickets/113-the-loaded-verdict.md) |
+| `html/semantics/…/the-img-element/update-the-source-set` | 0/89 | **88/89** — `srcset`/`sizes`/`<picture>` | ✅ | #513 |
+| `html/semantics/…/the-img-element/naturalWidth-naturalHeight-width-height` | 0/258 | **206/258** (fresh server) — SVG natural dimensions + density correction | ✅ | #513 · [`tickets/114-the-sourced-verdict.md`](tickets/114-the-sourced-verdict.md) |
+| `html/semantics/…/the-img-element/img.complete` | 0/19 | **16/19** | ✅ | #512 |
+| `html/semantics/…/the-img-element/natural-size-orientation` | 0/3 | **3/3** | ✅ | #512 |
+| `html/semantics/…/the-img-element/data-url` | 0/1 | **1/1** — `data:` URLs were sent to the HTTP client and refused as a blocked scheme | ✅ | #512 |
+| `html/semantics/…/the-img-element/update-src-complete` | 0/1 | **1/1** | ✅ | #512 |
+| `html/semantics/…/the-img-element/not-rendered-dimension-getter` | 0/1 | **1/1** | ✅ | #512 |
+| `html/semantics/…/the-img-element/picture-loading-lazy` | 0/4 | **3/4** — ⛔ `loading="lazy"` is parsed and inert | ⛔ capped | #513 |
+| `html/semantics/…/the-img-element/relevant-mutations` | 70/113 | 70/113 — ⛔ needs lazy loading + per-document base URLs | ⛔ capped | #512 |
 | **`html/canvas` — Quest #508 the drawn verdict (2026-08-07)** | **55/123 (44.7%)** over the 126-file canvas probe; canvas 2D was a fingerprinting costume — `fill`/`stroke`/`clip` and every transform method were `{}`, `fillText` painted PRNG noise, the bitmap was born noisy, `toDataURL` returned a fake | **119/127 (93.7%)** — 60 files improved, 0 regressions | ✅ realm opened | #508 · [`tickets/109-the-drawn-verdict.md`](tickets/109-the-drawn-verdict.md) |
 | `html/canvas/element/canvas-context` (5 files) | 3/5 | **5/5** | ✅ | #508 |
 | `html/canvas/element/conformance-requirements` (3 files) | 2/3 | **3/3** | ✅ | #508 |

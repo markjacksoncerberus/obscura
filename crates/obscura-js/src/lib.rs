@@ -12,6 +12,9 @@ pub mod compress_ops;
 pub mod crypto_ops;
 pub mod rsa_ops;
 pub mod ec_ops;
+/// The image decoder: encoded bytes in, RGBA out. Unconditional — the codecs are
+/// pure Rust, so a build with no renderer still has `createImageBitmap`.
+pub mod image_ops;
 pub mod sse_ops;
 pub mod ws_ops;
 pub mod v8_flags;
