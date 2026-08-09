@@ -398,3 +398,11 @@ editing/run/unlink.html
 /content-security-policy/img-src/img-src-none-blocks-data-uri.html
 /content-security-policy/meta/meta-outside-head.sub.html
 /content-security-policy/securitypolicyviolation/constructor-required-fields.html
+/content-security-policy/unsafe-eval/eval-blocked.sub.html
+/content-security-policy/unsafe-eval/function-constructor-blocked.sub.html
+/content-security-policy/style-src/style-src-inline-style-blocked.html
+/content-security-policy/style-src/style-src-inline-style-attribute-blocked.html
+/content-security-policy/connect-src/connect-src-xmlhttprequest-blocked.sub.html
+/content-security-policy/base-uri/base-uri-deny.sub.html
+/content-security-policy/form-action/form-action-src-blocked.sub.html
+/trusted-types/Window-block-eval-function-constructor.html

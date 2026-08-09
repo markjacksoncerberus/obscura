@@ -10,6 +10,44 @@ use crate::ops::{build_extension, ObscuraState};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
+thread_local! {
+    /// How many CDP evaluations are on the stack right now. See
+    /// `PrivilegedScript` and `ops::op_privileged_script`.
+    static PRIVILEGED_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// True while the embedder — not the page — is the one running script.
+pub fn in_privileged_script() -> bool {
+    PRIVILEGED_DEPTH.with(|d| d.get() > 0)
+}
+
+/// RAII marker for "this is the browser's own code, not the page's".
+///
+/// A page's CSP can forbid `eval`, and Obscura honours that by replacing `eval`
+/// in the page's realm. But the automation channel evaluates JavaScript in that
+/// same realm — Playwright's injected script compiles the caller's function with
+/// `eval` — and a real browser puts that code in an isolated world where the
+/// page's policy does not reach. One realm means no isolation by construction,
+/// so the guard stands in for it: raised around each CDP evaluation and dropped
+/// the moment it returns, including on the error path.
+///
+/// Without this, driving a CSP-protected page would break as soon as the page
+/// took security seriously — which is precisely backwards.
+pub struct PrivilegedScript;
+
+impl PrivilegedScript {
+    pub fn enter() -> Self {
+        PRIVILEGED_DEPTH.with(|d| d.set(d.get() + 1));
+        PrivilegedScript
+    }
+}
+
+impl Drop for PrivilegedScript {
+    fn drop(&mut self) {
+        PRIVILEGED_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     pub js_type: String,
@@ -131,6 +169,8 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<RemoteObjectInfo, String> {
+        // Everything below this point is the embedder's script, not the page's.
+        let _privileged = PrivilegedScript::enter();
         if !await_promise && return_by_value {
             let val = self.evaluate(expression)?;
             return Ok(Self::info_from_json(&val));
@@ -227,6 +267,7 @@ impl ObscuraJsRuntime {
         return_by_value: bool,
         await_promise: bool,
     ) -> Result<RemoteObjectInfo, String> {
+        let _privileged = PrivilegedScript::enter();
         let this_expr = self.resolve_this(object_id);
         let (setup, args_list) = self.build_args(arguments);
 

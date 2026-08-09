@@ -62,6 +62,35 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **THE VARIED, EVALUATED, CASCADED, OUTBOUND & COMPILED ARC — Quests #520–#524 (2026-08-09): the eval hook, and CSP's other half** | — | — | ✅ | #520–#524 |
+| **`content-security-policy` — Quests #521–#523, 130-file probe (106 realm + 24 new)** | **154/325** | **181/322 — 19 files improved, 1 moved row** | ✅ | #521–#523 · [`tickets/122`](122-the-evaluated-verdict.md) · [`tickets/123`](123-the-cascaded-verdict.md) · [`tickets/124`](124-the-outbound-verdict.md) |
+| `content-security-policy/unsafe-eval/eval-blocked.sub.html` | 0/3 | **1/1** | ✅ | #521 |
+| `content-security-policy/unsafe-eval/eval-scripts-setTimeout-blocked.sub.html` | 0/1 | **1/1** | ✅ | #521 |
+| `content-security-policy/unsafe-eval/eval-scripts-setInterval-blocked.sub.html` | 0/1 | **1/1** | ✅ | #521 |
+| `content-security-policy/unsafe-eval/function-constructor-blocked.sub.html` | 0/1 | **1/1** | ✅ | #521 |
+| `content-security-policy/style-src/style-src-inline-style-blocked.html` | 0/2 | **2/2** | ✅ | #522 |
+| `content-security-policy/style-src/style-src-inline-style-attribute-blocked.html` | 0/2 | **2/2** | ✅ | #522 |
+| `content-security-policy/style-src/style-src-inline-style-nonce-blocked.html` | 0/2 | **2/2** | ✅ | #522 |
+| `content-security-policy/style-src/style-src-hash-blocked.html` | 1/3 | **3/3** | ✅ | #522 |
+| `content-security-policy/style-src/style-src-none-blocked.html` | 1/2 | **2/2** | ✅ | #522 |
+| `content-security-policy/style-src-attr-elem/style-src-elem-allowed-attr-blocked.html` | 0/2 | **1/2** | 🟡 | #522 |
+| `content-security-policy/style-src-attr-elem/style-src-elem-blocked-attr-allowed.html` | 0/2 | **1/2** | 🟡 | #522 |
+| `content-security-policy/style-src-attr-elem/style-src-attr-blocked-src-allowed.html` | 0/2 | **1/2** | 🟡 | #522 |
+| `content-security-policy/connect-src/connect-src-xmlhttprequest-blocked.sub.html` | 0/1 | **1/1** | ✅ | #523 |
+| `content-security-policy/connect-src/connect-src-syncxmlhttprequest-blocked.sub.html` | 0/1 | **1/1** | ✅ | #523 |
+| `content-security-policy/connect-src/connect-src-beacon-blocked.sub.html` | 0/1 | **1/1** | ✅ | #523 |
+| `content-security-policy/connect-src/connect-src-eventsource-blocked.sub.html` | 0/1 | **1/1** | ✅ | #523 |
+| `content-security-policy/connect-src/connect-src-fetch-keepalive-blocked.sub.html` | 1/2 | **2/2** | ✅ | #523 |
+| `content-security-policy/base-uri/base-uri-deny.sub.html` | 0/2 | **2/2** | ✅ | #523 |
+| `content-security-policy/base-uri/base-uri-deny-url-encoded-host.sub.html` | 0/2 | **2/2** | ✅ | #523 |
+| `content-security-policy/base-uri/report-uri-does-not-respect-base-uri.sub.html` | 0/3 | **3/3** | ✅ | #523 |
+| `content-security-policy/form-action/form-action-src-blocked.sub.html` | 0/1 | **1/1** | ✅ | #523 |
+| `content-security-policy/form-action/form-action-src-get-blocked.sub.html` | 0/1 | **1/1** | ✅ | #523 |
+| `content-security-policy/parsing/invalid-directive.html` | 0/1 | **1/1** | ✅ | #522 |
+| `content-security-policy/meta/combine-header-and-meta-policies.sub.html` | 1/2 | **2/2** | ✅ | #522 |
+| `content-security-policy/style-src/inline-style-allowed-while-cloning-objects.sub.html` | 19/25 | **18/25** | ⚠️ one moved row — see [`tickets/123`](123-the-cascaded-verdict.md) | #522 |
+| `trusted-types/Window-block-eval-function-constructor.html` | 0/6 (harness ERROR) | **6/6 OK** | ✅ | #524 · [`tickets/125`](125-the-compiled-verdict.md) |
+| `trusted-types/DedicatedWorker-block-eval-function-constructor.html` | 0/6 (harness ERROR) | **6/6 OK** | ✅ | #524 |
 | **THE INTENDED, DECLARED & REPORTED ARC — Quests #517–#519 (2026-08-08): TWO untouched realms opened** | — | — | ✅ | #517–#519 |
 | **`input-events` — Quest #517, whole realm, 33 probe entries** | **180/3,240** | **1,805/2,978 — 17 files improved, 0 regressions** | ✅ realm opened | #517 · [`tickets/118-the-intended-verdict.md`](tickets/118-the-intended-verdict.md) |
 | `input-events/input-events-exec-command.html` | 123/195 | **290/305** | ✅ | #517 |

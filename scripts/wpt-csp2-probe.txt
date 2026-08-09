@@ -1,0 +1,47 @@
+# CSP part-two probe (quests #521-#524): unsafe-eval, style-src, connect-src,
+# base-uri, form-action, and the trusted-types compilation sinks.
+# Run alongside scripts/wpt-csp-probe.txt; together they are the 130-file list
+# the arc was measured on (154/325 -> 183/322).
+content-security-policy/connect-src/connect-src-xmlhttprequest-allowed.sub.html
+content-security-policy/connect-src/connect-src-xmlhttprequest-blocked.sub.html
+content-security-policy/connect-src/connect-src-syncxmlhttprequest-allowed.sub.html
+content-security-policy/connect-src/connect-src-syncxmlhttprequest-blocked.sub.html
+content-security-policy/connect-src/connect-src-beacon-allowed.sub.html
+content-security-policy/connect-src/connect-src-beacon-blocked.sub.html
+content-security-policy/connect-src/connect-src-eventsource-allowed.sub.html
+content-security-policy/connect-src/connect-src-eventsource-blocked.sub.html
+content-security-policy/connect-src/connect-src-fetch-keepalive-allowed.sub.html
+content-security-policy/connect-src/connect-src-fetch-keepalive-blocked.sub.html
+content-security-policy/form-action/form-action-src-allowed.sub.html
+content-security-policy/form-action/form-action-src-blocked.sub.html
+content-security-policy/form-action/form-action-src-get-allowed.sub.html
+content-security-policy/form-action/form-action-src-get-blocked.sub.html
+content-security-policy/form-action/form-action-src-default-ignored.sub.html
+content-security-policy/base-uri/base-uri-allow-leading-zero-port.sub.html
+content-security-policy/base-uri/base-uri-deny-url-encoded-host.sub.html
+content-security-policy/base-uri/report-uri-does-not-respect-base-uri.sub.html
+trusted-types/Window-block-eval-function-constructor.html
+trusted-types/Window-setTimeout-setInterval.html
+trusted-types/DedicatedWorker-block-eval-function-constructor.html
+trusted-types/TrustedTypePolicyFactory-createPolicy-cspTests.html
+trusted-types/TrustedTypePolicy-CSP-wildcard.html
+trusted-types/TrustedTypePolicy-CSP-no-name.html
+content-security-policy/unsafe-eval/eval-allowed.sub.html
+content-security-policy/unsafe-eval/eval-blocked.sub.html
+content-security-policy/unsafe-eval/eval-scripts-setTimeout-allowed.sub.html
+content-security-policy/unsafe-eval/eval-scripts-setTimeout-blocked.sub.html
+content-security-policy/unsafe-eval/eval-scripts-setInterval-allowed.sub.html
+content-security-policy/unsafe-eval/eval-scripts-setInterval-blocked.sub.html
+content-security-policy/unsafe-eval/function-constructor-allowed.sub.html
+content-security-policy/unsafe-eval/function-constructor-blocked.sub.html
+content-security-policy/style-src/style-src-inline-style-blocked.html
+content-security-policy/style-src/style-src-inline-style-attribute-allowed.html
+content-security-policy/style-src/style-src-inline-style-attribute-blocked.html
+content-security-policy/style-src/style-src-inline-style-nonce-allowed.html
+content-security-policy/style-src/style-src-inline-style-nonce-blocked.html
+content-security-policy/style-src/style-src-hash-allowed.html
+content-security-policy/style-src/style-src-hash-blocked.html
+content-security-policy/style-src/style-src-none-blocked.html
+content-security-policy/style-src/style-src-star-allowed.html
+content-security-policy/base-uri/base-uri-allow.sub.html
+content-security-policy/base-uri/base-uri-deny.sub.html

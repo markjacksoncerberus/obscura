@@ -75,6 +75,34 @@ faster than full rebuilds for diagnosing *why* something fails.
 
 ## 3. Hard-won gotchas (these will save you hours)
 
+- **⚠️⚠️ NEVER PIPE `cargo build` TO `tail` — 2026-08-09.** A shell pipeline reports
+  the exit status of the LAST command, so `cargo build … | tail -3` is *always*
+  exit 0, even when the build panicked. A `bootstrap.js` syntax error panics the
+  snapshot step in `crates/obscura-js/build.rs`, leaving the OLD binary in place —
+  so the tests still run, still pass, and measure code you did not write. Grep
+  instead:
+  ```sh
+  cargo build --release --features render 2>&1 | grep -E '^error|panicked|Finished'
+  ```
+- **⚠️⚠️ AND THEN PROVE THE *SERVER*, NOT JUST THE BINARY — 2026-08-09.** Two
+  measurement cycles in one session were spent reading a table produced by a
+  server started *before* the rebuild. `ls -l target/release/obscura` proves the
+  file; only a probe proves the process:
+  ```sh
+  .venv/bin/python scripts/eval_probe.py 'return typeof globalThis.__myNewThing'
+  ```
+  ⚠️ `eval_probe.py` takes a FUNCTION BODY, not an expression — you need `return`.
+- **⚠️ `bootstrap.js` IS STRICT-MODE CODE.** `function eval(…)` / `function
+  arguments(…)` as a binding identifier is a SyntaxError that takes the WHOLE
+  bootstrap with it — i.e. a browser with no DOM at all. Name the function
+  something else and stamp the name on with `Object.defineProperty(f, 'name', …)`.
+- **⚠️ CDP EVALUATIONS ARE PRIVILEGED, ON PURPOSE.** Playwright's injected script
+  compiles the caller's function with the PAGE's `eval`. A real browser runs it in
+  an isolated world; Obscura has one realm, so `runtime::PrivilegedScript` (an RAII
+  guard around each CDP entry point) plus `op_privileged_script` stands in for one.
+  Anything that takes a capability away from the page must consult it, or driving a
+  CSP-protected page stops working.
+
 - **⚠️⚠️ THE SERVER DEGRADES AFTER A HANDFUL OF CDP SESSIONS — MEASURED, 2026-08-07.
   Use `scripts/wpt_batch.sh`, not one long sweep.** A 30-file `xhr` sweep managed
   **five files in twenty-five minutes**; the same first file against a *fresh*

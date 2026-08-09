@@ -871,6 +871,25 @@ fn op_layout(state: &OpState, #[string] cmd: String, #[string] viewport: String)
     }
 }
 
+/// Is the code running right now the *embedder's*, rather than the page's?
+///
+/// A page's Content Security Policy governs the page. It does not govern the
+/// browser: a real engine runs its automation channel (WebDriver, DevTools,
+/// Playwright's injected script) in an ISOLATED WORLD, which shares the DOM but
+/// carries no policy of its own. Obscura has one JavaScript realm, so it cannot
+/// isolate by construction — it has to know, at the moment `eval` is called,
+/// whose code asked.
+///
+/// The counter lives in Rust and is raised only by the CDP entry points in
+/// `runtime.rs`, for exactly the span of one evaluation. A page can call this op
+/// — every `__obscura*` internal is reachable from a page in a single-realm
+/// engine — but calling it only ever READS, and while page script is running the
+/// answer is `false`. There is nothing here to set.
+#[op2(fast)]
+fn op_privileged_script() -> bool {
+    crate::runtime::in_privileged_script()
+}
+
 #[op2(fast)]
 fn op_console_msg(state: &OpState, #[string] level: &str, #[string] msg: &str) {
     let _ = state;
@@ -2107,6 +2126,7 @@ pub fn build_extension() -> Extension {
             op_dom(),
             op_layout(),
             op_console_msg(),
+            op_privileged_script(),
             op_fetch_url(),
             op_fetch_url_sync(),
             op_get_cookies(),

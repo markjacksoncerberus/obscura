@@ -435,6 +435,64 @@ _FAIL_RE = re.compile(r'<td class="(?:fail|timeout)"[^>]*>(?:Fail|Timeout)</td>\
                       re.IGNORECASE)
 
 
+# --- <meta name="variant"> expansion -----------------------------------------
+# A WPT file may declare that it is really N tests, each run with a different
+# query string:
+#
+#     <meta name="variant" content="?wpt_flags=h2">
+#     <meta name="variant" content="">
+#
+# The upstream runner (and wpt.fyi, and therefore every score we compare
+# ourselves against) treats each of those as a SEPARATE test with its own row.
+# A runner that fetches the bare URL runs only whichever variant the file
+# happens to behave as with no query string — and several suites, `input-events`
+# among them, deliberately `throw new Error("Unhandled variant")` when the
+# query string is missing, so the whole file scores nothing for a reason that
+# has nothing to do with the engine.
+#
+# We fetch the file once, read the declarations in document order, and hand back
+# one URL per variant. Failure to fetch is not fatal: we fall back to the bare
+# URL, which is exactly the old behaviour.
+_VARIANT_RE = re.compile(
+    r"""<meta\s+[^>]*name\s*=\s*['"]?variant['"]?[^>]*>""", re.IGNORECASE)
+_CONTENT_RE = re.compile(r"""content\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))""", re.IGNORECASE)
+
+_variant_cache = {}
+
+
+def variant_urls(url, timeout=15.0):
+    """Return the list of URLs this test really is — one per declared variant."""
+    # A URL the caller already qualified (a hand-written variant, or a `.sub.`
+    # test with its own query) is taken at its word: expanding it again would
+    # append a second `?`.
+    if "?" in url or "#" in url:
+        return [url]
+    if url in _variant_cache:
+        return _variant_cache[url]
+    out = [url]
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "obscura-wpt-run"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # Only the head of the file can carry a <meta>; 256 KB is far past
+            # any real <head> and keeps a giant generated test cheap to check.
+            body = resp.read(262144).decode("utf-8", "replace")
+        variants = []
+        for tag in _VARIANT_RE.findall(body):
+            m = _CONTENT_RE.search(tag)
+            if not m:
+                continue
+            content = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+            # An empty content means "also run me bare" — a real variant.
+            variants.append(url + content)
+        if variants:
+            out = variants
+    except Exception:  # noqa: BLE001
+        pass
+    _variant_cache[url] = out
+    return out
+
+
 async def run_one(ctx, url, timeout):
     """Run one test on a FRESH page (own page thread; no carried-over state) and
     return (ok_to_score, dict|errstr)."""
@@ -509,10 +567,18 @@ async def main_async(args):
 
         print(f"\n{'TEST':54} {'PASS/TOTAL':>11}  HARNESS", flush=True)
         print("-" * 80, flush=True)
+        expanded = []
         for t in tests:
             url = t if t.startswith("http") else f"{base}/{t.lstrip('/')}"
+            urls = [url] if args.no_variants else variant_urls(url)
+            for u in urls:
+                # Label the row the way the caller wrote it, plus whatever the
+                # variant added, so a probe list stays greppable against output.
+                expanded.append((t + u[len(url):], u))
+
+        for label_src, url in expanded:
             ok, data = await run_one(ctx, url, args.timeout)
-            label = t if len(t) <= 54 else "…" + t[-53:]
+            label = label_src if len(label_src) <= 54 else "…" + label_src[-53:]
             if not ok:
                 unloaded += 1
                 print(f"{label:54} {'—':>11}  {data}", flush=True)
@@ -548,6 +614,8 @@ def main():
     ap.add_argument("--base", default="https://wpt.live")
     ap.add_argument("--timeout", type=float, default=30.0, help="per-test seconds (default 30)")
     ap.add_argument("--verbose", "-v", action="store_true", help="list failing subtests")
+    ap.add_argument("--no-variants", action="store_true",
+                    help="do not expand <meta name=\"variant\"> into one run per variant")
     args = ap.parse_args()
     try:
         return asyncio.run(main_async(args))

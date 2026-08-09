@@ -2,6 +2,24 @@
 
 const __obscura_errors = [];
 
+// ⭐ THE ENGINE'S OWN COMPILERS, CAPTURED BEFORE THE PAGE CAN SEE THEM.
+//
+// Content Security Policy's `script-src` without `'unsafe-eval'` means "this
+// page may not turn data into code at runtime", and the only way to honour it
+// is to replace `eval` and `Function` with something that refuses (see the CSP
+// eval gate). But the engine itself compiles strings for reasons that have
+// nothing to do with the page's own `eval`: an inline `onclick=""` handler, a
+// frame's script, a worker's body, an AudioWorklet processor. Those are governed
+// by OTHER directives (`script-src-attr`, `script-src-elem`) and a policy that
+// forbids `eval` does not forbid any of them.
+//
+// So the engine keeps its own references, taken before anything else runs. A
+// gate that also gagged the engine would block inline event handlers on every
+// site that sensibly forbids `eval` — which is to say, on exactly the sites that
+// took security seriously.
+const _NativeEval = globalThis.eval;
+const _NativeFunction = globalThis.Function;
+
 globalThis.addEventListener = globalThis.addEventListener || function(){};
 // `window.onerror` / `window.onunhandledrejection` default to null per HTML (the
 // event-handler IDL attributes are null until a page assigns one). They used to be
@@ -457,7 +475,7 @@ const _ehMakeFn = function(name, isError, source, chain) {
   const fnSrc = 'function ' + name + '(' + params + ') {\n' + source + '\n}';
   let head = '', tail = ''; const argNames = [];
   for (let i = 0; i < chain.length; i++) { head += 'with(__s' + i + '){'; tail += '}'; argNames.push('__s' + i); }
-  const factory = new Function(...argNames, head + 'return (' + fnSrc + ');' + tail);
+  const factory = new _NativeFunction(...argNames, head + 'return (' + fnSrc + ');' + tail);
   return factory.apply(null, chain);
 };
 // HTML "compile a function body" for an element/document event handler.
@@ -798,10 +816,10 @@ const _runTimerHandler = (fn, code, args) => {
     if (code !== null) {
       // ⭐ `setTimeout("...")` IS `eval` WITH A DELAY, and CSP treats it as one:
       // it turns a string into code at runtime, which is exactly the step an
-      // injection needs. Without `'unsafe-eval'` the string form does nothing —
-      // silently, because the timer has no caller left to throw at.
-      if (typeof globalThis.__cspAllowsEval === 'function' && !globalThis.__cspAllowsEval()) return;
-      (0, eval)(code);
+      // injection needs. The CSP question is asked (and the report sent) when the
+      // timer is SCHEDULED, not here — see `_cspTimerStringAllowed`. By the time
+      // we are running, the string has already been cleared to compile.
+      (0, _NativeEval)(code);
     } else fn(...args);
   } catch (e) { _reportError(e); }
 };
@@ -809,8 +827,18 @@ const _runTimerHandler = (fn, code, args) => {
 // Trusted Types: the string form of setTimeout/setInterval compiles its argument
 // — `setTimeout("doThing(" + userInput + ")")` is eval with a delay — so the
 // string overload is a TrustedScript sink while the function overload is not.
+// ⭐ WHEN CSP BLOCKS THE STRING FORM, THE TIMER IS NEVER SCHEDULED AND THE ID IS
+// `0` — HTML's "timer initialisation steps" say so, and it is the only signal the
+// caller gets. Deciding this at FIRE time instead (as this used to) hands back a
+// real id for a timer that will never do anything, so a page that guards on
+// `if (!id)` believes its scheduled code is on its way. The violation report also
+// belongs here: at fire time there is no script on the stack to attribute it to.
+const _cspTimerStringAllowed = () =>
+  typeof globalThis.__cspAllowsEval !== 'function' || globalThis.__cspAllowsEval();
+
 globalThis.setTimeout = (fn, delay = 0, ...args) => {
   if (typeof fn !== "function") { const _tt = _ttSink('TrustedScript', fn, 'Window setTimeout'); if (_tt !== null) fn = _tt; }
+  if (typeof fn !== "function" && !_cspTimerStringAllowed()) return 0;
   const code = (typeof fn === "function") ? null : String(fn);
   const id = ++_tid;
   _scheduleAfter(delay, () => {
@@ -824,6 +852,7 @@ globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
   if (typeof fn !== "function") { const _tt = _ttSink('TrustedScript', fn, 'Window setInterval'); if (_tt !== null) fn = _tt; }
+  if (typeof fn !== "function" && !_cspTimerStringAllowed()) return 0;
   const code = (typeof fn === "function") ? null : String(fn);
   const id = ++_tid;
   _intervals.add(id);
@@ -3954,7 +3983,7 @@ class Node {
         if (code) {
           const _prevCS = globalThis.__currentScriptNid;
           globalThis.__currentScriptNid = c._nid;
-          try { (0, eval)(code); }
+          try { (0, _NativeEval)(code); }
           catch(e) { console.error('Dynamic inline script error:', e.message); }
           finally { globalThis.__currentScriptNid = _prevCS; }
         }
@@ -4451,6 +4480,18 @@ const _documentBaseURL = function(doc) {
     for (let i = 0; i < bases.length; i++) {
       const href = bases[i].getAttribute('href');
       if (href != null) {
+        // ⭐ `base-uri` exists because ONE injected tag re-points every relative
+        // URL on the page at once. `<base href="//evil/">` needs no script and
+        // no network access of its own: from that line down, every relative
+        // `src`, `href` and form target belongs to somebody else. A policy that
+        // carefully enumerates script hosts and forgets this one has enumerated
+        // nothing. A blocked <base> is IGNORED — the document falls back to its
+        // own URL, which is what it would have used had the tag never existed.
+        if (typeof globalThis.__cspAllowsURL === 'function') {
+          let abs = href;
+          try { abs = new URL(href, fallback).href; } catch (e) { abs = href; }
+          if (!globalThis.__cspAllowsURL('base-uri', abs, bases[i])) continue;
+        }
         try { return new URL(href, fallback).href; } catch (e) { return fallback; }
       }
     }
@@ -6445,6 +6486,15 @@ class Element extends Node {
       const sep = targetUrl.includes('?') ? '&' : '?';
       return targetUrl + (encoded ? sep + encoded : '');
     };
+
+    // ⭐ `form-action` is the directive that decides WHERE THE PASSWORD GOES. An
+    // injected `<form action="//evil/">`, or one line rewriting an existing
+    // form's `action`, sends the credentials the reader is about to type to
+    // somebody else — with no script running at submit time, on a page that
+    // still looks exactly like the real one. Blocking it is the difference
+    // between a defaced page and a stolen account.
+    if (typeof globalThis.__cspAllowsURL === 'function'
+        && !globalThis.__cspAllowsURL('form-action', targetUrl, this)) return;
 
     // `target` picks the browsing context to navigate. A named frame in this
     // document takes the submission; only an absent/self target navigates the
@@ -9257,7 +9307,7 @@ const _reportFrameError = function(err, win) {
 const _runFrameScript = function(code, win, url) {
   if (!code || !win) return;
   try {
-    const fn = new Function(
+    const fn = new _NativeFunction(
       'window', 'self', 'document', 'location', 'parent', 'top', 'frames',
       'frameElement', 'globalThis', 'localStorage', 'sessionStorage',
       code + '\n//# sourceURL=' + (url || 'about:blank-frame')
@@ -9323,7 +9373,7 @@ const _runFrameProgram = function(parts, win, baseUrl) {
     // wrapper) are still attached to the frame window. The parent realm drives the
     // frame through contentWindow.run()/setupRangeTests(), so dropping those on a
     // mid-script throw would silently break the entire frame.
-    const fn = new Function(
+    const fn = new _NativeFunction(
       'window', 'self', 'document', 'location', 'parent', 'top', 'frames',
       'frameElement', 'globalThis', 'localStorage', 'sessionStorage',
       'try {\n' + head + '\n' + body + '\n} finally {\n' + tail + '\n}'
@@ -9443,7 +9493,7 @@ const _fireIframeElementLoad = function(el) {
     const a = el.getAttribute && el.getAttribute('onload');
     if (a && (typeof globalThis.__cspAllowsInline !== 'function'
               || globalThis.__cspAllowsInline('script-attribute', el, a))) {
-      try { (0, eval)(a); } catch (e) {}
+      try { (0, _NativeEval)(a); } catch (e) {}
     }
   }
 };
@@ -9465,7 +9515,7 @@ const _fireElementError = function(el) {
     const a = el.getAttribute && el.getAttribute('onerror');
     if (a && (typeof globalThis.__cspAllowsInline !== 'function'
               || globalThis.__cspAllowsInline('script-attribute', el, a))) {
-      try { (0, eval)(a); } catch (e) {}
+      try { (0, _NativeEval)(a); } catch (e) {}
     }
   }
 };
@@ -10119,7 +10169,7 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
         }
       } catch (e) {}
       if (opts.eval && parsed.body) {
-        try { (0, eval)(parsed.body); } catch (e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
+        try { (0, _NativeEval)(parsed.body); } catch (e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
       }
       if (status === 0 || status >= 400) {
         if (initiatorType === 'img') _imgMarkBroken(el);
@@ -10342,7 +10392,7 @@ const __installBodyWindowHandlers = function() {
       for (const on of _BODY_WINDOW_HANDLERS) {
         const attr = el.getAttribute(on);
         if (attr == null) continue;
-        try { globalThis[on] = new Function('event', attr); } catch (e) {}
+        try { globalThis[on] = new _NativeFunction('event', attr); } catch (e) {}
       }
     }
   } catch (e) {}
@@ -10426,7 +10476,16 @@ globalThis.navigator = {
   // and both of them lied.
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
-  sendBeacon() { return true; },
+  // `connect-src` governs the beacon like any other fetch. A blocked beacon
+  // returns false rather than throwing: the caller is told the bytes are not
+  // queued, which is the whole contract of the method.
+  sendBeacon(url) {
+    try {
+      if (typeof globalThis.__cspAllowsURL === 'function'
+          && !globalThis.__cspAllowsURL('connect-src', String(url), null)) return false;
+    } catch (e) {}
+    return true;
+  },
   javaEnabled() { return false; },
 };
 // `navigator` is a Navigator, not a bag. The interface object has to exist and
@@ -10768,6 +10827,14 @@ globalThis.fetch = async (input, init = {}) => {
       });
     }
     throw new TypeError("Failed to fetch: blob URL not found, revoked, or non-GET method");
+  }
+  // `connect-src`: a blocked fetch REJECTS with a TypeError, which is what the
+  // Fetch spec calls a network error. It must not resolve with an error
+  // Response — a page that gets a Response back believes it reached the network.
+  if (typeof globalThis.__cspAllowsURL === 'function' && typeof url === 'string'
+      && !url.startsWith('data:') && !url.startsWith('blob:')
+      && !globalThis.__cspAllowsURL('connect-src', url, null)) {
+    throw new TypeError('Failed to fetch: blocked by Content Security Policy');
   }
   // data: URLs are resolved in-process (no network). reqwest can't fetch them,
   // so handle the WHATWG "data: URL processor" here and synthesize the Response.
@@ -11669,6 +11736,20 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
         url = new URL(url, base).href;
       } catch(e) {}
     }
+    // ⭐ `connect-src` is the directive that stops an injection PHONING HOME.
+    // Script that is already running cannot be un-run, but it still has to get
+    // what it stole off the machine, and every route out — XHR, fetch, beacon,
+    // EventSource, WebSocket — is a connection this directive can refuse. A
+    // blocked request is a NETWORK ERROR, not an exception: `send()` has already
+    // returned by the time the page hears, so the page hears through `onerror`,
+    // exactly as it would for a server that hung up.
+    if (typeof globalThis.__cspAllowsURL === 'function'
+        && !globalThis.__cspAllowsURL('connect-src', url, null)) {
+      this._sendFlag = true;
+      const _self = this;
+      _queueTask(() => { try { _self._requestError('error'); } catch (e) {} });
+      return;
+    }
 
     // Extract the request body + derive/adjust its Content-Type (XHR §send()).
     // GET/HEAD never carry a body (the spec discards send()'s argument).
@@ -11863,6 +11944,15 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     const isBlob = (typeof url === 'string' && url.startsWith('blob:')) || !!this._blobSnapshot;
     if (typeof url === 'string' && url && !url.includes('://') && !isData && !isBlob) {
       try { url = new URL(url, _domParse("document_url") || "about:blank").href; } catch (e) {}
+    }
+    // A synchronous request blocked by `connect-src` is still a network error —
+    // and the synchronous form reports one by THROWING, because there is no
+    // later task in which to fire an event.
+    if (!isData && !isBlob && typeof globalThis.__cspAllowsURL === 'function'
+        && !globalThis.__cspAllowsURL('connect-src', url, null)) {
+      this._readyState = 4;
+      try { this._fireEvent('readystatechange'); } catch (e) {}
+      throw new DOMException('Failed to load resource', 'NetworkError');
     }
     let status, statusText, respHeaders, respBytes = null, respText = null, finalUrl;
     try {
@@ -27846,6 +27936,11 @@ const _buildCascadeUncached = (el) => {
     // querySelector path uses. Gated cheaply inside _primeTarget/_primeValidity.
     const flat = [];
     for (const styleEl of styleEls) {
+      // ⭐ A <style> the page's own Content Security Policy forbade contributes
+      // nothing to the cascade. The element stays in the tree and its text is
+      // still readable — CSP stops a declaration APPLYING, it does not edit the
+      // document — but no rule of it ever matches anything.
+      if (typeof globalThis.__cspStyleBlocked === 'function' && globalThis.__cspStyleBlocked(styleEl)) continue;
       for (const rule of _styleSheetRules(styleEl)) flat.push(rule);
     }
     const combined = flat.map((r) => r.selectorText).join(' ');
@@ -27905,6 +28000,12 @@ const _buildCascadeUncached = (el) => {
     if (!el._styleSynced) {
       try { inlineText = el.getAttribute && el.getAttribute('style'); } catch { inlineText = ''; }
     }
+    // `style-src-attr` without `'unsafe-inline'`: the attribute is still there
+    // and still readable, and it applies to nothing. This is the sanitizer's
+    // blind spot — `<img src=x style="position:fixed;inset:0">` survives every
+    // filter that only looks for <script>.
+    if (inlineText && typeof globalThis.__cspStyleAttrBlocked === 'function'
+        && globalThis.__cspStyleAttrBlocked(el)) inlineText = '';
     if (inlineText) {
       const decls = _cssParseDecls(inlineText, _docIsQuirks(doc));
       // @page (and other at-rule-only) descriptors are invalid as element properties:
@@ -27919,6 +28020,16 @@ const _buildCascadeUncached = (el) => {
     // them as an inline-level source so a CSSOM-set value wins over author rules.
     let liveProps = null, livePrio = null;
     try { liveProps = el.style && el.style._props; livePrio = el.style && el.style._priority; } catch { liveProps = null; }
+    // ⚠️ The live declaration block is SEEDED FROM THE ATTRIBUTE the first time
+    // anything touches `.style`, so dropping only the attribute source lets a
+    // blocked `style=""` back in through the CSSOM the moment any code reads
+    // `el.style` — which `getComputedStyle` itself can cause. Both faces of one
+    // declaration have to go. ⛔ Cap: a genuine CSSOM write (`el.style.color =
+    // 'red'`, which CSP does NOT govern) on an element whose ATTRIBUTE was
+    // blocked is dropped with it; separating them needs the block to remember
+    // which properties came from the markup.
+    if (liveProps && typeof globalThis.__cspStyleAttrBlocked === 'function'
+        && globalThis.__cspStyleAttrBlocked(el)) liveProps = null;
     if (liveProps) {
       const decls = {};
       let any = false;
@@ -27981,6 +28092,12 @@ const _specifiedDecl = (el, kebab) => {
     if (w && w.d.value !== '') return { value: String(w.d.value), sh: w.d._sh || null };
   } catch (e) {}
   try {
+    // ⚠️ This fallback reads the LIVE inline declaration directly, around the
+    // cascade — so a `style=""` that `style-src-attr` forbade would arrive here
+    // anyway, having been correctly refused one line earlier. A gate is only a
+    // gate if every road goes through it.
+    if (typeof globalThis.__cspStyleAttrBlocked === 'function' && globalThis.__cspStyleAttrBlocked(el))
+      return { value: '', sh: null };
     const s = el && el.style;
     if (s && s.getPropertyValue) { const lv = s.getPropertyValue(kebab); if (lv) return { value: String(lv), sh: null }; }
   } catch (e) {}
@@ -35547,6 +35664,18 @@ function _ttCSP() {
     if (!he || _asciiLower(he) !== 'content-security-policy' || content == null) continue;
     _ttParseCSPInto(content, csp);
   }
+  // ⭐ A POLICY DELIVERED IN A HEADER IS THE SAME POLICY. This scan was written
+  // before the engine had a real CSP parser and reads only <meta>, so a site that
+  // sends `require-trusted-types-for 'script'` the ordinary way — in the response
+  // header, where a policy belongs, because it cannot be injected into markup —
+  // got no enforcement at all. The real parser owns every policy from every
+  // delivery path; ask it, and keep the meta walk above for the case where a
+  // policy arrived before that parser had run.
+  try {
+    if (typeof globalThis.__cspSerializedPolicies === 'function') {
+      for (const text of globalThis.__cspSerializedPolicies()) _ttParseCSPInto(text, csp);
+    }
+  } catch (e) {}
   // Policies only accumulate: a directive seen once is kept even if its element
   // is gone by the next scan.
   if (cached) {
@@ -35707,6 +35836,46 @@ function _ttAttrSink(el, attrLocal, attrNs, value) {
   if (!d) return null;
   return _ttCompliant(d.type, value, d.sink);
 }
+// ⭐⭐ THE COMPILATION SINK IS NOT LIKE THE OTHERS — CSP §"can compile strings".
+//
+// Every other Trusted Types sink accepts what the default policy hands back:
+// `el.innerHTML = userInput` under a default policy that sanitises is EXACTLY
+// how Trusted Types is meant to be adopted, one sink at a time, without
+// rewriting the application. `eval` refuses that bargain. Here the default
+// policy's return value must be **string-identical to what was passed in**, and
+// anything else — a sanitised version, a wrapped version, a merely reformatted
+// version — blocks the compilation.
+//
+// That looks pointlessly strict until you notice what it protects: the default
+// policy is the LAST line of defence, and for `eval` there is no safe rewrite.
+// Sanitising markup removes the dangerous parts and leaves a document; there is
+// no equivalent for a program. So the only thing the policy can usefully say is
+// "yes, exactly this, I have seen it" — and the identity check is how the
+// platform makes it say so rather than guess.
+//
+// It also throws **EvalError**, not the TypeError every other sink throws. That
+// is deliberate in the spec: `eval` already has a failure mode for "this
+// environment will not compile strings", and CSP's `'unsafe-eval'` uses it, so
+// a page's existing `catch (e)` keeps working when it turns Trusted Types on.
+// Returns the string to compile, or `null` when Trusted Types is not enforced.
+function _ttCanCompile(value, sink) {
+  if (!_ttOn()) return null;
+  const Ctor = _TT_CTOR.TrustedScript;
+  if (value instanceof Ctor && _ttData.has(value)) return _ttData.get(value);
+  const str = String(value);
+  const def = _ttEnv.defaultPolicy;
+  if (def !== null) {
+    let v = null;
+    try { v = _ttPolicyValue(def, _TT_CREATE_FN.TrustedScript, str, ['TrustedScript', sink], false); }
+    catch (e) { v = null; }
+    // The identity check. A default policy that CHANGED the program is a default
+    // policy that did not vouch for the program it was shown.
+    if (v !== null && String(v) === str) return str;
+  }
+  throw new EvalError("Refused to evaluate a string as JavaScript because this document requires " +
+    "'TrustedScript' assignment ('" + sink + "').");
+}
+
 // Property/operation sink hook (innerHTML, document.write, eval, …). Returns the
 // string to use; throws TypeError when the value is refused.
 function _ttSink(typeName, value, sink) {
@@ -40531,7 +40700,7 @@ globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMedi
       try { _dispatchSpec(el, ev); } catch (e) {}
       if (!el['__ehon_onerror']) {
         const a = el.getAttribute && el.getAttribute('onerror');
-        if (a) { try { (0, eval)(a); } catch (e) {} }
+        if (a) { try { (0, _NativeEval)(a); } catch (e) {} }
       }
     });
   };
@@ -46354,6 +46523,12 @@ globalThis.__obscuraAddCSP = (text, disposition, source) => {
       }
       _cspState.policies.push(p);
     }
+    // A policy that forbids `eval` only forbids it once the language stops
+    // offering it — see _cspInstallEvalGate. Done here rather than lazily so the
+    // very first `eval` on the page is already gated.
+    _cspInstallEvalGate();
+    // Same reason, and a sharper one: see __obscuraApplyStyleCSP.
+    globalThis.__obscuraApplyStyleCSP();
   } catch (e) { /* a policy we cannot parse must not take the page down with it */ }
 };
 
@@ -46404,7 +46579,11 @@ const _cspMatchesSource = (expr, url, selfOrigin) => {
   // host-source: [scheme "://"] host [":" port] [path]
   const m = /^(?:([a-zA-Z][a-zA-Z0-9+\-.]*):\/\/)?(\*|(?:\*\.)?[^\s/:]+)(?::(\d+|\*))?(\/[^\s]*)?$/.exec(e);
   if (!m) return false;
-  const [, scheme, host, port, path] = m;
+  const [, scheme, host, rawPort, path] = m;
+  // ⚠️ A PORT IS A NUMBER, NOT A STRING OF DIGITS. `:080` and `:80` are the same
+  // port, and a URL object has already normalised its side — so comparing the
+  // spellings refuses a policy that is, by the spec's own definition, a match.
+  const port = (rawPort && rawPort !== '*') ? String(parseInt(rawPort, 10)) : rawPort;
   if (scheme) { if (!_cspSchemeMatches(scheme, url.protocol)) return false; }
   else if (selfOrigin) {
     // No scheme in the expression: the document's own scheme is implied, and an
@@ -46486,7 +46665,17 @@ const _cspReport = (policy, effectiveDirective, violatedDirective, blockedURI, e
     referrer: (globalThis.document && document.referrer) || '',
     blockedURI: blockedURI || '',
     effectiveDirective: effectiveDirective,
-    violatedDirective: violatedDirective || effectiveDirective,
+    // ⭐ `violatedDirective` IS `effectiveDirective` — CSP3 keeps the older name
+    // as a historical alias of the same value, and every browser reports it that
+    // way. Reporting the DECLARED directive instead (`style-src` where the
+    // effective one is `style-src-elem`) looks more informative and is wrong:
+    // a report consumer grouping by this field would file inline-<style> and
+    // <link> violations under one heading and never be able to tell them apart,
+    // which is the one distinction the pair of names exists to make.
+    violatedDirective: effectiveDirective,
+    // The directive as the policy actually spelled it, kept for the report body's
+    // own use and for anyone debugging which line of the policy fired.
+    declaredDirective: violatedDirective || effectiveDirective,
     originalPolicy: policy.text,
     sourceFile: '',
     sample: sample || '',
@@ -46501,7 +46690,15 @@ const _cspReport = (policy, effectiveDirective, violatedDirective, blockedURI, e
   const target = (element && element.isConnected !== false) ? element : (globalThis.document || null);
   if (!target) return;
   ev.target = target;
-  try { _dispatchSpec(target, ev); } catch (e) {}
+  // ⭐ "QUEUE A TASK to fire the event" (CSP3 §"report a violation"), not "fire
+  // it here". The difference is visible: `try { eval(…) } catch (e) { log('blocked') }`
+  // must log `blocked` BEFORE the violation listener runs, because the throw
+  // happens inside the caller's own frame and the report is a separate task. Fire
+  // it synchronously and the page observes its security event arriving from the
+  // middle of its own expression — an ordering no real browser produces, and one
+  // that silently reorders every log a site keeps of its own violations.
+  try { _scheduleAfter(0, () => { try { _dispatchSpec(target, ev); } catch (e) {} }); }
+  catch (e) { try { _dispatchSpec(target, ev); } catch (e2) {} }
   _cspState.reported++;
   _cspSendReport(policy, init);
 };
@@ -46656,6 +46853,157 @@ const _cspEvalAllowed = () => {
   return allowed;
 };
 
+// ⭐⭐⭐ THE EVAL GATE — the one place CSP has to change the language itself.
+//
+// Every other CSP check happens at a seam the engine already owns: a fetch, a
+// <script> about to run, an inline handler about to compile. `eval` has no such
+// seam. It is a built-in of the JavaScript language, and the only way to stop it
+// is to take it away.
+//
+// Two things make that affordable here.
+//
+// 1. WE ONLY TAKE IT AWAY WHEN A POLICY ASKS. A page with no CSP — which is
+//    almost every page — keeps the real `eval`, with its real semantics, and
+//    nothing in this file runs at all. There is no cost to the 99%.
+//
+// 2. A BLOCKED `eval` NEVER EVALUATES ANYTHING, so it has no scope to get wrong.
+//    The long-standing objection to wrapping `eval` is real: a wrapper function
+//    turns DIRECT eval (which can see and write the caller's local variables)
+//    into INDIRECT eval (which runs in global scope), and swapping one for the
+//    other is a correctness regression traded for a security check. But that
+//    only matters when the call actually runs code. When the policy says no, the
+//    wrapper throws `EvalError` and no scope is ever consulted, so the direct/
+//    indirect distinction is unobservable. The engine gives up exactly nothing.
+//
+// ⛔ The narrow cap that remains: a REPORT-ONLY policy that forbids `eval` must
+// report and then run the code anyway, and that run goes through the wrapper —
+// so on such a page, and only there, a direct `eval` behaves as an indirect one.
+// That is one directive, in one disposition, on a page that has explicitly asked
+// to be told rather than protected. It is written down rather than hidden.
+//
+// `Function` gets the same treatment, plus `Function.prototype.constructor`,
+// because `({}).constructor.constructor('…')()` is the standard way around a
+// gate that only replaces the global binding — and a gate with a documented hole
+// in it is a gate that tells the site it is safe when it is not.
+
+// Does any policy in force have an opinion about `eval` at all? (Both
+// dispositions count: a report-only policy still has to send its report, which
+// means the wrapper has to be installed to notice the call.)
+// ⚠️ REPORT-ONLY DOES NOT INSTALL THE GATE, AND THAT IS A DELIBERATE TRADE.
+// A report-only policy must REPORT the eval and then RUN IT — and the run would
+// go through the wrapper, i.e. as an indirect eval, in the global scope instead
+// of the caller's. For a page that is only listening, that is the wrong bargain:
+// it breaks working code (a worker whose body is a wrapped function loses its
+// own scope entirely, and `postMessage` stops meaning the worker's) to deliver a
+// diagnostic. We give up the report and keep the page. Written down rather than
+// hidden; the day the compile hook is reachable, both become possible at once.
+const _cspAnyEvalDirective = () => {
+  for (const policy of _cspState.policies) {
+    if (policy.disposition !== 'enforce') continue;
+    const gov = _cspGoverning(policy, 'script-src');
+    if (!gov) continue;
+    if (gov.list.some((s) => _asciiLower(s) === "'unsafe-eval'")) continue;
+    return true;
+  }
+  return false;
+};
+
+// ⚠️ THE AUTOMATION CHANNEL IS NOT THE PAGE. Playwright — and every DevTools
+// client — compiles the caller's function with `eval` inside the page. A real
+// browser puts that code in an ISOLATED WORLD, which shares the DOM and carries
+// no policy; Obscura has one realm and cannot isolate by construction, so it
+// asks Rust instead: `op_privileged_script` is true only while a CDP evaluation
+// is on the stack. Without this, the first page that correctly forbade `eval`
+// became a page no agent could read — the browser locking itself out of exactly
+// the sites that took security seriously.
+const _cspPrivileged = () => {
+  try { return !!Deno.core.ops.op_privileged_script(); } catch (e) { return false; }
+};
+
+let _cspEvalGateOn = false;
+const _cspInstallEvalGate = () => {
+  if (_cspEvalGateOn) return;
+  let ttWants = false;
+  try { ttWants = _ttOn(); } catch (e) { ttWants = false; }
+  if (!ttWants && !_cspAnyEvalDirective()) return;
+  _cspEvalGateOn = true;
+
+  // ⚠️ The replacements CANNOT be named `function eval(…)` in source: this file
+  // is strict-mode code, and strict mode forbids `eval` (and `arguments`) as a
+  // binding identifier — a SyntaxError that takes the WHOLE bootstrap with it,
+  // i.e. a browser with no DOM at all. The names are stamped on afterwards with
+  // `defineProperty`, which the language is perfectly happy with, so a page that
+  // feature-detects on `eval.name` or `eval.length` still sees the built-in.
+  // ⭐⭐ TWO REALMS, ONE HOOK. `eval` is also a Trusted Types sink — under
+  // `require-trusted-types-for 'script'` the argument must be a `TrustedScript`,
+  // not a string, and that check runs BEFORE the `'unsafe-eval'` one (a page may
+  // legitimately allow eval and still demand that what reaches it went through a
+  // policy). `trusted-types` has been waiting for a compile hook since #490 and
+  // `content-security-policy` since #519; this is the hook, and it serves both.
+  const blockedEval = function (source) {
+    if (_cspPrivileged()) return _NativeEval(source);
+    // A non-string argument is returned unchanged by `eval` and compiles nothing,
+    // so it is not a sink — passing it through the policy would be a type error
+    // invented by us.
+    if (typeof source === 'string' || (source && typeof source === 'object')) {
+      const t = _ttCanCompile(source, 'eval');
+      if (t !== null) source = t;
+    }
+    if (!_cspEvalAllowed()) throw new EvalError('call to eval() blocked by Content Security Policy');
+    return _NativeEval(source);
+  };
+  const blockedFunction = function (...args) {
+    if (_cspPrivileged()) return _NativeFunction(...args);
+    // Every argument of `new Function` is compiled — the parameter names as much
+    // as the body — so every one of them is the sink.
+    for (let i = 0; i < args.length; i++) {
+      const t = _ttCanCompile(args[i], 'Function');
+      if (t !== null) args[i] = t;
+    }
+    if (!_cspEvalAllowed()) throw new EvalError('call to Function() blocked by Content Security Policy');
+    return _NativeFunction(...args);
+  };
+  try { Object.defineProperty(blockedEval, 'name', { value: 'eval', configurable: true }); } catch (e) {}
+  try { Object.defineProperty(blockedFunction, 'name', { value: 'Function', configurable: true }); } catch (e) {}
+  // `new Function(…)` must still produce something that is `instanceof Function`
+  // and whose prototype chain is the real one, on the report-only path where it
+  // succeeds. The constructor returns an object, so the wrapper's own `prototype`
+  // is never the result's — but a page reading `Function.prototype` deserves the
+  // real one regardless.
+  try {
+    Object.defineProperty(blockedFunction, 'prototype',
+      { value: _NativeFunction.prototype, writable: false, enumerable: false, configurable: false });
+  } catch (e) {}
+  try { Object.defineProperty(blockedEval, 'length', { value: 1, configurable: true }); } catch (e) {}
+
+  try { globalThis.eval = blockedEval; } catch (e) {}
+  try { globalThis.Function = blockedFunction; } catch (e) {}
+  // Close the `(function(){}).constructor` door — and the async/generator ones,
+  // which are separate constructors reachable the same way.
+  try {
+    Object.defineProperty(_NativeFunction.prototype, 'constructor',
+      { value: blockedFunction, writable: true, enumerable: false, configurable: true });
+  } catch (e) {}
+  for (const sample of [async function () {}, function* () {}, async function* () {}]) {
+    try {
+      const ctor = Object.getPrototypeOf(sample).constructor;
+      const kind = ctor.name;
+      const blocked = function (...args) {
+        if (_cspPrivileged()) return Reflect.construct(ctor, args);
+        for (let i = 0; i < args.length; i++) {
+          const t = _ttCanCompile(args[i], 'Function');
+          if (t !== null) args[i] = t;
+        }
+        if (!_cspEvalAllowed()) throw new EvalError('call to ' + kind + '() blocked by Content Security Policy');
+        return Reflect.construct(ctor, args);
+      };
+      try { Object.defineProperty(blocked, 'name', { value: kind, configurable: true }); } catch (e) {}
+      Object.defineProperty(Object.getPrototypeOf(sample), 'constructor',
+        { value: blocked, writable: true, enumerable: false, configurable: true });
+    } catch (e) {}
+  }
+};
+
 // ── Meta delivery ───────────────────────────────────────────────────────────
 // A <meta http-equiv="Content-Security-Policy"> is honoured when the parser
 // reaches it, and the policy it adds is FINAL: CSP3 says a later change to the
@@ -46778,6 +47126,109 @@ globalThis.__cspAllowsInline = (type, element, source) => {
 };
 globalThis.__cspAllowsEval = () => { try { return _cspEvalAllowed(); } catch (e) { return true; } };
 globalThis.__cspHasPolicies = () => _cspState.policies.length > 0;
+// The serialized text of every policy in force, in delivery order. Trusted Types
+// keeps its own tiny directive reader (it predates this parser); this is how it
+// gets to see header-delivered policies without either side re-implementing the
+// other.
+globalThis.__cspSerializedPolicies = () => _cspState.policies.map((p) => p.text);
+globalThis.__cspInstallEvalGate = () => { try { _cspInstallEvalGate(); } catch (e) {} };
+
+// ── style-src ───────────────────────────────────────────────────────────────
+// ⭐ A STYLESHEET IS NOT DECORATION. `style-src` is in the spec because CSS can
+// read the page and phone home: an attribute selector plus a `background-image`
+// URL exfiltrates a CSRF token one character at a time, and `position:fixed` over
+// a login form is a pixel-perfect phishing overlay that never runs a line of
+// JavaScript. A policy that stops injected script and lets injected style through
+// has closed the front door and left the window open.
+//
+// Three sources, three directives, and they are genuinely different questions:
+//   <style>…</style>          → style-src-elem   (inline, nonce/hash-able)
+//   <link rel=stylesheet>     → style-src-elem   (a URL)
+//   <p style="…">             → style-src-attr   (inline, and the commonest of
+//                               the three in an injection, because it survives
+//                               every sanitizer that only strips <script>)
+//
+// A blocked style is marked rather than deleted. CSP blocks a declaration from
+// APPLYING; it does not edit the document, and `el.getAttribute('style')` must
+// still return exactly what the markup said — a page that reads its own markup
+// back and finds it altered would be a much stranger thing to debug.
+const _cspStyleScanned = new WeakSet();
+let _cspStyleSweepDone = false;
+const _cspCheckStyleElement = (el) => {
+  if (!el || _cspStyleScanned.has(el)) return;
+  _cspStyleScanned.add(el);
+  try {
+    const name = _asciiLower(el.localName || '');
+    const saved = _cspState.policies;
+    _cspState.policies = _cspPoliciesGoverning(el);
+    try {
+      if (name === 'style') {
+        if (!_cspInlineAllowed('style', el, el.textContent || '')) el.__cspBlockedStyle = true;
+      } else if (name === 'link') {
+        const rel = _asciiLower(el.getAttribute('rel') || '');
+        const href = el.getAttribute('href');
+        if (href && rel.split(/\s+/).indexOf('stylesheet') >= 0) {
+          if (!_cspURLAllowed('style-src-elem', href, el)) el.__cspBlockedStyle = true;
+        }
+      }
+    } finally { _cspState.policies = saved; }
+  } catch (e) {}
+};
+const _cspCheckStyleAttr = (el) => {
+  if (!el || _cspStyleScanned.has(el)) return;
+  _cspStyleScanned.add(el);
+  try {
+    const src = el.getAttribute('style');
+    if (src == null) return;
+    const saved = _cspState.policies;
+    _cspState.policies = _cspPoliciesGoverning(el);
+    try {
+      if (!_cspInlineAllowed('style-attribute', el, src)) el.__cspBlockedStyleAttr = true;
+    } finally { _cspState.policies = saved; }
+  } catch (e) {}
+};
+// One sweep of the whole document, the first time anything needs the answer.
+// Guarded on there being a policy with an opinion at all, so a page without CSP
+// — which is nearly every page — never walks its own tree for this.
+globalThis.__obscuraApplyStyleCSP = () => {
+  if (_cspStyleSweepDone) return;
+  try {
+    if (!_cspState.policies.length) return;
+    let governed = false;
+    for (const p of _cspState.policies) {
+      if (_cspGoverning(p, 'style-src-elem') || _cspGoverning(p, 'style-src-attr')) { governed = true; break; }
+    }
+    if (!governed) { _cspStyleSweepDone = true; return; }
+    const doc = globalThis.document;
+    // ⚠️⚠️ THE SWEEP MUST RUN BEFORE THE PAGE'S FIRST SCRIPT, AND IT MUST NOT
+    // "FINISH" BEFORE THERE IS A DOCUMENT TO SWEEP. `style-src-attr` governs
+    // MARKUP — what the author (or an injection) wrote into the document. It does
+    // NOT govern `el.style.color = 'red'`, which is the page's own code doing the
+    // page's own work. Run this lazily, at the first `getComputedStyle`, and by
+    // then the page has already made CSSOM writes that were reflected back into
+    // the attribute — so the sweep reads them, cannot tell them from markup, and
+    // blocks the page's own perfectly legal styling. That is not a missed
+    // detection; it is a false positive, which is worse.
+    if (!doc || !doc.documentElement) return;
+    _cspStyleSweepDone = true;
+    for (const el of doc.querySelectorAll('style, link')) _cspCheckStyleElement(el);
+    for (const el of doc.querySelectorAll('[style]')) _cspCheckStyleAttr(el);
+  } catch (e) {}
+};
+globalThis.__cspStyleBlocked = (el) => {
+  try {
+    if (!_cspState.policies.length) return false;
+    globalThis.__obscuraApplyStyleCSP();
+    return !!(el && el.__cspBlockedStyle);
+  } catch (e) { return false; }
+};
+globalThis.__cspStyleAttrBlocked = (el) => {
+  try {
+    if (!_cspState.policies.length) return false;
+    globalThis.__obscuraApplyStyleCSP();
+    return !!(el && el.__cspBlockedStyleAttr);
+  } catch (e) { return false; }
+};
 // ===== CSP-END =====
 
 // ===== EDITING-ENGINE-BEGIN =====
@@ -57596,7 +58047,7 @@ const _workerEvalScript = function(scope, code, url) {
     return s;
   };
   const all = mirror(d.names);
-  const fn = new Function(S,
+  const fn = new _NativeFunction(S,
     'with (' + S + ') {\ntry {\n' + mirror(d.funcs) + '\n' + code +
     '\n' + all + '\n} finally {\n' + all + '\n}\n}\n//# sourceURL=' + (url || 'worker'));
   // `this` at the top level of a classic script is the global — the scope object
@@ -66892,6 +67343,16 @@ if (typeof FileReader === 'undefined') {
       // middle of a multi-byte character, and decoding each chunk on its own
       // turns one 'é' into two replacement characters.
       this._decoder = new TextDecoder('utf-8');
+      // `connect-src` governs a stream exactly as it governs a one-shot fetch —
+      // more so, because a stream is a channel that stays open. The constructor
+      // still returns an object (the page has an EventSource either way); it
+      // simply fails the connection, on a task, so a listener attached on the
+      // next line still hears the `error`.
+      if (typeof globalThis.__cspAllowsURL === 'function'
+          && !globalThis.__cspAllowsURL('connect-src', this._url, null)) {
+        _queueTask(() => { try { this._fail(); } catch (e) {} });
+        return;
+      }
       this._connect();
     }
 
@@ -74049,7 +74510,7 @@ const _waWaveshape = (curve, x) => {
       };
       // Only the AudioWorkletGlobalScope surface is in scope — a processor that
       // reaches for `document` gets the same ReferenceError a real worklet gives.
-      const fn = new Function('registerProcessor', 'AudioWorkletProcessor',
+      const fn = new _NativeFunction('registerProcessor', 'AudioWorkletProcessor',
         'sampleRate', 'currentTime', 'currentFrame', 'renderQuantumSize',
         '"use strict";\n' + src + '\n//# sourceURL=' + url);
       fn(registerProcessor, AudioWorkletProcessor,
