@@ -6321,6 +6321,27 @@ class Element extends Node {
       // Superseded by a newer load (e.g. srcdoc set while this was in flight)?
       // Don't clobber the current document or fire a stale load.
       if (_self._loadGen !== _gen) return;
+      // ⭐ `frame-ancestors` / `X-Frame-Options` are answered on the RESPONSE and
+      // before a document exists. A refused frame is left holding its initial
+      // `about:blank` with an OPAQUE ORIGIN — which is the observable part: the
+      // embedder can still see an <iframe> element and still gets a `load`, but
+      // reaching into it throws, exactly as a cross-origin frame does. That is
+      // what makes the clickjacking overlay useless: the attacker's page cannot
+      // read what it framed, and the reader's click lands on nothing.
+      let _faOK = true;
+      try {
+        _faOK = typeof globalThis.__cspFrameLoadAllowed !== 'function'
+          || globalThis.__cspFrameLoadAllowed(el, resp.url || fullUrl, resp.headers);
+      } catch (e) {}
+      if (!_faOK) {
+        el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', el);
+        el._iframeWin = new _IframeWindow(el._iframeDoc, 'about:blank', null, el);
+        el._frameBlocked = true;
+        el._opaqueWin = null;
+        _registerIframe(el);
+        if (_self._loadGen === _gen) _fireIframeElementLoad(el);
+        return;
+      }
       if (resp.ok || resp.type === 'opaque') {
         // NOT `resp.text()`: fetch's text() always decodes utf-8, but this is a
         // DOCUMENT load, and a document says what encoding it is in (HTML's
@@ -6339,6 +6360,28 @@ class Element extends Node {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl, null, el);
       }
+      // ⚠️⚠️ A CROSS-ORIGIN FRAME'S `location` WAS READABLE. `contentDocument`
+      // has always been guarded, and `contentWindow` never was — so any page
+      // could embed any site and read back where that frame had ended up:
+      // whether a session was live, which account, which order, which article.
+      // The same-origin policy is not a CSP feature; it is the floor everything
+      // else in this file stands on, and this was a hole in the floor.
+      try {
+        const _pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin;
+        el._crossOriginFrame = new URL(resp.url || fullUrl).origin !== _pageOrigin;
+        el._opaqueWin = null;
+      } catch (e) {}
+      // The framed document's OWN policy, from its own headers — or, for a local
+      // scheme that has no headers to send, the embedder's, inherited.
+      try {
+        if (/^(about|blob|data|filesystem):/i.test(fullUrl)) {
+          globalThis.__cspInheritInto(el._iframeDoc, el.ownerDocument);
+        } else {
+          globalThis.__cspAdoptFrameHeaders(el._iframeDoc, resp.headers);
+          globalThis.__cspScanFrameMeta(el._iframeDoc);
+        }
+        globalThis.__frameApplySandbox(el, el._iframeDoc);
+      } catch (e) {}
       _registerIframe(el);
       await _executeFrameScripts(el); // run same-origin frame scripts before load
       if (_self._loadGen === _gen) _fireIframeElementLoad(el);
@@ -6352,6 +6395,10 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    // A frame the policy refused, or one sandboxed without `allow-same-origin`,
+    // has an opaque origin — the embedder gets `null`, exactly as for any other
+    // document it is not allowed to look into.
+    if (this._frameBlocked || this._sandboxOpaque) return null;
     if (this._iframeDoc) {
       const pageOrigin = (function(){ try { return new URL(_domParse("document_url")).origin; } catch(e) { return ''; } })();
       const iframeOrigin = (function(url){ try { return new URL(url).origin; } catch(e) { return ''; } })(this.src);
@@ -6373,6 +6420,11 @@ class Element extends Node {
         this._iframeDoc = new _IframeDocument(srcdoc, 'about:srcdoc', this, parentUrl);
         // location.href === 'about:srcdoc', but origin inherited from the parent.
         this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:srcdoc', parentUrl, this);
+        // …and so is the policy. A srcdoc document is markup the EMBEDDER wrote,
+        // so a policy that did not follow it there would be a hole the width of
+        // one attribute.
+        try { globalThis.__cspInheritInto(this._iframeDoc, this.ownerDocument); } catch (e) {}
+        try { globalThis.__frameApplySandbox(this, this._iframeDoc); } catch (e) {}
         _registerIframe(this);
         _executeFrameScripts(this); // async; frame scripts run against the frame win
       } else if (srcAttr && srcAttr !== 'about:blank' && !this._srcLoadStarted) {
@@ -6398,6 +6450,17 @@ class Element extends Node {
     }
     // Back-link frameElement so code inside the frame can find its host element.
     if (this._iframeWin && !this._iframeWin.frameElement) this._iframeWin.frameElement = this;
+    // ⚠️⚠️ THE OPACITY BELONGS TO THE HANDLE, NOT TO THE WINDOW. Obscura runs
+    // every frame in one realm, so the object the embedder gets from
+    // `contentWindow` is the SAME object the frame's own scripts call `window`.
+    // Make that object's `location` throw and you have not implemented the
+    // same-origin policy — you have broken the framed page, which is entitled to
+    // read its own URL and is usually the only code that does. `contentWindow` is
+    // the embedder's handle; that is where the wall goes. (Same shape as Quest
+    // #521's find: the channel is not the page.)
+    if (this._crossOriginFrame || this._frameBlocked || this._sandboxOpaque) {
+      return this._opaqueWin ??= _makeOpaqueWindowHandle(this, this._iframeWin);
+    }
     return this._iframeWin;
   }
   get action() {
@@ -9419,6 +9482,19 @@ const _executeFrameScripts = async function(iframeEl) {
   const win = iframeEl._iframeWin, doc = iframeEl._iframeDoc;
   if (!win || !doc) return;
   iframeEl._frameScriptsRan = true;
+  // ⭐ A SANDBOXED FRAME WITHOUT `allow-scripts` RUNS NOTHING — not its inline
+  // scripts, not its external ones, not its event handlers. This is the flag the
+  // whole attribute exists for: it is what lets a site render a comment, an ad or
+  // an uploaded file and know that whatever is in it cannot act.
+  try {
+    // ⚠️ The flags were SETTLED AT NAVIGATION (`__frameApplySandbox`), not here.
+    // Computing them in the script path looks equivalent and is not: a frame that
+    // runs no scripts at all — an image, a PDF, a plain page — would never have
+    // been given its opaque origin, so the one thing `sandbox` is most often used
+    // for (show this untrusted thing, and stay out of my document) would hold for
+    // exactly the frames that carried code and fail for the quiet ones.
+    if (iframeEl._sandboxFlags && !iframeEl._sandboxFlags['allow-scripts']) return;
+  } catch (e) {}
   const base = doc._baseUrl || doc._url || win._url; // relative <script src> base
   let scripts = [];
   try { scripts = Array.from(doc.querySelectorAll('script')); } catch (e) {}
@@ -9452,6 +9528,14 @@ const _executeFrameScripts = async function(iframeEl) {
     if (src) {
       let full = src;
       try { full = new URL(src, base).href; } catch (e) {}
+      // The FRAME'S policy governs the FRAME'S scripts. Before per-document
+      // policies this question was never asked at all inside a frame — which is
+      // precisely backwards, because framing is what a page does with content it
+      // does not trust.
+      try {
+        if (typeof globalThis.__cspAllowsURL === 'function'
+            && !globalThis.__cspAllowsURL('script-src-elem', full, s)) continue;
+      } catch (e) {}
       try {
         const resp = await fetch(full, { mode: 'no-cors' });
         if (resp.ok || resp.type === 'opaque') {
@@ -9459,7 +9543,12 @@ const _executeFrameScripts = async function(iframeEl) {
         }
       } catch (e) { _reportError(e); }
     } else {
-      parts.push({ code: s.textContent || '', url: base });
+      const code = s.textContent || '';
+      try {
+        if (typeof globalThis.__cspAllowsInline === 'function'
+            && !globalThis.__cspAllowsInline('script', s, code)) continue;
+      } catch (e) {}
+      parts.push({ code: code, url: base });
     }
   }
   // A frame's window-reflecting <body on…=…> handlers, installed the same way the
@@ -10167,6 +10256,15 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
   }
   const gen = (el._resLoadGen = (el._resLoadGen || 0) + 1);
   el._loadEventFired = false;
+  // ⭐ THE INTEGRITY PROMISE IS READ NOW, NOT WHEN THE BYTES LAND. HTML snapshots
+  // `integrity` at "prepare a script", and WPT tests the seam in both directions:
+  // a script appended with a WRONG hash that has the attribute removed on the
+  // very next line must still be blocked, and one appended with an EMPTY
+  // integrity that is then set to a wrong hash must still run. Read the attribute
+  // in the callback instead and both go the other way — a page could disarm its
+  // own promise a statement after making it, which is no promise at all.
+  const _sriMeta = (el.localName === 'script' || el.localName === 'link')
+    ? ((el.getAttribute && el.getAttribute('integrity')) || '') : '';
   // Starting a fetch RESETS the current request to unavailable, and the reset is
   // observable: `2d.drawImage.incomplete.reload` sets a new `src` on an <img>
   // that has already loaded and then draws it in the same turn, asserting that
@@ -10223,6 +10321,24 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
           performance._addResourceEntry(parsed.url || fullUrl, initiatorType, start, performance.now(), { enc: sz, dec: sz, status: status, contentType: _ct });
         }
       } catch (e) {}
+      // Integrity, before anything is run or adopted. A failed check is a NETWORK
+      // ERROR, not a runtime one: the element fires `error`, exactly as if the
+      // file had not arrived, so every `onerror` fallback a careful page already
+      // has — the local copy of the library — is the thing that runs next.
+      if (_sriMeta && typeof globalThis.__sriMatches === 'function') {
+        let _corsOk = true;
+        try {
+          const _rurl = new URL(parsed.url || fullUrl);
+          _corsOk = (_rurl.origin === pageOrigin) || _useCors;
+        } catch (e) {}
+        const _bytes = parsed.bodyBase64
+          ? _base64ToUint8Array(parsed.bodyBase64)
+          : new TextEncoder().encode(parsed.body || '');
+        if (!globalThis.__sriMatches(_sriMeta, _bytes, _corsOk)) {
+          _fireElementError(el);
+          return;
+        }
+      }
       if (opts.eval && parsed.body) {
         try { (0, _NativeEval)(parsed.body); } catch (e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
       }
@@ -10284,6 +10400,27 @@ globalThis.__obscuraAdoptLinkSheet = function (nid, css) {
     // created means no stylesheet is created — not a stylesheet that is switched
     // off. The difference is visible in `document.styleSheets.length`.
     try { if (el.hasAttribute('disabled')) return; } catch (e) {}
+    // A sheet whose bytes do not match the promise the markup made never becomes
+    // real either. This is the MARKUP path — the Rust loader pre-fetches `<link>`
+    // before the first script — so it is the one that governs the common case: a
+    // stylesheet from a CDN, named in the HTML the author shipped.
+    // ⛔ Cap: the Rust prefetch hands over decoded TEXT, not the response bytes,
+    // so a stylesheet in a non-UTF-8 encoding hashes as its decoding. Same-origin
+    // ASCII CSS — which is nearly all of it — is byte-identical.
+    try {
+      const meta = el.getAttribute && el.getAttribute('integrity');
+      if (meta && typeof globalThis.__sriMatches === 'function') {
+        const bytes = new TextEncoder().encode(String(css == null ? '' : css));
+        let corsOk = true;
+        try {
+          const href = new URL(el.getAttribute('href') || '', _domParse('document_url') || 'about:blank');
+          const pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin;
+          corsOk = href.origin === pageOrigin
+            || el.crossOrigin === 'anonymous' || el.crossOrigin === 'use-credentials';
+        } catch (e) {}
+        if (!globalThis.__sriMatches(meta, bytes, corsOk)) { _fireElementError(el); return; }
+      }
+    } catch (e) {}
     el.__linkSheetText = String(css == null ? '' : css);
     _invalidateNodeSheet(el);
     try { _sheetRuleCache.delete(el); } catch (e) {}
@@ -47214,9 +47351,90 @@ globalThis.__obscuraScanMetaCSP = () => {
 // retroactively block the scripts above it, which no real browser does and which
 // silently breaks every page that declares its policy after loading a library.
 // The rule is document order, and it is a rule about time, not about markup.
+// ── A POLICY BELONGS TO A DOCUMENT, NOT TO A BROWSER ────────────────────────
+// ⭐⭐⭐ Obscura runs every frame in ONE JavaScript realm. That compromise is
+// hidden well nearly everywhere else in this file, and here is the one place it
+// turns into a security bug in BOTH directions: with a single global policy list
+// the top page's policy silently governs a frame that never asked for it (a page
+// breaks for a reason nobody can find), and a frame that sent a strict policy of
+// its own runs completely unprotected because the top page sent none (the whole
+// point of framing untrusted content, gone). A framed document's policy is its
+// own, and this WeakMap is where it lives.
+const _cspDocPolicies = new WeakMap();
+const _cspParseInto = (list, text, disposition, source) => {
+  if (!text) return;
+  for (const part of _cspSplitList(text)) {
+    if (!String(part).trim()) continue;
+    list.push(_cspParseOne(part, disposition, source));
+  }
+};
+// A framed document's own headers.
+globalThis.__cspAdoptFrameHeaders = (doc, headers) => {
+  try {
+    if (!doc) return;
+    const list = [];
+    let enforce = '', report = '';
+    try { enforce = (headers && headers.get('content-security-policy')) || ''; } catch (e) {}
+    try { report = (headers && headers.get('content-security-policy-report-only')) || ''; } catch (e) {}
+    _cspParseInto(list, enforce, 'enforce', 'http');
+    _cspParseInto(list, report, 'report', 'http');
+    _cspDocPolicies.set(doc, list);
+  } catch (e) {}
+};
+// ⭐⭐ HTML "initialise the document's CSP list": a document loaded from a LOCAL
+// scheme — `about:blank`, `about:srcdoc`, `blob:`, `data:` — has no headers of
+// its own and INHERITS its parent's policies wholesale. This is not a nicety: a
+// local-scheme document is content the embedding page supplied, so if it did not
+// inherit, `<iframe srcdoc="<script>…">` would be a one-line hole in every policy
+// on the web, and `URL.createObjectURL` would be the second one.
+globalThis.__cspInheritInto = (doc, parentDoc) => {
+  try {
+    if (!doc) return;
+    const src = parentDoc ? _cspDocPolicies.get(parentDoc) : null;
+    _cspDocPolicies.set(doc, (src || _cspState.policies).slice());
+  } catch (e) {}
+};
+// A framed document's `<meta http-equiv>` policies, which govern what follows
+// them in that document exactly as they do in the top-level one.
+globalThis.__cspScanFrameMeta = (doc) => {
+  try {
+    if (!doc) return;
+    const list = _cspDocPolicies.get(doc);
+    if (!list) return;
+    for (const m of doc.querySelectorAll('meta[http-equiv]')) {
+      const he = _asciiLower(m.getAttribute('http-equiv') || '');
+      if (he !== 'content-security-policy' && he !== 'content-security-policy-report-only') continue;
+      const content = m.getAttribute('content');
+      if (!content) continue;
+      const parent = m.parentNode;
+      if (!parent || parent.nodeType !== 1 || _asciiLower(parent.localName || '') !== 'head') continue;
+      const before = list.length;
+      _cspParseInto(list, content, he.endsWith('report-only') ? 'report' : 'enforce', 'meta');
+      for (let i = before; i < list.length; i++) {
+        for (const d of _CSP_META_IGNORED) delete list[i].directives[d];
+        list[i].reportEndpoints = [];
+        list[i].metaElement = m;
+      }
+    }
+  } catch (e) {}
+};
+// Which list governs this element? Its own document's, whenever that document has
+// one — otherwise the top-level page's, which is also the answer for every element
+// on a page with no frames at all.
+const _cspPoliciesForElement = (el) => {
+  try {
+    const doc = el && el.ownerDocument;
+    if (doc && doc !== globalThis.document) {
+      const own = _cspDocPolicies.get(doc);
+      if (own) return own;
+    }
+  } catch (e) {}
+  return _cspState.policies;
+};
 const _cspPoliciesGoverning = (element) => {
-  if (!element) return _cspState.policies;
-  return _cspState.policies.filter((p) => {
+  const base = _cspPoliciesForElement(element);
+  if (!element) return base;
+  return base.filter((p) => {
     if (!p.metaElement) return true;                 // header policies govern everything
     try {
       const rel = element.compareDocumentPosition(p.metaElement);
@@ -47271,11 +47489,36 @@ globalThis.__cspAllowsScriptURL = (nid, url) => {
       if (p.__nonceOK) return false;
       const gov = _cspGoverning(p, 'script-src-elem');
       if (!gov) return true;
-      // ⛔ A hash source can authorise an EXTERNAL script, by matching the
-      // `integrity` attribute rather than the URL (CSP3 + SRI). We do not check
-      // integrity metadata yet, so a list containing hashes is one we cannot
-      // decide — and an undecided policy must not block. Named as a cap.
-      if (gov.list.some((x) => _CSP_HASH_RE.test(x))) return false;
+      // ⭐⭐ A HASH SOURCE AUTHORISES AN EXTERNAL SCRIPT BY MATCHING ITS
+      // `integrity` ATTRIBUTE, NOT ITS URL (CSP3 §"does a source list allow a
+      // response", + SRI). Quest #519 named this as a cap and failed OPEN on it,
+      // because there was no digest machinery to decide with. Quest #530 built
+      // that machinery for `integrity` itself, and this is the seam the two
+      // specifications were written to meet at.
+      //
+      // ⭐ THE RULE IS "EVERY", NOT "ANY": each hash the element PROMISES must be
+      // one the policy PERMITS. A script pinned to two digests, only one of which
+      // the policy lists, is a script the policy has not fully vouched for — and
+      // taking "any" would let an author widen a policy just by appending a hash
+      // the server never had to honour.
+      //
+      // ⚠️ And it must be a real SRI check too: the policy only ever learns which
+      // BYTES are acceptable, so if nothing verifies that the response IS those
+      // bytes, a hash-source policy is a comment. #530's check does that.
+      const hashSources = gov.list.filter((x) => _CSP_HASH_RE.test(x));
+      if (hashSources.length) {
+        let meta = '';
+        try { meta = (el && el.getAttribute && el.getAttribute('integrity')) || ''; } catch (e) { meta = ''; }
+        const promised = _sriParseMetadata(meta);
+        if (!promised.length) return true;      // promises nothing → hashes cannot authorise it
+        const permitted = hashSources.map((h) => {
+          const m = _CSP_HASH_RE.exec(h);
+          return m ? (_asciiLower(m[1]) + '-' + _cspB64Norm(m[2])) : '';
+        });
+        const allVouched = promised.every(
+          (p) => permitted.indexOf(p.alg + '-' + _cspB64Norm(p.b64)) !== -1);
+        if (allVouched) return false;           // authorised: this policy has no further say
+      }
       return !_cspHasStrictDynamic(gov.list);
     });
     const saved = _cspState.policies;
@@ -47286,11 +47529,24 @@ globalThis.__cspAllowsScriptURL = (nid, url) => {
     return out;
   } catch (e) { return true; }
 };
+// ⚠️ Both of these swap in the policies of the ELEMENT'S OWN DOCUMENT. Before
+// per-document policies existed they read the global list directly, which is the
+// right answer only while there is exactly one document in the realm.
 globalThis.__cspAllowsURL = (directive, url, element) => {
-  try { return _cspURLAllowed(directive, url, element || null); } catch (e) { return true; }
+  try {
+    const saved = _cspState.policies;
+    _cspState.policies = _cspPoliciesGoverning(element || null);
+    try { return _cspURLAllowed(directive, url, element || null); }
+    finally { _cspState.policies = saved; }
+  } catch (e) { return true; }
 };
 globalThis.__cspAllowsInline = (type, element, source) => {
-  try { return _cspInlineAllowed(type, element || null, source); } catch (e) { return true; }
+  try {
+    const saved = _cspState.policies;
+    _cspState.policies = _cspPoliciesGoverning(element || null);
+    try { return _cspInlineAllowed(type, element || null, source); }
+    finally { _cspState.policies = saved; }
+  } catch (e) { return true; }
 };
 globalThis.__cspAllowsEval = () => { try { return _cspEvalAllowed(); } catch (e) { return true; } };
 globalThis.__cspHasPolicies = () => _cspState.policies.length > 0;
@@ -47414,6 +47670,375 @@ globalThis.__cspStyleAttrBlocked = (el) => {
   } catch (e) { return false; }
 };
 // ===== CSP-END =====
+
+// ===== SRI-BEGIN =====
+// Subresource Integrity — the promise a page makes about a file it does not host.
+//
+// ⭐ WHY THIS ONE MATTERS MOST TO THE PEOPLE WE ARE BUILDING FOR. A page on a
+// slow or metered connection leans hardest on shared CDNs: one copy of a
+// framework, cached across every site that uses it, is the cheapest byte on the
+// web. The whole arrangement rests on trusting a server the author does not run
+// — and `integrity` is the one attribute that removes the trust. It costs
+// nothing: the bytes have already arrived, and hashing them is work the device
+// does anyway. It is protection you get by reading an attribute.
+//
+// Before this, `integrity` was a string the engine reflected and never read.
+// Every `<script integrity="sha384-…">` loaded whatever the CDN sent, and the
+// author believed otherwise. That is the thirteenth "feature that answers, and
+// answers wrong" this campaign has found, and the wrong answer is the same one
+// CSP used to give: *"yes, this is the file you asked for."*
+//
+// SRI §3.3.2 "parse metadata". Anything that is not a token we understand — an
+// unknown algorithm, a value that is not base64 — is IGNORED, not an error. That
+// is deliberate in the spec and load-bearing: a page written for a future hash
+// function must keep working in a browser that does not know it yet, and the
+// only safe way to not know is to say nothing.
+const _SRI_METADATA_RE = /^(sha256|sha384|sha512)-([A-Za-z0-9+/\-_]+={0,2})$/;
+const _SRI_STRENGTH = { sha256: 1, sha384: 2, sha512: 3 };
+const _sriParseMetadata = (text) => {
+  const out = [];
+  for (const token of String(text == null ? '' : text).split(/[ \t\n\f\r]+/)) {
+    if (!token) continue;
+    // "sha256-…?foo=bar?spam=eggs" — everything from the first "?" is options,
+    // which this version of the spec has no use for and must not choke on.
+    const m = _SRI_METADATA_RE.exec(token.split('?')[0]);
+    if (!m) continue;
+    out.push({ alg: _asciiLower(m[1]), b64: m[2] });
+  }
+  return out;
+};
+// ⭐⭐ ONLY THE STRONGEST ALGORITHM IN THE LIST COUNTS, AND THE WEAKER ONES ARE
+// NOT A FALLBACK. `integrity="sha512-<wrong> sha256-<right>"` must BLOCK. That
+// reads backwards until you see what a list is for: an author lists several so a
+// browser that only knows sha256 can still check something, and one that knows
+// sha512 checks the strong one. If a weak match could rescue a strong mismatch,
+// an attacker who can only forge sha256 would simply append a sha256 token — and
+// every policy on the web would be worth exactly its weakest entry.
+const _sriStrongest = (list) => {
+  let best = 0;
+  for (const m of list) if (_SRI_STRENGTH[m.alg] > best) best = _SRI_STRENGTH[m.alg];
+  return list.filter((m) => _SRI_STRENGTH[m.alg] === best);
+};
+const _sriDigestB64 = (alg, bytes) => {
+  try { return _cspB64(Deno.core.ops.op_crypto_digest(alg, bytes)); } catch (e) { return null; }
+};
+// The whole check. `corsOk` is "this response is one we are allowed to look at":
+// ⭐ AN INTEGRITY CHECK ON AN OPAQUE RESPONSE IS NOT A CHECK, IT IS AN ORACLE.
+// A no-cors cross-origin response is a body the page may use but not read; if we
+// hashed it and let the load succeed or fail accordingly, any page could learn
+// the contents of any cross-origin file one guess at a time. So the spec makes
+// the answer "blocked" regardless of the bytes — which is also why every real
+// `<script integrity>` on a CDN carries `crossorigin="anonymous"` beside it.
+globalThis.__sriMatches = (integrityText, bytes, corsOk) => {
+  try {
+    const list = _sriParseMetadata(integrityText);
+    if (!list.length) return true;              // no metadata → nothing was promised
+    if (!corsOk) return false;
+    const strongest = _sriStrongest(list);
+    const alg = 'SHA-' + strongest[0].alg.slice(3);
+    const got = _sriDigestB64(alg, bytes);
+    // A digest we could not compute is a question we cannot answer, and an
+    // unanswered question must not block a page a correct browser would show.
+    if (got === null) return true;
+    const norm = _cspB64Norm(got);
+    for (const m of strongest) if (norm === _cspB64Norm(m.b64)) return true;
+    return false;
+  } catch (e) { return true; }
+};
+// Does this element promise anything at all? Asked from Rust before it hands over
+// a script body, so a page with no `integrity` anywhere pays one boolean.
+globalThis.__sriNeedsCheck = (nid) => {
+  try {
+    const el = (typeof _wrap === 'function') ? _wrap(Number(nid)) : null;
+    if (!el || !el.getAttribute) return false;
+    return _sriParseMetadata(el.getAttribute('integrity')).length > 0;
+  } catch (e) { return false; }
+};
+// Rust's markup-<script src> path: the bytes arrive there, not here.
+globalThis.__sriAllowsScript = (nid, bodyBase64, corsOk) => {
+  try {
+    const el = (typeof _wrap === 'function') ? _wrap(Number(nid)) : null;
+    if (!el || !el.getAttribute) return true;
+    const meta = el.getAttribute('integrity');
+    if (!_sriParseMetadata(meta).length) return true;
+    return globalThis.__sriMatches(meta, _base64ToUint8Array(String(bodyBase64 || '')), !!corsOk);
+  } catch (e) { return true; }
+};
+// Fire `error` at an element by node id — the Rust loader's way of telling a page
+// that a subresource it asked for is not coming.
+globalThis.__fireResourceError = (nid) => {
+  try {
+    const el = (typeof _wrap === 'function') ? _wrap(Number(nid)) : null;
+    if (el) _fireElementError(el);
+  } catch (e) {}
+};
+// ===== SRI-END =====
+
+// ===== FRAME-ANCESTORS-BEGIN =====
+// `frame-ancestors` is the only CSP directive that is not about what a page may
+// LOAD — it is about who may load THE PAGE. It is the standards-track answer to
+// clickjacking: an invisible frame over a real bank, a transfer button under the
+// reader's cursor, and the reader never sees the page they actually clicked.
+//
+// ⭐ IT IS ALSO THE ONE DIRECTIVE THE FRAMED SITE CANNOT ENFORCE ITSELF. Every
+// other protection a site ships runs in the site's own document; this one has to
+// be honoured by the browser of a reader who is visiting somebody ELSE'S page.
+// A browser that ignores it does not weaken its own user's security settings —
+// it hands an attacker every site that thought it was protected.
+//
+// ⚠️ The check is on the RESPONSE, before the document exists. That is why
+// `_CSP_META_IGNORED` drops `frame-ancestors` from a `<meta>` policy: by the time
+// markup is parsed the framing decision was made long ago, and honouring it there
+// would let a policy claim an authority it never had.
+const _fa_originOf = (u) => { try { return new URL(u).origin; } catch (e) { return null; } };
+// Give a frame window an opaque origin: reaching for its `location` throws, the
+// way it does for any frame you are not allowed to look into.
+// The handle an embedder gets for a frame it may not look into. It is a real
+// object with the members the cross-origin surface actually exposes — you can
+// still `postMessage` to it, still close it, still count its frames — and every
+// other reach throws. That list is short on purpose: it IS the cross-origin
+// window surface, and anything not on it is what the wall exists to withhold.
+const _makeOpaqueWindowHandle = (hostEl, realWin) => {
+  const deny = () => {
+    throw new DOMException(
+      "Blocked a frame from accessing a cross-origin frame.", 'SecurityError');
+  };
+  const handle = {
+    get closed() { return realWin ? !!realWin.closed : false; },
+    get length() { return realWin ? (realWin.length || 0) : 0; },
+    get opener() { return null; },
+    get frames() { return handle; },
+    get self() { return handle; },
+    get window() { return handle; },
+    get top() { return globalThis; },
+    get parent() { return globalThis; },
+    postMessage: function (...a) { try { return realWin && realWin.postMessage(...a); } catch (e) {} },
+    blur: function () {}, focus: function () {}, close: function () {},
+  };
+  // ⭐ READING a cross-origin `location` throws; ASSIGNING one navigates. That
+  // asymmetry is the whole same-origin policy in one property — an embedder may
+  // send a frame somewhere, and may not find out where it already is — and a
+  // property that threw for both would break every page that steers its own
+  // iframe (an OAuth popup, a payment frame, a docs viewer).
+  Object.defineProperty(handle, 'location', {
+    configurable: true,
+    get: deny,
+    set(v) { try { if (hostEl) hostEl._loadIframeSrc(String(v)); } catch (e) {} },
+  });
+  for (const k of ['document', 'localStorage', 'sessionStorage', 'name', 'origin',
+                   'history', 'navigator', 'frameElement']) {
+    Object.defineProperty(handle, k, { configurable: true, get: deny, set: deny });
+  }
+  return handle;
+};
+// The ancestor chain of the frame element that is loading, nearest first: the
+// document holding the <iframe>, then ITS host document, up to the top page.
+const _faAncestorURLs = (el) => {
+  const out = [];
+  let cur = el, guard = 0;
+  while (cur && guard++ < 64) {
+    let doc = null;
+    try { doc = cur.ownerDocument || null; } catch (e) {}
+    if (!doc) break;
+    let u = '';
+    try { u = (doc !== globalThis.document && doc._url) ? doc._url : (_domParse('document_url') || ''); } catch (e) {}
+    if (u) out.push(u);
+    let host = null;
+    try { host = (doc !== globalThis.document) ? (doc._iframeEl || null) : null; } catch (e) {}
+    cur = host;
+  }
+  return out;
+};
+// Ask the framed response's own policies whether this chain may frame it.
+// Returns true (may load) or false (blocked). Report-only policies report and
+// never block — which is the whole point of a rollout: watch first, break later.
+const _faAllows = (policies, resourceURL, ancestors) => {
+  let allowed = true;
+  const selfOrigin = (() => { try { return new URL(resourceURL); } catch (e) { return null; } })();
+  for (const policy of policies) {
+    const list = policy.directives['frame-ancestors'];
+    if (!list) continue;                       // no opinion; NOT a fallback to default-src
+    let ok = true;
+    for (const anc of ancestors) {
+      let url = null;
+      try { url = new URL(anc); } catch (e) { url = null; }
+      // An ancestor whose URL we cannot parse (an opaque origin) matches nothing
+      // but `*`, which is the safe reading: we cannot prove it is permitted.
+      let matched = false;
+      for (const expr of list) {
+        const le = _asciiLower(expr);
+        if (le === "'none'") { matched = false; break; }
+        if (le[0] === "'" && le !== "'self'") continue;
+        // ⭐ A SOURCE EXPRESSION WITH A PATH MATCHES NO ANCESTOR AT ALL. The
+        // check compares ORIGINS — an ancestor is not a URL you fetch, it is a
+        // document you are inside — so `https://site/some/path` can never be
+        // satisfied and must block, rather than quietly behaving like the
+        // origin the author probably meant. (WPT tests exactly this.)
+        if (/^(?:[a-zA-Z][a-zA-Z0-9+\-.]*:\/\/)?[^\s/:]+(?::\d+|:\*)?\/[^\s]*$/.test(expr)) continue;
+        if (url && _cspMatchesSource(expr, url, selfOrigin)) { matched = true; break; }
+      }
+      if (!matched) { ok = false; break; }
+    }
+    if (ok) continue;
+    // ⚠️⚠️ THE EMBEDDER MUST HEAR NOTHING. Every other violation fires a
+    // `securitypolicyviolation` event at the document that broke the rule; this
+    // one belongs to the FRAMED document, whose policy it is — and the framing
+    // page is, from the policy's point of view, the suspect. Firing it at the
+    // parent (which is where a global report helper naturally puts it) hands an
+    // attacker a reliable oracle for "is this site framable?", which is the exact
+    // question `frame-ancestors` exists to stop them answering. So: the endpoint
+    // named by the policy gets a report, and the page gets silence.
+    // ⛔ Cap: the framed document never loaded, so no event is fired anywhere;
+    // a real browser fires one inside the blocked frame, where nobody can see it.
+    try {
+      _cspSendReport(policy, {
+        documentURI: resourceURL, referrer: '',
+        blockedURI: (() => { try { return new URL(resourceURL).origin; } catch (e) { return ''; } })(),
+        effectiveDirective: 'frame-ancestors', violatedDirective: 'frame-ancestors',
+        originalPolicy: policy.text, disposition: policy.disposition,
+        statusCode: 200, sample: '',
+      });
+    } catch (e) {}
+    if (policy.disposition === 'enforce') allowed = false;
+  }
+  return allowed;
+};
+// `X-Frame-Options` — the pre-CSP spelling of the same idea, still sent by a
+// great many sites, and still the only one some of them send.
+// ⚠️ A CSP `frame-ancestors` OVERRIDES XFO ENTIRELY when both are present: the
+// modern header is the author's considered answer and the legacy one is what
+// their proxy adds. Honouring both means the STRICTER wins, which breaks the
+// migration the spec was written to make possible.
+const _xfoAllows = (xfo, resourceURL, ancestors) => {
+  const v = _asciiLower(String(xfo || '')).trim();
+  if (!v) return true;
+  if (v === 'deny') return ancestors.length === 0;
+  if (v === 'sameorigin') {
+    const selfO = _fa_originOf(resourceURL);
+    for (const a of ancestors) if (_fa_originOf(a) !== selfO) return false;
+    return true;
+  }
+  return true;                                  // ALLOW-FROM and friends: obsolete, ignored
+};
+// The one entry point `_loadIframeSrc` calls, with the response in hand.
+globalThis.__cspFrameLoadAllowed = (el, resourceURL, headers) => {
+  try {
+    let enforce = '', report = '', xfo = '';
+    try { enforce = (headers && headers.get('content-security-policy')) || ''; } catch (e) {}
+    try { report = (headers && headers.get('content-security-policy-report-only')) || ''; } catch (e) {}
+    try { xfo = (headers && headers.get('x-frame-options')) || ''; } catch (e) {}
+    if (!enforce && !report && !xfo) return true;
+    const policies = [];
+    _cspParseInto(policies, enforce, 'enforce', 'http');
+    _cspParseInto(policies, report, 'report', 'http');
+    const ancestors = _faAncestorURLs(el);
+    const hasFA = policies.some((p) => !!p.directives['frame-ancestors']);
+    if (!_faAllows(policies, resourceURL, ancestors)) return false;
+    if (!hasFA && !_xfoAllows(xfo, resourceURL, ancestors)) return false;
+    return true;
+  } catch (e) { return true; }
+};
+// ===== FRAME-ANCESTORS-END =====
+
+// ===== SANDBOX-BEGIN =====
+// `<iframe sandbox>` and the CSP `sandbox` directive — the same set of flags,
+// arrived at from two directions.
+//
+// ⭐ SANDBOX IS THE OTHER HALF OF FRAMING. `frame-ancestors` protects a page from
+// being framed; `sandbox` protects a page from what it frames. Every ad, every
+// embedded widget, every comment written by a stranger and every preview of an
+// uploaded file is content a site displays and does not trust, and this attribute
+// is the entire reason that is survivable. Obscura reflected NOTHING of it —
+// `grep -n sandbox` over the whole DOM returned three comments and no code — so
+// `<iframe sandbox="">` around hostile markup ran that markup with full script
+// access to a same-origin document. A restriction the page asked for, silently
+// not applied, is worse than one it never had: the site chose to embed the thing
+// BECAUSE it believed the box was closed.
+//
+// ⚠️ HONEST SCOPE. Obscura has one JavaScript realm for every frame, so a
+// sandbox here is not a security boundary the way a separate process is — it is
+// the observable behaviour of one: scripts do not run without `allow-scripts`,
+// the document is opaque-origin (unreadable from the embedder) without
+// `allow-same-origin`, and forms do not submit without `allow-forms`. That is
+// what a page can TEST for, and it is what the flags mean; it is not isolation,
+// and this comment is here so nobody mistakes it for isolation.
+const _SANDBOX_TOKENS = ['allow-downloads', 'allow-forms', 'allow-modals',
+  'allow-orientation-lock', 'allow-pointer-lock', 'allow-popups',
+  'allow-popups-to-escape-sandbox', 'allow-presentation', 'allow-same-origin',
+  'allow-scripts', 'allow-top-navigation', 'allow-top-navigation-by-user-activation',
+  'allow-top-navigation-to-custom-protocols'];
+const _sandboxParse = (text) => {
+  const set = Object.create(null);
+  for (const t of String(text == null ? '' : text).split(/[ \t\n\f\r]+/)) {
+    if (!t) continue;
+    const lt = _asciiLower(t);
+    if (_SANDBOX_TOKENS.indexOf(lt) !== -1) set[lt] = true;
+  }
+  return set;
+};
+// The flags in force for a frame: the `sandbox` ATTRIBUTE (absent ⇒ not
+// sandboxed at all), tightened by any CSP `sandbox` directive the framed response
+// itself sent. ⭐ The two never loosen each other — a document may always ask for
+// MORE restriction on itself, never less, which is why the merge is an
+// intersection of allowances and not a union.
+globalThis.__frameSandboxFlags = (el, cspSandboxValues) => {
+  let flags = null;
+  try {
+    if (el && el.hasAttribute && el.hasAttribute('sandbox')) {
+      flags = _sandboxParse(el.getAttribute('sandbox'));
+    }
+  } catch (e) {}
+  if (cspSandboxValues) {
+    const own = _sandboxParse(Array.isArray(cspSandboxValues) ? cspSandboxValues.join(' ') : cspSandboxValues);
+    if (!flags) flags = own;
+    else {
+      const merged = Object.create(null);
+      for (const k in flags) if (own[k]) merged[k] = true;
+      flags = merged;
+    }
+  }
+  return flags;
+};
+// Settle a frame's sandbox flags at NAVIGATION time, the moment its document
+// exists and before anything can observe it. Both inputs are known here: the
+// element's `sandbox` attribute, and the CSP `sandbox` directive the response
+// itself sent.
+globalThis.__frameApplySandbox = (el, doc) => {
+  try {
+    if (!el) return;
+    const flags = globalThis.__frameSandboxFlags(el, globalThis.__cspSandboxOf(doc));
+    el._sandboxFlags = flags;
+    // No `allow-same-origin` ⇒ an opaque origin ⇒ the embedder cannot read in.
+    el._sandboxOpaque = !!(flags && !flags['allow-same-origin']);
+    el._opaqueWin = null;
+  } catch (e) {}
+};
+// The CSP `sandbox` directive of a document's own policies, if any.
+globalThis.__cspSandboxOf = (doc) => {
+  try {
+    const list = doc ? _cspDocPolicies.get(doc) : null;
+    if (!list) return null;
+    let out = null;
+    for (const p of list) {
+      if (p.disposition !== 'enforce') continue;   // report-only sandbox is inert
+      const d = p.directives['sandbox'];
+      if (!d) continue;
+      out = (out === null) ? d.slice() : out.concat(d);
+    }
+    return out;
+  } catch (e) { return null; }
+};
+// Reflect the attribute. [PutForwards=value] is what makes `iframe.sandbox =
+// 'allow-scripts'` — the spelling every page and every test actually uses — set
+// the attribute rather than shadowing the accessor with a string.
+try {
+  Object.defineProperty(globalThis.HTMLIFrameElement.prototype, 'sandbox', {
+    enumerable: true, configurable: true,
+    get: function () { return this._sandboxList ??= _makeTokenList(this, 'sandbox'); },
+    set: function (v) { (this._sandboxList ??= _makeTokenList(this, 'sandbox')).value = v; },
+  });
+} catch (e) {}
+// ===== SANDBOX-END =====
 
 // ===== EDITING-ENGINE-BEGIN =====
 // document.execCommand and friends — the HTML Editing APIs.

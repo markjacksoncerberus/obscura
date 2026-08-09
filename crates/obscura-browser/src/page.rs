@@ -697,6 +697,49 @@ impl Page {
                         if !allowed {
                             continue;
                         }
+                        // ⭐ Subresource Integrity, on the path that carries the
+                        // real web's `<script integrity>`: almost every one of
+                        // them is in MARKUP, next to the CDN URL it guards, so a
+                        // check that only covers scripts inserted by JS covers
+                        // the rare half. Two questions, cheapest first — a page
+                        // with no `integrity` anywhere pays one boolean and never
+                        // base64s a script body it does not need to.
+                        let needs_sri = js
+                            .evaluate(&format!("globalThis.__sriNeedsCheck({})", script.nid))
+                            .ok()
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if needs_sri {
+                            let b64 = BASE64.encode(code.as_bytes());
+                            // Same-origin is the only case the markup prefetch can
+                            // prove is readable; a cross-origin `<script>` here was
+                            // fetched no-cors, and per SRI an opaque response fails
+                            // the check rather than becoming a byte oracle.
+                            let cors_ok = Url::parse(&url).ok().zip(self.url.as_ref())
+                                .map(|(u, page)| u.origin() == page.origin())
+                                .unwrap_or(false);
+                            let ok = js
+                                .evaluate(&format!(
+                                    "globalThis.__sriAllowsScript({}, '{}', {})",
+                                    script.nid, b64, cors_ok
+                                ))
+                                .ok()
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true);
+                            if !ok {
+                                tracing::warn!("SRI: integrity mismatch, script blocked: {}", url);
+                                let esc = url.replace('\\', "\\\\").replace('\'', "\\'");
+                                let _ = js.execute_script(
+                                    "<sri-error>",
+                                    &format!(
+                                        "try {{ globalThis.__fireResourceError({}); }} catch (e) {{}} \
+                                         try {{ console.error('Failed to find a valid digest in the \\'integrity\\' attribute for resource \\'{}\\'.'); }} catch (e) {{}}",
+                                        script.nid, esc
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
                         if let Err(e) = js.execute_script_guarded(&url, &code) {
                             tracing::warn!("Script error ({}): {}", url, e);
                             Self::report_script_error(js, &e);

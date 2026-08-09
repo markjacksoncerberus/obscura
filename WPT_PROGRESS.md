@@ -62,6 +62,25 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **THE ATTESTED, UNFRAMED, OWNED & VOUCHED ARC — Quests #530–#534 (2026-08-09): `integrity` was reflected and never read, and a cross-origin frame's `location` was readable** | — | — | ✅ | #530–#534 |
+| **`subresource-integrity/subresource-integrity.html` — a whole realm, zero rows before** | **33/48** | **48/48** | ✅ 100% | #530 · [`tickets/131`](tickets/131-the-attested-verdict.md) |
+| **`content-security-policy/frame-ancestors` — the 12 non-nested files** | **4/11** | **14/14** | ✅ 100% | #531 · [`tickets/132`](tickets/132-the-unframed-verdict.md) |
+| `frame-ancestors/frame-ancestors-self-block.html` | 0/1 | **1/1** | ✅ | #531 |
+| `frame-ancestors/frame-ancestors-url-block.html` | 0/1 | **1/1** | ✅ | #531 |
+| `frame-ancestors/frame-ancestors-path-ignored.window.html` | 0/1 | **1/1** | ✅ | #531 |
+| `frame-ancestors/frame-ancestors-overrides-xfo.html` | 1/2 | **2/2** | ✅ | #531 (X-Frame-Options did not exist) |
+| `frame-ancestors/frame-ancestors-none-block.html` | 1/2 | **2/2** | ✅ | #531 (the embedder must hear nothing) |
+| `frame-ancestors/frame-ancestors-star-allow-crossorigin.html` | 0/1 | **1/1** | ✅ | #531 (cross-origin `contentWindow.location` now throws) |
+| `frame-ancestors/report-blocked-frame.sub.html` | 0/1 | **1/1** | ✅ | #531 |
+| `frame-ancestors/report-only-frame.sub.html` | 0/1 | **1/1** | ✅ | #531 |
+| `frame-ancestors/frame-ancestors-from-serviceworker.https.html` | 0/1 | **1/1** | ✅ | #531 |
+| `frame-ancestors/frame-ancestors-url-allow.sub.html` (on `:8443`) | 1/1 | 1/1 | ✅ | #531 — ⚠️ **0/1 on `:443`**: the suite hard-codes `https://wpt.live:8443` |
+| **`content-security-policy` `sandbox` + `inheritance` — 41-file slice** | **7/100** | **10/100** | 🟡 | #532–#533 · [`tickets/133`](tickets/133-the-owned-verdict.md) |
+| `inheritance/sandboxed-blob-scheme.html` | 0/1 | **1/1** | ✅ | #532 (local schemes inherit the parent's policy) |
+| `inheritance/unsandboxed-blob-scheme.html` | 0/1 | **1/1** | ✅ | #532 |
+| `inheritance/sandboxed-data-scheme.html` | 0/1 | **1/1** | ✅ | #532 |
+| `inheritance/unsandboxed-data-scheme.html` | 0/1 | **1/1** | ✅ | #532 |
+| `sandbox/autoplay-disabled-by-csp.html` | 2/2 | **1/2** | ⚠️ **MOVED, SHIPPED & NAMED** | #533 — the 2/2 came from implementing *no* sandboxing; see [`tickets/133`](tickets/133-the-owned-verdict.md) |
 | **THE INCREMENTED, UNBLOCKED, LINKED, SEALED & FETCHED ARC — Quests #525–#529 (2026-08-09): layout stopped rebuilding the page to measure it** | — | — | ✅ | #525–#529 |
 | **Layout: mutate-then-measure, 404 elements** | **13.65 ms** | **2.70 ms — 5.1×** | ✅ | #525 · [`tickets/126`](126-the-incremented-verdict.md) |
 | **`editing` — 43-file probe, after incremental layout** | **78183/80787** | **82256/83982 — 3 improved, could-not-run 2 → 0** | ✅ | #526 · [`tickets/127`](127-the-unblocked-verdict.md) |
