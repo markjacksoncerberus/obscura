@@ -22,7 +22,7 @@ description = "Headless HTML/CSS rendering for Obscura, backed by the Blitz engi
 # crate instead — losing every fork fix (SVG currentColor, WOFF2 fonts, …).
 # When bumping the fork, bump these in lockstep and `anyrender*` below to the
 # versions the fork's workspace pins.
-blitz-dom = { version = "=0.3.0-alpha.5", default-features = false, features = ["svg", "woff"] }
+blitz-dom = { version = "=0.3.0-alpha.5", default-features = false, features = ["svg", "woff", "incremental"] }
 blitz-html = "=0.3.0-alpha.5"
 # Stylo's computed-value types, so geometry queries can read `display`,
 # `position`, `visibility` and `opacity` off a laid-out node. Blitz already

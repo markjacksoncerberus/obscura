@@ -368,6 +368,17 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             }
             "true".into()
         }
+        // CSP told us this element's styling must not reach the renderer.
+        // arg2 is "attr", "elem", or both separated by a comma.
+        "set_csp_blocked_style" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            dom.set_csp_blocked_style(
+                NodeId::new(nid),
+                arg2.contains("attr"),
+                arg2.contains("elem"),
+            );
+            "true".into()
+        }
         "inner_html" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             serde_json::to_string(&dom.inner_html(NodeId::new(nid))).unwrap_or("\"\"".into())

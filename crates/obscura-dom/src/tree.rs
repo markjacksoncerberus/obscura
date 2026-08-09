@@ -337,6 +337,62 @@ pub(crate) struct DomTreeInner {
     // toggles membership on enter/exit; read by the `:fullscreen` pseudo-class. All
     // elements on the stack match `:fullscreen` (not just the topmost). Non-monotonic.
     pub(crate) fullscreen: HashSet<NodeId>,
+    // ── The layout journal ──────────────────────────────────────────────────
+    // Which nodes have been touched since the layout bridge last looked. The
+    // bridge keeps a live Blitz document between queries and replays these onto
+    // it, so a page that mutates one element and measures it does not pay for a
+    // re-parse and a full restyle of everything else.
+    //
+    // Correctness rests on this list being COMPLETE: a mutation that reaches the
+    // tree without landing here would leave the box tree quietly describing a
+    // document that no longer exists, and a lie in geometry is the exact bug the
+    // bridge was built to end. Every mutating path on `DomTree` therefore funnels
+    // through `note_layout_dirty` — `with_node_mut` covers all node-data changes
+    // (attributes, character data), and `detach`/`append_child`/`insert_before`/
+    // `append_text` cover every structural one.
+    // Elements whose styling must not reach the RENDERER, though it stays in the
+    // document. Content Security Policy is the only source: a blocked `style=""`
+    // or a blocked `<style>` is still readable markup — CSP stops a declaration
+    // applying, it does not edit the page — but nothing it says may move a box.
+    //
+    // Two sets because the two are different refusals: `style-src-attr` blocks an
+    // element's own attribute, `style-src-elem` blocks a whole `<style>`'s
+    // content. Blocking the wrong one is a page that renders unstyled for no
+    // reason the reader can see.
+    pub(crate) csp_blocked_style_attr: HashSet<NodeId>,
+    pub(crate) csp_blocked_style_elem: HashSet<NodeId>,
+    pub(crate) layout_dirty: Vec<NodeId>,
+    // Set when the journal filled up (or when something happened that we cannot
+    // describe as a patch). It means "stop trusting the journal, re-parse" — the
+    // safe answer, and the only one that stays safe as the tree grows new
+    // mutation paths.
+    pub(crate) layout_dirty_overflow: bool,
+}
+
+/// How many touched nodes the journal will remember before giving up and asking
+/// for a full re-parse. Past a few dozen dirty subtrees a re-parse is cheaper
+/// than patching each one, and an unbounded list would grow forever on a page
+/// that mutates but never measures.
+const LAYOUT_DIRTY_CAP: usize = 192;
+
+impl DomTreeInner {
+    /// Record that `id` (or its child list) changed. Cheap by construction: one
+    /// comparison and, in the common case of a loop hammering one element, no
+    /// push at all.
+    pub(crate) fn note_layout_dirty(&mut self, id: NodeId) {
+        if self.layout_dirty_overflow {
+            return;
+        }
+        if self.layout_dirty.last() == Some(&id) {
+            return;
+        }
+        if self.layout_dirty.len() >= LAYOUT_DIRTY_CAP {
+            self.layout_dirty_overflow = true;
+            self.layout_dirty.clear();
+            return;
+        }
+        self.layout_dirty.push(id);
+    }
 }
 
 impl DomTree {
@@ -372,6 +428,10 @@ impl DomTree {
                 popover_open: HashSet::new(),
                 dialog_modal: HashSet::new(),
                 fullscreen: HashSet::new(),
+                csp_blocked_style_attr: HashSet::new(),
+                csp_blocked_style_elem: HashSet::new(),
+                layout_dirty: Vec::new(),
+                layout_dirty_overflow: false,
             }),
         }
     }
@@ -705,6 +765,55 @@ impl DomTree {
         }
     }
 
+    /// Record that Content Security Policy forbade this element's `style`
+    /// attribute (`attr`) or its `<style>` content (`elem`), so neither reaches
+    /// the renderer. The markup itself is untouched: the page can still read it.
+    pub fn set_csp_blocked_style(&self, id: NodeId, attr: bool, elem: bool) {
+        let mut inner = self.inner.borrow_mut();
+        if attr {
+            inner.csp_blocked_style_attr.insert(id);
+        }
+        if elem {
+            inner.csp_blocked_style_elem.insert(id);
+        }
+        // The renderer's view of the document just changed even though the tree
+        // did not, so the layout journal has to hear about it — otherwise the
+        // next query finds a matching snapshot hash and serves the boxes the
+        // blocked style produced.
+        inner.note_layout_dirty(id);
+    }
+
+    /// Is this element's `style` attribute blocked by CSP?
+    pub fn csp_style_attr_blocked(&self, id: NodeId) -> bool {
+        self.inner.borrow().csp_blocked_style_attr.contains(&id)
+    }
+
+    /// Is this `<style>` element's content blocked by CSP?
+    pub fn csp_style_elem_blocked(&self, id: NodeId) -> bool {
+        self.inner.borrow().csp_blocked_style_elem.contains(&id)
+    }
+
+    /// Take the layout journal, leaving it empty.
+    ///
+    /// Returns `(touched nodes in the order they were touched, overflowed)`.
+    /// `overflowed` means the list is not a complete account of what changed and
+    /// the caller must rebuild from scratch — the journal is an optimisation, and
+    /// an optimisation that is sometimes wrong is not one.
+    pub fn take_layout_dirty(&self) -> (Vec<NodeId>, bool) {
+        let mut inner = self.inner.borrow_mut();
+        let overflow = inner.layout_dirty_overflow;
+        inner.layout_dirty_overflow = false;
+        (std::mem::take(&mut inner.layout_dirty), overflow)
+    }
+
+    /// Drop the journal without reading it. For the caller that has just proved
+    /// its copy of the tree is already current.
+    pub fn clear_layout_dirty(&self) {
+        let mut inner = self.inner.borrow_mut();
+        inner.layout_dirty.clear();
+        inner.layout_dirty_overflow = false;
+    }
+
     pub fn new_node(&self, data: NodeData) -> NodeId {
         let mut inner = self.inner.borrow_mut();
         let id = if let Some(slot) = inner.free_list.pop() {
@@ -750,6 +859,11 @@ impl DomTree {
         F: FnOnce(&mut Node) -> R,
     {
         let mut inner = self.inner.borrow_mut();
+        // Pessimistic: we cannot see what the closure did, so any node handed out
+        // mutably is assumed changed. `with_node_mut` is the single door to every
+        // attribute and character-data write in the tree, which is exactly why
+        // journalling here is enough to cover all of them.
+        inner.note_layout_dirty(id);
         inner.nodes.get_mut(id.index())?.as_mut().map(f)
     }
 
@@ -757,6 +871,7 @@ impl DomTree {
         self.detach(child_id);
 
         let mut inner = self.inner.borrow_mut();
+        inner.note_layout_dirty(parent_id);
 
         let old_last = inner
             .nodes
@@ -834,6 +949,7 @@ impl DomTree {
         };
 
         let mut inner = self.inner.borrow_mut();
+        inner.note_layout_dirty(parent_id);
 
         if let Some(Some(node)) = inner.nodes.get_mut(new_sibling_id.index()) {
             node.parent = Some(parent_id);
@@ -877,6 +993,13 @@ impl DomTree {
                 Some(node) => (node.parent, node.prev_sibling, node.next_sibling),
                 None => return,
             };
+
+        // Every structural removal in the tree — `remove_child`, `remove`, and the
+        // implicit unlink at the head of `append_child`/`insert_before` — comes
+        // through here, so the losing parent is journalled exactly once.
+        if let Some(parent) = parent_id {
+            inner.note_layout_dirty(parent);
+        }
 
         if let Some(prev) = prev_id {
             if let Some(Some(node)) = inner.nodes.get_mut(prev.index()) {
@@ -1150,6 +1273,9 @@ impl DomTree {
                     .unwrap()
             };
             let mut inner = self.inner.borrow_mut();
+            // The merge path writes character data straight into the last child
+            // rather than going through `with_node_mut`, so it journals its own.
+            inner.note_layout_dirty(last_child_id);
             if let Some(Some(node)) = inner.nodes.get_mut(last_child_id.index()) {
                 if let NodeData::Text { contents } = &mut node.data {
                     contents.push_str(text);

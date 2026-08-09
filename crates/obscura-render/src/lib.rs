@@ -29,7 +29,7 @@ mod fonts;
 mod http;
 mod net;
 
-pub use document::{LayoutRect, NodeBox, ResolvedDoc, Size};
+pub use document::{ElementPatch, LayoutRect, NodeBox, ResolvedDoc, Size};
 pub use engine::{RenderEngine, RenderInput};
 pub use http::{decode_data_uri, ObscuraNetProvider};
 pub use net::{NoOpNetProvider, ResourceProvider};

@@ -21,6 +21,24 @@ use crate::{ImageFormat, PaintOptions, RenderError};
 /// painted Blitz node can be mapped back to the originating Obscura node id.
 const NID_ATTR: &str = "data-obscura-nid";
 
+/// One element's current state, as the page's own serializer sees it: the
+/// attributes it carries and the markup of its children.
+///
+/// The unit of an incremental layout update. Note there is no "what changed"
+/// here — only "what it is now". The journal that produces these knows which
+/// element was touched but not how, and rebuilding an element from the page's
+/// own serialization is the only patch that provably agrees with what a full
+/// re-parse would have built.
+pub struct ElementPatch {
+    /// The Obscura node id, as stamped in `data-obscura-nid`.
+    pub nid: u64,
+    /// `(local name, value)` pairs, in document order — the same names the
+    /// Obscura serializer emits, so the patched element matches a re-parse.
+    pub attrs: Vec<(String, String)>,
+    /// The element's children, serialized with `data-obscura-nid` stamps.
+    pub inner_html: String,
+}
+
 /// A box in CSS pixels (matching `getBoundingClientRect` / CDP box-model units).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayoutRect {
@@ -181,6 +199,90 @@ impl ResolvedDoc {
     /// The Obscura-node-id → Blitz-node-id map for this document.
     pub fn nid_map(&self) -> &HashMap<u64, usize> {
         &self.nid_map
+    }
+
+    /// Bring this document back in step with the page by rewriting a handful of
+    /// elements, instead of parsing the whole page again.
+    ///
+    /// This is what makes layout incremental. A re-parse throws away a styled,
+    /// laid-out document and rebuilds an identical one to change a single width;
+    /// the cost is paid by every page that measures after it mutates, which is
+    /// every page with an editor, a sticky header, or an autosizing textarea.
+    /// Patching keeps the document — and with it Stylo's rule tree, the parsed
+    /// stylesheets and Taffy's cached measurements — so the work left is
+    /// proportional to what actually changed.
+    ///
+    /// Each patch replaces one element's attributes and children wholesale. That
+    /// is deliberately blunt: the journal upstream only knows *which* element was
+    /// touched, not how, and rewriting it from the page's own serialization is
+    /// the one form of patch that cannot drift from what a re-parse would have
+    /// produced.
+    ///
+    /// Returns `false` — having changed nothing — when any target is missing from
+    /// this document. The caller must then re-parse. A partial patch is the one
+    /// outcome worse than a slow one.
+    pub fn patch(&mut self, patches: &[ElementPatch]) -> bool {
+        use blitz_dom::{ns, LocalName, QualName};
+
+        // Resolve every target BEFORE touching anything, so a miss costs nothing.
+        let mut targets = Vec::with_capacity(patches.len());
+        for p in patches {
+            match self.nid_map.get(&p.nid) {
+                Some(&id) => targets.push(id),
+                None => return false,
+            }
+        }
+
+        // Read the current attribute names first: `mutate()` takes the document
+        // mutably, so nothing can be read off it once the mutator exists.
+        let stale: Vec<Vec<QualName>> = patches
+            .iter()
+            .zip(targets.iter())
+            .map(|(p, &id)| {
+                let Some(el) = self.doc.get_node(id).and_then(|n| n.element_data()) else {
+                    return Vec::new();
+                };
+                el.attrs()
+                    .iter()
+                    .filter(|a| {
+                        a.name.local.as_ref() != NID_ATTR
+                            && !p
+                                .attrs
+                                .iter()
+                                .any(|(n, _)| n.as_str() == a.name.local.as_ref())
+                    })
+                    .map(|a| a.name.clone())
+                    .collect()
+            })
+            .collect();
+
+        {
+            let mut m = self.doc.mutate();
+            for ((p, &id), drop_names) in patches.iter().zip(targets.iter()).zip(stale.iter()) {
+                // Set what the page has, drop what it no longer has, and always
+                // (re)write `data-obscura-nid` — it is how this element will be
+                // found next time, so it is never a candidate for clearing.
+                for (name, value) in &p.attrs {
+                    m.set_attribute(id, QualName::new(None, ns!(), LocalName::from(&**name)), value);
+                }
+                for name in drop_names {
+                    m.clear_attribute(id, name.clone());
+                }
+                m.set_attribute(
+                    id,
+                    QualName::new(None, ns!(), LocalName::from(NID_ATTR)),
+                    &p.nid.to_string(),
+                );
+                m.set_inner_html(id, &p.inner_html);
+            }
+            m.flush();
+        }
+
+        self.doc.resolve(0.0);
+        // The patched subtrees are new Blitz nodes with new ids, so the map has to
+        // be rebuilt. Walking the tree is cheap next to laying it out.
+        self.nid_map = build_nid_map(&self.doc);
+        true
     }
 
     /// The full CSSOM-View box for `obscura_nid`, or `None` if the element

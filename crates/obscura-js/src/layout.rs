@@ -32,11 +32,11 @@ use std::time::Duration;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use obscura_dom::DomTree;
+use obscura_dom::{DomTree, NodeId};
 use obscura_net::ObscuraHttpClient;
 use obscura_render::{
-    Bytes, ColorScheme, MediaType, NetHandler, NetProvider, NoOpNetProvider, ObscuraNetProvider,
-    RenderEngine, RenderInput, ResolvedDoc, ResourceProvider, Request, Viewport,
+    Bytes, ColorScheme, ElementPatch, MediaType, NetHandler, NetProvider, NoOpNetProvider,
+    ObscuraNetProvider, RenderEngine, RenderInput, ResolvedDoc, ResourceProvider, Request, Viewport,
 };
 
 /// A [`ResourceProvider`] that remembers what it already fetched.
@@ -117,16 +117,174 @@ impl ResourceProvider for CachingProvider {
     }
 }
 
+/// The live document, and the exact inputs it currently reflects.
+///
+/// Kept between queries rather than rebuilt, so a mutation can be *patched* into
+/// it (see [`plan_patches`]). The viewport rides along because a viewport change
+/// is not something a patch can express: the whole document has to be laid out
+/// again against the new one.
+struct Cached {
+    key: u64,
+    doc: ResolvedDoc,
+    vw: u32,
+    vh: u32,
+    dsf: f64,
+}
+
 thread_local! {
     /// One engine — and its bundled `FontContext` — per thread, so the font is
     /// parsed once for the whole process rather than once per query.
     static ENGINE: RenderEngine = RenderEngine::new();
     /// The last resolved document, plus the hash of the snapshot and viewport it
     /// came from. Repeated reads between mutations reuse it.
-    static CACHE: RefCell<Option<(u64, ResolvedDoc)>> = const { RefCell::new(None) };
+    static CACHE: RefCell<Option<Cached>> = const { RefCell::new(None) };
     /// Sub-resources (stylesheets, fonts, images) fetched by any layout on this
     /// page, shared across every re-layout. See [`CachingProvider`].
     static RESOURCES: RefCell<Option<Arc<Mutex<HashMap<String, Bytes>>>>> = const { RefCell::new(None) };
+}
+
+/// Elements a patch will not touch, in the markup it is about to install or as
+/// the patched element itself.
+///
+/// Every one of them does something on insertion beyond occupying a box: fetch a
+/// file, register a stylesheet, run a program, retarget the document. Blitz
+/// handles all of it — but asynchronously, and the patch path deliberately does
+/// not wait for the network the way the full path does (it exists to answer a
+/// synchronous geometry read). So rather than hand back a box measured before
+/// the stylesheet landed, we re-parse and take the slow path, which does wait.
+///
+/// This is the honest cost of the fast path, and it is why the list errs long.
+const PATCH_UNSAFE_TAGS: [&str; 15] = [
+    "style", "link", "script", "base", "meta", "img", "picture", "source", "iframe", "frame",
+    "object", "embed", "video", "audio", "track",
+];
+
+/// Does `html` contain a start tag we refuse to patch? A byte scan rather than a
+/// lowercase-and-search: this runs on every mutation of a page that measures, and
+/// the markup can be the whole body.
+fn has_unsafe_tag(html: &str) -> bool {
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while let Some(off) = bytes[i..].iter().position(|&b| b == b'<') {
+        let start = i + off + 1;
+        i = start;
+        let rest = &bytes[start..];
+        if PATCH_UNSAFE_TAGS.iter().any(|tag| {
+            let t = tag.as_bytes();
+            rest.len() > t.len()
+                && rest[..t.len()].eq_ignore_ascii_case(t)
+                // A tag name ends at whitespace, '/' or '>'; without this
+                // `<sourceCode>` would read as `<source>`.
+                && matches!(rest[t.len()], b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>')
+        }) {
+            return true;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// Turn the DOM's journal of touched nodes into a set of whole-element rewrites,
+/// or `None` when the change cannot be expressed as one and the document must be
+/// parsed again.
+///
+/// The rules that make this safe, each earning its place:
+///  * a touched node resolves to its nearest **element** ancestor — character
+///    data has no box of its own, its parent draws it;
+///  * anything no longer connected to the document is dropped, because it is not
+///    in the snapshot either (whatever detached it journalled the losing parent,
+///    so the removal is still accounted for);
+///  * an element inside another dirty element is dropped, since rewriting the
+///    outer one rebuilds it anyway;
+///  * `<html>`/`<head>` and the document node are refused outright — patching
+///    them means re-installing the page's stylesheets, which is a re-parse
+///    wearing a disguise.
+fn plan_patches(dom: &DomTree, dirty: &[NodeId]) -> Option<Vec<ElementPatch>> {
+    let doc_id = dom.document();
+    let mut roots: Vec<NodeId> = Vec::with_capacity(dirty.len());
+
+    'next: for &id in dirty {
+        // Walk up to the nearest element, checking connectivity on the way. One
+        // pass answers both questions.
+        let mut cur = Some(id);
+        let mut element: Option<NodeId> = None;
+        while let Some(c) = cur {
+            if c == doc_id {
+                break;
+            }
+            let Some(node) = dom.get_node(c) else {
+                // Freed by `remove()`. Its parent was journalled on detach, so
+                // the change is not lost by skipping it.
+                continue 'next;
+            };
+            if element.is_none() && node.as_element().is_some() {
+                element = Some(c);
+            }
+            match node.parent {
+                Some(p) => cur = Some(p),
+                // Ran out of ancestors without reaching the document: detached,
+                // so it is not in the snapshot and cannot move a box.
+                None => continue 'next,
+            }
+        }
+        let Some(el) = element else { continue 'next };
+        // The document element and its head are refused: see the doc comment.
+        let name = dom
+            .get_node(el)
+            .and_then(|n| n.as_element().map(|q| q.local.as_ref().to_ascii_lowercase()));
+        match name.as_deref() {
+            Some("html") | Some("head") => return None,
+            Some(tag) if PATCH_UNSAFE_TAGS.contains(&tag) => return None,
+            None => return None,
+            _ => {}
+        }
+        if !roots.contains(&el) {
+            roots.push(el);
+        }
+    }
+
+    if roots.is_empty() {
+        return Some(Vec::new());
+    }
+
+    // Drop any root that sits inside another root.
+    let mut out: Vec<ElementPatch> = Vec::with_capacity(roots.len());
+    'root: for &el in &roots {
+        let mut cur = dom.get_node(el).and_then(|n| n.parent);
+        while let Some(c) = cur {
+            if roots.contains(&c) {
+                continue 'root;
+            }
+            cur = dom.get_node(c).and_then(|n| n.parent);
+        }
+        let inner_html = dom.inner_html_with_obscura_ids(el);
+        if has_unsafe_tag(&inner_html) {
+            return None;
+        }
+        // The patch has to agree with the serializer about what the renderer is
+        // allowed to see, or a CSP-blocked `style` would be quietly re-applied by
+        // the very mechanism that exists to keep the two in step.
+        let style_blocked = dom.csp_style_attr_blocked(el);
+        let attrs = dom
+            .get_node(el)
+            .and_then(|n| {
+                n.attrs().map(|a| {
+                    a.iter()
+                        .filter(|at| !(style_blocked && at.name.local.as_ref() == "style"))
+                        .map(|at| (at.name.local.as_ref().to_string(), at.value.clone()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        out.push(ElementPatch {
+            nid: el.raw() as u64,
+            attrs,
+            inner_html,
+        });
+    }
+    Some(out)
 }
 
 /// Inputs that change the layout, hashed into the cache key.
@@ -167,53 +325,130 @@ pub fn layout_boxes(
     dsf: f64,
     last_key: u64,
 ) -> String {
+    let prof = std::env::var_os("OBSCURA_LAYOUT_PROFILE").is_some();
+    let t0 = std::time::Instant::now();
     let html = dom.outer_html_with_obscura_ids(dom.document());
+    let t_ser = t0.elapsed();
     let key = cache_key(&html, vw, vh, dsf);
+    let t_hash = t0.elapsed() - t_ser;
     if key == last_key && last_key != 0 {
+        // The caller's copy is current, so the cached document is too: whatever
+        // the journal is holding has already been accounted for (a mutation that
+        // was undone before anyone looked). Drop it rather than replaying it.
+        dom.clear_layout_dirty();
+        if prof {
+            eprintln!(
+                "[layout-profile] SAME serialize={:?} hash={:?} len={}",
+                t_ser,
+                t_hash,
+                html.len()
+            );
+        }
         return format!("{{\"key\":{key},\"same\":1}}");
     }
 
+    let html_len = html.len();
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let fresh = cache.as_ref().is_none_or(|(k, _)| *k != key);
-        if fresh {
-            let base: Arc<dyn ResourceProvider> = match client {
-                Some(c) => Arc::new(ObscuraNetProvider::new(c.clone(), blocked.to_vec())),
-                None => Arc::new(NoOpNetProvider),
-            };
-            let resources = RESOURCES.with(|r| {
-                let mut r = r.borrow_mut();
-                r.get_or_insert_with(|| Arc::new(Mutex::new(HashMap::new()))).clone()
-            });
-            let provider: Arc<dyn ResourceProvider> = Arc::new(CachingProvider {
-                inner: base,
-                cache: resources,
-            });
-            let doc = ENGINE.with(|engine| {
-                engine.layout(RenderInput {
-                    html,
-                    base_url: Some(base_url.to_string()),
-                    viewport: Viewport::new(
-                        (vw as f64 * dsf).round().max(1.0) as u32,
-                        (vh as f64 * dsf).round().max(1.0) as u32,
-                        dsf as f32,
-                        ColorScheme::Light,
-                    ),
-                    media_type: MediaType::screen(),
-                    net_provider: provider,
-                    // A geometry read is synchronous from the page's point of
-                    // view — `getBoundingClientRect()` cannot await a font.
-                    // Keep the ceiling far below the screenshot path's 5s: a
-                    // late web font moves a box, but a frozen tab loses the
-                    // whole page.
-                    resource_timeout: Duration::from_millis(500),
-                })
-            });
-            *cache = Some((key, doc));
+        let stale = cache.as_ref().is_none_or(|c| c.key != key);
+        let mut how = "hit";
+        if stale {
+            // ── The fast path: patch the document we already have ────────────
+            // Only when the journal is a complete account of what changed, the
+            // viewport has not moved (a patch cannot express that), and the
+            // change is one whole-element rewrite can describe.
+            let (dirty, overflow) = dom.take_layout_dirty();
+            let viewport_same = cache
+                .as_ref()
+                .is_some_and(|c| c.vw == vw && c.vh == vh && c.dsf == dsf);
+            let patched = !overflow
+                && viewport_same
+                && !incremental_disabled()
+                && match plan_patches(dom, &dirty) {
+                    // An EMPTY patch list is not "nothing changed" — the snapshot
+                    // hash says something did, and the journal simply could not
+                    // account for it (every touched node had been detached, or
+                    // the change was one the DOM does not model as a mutation at
+                    // all). Re-parsing is the only honest answer: claiming the
+                    // document already matches would freeze the box tree at the
+                    // last state it happened to be in.
+                    Some(patches) if !patches.is_empty() => {
+                        cache.as_mut().is_some_and(|c| c.doc.patch(&patches))
+                    }
+                    _ => false,
+                };
+            if patched {
+                how = "patch";
+                if let Some(c) = cache.as_mut() {
+                    c.key = key;
+                }
+            } else {
+                how = "reparse";
+                let base: Arc<dyn ResourceProvider> = match client {
+                    Some(c) => Arc::new(ObscuraNetProvider::new(c.clone(), blocked.to_vec())),
+                    None => Arc::new(NoOpNetProvider),
+                };
+                let resources = RESOURCES.with(|r| {
+                    let mut r = r.borrow_mut();
+                    r.get_or_insert_with(|| Arc::new(Mutex::new(HashMap::new()))).clone()
+                });
+                let provider: Arc<dyn ResourceProvider> = Arc::new(CachingProvider {
+                    inner: base,
+                    cache: resources,
+                });
+                let doc = ENGINE.with(|engine| {
+                    engine.layout(RenderInput {
+                        html,
+                        base_url: Some(base_url.to_string()),
+                        viewport: Viewport::new(
+                            (vw as f64 * dsf).round().max(1.0) as u32,
+                            (vh as f64 * dsf).round().max(1.0) as u32,
+                            dsf as f32,
+                            ColorScheme::Light,
+                        ),
+                        media_type: MediaType::screen(),
+                        net_provider: provider,
+                        // A geometry read is synchronous from the page's point of
+                        // view — `getBoundingClientRect()` cannot await a font.
+                        // Keep the ceiling far below the screenshot path's 5s: a
+                        // late web font moves a box, but a frozen tab loses the
+                        // whole page.
+                        resource_timeout: Duration::from_millis(500),
+                    })
+                });
+                *cache = Some(Cached { key, doc, vw, vh, dsf });
+            }
+        } else {
+            // The document already matches; nothing in the journal can be news.
+            dom.clear_layout_dirty();
         }
-        let (_, doc) = cache.as_ref().expect("populated above");
-        serialize_boxes(doc, key)
+        let t_layout = t0.elapsed() - t_ser - t_hash;
+        let doc = &cache.as_ref().expect("populated above").doc;
+        let out = serialize_boxes(doc, key);
+        if prof {
+            eprintln!(
+                "[layout-profile] {how} serialize={:?} hash={:?} layout={:?} boxes={:?} htmlLen={} outLen={}",
+                t_ser,
+                t_hash,
+                t_layout,
+                t0.elapsed() - t_ser - t_hash - t_layout,
+                html_len,
+                out.len()
+            );
+        }
+        out
     })
+}
+
+/// The kill switch. Incremental layout is a correctness-critical optimisation:
+/// if a box ever looks wrong, this turns the whole patch path off in one
+/// environment variable and sends every query back down the re-parse road, so a
+/// bug here can be confirmed or ruled out without a rebuild.
+fn incremental_disabled() -> bool {
+    thread_local! {
+        static OFF: bool = std::env::var_os("OBSCURA_LAYOUT_NO_INCREMENTAL").is_some();
+    }
+    OFF.with(|o| *o)
 }
 
 /// Drop the cached layout. Called when the document is replaced, so a new page

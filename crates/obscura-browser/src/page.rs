@@ -340,6 +340,95 @@ impl Page {
         let _ = js.execute_script("<report-error>", &code);
     }
 
+    /// Fetch every `<link rel=stylesheet>` in the parsed markup and hand its CSS
+    /// to the JS realm, so the cascade is complete before the first script runs.
+    ///
+    /// The layout bridge has always seen these — Blitz fetches them itself — but
+    /// the JS realm never did, so `getComputedStyle` answered from the UA sheet
+    /// while `getBoundingClientRect` answered from the author's. One document,
+    /// two truths, and the page could read both.
+    async fn load_blocking_stylesheets(&mut self) {
+        let links: Vec<(u32, String)> = match &self.js {
+            Some(js) => js
+                .with_dom(|dom| {
+                    let mut out = Vec::new();
+                    for id in dom.query_selector_all("link").unwrap_or_default() {
+                        let Some(node) = dom.get_node(id) else { continue };
+                        let rel = node.get_attribute("rel").unwrap_or("").to_ascii_lowercase();
+                        if !rel.split_ascii_whitespace().any(|t| t == "stylesheet") {
+                            continue;
+                        }
+                        match node.get_attribute("href") {
+                            Some(h) if !h.trim().is_empty() => out.push((id.raw(), h.to_string())),
+                            _ => {}
+                        }
+                    }
+                    out
+                })
+                .unwrap_or_default(),
+            None => return,
+        };
+        if links.is_empty() {
+            return;
+        }
+
+        let mut tasks: Vec<(u32, String)> = Vec::new();
+        let mut inline: Vec<(u32, String)> = Vec::new();
+        for (nid, href) in links {
+            let full = if href.starts_with("http://") || href.starts_with("https://") {
+                href.clone()
+            } else if let Some(base) = &self.url {
+                base.join(&href)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| href.clone())
+            } else {
+                href.clone()
+            };
+            // A `data:` stylesheet carries its own bytes. There is nothing to
+            // fetch and nobody to ask — sending it to the HTTP client only gets
+            // it refused as a blocked scheme, which is how a perfectly valid
+            // inline sheet came to apply nowhere.
+            if full.len() >= 5 && full[..5].eq_ignore_ascii_case("data:") {
+                if let Some(bytes) = decode_data_uri(&full) {
+                    inline.push((nid, String::from_utf8_lossy(&bytes).into_owned()));
+                }
+                continue;
+            }
+            // Same two gates the script path uses: a stylesheet is a document the
+            // page did not write, and `<link href="file:///…">` is the same
+            // cross-scheme read as `<script src="file:///…">`.
+            if !subresource_allowed(self.url.as_ref(), &full) || self.should_block_url(&full) {
+                continue;
+            }
+            tasks.push((nid, full));
+        }
+
+        let client = self.http_client.clone();
+        let results = futures::future::join_all(tasks.into_iter().map(|(nid, url)| {
+            let client = client.clone();
+            async move {
+                let parsed = Url::parse(&url).ok()?;
+                let resp = client.fetch(&parsed).await.ok()?;
+                // A stylesheet is not HTML: only the HTTP charset applies.
+                Some((nid, obscura_net::decode_non_html(&resp.body, resp.content_type())))
+            }
+        }))
+        .await;
+
+        let Some(js) = &mut self.js else { return };
+        for (nid, css) in inline.into_iter().chain(results.into_iter().flatten()) {
+            // Through JSON, not string interpolation: a stylesheet is arbitrary
+            // remote text, and hand-escaping it into a script source is how a
+            // `</script>` or a stray backslash becomes a parse error — or worse.
+            let code = format!(
+                "try {{ globalThis.__obscuraAdoptLinkSheet({}, {}); }} catch (e) {{}}",
+                nid,
+                serde_json::to_string(&css).unwrap_or_else(|_| "\"\"".into())
+            );
+            let _ = js.execute_script("<link-stylesheet>", &code);
+        }
+    }
+
     async fn execute_scripts(&mut self) {
         tracing::info!(
             "execute_scripts called, js runtime exists: {}",
@@ -361,6 +450,16 @@ impl Page {
                 }
             }
         }
+
+        // ── Render-blocking stylesheets ──────────────────────────────────────
+        // Fetched and applied BEFORE the first page script runs. HTML calls these
+        // "style sheets that are blocking scripts" and the reason is not
+        // aesthetic: a script that reads `getComputedStyle` — or measures
+        // anything — before the page's CSS has landed measures a page that never
+        // existed. Doing this at DOMContentLoaded instead, which is where the
+        // rest of the subresource loads happen, would be too late for exactly the
+        // scripts that care.
+        self.load_blocking_stylesheets().await;
 
         #[derive(Debug)]
         struct ScriptInfo {

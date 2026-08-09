@@ -62,6 +62,33 @@ Previously: 2026-07-31 (Quests #427–#429 — **the interpolation-endpoints arc
 
 | Test | Before | Latest | Status | Quest / commit |
 |------|:------:|:------:|:------:|----------------|
+| **THE INCREMENTED, UNBLOCKED, LINKED, SEALED & FETCHED ARC — Quests #525–#529 (2026-08-09): layout stopped rebuilding the page to measure it** | — | — | ✅ | #525–#529 |
+| **Layout: mutate-then-measure, 404 elements** | **13.65 ms** | **2.70 ms — 5.1×** | ✅ | #525 · [`tickets/126`](126-the-incremented-verdict.md) |
+| **`editing` — 43-file probe, after incremental layout** | **78183/80787** | **82256/83982 — 3 improved, could-not-run 2 → 0** | ✅ | #526 · [`tickets/127`](127-the-unblocked-verdict.md) |
+| `editing/run/delete.html?6001-7000` | 0/1000 | **948/1000** | ✅ | #526 |
+| `editing/run/insertparagraph.html?5001-6000` | could-not-run | **997/1000** | ✅ | #526 |
+| `editing/run/justifyfull.html?2001-3000` | could-not-run | **981/1000** | ✅ | #526 |
+| `editing/run/forwarddelete.html?5001-6000` | never reached | **990/1000** | ✅ | #526 |
+| `editing/run/insertparagraph.html?6001-7000` | never reached | **965/1000** | ✅ | #526 |
+| `editing/run/insertparagraph.html?7001-last` | never reached | **164/195** | ✅ | #526 |
+| **`input-events` — 33-file probe, after incremental layout** | **1805/2980** | **2119/3209 — 7 files improved** | ✅ | #526 · [`tickets/127`](127-the-unblocked-verdict.md) |
+| `input-events/…get-target-ranges-joining-dl-elements.tentative?Backspace` | 173/337 | **254/389** | 🟡 | #526 |
+| `input-events/…get-target-ranges-joining-dl-elements.tentative?Delete` | 197/339 | **263/377** | 🟡 | #526 |
+| `input-events/…get-target-ranges-deleting-in-list-items.tentative?Delete,ol` | 134/275 | **179/313** | 🟡 | #526 |
+| `input-events/…get-target-ranges-deleting-in-list-items.tentative?Backspace,ul` | 150/285 | **188/316** | 🟡 | #526 |
+| `input-events/…get-target-ranges-forwarddelete.tentative` | 75/161 | **93/176** | 🟡 | #526 |
+| **`getComputedStyle` sees external `<link>` stylesheets** | never | **yes** (`rgba(0,0,0,0)` → `rgb(255,255,255)`) | ✅ | #527 · [`tickets/128`](128-the-linked-verdict.md) |
+| **44-file linked-CSS probe** | **87/143** | **90/143 — 3 files improved** | 🟡 | #527 · [`tickets/128`](128-the-linked-verdict.md) |
+| **`content-security-policy` — 130-file probe, `style-src` reaching layout** | **152/284** | **158/284 — 4 files improved** | ✅ | #528 · [`tickets/129`](129-the-sealed-verdict.md) |
+| `content-security-policy/style-src/inline-style-allowed-while-cloning-objects.sub.html` | 18/25 | **21/25** | ✅ | #528 |
+| `content-security-policy/style-src/inline-style-attribute-blocked.sub.html` | 0/1 | **1/1** | ✅ | #528 |
+| `content-security-policy/style-src-attr-elem/style-src-elem-allowed-attr-blocked.html` | 1/2 | **2/2** | ✅ | #528 |
+| `content-security-policy/style-src-attr-elem/style-src-attr-blocked-src-allowed.html` | 1/2 | **2/2** | ✅ | #528 |
+| **37-file CSP fetch-directive probe (`object-src`/`frame-src`/`worker-src`)** | **16/52** | **20/52 — 4 files improved** | 🟡 | #529 · [`tickets/130`](130-the-fetched-verdict.md) |
+| `content-security-policy/object-src/object-src-url-blocked.html` | 0/1 | **1/1** | ✅ | #529 |
+| `content-security-policy/frame-src/frame-src-blocked.sub.html` | 0/1 | **1/1** | ✅ | #529 |
+| `content-security-policy/worker-src/dedicated-worker-src-child-fallback-blocked.sub.html` | 0/1 | **1/1** | ✅ | #529 |
+| `content-security-policy/worker-src/dedicated-none.sub.html` | 0/2 | **1/2** | 🟡 | #529 |
 | **THE VARIED, EVALUATED, CASCADED, OUTBOUND & COMPILED ARC — Quests #520–#524 (2026-08-09): the eval hook, and CSP's other half** | — | — | ✅ | #520–#524 |
 | **`content-security-policy` — Quests #521–#523, 130-file probe (106 realm + 24 new)** | **154/325** | **181/322 — 19 files improved, 1 moved row** | ✅ | #521–#523 · [`tickets/122`](122-the-evaluated-verdict.md) · [`tickets/123`](123-the-cascaded-verdict.md) · [`tickets/124`](124-the-outbound-verdict.md) |
 | `content-security-policy/unsafe-eval/eval-blocked.sub.html` | 0/3 | **1/1** | ✅ | #521 |

@@ -5677,6 +5677,16 @@ class Element extends Node {
       this._styleSynced = true;
       let attr = null;
       try { attr = this.getAttribute('style'); } catch (e) {}
+      // ⭐ A `style` attribute the page's Content Security Policy forbade yields
+      // an EMPTY declaration block — not a populated one that the cascade later
+      // declines to use. CSP-3 says the attribute "is not applied", and CSSOM
+      // builds the block from what was applied, so `el.style.background` is `""`
+      // even though `el.getAttribute('style')` still returns the text. The
+      // difference is observable the moment anything clones the element: a clone
+      // built from the block and a clone built from the attribute disagree.
+      if (attr != null && attr !== ''
+          && typeof globalThis.__cspStyleAttrBlocked === 'function'
+          && globalThis.__cspStyleAttrBlocked(this)) attr = '';
       // Populate the decl from the existing attribute WITHOUT reflecting back
       // (the attribute is already the source of this value).
       if (attr != null && attr !== '') {
@@ -7931,7 +7941,16 @@ class Document extends Node {
     let els = [];
     try { els = this.querySelectorAll('style, link[rel~="stylesheet"]'); } catch { els = []; }
     const out = [];
-    for (const el of els) { try { out.push(_styleSheetForNode(el)); } catch (e) {} }
+    for (const el of els) {
+      try {
+        // A `<link>` has no associated stylesheet until its file arrives — and a
+        // link the markup declared `disabled` never gets one at all. Listing a
+        // sheet that does not exist yet is how a page comes to iterate
+        // `document.styleSheets` and read rules from a file still in flight.
+        if (el.localName === 'link' && el.__linkSheetText == null) continue;
+        out.push(_styleSheetForNode(el));
+      } catch (e) {}
+    }
     return _makeStyleSheetList(out);
   }
   // document.forms is an HTMLCollection (named access by id/name), not a NodeList.
@@ -10102,9 +10121,45 @@ const _imgLooksLikeSvg = function (bytes, headers) {
 };
 // ===== IMAGE-DECODE-END =====
 
+// Which fetch directive governs this element's load.
+//
+// CSP names a directive per *destination*, not per element, so the answer for a
+// `<link>` depends on what it says it is for. Everything here previously failed
+// OPEN — parsed, understood, and never asked — which is the one failure mode a
+// security feature must not have quietly.
+const _cspResourceDirective = function (el) {
+  try {
+    const ln = el && el.localName;
+    if (ln === 'object' || ln === 'embed') return 'object-src';
+    if (ln === 'video' || ln === 'audio' || ln === 'source' || ln === 'track') return 'media-src';
+    if (ln === 'iframe' || ln === 'frame') return 'frame-src';
+    if (ln === 'link') {
+      const rel = _asciiLower(String(el.getAttribute('rel') || '')).split(/\s+/);
+      if (rel.indexOf('stylesheet') >= 0) return 'style-src-elem';
+      if (rel.indexOf('manifest') >= 0) return 'manifest-src';
+      if (rel.indexOf('icon') >= 0) return 'img-src';
+      if (rel.indexOf('modulepreload') >= 0) return 'script-src-elem';
+      if (rel.indexOf('prefetch') >= 0 || rel.indexOf('preload') >= 0) return 'prefetch-src';
+    }
+  } catch (e) {}
+  return null;
+};
+
 const _loadElementResource = function(el, url, initiatorType, opts) {
   opts = opts || {};
   if (!el || !url) return;
+  // ⭐ Ask before fetching, not after. A blocked resource must never reach the
+  // network — the request itself is the leak the directive exists to stop — and
+  // the element must still hear `error`, so a page with a fallback shows it.
+  try {
+    const directive = _cspResourceDirective(el);
+    if (directive && typeof globalThis.__cspAllowsURL === 'function'
+        && !globalThis.__cspAllowsURL(directive, url, el)) {
+      el._resConnected = true;
+      _queueTask(() => { try { _fireElementError(el); } catch (e) {} });
+      return;
+    }
+  } catch (e) {}
   let fullUrl = url;
   // Resolve relative URLs against the document base (absolute URLs untouched).
   if (!/^[a-z][a-z0-9+.\-]*:/i.test(url)) {
@@ -10187,6 +10242,17 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
         _imgAdoptBytes(el, bytes, parsed.url || fullUrl, parsed.headers);
         return;
       }
+      // A stylesheet's bytes ARE its rules. Adopt them before firing `load`, so a
+      // handler that reads `link.sheet.cssRules` — or just calls
+      // `getComputedStyle` — sees the sheet the event is announcing.
+      if (el.localName === 'link') {
+        try {
+          const rel = _asciiLower(String(el.getAttribute('rel') || ''));
+          if (rel.split(/\s+/).indexOf('stylesheet') >= 0) {
+            globalThis.__obscuraAdoptLinkSheet(el._nid, parsed.body || '');
+          }
+        } catch (e) {}
+      }
       _fireIframeElementLoad(el);
     } catch (e) {
       if (el._resLoadGen !== gen) return;
@@ -10194,6 +10260,36 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
       _fireElementError(el);
     }
   })();
+};
+
+// Hand a `<link rel=stylesheet>` the CSS it fetched.
+//
+// Called from two places, because a stylesheet arrives two ways: the Rust page
+// loader pre-fetches the markup's links and adopts them BEFORE any page script
+// runs (a stylesheet blocks scripts, and a script that measures before its CSS
+// has landed measures the wrong page), and `_loadElementResource` adopts one
+// that a script inserted later.
+//
+// Adoption is what makes the rules real: the element's cached rule list is
+// dropped and `_styleGen` moves, which is the signal every computed-style cache
+// in this file watches.
+globalThis.__obscuraAdoptLinkSheet = function (nid, css) {
+  try {
+    const el = _wrap(Number(nid));
+    if (!el) return;
+    // A sheet the page's own Content Security Policy refused never becomes real
+    // — the element keeps its href, and no rule of it ever matches.
+    if (el.__cspBlockedStyle) return;
+    // HTML §the-link-element: a `disabled` attribute present when the element is
+    // created means no stylesheet is created — not a stylesheet that is switched
+    // off. The difference is visible in `document.styleSheets.length`.
+    try { if (el.hasAttribute('disabled')) return; } catch (e) {}
+    el.__linkSheetText = String(css == null ? '' : css);
+    _invalidateNodeSheet(el);
+    try { _sheetRuleCache.delete(el); } catch (e) {}
+    _styleGen++;
+    if (_csArmHook) _csArmHook();
+  } catch (e) {}
 };
 
 // Begin loading a non-iframe subresource element when it becomes connected
@@ -10266,7 +10362,23 @@ const _loadFrameFromAttributes = function(el) {
     el.contentDocument; // builds the srcdoc doc + runs frame scripts (idempotent)
     _scheduleFrameElementLoad(el);
   } else if (src && src !== 'about:blank' && !src.startsWith('about:')) {
-    if (!el._srcLoadStarted) el._loadIframeSrc(src); // fires element load on completion
+    // ⭐ `frame-src`. A blocked frame does not navigate; per CSP the element is
+    // left holding its initial `about:blank` document and fires `load` for it,
+    // so a page that frames an ad network under a policy sees an empty frame
+    // rather than a hung one.
+    let allowed = true;
+    try {
+      let full = src;
+      try { full = new URL(src, _domParse("document_url") || "about:blank").href; } catch (e) {}
+      allowed = typeof globalThis.__cspAllowsURL !== 'function'
+        || globalThis.__cspAllowsURL('frame-src', full, el);
+    } catch (e) {}
+    if (!allowed) {
+      el.contentDocument;
+      _scheduleFrameElementLoad(el);
+    } else if (!el._srcLoadStarted) {
+      el._loadIframeSrc(src); // fires element load on completion
+    }
   } else {
     el.contentDocument; // initial about:blank document
     _scheduleFrameElementLoad(el);
@@ -14039,9 +14151,20 @@ const _cssSplitRules = (cssText, quirks) => {
   return rules;
 };
 const _sheetRuleCache = new WeakMap(); // styleEl -> { text, rules }
+// The CSS text a style-bearing element contributes.
+//
+// A `<style>` keeps its rules in its child text node. A `<link rel=stylesheet>`
+// keeps them in a file, and until the bytes arrive it has none — which is not
+// the same as having an empty stylesheet, but is indistinguishable from it here,
+// and the difference is carried by whether `__linkSheetText` exists at all.
+const _sheetTextOf = (el) => {
+  try {
+    if (el && el.__linkSheetText != null) return String(el.__linkSheetText);
+    return (el && el.textContent) || '';
+  } catch (e) { return ''; }
+};
 const _styleSheetRules = (styleEl) => {
-  let text = '';
-  try { text = styleEl.textContent || ''; } catch { text = ''; }
+  let text = _sheetTextOf(styleEl);
   // Note the presence of an @property rule so getComputedStyle consults the registry
   // even for a page that never touches the CSSOM `.sheet` (which is what otherwise
   // parses @property rules and sets this flag). Cheap regex on the (cached) text.
@@ -27921,6 +28044,26 @@ const _buildCascade = (el) => {
   if (memo) memo.set(el, sources);
   return sources;
 };
+// Is this style-bearing element's sheet actually applied right now?
+//
+// Two ways to be present and contribute nothing, and they are not the same as
+// being absent: `disabled` (the page turned it off through the CSSOM or the
+// attribute) and a `media` attribute that does not match. Both leave the rules
+// readable through `document.styleSheets` — which is precisely why a page uses
+// them — so this is a cascade question, not a parsing one.
+const _sheetContributes = (el) => {
+  try {
+    if (el.localName !== 'link') return true;
+    if (el.disabled) return false;
+    // A link whose file has not arrived (or failed) has no rules to offer.
+    if (el.__linkSheetText == null) return false;
+    const media = el.getAttribute('media');
+    if (media && String(media).trim() && typeof globalThis.matchMedia === 'function') {
+      try { if (!globalThis.matchMedia(media).matches) return false; } catch (e) {}
+    }
+    return true;
+  } catch (e) { return true; }
+};
 const _buildCascadeUncached = (el) => {
   // Returns the list of matched declaration sources for `el`, each
   // { spec, order, decls }, including inline style as the highest source.
@@ -27929,7 +28072,13 @@ const _buildCascadeUncached = (el) => {
   if (typeof nid === 'number' && nid >= 0) {
     const doc = (el.ownerDocument) || globalThis.document;
     let styleEls = [];
-    try { styleEls = doc.querySelectorAll('style'); } catch { styleEls = []; }
+    // ⭐ `<link rel=stylesheet>` belongs here as much as `<style>` does. Leaving
+    // it out meant `getComputedStyle` answered from the UA sheet alone on every
+    // page that keeps its CSS in a file — while LAYOUT, which goes through Blitz
+    // and does fetch the file, used the real rules. The browser knew two
+    // different things about the same element, and the page could see both.
+    // Selector order is document order, which is the cascade order these need.
+    try { styleEls = doc.querySelectorAll('style, link[rel~="stylesheet"]'); } catch { styleEls = []; }
     // Flatten all rules in document order, then prime the JS-computed live-state
     // side-maps (:target, :valid/:invalid/:in-range/:out-of-range) once over the
     // combined selector text so the Rust matcher sees them — same machinery the
@@ -27941,6 +28090,7 @@ const _buildCascadeUncached = (el) => {
       // still readable — CSP stops a declaration APPLYING, it does not edit the
       // document — but no rule of it ever matches anything.
       if (typeof globalThis.__cspStyleBlocked === 'function' && globalThis.__cspStyleBlocked(styleEl)) continue;
+      if (!_sheetContributes(styleEl)) continue;
       for (const rule of _styleSheetRules(styleEl)) flat.push(rule);
     }
     const combined = flat.map((r) => r.selectorText).join(' ');
@@ -33942,8 +34092,10 @@ const _invalidateNodeSheet = (node) => {
   try { const sh = _nodeSheetMap.get(node); if (sh) sh.__text = null; } catch (e) {}
 };
 const _styleSheetForNode = (node) => {
-  let text = '';
-  try { text = node.textContent || ''; } catch { text = ''; }
+  // `_sheetTextOf` so a `<link rel=stylesheet>` reports the rules of the file it
+  // fetched. Before this, `link.sheet` was an empty CSSStyleSheet on every page
+  // in the world that keeps its CSS in a separate file — which is all of them.
+  let text = _sheetTextOf(node);
   let sheet = _nodeSheetMap.get(node);
   if (!sheet) {
     sheet = new CSSStyleSheet();
@@ -33953,6 +34105,22 @@ const _styleSheetForNode = (node) => {
     _nodeSheetMap.set(node, sheet);
   }
   if (sheet.__text !== text) { sheet.__text = text; sheet._setRules(text); }
+  // CSSOM: a sheet created for an element takes its location, title and media
+  // from that element. For a `<style>` the location is null — its rules have no
+  // separate address — which is exactly what distinguishes the two in
+  // `document.styleSheets`, and what `@import`/`url()` resolution needs.
+  try {
+    if (node.localName === 'link') {
+      sheet._href = node.href || node.getAttribute('href') || null;
+      sheet._disabled = !!node.disabled;
+    } else {
+      sheet._href = null;
+    }
+    const t = node.getAttribute && node.getAttribute('title');
+    sheet._title = (t && String(t)) || null;
+    const m = node.getAttribute && node.getAttribute('media');
+    if (m != null && sheet._media && sheet._media.mediaText !== String(m)) sheet._media.mediaText = String(m);
+  } catch (e) {}
   return sheet;
 };
 
@@ -47163,7 +47331,15 @@ const _cspCheckStyleElement = (el) => {
     _cspState.policies = _cspPoliciesGoverning(el);
     try {
       if (name === 'style') {
-        if (!_cspInlineAllowed('style', el, el.textContent || '')) el.__cspBlockedStyle = true;
+        if (!_cspInlineAllowed('style', el, el.textContent || '')) {
+          el.__cspBlockedStyle = true;
+          // ⭐ The JS cascade is not the only thing that styles this page. The
+          // Rust DOM is serialized for the renderer, so a `<style>` blocked here
+          // and nowhere else is a rule `getComputedStyle` refuses and the box
+          // tree obeys — the two halves of the browser disagreeing about what
+          // the page looks like, which is worse than either answer alone.
+          try { _dom('set_csp_blocked_style', el._nid, 'elem'); } catch (e) {}
+        }
       } else if (name === 'link') {
         const rel = _asciiLower(el.getAttribute('rel') || '');
         const href = el.getAttribute('href');
@@ -47183,7 +47359,15 @@ const _cspCheckStyleAttr = (el) => {
     const saved = _cspState.policies;
     _cspState.policies = _cspPoliciesGoverning(el);
     try {
-      if (!_cspInlineAllowed('style-attribute', el, src)) el.__cspBlockedStyleAttr = true;
+      if (!_cspInlineAllowed('style-attribute', el, src)) {
+        el.__cspBlockedStyleAttr = true;
+        // Same seam as the `<style>` case: the attribute stays in the markup and
+        // is still readable, but the renderer must never see it.
+        try { _dom('set_csp_blocked_style', el._nid, 'attr'); } catch (e) {}
+        // The declaration block is built from what was APPLIED, so if anything
+        // has already touched `el.style` (getComputedStyle does), empty it now.
+        try { if (el._styleSynced !== undefined) { el._styleSyncing = true; el._style.cssText = ''; el._styleSyncing = false; } } catch (e) {}
+      }
     } finally { _cspState.policies = saved; }
   } catch (e) {}
 };
@@ -58140,13 +58324,35 @@ globalThis.Worker = class Worker extends EventTarget {
     let url;
     try { url = new URL(String(scriptURL), base).href; }
     catch (e) { throw new DOMException("Failed to construct 'Worker': Invalid script URL.", 'SyntaxError'); }
+    // ⭐ `worker-src`. A worker is a whole second script environment, so a policy
+    // that stops a `<script src>` and lets a `new Worker` through has stopped
+    // nothing.
+    //
+    // ⚠️ It does NOT throw. The check happens inside "fetch a classic worker
+    // script", so a refusal is a *network error*, and HTML says a failed worker
+    // script fetch fires `error` at the Worker — asynchronously, because the
+    // constructor has to return the object the listener will be attached to. A
+    // constructor that threw would look right and break every page that wraps
+    // its worker creation in a try/catch it never expected to reach.
+    const _cspBlocked = (typeof globalThis.__cspAllowsURL === 'function'
+      && !globalThis.__cspAllowsURL('worker-src', url, null));
     const w = { url: url, name: String(opts.name == null ? '' : opts.name),
                 type: opts.type === 'module' ? 'module' : 'classic',
                 scope: null, worker: this, started: false, terminated: false, queue: [] };
     Object.defineProperty(this, '_wk', { value: w, enumerable: false, configurable: true });
     // A real worker fetches its script off-thread, so nothing about it can be
     // observable before the creating task ends. Start on the next task.
-    setTimeout(() => _workerStart(this), 0);
+    if (_cspBlocked) {
+      w.terminated = true;
+      setTimeout(() => {
+        try {
+          const ev = new Event('error');
+          this.dispatchEvent(ev);
+        } catch (e) {}
+      }, 0);
+    } else {
+      setTimeout(() => _workerStart(this), 0);
+    }
   }
   postMessage(message, transferOrOptions) {
     if (!(this instanceof globalThis.Worker)) throw new TypeError("Illegal invocation");

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use blitz_dom::{BaseDocument, DocumentConfig, MediaType, StyleThreading};
-use blitz_html::HtmlDocument;
+use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::net::NetProvider;
 use blitz_traits::shell::Viewport;
 
@@ -55,12 +55,23 @@ impl RenderEngine {
             // global rayon pool. Sequential traversal also sidesteps Stylo's
             // "already mutably borrowed" panic (blitz issue #430) outright.
             style_threading: StyleThreading::Sequential,
+            // Blitz's default is `DummyHtmlParserProvider`, whose `parse_inner_html`
+            // is an empty function body. Anything that later sets an element's
+            // inner HTML on this document — which is how the layout bridge patches
+            // a mutation in instead of re-parsing the page — would then drop the
+            // old children and add none, silently: no error, no log, just an
+            // element that quietly became empty and a box measured off it. Give
+            // the document the same real parser that built it.
+            html_parser_provider: Some(Arc::new(HtmlProvider)),
             ..Default::default()
         };
 
         tracing::debug!(html_len = input.html.len(), "render: laying out snapshot");
 
+        let prof = std::env::var_os("OBSCURA_LAYOUT_PROFILE").is_some();
+        let tp = Instant::now();
         let mut doc = HtmlDocument::from_html(&input.html, config);
+        let t_parse = tp.elapsed();
 
         // Render the *settled* state, not a mid-transition frame. Blitz has no
         // animation clock: a CSS `transition`/`animation` is evaluated at t=0,
@@ -88,7 +99,9 @@ impl RenderEngine {
             // re-running Stylo + layout on every tick would burn the whole
             // budget on a complex page (and we'd never wait long enough for the
             // resources to land).
+            let tr = Instant::now();
             base.resolve(0.0);
+            let t_first_resolve = tr.elapsed();
             let deadline = Instant::now() + input.resource_timeout;
             let mut iters = 1u32;
             while provider.pending() > 0 {
@@ -101,7 +114,17 @@ impl RenderEngine {
                 base.resolve(0.0);
                 iters += 1;
             }
+            let tr2 = Instant::now();
             base.resolve(0.0);
+            if prof {
+                eprintln!(
+                    "[layout-profile]   engine parse={:?} resolve1={:?} resolveN+final={:?} iters={}",
+                    t_parse,
+                    t_first_resolve,
+                    tr2.elapsed(),
+                    iters
+                );
+            }
             let root = base.root_element();
             tracing::debug!(
                 resolve_iters = iters,

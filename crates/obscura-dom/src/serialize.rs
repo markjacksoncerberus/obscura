@@ -23,6 +23,17 @@ impl DomTree {
         buf
     }
 
+    /// Like [`inner_html`](Self::inner_html), but stamped with `data-obscura-nid`
+    /// the same way [`outer_html_with_obscura_ids`](Self::outer_html_with_obscura_ids)
+    /// is. This is what the layout bridge hands Blitz when it patches one
+    /// element's children instead of re-parsing the document: the markup has to
+    /// carry the ids, or the patched subtree would come back unmappable.
+    pub fn inner_html_with_obscura_ids(&self, node_id: NodeId) -> String {
+        let mut buf = String::new();
+        self.serialize_children(node_id, true, &mut buf);
+        buf
+    }
+
     fn serialize_node(
         &self,
         node_id: NodeId,
@@ -46,12 +57,22 @@ impl DomTree {
             }
             NodeData::Element { name, attrs, template_contents, .. } => {
                 let tag = name.local.as_ref();
+                // `emit_nids` marks the one serialization that exists to be laid
+                // out and painted, which is also the only one Content Security
+                // Policy gets a say in. `innerHTML` and friends must keep showing
+                // the page exactly what its own markup says — CSP stops a
+                // declaration applying, it does not edit the document.
+                let csp_attr = emit_nids && self.csp_style_attr_blocked(node_id);
+                let csp_elem = emit_nids && self.csp_style_elem_blocked(node_id);
                 if include_self {
                     buf.push('<');
                     buf.push_str(tag);
                     for attr in attrs {
-                        buf.push(' ');
                         let attr_name = attr.name.local.as_ref();
+                        if csp_attr && attr_name == "style" {
+                            continue;
+                        }
+                        buf.push(' ');
                         buf.push_str(attr_name);
                         buf.push_str("=\"");
                         escape_attr(&attr.value, buf);
@@ -66,12 +87,17 @@ impl DomTree {
                 }
 
                 if !is_void_element(tag) {
-                    // HTML fragment-serialization: a <template>'s serialized body is
-                    // its template-contents children (a template has no direct
-                    // children — they all live in the separate content subtree).
-                    match template_contents {
-                        Some(tc) => self.serialize_children(*tc, emit_nids, buf),
-                        None => self.serialize_children(node_id, emit_nids, buf),
+                    // A blocked `<style>` keeps its element but contributes no
+                    // rules: an empty sheet, not a missing one.
+                    if !csp_elem {
+                        // HTML fragment-serialization: a <template>'s serialized
+                        // body is its template-contents children (a template has
+                        // no direct children — they all live in the separate
+                        // template-contents subtree).
+                        match template_contents {
+                            Some(tc) => self.serialize_children(*tc, emit_nids, buf),
+                            None => self.serialize_children(node_id, emit_nids, buf),
+                        }
                     }
                     if include_self {
                         buf.push_str("</");
