@@ -441,3 +441,43 @@ css/css-cascade/scope-media.html
 css/css-cascade/scope-supports.html
 css/css-cascade/at-scope-parsing.html
 content-security-policy/font-src/font-stylesheet-font-blocked.sub.html
+
+# ── Quests #545–#549 (the flattened, bound, validated, measured & conjured arc) ──
+# css-nesting: the realm's testharness files (reftests excluded — they never ran)
+css/css-nesting/block-skipping.html
+css/css-nesting/cssom.html
+css/css-nesting/implicit-nesting-ident-recovery.html
+css/css-nesting/implicit-nesting-ident.html
+css/css-nesting/invalid-inner-rules.html
+css/css-nesting/invalidation-001.html
+css/css-nesting/invalidation-002.html
+css/css-nesting/invalidation-003.html
+css/css-nesting/invalidation-004.html
+css/css-nesting/mixed-declarations-rules.html
+css/css-nesting/nested-declarations-cssom-whitespace.html
+css/css-nesting/nested-declarations-cssom.html
+css/css-nesting/nested-declarations-matching.html
+css/css-nesting/nested-error-recovery.html
+css/css-nesting/nested-rule-cssom-invalidation.html
+css/css-nesting/nesting-layer.html
+css/css-nesting/nesting-revert-rule.html
+css/css-nesting/parsing.html
+css/css-nesting/serialize-group-rules-with-decls.html
+css/css-nesting/set-selector-text.html
+css/css-nesting/top-level-is-scope.html
+css/css-nesting/top-level-parent-pseudo-specificity.html
+# @scope files not already above
+css/css-cascade/scope-nesting.html
+css/css-cascade/scope-invalidation.html
+# replaced-element boxes (#548)
+css/css-cascade/presentational-hints-rollback.html
+# pseudo-element computed style (#549)
+css/css-pseudo/before-after-dynamic-custom-property-001.html
+css/css-pseudo/first-letter-allowed-properties.html
+css/css-pseudo/first-line-allowed-properties.html
+css/css-pseudo/marker-computed-content.html
+css/css-pseudo/marker-default-styles.html
+css/css-pseudo/marker-variable-computed-style.html
+css/css-pseudo/marker-reverted-styles.html
+css/css-pseudo/marker-display-computed.html
+css/css-pseudo/marker-computed-size.html

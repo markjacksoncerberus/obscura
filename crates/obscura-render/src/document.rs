@@ -426,8 +426,22 @@ impl ResolvedDoc {
                 styles.clone_position(),
                 style::computed_values::position::T::Fixed
             ),
+            // A REPLACED inline element (img/iframe/video/…) is inline-level but
+            // is not an "inline box": it has a perfectly ordinary padding box,
+            // and CSSOM View's zero-rule must not apply to it — Chrome reports
+            // an <img width=44>'s clientWidth as 44, not 0.
             inline_level: display.outside() == DisplayOutside::Inline
-                && display.inside() == DisplayInside::Flow,
+                && display.inside() == DisplayInside::Flow
+                && !node
+                    .element_data()
+                    .map(|el| {
+                        matches!(
+                            el.name.local.as_ref(),
+                            "img" | "iframe" | "video" | "canvas" | "embed" | "object"
+                                | "input" | "textarea" | "select" | "button" | "audio" | "svg"
+                        )
+                    })
+                    .unwrap_or(false),
             pointer_events_none: styles.clone_pointer_events()
                 == style::computed_values::pointer_events::T::None,
         })

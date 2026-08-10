@@ -322,6 +322,12 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
         true
     }
 
+    // `:nth-child(An+B of <selector-list>)` / `:nth-last-child(… of …)`
+    // (Selectors 4). The crate implements the matching; this only gates parsing.
+    fn parse_nth_child_of(&self) -> bool {
+        true
+    }
+
     fn parse_non_ts_pseudo_class(
         &self,
         _location: cssparser::SourceLocation,
@@ -1450,7 +1456,45 @@ impl<'a> Element for DomElement<'a> {
     }
 }
 
+/// Outside a nested style rule, the nesting selector `&` "represents the same
+/// elements as `:scope`" (css-nesting-1 §nest-selector) — which is what makes
+/// `el.querySelectorAll('& > .x')` scope to `el`. The cascade never sends `&`
+/// here (it desugars against the parent rule in JS), so a textual rewrite —
+/// quote-aware, since `&` is valid inside attribute-selector strings — is safe.
+fn rewrite_nesting_selector(selector: &str) -> String {
+    let mut out = String::with_capacity(selector.len() + 8);
+    let mut quote: Option<char> = None;
+    let mut prev = '\0';
+    for c in selector.chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q && prev != '\\' {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    out.push(c);
+                }
+                '&' => out.push_str(":scope"),
+                _ => out.push(c),
+            },
+        }
+        prev = c;
+    }
+    out
+}
+
 pub fn parse_selector(selector: &str) -> Result<SelectorList<ObscuraSelector>, String> {
+    let rewritten;
+    let selector = if selector.contains('&') {
+        rewritten = rewrite_nesting_selector(selector);
+        rewritten.as_str()
+    } else {
+        selector
+    };
     let mut parser_input = cssparser::ParserInput::new(selector);
     let mut parser = cssparser::Parser::new(&mut parser_input);
     SelectorList::parse(&ObscuraSelectorParser, &mut parser, ParseRelative::No)
@@ -1601,10 +1645,25 @@ impl DomTree {
         node: NodeId,
         selector: &str,
     ) -> Option<u32> {
+        self.selector_match_specificity_scoped(node, selector, None)
+    }
+
+    /// `selector_match_specificity` with an explicit `:scope` scoping root —
+    /// what a scoped style rule (css-cascade-6 `@scope`) needs: `:scope` in the
+    /// rule's selector must match exactly the BOUND root of this element's
+    /// scope, not any element resembling it. `None` keeps the author-stylesheet
+    /// default (`:scope` == `:root`).
+    pub fn selector_match_specificity_scoped(
+        &self,
+        node: NodeId,
+        selector: &str,
+        scope: Option<NodeId>,
+    ) -> Option<u32> {
         let selector_list = parse_selector(selector).ok()?;
         if !self.with_node(node, |n| n.is_element()).unwrap_or(false) {
             return None;
         }
+        let scope = scope.and_then(|s| self.scope_opaque_for(s));
         let mut caches = selectors::context::SelectorCaches::default();
         let mut context = MatchingContext::new(
             MatchingMode::Normal,
@@ -1614,6 +1673,7 @@ impl DomTree {
             NeedsSelectorFlags::No,
             MatchingForInvalidation::No,
         );
+        context.scope_element = scope;
         let element = DomElement::new(self, node);
         let mut best: Option<u32> = None;
         for sel in selector_list.slice() {

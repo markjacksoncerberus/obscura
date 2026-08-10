@@ -165,9 +165,18 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
         // CSS cascade: highest specificity among the rule selector's complex
         // selectors that match this element, or "-1" if none match / non-element /
         // parse error. arg1 = node nid, arg2 = the rule's selector text.
+        // arg1 is "nid" or "nid,scope_nid" — the latter binds `:scope` in the
+        // selector to a concrete element (css-cascade-6 `@scope` rule matching).
         "selector_match_specificity" => {
-            let nid = arg1.parse::<u32>().unwrap_or(0);
-            match dom.selector_match_specificity(NodeId::new(nid), &arg2) {
+            let (nid, scope_nid) = match arg1.split_once(',') {
+                Some((n, s)) => (n.parse::<u32>().unwrap_or(0), s.parse::<u32>().ok()),
+                None => (arg1.parse::<u32>().unwrap_or(0), None),
+            };
+            match dom.selector_match_specificity_scoped(
+                NodeId::new(nid),
+                &arg2,
+                scope_nid.map(NodeId::new),
+            ) {
                 Some(spec) => spec.to_string(),
                 None => "-1".into(),
             }

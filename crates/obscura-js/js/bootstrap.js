@@ -4221,6 +4221,7 @@ class Node {
     }
     if (n instanceof Element && n.localName === 'iframe') _connectIframe(n);
     if (n instanceof Element) _connectResourceElement(n);
+    if (n instanceof Element && n.id) __defineNamedGlobal(n.id);   // parity with appendChild
     _ceInsertionSteps(n);
     } finally { if (_ceBoundaryI) _cePop(); }
     return n;
@@ -5573,6 +5574,15 @@ class Element extends Node {
     if (_ceLive) { let c = this.firstChild; while (c) { _ceRemovalSteps(c); c = c.nextSibling; } }
     _dom("set_inner_html", this._nid, String(v ?? ""));
     _invalidateNodeSheet(this);   // replacing a <style>'s children must re-parse its sheet
+    // Parsed ids become Window-named globals. The getter is LIVE
+    // (document.getElementById at read time), so exposing here is right even for
+    // a detached subtree that gets appended later. Gated on a cheap string test.
+    if (v && /\bid\s*=/i.test(String(v))) {
+      try {
+        const _idEls = this.querySelectorAll('[id]');
+        for (let i = 0; i < _idEls.length; i++) { const _id = _idEls[i].getAttribute('id'); if (_id) __defineNamedGlobal(_id); }
+      } catch (e) {}
+    }
     if (_watching) {
       const _new = _domParse("child_nodes", this._nid) || [];
       __notifyMutation('childList', this._nid, _new, _old);
@@ -13727,6 +13737,12 @@ const _SHORTHAND_LONGHANDS = {
   // via _expandBorderRadius in _expandShorthand).
   'border-radius': ['border-top-left-radius', 'border-top-right-radius',
     'border-bottom-right-radius', 'border-bottom-left-radius'],
+  // css-backgrounds-3 background — feed the cascade so a stylesheet
+  // `background: green` sets background-color (etc.) for getComputedStyle
+  // (split lazily via _parseBackgroundShort in _expandShorthand). Same literal
+  // list as _BG_SH_LH, which is declared later in the file.
+  background: ['background-image', 'background-position', 'background-size', 'background-repeat',
+    'background-attachment', 'background-origin', 'background-clip', 'background-color'],
 };
 // Set a declaration into a block-level map, respecting within-block cascade
 // order: an !important declaration is never overridden by a later normal one of
@@ -14178,6 +14194,9 @@ const _expandShorthand = (sh, value) => {
     if (!p || p.system) return null;   // invalid / system font → no per-longhand pieces (falls to initial/inherited)
     return p;                          // already keyed by the 7 font longhands
   }
+  if (sh === 'background') {
+    return _parseBackgroundShort(value);  // keyed by the 8 background longhands, or null
+  }
   return null;
 };
 
@@ -14444,6 +14463,145 @@ const _LAYER_PATH_RE = /^-?[A-Za-z_][\w-]*(\.-?[A-Za-z_][\w-]*)*$/;
 // sheet keeps the names its parse minted, so its anonymous layers stay themselves
 // across cascade rebuilds instead of colliding with a later sheet's.
 let _anonLayerN = 0;
+// ── CSS Nesting (css-nesting-1) ──────────────────────────────────────────────
+// A nested style rule's selector is RELATIVE to its parent rule. The flat
+// cascade desugars: every `&` becomes `:is(<parent list>)` — which carries the
+// max-specificity-of-the-list the spec gives the nesting selector — and a
+// selector with no `&` gets an implied `:is(parent) ` descendant prefix (a
+// leading combinator binds to the same implied parent, so plain concatenation
+// covers both). At the TOP LEVEL of a sheet `&` matches like `:scope` — for a
+// stylesheet that is the root element — with ZERO specificity: `:where(:root)`.
+const _cssAmpSubst = (sel, repl) => {
+  let out = '', q = null;
+  for (let i = 0; i < sel.length; i++) {
+    const c = sel[i];
+    if (q) { out += c; if (c === q && sel[i - 1] !== '\\') q = null; }
+    else if (c === '"' || c === "'") { q = c; out += c; }
+    else out += (c === '&') ? repl : c;
+  }
+  return out;
+};
+const _cssTopCommaSplit = (s) => {
+  const parts = []; let depth = 0, q = null, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (c === q && s[i - 1] !== '\\') q = null; }
+    else if (c === '"' || c === "'") q = c;
+    else if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') { if (depth) depth--; }
+    else if (c === ',' && !depth) { parts.push(s.slice(start, i)); start = i + 1; }
+  }
+  parts.push(s.slice(start));
+  return parts;
+};
+const _cssNestSelector = (selList, parentList) => {
+  const repl = parentList == null ? ':where(:root)' : `:is(${parentList})`;
+  const out = [];
+  for (let p of _cssTopCommaSplit(String(selList))) {
+    p = p.trim();
+    if (!p) continue;
+    if (p.indexOf('&') >= 0) out.push(_cssAmpSubst(p, repl));
+    else out.push(parentList == null ? p : repl + ' ' + p);
+  }
+  return out.join(', ');
+};
+// Split a style rule's BODY into ordered segments: declaration runs and nested
+// rules {prelude, body}. Order is load-bearing — a declaration AFTER a nested
+// rule forms a later rule of its own (the CSSNestedDeclarations model), so
+// `color:red; & {…} color:blue` ends blue. A statement at-rule (`@layer a, b;`)
+// is invalid inside a style rule and is dropped whole; `--x: {…}` is a custom
+// property whose VALUE is a block, not a nested rule.
+const _cssStyleBodySegments = (css) => {
+  const segs = []; let buf = ''; let i = 0; const n = css.length;
+  while (i < n) {
+    let j = i, q = null, paren = 0;
+    while (j < n) {
+      const c = css[j];
+      if (q) { if (c === q && css[j - 1] !== '\\') q = null; }
+      else if (c === '"' || c === "'") q = c;
+      else if (c === '(') paren++;
+      else if (c === ')') { if (paren) paren--; }
+      else if (!paren && (c === '{' || c === ';')) break;
+      j++;
+    }
+    if (j >= n) { buf += css.slice(i); break; }
+    if (css[j] === ';') {
+      const chunk = css.slice(i, j);
+      if (chunk.trim()[0] !== '@') buf += chunk + ';';
+      i = j + 1; continue;
+    }
+    // A top-level '{' — find its matching close, ()/[]/{} aware.
+    let k = j + 1; const stack = ['{'];
+    while (k < n && stack.length > 0) {
+      const c = css[k];
+      if (c === '{' || c === '(' || c === '[') stack.push(c);
+      else if (c === '}' || c === ')' || c === ']') {
+        const top = stack[stack.length - 1];
+        if ((c === '}' && top === '{') || (c === ')' && top === '(') || (c === ']' && top === '[')) stack.pop();
+      }
+      k++;
+    }
+    if (/^\s*--[^:;{}]*:/.test(css.slice(i, j))) { buf += css.slice(i, k); i = k; continue; }
+    if (buf.trim()) segs.push({ decls: buf });
+    buf = '';
+    segs.push({ prelude: css.slice(i, j).trim(), body: css.slice(j + 1, k - 1) });
+    i = k;
+  }
+  if (buf.trim()) segs.push({ decls: buf });
+  return segs;
+};
+// Emit one style rule (and everything nested in it) into the flat rule list.
+// `selText` is already absolute (parent-desugared). Bodies with no '{' take the
+// original single-push path byte for byte — a nesting-free page is untouched.
+const _cssEmitStyleRule = (rules, selText, body, quirks, base, depth, _layer, _scope) => {
+  if (body.indexOf('{') < 0) {
+    rules.push({ selectorText: selText, decls: _cssParseDecls(body, quirks), layer: _layer || null, scope: _scope || null });
+    return;
+  }
+  for (const seg of _cssStyleBodySegments(body)) {
+    if (seg.decls !== undefined) {
+      const d = _cssParseDecls(seg.decls, quirks);
+      for (const k0 in d) { rules.push({ selectorText: selText, decls: d, layer: _layer || null, scope: _scope || null }); break; }
+      continue;
+    }
+    const prelude = seg.prelude;
+    if (!prelude) continue;                       // `{ … }` with no prelude: error-recovered, skipped
+    if (prelude[0] === '@') {
+      if (depth >= 8) continue;
+      const gm = /^@(media|supports|layer|scope)\b([\s\S]*)$/i.exec(prelude);
+      if (!gm) continue;                          // @container/@starting-style/…: unsupported, dropped
+      const name = gm[1].toLowerCase(); const cond = gm[2].trim();
+      let sub = _layer || null;
+      if (name === 'media') {
+        let ok = false; try { ok = !cond || globalThis.matchMedia(cond).matches; } catch (e) { ok = false; }
+        if (!ok) continue;
+      } else if (name === 'supports') {
+        let ok = false; try { ok = !!_evalSupportsCondition(cond); } catch (e) { ok = false; }
+        if (!ok) continue;
+      } else if (name === 'layer') {
+        const segsL = cond === '' ? [`«anon-${_anonLayerN++}»`] : (_LAYER_PATH_RE.test(cond) ? cond.split('.') : null);
+        if (segsL === null) continue;
+        sub = (_layer || []).concat(segsL);
+        rules.push({ layerDecl: [sub] });
+      } else {
+        // @scope nested in a style rule: its root selector is nest-relative to
+        // the parent — and a PRELUDE-LESS nested @scope roots at the parent
+        // rule's elements (not at the <style>'s parent, which is the top-level
+        // implicit-@scope rule). The body then follows top-level @scope grammar
+        // (bare declarations style the ROOT, rules get scoped-selector semantics).
+        if (!_validScopePrelude(cond)) continue;
+        const p = _parseScopePrelude(cond);
+        const start = p.start != null ? _cssNestSelector(p.start, selText) : selText;
+        const subScope = (_scope || []).concat({ start, end: p.end, implicit: false });
+        for (const r of _cssSplitRules(seg.body, quirks, base, depth + 1, _layer, subScope)) rules.push(r);
+        continue;
+      }
+      _cssEmitStyleRule(rules, selText, seg.body, quirks, base, depth + 1, sub, _scope);
+      continue;
+    }
+    _cssEmitStyleRule(rules, _cssNestSelector(prelude, selText), seg.body, quirks, base, depth + 1, _layer, _scope);
+  }
+};
 const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
   // Returns [{ selectorText, decls, layer }] — the flat, cascade-shaped view of a
   // sheet. `layer` is the rule's cascade-layer path (array of name segments) or
@@ -14569,10 +14727,12 @@ const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
             // `@scope (root)? [to (limit)]? { … }` (css-cascade-6): its rules
             // carry a scope FRAME — root/limit selectors, or implicit (the owner
             // <style>'s parent, resolved at cascade time). Frames stack for
-            // nested @scope.
-            const p = _parseScopePrelude(cond);
-            subScope = (_scope || []).concat({ start: p.start, end: p.end, implicit: p.start == null });
-            applies = true;
+            // nested @scope. An invalid prelude drops the whole rule.
+            if (_validScopePrelude(cond)) {
+              const p = _parseScopePrelude(cond);
+              subScope = (_scope || []).concat({ start: p.start, end: p.end, implicit: p.start == null });
+              applies = true;
+            }
           }
           else if (name === 'layer') {
             // Block form: `@layer name? { … }` — its contents belong to that
@@ -14598,7 +14758,12 @@ const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
       }
       continue; // other at-rules (keyframes/font-face/page/…) stay skipped
     }
-    rules.push({ selectorText: prelude, decls: _cssParseDecls(body, quirks), layer: _layer || null, scope: _scope || null });
+    // A style rule. Top-level `&` (outside @scope, which rewrites its own `&`)
+    // matches like `:scope` — the root element — at zero specificity; nested
+    // rules in the body are flattened by _cssEmitStyleRule.
+    let selText = prelude;
+    if (!_scope && selText.indexOf('&') >= 0) selText = _cssNestSelector(selText, null);
+    _cssEmitStyleRule(rules, selText, body, quirks, base, depth, _layer, _scope);
   }
   return rules;
 };
@@ -21462,8 +21627,13 @@ const _isBgImageTok = (t) => t.toLowerCase() === 'none' || _BG_IMAGE_FN_RE.test(
 const _BG_POS_KW = new Set(['left', 'right', 'top', 'bottom', 'center']);
 // A single <length-percentage>|<number>|math token (used to sniff position/size
 // components; the run is then validated by _parsePosition / _canonBgLayer).
+// A <length-percentage> token: a math function, a number WITH a unit or `%`,
+// or zero. A bare nonzero number (`background: 1 1`) is NOT a length — the
+// quirks-mode unitless quirk explicitly EXCLUDES the background shorthand, and
+// in standards mode it is invalid everywhere.
 const _isLPTok = (t) => _MATHFN_NAME_RE.test(t)
-  || /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?(?:%|[a-z]+)?$/i.test(t);
+  || /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?(?:%|[a-z]+)$/i.test(t)
+  || /^[+-]?(?:0+\.?0*|\.0+)(?:e[+-]?\d+)?$/.test(t);
 const _isBgPosTok = (t) => _BG_POS_KW.has(t.toLowerCase()) || _isLPTok(t);
 const _isBgSizeTok = (t) => { const l = t.toLowerCase(); return l === 'auto' || l === 'cover' || l === 'contain' || _isLPTok(t); };
 // Split a layer into whitespace tokens, keeping functions/brackets whole and
@@ -28574,6 +28744,48 @@ const _buildCascade = (el) => {
   if (memo) memo.set(el, sources);
   return sources;
 };
+// ── Pseudo-element computed style (getComputedStyle(el, '::before')) ─────────
+// A PSEUDO VIEW is a lightweight stand-in for the pseudo-element: it delegates
+// to the originating element (so `_nid`, ancestors, attributes all resolve),
+// but its `parentElement` is the ORIGINATING element — which is exactly the
+// inheritance chain a pseudo-element has — and its inline `style` is empty
+// (a pseudo-element cannot carry a style attribute). The cascade recognises
+// `_pseudoName` and keeps only the rules whose selectors target that pseudo.
+const _pseudoViews = new WeakMap();       // el -> Map(name -> view)
+const _GCS_PSEUDO_RE = /^::?(before|after|marker|first-line|first-letter|backdrop|placeholder|selection|file-selector-button)$/i;
+const _pseudoViewFor = (el, name) => {
+  let m = _pseudoViews.get(el);
+  if (!m) { m = new Map(); _pseudoViews.set(el, m); }
+  let pv = m.get(name);
+  if (!pv) {
+    pv = Object.create(el);
+    Object.defineProperty(pv, '_pseudoName', { value: name });
+    Object.defineProperty(pv, '_pseudoOwner', { value: el });
+    Object.defineProperty(pv, 'parentElement', { get: () => el });
+    Object.defineProperty(pv, 'style', { value: _newStyleDecl() });
+    m.set(name, pv);
+  }
+  return pv;
+};
+// The complex selectors of `selText` whose subject compound targets `pseudo`,
+// with the pseudo-element stripped (the stripped selector is matched against
+// the ORIGINATING element; the caller re-adds the pseudo's own (0,0,1)
+// specificity). Null when no part targets the pseudo.
+const _pseudoSelFor = (selText, pseudo) => {
+  const re = new RegExp('::?' + pseudo + '\\s*$', 'i');
+  const out = [];
+  for (let p of _cssTopCommaSplit(String(selText))) {
+    p = p.trim();
+    const m = re.exec(p);
+    if (!m) continue;
+    const rawBase = p.slice(0, m.index);
+    let base = rawBase.trim();
+    if (!base) base = '*';                                   // bare `::after`
+    else if (/[\s>+~]$/.test(rawBase)) base = rawBase + '*'; // `.a ::after` → `.a *`
+    out.push(base);
+  }
+  return out.length ? out.join(', ') : null;
+};
 // Is this style-bearing element's sheet actually applied right now?
 //
 // Two ways to be present and contribute nothing, and they are not the same as
@@ -28597,6 +28809,11 @@ const _sheetContributes = (el) => {
 const _buildCascadeUncached = (el) => {
   // Returns the list of matched declaration sources for `el`, each
   // { spec, order, decls }, including inline style as the highest source.
+  // For a PSEUDO VIEW (el._pseudoName) only rules targeting that pseudo-element
+  // participate — matched against the originating element with the pseudo
+  // stripped, plus the pseudo's own (0,0,1) — and the UA/hint sources are the
+  // element's, not the pseudo's, so they are skipped.
+  const _pseudo = (el && Object.prototype.hasOwnProperty.call(el, '_pseudoName')) ? el._pseudoName : null;
   const sources = [];
   const nid = el && el._nid;
   if (typeof nid === 'number' && nid >= 0) {
@@ -28634,9 +28851,20 @@ const _buildCascadeUncached = (el) => {
     // rule with real specificity wins outright. (No UA declaration is
     // `!important`, so the importance-first ordering never lifts one above an
     // author rule — which is the whole point of an origin.)
-    const uaDecls = _uaDecls(el);
+    const uaDecls = _pseudo ? null : _uaDecls(el);
     if (uaDecls) sources.push({ spec: 0, order: -2, decls: uaDecls, uaLike: true });
-    const hintDecls = _presHintDecls(el);
+    // The UA sheet for ::marker (CSS Lists §ua-stylesheet): these override the
+    // values a marker would otherwise INHERIT from its list item.
+    if (_pseudo === 'marker') {
+      sources.push({ spec: 0, order: -2, uaLike: true, decls: {
+        'unicode-bidi': { value: 'isolate' },
+        'font-variant-numeric': { value: 'tabular-nums' },
+        'text-transform': { value: 'none' },
+        'text-indent': { value: '0px' },
+        'white-space': { value: 'pre' },
+      } });
+    }
+    const hintDecls = _pseudo ? null : _presHintDecls(el);
     // `hint` distinguishes presentational hints from the UA sheet inside the
     // uaLike pair: `revert` rolls hints back (they are author-origin to it)
     // while `revert-layer` leaves them standing (an independent origin between
@@ -28671,7 +28899,15 @@ const _buildCascadeUncached = (el) => {
       }
       const lpath = rule.layer ? layerKey(rule.layer) : null;
       if (lpath) sources._layered = true;
-      let selText = rule.selectorText, prox;
+      let selText = rule.selectorText, prox, matchKey = String(nid);
+      if (_pseudo) {
+        if (rule.scope) continue;                 // scoped pseudo rules: out of scope (cap)
+        const ps = _pseudoSelFor(selText, _pseudo);
+        if (!ps) continue;
+        const spec = parseInt(_dom('selector_match_specificity', matchKey, ps), 10);
+        if (spec >= 0) sources.push({ spec: spec + 1, order: order++, decls: rule.decls, lpath });
+        continue;
+      }
       if (rule.scope) {
         const sc = _scopedSelectorFor(el, rule);
         if (!sc) continue;
@@ -28681,8 +28917,9 @@ const _buildCascadeUncached = (el) => {
           continue;
         }
         selText = sc.sel; prox = sc.prox;
+        if (sc.scopeNid !== undefined) matchKey = nid + ',' + sc.scopeNid;   // bind :scope to the real root
       }
-      const spec = parseInt(_dom('selector_match_specificity', String(nid), selText), 10);
+      const spec = parseInt(_dom('selector_match_specificity', matchKey, selText), 10);
       if (spec >= 0) {
         if (prox !== undefined) sources._scoped = true;
         sources.push({ spec, order: order++, decls: rule.decls, lpath, prox });
@@ -28708,8 +28945,10 @@ const _buildCascadeUncached = (el) => {
           // All plain style rules — the original fast path, byte for byte.
           for (const r of arr) {
             if (!r || r.type !== 1) continue;
-            const spec = parseInt(_dom('selector_match_specificity', String(nid), r._selectorSource || r.selectorText), 10);
-            if (spec >= 0) sources.push({ spec, order: order++, decls: r._cascadeDecls });
+            let rsel = r._selectorSource || r.selectorText;
+            if (_pseudo) { rsel = _pseudoSelFor(rsel, _pseudo); if (!rsel) continue; }
+            const spec = parseInt(_dom('selector_match_specificity', String(nid), rsel), 10);
+            if (spec >= 0) sources.push({ spec: _pseudo ? spec + 1 : spec, order: order++, decls: r._cascadeDecls });
           }
           continue;
         }
@@ -28731,7 +28970,15 @@ const _buildCascadeUncached = (el) => {
           }
           const lpath = rule.layer ? layerKey(rule.layer) : null;
           if (lpath) sources._layered = true;
-          let selText = rule.selectorText, prox;
+          let selText = rule.selectorText, prox, matchKey = String(nid);
+          if (_pseudo) {
+            if (rule.scope) continue;             // scoped pseudo rules: out of scope (cap)
+            const ps = _pseudoSelFor(selText, _pseudo);
+            if (!ps) continue;
+            const spec = parseInt(_dom('selector_match_specificity', matchKey, ps), 10);
+            if (spec >= 0) sources.push({ spec: spec + 1, order: order++, decls: rule.decls, lpath });
+            continue;
+          }
           if (rule.scope) {
             const sc = _scopedSelectorFor(el, rule);   // implicit scope has no owner in a constructed sheet → out of scope
             if (!sc) continue;
@@ -28741,8 +28988,9 @@ const _buildCascadeUncached = (el) => {
               continue;
             }
             selText = sc.sel; prox = sc.prox;
+            if (sc.scopeNid !== undefined) matchKey = nid + ',' + sc.scopeNid;   // bind :scope to the real root
           }
-          const spec = parseInt(_dom('selector_match_specificity', String(nid), selText), 10);
+          const spec = parseInt(_dom('selector_match_specificity', matchKey, selText), 10);
           if (spec >= 0) {
             if (prox !== undefined) sources._scoped = true;
             sources.push({ spec, order: order++, decls: rule.decls, lpath, prox });
@@ -28842,83 +29090,116 @@ const _allCovers = (name) => name !== 'direction' && name !== 'unicode-bidi' && 
 // nearest valid root also supplies PROXIMITY — a cascade tie-breaker between
 // specificity and order of appearance.
 // True when a scoping limit sits on the path el(inclusive) … A(exclusive).
-const _scopeLimited = (el, A, endSel, R) => {
-  let L = String(endSel);
+const _scopeLimited = (el, A, endSel) => {
   // Limit selectors carry scoped-selector semantics too: a bare `.b` is
   // implicitly `:scope .b` (a STRICT descendant — the root can never be its own
   // limit that way), while `:scope`/`&` reference the root explicitly — and a
   // limit the ROOT ITSELF satisfies (`to (.b&)`) empties the whole scope, so
   // the walk includes the root exactly when the selector could name it.
+  // `:scope`/`&` are BOUND to the actual root A (the Rust matcher's scope
+  // element), not rewritten to "anything matching the root selector".
+  let L = String(endSel);
   const refsRoot = /:scope\b/i.test(L) || L.indexOf('&') >= 0;
-  L = L.replace(/:scope\b/gi, R ? `:is(${R})` : '*').replace(/&/g, R ? `:is(${R})` : '*');
-  if (/^\s*[>+~]/.test(L)) L = (R ? `:is(${R})` : '*') + ' ' + L;
+  L = _cssAmpSubst(L, ':where(:scope)');
+  if (/^\s*[>+~]/.test(L)) L = ':where(:scope) ' + L;
+  const bind = (cur) => {
+    try { return _dom('element_matches', cur._nid + ',' + A._nid, L) === 'true'; } catch (e) { return false; }
+  };
   for (let cur = el, g = 0; cur && g < 200; cur = cur.parentElement, g++) {
     if (cur === A) {
-      if (refsRoot) { try { if (cur.matches && cur.matches(L)) return true; } catch (e) {} }
+      if (refsRoot && bind(cur)) return true;
       break;
     }
-    try { if (cur.matches && cur.matches(L)) return true; } catch (e) {}
+    if (bind(cur)) return true;
   }
   return false;
 };
-// The nearest ancestor-or-self scope root of `el` for one @scope frame, with the
-// hop count (proximity); null when `el` is not in the frame's scope.
-const _scopeRootFor = (el, fr, owner) => {
-  try {
-    if (fr.implicit) {
-      // An implicit @scope roots at the owner <style>'s parent element.
-      const A = owner && owner.parentElement;
-      if (!A || !(A === el || (A.contains && A.contains(el)))) return null;
-      if (fr.end && _scopeLimited(el, A, fr.end, null)) return null;
-      let hops = 0;
-      for (let c = el; c && c !== A; c = c.parentElement) hops++;
-      return { A, hops };
-    }
+// The innermost scope root of `el` for a FRAME CHAIN (outermost frame first),
+// with the hop count (proximity); null when `el` is not in scope. Nested
+// @scope (css-cascade-6): an inner scope root must itself lie IN the outer
+// frame's scope (inclusive — the inner root may BE the outer root), `:scope`/
+// `&` in a scope-start refer to an outer scope root, and a RELATIVE start
+// (`> .b`, `+ .b`, `~ .b`) positions the root against an outer root.
+const _scopeChainRoot = (el, frames, idx, owner) => {
+  const fr = frames[idx];
+  if (fr.implicit) {
+    // An implicit @scope roots at the owner <style>'s parent element.
+    const A = owner && owner.parentElement;
+    if (!A || !(A === el || (A.contains && A.contains(el)))) return null;
+    if (idx > 0 && !_scopeChainRoot(A, frames, idx - 1, owner)) return null;
+    if (fr.end && _scopeLimited(el, A, fr.end)) return null;
     let hops = 0;
+    for (let c = el; c && c !== A; c = c.parentElement) hops++;
+    return { A, hops };
+  }
+  let start = String(fr.start);
+  const combm = /^\s*([>+~])\s*([\s\S]*)$/.exec(start);
+  const comb = combm ? combm[1] : null;
+  let matchSel = combm ? combm[2] : start;
+  const scopeRef = /:scope\b/i.test(matchSel) || matchSel.indexOf('&') >= 0;
+  if (scopeRef) matchSel = _cssAmpSubst(matchSel, ':where(:scope)');
+  let hops = 0;
+  try {
     for (let cur = el, g = 0; cur && g < 200; cur = cur.parentElement, g++, hops++) {
-      let isRoot = false;
-      try { isRoot = cur.matches && cur.matches(fr.start); } catch (e) { isRoot = false; }
-      if (isRoot && !(fr.end && _scopeLimited(el, cur, fr.end, fr.start))) return { A: cur, hops };
+      let ok = false;
+      if (comb === '+' || comb === '~') {
+        // The root stands in sibling relation to an OUTER scope root.
+        if (idx > 0) {
+          for (let sib = cur.previousElementSibling; sib; sib = sib.previousElementSibling) {
+            const r = _scopeChainRoot(sib, frames, idx - 1, owner);
+            if (r && r.A === sib) {
+              try { ok = _dom('element_matches', cur._nid + ',' + sib._nid, matchSel) === 'true'; } catch (e) { ok = false; }
+              if (ok) break;
+            }
+            if (comb === '+') break;
+          }
+        }
+      } else if (idx > 0) {
+        // cur is only a candidate root if it lies in the outer scope; bind
+        // `:scope` in the start to the outer root that admits it.
+        const outer = _scopeChainRoot(cur, frames, idx - 1, owner);
+        if (!outer) continue;
+        try { ok = _dom('element_matches', cur._nid + ',' + outer.A._nid, matchSel) === 'true'; } catch (e) { ok = false; }
+        if (ok && comb === '>') {
+          const p = cur.parentElement;
+          const pr = p ? _scopeChainRoot(p, frames, idx - 1, owner) : null;
+          ok = !!(pr && pr.A === p);
+        }
+      } else {
+        // Top level: no outer scope for a relative or :scope-referencing start.
+        if (comb || scopeRef) ok = false;
+        else { try { ok = cur.matches && cur.matches(matchSel); } catch (e) { ok = false; } }
+      }
+      if (ok && !(fr.end && _scopeLimited(el, cur, fr.end))) return { A: cur, hops };
     }
   } catch (e) {}
   return null;
 };
 // Resolve a scoped rule against `el`: null when out of scope, else the selector
-// to actually match plus the proximity to the innermost root. Scoped-selector
-// semantics: a selector with no `:scope`/`&` is implicitly `:scope <sel>` — the
-// subject is a STRICT descendant of the root and the implied prefix adds no
-// specificity (so the bare selector is matched and membership carries the
-// scoping); `:scope` and `&` rewrite to `:is(<root>)`. ⛔ Caps: the rewrite lets
-// `:scope` match any element matching the root selector (not just the bound
-// root), and `:scope`/`&` under an IMPLICIT root are only expressible when the
-// selector is exactly `:scope`.
+// to actually match, the proximity to the innermost root, and that root's nid —
+// the Rust matcher binds `:scope` to it, so `:scope + .c` (a sibling of the
+// root) correctly never matches, and `:scope`/`&` work under an IMPLICIT root.
+// Scoped-selector semantics: a selector with no `:scope`/`&` is implicitly
+// `:scope <sel>` — the subject is a STRICT descendant of the root and the
+// implied prefix adds no specificity; `:scope` keeps its own (0,1,0)
+// specificity; `&` is `:where(:scope)`, zero.
 const _scopedSelectorFor = (el, rule) => {
-  let sel = rule.selectorText, res = null;
-  for (const fr of rule.scope) {
-    res = _scopeRootFor(el, fr, rule.scopeOwner || null);
-    if (!res) return null;
-  }
+  const res = _scopeChainRoot(el, rule.scope, rule.scope.length - 1, rule.scopeOwner || null);
+  if (!res) return null;
   // Bare declarations directly inside @scope style the ROOT itself, as if
   // wrapped in `:where(:scope)` — zero specificity (css-cascade-6 §scoped-declarations).
   if (rule.scopeRootOnly) return el === res.A ? { sel: null, prox: res.hops } : null;
-  const R = rule.scope[rule.scope.length - 1].start;
+  let sel = rule.selectorText;
   const hasScopeRef = /:scope\b/i.test(sel) || sel.indexOf('&') >= 0;
   if (!hasScopeRef) {
     if (el === res.A) return null;                       // plain selectors never match the root itself
     // A leading combinator is relative to the root; the implied prefix adds no
-    // specificity, hence :where().
-    if (/^\s*[>+~]/.test(sel)) sel = (R ? `:where(:is(${R}))` : ':where(*)') + ' ' + sel;
-  } else if (/^\s*:scope\s*$/i.test(sel) && !R) {
-    if (el !== res.A) return null;                       // implicit root: `:scope` is exactly the root
-    sel = '*';
+    // specificity, hence :where(:scope).
+    if (/^\s*[>+~]/.test(sel)) sel = ':where(:scope) ' + sel;
   } else {
-    // `:scope` keeps its own (0,1,0) specificity — :where() zeroes the root
-    // selector and :nth-child(n) (which matches every element) restores exactly
-    // one class-level unit. `&` is :where(:scope): zero specificity.
-    const rootMatch = R ? `:where(:is(${R}))` : ':where(*)';
-    sel = sel.replace(/:scope\b/gi, `${rootMatch}:nth-child(n)`).replace(/&/g, rootMatch);
+    sel = _cssAmpSubst(sel, ':where(:scope)');
   }
-  return { sel, prox: res.hops };
+  return { sel, prox: res.hops, scopeNid: res.A._nid };
 };
 // Lexicographic layer-key comparison where a missing tail reads as Infinity:
 // an unlayered source (null/empty key) is all-Infinity and a layer's direct
@@ -30739,6 +31020,14 @@ globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
   // the document actually declares a transition somewhere.
   if (globalThis._csFlush) globalThis._csFlush();
   if (!el) el = document.body || {};
+  // A recognised pseudo-element argument computes the PSEUDO's style: the
+  // cascade keeps only rules targeting it, and inheritance runs through the
+  // originating element (the pseudo view's parentElement). An unrecognised
+  // string keeps the old behaviour (the element itself).
+  if (_pseudo != null && _pseudo !== '' && el && typeof el._nid === 'number') {
+    const pm = _GCS_PSEUDO_RE.exec(String(_pseudo));
+    if (pm) el = _pseudoViewFor(el, pm[1].toLowerCase());
+  }
   const style = el?.style || el?._style || _newStyleDecl();
   const sources = _buildCascade(el);
   const resolve = (name) => {
@@ -31458,8 +31747,13 @@ const _cssParseRuleList = (cssText) => {
           rules.push({ type: 'layer-block', name, condition, prelude, rules: _cssParseRuleList(body) });
       } else if (name === 'scope') {
         // @scope (<scope-start>)? [to (<scope-end>)]? { <rule-list> } → CSSScopeRule.
-        const sc = _parseScopePrelude(condition);
-        rules.push({ type: 'scope', name, condition, prelude, _start: sc.start, _end: sc.end, rules: _cssParseRuleList(body) });
+        // An invalid prelude drops the whole rule; the body is a NESTING CONTEXT
+        // (css-cascade-6): bare declaration runs become CSSNestedDeclarations
+        // children, not dropped text.
+        if (_validScopePrelude(condition)) {
+          const sc = _parseScopePrelude(condition);
+          rules.push({ type: 'scope', name, condition, prelude, _start: sc.start, _end: sc.end, rules: _buildNestedItems(body, true) });
+        }
       } else {
         rules.push({ type: 'at', name, condition, prelude, body });
       }
@@ -32780,13 +33074,15 @@ const _splitNestedRuleBody = (body) => {
 // e.g. `@media { @font-face { … } }` is perfectly valid — so the filter runs only
 // on the descriptors of a style rule's nested body, recursing through nested group
 // rules to drop the same at-rules there too.
-const _nestOkDesc = (d) => d.type === 'style' || d.type === 'group' || d.type === 'scope';
+const _nestOkDesc = (d) => d.type === 'style' || d.type === 'group' || d.type === 'scope' || d.type === 'layer-block';
 const _filterNestDescs = (descs) => descs.filter(_nestOkDesc).map((d) =>
   (d.type === 'group' && Array.isArray(d.rules)) ? Object.assign({}, d, { rules: _filterNestDescs(d.rules) }) : d);
 // A rule is in nesting context iff a style rule appears anywhere on its parentRule
 // chain (the rule itself, if a style rule, counts). Used to gate insertRule.
 const _ruleInNestingContext = (rule) => {
-  for (let r = rule; r; r = r._parentRule) if (r instanceof CSSStyleRule) return true;
+  // A @scope rule's body is ALWAYS a nesting context (css-cascade-6: bare
+  // declarations there become CSSNestedDeclarations), even at the top level.
+  for (let r = rule; r; r = r._parentRule) if (r instanceof CSSStyleRule || r instanceof CSSScopeRule) return true;
   return false;
 };
 
@@ -32826,9 +33122,16 @@ const _buildNestedItems = (body, inScope) => {
       if (name === 'media' || name === 'supports' || name === 'container' || name === 'document') {
         if (name !== 'container' || _isValidContainerConditionList(condition))
           out.push({ type: 'group', name, condition, prelude, rules: _buildNestedItems(it.body) });
+      } else if (name === 'layer') {
+        // The BLOCK form of @layer is a valid nested group rule (css-nesting
+        // §nested-group-rules); an invalid layer name invalidates the block.
+        if (condition === '' || _LAYER_PATH_RE.test(condition))
+          out.push({ type: 'layer-block', condition, prelude, rules: _buildNestedItems(it.body) });
       } else if (name === 'scope') {
-        const sc = _parseScopePrelude(condition);
-        out.push({ type: 'scope', name, condition, prelude, _start: sc.start, _end: sc.end, rules: _buildNestedItems(it.body, true) });
+        if (_validScopePrelude(condition)) {
+          const sc = _parseScopePrelude(condition);
+          out.push({ type: 'scope', name, condition, prelude, _start: sc.start, _end: sc.end, rules: _buildNestedItems(it.body, true) });
+        }
       }
     } else if (_parseSelectorList(prelude, true) !== null) {
       // Inside @scope the child selector is implicitly :scope-relative → serialize as
@@ -32970,7 +33273,11 @@ class CSSStyleRule extends CSSGroupingRule {
   set selectorText(v) {
     if (!(this instanceof CSSStyleRule)) throw new TypeError("Illegal invocation");   // WebIDL brand check (setter on wrong object)
     const val = String(v == null ? '' : v);
-    if (_parseSelectorList(val, this._nested) === null) return;   // invalid → no-op
+    // A rule inside ANY nesting context (a parent style rule OR a @scope body)
+    // accepts relative selectors — `> .b` set on a @scope child is relative to
+    // `:scope` (css-cascade-6), not invalid.
+    const rel = this._nested || _ruleInNestingContext(this._parentRule);
+    if (_parseSelectorList(val, rel) === null) return;   // invalid → no-op
     this._selectorSource = val.trim();
     // Flag the owning sheet so getComputedStyle re-reads the live rule (CSSOM edit).
     try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
@@ -33967,6 +34274,56 @@ const _parseScopePrelude = (raw) => {
     if (end === '') end = null;
   }
   return { start, end };
+};
+// Is a <scope-start>/<scope-end> selector list valid? Non-empty, parses as a
+// relative selector list (`> .b`, `&`, `:scope` all admitted), and contains no
+// pseudo-element — a scope root is an element (css-cascade-6 §scope-syntax).
+const _validScopeSelList = (sel) => {
+  if (!sel) return false;                                   // `()` — empty list
+  if (_parseSelectorList(sel, true) === null) return false;
+  // Quote-aware '::' scan (a pseudo-element in either list invalidates the rule).
+  let q = null;
+  for (let i = 0; i < sel.length; i++) {
+    const c = sel[i];
+    if (q) { if (c === q && sel[i - 1] !== '\\') q = null; }
+    else if (c === '"' || c === "'") q = c;
+    else if (c === ':' && sel[i + 1] === ':') return false;
+  }
+  return true;
+};
+// Validate a whole @scope prelude: `(<start>)? [to (<end>)]?` and NOTHING else.
+// `@scope div`, `@scope ()`, `@scope (.a) from (.c)` are all invalid — and an
+// invalid prelude drops the whole at-rule (CSS Syntax invalid-rule handling).
+const _validScopePrelude = (raw) => {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return true;                                      // prelude-less form
+  let i = 0;
+  const ws = () => { while (i < s.length && /[ \t\n\r\f]/.test(s[i])) i++; };
+  const readParen = () => {
+    let depth = 0; const st = i;
+    let closed = false;
+    for (; i < s.length; i++) {
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')') { depth--; if (depth === 0) { i++; closed = true; break; } }
+    }
+    if (!closed) return undefined;
+    return s.slice(st + 1, i - 1).trim();
+  };
+  if (s[i] === '(') {
+    const start = readParen();
+    if (start === undefined || !_validScopeSelList(start)) return false;
+  }
+  ws();
+  if (i < s.length) {
+    if (!/^to\b/i.test(s.slice(i))) return false;
+    i += 2; ws();
+    if (s[i] !== '(') return false;
+    const end = readParen();
+    if (end === undefined || !_validScopeSelList(end)) return false;
+    ws();
+    if (i < s.length) return false;                         // trailing garbage
+  }
+  return true;
 };
 // CSSScopeRule (CSS Cascade 6 §CSSScopeRule) — `@scope (start)? [to (end)]? { … }`.
 // A grouping rule exposing the scope roots (`.start`/`.end`, the selector text or
