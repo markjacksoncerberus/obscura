@@ -23,12 +23,14 @@
 //! for every generic family and system-font discovery is disabled, so identical
 //! input renders identically across machines and containers.
 
+pub mod csp;
 mod document;
 mod engine;
 mod fonts;
 mod http;
 mod net;
 
+pub use csp::RenderCsp;
 pub use document::{ElementPatch, LayoutRect, NodeBox, ResolvedDoc, Size};
 pub use engine::{RenderEngine, RenderInput};
 pub use http::{decode_data_uri, ObscuraNetProvider};

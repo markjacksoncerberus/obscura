@@ -146,17 +146,26 @@ thread_local! {
 /// Elements a patch will not touch, in the markup it is about to install or as
 /// the patched element itself.
 ///
-/// Every one of them does something on insertion beyond occupying a box: fetch a
-/// file, register a stylesheet, run a program, retarget the document. Blitz
-/// handles all of it — but asynchronously, and the patch path deliberately does
-/// not wait for the network the way the full path does (it exists to answer a
-/// synchronous geometry read). So rather than hand back a box measured before
-/// the stylesheet landed, we re-parse and take the slow path, which does wait.
+/// Every one of them does something on insertion beyond occupying a box: register
+/// a stylesheet, run a program, retarget the document, decode audio/video Blitz
+/// cannot play here anyway. The patch keeps the document — it does not re-run
+/// these side effects — so an element whose whole point IS a side effect must
+/// take the slow path.
 ///
-/// This is the honest cost of the fast path, and it is why the list errs long.
-const PATCH_UNSAFE_TAGS: [&str; 15] = [
-    "style", "link", "script", "base", "meta", "img", "picture", "source", "iframe", "frame",
-    "object", "embed", "video", "audio", "track",
+/// ⭐ `<img>`/`<picture>`/`<source>` used to be here (Quest #525's cap): a patch
+/// resolved once and could measure an image before its bytes — and its intrinsic
+/// size — had arrived. Quest #539 lifted them: `ResolvedDoc::patch` now waits on
+/// the same provider the full layout does, so a patched-in image is sized from
+/// its file, and one the page already loaded (the common case — a gallery
+/// re-sorting, a lightbox) is delivered from the shared cache with no wait at
+/// all. So the biggest incremental-layout win the campaign kept naming is taken:
+/// a page whose mutations carry an `<img>` gets the fast path now.
+///
+/// This is the honest cost of the fast path, and it is why the list still errs
+/// long.
+const PATCH_UNSAFE_TAGS: [&str; 12] = [
+    "style", "link", "script", "base", "meta", "iframe", "frame", "object", "embed", "video",
+    "audio", "track",
 ];
 
 /// Does `html` contain a start tag we refuse to patch? A byte scan rather than a

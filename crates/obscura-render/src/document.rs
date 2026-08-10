@@ -2,6 +2,9 @@
 
 use std::collections::HashMap;
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use anyrender::{render_to_buffer, PaintScene};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
 use blitz_dom::util::Color;
@@ -9,6 +12,8 @@ use blitz_dom::BaseDocument;
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use blitz_traits::shell::Viewport;
+
+use crate::net::ResourceProvider;
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
@@ -156,12 +161,27 @@ pub struct ResolvedDoc {
     /// Obscura `NodeId` → Blitz node id, built from the `data-obscura-nid`
     /// attributes once after layout.
     nid_map: HashMap<u64, usize>,
+    /// The provider this document fetches through, kept so an incremental
+    /// [`patch`](Self::patch) can wait on a newly-referenced resource (a
+    /// patched-in `<img>`'s bytes) the same way the initial layout does —
+    /// otherwise a patch would measure an image before its intrinsic size
+    /// is known. `None` for documents built without one (tests).
+    provider: Option<Arc<dyn ResourceProvider>>,
 }
 
 impl ResolvedDoc {
     pub(crate) fn new(doc: HtmlDocument, viewport: Viewport) -> Self {
+        Self::with_provider(doc, viewport, None)
+    }
+
+    pub(crate) fn with_provider(
+        doc: HtmlDocument,
+        viewport: Viewport,
+        provider: Option<Arc<dyn ResourceProvider>>,
+    ) -> Self {
         let nid_map = build_nid_map(&doc);
         Self {
+            provider,
             doc,
             viewport,
             nid_map,
@@ -279,6 +299,25 @@ impl ResolvedDoc {
         }
 
         self.doc.resolve(0.0);
+        // A patched-in element may reference a resource whose bytes decide its
+        // box — an `<img>` with no width/height is sized by the file. The first
+        // resolve only DISCOVERS the fetch; wait for it (bounded) and re-resolve,
+        // exactly as the initial layout does, so the box the caller reads is the
+        // settled one rather than the zero-size placeholder. A shared cache means
+        // an image the page already loaded is delivered synchronously and this
+        // loop never spins. No provider (tests) → the single resolve above is it.
+        if let Some(provider) = &self.provider {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while provider.pending() > 0 {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let budget = (deadline - now).min(Duration::from_millis(250));
+                provider.wait_for_progress(budget);
+                self.doc.resolve(0.0);
+            }
+        }
         // The patched subtrees are new Blitz nodes with new ids, so the map has to
         // be rebuilt. Walking the tree is cheap next to laying it out.
         self.nid_map = build_nid_map(&self.doc);

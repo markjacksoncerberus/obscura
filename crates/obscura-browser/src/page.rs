@@ -788,6 +788,21 @@ impl Page {
 
                 tracing::info!("Loading ES module: {}", full_url);
                 if let Some(js) = &mut self.js {
+                    // The same CSP question the classic path asks, by node id so
+                    // the element's nonce (and `'strict-dynamic'` provenance) are
+                    // visible. Modules had no gate at all before Quest #535.
+                    let url_esc = full_url.replace('\\', "\\\\").replace('\'', "\\'");
+                    let allowed = js
+                        .evaluate(&format!(
+                            "globalThis.__cspAllowsScriptURL({}, '{}')",
+                            module_script.nid, url_esc
+                        ))
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if !allowed {
+                        continue;
+                    }
                     match js.load_module(&full_url).await {
                         Ok(()) => {
                             tracing::info!("ES module loaded: {}", full_url);
@@ -808,6 +823,19 @@ impl Page {
             } else if !module_script.inline.is_empty() {
                 let base = self.url_string();
                 if let Some(js) = &mut self.js {
+                    // An inline module is an inline script to CSP (nonce/hash by
+                    // node id), same as the classic inline gate above.
+                    let allowed = js
+                        .evaluate(&format!(
+                            "globalThis.__cspAllowsInlineScript({})",
+                            module_script.nid
+                        ))
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    if !allowed {
+                        continue;
+                    }
                     if let Err(e) = js.load_inline_module(&module_script.inline, &base).await {
                         tracing::warn!("Inline ES module error: {}", e);
                     }
@@ -1451,7 +1479,7 @@ impl Page {
     /// CSS, images, web fonts). Routes through Obscura's HTTP client so cookies,
     /// proxy, and request-blocking all apply.
     #[cfg(feature = "render")]
-    fn make_net_provider(&self) -> std::sync::Arc<dyn obscura_render::ResourceProvider> {
+    fn make_net_provider(&mut self) -> std::sync::Arc<dyn obscura_render::ResourceProvider> {
         let patterns = if self.intercept_enabled {
             self.intercept_block_patterns.clone()
         } else {
@@ -1468,7 +1496,33 @@ impl Page {
             self.context.cookie_jar.clone(),
             self.context.proxy_url.as_deref(),
         ));
-        std::sync::Arc::new(crate::render::ObscuraNetProvider::new(client, patterns))
+        std::sync::Arc::new(
+            crate::render::ObscuraNetProvider::new(client, patterns)
+                .with_csp(self.render_csp()),
+        )
+    }
+
+    /// The document's ENFORCED Content Security Policy, compiled for the render
+    /// path's fetch decisions (fonts, linked/`@import`ed CSS, `url()` images —
+    /// everything Blitz fetches where the JS gates cannot see). Report-only
+    /// policies are excluded: they must never change what loads.
+    #[cfg(feature = "render")]
+    fn render_csp(&mut self) -> obscura_render::RenderCsp {
+        let mut texts: Vec<String> = Vec::new();
+        if let Some(js) = &mut self.js {
+            if let Ok(v) = js.evaluate(
+                "(function(){try{globalThis.__obscuraScanMetaCSP&&globalThis.__obscuraScanMetaCSP();\
+                 return JSON.stringify(globalThis.__cspEnforcedPolicies?globalThis.__cspEnforcedPolicies():[])}\
+                 catch(e){return '[]'}})()",
+            ) {
+                if let Some(s) = v.as_str() {
+                    if let Ok(parsed) = serde_json::from_str::<Vec<String>>(s) {
+                        texts = parsed;
+                    }
+                }
+            }
+        }
+        obscura_render::RenderCsp::parse(&texts, &self.url_string())
     }
 
     pub fn capture_snapshot_mhtml(&self) -> String {

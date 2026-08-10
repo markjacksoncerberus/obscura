@@ -135,7 +135,7 @@ impl RenderEngine {
             );
         }
 
-        ResolvedDoc::new(doc, input.viewport)
+        ResolvedDoc::with_provider(doc, input.viewport, Some(provider))
     }
 }
 

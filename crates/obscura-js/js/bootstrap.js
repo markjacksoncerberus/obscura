@@ -3969,21 +3969,46 @@ class Node {
     else c._ownerDoc = _adoptDoc;
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [c._nid], [], null, { previousSibling: _prev >= 0 ? _prev : null });
     if (c instanceof Element && c.tagName === 'SCRIPT' && !c._scriptAlreadyStarted) {
-      const scriptType = c.getAttribute('type') || '';
-      if (scriptType && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
+      const scriptType = (c.getAttribute('type') || '').toLowerCase();
+      const _isModule = scriptType === 'module';
+      if (scriptType && scriptType !== 'text/javascript' && scriptType !== 'application/javascript' && !_isModule) {
         return c;
       }
       const src = c.getAttribute('src');
       if (src) {
+        // ⭐ A dynamically inserted <script src> is a SCRIPT LOAD and CSP gets
+        // the same question the markup path asks (`script-src-elem`, by node id
+        // so the nonce and `'strict-dynamic'` insertion metadata are visible).
+        // This path used to skip the gate entirely — the exact fail-open
+        // `'strict-dynamic'` exists to close. Blocked → no fetch, `error` on a
+        // task, exactly as for a server that was never reachable.
+        let _full = src;
+        try { _full = new URL(src, _domParse("document_url") || "about:blank").href; } catch (e) {}
+        if (typeof globalThis.__cspAllowsScriptURL === 'function'
+            && !globalThis.__cspAllowsScriptURL(c._nid, _full)) {
+          c._resConnected = true;
+          _queueTask(() => { try { _fireElementError(c); } catch (e) {} });
+          return c;
+        }
         // Fetch + execute the external script, record a Resource Timing entry
         // (initiatorType "script"), and fire its load/error event.
-        _loadElementResource(c, src, 'script', { eval: true });
+        _loadElementResource(c, src, 'script', { eval: true, module: _isModule });
       } else {
         const code = c.textContent;
         if (code) {
+          // Same gate as a markup inline <script>; the element's provenance
+          // (`_nonParserInserted`) is what `'strict-dynamic'` decides by.
+          if (typeof globalThis.__cspAllowsInline === 'function'
+              && !globalThis.__cspAllowsInline('script', c, code)) return c;
           const _prevCS = globalThis.__currentScriptNid;
-          globalThis.__currentScriptNid = c._nid;
-          try { (0, _NativeEval)(code); }
+          globalThis.__currentScriptNid = _isModule ? -1 : c._nid;
+          try {
+            // Best-effort inline module: strict code, no static import/export
+            // (one realm, no module map — same trade the iframe path makes).
+            if (_isModule && /(^|[\n;{}])\s*(?:import|export)\b/.test(code)) {
+              console.warn('[obscura] dynamic <script type=module> with import/export is not supported');
+            } else (0, _NativeEval)(_isModule ? '"use strict";\n' + code : code);
+          }
           catch(e) { console.error('Dynamic inline script error:', e.message); }
           finally { globalThis.__currentScriptNid = _prevCS; }
         }
@@ -6124,7 +6149,21 @@ class Element extends Node {
     const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
     if (link) {
       const href = link.getAttribute('href');
-      if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+      if (href && href.startsWith('javascript:')) {
+        // A `javascript:` navigation runs the URL body as an inline script, and
+        // CSP is asked FIRST (HTML §navigate to a javascript: URL; the check —
+        // and the violation report — is the inline one, `script-src-elem`).
+        // A completion value that is a string would replace the document; that
+        // half is not implemented, so the result is simply dropped.
+        let body = href.slice('javascript:'.length);
+        try { body = decodeURIComponent(body); } catch (e) {}
+        if (typeof globalThis.__cspAllowsInline !== 'function'
+            || globalThis.__cspAllowsInline('script', link, body)) {
+          try { (0, _NativeEval)(body); } catch (e) { _reportError(e); }
+        }
+        return;
+      }
+      if (href && !href.startsWith('#')) {
         location.assign(href);
         return;
       }
@@ -7776,6 +7815,11 @@ class Document extends Node {
     if (el && local === 'template') {
       el._templateContent = this.createDocumentFragment();
     }
+    // CSP `'strict-dynamic'` needs to know how a <script> came to exist: one
+    // created by script (here) is "non-parser-inserted" and inherits the
+    // creator's trust; one the parser made (markup, document.write) must carry
+    // its own nonce. The flag lives only on scripts — nothing else asks.
+    if (el && local === 'script') el._nonParserInserted = true;
     return el;
   }
   createElementNS(namespace, qualifiedName) {
@@ -7798,6 +7842,7 @@ class Document extends Node {
     el._ns = nsv; el._nsSet = true; el._prefix = prefix; el._localName = local;
     el._ownerDoc = this;
     if (nsv === _HTML_NS && local === 'template') el._templateContent = this.createDocumentFragment();
+    if (nsv === _HTML_NS && local === 'script') el._nonParserInserted = true; // see createElement
     return el;
   }
   createTextNode(t) {
@@ -8987,6 +9032,11 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
   configurable: true,
 });
+// `Object.prototype.toString.call(window)` must say `[object Window]`, not
+// `[object Object]` — feature-detection code branches on it (WPT's own
+// `getGlobalThisStr()` decides whether it is in a Window or a Worker this way,
+// and a wrong answer sends every assertion down the worker branch).
+Object.defineProperty(globalThis, Symbol.toStringTag, { value: 'Window', configurable: true });
 
 
 // Child browsing contexts. Per HTML, `window.frames === window`, and `window[i]`
@@ -10228,7 +10278,22 @@ const _cspResourceDirective = function (el) {
       if (rel.indexOf('manifest') >= 0) return 'manifest-src';
       if (rel.indexOf('icon') >= 0) return 'img-src';
       if (rel.indexOf('modulepreload') >= 0) return 'script-src-elem';
-      if (rel.indexOf('prefetch') >= 0 || rel.indexOf('preload') >= 0) return 'prefetch-src';
+      // ⭐ A preload is governed by the directive of what it SAYS it is (`as=`):
+      // the fetch it makes is the same fetch the real consumer would make, so
+      // `<link rel=preload as=font>` answers to `font-src`, not to a generic
+      // prefetch bucket — otherwise preloading is a way AROUND every resource
+      // directive at once.
+      if (rel.indexOf('preload') >= 0) {
+        const as = _asciiLower(String(el.getAttribute('as') || ''));
+        if (as === 'font') return 'font-src';
+        if (as === 'style') return 'style-src-elem';
+        if (as === 'script' || as === 'worker') return 'script-src-elem';
+        if (as === 'image') return 'img-src';
+        if (as === 'audio' || as === 'video' || as === 'track') return 'media-src';
+        if (as === 'fetch') return 'connect-src';
+        return 'prefetch-src';
+      }
+      if (rel.indexOf('prefetch') >= 0) return 'prefetch-src';
     }
   } catch (e) {}
   return null;
@@ -10340,7 +10405,30 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
         }
       }
       if (opts.eval && parsed.body) {
-        try { (0, _NativeEval)(parsed.body); } catch (e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
+        // ⭐ `document.currentScript` points at a classic external script for the
+        // duration of its execution too — WPT's own helper scripts read
+        // `document.currentScript.id` to name the message they post, and a null
+        // there throws before the message ever leaves. Modules run with it null.
+        const _prevCS = globalThis.__currentScriptNid;
+        globalThis.__currentScriptNid = opts.module ? -1 : el._nid;
+        try {
+          if (opts.module) {
+            // Best-effort dynamic module (one realm, no module map): a module
+            // with no static import/export is strict-mode code, and the one
+            // piece of module scope such a file can still touch — `import.meta`
+            // — is provided by rewriting `import.meta.url` to the literal URL
+            // it would have carried. Anything deeper is named, not silent.
+            if (/(^|[\n;{}])\s*(?:import|export)\b/.test(parsed.body)) {
+              console.warn('[obscura] dynamic module with import/export is not supported: ' + fullUrl);
+            } else {
+              const _murl = JSON.stringify(parsed.url || fullUrl);
+              const _code = parsed.body.replace(/\bimport\.meta\.url\b/g, _murl)
+                .replace(/\bimport\.meta\b/g, '({url:' + _murl + '})');
+              (0, _NativeEval)('"use strict";\n' + _code);
+            }
+          } else (0, _NativeEval)(parsed.body);
+        } catch (e) { console.error('Dynamic script error (' + fullUrl + '):', e.message); }
+        finally { globalThis.__currentScriptNid = _prevCS; }
       }
       if (status === 0 || status >= 400) {
         if (initiatorType === 'img') _imgMarkBroken(el);
@@ -14250,8 +14338,87 @@ const _cssParseDecls = (body, quirks) => {
   }
   return out;
 };
-const _cssSplitRules = (cssText, quirks) => {
-  // Returns [{ selectorText, decls }]; skips at-rules (and their nested blocks).
+// ── @import for the CASCADE ──────────────────────────────────────────────────
+// The imported sheet's TEXT, cached per absolute URL. `data:` URLs decode
+// synchronously (WPT leans on this: the import is expected to apply within the
+// same style-flush); anything else fetches once, and arrival bumps `_styleGen`
+// (computed-style caches) and `_importGen` (the split-rule cache below) so the
+// next read sees the sheet the page asked for. A sheet the document's CSP
+// refused never becomes text at all — the request is the leak.
+let _importGen = 0;
+const _importedCssCache = new Map(); // absURL -> { state: 'loading'|'done'|'error', text }
+const _importFetchCss = (absUrl) => {
+  let ent = _importedCssCache.get(absUrl);
+  if (ent) return ent;
+  ent = { state: 'loading', text: '' };
+  _importedCssCache.set(absUrl, ent);
+  try {
+    if (typeof globalThis.__cspAllowsURL === 'function'
+        && !globalThis.__cspAllowsURL('style-src-elem', absUrl, null)) {
+      ent.state = 'error';
+      return ent;
+    }
+  } catch (e) {}
+  if (/^data:/i.test(absUrl)) {
+    try {
+      const comma = absUrl.indexOf(',');
+      const meta = absUrl.slice(5, comma < 0 ? 5 : comma);
+      let body = comma < 0 ? '' : absUrl.slice(comma + 1);
+      body = /;base64$/i.test(meta) ? atob(body) : decodeURIComponent(body);
+      ent.text = body; ent.state = 'done';
+    } catch (e) { ent.state = 'error'; }
+    return ent;
+  }
+  (async () => {
+    try {
+      const pageOrigin = (function () { try { return new URL(_domParse("document_url") || "about:blank").origin; } catch (e) { return ""; } })();
+      const raw = await Deno.core.ops.op_fetch_url(absUrl, "GET", "{}", "", pageOrigin, "no-cors", "");
+      const parsed = JSON.parse(raw);
+      if (parsed.blocked || parsed.corsBlocked || (parsed.status && parsed.status >= 400)) {
+        ent.state = 'error';
+      } else {
+        ent.text = parsed.body || ''; ent.state = 'done';
+      }
+    } catch (e) { ent.state = 'error'; }
+    _importGen++; _styleGen++; if (_csArmHook) _csArmHook();
+  })();
+  return ent;
+};
+// Do this @import's conditions hold right now? (CSS Cascade 5 §import-conditions:
+// `layer`/`layer(name)`, then `supports(<condition>|<declaration>)`, then a media
+// query list — in that order; anything unparseable is a condition that is false.)
+const _importConditionMatches = (p) => {
+  if (p.supportsText != null) {
+    const st = String(p.supportsText).trim();
+    if (!st) return false;
+    let ok = false;
+    // The bare-<declaration> form (`supports(display:block)`) — with the
+    // `!important` the grammar explicitly admits — before the condition grammar.
+    const dm = /^(-{0,2}[a-zA-Z][\w-]*)\s*:([\s\S]*)$/.exec(st);
+    if (dm) {
+      let val = dm[2].trim();
+      val = val.replace(/!\s*important\s*$/i, '').trim();
+      try { ok = !!(val && globalThis.CSS.supports(dm[1], val)); } catch (e) { ok = false; }
+    } else {
+      try { ok = !!_evalSupportsCondition(st); } catch (e) { ok = false; }
+    }
+    if (!ok) return false;
+  }
+  const mt = String(p.mediaText || '').trim();
+  if (mt) {
+    try { if (!globalThis.matchMedia(mt).matches) return false; } catch (e) { return false; }
+  }
+  return true;
+};
+const _cssSplitRules = (cssText, quirks, base, _depth) => {
+  // Returns [{ selectorText, decls }] — the flat, cascade-shaped view of a sheet.
+  // Conditional groups (@media/@supports) contribute their contents when their
+  // condition holds; `@layer` blocks contribute theirs in place (⛔ cap: layer
+  // ORDERING is not modelled — a layered rule participates like an unlayered one
+  // at its position, which is closer to author intent than the previous state,
+  // where everything inside any at-rule was invisible to getComputedStyle);
+  // `@import` splices the imported sheet's rules at its position. Other at-rules
+  // are still skipped whole.
   // ⚠️ A comment is replaced by a SPACE, not by nothing. CSS Syntax consumes a
   // comment and emits no token, so `+/**/1` is two tokens (a `+` delimiter and
   // the number 1) and is invalid wherever one number token is required. Deleting
@@ -14260,13 +14427,43 @@ const _cssSplitRules = (cssText, quirks) => {
   // so it is the safe substitution.
   const css = String(cssText).replace(/\/\*[\s\S]*?\*\//g, ' ');
   const rules = [];
+  const depth = _depth || 0;
   let i = 0;
   const n = css.length;
   while (i < n) {
-    let j = i;
-    while (j < n && css[j] !== '{' && css[j] !== '}') j++;
+    // Scan to the first top-level '{', '}' or ';' — quote/paren-aware, because
+    // `@import "a;b.css";` and `url(a;b)` carry semicolons that end nothing.
+    let j = i, q = null, paren = 0;
+    while (j < n) {
+      const c = css[j];
+      if (q) { if (c === q && css[j - 1] !== '\\') q = null; }
+      else if (c === '"' || c === "'") q = c;
+      else if (c === '(') paren++;
+      else if (c === ')') { if (paren) paren--; }
+      else if (!paren && (c === '{' || c === '}' || c === ';')) break;
+      j++;
+    }
     if (j >= n) break;
-    if (css[j] === '}') { i = j + 1; continue; }
+    const ch = css[j];
+    if (ch === ';') {
+      // A statement at-rule. Only @import contributes rules; the depth cap keeps
+      // an import cycle from being a hang (a sheet importing itself terminates).
+      const stmt = css.slice(i, j).trim();
+      i = j + 1;
+      if (depth < 6 && /^@import\b/i.test(stmt)) {
+        const p = _parseImportRule(stmt);
+        if (p.href && _importConditionMatches(p)) {
+          let abs = p.href;
+          try { abs = new URL(p.href, base || _domParse("document_url") || "about:blank").href; } catch (e) {}
+          const ent = _importFetchCss(abs);
+          if (ent.state === 'done') {
+            for (const r of _cssSplitRules(ent.text, quirks, abs, depth + 1)) rules.push(r);
+          }
+        }
+      }
+      continue;
+    }
+    if (ch === '}') { i = j + 1; continue; }
     const prelude = css.slice(i, j).trim();
     // Find the matching close-brace, tracking ()/[]/{} nesting so a stray `}`
     // inside a declaration value (e.g. `--x: (})`) doesn't close the rule early.
@@ -14282,7 +14479,27 @@ const _cssSplitRules = (cssText, quirks) => {
     }
     const body = css.slice(j + 1, k - 1);
     i = k;
-    if (!prelude || prelude[0] === '@') continue; // skip @media/@supports/etc.
+    if (!prelude) continue;
+    if (prelude[0] === '@') {
+      if (depth < 6) {
+        const gm = /^@(media|supports|layer)\b([\s\S]*)$/i.exec(prelude);
+        if (gm) {
+          const name = gm[1].toLowerCase();
+          const cond = gm[2].trim();
+          let applies = false;
+          if (name === 'layer') applies = true;   // block form always applies (see cap above)
+          else if (name === 'media') {
+            try { applies = !cond || globalThis.matchMedia(cond).matches; } catch (e) { applies = false; }
+          } else {
+            try { applies = !!_evalSupportsCondition(cond); } catch (e) { applies = false; }
+          }
+          if (applies) {
+            for (const r of _cssSplitRules(body, quirks, base, depth + 1)) rules.push(r);
+          }
+        }
+      }
+      continue; // other at-rules (keyframes/font-face/page/…) stay skipped
+    }
     rules.push({ selectorText: prelude, decls: _cssParseDecls(body, quirks) });
   }
   return rules;
@@ -14323,10 +14540,18 @@ const _styleSheetRules = (styleEl) => {
   // document's `width:1` is a length, a standards document's is a typo.
   let quirks = false;
   try { quirks = _docIsQuirks(styleEl.ownerDocument); } catch (e) { quirks = false; }
+  // The cache also keys on `_importGen`: an imported sheet ARRIVING changes what
+  // this element contributes without changing a byte of its own text.
   const cached = _sheetRuleCache.get(styleEl);
-  if (cached && cached.text === text && cached.quirks === quirks) return cached.rules;
-  const rules = _cssSplitRules(text, quirks);
-  _sheetRuleCache.set(styleEl, { text, rules, quirks });
+  if (cached && cached.text === text && cached.quirks === quirks && cached.igen === _importGen) return cached.rules;
+  // Relative @import targets resolve against the sheet's own address: the file's
+  // URL for a <link>, the document's for a <style>.
+  let base = null;
+  try {
+    if (styleEl.localName === 'link') base = styleEl.href || null;
+  } catch (e) { base = null; }
+  const rules = _cssSplitRules(text, quirks, base);
+  _sheetRuleCache.set(styleEl, { text, rules, quirks, igen: _importGen });
   return rules;
 };
 // Computed-value serialization for <color> properties: named/hex/rgb()/rgba()
@@ -32007,6 +32232,11 @@ class CSSGroupingRule extends CSSRule {
     if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
     const [removed] = arr.splice(index, 1);
     if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
+    // Removing an @import also unlinks its CHILD sheet from this one — the child
+    // object survives (a page may hold it), but it belongs to nobody now.
+    try {
+      if (removed && removed.type === 3 && removed._styleSheet) removed._styleSheet._parentStyleSheet = null;
+    } catch (e) {}
   }
 }
 _exposeIface('CSSGroupingRule', CSSGroupingRule);
@@ -32777,6 +33007,7 @@ class CSSImportRule extends CSSRule {
     this._media = _makeMediaList(p.mediaText);
     const sheet = new CSSStyleSheet();
     sheet._ownerRule = this;            // ownerRule is a readonly getter now (backing field)
+    sheet._constructed = false;         // an imported sheet is a document sheet, not a constructed one
     this._styleSheet = sheet;
   }
   get type() { return 3; }                                 // CSSRule.IMPORT_RULE
@@ -32787,7 +33018,21 @@ class CSSImportRule extends CSSRule {
   // CSS Cascade 5 partial: the cascade layer this sheet is imported into — the layer
   // name, '' for an anonymous `layer`, or null when no layer was specified.
   get layerName() { if (!(this instanceof CSSImportRule)) throw new TypeError("Illegal invocation"); return this._layerName; }
-  get styleSheet() { if (!(this instanceof CSSImportRule)) throw new TypeError("Illegal invocation"); return this._styleSheet; }
+  get styleSheet() {
+    if (!(this instanceof CSSImportRule)) throw new TypeError("Illegal invocation");
+    // The child sheet's rules are filled in lazily from the shared text cache —
+    // the fetch was kicked when the rule was built, and each rule owns its own
+    // CSSStyleSheet object even when two rules name one URL (the CSSOM requires
+    // distinct objects; only the TEXT is shared).
+    const sh = this._styleSheet;
+    try {
+      if (!sh.__importFilled && this._absHref) {
+        const ent = _importedCssCache.get(this._absHref);
+        if (ent && ent.state === 'done') { sh._setRules(ent.text); sh.__importFilled = true; }
+      }
+    } catch (e) {}
+    return sh;
+  }
   get [Symbol.toStringTag]() { return 'CSSImportRule'; }
   get cssText() {
     let out = '@import url(' + _serCssString(this._href) + ')';
@@ -34076,6 +34321,25 @@ const _makeRule = (desc, parentSheet, parentRule) => {
     try { rule = new CSSImportRule(desc); } finally { _allowCssCondCtor = false; }
     rule._parentStyleSheet = parentSheet || null;
     rule._parentRule = parentRule || null;
+    // Link the child sheet and start its fetch: the imported sheet is a REAL
+    // sheet now, not an empty placeholder. Relative targets resolve against the
+    // parent sheet's own address (a <link>'s file URL; the document for <style>).
+    try {
+      const child = rule._styleSheet;
+      child._parentStyleSheet = parentSheet || null;
+      if (rule._href) {
+        const base = (parentSheet && (parentSheet._href || parentSheet._baseURL))
+          || _domParse("document_url") || "about:blank";
+        let abs = rule._href;
+        try { abs = new URL(rule._href, base).href; } catch (e) {}
+        rule._absHref = abs;
+        child._href = abs;
+        // A CONSTRUCTED sheet never loads imports (its replace()/replaceSync()
+        // strip them before parse, and insertRule refuses them) — but a rule
+        // built for a document sheet fetches once, shared by URL.
+        if (!(parentSheet && parentSheet._constructed)) _importFetchCss(abs);
+      }
+    } catch (e) {}
     return rule;
   }
   if (desc.type === 'stmt' && desc.name === 'namespace') {
@@ -34170,6 +34434,30 @@ class CSSStyleSheet extends StyleSheet {
     const parsed = _cssParseRuleList(text);
     if (parsed.length !== 1) throw new DOMException("insertRule expects exactly one rule.", "SyntaxError");
     _assertRuleSelectorValid(parsed[0]);
+    const newIsImport = parsed[0].type === 'stmt' && parsed[0].name === 'import';
+    // A constructed sheet refuses @import outright (construct-stylesheets:
+    // imports and the async loads they imply have no place in a sheet built
+    // from a string) — SyntaxError, per the WPT for the resolved issue.
+    if (newIsImport && this._constructed)
+      throw new DOMException("@import is not allowed in a constructed style sheet.", "SyntaxError");
+    // CSSOM §insert-a-css-rule ordering: @import lives before every other kind
+    // of rule (@layer statements aside). Inserting a non-import ABOVE an
+    // existing import — or an import BELOW a non-import — is a
+    // HierarchyRequestError, not a silent reordering.
+    const _precedesImport = (r) => r && (r.type === 3
+      || (r instanceof CSSLayerStatementRule && !arr.slice(0, arr.indexOf(r)).some((x) => x && x.type !== 3 && !(x instanceof CSSLayerStatementRule))));
+    if (!newIsImport) {
+      for (let k2 = index; k2 < arr.length; k2++) {
+        if (arr[k2] && arr[k2].type === 3)
+          throw new DOMException("Cannot insert a rule before an @import rule.", "HierarchyRequestError");
+      }
+    } else {
+      for (let k2 = 0; k2 < index; k2++) {
+        const r = arr[k2];
+        if (r && r.type !== 3 && !(r instanceof CSSLayerStatementRule))
+          throw new DOMException("An @import rule cannot follow other rules.", "HierarchyRequestError");
+      }
+    }
     arr.splice(index, 0, _makeRule(parsed[0], this, null));
     return index;
   }
@@ -34180,6 +34468,11 @@ class CSSStyleSheet extends StyleSheet {
     if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
     const [removed] = arr.splice(index, 1);
     if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
+    // Removing an @import also unlinks its CHILD sheet from this one — the child
+    // object survives (a page may hold it), but it belongs to nobody now.
+    try {
+      if (removed && removed.type === 3 && removed._styleSheet) removed._styleSheet._parentStyleSheet = null;
+    } catch (e) {}
   }
   // Legacy CSSStyleSheet members (CSSOM §legacy-css-style-sheet-members). addRule
   // string-concatenates a selector + block into a rule, inserts it (index defaults
@@ -40372,7 +40665,29 @@ const _evalSupportsOperand = (part) => {
       const sctx = { f: { forgiving: false }, inHas: false, noComb: false };
       return _parseSelectorList(inner, false, sctx) !== null && !sctx.f.forgiving;
     }
-    return false;                                     // font-tech()/font-format()/unknown → general-enclosed
+    // css-fonts-4 <supports-feature>s: a known keyword is support, an unknown one
+    // is not — these are enumerated grammars, not probes of a font engine.
+    if (part.name === 'font-tech') {
+      const inner = part.v.slice(1, -1).trim().toLowerCase();
+      return ['color-colrv0', 'color-colrv1', 'color-svg', 'color-sbix', 'color-cbdt',
+        'variations', 'palettes', 'features-opentype', 'features-aat',
+        'features-graphite', 'incremental'].indexOf(inner) !== -1;
+    }
+    if (part.name === 'font-format') {
+      const inner = part.v.slice(1, -1).trim().toLowerCase();
+      return ['collection', 'embedded-opentype', 'opentype', 'svg', 'truetype',
+        'woff', 'woff2'].indexOf(inner) !== -1;
+    }
+    // css-conditional-5 at-rule(): does this engine recognize the at-rule (and
+    // that is the question — not whether it is fully implemented elsewhere).
+    if (part.name === 'at-rule') {
+      const inner = part.v.slice(1, -1).trim().toLowerCase();
+      const m = /^@([a-z-]+)$/.exec(inner);
+      return !!m && ['media', 'supports', 'import', 'charset', 'namespace', 'keyframes',
+        'font-face', 'page', 'layer', 'property', 'counter-style', 'container',
+        'scope', 'font-feature-values', 'font-palette-values', 'starting-style'].indexOf(m[1]) !== -1;
+    }
+    return false;                                     // unknown function → general-enclosed
   }
   // a parenthesized group
   const inner = part.v.slice(1, -1).trim();
@@ -47073,14 +47388,22 @@ const _cspInlineAllowed = (type, element, source) => {
     const list = gov.list;
     const nonces = list.filter((s) => _CSP_NONCE_RE.test(s));
     const hashes = list.filter((s) => _CSP_HASH_RE.test(s));
+    // `'strict-dynamic'` is script-only; in a style directive the token is inert.
+    const sd = type.indexOf('script') === 0 && _cspHasStrictDynamic(list);
     let ok = false;
     // ⭐⭐ A NONCE OR A HASH IN THE LIST TURNS `'unsafe-inline'` OFF. That looks
     // like a contradiction and is the most important line in the whole spec: it
     // is how a site ships ONE policy that both old browsers and new ones read
     // correctly. An old browser that does not understand nonces sees
     // `'unsafe-inline'` and at least runs the page; a new one ignores it and
-    // enforces the nonce. Honouring both would enforce neither.
-    if (list.some((s) => _asciiLower(s) === "'unsafe-inline'") && !nonces.length && !hashes.length) ok = true;
+    // enforces the nonce. Honouring both would enforce neither. `'strict-dynamic'`
+    // turns it off the same way, for the same reason.
+    if (list.some((s) => _asciiLower(s) === "'unsafe-inline'") && !nonces.length && !hashes.length && !sd) ok = true;
+    // ⭐ Under `'strict-dynamic'`, an inline <script> BUILT BY trusted script
+    // (createElement + textContent + appendChild) inherits that trust — the
+    // propagation is the whole point of the keyword. Only elements: an inline
+    // event handler attribute is authored markup, never propagated trust.
+    if (!ok && sd && !isAttr && element && element._nonParserInserted) ok = true;
     if (!ok && !isAttr && nonces.length && element) {
       let n = null;
       try { n = element.nonce || element.getAttribute('nonce'); } catch (e) { n = null; }
@@ -47122,7 +47445,22 @@ const _cspURLAllowed = (directive, urlText, element) => {
     const gov = _cspGoverning(policy, directive);
     if (!gov) continue;
     const list = gov.list;
-    if (_cspHasStrictDynamic(list)) continue;   // see _cspHasStrictDynamic: a named cap
+    // ⭐⭐ `'strict-dynamic'` (CSP3 §8.2): in a SCRIPT directive it replaces URL
+    // matching with TRUST PROPAGATION — host sources and `'self'` stop counting,
+    // and what decides is how the script came to exist. A script inserted by
+    // already-trusted script (non-parser-inserted) is allowed, wrong nonce and
+    // all; one the PARSER made (markup, document.write) must have matched a
+    // nonce/hash before we got here (`__cspAllowsScriptURL` strips policies a
+    // nonce or vouched integrity satisfied). A worker is never parser-inserted.
+    // In a NON-script directive the keyword means nothing: fall through and
+    // match the list normally — the quoted token itself matches no URL.
+    if (_cspHasStrictDynamic(list)
+        && (directive === 'script-src-elem' || directive === 'script-src' || directive === 'worker-src')) {
+      if (directive === 'worker-src' || (element && element._nonParserInserted)) continue;
+      _cspReport(policy, directive, gov.name, url.href, element, '');
+      if (policy.disposition === 'enforce') allowed = false;
+      continue;
+    }
     // A list of exactly 'none' forbids everything; nonces and hashes never match
     // a URL, so a list made only of those forbids everything too.
     let ok = false;
@@ -47519,7 +47857,10 @@ globalThis.__cspAllowsScriptURL = (nid, url) => {
           (p) => permitted.indexOf(p.alg + '-' + _cspB64Norm(p.b64)) !== -1);
         if (allVouched) return false;           // authorised: this policy has no further say
       }
-      return !_cspHasStrictDynamic(gov.list);
+      // A policy with `'strict-dynamic'` that no nonce/hash satisfied is KEPT:
+      // `_cspURLAllowed` now decides it by parser-inserted-ness rather than
+      // being skipped (the old fail-open cap, closed in Quest #535).
+      return true;
     });
     const saved = _cspState.policies;
     _cspState.policies = kept;
@@ -47555,6 +47896,10 @@ globalThis.__cspHasPolicies = () => _cspState.policies.length > 0;
 // gets to see header-delivered policies without either side re-implementing the
 // other.
 globalThis.__cspSerializedPolicies = () => _cspState.policies.map((p) => p.text);
+// The ENFORCED policies only — what the render path's net provider compiles
+// into fetch decisions. A report-only policy must never change what loads.
+globalThis.__cspEnforcedPolicies = () =>
+  _cspState.policies.filter((p) => p.disposition === 'enforce').map((p) => p.text);
 globalThis.__cspInstallEvalGate = () => { try { _cspInstallEvalGate(); } catch (e) {} };
 
 // ── style-src ───────────────────────────────────────────────────────────────
@@ -59711,7 +60056,43 @@ globalThis.prompt = function() { return null; };
 globalThis.open = function() { return null; };
 globalThis.close = function() {};
 globalThis.stop = function() {};
-globalThis.postMessage = function() {};
+// HTML §window.postMessage — the top-level window posting to ITSELF. This was a
+// no-op stub, which silently broke the most common cross-piece signalling idiom
+// on the web (and the relay every CSP `simpleSourcedScript.js` test hangs on):
+// a helper posts, the page listens, and a listener that never hears is
+// indistinguishable from a helper that never ran. The message is structured-
+// cloned NOW (a DataCloneError belongs to the caller, synchronously) and
+// delivered on a TASK (the caller must be able to attach its listener on the
+// next line and still hear this message).
+globalThis.postMessage = function(message, targetOriginOrOptions) {
+  let targetOrigin = '/';
+  if (targetOriginOrOptions && typeof targetOriginOrOptions === 'object'
+      && !Array.isArray(targetOriginOrOptions)) {
+    targetOrigin = targetOriginOrOptions.targetOrigin !== undefined
+      ? String(targetOriginOrOptions.targetOrigin) : '/';
+  } else if (targetOriginOrOptions !== undefined) {
+    targetOrigin = String(targetOriginOrOptions);
+  }
+  let ownOrigin = 'null';
+  try { ownOrigin = location.origin; } catch (e) {}
+  if (targetOrigin !== '*' && targetOrigin !== '/') {
+    let parsed = null;
+    try { parsed = new URL(targetOrigin); } catch (e) {
+      throw new DOMException("Invalid target origin '" + targetOrigin + "'", 'SyntaxError');
+    }
+    // A mismatched targetOrigin drops the message SILENTLY — that is the
+    // feature: the caller names who may hear, and nobody else learns anything.
+    if (parsed.origin !== ownOrigin) return;
+  }
+  const data = (typeof structuredClone === 'function') ? structuredClone(message) : message;
+  _queueTask(() => {
+    try {
+      const ev = new MessageEvent('message', { data: data, origin: ownOrigin, source: globalThis });
+      ev.isTrusted = true;
+      _dispatchSpec(globalThis, ev);
+    } catch (e) {}
+  });
+};
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 // ══════════════════════════════════════════════════════════════════════════════

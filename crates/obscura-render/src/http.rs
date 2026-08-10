@@ -81,6 +81,9 @@ pub struct ObscuraNetProvider {
     client: Arc<ObscuraHttpClient>,
     block_patterns: Vec<String>,
     inflight: Arc<Inflight>,
+    /// The document's enforced Content Security Policy, compiled for fetch
+    /// decisions. Empty (the default) gates nothing.
+    csp: crate::csp::RenderCsp,
 }
 
 impl ObscuraNetProvider {
@@ -89,7 +92,16 @@ impl ObscuraNetProvider {
             client,
             block_patterns,
             inflight: Arc::new(Inflight::new()),
+            csp: crate::csp::RenderCsp::default(),
         }
+    }
+
+    /// Builder: run every fetch under this document CSP (enforced policies
+    /// only). Ask BEFORE fetching — the request itself is the leak a resource
+    /// directive exists to stop.
+    pub fn with_csp(mut self, csp: crate::csp::RenderCsp) -> Self {
+        self.csp = csp;
+        self
     }
 
     fn is_blocked(&self, url: &str) -> bool {
@@ -156,6 +168,16 @@ fn hex_val(b: u8) -> Option<u8> {
 impl NetProvider for ObscuraNetProvider {
     fn fetch(&self, _doc_id: usize, request: Request, handler: Box<dyn NetHandler>) {
         let url = request.url;
+        // The CSP question comes first, and it covers data: too (`img-src
+        // data:` is a real policy). A refused resource simply never arrives —
+        // for a stylesheet that also means empty bytes are delivered so the
+        // renderer does not wait on a load that will never happen.
+        if !self.csp.allows(request.kind, &url) {
+            if request.kind == blitz_traits::net::ResourceKind::Style {
+                handler.bytes(url.to_string(), Bytes::new());
+            }
+            return;
+        }
         match url.scheme() {
             // Inline data: payloads never hit the network.
             "data" => {
