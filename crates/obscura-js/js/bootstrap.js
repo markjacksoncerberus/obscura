@@ -10514,6 +10514,34 @@ globalThis.__obscuraAdoptLinkSheet = function (nid, css) {
     try { _sheetRuleCache.delete(el); } catch (e) {}
     _styleGen++;
     if (_csArmHook) _csArmHook();
+    // `font-src` on the fonts this stylesheet names. The FETCH is refused inside
+    // the render path's net provider (which compiles the enforced policies), but
+    // that side is deliberately silent and may never even run under on-demand
+    // rendering — the page-visible `securitypolicyviolation` event has to come
+    // from here, at adoption, where the stylesheet text first becomes known.
+    _cspScanFontFaces(el.__linkSheetText, el.href || null, el);
+  } catch (e) {}
+};
+// Ask font-src about each @font-face's first url() source (the one the engine
+// would fetch) — __cspAllowsURL fires the violation event/report when a policy
+// objects. ⛔ Cap: only <link> sheets are scanned (a <style>'s @font-face URLs
+// are refused at fetch but unreported), and only the FIRST url() per rule.
+const _cspScanFontFaces = (cssText, baseUrl, el) => {
+  try {
+    if (typeof globalThis.__cspAllowsURL !== 'function') return;
+    if (typeof globalThis.__cspHasPolicies === 'function' && !globalThis.__cspHasPolicies()) return;
+    const css = String(cssText || '');
+    if (!/@font-face/i.test(css)) return;
+    for (const m of css.matchAll(/@font-face\s*\{([^}]*)\}/gi)) {
+      const sm = /(?:^|;|\s)src\s*:\s*([^;]+)/i.exec(m[1]);
+      if (!sm) continue;
+      const um = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]+))\s*\)/i.exec(sm[1]);
+      const raw = um && (um[1] != null ? um[1] : um[2] != null ? um[2] : um[3]);
+      if (!raw) continue;
+      let abs = raw;
+      try { abs = new URL(raw, baseUrl || _domParse('document_url') || 'about:blank').href; } catch (e) {}
+      globalThis.__cspAllowsURL('font-src', abs, el);
+    }
   } catch (e) {}
 };
 
@@ -10536,14 +10564,12 @@ const _connectResourceElement = function(el) {
     const data = el.getAttribute('data') || el.data;
     if (data) { el._resConnected = true; _loadElementResource(el, data, 'object'); }
   } else if (ln === 'style') {
-    // A <style> that imports sheets fires a `load` event once its (sub)sheets load
-    // (HTML §the-style-element). We don't fetch @import targets, so fire on a queued
-    // task after connection. Scoped to @import-bearing styles so the many plain
-    // <style>s that never observe load are left untouched.
-    if (/@import/i.test(el.textContent || '')) {
-      el._resConnected = true;
-      Promise.resolve().then(() => { try { _fireIframeElementLoad(el); } catch (e) {} });
-    }
+    // EVERY connected <style> fires `load` once its style block is processed
+    // (HTML §the-style-element §update-a-style-block) — not just @import-bearing
+    // ones. A page that awaits `styleElement.onload` before reading the sheet
+    // hangs forever if the plain-CSS case never fires.
+    el._resConnected = true;
+    Promise.resolve().then(() => { try { _fireIframeElementLoad(el); } catch (e) {} });
   }
 };
 
@@ -14410,15 +14436,23 @@ const _importConditionMatches = (p) => {
   }
   return true;
 };
-const _cssSplitRules = (cssText, quirks, base, _depth) => {
-  // Returns [{ selectorText, decls }] — the flat, cascade-shaped view of a sheet.
-  // Conditional groups (@media/@supports) contribute their contents when their
-  // condition holds; `@layer` blocks contribute theirs in place (⛔ cap: layer
-  // ORDERING is not modelled — a layered rule participates like an unlayered one
-  // at its position, which is closer to author intent than the previous state,
-  // where everything inside any at-rule was invisible to getComputedStyle);
-  // `@import` splices the imported sheet's rules at its position. Other at-rules
-  // are still skipped whole.
+// A `<layer-name>` is ident(.ident)* — anything else makes the whole rule invalid.
+const _LAYER_PATH_RE = /^-?[A-Za-z_][\w-]*(\.-?[A-Za-z_][\w-]*)*$/;
+// Anonymous layers are distinct from every other layer, each occurrence its own —
+// a counter gives each block/import a name no author-written ident can collide
+// with ('«' is not an ident code point). The counter never resets: a cached
+// sheet keeps the names its parse minted, so its anonymous layers stay themselves
+// across cascade rebuilds instead of colliding with a later sheet's.
+let _anonLayerN = 0;
+const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
+  // Returns [{ selectorText, decls, layer }] — the flat, cascade-shaped view of a
+  // sheet. `layer` is the rule's cascade-layer path (array of name segments) or
+  // null for an unlayered rule; `{ layerDecl: [paths] }` marker entries record
+  // where a layer NAME first appears (statements, empty blocks, layer() imports)
+  // so _buildCascadeUncached can build the layer order even from layers that
+  // contribute no rules. Conditional groups (@media/@supports) contribute their
+  // contents when their condition holds; `@import` splices the imported sheet's
+  // rules at its position. Other at-rules are still skipped whole.
   // ⚠️ A comment is replaced by a SPACE, not by nothing. CSS Syntax consumes a
   // comment and emits no token, so `+/**/1` is two tokens (a `+` delimiter and
   // the number 1) and is invalid wherever one number token is required. Deleting
@@ -14443,22 +14477,64 @@ const _cssSplitRules = (cssText, quirks, base, _depth) => {
       else if (!paren && (c === '{' || c === '}' || c === ';')) break;
       j++;
     }
-    if (j >= n) break;
+    if (j >= n) {
+      // Trailing chunk with no terminator: inside @scope it can be a bare
+      // declaration (`@scope (.a) { color: green }` — no semicolon at all).
+      const stmt = css.slice(i, n).trim();
+      if (stmt && stmt[0] !== '@' && _scope && stmt.indexOf(':') >= 0) {
+        const bare = _cssParseDecls(stmt, quirks);
+        for (const k in bare) {
+          rules.push({ scopeRootOnly: true, decls: bare, layer: _layer || null, scope: _scope });
+          break;
+        }
+      }
+      break;
+    }
     const ch = css[j];
     if (ch === ';') {
-      // A statement at-rule. Only @import contributes rules; the depth cap keeps
-      // an import cycle from being a hang (a sheet importing itself terminates).
+      // A statement at-rule. @import contributes rules (the depth cap keeps an
+      // import cycle from being a hang); a `@layer a, b;` statement contributes
+      // no rules but does declare layer ORDER, so it emits a marker.
       const stmt = css.slice(i, j).trim();
       i = j + 1;
+      if (stmt && stmt[0] !== '@' && _scope && stmt.indexOf(':') >= 0) {
+        // Bare declarations directly inside an @scope block style the scope
+        // ROOT with zero specificity (css-cascade-6 §scoped-declarations) —
+        // emitted as scopeRootOnly rules instead of being dropped.
+        const bare = _cssParseDecls(stmt, quirks);
+        for (const k in bare) {
+          rules.push({ scopeRootOnly: true, decls: bare, layer: _layer || null, scope: _scope });
+          break;
+        }
+        continue;
+      }
       if (depth < 6 && /^@import\b/i.test(stmt)) {
         const p = _parseImportRule(stmt);
         if (p.href && _importConditionMatches(p)) {
           let abs = p.href;
           try { abs = new URL(p.href, base || _domParse("document_url") || "about:blank").href; } catch (e) {}
+          // `@import … layer(name)` imports INTO a layer; bare `layer` into an
+          // anonymous one. The layer exists (and takes its order slot) even if
+          // the fetch fails — css-cascade-5 says a layer() import establishes
+          // its layer regardless of whether the sheet loads.
+          let sub = _layer || null;
+          if (p.layerName != null) {
+            const segs = p.layerName === '' ? [`«anon-${_anonLayerN++}»`]
+              : (_LAYER_PATH_RE.test(p.layerName) ? p.layerName.split('.') : null);
+            if (segs === null) continue;             // invalid layer name → rule invalid
+            sub = (_layer || []).concat(segs);
+            rules.push({ layerDecl: [sub] });
+          }
           const ent = _importFetchCss(abs);
           if (ent.state === 'done') {
-            for (const r of _cssSplitRules(ent.text, quirks, abs, depth + 1)) rules.push(r);
+            for (const r of _cssSplitRules(ent.text, quirks, abs, depth + 1, sub, _scope)) rules.push(r);
           }
+        }
+      } else if (/^@layer\b/i.test(stmt)) {
+        const names = stmt.replace(/^@layer\s*/i, '').split(',').map((s) => s.trim());
+        // One invalid name invalidates the whole statement (CSS invalid-rule rule).
+        if (names.length && names.every((nm) => _LAYER_PATH_RE.test(nm))) {
+          rules.push({ layerDecl: names.map((nm) => (_layer || []).concat(nm.split('.'))) });
         }
       }
       continue;
@@ -14482,29 +14558,52 @@ const _cssSplitRules = (cssText, quirks, base, _depth) => {
     if (!prelude) continue;
     if (prelude[0] === '@') {
       if (depth < 6) {
-        const gm = /^@(media|supports|layer)\b([\s\S]*)$/i.exec(prelude);
+        const gm = /^@(media|supports|layer|scope)\b([\s\S]*)$/i.exec(prelude);
         if (gm) {
           const name = gm[1].toLowerCase();
           const cond = gm[2].trim();
           let applies = false;
-          if (name === 'layer') applies = true;   // block form always applies (see cap above)
+          let sub = _layer || null;
+          let subScope = _scope || null;
+          if (name === 'scope') {
+            // `@scope (root)? [to (limit)]? { … }` (css-cascade-6): its rules
+            // carry a scope FRAME — root/limit selectors, or implicit (the owner
+            // <style>'s parent, resolved at cascade time). Frames stack for
+            // nested @scope.
+            const p = _parseScopePrelude(cond);
+            subScope = (_scope || []).concat({ start: p.start, end: p.end, implicit: p.start == null });
+            applies = true;
+          }
+          else if (name === 'layer') {
+            // Block form: `@layer name? { … }` — its contents belong to that
+            // layer (nested under the current one); no name means a fresh
+            // anonymous layer. An invalid name invalidates the whole block.
+            const segs = cond === '' ? [`«anon-${_anonLayerN++}»`]
+              : (_LAYER_PATH_RE.test(cond) ? cond.split('.') : null);
+            if (segs !== null) {
+              sub = (_layer || []).concat(segs);
+              rules.push({ layerDecl: [sub] });    // the block itself declares the layer, even empty
+              applies = true;
+            }
+          }
           else if (name === 'media') {
             try { applies = !cond || globalThis.matchMedia(cond).matches; } catch (e) { applies = false; }
           } else {
             try { applies = !!_evalSupportsCondition(cond); } catch (e) { applies = false; }
           }
           if (applies) {
-            for (const r of _cssSplitRules(body, quirks, base, depth + 1)) rules.push(r);
+            for (const r of _cssSplitRules(body, quirks, base, depth + 1, sub, subScope)) rules.push(r);
           }
         }
       }
       continue; // other at-rules (keyframes/font-face/page/…) stay skipped
     }
-    rules.push({ selectorText: prelude, decls: _cssParseDecls(body, quirks) });
+    rules.push({ selectorText: prelude, decls: _cssParseDecls(body, quirks), layer: _layer || null, scope: _scope || null });
   }
   return rules;
 };
 const _sheetRuleCache = new WeakMap(); // styleEl -> { text, rules }
+const _liveRuleCache = new WeakMap();  // styleEl -> { text, rules } (CSSOM-dirty sheets, keyed on live serialization)
 // The CSS text a style-bearing element contributes.
 //
 // A `<style>` keeps its rules in its child text node. A `<link rel=stylesheet>`
@@ -14528,12 +14627,30 @@ const _styleSheetRules = (styleEl) => {
   // serve the cascade from those live rules so a CSSOM edit is honoured by
   // getComputedStyle. Gated on _cssomDirty so untouched pages keep the fast
   // text-parse path byte-for-byte (zero regression).
+  //
+  // The live rules are re-serialized and fed through the same splitter as the
+  // text path — the earlier shape (top-level type-1 rules only) silently DROPPED
+  // every at-rule from the cascade, so one CSSOM write into a sheet that also
+  // carried @layer/@media blocks made those blocks' rules vanish from
+  // getComputedStyle while layout kept honouring them.
   try {
     const sheet = _nodeSheetMap && _nodeSheetMap.get(styleEl);
     if (sheet && sheet._cssomDirty && sheet.__text === text) {
-      return sheet._ruleListObj._rules
-        .filter((r) => r && r.type === 1)
-        .map((r) => ({ selectorText: r._selectorSource, decls: r._cascadeDecls }));
+      const parts = [];
+      for (const r of sheet._ruleListObj._rules) {
+        try { const t = r && r.cssText; if (t) parts.push(t); } catch (e) {}
+      }
+      const liveText = parts.join('\n');
+      let quirksL = false;
+      try { quirksL = _docIsQuirks(styleEl.ownerDocument); } catch (e) { quirksL = false; }
+      const cachedL = _liveRuleCache.get(styleEl);
+      if (cachedL && cachedL.text === liveText && cachedL.quirks === quirksL && cachedL.igen === _importGen) return cachedL.rules;
+      let base = null;
+      try { if (styleEl.localName === 'link') base = styleEl.href || null; } catch (e) { base = null; }
+      const rules = _cssSplitRules(liveText, quirksL, base);
+      for (const r of rules) if (r.scope && !r.scopeOwner) r.scopeOwner = styleEl;   // implicit @scope roots at the owner's parent
+      _liveRuleCache.set(styleEl, { text: liveText, rules, quirks: quirksL, igen: _importGen });
+      return rules;
     }
   } catch (e) {}
   // A stylesheet is parsed in the mode of the document it belongs to — a quirks
@@ -14551,6 +14668,7 @@ const _styleSheetRules = (styleEl) => {
     if (styleEl.localName === 'link') base = styleEl.href || null;
   } catch (e) { base = null; }
   const rules = _cssSplitRules(text, quirks, base);
+  for (const r of rules) if (r.scope && !r.scopeOwner) r.scopeOwner = styleEl;   // implicit @scope roots at the owner's parent
   _sheetRuleCache.set(styleEl, { text, rules, quirks, igen: _importGen });
   return rules;
 };
@@ -17319,7 +17437,7 @@ const _INHERITED_PROPS = new Set([
   // css-size-adjust: text-size-adjust inherits (initial `auto`).
   'text-size-adjust',
 ]);
-const _CSS_WIDE = new Set(['initial', 'inherit', 'unset', 'revert', 'revert-layer']);
+const _CSS_WIDE = new Set(['initial', 'inherit', 'unset', 'revert', 'revert-layer', 'revert-rule']);
 // Initial (computed) value for a property. The defaults table doubles as the
 // initial-values table; colour properties not present in it fall back to a
 // sensible initial.
@@ -27915,18 +28033,59 @@ const _atPropRegsOf = (styleEl) => {
   if (cached && cached.text === text) return cached.regs;
   const regs = [];
   if (/@property/i.test(text)) {
-    for (const r of _cssParseRuleList(text)) {
-      if (r.type !== 'property' || !r._prop) continue;
-      const syn = _parsePropSyntax(r._prop.syntaxValue);
-      if (syn) regs.push({ name: r._prop.name, reg: { syn, inherits: r._prop.inherits, initialValue: r._prop.initialValue } });
-    }
+    // Walk into @layer blocks too, tagging each registration with its layer path
+    // (null = unlayered): @property name conflicts resolve by cascade-layer order,
+    // not bare document order (css-cascade-5 + properties-values-api).
+    const walk = (list, layer) => {
+      for (const r of list) {
+        if (r.type === 'property' && r._prop) {
+          const syn = _parsePropSyntax(r._prop.syntaxValue);
+          if (syn) regs.push({ name: r._prop.name, layer, reg: { syn, inherits: r._prop.inherits, initialValue: r._prop.initialValue } });
+        } else if (r.type === 'layer-block' && r.rules) {
+          const segs = r.condition === '' ? [`«cssom-anon-${_anonLayerN++}»`] : r.condition.split('.');
+          walk(r.rules, (layer || []).concat(segs));
+        }
+      }
+    };
+    walk(_cssParseRuleList(text), null);
   }
   _atPropCache.set(styleEl, { text, regs });
   return regs;
 };
+// The layer-order key for every layer the document's sheets declare, keyed by the
+// joined layer-name path — the same first-appearance sibling-index walk the
+// cascade uses, so an @property conflict resolves against the same order the
+// style rules cascade by.
+const _docLayerKeys = (doc) => {
+  let styleEls = [];
+  try { styleEls = doc.querySelectorAll('style, link[rel~="stylesheet"]'); } catch (e) { styleEls = []; }
+  const root = { children: new Map() };
+  const keyFor = (path) => {
+    let node = root; const key = [];
+    for (const seg of path) {
+      let child = node.children.get(seg);
+      if (!child) { child = { idx: node.children.size, children: new Map() }; node.children.set(seg, child); }
+      key.push(child.idx); node = child;
+    }
+    return key;
+  };
+  const map = new Map();
+  for (const se of styleEls) {
+    let rules = [];
+    try { rules = _styleSheetRules(se); } catch (e) { rules = []; }
+    for (const r of rules) {
+      const paths = r.layerDecl || (r.layer ? [r.layer] : null);
+      if (!paths) continue;
+      for (const p of paths) { const k = keyFor(p); if (!map.has(p.join('.'))) map.set(p.join('.'), k); }
+    }
+  }
+  return map;
+};
 // The effective registration for a custom-property `name` (or null when it is not
 // registered). A CSS.registerProperty registration ALWAYS wins over an @property
-// rule; among @property rules the LAST in document order wins (determine-registration).
+// rule; among @property rules the winner follows NORMAL declaration order across
+// layers — unlayered beats layered, a later layer beats an earlier one — with
+// document order breaking ties (determine-registration).
 const _effectivePropReg = (el, name) => {
   const js = _registeredProps.get(name);
   if (js) return js;                                         // registerProperty wins over @property
@@ -27934,10 +28093,19 @@ const _effectivePropReg = (el, name) => {
   const doc = (el && el.ownerDocument) || globalThis.document;
   let styleEls = [];
   try { styleEls = doc.querySelectorAll('style'); } catch { styleEls = []; }
-  let found = null;
+  let found = null, foundKey = null, anyLayered = false, keys = null;
   for (const styleEl of styleEls)
-    for (const entry of _atPropRegsOf(styleEl))
-      if (entry.name === name) found = entry.reg;            // later in document order wins
+    for (const entry of _atPropRegsOf(styleEl)) {
+      if (entry.name !== name) continue;
+      if (entry.layer && !anyLayered) {
+        anyLayered = true;
+        keys = _docLayerKeys(doc);
+      }
+      // A layer the cascade walk never saw ranks weakest ([-1] sorts before any
+      // real sibling index); unlayered is null → all-Infinity → strongest.
+      const k = entry.layer ? ((keys && keys.get(entry.layer.join('.'))) || [-1]) : null;
+      if (found === null || _layerCmp(k, foundKey) >= 0) { found = entry.reg; foundKey = k; }
+    }
   return found;
 };
 // Canonicalize a <resolution> to dppx (96dpi = 1dppx; 1dpcm = 2.54/96 dppx). A
@@ -28467,13 +28635,58 @@ const _buildCascadeUncached = (el) => {
     // `!important`, so the importance-first ordering never lifts one above an
     // author rule — which is the whole point of an origin.)
     const uaDecls = _uaDecls(el);
-    if (uaDecls) sources.push({ spec: 0, order: -2, decls: uaDecls });
+    if (uaDecls) sources.push({ spec: 0, order: -2, decls: uaDecls, uaLike: true });
     const hintDecls = _presHintDecls(el);
-    if (hintDecls) sources.push({ spec: 0, order: -1, decls: hintDecls });
+    // `hint` distinguishes presentational hints from the UA sheet inside the
+    // uaLike pair: `revert` rolls hints back (they are author-origin to it)
+    // while `revert-layer` leaves them standing (an independent origin between
+    // user and author — css-cascade-5 §preshint).
+    if (hintDecls) sources.push({ spec: 0, order: -1, decls: hintDecls, uaLike: true, hint: true });
+    // Cascade layers (css-cascade-5): layer ORDER is first-appearance order of
+    // each name among its siblings, taken over the whole document in cascade
+    // order — which is exactly the order `flat` already has. A rule's layer path
+    // becomes a numeric key array (one sibling index per segment) compared
+    // lexicographically in _cascadeWinner, where a missing tail reads as
+    // Infinity so a layer's DIRECT rules outrank its sub-layers' the same way
+    // unlayered rules (empty path ⇒ all-Infinity) outrank every layer.
+    // `_layered` stays false on a layerless page, which keeps the winner
+    // comparison on its original path byte for byte.
+    let layerRoot = null;
+    const layerKey = (path) => {
+      if (!layerRoot) layerRoot = { children: new Map() };
+      let node = layerRoot; const key = [];
+      for (const seg of path) {
+        let child = node.children.get(seg);
+        if (!child) { child = { idx: node.children.size, children: new Map() }; node.children.set(seg, child); }
+        key.push(child.idx); node = child;
+      }
+      return key;
+    };
     let order = 0;
     for (const rule of flat) {
-      const spec = parseInt(_dom('selector_match_specificity', String(nid), rule.selectorText), 10);
-      if (spec >= 0) sources.push({ spec, order: order++, decls: rule.decls });
+      if (rule.layerDecl) {                       // layer-order marker, not a rule
+        sources._layered = true;
+        for (const p of rule.layerDecl) layerKey(p);
+        continue;
+      }
+      const lpath = rule.layer ? layerKey(rule.layer) : null;
+      if (lpath) sources._layered = true;
+      let selText = rule.selectorText, prox;
+      if (rule.scope) {
+        const sc = _scopedSelectorFor(el, rule);
+        if (!sc) continue;
+        if (sc.sel === null) {   // bare scoped declarations: root-only, zero specificity
+          sources._scoped = true;
+          sources.push({ spec: 0, order: order++, decls: rule.decls, lpath, prox: sc.prox });
+          continue;
+        }
+        selText = sc.sel; prox = sc.prox;
+      }
+      const spec = parseInt(_dom('selector_match_specificity', String(nid), selText), 10);
+      if (spec >= 0) {
+        if (prox !== undefined) sources._scoped = true;
+        sources.push({ spec, order: order++, decls: rule.decls, lpath, prox });
+      }
     }
     // Adopted constructable stylesheets (document.adoptedStyleSheets) apply at
     // author origin, ordered after the document's <style> rules (later source
@@ -28489,10 +28702,51 @@ const _buildCascadeUncached = (el) => {
         let arr = null;
         try { arr = sheet.cssRules && sheet.cssRules._rules; } catch { arr = null; }
         if (!arr) continue;
-        for (const r of arr) {
-          if (!r || r.type !== 1) continue;
-          const spec = parseInt(_dom('selector_match_specificity', String(nid), r._selectorSource || r.selectorText), 10);
-          if (spec >= 0) sources.push({ spec, order: order++, decls: r._cascadeDecls });
+        let anyAt = false;
+        for (const r of arr) { if (r && r.type !== 1) { anyAt = true; break; } }
+        if (!anyAt) {
+          // All plain style rules — the original fast path, byte for byte.
+          for (const r of arr) {
+            if (!r || r.type !== 1) continue;
+            const spec = parseInt(_dom('selector_match_specificity', String(nid), r._selectorSource || r.selectorText), 10);
+            if (spec >= 0) sources.push({ spec, order: order++, decls: r._cascadeDecls });
+          }
+          continue;
+        }
+        // The sheet carries at-rules (@layer/@media/@supports/…): re-serialize and
+        // run it through the same splitter the document sheets use, so its layers
+        // join the document's layer order. Serializing PER ADOPTION OCCURRENCE is
+        // load-bearing: an anonymous layer is distinct each time one sheet is
+        // adopted twice (crbug 462744687 — the last adoption's layer is the later
+        // one, so its rules win).
+        const parts = [];
+        for (const r of arr) { try { const t = r && r.cssText; if (t) parts.push(t); } catch (e) {} }
+        let quirksA = false;
+        try { quirksA = _docIsQuirks(doc); } catch (e) { quirksA = false; }
+        for (const rule of _cssSplitRules(parts.join('\n'), quirksA, sheet._baseURL || null)) {
+          if (rule.layerDecl) {
+            sources._layered = true;
+            for (const p of rule.layerDecl) layerKey(p);
+            continue;
+          }
+          const lpath = rule.layer ? layerKey(rule.layer) : null;
+          if (lpath) sources._layered = true;
+          let selText = rule.selectorText, prox;
+          if (rule.scope) {
+            const sc = _scopedSelectorFor(el, rule);   // implicit scope has no owner in a constructed sheet → out of scope
+            if (!sc) continue;
+            if (sc.sel === null) {   // bare scoped declarations: root-only, zero specificity
+              sources._scoped = true;
+              sources.push({ spec: 0, order: order++, decls: rule.decls, lpath, prox: sc.prox });
+              continue;
+            }
+            selText = sc.sel; prox = sc.prox;
+          }
+          const spec = parseInt(_dom('selector_match_specificity', String(nid), selText), 10);
+          if (spec >= 0) {
+            if (prox !== undefined) sources._scoped = true;
+            sources.push({ spec, order: order++, decls: rule.decls, lpath, prox });
+          }
         }
       }
     }
@@ -28523,7 +28777,7 @@ const _buildCascadeUncached = (el) => {
       // @page (and other at-rule-only) descriptors are invalid as element properties:
       // an inline `style="page-orientation:…"` must not reach the computed value.
       for (const dn of _DESCRIPTOR_ONLY) delete decls[dn];
-      sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC, decls });
+      sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC, decls, sattr: true });
     }
     // Live CSSOM inline declarations (`el.style.foo = …`) set through the object
     // model do NOT reflect into the style="" attribute read above, yet they are
@@ -28550,7 +28804,7 @@ const _buildCascadeUncached = (el) => {
         _expandDeclInto(decls, name, liveProps[k], !!(livePrio && livePrio[k] === 'important'));
         any = true;
       }
-      if (any) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 1, decls });
+      if (any) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 1, decls, sattr: true });
     }
     // Animated values (Web Animations §the-cascade) sit above every NORMAL
     // author declaration, inline style included, and below an author
@@ -28568,31 +28822,208 @@ const _buildCascadeUncached = (el) => {
     // exactly "wins against every finite-specificity important author rule".
     const waDecls = globalThis._waAnimatedDecls && globalThis._waAnimatedDecls(el);
     if (waDecls) {
-      if (waDecls.anim) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 2, decls: waDecls.anim });
-      if (waDecls.trans) sources.push({ spec: Infinity, order: Infinity, decls: waDecls.trans });
+      if (waDecls.anim) sources.push({ spec: _GCS_INLINE_SPEC, order: _GCS_INLINE_SPEC + 2, decls: waDecls.anim, sattr: true });
+      if (waDecls.trans) sources.push({ spec: Infinity, order: Infinity, decls: waDecls.trans, sattr: true });
     }
+    // `all: <css-wide>` in any source resets every longhand it covers. Flagged
+    // once here so _cascadeWinner only pays the extra decls['all'] lookup on the
+    // rare page that actually writes `all` in a rule.
+    for (const s of sources) { if (s.decls['all'] !== undefined) { sources._anyAll = true; break; } }
   }
   return sources;
+};
+// Properties the `all` shorthand does NOT cover (css-cascade §all-shorthand):
+// direction/unicode-bidi (so `all: initial` can't silently flip bidi) and
+// custom properties.
+const _allCovers = (name) => name !== 'direction' && name !== 'unicode-bidi' && !(name.length > 1 && name[0] === '-' && name[1] === '-');
+// ── @scope (css-cascade-6) ──────────────────────────────────────────────────
+// A scoped rule applies only to elements "in scope": descendants (inclusive) of
+// a scope ROOT, excluding scoping-LIMIT elements and their descendants. The
+// nearest valid root also supplies PROXIMITY — a cascade tie-breaker between
+// specificity and order of appearance.
+// True when a scoping limit sits on the path el(inclusive) … A(exclusive).
+const _scopeLimited = (el, A, endSel, R) => {
+  let L = String(endSel);
+  // Limit selectors carry scoped-selector semantics too: a bare `.b` is
+  // implicitly `:scope .b` (a STRICT descendant — the root can never be its own
+  // limit that way), while `:scope`/`&` reference the root explicitly — and a
+  // limit the ROOT ITSELF satisfies (`to (.b&)`) empties the whole scope, so
+  // the walk includes the root exactly when the selector could name it.
+  const refsRoot = /:scope\b/i.test(L) || L.indexOf('&') >= 0;
+  L = L.replace(/:scope\b/gi, R ? `:is(${R})` : '*').replace(/&/g, R ? `:is(${R})` : '*');
+  if (/^\s*[>+~]/.test(L)) L = (R ? `:is(${R})` : '*') + ' ' + L;
+  for (let cur = el, g = 0; cur && g < 200; cur = cur.parentElement, g++) {
+    if (cur === A) {
+      if (refsRoot) { try { if (cur.matches && cur.matches(L)) return true; } catch (e) {} }
+      break;
+    }
+    try { if (cur.matches && cur.matches(L)) return true; } catch (e) {}
+  }
+  return false;
+};
+// The nearest ancestor-or-self scope root of `el` for one @scope frame, with the
+// hop count (proximity); null when `el` is not in the frame's scope.
+const _scopeRootFor = (el, fr, owner) => {
+  try {
+    if (fr.implicit) {
+      // An implicit @scope roots at the owner <style>'s parent element.
+      const A = owner && owner.parentElement;
+      if (!A || !(A === el || (A.contains && A.contains(el)))) return null;
+      if (fr.end && _scopeLimited(el, A, fr.end, null)) return null;
+      let hops = 0;
+      for (let c = el; c && c !== A; c = c.parentElement) hops++;
+      return { A, hops };
+    }
+    let hops = 0;
+    for (let cur = el, g = 0; cur && g < 200; cur = cur.parentElement, g++, hops++) {
+      let isRoot = false;
+      try { isRoot = cur.matches && cur.matches(fr.start); } catch (e) { isRoot = false; }
+      if (isRoot && !(fr.end && _scopeLimited(el, cur, fr.end, fr.start))) return { A: cur, hops };
+    }
+  } catch (e) {}
+  return null;
+};
+// Resolve a scoped rule against `el`: null when out of scope, else the selector
+// to actually match plus the proximity to the innermost root. Scoped-selector
+// semantics: a selector with no `:scope`/`&` is implicitly `:scope <sel>` — the
+// subject is a STRICT descendant of the root and the implied prefix adds no
+// specificity (so the bare selector is matched and membership carries the
+// scoping); `:scope` and `&` rewrite to `:is(<root>)`. ⛔ Caps: the rewrite lets
+// `:scope` match any element matching the root selector (not just the bound
+// root), and `:scope`/`&` under an IMPLICIT root are only expressible when the
+// selector is exactly `:scope`.
+const _scopedSelectorFor = (el, rule) => {
+  let sel = rule.selectorText, res = null;
+  for (const fr of rule.scope) {
+    res = _scopeRootFor(el, fr, rule.scopeOwner || null);
+    if (!res) return null;
+  }
+  // Bare declarations directly inside @scope style the ROOT itself, as if
+  // wrapped in `:where(:scope)` — zero specificity (css-cascade-6 §scoped-declarations).
+  if (rule.scopeRootOnly) return el === res.A ? { sel: null, prox: res.hops } : null;
+  const R = rule.scope[rule.scope.length - 1].start;
+  const hasScopeRef = /:scope\b/i.test(sel) || sel.indexOf('&') >= 0;
+  if (!hasScopeRef) {
+    if (el === res.A) return null;                       // plain selectors never match the root itself
+    // A leading combinator is relative to the root; the implied prefix adds no
+    // specificity, hence :where().
+    if (/^\s*[>+~]/.test(sel)) sel = (R ? `:where(:is(${R}))` : ':where(*)') + ' ' + sel;
+  } else if (/^\s*:scope\s*$/i.test(sel) && !R) {
+    if (el !== res.A) return null;                       // implicit root: `:scope` is exactly the root
+    sel = '*';
+  } else {
+    // `:scope` keeps its own (0,1,0) specificity — :where() zeroes the root
+    // selector and :nth-child(n) (which matches every element) restores exactly
+    // one class-level unit. `&` is :where(:scope): zero specificity.
+    const rootMatch = R ? `:where(:is(${R}))` : ':where(*)';
+    sel = sel.replace(/:scope\b/gi, `${rootMatch}:nth-child(n)`).replace(/&/g, rootMatch);
+  }
+  return { sel, prox: res.hops };
+};
+// Lexicographic layer-key comparison where a missing tail reads as Infinity:
+// an unlayered source (null/empty key) is all-Infinity and a layer's direct
+// rules (shorter key) outrank its sub-layers'. Returns -1/0/1.
+const _layerCmp = (a, b) => {
+  const la = a ? a.length : 0, lb = b ? b.length : 0;
+  const n = la > lb ? la : lb;
+  for (let i = 0; i < n; i++) {
+    const x = i < la ? a[i] : Infinity, y = i < lb ? b[i] : Infinity;
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
 };
 const _cascadeWinner = (sources, name) => {
   // Winning declaration for property `name` (a CSS property / custom-property
   // name): !important beats normal; within the same importance, higher
   // specificity wins, ties broken by later source order. Returns { s, d } or null.
+  //
+  // When the page declares cascade layers (sources._layered), the css-cascade-5
+  // criteria slot in between importance and specificity: the style attribute
+  // (and the animation/transition sources encoded at its level) beats rules;
+  // author beats UA/presentational hints; then LAYERS — for normal declarations
+  // a LATER layer wins and unlayered beats them all, for !important the order
+  // REVERSES (an earlier layer wins and unlayered loses to any layer): the
+  // reversal is the point of layers — a base layer's !important cannot be
+  // overridden by the layers stacked above it. A layerless page never enters
+  // this branch, keeping the original comparison exactly.
   let best = null;
+  const layered = !!sources._layered;
+  const scoped = !!sources._scoped;
+  const anyAll = !!sources._anyAll && _allCovers(name);
   for (const s of sources) {
-    const d = s.decls[name];
+    let d = s.decls[name];
+    // A source's `all` declaration stands in for every longhand it covers that
+    // the source doesn't declare itself (a declared longhand wins within its
+    // own block regardless of order — a modelling cap, not the spec's rule).
+    if (d === undefined && anyAll) d = s.decls['all'];
     if (d === undefined) continue;
-    if (best === null
-        || (d.important && !best.d.important)
+    if (best === null) { best = { s, d }; continue; }
+    let wins;
+    if (layered || scoped) {
+      const di = !!d.important, bi = !!best.d.important;
+      if (di !== bi) wins = di;
+      else if (layered && !!s.sattr !== !!best.s.sattr) wins = !!s.sattr;
+      else if (layered && !!s.uaLike !== !!best.s.uaLike) wins = !s.uaLike;
+      else {
+        const c = layered ? _layerCmp(s.lpath, best.s.lpath) : 0;
+        if (c !== 0) wins = di ? c < 0 : c > 0;
+        else if (s.spec !== best.s.spec) wins = s.spec > best.s.spec;
+        else {
+          // Scope PROXIMITY (css-cascade-6): same specificity → the declaration
+          // whose scope root is nearer wins; an unscoped declaration counts as
+          // infinitely far (the WPT asserts a scoped rule beats an unscoped one
+          // of EQUAL specificity in both orders).
+          const pa = s.prox === undefined ? Infinity : s.prox;
+          const pb = best.s.prox === undefined ? Infinity : best.s.prox;
+          wins = (scoped && pa !== pb) ? pa < pb : s.order >= best.s.order;
+        }
+      }
+    } else {
+      wins = (d.important && !best.d.important)
         || (d.important === best.d.important
-            && (s.spec > best.s.spec || (s.spec === best.s.spec && s.order >= best.s.order)))) {
-      best = { s, d };
+            && (s.spec > best.s.spec || (s.spec === best.s.spec && s.order >= best.s.order)));
     }
+    if (wins) best = { s, d };
   }
   return best;
 };
+// The cascade-rollback keywords (css-cascade-5 §default, css-cascade-6
+// §revert-rule): each discards part of the cascade and asks again.
+//   revert       → discard the whole author origin, presentational hints
+//                  included (they are author-level to `revert`).
+//   revert-layer → discard the winning declaration's cascade layer; from
+//                  unlayered author style it discards all author sources but
+//                  LEAVES presentational hints (an independent origin between
+//                  user and author).
+//   revert-rule  → discard just the winning rule.
+// Looping handles chains (a rule revealed by a rollback may itself revert).
+// A null return means "nothing left" — callers fall through to the property's
+// initial/inherited value, which is exactly the rolled-back-past-everything answer.
+const _REVERT_KW = new Set(['revert', 'revert-layer', 'revert-rule']);
+const _cascadeWinnerR = (sources, name) => {
+  let w = _cascadeWinner(sources, name);
+  if (w === null || !_REVERT_KW.has(String(w.d.value).trim().toLowerCase())) return w;
+  let pool = sources;
+  for (let guard = 0; w !== null && guard < 64; guard++) {
+    const v = String(w.d.value).trim().toLowerCase();
+    if (!_REVERT_KW.has(v)) return w;
+    const ws = w.s;
+    let filtered;
+    if (v === 'revert-rule') filtered = pool.filter((s) => s !== ws);
+    else if (v === 'revert') filtered = pool.filter((s) => s.uaLike && !s.hint);
+    else if (ws.lpath) {
+      const key = ws.lpath.join(' ');
+      filtered = pool.filter((s) => !(s.lpath && s.lpath.join(' ') === key));
+    } else if (ws.uaLike) filtered = pool.filter((s) => s !== ws);
+    else filtered = pool.filter((s) => s.uaLike);
+    filtered._layered = pool._layered; filtered._anyAll = pool._anyAll;
+    pool = filtered;
+    w = _cascadeWinner(pool, name);
+  }
+  return w;
+};
 const _cascadeResolve = (sources, name) => {
-  const w = _cascadeWinner(sources, name);
+  const w = _cascadeWinnerR(sources, name);
   return w ? w.d.value : '';
 };
 // The element's own specified declaration for `kebab` — the winning value plus
@@ -28600,7 +29031,7 @@ const _cascadeResolve = (sources, name) => {
 // shorthand slot). Mirrors _specifiedValue's cascade-first / live-decl-fallback.
 const _specifiedDecl = (el, kebab) => {
   try {
-    const w = _cascadeWinner(_buildCascade(el), kebab);
+    const w = _cascadeWinnerR(_buildCascade(el), kebab);
     if (w && w.d.value !== '') return { value: String(w.d.value), sh: w.d._sh || null };
   } catch (e) {}
   try {
@@ -30333,6 +30764,15 @@ globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
       if (vals.some((x) => !x)) return '';
       return _serializeBoxValue(kebab, vals);
     }
+    // border-color/-style/-width 4-edge shorthands: reconstruct from the COMPUTED
+    // edge longhands (colours canonicalize to rgb(), widths to px) — echoing the
+    // specified text left `borderColor` reading "green" beside a
+    // `borderTopColor` of "rgb(0, 128, 0)".
+    if (kebab === 'border-color' || kebab === 'border-style' || kebab === 'border-width') {
+      const vals = _SHORTHAND_LONGHANDS[kebab].map((ln) => resolve(ln));
+      if (vals.some((x) => !x)) return '';
+      return _serializeBoxValue(kebab, vals);
+    }
     // css-logical two-value border shorthand (border-block-color/-style/-width +
     // inline): reconstruct from the COMPUTED start/end longhands, collapsing an
     // equal pair to a single value.
@@ -30928,10 +31368,16 @@ const _cssParseRuleList = (cssText) => {
       else if (depth === 0 && (c === '{' || c === ';')) break;
       j++;
     }
-    if (j >= n) break;                                   // dangling prelude, no block
-    if (css[j] === ';') {                                // statement at-rule (@import/@namespace/@charset)
-      const prelude = css.slice(i, j).trim();
+    if (j >= n || css[j] === ';') {                      // statement at-rule (@import/@namespace/@charset/@layer)
+      // EOF ends a statement at-rule the same way `;` does (CSS Syntax §consume-
+      // an-at-rule) — `insertRule('@layer a, b', 0)` carries no semicolon at all.
+      // But ONLY for the at-rules whose grammar IS a statement: a BLOCK at-rule
+      // (`@scope (.a)`, `@media …`) dangling without its block is invalid and
+      // stays dropped, or `insertRule` would accept it. A dangling
+      // qualified-rule prelude with no block is dropped too.
+      const prelude = css.slice(i, Math.min(j, n)).trim();
       i = j + 1;
+      if (j >= n && !/^@(layer|import|namespace|charset)\b/i.test(prelude)) break;
       if (prelude && prelude[0] === '@') {
         const m = /^@([\w-]+)/.exec(prelude);
         const nm = m ? m[1].toLowerCase() : '';
@@ -32223,6 +32669,7 @@ class CSSGroupingRule extends CSSRule {
     if (_ruleInNestingContext(this) && !_nestOkDesc(parsed[0])) throw new DOMException("Cannot insert this rule type in a nesting context.", "HierarchyRequestError");
     _assertRuleSelectorValid(parsed[0]);
     arr.splice(index, 0, _makeRule(parsed[0], this.parentStyleSheet, this));
+    try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
     return index;
   }
   deleteRule(index) {
@@ -32232,6 +32679,7 @@ class CSSGroupingRule extends CSSRule {
     if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
     const [removed] = arr.splice(index, 1);
     if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
+    try { if (this._parentStyleSheet) this._parentStyleSheet._cssomDirty = true; } catch (e) {}
     // Removing an @import also unlinks its CHILD sheet from this one — the child
     // object survives (a page may hold it), but it belongs to nobody now.
     try {
@@ -34444,14 +34892,17 @@ class CSSStyleSheet extends StyleSheet {
     // of rule (@layer statements aside). Inserting a non-import ABOVE an
     // existing import — or an import BELOW a non-import — is a
     // HierarchyRequestError, not a silent reordering.
-    const _precedesImport = (r) => r && (r.type === 3
-      || (r instanceof CSSLayerStatementRule && !arr.slice(0, arr.indexOf(r)).some((x) => x && x.type !== 3 && !(x instanceof CSSLayerStatementRule))));
-    if (!newIsImport) {
+    // A @layer STATEMENT may sit before @import rules (css-cascade-5 §layer-empty:
+    // it is the one rule allowed there, so early layer order can be declared
+    // above the imports) — every other non-import rule inserted above an @import
+    // is a HierarchyRequestError, not a silent reordering.
+    const newIsLayerStmt = parsed[0].type === 'layer-statement';
+    if (!newIsImport && !newIsLayerStmt) {
       for (let k2 = index; k2 < arr.length; k2++) {
         if (arr[k2] && arr[k2].type === 3)
           throw new DOMException("Cannot insert a rule before an @import rule.", "HierarchyRequestError");
       }
-    } else {
+    } else if (newIsImport) {
       for (let k2 = 0; k2 < index; k2++) {
         const r = arr[k2];
         if (r && r.type !== 3 && !(r instanceof CSSLayerStatementRule))
@@ -34459,6 +34910,7 @@ class CSSStyleSheet extends StyleSheet {
       }
     }
     arr.splice(index, 0, _makeRule(parsed[0], this, null));
+    this._cssomDirty = true;   // getComputedStyle must re-read the live rules
     return index;
   }
   deleteRule(index) {
@@ -34468,6 +34920,7 @@ class CSSStyleSheet extends StyleSheet {
     if (index >= arr.length) throw new DOMException("Index is past the end of the rule list.", "IndexSizeError");
     const [removed] = arr.splice(index, 1);
     if (removed) { removed._parentStyleSheet = null; removed._parentRule = null; }  // CSSOM §remove-a-css-rule
+    this._cssomDirty = true;   // getComputedStyle must re-read the live rules
     // Removing an @import also unlinks its CHILD sheet from this one — the child
     // object survives (a page may hold it), but it belongs to nobody now.
     try {
@@ -41015,6 +41468,9 @@ globalThis.CSS = {
         return _isValidShapeThreshold(val);
       }
       if (!_CSS_KNOWN_PROPS.has(name) && !_CSS_KNOWN_PROPS.has(_toCamel(name))) return false;
+      // The CSS-wide keywords (initial/inherit/unset/revert/revert-layer/
+      // revert-rule) are valid for every known property.
+      if (_CSS_WIDE.has(val.toLowerCase())) return true;
       if (_COLOR_PROPS.has(name)) return _isValidColor(val);
       return true;
     }
@@ -67423,25 +67879,44 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   // cascade seat above the author's normal declarations, and #421's style change
   // event is exactly the moment a browser creates, updates and cancels them.
 
-  // The LAST `@keyframes` of a given name in document order wins. Grouping rules
-  // (`@media`, `@supports`) are walked, since a rule inside one still counts.
+  // A `@keyframes` name conflict resolves like a NORMAL declaration across
+  // cascade layers (css-cascade-5): unlayered beats layered, a later layer beats
+  // an earlier one, and document order (last wins) breaks ties. Grouping rules
+  // (`@media`, `@supports`, `@layer`) are walked, since a rule inside one still
+  // counts — and a CSSLayerBlockRule ALSO has `.name` and `.cssRules`, which the
+  // old duck-typed check here mistook for a keyframes rule, so a `@keyframes`
+  // inside any `@layer` block was invisible to the animation engine.
   let _caRuleGen = null, _caRuleCache = null;
   const _caFindKeyframes = (name) => {
     const gen = _styleGen + '|' + _cssomInlineGen;
     if (_caRuleGen !== gen) { _caRuleGen = gen; _caRuleCache = new Map(); }
     if (_caRuleCache.has(name)) return _caRuleCache.get(name);
-    let hit = null;
-    const walk = (rules, depth) => {
+    let hit = null, hitKey = null, layerKeys = null;
+    const walk = (rules, depth, lpath) => {
       if (!rules || depth > 4) return;
       for (let i = 0; i < rules.length; i++) {
         const r = rules[i];
         if (!r) continue;
-        if (r.name !== undefined && r.cssRules && r.style === undefined) {
-          if (r.name === name) hit = r;
-        } else if (r.cssRules) walk(r.cssRules, depth + 1);
+        if (r.type === 7) {                                    // CSSRule.KEYFRAMES_RULE
+          if (r.name !== name) continue;
+          let k = null;
+          if (lpath) {
+            if (!layerKeys) { try { layerKeys = _docLayerKeys(document); } catch (e) { layerKeys = new Map(); } }
+            k = layerKeys.get(lpath.join('.')) || [-1];
+          }
+          if (hit === null || _layerCmp(k, hitKey) >= 0) { hit = r; hitKey = k; }
+        } else if (r.cssRules) {
+          let sub = lpath;
+          try {
+            if (r instanceof CSSLayerBlockRule) {
+              sub = (lpath || []).concat(r.name ? r.name.split('.') : ['«kf-anon»']);
+            }
+          } catch (e) {}
+          walk(r.cssRules, depth + 1, sub);
+        }
       }
     };
-    try { for (const sheet of document.styleSheets) { try { walk(sheet.cssRules, 0); } catch (e) {} } }
+    try { for (const sheet of document.styleSheets) { try { walk(sheet.cssRules, 0, null); } catch (e) {} } }
     catch (e) {}
     _caRuleCache.set(name, hit);
     return hit;
