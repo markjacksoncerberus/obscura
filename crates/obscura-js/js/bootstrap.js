@@ -6336,6 +6336,32 @@ class Element extends Node {
       if (globalThis.__mediaSrcChanged) globalThis.__mediaSrcChanged(this);
       return;
     }
+    // <track>: fetches a text track, governed by `media-src`. No VTT support in
+    // this build, so the fetch fails either way — but the ASK fires the
+    // violation event (blockedURI = the track URL), and the error lands on the
+    // TRACK element, which is where every player listens for a missing caption
+    // file. (A media element's own failure never fires here — a track is its
+    // own fetch with its own error target.)
+    if (this.localName === 'track') {
+      const el2 = this;
+      if (v) {
+        let abs = v;
+        try { abs = new URL(v, _domParse('document_url') || 'about:blank').href; } catch (e) {}
+        try {
+          if (typeof globalThis.__cspAllowsURL === 'function') globalThis.__cspAllowsURL('media-src', abs, el2);
+        } catch (e) {}
+        _queueTask(() => {
+          const ev = new Event('error');
+          ev.isTrusted = true; ev.target = el2;
+          try { _dispatchSpec(el2, ev); } catch (e) {}
+          if (!el2['__ehon_onerror']) {
+            const a = el2.getAttribute && el2.getAttribute('onerror');
+            if (a) { try { (0, _NativeEval)(a); } catch (e) {} }
+          }
+        });
+      }
+      return;
+    }
     if (this.localName === 'iframe') {
       if (v && v !== 'about:blank') {
         this._loadIframeSrc(v);
@@ -6366,6 +6392,38 @@ class Element extends Node {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
     }
     const el = this;
+    // ⭐ A `javascript:` frame navigation is an INLINE SCRIPT question for the
+    // EMBEDDING document — script-src-elem, blockedURI "inline" — and frame-src
+    // has NO say (to-javascript-url-frame-src.html asserts a `frame-src 'none'`
+    // page still runs it). When allowed, the URL body executes; a string
+    // completion value would replace the frame's document, which is not
+    // implemented — the frame keeps its about:blank either way.
+    if (/^javascript:/i.test(fullUrl)) {
+      let body = fullUrl.slice('javascript:'.length);
+      try { body = decodeURIComponent(body); } catch (e) {}
+      el.contentDocument;   // the frame holds (or gains) its about:blank document
+      const jsAllowed = typeof globalThis.__cspAllowsInline !== 'function'
+        || globalThis.__cspAllowsInline('script', el, body);
+      if (jsAllowed) { try { (0, _NativeEval)(body); } catch (e) { _reportError(e); } }
+      _scheduleFrameElementLoad(el);
+      return;
+    }
+    // ⭐ `frame-src` is asked on the REQUEST, before any fetch: a blocked frame
+    // never navigates — it is left holding its about:blank and fires `load` for
+    // it. The violation reports the target's ORIGIN, not its full URL: a frame
+    // load is a NAVIGATION, and reporting the path would leak where inside a
+    // cross-origin site the document tried to go.
+    try {
+      if (typeof globalThis.__cspAllowsURL === 'function') {
+        let reportUri = fullUrl;
+        try { const o = new URL(fullUrl).origin; if (o && o !== 'null') reportUri = o; } catch (e) {}
+        if (!globalThis.__cspAllowsURL('frame-src', fullUrl, el, reportUri)) {
+          el.contentDocument;
+          _scheduleFrameElementLoad(el);
+          return;
+        }
+      }
+    } catch (e) {}
     fetch(fullUrl, {mode: 'no-cors', _initiatorType: 'iframe'}).then(async resp => {
       // Superseded by a newer load (e.g. srcdoc set while this was in flight)?
       // Don't clobber the current document or fire a stale load.
@@ -10570,9 +10628,30 @@ const _connectResourceElement = function(el) {
       el._resConnected = true;
       _loadElementResource(el, href, /(^|\s)modulepreload(\s|$)/.test(rel) ? 'other' : 'link');
     }
-  } else if (ln === 'object') {
-    const data = el.getAttribute('data') || el.data;
-    if (data) { el._resConnected = true; _loadElementResource(el, data, 'object'); }
+  } else if (ln === 'object' || ln === 'embed') {
+    const data = ln === 'object' ? (el.getAttribute('data') || el.data) : el.getAttribute('src');
+    if (data) { el._resConnected = true; _loadElementResource(el, data, ln); }
+    else if (el.getAttribute('type') != null) {
+      // ⭐ An <object>/<embed> with a `type` but NO url still requests PLUGIN
+      // instantiation, and `object-src` governs the plugin, not just its data
+      // stream — `object-src 'none'` must fire a violation for
+      // `<object type="application/x-…">` even though nothing would be
+      // fetched. The ask fires the event; there is nothing to load either way.
+      el._resConnected = true;
+      try {
+        if (typeof globalThis.__cspAllowsURL === 'function') {
+          globalThis.__cspAllowsURL('object-src', _domParse('document_url') || 'about:blank', el);
+        }
+      } catch (e) {}
+    }
+  } else if (ln === 'video' || ln === 'audio') {
+    // Dynamically appended media (createElement + appendChild) must run
+    // resource selection on insertion — the markup scan only sees parse-time
+    // elements, and a src-less element with <source> children never touches
+    // the src setter.
+    if (!el.__mediaStarted && globalThis.__mediaSrcChanged) {
+      try { globalThis.__mediaSrcChanged(el); } catch (e) {}
+    }
   } else if (ln === 'style') {
     // EVERY connected <style> fires `load` once its style block is processed
     // (HTML §the-style-element §update-a-style-block) — not just @import-bearing
@@ -10631,8 +10710,10 @@ const _loadFrameFromAttributes = function(el) {
     try {
       let full = src;
       try { full = new URL(src, _domParse("document_url") || "about:blank").href; } catch (e) {}
+      let reportUri = full;   // a frame load is a navigation: report the ORIGIN
+      try { const o = new URL(full).origin; if (o && o !== 'null') reportUri = o; } catch (e) {}
       allowed = typeof globalThis.__cspAllowsURL !== 'function'
-        || globalThis.__cspAllowsURL('frame-src', full, el);
+        || globalThis.__cspAllowsURL('frame-src', full, el, reportUri);
     } catch (e) {}
     if (!allowed) {
       el.contentDocument;
@@ -10680,7 +10761,7 @@ globalThis.__startResourceLoads = function() {
       if (el._resLoadGen) continue; // already loading (e.g. via the src setter)
       try { _imgUpdateImageData(el); } catch (e) {}
     }
-    const others = document.querySelectorAll('link, object');
+    const others = document.querySelectorAll('link, object, embed');
     for (let i = 0; i < others.length; i++) { try { _connectResourceElement(others[i]); } catch (e) {} }
     // Markup <video>/<audio> run resource selection too — a page whose player is
     // written entirely in HTML (`<video src=… onerror=…>`) never touches the src
@@ -42886,18 +42967,27 @@ globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMedi
   // it is not supported. Runs on a TASK, never synchronously — a page is
   // entitled to attach its `onerror` after setting `src`, which is how almost
   // everyone writes it.
-  const _mediaFail = (el) => {
+  //
+  // ⭐ WHERE the failure lands depends on where the candidate came from. A `src`
+  // attribute fails at the MEDIA ELEMENT (error attribute set, `error` event
+  // there); a candidate from a `<source>` child fails with the spec's
+  // "dedicated media source failure steps" — the `error` event fires at the
+  // SOURCE ELEMENT, the media element's error attribute stays null, and the
+  // algorithm would move on to the next candidate. Every player that offers
+  // multiple formats listens on its <source> children for exactly this.
+  const _mediaFail = (el, srcEl) => {
     const st = _ms(el);
     const gen = ++st.gen;
     _queueTask(() => {
       if (st.gen !== gen) return;                        // a newer src superseded us
-      st.error = _newMediaError(4, 'The media resource indicated by the src attribute was not suitable.');
       st.network = 3;                                    // NETWORK_NO_SOURCE
+      const target = srcEl || el;
+      if (!srcEl) st.error = _newMediaError(4, 'The media resource indicated by the src attribute was not suitable.');
       const ev = new Event('error');
-      ev.isTrusted = true; ev.target = el;
-      try { _dispatchSpec(el, ev); } catch (e) {}
-      if (!el['__ehon_onerror']) {
-        const a = el.getAttribute && el.getAttribute('onerror');
+      ev.isTrusted = true; ev.target = target;
+      try { _dispatchSpec(target, ev); } catch (e) {}
+      if (!target['__ehon_onerror']) {
+        const a = target.getAttribute && target.getAttribute('onerror');
         if (a) { try { (0, _NativeEval)(a); } catch (e) {} }
       }
     });
@@ -42905,7 +42995,30 @@ globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMedi
   globalThis.__mediaSrcChanged = (el) => {
     const st = _ms(el);
     st.error = null; st.network = 2;                     // NETWORK_LOADING
-    _mediaFail(el);
+    el.__mediaStarted = true;
+    // The candidate resource: the `src` attribute, else the first `<source src>`
+    // child (whose failure must land on that child — see _mediaFail).
+    let cand = null, srcEl = null;
+    try {
+      cand = el.getAttribute && el.getAttribute('src');
+      if (!cand && el.querySelectorAll) {
+        const ss = el.querySelectorAll('source[src]');
+        if (ss && ss.length) { srcEl = ss[0]; cand = ss[0].getAttribute('src'); }
+      }
+    } catch (e) {}
+    // ⭐ `media-src`: ask BEFORE the fetch would happen. In this build resource
+    // selection fails either way (no codecs), so blocked and unsupported
+    // converge on the same `error` — but the ASK is what fires the
+    // securitypolicyviolation event, and that event is how the page (and the
+    // whole media-src suite) tells a policy decision from a codec gap.
+    try {
+      if (cand && typeof globalThis.__cspAllowsURL === 'function') {
+        let abs = cand;
+        try { abs = new URL(cand, _domParse('document_url') || 'about:blank').href; } catch (e) {}
+        globalThis.__cspAllowsURL('media-src', abs, el);
+      }
+    } catch (e) {}
+    _mediaFail(el, srcEl);
   };
 
   const ro = (name, get) => Object.defineProperty(MP, name, { configurable: true, enumerable: true, get });
@@ -48766,6 +48879,14 @@ const _cspMatchesSource = (expr, url, selfOrigin) => {
   }
   if (_asciiLower(e) === "'self'") {
     if (!selfOrigin) return false;
+    // ⭐ `'self'` NEVER matches a local-scheme URL. A blob:/data:/filesystem:
+    // URL made by an https page SERIALIZES with that page's origin, so an
+    // origin comparison says "same site" — and a policy of `worker-src 'self'`
+    // would then allow `new Worker(URL.createObjectURL(blob))`, i.e. any
+    // injected string as a whole second script environment. The spec requires
+    // the local scheme to be granted BY NAME (`blob:`), precisely so that
+    // 'self' keeps meaning "my own server", not "anything I can mint".
+    if (url.protocol === 'blob:' || url.protocol === 'data:' || url.protocol === 'filesystem:') return false;
     if (url.origin === selfOrigin.origin) return true;
     // 'self' also permits the same host upgraded to a secure scheme.
     return url.hostname === selfOrigin.hostname
@@ -49013,7 +49134,7 @@ const _cspInlineAllowed = (type, element, source) => {
 };
 
 // "Should request be blocked by policy" for a URL-bearing fetch.
-const _cspURLAllowed = (directive, urlText, element) => {
+const _cspURLAllowed = (directive, urlText, element, reportUri) => {
   if (!_cspState.policies.length) return true;
   const url = _cspParsedURL(urlText);
   if (!url) return true;                       // an unparseable URL is not ours to judge
@@ -49035,7 +49156,7 @@ const _cspURLAllowed = (directive, urlText, element) => {
     if (_cspHasStrictDynamic(list)
         && (directive === 'script-src-elem' || directive === 'script-src' || directive === 'worker-src')) {
       if (directive === 'worker-src' || (element && element._nonParserInserted)) continue;
-      _cspReport(policy, directive, gov.name, url.href, element, '');
+      _cspReport(policy, directive, gov.name, reportUri || url.href, element, '');
       if (policy.disposition === 'enforce') allowed = false;
       continue;
     }
@@ -49053,7 +49174,7 @@ const _cspURLAllowed = (directive, urlText, element) => {
       if (_cspMatchesSource(expr, url, self)) { ok = true; break; }
     }
     if (ok) continue;
-    _cspReport(policy, directive, gov.name, url.href, element, '');
+    _cspReport(policy, directive, gov.name, reportUri || url.href, element, '');
     if (policy.disposition === 'enforce') allowed = false;
   }
   return allowed;
@@ -49451,11 +49572,11 @@ globalThis.__cspAllowsScriptURL = (nid, url) => {
 // ⚠️ Both of these swap in the policies of the ELEMENT'S OWN DOCUMENT. Before
 // per-document policies existed they read the global list directly, which is the
 // right answer only while there is exactly one document in the realm.
-globalThis.__cspAllowsURL = (directive, url, element) => {
+globalThis.__cspAllowsURL = (directive, url, element, reportUri) => {
   try {
     const saved = _cspState.policies;
     _cspState.policies = _cspPoliciesGoverning(element || null);
-    try { return _cspURLAllowed(directive, url, element || null); }
+    try { return _cspURLAllowed(directive, url, element || null, reportUri); }
     finally { _cspState.policies = saved; }
   } catch (e) { return true; }
 };
