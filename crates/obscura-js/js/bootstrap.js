@@ -13663,6 +13663,8 @@ const _GCS_DEFAULTS = {
   'will-change': 'auto',
   // css-contain — does not inherit.
   'contain': 'none',
+  // css-conditional-5 query containers — neither inherits.
+  'container-name': 'none', 'container-type': 'normal',
   // css-color-adjust — every property in this family inherits. color-adjust is a
   // legacy alias for print-color-adjust (initial `economy`).
   'color-scheme': 'normal', 'color-adjust': 'economy',
@@ -14553,31 +14555,42 @@ const _cssStyleBodySegments = (css) => {
 // Emit one style rule (and everything nested in it) into the flat rule list.
 // `selText` is already absolute (parent-desugared). Bodies with no '{' take the
 // original single-push path byte for byte — a nesting-free page is untouched.
-const _cssEmitStyleRule = (rules, selText, body, quirks, base, depth, _layer, _scope) => {
+const _cssEmitStyleRule = (rules, selText, body, quirks, base, depth, _layer, _scope, _cq) => {
   if (body.indexOf('{') < 0) {
-    rules.push({ selectorText: selText, decls: _cssParseDecls(body, quirks), layer: _layer || null, scope: _scope || null });
+    rules.push({ selectorText: selText, decls: _cssParseDecls(body, quirks), layer: _layer || null, scope: _scope || null, cq: _cq || null });
     return;
   }
   for (const seg of _cssStyleBodySegments(body)) {
     if (seg.decls !== undefined) {
       const d = _cssParseDecls(seg.decls, quirks);
-      for (const k0 in d) { rules.push({ selectorText: selText, decls: d, layer: _layer || null, scope: _scope || null }); break; }
+      for (const k0 in d) { rules.push({ selectorText: selText, decls: d, layer: _layer || null, scope: _scope || null, cq: _cq || null }); break; }
       continue;
     }
     const prelude = seg.prelude;
     if (!prelude) continue;                       // `{ … }` with no prelude: error-recovered, skipped
     if (prelude[0] === '@') {
       if (depth >= 8) continue;
-      const gm = /^@(media|supports|layer|scope)\b([\s\S]*)$/i.exec(prelude);
-      if (!gm) continue;                          // @container/@starting-style/…: unsupported, dropped
+      const gm = /^@(media|supports|layer|scope|container)\b([\s\S]*)$/i.exec(prelude);
+      if (!gm) continue;                          // @starting-style/…: unsupported, dropped
       const name = gm[1].toLowerCase(); const cond = gm[2].trim();
       let sub = _layer || null;
+      let subCq = _cq || null;
       if (name === 'media') {
         let ok = false; try { ok = !cond || globalThis.matchMedia(cond).matches; } catch (e) { ok = false; }
         if (!ok) continue;
       } else if (name === 'supports') {
         let ok = false; try { ok = !!_evalSupportsCondition(cond); } catch (e) { ok = false; }
         if (!ok) continue;
+      } else if (name === 'container') {
+        // Nested `@container` (CSS Conditional 5): the condition cannot be
+        // decided here — it depends on which ELEMENT the parent selector
+        // matches — so it travels with the rule as a frame and is evaluated
+        // per-element at cascade time (_cqRuleApplies). An invalid prelude
+        // invalidates the whole block.
+        if (!_isValidContainerConditionList(cond)) continue;
+        subCq = (_cq || []).concat(cond);
+        _cssEmitStyleRule(rules, selText, seg.body, quirks, base, depth + 1, _layer, _scope, subCq);
+        continue;
       } else if (name === 'layer') {
         const segsL = cond === '' ? [`«anon-${_anonLayerN++}»`] : (_LAYER_PATH_RE.test(cond) ? cond.split('.') : null);
         if (segsL === null) continue;
@@ -14593,16 +14606,16 @@ const _cssEmitStyleRule = (rules, selText, body, quirks, base, depth, _layer, _s
         const p = _parseScopePrelude(cond);
         const start = p.start != null ? _cssNestSelector(p.start, selText) : selText;
         const subScope = (_scope || []).concat({ start, end: p.end, implicit: false });
-        for (const r of _cssSplitRules(seg.body, quirks, base, depth + 1, _layer, subScope)) rules.push(r);
+        for (const r of _cssSplitRules(seg.body, quirks, base, depth + 1, _layer, subScope, _cq)) rules.push(r);
         continue;
       }
-      _cssEmitStyleRule(rules, selText, seg.body, quirks, base, depth + 1, sub, _scope);
+      _cssEmitStyleRule(rules, selText, seg.body, quirks, base, depth + 1, sub, _scope, subCq);
       continue;
     }
-    _cssEmitStyleRule(rules, _cssNestSelector(prelude, selText), seg.body, quirks, base, depth + 1, _layer, _scope);
+    _cssEmitStyleRule(rules, _cssNestSelector(prelude, selText), seg.body, quirks, base, depth + 1, _layer, _scope, _cq);
   }
 };
-const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
+const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope, _cq) => {
   // Returns [{ selectorText, decls, layer }] — the flat, cascade-shaped view of a
   // sheet. `layer` is the rule's cascade-layer path (array of name segments) or
   // null for an unlayered rule; `{ layerDecl: [paths] }` marker entries record
@@ -14642,7 +14655,7 @@ const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
       if (stmt && stmt[0] !== '@' && _scope && stmt.indexOf(':') >= 0) {
         const bare = _cssParseDecls(stmt, quirks);
         for (const k in bare) {
-          rules.push({ scopeRootOnly: true, decls: bare, layer: _layer || null, scope: _scope });
+          rules.push({ scopeRootOnly: true, decls: bare, layer: _layer || null, scope: _scope, cq: _cq || null });
           break;
         }
       }
@@ -14661,7 +14674,7 @@ const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
         // emitted as scopeRootOnly rules instead of being dropped.
         const bare = _cssParseDecls(stmt, quirks);
         for (const k in bare) {
-          rules.push({ scopeRootOnly: true, decls: bare, layer: _layer || null, scope: _scope });
+          rules.push({ scopeRootOnly: true, decls: bare, layer: _layer || null, scope: _scope, cq: _cq || null });
           break;
         }
         continue;
@@ -14685,7 +14698,7 @@ const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
           }
           const ent = _importFetchCss(abs);
           if (ent.state === 'done') {
-            for (const r of _cssSplitRules(ent.text, quirks, abs, depth + 1, sub, _scope)) rules.push(r);
+            for (const r of _cssSplitRules(ent.text, quirks, abs, depth + 1, sub, _scope, _cq)) rules.push(r);
           }
         }
       } else if (/^@layer\b/i.test(stmt)) {
@@ -14716,14 +14729,26 @@ const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
     if (!prelude) continue;
     if (prelude[0] === '@') {
       if (depth < 6) {
-        const gm = /^@(media|supports|layer|scope)\b([\s\S]*)$/i.exec(prelude);
+        const gm = /^@(media|supports|layer|scope|container)\b([\s\S]*)$/i.exec(prelude);
         if (gm) {
           const name = gm[1].toLowerCase();
           const cond = gm[2].trim();
           let applies = false;
           let sub = _layer || null;
           let subScope = _scope || null;
-          if (name === 'scope') {
+          let subCq = _cq || null;
+          if (name === 'container') {
+            // `@container [<name>]? <query> { … }` — whether it holds depends on
+            // the element being styled (its ancestor query container), which is
+            // unknowable at split time. Valid preludes travel with each nested
+            // rule as a `cq` frame, evaluated per-element by _cqRuleApplies;
+            // frames stack for nested @container (all must hold).
+            if (_isValidContainerConditionList(cond)) {
+              subCq = (_cq || []).concat(cond);
+              applies = true;
+            }
+          }
+          else if (name === 'scope') {
             // `@scope (root)? [to (limit)]? { … }` (css-cascade-6): its rules
             // carry a scope FRAME — root/limit selectors, or implicit (the owner
             // <style>'s parent, resolved at cascade time). Frames stack for
@@ -14752,7 +14777,7 @@ const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
             try { applies = !!_evalSupportsCondition(cond); } catch (e) { applies = false; }
           }
           if (applies) {
-            for (const r of _cssSplitRules(body, quirks, base, depth + 1, sub, subScope)) rules.push(r);
+            for (const r of _cssSplitRules(body, quirks, base, depth + 1, sub, subScope, subCq)) rules.push(r);
           }
         }
       }
@@ -14763,7 +14788,7 @@ const _cssSplitRules = (cssText, quirks, base, _depth, _layer, _scope) => {
     // rules in the body are flattened by _cssEmitStyleRule.
     let selText = prelude;
     if (!_scope && selText.indexOf('&') >= 0) selText = _cssNestSelector(selText, null);
-    _cssEmitStyleRule(rules, selText, body, quirks, base, depth, _layer, _scope);
+    _cssEmitStyleRule(rules, selText, body, quirks, base, depth, _layer, _scope, _cq);
   }
   return rules;
 };
@@ -15821,6 +15846,14 @@ const _evalMath = (input, percentBase, opts) => {
           const vf = /^[sld]?v[wi]$/.test(u) ? opts.vw : /^[sld]?v[hb]$/.test(u) ? opts.vh
                    : /^[sld]?vmin$/.test(u) ? vmin : /^[sld]?vmax$/.test(u) ? vmax : undefined;
           if (vf !== undefined) return [tok.v * vf, false];
+        }
+        // Container query length units (cqw/cqh/cqi/cqb/cqmin/cqmax): resolved
+        // against the element's query containers when the caller supplies the
+        // element (`opts.cqEl`); the resolver falls back to the small viewport
+        // when no eligible container exists (css-values-4 §container-lengths).
+        if (opts.cqEl && /^cq(?:w|h|i|b|min|max)$/.test(tok.unit)) {
+          const cf = _cqUnitPx(opts.cqEl, tok.unit);
+          if (cf !== null) return [tok.v * cf, false];
         }
         // `opts.cqZero` (filter computed only) treats a viewport/container-relative
         // unit as 0 — the filter tests gate every such unit inside `sign(2cqw - 10px)`
@@ -26304,8 +26337,8 @@ const _allPctZero = (t) => {
 const _trComp = (t, el, computed, vp) => {
   t = t.trim();
   if (computed) t = _unwrapSingleMinMax(t);
-  const lenOpts = () => (vp ? { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, nonFinite: true, ..._siblingOpts(el, t) }
-                            : { lengths: true, emPx: _emPxOf(el), nonFinite: true, ..._siblingOpts(el, t) });
+  const lenOpts = () => (vp ? { lengths: true, emPx: _emPxOf(el), vw: vp.vw, vh: vp.vh, cqEl: el, nonFinite: true, ..._siblingOpts(el, t) }
+                            : { lengths: true, emPx: _emPxOf(el), cqEl: el, nonFinite: true, ..._siblingOpts(el, t) });
   if (_FILTER_MATH_RE.test(t)) {
     if (/%/.test(t)) {                                        // mixed %+<length> → canonical calc(P% ± Lpx)
       // A non-finite result (infinity/NaN coefficient) can no longer be kept as a
@@ -28737,12 +28770,29 @@ const _presHintDecls = (el) => {
 // because the after-change style is computed with transitions suppressed, which
 // changes what _buildCascade returns.
 let _cascadeMemo = null, _cascadeMemoSuppressed = null;
+// @container evaluation state (used by the _cq* machinery defined further down;
+// declared here so _buildCascade can own the memo without a TDZ hazard).
+let _cqEvalDepth = 0;
+let _cqMemo = null;   // (nid|frames → bool, 'p§'nid|prop → string) for one outer build
 const _buildCascade = (el) => {
   const memo = globalThis._csSuppress ? _cascadeMemoSuppressed : _cascadeMemo;
   if (memo) { const hit = memo.get(el); if (hit !== undefined) return hit; }
-  const sources = _buildCascadeUncached(el);
-  if (memo) memo.set(el, sources);
-  return sources;
+  // The OUTERMOST cascade build owns the @container evaluation memo: every
+  // nested build this one triggers (style() queries reading a container's
+  // custom properties) shares it, so each (element, frames) gate and each
+  // (container, property) read is evaluated once per outer build. Nothing can
+  // mutate the document inside one synchronous build, so this is safe — and
+  // without it a page with N @container rules costs O(N²) nested cascade
+  // rebuilds per getComputedStyle read.
+  const ownCqMemo = _cqMemo === null;
+  if (ownCqMemo) _cqMemo = new Map();
+  try {
+    const sources = _buildCascadeUncached(el);
+    if (memo) memo.set(el, sources);
+    return sources;
+  } finally {
+    if (ownCqMemo) _cqMemo = null;
+  }
 };
 // ── Pseudo-element computed style (getComputedStyle(el, '::before')) ─────────
 // A PSEUDO VIEW is a lightweight stand-in for the pseudo-element: it delegates
@@ -28899,6 +28949,10 @@ const _buildCascadeUncached = (el) => {
       }
       const lpath = rule.layer ? layerKey(rule.layer) : null;
       if (lpath) sources._layered = true;
+      // A rule that travelled out of an `@container` block applies only when
+      // every one of its frames holds for THIS element (evaluated against the
+      // element's ancestor query containers — see _cqRuleApplies).
+      if (rule.cq && !_cqRuleApplies(el, rule.cq)) continue;
       let selText = rule.selectorText, prox, matchKey = String(nid);
       if (_pseudo) {
         if (rule.scope) continue;                 // scoped pseudo rules: out of scope (cap)
@@ -28971,6 +29025,7 @@ const _buildCascadeUncached = (el) => {
           const lpath = rule.layer ? layerKey(rule.layer) : null;
           if (lpath) sources._layered = true;
           let selText = rule.selectorText, prox, matchKey = String(nid);
+          if (rule.cq && !_cqRuleApplies(el, rule.cq)) continue;   // @container frames (see above)
           if (_pseudo) {
             if (rule.scope) continue;             // scoped pseudo rules: out of scope (cap)
             const ps = _pseudoSelFor(selText, _pseudo);
@@ -31053,6 +31108,13 @@ globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
       if (vals.some((x) => !x)) return '';
       return _serializeBoxValue(kebab, vals);
     }
+    // `container` shorthand: reconstruct from the computed longhands (so
+    // CSS-wide keywords land on `none` / drop a `normal` container-type).
+    if (kebab === 'container') {
+      const n = resolve('container-name'), t = resolve('container-type');
+      if (!n || !t) return '';
+      return _serContainerShorthand(n, t);
+    }
     // border-color/-style/-width 4-edge shorthands: reconstruct from the COMPUTED
     // edge longhands (colours canonicalize to rgb(), widths to px) — echoing the
     // specified text left `borderColor` reading "green" beside a
@@ -31334,11 +31396,14 @@ const _PROP_SYNTAX_TYPES = new Set([
   'integer', 'angle', 'time', 'resolution', 'transform-function', 'transform-list',
   'custom-ident', 'string',
 ]);
-// Length units that are NOT computationally independent (they depend on the font),
-// so they are rejected in a registered property's initial value even though they
-// are valid <length> units elsewhere. Absolute / viewport / container units are OK.
+// Length units that are NOT computationally independent (font-relative units
+// depend on the font; container units on an ancestor's layout —
+// container-units-computational-independence.html), so they are rejected in a
+// registered property's initial value even though they are valid <length>
+// units elsewhere. Absolute / viewport units are OK.
 const _PROP_FONTREL_UNITS = new Set([
   'em', 'rem', 'ex', 'rex', 'ch', 'rch', 'ic', 'ric', 'cap', 'rcap', 'lh', 'rlh',
+  'cqw', 'cqh', 'cqi', 'cqb', 'cqmin', 'cqmax',
 ]);
 // A bare numeric/dimension token → { num, unit } (unit '' for a plain number), or
 // null. No calc — a single numeric token only.
@@ -34138,6 +34203,706 @@ const _isValidContainerConditionList = (prelude) => {
     if (!_isValidContainerQuery(query)) return false;
   }
   return true;
+};
+
+// ── @container query EVALUATION (CSS Conditional 5 §container-queries) ─────────
+// A rule that travelled out of an `@container` block carries `cq` frames (raw
+// prelude strings, outermost first). Whether the rule applies to an element is
+// decided HERE, per element, at cascade-build time: select the query container
+// (nearest eligible ancestor), then evaluate the condition against its layout
+// box / computed style. Three-valued logic: an operand that evaluates to
+// "unknown" (unknown feature, unknown function, unresolvable value) makes the
+// WHOLE condition unknown — `(unknown) or (width)` is unknown, not true — and
+// an unknown condition never applies. (query-evaluation.html tests exactly this
+// contagion, which is where container queries differ from Kleene logic.)
+const _CQ_SIZE_FEATURES = new Set(['width', 'height', 'inline-size', 'block-size', 'aspect-ratio', 'orientation']);
+// Parse the interior of one `( … )` as a <size-feature>. Shapes: boolean
+// `(width)`, plain `(width: 16px)` (min-/max- prefixed too), range
+// `(width < 100px)` / `(100px <= width)` / `(8px < width < 32px)`.
+// Returns null for "not a recognized size feature" (→ unknown).
+const _cqParseSizeFeature = (inner) => {
+  const s = inner.trim();
+  if (!/[<>=]/.test(s)) {
+    const ci = _topLevelColon(s);
+    if (ci === -1) {
+      const name = s.toLowerCase();
+      if (!_CQ_SIZE_FEATURES.has(_mqStripRange(name))) return null;
+      return { name: _mqStripRange(name), bool: true, minmax: _mqMinMax(name) };
+    }
+    const name = s.slice(0, ci).trim().toLowerCase();
+    const value = s.slice(ci + 1).trim();
+    if (!value || !_CQ_SIZE_FEATURES.has(_mqStripRange(name))) return null;
+    return { name: _mqStripRange(name), minmax: _mqMinMax(name), op: '=', raw: value };
+  }
+  const parts = s.split(/(<=|>=|<|>|=)/).map((t) => t.trim());
+  if (parts.length === 3) {
+    const [a, op, b] = parts;
+    if (_CQ_SIZE_FEATURES.has(a.toLowerCase())) return { name: a.toLowerCase(), op, raw: b };
+    if (_CQ_SIZE_FEATURES.has(b.toLowerCase())) return { name: b.toLowerCase(), op: _mqFlipOp(op), raw: a };
+    return null;
+  }
+  if (parts.length === 5) {
+    const [a, op1, nm, op2, b] = parts;
+    const name = nm.toLowerCase();
+    if (!_CQ_SIZE_FEATURES.has(name)) return null;
+    // A dual range needs two SAME-DIRECTION ordering comparisons; `=` (and
+    // mixed directions) are grammar errors → <general-enclosed> → unknown.
+    if (!/^[<>]=?$/.test(op1) || !/^[<>]=?$/.test(op2)) return null;
+    if ((op1[0] === '<') !== (op2[0] === '<')) return null;
+    return { name, range2: [{ op: _mqFlipOp(op1), raw: a }, { op: op2, raw: b }] };
+  }
+  return null;
+};
+// Parse a <container-condition> (already structurally validated) into an AST:
+//   {not: kid} | {op:'and'|'or', kids:[…]} | {feat} | {style: inner} | {unknown:true}
+const _cqParseCond = (queryText) => {
+  const toks = _tokenizeContainerQuery(String(queryText).trim());
+  if (!toks.length) return null;
+  const parseInParens = (tok) => {
+    if (tok[0] === '(') {
+      const inner = tok.slice(1, -1).trim();
+      const innerToks = _tokenizeContainerQuery(inner);
+      const nested = innerToks.some((x) => x[0] === '(' || /^(and|or|not)$/i.test(x));
+      if (nested) { const sub = _cqParseCond(inner); return sub || { unknown: true }; }
+      // A lone functional token inside parens — `(style(--x: y))` — is that
+      // function as an operand, not a size feature.
+      if (innerToks.length === 1 && /^[A-Za-z-]+\(/.test(innerToks[0])) return parseInParens(innerToks[0]);
+      const feat = _cqParseSizeFeature(inner);
+      return feat ? { feat } : { unknown: true };
+    }
+    const fm = /^([A-Za-z-]+)\(/.exec(tok);
+    if (fm && fm[1].toLowerCase() === 'style') return { style: tok.slice(fm[0].length, -1) };
+    return { unknown: true };                       // other <general-enclosed> function
+  };
+  if (/^not$/i.test(toks[0])) {
+    if (toks.length !== 2) return null;
+    return { not: parseInParens(toks[1]) };
+  }
+  const kids = [parseInParens(toks[0])];
+  let op = null;
+  for (let i = 1; i < toks.length; i += 2) {
+    const o = String(toks[i]).toLowerCase();
+    if (o !== 'and' && o !== 'or') return null;
+    if (op === null) op = o; else if (op !== o) return null;   // mixing and/or without parens is invalid
+    if (toks[i + 1] === undefined) return null;
+    kids.push(parseInParens(toks[i + 1]));
+  }
+  return kids.length === 1 ? kids[0] : { op, kids };
+};
+// Which size features a condition consults (fills `out`); `style()` interiors
+// don't constrain container-type eligibility, so they're not collected.
+const _cqCollectSizeNeeds = (node, out) => {
+  if (!node) return out;
+  if (node.feat) out.add(node.feat.name);
+  else if (node.not) _cqCollectSizeNeeds(node.not, out);
+  else if (node.kids) for (const k of node.kids) _cqCollectSizeNeeds(k, out);
+  return out;
+};
+// Layout comparisons run on real (often fractional) used values; `=` and the
+// closed bounds tolerate sub-1/100-px noise so `(width: 16px)` holds on a
+// 16.0000001px box.
+const _cqCompare = (op, actual, expected) => {
+  const EPS = 0.01;
+  switch (op) {
+    case '=':  return Math.abs(actual - expected) < EPS;
+    case '<':  return actual < expected - EPS;
+    case '<=': return actual <= expected + EPS;
+    case '>':  return actual > expected + EPS;
+    case '>=': return actual >= expected - EPS;
+  }
+  return false;
+};
+// The container's CONTENT-box size (size features are content-box per spec).
+// An INLINE box never establishes a size container however its container-type
+// computes (never-match-container.html) — its features evaluate unknown.
+const _cqContentBox = (C) => {
+  const b = _layoutBoxOf(C);
+  if (!b || !b.hasBox || b.inline) return null;
+  return {
+    w: Math.max(0, b.width - b.bl - b.br - b.pl - b.pr),
+    h: Math.max(0, b.height - b.bt - b.bb - b.pt - b.pb),
+  };
+};
+// A LIGHT read of one declared property — the container-selection metadata
+// (container-name / container-type / writing-mode) must NOT be read through
+// full getComputedStyle: each such read rebuilds the ancestor's cascade, which
+// re-evaluates every @container rule for THAT element, which walks ITS
+// ancestors… — exponential in tree depth × rule count (container-nested.html
+// went from "instant" to "minutes"). This mini-cascade iterates the same flat
+// rules, considers only rules that DECLARE the property, and — deliberately —
+// skips rules gated behind @container: container establishment must not depend
+// on container query results (the spec's cycle rule; style-query-no-cycle).
+const _cqPropOf = (el, prop) => {
+  const doc = el.ownerDocument || globalThis.document;
+  let styleEls = [];
+  try { styleEls = doc.querySelectorAll('style, link[rel~="stylesheet"]'); } catch (e) { styleEls = []; }
+  const nid = el._nid;
+  if (typeof nid !== 'number' || nid < 0) return '';
+  let best = null, bestSpec = -1, bestImp = false, order = 0;
+  for (const styleEl of styleEls) {
+    if (typeof globalThis.__cspStyleBlocked === 'function' && globalThis.__cspStyleBlocked(styleEl)) continue;
+    if (!_sheetContributes(styleEl)) continue;
+    for (const rule of _styleSheetRules(styleEl)) {
+      if (rule.layerDecl || rule.scopeRootOnly || !rule.decls) continue;
+      order++;
+      const d = rule.decls[prop];
+      if (d === undefined) continue;
+      if (rule.scope) continue;                   // container-* in @scope: out of scope here
+      let spec = -1;
+      try { spec = parseInt(_dom('selector_match_specificity', String(nid), rule.selectorText), 10); } catch (e) { spec = -1; }
+      if (spec < 0) continue;
+      // A cq-gated rule that DECLARES this property is evaluated (selector
+      // first, so the recursion only ever climbs to ancestors — this is what
+      // lets `@container (min-width: 200px) { .child { container-type:
+      // initial } }` conditionally remove .child's container status). The
+      // depth guard in _cqRuleApplies breaks pathological cycles.
+      if (rule.cq && !_cqRuleApplies(el, rule.cq)) continue;
+      const imp = !!d.important;
+      if (imp && !bestImp) { best = d; bestSpec = spec; bestImp = true; continue; }
+      if (!imp && bestImp) continue;
+      if (spec >= bestSpec) { best = d; bestSpec = spec; }
+    }
+  }
+  let v = best ? String(best.value) : '';
+  try {
+    const iv = el.style && el.style.getPropertyValue(prop);
+    if (iv && (!bestImp || (el.style.getPropertyPriority && el.style.getPropertyPriority(prop) === 'important'))) v = iv;
+  } catch (e) {}
+  // CSS-wide keywords: initial/unset/revert* fall back to the property's
+  // initial value (none of these properties inherit by default except
+  // writing-mode, whose `inherit` chases the parent).
+  const low = v.trim().toLowerCase();
+  if (low === 'initial' || low === 'unset' || low === 'revert' || low === 'revert-layer') return '';
+  if (low === 'inherit') { const p = el.parentElement; return p && typeof p._nid === 'number' ? _cqPropOf(p, prop) : ''; }
+  return v;
+};
+// Inherited-property variant (writing-mode): nearest ancestor-or-self with a
+// declared value.
+const _cqPropInherited = (el, prop) => {
+  for (let a = el, guard = 0; a && guard++ < 1024; a = a.parentElement) {
+    if (typeof a._nid !== 'number') break;
+    const v = _cqPropOf(a, prop);
+    if (v) return v;
+  }
+  return '';
+};
+const _cqIsVertical = (C) => {
+  const wm = _cqPropInherited(C, 'writing-mode') || 'horizontal-tb';
+  return /^(vertical|sideways)/.test(String(wm));
+};
+// px per 1 unit of a container query LENGTH unit (cqw/cqh/cqi/cqb/cqmin/cqmax)
+// for `el`: 1% of the nearest eligible query container's content-box size in
+// the corresponding axis — per-AXIS selection, so `cqi` and `cqb` may resolve
+// against two DIFFERENT containers (an inline-size container answers only its
+// inline axis). No eligible container → the small viewport size.
+const _cqUnitPx = (el, unit) => {
+  if (unit === 'cqmin' || unit === 'cqmax') {
+    const i = _cqUnitPx(el, 'cqi'), b = _cqUnitPx(el, 'cqb');
+    if (i === null || b === null) return null;
+    return unit === 'cqmin' ? Math.min(i, b) : Math.max(i, b);
+  }
+  let axis;
+  if (unit === 'cqw') axis = 'x';
+  else if (unit === 'cqh') axis = 'y';
+  else if (unit === 'cqi') axis = _cqIsVertical(el) ? 'y' : 'x';
+  else if (unit === 'cqb') axis = _cqIsVertical(el) ? 'x' : 'y';
+  else return null;
+  for (let c = el.parentElement, g = 0; c && g++ < 1024; c = c.parentElement) {
+    if (typeof c._nid !== 'number') break;
+    const ct = String(_cqPropOf(c, 'container-type') || 'normal').toLowerCase().split(/\s+/);
+    const hasSize = ct.includes('size'), hasInline = ct.includes('inline-size');
+    if (!hasSize && !hasInline) continue;
+    if (!hasSize && (( _cqIsVertical(c) ? 'y' : 'x') !== axis)) continue;
+    const box = _cqContentBox(c);
+    if (!box) continue;
+    return (axis === 'x' ? box.w : box.h) / 100;
+  }
+  return (axis === 'x' ? (Number(globalThis.innerWidth) || 0) : (Number(globalThis.innerHeight) || 0)) / 100;
+};
+// Evaluate one parsed size feature against container C → true | false | 'u'.
+const _cqEvalSizeFeature = (f, C) => {
+  const box = _cqContentBox(C);
+  if (!box) return 'u';
+  const vertical = _cqIsVertical(C);
+  if (f.name === 'orientation') {
+    const cur = box.h >= box.w ? 'portrait' : 'landscape';
+    if (f.bool) return true;
+    const want = String(f.raw).trim().toLowerCase();
+    if (want !== 'portrait' && want !== 'landscape') return 'u';
+    return want === cur;
+  }
+  let actual;
+  if (f.name === 'width') actual = box.w;
+  else if (f.name === 'height') actual = box.h;
+  else if (f.name === 'inline-size') actual = vertical ? box.h : box.w;
+  else if (f.name === 'block-size') actual = vertical ? box.w : box.h;
+  else if (f.name === 'aspect-ratio') actual = box.h > 0 ? box.w / box.h : (box.w > 0 ? Infinity : 1);
+  else return 'u';
+  if (f.bool) return actual !== 0;
+  // Values go through the typed evaluator: calc(), var() (substituted against
+  // the CONTAINER — css-conditional-5 §container-lengths), rem/em, min/max.
+  const parseVal = (raw) => {
+    if (f.name === 'aspect-ratio') {
+      const r = _mqParseValue('ratio', String(raw).trim());
+      return (r === null || typeof r === 'object') ? null : r;
+    }
+    const r = _cqNumEval(_cqSubstFns(raw, C, 0), C);
+    if (!r || (r.t !== 'len' && r.t !== 'zero')) return null;
+    return r.v;
+  };
+  if (f.range2) {
+    for (const b2 of f.range2) {
+      const want = parseVal(b2.raw);
+      if (want === null) return 'u';
+      if (!_cqCompare(b2.op, actual, want)) return false;
+    }
+    return true;
+  }
+  const want = parseVal(f.raw);
+  if (want === null) return 'u';
+  return _cqCompare(f.minmax || f.op, actual, want);
+};
+// ── A typed numeric evaluator for style-range / size-feature VALUES ─────────
+// Evaluates a <calc-sum> (with calc()/min()/max()/clamp(), var(), attr(), env())
+// into { v, t } — a number in a canonical unit plus a TYPE tag:
+//   num · len(px) · pct(%) · ang(deg) · time(ms) · res(dppx) · zero (bare 0)
+// Comparisons require matching types; a bare `0` compares as a number OR a
+// length (`style(0 = 0px)` is true) but never as an angle/time/resolution
+// (`style(0 = 0deg)` is false). Returns null for anything unresolvable.
+const _CQ_UNIT = (() => {
+  const t = {};
+  for (const [u, f] of [['px', 1], ['cm', 96 / 2.54], ['mm', 96 / 25.4], ['q', 96 / 101.6], ['in', 96], ['pc', 16], ['pt', 96 / 72]]) t[u] = { t: 'len', f };
+  t['%'] = { t: 'pct', f: 1 };
+  for (const [u, f] of [['deg', 1], ['grad', 0.9], ['rad', 180 / Math.PI], ['turn', 360]]) t[u] = { t: 'ang', f };
+  for (const [u, f] of [['ms', 1], ['s', 1000]]) t[u] = { t: 'time', f };
+  for (const [u, f] of [['dppx', 1], ['x', 1], ['dpi', 1 / 96], ['dpcm', 2.54 / 96]]) t[u] = { t: 'res', f };
+  return t;
+})();
+const _cqFontSize = (el) => {
+  try { return parseFloat(globalThis.getComputedStyle(el).getPropertyValue('font-size')) || 16; } catch (e) { return 16; }
+};
+// Substitute var()/attr()/env() textually against container C. A MISSING attr
+// with a fallback substitutes the fallback's raw tokens (so `attr(plugh, 5px)`
+// is a length); a PRESENT attr with no type() is a string — represented as a
+// quoted token so the numeric parser rejects it.
+const _cqSubstFns = (text, C, depth) => {
+  let s = String(text);
+  if (depth > 8) return s;
+  for (let round = 0; round < 8; round++) {
+    let changed = false;
+    s = s.replace(/\b(var|attr|env)\(([^()]*(?:\([^()]*\))?[^()]*)\)/g, (all, fn, argstr) => {
+      changed = true;
+      const args = _splitTopLevelCommas(argstr).map((a) => a.trim());
+      if (fn === 'var') {
+        let v = _cqStyleRead(C, args[0]);
+        if (v === '' && args.length > 1) v = args.slice(1).join(', ');
+        return ' ' + v + ' ';
+      }
+      if (fn === 'env') {
+        if (/^safe-area-inset-/.test(args[0])) return ' 0px ';
+        return args.length > 1 ? ' ' + args.slice(1).join(', ') + ' ' : ' «invalid» ';
+      }
+      // attr(name <type>?, fallback?)
+      const head = args[0].split(/\s+/);
+      const nm = head[0];
+      const typed = head.slice(1).join(' ');
+      let av = null;
+      try { av = C.getAttribute && C.getAttribute(nm); } catch (e) { av = null; }
+      if (av == null || av === '') {
+        return args.length > 1 ? ' ' + args.slice(1).join(', ') + ' ' : ' «invalid» ';
+      }
+      if (/type\(/i.test(typed) || typed) return ' ' + av + ' ';   // typed: raw tokens
+      return ' "' + av + '" ';                                     // untyped: a string
+    });
+    if (!changed) break;
+  }
+  return s;
+};
+// Recursive-descent <calc-sum> over a pre-substituted string. Returns {v,t} or null.
+const _cqNumEval = (text, C) => {
+  const s = String(text).trim();
+  if (!s || s.indexOf('«invalid»') >= 0 || /["']/.test(s)) return null;
+  if (/(^|[^\w-])--[A-Za-z_-]/.test(s)) return null;   // bare custom idents inside math: invalid
+  let i = 0; const n = s.length;
+  const ws = () => { while (i < n && /\s/.test(s[i])) i++; };
+  const fail = { f: true };
+  const num = () => {
+    ws();
+    const m = /^[-+]?(\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/i.exec(s.slice(i));
+    if (!m) return fail;
+    i += m[0].length;
+    const um = /^(%|[A-Za-z]+)/.exec(s.slice(i));
+    if (!um) {
+      const v = parseFloat(m[0]);
+      return { v, t: v === 0 && m[0].trim() === '0' ? 'zero' : 'num' };
+    }
+    const u = um[1].toLowerCase();
+    const spec = _CQ_UNIT[u];
+    if (!spec) {
+      // font-relative / viewport units resolve here (need the container).
+      const nv = parseFloat(m[0]);
+      i += um[1].length;
+      const vw = Number(globalThis.innerWidth) || 0, vh = Number(globalThis.innerHeight) || 0;
+      if (u === 'em') return { v: nv * _cqFontSize(C), t: 'len' };
+      if (u === 'rem') { const root = (C.ownerDocument || globalThis.document).documentElement; return { v: nv * _cqFontSize(root), t: 'len' }; }
+      if (u === 'ex' || u === 'ch') return { v: nv * _cqFontSize(C) / 2, t: 'len' };
+      if (u === 'vw') return { v: nv * vw / 100, t: 'len' };
+      if (u === 'vh') return { v: nv * vh / 100, t: 'len' };
+      if (u === 'vmin') return { v: nv * Math.min(vw, vh) / 100, t: 'len' };
+      if (u === 'vmax') return { v: nv * Math.max(vw, vh) / 100, t: 'len' };
+      if (/^cq(?:w|h|i|b|min|max)$/.test(u)) {
+        const cf = _cqUnitPx(C, u);
+        if (cf !== null) return { v: nv * cf, t: 'len' };
+      }
+      return fail;
+    }
+    i += um[1].length;
+    return { v: parseFloat(m[0]) * spec.f, t: spec.t };
+  };
+  const primary = () => {
+    ws();
+    const fm = /^([A-Za-z-]+)?\(/.exec(s.slice(i));
+    if (fm) {
+      const fname = (fm[1] || '').toLowerCase();
+      i += fm[0].length;
+      const args = [];
+      let a = sum();
+      if (a === fail) return fail;
+      args.push(a); ws();
+      while (i < n && s[i] === ',') { i++; a = sum(); if (a === fail) return fail; args.push(a); ws(); }
+      if (i >= n || s[i] !== ')') return fail;
+      i++;
+      const sameT = args.every((x) => x.t === args[0].t || x.t === 'zero' || args[0].t === 'zero');
+      const tOf = args.find((x) => x.t !== 'zero');
+      const rt = tOf ? tOf.t : 'zero';
+      if (fname === '' || fname === 'calc') return args.length === 1 ? args[0] : fail;
+      if (!sameT) return fail;
+      if (fname === 'min') return { v: Math.min(...args.map((x) => x.v)), t: rt };
+      if (fname === 'max') return { v: Math.max(...args.map((x) => x.v)), t: rt };
+      if (fname === 'clamp') return args.length === 3 ? { v: Math.min(Math.max(args[1].v, args[0].v), args[2].v), t: rt } : fail;
+      return fail;
+    }
+    return num();
+  };
+  const prod = () => {
+    let a = primary();
+    if (a === fail) return fail;
+    for (;;) {
+      ws();
+      if (i < n && s[i] === '*') {
+        i++; const b = primary(); if (b === fail) return fail;
+        if (a.t !== 'num' && a.t !== 'zero' && b.t !== 'num' && b.t !== 'zero') return fail;
+        a = { v: a.v * b.v, t: (a.t === 'num' || a.t === 'zero') ? b.t : a.t };
+      } else if (i < n && s[i] === '/') {
+        i++; const b = primary(); if (b === fail || (b.t !== 'num' && b.t !== 'zero') || b.v === 0) return fail;
+        a = { v: a.v / b.v, t: a.t };
+      } else break;
+    }
+    return a;
+  };
+  const sum = () => {
+    let a = prod();
+    if (a === fail) return fail;
+    for (;;) {
+      ws();
+      const c = s[i];
+      if ((c === '+' || c === '-') && /\s/.test(s[i + 1] || '')) {
+        i++; const b = prod(); if (b === fail) return fail;
+        let t = a.t;
+        if (a.t !== b.t) {
+          if (a.t === 'zero' && (b.t === 'num' || b.t === 'len')) t = b.t;
+          else if (b.t === 'zero' && (a.t === 'num' || a.t === 'len')) t = a.t;
+          else return fail;
+        }
+        a = { v: c === '+' ? a.v + b.v : a.v - b.v, t };
+      } else break;
+    }
+    return a;
+  };
+  const out = sum();
+  ws();
+  if (out === fail || i < n) return null;
+  return out;
+};
+// One side of a <style-range>: a bare `--x` reads the container's computed
+// value (registered properties give their canonical computed form); anything
+// else goes through substitution + the numeric evaluator.
+const _cqRangeOperand = (raw, C) => {
+  const s = String(raw).trim();
+  if (/^--[\w-]+$/.test(s)) {
+    const v = _cqStyleRead(C, s);
+    if (v === '') return null;
+    return _cqNumEval(_cqSubstFns(v, C, 0), C);
+  }
+  return _cqNumEval(_cqSubstFns(s, C, 0), C);
+};
+const _cqTypesComparable = (a, b) => {
+  if (a.t === b.t) return true;
+  const z = (x, y) => x.t === 'zero' && (y.t === 'num' || y.t === 'len');
+  return z(a, b) || z(b, a);
+};
+// Evaluate one <style-feature> (the interior of style(…) when not a boolean).
+const _cqEvalStyleFeature = (inner, C) => {
+  const s = inner.trim();
+  if (_hasTopLevelCompare(s)) {
+    // <style-range>: `a op b` or `a op1 name op2 b` — typed comparison.
+    const ops = [], parts = []; let depth = 0, seg = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '\\') { i++; continue; }
+      else if (c === '(') depth++;
+      else if (c === ')') { if (depth > 0) depth--; }
+      else if (depth === 0 && (c === '<' || c === '>' || c === '=')) {
+        let op = c;
+        if ((c === '<' || c === '>') && s[i + 1] === '=') op = c + '=';
+        parts.push(s.slice(seg, i)); ops.push(op); i += op.length - 1; seg = i + 1;
+      }
+    }
+    parts.push(s.slice(seg));
+    if (ops.length < 1 || ops.length > 2) return 'u';
+    if (ops.length === 2 && (ops[0][0] === '<') !== (ops[1][0] === '<')) return 'u';
+    if (ops.length === 2 && !(/^[<>]=?$/.test(ops[0]) && /^[<>]=?$/.test(ops[1]))) return 'u';
+    // An EMPTY operand or a stray `!` is a grammar error, not a failed
+    // resolution — <general-enclosed> → unknown.
+    if (parts.some((p) => !p.trim() || p.indexOf('!') >= 0)) return 'u';
+    const vals = parts.map((p) => _cqRangeOperand(p, C));
+    // An operand that fails to RESOLVE (a missing custom property, a CSS-wide
+    // keyword, an incomparable value) makes the range FALSE, not unknown —
+    // at-container-style-parsing asserts `(f) or (not f)` is true for every
+    // grammatically valid range.
+    if (vals.some((v) => v === null)) return false;
+    for (let k = 0; k < ops.length; k++) {
+      const a = vals[k], b = vals[k + 1];
+      if (!_cqTypesComparable(a, b)) return false;
+      const cmp = { '<': a.v < b.v, '<=': a.v <= b.v, '>': a.v > b.v, '>=': a.v >= b.v, '=': a.v === b.v }[ops[k]];
+      if (!cmp) return false;
+    }
+    return true;
+  }
+  const ci = _topLevelColon(s);
+  const prop = (ci >= 0 ? s.slice(0, ci) : s).trim();
+  if (!/^--/.test(prop)) {
+    // A standard property: `style(prop: value)` matches when the container's
+    // COMPUTED value equals the query value computed against the container.
+    if (ci < 0) return 'u';
+    if (!_CSS_KNOWN_PROPS.has(prop.toLowerCase())) return 'u';
+    const actual = _cqStyleRead(C, prop.toLowerCase());
+    const want = _cqSubstFns(s.slice(ci + 1).trim(), C, 0).trim().replace(/\s+/g, ' ');
+    if (actual === want) return true;
+    // Canonicalize the query value through a detached declaration, then compare
+    // the computed forms (colors: 'green' vs 'rgb(0, 128, 0)').
+    try {
+      const d = _newStyleDecl();
+      d.setProperty(prop, want);
+      const canon = d.getPropertyValue(prop);
+      if (canon && canon === actual) return true;
+      const compA = _cqNumEval(_cqSubstFns(actual, C, 0), C);
+      const compB = _cqNumEval(_cqSubstFns(want, C, 0), C);
+      if (compA && compB && _cqTypesComparable(compA, compB)) return compA.v === compB.v;
+      // Colors: gCS serves the COMPUTED form ('rgb(0, 128, 0)'); resolve the
+      // query value through the engine's CSS Color 4 parser and compare.
+      const rgba = _c2dColor(want, C);
+      if (rgba) {
+        const ser = rgba[3] >= 1
+          ? `rgb(${rgba[0]}, ${rgba[1]}, ${rgba[2]})`
+          : `rgba(${rgba[0]}, ${rgba[1]}, ${rgba[2]}, ${rgba[3]})`;
+        if (ser === actual) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  const actual = _cqStyleRead(C, prop);
+  if (ci < 0) return actual.trim() !== '';          // bare `style(--x)`: non-initial?
+  let want = s.slice(ci + 1).trim();
+  // `!important` is allowed in a style() declaration and ignored for matching;
+  // a stray top-level `;` makes the declaration invalid → <general-enclosed>.
+  want = want.replace(/!\s*important\s*$/i, '').trim();
+  if (want.indexOf(';') >= 0) return 'u';
+  // CSS-wide keywords in the query VALUE compute against the container first
+  // (custom-property-style-queries §defaulting): `initial` is the registered
+  // initial (guaranteed-invalid when unregistered), `inherit` is the parent's
+  // value, `unset` picks by the registration's inherits flag (an unregistered
+  // custom property always inherits). The revert family never matches.
+  const wlow = want.toLowerCase();
+  if (wlow === 'revert' || wlow === 'revert-layer' || wlow === 'revert-rule') return false;
+  if (wlow === 'initial' || wlow === 'inherit' || wlow === 'unset') {
+    let reg = null;
+    try { reg = _effectivePropReg(C, prop); } catch (e) { reg = null; }
+    const parentVal = () => {
+      const p = C.parentElement;
+      return (p && typeof p._nid === 'number') ? _cqStyleRead(p, prop) : '';
+    };
+    let target;
+    if (wlow === 'initial') target = reg ? String(reg.initialValue == null ? '' : reg.initialValue) : '';
+    else if (wlow === 'inherit') target = parentVal();
+    else target = (reg && !reg.inherits) ? String(reg.initialValue == null ? '' : reg.initialValue) : parentVal();
+    if (actual.trim() === String(target).trim()) return true;
+    const ta = _cqNumEval(_cqSubstFns(actual, C, 0), C);
+    const tb = _cqNumEval(_cqSubstFns(String(target), C, 0), C);
+    return !!(ta && tb && _cqTypesComparable(ta, tb) && ta.v === tb.v);
+  }
+  // var() in the query value substitutes against the CONTAINER's computed values.
+  if (want.indexOf('var(') >= 0) want = _cqSubstFns(want, C, 0).trim().replace(/\s+/g, ' ');
+  if (actual.trim() === want) return true;
+  // A REGISTERED numeric property compares by computed value (10em ≡ 160px);
+  // an unregistered one is token-equality only.
+  let reg2 = null;
+  try { reg2 = _effectivePropReg(C, prop); } catch (e) { reg2 = null; }
+  if (reg2) {
+    const a = _cqNumEval(_cqSubstFns(actual, C, 0), C);
+    const b = _cqNumEval(_cqSubstFns(want, C, 0), C);
+    if (a && b && _cqTypesComparable(a, b)) return a.v === b.v;
+  }
+  return false;
+};
+// Evaluate the interior of `style( … )` — a <style-query> — against container C.
+const _cqEvalStyleQuery = (inner, C) => {
+  const s = String(inner).trim();
+  const toks = _tokenizeContainerQuery(s);
+  if (!_styleQueryIsBoolean(toks)) return _cqEvalStyleFeature(s, C);
+  // boolean of <style-in-parens>: reuse the condition shape with style operands.
+  const evalTok = (tok) => {
+    if (tok[0] === '(') {
+      const in2 = tok.slice(1, -1).trim();
+      const inToks = _tokenizeContainerQuery(in2);
+      if (_styleQueryIsBoolean(inToks) && inToks.some((x) => x[0] === '(' || /^(and|or|not)$/i.test(x))) return _cqEvalStyleQuery(in2, C);
+      return _cqEvalStyleFeature(in2, C);
+    }
+    return 'u';
+  };
+  if (/^not$/i.test(toks[0])) {
+    if (toks.length !== 2) return 'u';
+    const v = evalTok(toks[1]);
+    return v === 'u' ? 'u' : !v;
+  }
+  let op = null, sawU = false, acc = null;
+  for (let i = 0; i < toks.length; i++) {
+    if (i % 2) { const o = toks[i].toLowerCase(); if (o !== 'and' && o !== 'or') return 'u'; if (op === null) op = o; else if (op !== o) return 'u'; continue; }
+    const v = evalTok(toks[i]);
+    if (v === 'u') { sawU = true; continue; }
+    acc = acc === null ? v : (op === 'or' ? (acc || v) : (acc && v));
+  }
+  if (sawU) return 'u';
+  return acc === null ? 'u' : acc;
+};
+// Evaluate a condition AST against container C → true | false | 'u'. Unknown is
+// contagious through not/and/or (see header note).
+const _cqEvalCond = (node, C) => {
+  if (!node || node.unknown) return 'u';
+  if (node.not) { const v = _cqEvalCond(node.not, C); return v === 'u' ? 'u' : !v; }
+  if (node.kids) {
+    let sawU = false, acc = node.op === 'and';
+    for (const k of node.kids) {
+      const v = _cqEvalCond(k, C);
+      if (v === 'u') { sawU = true; continue; }
+      acc = node.op === 'and' ? (acc && v) : (acc || v);
+    }
+    return sawU ? 'u' : acc;
+  }
+  if (node.style !== undefined) return _cqEvalStyleQuery(node.style, C);
+  if (node.feat) return _cqEvalSizeFeature(node.feat, C);
+  return 'u';
+};
+// Select the query container for `el` given an optional name and the size
+// features the condition consults. Walks ancestors from the parent (for a
+// pseudo view, `parentElement` IS the originating element — which is exactly
+// the spec's rule that a pseudo's own element can be its container):
+//  • name given → container-name must include it;
+//  • size features present → container-type must be `size`, or `inline-size`
+//    when every consulted feature lies on the candidate's inline axis (an
+//    ineligible candidate is SKIPPED, not selected-and-unknown — an outer
+//    `size` container answers `(height)` when the nearer one is inline-only);
+//  • a pure style() query needs no container-type at all (every element is a
+//    style container), so unnamed ones resolve to the parent element.
+const _cqSelectContainer = (el, name, needs) => {
+  for (let a = el.parentElement, guard = 0; a && guard++ < 1024; a = a.parentElement) {
+    if (!a || typeof a._nid !== 'number') break;
+    if (name) {
+      const cn = String(_cqPropOf(a, 'container-name') || 'none');
+      if (cn === 'none' || !cn.split(/\s+/).includes(name)) continue;
+    }
+    if (needs.size) {
+      const ct = String(_cqPropOf(a, 'container-type') || 'normal').toLowerCase();
+      const toks = ct.split(/\s+/);
+      const hasSize = toks.includes('size'), hasInline = toks.includes('inline-size');
+      if (!hasSize && !hasInline) continue;
+      if (!hasSize) {
+        const vertical = _cqIsVertical(a);
+        let ok = true;
+        for (const f of needs) {
+          if (f === 'inline-size') continue;
+          if (f === 'width') { if (vertical) { ok = false; break; } }
+          else if (f === 'height') { if (!vertical) { ok = false; break; } }
+          else { ok = false; break; }               // block-size / aspect-ratio / orientation
+        }
+        if (!ok) continue;
+      }
+    }
+    return a;
+  }
+  return null;
+};
+// Does one @container prelude (a comma-separated condition list — OR) hold for `el`?
+// (_cqEvalDepth/_cqMemo are declared beside _buildCascade, which owns the memo.)
+const _cqPreludeApplies = (el, prelude) => {
+  for (const part of _splitTopLevelCommas(String(prelude))) {
+    const s = part.trim();
+    if (!s) continue;
+    let name = '', query = s;
+    if (s[0] !== '(' && !/^style\(/i.test(s) && !/^not\b/i.test(s)) {
+      const m = /^[^\s(]+/.exec(s);
+      if (m) { name = m[0]; query = s.slice(m[0].length).trim(); }
+    }
+    const ast = query ? _cqParseCond(query) : null;
+    if (query && !ast) continue;
+    const needs = _cqCollectSizeNeeds(ast, new Set());
+    const C = _cqSelectContainer(el, name, needs);
+    if (!C) continue;
+    if (!query) return true;                        // name-only condition: a named container exists
+    if (_cqEvalCond(ast, C) === true) return true;
+  }
+  return false;
+};
+// The cascade gate: every frame (outermost @container first) must hold.
+// A memo (keyed element+frames) lives for the duration of one TOP-LEVEL
+// evaluation chain: style() queries read the container's computed custom
+// properties through real getComputedStyle, whose cascade re-enters this gate
+// for every @container rule in the document — without the memo that recursion
+// is exponential in rule count × tree depth.
+const _cqRuleApplies = (el, frames) => {
+  if (_cqEvalDepth > 16) return false;              // defensive cycle guard
+  const own = _cqMemo === null;                     // normally owned by the outermost
+  if (own) _cqMemo = new Map();                     // cascade build (_buildCascade)
+  const key = (el._nid) + '§' + frames.join('§');
+  const hit = _cqMemo.get(key);
+  if (hit !== undefined) { if (own) _cqMemo = null; return hit; }
+  _cqEvalDepth++;
+  let out = false;
+  try {
+    out = true;
+    for (const prelude of frames) {
+      if (!_cqPreludeApplies(el, prelude)) { out = false; break; }
+    }
+    return out;
+  } catch (e) { out = false; return false; }
+  finally {
+    _cqEvalDepth--;
+    if (_cqMemo) _cqMemo.set(key, out);
+    if (own) _cqMemo = null;
+  }
+};
+// A memoized computed-property read against a container — the style()-query
+// read path. One outer getComputedStyle can gate dozens of @container rules
+// that all read the same few properties off the same few containers; without
+// this, every gate rebuilt the container's full cascade and the 78-test
+// style-query file went from seconds to MINUTES (it looked like a hang).
+const _cqStyleRead = (C, prop) => {
+  const key = 'p§' + C._nid + '§' + prop;
+  if (_cqMemo) { const hit = _cqMemo.get(key); if (hit !== undefined) return hit; }
+  let v = '';
+  try { v = String(globalThis.getComputedStyle(C).getPropertyValue(prop) || ''); } catch (e) { v = ''; }
+  if (_cqMemo) _cqMemo.set(key, v);
+  return v;
 };
 
 // CSSContainerRule (CSS Conditional 5) — `@container [<name>]? <query> { … }`. A

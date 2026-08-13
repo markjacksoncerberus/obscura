@@ -481,3 +481,16 @@ css/css-pseudo/marker-variable-computed-style.html
 css/css-pseudo/marker-reverted-styles.html
 css/css-pseudo/marker-display-computed.html
 css/css-pseudo/marker-computed-size.html
+# @container / container-queries (#550–#554) — the query core, held perfect
+css/css-conditional/container-queries/query-evaluation.html
+css/css-conditional/container-queries/container-selection.html
+css/css-conditional/container-queries/size-feature-evaluation.html
+css/css-conditional/container-queries/container-nested.html
+css/css-conditional/container-queries/query-evaluation-style.html
+css/css-conditional/container-queries/custom-property-style-queries.html
+css/css-conditional/container-queries/at-container-parsing.html
+css/css-conditional/container-queries/at-container-style-parsing.html
+css/css-conditional/container-queries/container-units-basic.html
+css/css-conditional/container-queries/container-computed.html
+css/css-conditional/container-queries/conditional-container-status.html
+css/css-conditional/container-queries/never-match-container.html
