@@ -5685,8 +5685,37 @@ class Element extends Node {
     return _makeHTMLCollection(() => (_domParse("element_children", this._nid) || []).map(_wrapEl).filter(Boolean));
   }
   get content() {
-    if (this.localName !== 'template') return undefined;
-    return _templateContentFragment(this);
+    if (this.localName === 'template') return _templateContentFragment(this);
+    // HTMLMetaElement.content reflects the attribute — WPT (and real pages)
+    // build `<meta http-equiv=Content-Security-Policy>` through the IDL
+    // properties, and without reflection the policy simply never existed.
+    if (this.localName === 'meta') return this.getAttribute('content') || '';
+    return undefined;
+  }
+  set content(v) {
+    if (this.localName === 'meta') this.setAttribute('content', String(v));
+  }
+  get httpEquiv() {
+    if (this.localName !== 'meta') return undefined;
+    return this.getAttribute('http-equiv') || '';
+  }
+  set httpEquiv(v) {
+    if (this.localName === 'meta') this.setAttribute('http-equiv', String(v));
+  }
+  // CSS Conditional 5 `Element.matchContainer(query)` (csswg-drafts#13551): ask
+  // the element's own query containers the question an `@container <query>`
+  // prelude would ask for it. `.matches` is LIVE — a getter re-evaluating on
+  // read — so container resizes, style flips and re-parenting are all visible
+  // without an event model. An unparseable/empty query simply never matches.
+  matchContainer(query) {
+    const el = this;
+    const q = String(query == null ? '' : query).trim();
+    return {
+      get matches() {
+        if (!q) return false;
+        try { return !!_cqRuleApplies(el, [q]); } catch (e) { return false; }
+      },
+    };
   }
   get childElementCount() { return this.children.length; }
   get firstElementChild() { return this.children[0] || null; }
@@ -6376,6 +6405,14 @@ class Element extends Node {
   }
   _loadIframeSrc(url) {
     this._srcLoadStarted = true; // markup-src auto-load (below) won't double-fire
+    // ⚠️ A navigation BLOCKED by CSP must not fire a fresh `load` on a frame that
+    // already fired one: WPT (and real pages) set `frame.src` from inside a load
+    // handler, and a blocked assignment that re-fired `load` re-ran the handler —
+    // an infinite loop that wedged the whole page thread (the three CSP wedge
+    // files: to-javascript-url-script-src, frame-src-blocked-path-matching,
+    // frame-src-redirect). A blocked navigation loads NOTHING; only the INITIAL
+    // about:blank (a frame that has never fired `load`) still announces itself.
+    const _hadLoaded = this._loadEventFired;
     this._loadEventFired = false; // a (re)load fires a fresh element load event
     // A NEW document means new scripts. `_executeFrameScripts` is idempotent per
     // frame element, and only the `srcdoc` path used to clear that flag — so a
@@ -6405,7 +6442,11 @@ class Element extends Node {
       const jsAllowed = typeof globalThis.__cspAllowsInline !== 'function'
         || globalThis.__cspAllowsInline('script', el, body);
       if (jsAllowed) { try { (0, _NativeEval)(body); } catch (e) { _reportError(e); } }
-      _scheduleFrameElementLoad(el);
+      // A BLOCKED javascript: navigation commits no document — no `load`. Only
+      // the initial about:blank (never-loaded frame) or an allowed execution
+      // (whose string completion would replace the document) announces a load.
+      if (jsAllowed || !_hadLoaded) _scheduleFrameElementLoad(el);
+      else el._loadEventFired = _hadLoaded;
       return;
     }
     // ⭐ `frame-src` is asked on the REQUEST, before any fetch: a blocked frame
@@ -6419,7 +6460,10 @@ class Element extends Node {
         try { const o = new URL(fullUrl).origin; if (o && o !== 'null') reportUri = o; } catch (e) {}
         if (!globalThis.__cspAllowsURL('frame-src', fullUrl, el, reportUri)) {
           el.contentDocument;
-          _scheduleFrameElementLoad(el);
+          // Blocked navigation: no fresh `load` on an already-loaded frame
+          // (see _hadLoaded above — the re-fire was an infinite loop).
+          if (!_hadLoaded) _scheduleFrameElementLoad(el);
+          else el._loadEventFired = _hadLoaded;
           return;
         }
       }
@@ -6428,6 +6472,28 @@ class Element extends Node {
       // Superseded by a newer load (e.g. srcdoc set while this was in flight)?
       // Don't clobber the current document or fire a stale load.
       if (_self._loadGen !== _gen) return;
+      // ⭐ A REDIRECT IS A SECOND REQUEST and CSP §4.2.4 asks the directive again
+      // for every hop: a policy that allows /common/redirect.py must still refuse
+      // the cross-origin document it bounces to, or any allowed same-origin
+      // endpoint that redirects becomes a hole through frame-src. Our fetch
+      // follows hops internally, so the re-ask happens once, on the FINAL url.
+      try {
+        const _finalUrl = resp.url || fullUrl;
+        if (typeof globalThis.__cspAllowsURL === 'function' && _finalUrl) {
+          let _redirected = false;
+          try { _redirected = new URL(_finalUrl).href !== new URL(fullUrl).href; } catch (e) {}
+          if (_redirected) {
+            let _rep = _finalUrl;   // navigation: report the origin, not the path
+            try { const o = new URL(_finalUrl).origin; if (o && o !== 'null') _rep = o; } catch (e) {}
+            if (!globalThis.__cspAllowsURL('frame-src', _finalUrl, el, _rep)) {
+              el.contentDocument;
+              if (!_hadLoaded) _scheduleFrameElementLoad(el);
+              else el._loadEventFired = _hadLoaded;
+              return;
+            }
+          }
+        }
+      } catch (e) {}
       // ⭐ `frame-ancestors` / `X-Frame-Options` are answered on the RESPONSE and
       // before a document exists. A refused frame is left holding its initial
       // `about:blank` with an OPAQUE ORIGIN — which is the observable part: the
@@ -9517,8 +9583,12 @@ const _runFrameScript = function(code, win, url) {
     // Without that, `localStorage.setItem(…)` inside an iframe looked like the
     // top document doing the write, so the top document was skipped by the
     // storage-event broadcast and never heard about the change at all.
-    fn.call(win, win, win, win.document, win.location, win.parent, win.top,
-            win.frames, win.frameElement, win, win.localStorage, win.sessionStorage);
+    const _prevInc = globalThis.__frameIncumbent;
+    globalThis.__frameIncumbent = win;   // postMessage stamps `source` by this
+    try {
+      fn.call(win, win, win, win.document, win.location, win.parent, win.top,
+              win.frames, win.frameElement, win, win.localStorage, win.sessionStorage);
+    } finally { globalThis.__frameIncumbent = _prevInc; }
   } catch (e) {
     _reportFrameError(e, win);
   }
@@ -9583,8 +9653,12 @@ const _runFrameProgram = function(parts, win, baseUrl) {
     // Without that, `localStorage.setItem(…)` inside an iframe looked like the
     // top document doing the write, so the top document was skipped by the
     // storage-event broadcast and never heard about the change at all.
-    fn.call(win, win, win, win.document, win.location, win.parent, win.top,
-            win.frames, win.frameElement, win, win.localStorage, win.sessionStorage);
+    const _prevInc = globalThis.__frameIncumbent;
+    globalThis.__frameIncumbent = win;
+    try {
+      fn.call(win, win, win, win.document, win.location, win.parent, win.top,
+              win.frames, win.frameElement, win, win.localStorage, win.sessionStorage);
+    } finally { globalThis.__frameIncumbent = _prevInc; }
   } catch (e) {
     _reportFrameError(e, win);
   }
@@ -10418,6 +10492,41 @@ const _loadElementResource = function(el, url, initiatorType, opts) {
   // request; the response is then non-opaque when the access-control check passes,
   // which exposes contentType (Resource Timing) even cross-origin.
   const _useCors = !!(el && (el.crossOrigin === 'anonymous' || el.crossOrigin === 'use-credentials'));
+  // A blob: URL resolves from the in-page object-URL store, never the network —
+  // `script.src = URL.createObjectURL(blob)` is how pages run code they just
+  // assembled, and routing it at op_fetch_url handed reqwest a scheme it cannot
+  // fetch (the script silently never ran). Same task-delay contract as data:.
+  if (/^blob:/i.test(fullUrl)) {
+    const _bkey = fullUrl.split('#')[0];
+    _queueTask(() => {
+      if (el._resLoadGen !== gen) return;
+      if (!Object.prototype.hasOwnProperty.call(__blobStore, _bkey)) {
+        if (initiatorType === 'img') _imgMarkBroken(el);
+        _fireElementError(el);
+        return;
+      }
+      const _bb = __blobStore[_bkey];
+      const _btype = __blobTypes[_bkey] || '';
+      if (initiatorType === 'img') {
+        const _bytes = _bb instanceof Uint8Array ? _bb : new TextEncoder().encode(String(_bb));
+        _imgAdoptBytes(el, _bytes, fullUrl, { 'content-type': _btype });
+        return;
+      }
+      if (opts.eval) {
+        const _code = _bb instanceof Uint8Array ? new TextDecoder().decode(_bb) : String(_bb);
+        const _prevCS = globalThis.__currentScriptNid;
+        globalThis.__currentScriptNid = opts.module ? -1 : el._nid;
+        try {
+          if (opts.module && /(^|[\n;{}])\s*(?:import|export)\b/.test(_code)) {
+            console.warn('[obscura] blob: <script type=module> with import/export is not supported');
+          } else (0, _NativeEval)(opts.module ? '"use strict";\n' + _code : _code);
+        } catch (e) { _reportError(e); }
+        finally { globalThis.__currentScriptNid = _prevCS; }
+      }
+      _fireIframeElementLoad(el);
+    });
+    return;
+  }
   // An <img> with a data: URL has its bytes already. Decode on a task — the load
   // event must not fire before the caller has had a chance to attach a listener.
   if (initiatorType === 'img' && /^data:/i.test(fullUrl)) {
@@ -11398,7 +11507,7 @@ globalThis.fetch = async (input, init = {}) => {
     headers: parsed.headers || {},
     type: respType,
     url: parsed.url || url,
-    redirected: false,
+    redirected: !!parsed.redirected,
   });
 };
 
@@ -13534,6 +13643,10 @@ const _GCS_DEFAULTS = {
   'background-origin': 'padding-box', 'background-position': '0% 0%',
   'background-repeat': 'repeat', 'background-size': 'auto',
   'background-image': 'none', filter: 'none', 'backdrop-filter': 'none',
+  // css-compositing: how each background layer blends with the ones below it.
+  'background-blend-mode': 'normal', 'mix-blend-mode': 'normal', isolation: 'auto',
+  // css-backgrounds-3 §box-shadow — initial none, not inherited.
+  'box-shadow': 'none',
   // css-text properties (all inherited) — initial computed values per spec.
   // Computed serialization for these is identity (keyword / simple length),
   // so the #52 inheritance engine resolves initial/inherit/unset directly.
@@ -28898,6 +29011,38 @@ const _pseudoViewFor = (el, name) => {
   }
   return pv;
 };
+// css-pseudo-4: ::first-line and ::first-letter accept only a SUBSET of
+// properties — a `::first-line { margin: 10px }` simply does not apply (the
+// pseudo computes as if the declaration were absent), while typography,
+// background and (for ::first-letter) box properties do. Filtering happens on
+// the EXPANDED longhands, so a filtered shorthand drops whole.
+const _FL_COMMON_EXACT = new Set([
+  'color', 'letter-spacing', 'word-spacing', 'line-height', 'opacity',
+  'text-transform', 'text-shadow', 'text-justify', 'vertical-align',
+  'text-combine-upright', 'caret-color', 'box-decoration-break',
+]);
+const _flPropAllowed = (p, pseudo) => {
+  if (p.startsWith('--')) return true;               // custom props feed allowed ones
+  if (p.startsWith('background')) return true;       // background-* incl. blend-mode
+  if (p.startsWith('font')) return true;             // font-*, variants, features
+  if (p.startsWith('text-decoration') || p.startsWith('text-emphasis')
+      || p.startsWith('text-underline') || p.startsWith('-webkit-text')) return true;
+  if (_FL_COMMON_EXACT.has(p)) return true;
+  if (pseudo === 'first-letter') {
+    if (p.startsWith('border') || p.startsWith('margin') || p.startsWith('padding')) return true;
+    if (p === 'float' || p === 'box-shadow' || p === 'box-sizing') return true;
+  }
+  return false;
+};
+const _pseudoFilterDecls = (decls, pseudo) => {
+  if (pseudo !== 'first-line' && pseudo !== 'first-letter') return decls;
+  let out = null;
+  for (const k in decls) {
+    if (_flPropAllowed(k, pseudo)) continue;
+    if (out === null) { out = {}; for (const k2 in decls) if (_flPropAllowed(k2, pseudo)) out[k2] = decls[k2]; break; }
+  }
+  return out === null ? decls : out;
+};
 // The complex selectors of `selText` whose subject compound targets `pseudo`,
 // with the pseudo-element stripped (the stripped selector is matched against
 // the ORIGINATING element; the caller re-adds the pseudo's own (0,0,1)
@@ -28987,12 +29132,24 @@ const _buildCascadeUncached = (el) => {
     // The UA sheet for ::marker (CSS Lists §ua-stylesheet): these override the
     // values a marker would otherwise INHERIT from its list item.
     if (_pseudo === 'marker') {
+      // css-lists §markers: an OUTSIDE marker is a block container the UA lays
+      // out beside the item (computed display inline-block); an INSIDE marker
+      // is an ordinary inline at the start of the item's content. The position
+      // is the ORIGINATING element's computed list-style-position (inherited
+      // from the list, usually), so it must be read, not assumed.
+      let _mdisp = 'inline-block';
+      try {
+        const owner = el._pseudoOwner || Object.getPrototypeOf(el);
+        const lsp = String(globalThis.getComputedStyle(owner).getPropertyValue('list-style-position') || '');
+        if (lsp.toLowerCase() === 'inside') _mdisp = 'inline';
+      } catch (e) {}
       sources.push({ spec: 0, order: -2, uaLike: true, decls: {
         'unicode-bidi': { value: 'isolate' },
         'font-variant-numeric': { value: 'tabular-nums' },
         'text-transform': { value: 'none' },
         'text-indent': { value: '0px' },
         'white-space': { value: 'pre' },
+        display: { value: _mdisp },
       } });
     }
     const hintDecls = _pseudo ? null : _presHintDecls(el);
@@ -29040,7 +29197,7 @@ const _buildCascadeUncached = (el) => {
         const ps = _pseudoSelFor(selText, _pseudo);
         if (!ps) continue;
         const spec = parseInt(_dom('selector_match_specificity', matchKey, ps), 10);
-        if (spec >= 0) sources.push({ spec: spec + 1, order: order++, decls: rule.decls, lpath });
+        if (spec >= 0) sources.push({ spec: spec + 1, order: order++, decls: _pseudoFilterDecls(rule.decls, _pseudo), lpath });
         continue;
       }
       if (rule.scope) {
@@ -31204,6 +31361,36 @@ globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
       const vals = _SHORTHAND_LONGHANDS[kebab].map((ln) => resolve(ln));
       if (vals.some((x) => !x)) return '';
       return _serializeBoxValue(kebab, vals);
+    }
+    // `border` (computed): `width style color`, only when all four edges agree on
+    // all three components — a heterogeneous border has no shorthand and reads ''.
+    if (kebab === 'border') {
+      const w4 = _SHORTHAND_LONGHANDS['border-width'].map((ln) => resolve(ln));
+      const s4 = _SHORTHAND_LONGHANDS['border-style'].map((ln) => resolve(ln));
+      const c4 = _SHORTHAND_LONGHANDS['border-color'].map((ln) => resolve(ln));
+      if (w4.concat(s4, c4).some((x) => !x)) return '';
+      if (new Set(w4).size !== 1 || new Set(s4).size !== 1 || new Set(c4).size !== 1) return '';
+      return w4[0] + ' ' + s4[0] + ' ' + c4[0];
+    }
+    // border-top/right/bottom/left (computed): the side's full `width style color`.
+    if (/^border-(top|right|bottom|left)$/.test(kebab)) {
+      const w = resolve(kebab + '-width'), s = resolve(kebab + '-style'), c = resolve(kebab + '-color');
+      if (!w || !s || !c) return '';
+      return w + ' ' + s + ' ' + c;
+    }
+    // `border-image` (computed): `source [slice [/ width [/ outset]]] [repeat]`,
+    // trailing parts at their initial values dropped (Chrome's serialization).
+    if (kebab === 'border-image') {
+      const src = resolve('border-image-source'), sl = resolve('border-image-slice');
+      const w = resolve('border-image-width'), o = resolve('border-image-outset');
+      const r = resolve('border-image-repeat');
+      if (!src || !sl || !w || !o || !r) return '';
+      let out = src;
+      if (sl !== '100%' || w !== '1' || o !== '0') out += ' ' + sl;
+      if (w !== '1' || o !== '0') out += ' / ' + w;
+      if (o !== '0') out += ' / ' + o;
+      if (r !== 'stretch') out += ' ' + r;
+      return out;
     }
     // css-logical two-value border shorthand (border-block-color/-style/-width +
     // inline): reconstruct from the COMPUTED start/end longhands, collapsing an
@@ -34026,8 +34213,20 @@ class CSSMediaRule extends CSSConditionRule {
 _exposeIface('CSSMediaRule', CSSMediaRule);
 _enumAccessors(CSSMediaRule.prototype, 'media', 'matches', 'conditionText');
 
+// css-conditional-5 §at-rule(): the serialized condition re-emits the at-keyword
+// in CANONICAL form — surrounding whitespace dropped, the ident unescaped and
+// minimally re-escaped (`at-rule( @supports )` → `at-rule(@supports)`,
+// `@--\31 23` → `@--123`, while `@\31 23` keeps its escape because a leading
+// digit needs one). Only at-rule() gets this; the rest of the condition text is
+// stored as written.
+const _normalizeAtRuleFns = (text) => {
+  return String(text).replace(/at-rule\(\s*@((?:[^)\\]|\\.)*?)\s*\)/gi, (m, ident) => {
+    try { return 'at-rule(@' + globalThis.CSS.escape(_unescapeIdent(ident)) + ')'; }
+    catch (e) { return m; }
+  });
+};
 class CSSSupportsRule extends CSSConditionRule {
-  constructor(...args) { super(); this._conditionText = String(args[0] || ''); }
+  constructor(...args) { super(); this._conditionText = _normalizeAtRuleFns(String(args[0] || '')); }
   get type() { return 12; }
   // CSS Conditional 3: `matches` is whether the UA supports the condition — a real
   // evaluation of the stored <supports-condition> (declarations via CSS.supports,
@@ -49574,6 +49773,11 @@ globalThis.__cspAllowsScriptURL = (nid, url) => {
 // right answer only while there is exactly one document in the realm.
 globalThis.__cspAllowsURL = (directive, url, element, reportUri) => {
   try {
+    // A <meta> policy INSERTED at runtime (createElement + head.appendChild)
+    // must start governing resource loads too, not only script execution — the
+    // script gates already scanned; this gate never did, so a page that turned
+    // on `frame-src 'none'` mid-life kept navigating frames.
+    globalThis.__obscuraScanMetaCSP();
     const saved = _cspState.policies;
     _cspState.policies = _cspPoliciesGoverning(element || null);
     try { return _cspURLAllowed(directive, url, element || null, reportUri); }
@@ -61752,7 +61956,27 @@ globalThis.print = function() {};
 globalThis.alert = function() {};
 globalThis.confirm = function() { return true; };
 globalThis.prompt = function() { return null; };
-globalThis.open = function() { return null; };
+// HTML §window.open: a target naming an existing FRAME is a navigation of that
+// frame, not a popup — `window.open(url, "theiframe")` goes through the same
+// gated path as `iframe.src = url` (so frame-src has its say and violations
+// fire). Real popups are not implemented (no second top-level browsing
+// context); those still return null, which is what a popup blocker looks like.
+globalThis.open = function(url, target) {
+  try {
+    const t = target == null ? '' : String(target);
+    if (url != null && t && t !== '_blank' && t !== '_self' && t !== '_parent' && t !== '_top') {
+      const doc = globalThis.document;
+      const frames = doc ? doc.querySelectorAll('iframe[name], frame[name]') : [];
+      for (const f of frames) {
+        if (f.getAttribute('name') === t) {
+          f._loadIframeSrc(String(url));
+          return f.contentWindow || null;
+        }
+      }
+    }
+  } catch (e) {}
+  return null;
+};
 globalThis.close = function() {};
 globalThis.stop = function() {};
 // HTML §window.postMessage — the top-level window posting to ITSELF. This was a
@@ -61784,9 +62008,24 @@ globalThis.postMessage = function(message, targetOriginOrOptions) {
     if (parsed.origin !== ownOrigin) return;
   }
   const data = (typeof structuredClone === 'function') ? structuredClone(message) : message;
+  // ⭐ `source` is the CALLER's window AS THE RECEIVER SEES IT. A frame script
+  // posting to its parent must show up as `frameElement.contentWindow` — which
+  // for a cross-origin frame is the OPAQUE handle, the very object the parent
+  // compares against (`e.source === frame.contentWindow` is how every multi-
+  // frame page routes replies). The incumbent is captured NOW, at call time;
+  // origin likewise comes from the caller's document, not the receiver's.
+  let _srcWin = globalThis, _srcOrigin = ownOrigin;
+  try {
+    const inc = globalThis.__frameIncumbent;
+    if (inc && inc !== globalThis) {
+      const host = inc.frameElement || inc._hostEl;
+      _srcWin = (host && host.contentWindow) || inc;
+      try { _srcOrigin = inc.location && inc.location.origin || ownOrigin; } catch (e) {}
+    }
+  } catch (e) {}
   _queueTask(() => {
     try {
-      const ev = new MessageEvent('message', { data: data, origin: ownOrigin, source: globalThis });
+      const ev = new MessageEvent('message', { data: data, origin: _srcOrigin, source: _srcWin });
       ev.isTrusted = true;
       _dispatchSpec(globalThis, ev);
     } catch (e) {}
@@ -65406,12 +65645,75 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
     get type() { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); return this._type; }
     get element() { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); return this._element; }
     get parent() { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); return this._parent; }
-    get selectorText() { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); return this._type ? '::' + this._type : ''; }
+    get selectorText() { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); return this._type || ''; }
     pseudo(type) { if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation"); if (arguments.length < 1) throw new TypeError("Failed to execute 'pseudo' on 'CSSPseudoElement': 1 argument required, but only 0 present."); return null; }
     get [Symbol.toStringTag]() { return 'CSSPseudoElement'; }
   }
   _enumAccessors(CSSPseudoElement.prototype, 'type', 'element', 'parent', 'selectorText', 'pseudo');
   _exposeIface('CSSPseudoElement', CSSPseudoElement); _markNative(CSSPseudoElement);
+
+  // ── Element.pseudo() + the legacy getPseudoElements()/CSSPseudoElementList ──
+  // css-pseudo-4 §CSSPseudoElement: `el.pseudo('::before')` returns a STABLE
+  // handle (same object every call — identity is the observable contract) whose
+  // `element`/`parent` are the originating element. An unrecognized type
+  // returns null; the argument is required (WebIDL arity).
+  const _makeCSSPseudo = (el, norm) => {
+    _allowCPECtor = true;
+    const p = new CSSPseudoElement();
+    _allowCPECtor = false;
+    p._type = norm; p._element = el; p._parent = el;
+    return p;
+  };
+  const _cssPseudoCache = new WeakMap();       // el -> Map(normType -> CSSPseudoElement)
+  const _elementPseudo = function pseudo(type) {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+    if (arguments.length < 1) throw new TypeError("Failed to execute 'pseudo' on 'Element': 1 argument required, but only 0 present.");
+    const raw = String(type).trim();
+    const m = _GCS_PSEUDO_RE.exec(raw);
+    if (!m) return null;
+    const norm = '::' + m[1].toLowerCase();
+    let cache = _cssPseudoCache.get(this);
+    if (!cache) { cache = new Map(); _cssPseudoCache.set(this, cache); }
+    let p = cache.get(norm);
+    if (!p) { p = _makeCSSPseudo(this, norm); cache.set(norm, p); }
+    return p;
+  };
+  _markNative(_elementPseudo);
+  Object.defineProperty(globalThis.Element.prototype, 'pseudo',
+    { value: _elementPseudo, writable: true, enumerable: true, configurable: true });
+  // The 2015-era draft the WPT idlharness file still loads: a list interface
+  // over one pseudo type. `item()` beyond the end is null; the type argument
+  // here is COLONLESS ('before'), unlike Element.pseudo's.
+  let _allowCPELCtor = false;
+  class CSSPseudoElementList {
+    constructor() { if (!_allowCPELCtor) throw new TypeError("Illegal constructor"); this._items = []; }
+    get length() { if (!(this instanceof CSSPseudoElementList)) throw new TypeError("Illegal invocation"); return this._items.length; }
+    item(index) {
+      if (!(this instanceof CSSPseudoElementList)) throw new TypeError("Illegal invocation");
+      if (arguments.length < 1) throw new TypeError("Failed to execute 'item' on 'CSSPseudoElementList': 1 argument required, but only 0 present.");
+      return this._items[index | 0] || null;
+    }
+    getByOrdinalAndType(index, type) {
+      if (!(this instanceof CSSPseudoElementList)) throw new TypeError("Illegal invocation");
+      if (arguments.length < 2) throw new TypeError("Failed to execute 'getByOrdinalAndType' on 'CSSPseudoElementList': 2 arguments required.");
+      return this._items[index | 0] || null;
+    }
+    get [Symbol.toStringTag]() { return 'CSSPseudoElementList'; }
+  }
+  _enumAccessors(CSSPseudoElementList.prototype, 'length', 'item', 'getByOrdinalAndType');
+  _exposeIface('CSSPseudoElementList', CSSPseudoElementList); _markNative(CSSPseudoElementList);
+  globalThis.getPseudoElements = function getPseudoElements(element, type) {
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'getPseudoElements': 2 arguments required, but only " + arguments.length + " present.");
+    _allowCPELCtor = true;
+    const list = new CSSPseudoElementList();
+    _allowCPELCtor = false;
+    try {
+      const p = element && typeof element.pseudo === 'function' ? element.pseudo('::' + String(type).replace(/^:+/, '')) : null;
+      if (p) list._items.push(p);
+    } catch (e) {}
+    return list;
+  };
+  _markNative(globalThis.getPseudoElements);
 
   // ── GeometryUtils mixin ─────────────────────────────────────────────────────
   // Text/Element/CSSPseudoElement/Document include GeometryUtils. No layout engine,
@@ -68613,12 +68915,21 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
     // §starting-of-transitions) — that suppression is a global latch, because
     // the after-change style also INHERITS from the parent's after-change style.
     const noTrans = !!globalThis._csSuppress;
+    // A PSEUDO VIEW collects the effects declared with the matching
+    // `pseudoElement` option against its ORIGINATING element; a plain element
+    // keeps only its principal-box effects — a ::marker animation must not
+    // tint the list item, and the item's animations must not tint the marker.
+    const _pvName = (el && Object.prototype.hasOwnProperty.call(el, '_pseudoName'))
+      ? String(el._pseudoName).toLowerCase() : null;
+    const _pvOwner = _pvName ? (el._pseudoOwner || Object.getPrototypeOf(el)) : null;
     const anims = [];
     for (const a of _waLive) {
       const eff = a._effect;
-      // Only an effect targeting THIS element, and only a principal-box effect —
-      // a ::before/::after effect styles a pseudo-element, not the element.
-      if (eff && eff._target === el && !eff._pseudo) {
+      if (!eff) continue;
+      const effPseudo = eff._pseudo ? String(eff._pseudo).replace(/^::?/, '').toLowerCase() : null;
+      const match = _pvName ? (eff._target === _pvOwner && effPseudo === _pvName)
+                            : (eff._target === el && !eff._pseudo);
+      if (match) {
         if (noTrans && a._csProp !== undefined) continue;
         anims.push(a);
       }
@@ -68674,11 +68985,19 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
       for (const name of Object.keys(values)) { cur[name] = values[name]; owner[name] = isTrans; any = true; }
     }
     if (!any) return null;
+    // css-pseudo-4 §marker-pseudo: only the marker-applicable properties
+    // animate on a ::marker — `opacity` in the same keyframes as `color`
+    // simply does not take (the test animates both and asserts exactly this).
+    const _markerOK = (kebab) => kebab === 'color' || kebab.startsWith('font')
+      || kebab === 'white-space' || kebab === 'text-combine-upright'
+      || kebab === 'unicode-bidi' || kebab === 'direction' || kebab === 'content'
+      || kebab === 'line-height' || kebab.startsWith('--');
     let animDecls = null, transDecls = null;
     for (const name of Object.keys(cur)) {
       const v = cur[name];
       if (v === null || v === undefined || v === '') continue;
       const kebab = _waKebab(name);
+      if (_pvName === 'marker' && !_markerOK(kebab)) continue;
       const isTrans = owner[name];
       const into = isTrans ? (transDecls || (transDecls = Object.create(null)))
                            : (animDecls || (animDecls = Object.create(null)));

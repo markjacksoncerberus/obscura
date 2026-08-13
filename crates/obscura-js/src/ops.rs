@@ -1387,7 +1387,13 @@ async fn perform_fetch_core(
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
-        "url": url,
+        // Fetch §4.6: a Response's url is the LAST url in its url list — after
+        // redirects, the final hop, not the request url. CSP re-asks its
+        // directives per hop against this, and `response.redirected` is how a
+        // page discovers it was bounced (both were reporting the original url,
+        // which hid every redirect from script and from CSP alike).
+        "url": current_url,
+        "redirected": redirects_followed > 0,
         "headers": resp_headers,
     })
     .to_string())
