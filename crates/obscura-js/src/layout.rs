@@ -523,7 +523,42 @@ fn serialize_boxes(doc: &ResolvedDoc, key: u64) -> String {
         }
         out.pop();
     }
-    out.push_str("]}");
+    out.push(']');
+    // Pseudo-element boxes ride in two parallel arrays: `pn` = [nid, which, …]
+    // pairs (which: 0=::before 1=::after 2=::marker) and `pb` = 18 numbers per
+    // entry — border-box x/y/w/h, border edges, padding edges, margin edges,
+    // and two spare zeros so the stride matches the element array's.
+    let pseudos = doc.pseudo_boxes();
+    if !pseudos.is_empty() {
+        out.push_str(",\"pn\":[");
+        for (i, (nid, which, _)) in pseudos.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&nid.to_string());
+            out.push(',');
+            out.push_str(&which.to_string());
+        }
+        out.push_str("],\"pb\":[");
+        for (i, (_, _, b)) in pseudos.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            for v in [
+                b.x, b.y, b.width, b.height,
+                b.border[0], b.border[1], b.border[2], b.border[3],
+                b.padding[0], b.padding[1], b.padding[2], b.padding[3],
+                b.margin[0], b.margin[1], b.margin[2], b.margin[3],
+                0.0, 0.0,
+            ] {
+                push_num(&mut out, v);
+                out.push(',');
+            }
+            out.pop();
+        }
+        out.push(']');
+    }
+    out.push('}');
     out
 }
 

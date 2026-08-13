@@ -297,6 +297,9 @@ pub(crate) struct DomTreeInner {
     // does not model the host↔shadow-root link (a shadow root is a detached
     // fragment here). Empty whenever nothing is focused.
     pub(crate) focus_hosts: Vec<NodeId>,
+    // The focused element's HTML "focus visible" flag (`:focus-visible`). Synced by
+    // JS from the focusing steps; false whenever nothing is focused.
+    pub(crate) focus_visible: bool,
     // The id named by the current document's URL fragment, for `:target`. JS sets
     // it from the queried document's URL right before a `:target` query.
     pub(crate) target_id: Option<String>,
@@ -419,6 +422,7 @@ impl DomTree {
                 indeterminate_state: HashMap::new(),
                 focused: None,
                 focus_hosts: Vec::new(),
+                focus_visible: false,
                 target_id: None,
                 validity_state: HashMap::new(),
                 design_mode: false,
@@ -611,7 +615,19 @@ impl DomTree {
         inner.focused = id;
         if id.is_none() {
             inner.focus_hosts.clear();
+            inner.focus_visible = false;
         }
+    }
+
+    /// The HTML "focus visible" flag of the focused element (drives `:focus-visible`).
+    /// JS decides it in the focusing steps (keyboard vs pointer vs script heuristic)
+    /// and syncs it here beside the focus itself.
+    pub fn set_focus_visible(&self, visible: bool) {
+        self.inner.borrow_mut().focus_visible = visible;
+    }
+
+    pub fn focus_visible(&self) -> bool {
+        self.inner.borrow().focus_visible
     }
 
     /// The shadow hosts that contain the focused element (see `focus_hosts`). Each

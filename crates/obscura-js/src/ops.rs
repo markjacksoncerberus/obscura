@@ -595,6 +595,10 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             }
             "true".into()
         }
+        "set_focus_visible" => {
+            dom.set_focus_visible(arg1 == "1");
+            "true".into()
+        }
         "get_focus" => match dom.focused() {
             Some(n) => n.raw().to_string(),
             None => "-1".into(),

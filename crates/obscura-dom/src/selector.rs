@@ -107,6 +107,10 @@ pub enum PseudoClass {
     /// ancestors in the light tree, and any shadow host whose shadow tree contains
     /// the focused element (plus that host's ancestors).
     FocusWithin,
+    /// `:focus-visible` — the focused element, when its HTML "focus visible" flag
+    /// is set (keyboard focus, texty controls, or the script-focus heuristic —
+    /// decided in JS's focusing steps and synced into the tree).
+    FocusVisible,
     Enabled,
     Disabled,
     Checked,
@@ -185,7 +189,7 @@ fn is_known_pseudo_class(name: &str) -> bool {
     matches!(
         name,
         "link" | "visited" | "any-link" | "local-link" | "target" | "target-within"
-            | "focus-visible" | "indeterminate" | "default" | "required"
+            | "indeterminate" | "default" | "required"
             | "optional" | "valid" | "invalid" | "in-range" | "out-of-range" | "read-only"
             | "read-write" | "placeholder-shown" | "autofill" | "current" | "past" | "future"
             | "playing" | "paused" | "user-invalid" | "user-valid" | "blank" | "defined"
@@ -204,7 +208,10 @@ impl parser::NonTSPseudoClass for PseudoClass {
     fn is_user_action_state(&self) -> bool {
         matches!(
             self,
-            PseudoClass::Hover | PseudoClass::Active | PseudoClass::Focus
+            PseudoClass::Hover
+                | PseudoClass::Active
+                | PseudoClass::Focus
+                | PseudoClass::FocusVisible
         )
     }
 
@@ -223,6 +230,7 @@ impl ToCss for PseudoClass {
             PseudoClass::Active => dest.write_str(":active"),
             PseudoClass::Focus => dest.write_str(":focus"),
             PseudoClass::FocusWithin => dest.write_str(":focus-within"),
+            PseudoClass::FocusVisible => dest.write_str(":focus-visible"),
             PseudoClass::Enabled => dest.write_str(":enabled"),
             PseudoClass::Disabled => dest.write_str(":disabled"),
             PseudoClass::Checked => dest.write_str(":checked"),
@@ -338,6 +346,7 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             "active" => Ok(PseudoClass::Active),
             "focus" => Ok(PseudoClass::Focus),
             "focus-within" => Ok(PseudoClass::FocusWithin),
+            "focus-visible" => Ok(PseudoClass::FocusVisible),
             "enabled" => Ok(PseudoClass::Enabled),
             "disabled" => Ok(PseudoClass::Disabled),
             "checked" => Ok(PseudoClass::Checked),
@@ -1223,6 +1232,12 @@ impl<'a> Element for DomElement<'a> {
             // the focused element (Selectors-4). Computed in the tree from the live
             // focused node + its shadow-host chain.
             PseudoClass::FocusWithin => self.tree.focus_within(self.node_id),
+            // `:focus-visible` — the focused element while its focus-visible flag is
+            // set. Unlike `:focus` it does NOT light up shadow hosts: the indication
+            // belongs to the control the user is on, not to every host around it.
+            PseudoClass::FocusVisible => {
+                self.tree.focus_visible() && self.tree.focused() == Some(self.node_id)
+            }
             // :disabled/:enabled = "actually disabled" per HTML (own attr, option's
             // optgroup, or a disabled <fieldset> ancestor); :checked from live state.
             PseudoClass::Disabled => self.is_actually_disabled(),

@@ -60,6 +60,20 @@ pub struct Size {
     pub height: f64,
 }
 
+/// A pseudo-element's box: border-box geometry plus the edge widths needed to
+/// derive the content/padding/margin boxes (GeometryUtils' four `box` options).
+/// Edges are `[top, right, bottom, left]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PseudoBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub border: [f64; 4],
+    pub padding: [f64; 4],
+    pub margin: [f64; 4],
+}
+
 /// Everything CSSOM View needs to know about one laid-out element, in CSS
 /// pixels, read straight off the box the layout engine computed.
 ///
@@ -366,6 +380,146 @@ impl ResolvedDoc {
         out
     }
 
+    /// The document-relative fragment rect of an inline element (the union of
+    /// its glyph runs in the inline root's text layout) — computed in the fork,
+    /// where the Parley types live.
+    fn inline_fragment_rect(&self, node_id: usize) -> Option<(f64, f64, f64, f64)> {
+        let (x, y, w, h) = self.doc.inline_fragment_rect(node_id)?;
+        Some((x as f64, y as f64, w as f64, h as f64))
+    }
+
+    /// Every pseudo-element box in the document, as `(originating nid, which, box)`
+    /// with `which` 0 = `::before`, 1 = `::after`, 2 = `::marker`.
+    ///
+    /// `::before`/`::after` are real Blitz layout nodes (the `node.before/.after`
+    /// slots `flush_pseudo_elements` fills), so their boxes read exactly like an
+    /// element's — margins included, because a pseudo has no DOM node for JS to
+    /// ask `getComputedStyle` used values from. An outside `::marker` is NOT a
+    /// box in Blitz — it is text painted at an offset left of the list item
+    /// (`draw_marker`) — so its box is reconstructed here with the same
+    /// arithmetic the painter uses; inside markers ride in the item's inline
+    /// flow and get no entry.
+    pub fn pseudo_boxes(&self) -> Vec<(u64, u8, PseudoBox)> {
+        use blitz_dom::node::{ListItemLayout, ListItemLayoutPosition, Marker};
+        let mut out = Vec::new();
+        let mut stack = vec![self.doc.root_node().id];
+        while let Some(id) = stack.pop() {
+            let Some(node) = self.doc.get_node(id) else {
+                continue;
+            };
+            let Some(element) = node.element_data() else {
+                stack.extend(node.children.iter().rev().copied());
+                continue;
+            };
+            let nid = element
+                .attrs()
+                .iter()
+                .find(|a| a.name.local.as_ref() == NID_ATTR)
+                .and_then(|a| a.value.parse::<u64>().ok());
+            if let Some(nid) = nid {
+                if let Some(before) = node.before {
+                    if let Some(b) = self.pseudo_box_for(before) {
+                        out.push((nid, 0, b));
+                    }
+                }
+                if let Some(after) = node.after {
+                    if let Some(b) = self.pseudo_box_for(after) {
+                        out.push((nid, 1, b));
+                    }
+                }
+                // Outside ::marker: mirror blitz-paint's draw_marker placement.
+                if let Some(ListItemLayout {
+                    marker,
+                    position: ListItemLayoutPosition::Outside(layout),
+                }) = element.list_item_data.as_deref()
+                {
+                    let x_padding = match marker {
+                        Marker::Char(_) => 8.0f32,
+                        Marker::String(_) => 0.0,
+                    };
+                    let m_width = layout.full_width() / layout.scale();
+                    let m_height = layout
+                        .lines()
+                        .next()
+                        .map(|l| l.metrics().line_height / layout.scale())
+                        .unwrap_or(0.0);
+                    let pos = node.absolute_position(0.0, 0.0);
+                    let l = &node.final_layout;
+                    // The painter anchors at the content-box origin of the item.
+                    let content_x = pos.x + l.border.left + l.padding.left;
+                    let content_y = pos.y + l.border.top + l.padding.top;
+                    out.push((
+                        nid,
+                        2,
+                        PseudoBox {
+                            x: (content_x - m_width - x_padding) as f64,
+                            y: content_y as f64,
+                            width: m_width as f64,
+                            height: m_height as f64,
+                            border: [0.0; 4],
+                            padding: [0.0; 4],
+                            margin: [0.0; 4],
+                        },
+                    ));
+                }
+            }
+            stack.extend(node.children.iter().rev().copied());
+        }
+        out
+    }
+
+    fn pseudo_box_for(&self, blitz_id: usize) -> Option<PseudoBox> {
+        use style::values::specified::box_::DisplayOutside;
+        let node = self.doc.get_node(blitz_id)?;
+        let styles = node.primary_styles();
+        let styles = styles.as_ref()?;
+        if styles.clone_display().outside() == DisplayOutside::None {
+            return None;
+        }
+        let l = &node.final_layout;
+        // An INLINE pseudo (`div::after { content: "A" }` with no display) is an
+        // inline participant with no Taffy box of its own — reconstruct its rect
+        // from the glyph runs, exactly like an inline element's.
+        if l.size.width == 0.0 && l.size.height == 0.0 {
+            if let Some((x, y, w, h)) = self.inline_fragment_rect(blitz_id) {
+                return Some(PseudoBox {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                    border: [0.0; 4],
+                    padding: [0.0; 4],
+                    margin: [0.0; 4],
+                });
+            }
+        }
+        let pos = node.absolute_position(0.0, 0.0);
+        Some(PseudoBox {
+            x: pos.x as f64,
+            y: pos.y as f64,
+            width: l.size.width as f64,
+            height: l.size.height as f64,
+            border: [
+                l.border.top as f64,
+                l.border.right as f64,
+                l.border.bottom as f64,
+                l.border.left as f64,
+            ],
+            padding: [
+                l.padding.top as f64,
+                l.padding.right as f64,
+                l.padding.bottom as f64,
+                l.padding.left as f64,
+            ],
+            margin: [
+                l.margin.top as f64,
+                l.margin.right as f64,
+                l.margin.bottom as f64,
+                l.margin.left as f64,
+            ],
+        })
+    }
+
     fn box_for_blitz_id(&self, blitz_id: usize) -> Option<NodeBox> {
         use style::computed_values::visibility::T as Visibility;
         use style::values::specified::box_::{DisplayInside, DisplayOutside};
@@ -387,14 +541,31 @@ impl ResolvedDoc {
 
         let l = &node.final_layout;
         let pos = node.absolute_position(0.0, 0.0);
+        // A non-replaced INLINE element gets no box from Taffy (its size stays
+        // 0×0): its fragments live in the inline root's Parley layout, where
+        // every glyph run's brush carries the id of the node whose style it
+        // renders. Union those runs to reconstruct the fragment rect — without
+        // this, every <span>/<a>'s getBoundingClientRect was 0×0, and WebDriver's
+        // pointer-interactable check ("does elementFromPoint(center) hit the
+        // element?") rejected every automation click on inline content.
+        let mut frag: Option<(f64, f64, f64, f64)> = None;
+        if l.size.width == 0.0 && l.size.height == 0.0 {
+            frag = self.inline_fragment_rect(blitz_id);
+        }
+        let (fx, fy, fw, fh) = frag.unwrap_or((
+            pos.x as f64,
+            pos.y as f64,
+            l.size.width as f64,
+            l.size.height as f64,
+        ));
         // `scroll_offset` is subtracted by `absolute_position` on the way up, so
         // this box is already in the same coordinate space the spec calls
         // "viewport-relative before the viewport's own scroll is applied".
         Some(NodeBox {
-            x: pos.x as f64,
-            y: pos.y as f64,
-            width: l.size.width as f64,
-            height: l.size.height as f64,
+            x: fx,
+            y: fy,
+            width: fw,
+            height: fh,
             border_top: l.border.top as f64,
             border_right: l.border.right as f64,
             border_bottom: l.border.bottom as f64,

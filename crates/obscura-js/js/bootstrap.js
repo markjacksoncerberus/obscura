@@ -248,6 +248,16 @@ let __obscura_click_target = null;
 // start. Cleared whenever focus actually moves (see `_performFocus`).
 let __obscura_seqFocusStart = null;
 let __obscura_focusFixupPending = false;
+// `:focus-visible` state. `__obscura_focusVisible` is the HTML "focus visible" flag
+// of the currently focused element. `__fvLastFocusModality` records how the user
+// last drove focus: 'keyboard' after any (non-shortcut) trusted key press,
+// 'pointer' after a press that actually focused an element, null before any such
+// interaction. A SCRIPT-initiated focus is visible unless the modality is
+// 'pointer' — clicking a focusable control tells us the user is mousing, and a
+// programmatic move right after inherits that (WPT script-focus-008..011/018..020);
+// typing, or a click that focused nothing, does not (script-focus-002..007/016).
+let __obscura_focusVisible = false;
+let __fvLastFocusModality = null;
 
 // Rust<->JS eval bridge scratchpad / object registry. `__obscura_objects` is a
 // persistent map of CDP objectId -> live JS value (so callFunctionOn can re-
@@ -5353,9 +5363,36 @@ function _layoutRefresh() {
   const off = new Map();
   for (let i = 0; i < d.nids.length; i++) off.set(d.nids[i], i * _LAYOUT_STRIDE);
   d.off = off;
+  // Pseudo-element boxes: `pn` is [nid, which, …] pairs (0=::before 1=::after
+  // 2=::marker), `pb` the box runs. Keyed nid*4+which — an element has at most
+  // one box of each kind.
+  const poff = new Map();
+  if (d.pn) {
+    for (let i = 0; i + 1 < d.pn.length; i += 2)
+      poff.set(d.pn[i] * 4 + d.pn[i + 1], (i / 2) * _LAYOUT_STRIDE);
+  }
+  d.poff = poff;
   _layoutData = d;
   _layoutGen = stamp;
   return d;
+}
+
+// The box of `el`'s ::before/::after/::marker, or null when the layout has none.
+// `which`: 0=before, 1=after, 2=marker. Geometry is the border box; the edge
+// widths let GeometryUtils derive the content/padding/margin boxes.
+function _layoutPseudoBoxOf(el, which) {
+  if (!el || typeof el._nid !== 'number') return null;
+  const d = _layoutRefresh();
+  if (!d || !d.poff) return null;
+  const i = d.poff.get(el._nid * 4 + which);
+  if (i === undefined) return null;
+  const b = d.pb;
+  return {
+    x: b[i], y: b[i + 1], width: b[i + 2], height: b[i + 3],
+    bt: b[i + 4], br: b[i + 5], bb: b[i + 6], bl: b[i + 7],
+    pt: b[i + 8], pr: b[i + 9], pb: b[i + 10], pl: b[i + 11],
+    mt: b[i + 12], mr: b[i + 13], mb: b[i + 14], ml: b[i + 15],
+  };
 }
 
 // The box for one element, or null if we have no layout / it isn't in it.
@@ -6256,6 +6293,8 @@ class Element extends Node {
     if (__obscura_focused !== this && !inShadow) return;
     const target = __obscura_focused;
     __obscura_focused = null;
+    __obscura_focusVisible = false;
+    try { globalThis._fvSyncRust && globalThis._fvSyncRust(); } catch (e) {}
     _dom("set_focus", "", ""); // Phase 0b: clear Rust focus state
     try { target.dispatchEvent(new Event('blur', { bubbles: false })); } catch(e) {}
     try { target.dispatchEvent(new Event('focusout', { bubbles: true })); } catch(e) {}
@@ -13939,6 +13978,12 @@ const _SHORTHAND_LONGHANDS = {
   // list as _BG_SH_LH, which is declared later in the file.
   background: ['background-image', 'background-position', 'background-size', 'background-repeat',
     'background-attachment', 'background-origin', 'background-clip', 'background-color'],
+  // css-ui outline / css-multicol column-rule — feed the cascade so a stylesheet
+  // `outline: green solid 5px` sets outline-color (etc.) for getComputedStyle.
+  // Without these a page's focus ring read as black/none in computed style on
+  // every element (split lazily via _parseBorderSideStrict in _expandShorthand).
+  outline: ['outline-width', 'outline-style', 'outline-color'],
+  'column-rule': ['column-rule-width', 'column-rule-style', 'column-rule-color'],
 };
 // Set a declaration into a block-level map, respecting within-block cascade
 // order: an !important declaration is never overridden by a later normal one of
@@ -14374,6 +14419,20 @@ const _expandShorthand = (sh, value) => {
       out['border-' + side + '-color'] = p.color;
     }
     return out;
+  }
+  // outline / column-rule (for the cascade → getComputedStyle): the same
+  // border-side grammar the CSSOM setter already parsed — without this branch a
+  // stylesheet's `outline: green solid 5px` computed outline-color BLACK on
+  // every element, every page (the #547 `background` shape: the shorthand
+  // expanded on the SETTER path only, and _SHORTHAND_LONGHANDS named it so the
+  // cascade found the declaration and then dropped it as unexpandable).
+  if (sh === 'outline') {
+    const p = _parseBorderSideStrict(value, true); if (!p) return null;
+    return { 'outline-width': p.width, 'outline-style': p.style, 'outline-color': p.color };
+  }
+  if (sh === 'column-rule') {
+    const p = _parseBorderSideStrict(value, false); if (!p) return null;
+    return { 'column-rule-width': p.width, 'column-rule-style': p.style, 'column-rule-color': p.color };
   }
   if (sh === 'transition') return _expandTransition(value);
   // css-logical flow-relative border shorthands (for the cascade → getComputedStyle):
@@ -28315,6 +28374,13 @@ const _computedPropOf = (el, kebab, guard) => {
       && _isHiddenPopover(el)) {
     return _normComputed(el, 'display', 'none');
   }
+  // UA stylesheet: `:focus-visible { outline: auto }` — the default focus ring.
+  // Only when no author declaration reached the cascade, and never for a pseudo
+  // view (a ::before does not grow a ring because its owner has one).
+  if (kebab === 'outline-style' && !String(spec.value || '').trim() && !el._pseudoName
+      && __obscura_focused && typeof el._nid === 'number') {
+    try { if (el.matches(':focus-visible')) return 'auto'; } catch (e) {}
+  }
   // UA stylesheet: `dialog:not([open]) { display: none }`. A closed <dialog> computes
   // display:none (an author `display` still wins). Open dialogs fall through to the
   // default `block`. A <dialog popover> that is currently SHOWING as a popover is
@@ -31329,6 +31395,23 @@ globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
     // Custom properties (`--*`) inherit by default and resolve the CSS-wide
     // keywords through the dedicated engine (no var() substitution yet).
     if (kebab.startsWith('--')) return _computedCustomProp(el, kebab, 0);
+    // A pseudo-element WITH a layout box answers width/height with the USED size
+    // (CSSOM: the resolved value of width/height for a box is the used value) —
+    // this is what lets a page measure a ::marker or ::before it cannot
+    // getBoundingClientRect. No box → fall through to the computed value.
+    if ((kebab === 'width' || kebab === 'height') && el && el._pseudoName) {
+      const which = el._pseudoName === 'before' ? 0 : el._pseudoName === 'after' ? 1
+        : el._pseudoName === 'marker' ? 2 : -1;
+      if (which >= 0) {
+        const b = _layoutPseudoBoxOf(el._pseudoOwner, which);
+        if (b) {
+          const used = kebab === 'width'
+            ? b.width - b.bl - b.br - b.pl - b.pr
+            : b.height - b.bt - b.bb - b.pt - b.pb;
+          return _serNumber(Math.max(0, used)) + 'px';
+        }
+      }
+    }
     // Box-alignment shorthands: reconstruct the computed value from the computed
     // longhands (grid-*-gap are legacy aliases for a single longhand).
     if (_GRID_GAP_ALIAS[kebab]) return resolve(_GRID_GAP_ALIAS[kebab]);
@@ -37034,6 +37117,29 @@ globalThis.MouseEvent = class MouseEvent extends UIEvent {
 _idlEventAttrs(MouseEvent, ['screenX', 'screenY', 'clientX', 'clientY', 'ctrlKey',
   'shiftKey', 'altKey', 'metaKey', 'button', 'buttons', 'relatedTarget',
   'movementX', 'movementY'], { getModifierState: 1, initMouseEvent: 1 });
+// css-pseudo-4 (proposed) `event.pseudoTarget`: when an ACTIVATION click landed
+// on a pseudo-element's box, the CSSPseudoElement that was hit — the event's
+// `target` stays the originating element (a pseudo is not an EventTarget).
+// Derived lazily from the click point against the target's own pseudo boxes;
+// hover-family events (mouseover/enter/…) never carry it, per the WPT contract
+// ("mouseover never sets pseudoTarget").
+Object.defineProperty(MouseEvent.prototype, 'pseudoTarget', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'pseudoTarget', function () {
+    if (!(this instanceof MouseEvent)) throw new TypeError("Illegal invocation");
+    const t = this.type;
+    if (t !== 'click' && t !== 'dblclick' && t !== 'auxclick') return null;
+    const el = this.target;
+    if (!el || typeof el._nid !== 'number' || typeof el.pseudo !== 'function') return null;
+    const x = this._clientX, y = this._clientY;
+    for (const [which, name] of [[2, '::marker'], [0, '::before'], [1, '::after']]) {
+      const b = (typeof _layoutPseudoBoxOf === 'function') ? _layoutPseudoBoxOf(el, which) : null;
+      if (b && x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height)
+        return el.pseudo(name);
+    }
+    return null;
+  }),
+});
 // layerX/layerY are legacy: the point relative to the nearest POSITIONED ancestor.
 // Without a layout tree there is no way to find that ancestor's box, so these
 // report the client point — right whenever the positioned ancestor is the
@@ -43312,6 +43418,28 @@ Object.defineProperty(globalThis.HTMLElement.prototype, 'contentEditable', {
     throw new DOMException("The value provided ('" + v + "') is not one of 'true', 'false', 'plaintext-only', or 'inherit'.", 'SyntaxError');
   },
 });
+// ElementContentEditable.isContentEditable — is the element actually EDITABLE:
+// its own contenteditable state, inherited through ancestors when "inherit",
+// or the document's designMode. Read-only. (This had never existed — pages and
+// the :focus-visible texty heuristic read `undefined`, i.e. "not editable",
+// for every editing host on the web.)
+Object.defineProperty(globalThis.HTMLElement.prototype, 'isContentEditable', {
+  configurable: true, enumerable: true,
+  get() {
+    try { if (this.ownerDocument && this.ownerDocument.designMode === 'on') return true; } catch (e) {}
+    let n = this;
+    while (n && n.nodeType === 1) {
+      const a = n.getAttribute && n.getAttribute('contenteditable');
+      if (a !== null && a !== undefined) {
+        const low = String(a).toLowerCase();
+        if (low === '' || low === 'true' || low === 'plaintext-only') return true;
+        if (low === 'false') return false;
+      }
+      n = n.parentNode;
+    }
+    return false;
+  },
+});
 
 // ===================== Focus model (HTML §focus) ===============================
 // A small, layout-free focus model: `document.activeElement` tracks `__obscura_focused`
@@ -43357,11 +43485,37 @@ globalThis._syncRustFocus = function(el) {
     _dom("set_focus", el._nid, _focusShadowHosts(el).join(","));
   } catch (e) {}
 };
-globalThis._performFocus = function(el) {
+// Does the element "support keyboard input" for the :focus-visible heuristic?
+// Texty controls always match :focus-visible when focused, whatever focused them
+// (Selectors-4 §the-focus-visible-pseudo, and WPT focus-visible-002/-016): a caret
+// with no visible indication strands the user. Buttons/checkboxes/radios/ranges/
+// colors do not; an unknown input type behaves as text (it IS text per HTML).
+globalThis._fvSupportsKeyboardInput = function(el) {
+  if (!el || el.nodeType !== 1) return false;
+  try { if (el.isContentEditable) return true; } catch (e) {}
+  const ln = el.localName;
+  if (ln === 'textarea') return true;
+  if (ln !== 'input') return false;
+  const t = String(el.getAttribute('type') || 'text').toLowerCase();
+  return !(t === 'button' || t === 'checkbox' || t === 'radio' || t === 'range' ||
+           t === 'color' || t === 'file' || t === 'submit' || t === 'reset' ||
+           t === 'image' || t === 'hidden');
+};
+// Push the focus-visible flag to the Rust tree (drives `:focus-visible` matching in
+// querySelector AND the getComputedStyle cascade, which share the Rust matcher).
+globalThis._fvSyncRust = function() {
+  try { _dom("set_focus_visible", __obscura_focusVisible ? "1" : "0", ""); } catch (e) {}
+};
+// `method`: 'key' (sequential focus navigation), 'pointer' (click focusing steps),
+// undefined = script/autofocus/dialog/popover — the modality heuristic decides.
+globalThis._performFocus = function(el, method) {
   // Any genuine focus move clears a pending sequential-focus starting point.
   __obscura_seqFocusStart = null;
   const prev = __obscura_focused;
   if (prev === el) return;
+  const fv = method === 'key' ? true
+    : method === 'pointer' ? globalThis._fvSupportsKeyboardInput(el)
+    : (globalThis._fvSupportsKeyboardInput(el) || __fvLastFocusModality !== 'pointer');
   if (prev) {
     // Platform focus update steps: the old element loses focus BEFORE its blur/focusout
     // fire, so `document.activeElement` reads as <body> (and `:focus`/`:focus-within`
@@ -43369,7 +43523,9 @@ globalThis._performFocus = function(el) {
     // `el` blindly afterwards would leave stale state (whatwg/selectors #the-focus-within).
     __obscura_focused = null;
     __obscura_click_target = null;
+    __obscura_focusVisible = false;
     globalThis._syncRustFocus(null);
+    globalThis._fvSyncRust();
     try { prev.dispatchEvent(new Event('blur', { bubbles: false })); } catch (e) {}
     try { prev.dispatchEvent(new Event('focusout', { bubbles: true })); } catch (e) {}
     // A nested focusing operation during those events won — don't clobber its result.
@@ -43379,7 +43535,9 @@ globalThis._performFocus = function(el) {
   }
   __obscura_focused = el;
   __obscura_click_target = el;
+  __obscura_focusVisible = fv;
   globalThis._syncRustFocus(el);
+  globalThis._fvSyncRust();
   try { el.dispatchEvent(new Event('focus', { bubbles: false })); } catch (e) {}
   try { el.dispatchEvent(new Event('focusin', { bubbles: true })); } catch (e) {}
   // Focusing an editing host puts the caret in it (HTML's focusing steps for an
@@ -43402,6 +43560,8 @@ globalThis._runFocusFixup = function() {
   try { el.dispatchEvent(new Event('focusout', { bubbles: true })); } catch (e) {}
   __obscura_focused = null;
   __obscura_click_target = null;
+  __obscura_focusVisible = false;
+  try { globalThis._fvSyncRust(); } catch (e) {}
   try { _dom("set_focus", "", ""); } catch (e) {}
   __obscura_seqFocusStart = el;
 };
@@ -43726,7 +43886,7 @@ globalThis._sequentialFocusNavigation = function(backward) {
   } else {
     target = (idx === -1 || idx === order.length - 1) ? order[0] : order[idx + 1];
   }
-  if (target) globalThis._performFocus(target);
+  if (target) globalThis._performFocus(target, 'key');
 };
 
 // Document autofocus: after the document loads, "flush the autofocus candidates" —
@@ -43735,7 +43895,7 @@ globalThis._sequentialFocusNavigation = function(backward) {
 // (a script that already moved focus wins), so it is inert for pages without an
 // unfocused autofocus candidate.
 try {
-  window.addEventListener('load', () => {
+  const _flushAutofocus = () => {
     try {
       if (__obscura_focused) return;
       const root = document.documentElement || document.body;
@@ -43743,7 +43903,14 @@ try {
       const cand = globalThis._autofocusDelegate(root);
       if (cand) globalThis._performFocus(cand);
     } catch (e) {}
-  });
+  };
+  // HTML flushes the autofocus candidates when the document becomes ready —
+  // BEFORE the first animation frame after parsing. Waiting for `load` is too
+  // late: WPT's waitUntilStableAutofocusState (one rAF) reads activeElement
+  // before a load-driven flush has run. Keep the load pass as a safety net for
+  // documents whose DCL slipped past us.
+  window.addEventListener('DOMContentLoaded', _flushAutofocus);
+  window.addEventListener('load', _flushAutofocus);
 } catch (e) {}
 
 // ===================== Popover API (HTML §popover) ==============================
@@ -44141,10 +44308,52 @@ try {
         if (e.defaultPrevented) return;
         let n = e.target;
         while (n && n.nodeType === 1) {
-          if (globalThis._isFocusableArea(n)) { globalThis._performFocus(n); return; }
+          if (globalThis._isFocusableArea(n)) {
+            // A press that actually focuses something is the user mousing — it
+            // decides the modality a later SCRIPT focus inherits. A press on
+            // non-focusable content moves no focus and leaves the modality alone
+            // (WPT focus-visible-script-focus-002/-006/-016).
+            __fvLastFocusModality = 'pointer';
+            globalThis._performFocus(n, 'pointer');
+            return;
+          }
           n = n.parentNode;
         }
       }, false);
+      // :focus-visible modality tracking: any trusted key press that is not a
+      // shortcut chord (Ctrl/Alt/Meta held — focus-visible-012) and not a bare
+      // modifier switches the user to keyboard modality, and — "keyboard use
+      // while focused triggers :focus-visible" (focus-visible-007/-011) — lights
+      // the flag on the currently focused element. Capture phase: preventDefault
+      // must not suppress it (focus-visible-011 cancels everything).
+      document.addEventListener('keydown', (e) => {
+        if (!e || !(e.isTrusted || globalThis.__obscura_trusted_input)) return;
+        const k = e.key;
+        if (k === 'Control' || k === 'Alt' || k === 'Meta' || k === 'Shift') return;
+        // Alt+<key> runs the ACCESSKEY behaviour before the shortcut-chord guard
+        // (an accesskey IS an alt-chord): focus the matching [accesskey] element,
+        // as keyboard-driven focus (`:focus-visible` matches — focus-visible-024/-025).
+        if (e.altKey && !e.ctrlKey && !e.metaKey && typeof k === 'string' && k.length === 1) {
+          try {
+            const low = k.toLowerCase();
+            for (const cand of document.querySelectorAll('[accesskey]')) {
+              if (String(cand.getAttribute('accesskey')).toLowerCase() !== low) continue;
+              if (globalThis._isFocusableArea(cand)) {
+                __fvLastFocusModality = 'keyboard';
+                globalThis._performFocus(cand, 'key');
+              }
+              break;
+            }
+          } catch (e2) {}
+          return;
+        }
+        if (e.ctrlKey || e.altKey || e.metaKey) return;
+        __fvLastFocusModality = 'keyboard';
+        if (__obscura_focused && !__obscura_focusVisible) {
+          __obscura_focusVisible = true;
+          globalThis._fvSyncRust();
+        }
+      }, true);
     } catch (e) {}
   };
 
@@ -54488,8 +54697,32 @@ globalThis._installEditingKeys = () => {
       let doc = null;
       try { doc = (e.target && e.target.ownerDocument) || document; } catch (err) { doc = document; }
       if (!doc) return;
+      // UI Events: a non-canceled keydown whose key produces a character value
+      // fires `keypress` before the text lands (legacy but ubiquitous — pages
+      // hang listeners for typing on it). Canceling keypress cancels the edit,
+      // exactly like canceling keydown. Fired here — the keydown default action
+      // — so it happens for BOTH the WPT input bridge and CDP Input keys.
+      const kk = e.key;
+      if ((kk && kk.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) || kk === 'Enter') {
+        const kc = kk === 'Enter' ? 13 : kk.charCodeAt(0);
+        let kpOk = true;
+        try {
+          const kev = new KeyboardEvent('keypress', { bubbles: true, cancelable: true,
+            composed: true, key: kk, code: e.code || '', charCode: kc, keyCode: kc,
+            which: kc, shiftKey: e.shiftKey });
+          kpOk = (e.target || doc).dispatchEvent(kev);
+        } catch (err) {}
+        if (!kpOk) return;
+      }
       let el = null;
       try { el = doc.activeElement; } catch (err) { el = null; }
+      // Enter on a focused button ACTIVATES it (HTML: keydown activation
+      // behaviour) — the click every "press Enter to submit" page listens for.
+      if (kk === 'Enter' && el && (el.localName === 'button' ||
+          (el.localName === 'input' && /^(button|submit|reset)$/i.test(String(el.getAttribute('type') || ''))))) {
+        try { el.click(); } catch (err) {}
+        return;
+      }
       if (_edIsTextControl(el)) { _edTextControlKey(el, e); return; }
       _edRecoverCaret(doc);
       if (_edStartIsEditable(doc)) _edRichKey(doc, e);
@@ -65745,6 +65978,34 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   _installGeometryUtils(Text.prototype, _isViewNode);
   _installGeometryUtils(Document.prototype, _isViewNode);
   _installGeometryUtils(CSSPseudoElement.prototype, (t) => t instanceof CSSPseudoElement);
+  // CSSPseudoElement's getBoxQuads is REAL: ::before/::after are layout boxes in
+  // the render engine (an outside ::marker's box is reconstructed from its text
+  // run), shipped alongside the element boxes. The `box` option picks the edge:
+  // border (default) / content / padding / margin.
+  Object.defineProperty(CSSPseudoElement.prototype, 'getBoxQuads', {
+    writable: true, enumerable: true, configurable: true,
+    value: _markNative(function getBoxQuads(options) {
+      if (!(this instanceof CSSPseudoElement)) throw new TypeError("Illegal invocation");
+      const which = this._type === '::before' ? 0 : this._type === '::after' ? 1
+        : this._type === '::marker' ? 2 : -1;
+      if (which < 0) return [];
+      const b = _layoutPseudoBoxOf(this._element, which);
+      if (!b) return [];
+      const box = options && typeof options === 'object' ? String(options.box || 'border') : 'border';
+      let x = b.x, y = b.y, w = b.width, h = b.height;
+      if (box === 'content') {
+        x += b.bl + b.pl; y += b.bt + b.pt;
+        w -= b.bl + b.br + b.pl + b.pr; h -= b.bt + b.bb + b.pt + b.pb;
+      } else if (box === 'padding') {
+        x += b.bl; y += b.bt;
+        w -= b.bl + b.br; h -= b.bt + b.bb;
+      } else if (box === 'margin') {
+        x -= b.ml; y -= b.mt;
+        w += b.ml + b.mr; h += b.mt + b.mb;
+      }
+      return [globalThis.DOMQuad.fromRect({ x, y, width: Math.max(0, w), height: Math.max(0, h) })];
+    }),
+  });
 
   // ── Element / HTMLElement box-metric surface (CSSOM View partials) ───────────
   // Redefine the existing box metrics on Element.prototype as ENUMERABLE, brand-
@@ -72558,8 +72819,21 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       if (lb && (!lb.hasBox || lb.visHidden || lb.peNone)) continue;
       var r;
       try { r = el.getBoundingClientRect(); } catch (e) { continue; }
-      if (!r || (r.width === 0 && r.height === 0)) continue;  // no generated box
-      if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) matches.push(el);
+      var hit = false;
+      if (r && (r.width !== 0 || r.height !== 0) &&
+          x >= r.left && x < r.right && y >= r.top && y < r.bottom) hit = true;
+      // A pseudo-element's box hits FOR its originating element (css-pseudo-4:
+      // hit-testing a ::before/::after/::marker reports the nearest real element
+      // ancestor) — this is how a click on an outside list bullet reaches the
+      // <li> whose own border box the bullet sits entirely outside of.
+      if (!hit && typeof _layoutPseudoBoxOf === 'function') {
+        for (var pw = 0; pw < 3 && !hit; pw++) {
+          var pbx = _layoutPseudoBoxOf(el, pw);
+          if (pbx && x >= pbx.x && x < pbx.x + pbx.width &&
+              y >= pbx.y && y < pbx.y + pbx.height) hit = true;
+        }
+      }
+      if (hit) matches.push(el);
     }
     globalThis.__obscura_click_target = saved;
     matches.reverse();  // topmost first: later in tree order / deeper paints on top

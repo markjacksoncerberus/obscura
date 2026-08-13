@@ -9,9 +9,16 @@ which is itself an honest signal: the engine can't even run that test.
 
 Usage: wpt_baseline.py --list <file> [--timeout 30] [--out baseline.json]
 """
-import argparse, asyncio, json, re, sys, time
+import argparse, asyncio, json, os, re, sys, time
 from collections import defaultdict
 from playwright.async_api import async_playwright
+
+# The test_driver → in-page input bridge from wpt_run: without it every test
+# that drives real input (test_driver.click / send_keys / Actions) sits waiting
+# for a driver that never answers and reads as a TIMEOUT — which silently
+# under-counts whole realms (focus, pointer, accesskey…) in every sweep.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wpt_run import TESTDRIVER_BRIDGE_JS
 
 SCRAPE_JS = """
 () => {
@@ -50,6 +57,10 @@ def realm_of(path):
 async def run_one(ctx, url, timeout):
     page = await ctx.new_page()
     try:
+        try:
+            await page.add_init_script(TESTDRIVER_BRIDGE_JS)
+        except Exception:
+            pass
         try:
             await page.goto(url, wait_until="load", timeout=timeout * 1000)
         except Exception as exc:

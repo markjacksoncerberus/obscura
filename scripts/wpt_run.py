@@ -276,17 +276,22 @@ TESTDRIVER_BRIDGE_JS = r"""
     impl.click = function(element, coords) {
       // Element-targeted: dispatch the pointer/mouse sequence directly on the element
       // (testdriver.js already resolved its center), so it works regardless of layout.
+      // ASYNCHRONOUS like a real driver round trip: the caller's statement after
+      // `test_driver.click(...)` must run before the events land — a focus handler
+      // that reads the promise variable the call assigns depends on it
+      // (css/selectors/focus-visible-006).
       var c = coords || {};
       var x = Math.round(c.x || 0), y = Math.round(c.y || 0);
-      try { globalThis.__obscura_click_target = element; } catch (e) {}
-      firePointer('pointerdown', element, x, y, 0, 1);
-      fireMouse('mousedown', element, x, y, 0, 1, 1);
-      firePointer('pointerup', element, x, y, 0, 0);
-      fireMouse('mouseup', element, x, y, 0, 0, 1);
-      fireMouse('click', element, x, y, 0, 0, 1);
-      // A click is user activation (for the close-watcher grouping model etc.).
-      try { globalThis.__obscuraUserActivation && globalThis.__obscuraUserActivation(); } catch (e) {}
-      return Promise.resolve();
+      return Promise.resolve().then(function () {
+        try { globalThis.__obscura_click_target = element; } catch (e) {}
+        firePointer('pointerdown', element, x, y, 0, 1);
+        fireMouse('mousedown', element, x, y, 0, 1, 1);
+        firePointer('pointerup', element, x, y, 0, 0);
+        fireMouse('mouseup', element, x, y, 0, 0, 1);
+        fireMouse('click', element, x, y, 0, 0, 1);
+        // A click is user activation (for the close-watcher grouping model etc.).
+        try { globalThis.__obscuraUserActivation && globalThis.__obscuraUserActivation(); } catch (e) {}
+      });
     };
     impl.send_keys = function(element, keys) {
       // Real test_driver.send_keys is ASYNCHRONOUS: it returns a promise and the
