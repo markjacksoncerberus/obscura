@@ -2146,6 +2146,13 @@ class CSSStyleDeclaration {
       }
     }
     if (this._onChange && !this._styleBatch) this._onChange();
+    // Focus fixup rule: an inline-style write (`el.style.visibility='hidden'`,
+    // `display:none`) may have made the focused element unfocusable. Cheap
+    // guard — only when something is focused.
+    if (__obscura_focused && this._ownerEl !== null && typeof this._ownerEl === 'object'
+        && globalThis._scheduleFocusFixup) {
+      try { globalThis._scheduleFocusFixup(); } catch (e) {}
+    }
   }
   setProperty(name, value, priority = "") {   // priority optional (default "") → WebIDL .length 2
     if (arguments.length < 2) throw new TypeError("Failed to execute 'setProperty' on 'CSSStyleDeclaration': 2 arguments required");
@@ -4029,6 +4036,11 @@ class Node {
     if (c instanceof Element && c.id) __defineNamedGlobal(c.id);
     _ceInsertionSteps(c);
     } finally { if (_ceBoundary) _cePop(); }
+    if (globalThis._autofocusInserted) globalThis._autofocusInserted(c);
+    // Focus fixup rule: an insertion can make the focused element unfocusable
+    // (a new first <legend> demotes the one holding a focused control inside a
+    // disabled fieldset).
+    if (__obscura_focused && globalThis._scheduleFocusFixup) globalThis._scheduleFocusFixup();
     return c;
   }
   removeChild(c) {
@@ -4047,6 +4059,7 @@ class Node {
     _dom("remove_child", c._nid);
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [], [c._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
     if (_wasConnected) _ceRemovalSteps(c);
+    if (globalThis._autofocusRemoved) globalThis._autofocusRemoved(c);
     if (_popoverShowingCount > 0) globalThis._popoverRemovalSteps(c);
     if (globalThis._dialogModalCount > 0) globalThis._dialogRemovalSteps(c);
     // Focus fixup rule: removing the focused element resets focus SYNCHRONOUSLY
@@ -4147,6 +4160,21 @@ class Node {
     }
     return child;
   }
+  // DOM §moveBefore: move `n` into this parent before `ref` ATOMICALLY — same
+  // tree position outcome as insertBefore, but state-preserving (no
+  // disconnect/reconnect side effects like iframe reloads or focus resets).
+  // Both nodes must already be connected to the same document. Approximated
+  // with the ordinary insertion machinery; the observable tree shape and
+  // mutation records match, which is what pages (and WPT) mostly rely on.
+  moveBefore(n, ref) {
+    if (arguments.length < 2)
+      throw new TypeError("Failed to execute 'moveBefore' on 'Node': 2 arguments required, but only " + arguments.length + " present.");
+    if (n == null || typeof n !== 'object' || (typeof n._nid !== 'number' && typeof n.nodeType !== 'number'))
+      throw new TypeError("Failed to execute 'moveBefore': parameter 1 is not of type 'Node'");
+    if (!this.isConnected || !n.isConnected)
+      throw new DOMException("Both nodes must be connected", "HierarchyRequestError");
+    return this.insertBefore(n, ref);
+  }
   insertBefore(n, ref) {
     __xpDomVersion++;
     // WebIDL: the node must be a Node (the reference child may be null).
@@ -4234,6 +4262,10 @@ class Node {
     if (n instanceof Element && n.id) __defineNamedGlobal(n.id);   // parity with appendChild
     _ceInsertionSteps(n);
     } finally { if (_ceBoundaryI) _cePop(); }
+    if (globalThis._autofocusInserted) globalThis._autofocusInserted(n);
+    // Focus fixup rule — see appendChild (a new first <legend> can demote the
+    // one holding the focused control inside a disabled fieldset).
+    if (__obscura_focused && globalThis._scheduleFocusFixup) globalThis._scheduleFocusFixup();
     return n;
   }
   // DOM §4.4: contains(other) is true iff other is an *inclusive* descendant of
@@ -5620,6 +5652,14 @@ class Element extends Node {
         for (let i = 0; i < _idEls.length; i++) { const _id = _idEls[i].getAttribute('id'); if (_id) __defineNamedGlobal(_id); }
       } catch (e) {}
     }
+    // Parsed autofocus elements become autofocus candidates (HTML: they were
+    // just inserted into a document). Gated on a cheap string test.
+    if (v && /\bautofocus\b/i.test(String(v)) && globalThis._autofocusInserted) {
+      try {
+        const _afEls = this.querySelectorAll('[autofocus]');
+        for (let i = 0; i < _afEls.length; i++) globalThis._autofocusInserted(_afEls[i]);
+      } catch (e) {}
+    }
     if (_watching) {
       const _new = _domParse("child_nodes", this._nid) || [];
       __notifyMutation('childList', this._nid, _new, _old);
@@ -6223,27 +6263,7 @@ class Element extends Node {
     // an invoker — not just the scripted `.click()` method — runs its activation.
     globalThis._runInvokerActivation(this);
     const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
-    if (link) {
-      const href = link.getAttribute('href');
-      if (href && href.startsWith('javascript:')) {
-        // A `javascript:` navigation runs the URL body as an inline script, and
-        // CSP is asked FIRST (HTML §navigate to a javascript: URL; the check —
-        // and the violation report — is the inline one, `script-src-elem`).
-        // A completion value that is a string would replace the document; that
-        // half is not implemented, so the result is simply dropped.
-        let body = href.slice('javascript:'.length);
-        try { body = decodeURIComponent(body); } catch (e) {}
-        if (typeof globalThis.__cspAllowsInline !== 'function'
-            || globalThis.__cspAllowsInline('script', link, body)) {
-          try { (0, _NativeEval)(body); } catch (e) { _reportError(e); }
-        }
-        return;
-      }
-      if (href && !href.startsWith('#')) {
-        location.assign(href);
-        return;
-      }
-    }
+    if (link && globalThis._followHyperlink(link)) return;
     const type = (this.getAttribute('type') || '').toLowerCase();
     // A <button> is a submit button in the Submit state, OR in the Auto state (missing
     // /invalid type) only when it has NEITHER a command nor a commandfor attribute —
@@ -6281,7 +6301,12 @@ class Element extends Node {
     // focus to a focusable area). `_performFocus` does the actual state change + events
     // (blur/focusout on the old, focus/focusin on the new, Rust `:focus` bit).
     if (globalThis._isFocusableArea && !globalThis._isFocusableArea(this)) return;
-    globalThis._performFocus(this);
+    // FocusOptions.focusVisible: an explicit request overrides the UA's
+    // modality heuristic in either direction (HTML §dom-focusoptions-focusvisible).
+    const _opts = arguments.length ? arguments[0] : undefined;
+    const _fvOpt = (_opts && typeof _opts === 'object' && 'focusVisible' in _opts)
+      ? !!_opts.focusVisible : undefined;
+    globalThis._performFocus(this, undefined, _fvOpt);
   }
   blur() {
     // blur() clears focus when this element is focused, or — for a delegatesFocus
@@ -6296,8 +6321,11 @@ class Element extends Node {
     __obscura_focusVisible = false;
     try { globalThis._fvSyncRust && globalThis._fvSyncRust(); } catch (e) {}
     _dom("set_focus", "", ""); // Phase 0b: clear Rust focus state
-    try { target.dispatchEvent(new Event('blur', { bubbles: false })); } catch(e) {}
-    try { target.dispatchEvent(new Event('focusout', { bubbles: true })); } catch(e) {}
+    try { globalThis._fireFocusEvent(target, 'blur', false, null); } catch(e) {}
+    try { globalThis._fireFocusEvent(target, 'focusout', true, null); } catch(e) {}
+    // Blurring keeps the element's position as the sequential-focus starting
+    // point: a Tab after blur() resumes from where focus was, not the top.
+    try { globalThis._setSeqFocusStart && globalThis._setSeqFocusStart(target); } catch(e) {}
   }
   get value() {
     // <li>.value reflects a `long` content attribute (default 0) — not a form value.
@@ -8294,7 +8322,10 @@ class Document extends Node {
   close() {
     return;
   }
-  hasFocus() { return true; }
+  // hasFocus() is false for a document with NO browsing context (a
+  // createHTMLDocument/DOMParser document); the page's own document — one
+  // realm, always the active window — answers true.
+  hasFocus() { return this === globalThis.document; }
 }
 
 class DocumentFragment extends Node {
@@ -9058,9 +9089,29 @@ const _resolveUrl = function(url) {
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
   try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
 };
+// Navigate to `url` (already absolute). HTML §navigate: when the target differs
+// from the current URL only in its fragment — and HAS one — this is a
+// SAME-DOCUMENT fragment navigation: no fetch, the document stays, hashchange
+// fires, the fragment's element becomes the sequential-focus starting point.
+// Everything else schedules a real navigation. `_fragmentNavigate` is defined
+// with the focus machinery (it moves focus); a call this early in a page's life
+// simply falls through to the full navigation.
+const _navigateTo = function(url) {
+  try {
+    const target = new URL(url);
+    const cur = new URL(_domParse("document_url") ?? "about:blank");
+    if (target.hash !== '' &&
+        target.href.split('#')[0] === cur.href.split('#')[0] &&
+        typeof globalThis._fragmentNavigate === 'function') {
+      globalThis._fragmentNavigate(target.href);
+      return;
+    }
+  } catch (e) {}
+  Deno.core.ops.op_navigate(url, 'GET', '');
+};
 globalThis.location = {
   get href() { return _domParse("document_url") ?? "about:blank"; },
-  set href(url) { Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  set href(url) { _navigateTo(_resolveUrl(url)); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -9069,15 +9120,32 @@ globalThis.location = {
   get search() { try { return new URL(this.href).search; } catch { return ""; } },
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
+  // The writable half of the Location partials. `hash` is the one every page
+  // uses: it is ALWAYS a same-document fragment navigation (even to the same
+  // value — the starting-point/scroll steps still run; hashchange only fires
+  // when the URL actually changed). The rest rebuild the URL and navigate.
+  set hash(v) {
+    let s = String(v);
+    if (s[0] === '#') s = s.slice(1);
+    let u; try { u = new URL('#' + s, this.href).href; } catch (e) { return; }
+    if (s === '') u = u.split('#')[0];
+    if (typeof globalThis._fragmentNavigate === 'function') globalThis._fragmentNavigate(u);
+  },
+  set search(v) { try { const u = new URL(this.href); u.search = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
+  set pathname(v) { try { const u = new URL(this.href); u.pathname = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
+  set protocol(v) { try { const u = new URL(this.href); u.protocol = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
+  set host(v) { try { const u = new URL(this.href); u.host = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
+  set hostname(v) { try { const u = new URL(this.href); u.hostname = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
+  set port(v) { try { const u = new URL(this.href); u.port = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
   toString() { return this.href; },
-  assign(url) { Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  assign(url) { _navigateTo(_resolveUrl(url)); },
   reload() {},
-  replace(url) { Deno.core.ops.op_navigate(_resolveUrl(url), 'GET', ''); },
+  replace(url) { _navigateTo(_resolveUrl(url)); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); },
+  set(url) { _navigateTo(_resolveUrl(String(url))); },
   configurable: false,
   enumerable: true,
 });
@@ -9726,6 +9794,10 @@ const _executeFrameScripts = async function(iframeEl) {
     // exactly the frames that carried code and fail for the quiet ones.
     if (iframeEl._sandboxFlags && !iframeEl._sandboxFlags['allow-scripts']) return;
   } catch (e) {}
+  // The frame's markup-parsed autofocus elements become candidates now (they
+  // never pass through the JS insertion methods). A sandboxed frame returned
+  // above — sandbox blocks automatic features, autofocus included.
+  try { globalThis._autofocusScanFrameDoc && globalThis._autofocusScanFrameDoc(doc); } catch (e) {}
   const base = doc._baseUrl || doc._url || win._url; // relative <script src> base
   let scripts = [];
   try { scripts = Array.from(doc.querySelectorAll('script')); } catch (e) {}
@@ -36692,8 +36764,17 @@ class ShadowRoot extends DocumentFragment {
   // node whose root is this shadow root (i.e. focus is in this tree, or in a nested
   // shadow tree whose host lives here). Otherwise null.
   get activeElement() {
-    if (!__obscura_focused) return null;
-    const c = _retarget(__obscura_focused, this);
+    // In a frame/popup document, focus is tracked on that document — ask the
+    // document this shadow root actually sits in, not just the page global.
+    let f = __obscura_focused;
+    try {
+      const d = globalThis._docOfFocusNode && this._shadowHost
+        ? globalThis._docOfFocusNode(this._shadowHost) : null;
+      if (d && d !== globalThis.document && d._focusedElement !== undefined)
+        f = d._focusedElement;
+    } catch (e) {}
+    if (!f) return null;
+    const c = _retarget(f, this);
     return (c && typeof c.nodeType === 'number' && _nodeRoot(c) === this) ? c : null;
   }
   // styleSheets is connectedness-gated and our shadow trees never enter the render
@@ -40619,12 +40700,43 @@ const __navTimingLoad = function () {
   try { _queuePerformanceEntry(nav); } catch (e) {} // notify observers (registered during parse)
 };
 
+// document.fonts — enough of a FontFaceSet for the pattern real pages (and WPT)
+// actually use: `document.fonts.load('10px Ahem').then(measure)` /
+// `await document.fonts.ready`. A geometry read is synchronous and BOUNDED on
+// the render side, so a slow web font can outlive the layout's own wait and
+// leave text measured in a fallback face; load()/ready poll the render path's
+// in-flight fetch count (folding in whatever landed) and only settle when the
+// layout the page is about to measure is the settled one. Without this the old
+// stub resolved immediately and every "wait for the font, then measure" page
+// measured the fallback.
+const _fontsSettled = () => new Promise((resolve) => {
+  let tries = 0;
+  const poll = () => {
+    let n = 0;
+    try {
+      _layoutRefresh(); // discover any fetches the page hasn't triggered yet
+      n = Number(Deno.core.ops.op_layout('pending', '')) || 0;
+    } catch (e) { n = 0; }
+    if (n <= 0 || ++tries > 100) {
+      // The landed bytes may have moved boxes: drop the JS geometry snapshot
+      // so the next read re-ships from the re-resolved document.
+      _layoutData = null;
+      resolve([]);
+      return;
+    }
+    setTimeout(poll, 50);
+  };
+  poll();
+});
+const _fontFaceSetOf = new WeakMap();
 Object.defineProperty(Document.prototype, 'fonts', {
   get() {
-    return {
-      ready: Promise.resolve(),
+    let s = _fontFaceSetOf.get(this);
+    if (s) return s;
+    s = {
+      get ready() { return _fontsSettled().then(() => s); },
       check() { return true; },
-      load() { return Promise.resolve([]); },
+      load() { return _fontsSettled(); },
       add() {},
       delete() { return false; },
       clear() {},
@@ -40635,6 +40747,8 @@ Object.defineProperty(Document.prototype, 'fonts', {
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
       [Symbol.iterator]() { return [][Symbol.iterator](); },
     };
+    _fontFaceSetOf.set(this, s);
+    return s;
   },
   configurable: true,
 });
@@ -42606,7 +42720,35 @@ globalThis.atob = function atob(data) {
   return out;
 };
 
-globalThis.history = { length:1, state:null, pushState(){}, replaceState(){}, go(){}, back(){}, forward(){}, scrollRestoration:"auto" };
+// History: pushState/replaceState are REAL for the half single-page apps live
+// on — they update the document's URL (same-document, no fetch, no events) and
+// `history.state`. Session-history TRAVERSAL (back/forward/go, popstate from
+// user navigation) is not modelled: there is one document and no joint session
+// history to walk.
+globalThis.history = {
+  length: 1, state: null, scrollRestoration: "auto",
+  pushState(state, _unused, url) { this._update(state, url, true); },
+  replaceState(state, _unused, url) { this._update(state, url, false); },
+  _update(state, url, push) {
+    let clone = null;
+    try { clone = state === undefined ? null : structuredClone(state); }
+    catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
+    if (url !== undefined && url !== null) {
+      let u;
+      try { u = new URL(String(url), location.href); } catch (e) {
+        throw new DOMException("Invalid URL '" + url + "'", 'SecurityError');
+      }
+      // Same-origin only: a document must not dress its address bar as another site.
+      let cur; try { cur = new URL(location.href); } catch (e) { cur = null; }
+      if (cur && u.origin !== cur.origin)
+        throw new DOMException('Cannot change history to a cross-origin URL', 'SecurityError');
+      try { Deno.core.ops.op_set_document_url(u.href); } catch (e) {}
+    }
+    this.state = clone;
+    if (push) this.length++;
+  },
+  go() {}, back() {}, forward() {},
+};
 globalThis.screenX = 0; globalThis.screenY = 0;
 globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
@@ -43508,12 +43650,64 @@ globalThis._fvSyncRust = function() {
 };
 // `method`: 'key' (sequential focus navigation), 'pointer' (click focusing steps),
 // undefined = script/autofocus/dialog/popover — the modality heuristic decides.
-globalThis._performFocus = function(el, method) {
+// Focus/blur/focusin/focusout are UA-originated: they dispatch through
+// _dispatchSpec with isTrusted TRUE (the public dispatchEvent would clear it),
+// as real FocusEvents carrying the "other" element as relatedTarget.
+globalThis._fireFocusEvent = function(target, type, bubbles, related) {
+  try {
+    const C = (typeof FocusEvent === 'function') ? FocusEvent : Event;
+    const ev = new C(type, { bubbles: !!bubbles, composed: true, relatedTarget: related || null });
+    ev.isTrusted = true;
+    _dispatchSpec(target, ev);
+  } catch (e) {}
+};
+
+// The document a node actually SITS IN, found by walking the tree (jumping
+// shadow roots to their hosts). Frame-document nodes report the MAIN document
+// as their `ownerDocument` (a long-standing quirk), so focus routing must ask
+// the tree, not the property.
+globalThis._docOfFocusNode = function(n) {
+  let node = n;
+  for (let d = 0; node && d < 500; d++) {
+    if (node.nodeType === 9) return node;
+    let p = node.parentNode;
+    if (!p && _isSR(node)) p = node._shadowHost;
+    node = p;
+  }
+  return null;
+};
+
+globalThis._performFocus = function(el, method, fvOverride) {
+  // An element in a FRAME document: focus is per document — the inner document
+  // remembers its own focused element (its activeElement), and the top-level
+  // document's focused area becomes the host <iframe> chain (HTML: the focused
+  // area of a nested browsing context is its container, as the ancestors see it).
+  const odoc = el ? globalThis._docOfFocusNode(el) : null;
+  if (odoc && odoc !== document && (odoc._iframeEl || odoc._popupWin)) {
+    const fprev = odoc._focusedElement;
+    if (fprev !== el) {
+      odoc._focusedElement = el;
+      if (fprev) {
+        globalThis._fireFocusEvent(fprev, 'blur', false, el);
+        globalThis._fireFocusEvent(fprev, 'focusout', true, el);
+      }
+      globalThis._fireFocusEvent(el, 'focus', false, fprev);
+      globalThis._fireFocusEvent(el, 'focusin', true, fprev);
+    }
+    // A POPUP is its own top-level context — focus inside it never climbs into
+    // this page. Only a nested frame's host chain gets focused.
+    const host = odoc._iframeEl;
+    if (host && globalThis._isFocusableArea && globalThis._isFocusableArea(host))
+      globalThis._performFocus(host, method);
+    return;
+  }
   // Any genuine focus move clears a pending sequential-focus starting point.
   __obscura_seqFocusStart = null;
+  try { if (typeof globalThis._setSeqFocusStart === 'function') globalThis._setSeqFocusStart(null); } catch (e) {}
   const prev = __obscura_focused;
   if (prev === el) return;
-  const fv = method === 'key' ? true
+  const fv = fvOverride !== undefined ? fvOverride
+    : method === 'key' ? true
     : method === 'pointer' ? globalThis._fvSupportsKeyboardInput(el)
     : (globalThis._fvSupportsKeyboardInput(el) || __fvLastFocusModality !== 'pointer');
   if (prev) {
@@ -43526,8 +43720,8 @@ globalThis._performFocus = function(el, method) {
     __obscura_focusVisible = false;
     globalThis._syncRustFocus(null);
     globalThis._fvSyncRust();
-    try { prev.dispatchEvent(new Event('blur', { bubbles: false })); } catch (e) {}
-    try { prev.dispatchEvent(new Event('focusout', { bubbles: true })); } catch (e) {}
+    globalThis._fireFocusEvent(prev, 'blur', false, el);
+    globalThis._fireFocusEvent(prev, 'focusout', true, el);
     // A nested focusing operation during those events won — don't clobber its result.
     if (__obscura_focused !== null) return;
     // …or a handler made `el` unfocusable (e.g. removed it) — focus lands nowhere.
@@ -43536,10 +43730,13 @@ globalThis._performFocus = function(el, method) {
   __obscura_focused = el;
   __obscura_click_target = el;
   __obscura_focusVisible = fv;
+  // Snapshot the element's flat-tree position now: the focus-fixup that runs
+  // after a removal cannot reconstruct it (the ancestors are already gone).
+  try { globalThis._captureFocusAnchor && globalThis._captureFocusAnchor(el); } catch (e) {}
   globalThis._syncRustFocus(el);
   globalThis._fvSyncRust();
-  try { el.dispatchEvent(new Event('focus', { bubbles: false })); } catch (e) {}
-  try { el.dispatchEvent(new Event('focusin', { bubbles: true })); } catch (e) {}
+  globalThis._fireFocusEvent(el, 'focus', false, prev);
+  globalThis._fireFocusEvent(el, 'focusin', true, prev);
   // Focusing an editing host puts the caret in it (HTML's focusing steps for an
   // editable region). Every editing command is defined over the selection, so
   // without this a freshly focused contenteditable is a box that has focus, shows
@@ -43556,14 +43753,16 @@ globalThis._performFocus = function(el, method) {
 globalThis._runFocusFixup = function() {
   const el = __obscura_focused;
   if (!el) return;
-  try { el.dispatchEvent(new Event('blur', { bubbles: false })); } catch (e) {}
-  try { el.dispatchEvent(new Event('focusout', { bubbles: true })); } catch (e) {}
+  try { globalThis._fireFocusEvent(el, 'blur', false, null); } catch (e) {}
+  try { globalThis._fireFocusEvent(el, 'focusout', true, null); } catch (e) {}
   __obscura_focused = null;
   __obscura_click_target = null;
   __obscura_focusVisible = false;
   try { globalThis._fvSyncRust(); } catch (e) {}
   try { _dom("set_focus", "", ""); } catch (e) {}
-  __obscura_seqFocusStart = el;
+  // Removal already happened by the time this runs — resume from the chain
+  // captured when the element was focused.
+  globalThis._seqFocusStartFromFixup(el);
 };
 
 // Schedule an asynchronous focus-fixup check. Attribute-driven unfocusability
@@ -43573,12 +43772,132 @@ globalThis._runFocusFixup = function() {
 globalThis._scheduleFocusFixup = function() {
   if (__obscura_focusFixupPending) return;
   __obscura_focusFixupPending = true;
-  requestAnimationFrame(() => {
+  // Spec point: the fixup runs at the END of "update the rendering" — after
+  // that frame's animation callbacks AND its ResizeObserver notifications,
+  // before the next frame. rAF + a zero timeout lands there: the page's own
+  // rAF callbacks (registered after the change) and RO notifications run
+  // first, the fixup right after, still ahead of the next frame.
+  requestAnimationFrame(() => setTimeout(() => {
     __obscura_focusFixupPending = false;
     const el = __obscura_focused;
     if (el && globalThis._isFocusableArea && !globalThis._isFocusableArea(el))
       globalThis._runFocusFixup();
-  });
+  }, 0));
+};
+
+// ── The sequential focus navigation starting point ──────────────────────────
+// HTML §sequential-focus-navigation-starting-point: a POSITION in the document,
+// not just an element — set when the user clicks, when a fragment is navigated
+// to, and when the focused element is fixed up away. It has to survive the
+// element (and its ancestors) being removed, so alongside the element itself we
+// capture its FLAT-TREE ancestor chain with each level's following siblings:
+// navigation resumes from the deepest still-connected level, at the boundary
+// just before the first of those siblings that still lives there.
+let __obscura_seqFocusAnchor = null;
+const _flatParentForFocus = (n) => {
+  if (n.assignedSlot) return n.assignedSlot;
+  const p = n.parentNode;
+  if (p && _isSR(p)) return p._shadowHost || null;
+  return p || null;
+};
+const _flatChildrenForFocus = (parent) => {
+  let kids;
+  if (parent.nodeType === 1 && parent._shadowRoot) kids = parent._shadowRoot.childNodes;
+  else if (_isSlotEl(parent) && _shadowRootContaining(parent)) {
+    let s = _findSlottables(parent);
+    if (!s.length) s = Array.prototype.filter.call(parent.childNodes, _isSlottable);
+    kids = s;
+  } else kids = parent.childNodes;
+  return Array.prototype.filter.call(kids, (k) => k && k.nodeType === 1);
+};
+const _captureFlatChain = (el) => {
+  try {
+    const chain = [];
+    let n = el;
+    for (let depth = 0; n && depth < 200; depth++) {
+      const parent = _flatParentForFocus(n);
+      if (!parent || parent.nodeType === 9) break;
+      const sibs = _flatChildrenForFocus(parent);
+      const i = sibs.indexOf(n);
+      chain.push({ parent, nextSibs: i >= 0 ? sibs.slice(i + 1) : sibs.slice() });
+      n = parent;
+    }
+    return chain;
+  } catch (e) { return null; }
+};
+// The focused element's own chain, captured WHEN IT WAS FOCUSED: the fixup that
+// runs after its removal cannot see its old ancestors, so removal-time anchoring
+// depends on this snapshot existing beforehand.
+let __obscura_focusAnchor = null;
+globalThis._captureFocusAnchor = function(el) {
+  __obscura_focusAnchor = el ? _captureFlatChain(el) : null;
+};
+globalThis._setSeqFocusStart = function(el, presetChain) {
+  __obscura_seqFocusStart = el;
+  __obscura_seqFocusAnchor = el ? (presetChain || _captureFlatChain(el)) : null;
+};
+globalThis._seqFocusStartFromFixup = function(el) {
+  __obscura_seqFocusStart = el;
+  __obscura_seqFocusAnchor = (el && globalThis._shadowConnected(el))
+    ? _captureFlatChain(el)
+    : __obscura_focusAnchor;
+};
+// Proposed API (whatwg/html#5326), exercised by WPT: set the starting point
+// directly, without moving focus.
+try {
+  Document.prototype.setSequentialFocusStartingPoint = function(el) {
+    globalThis._setSeqFocusStart(el && el.nodeType === 1 ? el : null);
+  };
+} catch (e) {}
+
+// Same-document fragment navigation (HTML §scroll-to-the-fragment): update the
+// URL without a fetch, find the indicated element, make it the sequential-focus
+// starting point, and run the focusing steps for it "with the viewport as the
+// fallback" — which for a non-focusable target means the currently focused
+// element is UNFOCUSED (its blur fires) without recording a fixup resume point.
+// hashchange (and popstate) fire on a later task, and only if the URL changed.
+globalThis._fragmentNavigate = function(newUrl) {
+  const oldUrl = _domParse("document_url") ?? "about:blank";
+  try { Deno.core.ops.op_set_document_url(newUrl); } catch (e) { return; }
+  let frag = '';
+  try { frag = (new URL(newUrl).hash || '').replace(/^#/, ''); } catch (e) {}
+  let target = null;
+  if (frag !== '' && document) {
+    let dec = frag; try { dec = decodeURIComponent(frag); } catch (e) {}
+    try {
+      target = document.getElementById(dec) || document.getElementById(frag) || null;
+      if (!target && typeof CSS !== 'undefined' && CSS.escape)
+        target = document.querySelector('a[name="' + CSS.escape(dec) + '"]');
+    } catch (e) {}
+  }
+  if (target && globalThis._isFocusableArea && globalThis._isFocusableArea(target)) {
+    globalThis._performFocus(target);
+  } else if (target && typeof __obscura_focused !== 'undefined' && __obscura_focused) {
+    // Only an ACTUAL indicated element runs the focusing steps (with the
+    // viewport as fallback → unfocus). A fragment that matches nothing leaves
+    // focus alone — `location.hash = 'nowhere'` must not blur the page's input.
+    const prevEl = __obscura_focused;
+    __obscura_focused = null;
+    __obscura_click_target = null;
+    __obscura_focusVisible = false;
+    try { globalThis._syncRustFocus(null); } catch (e) {}
+    try { globalThis._fvSyncRust(); } catch (e) {}
+    try { globalThis._fireFocusEvent(prevEl, 'blur', false, null); } catch (e) {}
+    try { globalThis._fireFocusEvent(prevEl, 'focusout', true, null); } catch (e) {}
+  }
+  try { globalThis._setSeqFocusStart(target); } catch (e) {}
+  // :target now matches the indicated element (and nothing, for '' / no match).
+  try {
+    let dec = frag; try { dec = decodeURIComponent(frag); } catch (e) {}
+    _dom('set_target_id', dec, '');
+  } catch (e) {}
+  try { if (target && target.scrollIntoView) target.scrollIntoView(); } catch (e) {}
+  if (newUrl !== oldUrl) {
+    setTimeout(() => {
+      try { window.dispatchEvent(new (globalThis.PopStateEvent || Event)('popstate')); } catch (e) {}
+      try { window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL: oldUrl, newURL: newUrl })); } catch (e) {}
+    }, 0);
+  }
 };
 
 // Is `el` (or any ancestor) not rendered — display:none per the UA sheet / an author
@@ -43586,10 +43905,23 @@ globalThis._scheduleFocusFixup = function() {
 // their descendants) are never focusable.
 globalThis._isRenderedForFocus = function(el) {
   let n = el;
+  let visDecided = false;
   while (n && n.nodeType === 1) {
     if (n.hasAttribute('hidden')) return false;
+    // Inline styles: the attribute alone is not enough — a CSSOM write
+    // (`el.style.visibility = 'hidden'`) never reaches the attribute, so read
+    // the live declaration too. `visibility` is decided by the NEAREST
+    // inclusive ancestor that declares it (a descendant may re-show itself
+    // under a hidden ancestor); `display:none` anywhere up kills rendering.
+    let disp = '', vis = '';
+    try { const s = n.style; disp = s.display || ''; vis = visDecided ? '' : (s.visibility || ''); } catch (e) {}
+    if (disp === 'none') return false;
     const st = n.getAttribute('style');
-    if (st && /(^|;)\s*display\s*:\s*none(\s*;|\s*$|\s*!)/i.test(st)) return false;
+    if (!disp && st && /(^|;)\s*display\s*:\s*none(\s*;|\s*$|\s*!)/i.test(st)) return false;
+    if (vis) {
+      if (vis === 'hidden' || vis === 'collapse') return false;
+      visDecided = true;
+    }
     // UA sheet: `dialog:not([open]) { display:none }` (unless it is showing as a popover).
     if (n.localName === 'dialog' && !n.hasAttribute('open') && !n._popoverShowing) return false;
     // UA sheet: a `[popover]` that is not currently showing is `display:none`.
@@ -43639,6 +43971,23 @@ globalThis._isFocusableArea = function(el) {
   if ((ln === 'button' || ln === 'input' || ln === 'select' || ln === 'textarea' ||
        ln === 'optgroup' || ln === 'option' || ln === 'fieldset') && el.hasAttribute('disabled'))
     return false;
+  // A form control inside a DISABLED <fieldset> is disabled too — unless it
+  // sits inside that fieldset's FIRST <legend> child (HTML §the-fieldset-element:
+  // the legend escape hatch, so a legend's own controls stay usable).
+  if (ln === 'button' || ln === 'input' || ln === 'select' || ln === 'textarea') {
+    let a = el.parentNode;
+    while (a && a.nodeType === 1) {
+      if (a.localName === 'fieldset' && a.hasAttribute('disabled')) {
+        let leg = null;
+        const kids = a.children || [];
+        for (let i = 0; i < kids.length; i++) {
+          if (kids[i].localName === 'legend') { leg = kids[i]; break; }
+        }
+        if (!leg || !leg.contains(el)) return false;
+      }
+      a = a.parentNode;
+    }
+  }
   const ti = el.getAttribute('tabindex');
   if (ti !== null && __parseHtmlSignedInt(ti) !== null) return true;
   if (ln === 'button' || ln === 'select' || ln === 'textarea') return true;
@@ -43773,6 +44122,13 @@ globalThis._restorePreviousFocus = function(el) {
 //
 // Builds the full flat-tree tab order once, then moves ±1 from the focused element.
 globalThis._sequentialFocusNavigation = function(backward) {
+  // A pending focus fixup settles NOW: attribute-driven unfocusability
+  // (disabled/hidden/…) fixes up on a later frame, but a Tab that arrives
+  // first must resume from the fixed-up position, not from stale focus.
+  try {
+    if (__obscura_focused && globalThis._isFocusableArea && !globalThis._isFocusableArea(__obscura_focused))
+      globalThis._runFocusFixup();
+  } catch (e) {}
   // Flat-tree children of a scope node: a shadow host exposes its shadow root's
   // children; a <slot> exposes its assigned slottables (its own fallback content when
   // nothing is assigned); a shadow root or ordinary node exposes its child nodes.
@@ -43801,6 +44157,24 @@ globalThis._sequentialFocusNavigation = function(backward) {
   const flatPos = new Map();
   let posCounter = 0;
   const seenScopes = new Set();   // guard against a pathological slot-assignment cycle
+
+  // Rank the whole flat tree in TRUE preorder first. The scope-emission walk
+  // below visits a scope's members before descending its nested scopes, so
+  // ranks assigned there interleave scopes out of document order — a slotted
+  // element would rank after every slot of its shadow tree, and the resume
+  // boundary comparisons below would misplace it.
+  {
+    const rank = (node, depth) => {
+      if (depth > 200) return;
+      for (const k of flatChildren(node)) {
+        if (k && k.nodeType === 1 && !flatPos.has(k)) {
+          flatPos.set(k, posCounter++);
+          rank(k, depth + 1);
+        }
+      }
+    };
+    try { rank(document, 0); } catch (e) {}
+  }
 
   // Collect one focus navigation scope's members in flat-preorder. Each member is a
   // focusable element and/or a nested scope owner (shadow host / slot).
@@ -43862,21 +44236,88 @@ globalThis._sequentialFocusNavigation = function(backward) {
   const cur = __obscura_focused;
   let idx = cur ? order.indexOf(cur) : -1;
   let target;
-  if (idx === -1 && __obscura_seqFocusStart && __obscura_seqFocusStart.isConnected &&
-      flatPos.has(__obscura_seqFocusStart)) {
-    // The focused element was fixed up away (disabled/removed/…). Resume navigation
-    // from its recorded position: pick the first candidate whose (tabindex, flat-order)
-    // key falls after it (backward: the last one before it), wrapping at the ends.
-    const sp = __obscura_seqFocusStart;
-    const spTi = sp.tabIndex > 0 ? sp.tabIndex : Infinity;
-    const spTree = flatPos.get(sp);
-    const after = (el) => {
+
+  // The starting point outranks the focused element when both exist (HTML: the
+  // user's last click/fragment/fixup position is where Tab resumes) — every
+  // genuine focus move clears it, so a stale one can't linger.
+  const sp = __obscura_seqFocusStart;
+  const spConnected = sp && globalThis._shadowConnected(sp) && flatPos.has(sp);
+  // An element's slot in the (tabindex, flat-order) comparison space. A node
+  // with no tabindex of its own (a clicked <span>) resumes inside its nearest
+  // focusable flat ancestor's slot — that is what makes Tab from a click inside
+  // a `tabindex=1` container land on the NEXT tabindex=1 stop, not tabindex=2.
+  const tiKeyOf = (el) => {
+    let n = el;
+    for (let d = 0; n && n.nodeType === 1 && d < 200; d++) {
+      if ((n.hasAttribute && n.hasAttribute('tabindex')) || globalThis._isFocusableArea(n)) {
+        const t = n.tabIndex;
+        return t > 0 ? t : Infinity;
+      }
+      n = _flatParentForFocus(n);
+    }
+    return Infinity;
+  };
+  const flatContains = (anc, node) => {
+    let n = node;
+    for (let d = 0; n && d < 200; d++) {
+      if (n === anc) return true;
+      n = _flatParentForFocus(n);
+    }
+    return false;
+  };
+
+  let after = null;        // boundary comparator: is `el` past the starting point?
+  let boundaryRef = null;  // the node the boundary sits at (for the backward rule)
+  if (spConnected) {
+    const spTi = tiKeyOf(sp), spTree = flatPos.get(sp);
+    after = (el) => {
       const ti = el.tabIndex > 0 ? el.tabIndex : Infinity;
       return ti !== spTi ? ti > spTi : (flatPos.get(el) || 0) > spTree;
     };
+    boundaryRef = sp;
+  } else if (sp && __obscura_seqFocusAnchor) {
+    // The recorded element is gone. Resume from its captured flat-tree anchor:
+    // the deepest still-connected ancestor level, at the boundary just before
+    // the first of that level's following siblings that still lives there —
+    // removals BEFORE the position don't shift it, and a level whose parent
+    // vanished climbs to the next one.
+    for (const level of __obscura_seqFocusAnchor) {
+      const P = level.parent;
+      if (!P || !globalThis._shadowConnected(P)) continue;
+      const nextSib = level.nextSibs.find((s) =>
+        s && globalThis._shadowConnected(s) && flatPos.has(s) && _flatParentForFocus(s) === P);
+      if (nextSib) {
+        const bTi = tiKeyOf(nextSib), bTree = flatPos.get(nextSib);
+        after = (el) => {
+          const ti = el.tabIndex > 0 ? el.tabIndex : Infinity;
+          return ti !== bTi ? ti > bTi : (flatPos.get(el) || 0) >= bTree;
+        };
+        boundaryRef = nextSib;
+      } else if (flatPos.has(P)) {
+        // Boundary at the end of P's remaining content.
+        const pTi = tiKeyOf(P), pTree = flatPos.get(P);
+        after = (el) => {
+          if (flatContains(P, el)) return false;
+          const ti = el.tabIndex > 0 ? el.tabIndex : Infinity;
+          return ti !== pTi ? ti > pTi : (flatPos.get(el) || 0) > pTree;
+        };
+        boundaryRef = P;
+      } else continue;
+      break;
+    }
+  }
+
+  if (after) {
     if (backward) {
       target = null;
-      for (const el of order) { if (after(el)) break; target = el; }
+      for (const el of order) {
+        if (after(el)) break;
+        // Backwards navigation never lands ON a container the starting point
+        // sits inside — the user is already within it; it exits to the stop
+        // before it instead.
+        if (boundaryRef && flatContains(el, boundaryRef)) continue;
+        target = el;
+      }
       if (!target) target = order[order.length - 1];
     } else {
       target = order.find(after) || order[0];
@@ -43889,29 +44330,190 @@ globalThis._sequentialFocusNavigation = function(backward) {
   if (target) globalThis._performFocus(target, 'key');
 };
 
-// Document autofocus: after the document loads, "flush the autofocus candidates" —
-// focus the first focusable element in tree order that carries the `autofocus`
-// attribute (HTML §the-autofocus-attribute). Only when nothing has been focused yet
-// (a script that already moved focus wins), so it is inert for pages without an
-// unfocused autofocus candidate.
-try {
-  const _flushAutofocus = () => {
+// ── Autofocus (HTML §the-autofocus-attribute) ────────────────────────────────
+// A QUEUE of candidates in TEMPORAL insertion order — not a tree scan. The
+// distinction is observable: reconnecting the first of two autofocus elements
+// re-queues it BEHIND the second (first-reconnected), and an element inserted
+// later loses to one already queued even if it lands earlier in the tree
+// (first-when-later-but-before). Candidates are appended when an element with
+// `autofocus` is inserted into a document (appendChild / insertBefore /
+// innerHTML / frame-document parse) and dequeued on removal.
+//
+// Flushing (microtask, so it lands before WPT's one-rAF stability wait):
+//  * a candidate whose document currently has a fragment TARGET is dropped —
+//    the author navigated the user somewhere specific, autofocus must not
+//    yank them away (document-with-fragment-valid vs -empty/-top/-nonexistent:
+//    only an ACTUAL matching element blocks, not the fragment's mere presence);
+//  * if the top document's focused area is no longer the document itself
+//    (a script focused something, or a frame's autofocus already focused the
+//    iframe), processing stops FOR GOOD (the processed flag);
+//  * the first focusable candidate gets the focusing steps; a frame document's
+//    candidate focuses the frame's document AND the host iframe chain above it.
+{
+  let __afCandidates = [];
+  let __afProcessed = false;
+  let __afReady = false;
+  let __afFlushPending = false;
+  const _afDocHasTarget = (doc) => {
     try {
-      if (__obscura_focused) return;
-      const root = document.documentElement || document.body;
-      if (!root) return;
-      const cand = globalThis._autofocusDelegate(root);
-      if (cand) globalThis._performFocus(cand);
+      const url = (doc === document) ? location.href : (doc._url || '');
+      const h = (String(url).split('#')[1] || '');
+      if (!h) return false;
+      let dec = h; try { dec = decodeURIComponent(h); } catch (e) {}
+      if (doc.getElementById && (doc.getElementById(dec) || doc.getElementById(h))) return true;
+      try {
+        if (doc.querySelector && typeof CSS !== 'undefined' && CSS.escape &&
+            doc.querySelector('a[name="' + CSS.escape(dec) + '"]')) return true;
+      } catch (e) {}
+      return false;
+    } catch (e) { return false; }
+  };
+  const _afConnected = (el) => {
+    const doc = globalThis._docOfFocusNode ? globalThis._docOfFocusNode(el) : null;
+    if (!doc) return false;
+    if (doc === document) return true;
+    if (doc._iframeEl) return globalThis._shadowConnected(doc._iframeEl);
+    // A popup document is its own top-level context; anything else (a detached
+    // createHTMLDocument tree) never autofocuses.
+    return !!(doc._popupWin && !doc._popupWin.closed);
+  };
+  // A candidate belongs to a TOP-LEVEL browsing context: this page (frames
+  // included — their focus climbs to the host iframe) or one popup. Each
+  // context settles independently: focusing a candidate, or finding the
+  // context already has a focused area, stops processing for THAT context
+  // only (skip-another-top-level-browsing-context).
+  const _afTopKey = (doc) => (doc === document || doc._iframeEl) ? 'main' : doc;
+  const _afFlush = () => {
+    __afFlushPending = false;
+    if (!__afReady) return;
+    try {
+      const settled = new Set();
+      if (__afProcessed) settled.add('main');
+      const rest = [];
+      for (const cand of __afCandidates) {
+        const el = cand && cand.el;
+        if (!el || !_afConnected(el)) continue;
+        const doc = (globalThis._docOfFocusNode && globalThis._docOfFocusNode(el)) || document;
+        const key = _afTopKey(doc);
+        // Queued in one top-level context, now living in another → skipped.
+        if (cand.key !== undefined && cand.key !== key) continue;
+        if (settled.has(key)) continue;
+        // A SANDBOXED frame's automatic-features flag blocks autofocus outright
+        // (there is no allow- token for it), and a CROSS-ORIGIN frame must not
+        // steal its embedder's focus either.
+        const host = doc !== document ? doc._iframeEl : null;
+        if (host && (host._sandboxFlags || host.hasAttribute('sandbox')
+            || host._crossOriginFrame || host._frameBlocked || host._sandboxOpaque)) continue;
+        if (_afDocHasTarget(doc)) continue;
+        const topFocused = key === 'main' ? __obscura_focused : doc._focusedElement;
+        if (topFocused) {
+          settled.add(key);
+          if (key === 'main') __afProcessed = true;
+          continue;
+        }
+        // A shadow host with delegatesFocus autofocuses through its delegate.
+        if (el._shadowRoot && el._shadowRoot._delegatesFocus) {
+          const d = globalThis._shadowFocusDelegate(el);
+          if (d) { globalThis._performFocus(d); settled.add(key); continue; }
+        }
+        if (globalThis._isFocusableArea(el)) {
+          globalThis._performFocus(el);
+          settled.add(key);
+          continue;
+        }
+        // Non-focusable: dropped (skip-non-focusable), never re-queued.
+      }
+      __afCandidates = rest;
     } catch (e) {}
   };
-  // HTML flushes the autofocus candidates when the document becomes ready —
-  // BEFORE the first animation frame after parsing. Waiting for `load` is too
-  // late: WPT's waitUntilStableAutofocusState (one rAF) reads activeElement
-  // before a load-driven flush has run. Keep the load pass as a safety net for
-  // documents whose DCL slipped past us.
-  window.addEventListener('DOMContentLoaded', _flushAutofocus);
-  window.addEventListener('load', _flushAutofocus);
-} catch (e) {}
+  const _afSchedule = () => {
+    if (__afFlushPending) return;
+    __afFlushPending = true;
+    try { queueMicrotask(_afFlush); } catch (e) { setTimeout(_afFlush, 0); }
+  };
+  // Markup-parsed candidates never pass through the JS insertion methods, and
+  // TEMPORALLY they all precede any script-driven insertion (the whole markup
+  // tree exists before the first script runs). Seed them at the FRONT of the
+  // queue the first time anything autofocus-related happens — excluding the
+  // subtree a JS insertion is right now adding, whose elements are dynamic,
+  // not markup (first-when-later-but-before: a prepend that lands EARLIER in
+  // the tree still loses to the markup element that was there first).
+  let __afSeeded = false;
+  const _afSeedMarkup = (excludeSubtree) => {
+    if (__afSeeded) return;
+    __afSeeded = true;
+    try {
+      const root = document && (document.documentElement || document.body);
+      if (!root || !root.querySelectorAll) return;
+      const markup = [];
+      for (const el of root.querySelectorAll('[autofocus]')) {
+        if (excludeSubtree && (excludeSubtree === el || (excludeSubtree.contains && excludeSubtree.contains(el)))) continue;
+        if (!__afCandidates.some((c) => c.el === el)) markup.push({ el, key: 'main' });
+      }
+      __afCandidates = markup.concat(__afCandidates);
+    } catch (e) {}
+  };
+  // Each candidate remembers WHICH top-level context queued it: an element
+  // moved to a different top-level context before the flush is skipped there
+  // (skip-another-top-level-browsing-context — the popup queued it, the
+  // opener must not act on it).
+  const _afKeyOfNow = (el) => {
+    const doc = (globalThis._docOfFocusNode && globalThis._docOfFocusNode(el)) || document;
+    return _afTopKey(doc);
+  };
+  globalThis._autofocusInserted = function(node) {
+    try {
+      if (!node || node.nodeType !== 1) return;
+      const own = node.hasAttribute('autofocus');
+      const deep = !own && node.firstElementChild && node.querySelectorAll;
+      if (!own && !deep) return;
+      _afSeedMarkup(node);
+      if (own) {
+        if (_afConnected(node)) { __afCandidates.push({ el: node, key: _afKeyOfNow(node) }); _afSchedule(); }
+      } else if (_afConnected(node)) {
+        for (const el of node.querySelectorAll('[autofocus]')) __afCandidates.push({ el, key: _afKeyOfNow(el) });
+        if (__afCandidates.length) _afSchedule();
+      }
+    } catch (e) {}
+  };
+  globalThis._autofocusRemoved = function(node) {
+    if (!node) return;
+    try {
+      // Seeding here (the node is already detached, so it never enters) keeps
+      // remove-and-reinsert TEMPORAL: the reinsertion appends to the END,
+      // behind markup candidates that never moved (first-reconnected).
+      _afSeedMarkup(null);
+      if (__afCandidates.length)
+        __afCandidates = __afCandidates.filter(
+          (c) => c.el !== node && !(node.contains && node.contains(c.el)));
+    } catch (e) {}
+  };
+  const _afBecomeReady = () => {
+    __afReady = true;
+    _afSeedMarkup(null);
+    _afFlush();
+  };
+  try {
+    // HTML flushes the autofocus candidates when the document becomes ready —
+    // BEFORE the first animation frame after parsing. Waiting for `load` is too
+    // late: WPT's waitUntilStableAutofocusState (one rAF) reads activeElement
+    // before a load-driven flush has run. Keep the load pass as a safety net.
+    window.addEventListener('DOMContentLoaded', _afBecomeReady);
+    window.addEventListener('load', _afBecomeReady);
+  } catch (e) {}
+  // Frame documents parse their markup outside the JS insertion methods; the
+  // frame constructor calls this with the frame's document root.
+  globalThis._autofocusScanFrameDoc = function(doc) {
+    try {
+      if (!doc || !doc.querySelectorAll) return;
+      const key = _afTopKey(doc);
+      for (const el of doc.querySelectorAll('[autofocus]')) {
+        if (!__afCandidates.some((c) => c.el === el)) __afCandidates.push({ el, key });
+      }
+      if (__afCandidates.length) _afSchedule();
+    } catch (e) {}
+  };
+}
 
 // ===================== Popover API (HTML §popover) ==============================
 // The `popover` attribute turns any HTML element into a top-layer popover with
@@ -44264,6 +44866,32 @@ try {
   // `dispatchEvent(new MouseEvent('click'))` — which is untrusted — activates nothing, and
   // the untrusted click that `.click()` itself dispatches (which already runs activation
   // inline) does not double-fire here.
+  // HTML "follow the hyperlink" — the shared activation for both the click()
+  // METHOD and a dispatched trusted click. `javascript:` URLs run as inline
+  // script (CSP asked first); `#fragment` hrefs route through the fragment
+  // navigation via `location.assign`; everything else is a real navigation.
+  // Returns true when the link had an href to follow.
+  globalThis._followHyperlink = function(link) {
+    const href = link.getAttribute('href');
+    if (!href) return false;
+    if (href.startsWith('javascript:')) {
+      // A `javascript:` navigation runs the URL body as an inline script, and
+      // CSP is asked FIRST (HTML §navigate to a javascript: URL; the check —
+      // and the violation report — is the inline one, `script-src-elem`).
+      // A completion value that is a string would replace the document; that
+      // half is not implemented, so the result is simply dropped.
+      let body = href.slice('javascript:'.length);
+      try { body = decodeURIComponent(body); } catch (e) {}
+      if (typeof globalThis.__cspAllowsInline !== 'function'
+          || globalThis.__cspAllowsInline('script', link, body)) {
+        try { (0, _NativeEval)(body); } catch (e) { _reportError(e); }
+      }
+      return true;
+    }
+    location.assign(href);
+    return true;
+  };
+
   globalThis._installInvokerActivation = () => {
     try {
       document.addEventListener('click', (e) => {
@@ -44275,6 +44903,13 @@ try {
               && (n.hasAttribute('popovertarget') || n._popoverTargetElement
                   || n.hasAttribute('commandfor'))) {
             globalThis._runInvokerActivation(n);
+            return;
+          }
+          // Following a hyperlink is the default action of a trusted click
+          // anywhere in the link's subtree — a dispatched click (the WPT
+          // driver, CDP input) must navigate exactly like the click() method.
+          if ((n.localName === 'a' || n.localName === 'area') && n.hasAttribute('href')) {
+            try { globalThis._followHyperlink(n); } catch (e2) {}
             return;
           }
           n = n.parentNode;
@@ -44315,10 +44950,18 @@ try {
             // (WPT focus-visible-script-focus-002/-006/-016).
             __fvLastFocusModality = 'pointer';
             globalThis._performFocus(n, 'pointer');
-            return;
+            break;
           }
           n = n.parentNode;
         }
+        // A user click moves the sequential focus navigation starting point to
+        // the click position (HTML §sequential-focus-navigation-starting-point)
+        // — AFTER the focusing steps, which clear it: a Tab after any click
+        // resumes from where the user clicked, even inside a focused container.
+        try {
+          if (e.target && e.target.nodeType === 1 && globalThis._setSeqFocusStart)
+            globalThis._setSeqFocusStart(e.target);
+        } catch (e2) {}
       }, false);
       // :focus-visible modality tracking: any trusted key press that is not a
       // shortcut chord (Ctrl/Alt/Meta held — focus-visible-012) and not a bare
@@ -54999,7 +55642,15 @@ class _IframeDocument extends DetachedDocument {
   get readyState() { return 'complete'; }
   get visibilityState() { return 'visible'; }
   get hidden() { return false; }
-  get activeElement() { return this.body; }
+  get activeElement() {
+    // A frame document tracks its own focused element (set through the frame
+    // focus routing in _performFocus); everything else answers <body>. Focus
+    // inside a shadow tree retargets to the host, like the main document.
+    const f = this._focusedElement;
+    if (!f) return this.body;
+    const r = (typeof _retarget === 'function') ? _retarget(f, this) : f;
+    return (r && this.contains && this.contains(r)) ? r : this.body;
+  }
   // A frame's cookies are resolved against the FRAME's URL, not the page's:
   // visibility is decided by path, so a frame at `/cookies/resources/` must not
   // see a cookie scoped to `/cookies/attributes/`. This used to return "" flat,
@@ -55138,6 +55789,34 @@ class _IframeWindow {
     // parent URL as originUrl to override just the origin (HTML spec).
     if (originUrl) {
       try { this.location.origin = new URL(originUrl).origin; } catch(e) {}
+    }
+    // `location.hash` is a live accessor: assigning is a same-document fragment
+    // navigation WITHIN the frame — the frame document's URL updates, the
+    // fragment's element becomes the tree's :target, and hashchange fires at
+    // THIS window. (The full-navigation setters stay inert; a frame's real
+    // navigation goes through the src attribute.)
+    {
+      const _self = this;
+      Object.defineProperty(this.location, 'hash', {
+        configurable: true, enumerable: true,
+        get() { try { return new URL(_self._url).hash; } catch (e) { return ''; } },
+        set(v) {
+          let s = String(v); if (s[0] === '#') s = s.slice(1);
+          let nu; try { nu = new URL('#' + s, _self._url).href; } catch (e) { return; }
+          if (s === '') nu = nu.split('#')[0];
+          const old = _self._url;
+          _self._url = nu;
+          try { if (_self.document) _self.document._url = nu; } catch (e) {}
+          try { this.href = nu; } catch (e) {}
+          let dec = s; try { dec = decodeURIComponent(s); } catch (e) {}
+          try { _dom('set_target_id', dec, ''); } catch (e) {}
+          if (nu !== old) {
+            setTimeout(() => {
+              try { _self.dispatchEvent(new HashChangeEvent('hashchange', { oldURL: old, newURL: nu })); } catch (e) {}
+            }, 0);
+          }
+        },
+      });
     }
     // This frame window's `onerror` is a real OnErrorEventHandler `error`-listener
     // (mirroring the main window, Quest #169) rather than a plain data prop — so a
@@ -62192,8 +62871,51 @@ globalThis.prompt = function() { return null; };
 // HTML §window.open: a target naming an existing FRAME is a navigation of that
 // frame, not a popup — `window.open(url, "theiframe")` goes through the same
 // gated path as `iframe.src = url` (so frame-src has its say and violations
-// fire). Real popups are not implemented (no second top-level browsing
-// context); those still return null, which is what a popup blocker looks like.
+// fire). Anything else opens a POPUP: a second top-level browsing context,
+// modelled as a frame window WITHOUT a host element (`doc._popupWin` marks it,
+// so focus stays per-document and never climbs into this page). The returned
+// window starts as about:blank; the URL loads asynchronously, its scripts run
+// against the popup window, and `load` fires there — which is exactly the
+// contract `w = window.open(u); await waitForLoad(w)` pages are written to.
+const _schedulePopupLoad = function(win) {
+  setTimeout(() => {
+    if (win.closed) return;
+    try { const ev = new Event('load'); ev.isTrusted = true; win.dispatchEvent(ev); } catch (e) {}
+  }, 0);
+};
+const _loadPopupUrl = async function(win, fullUrl) {
+  let text = '', kind, gotDoc = false;
+  try {
+    // Same internal road as a frame navigation (no CORS filter, not a
+    // connect-src fetch — a document load is a navigation, not a subresource).
+    const resp = await fetch(fullUrl, { mode: 'no-cors', _initiatorType: 'iframe' });
+    if (resp && (resp.ok || resp.type === 'opaque')) {
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      let ct = null;
+      try { ct = resp.headers.get('content-type'); } catch (e) {}
+      const dec = _decodeDocumentBytes(buf, ct);
+      text = dec.text;
+      kind = _iframeDocKind(fullUrl, resp);
+      gotDoc = true;
+    }
+  } catch (e) {}
+  if (win.closed) return;
+  try {
+    const doc = new _IframeDocument(
+      gotDoc && text ? text : '<!DOCTYPE html><html><head></head><body></body></html>',
+      fullUrl, null, undefined, kind);
+    doc._popupWin = win;
+    win.document = doc;
+    win._url = fullUrl;
+    try { win.location.href = fullUrl; } catch (e) {}
+    try { globalThis._autofocusScanFrameDoc && globalThis._autofocusScanFrameDoc(doc); } catch (e) {}
+    // Run the popup's scripts through the frame-script machinery (it only
+    // needs the _iframeWin/_iframeDoc pair and the ran-flag).
+    const holder = { _iframeWin: win, _iframeDoc: doc, _frameScriptsRan: false };
+    try { await _executeFrameScripts(holder); } catch (e) {}
+  } catch (e) {}
+  _schedulePopupLoad(win);
+};
 globalThis.open = function(url, target) {
   try {
     const t = target == null ? '' : String(target);
@@ -62207,6 +62929,21 @@ globalThis.open = function(url, target) {
         }
       }
     }
+    let fullUrl = (url == null || url === '') ? 'about:blank' : _resolveUrl(String(url));
+    const pdoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl === 'about:blank' ? 'about:blank' : fullUrl, null);
+    const win = new _IframeWindow(pdoc, fullUrl === 'about:blank' ? 'about:blank' : fullUrl, null, null);
+    pdoc._popupWin = win;
+    win.opener = globalThis;
+    // A top-level context is its own top and parent.
+    win.top = win;
+    win.parent = win;
+    if (t && t !== '_blank') { try { win.name = t; } catch (e) {} }
+    win.close = function() { win.closed = true; };
+    win.focus = function() {};
+    win.blur = function() {};
+    if (fullUrl === 'about:blank') _schedulePopupLoad(win);
+    else _loadPopupUrl(win, fullUrl);
+    return win;
   } catch (e) {}
   return null;
 };

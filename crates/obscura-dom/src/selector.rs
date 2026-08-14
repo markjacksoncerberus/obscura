@@ -1272,12 +1272,25 @@ impl<'a> Element for DomElement<'a> {
             // :target — the element whose id equals the document's URL fragment
             // (set by JS on the tree before the query). Empty fragment → no match.
             PseudoClass::Target => match self.tree.target_id() {
-                Some(t) if !t.is_empty() => self
-                    .tree
-                    .with_node(self.node_id, |n| {
-                        n.get_attribute("id").map(|v| v == t.as_str()).unwrap_or(false)
-                    })
-                    .unwrap_or(false),
+                Some(t) if !t.is_empty() => {
+                    // The indicated element is matched by id — or, for the
+                    // legacy anchor form, an <a name="..."> (HTML "select the
+                    // indicated part": id first, then a[name]).
+                    self.tree
+                        .with_node(self.node_id, |n| {
+                            n.get_attribute("id").map(|v| v == t.as_str()).unwrap_or(false)
+                        })
+                        .unwrap_or(false)
+                        || (self.local_name().as_deref() == Some("a")
+                            && self
+                                .tree
+                                .with_node(self.node_id, |n| {
+                                    n.get_attribute("name")
+                                        .map(|v| v == t.as_str())
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false))
+                }
                 _ => false,
             },
             // :lang(...) matches against the element's language, which is the

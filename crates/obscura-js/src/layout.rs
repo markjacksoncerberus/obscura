@@ -460,6 +460,17 @@ fn incremental_disabled() -> bool {
     OFF.with(|o| *o)
 }
 
+/// How many render-path resource fetches are still in flight for the cached
+/// document, folding in anything that already landed (which may rebuild text
+/// and marker layouts that measured with a fallback font). No cached layout →
+/// "0": nothing was ever requested, so there is nothing to wait for.
+pub fn pump_pending() -> String {
+    CACHE.with(|c| match c.borrow_mut().as_mut() {
+        Some(cached) => cached.doc.pump_resources().to_string(),
+        None => "0".to_string(),
+    })
+}
+
 /// Drop the cached layout. Called when the document is replaced, so a new page
 /// can never be measured against the old one's boxes.
 pub fn invalidate() {

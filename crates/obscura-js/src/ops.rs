@@ -880,6 +880,9 @@ fn op_layout(state: &OpState, #[string] cmd: String, #[string] viewport: String)
                 crate::layout::invalidate();
                 "null".to_string()
             }
+            // document.fonts polls this: fold newly-arrived resource bytes into
+            // the cached layout and answer how many fetches are still in flight.
+            "pending" => crate::layout::pump_pending(),
             _ => "null".to_string(),
         }
     }
@@ -1664,6 +1667,18 @@ fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[s
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));
 }
 
+/// A SAME-DOCUMENT URL change — fragment navigation (`location.hash = …`,
+/// clicking `<a href="#x">`) or `history.pushState`/`replaceState`. Updates
+/// what `location`/`document.URL` report without scheduling a navigation:
+/// the document stays, no fetch happens, and the JS side fires
+/// hashchange/popstate itself.
+#[op2(fast)]
+fn op_set_document_url(state: &OpState, #[string] url: &str) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.url = url.to_string();
+}
+
 #[op2(async)]
 async fn op_sleep(#[number] millis: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
@@ -2165,6 +2180,7 @@ pub fn build_extension() -> Extension {
             op_get_cookies_for(),
             op_set_cookie_for(),
             op_navigate(),
+            op_set_document_url(),
             op_sleep(),
             op_url_parse(),
             op_url_set(),

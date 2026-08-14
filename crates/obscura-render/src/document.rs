@@ -338,6 +338,22 @@ impl ResolvedDoc {
         true
     }
 
+    /// Fold any resource bytes that arrived since the last resolve into the
+    /// document, and report how many fetches are still in flight.
+    ///
+    /// A geometry read is synchronous and bounded, so a slow web font can
+    /// outlive its wait and leave text (and outside list markers) measured in
+    /// a fallback face. `document.fonts.load()`/`.ready` poll this instead:
+    /// each call folds whatever landed, and a zero return means the settled
+    /// layout is the one the page will now measure.
+    pub fn pump_resources(&mut self) -> usize {
+        let Some(provider) = &self.provider else {
+            return 0;
+        };
+        self.doc.resolve(0.0);
+        provider.pending()
+    }
+
     /// The full CSSOM-View box for `obscura_nid`, or `None` if the element
     /// wasn't in the snapshot at all.
     ///
@@ -421,6 +437,15 @@ impl ResolvedDoc {
                     if let Some(b) = self.pseudo_box_for(before) {
                         out.push((nid, 0, b));
                     }
+                    // A ::before that is itself a list-item carries a marker of
+                    // its own; hit-testing that marker must land on the
+                    // originating element, so its box ships under the element's
+                    // nid (only when the element has no marker of its own).
+                    if element.list_item_data.is_none() {
+                        if let Some(mb) = self.marker_box_for(before) {
+                            out.push((nid, 2, mb));
+                        }
+                    }
                 }
                 if let Some(after) = node.after {
                     if let Some(b) = self.pseudo_box_for(after) {
@@ -428,44 +453,53 @@ impl ResolvedDoc {
                     }
                 }
                 // Outside ::marker: mirror blitz-paint's draw_marker placement.
-                if let Some(ListItemLayout {
-                    marker,
-                    position: ListItemLayoutPosition::Outside(layout),
-                }) = element.list_item_data.as_deref()
-                {
-                    let x_padding = match marker {
-                        Marker::Char(_) => 8.0f32,
-                        Marker::String(_) => 0.0,
-                    };
-                    let m_width = layout.full_width() / layout.scale();
-                    let m_height = layout
-                        .lines()
-                        .next()
-                        .map(|l| l.metrics().line_height / layout.scale())
-                        .unwrap_or(0.0);
-                    let pos = node.absolute_position(0.0, 0.0);
-                    let l = &node.final_layout;
-                    // The painter anchors at the content-box origin of the item.
-                    let content_x = pos.x + l.border.left + l.padding.left;
-                    let content_y = pos.y + l.border.top + l.padding.top;
-                    out.push((
-                        nid,
-                        2,
-                        PseudoBox {
-                            x: (content_x - m_width - x_padding) as f64,
-                            y: content_y as f64,
-                            width: m_width as f64,
-                            height: m_height as f64,
-                            border: [0.0; 4],
-                            padding: [0.0; 4],
-                            margin: [0.0; 4],
-                        },
-                    ));
+                if let Some(mb) = self.marker_box_for(id) {
+                    out.push((nid, 2, mb));
                 }
             }
             stack.extend(node.children.iter().rev().copied());
         }
         out
+    }
+
+    /// The reconstructed box of an outside marker belonging to `blitz_id` (an
+    /// element OR a `display:list-item` pseudo node) — the same placement
+    /// arithmetic blitz-paint's `draw_marker` uses.
+    fn marker_box_for(&self, blitz_id: usize) -> Option<PseudoBox> {
+        use blitz_dom::node::{ListItemLayout, ListItemLayoutPosition, Marker};
+        let node = self.doc.get_node(blitz_id)?;
+        let element = node.element_data()?;
+        let Some(ListItemLayout {
+            marker,
+            position: ListItemLayoutPosition::Outside(layout),
+        }) = element.list_item_data.as_deref()
+        else {
+            return None;
+        };
+        let x_padding = match marker {
+            Marker::Char(_) => 8.0f32,
+            Marker::String(_) => 0.0,
+        };
+        let m_width = layout.full_width() / layout.scale();
+        let m_height = layout
+            .lines()
+            .next()
+            .map(|l| l.metrics().line_height / layout.scale())
+            .unwrap_or(0.0);
+        let pos = node.absolute_position(0.0, 0.0);
+        let l = &node.final_layout;
+        // The painter anchors at the content-box origin of the item.
+        let content_x = pos.x + l.border.left + l.padding.left;
+        let content_y = pos.y + l.border.top + l.padding.top;
+        Some(PseudoBox {
+            x: (content_x - m_width - x_padding) as f64,
+            y: content_y as f64,
+            width: m_width as f64,
+            height: m_height as f64,
+            border: [0.0; 4],
+            padding: [0.0; 4],
+            margin: [0.0; 4],
+        })
     }
 
     fn pseudo_box_for(&self, blitz_id: usize) -> Option<PseudoBox> {
