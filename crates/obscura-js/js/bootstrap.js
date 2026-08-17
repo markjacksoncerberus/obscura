@@ -4059,6 +4059,7 @@ class Node {
     _dom("remove_child", c._nid);
     if (__mutationObservers?.length) __notifyMutation('childList', this._nid, [], [c._nid], null, { previousSibling: _prev >= 0 ? _prev : null, nextSibling: _next >= 0 ? _next : null });
     if (_wasConnected) _ceRemovalSteps(c);
+    try { if (typeof _discardRemovedBrowsingContexts === 'function') _discardRemovedBrowsingContexts(c); } catch (e) {}
     if (globalThis._autofocusRemoved) globalThis._autofocusRemoved(c);
     if (_popoverShowingCount > 0) globalThis._popoverRemovalSteps(c);
     if (globalThis._dialogModalCount > 0) globalThis._dialogRemovalSteps(c);
@@ -42496,6 +42497,11 @@ function _storageBroadcast(state, key, oldValue, newValue) {
     if (win === state.win) continue;
     const area = (state.kind === 'local') ? win.localStorage : win.sessionStorage;
     if (!area || typeof win.dispatchEvent !== 'function') continue;
+    // sessionStorage events stay inside one top-level context. A popup write
+    // must not wake the opener (event_session_window_open_scope).
+    if (state.kind === 'session') {
+      try { if (_storageState(area).bottle !== state.bottle) continue; } catch (e) { continue; }
+    }
     // A task, not a microtask: HTML queues a global task per window, and after
     // Quest #461 `setTimeout(…, 0)` is a real task in insertion order.
     setTimeout(() => {
@@ -42571,9 +42577,12 @@ class Storage {
 }
 globalThis.Storage = _markNative(Storage);
 
-// Build one window's Storage object over a bottle.
-function _mkStore(kind, win) {
-  const bottle = _storageBottles[kind];
+// Build one window's Storage object over a bottle. A popup (a new top-level
+// browsing context) gets its OWN session bottle — HTML's sessionStorage is
+// per-origin per-top-level-browsing-context, cloned from the opener at
+// creation (and empty under noopener). localStorage stays the shared bottle.
+function _mkStore(kind, win, bottle) {
+  if (!bottle) bottle = _storageBottles[kind];
   const state = { kind, bottle, win };
   const target = Object.create(Storage.prototype);
 
@@ -55727,6 +55736,108 @@ const _frameViewportDim = (win, attr, dflt) => {
   return parseInt(m[1], 10);
 };
 
+// A browsing context's child frames. After the context is discarded (iframe
+// removed from the document, or a popup's close() discard task) there are none
+// — even if the detached document still has <iframe> children in the tree.
+// `closed` alone is NOT enough: window.close() marks closed immediately but
+// children stay reachable until the discard task (closed-after-close).
+const _windowIsLive = function(win) {
+  if (!win || win._discarded) return false;
+  if (win._hostEl && !win._hostEl.isConnected) return false;
+  return true;
+};
+const _childFrameElements = function(win) {
+  if (!_windowIsLive(win)) return [];
+  const doc = win.document;
+  if (!doc || typeof doc.querySelectorAll !== 'function') return [];
+  try { return Array.prototype.slice.call(doc.querySelectorAll('iframe, frame')); }
+  catch (e) { return []; }
+};
+const _namedChildWindow = function(win, name) {
+  if (!name || typeof name !== 'string') return undefined;
+  const frames = _childFrameElements(win);
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
+    try {
+      if (f.getAttribute('name') === name || f.getAttribute('id') === name)
+        return f.contentWindow;
+    } catch (e) {}
+  }
+  return undefined;
+};
+const _sessionBottleOf = function(win) {
+  try { return _storageState(win.sessionStorage).bottle; }
+  catch (e) { return _storageBottles.session; }
+};
+const _newSessionBottle = function(srcBottle) {
+  const map = new Map();
+  let used = 0;
+  if (srcBottle && srcBottle.map) {
+    for (const [k, v] of srcBottle.map) {
+      map.set(k, v);
+      used += k.length + v.length;
+    }
+  }
+  return { map, used };
+};
+// Discard a browsing context AND every nested one in its document. Walking
+// the host element's children is not enough: a srcdoc/src document's
+// <iframe>s live in `win.document`, not as children of the host.
+const _discardWindowTree = function(win) {
+  if (!win || win._discarded) return;
+  win.closed = true;
+  win._discarded = true;
+  try {
+    const doc = win.document;
+    if (doc && typeof doc.querySelectorAll === 'function') {
+      const frames = doc.querySelectorAll('iframe, frame');
+      for (let i = 0; i < frames.length; i++) {
+        if (frames[i]._iframeWin) _discardWindowTree(frames[i]._iframeWin);
+      }
+    }
+  } catch (e) {}
+};
+// Removing an <iframe> discards its nested browsing context immediately
+// (HTML: the nested context is discarded as a removing step). closed becomes
+// true and named/indexed access on the old window goes empty.
+const _discardRemovedBrowsingContexts = function(node) {
+  const walk = (el) => {
+    if (el && el.nodeType === 1 && el.localName === 'iframe' && el._iframeWin) {
+      try { _discardWindowTree(el._iframeWin); } catch (e) {}
+    }
+    let c = el && el.firstChild;
+    while (c) { walk(c); c = c.nextSibling; }
+  };
+  if (!node) return;
+  if (node.nodeType === 1) walk(node);
+  else { let c = node.firstChild; while (c) { walk(c); c = c.nextSibling; } }
+};
+
+// Named auxiliary browsing contexts (popups opened with a target name).
+const _namedAuxWindows = new Map();
+const _forgetNamedWindow = function(win) {
+  for (const [n, w] of _namedAuxWindows) {
+    if (w === win) _namedAuxWindows.delete(n);
+  }
+};
+const _windowClose = function(win) {
+  if (!win || win.closed) return;
+  win.closed = true;
+  _forgetNamedWindow(win);
+  // HTML: closed is true immediately; discard (pagehide, opener = null) is
+  // a queued task. pagehide fires with opener still set; the next task
+  // after the handler sees opener === null (close-method.window.js).
+  setTimeout(() => {
+    try {
+      const ev = new Event('pagehide');
+      ev.isTrusted = true;
+      win.dispatchEvent(ev);
+    } catch (e) {}
+    try { win.opener = null; } catch (e) {}
+    try { _discardWindowTree(win); } catch (e) {}
+  }, 0);
+};
+
 class _IframeWindow {
   constructor(doc, url, originUrl, hostEl) {
     this.document = doc;
@@ -55745,11 +55856,39 @@ class _IframeWindow {
     this.parent = globalThis;
     this.window = this;
     this.frames = this;
+    this.globalThis = this;
     this.frameElement = null;
     this._evtKey = _nextSyntheticKey();
-    this.length = 0;
-    this.name = '';
     this.closed = false;
+    this._discarded = false;
+    this.opener = null;
+    // window.name: starts as the host iframe's name attribute. Writing it does
+    // NOT mutate the attribute. After the host is removed (or the context is
+    // discarded) the getter is "" and writes are ignored.
+    this._name = '';
+    if (hostEl) {
+      try { this._name = hostEl.getAttribute('name') || ''; } catch (e) {}
+    }
+    {
+      const _tgt = this;
+      Object.defineProperty(this, 'name', {
+        configurable: true, enumerable: true,
+        get() {
+          if (_tgt._discarded) return '';
+          if (_tgt._hostEl && !_tgt._hostEl.isConnected) return '';
+          return _tgt._name;
+        },
+        set(v) {
+          if (_tgt._discarded) return;
+          if (_tgt._hostEl && !_tgt._hostEl.isConnected) return;
+          _tgt._name = String(v);
+        },
+      });
+      Object.defineProperty(this, 'length', {
+        configurable: true, enumerable: true,
+        get() { return _childFrameElements(_tgt).length; },
+      });
+    }
     this.navigator = globalThis.navigator;
     this.screen = globalThis.screen;
     this.devicePixelRatio = globalThis.devicePixelRatio;
@@ -55758,7 +55897,23 @@ class _IframeWindow {
     // document that made the change is skipped, and every other window sees the
     // change through its own `event.storageArea`.
     this.localStorage = _mkStore('local', this);
-    this.sessionStorage = _mkStore('session', this);
+    // Iframes share their top-level context's session bottle; a popup
+    // constructor starts on a fresh bottle (window.open clones the opener's
+    // after construction, or leaves it empty under noopener).
+    {
+      let sessionSrc = globalThis;
+      if (hostEl) {
+        try {
+          const od = hostEl.ownerDocument;
+          if (od && od._popupWin) sessionSrc = od._popupWin;
+          else if (od && od.defaultView) sessionSrc = od.defaultView;
+        } catch (e) {}
+      } else {
+        sessionSrc = null;
+      }
+      this.sessionStorage = _mkStore('session', this,
+        sessionSrc ? _sessionBottleOf(sessionSrc) : _newSessionBottle(null));
+    }
     // Navigating an <iframe> builds a NEW window for the same element; the old
     // one is gone as far as the page is concerned, so drop it from the broadcast
     // list. Otherwise every `iframe.src = …` left another dead listener behind
@@ -55853,10 +56008,41 @@ class _IframeWindow {
     // window doesn't define itself (global constructors like DOMException/Node/
     // Event, etc.) falls through to globalThis. Frame-specific props (document,
     // location, parent, top, frames, self, window) are defined above and win.
-    return new Proxy(this, {
-      get(t, p, r) { return (p in t) ? Reflect.get(t, p, r) : globalThis[p]; },
-      has(t, p) { return (p in t) || (p in globalThis); },
+    //
+    // Indexed / named access is per THIS window's document (not the embedder's):
+    // `frameW[0]` and `frameW.x` are THIS frame's child browsing contexts.
+    //
+    // ⭐ self/window/frames/globalThis must be the PROXY, not the target.
+    // The page only ever holds the proxy; `w.window === w` is how every
+    // identity check on the web is written, and `this.self = this` before
+    // the Proxy is built made them compare unequal forever.
+    const proxy = new Proxy(this, {
+      get(t, p, r) {
+        if (typeof p === 'string') {
+          if (/^[0-9]+$/.test(p)) {
+            const list = _childFrameElements(t);
+            const el = list[p | 0];
+            return el ? el.contentWindow : undefined;
+          }
+          if (!(p in t)) {
+            const named = _namedChildWindow(t, p);
+            if (named !== undefined) return named;
+          }
+        }
+        return (p in t) ? Reflect.get(t, p, r) : globalThis[p];
+      },
+      has(t, p) {
+        if (typeof p === 'string' && /^[0-9]+$/.test(p))
+          return (p | 0) < _childFrameElements(t).length;
+        if ((p in t) || (p in globalThis)) return true;
+        return _namedChildWindow(t, p) !== undefined;
+      },
     });
+    this.self = proxy;
+    this.window = proxy;
+    this.frames = proxy;
+    this.globalThis = proxy;
+    return proxy;
   }
 
   postMessage(data, origin) {
@@ -55905,7 +56091,7 @@ class _IframeWindow {
   // compares the two objects to tell the frames apart.
   getSelection() { return __obscura_getSelectionFor(this); }
   fetch(input, init) { return globalThis.fetch(input, init); }
-  close() { this.closed = true; }
+  close() { _windowClose(this); }
   focus() {}
   blur() {}
 }
@@ -61605,7 +61791,22 @@ if (typeof navigator.credentials === 'undefined') {
   navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
 }
 
-globalThis.opener = null;
+// HTML `Window.opener` is a [Replaceable] accessor. Assigning replaces it when
+// configurable; a non-configurable opener rejects the write with TypeError
+// (window-opener-unconfigurable).
+{
+  let _opener = null;
+  Object.defineProperty(globalThis, 'opener', {
+    configurable: true, enumerable: true,
+    get() { return _opener; },
+    set(v) {
+      const desc = Object.getOwnPropertyDescriptor(globalThis, 'opener');
+      if (desc && desc.configurable === false)
+        throw new TypeError("Cannot set property opener of #<Window> which has only a getter");
+      _opener = v;
+    },
+  });
+}
 
 // ═══════════════════════ Web Workers (HTML §8.6) ═════════════════════════════
 // A REAL DedicatedWorkerGlobalScope.
@@ -62916,35 +63117,123 @@ const _loadPopupUrl = async function(win, fullUrl) {
   } catch (e) {}
   _schedulePopupLoad(win);
 };
-globalThis.open = function(url, target) {
+const _parseOpenFeatures = function(features) {
+  const out = { noopener: false, noreferrer: false };
+  if (features == null || features === '') return out;
+  const parts = String(features).toLowerCase().split(/[,;\s]+/);
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    const key = (eq < 0 ? part : part.slice(0, eq)).trim();
+    const val = (eq < 0 ? '' : part.slice(eq + 1)).trim();
+    const on = (eq < 0) || val === '' || val === 'yes' || val === 'true' || val === '1';
+    if (key === 'noopener' && on) out.noopener = true;
+    if (key === 'noreferrer' && on) { out.noreferrer = true; out.noopener = true; }
+  }
+  return out;
+};
+const _openUrlOrThrow = function(url) {
+  if (url == null || url === '') return null;
+  const raw = String(url);
+  if (raw.indexOf('\0') >= 0)
+    throw new DOMException("Failed to execute 'open' on 'Window': Unable to parse URL", 'SyntaxError');
   try {
-    const t = target == null ? '' : String(target);
-    if (url != null && t && t !== '_blank' && t !== '_self' && t !== '_parent' && t !== '_top') {
-      const doc = globalThis.document;
-      const frames = doc ? doc.querySelectorAll('iframe[name], frame[name]') : [];
-      for (const f of frames) {
-        if (f.getAttribute('name') === t) {
-          f._loadIframeSrc(String(url));
-          return f.contentWindow || null;
-        }
-      }
+    const resolved = _resolveUrl(raw);
+    void new URL(resolved);
+    return resolved;
+  } catch (e) {
+    throw new DOMException("Failed to execute 'open' on 'Window': Unable to parse URL", 'SyntaxError');
+  }
+};
+const _findNamedBrowsingContext = function(name) {
+  if (!name || name === '_blank' || name === '_self' || name === '_parent' || name === '_top')
+    return null;
+  try {
+    const doc = globalThis.document;
+    const frames = doc ? doc.querySelectorAll('iframe[name], frame[name]') : [];
+    for (let i = 0; i < frames.length; i++) {
+      if (frames[i].getAttribute('name') === name)
+        return { kind: 'frame', el: frames[i], win: frames[i].contentWindow };
     }
-    let fullUrl = (url == null || url === '') ? 'about:blank' : _resolveUrl(String(url));
-    const pdoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl === 'about:blank' ? 'about:blank' : fullUrl, null);
-    const win = new _IframeWindow(pdoc, fullUrl === 'about:blank' ? 'about:blank' : fullUrl, null, null);
+  } catch (e) {}
+  const aux = _namedAuxWindows.get(name);
+  if (aux && !aux.closed) return { kind: 'aux', win: aux };
+  return null;
+};
+globalThis.open = function(url, target, features) {
+  const t = target == null ? '' : String(target);
+  const feat = _parseOpenFeatures(features);
+  // SyntaxError is the caller's — do not swallow it. Everything else below
+  // is best-effort so a popup construction failure still returns null.
+  const fullUrl = _openUrlOrThrow(url);
+  try {
+    if (t === '_self' || t === '_parent' || t === '_top') {
+      const dest = (t === '_top') ? globalThis.top
+        : (t === '_parent') ? globalThis.parent
+        : globalThis;
+      if (fullUrl && !feat.noopener) {
+        try { dest.location.href = fullUrl; } catch (e) {}
+      }
+      return feat.noopener ? null : dest;
+    }
+    const existing = _findNamedBrowsingContext(t);
+    if (existing && !feat.noopener) {
+      // Empty / omitted URL = "just hand me that window". A non-empty URL
+      // navigates it. This is window-open-defaults and session_reopen.
+      if (fullUrl) {
+        if (existing.kind === 'frame' && existing.el && existing.el._loadIframeSrc)
+          existing.el._loadIframeSrc(fullUrl);
+        else _loadPopupUrl(existing.win, fullUrl);
+      }
+      return existing.win;
+    }
+    if (feat.noopener) {
+      // The caller must not receive a handle. Still load the URL as an
+      // independent top-level context (empty session, no opener) so a
+      // BroadcastChannel / storage test on the other side can run.
+      if (fullUrl) {
+        try {
+          const pdoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, null);
+          const win = new _IframeWindow(pdoc, fullUrl, null, null);
+          pdoc._popupWin = win;
+          win.opener = null;
+          win.top = win;
+          win.parent = win;
+          if (t && t !== '_blank') { try { win.name = t; } catch (e) {} }
+          win.close = function() { _windowClose(win); };
+          win.focus = function() {};
+          win.blur = function() {};
+          _loadPopupUrl(win, fullUrl);
+        } catch (e) {}
+      }
+      return null;
+    }
+    const loadUrl = fullUrl || 'about:blank';
+    const pdoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', loadUrl, null);
+    const win = new _IframeWindow(pdoc, loadUrl, null, null);
     pdoc._popupWin = win;
     win.opener = globalThis;
     // A top-level context is its own top and parent.
     win.top = win;
     win.parent = win;
-    if (t && t !== '_blank') { try { win.name = t; } catch (e) {} }
-    win.close = function() { win.closed = true; };
+    if (t && t !== '_blank') {
+      try { win.name = t; } catch (e) {}
+      _namedAuxWindows.set(t, win);
+    }
+    win.close = function() { _windowClose(win); };
     win.focus = function() {};
     win.blur = function() {};
-    if (fullUrl === 'about:blank') _schedulePopupLoad(win);
-    else _loadPopupUrl(win, fullUrl);
+    // Clone the opener's sessionStorage at creation; they then diverge.
+    try {
+      win.sessionStorage = _mkStore('session', win, _newSessionBottle(_sessionBottleOf(globalThis)));
+    } catch (e) {}
+    if (loadUrl === 'about:blank') _schedulePopupLoad(win);
+    else _loadPopupUrl(win, loadUrl);
     return win;
-  } catch (e) {}
+  } catch (e) {
+    if (e && e.name === 'SyntaxError') throw e;
+  }
   return null;
 };
 globalThis.close = function() {};
@@ -72354,10 +72643,49 @@ globalThis.WebSocketStream = class WebSocketStream {
 _idlShape(WebSocketStream, { ctorLength: 1, arity: { close: 0 } });
 
 if (typeof BroadcastChannel === 'undefined') {
+  // Same-origin same-name channels deliver to every OTHER listener on a task.
+  // This is the pipe a noopener popup uses to talk back (it has no opener).
+  const _bcByName = new Map();
   globalThis.BroadcastChannel = class BroadcastChannel {
-    constructor(name) { this.name = name; this.onmessage = null; }
-    postMessage(msg) {} close() {}
-    addEventListener() {} removeEventListener() {}
+    constructor(name) {
+      this.name = String(name);
+      this.onmessage = null;
+      this._closed = false;
+      this._fns = [];
+      if (!_bcByName.has(this.name)) _bcByName.set(this.name, new Set());
+      _bcByName.get(this.name).add(this);
+    }
+    postMessage(msg) {
+      if (this._closed)
+        throw new DOMException('BroadcastChannel is closed', 'InvalidStateError');
+      const data = (typeof structuredClone === 'function') ? structuredClone(msg) : msg;
+      const peers = _bcByName.get(this.name);
+      if (!peers) return;
+      for (const ch of peers) {
+        if (ch === this || ch._closed) continue;
+        setTimeout(() => {
+          if (ch._closed) return;
+          try {
+            const ev = new MessageEvent('message', { data });
+            if (typeof ch.onmessage === 'function') ch.onmessage(ev);
+            for (let i = 0; i < ch._fns.length; i++) {
+              try { ch._fns[i](ev); } catch (e) {}
+            }
+          } catch (e) {}
+        }, 0);
+      }
+    }
+    addEventListener(type, fn) {
+      if (type === 'message' && typeof fn === 'function') this._fns.push(fn);
+    }
+    removeEventListener(type, fn) {
+      this._fns = this._fns.filter((f) => f !== fn);
+    }
+    close() {
+      this._closed = true;
+      const s = _bcByName.get(this.name);
+      if (s) s.delete(this);
+    }
   };
 }
 

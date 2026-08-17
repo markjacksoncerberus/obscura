@@ -64,6 +64,18 @@ webstorage/symbol-props.window.html
 webstorage/event_no_duplicates.html
 webstorage/event_basic.html
 webstorage/storage_local_setitem_quotaexceedederr.window.html
+webstorage/storage_session_window_open.window.html
+webstorage/storage_session_window_reopen.window.html
+webstorage/event_session_window_open_scope.html
+# ── the-window-object (Quests #590–#594). Window identity, named targeting,
+#    close/discard, live length. A change to _IframeWindow's proxy shows here.
+html/browsers/the-window-object/self-et-al.window.html
+html/browsers/the-window-object/name-attribute.window.html
+html/browsers/the-window-object/window-open-defaults.window.html
+html/browsers/the-window-object/close-method.window.html
+html/browsers/the-window-object/closed-attribute.window.html
+html/browsers/the-window-object/length-attribute.window.html
+html/browsers/the-window-object/accessing-other-browsing-contexts/window_length.html
 # ── The frame machinery those event tests depend on (Quest #463 found three bugs
 #    here). event-handler-attributes-body-window covers <body on…> reflection.
 html/webappapis/scripting/events/event-handler-attributes-body-window.html
