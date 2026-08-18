@@ -199,6 +199,55 @@ faster than full rebuilds for diagnosing *why* something fails.
 - **Chronicle every win:** update `WPT_PROGRESS.md` + the quest board (row + session
   entry) + the relevant scroll. Commit message format ends with the `Co-Authored-By`
   trailer the repo uses.
+- **A Proxy in the GLOBAL's prototype chain is a live wire** (added 2026-08-18, the
+  named arc). `window`'s prototype chain now ends in a `WindowProperties` Proxy, so
+  **every missing-property lookup on the window runs a trap**. Three ways that
+  bites, all of which present as *"testharness did not load / run"* with no page
+  error, because the failure happens while bootstrap is still wiring the page up:
+  1. **Reentrancy.** The trap walks the tree; walking the tree runs engine JS whose
+     own global misses land back in the trap. Guard with a latch, and raise the
+     latch *before* any check that itself reads a missing property.
+  2. **Cross-origin frames throw on every read**, internal properties included. An
+     unguarded read inside a trap poisons every missing-property lookup on that
+     window with a `SecurityError`.
+  3. **PERFORMANCE.** Every missing-property read on the window runs the trap.
+     The engine's own shared node/event code asks the window for `nodeType` /
+     `_shadowHost` / `parentNode` *thousands of times per page load*. Three
+     defences are in place and all three matter: the `_NPO_ENGINE_INTERNALS`
+     fast-reject set (**add to it any internal name you find the engine probing on
+     a Window**), own slots on the window for state it really has (`_discarded`,
+     `_hostEl`), and two dedicated Rust ops (`window_named_objects`,
+     `navigable_container_candidates`) so the lookup never builds a selector
+     string. **Never put a per-call `querySelectorAll` on this path** — a freshly
+     built selector is re-parsed by the DOM every single time. Symptom of getting
+     it wrong: a timing-sensitive file (e.g. the img `naturalWidth` one) loses 40
+     subtests while its ceiling stays the same.
+  Diagnostic: `Runtime.evaluate {expression: "window", returnByValue: false}` over
+  raw CDP. If it answers `{"type":"undefined"}`, the meta-extraction probe
+  (`v._nid`) threw — that is a broken window, not a broken test.
+- **`page.evaluate` is not a substitute for the page's own event loop.** A raw CDP
+  `Runtime.evaluate` of `window.open(...)` can leave the popup's `fetch` unsettled,
+  so `location.href` looks unchanged and you chase a navigation bug that is not
+  there. Drive async probes through Playwright with an `async () => { … await … }`
+  body (`scripts/` has `pwprobe`-shaped helpers in the scratchpad pattern), or just
+  run the real WPT file.
+- **A window's `location` object caches its components.** Assigning `href` alone
+  leaves `search`/`pathname`/`origin` describing the previous document. Use
+  `_relocateWindow(win, url)`.
+- **The ritual is ~25 minutes, not hours** — `scripts/wpt_batch_par.sh <list> <out>
+  8 4 30 <binary>` shards it across 8 independent servers. It takes a **binary path**,
+  so the before/after pair is: stash → build → `cp target/release/obscura` aside →
+  unstash → build → run both sweeps against the two binaries with
+  `scripts/wpt_batch_diff.py`.
+- **Never put `pkill -f 'obscura serve'` in a Bash tool command line.** The tool's own
+  shell command line contains that string, so `pkill` kills the shell running it
+  (exit 144, no output). Put it inside a *script file* the tool invokes.
+- **`pkill -f 'obscura serve'` does not match a server started from a COPY of the
+  binary** (`obscura-base serve` has no `obscura serve` substring). If you keep a
+  baseline binary around for A/B measurement, the old server keeps port 9222, your
+  new server silently fails to bind, and **every measurement after that is of the
+  wrong binary**. Kill by port (`fuser -k 9222/tcp`) whenever two binaries are in
+  play, and sanity-check a known-changed test before trusting an A/B result.
 
 ---
 

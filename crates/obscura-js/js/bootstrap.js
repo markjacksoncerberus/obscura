@@ -6038,6 +6038,22 @@ class Element extends Node {
     }
     // Removing srcdoc reprocesses: the frame falls back to src or about:blank.
     if (qname === 'srcdoc' && this.localName === 'iframe') _reprocessIframe(this);
+    // Losing the URL that made an <object>/<embed> a navigable container ends its
+    // nested browsing context — but NOT synchronously. HTML destroys it as a
+    // queued task, and page code that reads `window.length` on the very next line
+    // still sees the old count (indexed-browsing-contexts-02's third assertion is
+    // exactly that pair of reads, one before the task and one after).
+    if ((qname === 'data' && this.localName === 'object') ||
+        (qname === 'src' && this.localName === 'embed')) {
+      const _el = this;
+      _el._bcLingers = true;
+      setTimeout(() => {
+        if (_el.hasAttribute(qname)) return;   // navigated again in the meantime
+        _el._bcLingers = false;
+        if (_el._iframeWin) { try { _discardWindowTree(_el._iframeWin); } catch (e) {} }
+        _el._iframeWin = null; _el._iframeDoc = null;
+      }, 0);
+    }
     // Removing a reflected ARIA-element content attribute drops the explicit
     // element association too.
     if (__ariaElementContentAttrs.has(qname)) __ariaResetExplicit(this, qname);
@@ -6576,7 +6592,7 @@ class Element extends Node {
       } catch (e) {}
       if (!_faOK) {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, 'about:blank', null, el);
+        el._iframeWin = _installFrameWindow(el, el._iframeDoc, 'about:blank', null);
         el._frameBlocked = true;
         el._opaqueWin = null;
         _registerIframe(el);
@@ -6596,10 +6612,10 @@ class Element extends Node {
         const _dec = _decodeDocumentBytes(_buf, _ct);
         el._iframeDoc = new _IframeDocument(_dec.text, fullUrl, el, undefined, _iframeDocKind(fullUrl, resp));
         el._iframeDoc._charset = _characterSetLabel(_dec.encoding);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl, null, el);
+        el._iframeWin = _installFrameWindow(el, el._iframeDoc, fullUrl, null);
       } else {
         el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl, null, el);
+        el._iframeWin = _installFrameWindow(el, el._iframeDoc, fullUrl, null);
       }
       // ⚠️⚠️ A CROSS-ORIGIN FRAME'S `location` WAS READABLE. `contentDocument`
       // has always been guarded, and `contentWindow` never was — so any page
@@ -6629,12 +6645,30 @@ class Element extends Node {
     }).catch(() => {
       if (_self._loadGen !== _gen) return; // superseded — leave the current doc intact
       el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-      el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl, null, el);
+      el._iframeWin = _installFrameWindow(el, el._iframeDoc, fullUrl, null);
       _registerIframe(el);
       _fireIframeElementLoad(el);
     });
   }
+  // ---- object / embed nested browsing contexts -----------------------------
+  // An `<object data>` or `<embed src>` is a navigable container just like an
+  // <iframe>: `window.length` counts it, `window[i]` indexes it, and its window
+  // answers to the container's `name`. What it does NOT do here yet is NAVIGATE
+  // — the context exists and is about:blank. ⛔ Honest cap: the resource behind
+  // `data`/`src` is not fetched into it, so `contentDocument` is empty rather
+  // than the framed document.
+  _ensureObjectBrowsingContext() {
+    if (this._iframeWin) return;
+    if (!_isNavigableContainer(this)) return;
+    this._iframeDoc = new _IframeDocument(
+      '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+    this._iframeWin = _installFrameWindow(this, this._iframeDoc, 'about:blank', null);
+  }
   get contentDocument() {
+    if (this.localName === 'object' || this.localName === 'embed') {
+      this._ensureObjectBrowsingContext();
+      return this._iframeDoc || null;
+    }
     if (this.localName !== 'iframe') return undefined;
     // A frame the policy refused, or one sandboxed without `allow-same-origin`,
     // has an opaque origin — the embedder gets `null`, exactly as for any other
@@ -6660,7 +6694,7 @@ class Element extends Node {
         const parentUrl = _domParse("document_url") || 'about:blank';
         this._iframeDoc = new _IframeDocument(srcdoc, 'about:srcdoc', this, parentUrl);
         // location.href === 'about:srcdoc', but origin inherited from the parent.
-        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:srcdoc', parentUrl, this);
+        this._iframeWin = _installFrameWindow(this, this._iframeDoc, 'about:srcdoc', parentUrl);
         // …and so is the policy. A srcdoc document is markup the EMBEDDER wrote,
         // so a policy that did not follow it there would be a hole the width of
         // one attribute.
@@ -6675,16 +6709,20 @@ class Element extends Node {
         // the same path as an assigned src (cross-origin reads still blocked by the
         // origin check above once the real doc lands).
         this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank', null, this);
+        this._iframeWin = _installFrameWindow(this, this._iframeDoc, 'about:blank', null);
         this._loadIframeSrc(srcAttr);
       } else {
         this._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-        this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank', null, this);
+        this._iframeWin = _installFrameWindow(this, this._iframeDoc, 'about:blank', null);
       }
     }
     return this._iframeDoc;
   }
   get contentWindow() {
+    if (this.localName === 'object' || this.localName === 'embed') {
+      this._ensureObjectBrowsingContext();
+      return this._iframeWin || null;
+    }
     if (this.localName !== 'iframe') return undefined;
     if (!this._iframeWin) {
       this.contentDocument; // side effect: creates _iframeDoc + _iframeWin
@@ -7897,6 +7935,12 @@ class Document extends Node {
   }
   get URL() { return this._standalone ? "about:blank" : (_domParse("document_url") ?? ""); }
   get documentURI() { return this.URL; }
+  // The address of the document that linked here. The engine does not carry a
+  // navigation's referrer across a top-level load yet, so the honest answer for
+  // the main document is the empty string — which is also the answer HTML gives
+  // when there is no referrer. Nested and auxiliary documents DO get a real one
+  // (see _IframeDocument), because their creator is right here in the realm.
+  get referrer() { return this._referrer || ""; }
   // The document's effective domain: its origin's host (empty for an opaque origin).
   // Setting it is subject to same-origin restrictions we don't model, so the setter
   // just stores the override (no page depends on the security semantics here yet).
@@ -8480,6 +8524,7 @@ class DetachedDocument extends Document {
   set title(v) { this._title = String(v); }
   get URL() { return "about:blank"; }
   get documentURI() { return "about:blank"; }
+  get referrer() { return this._referrer || ""; }
   get defaultView() { return null; }
   get location() { return null; }
   get doctype() {
@@ -9287,19 +9332,29 @@ Object.defineProperty(globalThis, Symbol.toStringTag, { value: 'Window', configu
 // createElement+append, or src assignment) — not just `el.src = "..."`.
 const _frameWindowAt = function(i) {
   let list;
-  try { list = document.querySelectorAll('iframe'); } catch (e) { return undefined; }
+  try { list = _childFrameElements(globalThis); } catch (e) { return undefined; }
   const el = list && list[i];
-  return el ? el.contentWindow : undefined;
+  return el ? _navigableWindowOf(el) : undefined;
 };
 Object.defineProperty(globalThis, 'length', {
-  get() { try { return document.querySelectorAll('iframe').length; } catch (e) { return 0; } },
+  get() { try { return _childFrameElements(globalThis).length; } catch (e) { return 0; } },
   configurable: true,
 });
 // window[0..N] index into the child frames. A fixed window of getters covers the
 // realistic case (pages essentially never exceed this many frames).
+//
+// Past the last child navigable an index is NOT a supported property index, and
+// the lookup becomes an ordinary named one — `window[3]` with three frames is
+// the frame whose target name is "3", or the element with id="3". Because these
+// are own accessors on the global they can never fall through the prototype
+// chain to the named-properties object by themselves, so they do it here.
 for (let _i = 0; _i < 64; _i++) {
   Object.defineProperty(globalThis, _i, {
-    get() { return _frameWindowAt(_i); },
+    get() {
+      const w = _frameWindowAt(_i);
+      if (w !== undefined) return w;
+      return _windowNamedItem(globalThis, String(_i));
+    },
     configurable: true,
     enumerable: false,
   });
@@ -11001,7 +11056,9 @@ globalThis.__startResourceLoads = function() {
 // supersedes any still-pending load from the previous document.
 const _reprocessIframe = function(el) {
   if (!el || el.localName !== 'iframe') return;
-  el._iframeDoc = null; el._iframeWin = null;
+  // The Document goes; the Window STAYS (a reprocess is a navigation of the same
+  // navigable, and `contentWindow` must survive it — see _installFrameWindow).
+  el._iframeDoc = null;
   el._frameScriptsRan = false; el._srcLoadStarted = false; el._loadEventFired = false;
   _loadFrameFromAttributes(el);
 };
@@ -11015,33 +11072,16 @@ const _reprocessIframe = function(el) {
 // existing properties), and assigning to it replaces it with a normal property
 // (so `var foo`/`foo = x` still work). _namedGlobals (a lexical Set, itself off
 // getOwnPropertyNames) tracks which names we defined so re-scans stay idempotent.
-const _namedGlobals = new Set();
-const __defineNamedGlobal = function(name) {
-  if (!name || typeof name !== 'string') return;
-  if (_namedGlobals.has(name)) return;   // already exposed by us
-  if (name in globalThis) return;        // don't shadow a real global / Web API
-  _namedGlobals.add(name);
-  Object.defineProperty(globalThis, name, {
-    configurable: true,
-    enumerable: false,
-    get() { return document.getElementById(name) || null; },
-    set(v) {
-      _namedGlobals.delete(name);
-      Object.defineProperty(globalThis, name, { value: v, writable: true, configurable: true, enumerable: true });
-    },
-  });
-};
-// Scan the current document for id'd elements and expose them. Called from Rust
-// right before page scripts run (covers markup), and on dynamic id changes.
-const __exposeNamedGlobals = function() {
-  try {
-    const els = document.querySelectorAll('[id]');
-    for (let i = 0; i < els.length; i++) {
-      const id = els[i].getAttribute && els[i].getAttribute('id');
-      if (id) __defineNamedGlobal(id);
-    }
-  } catch (e) {}
-};
+// ⭐ Superseded: named access is now the WebIDL named-properties object in the
+// Window prototype chain (installed at the end of __obscura_init). Defining an
+// OWN property on the global for every id was wrong in four ways at once — it
+// could not see an element appended after the scan without a matching hook, it
+// could never forget one that left the tree, it ignored the `name` attribute
+// entirely, and two elements sharing a name returned one element instead of an
+// HTMLCollection. These two entry points stay because the tree code and the
+// Rust bootstrap call them; they are deliberately inert.
+const __defineNamedGlobal = function(_name) {};
+const __exposeNamedGlobals = function() {};
 
 // HTML "Window-reflecting body element event handler set" + the body/frameset
 // window event handlers: an on* content attribute on <body> (or <frameset>) is
@@ -55635,6 +55675,7 @@ class _IframeDocument extends DetachedDocument {
   }
   get URL() { return this._url; }
   get documentURI() { return this._url; }
+  get referrer() { return this._referrer || ""; }
   get baseURI() { return this._baseUrl; }
   // A DOMParser-built document has no iframe element → location is null (spec).
   get location() { return this._iframeEl ? (this._iframeEl.contentWindow?.location ?? null) : null; }
@@ -55746,25 +55787,200 @@ const _windowIsLive = function(win) {
   if (win._hostEl && !win._hostEl.isConnected) return false;
   return true;
 };
+// HTML: `iframe` and `frame` ALWAYS have a nested navigable; `object` has one
+// only while it has a `data` attribute to navigate to, and `embed` only while it
+// has a `src`. That distinction is load-bearing in both directions — a
+// `<object name=a>` with no data is a NAMED ELEMENT and must be reachable as one
+// (named-objects.html), while an `<object data=…>` is a child browsing context
+// that `window.length` counts and `window[i]` indexes
+// (indexed-browsing-contexts-02/03).
+// …and a URL alone is not enough: an `<embed type=image/png src=…>` is a picture,
+// not a browsing context, while `image/svg+xml` IS a document and does get one.
+// test2.html — two image-typed plugins and nothing else — is a whole subtest
+// asserting that such a document has ZERO child browsing contexts.
+const _isPluginMediaType = function(t) {
+  if (!t) return false;
+  const type = String(t).toLowerCase().split(';')[0].trim();
+  if (type === 'image/svg+xml') return false;   // an SVG document IS navigable
+  return /^(image|audio|video)\//.test(type) || type === 'application/pdf';
+};
+const _isNavigableContainer = function(el) {
+  if (!el || el.nodeType !== 1) return false;
+  const ln = el.localName;
+  if (ln === 'iframe' || ln === 'frame') return true;
+  if (ln !== 'object' && ln !== 'embed') return false;
+  if (el._bcLingers === true) return true;
+  if (!el.hasAttribute(ln === 'object' ? 'data' : 'src')) return false;
+  return !_isPluginMediaType(el.getAttribute('type'));
+};
+// The Window of a container's nested navigable. NOT simply `el.contentWindow`:
+// WebIDL gives `contentWindow` to HTMLIFrameElement/HTMLObjectElement/
+// HTMLFrameElement and deliberately NOT to HTMLEmbedElement — yet an
+// `<embed src>` is still a child browsing context that `window.length` counts
+// and `window[i]` hands back.
+const _navigableWindowOf = function(el) {
+  if (!el) return undefined;
+  try {
+    if (el.localName === 'object' || el.localName === 'embed') {
+      el._ensureObjectBrowsingContext();
+      return el._iframeWin || undefined;
+    }
+    return el.contentWindow;
+  } catch (e) { return undefined; }
+};
 const _childFrameElements = function(win) {
   if (!_windowIsLive(win)) return [];
   const doc = win.document;
   if (!doc || typeof doc.querySelectorAll !== 'function') return [];
-  try { return Array.prototype.slice.call(doc.querySelectorAll('iframe, frame')); }
-  catch (e) { return []; }
+  try {
+    // The MAIN document uses the dedicated op — `window.length`, `window[i]` and
+    // every named lookup ask this question, and a re-parsed selector per call is
+    // the one cost this path cannot afford. Frame documents keep the selector.
+    let all;
+    if (win === globalThis) {
+      const ids = JSON.parse(_dom('navigable_container_candidates', ''));
+      all = [];
+      for (let i = 0; i < ids.length; i++) { const el = _wrap(ids[i]); if (el) all.push(el); }
+    } else {
+      all = doc.querySelectorAll('iframe, frame, object, embed');
+    }
+    const out = [];
+    for (let i = 0; i < all.length; i++) if (_isNavigableContainer(all[i])) out.push(all[i]);
+    return out;
+  } catch (e) { return []; }
 };
-const _namedChildWindow = function(win, name) {
-  if (!name || typeof name !== 'string') return undefined;
-  const frames = _childFrameElements(win);
-  for (let i = 0; i < frames.length; i++) {
-    const f = frames[i];
+// ---- HTML "named access on the Window object" -------------------------------
+// The named objects of a Window with a given name are the union of
+//   · its document-tree child navigables whose TARGET NAME is that name,
+//   · the `embed`/`form`/`img`/`object` elements whose `name` content attribute
+//     is that name, and
+//   · any HTML element whose `id` content attribute is that name,
+// all within the window's associated Document. If any of them is a navigable
+// container with a live content navigable, the answer is that container's
+// WindowProxy; otherwise one element is returned as-is and several become a
+// live HTMLCollection.
+//
+// A container's target name is NOT its `name` content attribute: a frame that
+// runs `window.name = "foo"` renames its navigable without touching the markup,
+// and the embedder must then find it under "foo" and no longer under the old
+// name (window-named-properties.html's "Dynamic name" / "Ghost name").
+const _NAMED_ACCESS_NAME_LOCALS = new Set(['embed', 'form', 'img', 'object']);
+const _attrSelEscape = function(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+};
+// Every element in `doc` that is a named object of `win` by id or by name.
+//
+// The MAIN document goes through the dedicated `window_named_objects` op rather
+// than a `querySelectorAll`: this is the hottest path in the engine now that the
+// named-properties object sits in the Window's prototype chain, and building a
+// fresh selector string per lookup made the DOM re-parse a selector thousands of
+// times per page load. A frame document (which the op cannot address) still
+// takes the selector road.
+const _windowNamedElements = function(win, name) {
+  const doc = win && win.document;
+  if (!doc || typeof doc.querySelectorAll !== 'function') return [];
+  if (win === globalThis) {
+    let ids;
+    try { ids = JSON.parse(_dom('window_named_objects', name)); } catch (e) { return []; }
+    if (!ids || !ids.length) return [];
+    const out = [];
+    for (let i = 0; i < ids.length; i++) { const el = _wrap(ids[i]); if (el) out.push(el); }
+    return out;
+  }
+  const q = _attrSelEscape(name);
+  let els;
+  try {
+    els = doc.querySelectorAll(
+      '[id="' + q + '"], embed[name="' + q + '"], form[name="' + q + '"], ' +
+      'img[name="' + q + '"], object[name="' + q + '"]');
+  } catch (e) { return []; }
+  return Array.prototype.slice.call(els);
+};
+// Answering a named lookup means walking the tree, and walking the tree runs
+// engine JS whose own global misses land right back here. Without this latch the
+// first miss inside `querySelectorAll` recurses until the stack is gone — and
+// since that happens while bootstrap is wiring the page up, the symptom is not a
+// wrong answer but a document that never runs a line of script.
+let _windowNamedItemBusy = false;
+// The single value HTML's "named access" step yields for `name`, or undefined.
+const _windowNamedItem = function(win, name) {
+  if (typeof name !== 'string' || name === '') return undefined;
+  if (_NPO_ENGINE_INTERNALS.has(name)) return undefined;
+  if (_windowNamedItemBusy) return undefined;
+  // The latch goes up BEFORE the liveness check: `_windowIsLive` reads
+  // `win._discarded`, which on the main window is itself a missing property —
+  // straight back into this trap, forever.
+  _windowNamedItemBusy = true;
+  try {
+    if (!_windowIsLive(win)) return undefined;
+    return _windowNamedItemInner(win, name);
+  } catch (e) { return undefined; }
+  finally { _windowNamedItemBusy = false; }
+};
+// Names the ENGINE itself probes on a Window because its shared node/event code
+// treats every target alike. Each one used to become a full tree query — event
+// dispatch alone asked for `nodeType`, `_shadowHost` and `parentNode` thousands
+// of times on one page load. They are rejected up front: a Window is not a node,
+// and no page's `<div id=nodeType>` is worth making every dispatch pay for.
+const _NPO_ENGINE_INTERNALS = new Set([
+  '_nid', 'nodeType', 'nodeName', 'parentNode', 'parentElement', 'ownerDocument',
+  '_shadowHost', '_idbEventParent', '_noEventParent', '_eventParent', '_evtKey',
+  '_discarded', '_hostEl', '_barProps', '_isPopupWindow', '_docReferrer', '_url',
+]);
+const _windowNamedItemInner = function(win, name) {
+  // Child navigables first — they are matched on their live target name, so a
+  // container whose markup name is stale still answers to its current one.
+  const containers = _childFrameElements(win);
+  for (let i = 0; i < containers.length; i++) {
+    // A cross-origin frame throws SecurityError on every property read,
+    // including the internal ones. Swallowed here: an inaccessible frame is
+    // simply not a match, and letting the throw escape would poison EVERY
+    // missing-property lookup on the window that asked.
     try {
-      if (f.getAttribute('name') === name || f.getAttribute('id') === name)
-        return f.contentWindow;
+      const w = _navigableWindowOf(containers[i]);
+      if (w && _windowIsLive(w) && w.name === name) return w;
     } catch (e) {}
   }
-  return undefined;
+  // Only the TARGET-NAME match above yields a window. A container reached by
+  // its `id` is handed back as the element itself — `<iframe id=quux>` is
+  // `window.quux === theIframeElement`, which is what browsers do and what
+  // window-named-properties.html's "Static id" asserts.
+  const els = _windowNamedElements(win, name);
+  if (els.length === 0) return undefined;
+  if (els.length === 1) return els[0];
+  return _makeHTMLCollection(() => _windowNamedElements(win, name));
 };
+// The window's supported property names, in tree order, each listed once.
+const _windowNamedPropertyNames = function(win) {
+  if (_windowNamedItemBusy) return [];
+  _windowNamedItemBusy = true;
+  try { return _windowNamedPropertyNamesInner(win); }
+  catch (e) { return []; }
+  finally { _windowNamedItemBusy = false; }
+};
+const _windowNamedPropertyNamesInner = function(win) {
+  const doc = win && win.document;
+  if (!_windowIsLive(win) || !doc || typeof doc.querySelectorAll !== 'function') return [];
+  const names = [], seen = new Set();
+  const add = (n) => { if (n && !seen.has(n)) { seen.add(n); names.push(n); } };
+  const containers = _childFrameElements(win);
+  for (let i = 0; i < containers.length; i++) {
+    try {
+      const w = _navigableWindowOf(containers[i]);
+      if (w && _windowIsLive(w)) add(w.name);
+    } catch (e) {}
+  }
+  let els;
+  try { els = doc.querySelectorAll('[id], embed[name], form[name], img[name], object[name]'); }
+  catch (e) { return names; }
+  for (let i = 0; i < els.length; i++) {
+    const el = els[i];
+    add(el.getAttribute('id'));
+    if (_NAMED_ACCESS_NAME_LOCALS.has(el.localName)) add(el.getAttribute('name'));
+  }
+  return names;
+};
+
 const _sessionBottleOf = function(win) {
   try { return _storageState(win.sessionStorage).bottle; }
   catch (e) { return _storageBottles.session; }
@@ -56022,10 +56238,10 @@ class _IframeWindow {
           if (/^[0-9]+$/.test(p)) {
             const list = _childFrameElements(t);
             const el = list[p | 0];
-            return el ? el.contentWindow : undefined;
+            return el ? _navigableWindowOf(el) : undefined;
           }
           if (!(p in t)) {
-            const named = _namedChildWindow(t, p);
+            const named = _windowNamedItem(t, p);
             if (named !== undefined) return named;
           }
         }
@@ -56035,7 +56251,7 @@ class _IframeWindow {
         if (typeof p === 'string' && /^[0-9]+$/.test(p))
           return (p | 0) < _childFrameElements(t).length;
         if ((p in t) || (p in globalThis)) return true;
-        return _namedChildWindow(t, p) !== undefined;
+        return _windowNamedItem(t, p) !== undefined;
       },
     });
     this.self = proxy;
@@ -56119,6 +56335,94 @@ for (const _ev of [
       this[_slot] = (typeof fn === 'function') ? fn : null;
       if (this[_slot]) _addListenerByKey(this._evtKey, _type, this[_slot]);
     },
+  });
+}
+
+// Re-point a window's Location at a new URL. `location` is a plain object whose
+// component fields were computed once at construction, so assigning only `href`
+// left `search`, `pathname` and the rest describing the PREVIOUS document — and
+// a reused popup that navigated to `target.html?channelName` still reported an
+// empty `location.search`, so every one of those pages opened a BroadcastChannel
+// named "" and talked to nobody.
+const _relocateWindow = function(win, url) {
+  const loc = win.location;
+  if (!loc) return;
+  let u = null;
+  try { u = new URL(url); } catch (e) {}
+  try { loc.href = url; } catch (e) {}
+  const fields = u
+    ? { origin: u.origin, protocol: u.protocol, host: u.host, hostname: u.hostname,
+        port: u.port, pathname: u.pathname, search: u.search }
+    : { origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '' };
+  for (const k of Object.keys(fields)) { try { loc[k] = fields[k]; } catch (e) {} }
+  try { loc.toString = function() { return url; }; } catch (e) {}
+};
+// Navigating a navigable REPLACES its active Document — it does NOT replace the
+// object the embedder is holding. `iframe.contentWindow` captured before
+// `iframe.src = …` must still be the frame's window afterwards, and the Document
+// it used to point at must still be the OLD document (Window-document.html). The
+// old code built a brand-new _IframeWindow on every load, so a page that kept a
+// handle across a navigation was left talking to a window nothing pointed at.
+const _installFrameWindow = function(hostEl, doc, url, originUrl) {
+  const prev = hostEl && hostEl._iframeWin;
+  if (!prev || prev._discarded) {
+    hostEl._iframeWin = new _IframeWindow(doc, url, originUrl, hostEl);
+    return hostEl._iframeWin;
+  }
+  prev.document = doc;
+  prev._url = url;
+  try { doc._ceRegistry = prev.customElements; } catch (e) {}
+  _relocateWindow(prev, url);
+  // An about:srcdoc document is same-origin with its host, so its origin comes
+  // from the parent URL rather than from its own (opaque) address.
+  if (originUrl) { try { prev.location.origin = new URL(originUrl).origin; } catch (e) {} }
+  return prev;
+};
+
+// ---- BarProp (HTML §"The Window object" / browser interface elements) --------
+// `window.locationbar`, `menubar`, `personalbar`, `scrollbars`, `statusbar` and
+// `toolbar` are six DISTINCT BarProp objects per Window, each stable for that
+// Window's whole lifetime — page code holds one and reads `visible` again later,
+// so handing back a fresh object each time is as wrong as handing back the same
+// one for all six.
+//
+// `visible` is false once the browsing context is discarded, and false for every
+// bar of a POPUP. That second rule is the only way a page can tell a popup from
+// a tab, and `support/window-open-popup-target.html` — the target behind all 51
+// rows of window-open-popup-behavior.html — is built entirely out of it. Before
+// this, `window.locationbar` was undefined, so that target threw on its first
+// line, never posted its message, and every one of those rows timed out.
+const _BARPROP_NAMES = ['locationbar', 'menubar', 'personalbar', 'scrollbars', 'statusbar', 'toolbar'];
+const _barPropWindow = new WeakMap();
+globalThis.BarProp = class BarProp {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get visible() {
+    const win = _barPropWindow.get(this);
+    if (win === undefined) throw new TypeError('Illegal invocation');
+    if (!_windowIsLive(win)) return false;
+    return !win._isPopupWindow;
+  }
+};
+const _barPropsFor = function(win) {
+  let bag = win._barProps;
+  if (!bag) {
+    bag = Object.create(null);
+    for (const n of _BARPROP_NAMES) {
+      const bp = Object.create(BarProp.prototype);
+      _barPropWindow.set(bp, win);
+      bag[n] = bp;
+    }
+    try {
+      Object.defineProperty(win, '_barProps', { value: bag, writable: true, configurable: true });
+    } catch (e) { return bag; }
+  }
+  return bag;
+};
+for (const _bn of _BARPROP_NAMES) {
+  const _accessor = { configurable: true, enumerable: true, get() { return _barPropsFor(this)[_bn]; } };
+  Object.defineProperty(_IframeWindow.prototype, _bn, _accessor);
+  Object.defineProperty(globalThis, _bn, {
+    configurable: true, enumerable: true, get() { return _barPropsFor(globalThis)[_bn]; },
   });
 }
 
@@ -63106,9 +63410,10 @@ const _loadPopupUrl = async function(win, fullUrl) {
       gotDoc && text ? text : '<!DOCTYPE html><html><head></head><body></body></html>',
       fullUrl, null, undefined, kind);
     doc._popupWin = win;
+    doc._referrer = win._docReferrer || '';
     win.document = doc;
     win._url = fullUrl;
-    try { win.location.href = fullUrl; } catch (e) {}
+    _relocateWindow(win, fullUrl);
     try { globalThis._autofocusScanFrameDoc && globalThis._autofocusScanFrameDoc(doc); } catch (e) {}
     // Run the popup's scripts through the frame-script machinery (it only
     // needs the _iframeWin/_iframeDoc pair and the ran-flag).
@@ -63117,20 +63422,52 @@ const _loadPopupUrl = async function(win, fullUrl) {
   } catch (e) {}
   _schedulePopupLoad(win);
 };
+// HTML §"parsing a boolean feature": an absent value, the empty string, "yes"
+// and "true" are on; "no"/"false" are off; anything else is read as an integer
+// and only 0 (or unparseable) is off.
+const _openFeatureBool = function(val) {
+  if (val === undefined || val === '' || val === 'yes' || val === 'true') return true;
+  if (val === 'no' || val === 'false') return false;
+  const n = parseInt(val, 10);
+  return Number.isNaN(n) ? false : n !== 0;
+};
 const _parseOpenFeatures = function(features) {
-  const out = { noopener: false, noreferrer: false };
+  const out = { noopener: false, noreferrer: false, popup: false, tokens: null };
   if (features == null || features === '') return out;
+  const tokens = Object.create(null);
   const parts = String(features).toLowerCase().split(/[,;\s]+/);
+  let any = false;
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
     if (!part) continue;
     const eq = part.indexOf('=');
     const key = (eq < 0 ? part : part.slice(0, eq)).trim();
-    const val = (eq < 0 ? '' : part.slice(eq + 1)).trim();
-    const on = (eq < 0) || val === '' || val === 'yes' || val === 'true' || val === '1';
-    if (key === 'noopener' && on) out.noopener = true;
-    if (key === 'noreferrer' && on) { out.noreferrer = true; out.noopener = true; }
+    if (!key) continue;
+    const val = (eq < 0 ? undefined : part.slice(eq + 1).trim());
+    if (!(key in tokens)) tokens[key] = val;   // first occurrence wins
+    any = true;
   }
+  if (!any) return out;
+  out.tokens = tokens;
+  const on = (k) => (k in tokens) && _openFeatureBool(tokens[k]);
+  out.noopener = on('noopener');
+  out.noreferrer = on('noreferrer');
+  if (out.noreferrer) out.noopener = true;
+  // HTML §"check if a popup window is requested". The chrome-less window is the
+  // exception, not the rule: a feature string that asks for the full set of bars
+  // still gets an ordinary tab, and dropping ANY one of them asks for a popup.
+  //
+  // ⚠ `noopener`/`noreferrer` short-circuit to "tab". That is not in the spec
+  // prose but it is what browsers do and what all 51 rows of
+  // window-open-popup-behavior.html assert (`,popup` alone expects a popup;
+  // `,noopener,noreferrer,popup` expects a tab).
+  if (out.noopener || out.noreferrer) out.popup = false;
+  else if ('popup' in tokens) out.popup = _openFeatureBool(tokens.popup);
+  else if (!on('location') && !on('toolbar')) out.popup = true;
+  else if (!on('menubar')) out.popup = true;
+  else if (!on('resizable')) out.popup = true;
+  else if (!on('scrollbars')) out.popup = true;
+  else if (!on('status')) out.popup = true;
   return out;
 };
 const _openUrlOrThrow = function(url) {
@@ -63178,15 +63515,21 @@ globalThis.open = function(url, target, features) {
       return feat.noopener ? null : dest;
     }
     const existing = _findNamedBrowsingContext(t);
-    if (existing && !feat.noopener) {
+    if (existing) {
       // Empty / omitted URL = "just hand me that window". A non-empty URL
       // navigates it. This is window-open-defaults and session_reopen.
+      //
+      // `noopener` does NOT mean "make a new window here": an existing target
+      // with that name is still reused and still navigated, and still keeps the
+      // opener it already had. All noopener withholds is the RETURN VALUE — the
+      // caller is handed null and loses its handle on a window that carries on
+      // loading (window-open-noopener.html?indexed, all eight noopener rows).
       if (fullUrl) {
         if (existing.kind === 'frame' && existing.el && existing.el._loadIframeSrc)
           existing.el._loadIframeSrc(fullUrl);
         else _loadPopupUrl(existing.win, fullUrl);
       }
-      return existing.win;
+      return feat.noopener ? null : existing.win;
     }
     if (feat.noopener) {
       // The caller must not receive a handle. Still load the URL as an
@@ -63200,6 +63543,12 @@ globalThis.open = function(url, target, features) {
           win.opener = null;
           win.top = win;
           win.parent = win;
+          win._isPopupWindow = feat.popup;
+          // `noreferrer` means the new context is told nothing about who opened
+          // it: no opener handle AND no Referer. Plain `noopener` still passes
+          // the referrer along.
+          win._docReferrer = feat.noreferrer ? '' : (globalThis.document ? globalThis.document.URL : '');
+          pdoc._referrer = win._docReferrer;
           if (t && t !== '_blank') { try { win.name = t; } catch (e) {} }
           win.close = function() { _windowClose(win); };
           win.focus = function() {};
@@ -63217,6 +63566,11 @@ globalThis.open = function(url, target, features) {
     // A top-level context is its own top and parent.
     win.top = win;
     win.parent = win;
+    // Popup-ness is decided once, at creation, from the feature string — it is
+    // what every BarProp of this window answers with for the rest of its life.
+    win._isPopupWindow = feat.popup;
+    win._docReferrer = globalThis.document ? globalThis.document.URL : '';
+    pdoc._referrer = win._docReferrer;
     if (t && t !== '_blank') {
       try { win.name = t; } catch (e) {}
       _namedAuxWindows.set(t, win);
@@ -80489,5 +80843,96 @@ globalThis.__obscura_init = function() {
     try { Object.defineProperty(globalThis, p, { enumerable: false }); } catch(e) {
     }
   }
+  // ---- The Window prototype chain, and the named-properties object -----------
+  // WebIDL gives a global with a named property getter a "named properties
+  // object" sitting between its interface prototype and that interface's
+  // inherited one:
+  //
+  //     window → Window.prototype → WindowProperties → EventTarget.prototype
+  //            → Object.prototype
+  //
+  // Before this, the global's prototype was plain Object.prototype: `window
+  // instanceof EventTarget` was false, `window.constructor` was not `Window`,
+  // and named access was faked by eagerly defining an own getter on the global
+  // for every id in the document at parse time. That fake could not see an
+  // element added later, could not forget one that left the tree, never
+  // answered to a `name` attribute, and never returned an HTMLCollection when
+  // two elements shared a name.
+  //
+  // The named-properties object is where all of that belongs, because it is
+  // consulted only AFTER the global's own properties and Window.prototype have
+  // both missed — so a real global or Web API can never be shadowed by page
+  // markup, which is exactly the guarantee the old code was hand-rolling.
+  try {
+    // ⛔ The chain stops at Object.prototype rather than continuing through
+    // EventTarget.prototype, because in this engine `EventTarget` IS `Node`
+    // (see `globalThis.EventTarget = Node`) — splicing Node.prototype above the
+    // global would hand every page a `window.parentNode`, `window.textContent`
+    // and forty more Node accessors invoked with a receiver that has no node id.
+    // A real, separate EventTarget interface is the prerequisite; until then the
+    // last two subtests of window-prototype-chain.html stay red, honestly.
+    // Own slots for the two fields `_windowIsLive` reads, so the commonest
+    // internal question about the main window is answered by a property hit
+    // instead of a walk down to the named-properties object and a tree query.
+    if (!Object.prototype.hasOwnProperty.call(globalThis, '_discarded'))
+      Object.defineProperty(globalThis, '_discarded', { value: false, writable: true, configurable: true });
+    if (!Object.prototype.hasOwnProperty.call(globalThis, '_hostEl'))
+      Object.defineProperty(globalThis, '_hostEl', { value: null, writable: true, configurable: true });
+    // WebIDL §"named property visibility": a supported name is NOT an own property
+    // of the named-properties object if anything BETWEEN the global and it
+    // already answers to that name. An `<iframe name=constructor>` therefore does
+    // not put a `constructor` on the object sitting under Window.prototype —
+    // `Window.prototype.constructor` got there first, and shadowing it from below
+    // would be invisible anyway (window-named-properties.html's "constructor").
+    const _npoNameVisible = function(p) {
+      const hasOwn = Object.prototype.hasOwnProperty;
+      try {
+        if (hasOwn.call(globalThis, p)) return false;
+        let proto = Object.getPrototypeOf(globalThis);
+        while (proto && proto !== _windowProperties) {
+          if (hasOwn.call(proto, p)) return false;
+          proto = Object.getPrototypeOf(proto);
+        }
+      } catch (e) {}
+      return true;
+    };
+    const _npoTarget = Object.create(Object.prototype);
+    Object.defineProperty(_npoTarget, Symbol.toStringTag,
+      { value: 'WindowProperties', writable: false, enumerable: false, configurable: true });
+    const _windowProperties = new Proxy(_npoTarget, {
+      get(t, p, r) {
+        if (typeof p === 'string' && !Reflect.has(t, p)) {
+          const v = _windowNamedItem(globalThis, p);
+          if (v !== undefined) return v;
+        }
+        return Reflect.get(t, p, r);
+      },
+      has(t, p) {
+        if (Reflect.has(t, p)) return true;
+        return typeof p === 'string' && _windowNamedItem(globalThis, p) !== undefined;
+      },
+      getOwnPropertyDescriptor(t, p) {
+        const own = Reflect.getOwnPropertyDescriptor(t, p);
+        if (own) return own;
+        if (typeof p !== 'string') return undefined;
+        if (!_npoNameVisible(p)) return undefined;
+        const v = _windowNamedItem(globalThis, p);
+        if (v === undefined) return undefined;
+        // WebIDL §named properties object: a value property that is writable
+        // and configurable but NOT enumerable, so `for (k in window)` never
+        // walks the page's own ids and names.
+        return { value: v, writable: true, enumerable: false, configurable: true };
+      },
+      ownKeys(t) {
+        let keys = [];
+        try { keys = _windowNamedPropertyNames(globalThis).filter(_npoNameVisible); } catch (e) { keys = []; }
+        for (const k of Reflect.ownKeys(t)) if (!keys.includes(k)) keys.push(k);
+        return keys;
+      },
+    });
+    Object.setPrototypeOf(globalThis.Window.prototype, _windowProperties);
+    Object.setPrototypeOf(globalThis, globalThis.Window.prototype);
+  } catch (e) {}
+
   delete globalThis.__obscura_init;
 };

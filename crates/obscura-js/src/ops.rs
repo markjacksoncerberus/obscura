@@ -115,6 +115,23 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             }
             "null".into()
         }
+        // HTML named access on the Window object (the element half). One op
+        // instead of a freshly parsed `querySelectorAll` selector per lookup —
+        // see DomTree::window_named_objects for why that matters.
+        "navigable_container_candidates" => serde_json::to_string(
+            &dom.navigable_container_candidates()
+                .iter()
+                .map(|id| id.index() as i32)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or("[]".into()),
+        "window_named_objects" => serde_json::to_string(
+            &dom.window_named_objects(&arg1)
+                .iter()
+                .map(|id| id.index() as i32)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or("[]".into()),
         "get_element_by_id" => {
             dom.get_element_by_id(&arg1).map(|id| id.index().to_string()).unwrap_or("-1".into())
         }

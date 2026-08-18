@@ -1247,6 +1247,69 @@ impl DomTree {
         None
     }
 
+    /// HTML §"named access on the Window object" — the element half of it.
+    ///
+    /// Returns, in tree order, every document descendant whose `id` attribute is
+    /// `name`, plus every `embed`/`form`/`img`/`object` whose `name` attribute is
+    /// `name`. Each element appears once even when it matches both ways.
+    ///
+    /// This lives in Rust because it is on the hottest path there is: with the
+    /// Window's named-properties object in the prototype chain, EVERY
+    /// missing-property read on `window` asks this question, and the engine's own
+    /// shared node/event code asks it thousands of times per page load. Expressed
+    /// as a `querySelectorAll` it re-parsed a freshly built selector string every
+    /// single time.
+    pub fn window_named_objects(&self, name: &str) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        if name.is_empty() {
+            return out;
+        }
+        let inner = self.inner.borrow();
+        let mut stack: Vec<NodeId> = Vec::new();
+        push_children_rev(&inner, inner.document, &mut stack);
+        while let Some(cur) = stack.pop() {
+            if let Some(Some(node)) = inner.nodes.get(cur.index()) {
+                if let NodeData::Element { name: ref qname, attrs: ref attrs, .. } = node.data {
+                    let local = qname.local.as_ref();
+                    let name_counts =
+                        matches!(local, "embed" | "form" | "img" | "object");
+                    let hit = attrs.iter().any(|a| {
+                        let an = a.name.local.as_ref();
+                        (an == "id" || (name_counts && an == "name")) && a.value.as_str() == name
+                    });
+                    if hit {
+                        out.push(cur);
+                    }
+                }
+                push_children_rev(&inner, cur, &mut stack);
+            }
+        }
+        out
+    }
+
+    /// Every `iframe` / `frame` / `object` / `embed` in the document, in tree
+    /// order. The caller decides which of them actually hold a nested navigable
+    /// (an `<object>` needs `data`, an `<embed>` needs `src`, and neither may be
+    /// a plugin/media type) — this only has to find the candidates, which it does
+    /// with one tree walk instead of a re-parsed selector per call.
+    pub fn navigable_container_candidates(&self) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        let inner = self.inner.borrow();
+        let mut stack: Vec<NodeId> = Vec::new();
+        push_children_rev(&inner, inner.document, &mut stack);
+        while let Some(cur) = stack.pop() {
+            if let Some(Some(node)) = inner.nodes.get(cur.index()) {
+                if let NodeData::Element { name: ref qname, .. } = node.data {
+                    if matches!(qname.local.as_ref(), "iframe" | "frame" | "object" | "embed") {
+                        out.push(cur);
+                    }
+                }
+                push_children_rev(&inner, cur, &mut stack);
+            }
+        }
+        out
+    }
+
     pub fn text_content(&self, node_id: NodeId) -> String {
         let inner = self.inner.borrow();
         // A CharacterData node's textContent is its OWN data. For Element /
