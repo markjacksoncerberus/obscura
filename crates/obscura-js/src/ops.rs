@@ -231,9 +231,37 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
             let ids: Vec<i32> = dom.children(NodeId::new(nid)).iter().map(|id| id.index() as i32).collect();
             serde_json::to_string(&ids).unwrap_or("[]".into())
         }
+        // DOM §element-html-uppercased-qualified-name: an element's tagName is its
+        // qualified name ASCII-uppercased ONLY when it is in the HTML namespace and
+        // its node document is an HTML document. Foreign content keeps its case —
+        // `<math><mspace>` is `math`/`mspace`, and SVG's adjusted locals stay
+        // camel-cased (`foreignObject`, `clipPath`). This used to uppercase
+        // unconditionally, so every parsed MathML and SVG element reported a tag name
+        // no spec-following page would recognise.
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            let name = dom.get_node(NodeId::new(nid)).and_then(|n| n.as_element().map(|name| name.local.as_ref().to_ascii_uppercase())).unwrap_or_default();
+            let name = dom
+                .get_node(NodeId::new(nid))
+                .and_then(|n| n.as_element().map(|name| {
+                    if name.ns == html5ever::ns!(html) {
+                        name.local.as_ref().to_ascii_uppercase()
+                    } else {
+                        name.local.as_ref().to_string()
+                    }
+                }))
+                .unwrap_or_default();
+            serde_json::to_string(&name).unwrap_or("\"\"".into())
+        }
+        // The raw local name, never case-folded — what `Element.localName` is for a
+        // parsed element. Derived from `tag_name` before foreign content had its case
+        // preserved, which lowercased `foreignObject` into something that matched no
+        // selector and no getElementsByTagName call.
+        "local_name" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let name = dom
+                .get_node(NodeId::new(nid))
+                .and_then(|n| n.as_element().map(|name| name.local.as_ref().to_string()))
+                .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
         }
         "namespace_uri" => {

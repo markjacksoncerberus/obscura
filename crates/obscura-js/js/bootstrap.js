@@ -2682,6 +2682,14 @@ class CSSStyleDeclaration {
         if (c === null) return;
         stored = c;
       }
+    } else if (!custom && _MATH_PROP_VALIDATED.has(name)) {
+      // math-style / math-shift / math-depth (css-inline-3 §math).
+      const low = stored.toLowerCase();
+      if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(stored)) {
+        const c = _canonMathProp(name, stored);
+        if (c === null) return;
+        stored = c;
+      }
     } else if (!custom && _OVERFLOW_VALIDATED.has(name)) {
       // css-overflow longhands (overflow-x/-y/-block/-inline, scrollbar-gutter,
       // block-ellipsis, overflow-clip-margin): validate + canonicalize the grammar
@@ -5604,7 +5612,14 @@ class Element extends Node {
   }
   get localName() {
     if (this._localName !== undefined) return this._localName;
-    return _asciiLower(this.tagName || "");
+    // Not `_asciiLower(tagName)`: a foreign-content local is case-preserved, so
+    // lowercasing the tag name would turn SVG's `foreignObject` into
+    // `foreignobject`. An element's local name never changes, so the bridge answer
+    // is memoised on the (nid-cached) wrapper and costs one call per element ever.
+    if (this.__localNameMemo !== undefined) return this.__localNameMemo;
+    const ln = _domParse("local_name", this._nid) || "";
+    this.__localNameMemo = ln;
+    return ln;
   }
   // An element's nodeName is its tagName (qualified name, HTML-uppercased).
   get nodeName() { return this.tagName; }
@@ -8082,7 +8097,9 @@ class Document extends Node {
     const C = (nsv === _HTML_NS) ? _htmlClassForLocal(local)
       : (nsv === 'http://www.w3.org/2000/svg')
         ? _svgClassForLocal(_asciiLower(local))
-        : Element;
+        : (nsv === 'http://www.w3.org/1998/Math/MathML')
+          ? _mathmlClassForLocal(_asciiLower(local))
+          : Element;
     let el = _cache.get(nid);
     if (!el) { el = new C(nid); _cache.set(nid, el); }
     el._ns = nsv; el._nsSet = true; el._prefix = prefix; el._localName = local;
@@ -8672,6 +8689,26 @@ const _svgClassForLocal = function(local) {
   const n = _SVG_IFACE_BY_TAG[local];
   return (n && globalThis[n]) || globalThis.SVGElement;
 };
+// MathML-namespace elements all share ONE interface: MathML Core defines exactly
+// `MathMLElement` and no per-element subclasses (unlike HTML and SVG). Anything in
+// the MathML namespace — including a local name MathML Core does not know — is a
+// MathMLElement, which is what `document.createElementNS(mathml_ns, "foo")` gives
+// in every shipping engine.
+const _MATHML_NS_CONST = 'http://www.w3.org/1998/Math/MathML';
+const _mathmlClassForLocal = function(_local) {
+  return globalThis.MathMLElement || Element;
+};
+// Locals that MIGHT be MathML — the MathML Core element index. A parsed element whose
+// lowercased local isn't in here is unambiguously not MathML, so the common HTML wrap
+// pays no extra namespace bridge call (same trick as `_MAYBE_SVG_TAGS` above). `a`,
+// `annotation-xml` and `style` are deliberately absent from the fast set for the same
+// reason they are absent there: an HTML <a> must not pay a namespace lookup on every
+// wrap. A MathML <a> still reaches the right interface through the SVG-style parsed
+// fallback below, which consults the namespace for any local that is not known HTML.
+const _MAYBE_MATHML_TAGS = new Set(('math semantics annotation mrow mi mn mo mtext ms mspace ' +
+  'mpadded mphantom mfrac msqrt mroot mstyle merror menclose maction ' +
+  'msub msup msubsup munder mover munderover mmultiscripts mprescripts none ' +
+  'mtable mtr mtd mlabeledtr malignmark maligngroup').split(' '));
 // Tags that MIGHT belong to the SVG namespace — the SVG-only element locals plus the
 // SVG root. A parsed element whose lowercased local isn't here is unambiguously HTML,
 // so the common HTML wrap pays NO extra namespace bridge call; only these trigger the
@@ -8694,9 +8731,10 @@ const _elementClassFor = function(nid) {
   const tag = _domParse("tag_name", nid);
   if (!tag) return globalThis.HTMLElement || Element;
   const local = _asciiLower(tag);
-  if (_MAYBE_SVG_TAGS.has(local)) {
+  if (_MAYBE_SVG_TAGS.has(local) || _MAYBE_MATHML_TAGS.has(local)) {
     const ns = _domParse("namespace_uri", nid);
     if (ns === 'http://www.w3.org/2000/svg') return _svgClassForLocal(local);
+    if (ns === _MATHML_NS_CONST) return _mathmlClassForLocal(local);
   }
   return _htmlClassForLocal(local);
 };
@@ -13717,6 +13755,10 @@ const _GCS_DEFAULTS = {
   // now lives there (_UA_DISPLAY); leaving it here made every element on every
   // page — <span>, <b>, <a> — report `display: block`.
   display: 'inline', visibility: 'visible', opacity: '1',
+  // css-inline / MathML Core: the three math properties. All inherit; all are
+  // keyword/integer identities, so registering the initial value here is the
+  // whole implementation of their computed value outside MathML content.
+  'math-depth': '0', 'math-style': 'normal', 'math-shift': 'normal',
   position: 'static', overflow: 'visible',
   transform: 'none', transition: 'none', animation: 'none',
   scale: 'none', rotate: 'none', translate: 'none',
@@ -17948,6 +17990,9 @@ const _specifiedColor = (el) => _specifiedValue(el, 'color');
 // properties our computed-style engine actually models need appear here.
 const _INHERITED_PROPS = new Set([
   'color', 'font-size', 'font-weight', 'line-height', 'visibility',
+  // css-inline §math: math-depth, math-style and math-shift all inherit — which
+  // is the entire mechanism behind MathML's nested script sizing.
+  'math-depth', 'math-style', 'math-shift',
   'cursor', 'pointer-events',
   // css-text: every property in this family inherits.
   'hanging-punctuation', 'hyphens', 'letter-spacing', 'line-break',
@@ -21017,6 +21062,28 @@ const _computeCounter = (el, value) => {
     if (i < toks.length && _isCounterIntTok(toks[i])) { out.push(_computeCounterInt(el, toks[i])); i++; }
   }
   return out.join(' ');
+};
+
+// ── MathML / css-inline math property parsing ────────────────────────────────
+// `math-style`, `math-shift` and `math-depth` (css-inline-3 §math). Registering
+// these in the defaults table is what makes them EXIST; without a grammar here
+// `el.style.mathDepth = "invalid"` would be stored verbatim, which is exactly the
+// bug the `*-invalid` WPT files test for. A null return means "invalid → ignore
+// the declaration", matching CSSOM.
+const _MATH_PROP_ENUM = { 'math-style': new Set(['normal', 'compact']), 'math-shift': new Set(['normal', 'compact']) };
+const _MATH_PROP_VALIDATED = new Set(['math-style', 'math-shift', 'math-depth']);
+const _canonMathProp = (name, value) => {
+  const v = String(value).trim();
+  if (v === '') return null;
+  const low = v.toLowerCase();
+  const enumSet = _MATH_PROP_ENUM[name];
+  if (enumSet) return enumSet.has(low) ? low : null;
+  // math-depth: `auto-add | add(<integer>) | <integer>` — exactly one of the three.
+  if (low === 'auto-add') return 'auto-add';
+  const add = /^add\(\s*([+-]?\d+)\s*\)$/.exec(low);
+  if (add) return 'add(' + parseInt(add[1], 10) + ')';
+  if (/^[+-]?\d+$/.test(low)) return String(parseInt(low, 10));
+  return null;
 };
 
 // ── CSS Overflow (css-overflow-3/4) value parsing ─────────────────────────────
@@ -28131,6 +28198,29 @@ const _computeLineHeight = (el, v) => {
   return _clampNegPx(_trComp(s, el, true, _vpUnits()));         // plain <length> → px, clamp ≥0
 };
 const _normComputed = (el, kebab, v) => {
+  // css-inline-3 §math-depth: the computed value is always an <integer>. The two
+  // relative forms resolve against the PARENT's computed math-depth — `add(N)`
+  // adds N, and `auto-add` adds 1 only when the inherited math-style is already
+  // `compact`, which is why a fraction shrinks its parts in inline maths but
+  // leaves them alone in display maths.
+  if (kebab === 'math-depth') {
+    const t = String(v).trim().toLowerCase();
+    if (t === 'auto-add' || /^add\(/.test(t)) {
+      let base = 0, style = 'normal';
+      try {
+        const pe = el && el.parentElement;
+        if (pe) {
+          const ps = globalThis.getComputedStyle(pe);
+          base = parseInt(ps.getPropertyValue('math-depth'), 10) || 0;
+          style = String(ps.getPropertyValue('math-style') || 'normal');
+        }
+      } catch (e) {}
+      if (t === 'auto-add') return String(base + (style === 'compact' ? 1 : 0));
+      const m = /^add\(\s*([+-]?\d+)\s*\)$/.exec(t);
+      return String(base + (m ? parseInt(m[1], 10) : 0));
+    }
+    return t;
+  }
   // css-gaps: a MULTI-item / repeat() gap-rule value computes its list (structure kept,
   // integer folded, each leaf resolved). Must precede the _LENGTH_COMPUTED_PROPS /
   // _COLOR_PROPS branches (which would mangle the whole list). Single-leaf values fall
@@ -28503,6 +28593,15 @@ const _computedPropOf = (el, kebab, guard) => {
   if (kebab === 'display' && el.localName === 'dialog' && !String(spec.value || '').trim()
       && el.hasAttribute && !el.hasAttribute('open') && !el._popoverShowing) {
     return _normComputed(el, 'display', 'none');
+  }
+  // MathML Core: `display: contents` is not a thing MathML content can be. A MathML
+  // element whose display would compute to `contents` computes to `none` instead —
+  // the box is not replaced by its children, it stops existing. (Written here rather
+  // than in the UA sheet because it is a rule about the COMPUTED value, which no
+  // stylesheet declaration of any origin can express.)
+  if (kebab === 'display' && _isMathMLNsEl(el)) {
+    const dv = String(spec.value || '').trim().toLowerCase();
+    if (dv === 'contents') return 'none';
   }
   let v = String(spec.value || '').trim();
   const sh = spec.sh;
@@ -29017,11 +29116,280 @@ const _UA_DECLS = (() => {
 // two properties off an <a> ancestor when deciding what a selection's colour and
 // underline already are.
 const _UA_LINK_DECLS = { color: 'rgb(0, 0, 238)', 'text-decoration-line': 'underline' };
+// ── The MathML Core user-agent stylesheet (MathML Core Appendix A) ───────────
+// MathML content is styled by its own UA sheet, in its own namespace, and until
+// now Obscura had none: `_uaDecls` returned null for anything that was not an
+// HTML element, so every <mi>, <mfrac> and <mtable> in the document computed the
+// bare CSS initial values — `display: inline`, no `math-style`, no `math-depth`.
+// A page's maths was styled as if it were a run of unknown inline elements.
+//
+// The rules below are the spec's sheet transcribed, with the values already in
+// computed form. Two of them need the element's PARENT (the `semantics`/`maction`
+// "only the first child is shown" rules and the scripted-element depth rules), so
+// this walks one link up rather than asking the selector engine — every selector
+// here is either a type selector or one type-selector step, which is cheaper to
+// answer directly than to hand to the matcher.
+const _MATHML_UA_NS = 'http://www.w3.org/1998/Math/MathML';
+const _isMathMLNsEl = (el) => { try { return el.namespaceURI === _MATHML_UA_NS; } catch (e) { return false; } };
+// The MathML Core element index (spec §2.1). Anything else in the MathML
+// namespace is an "Unknown MathML element", which the spec still lays out as a
+// grouping element — so the universal rules apply to it too.
+const _MATHML_CORE_TAGS = new Set(('a annotation annotation-xml maction math merror mfrac mi ' +
+  'mmultiscripts mn mo mover mpadded mphantom mprescripts mroot mrow ms mspace msqrt ' +
+  'mstyle msub msubsup msup mtable mtd mtext mtr munder munderover semantics').split(' '));
+// Elements whose non-first children are scripts: they get math-depth: add(1) and
+// math-style: compact from the UA sheet. mroot's non-first child gets add(2).
+const _MATHML_SCRIPTED = new Set(['msub', 'msup', 'msubsup', 'mmultiscripts', 'munder', 'mover', 'munderover']);
+// Parse a MathML `scriptlevel` attribute into {mode, value}: "<U>" sets the depth
+// absolutely, "+<U>"/"-<U>" adds a delta. Anything else is invalid and maps to
+// nothing at all (the attribute is ignored, not treated as 0).
+const _mathParseScriptLevel = (raw) => {
+  const t = String(raw).trim();
+  let m = /^([+-]?)([0-9]+)$/.exec(t);
+  if (!m) return null;
+  const n = parseInt(m[2], 10);
+  if (!isFinite(n)) return null;
+  if (m[1] === '+') return { add: n };
+  if (m[1] === '-') return { add: -n };
+  return { set: n };
+};
+// The MathML `<length-percentage>` attribute syntax (mspace/mpadded width, height,
+// depth, lspace, voffset). MathML Core restricts these to a CSS <length-percentage>;
+// a bare number is NOT valid (that was MathML 3's "number optionally followed by a
+// unit"), and an invalid value means the attribute is ignored.
+const _MATHML_LEN_RE = /^[+-]?(\d+\.?\d*|\.\d+)(em|ex|px|in|cm|mm|pt|pc|q|rem|ch|vw|vh|vmin|vmax|%)$/i;
+const _mathParseLength = (raw) => {
+  const t = String(raw).trim();
+  return _MATHML_LEN_RE.test(t) ? t : null;
+};
+// Resolve the computed `math-depth` of a MathML element: start from the inherited
+// value, apply the UA sheet's structural rules, then the `scriptlevel` attribute.
+// (`auto-add` — mfrac's children — adds 1 only when the INHERITED math-style is
+// already `compact`, which is why a fraction shrinks its parts in inline maths but
+// not in display maths.)
+const _mathmlUaDecls = (el, ln) => {
+  const decls = {};
+  const set = (k, v) => { _expandDeclInto(decls, k, v, false); };
+  // ── Universal rules: `* { font-size: math; display: block math;
+  //    writing-mode: horizontal-tb !important }`
+  set('display', 'block math');
+  // The `!important` is the spec's, and it is the whole rule: MathML is laid out
+  // horizontally whatever the surrounding page's writing mode is, and a UA-origin
+  // `!important` is the only declaration an author cannot override. Without it a
+  // `writing-mode: vertical-rl` on a formula was reported back by
+  // getComputedStyle — and every layout comparison in the realm then measured the
+  // formula's inline and block axes the wrong way round.
+  _expandDeclInto(decls, 'writing-mode', 'horizontal-tb', true);
+  let parent = null, parentLn = '', indexInParent = -1;
+  try {
+    parent = el.parentElement;
+    if (parent && parent.namespaceURI === _MATHML_UA_NS) {
+      parentLn = String(parent.localName || '');
+      let i = 0;
+      for (let c = parent.firstElementChild; c; c = c.nextElementSibling, i++) {
+        if (c === el || (c && el && c._nid === el._nid)) { indexInParent = i; break; }
+      }
+    } else { parent = null; }
+  } catch (e) { parent = null; }
+  // ── The <math> element
+  if (ln === 'math') {
+    set('direction', 'ltr');
+    set('text-indent', '0px');
+    set('letter-spacing', 'normal');
+    set('line-height', 'normal');
+    set('word-spacing', 'normal');
+    set('font-family', 'math');
+    set('font-style', 'normal');
+    set('font-weight', '400');
+    set('math-shift', 'normal');
+    set('math-depth', '0');
+    // `math[display="block" i]` is block maths in display style; anything else
+    // (absent attribute, "inline", or a value the spec does not know) is inline
+    // maths in compact style. `inline math` serialises as `math`.
+    let dispAttr = '';
+    try { dispAttr = String(el.getAttribute('display') || '').toLowerCase(); } catch (e) {}
+    if (dispAttr === 'block') { set('display', 'block math'); set('math-style', 'normal'); }
+    else { set('display', 'math'); set('math-style', 'compact'); }
+  }
+  // ── <mrow>-like elements
+  if (parentLn === 'semantics' || parentLn === 'maction') {
+    if (indexInParent > 0) set('display', 'none');
+  }
+  if (ln === 'merror') { set('border', '1px solid rgb(255, 0, 0)'); set('background-color', 'rgb(255, 255, 224)'); }
+  if (ln === 'mphantom') set('visibility', 'hidden');
+  // ── Token elements
+  if (ln === 'mi') set('text-transform', 'math-auto');
+  // ── Tables
+  if (ln === 'mtable') { set('display', 'inline-table'); set('math-style', 'compact'); }
+  else if (ln === 'mtr') set('display', 'table-row');
+  else if (ln === 'mtd') { set('display', 'table-cell'); set('text-align', 'center'); set('padding', '0.5ex 0.4em'); }
+  // ── Fractions
+  if (ln === 'mfrac') { set('padding-inline', '1px'); }
+  // ── math-depth, math-style and the font-size scaling they drive ────────────
+  // Every rule that changes math-depth is STRUCTURAL (a fraction's children, a
+  // radical's index, a script, or the `scriptlevel` attribute), so the depth is
+  // computed from the tree rather than by asking the cascade for the parent's
+  // value — which would mean a getComputedStyle per ancestor per property read.
+  const depth = _mathStructDepth(el, 0);
+  const parentDepth = (parent && parentLn) ? _mathStructDepth(parent, 0) : 0;
+  if (_mathStructStyleCompact(el, 0)) set('math-style', 'compact');
+  if (parentLn === 'mfrac' && indexInParent === 1) set('math-shift', 'compact');
+  if (ln === 'mroot' || ln === 'msqrt') set('math-shift', 'compact');
+  set('math-depth', String(depth));
+  // `font-size: math` (the universal rule): one step of math-depth shrinks the
+  // text by the font's scriptPercentScaleDown, 0.71 by default. Emitted as a
+  // PERCENTAGE so it resolves against the parent's font size and composes down the
+  // tree the way the per-level scaling does. This is what makes a superscript
+  // smaller than its base.
+  // ...except under an ACCENT. `munder[accentunder=true] > :nth-child(2)` and its
+  // three siblings in the UA sheet reset `font-size: inherit`: an accent (a hat, a
+  // bar, an arrow drawn over a symbol) is not a script and must not shrink, even
+  // though its math-depth still goes up.
+  const dDelta = _mathAccentKeepsFontSize(el, parent, parentLn, indexInParent) ? 0 : depth - parentDepth;
+  if (dDelta !== 0 && Math.abs(dDelta) <= 32)
+    set('font-size', (Math.pow(0.71, dDelta) * 100).toFixed(4) + '%');
+  return decls;
+};
+const _mathAccentKeepsFontSize = (el, parent, parentLn, idx) => {
+  if (!parent) return false;
+  const attrIs = (n, v) => {
+    let a = null;
+    try { a = parent.getAttribute(n); } catch (e) { return false; }
+    return a !== null && String(a).trim().toLowerCase() === v;
+  };
+  if (parentLn === 'munder' && idx === 1) return attrIs('accentunder', 'true');
+  if (parentLn === 'mover' && idx === 1) return attrIs('accent', 'true');
+  if (parentLn === 'munderover' && idx === 1) return attrIs('accentunder', 'true');
+  if (parentLn === 'munderover' && idx === 2) return attrIs('accent', 'true');
+  return false;
+};
+// The structural half of MathML's math-style / math-depth, mirroring the same two
+// functions in the layout engine (blitz-dom's stylo glue) so the computed style a
+// page reads and the box it gets are answering from the same rules.
+const _mathStructStyleCompact = (el, guard) => {
+  if (!el || guard > 32 || !_isMathMLNsEl(el)) return false;
+  let ln = '';
+  try { ln = String(el.localName || ''); } catch (e) { return false; }
+  let ds = null;
+  try { ds = el.getAttribute('displaystyle'); } catch (e) {}
+  if (ds !== null) {
+    const v = String(ds).trim().toLowerCase();
+    if (v === 'true') return false;
+    if (v === 'false') return true;
+  }
+  if (ln === 'math') {
+    let d = '';
+    try { d = String(el.getAttribute('display') || '').toLowerCase(); } catch (e) {}
+    return d !== 'block';
+  }
+  if (ln === 'mtable') return true;
+  const p = el.parentElement;
+  if (!p) return false;
+  if (_isMathMLNsEl(p)) {
+    let pln = '';
+    try { pln = String(p.localName || ''); } catch (e) {}
+    const idx = _mathChildIndex(el);
+    if (pln === 'mfrac' || (pln === 'mroot' && idx > 0) || (_MATHML_SCRIPTED.has(pln) && idx > 0))
+      return true;
+  }
+  return _mathStructStyleCompact(p, guard + 1);
+};
+const _mathChildIndex = (el) => {
+  const p = el && el.parentElement;
+  if (!p) return -1;
+  let i = 0;
+  for (let c = p.firstElementChild; c; c = c.nextElementSibling, i++)
+    if (c === el || (c && c._nid === el._nid)) return i;
+  return -1;
+};
+const _mathStructDepth = (el, guard) => {
+  if (!el || guard > 32 || !_isMathMLNsEl(el)) return 0;
+  let ln = '';
+  try { ln = String(el.localName || ''); } catch (e) { return 0; }
+  const p = el.parentElement;
+  // The <math> root pins math-depth to 0; nothing above it counts.
+  const inherited = (ln === 'math' || !p) ? 0 : _mathStructDepth(p, guard + 1);
+  let depth = inherited;
+  if (ln !== 'math' && p && _isMathMLNsEl(p)) {
+    let pln = '';
+    try { pln = String(p.localName || ''); } catch (e) {}
+    const idx = _mathChildIndex(el);
+    if (pln === 'mfrac') {
+      // `auto-add`: a fraction shrinks its parts only when it is ALREADY compact.
+      if (_mathStructStyleCompact(p, 0)) depth = inherited + 1;
+    } else if (pln === 'mroot' && idx > 0) depth = inherited + 2;
+    else if (_MATHML_SCRIPTED.has(pln) && idx > 0) depth = inherited + 1;
+  }
+  let sl = null;
+  try { sl = el.getAttribute('scriptlevel'); } catch (e) {}
+  if (sl !== null) {
+    const parsed = _mathParseScriptLevel(sl);
+    if (parsed) depth = (parsed.set !== undefined) ? parsed.set : inherited + parsed.add;
+  }
+  return depth;
+};
+// MathML attribute mapping (MathML Core §2.1.5 and §"Legacy MathML style
+// attributes"): the four attributes that map to CSS — `dir`, `mathcolor`,
+// `mathbackground`, `mathsize` — plus `displaystyle`/`scriptlevel` mapping to
+// math-style/math-depth, and `mathvariant="normal"` cancelling <mi>'s automatic
+// italic. The MathML 3 attributes this REPLACED (fontsize, color, background,
+// fontfamily, fontstyle, fontweight) are deliberately NOT mapped: MathML Core
+// dropped them, and a page that still carries them must not have them honoured.
+const _mathmlHintDecls = (el, ln) => {
+  let decls = null;
+  const set = (k, v) => { if (!decls) decls = {}; _expandDeclInto(decls, k, v, false); };
+  const attr = (n) => { try { const v = el.getAttribute(n); return v == null ? null : String(v); } catch (e) { return null; } };
+  const dir = attr('dir');
+  if (dir !== null) {
+    const d = dir.toLowerCase();
+    if (d === 'ltr' || d === 'rtl') set('direction', d);
+  }
+  const mc = attr('mathcolor');
+  if (mc !== null && mc !== '') { const c = _computeColor ? _computeColor(mc) : null; if (c) set('color', c); }
+  const mb = attr('mathbackground');
+  if (mb !== null && mb !== '') { const c = _computeColor ? _computeColor(mb) : null; if (c) set('background-color', c); }
+  // `mathvariant` only has an effect for the single value MathML Core kept, and
+  // only on <mi>, where it turns OFF the automatic single-letter italic.
+  if (ln === 'mi') {
+    const mv = attr('mathvariant');
+    if (mv !== null && mv.trim().toLowerCase() === 'normal') set('text-transform', 'none');
+  }
+  const ds = attr('displaystyle');
+  if (ds !== null) {
+    const d = ds.trim().toLowerCase();
+    if (d === 'true') set('math-style', 'normal');
+    else if (d === 'false') set('math-style', 'compact');
+  }
+  const sl = attr('scriptlevel');
+  if (sl !== null) {
+    const parsed = _mathParseScriptLevel(sl);
+    if (parsed) {
+      if (parsed.set !== undefined) set('math-depth', String(parsed.set));
+      else {
+        let base = 0;
+        try {
+          const pe = el.parentElement;
+          if (pe) base = parseInt(globalThis.getComputedStyle(pe).getPropertyValue('math-depth'), 10) || 0;
+        } catch (e) {}
+        set('math-depth', String(base + parsed.add));
+      }
+    }
+  }
+  // `mathsize` maps to font-size and, being a presentational hint, beats the UA
+  // sheet's `font-size: math` (which is what scriptlevel scales) — the spec's
+  // "mathsize wins over scriptlevel".
+  const ms = attr('mathsize');
+  if (ms !== null && ms !== '') { const l = _mathParseLength(ms); if (l) set('font-size', l); }
+  return decls;
+};
 const _uaDecls = (el) => {
   let ln;
   try { ln = el.localName; } catch (e) { return null; }
   // HTML-namespace only: an SVG <a> or a MathML <style> is not this <a>/<style>.
-  try { if (el.namespaceURI && el.namespaceURI !== 'http://www.w3.org/1999/xhtml') return null; } catch (e) {}
+  // MathML content is handled by its own UA sheet (above); SVG has none here.
+  try { if (el.namespaceURI && el.namespaceURI !== 'http://www.w3.org/1999/xhtml') {
+    return _isMathMLNsEl(el) ? _mathmlUaDecls(el, ln) : null;
+  } } catch (e) {}
   const disp = _UA_DISPLAY[ln];
   const own = _UA_DECLS[ln];
   let link = null;
@@ -29099,6 +29467,12 @@ const _parseLegacyColor = (raw) => {
 const _presHintDecls = (el) => {
   // Returns a decls map { name: {value, important} } of presentational-hint
   // declarations for `el`, or null when the element contributes none.
+  // MathML has its own, disjoint mapping table (MathML Core §2.1.5) — and none
+  // of HTML's legacy hints (`align`, `bgcolor`, `<font>`) apply inside maths.
+  if (_isMathMLNsEl(el)) {
+    let mln = ''; try { mln = String(el.localName || ''); } catch (e) {}
+    return _mathmlHintDecls(el, mln);
+  }
   let decls = null;
   const set = (name, value) => { if (!decls) decls = {}; _expandDeclInto(decls, name, value, false); };
   try {
@@ -29782,10 +30156,132 @@ const _cascadeResolve = (sources, name) => {
 // The element's own specified declaration for `kebab` — the winning value plus
 // the shorthand it was expanded from (`sh`, when this longhand is a pending
 // shorthand slot). Mirrors _specifiedValue's cascade-first / live-decl-fallback.
+// ── css-logical: flow-relative properties ARE their physical counterparts ─────
+//
+// `padding-block-start: 10px` on a horizontal-tb element IS `padding-top: 10px`.
+// The two are separate properties in the cascade — either may win — but they set
+// the SAME box edge, so getComputedStyle must answer with the winner for BOTH
+// names. Until now the two families never met: a page that wrote `margin-inline`
+// (which is most modern CSS) computed `margin-left: 0px`, and a page that wrote
+// `margin-left` computed `margin-inline-start: 0px`. Every piece of code that asks
+// "what is this element's left margin" — ours and the page's — got a zero that was
+// not true, in either direction.
+//
+// The mapping depends on the element's own COMPUTED `writing-mode` and
+// `direction`, which is why it cannot be a static table: `inline-start` is the
+// left edge in `horizontal-tb ltr`, the right edge in `horizontal-tb rtl`, and the
+// TOP edge in a vertical writing mode.
+const _LOGICAL_FAMILIES = [
+  { l: ['margin-block-start', 'margin-block-end', 'margin-inline-start', 'margin-inline-end'],
+    p: ['margin-top', 'margin-bottom', 'margin-left', 'margin-right'] },
+  { l: ['padding-block-start', 'padding-block-end', 'padding-inline-start', 'padding-inline-end'],
+    p: ['padding-top', 'padding-bottom', 'padding-left', 'padding-right'] },
+  { l: ['inset-block-start', 'inset-block-end', 'inset-inline-start', 'inset-inline-end'],
+    p: ['top', 'bottom', 'left', 'right'] },
+  { l: ['border-block-start-width', 'border-block-end-width', 'border-inline-start-width', 'border-inline-end-width'],
+    p: ['border-top-width', 'border-bottom-width', 'border-left-width', 'border-right-width'] },
+  { l: ['border-block-start-style', 'border-block-end-style', 'border-inline-start-style', 'border-inline-end-style'],
+    p: ['border-top-style', 'border-bottom-style', 'border-left-style', 'border-right-style'] },
+  { l: ['border-block-start-color', 'border-block-end-color', 'border-inline-start-color', 'border-inline-end-color'],
+    p: ['border-top-color', 'border-bottom-color', 'border-left-color', 'border-right-color'] },
+  { l: ['inline-size', 'block-size'], p: ['width', 'height'] },
+  { l: ['min-inline-size', 'min-block-size'], p: ['min-width', 'min-height'] },
+  { l: ['max-inline-size', 'max-block-size'], p: ['max-width', 'max-height'] },
+];
+// Every property that takes part, so the common case (a property in no family at
+// all) is a single Set lookup and costs nothing.
+const _LOGICAL_PARTICIPANTS = (() => {
+  const s = new Set();
+  for (const f of _LOGICAL_FAMILIES) { for (const n of f.l) s.add(n); for (const n of f.p) s.add(n); }
+  return s;
+})();
+// The counterpart of `kebab` for an element in writing mode `wm` with direction
+// `dir` — the other name that sets the same box edge (or the same axis, for the
+// sizing families), or null when there is none.
+const _logicalCounterpart = (kebab, wm, dir) => {
+  const vertical = /^(vertical|sideways)/.test(wm);
+  const rtl = dir === 'rtl';
+  // Block-flow direction: which physical edge `block-start` is.
+  //   horizontal-tb → top; vertical-rl / sideways-rl → right; vertical-lr / sideways-lr → left.
+  const blockStartPhys = vertical ? (/-rl$/.test(wm) ? 'right' : 'left') : 'top';
+  const blockEndPhys = blockStartPhys === 'top' ? 'bottom' : (blockStartPhys === 'right' ? 'left' : 'right');
+  // Inline direction runs along the other axis, flipped by `direction`.
+  const inlineStartPhys = vertical ? (rtl ? 'bottom' : 'top') : (rtl ? 'right' : 'left');
+  const inlineEndPhys = inlineStartPhys === 'top' ? 'bottom'
+    : inlineStartPhys === 'bottom' ? 'top'
+      : inlineStartPhys === 'left' ? 'right' : 'left';
+  const sideOf = { 'block-start': blockStartPhys, 'block-end': blockEndPhys,
+    'inline-start': inlineStartPhys, 'inline-end': inlineEndPhys };
+  for (const f of _LOGICAL_FAMILIES) {
+    let i = f.l.indexOf(kebab);
+    if (i >= 0) {
+      if (f.l.length === 2) return f.p[(kebab.indexOf('inline-size') >= 0) === !vertical ? 0 : 1];
+      // Edge families: l[] is ordered block-start, block-end, inline-start, inline-end
+      // and p[] is top, bottom, left, right — so map through the side name.
+      const side = ['block-start', 'block-end', 'inline-start', 'inline-end'][i];
+      const phys = sideOf[side];
+      return f.p[['top', 'bottom', 'left', 'right'].indexOf(phys)];
+    }
+    i = f.p.indexOf(kebab);
+    if (i >= 0) {
+      if (f.l.length === 2) return f.l[(i === 0) === !vertical ? 0 : 1];
+      const phys = ['top', 'bottom', 'left', 'right'][i];
+      for (const side of ['block-start', 'block-end', 'inline-start', 'inline-end'])
+        if (sideOf[side] === phys)
+          return f.l[['block-start', 'block-end', 'inline-start', 'inline-end'].indexOf(side)];
+      return null;
+    }
+  }
+  return null;
+};
+// Reading the element's own writing-mode/direction must not re-enter this
+// resolution (they are not logical properties, so it terminates — but the guard
+// keeps a malformed cascade from looping).
+let _logicalDepth = 0;
+const _logicalCounterpartFor = (el, kebab) => {
+  if (!_LOGICAL_PARTICIPANTS.has(kebab) || _logicalDepth > 4) return null;
+  _logicalDepth++;
+  try {
+    const wm = String(_computedPropOf(el, 'writing-mode', 0) || 'horizontal-tb');
+    const dir = String(_computedPropOf(el, 'direction', 0) || 'ltr');
+    return _logicalCounterpart(kebab, wm, dir);
+  } catch (e) { return null; } finally { _logicalDepth--; }
+};
 const _specifiedDecl = (el, kebab) => {
   try {
-    const w = _cascadeWinnerR(_buildCascade(el), kebab);
-    if (w && w.d.value !== '') return { value: String(w.d.value), sh: w.d._sh || null };
+    const sources = _buildCascade(el);
+    let w = _cascadeWinnerR(sources, kebab);
+    // css-logical: a flow-relative property and its physical counterpart set the
+    // same thing, so the cascade is asked about BOTH names and the stronger
+    // declaration wins. `_cascadeWinner` already knows how to compare two
+    // declarations; running it over a two-name pool is exactly that comparison.
+    const other = _logicalCounterpartFor(el, kebab);
+    if (other) {
+      const w2 = _cascadeWinnerR(sources, other);
+      if (w2 && w2.d.value !== '') {
+        w2.__logicalFor = other;
+        if (!w || w.d.value === '') w = w2;
+        else {
+          const di = !!w2.d.important, bi = !!w.d.important;
+          if (di !== bi ? di
+            : (w2.s.spec !== w.s.spec ? w2.s.spec > w.s.spec : w2.s.order > w.s.order)) w = w2;
+        }
+      }
+    }
+    if (w && w.d.value !== '') {
+      const sh = w.d._sh || null;
+      // A winner taken from the COUNTERPART name carries that name's shorthand
+      // (`border-inline-start`), whose expansion has no entry for the physical
+      // longhand being asked about. Resolve it here, while the name it belongs to
+      // is still known, and hand back a plain longhand value.
+      if (sh && w.__logicalFor) {
+        let parts = null;
+        try { parts = _expandShorthand(sh, String(w.d.value)); } catch (e) { parts = null; }
+        const pv = parts ? parts[w.__logicalFor] : null;
+        if (pv != null) return { value: String(pv), sh: null };
+      }
+      return { value: String(w.d.value), sh };
+    }
   } catch (e) {}
   try {
     // ⚠️ This fallback reads the LIVE inline declaration directly, around the
@@ -43022,6 +43518,8 @@ globalThis.CSS = {
         if (/\bvar\(/i.test(val)) return true;
         if (_CSS_WIDE.has(val.toLowerCase())) return true;   // CSS-wide keywords valid for every property
         return _canonCssOverflow(name, _canonStandardValue(val)) != null;
+      if (_MATH_PROP_VALIDATED.has(name))
+        return _canonMathProp(name, _canonStandardValue(val)) != null;
       }
       if (name === 'overflow') {                         // the `overflow` shorthand
         if (/\bvar\(/i.test(val)) return true;
@@ -47659,7 +48157,10 @@ globalThis.SVGStyleElement = class SVGStyleElement extends globalThis.SVGElement
   constructor(...args) { const nid = args[0]; if (typeof nid !== 'number') throw new TypeError("Illegal constructor"); super(nid); }
   get [Symbol.toStringTag]() { return 'SVGStyleElement'; }
 };
-globalThis.MathMLElement = class MathMLElement extends Element {};
+globalThis.MathMLElement = class MathMLElement extends Element {
+  constructor(...args) { const nid = args[0]; if (typeof nid !== 'number') throw new TypeError("Illegal constructor"); super(nid); }
+  get [Symbol.toStringTag]() { return 'MathMLElement'; }
+};
 _markNative(globalThis.SVGElement); _markNative(globalThis.SVGSVGElement);
 _markNative(globalThis.SVGStyleElement); _markNative(globalThis.MathMLElement);
 _installLinkStyleSheet(globalThis.SVGStyleElement);
@@ -48615,6 +49116,11 @@ _exposeIface('SVGUseElementShadowRoot', SVGUseElementShadowRoot); _markNative(SV
 // Element.prototype (SVG/HTML elements reach them through their own prototypes).
 _ehDefineOnProto(globalThis.HTMLElement.prototype, false);
 _ehDefineOnProto(globalThis.SVGElement.prototype, false);
+// MathML Core gives MathMLElement the same GlobalEventHandlers mixin HTML and SVG
+// elements get — `<math onclick=…>` compiles, and `mathEl.onclick` is null until it
+// does. Without this a MathML element inherited nothing but Element and every `on*`
+// read came back undefined.
+_ehDefineOnProto(globalThis.MathMLElement.prototype, false);
 _ehDefineOnProto(Document.prototype, false);
 _ehDefineOnProto(globalThis, true);
 // Web IDL [Unscopable] members — the @@unscopables object each interface exposes so
@@ -49498,6 +50004,73 @@ Range.prototype.END_TO_END = 2; Range.prototype.END_TO_START = 3;
 // real line boxes) is the one part of the interface left out.
 const __obscura_selections = new WeakMap();   // Window → its one Selection
 let __obscura_allowSelectionCtor = false;
+// css-text-4 `text-transform: math-auto` — MathML Core's automatic italic. A token
+// element (in practice `<mi>`) whose text is a SINGLE character renders that
+// character as its italic mathematical alphanumeric symbol; anything longer is left
+// alone, which is what distinguishes the variable `x` from the function name `sin`.
+// The table is MathML Core Appendix C's italic mapping, run-length encoded as
+// [firstCodePoint, lastCodePoint, delta] — 18 runs instead of 112 entries.
+const _MATH_ITALIC_RUNS = [[0x41,0x5A,119795],[0x61,0x67,119789],[0x68,0x68,8358],[0x69,0x7A,119789],
+  [0x131,0x131,120179],[0x237,0x237,119918],[0x391,0x3A1,119633],[0x3A3,0x3A9,119633],
+  [0x3B1,0x3C9,119627],[0x3D1,0x3D1,119622],[0x3D5,0x3D5,119620],[0x3D6,0x3D6,119621],
+  [0x3F0,0x3F0,119592],[0x3F1,0x3F1,119593],[0x3F4,0x3F4,119551],[0x3F5,0x3F5,119585],
+  [0x2202,0x2202,111891],[0x2207,0x2207,111860]];
+const _mathAutoTransform = (text) => {
+  // "A single character" means a single CODE POINT, so an astral character counts
+  // once — `String.length` would call it two and refuse to transform it.
+  const cps = Array.from(text);
+  if (cps.length !== 1) return text;
+  const cp = cps[0].codePointAt(0);
+  for (const [lo, hi, delta] of _MATH_ITALIC_RUNS)
+    if (cp >= lo && cp <= hi) return String.fromCodePoint(cp + delta);
+  return text;
+};
+// Apply the parent element's `text-transform` to one text node's data, the way the
+// text is actually painted.
+const _transformedTextData = (textNode, data) => {
+  const p = textNode.parentNode;
+  if (!p || p.nodeType !== 1) return data;
+  let tt = '';
+  try { tt = String(globalThis.getComputedStyle(p).getPropertyValue('text-transform') || ''); } catch (e) { return data; }
+  switch (tt) {
+    case 'uppercase': return data.toUpperCase();
+    case 'lowercase': return data.toLowerCase();
+    case 'capitalize':
+      return data.replace(/(^|[\t\n\f\r ])([^\t\n\f\r ])/g, (m, ws, c) => ws + c.toUpperCase());
+    case 'math-auto': {
+      // The single-character test is about the ELEMENT's text, not about the
+      // slice the selection happens to cover: selecting the "x" out of "xy"
+      // copies a plain "x".
+      let whole = '';
+      try { whole = String(p.textContent || ''); } catch (e) { whole = data; }
+      if (Array.from(whole).length !== 1) return data;
+      return _mathAutoTransform(data);
+    }
+    default: return data;
+  }
+};
+// The rendered text of a range: `Range.toString()`'s walk, with each piece put
+// through its parent's text-transform.
+const _selectionRenderedText = (r) => {
+  let s = "";
+  const sc = r._sc, so = r._so, ec = r._ec, eo = r._eo;
+  const piece = (node, text) => _transformedTextData(node, text);
+  if (sc === ec && sc.nodeType === 3) return piece(sc, sc.data.slice(so, eo));
+  if (sc.nodeType === 3) s += piece(sc, sc.data.slice(so));
+  const common = r.commonAncestorContainer;
+  (function rec(n) {
+    for (let c = n.firstChild; c; c = c.nextSibling) {
+      if (c.nodeType === 3
+          && __obscura_bpCompare(c, 0, sc, so) === 1
+          && __obscura_bpCompare(c, c.data.length, ec, eo) === -1) {
+        s += piece(c, c.data);
+      }
+      rec(c);
+    }
+  })(common);
+  if (ec.nodeType === 3) s += piece(ec, ec.data.slice(0, eo));
+  return s;
+};
 globalThis.Selection = class Selection {
   constructor() {
     if (!__obscura_allowSelectionCtor)
@@ -49682,7 +50255,17 @@ globalThis.Selection = class Selection {
     return __obscura_bpCompare(node, 0, r._sc, r._so) >= 0
         && __obscura_bpCompare(node, len, r._ec, r._eo) <= 0;
   }
-  toString() { return this._range ? this._range.toString() : ''; }
+  // Selection.toString() is the RENDERED text, not the source text — which is why
+  // it is not `range.toString()` (DOM's Range concatenates raw `data`). The
+  // difference is `text-transform`: what a user selects and copies is what they
+  // see, so a `text-transform: uppercase` heading copies uppercase, and — the
+  // reason this exists — a single-letter `<mi>` copies as its ITALIC MATHEMATICAL
+  // character, because MathML's automatic italic is a text transform, not a font.
+  toString() {
+    const r = this._range;
+    if (!r) return '';
+    return _selectionRenderedText(r);
+  }
 
   // Selection.modify (a legacy-but-universal caret-movement primitive: it is how
   // an arrow key moves a text cursor). Only `character` granularity is honest
