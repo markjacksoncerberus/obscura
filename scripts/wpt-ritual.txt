@@ -567,3 +567,6 @@ dom/events/scrolling/wheel-event-composed.html
 # ── The contained arc (Quests #673–#675) — the containing block's held ground ──
 css/css-position/position-absolute-container-dynamic-002.html
 css/css-position/position-absolute-dynamic-containing-block.html
+css/css-position/sticky/position-sticky-top.html
+css/css-position/sticky/position-sticky-nested-top.html
+css/css-position/sticky/position-sticky-margins.html

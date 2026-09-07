@@ -25,6 +25,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F57** | ✅ [The Stuck Verdict](496-the-stuck-verdict.md) | **`position: sticky` — the other half of the overlay vocabulary (chosen over `float` after measuring both)** | `css/css-position/` 1167/1488 → **1200/1488**, 13 files up, 0 down | ⚔️⚔️ | **SECURED (Quests #676–#679, 2026-09-07).** THE HEADER NEVER FOLLOWED YOU DOWN THE PAGE. ⚠️ The engine's handling was worse than nothing: sticky was mapped to Taffy's `Relative` AND handed its insets, so a `top: 50px` header sat 50px low before anything scrolled. Insets no longer reach Taffy; the offset is computed from the scroll model and clamped to the containing block inset by the box's own margins. Nested sticky accumulates ancestors' shifts. ⭐ `float` was measured FIRST and rejected: `css/CSS2/floats*` is almost all reftests and its scoreable files already sit at 120/128 — worth doing for rendering, not for the score. ⛔ The offset does not reach the paint path. |
 | **F56** | ✅ [The Contained Verdict](495-the-contained-verdict.md) | **The containing block — `position: fixed` / `absolute` placed against the right box at last (a ⭐⭐⭐ carried by four arcs)** | `css-position` 1163/1488 → **1167/1488**, `css-scroll-snap` 584 → **592**, scroll list 856 → **861**, layout probe 551 → **553**; **0 files down anywhere** | ⚔️⚔️⚔️ | **SECURED (Quests #673–#675, 2026-09-07).** THE FIXED HEADER WAS NEVER FIXED — Taffy has no containing-block chain and both out-of-flow positions were mapped onto its `Absolute`, so a fixed box was placed against its DOM parent's padding box: `left: 100px` landed at 108px on any page with the default body margin. Out-of-flow boxes are now reparented in the LAYOUT tree only (which is allowed to differ from the DOM tree — `layout_parent` exists because it already does). ⭐ The chain is read from the DOM, not from the tree being edited, so a box comes back when its ancestor *becomes* positioned; ⭐ and an all-`auto`-inset box keeps its static position and is never moved. |
 | **F55** | ✅ [The Snapped Verdict](494-the-snapped-verdict.md) | **`css/css-scroll-snap/` — the untouched behavioural half of a realm whose parsing was already green** | realm 510/788 → **584/796**, 43 files up, 1 down | ⚔️⚔️ | **SECURED (Quests #667–#672, 2026-09-07).** THE CAROUSEL STOPPED BETWEEN SLIDES — `scroll-snap-type` and `scroll-snap-align` were parsed, computed, and acted on by nothing. Built on the previous arc's scroll model (this one was not attemptable before it): a snap position IS an alignment of one area inside the snapport, sharing `scrollIntoView`'s arithmetic. ⭐ Snap scope is TWO rules — cross-axis rejection when one axis snaps, mutual-visibility with a single-area fallback when both do. ⭐ The reported position is DERIVED, so a container snaps on layout and re-snaps when its areas move. Plus the CSS Scroll Snap 2 snap events (fired BEFORE `scrollend`) and, in the RUNNER, the WebDriver **wheel** action source that had been missing entirely. |
 | **F54** | ✅ [The Scrolled Verdict](493-the-scrolled-verdict.md) | **The scroll model — `css/cssom-view/scroll*`, `navigation-api/scroll-behavior/`, `dom/events/scrolling/` (untouched)** | scroll list 462/1579 → **814/1618** (50 files up, 0 down); `dom/events/scrolling` 9/71 → **34/72** (22 up, 0 down) | ⚔️⚔️⚔️ | **SECURED (Quests #650–#666, 2026-09-07).** THE BROWSER COULD NOT MOVE THE PAGE — `window.scrollTo` was an empty function, `window.scrollY` the literal `0`, the `Element` scroll operations converted their arguments and then did nothing, `scrollIntoView` set a click target and returned, and neither `scroll` nor `scrollend` existed anywhere. One *scrolling box* model now covers the viewport and every element. Three finds underneath it: the `overflow` shorthand never reached computed style (the #547 `background` bug, fourth instance); `scrollWidth`/`scrollHeight` were arithmetically wrong (Taffy's `content_size` clamps child offsets to zero); and ⭐⭐ **overflow propagates to the viewport**, which alone took `scrollintoview.html` 0/40 → 40/40. Zero-regression ritual 360 rows, 55,257/55,814 → 55,272/55,829. |
@@ -358,6 +359,46 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-09-07 — Quests #676–#679: **the stuck arc** (`position: sticky`)
+
+The outgoing pointer named `float` as the ⭐⭐⭐. It was **measured first**, and
+the answer was clear: `css/CSS2/floats*` is 378 probe rows of which the
+overwhelming majority are reftests, and its 19 scoreable files already sit at
+120/128. Float layout would win almost nothing on the scoreboard — it is still
+worth doing for *rendering*, and for the five `scrollIntoView-*-writing-mode*`
+files it blocks — so it was banked with a note saying why, and this arc took
+`position: sticky` instead: ~70 scoreable subtests, and the second half of the
+overlay vocabulary the containing-block arc started.
+
+⚠️ What the engine did was worse than doing nothing. `stylo_taffy` mapped
+`Position::Sticky` onto `taffy::Position::Relative` — right as far as it goes,
+because a sticky box does take part in flow — and then handed Taffy the insets.
+But a sticky box's insets are not an offset from where it sits; they are the
+distance from the **scrollport edge** it must keep once the scroll reaches it. So
+a `top: 50px` sticky header sat 50px low before anything had scrolled at all, and
+any engine computing the real offset on top of that would double-count it.
+
+Now the insets never reach Taffy, and the offset is computed from the same scroll
+positions everything else reads: pushed so the box keeps the inset's distance
+from the scrollport edge, never backwards, then clamped to its containing block's
+content box **inset by the box's own margins** — which is the clamp that makes
+each section's header hand over to the next one instead of piling up. It reaches
+`offsetTop`/`offsetLeft` (how every sticky test asks "has it stuck yet") and
+`getBoundingClientRect`, which carries it into hit-testing for free. Nested
+sticky accumulates its ancestors' shifts into the natural position, the
+containing block, and `offsetTop`'s subtraction of its `offsetParent`.
+
+`css/css-position/` 1167/1488 → 1200/1488, 13 files up, 0 down — and 1163 → 1200
+taken together with the containing-block arc. Zero real regressions across the
+ritual, the scroll probe list and the snap realm; every flagged row came back at
+or above baseline solo.
+
+**NEXT:** (1) ⭐⭐ the sticky offset in the PAINT path — the model is computed and
+only the renderer does not read it; (2) ⭐⭐ layout for iframe documents in the
+parent realm; (3) ⭐⭐ touch panning and keyboard scrolling; (4) ⭐ `float` layout,
+for rendering rather than for the score.
+
 
 ### 2026-09-07 — Quests #673–#675: **the contained arc** (the containing block)
 

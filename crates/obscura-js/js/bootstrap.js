@@ -6171,6 +6171,140 @@ function _lbSetScroll(el, axis, v) {
     undefined);
 }
 
+// ── position: sticky (CSS Position 3 §sticky) ───────────────────────────────
+// A sticky box is laid out in flow like a relative one and then SHIFTED so it
+// stays inside the scrollport while its containing block still has room. That is
+// the table header that keeps its labels, the section index that follows you down
+// a long document, the toolbar that stays reachable on a phone — the one piece of
+// overlay UI that does not take itself out of flow, and until the scroll model
+// existed there was nothing to compute it against.
+//
+// The layout engine underneath has no idea any of this is happening: the box tree
+// is a static snapshot. What CAN be computed is the offset, from the same scroll
+// positions everything else now reads — and the offset is the whole of what a
+// page can observe, through `offsetTop`, `offsetLeft` and the client rect.
+const _LB_STICKY_SIDES = { x: ['left', 'right'], y: ['top', 'bottom'] };
+// The scrolling box a sticky element is stuck INSIDE: its nearest scrollable
+// ancestor, or the viewport.
+function _lbStickyScroller(el) {
+  for (let p = el && el.parentElement; p; p = p.parentElement) {
+    if (_lbViewportScroller(p) || _lbInertRootScroller(p)) break;
+    if (_lbIsScrollContainer(p)) return p;
+  }
+  return _SCROLL_VIEWPORT;
+}
+// Does this document contain a sticky box at all? Almost none do, and the answer
+// only changes when the layout does — so one scan per layout snapshot buys every
+// other page out of the whole model.
+let _lbStickySeen = { key: -1, has: false };
+function _lbDocumentHasSticky() {
+  const d = _layoutRefresh();
+  const key = d ? d.key : 0;
+  if (_lbStickySeen.key === key) return _lbStickySeen.has;
+  let has = false;
+  try {
+    for (const el of globalThis.document.querySelectorAll('*')) {
+      const cs = globalThis.getComputedStyle(el);
+      if (cs && cs.position === 'sticky') { has = true; break; }
+    }
+  } catch (e) { has = false; }
+  _lbStickySeen = { key, has };
+  return has;
+}
+// The shift every STICKY ANCESTOR has already applied to this box. A sticky box
+// nested in another moves with it, and both its own constraint and its
+// `offsetTop` are measured from where the outer one currently sits — which is
+// what makes a sticky sub-heading hand over inside a sticky section header.
+function _lbStickyAncestorShift(el, axis) {
+  let acc = 0;
+  for (let p = el && el.parentElement; p; p = p.parentElement) {
+    const pb = _layoutBoxOf(p);
+    if (pb && pb.hasBox && pb.positioned) acc += _lbStickyOffset(p, axis);
+  }
+  return acc;
+}
+// How far this sticky box has been pushed along `axis`, in layout pixels.
+function _lbStickyOffset(el, axis) {
+  let cs = null;
+  try { cs = globalThis.getComputedStyle(el); } catch (e) { return 0; }
+  if (!cs || cs.position !== 'sticky') return 0;
+  const lb = _layoutBoxOf(el);
+  if (!lb || !lb.hasBox) return 0;
+  // The CONTAINING BLOCK: the nearest ancestor that generates a box, whose
+  // content edges are the far end of how far this box may travel. A sticky header
+  // stops at the bottom of its own section — that is what makes each section's
+  // header hand over to the next one instead of piling up.
+  const parent = el.parentElement;
+  const pb = parent ? _layoutBoxOf(parent) : null;
+  if (!pb || !pb.hasBox) return 0;
+  const box = _lbStickyScroller(el);
+  // Where the scrollport's start edge sits in the same document coordinates the
+  // layout gave us.
+  let portStart, portSize;
+  if (box === _SCROLL_VIEWPORT) {
+    const vp = _lbViewport();
+    portStart = _lbScrollBoxPos(_SCROLL_VIEWPORT, axis);
+    portSize = axis === 'x' ? vp.w : vp.h;
+  } else {
+    const sb = _layoutBoxOf(box);
+    if (!sb || !sb.hasBox) return 0;
+    portStart = (axis === 'x' ? sb.x + sb.bl : sb.y + sb.bt) + _lbScrollBoxPos(box, axis);
+    portSize = axis === 'x' ? Math.max(0, sb.width - sb.bl - sb.br)
+                            : Math.max(0, sb.height - sb.bt - sb.bb);
+  }
+  const [loSide, hiSide] = _LB_STICKY_SIDES[axis];
+  // Everything below is measured from where the box CURRENTLY is, which for a box
+  // inside another sticky one is not where the flow first put it.
+  const anc = _lbStickyAncestorShift(el, axis);
+  const natStart = (axis === 'x' ? lb.x : lb.y) + anc;
+  const size = axis === 'x' ? lb.width : lb.height;
+  // The containing block's content box, INSET BY THE ELEMENT'S OWN MARGINS —
+  // that is how far the box may travel. A sticky header with a 15px bottom margin
+  // stops 15px earlier, because the margin is part of what has to stay inside.
+  const px = (v) => { const n = parseFloat(v); return isFinite(n) ? n : 0; };
+  const mStart = px(cs.getPropertyValue(axis === 'x' ? 'margin-left' : 'margin-top'));
+  const mEnd = px(cs.getPropertyValue(axis === 'x' ? 'margin-right' : 'margin-bottom'));
+  const cbStart = (axis === 'x' ? pb.x + pb.bl + pb.pl : pb.y + pb.bt + pb.pt) + mStart + anc;
+  const cbEnd = (axis === 'x'
+    ? pb.x + pb.width - pb.br - pb.pr
+    : pb.y + pb.height - pb.bb - pb.pb) - mEnd + anc;
+  const inset = (side) => {
+    const v = cs.getPropertyValue(side);
+    if (!v || v === 'auto') return null;
+    const n = parseFloat(v);
+    return isFinite(n) ? n : null;
+  };
+  let offset = 0;
+  const lo = inset(loSide), hi = inset(hiSide);
+  if (lo !== null) {
+    // Stick to the START edge: never move backwards, never past the containing
+    // block's far edge.
+    const want = portStart + lo - natStart;
+    if (want > 0) offset = Math.min(want, Math.max(0, cbEnd - (natStart + size)));
+  }
+  if (hi !== null && offset === 0) {
+    const want = (portStart + portSize - hi) - (natStart + size);
+    if (want < 0) offset = Math.max(want, Math.min(0, cbStart - natStart));
+  }
+  return offset;
+}
+// Does this page have anything a sticky offset could even be computed from? A
+// document nothing has scrolled has every sticky box at rest, so the whole model
+// costs one boolean there.
+function _lbAnythingScrolled() {
+  if (_lbAnyElementScrolled) return true;
+  const wv = globalThis._winView;
+  return !!(wv && (wv.scrollX || wv.scrollY));
+}
+// The sticky shift for `el`, or 0 — cheap enough to sit in `getBoundingClientRect`
+// because a box that is not positioned at all cannot be sticky, and the layout
+// snapshot already says which those are.
+function _lbStickyShift(el, axis, lb) {
+  if (!lb || !_lbAnythingScrolled() || !_lbDocumentHasSticky()) return 0;
+  const own = lb.positioned ? _lbStickyOffset(el, axis) : 0;
+  return _lbStickyAncestorShift(el, axis) + own;
+}
+
 // How far the scrolling ancestors between `el` and the viewport have shifted it.
 // `getBoundingClientRect` is viewport-relative, so every one of those offsets
 // comes off the document-space box the layout engine handed us — that is what
@@ -7836,8 +7970,10 @@ class Element extends Node {
       const vx = lb.fixed ? 0 : _lbScrollBoxPos(_SCROLL_VIEWPORT, 'x');
       const vy = lb.fixed ? 0 : _lbScrollBoxPos(_SCROLL_VIEWPORT, 'y');
       return new globalThis.DOMRect(
-        lb.x - vx - (lb.fixed ? 0 : _lbAncestorScrollOffset(this, 'x')),
-        lb.y - vy - (lb.fixed ? 0 : _lbAncestorScrollOffset(this, 'y')),
+        lb.x - vx - (lb.fixed ? 0 : _lbAncestorScrollOffset(this, 'x'))
+          + _lbStickyShift(this, 'x', lb),
+        lb.y - vy - (lb.fixed ? 0 : _lbAncestorScrollOffset(this, 'y'))
+          + _lbStickyShift(this, 'y', lb),
         lb.width, lb.height);
     }
     // A display:none element (self or ancestor) generates no box: an all-zero rect.
@@ -70589,11 +70725,18 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   const _offsetDelta = (el, axis) => {
     const b = _layoutResolve(el);
     if (b === 'none' || !b) return 0;
+    // A sticky box's offset is measured where it CURRENTLY is, not where the flow
+    // first put it: `offsetTop` is how every sticky test asks "has it stuck yet".
+    const st = _lbStickyShift(el, axis, b);
     const p = (typeof el.offsetParent !== 'undefined') ? el.offsetParent : null;
-    if (!p) return _lbRound(axis === 'y' ? b.y : b.x);
+    if (!p) return _lbRound((axis === 'y' ? b.y : b.x) + st);
     const pb = _layoutBoxOf(p);
-    if (!pb) return _lbRound(axis === 'y' ? b.y : b.x);
-    return _lbRound(axis === 'y' ? (b.y - pb.y - pb.bt) : (b.x - pb.x - pb.bl));
+    if (!pb) return _lbRound((axis === 'y' ? b.y : b.x) + st);
+    // …and the offsetParent may have been shifted too.
+    const pst = _lbStickyShift(p, axis, pb);
+    return _lbRound(axis === 'y'
+      ? (b.y + st - pb.y - pst - pb.bt)
+      : (b.x + st - pb.x - pst - pb.bl));
   };
   const _offsetMembers = {
     offsetTop: function() { _csTouch(); return _offsetDelta(this, 'y'); },
