@@ -195,6 +195,24 @@ TESTDRIVER_BRIDGE_JS = r"""
             cmds.push({kind:'mouse', type:'mouseReleased', x:Math.round(px), y:Math.round(py),
                        button:btnName(a.button || 0), buttons, clickCount:1});
           }
+        } else if (s.type === 'wheel') {
+          // A WHEEL action source. WebDriver's `scroll` action names an origin
+          // point and a delta; the browser fires a `wheel` event there and, if
+          // nothing cancels it, scrolls the nearest scrollable ancestor by that
+          // delta. Without this the whole `wheel-event-*` family and every
+          // "on wheel scroll" snap test sits waiting for input that never comes —
+          // and hangs the FILE, not just the test, because testdriver's action
+          // promise never settles.
+          if (a.type === 'scroll') {
+            let x = a.x || 0, y = a.y || 0;
+            const origin = a.origin;
+            if (origin && typeof origin === 'object' && origin.getBoundingClientRect) {
+              const r = origin.getBoundingClientRect();
+              x = r.left + (a.x || 0); y = r.top + (a.y || 0);
+            }
+            cmds.push({kind:'wheel', x:Math.round(x), y:Math.round(y),
+                       dx:(a.deltaX || 0), dy:(a.deltaY || 0)});
+          }
         } else if (s.type === 'key') {
           if (a.type === 'keyDown' || a.type === 'keyUp') {
             const m = mapKey(a.value);
@@ -306,11 +324,50 @@ TESTDRIVER_BRIDGE_JS = r"""
       _mouse = {pressTarget: null, downX: 0, downY: 0, moved: false};
     }
   };
+  // The nearest ancestor (or the viewport) that can actually take the delta.
+  const scrollableFrom = (node, dx, dy) => {
+    for (var n = node; n && n.nodeType === 1; n = n.parentElement) {
+      var cs = null;
+      try { cs = getComputedStyle(n); } catch (e) { cs = null; }
+      if (!cs) continue;
+      var ox = cs.overflowX, oy = cs.overflowY;
+      var scrolls = (v) => v && v !== 'visible' && v !== 'clip';
+      if (!scrolls(ox) && !scrolls(oy)) continue;
+      if (dy && n.scrollHeight > n.clientHeight) return n;
+      if (dx && n.scrollWidth > n.clientWidth) return n;
+    }
+    return null;
+  };
+  const fireWheelCmd = (c) => {
+    var target = hitTest(c.x, c.y);
+    var ev = null;
+    try {
+      ev = new WheelEvent('wheel', {bubbles: true, cancelable: true, composed: true,
+        clientX: c.x, clientY: c.y, screenX: c.x, screenY: c.y,
+        deltaX: c.dx, deltaY: c.dy, deltaZ: 0, deltaMode: 0});
+    } catch (e) { ev = null; }
+    var prevented = false;
+    if (ev && target) {
+      var _pt = globalThis.__obscura_trusted_input; globalThis.__obscura_trusted_input = true;
+      try { target.dispatchEvent(ev); } catch (e) {}
+      globalThis.__obscura_trusted_input = _pt;
+      prevented = !!ev.defaultPrevented;
+    }
+    // `preventDefault()` on a wheel event is how a page says "I am handling this
+    // scroll myself" — honouring it is the whole point of the cancelable flag.
+    if (prevented) return;
+    var scroller = scrollableFrom(target, c.dx, c.dy);
+    try {
+      if (scroller) scroller.scrollBy(c.dx, c.dy);
+      else window.scrollBy(c.dx, c.dy);
+    } catch (e) {}
+  };
   const dispatchCmds = (cmds) => {
     for (var i = 0; i < cmds.length; i++) {
       var c = cmds[i];
       if (c.kind === 'mouse') fireMouseCmd(c);
       else if (c.kind === 'key') fireKeyCmd(c);
+      else if (c.kind === 'wheel') fireWheelCmd(c);
     }
   };
 

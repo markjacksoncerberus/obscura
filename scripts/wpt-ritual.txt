@@ -551,3 +551,15 @@ css/cssom-view/scroll-offsets-fractional-zoom.html
 dom/events/scrolling/scroll-event-fired-to-element.html
 dom/events/scrolling/scrollend-event-handler-content-attributes.html
 dom/events/scrolling/scrollend-event-not-fired-on-no-scroll.html
+
+# ── The snapped arc (Quests #667–#672) — the snap model's own held ground ──
+css/css-scroll-snap/snap-to-visible-areas-both.html
+css/css-scroll-snap/snap-to-combination-of-two-elements-1.html
+css/css-scroll-snap/overflowing-snap-areas.html
+css/css-scroll-snap/snap-inline-block.html
+css/css-scroll-snap/scroll-snap-type.html
+css/css-scroll-snap/resnap-on-layout-is-immediate.html
+css/css-scroll-snap/snap-after-relayout/not-resnap-outside-proximity-threshold.html
+css/css-scroll-snap/snap-events/scrollsnapchange/scrollsnapchange-on-programmatic-scroll.tentative.html
+css/css-scroll-snap/snap-events/scrollsnapchanging/scrollsnapchanging-on-programmatic-scroll.tentative.html
+dom/events/scrolling/wheel-event-composed.html

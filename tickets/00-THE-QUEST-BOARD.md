@@ -25,6 +25,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F55** | ✅ [The Snapped Verdict](494-the-snapped-verdict.md) | **`css/css-scroll-snap/` — the untouched behavioural half of a realm whose parsing was already green** | realm 510/788 → **584/796**, 43 files up, 1 down | ⚔️⚔️ | **SECURED (Quests #667–#672, 2026-09-07).** THE CAROUSEL STOPPED BETWEEN SLIDES — `scroll-snap-type` and `scroll-snap-align` were parsed, computed, and acted on by nothing. Built on the previous arc's scroll model (this one was not attemptable before it): a snap position IS an alignment of one area inside the snapport, sharing `scrollIntoView`'s arithmetic. ⭐ Snap scope is TWO rules — cross-axis rejection when one axis snaps, mutual-visibility with a single-area fallback when both do. ⭐ The reported position is DERIVED, so a container snaps on layout and re-snaps when its areas move. Plus the CSS Scroll Snap 2 snap events (fired BEFORE `scrollend`) and, in the RUNNER, the WebDriver **wheel** action source that had been missing entirely. |
 | **F54** | ✅ [The Scrolled Verdict](493-the-scrolled-verdict.md) | **The scroll model — `css/cssom-view/scroll*`, `navigation-api/scroll-behavior/`, `dom/events/scrolling/` (untouched)** | scroll list 462/1579 → **814/1618** (50 files up, 0 down); `dom/events/scrolling` 9/71 → **34/72** (22 up, 0 down) | ⚔️⚔️⚔️ | **SECURED (Quests #650–#666, 2026-09-07).** THE BROWSER COULD NOT MOVE THE PAGE — `window.scrollTo` was an empty function, `window.scrollY` the literal `0`, the `Element` scroll operations converted their arguments and then did nothing, `scrollIntoView` set a click target and returned, and neither `scroll` nor `scrollend` existed anywhere. One *scrolling box* model now covers the viewport and every element. Three finds underneath it: the `overflow` shorthand never reached computed style (the #547 `background` bug, fourth instance); `scrollWidth`/`scrollHeight` were arithmetically wrong (Taffy's `content_size` clamps child offsets to zero); and ⭐⭐ **overflow propagates to the viewport**, which alone took `scrollintoview.html` 0/40 → 40/40. Zero-regression ritual 360 rows, 55,257/55,814 → 55,272/55,829. |
 | **F53** | ✅ [The Traversable Verdict](492-the-traversable-verdict.md) | **`navigation-api/*` — the whole realm, untouched in 624 quests, and the session history underneath it** | realm 1/543 → **230/540**, 179 files up, 7 down (all `0/N`) | ⚔️⚔️⚔️ | **SECURED (Quests #625–#649, 2026-09-06).** `window.navigation` did not exist, and neither did a session history: `history.length` was the constant 1 and `go`/`back`/`forward` were empty functions — the back button of a browser that cannot go back. A real per-window session history (key = the slot, id = the version), mirrored into a cell the Rust `Page` owns so it outlives the document; **a frame is a traversable too** (an `<iframe>` had no `history`, no `navigation`, dead `location` methods, and a link inside it navigated the WHOLE PAGE); the exact event/promise ordering the realm asserts; the push-vs-replace rules 316 of its files are written around; forms, downloads, `<area>`, `precommitHandler`, focus reset, `window.stop()`. ⚠️ Also fixed the RUNNER, which could not see any test registered from an ES module (63 files here alone). |
 | **F52** | ✅ [The Mathematical Verdict](491-the-mathematical-verdict.md) | **`mathml/*` — the whole realm, untouched in 604 quests** | realm 719/3407 → **2850/3409**, 92 files up, 0 down, 79 at 100% | ⚔️⚔️⚔️ | **SECURED (Quests #605–#624, 2026-09-06).** ⭐⭐⭐ **THERE WAS NO MATHML** — `is_mathml_element()` returned `false` with the comment `// not implemented.....`, there was no MathML UA stylesheet anywhere, MathML elements wrapped as `HTMLUnknownElement` with UPPERCASED tag names, and `<mspace width="20px">` measured 0×0 — which is the whole realm, because nearly every `has_<element>` in the shared feature-detection helper resolves to `has_mspace`. ⭐⭐ Foreign content keeps its case (**an SVG bug too**). ⭐⭐ MathML rows are flex, because whitespace between MathML elements is not content. ⭐⭐ Operator spacing hoists to the embellished operator. ⭐⭐ `Selection.toString()` returns RENDERED text (italic `<mi>` 0/112→**112/112**). ⭐⭐⭐ **css-logical never reached the physical properties** — engine-wide, `css/css-logical` 17/269→**167/269**. ⭐⭐ `font-size: math` derived structurally (stylo compiles it for Gecko only). ⛔ Not MathML layout: no fraction bars, no stretchy glyphs, no MATH-table script shifts; `display: math` unparseable here; operator dictionary unimplemented. ⭐ **Found, not fixed: `position: fixed` is not viewport-relative (`left:100px` → 108px) — engine-wide.** |
@@ -356,6 +357,48 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-09-07 — Quests #667–#672: **the snapped arc** (`css/css-scroll-snap/`)
+
+Chosen straight off the previous arc's own next-leverage list — *"`css-scroll-snap`
+(93 files, untouched) now has a scroll model to snap"* — and measured before
+committing: the realm's `parsing/` subdirectory was already green from an earlier
+arc, and essentially every remaining behavioural file read `0/1`. The properties
+were parsed, computed, and acted on by nothing at all: `scroll-snap-type: y
+mandatory` on a container and `scroll-snap-align: start` on its children
+described a set of positions that meant something, and every scroll went straight
+past them.
+
+A snap position is an **alignment of one area inside the snapport** — exactly
+what `scrollIntoView` computes — so both share one implementation rather than two
+that can disagree. ⭐ **Snap scope turned out to be two rules, not one**: with a
+single axis snapping, a candidate can be rejected outright for being off-screen
+along the other (which is what stops a gallery scrolling down from snapping to a
+picture parked far off to the right); with both axes snapping, neither cross
+position is known until both are chosen, so the axes are picked independently —
+different elements may supply them — and the *pair* is then checked, falling back
+to the single nearest area that satisfies both. Neither rule alone passes both of
+the tests that pin them down.
+
+⭐ **Re-snapping is not an event, it is the truth.** A snapping container is never
+at rest between snap positions: it snaps the moment it has areas, before any
+script runs, and re-snaps when a layout change moves them. So the reported
+position is *derived* from the raw one rather than stored — memoized against the
+layout snapshot — which is what makes a carousel that has never been scrolled
+start on a slide, and what makes the whole `snap-after-relayout/` family pass
+without any of it needing a scroll.
+
+Also: the CSS Scroll Snap 2 snap events as a real `SnapEvent` with
+`snapTargetBlock`/`snapTargetInline` (⚠️ fired BEFORE `scrollend` — WPT's own
+helper stops listening the moment `scrollend` arrives), and ⚠️ a **runner** fix
+that had been hiding whole files: the testdriver bridge had no WebDriver **wheel**
+action source, so every `wheel-event-*` test hung rather than failed.
+
+**NEXT:** (1) ⭐⭐⭐ the `position: absolute`/`fixed` containing block — one fix,
+now the top blocker in two realms; (2) ⭐⭐⭐ `float` layout (carried); (3) ⭐⭐
+touch panning and keyboard scrolling behind a `touch-action` model; (4) ⭐ the
+`scroll-initial-target` / `scroll-start` family.
+
 
 ### 2026-09-07 — Quests #650–#666: **the scrolled arc** (the scroll model)
 

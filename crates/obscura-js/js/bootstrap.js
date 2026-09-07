@@ -391,7 +391,11 @@ const _EH_HANDLER_NAMES = ('onabort onauxclick onbeforeinput onbeforematch ' +
   'onfocus onformdata oninput oninvalid onkeydown onkeypress onkeyup onload ' +
   'onloadeddata onloadedmetadata onloadstart onmousedown onmouseenter ' +
   'onmouseleave onmousemove onmouseout onmouseover onmouseup onpaste onpause ' +
-  'onplay onplaying onprogress onratechange onreset onresize onscroll onscrollend ' +
+  'onplay onplaying onprogress onratechange onreset onresize onscroll onscrollend '
+  // CSS Scroll Snap 2: the snap events. `checkSnapEventSupport` in WPT's own
+  // helper decides the whole feature is missing on `window.onscrollsnapchange
+  // === undefined`, so the handler has to exist before any of it can be measured.
+  + 'onscrollsnapchange onscrollsnapchanging ' +
   'onsecuritypolicyviolation onseeked onseeking onselect onselectionchange ' +
   'onselectstart onslotchange onstalled ' +
   // Pointer Events adds its own GlobalEventHandlers. A page that only listens for
@@ -5673,7 +5677,8 @@ const _lbScrollKey = (box) => (box === _SCROLL_VIEWPORT ? '#viewport' : box);
 function _lbScrollBoxRange(box, axis) {
   return box === _SCROLL_VIEWPORT ? _lbViewportRange(axis) : _lbScrollRange(box, axis);
 }
-function _lbScrollBoxPos(box, axis) {
+// The position the box is ACTUALLY holding, before snapping has an opinion.
+function _lbRawScrollPos(box, axis) {
   if (box === _SCROLL_VIEWPORT) {
     const wv = globalThis._winView;
     const raw = wv ? (axis === 'x' ? wv.scrollX : wv.scrollY) : 0;
@@ -5689,6 +5694,48 @@ function _lbScrollBoxPos(box, axis) {
   const r = _lbScrollRange(box, axis);
   return Math.min(r.max, Math.max(r.min, stored));
 }
+// …and the position the page is entitled to READ. A snapping container is never
+// at rest between snap positions: it snaps the moment it has areas to snap to,
+// and it RE-snaps when a layout change moves them — which is why the reported
+// position is derived rather than stored, and why a carousel that has never been
+// scrolled still starts on a slide.
+//
+// Memoized against the layout snapshot and the raw offsets, so the per-read cost
+// on a page with no `scroll-snap-type` anywhere is one `getComputedStyle`.
+const _lbSnapCache = new WeakMap();
+let _lbViewportSnap = null;
+function _lbScrollBoxPos(box, axis) {
+  const rawX = _lbRawScrollPos(box, 'x'), rawY = _lbRawScrollPos(box, 'y');
+  // Mid-glide the box really IS between two snap positions, and a page watching
+  // a smooth scroll has to see that; the animation was aimed at a snap position
+  // to begin with, so it still lands on one.
+  if (_lbSnapDepth > 0 || _lbScrollAnims.has(_lbScrollKey(box))) {
+    return axis === 'x' ? rawX : rawY;
+  }
+  const d = _layoutRefresh();
+  const key = d ? d.key : 0;
+  let hit = box === _SCROLL_VIEWPORT ? _lbViewportSnap : _lbSnapCache.get(box);
+  if (!hit || hit.key !== key || hit.rawX !== rawX || hit.rawY !== rawY) {
+    let out;
+    _lbSnapDepth++;
+    try { out = _lbApplySnap(box, rawX, rawY); }
+    catch (e) { out = { x: rawX, y: rawY, block: null, inline: null }; }
+    finally { _lbSnapDepth--; }
+    const rx = _lbScrollBoxRange(box, 'x'), ry = _lbScrollBoxRange(box, 'y');
+    hit = {
+      key, rawX, rawY,
+      x: Math.min(rx.max, Math.max(rx.min, out.x)),
+      y: Math.min(ry.max, Math.max(ry.min, out.y)),
+      block: out.block || null, inline: out.inline || null,
+    };
+    if (box === _SCROLL_VIEWPORT) _lbViewportSnap = hit; else _lbSnapCache.set(box, hit);
+  }
+  return axis === 'x' ? hit.x : hit.y;
+}
+// Re-entrancy guard: `_lbApplySnap` measures boxes and ranges, and anything it
+// touches that asks for a scroll position must get the RAW one — otherwise
+// deciding where to snap would ask where we snapped to.
+let _lbSnapDepth = 0;
 // Store one axis, clamped. Returns whether the position actually MOVED — which
 // is what decides whether a `scroll` event is owed.
 function _lbScrollBoxWrite(box, axis, v) {
@@ -5747,6 +5794,78 @@ const _lbQueueScrollEvent = (box) => _lbQueueScrollEventOfType(box, 'scroll');
 // never overtake it.
 const _lbQueueScrollEnd = (box) => _lbQueueScrollEventOfType(box, 'scrollend');
 
+// ── The snap events (CSS Scroll Snap 2) ─────────────────────────────────────
+// A carousel that has snapped needs to know WHICH slide it landed on, and the
+// alternative every page ships today is measuring every child's rect on every
+// scroll. `scrollsnapchanging` fires while the target is still moving;
+// `scrollsnapchange` fires once it has come to rest on a new one.
+const _lbSnapSeen = new WeakMap();      // scrolling box -> {ing:{…}, ed:{…}}
+let _lbViewportSnapSeen = null;
+function _lbSnapSeenOf(box) {
+  if (box === _SCROLL_VIEWPORT) return _lbViewportSnapSeen || (_lbViewportSnapSeen = {});
+  let r = _lbSnapSeen.get(box);
+  if (!r) { r = {}; _lbSnapSeen.set(box, r); }
+  return r;
+}
+function _lbFireSnapEvent(box, type, block, inline) {
+  // The listener is the DOCUMENT for the viewport's own scrolling box — and that
+  // is the only case where a snap event bubbles.
+  const t = box === _SCROLL_VIEWPORT ? (globalThis.document || null) : box;
+  if (!t) return;
+  try {
+    const ev = new globalThis.SnapEvent(type, {
+      bubbles: box === _SCROLL_VIEWPORT, cancelable: false,
+      snapTargetBlock: block || null, snapTargetInline: inline || null,
+    });
+    ev._isTrusted = true;
+    _dispatchSpec(t, ev, false);
+  } catch (e) {}
+}
+// `phase` is 'ing' (the target changed mid-scroll) or 'ed' (it came to rest).
+function _lbNotifySnap(box, phase) {
+  const el = box === _SCROLL_VIEWPORT
+    ? (globalThis.document && (globalThis.document.scrollingElement || globalThis.document.documentElement))
+    : box;
+  if (!el || !_lbSnapTypeOf(el)) return;
+  // Reading the position is what computes (and caches) the snap targets.
+  _lbScrollBoxPos(box, 'y');
+  const hit = box === _SCROLL_VIEWPORT ? _lbViewportSnap : _lbSnapCache.get(box);
+  if (!hit) return;
+  const seen = _lbSnapSeenOf(box);
+  const prev = seen[phase];
+  if (prev && prev.block === hit.block && prev.inline === hit.inline) return;
+  seen[phase] = { block: hit.block, inline: hit.inline };
+  // The FIRST resting target is where the container started, not a change.
+  if (prev === undefined && phase === 'ed') return;
+  if (prev === undefined && phase === 'ing') return;
+  const t = box === _SCROLL_VIEWPORT ? (globalThis.document || null) : box;
+  const key = _lbScrollKey(box) + '#' + phase;
+  if (_lbSnapEventQueued.has(key)) return;
+  _lbSnapEventQueued.add(key);
+  const run = () => {
+    _lbSnapEventQueued.delete(key);
+    const cur = box === _SCROLL_VIEWPORT ? _lbViewportSnap : _lbSnapCache.get(box);
+    _lbFireSnapEvent(box, phase === 'ing' ? 'scrollsnapchanging' : 'scrollsnapchange',
+      cur ? cur.block : null, cur ? cur.inline : null);
+  };
+  try { globalThis.setTimeout(run, 0); } catch (e) { try { run(); } catch (e2) {} }
+}
+const _lbSnapEventQueued = new Set();
+// The resting targets have to be seeded before the first scroll, or the initial
+// snap (which every mandatory container performs on layout) would read as a
+// change and fire an event nobody scrolled for.
+function _lbSeedSnapSeen(box) {
+  const seen = _lbSnapSeenOf(box);
+  if (seen.ed !== undefined) return;
+  const el = box === _SCROLL_VIEWPORT
+    ? (globalThis.document && (globalThis.document.scrollingElement || globalThis.document.documentElement))
+    : box;
+  if (!el || !_lbSnapTypeOf(el)) return;
+  _lbScrollBoxPos(box, 'y');
+  const hit = box === _SCROLL_VIEWPORT ? _lbViewportSnap : _lbSnapCache.get(box);
+  if (hit) { seen.ed = { block: hit.block, inline: hit.inline }; seen.ing = seen.ed; }
+}
+
 // ── "Perform a scroll" (CSSOM View §"perform a scroll") ─────────────────────
 // One in-flight smooth scroll per box. Anything else arriving at the same box —
 // another smooth scroll, an instant one, or a bare `scrollTop =` — INTERRUPTS
@@ -5761,10 +5880,11 @@ const _lbNow = () => {
 function _lbCancelScrollAnim(box, interrupted) {
   const key = _lbScrollKey(box);
   const a = _lbScrollAnims.get(key);
-  if (!a) return;
+  if (!a) return false;
   _lbScrollAnims.delete(key);
   try { globalThis.cancelAnimationFrame(a.raf); } catch (e) {}
   try { a.settle({ interrupted: !!interrupted }); } catch (e) {}
+  return true;
 }
 // `auto` is not a synonym for "instant": it defers to the scrolling box's own
 // `scroll-behavior`, which is how a stylesheet — with no script at all — makes
@@ -5778,18 +5898,221 @@ function _lbResolveScrollBehavior(box, behavior) {
   try { cs = el ? globalThis.getComputedStyle(el) : null; } catch (e) { cs = null; }
   return (cs && cs.scrollBehavior === 'smooth') ? 'smooth' : 'instant';
 }
+// ── Scroll snapping (CSS Scroll Snap 1) ─────────────────────────────────────
+// A carousel that lands between two slides is broken, and so is a photo gallery
+// that stops half a picture along. Snapping is the page telling the browser
+// "these are the positions that mean something" — and until there was a scroll
+// model there was nothing to say it to.
+//
+// Every scroll that reaches `_lbPerformScroll` passes through here, so a
+// `scrollTop =`, a `scrollTo`, a `scrollIntoView` and a smooth glide all land on
+// the same positions. The maths is `_lbAlignScroll`'s: a snap position IS an
+// alignment of one area inside the snapport, which is exactly what
+// `scrollIntoView` computes — so there is one implementation of "put this box
+// there", not two that can disagree.
+function _lbSnapTypeOf(el) {
+  let cs = null;
+  try { cs = globalThis.getComputedStyle(el); } catch (e) { cs = null; }
+  const v = ((cs && cs.scrollSnapType) || 'none').trim();
+  if (!v || v === 'none') return null;
+  const t = v.split(/\s+/);
+  // `scroll-snap-type: x` means `x proximity` — the strictness is optional and
+  // proximity is the initial one.
+  return { axis: t[0], strict: t[1] === 'mandatory' ? 'mandatory' : 'proximity' };
+}
+// `scroll-snap-align: <align>{1,2}` — BLOCK axis first, then inline; one value
+// sets both. These are the SCROLL CONTAINER's axes, not the element's own.
+function _lbSnapAlignOf(el) {
+  let cs = null;
+  try { cs = globalThis.getComputedStyle(el); } catch (e) { cs = null; }
+  const v = ((cs && cs.scrollSnapAlign) || 'none').trim();
+  const t = v.split(/\s+/);
+  return { block: t[0] || 'none', inline: t.length > 1 ? t[1] : (t[0] || 'none') };
+}
+// The scroll position `x`/`y` adjusted to the nearest snap position, or the
+// position unchanged when the container does not snap.
+function _lbApplySnap(box, x, y) {
+  const doc = globalThis.document;
+  const el = box === _SCROLL_VIEWPORT
+    ? (doc && (doc.scrollingElement || doc.documentElement))
+    : box;
+  if (!el) return { x, y, block: null, inline: null };
+  const type = _lbSnapTypeOf(el);
+  if (!type) return { x, y, block: null, inline: null };
+  const flow = _lbFlow(el);
+  let snapX = false, snapY = false;
+  switch (type.axis) {
+    case 'x': snapX = true; break;
+    case 'y': snapY = true; break;
+    case 'block': if (flow.xLogical === 'block') snapX = true; else snapY = true; break;
+    case 'inline': if (flow.xLogical === 'inline') snapX = true; else snapY = true; break;
+    case 'both': snapX = true; snapY = true; break;
+    default: return { x, y, block: null, inline: null };
+  }
+  // The SNAPPORT: the scrollport reduced by the container's `scroll-padding` —
+  // the strip a sticky header covers, which nothing should be snapped under.
+  let originX, originY, clientW, clientH;
+  if (box === _SCROLL_VIEWPORT) {
+    const vp = _lbViewport();
+    originX = 0; originY = 0; clientW = vp.w; clientH = vp.h;
+  } else {
+    const pb = _layoutBoxOf(el);
+    if (!pb || !pb.hasBox) return { x, y, block: null, inline: null };
+    originX = pb.x + pb.bl; originY = pb.y + pb.bt;
+    clientW = Math.max(0, pb.width - pb.bl - pb.br);
+    clientH = Math.max(0, pb.height - pb.bt - pb.bb);
+  }
+  const padL = _lbInsetPx(el, 'scroll-padding-left'), padR = _lbInsetPx(el, 'scroll-padding-right');
+  const padT = _lbInsetPx(el, 'scroll-padding-top'), padB = _lbInsetPx(el, 'scroll-padding-bottom');
+  // Scanning every descendant for `scroll-snap-align` is the expensive half of
+  // this, and the answer only changes when the layout does — so it is cached
+  // against the layout snapshot. Without it a page that reads a scroll position
+  // in a loop re-runs a whole-subtree `getComputedStyle` sweep every time.
+  const lkey = (() => { const d = _layoutRefresh(); return d ? d.key : 0; })();
+  const cached = _lbSnapAreaCache.get(el);
+  if (cached && cached.key === lkey && cached.snapX === snapX && cached.snapY === snapY) {
+    return _lbSnapChoose(cached.recs, x, y, box, snapX, snapY, type, flow,
+      clientW, clientH, padL, padR, padT, padB);
+  }
+  let areas;
+  try { areas = el.querySelectorAll('*'); } catch (e) { return { x, y, block: null, inline: null }; }
+  // One record per snap AREA — the element's border box grown by its
+  // `scroll-margin` — carrying the position each axis would land on and the
+  // extent it occupies, because both questions get asked about the same box.
+  const recs = [];
+  for (const a of areas) {
+    const al = _lbSnapAlignOf(a);
+    if (al.block === 'none' && al.inline === 'none') continue;
+    const ab = _layoutBoxOf(a);
+    if (!ab || !ab.hasBox) continue;
+    const ml = _lbInsetPx(a, 'scroll-margin-left'), mr = _lbInsetPx(a, 'scroll-margin-right');
+    const mt = _lbInsetPx(a, 'scroll-margin-top'), mb = _lbInsetPx(a, 'scroll-margin-bottom');
+    const sx = ab.x - ml - originX, sw = ab.width + ml + mr;
+    const sy = ab.y - mt - originY, sh = ab.height + mt + mb;
+    const alignX = _lbPhysicalAlign(flow.xLogical === 'block' ? al.block : al.inline, flow.xReversed);
+    const alignY = _lbPhysicalAlign(flow.yLogical === 'block' ? al.block : al.inline, flow.yReversed);
+    recs.push({
+      el: a, sx, ex: sx + sw, sy, ey: sy + sh, w: sw, h: sh,
+      px: (snapX && alignX !== 'none') ? _lbAlignScroll(alignX, sx, sw, clientW, 0, padL, padR) : null,
+      py: (snapY && alignY !== 'none') ? _lbAlignScroll(alignY, sy, sh, clientH, 0, padT, padB) : null,
+    });
+  }
+  _lbSnapAreaCache.set(el, { key: lkey, snapX, snapY, recs });
+  return _lbSnapChoose(recs, x, y, box, snapX, snapY, type, flow,
+    clientW, clientH, padL, padR, padT, padB);
+}
+const _lbSnapAreaCache = new WeakMap();
+// Choose the snap position(s) from an already-measured area list.
+function _lbSnapChoose(recs, x, y, box, snapX, snapY, type, flow,
+                       clientW, clientH, padL, padR, padT, padB) {
+  if (!recs.length) return { x, y, block: null, inline: null };
+  const rx = _lbScrollBoxRange(box, 'x'), ry = _lbScrollBoxRange(box, 'y');
+  const clampX = (v) => Math.min(rx.max, Math.max(rx.min, v));
+  const clampY = (v) => Math.min(ry.max, Math.max(ry.min, v));
+  // Is this area actually ON SCREEN once the container is at (px, py)?
+  const visible = (r, px, py) =>
+    r.ex > px + padL && r.sx < px + clientW - padR &&
+    r.ey > py + padT && r.sy < py + clientH - padB;
+  // `proximity` means "snap only if you are nearly there". The spec deliberately
+  // leaves the range to the UA; 30% of the snapport is the shipping engines'
+  // choice, and `not-resnap-outside-proximity-threshold` is written around a
+  // threshold small enough to leave the midpoint between two snap points alone.
+  const near = (d, size) => type.strict === 'mandatory' || d <= size * 0.3;
+  // ⭐ AN AREA BIGGER THAN THE SNAPPORT cannot be aligned to it — there is no one
+  // position that shows it. So every position that keeps the snapport INSIDE the
+  // area is a valid snap position, and the nearest of those is wherever you
+  // already are. Without this rule, scrolling within a full-bleed section snaps
+  // you back to its top edge on every nudge.
+  const coverPos = (r, start, size, client, padStart, padEnd, intended) => {
+    const region = client - padStart - padEnd;
+    if (size <= region) return null;
+    const lo = (start + size) - (client - padEnd);   // area's end at the region's end
+    const hi = start - padStart;                     // area's start at the region's start
+    return Math.min(Math.max(intended, Math.min(lo, hi)), Math.max(lo, hi));
+  };
+
+  // ⭐ SNAP SCOPE, and why it is two rules rather than one.
+  //
+  // When only ONE axis snaps, the other axis stays where it is, so a candidate
+  // can be rejected outright for being off-screen along it — that is what stops
+  // a gallery scrolling DOWN from snapping to a picture parked far off to the
+  // right, leaving the reader at a blank scrollport.
+  //
+  // When BOTH axes snap, neither cross position is known until both are chosen,
+  // so the axes are picked independently first — different elements may supply
+  // them, and often should — and the PAIR is then checked. If the two areas are
+  // not both on screen at the position they jointly imply, the container falls
+  // back to the single nearest area that can satisfy both axes at once.
+  let bestX = null, bestXD = Infinity, bestY = null, bestYD = Infinity;
+  for (const r of recs) {
+    if (r.px !== null && (snapY || (r.ey > y + padT && r.sy < y + clientH - padB))) {
+      const cover = coverPos(r, r.sx, r.w, clientW, padL, padR, x);
+      const p = clampX(cover === null ? r.px : cover), d = Math.abs(p - x);
+      if (d < bestXD) { bestXD = d; bestX = r; bestX.pxc = p; }
+    }
+    if (r.py !== null && (snapX || (r.ex > x + padL && r.sx < x + clientW - padR))) {
+      const cover = coverPos(r, r.sy, r.h, clientH, padT, padB, y);
+      const p = clampY(cover === null ? r.py : cover), d = Math.abs(p - y);
+      if (d < bestYD) { bestYD = d; bestY = r; bestY.pyc = p; }
+    }
+  }
+  let outX = (bestX && near(bestXD, clientW)) ? bestX.pxc : x;
+  let outY = (bestY && near(bestYD, clientH)) ? bestY.pyc : y;
+  let elX = (bestX && near(bestXD, clientW)) ? bestX.el : null;
+  let elY = (bestY && near(bestYD, clientH)) ? bestY.el : null;
+  if (snapX && snapY && bestX && bestY && bestX !== bestY &&
+      !(visible(bestX, outX, outY) && visible(bestY, outX, outY))) {
+    let pick = null, pickD = Infinity;
+    for (const r of recs) {
+      if (r.px === null || r.py === null) continue;
+      const cx2 = coverPos(r, r.sx, r.w, clientW, padL, padR, x);
+      const cy2 = coverPos(r, r.sy, r.h, clientH, padT, padB, y);
+      const px = clampX(cx2 === null ? r.px : cx2), py = clampY(cy2 === null ? r.py : cy2);
+      const dx = px - x, dy = py - y, d = dx * dx + dy * dy;
+      if (d < pickD) { pickD = d; pick = { px, py, el: r.el }; }
+    }
+    if (pick) { outX = pick.px; outY = pick.py; elX = pick.el; elY = pick.el; }
+  }
+  // The event reports LOGICAL axes, so hand back the block/inline pair.
+  return {
+    x: outX, y: outY,
+    block: flow.xLogical === 'block' ? elX : elY,
+    inline: flow.xLogical === 'inline' ? elX : elY,
+  };
+}
+
 function _lbPerformScroll(box, x, y, behavior) {
-  _lbCancelScrollAnim(box, true);
+  _lbSeedSnapSeen(box);
+  const hadAnim = _lbCancelScrollAnim(box, true);
   const rx = _lbScrollBoxRange(box, 'x'), ry = _lbScrollBoxRange(box, 'y');
   const cx = _lbScrollBoxPos(box, 'x'), cy = _lbScrollBoxPos(box, 'y');
   const nx = Number(x), ny = Number(y);
-  const tx = isFinite(nx) ? Math.min(rx.max, Math.max(rx.min, nx)) : cx;
-  const ty = isFinite(ny) ? Math.min(ry.max, Math.max(ry.min, ny)) : cy;
+  let tx = isFinite(nx) ? Math.min(rx.max, Math.max(rx.min, nx)) : cx;
+  let ty = isFinite(ny) ? Math.min(ry.max, Math.max(ry.min, ny)) : cy;
+  // Every scroll lands on a snap position if the container has any, so a
+  // `scrollTop =`, a `scrollTo`, a `scrollIntoView` and a smooth glide all agree.
+  const snapped = _lbApplySnap(box, tx, ty);
+  tx = Math.min(rx.max, Math.max(rx.min, snapped.x));
+  ty = Math.min(ry.max, Math.max(ry.min, snapped.y));
   const mode = _lbResolveScrollBehavior(box, behavior);
   if (mode !== 'smooth' || (tx === cx && ty === cy)) {
     let moved = _lbScrollBoxWrite(box, 'x', tx);
     moved = _lbScrollBoxWrite(box, 'y', ty) || moved;
-    if (moved) { _lbQueueScrollEvent(box); _lbQueueScrollEnd(box); }
+    if (moved) {
+      // ⚠️ ORDER: scroll, then the snap events, then scrollend. The snap events
+      // fire BEFORE scrollend — a page waiting for "the scroll is over" has to be
+      // able to read which target it landed on by then, and WPT's own helper
+      // stops listening for snap events the moment scrollend arrives.
+      _lbQueueScrollEvent(box);
+      _lbNotifySnap(box, 'ing'); _lbNotifySnap(box, 'ed');
+      _lbQueueScrollEnd(box);
+    } else if (hadAnim) {
+      // A glide that was interrupted by a scroll going nowhere still ENDED. The
+      // page is waiting on `scrollend` to know the sequence is over, and it is —
+      // a listener that cancels the scroll it just saw start would otherwise wait
+      // forever for an end that never came.
+      _lbQueueScrollEnd(box);
+    }
     return Promise.resolve({ interrupted: false });
   }
   const key = _lbScrollKey(box);
@@ -5808,6 +6131,7 @@ function _lbPerformScroll(box, x, y, behavior) {
       if (moved) _lbQueueScrollEvent(box);
       if (p >= 1) {
         _lbScrollAnims.delete(key);
+        _lbNotifySnap(box, 'ing'); _lbNotifySnap(box, 'ed');
         _lbQueueScrollEnd(box);
         resolve({ interrupted: false });
         return;
@@ -38623,6 +38947,21 @@ _exposeIface('AnimationEvent', AnimationEvent);
 _exposeIface('TransitionEvent', TransitionEvent);
 _enumAccessors(AnimationEvent.prototype, 'animationName', 'elapsedTime', 'pseudoElement');
 _enumAccessors(TransitionEvent.prototype, 'propertyName', 'elapsedTime', 'pseudoElement', 'animation');
+// CSS Scroll Snap 2 §snap events. `snapTargetBlock` / `snapTargetInline` name the
+// elements the container came to rest on — which is the whole point: a carousel
+// that has snapped needs to know WHICH slide it snapped to, and the alternative
+// is measuring every child's rect on every scroll.
+globalThis.SnapEvent = class SnapEvent extends Event {
+  constructor(type, init) {
+    init = (init == null) ? {} : init;
+    super(type, init);
+    this._snapTargetBlock = init.snapTargetBlock ?? null;
+    this._snapTargetInline = init.snapTargetInline ?? null;
+  }
+  get snapTargetBlock() { return this._snapTargetBlock; }
+  get snapTargetInline() { return this._snapTargetInline; }
+  get [Symbol.toStringTag]() { return 'SnapEvent'; }
+};
 globalThis.PopStateEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.state=o.state??null; } };
 globalThis.HashChangeEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o); this.oldURL=o.oldURL||""; this.newURL=o.newURL||""; } };
 globalThis.MessageEvent = class extends Event { constructor(t,o) { o = (o == null) ? {} : o; super(t,o);this.data=o.data??null;this.origin=o.origin||"";this.lastEventId=o.lastEventId||"";this.source=o.source??null;this.ports=o.ports||[]; } };
