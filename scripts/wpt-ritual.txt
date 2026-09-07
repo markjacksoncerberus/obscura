@@ -506,3 +506,26 @@ css/css-conditional/container-queries/container-units-basic.html
 css/css-conditional/container-queries/container-computed.html
 css/css-conditional/container-queries/conditional-container-status.html
 css/css-conditional/container-queries/never-match-container.html
+
+# ── navigation-api (Quests #625–#649, the traversable arc) ───────────────────
+# The session history and the Navigation API. These rows are the CORE of it: a
+# realm-wide sweep lives in scripts/wpt-navigation-api-probe.txt.
+navigation-api/navigate-event/event-constructor.html
+navigation-api/navigate-event/navigate-anchor-download.html
+navigation-api/navigate-event/navigate-anchor-fragment.html
+navigation-api/navigate-event/navigate-anchor-same-url.html
+navigation-api/navigate-event/navigate-form.html
+navigation-api/navigate-event/navigate-form-get.html
+navigation-api/navigate-event/navigate-history-pushState.html
+navigation-api/navigate-event/navigate-history-replaceState.html
+navigation-api/navigate-event/signal-abort-window-stop.html
+navigation-api/navigation-history-entry/current-basic.html
+navigation-api/navigation-history-entry/entries-array-equality.html
+navigation-api/navigation-history-entry/entries-after-blank-navigation.html
+navigation-api/navigation-methods/navigate-same-document.html
+navigation-api/navigation-methods/return-value/back.html
+navigation-api/currententrychange-event/history-pushState.html
+navigation-api/currententrychange-event/properties.html
+navigation-api/updateCurrentEntry-method/basic.html
+navigation-api/precommit-handler/precommitHandler-addHandler.html
+navigation-api/focus-reset/basic.html

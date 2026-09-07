@@ -36,9 +36,53 @@ SCRAPE_JS = """
   return JSON.stringify({
     hasHarness: typeof add_completion_callback === 'function',
     harnessText: log ? (log.textContent || '') : '',
-    resultsHTML: r ? r.outerHTML : ''
+    resultsHTML: r ? r.outerHTML : '',
+    callbackResults: globalThis.__obscuraHarnessResults || null
   });
 }
+"""
+
+# ⚠️ THE RENDERED TABLE IS NOT THE ONLY PLACE THE ANSWER LIVES.
+#
+# testharness renders its results into `#log` only if its Output handler was
+# initialised — which happens on a START callback, i.e. when the first test is
+# pushed. A file whose tests are registered from an ES MODULE can finish, time
+# out and run every completion callback while `#log` is never created at all, and
+# the scrape above then reports "no-results" for a run that produced a perfectly
+# good verdict. That is the runner being blind, not the browser failing, and it
+# was hiding ~50 rows of `navigation-api/` alone.
+#
+# So we also ask the harness directly: register a completion callback as soon as
+# testharness exists and keep the verdict in a global. The rendered table stays
+# the primary source (it is what every historical number was read from); this is
+# the fallback used only when the table never appears.
+HARNESS_CALLBACK_JS = """
+(() => {
+  const STATUS = {0: 'pass', 1: 'fail', 2: 'timeout', 3: 'notrun'};
+  let armed = false;
+  const arm = () => {
+    if (armed || typeof add_completion_callback !== 'function') return;
+    armed = true;
+    add_completion_callback((tests, status) => {
+      const counts = {pass: 0, fail: 0, timeout: 0, notrun: 0};
+      const failNames = [];
+      for (const t of tests) {
+        const k = STATUS[t.status] || 'fail';
+        counts[k]++;
+        if (k !== 'pass') failNames.push(t.name);
+      }
+      globalThis.__obscuraHarnessResults = {
+        found: tests.length,
+        pass: counts.pass, fail: counts.fail,
+        timeout: counts.timeout, notrun: counts.notrun,
+        harness: status ? status.status : 0,
+        failNames: failNames.slice(0, 200),
+      };
+    });
+  };
+  arm();
+  const iv = setInterval(() => { arm(); if (armed) clearInterval(iv); }, 5);
+})();
 """
 PUMP_JS = "() => new Promise(r => setTimeout(r, 4500))"
 
@@ -509,6 +553,7 @@ async def run_one(ctx, url, timeout):
         # before). Draining is done inline in _run_on_page (serial, never concurrent).
         try:
             await page.add_init_script(TESTDRIVER_BRIDGE_JS)
+            await page.add_init_script(HARNESS_CALLBACK_JS)
         except Exception:  # noqa: BLE001
             pass
         return await _run_on_page(page, url, timeout)
@@ -543,6 +588,19 @@ async def _run_on_page(page, url, timeout):
                 2 if "Timeout" in text else 1)
             summary["fail_names"] = [n.strip() for n in _FAIL_RE.findall(data.get("resultsHTML", ""))]
             return True, summary
+        cb = data.get("callbackResults")
+        if cb:
+            # The table never appeared but the harness answered. Same shape as a
+            # scraped summary, so every caller downstream is none the wiser.
+            return True, {
+                "found": cb.get("found", 0),
+                "pass": cb.get("pass", 0),
+                "fail": cb.get("fail", 0),
+                "timeout": cb.get("timeout", 0),
+                "notrun": cb.get("notrun", 0),
+                "harness": cb.get("harness", 0),
+                "fail_names": cb.get("failNames", []),
+            }
         if not data.get("hasHarness") and not data.get("resultsHTML"):
             return False, "testharness did not load / run"
         try:

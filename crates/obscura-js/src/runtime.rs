@@ -115,6 +115,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().http_client = Some(client);
     }
 
+    /// Share the owning Page's session-history cell with this realm. See
+    /// `ObscuraState::session_history`: the realm dies at every navigation, the
+    /// session history must not.
+    pub fn set_session_history(&self, cell: std::sync::Arc<std::sync::Mutex<String>>) {
+        self.state.borrow_mut().session_history = Some(cell);
+    }
+
     pub fn set_dom(&self, dom: DomTree) {
         self.state.borrow_mut().dom = Some(dom);
     }

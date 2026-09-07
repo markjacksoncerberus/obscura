@@ -165,6 +165,14 @@ pub struct Page {
     /// appears in the markup they are injecting into — so it has to survive the
     /// trip from the response into the JS realm, which is what this carries.
     csp_headers: Vec<(&'static str, String)>,
+    /// The traversable's SESSION HISTORY, in the JSON the JS side keeps it in.
+    ///
+    /// The JS realm is thrown away and rebuilt on every navigation (see
+    /// `init_js`), which is exactly right for script state and exactly wrong for
+    /// the session history: `history.length`, `navigation.entries()` and the back
+    /// button all describe the traversable, not the document. The Page owns the
+    /// cell; every realm it builds gets a handle to the same one.
+    session_history: Arc<std::sync::Mutex<String>>,
     /// Cached resolved layout/paint, keyed by a hash of the last snapshot.
     /// `None` until the first render in `on-demand`/`always` mode.
     #[cfg(feature = "render")]
@@ -234,6 +242,7 @@ impl Page {
             document_body_size: None,
             document_charset: "UTF-8".to_string(),
             csp_headers: Vec::new(),
+            session_history: Arc::new(std::sync::Mutex::new(String::from("null"))),
             #[cfg(feature = "render")]
             render_cache: None,
             #[cfg(feature = "stealth")]
@@ -311,6 +320,7 @@ impl Page {
         }
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        rt.set_session_history(self.session_history.clone());
         rt.set_http_client(self.http_client.clone());
 
         if let Some(tx) = &self.intercept_tx {

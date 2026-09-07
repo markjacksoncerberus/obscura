@@ -438,7 +438,7 @@ const _ehFormOwner = function(el) {
 // freshly-parsed frame node whose `ownerDocument` mis-resolves to the main document
 // because it isn't `_ownerDoc`-tagged). Returns the main window (globalThis) for a
 // main-document node, the frame window for an in-frame node, or null.
-const _windowForNode = function(node) {
+const _windowForNode = globalThis._windowForNode = function(node) {
   try {
     let r = node;
     while (r && r.parentNode) r = r.parentNode;
@@ -6294,7 +6294,10 @@ class Element extends Node {
     // click activation path (`_installInvokerActivation`) so a real (trusted) click on
     // an invoker — not just the scripted `.click()` method — runs its activation.
     globalThis._runInvokerActivation(this);
-    const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
+    // `<area href>` is a hyperlink too — an image map's clickable region. It was
+    // never followed here, so an image map navigated nowhere.
+    const link = (this.tagName === 'A' || this.tagName === 'AREA')
+      ? this : (this.closest ? this.closest('a[href], area[href]') : null);
     if (link && globalThis._followHyperlink(link)) return;
     const type = (this.getAttribute('type') || '').toLowerCase();
     // A <button> is a submit button in the Submit state, OR in the Auto state (missing
@@ -6307,7 +6310,9 @@ class Element extends Node {
       // Resolve the form owner via the `form=` attribute or ancestry (HTML §form owner).
       const form = _ceiFormOwner(this) || (this.closest ? this.closest('form') : null);
       if (form && typeof form.submit === 'function') {
-        form.submit(this);
+        // Pressing a submit button IS the user asking, so this submission pushes
+        // a history entry where a scripted `form.submit()` would replace one.
+        form.submit(this, true);
       }
     } else if (type === 'reset' && (this.localName === 'button' || this.localName === 'input')) {
       // A reset button's activation behavior (HTML §4.10.6.1) resets its form owner.
@@ -6496,7 +6501,21 @@ class Element extends Node {
       } else {
         // about:blank (or empty): ensure a blank document exists and fire load,
         // mirroring how real browsers load the initial about:blank document.
-        this.contentDocument; // side effect: creates _iframeDoc + _iframeWin
+        //
+        // A frame that was showing something else is really NAVIGATING here, so
+        // it gets a fresh blank document rather than keeping the one it had —
+        // otherwise `frame.src = "about:blank"` left the old page in place and
+        // recorded nothing in the frame's session history.
+        const _atBlank = !this._iframeWin || this._iframeWin._url === 'about:blank';
+        if (!_atBlank) {
+          this._loadEventFired = false;
+          this._frameScriptsRan = false;
+          this._iframeDoc = new _IframeDocument(
+            '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
+          this._iframeWin = _installFrameWindow(this, this._iframeDoc, 'about:blank', null);
+        } else {
+          this.contentDocument; // side effect: creates _iframeDoc + _iframeWin
+        }
         _registerIframe(this);
         _scheduleFrameElementLoad(this);
       }
@@ -6803,7 +6822,7 @@ class Element extends Node {
       opts[i]._selected = (i === v);
     }
   }
-  submit(submitter) {
+  submit(submitter, userInitiated) {
     const cancelled = !this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
     if (cancelled) return;
 
@@ -6849,9 +6868,24 @@ class Element extends Node {
     let targetUrl;
     try { targetUrl = new URL(action, baseUrl).href; } catch(e) { targetUrl = action; }
 
+    // HTML §form submission, "mutate action URL": the action URL's query is SET
+    // to the encoded entry list — replaced, not appended — and an empty entry
+    // list still leaves the "?" behind. Appending with "&" made a form submitted
+    // twice accumulate its own query string.
     const getUrl = () => {
-      const sep = targetUrl.includes('?') ? '&' : '?';
-      return targetUrl + (encoded ? sep + encoded : '');
+      try {
+        const u = new URL(targetUrl);
+        u.search = encoded;
+        let href = u.href;
+        if (!encoded && href.indexOf('?') === -1) {
+          const hash = u.hash;
+          href = hash ? href.slice(0, href.length - hash.length) + '?' + hash : href + '?';
+        }
+        return href;
+      } catch (e) {
+        const sep = targetUrl.includes('?') ? '&' : '?';
+        return targetUrl + (encoded ? sep + encoded : '?');
+      }
     };
 
     // ⭐ `form-action` is the directive that decides WHERE THE PASSWORD GOES. An
@@ -6870,6 +6904,31 @@ class Element extends Node {
     const frame = _frameForTarget(this, this.getAttribute('target'));
     if (frame) { frame._loadIframeSrc(method === 'POST' ? targetUrl : getUrl()); return; }
 
+    // A form submission is a navigation like any other: it fires `navigate` at
+    // the window's Navigation object first, naming the form as the source
+    // element and — for a POST — handing over the entry list as a FormData, so a
+    // single-page app can intercept its own form instead of losing the page.
+    // `preventDefault()` on that event cancels the submission outright.
+    const finalUrl = method === 'POST' ? targetUrl : getUrl();
+    let fd = null;
+    if (method === 'POST') {
+      try { fd = new FormData(); for (const [n, v] of pairs) fd.append(n, v); } catch (e) { fd = null; }
+    }
+    if (typeof globalThis._shSubmitNavigate === 'function') {
+      let fsh = null;
+      try {
+        const w = globalThis._windowForNode(this);
+        if (w && w !== globalThis) fsh = globalThis._shForFrame(w);
+      } catch (e) {}
+      const proceed = globalThis._shSubmitNavigate(finalUrl, {
+        // The navigate event's source element is the SUBMITTER when a button was
+        // pressed, and the form itself when script called `submit()`.
+        sourceElement: submitter || this,
+        formData: fd, sh: fsh,
+        userInitiated: !!userInitiated,
+      });
+      if (!proceed) return;
+    }
     if (method === 'POST') {
       Deno.core.ops.op_navigate(targetUrl, 'POST', encoded);
     } else {
@@ -7286,6 +7345,11 @@ const __reflectedExtraStringAttrs = {
   target: 'target',        // <base> / <link> / <a> / <area> / <form>
   rev: 'rev',              // <link> / <a> (obsolete)
   hreflang: 'hreflang',    // <link> / <a>
+  // <a> / <area>. Reflection is the whole point here: `a.download = ""` is how a
+  // page marks a link as a download, and without a reflector it set a plain JS
+  // property that the navigation path — which asks the ATTRIBUTE — could not see,
+  // so the link navigated instead of downloading.
+  download: 'download',    // <a> / <area>
   nonce: 'nonce',          // HTMLElement / SVGElement (global)
   // Obsolete presentational DOMString reflectors. Each is DOMString wherever it
   // is reflected, so a generic definition is correct (and inert on elements that
@@ -9180,7 +9244,12 @@ const _resolveUrl = function(url) {
 // Everything else schedules a real navigation. `_fragmentNavigate` is defined
 // with the focus machinery (it moves focus); a call this early in a page's life
 // simply falls through to the full navigation.
-const _navigateTo = function(url) {
+const _navigateTo = function(url, opts) {
+  if (typeof globalThis._shDocumentNavigate === 'function') {
+    try { globalThis._shDocumentNavigate((opts && opts.sh) || null, url, opts); return; } catch (e) {}
+  }
+  // Before the Navigation API section has run (very early page life), fall back
+  // to the old behaviour: fragment-only differences stay in this document.
   try {
     const target = new URL(url);
     const cur = new URL(_domParse("document_url") ?? "about:blank");
@@ -9215,16 +9284,22 @@ globalThis.location = {
     if (s === '') u = u.split('#')[0];
     if (typeof globalThis._fragmentNavigate === 'function') globalThis._fragmentNavigate(u);
   },
-  set search(v) { try { const u = new URL(this.href); u.search = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
-  set pathname(v) { try { const u = new URL(this.href); u.pathname = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
-  set protocol(v) { try { const u = new URL(this.href); u.protocol = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
-  set host(v) { try { const u = new URL(this.href); u.host = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
-  set hostname(v) { try { const u = new URL(this.href); u.hostname = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
-  set port(v) { try { const u = new URL(this.href); u.port = String(v); Deno.core.ops.op_navigate(u.href, 'GET', ''); } catch (e) {} },
+  set search(v) { try { const u = new URL(this.href); u.search = String(v); _navigateTo(u.href); } catch (e) {} },
+  set pathname(v) { try { const u = new URL(this.href); u.pathname = String(v); _navigateTo(u.href); } catch (e) {} },
+  set protocol(v) { try { const u = new URL(this.href); u.protocol = String(v); _navigateTo(u.href); } catch (e) {} },
+  set host(v) { try { const u = new URL(this.href); u.host = String(v); _navigateTo(u.href); } catch (e) {} },
+  set hostname(v) { try { const u = new URL(this.href); u.hostname = String(v); _navigateTo(u.href); } catch (e) {} },
+  set port(v) { try { const u = new URL(this.href); u.port = String(v); _navigateTo(u.href); } catch (e) {} },
   toString() { return this.href; },
   assign(url) { _navigateTo(_resolveUrl(url)); },
-  reload() {},
-  replace(url) { _navigateTo(_resolveUrl(url)); },
+  // A reload is a navigation like any other: it fires `navigate` with type
+  // "reload", and a page may intercept it.
+  reload() {
+    if (typeof globalThis.navigation === 'object' && globalThis.navigation)
+      try { globalThis.navigation.reload(); return; } catch (e) {}
+  },
+  // `location.replace` never adds an entry, load event or no load event.
+  replace(url) { _navigateTo(_resolveUrl(url), { replace: true }); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
@@ -9969,6 +10044,10 @@ const _executeFrameScripts = async function(iframeEl) {
   // inside the frame now that those are real (increment 4 step 2).
   try {
     doc.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+    // The frame document is now "completely loaded": a navigation the frame asks
+    // for from here on PUSHES rather than replaces (the same rule the top-level
+    // document follows).
+    win._docLoaded = true;
     // `win.onload` is a handler accessor now (it registers a listener), so the
     // dispatch below delivers it — an explicit call here would fire it twice.
     win.dispatchEvent(new Event('load'));
@@ -43265,34 +43344,1391 @@ globalThis.atob = function atob(data) {
   return out;
 };
 
-// History: pushState/replaceState are REAL for the half single-page apps live
-// on — they update the document's URL (same-document, no fetch, no events) and
-// `history.state`. Session-history TRAVERSAL (back/forward/go, popstate from
-// user navigation) is not modelled: there is one document and no joint session
-// history to walk.
-globalThis.history = {
-  length: 1, state: null, scrollRestoration: "auto",
-  pushState(state, _unused, url) { this._update(state, url, true); },
-  replaceState(state, _unused, url) { this._update(state, url, false); },
-  _update(state, url, push) {
-    let clone = null;
-    try { clone = state === undefined ? null : structuredClone(state); }
-    catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
-    if (url !== undefined && url !== null) {
-      let u;
-      try { u = new URL(String(url), location.href); } catch (e) {
-        throw new DOMException("Invalid URL '" + url + "'", 'SecurityError');
-      }
-      // Same-origin only: a document must not dress its address bar as another site.
-      let cur; try { cur = new URL(location.href); } catch (e) { cur = null; }
-      if (cur && u.origin !== cur.origin)
-        throw new DOMException('Cannot change history to a cross-origin URL', 'SecurityError');
-      try { Deno.core.ops.op_set_document_url(u.href); } catch (e) {}
+// ─────────────────────────────────────────────────────────────────────────────
+// The session history, and the Navigation API that reads and writes it.
+//
+// `history` used to be an object literal: pushState/replaceState changed the
+// document's URL and nothing remembered that they had, `history.length` was the
+// constant 1, and `go()`/`back()`/`forward()` were empty functions — the back
+// button of a browser that cannot go back. `window.navigation` did not exist at
+// all, so the whole `navigation-api/` realm stopped on its first line.
+//
+// What lives here is HTML's session history for one traversable, plus the
+// Navigation API on top of it. Entries are plain records in `sh.entries`; every
+// web-facing object over one is minted by `_shWrap`, which keeps a single
+// NavigationHistoryEntry per (entry, id) so identity comparisons in author code
+// mean what they say.
+//
+// An entry's `key` names a SLOT in the list and survives a replace; its `id`
+// names one VERSION of that slot and changes on every mutation. That is why
+// `navigation.currentEntry` is a DIFFERENT object after `history.replaceState`
+// while `currentEntry.key` is the same string.
+//
+// ORDERING IS THE HARD PART, and it is not decoration: the whole
+// `navigation-api/ordering-and-transition/` directory asserts the exact
+// interleaving of events, promise resolutions and unrelated microtasks. Three
+// rules produce all of it, and they are uniform across push, replace, reload and
+// traverse:
+//
+//   1. `committed` resolves SYNCHRONOUSLY at the commit — the moment the URL and
+//      the current entry change.
+//   2. `navigatesuccess` (or `navigateerror`) is fired from a `committed.then(…)`
+//      attached at the moment the intercept handlers settle, and `finished` is
+//      resolved inside that same reaction. Attaching there rather than firing
+//      directly is what puts `navigatesuccess` BEFORE the page's own
+//      `committed.then` for a synchronous navigate() (we attached first) and
+//      AFTER it for a traversal (the page attached first, while the task that
+//      commits had not yet run). One line, both orders, no special-casing.
+//   3. `navigation.transition` exists only for an INTERCEPTED navigation, and is
+//      cleared in that same reaction — so it is still readable from
+//      `navigatesuccess` and already null by the time `committed`'s reactions run.
+//
+// `navigate()` and `reload()` run their whole sequence synchronously; `back()`,
+// `forward()`, `traverseTo()` and `history.go()` queue a task first, because a
+// traversal is something the session history does to the document, not something
+// the document does to itself.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// A v4 UUID. `navigation-api`'s own `isUUID` helper checks the version nibble and
+// the variant bits, so a lazy random hex string does not pass for one.
+const _shUUID = () => {
+  try { if (globalThis.crypto && crypto.randomUUID) return crypto.randomUUID(); } catch (e) {}
+  const h = '0123456789abcdef';
+  let s = '';
+  for (let i = 0; i < 36; i++) {
+    if (i === 8 || i === 13 || i === 18 || i === 23) s += '-';
+    else if (i === 14) s += '4';
+    else {
+      const r = (Math.random() * 16) | 0;
+      s += h[i === 19 ? ((r & 0x3) | 0x8) : r];
     }
-    this.state = clone;
-    if (push) this.length++;
+  }
+  return s;
+};
+
+// ── One session history per WINDOW ──────────────────────────────────────────
+// A traversable is a window, not a page: an `<iframe>` has its own entry list,
+// its own current index and its own back button, and half this realm's files are
+// written from the parent about `i.contentWindow.navigation`. So the list is an
+// object, and the handful of things that differ between the top-level window and
+// a frame — where the current URL is read, how the URL is written, whether the
+// document has finished loading, and what "actually go there" means — are
+// methods on it rather than branches scattered through the algorithms.
+//
+// `docSeq` is which DOCUMENT an entry belongs to. Entries this document created
+// are same-document with it; entries restored from a previous one are not, and
+// reaching them means a real navigation.
+const _shTop = {
+  entries: [], index: 0, docSeq: 0, pendingActivation: null, persist: true,
+  win: null,                                            // globalThis; set below
+  docUrl() {
+    try { return _domParse('document_url') ?? 'about:blank'; } catch (e) { return 'about:blank'; }
   },
-  go() {}, back() {}, forward() {},
+  setUrl(u) { try { Deno.core.ops.op_set_document_url(u); } catch (e) {} },
+  // Has the document finished loading? A script-initiated navigation before that
+  // point REPLACES rather than pushes — which is why 316 of this realm's files
+  // begin by waiting for the load event. (Following a hyperlink is exempt: an
+  // activated link pushes even during parse.)
+  loaded() {
+    try { return !!document && document.readyState === 'complete'; } catch (e) { return false; }
+  },
+  navigateCross(url, navType) {
+    _shMarkOutgoing(this, navType);
+    try { Deno.core.ops.op_navigate(url, 'GET', ''); } catch (e) {}
+  },
+  // A traversal that has to cross documents leaves the target INDEX behind, so
+  // the document that loads next lands in that slot instead of pushing a new
+  // entry on top of it.
+  navigateCrossTraverse(url, at, fromKey) {
+    _shMarkOutgoing(this, 'traverse', at, fromKey);
+    try { Deno.core.ops.op_navigate(url, 'GET', ''); } catch (e) {}
+  },
+  effects(newUrl, oldUrl, isTraverse, state) {
+    try { globalThis._shFragmentEffects(newUrl, oldUrl, isTraverse, state); } catch (e) {}
+  },
+  scrollTo(url) { try { globalThis._shScrollToFragment(url); } catch (e) {} },
+  focusReset() { try { globalThis._shFocusReset(); } catch (e) {} },
+};
+// The old name, kept because it reads better at the call sites that are only
+// ever about the top-level traversable (the persistence hooks).
+const _SH = _shTop;
+_shTop.win = globalThis;
+globalThis._shTop = _shTop;
+
+// ── Making the session history outlive the document ─────────────────────────
+// `Page::init_js` throws the whole JS realm away on every navigation, which is
+// right for script state and wrong for the session history: `history.length`,
+// `navigation.entries()` and the back button describe the TRAVERSABLE, not the
+// document. So the list is mirrored into a cell the Page owns (see
+// `ObscuraState::session_history`) after every mutation, and read back at the
+// start of each new document's life.
+//
+// ⚠️ An entry's `state` crosses that boundary as JSON. A structured-clone value
+// that JSON cannot express (a Map, a Blob, a cycle) survives inside one document
+// and arrives as null in the next — an honest cap, named in the scroll, not a
+// silent one: the alternative is a second serializer for a case no test in the
+// realm exercises.
+const _shStateOut = (v) => {
+  if (v === undefined) return undefined;
+  try { return JSON.parse(JSON.stringify(v === undefined ? null : v)); }
+  catch (e) { return null; }
+};
+
+const _shSnapshot = (sh, extra) => {
+  const o = {
+    entries: sh.entries.map((e) => {
+      const r = { key: e.key, id: e.id, url: e.url, docSeq: e.docSeq };
+      if (e.state !== undefined) r.st = _shStateOut(e.state);
+      if (e.cstate !== undefined) r.cst = _shStateOut(e.cstate);
+      return r;
+    }),
+    index: sh.index,
+    docSeq: sh.docSeq,
+  };
+  if (extra) for (const k of Object.keys(extra)) o[k] = extra[k];
+  return o;
+};
+
+// Only the top-level traversable is mirrored into the Page — a frame's history
+// dies with the frame, exactly as its document does.
+const _shStore = (sh, extra) => {
+  if (!sh.persist) return;
+  try { Deno.core.ops.op_session_history_store(JSON.stringify(_shSnapshot(sh, extra))); }
+  catch (e) {}
+};
+
+// About to leave this document for another one: leave a note saying WHY, so the
+// next document can put itself in the right slot instead of guessing.
+const _shMarkOutgoing = (sh, navType, pendingIndex, fromKey) => {
+  _shStore(sh, { navType, pending: pendingIndex === undefined ? null : pendingIndex,
+    fromKey: fromKey === undefined ? null : fromKey });
+};
+
+// What the previous document handed this one, if anything. Read once, at the
+// first touch of the session history, and turned into `navigation.activation`.
+const _shInit = (sh) => {
+  if (sh.entries.length) return;
+  const url = sh.docUrl();
+  let prev = null;
+  if (sh.persist) {
+    try {
+      const raw = Deno.core.ops.op_session_history_load();
+      if (raw && raw !== 'null') prev = JSON.parse(raw);
+    } catch (e) { prev = null; }
+  }
+
+  if (!prev || !prev.entries || !prev.entries.length) {
+    sh.docSeq = 0;
+    sh.entries = [{
+      key: _shUUID(), id: _shUUID(), url,
+      state: undefined, cstate: undefined, docSeq: 0, sh, w: null, disposed: false,
+    }];
+    sh.index = 0;
+    _shStore(sh);
+    return;
+  }
+
+  let maxSeq = 0;
+  for (const e of prev.entries) if ((e.docSeq | 0) > maxSeq) maxSeq = e.docSeq | 0;
+  sh.docSeq = maxSeq + 1;
+  sh.entries = prev.entries.map((e) => ({
+    key: e.key, id: e.id, url: e.url,
+    state: 'st' in e ? e.st : undefined,
+    cstate: 'cst' in e ? e.cst : undefined,
+    docSeq: e.docSeq | 0, sh, w: null, disposed: false,
+  }));
+
+  const prevIndex = Math.min(Math.max(prev.index | 0, 0), sh.entries.length - 1);
+  const fromRec = sh.entries[prevIndex] || null;
+  let navType = prev.navType || 'push';
+
+  if (prev.pending != null && prev.pending >= 0 && prev.pending < sh.entries.length) {
+    // A traversal that had to cross documents: this IS the entry that was
+    // traversed to, restored into a new document.
+    sh.index = prev.pending;
+    navType = 'traverse';
+  } else if (navType === 'replace' || navType === 'reload') {
+    sh.index = prevIndex;
+    sh.entries[prevIndex] = {
+      key: navType === 'reload' ? fromRec.key : _shUUID(), id: _shUUID(), url,
+      state: undefined, cstate: undefined, docSeq: sh.docSeq, sh, w: null, disposed: false,
+    };
+  } else {
+    sh.entries.splice(prevIndex + 1);
+    sh.entries.push({
+      key: _shUUID(), id: _shUUID(), url,
+      state: undefined, cstate: undefined, docSeq: sh.docSeq, sh, w: null, disposed: false,
+    });
+    sh.index = sh.entries.length - 1;
+  }
+  const landed = sh.entries[sh.index];
+  landed.docSeq = sh.docSeq;
+  landed.url = url;
+  sh.pendingActivation = { from: fromRec, navigationType: navType };
+  _shStore(sh);
+};
+
+// StructuredSerialize once at write time, StructuredDeserialize per read — so a
+// page that mutates what `getState()` handed it cannot edit the session history.
+const _shClone = (v) => {
+  if (v === undefined) return undefined;
+  try { return structuredClone(v); } catch (e) {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
+};
+
+const _shCur = (sh) => { _shInit(sh); return sh.entries[sh.index] || null; };
+
+const _shAllow = { on: false };
+const _shMint = (Ctor, rec) => {
+  _shAllow.on = true;
+  let o; try { o = new Ctor(); } finally { _shAllow.on = false; }
+  o._e = rec;
+  return o;
+};
+
+class NavigationHistoryEntry extends Node {
+  constructor() {
+    if (!_shAllow.on) throw new TypeError('Illegal constructor');
+    super(undefined);
+  }
+  get url() {
+    if (!(this instanceof NavigationHistoryEntry)) throw new TypeError('Illegal invocation');
+    return this._e.url;
+  }
+  get key() {
+    if (!(this instanceof NavigationHistoryEntry)) throw new TypeError('Illegal invocation');
+    return this._e.key;
+  }
+  get id() {
+    if (!(this instanceof NavigationHistoryEntry)) throw new TypeError('Illegal invocation');
+    return this._e.id;
+  }
+  // An entry that has fallen out of the list (pruned by a push, or belonging to a
+  // detached document) reports -1 rather than a stale position.
+  get index() {
+    if (!(this instanceof NavigationHistoryEntry)) throw new TypeError('Illegal invocation');
+    return this._e.sh.entries.indexOf(this._e);
+  }
+  get sameDocument() {
+    if (!(this instanceof NavigationHistoryEntry)) throw new TypeError('Illegal invocation');
+    return this._e.docSeq === this._e.sh.docSeq && this._e.sh.entries.indexOf(this._e) !== -1;
+  }
+  getState() {
+    if (!(this instanceof NavigationHistoryEntry)) throw new TypeError('Illegal invocation');
+    return _shClone(this._e.state);
+  }
+  get [Symbol.toStringTag]() { return 'NavigationHistoryEntry'; }
+}
+// An entry's `dispose` goes to the entry and stops there.
+NavigationHistoryEntry.prototype._noEventParent = true;
+
+const _shWrap = (rec) => {
+  if (!rec) return null;
+  if (!rec.w) rec.w = _shMint(NavigationHistoryEntry, rec);
+  return rec.w;
+};
+
+// Where a navigation is GOING. For a push or replace there is no entry yet, so
+// key/id are "" and index is -1 — the destination is a URL, not a slot.
+class NavigationDestination {
+  constructor() { if (!_shAllow.on) throw new TypeError('Illegal constructor'); }
+  get url() {
+    if (!(this instanceof NavigationDestination)) throw new TypeError('Illegal invocation');
+    return this._url;
+  }
+  get key() {
+    if (!(this instanceof NavigationDestination)) throw new TypeError('Illegal invocation');
+    return this._e ? this._e.key : '';
+  }
+  get id() {
+    if (!(this instanceof NavigationDestination)) throw new TypeError('Illegal invocation');
+    return this._e ? this._e.id : '';
+  }
+  get index() {
+    if (!(this instanceof NavigationDestination)) throw new TypeError('Illegal invocation');
+    return this._e ? this._e.sh.entries.indexOf(this._e) : -1;
+  }
+  get sameDocument() {
+    if (!(this instanceof NavigationDestination)) throw new TypeError('Illegal invocation');
+    return !!this._sameDocument;
+  }
+  getState() {
+    if (!(this instanceof NavigationDestination)) throw new TypeError('Illegal invocation');
+    return _shClone(this._state);
+  }
+  get [Symbol.toStringTag]() { return 'NavigationDestination'; }
+}
+
+const _shMintDest = (url, rec, sameDocument, state) => {
+  _shAllow.on = true;
+  let d; try { d = new NavigationDestination(); } finally { _shAllow.on = false; }
+  d._url = url; d._e = rec || null; d._sameDocument = !!sameDocument; d._state = state;
+  return d;
+};
+
+const _NAV_TYPES = ['push', 'replace', 'reload', 'traverse'];
+const _NAV_FOCUS_RESET = ['after-transition', 'manual'];
+const _NAV_SCROLL = ['after-transition', 'manual'];
+
+class NavigateEvent extends Event {
+  constructor(type, init) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'NavigateEvent': 1 argument required, but only 0 present.");
+    // `destination` and `signal` are REQUIRED dictionary members: omitting the
+    // dictionary entirely must not be a way around them.
+    if (init == null || typeof init !== 'object')
+      throw new TypeError("Failed to construct 'NavigateEvent': required members are undefined.");
+    if (init.destination === undefined)
+      throw new TypeError("Failed to construct 'NavigateEvent': required member destination is undefined.");
+    if (init.signal === undefined)
+      throw new TypeError("Failed to construct 'NavigateEvent': required member signal is undefined.");
+    super(type, init);
+    const nt = init.navigationType === undefined ? 'push' : String(init.navigationType);
+    if (_NAV_TYPES.indexOf(nt) === -1)
+      throw new TypeError("Failed to construct 'NavigateEvent': '" + nt + "' is not a valid NavigationType.");
+    this._navigationType = nt;
+    this._destination = init.destination;
+    this._canIntercept = !!init.canIntercept;
+    this._userInitiated = !!init.userInitiated;
+    this._hashChange = !!init.hashChange;
+    this._signal = init.signal;
+    this._formData = init.formData === undefined ? null : init.formData;
+    this._downloadRequest = init.downloadRequest === undefined ? null : init.downloadRequest;
+    this._info = init.info;
+    this._hasUAVisualTransition = !!init.hasUAVisualTransition;
+    this._sourceElement = init.sourceElement === undefined ? null : init.sourceElement;
+    // Only an event the ENGINE fired for a real navigation can be intercepted;
+    // one the page constructed has nothing to intercept.
+    this._nav = null;
+  }
+  get navigationType() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._navigationType; }
+  get destination() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._destination; }
+  get canIntercept() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._canIntercept; }
+  get userInitiated() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._userInitiated; }
+  get hashChange() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._hashChange; }
+  get signal() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._signal; }
+  get formData() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._formData; }
+  get downloadRequest() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._downloadRequest; }
+  get info() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._info; }
+  get hasUAVisualTransition() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._hasUAVisualTransition; }
+  get sourceElement() { if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation'); return this._sourceElement; }
+
+  intercept(options) {
+    if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation');
+    if (!this._canIntercept)
+      throw new DOMException('The navigation cannot be intercepted.', 'SecurityError');
+    if (!this._dispatching)
+      throw new DOMException('intercept() may only be called while the navigate event is being dispatched.', 'InvalidStateError');
+    if (this.defaultPrevented)
+      throw new DOMException('intercept() may not be called after preventDefault().', 'InvalidStateError');
+    const o = options == null ? {} : options;
+    if (o.handler !== undefined && o.handler !== null && typeof o.handler !== 'function')
+      throw new TypeError('handler must be a function');
+    if (o.focusReset !== undefined) {
+      const v = String(o.focusReset);
+      if (_NAV_FOCUS_RESET.indexOf(v) === -1)
+        throw new TypeError("'" + v + "' is not a valid NavigationFocusReset.");
+      this._focusReset = v;
+    }
+    if (o.scroll !== undefined) {
+      const v = String(o.scroll);
+      if (_NAV_SCROLL.indexOf(v) === -1)
+        throw new TypeError("'" + v + "' is not a valid NavigationScrollBehavior.");
+      this._scrollBehavior = v;
+    }
+    if (o.precommitHandler !== undefined && o.precommitHandler !== null
+        && typeof o.precommitHandler !== 'function')
+      throw new TypeError('precommitHandler must be a function');
+    this._intercepted = true;
+    if (o.handler != null) (this._handlers || (this._handlers = [])).push(o.handler);
+    if (o.precommitHandler != null)
+      (this._precommitHandlers || (this._precommitHandlers = [])).push(o.precommitHandler);
+  }
+
+  scroll() {
+    if (!(this instanceof NavigateEvent)) throw new TypeError('Illegal invocation');
+    if (!this._intercepted)
+      throw new DOMException('scroll() may only be called on an intercepted navigation.', 'InvalidStateError');
+    if (this._scrolled)
+      throw new DOMException('scroll() has already been called.', 'InvalidStateError');
+    this._scrolled = true;
+    if (this._nav && typeof this._nav.doScroll === 'function') this._nav.doScroll();
+  }
+  get [Symbol.toStringTag]() { return 'NavigateEvent'; }
+}
+
+class NavigationCurrentEntryChangeEvent extends Event {
+  constructor(type, init) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'NavigationCurrentEntryChangeEvent': 1 argument required, but only 0 present.");
+    if (init == null || typeof init !== 'object' || init.from === undefined)
+      throw new TypeError("Failed to construct 'NavigationCurrentEntryChangeEvent': required member from is undefined.");
+    super(type, init);
+    const nt = init.navigationType === undefined || init.navigationType === null
+      ? null : String(init.navigationType);
+    if (nt !== null && _NAV_TYPES.indexOf(nt) === -1)
+      throw new TypeError("'" + nt + "' is not a valid NavigationType.");
+    this._navigationType = nt;
+    this._from = init.from;
+  }
+  get navigationType() { if (!(this instanceof NavigationCurrentEntryChangeEvent)) throw new TypeError('Illegal invocation'); return this._navigationType; }
+  get from() { if (!(this instanceof NavigationCurrentEntryChangeEvent)) throw new TypeError('Illegal invocation'); return this._from; }
+  get [Symbol.toStringTag]() { return 'NavigationCurrentEntryChangeEvent'; }
+}
+
+class NavigationTransition {
+  constructor() { if (!_shAllow.on) throw new TypeError('Illegal constructor'); }
+  get navigationType() { if (!(this instanceof NavigationTransition)) throw new TypeError('Illegal invocation'); return this._navigationType; }
+  get from() { if (!(this instanceof NavigationTransition)) throw new TypeError('Illegal invocation'); return this._from; }
+  get finished() { if (!(this instanceof NavigationTransition)) throw new TypeError('Illegal invocation'); return this._finished; }
+  get [Symbol.toStringTag]() { return 'NavigationTransition'; }
+}
+
+class NavigationActivation {
+  constructor() { if (!_shAllow.on) throw new TypeError('Illegal constructor'); }
+  get from() { if (!(this instanceof NavigationActivation)) throw new TypeError('Illegal invocation'); return this._from; }
+  get entry() { if (!(this instanceof NavigationActivation)) throw new TypeError('Illegal invocation'); return this._entry; }
+  get navigationType() { if (!(this instanceof NavigationActivation)) throw new TypeError('Illegal invocation'); return this._navigationType; }
+  get [Symbol.toStringTag]() { return 'NavigationActivation'; }
+}
+
+// A promise pair nobody is obliged to handle: a page may ignore `finished`
+// entirely, and an ignored rejection must not become an unhandled one.
+const _navDeferred = () => {
+  let res, rej;
+  const promise = new Promise((a, b) => { res = a; rej = b; });
+  promise.catch(() => {});
+  return { promise, resolve: res, reject: rej };
+};
+
+const _navAllow = { on: false };
+class Navigation extends Node {
+  constructor() {
+    if (!_navAllow.on) throw new TypeError('Illegal constructor');
+    super(undefined);
+    this._transition = null;
+    this._activation = null;
+    this._ongoing = null;
+  }
+  entries() {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    const sh = this._sh; _shInit(sh);
+    return sh.entries.map(_shWrap);
+  }
+  get currentEntry() {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    return _shWrap(_shCur(this._sh));
+  }
+  get transition() {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    return this._transition;
+  }
+  // What loaded THIS document: the entry navigated away from, the entry that
+  // won, and how. Null when nothing preceded us.
+  get activation() {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    const sh = this._sh; _shInit(sh);
+    if (this._activation) return this._activation;
+    const pa = sh.pendingActivation;
+    if (!pa) return null;
+    _shAllow.on = true;
+    let a; try { a = new NavigationActivation(); } finally { _shAllow.on = false; }
+    a._from = pa.from ? _shWrap(pa.from) : null;
+    a._entry = _shWrap(sh.entries[sh.index]);
+    a._navigationType = pa.navigationType;
+    this._activation = a;
+    return a;
+  }
+  get canGoBack() {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    const sh = this._sh; _shInit(sh);
+    return sh.index > 0;
+  }
+  get canGoForward() {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    const sh = this._sh; _shInit(sh);
+    return sh.index < sh.entries.length - 1;
+  }
+  updateCurrentEntry(options) {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    if (options == null || typeof options !== 'object' || !('state' in options))
+      throw new TypeError("Failed to execute 'updateCurrentEntry' on 'Navigation': required member state is undefined.");
+    const sh = this._sh;
+    const cur = _shCur(sh);
+    if (!cur)
+      throw new DOMException('The current entry is null.', 'InvalidStateError');
+    const serialized = _shClone(options.state);
+    cur.state = serialized;
+    cur.cstate = undefined;
+    if (this._history) this._history._stateId = null;
+    _shStore(sh);
+    // The slot keeps its key AND its id: updateCurrentEntry edits the entry the
+    // page is already holding rather than minting a new version of it.
+    const from = _shWrap(cur);
+    _navFireCurrentChange(this, null, from);
+    return undefined;
+  }
+  navigate(url, options) {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    return _navNavigateMethod(this, url, options);
+  }
+  reload(options) {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    return _navReloadMethod(this, options);
+  }
+  traverseTo(key, options) {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    return _navTraverseMethod(this, String(key), options);
+  }
+  back(options) {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    const sh = this._sh; _shInit(sh);
+    if (sh.index <= 0) return _navRejectedResult('Cannot go back; there is no previous entry.');
+    return _navTraverseMethod(this, sh.entries[sh.index - 1].key, options);
+  }
+  forward(options) {
+    if (!(this instanceof Navigation)) throw new TypeError('Illegal invocation');
+    const sh = this._sh; _shInit(sh);
+    if (sh.index >= sh.entries.length - 1)
+      return _navRejectedResult('Cannot go forward; there is no next entry.');
+    return _navTraverseMethod(this, sh.entries[sh.index + 1].key, options);
+  }
+  get [Symbol.toStringTag]() { return 'Navigation'; }
+}
+Navigation.prototype._noEventParent = true;
+
+const _navRejectedResult = (msg) => {
+  const e = new DOMException(msg, 'InvalidStateError');
+  const committed = Promise.reject(e);
+  const finished = Promise.reject(e);
+  committed.catch(() => {}); finished.catch(() => {});
+  return { committed, finished };
+};
+
+const _navFireCurrentChange = (nav, navigationType, from) => {
+  const ev = new NavigationCurrentEntryChangeEvent('currententrychange', {
+    navigationType, from,
+  });
+  ev._isTrusted = true;
+  try { _dispatchSpec(nav, ev, false); } catch (e) {}
+};
+
+const _navFireAt = (nav, type, extra) => {
+  let ev;
+  if (type === 'navigateerror') {
+    ev = new (globalThis.ErrorEvent || Event)('navigateerror', extra || {});
+  } else {
+    ev = new Event(type);
+  }
+  ev._isTrusted = true;
+  try { _dispatchSpec(nav, ev, false); } catch (e) {}
+};
+
+// An entry that has fallen out of the list is gone for good: `dispose` fires at
+// its NavigationHistoryEntry so a page holding one can drop what it cached.
+const _shDispose = (records) => {
+  if (!records || !records.length) return;
+  for (const r of records) {
+    r.disposed = true;
+    if (!r.w) continue;
+    const de = new Event('dispose');
+    de._isTrusted = true;
+    try { _dispatchSpec(r.w, de, false); } catch (e) {}
+  }
+};
+
+// Commit a same-document navigation: mutate the session history, then the URL.
+// Returns the entry record that is now current.
+//
+// An entry carries TWO states, and they are not the same slot. `state` is the
+// Navigation API's (`entry.getState()`, written by `navigation.navigate({state})`
+// and `updateCurrentEntry`); `cstate` is the classic one (`history.state`,
+// written by `pushState`/`replaceState`). Writing either CLEARS the other,
+// because each is a fresh statement about what this entry means — which is why
+// `history.pushState(1)` leaves `currentEntry.getState()` undefined rather than
+// stale.
+const _shCommit = (sh, url, navigationType, st) => {
+  _shInit(sh);
+  st = st || {};
+  let pendingDispose = null;
+  const cur = sh.entries[sh.index];
+  let rec;
+  if (navigationType === 'push') {
+    rec = {
+      key: _shUUID(), id: _shUUID(), url,
+      state: st.nav, cstate: st.classic,
+      docSeq: sh.docSeq, sh, w: null, disposed: false,
+    };
+    // A push prunes the forward entries — the future you did not take.
+    const removed = sh.entries.splice(sh.index + 1);
+    sh.entries.push(rec);
+    sh.index = sh.entries.length - 1;
+    // Disposal is announced AFTER the commit: a `dispose` listener asking where
+    // the document is must be told the truth, not the URL it was leaving.
+    pendingDispose = removed;
+  } else if (navigationType === 'reload') {
+    rec = cur;
+    if (st.hasNav) { rec.state = st.nav; rec.cstate = undefined; }
+  } else {                                              // replace
+    // A replace makes a NEW VERSION of the slot. It has to be a new record, not
+    // an edit of the old one: a page that captured `navigation.currentEntry`
+    // before the replace still holds an object, and that object must keep
+    // reporting the id it was minted with. Mutating in place made the old
+    // wrapper silently report the new version's id — which is the one thing
+    // `key` (stable) and `id` (per-version) exist to tell apart.
+    rec = {
+      key: cur.key, id: _shUUID(), url,
+      state: st.nav, cstate: st.classic,
+      docSeq: sh.docSeq, sh, w: null, disposed: false,
+    };
+    sh.entries[sh.index] = rec;
+  }
+  sh.setUrl(url);
+  _shStore(sh);
+  if (pendingDispose) _shDispose(pendingDispose);
+  return rec;
+};
+
+// Two URLs that differ only in their fragment name the same document.
+const _shOnlyFragmentDiffers = (a, b) => {
+  try {
+    const ua = new URL(a), ub = new URL(b);
+    return ua.href.split('#')[0] === ub.href.split('#')[0] && ua.hash !== ub.hash;
+  } catch (e) { return false; }
+};
+
+// Is navigating from `from` to `to` a FRAGMENT navigation? HTML asks two things:
+// that the two URLs agree once fragments are excluded, and that the destination
+// HAS a fragment. The second half is easy to drop and expensive to drop:
+// `navigation.navigate("#d")` when the page is already at `#d` is still a
+// same-document navigation, and treating it as a cross-document one sends the
+// engine round the redirect loop until it gives up.
+const _shIsFragmentNav = (to, from) => {
+  try {
+    const ut = new URL(to), uf = new URL(from);
+    if (ut.href.split('#')[0] !== uf.href.split('#')[0]) return false;
+    // "has a fragment", not "has a NON-EMPTY fragment". `navigate("#")` — which
+    // is how this realm's own helpers replace the current entry — parses to a
+    // URL whose fragment is the empty string, and WHATWG's `hash` getter reports
+    // "" for both "no fragment" and "empty fragment". Reading `hash` therefore
+    // sent it down the cross-document path, into a reload of the page that had
+    // just asked for it, ten times, until the engine gave up.
+    return ut.href.indexOf('#') !== -1;
+  } catch (e) { return false; }
+};
+
+// ── The one routine every navigation goes through ───────────────────────────
+// See the ordering note at the top of this section: `committed` resolves at the
+// commit, and everything after it hangs off a `committed.then(…)` attached at
+// the moment the intercept handlers settle.
+const _navPerform = (o) => {
+  const nav = o.nav;
+  const sh = o.sh;
+  const committed = o.committedD || _navDeferred();
+  const finished = o.finishedD || _navDeferred();
+  const result = { committed: committed.promise, finished: finished.promise };
+  let committedOk = false;
+
+  // Starting a navigation ABORTS the one already in flight: its signal fires,
+  // its `finished` rejects with an AbortError, and `navigateerror` goes out. A
+  // page that starts two navigations in a row must not be left holding a promise
+  // for the one that lost.
+  if (nav._ongoing) { const prev = nav._ongoing; nav._ongoing = null; try { prev.abort(); } catch (e) {} }
+
+  const controller = new AbortController();
+  const dest = _shMintDest(
+    o.url, o.destEntry || null,
+    o.destSameDocument !== undefined ? o.destSameDocument : true,
+    o.destState);
+
+  const ev = new NavigateEvent('navigate', {
+    navigationType: o.navigationType,
+    destination: dest,
+    canIntercept: o.canIntercept !== false,
+    userInitiated: !!o.userInitiated,
+    hashChange: !!o.hashChange,
+    signal: controller.signal,
+    formData: o.formData === undefined ? null : o.formData,
+    downloadRequest: o.downloadRequest === undefined ? null : o.downloadRequest,
+    info: o.info,
+    sourceElement: o.sourceElement === undefined ? null : o.sourceElement,
+    cancelable: true,
+    bubbles: false,
+  });
+  ev._nav = { doScroll: o.doScroll || function () {} };
+  ev._isTrusted = true;
+  ev._dispatching = true;
+  try { _dispatchSpec(nav, ev, false); } catch (e) {}
+  ev._dispatching = false;
+
+  const fail = (err) => {
+    try { controller.abort(err); } catch (e) {}
+    committed.reject(err);
+    finished.reject(err);
+    nav._transition = null;
+    _navFireAt(nav, 'navigateerror', {
+      error: err, message: (err && err.message) || '', filename: '', lineno: 0, colno: 0,
+    });
+  };
+
+  if (ev.defaultPrevented) {
+    _navLastWentCrossDocument = false;
+    fail(new DOMException('Navigation was aborted', 'AbortError'));
+    return result;
+  }
+
+  const ongoing = {
+    abort: () => {
+      const err = new DOMException('Navigation was aborted', 'AbortError');
+      try { controller.abort(err); } catch (e) {}
+      if (!committedOk) committed.reject(err);
+      finished.reject(err);
+      nav._transition = null;
+      _navFireAt(nav, 'navigateerror', {
+        error: err, message: err.message, filename: '', lineno: 0, colno: 0,
+      });
+    },
+  };
+  nav._ongoing = ongoing;
+
+  // Nobody intercepted, and the destination is another document: hand it to the
+  // engine and let this realm end. `committed`/`finished` never settle, which is
+  // exactly what a page observes in a real browser — unless a second navigation
+  // starts first, which aborts this one on its way past.
+  if (!ev._intercepted && o.crossDocument) {
+    _navLastWentCrossDocument = true;
+    o.crossDocument();
+    return result;
+  }
+  _navLastWentCrossDocument = false;
+
+  const fromRec = sh.entries[sh.index];
+  const fromWrapper = _shWrap(fromRec);
+  let destUrl = o.url;
+
+  // `navigation.transition` belongs to an INTERCEPTED navigation only — a plain
+  // same-document push has none, and the ordering tests assert that null.
+  if (ev._intercepted) {
+    _shAllow.on = true;
+    let tr; try { tr = new NavigationTransition(); } finally { _shAllow.on = false; }
+    tr._navigationType = o.navigationType;
+    tr._from = fromWrapper;
+    // One microtask BEHIND `finished`, so a page that listens to both sees them
+    // settle in that order.
+    tr._finished = finished.promise.then((e) => e);
+    tr._finished.catch(() => {});
+    nav._transition = tr;
+  }
+
+  let rec = fromRec;
+
+  const settle = (ok, err) => {
+    if (!committedOk) return;
+    committed.promise.then(() => {
+      // Finishing an intercepted navigation is the moment the page becomes "the
+      // new page": unless the author asked to keep the focus and the scroll
+      // where they were, the focus goes back to the top of the document and the
+      // fragment is scrolled to. Both run whether the handlers fulfilled or
+      // rejected — the transition is over either way.
+      if (ev._intercepted) {
+        if (ev._focusReset !== 'manual') sh.focusReset();
+        if (ev._scrollBehavior !== 'manual' && !ev._scrolled) sh.scrollTo(destUrl);
+      }
+      if (ok) {
+        _navFireAt(nav, 'navigatesuccess');
+        finished.resolve(_shWrap(rec));
+      } else {
+        _navFireAt(nav, 'navigateerror', {
+          error: err, message: (err && err.message) || '', filename: '', lineno: 0, colno: 0,
+        });
+        finished.reject(err);
+      }
+      nav._transition = null;
+      if (nav._ongoing === ongoing) nav._ongoing = null;
+    }, () => {});
+  };
+
+  // Commit, then run the intercept handlers. When none of them returns a
+  // thenable the whole navigation finishes inside this call — which the ordering
+  // tests require.
+  const proceed = () => {
+    rec = o.commit ? o.commit(destUrl) : fromRec;
+    committedOk = true;
+    committed.resolve(_shWrap(rec));
+
+    _navFireCurrentChange(nav, o.navigationType, fromWrapper);
+
+    // The document-side effects of a same-document navigation — :target, the
+    // focusing steps, the scroll, hashchange, popstate — come AFTER
+    // currententrychange, which is the order `currententrychange-before-popstate`
+    // asserts.
+    if (o.afterCommit) { try { o.afterCommit(rec, fromRec, destUrl); } catch (e) {} }
+
+    const handlers = ev._handlers || [];
+    const results = [];
+    let thrown = null;
+    for (const h of handlers) {
+      try { results.push(h.call(undefined)); }
+      catch (e) { thrown = e; break; }
+    }
+    if (thrown !== null) { settle(false, thrown); return; }
+    let anyThenable = false;
+    for (const r of results) {
+      if (r != null && typeof r.then === 'function') { anyThenable = true; break; }
+    }
+    if (!anyThenable) { settle(true); return; }
+    Promise.all(results).then(() => settle(true), (e) => settle(false, e));
+  };
+
+  // `intercept({ precommitHandler })` holds the COMMIT open: the URL does not
+  // change, the entry list does not change, and `committed` does not settle
+  // until the handler's promise does. While it is open the handler may
+  // `redirect()` somewhere else entirely — which is the point of it, and why
+  // the destination is read from `destUrl` rather than captured at dispatch.
+  const pre = ev._precommitHandlers;
+  if (!pre || !pre.length) { proceed(); return result; }
+
+  const preController = {
+    // Queue a handler to run once the navigation commits — the same thing
+    // `intercept({handler})` does, but decided during the precommit phase, when
+    // the page may only just have worked out what it needs to load.
+    addHandler(fn) {
+      if (typeof fn !== 'function')
+        throw new TypeError('addHandler requires a function');
+      (ev._handlers || (ev._handlers = [])).push(fn);
+    },
+    redirect(to, options) {
+      const opt = options == null ? {} : options;
+      let abs;
+      try { abs = new URL(String(to), sh.docUrl()).href; }
+      catch (e) { throw new DOMException("Invalid URL '" + to + "'", 'SyntaxError'); }
+      destUrl = abs;
+      dest._url = abs;
+      if (opt.state !== undefined) dest._state = _shClone(opt.state);
+      if (opt.info !== undefined) ev._info = opt.info;
+      if (opt.history !== undefined) {
+        const h = String(opt.history);
+        if (_NAV_HISTORY_BEHAVIOR.indexOf(h) === -1)
+          throw new TypeError("'" + h + "' is not a valid NavigationHistoryBehavior.");
+        if (h !== 'auto') o.navigationType = h;
+      }
+    },
+  };
+  const preResults = [];
+  let preThrown = null;
+  for (const h of pre) {
+    try { preResults.push(h.call(undefined, preController)); }
+    catch (e) { preThrown = e; break; }
+  }
+  const abandon = (err) => {
+    try { controller_abort(err); } catch (e) {}
+    committed.reject(err);
+    finished.reject(err);
+    nav._transition = null;
+    _navFireAt(nav, 'navigateerror', {
+      error: err, message: (err && err.message) || '', filename: '', lineno: 0, colno: 0,
+    });
+  };
+  if (preThrown !== null) { abandon(preThrown); return result; }
+  Promise.all(preResults).then(() => proceed(), (e) => abandon(e));
+  return result;
+};
+
+const _navFailedResult = (err) => {
+  const committed = Promise.reject(err);
+  const finished = Promise.reject(err);
+  committed.catch(() => {}); finished.catch(() => {});
+  return { committed, finished };
+};
+
+const _NAV_HISTORY_BEHAVIOR = ['auto', 'push', 'replace'];
+
+// Did the navigation just performed actually leave for another document? Only
+// the form-submission path asks, because it is the only caller that has to do
+// the going itself.
+let _navLastWentCrossDocument = false;
+
+const _navNavigateMethod = (nav, url, options) => {
+  const sh = nav._sh; _shInit(sh);
+  const o = options == null ? {} : options;
+  const hist = o.history === undefined ? 'auto' : String(o.history);
+  if (_NAV_HISTORY_BEHAVIOR.indexOf(hist) === -1)
+    throw new TypeError("Failed to execute 'navigate' on 'Navigation': '" + hist +
+      "' is not a valid value for enumeration NavigationHistoryBehavior.");
+  let abs;
+  try { abs = new URL(String(url), sh.docUrl()).href; }
+  catch (e) {
+    return _navFailedResult(new DOMException("Invalid URL '" + url + "'", 'SyntaxError'));
+  }
+  let state, hasState = false;
+  if (o.state !== undefined) {
+    hasState = true;
+    try { state = _shClone(o.state); } catch (e) { return _navFailedResult(e); }
+  }
+  const cur = sh.entries[sh.index];
+  const sameDoc = _shIsFragmentNav(abs, cur.url);
+  // "auto" before the load event REPLACES. This is the rule the whole realm is
+  // written around, and getting it wrong shifts every index by one. Going to the
+  // URL you are already at replaces too — there is nowhere to go back to.
+  const navigationType = hist === 'replace' ? 'replace'
+    : hist === 'push' ? 'push'
+      : (sh.loaded() && abs !== cur.url) ? 'push' : 'replace';
+  const prevUrl = cur.url;
+  return _navPerform({
+    nav, sh, navigationType, url: abs,
+    destEntry: null, destSameDocument: sameDoc,
+    destState: hasState ? state : undefined,
+    info: o.info, canIntercept: true, hashChange: sameDoc,
+    commit: (u) => _shCommit(sh, u, navigationType, { nav: hasState ? state : undefined }),
+    afterCommit: sameDoc ? (r, from, u) => sh.effects(u, prevUrl, false) : null,
+    crossDocument: sameDoc ? null : () => sh.navigateCross(abs, navigationType),
+    doScroll: sameDoc ? () => sh.scrollTo(abs) : null,
+  });
+};
+
+const _navReloadMethod = (nav, options) => {
+  const sh = nav._sh; _shInit(sh);
+  const o = options == null ? {} : options;
+  let state, hasState = false;
+  if (o.state !== undefined) {
+    hasState = true;
+    try { state = _shClone(o.state); } catch (e) { return _navFailedResult(e); }
+  }
+  const cur = sh.entries[sh.index];
+  return _navPerform({
+    nav, sh, navigationType: 'reload', url: cur.url,
+    // A reload's destination is a URL, not a slot: `key`/`id` are "" and `index`
+    // is -1, exactly as for a push or a replace. Only a TRAVERSAL names an entry.
+    destEntry: null, destSameDocument: true,
+    destState: hasState ? state : cur.state,
+    info: o.info, canIntercept: true, hashChange: false,
+    commit: (u) => _shCommit(sh, u, 'reload', { nav: state, hasNav: hasState }),
+    crossDocument: () => sh.navigateCross(cur.url, 'reload'),
+  });
+};
+
+// A traversal is something the session history does TO the document, so it runs
+// on a task — `navigation.back()` returns before anything has happened, and an
+// unrelated microtask queued right after it runs first.
+const _navTraverseMethod = (nav, key, options) => {
+  const sh = nav._sh; _shInit(sh);
+  const o = options == null ? {} : options;
+  const idx = sh.entries.findIndex((e) => e.key === key);
+  if (idx === -1)
+    return _navFailedResult(new DOMException(
+      'No history entry with the given key.', 'InvalidStateError'));
+  if (idx === sh.index) {
+    const w = _shWrap(sh.entries[idx]);
+    const committed = Promise.resolve(w), finished = Promise.resolve(w);
+    return { committed, finished };
+  }
+  const committedD = _navDeferred(), finishedD = _navDeferred();
+  _queueTask(() => {
+    const at = sh.entries.findIndex((e) => e.key === key);
+    if (at === -1) {
+      const err = new DOMException('The history entry was disposed.', 'InvalidStateError');
+      committedD.reject(err); finishedD.reject(err);
+      return;
+    }
+    const target = sh.entries[at];
+    const prevUrl = sh.docUrl();
+    const crossDoc = target.docSeq !== sh.docSeq;
+    _navPerform({
+      nav, sh, navigationType: 'traverse', url: target.url,
+      destEntry: target, destSameDocument: !crossDoc, destState: target.state,
+      info: o.info, canIntercept: !crossDoc, hashChange: _shOnlyFragmentDiffers(target.url, prevUrl),
+      committedD, finishedD,
+      commit: (u) => {
+        sh.index = at;
+        if (u !== target.url) target.url = u;
+        sh.setUrl(target.url);
+        _shStore(sh);
+        return target;
+      },
+      afterCommit: (r, from, u) => sh.effects(u, prevUrl, true, target.cstate),
+      // ⚠️ THE TRAVERSAL BELONGS TO ITS OWN WINDOW. Reaching for `op_navigate`
+      // here — the top-level engine navigation — meant `frame.navigation.back()`
+      // navigated THE PAGE, which for a page whose iframe is the thing under
+      // test means the test itself is thrown away mid-run.
+      crossDocument: crossDoc ? () => sh.navigateCrossTraverse(target.url, at,
+        sh.entries[sh.index].key) : null,
+      doScroll: () => sh.scrollTo(target.url),
+    });
+  });
+  return { committed: committedD.promise, finished: finishedD.promise };
+};
+
+// ── history ─────────────────────────────────────────────────────────────────
+const _histAllow = { on: false };
+class History {
+  constructor() { if (!_histAllow.on) throw new TypeError('Illegal constructor'); }
+  get length() {
+    if (!(this instanceof History)) throw new TypeError('Illegal invocation');
+    const sh = this._sh; _shInit(sh); return sh.entries.length;
+  }
+  get scrollRestoration() {
+    if (!(this instanceof History)) throw new TypeError('Illegal invocation');
+    return this._scrollRestoration || 'auto';
+  }
+  set scrollRestoration(v) {
+    if (!(this instanceof History)) throw new TypeError('Illegal invocation');
+    const s = String(v);
+    if (s !== 'auto' && s !== 'manual') return;
+    this._scrollRestoration = s;
+  }
+  // The SAME object across reads within one entry version: a page that mutates
+  // `history.state` and reads it back must see its own mutation.
+  get state() {
+    if (!(this instanceof History)) throw new TypeError('Illegal invocation');
+    const cur = _shCur(this._sh);
+    if (!cur) return null;
+    if (this._stateId !== cur.id) {
+      this._stateId = cur.id;
+      this._stateValue = cur.cstate === undefined ? null : _shClone(cur.cstate);
+    }
+    return this._stateValue;
+  }
+  go(delta) {
+    if (!(this instanceof History)) throw new TypeError('Illegal invocation');
+    const sh = this._sh; _shInit(sh);
+    const d = delta === undefined ? 0 : (Number(delta) | 0);
+    const nav = this._navigation;
+    _queueTask(() => {
+      const at = sh.index + d;
+      if (d === 0 || at < 0 || at >= sh.entries.length) return;
+      _navTraverseMethod(nav, sh.entries[at].key, {});
+    });
+  }
+  back() {
+    if (!(this instanceof History)) throw new TypeError('Illegal invocation');
+    this.go(-1);
+  }
+  forward() {
+    if (!(this instanceof History)) throw new TypeError('Illegal invocation');
+    this.go(1);
+  }
+  pushState(data, unused, url) {
+    if (!(this instanceof History)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'pushState' on 'History': 2 arguments required.");
+    _histUpdate(this, data, url, 'push');
+  }
+  replaceState(data, unused, url) {
+    if (!(this instanceof History)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 2) throw new TypeError("Failed to execute 'replaceState' on 'History': 2 arguments required.");
+    _histUpdate(this, data, url, 'replace');
+  }
+  get [Symbol.toStringTag]() { return 'History'; }
+}
+
+// pushState/replaceState fire the `navigate` event like any other same-document
+// navigation — and a page that calls preventDefault() on it keeps its URL, its
+// state and its history length.
+const _histUpdate = (hist, data, url, type) => {
+  const sh = hist._sh; _shInit(sh);
+  let serialized;
+  try { serialized = data === undefined ? null : _shClone(data); }
+  catch (e) { throw new DOMException('The object could not be cloned.', 'DataCloneError'); }
+  const cur = sh.entries[sh.index];
+  let target = cur.url;
+  if (url !== undefined && url !== null) {
+    let u;
+    try { u = new URL(String(url), sh.docUrl()); }
+    catch (e) { throw new DOMException("Invalid URL '" + url + "'", 'SyntaxError'); }
+    let curU; try { curU = new URL(sh.docUrl()); } catch (e) { curU = null; }
+    // Same-origin only: a document must not dress its address bar as another site.
+    if (curU && u.origin !== curU.origin)
+      throw new DOMException('Cannot change history to a cross-origin URL', 'SecurityError');
+    target = u.href;
+  }
+  _navPerform({
+    nav: hist._navigation, sh, navigationType: type, url: target,
+    // A push AND a replace both go to a URL, not to a slot: `destination.key`
+    // is "" and `destination.index` is -1 for either. Only a traversal or a
+    // reload names an entry that already exists.
+    destEntry: null,
+    destSameDocument: true, destState: serialized,
+    canIntercept: true, hashChange: false,
+    commit: (u) => {
+      const r = _shCommit(sh, u, type, { classic: serialized });
+      hist._stateId = null;
+      return r;
+    },
+  });
+};
+
+// One session history, one `navigation`, one `history` — per window. The two
+// interfaces are two views of the same list, so they are minted together and
+// each keeps a handle on the other: `history.pushState` fires `navigate` at the
+// window's own Navigation object, and `navigation.updateCurrentEntry` clears the
+// cached `history.state` on the window's own History object.
+globalThis._shMakeWindowHistory = function (sh) {
+  _histAllow.on = true;
+  const h = new History();
+  _histAllow.on = false;
+  _navAllow.on = true;
+  const n = new Navigation();
+  _navAllow.on = false;
+  h._sh = sh; n._sh = sh;
+  h._navigation = n; n._history = h;
+  sh.navigation = n; sh.history = h;
+  return { history: h, navigation: n };
+};
+
+const _topWindowHistory = globalThis._shMakeWindowHistory(_shTop);
+Object.defineProperty(globalThis, 'history', {
+  value: _topWindowHistory.history, writable: true, enumerable: true, configurable: true,
+});
+Object.defineProperty(globalThis, 'navigation', {
+  value: _topWindowHistory.navigation, writable: true, enumerable: true, configurable: true,
+});
+
+_exposeIface('History', History);
+_exposeIface('Navigation', Navigation);
+_exposeIface('NavigationHistoryEntry', NavigationHistoryEntry);
+_exposeIface('NavigationDestination', NavigationDestination);
+_exposeIface('NavigateEvent', NavigateEvent);
+_exposeIface('NavigationCurrentEntryChangeEvent', NavigationCurrentEntryChangeEvent);
+_exposeIface('NavigationTransition', NavigationTransition);
+_exposeIface('NavigationActivation', NavigationActivation);
+_enumAccessors(History.prototype, 'length', 'scrollRestoration', 'state',
+  'go', 'back', 'forward', 'pushState', 'replaceState');
+_enumAccessors(Navigation.prototype, 'entries', 'currentEntry', 'transition', 'activation',
+  'canGoBack', 'canGoForward', 'updateCurrentEntry', 'navigate', 'reload',
+  'traverseTo', 'back', 'forward');
+_enumAccessors(NavigationHistoryEntry.prototype, 'url', 'key', 'id', 'index',
+  'sameDocument', 'getState');
+_enumAccessors(NavigationDestination.prototype, 'url', 'key', 'id', 'index',
+  'sameDocument', 'getState');
+_enumAccessors(NavigateEvent.prototype, 'navigationType', 'destination', 'canIntercept',
+  'userInitiated', 'hashChange', 'signal', 'formData', 'downloadRequest', 'info',
+  'hasUAVisualTransition', 'sourceElement', 'intercept', 'scroll');
+_enumAccessors(NavigationCurrentEntryChangeEvent.prototype, 'navigationType', 'from');
+_enumAccessors(NavigationTransition.prototype, 'navigationType', 'from', 'finished');
+_enumAccessors(NavigationActivation.prototype, 'from', 'entry', 'navigationType');
+_xhrDefEventHandlers(Navigation.prototype, Navigation,
+  ['onnavigate', 'onnavigatesuccess', 'onnavigateerror', 'oncurrententrychange']);
+_xhrDefEventHandlers(NavigationHistoryEntry.prototype, NavigationHistoryEntry, ['ondispose']);
+
+// A same-document navigation the DOCUMENT asked for: `location.hash = …`,
+// `location.href = "#x"`, `location.assign`/`replace` with a fragment-only
+// difference, or an activated `<a href="#x">`. All of them are ordinary
+// Navigation-API navigations — they fire `navigate`, they can be cancelled, and
+// they can be intercepted.
+//
+// `sourceElement` is the link that was followed, if any; a link push()es even
+// during parse, while a `location` write before the load event replaces.
+// Every navigation the DOCUMENT asks for goes through here — `location.href`,
+// `location.assign`/`replace`, a `location` component setter, an activated
+// `<a href>`. Fragment or not, it fires `navigate` first, so a page can cancel
+// it or intercept it; only when nobody did does the engine actually go.
+globalThis._shDocumentNavigate = function (sh, url, opts) {
+  opts = opts || {};
+  sh = sh || _shTop;
+  _shInit(sh);
+  const cur = sh.entries[sh.index];
+  const prevUrl = cur.url;
+  // A download is never a fragment navigation: it does not move the document at
+  // all, so it goes down the general path where nothing is committed.
+  const sameDoc = opts.downloadRequest == null && _shIsFragmentNav(url, prevUrl);
+  if (sameDoc) return globalThis._shNavigateFragment(sh, url, opts);
+  // Going to the URL already showing is a REPLACE, link or no link: it is a
+  // reload of the same address, and it must not add a back-button step that
+  // takes the reader nowhere.
+  const navigationType = opts.replace || url === prevUrl ? 'replace'
+    : (opts.fromLink || sh.loaded()) ? 'push' : 'replace';
+  return _navPerform({
+    nav: sh.navigation, sh,
+    navigationType, url,
+    destEntry: null, destSameDocument: false, destState: undefined,
+    canIntercept: true, hashChange: false,
+    userInitiated: !!opts.userInitiated,
+    sourceElement: opts.sourceElement || null,
+    downloadRequest: opts.downloadRequest,
+    // Nobody intercepted: this really is another document.
+    commit: (u) => _shCommit(sh, u, navigationType, {}),
+    // A `<a download>` fires `navigate` and then downloads: there is no
+    // navigation to perform, and neither `navigatesuccess` nor `navigateerror`
+    // ever comes.
+    crossDocument: opts.downloadRequest != null
+      ? function () {}
+      : () => sh.navigateCross(url, navigationType),
+  });
+};
+
+// ── A frame is a traversable too ────────────────────────────────────────────
+// Half of `navigation-api/` is written from the PARENT, about
+// `i.contentWindow.navigation`: an `<iframe>` has its own entry list, its own
+// current entry and its own back button. Without this, every one of those files
+// threw on its first line — and worse, a link clicked inside a frame reached the
+// top-level `location` and navigated the WHOLE PAGE, which is how a realm full
+// of frame tests turned into a redirect loop.
+//
+// A frame's history is not persisted: it belongs to the frame, and the frame
+// does not outlive its parent document.
+globalThis._shForFrame = function (win) {
+  if (!win) return _shTop;
+  if (win._sh) return win._sh;
+  const sh = {
+    entries: [], index: 0, docSeq: 0, pendingActivation: null, persist: false,
+    win,
+    docUrl() { return win._url || 'about:blank'; },
+    setUrl(u) {
+      win._url = u;
+      try { if (win.document) win.document._url = u; } catch (e) {}
+    },
+    loaded() { return !!win._docLoaded; },
+    navigateCross(url) {
+      const host = win._hostEl;
+      if (host && typeof host._loadIframeSrc === 'function') {
+        try { host._loadIframeSrc(url); } catch (e) {}
+      }
+    },
+    // The frame's own list survives the reload (the Window is reused), so a
+    // cross-document traversal just says which slot the arriving document lands
+    // in and reloads the frame there.
+    navigateCrossTraverse(url, at) {
+      sh.pendingTraverse = at;
+      this.navigateCross(url);
+    },
+    effects(newUrl, oldUrl, isTraverse, state) {
+      let frag = '';
+      try { frag = (new URL(newUrl).hash || '').replace(/^#/, ''); } catch (e) {}
+      let dec = frag; try { dec = decodeURIComponent(frag); } catch (e) {}
+      try { _dom('set_target_id', dec, ''); } catch (e) {}
+      const changed = newUrl !== oldUrl;
+      if (!isTraverse && !changed) return;
+      setTimeout(() => {
+        if (isTraverse) {
+          try {
+            win.dispatchEvent(new (globalThis.PopStateEvent || Event)('popstate', {
+              state: state === undefined ? null : state,
+            }));
+          } catch (e) {}
+        }
+        if (changed) {
+          try { win.dispatchEvent(new HashChangeEvent('hashchange', { oldURL: oldUrl, newURL: newUrl })); } catch (e) {}
+        }
+      }, 0);
+    },
+    scrollTo() {},
+    focusReset() {},
+  };
+  win._sh = sh;
+  const pair = globalThis._shMakeWindowHistory(sh);
+  win.history = pair.history;
+  win.navigation = pair.navigation;
+  // Seed the first entry NOW, while the frame is still at the URL it was created
+  // with — a list initialised lazily would record wherever the frame had got to
+  // by the time somebody first asked.
+  _shInit(sh);
+  sh.initialAboutBlank = (sh.entries[0] && sh.entries[0].url === 'about:blank');
+  return sh;
+};
+
+// The frame went somewhere new by itself (its `src` changed, its parent called
+// `_loadIframeSrc`, a link inside it was followed). Record that in the frame's
+// own session history so `contentWindow.navigation.entries()` describes what the
+// frame actually did.
+globalThis._shFrameLanded = function (win, url, replace) {
+  if (!win) return;
+  const sh = globalThis._shForFrame(win);
+  _shInit(sh);
+  sh.docSeq += 1;
+  win._docLoaded = false;
+  // The frame is arriving because it was TRAVERSED to: it lands in the slot the
+  // traversal named, and adds nothing.
+  if (sh.pendingTraverse != null) {
+    const at = sh.pendingTraverse;
+    sh.pendingTraverse = null;
+    if (at >= 0 && at < sh.entries.length) {
+      sh.index = at;
+      const rec = sh.entries[at];
+      rec.docSeq = sh.docSeq;
+      rec.url = url;
+      rec.w = null;
+      return;
+    }
+  }
+  const cur = sh.entries[sh.index];
+  // A frame starts life on the INITIAL about:blank, and the document it was
+  // actually pointed at REPLACES that — it does not sit on top of it. Otherwise
+  // every frame on the web would begin its history with a blank page nobody
+  // asked for, and `back()` inside it would land there.
+  const initialBlank = sh.initialAboutBlank && cur && cur.url === 'about:blank';
+  if (initialBlank) sh.initialAboutBlank = false;
+  if (replace || initialBlank || !cur || cur.url === url) {
+    sh.entries[sh.index] = {
+      key: cur ? cur.key : _shUUID(), id: _shUUID(), url,
+      state: undefined, cstate: undefined,
+      docSeq: sh.docSeq, sh, w: null, disposed: false,
+    };
+  } else {
+    const removed = sh.entries.splice(sh.index + 1);
+    sh.entries.push({
+      key: _shUUID(), id: _shUUID(), url,
+      state: undefined, cstate: undefined,
+      docSeq: sh.docSeq, sh, w: null, disposed: false,
+    });
+    sh.index = sh.entries.length - 1;
+    _shDispose(removed);
+  }
+};
+
+// A form submission. Returns TRUE when the engine should go ahead and perform
+// the navigation, FALSE when the page cancelled or intercepted it — a form is
+// the one navigation whose request body the engine still has to build itself, so
+// this fires the event and reports the verdict rather than owning the fetch.
+globalThis._shSubmitNavigate = function (url, opts) {
+  opts = opts || {};
+  const sh = opts.sh || _shTop;
+  _shInit(sh);
+  const cur = sh.entries[sh.index];
+  const prevUrl = cur.url;
+  const sameDoc = _shIsFragmentNav(url, prevUrl);
+  // ⚠️ A FORM SUBMISSION REPLACES UNLESS A PERSON ASKED FOR IT. `form.submit()`
+  // from script is a replace even on a fully loaded page — it is the page
+  // redirecting itself, and it must not put a step in the reader's back button
+  // that takes them nowhere. A submit BUTTON someone actually pressed pushes.
+  const navigationType = opts.userInitiated ? 'push' : 'replace';
+  let go = true;
+  _navPerform({
+    nav: sh.navigation, sh,
+    navigationType, url,
+    destEntry: null, destSameDocument: sameDoc, destState: undefined,
+    canIntercept: true, hashChange: false,
+    userInitiated: !!opts.userInitiated,
+    sourceElement: opts.sourceElement || null,
+    formData: opts.formData || null,
+    commit: (u) => _shCommit(sh, u, navigationType, {}),
+    afterCommit: sameDoc ? (r, from, u) => sh.effects(u, prevUrl, false) : null,
+    crossDocument: () => { go = true; },
+  });
+  // Cancelled, or turned into a same-document navigation by intercept(): either
+  // way the engine must not fetch.
+  return go && !!_navLastWentCrossDocument;
+};
+
+globalThis._shNavigateFragment = function (sh, newUrl, opts) {
+  opts = opts || {};
+  sh = sh || _shTop;
+  _shInit(sh);
+  const cur = sh.entries[sh.index];
+  const prevUrl = cur.url;
+  const navigationType = opts.replace ? 'replace'
+    : (opts.fromLink || sh.loaded()) ? 'push' : 'replace';
+  return _navPerform({
+    nav: sh.navigation, sh,
+    navigationType, url: newUrl,
+    destEntry: null, destSameDocument: true, destState: undefined,
+    canIntercept: true, hashChange: _shOnlyFragmentDiffers(newUrl, prevUrl),
+    userInitiated: !!opts.userInitiated,
+    sourceElement: opts.sourceElement || null,
+    downloadRequest: opts.downloadRequest,
+    commit: (u) => _shCommit(sh, u, navigationType, {}),
+    afterCommit: (r, from, u) => sh.effects(u, prevUrl, false),
+    doScroll: () => sh.scrollTo(newUrl),
+  });
 };
 globalThis.screenX = 0; globalThis.screenY = 0;
 globalThis.screenLeft = 0; globalThis.screenTop = 0;
@@ -44403,9 +45839,15 @@ try {
 // fallback" — which for a non-focusable target means the currently focused
 // element is UNFOCUSED (its blur fires) without recording a fixup resume point.
 // hashchange (and popstate) fire on a later task, and only if the URL changed.
-globalThis._fragmentNavigate = function(newUrl) {
-  const oldUrl = _domParse("document_url") ?? "about:blank";
-  try { Deno.core.ops.op_set_document_url(newUrl); } catch (e) { return; }
+// The DOCUMENT-side effects of a same-document navigation, once the URL has
+// already changed: find the indicated element, make it the sequential-focus
+// starting point, and run the focusing steps for it "with the viewport as the
+// fallback" — which for a non-focusable target means the currently focused
+// element is UNFOCUSED (its blur fires) without recording a fixup resume point.
+// hashchange fires on a later task, and only if the URL actually changed;
+// popstate fires only for a TRAVERSAL — a push or a replace does not go back to
+// anything, so there is no state to pop.
+globalThis._shFragmentEffects = function(newUrl, oldUrl, isTraverse, state) {
   let frag = '';
   try { frag = (new URL(newUrl).hash || '').replace(/^#/, ''); } catch (e) {}
   let target = null;
@@ -44439,12 +45881,64 @@ globalThis._fragmentNavigate = function(newUrl) {
     _dom('set_target_id', dec, '');
   } catch (e) {}
   try { if (target && target.scrollIntoView) target.scrollIntoView(); } catch (e) {}
-  if (newUrl !== oldUrl) {
+  const changed = newUrl !== oldUrl;
+  if (isTraverse || changed) {
     setTimeout(() => {
-      try { window.dispatchEvent(new (globalThis.PopStateEvent || Event)('popstate')); } catch (e) {}
-      try { window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL: oldUrl, newURL: newUrl })); } catch (e) {}
+      if (isTraverse) {
+        try {
+          window.dispatchEvent(new (globalThis.PopStateEvent || Event)('popstate', {
+            state: state === undefined ? null : state,
+          }));
+        } catch (e) {}
+      }
+      if (changed) {
+        try { window.dispatchEvent(new HashChangeEvent('hashchange', { oldURL: oldUrl, newURL: newUrl })); } catch (e) {}
+      }
     }, 0);
   }
+};
+
+// The focus reset an intercepted navigation performs when it finishes: focus
+// goes to the document's autofocus candidate if it has one, otherwise nowhere —
+// and the sequential focus starting point is CLEARED, so the next Tab starts
+// from the top of the document rather than from wherever the reader happened to
+// be before the page changed under them.
+globalThis._shFocusReset = function() {
+  let target = null;
+  try { target = document.querySelector('[autofocus]'); } catch (e) {}
+  if (target && globalThis._isFocusableArea && globalThis._isFocusableArea(target)) {
+    globalThis._performFocus(target);
+  } else if (typeof __obscura_focused !== 'undefined' && __obscura_focused) {
+    const prevEl = __obscura_focused;
+    __obscura_focused = null;
+    __obscura_click_target = null;
+    __obscura_focusVisible = false;
+    try { globalThis._syncRustFocus(null); } catch (e) {}
+    try { globalThis._fvSyncRust(); } catch (e) {}
+    try { globalThis._fireFocusEvent(prevEl, 'blur', false, null); } catch (e) {}
+    try { globalThis._fireFocusEvent(prevEl, 'focusout', true, null); } catch (e) {}
+  }
+  try { globalThis._setSeqFocusStart(null); } catch (e) {}
+};
+
+// Just the scroll half, for `NavigateEvent.scroll()`.
+globalThis._shScrollToFragment = function(url) {
+  let frag = '';
+  try { frag = (new URL(url).hash || '').replace(/^#/, ''); } catch (e) {}
+  if (frag === '' || !document) return;
+  let dec = frag; try { dec = decodeURIComponent(frag); } catch (e) {}
+  let target = null;
+  try { target = document.getElementById(dec) || document.getElementById(frag) || null; } catch (e) {}
+  try { if (target && target.scrollIntoView) target.scrollIntoView(); } catch (e) {}
+};
+
+// The old entry point, kept for every caller that just wants "go to this
+// fragment": it is now an ordinary Navigation-API navigation.
+globalThis._fragmentNavigate = function(newUrl, opts, sh) {
+  if (typeof globalThis._shNavigateFragment === 'function')
+    return globalThis._shNavigateFragment(sh || null, newUrl, opts);
+  try { Deno.core.ops.op_set_document_url(newUrl); } catch (e) {}
+  return undefined;
 };
 
 // Is `el` (or any ancestor) not rendered — display:none per the UA sheet / an author
@@ -45435,7 +46929,45 @@ globalThis._sequentialFocusNavigation = function(backward) {
       }
       return true;
     }
-    location.assign(href);
+    // A followed link pushes even before the load event (unlike a `location`
+    // write, which replaces), and it tells the navigate event which element it
+    // came from.
+    //
+    // `<a download>` is a link that does NOT navigate: it fires `navigate` with
+    // `downloadRequest` set to the attribute's value (the filename the author
+    // asked for, "" when bare) so a page can intercept it, and then — if nobody
+    // did — downloads instead of going anywhere. Neither `navigatesuccess` nor
+    // `navigateerror` ever follows, because no navigation happened.
+    const dl = link.hasAttribute && link.hasAttribute('download')
+      ? (link.getAttribute('download') || '') : null;
+    // ⚠️ THE LINK BELONGS TO A WINDOW. A link inside an `<iframe>` navigates THAT
+    // frame; resolving its href against the top-level document and handing the
+    // navigation to the page was how a click in a frame took the whole page with
+    // it — and, when the frame was showing the test that did the clicking, how a
+    // click became an infinite reload.
+    let lsh = null, lbase = null;
+    try {
+      // `target` picks the browsing context: a link with `target="foo"` steers
+      // the frame named foo, not the window the link is sitting in.
+      let w = null;
+      const tgt = link.getAttribute && link.getAttribute('target');
+      if (tgt && typeof _frameForTarget === 'function') {
+        const fr = _frameForTarget(link, tgt);
+        if (fr) { try { fr._loadIframeSrc(_resolveUrl(href)); } catch (e) {} return true; }
+      }
+      w = globalThis._windowForNode(link);
+      if (w && w !== globalThis && typeof globalThis._shForFrame === 'function') {
+        lsh = globalThis._shForFrame(w);
+        lbase = w._url || null;
+      }
+    } catch (e) {}
+    let target = href;
+    try { target = new URL(href, lbase || (_domParse('document_url') ?? 'about:blank')).href; }
+    catch (e) { target = _resolveUrl(href); }
+    _navigateTo(target, {
+      fromLink: true, sourceElement: link,
+      downloadRequest: dl, sh: lsh,
+    });
     return true;
   };
 
@@ -51558,7 +53090,7 @@ const _makeOpaqueWindowHandle = (hostEl, realWin) => {
     set(v) { try { if (hostEl) hostEl._loadIframeSrc(String(v)); } catch (e) {} },
   });
   for (const k of ['document', 'localStorage', 'sessionStorage', 'name', 'origin',
-                   'history', 'navigator', 'frameElement']) {
+                   'history', 'navigation', 'navigator', 'frameElement']) {
     Object.defineProperty(handle, k, { configurable: true, get: deny, set: deny });
   }
   return handle;
@@ -56744,6 +58276,36 @@ class _IframeWindow {
     if (originUrl) {
       try { this.location.origin = new URL(originUrl).origin; } catch(e) {}
     }
+    // Its own session history, its own `navigation`, its own `history`. A frame
+    // is a traversable, not a view of the page's.
+    try { globalThis._shForFrame(this); } catch (e) {}
+    // A frame's `location` really navigates the frame. It used to be a snapshot
+    // object with `assign(){}`, `reload(){}` and `replace(){}` as empty functions
+    // and `href` as a plain string field, so a parent steering its own frame
+    // ("go to the next step", "reload after saving") silently did nothing — and
+    // `contentWindow.location.href = url` wrote a string nobody read.
+    {
+      const _w = this;
+      Object.defineProperty(this.location, 'href', {
+        configurable: true, enumerable: true,
+        get() { return _w._url; },
+        set(v) {
+          let abs; try { abs = new URL(String(v), _w._url).href; } catch (e) { return; }
+          try { globalThis._shDocumentNavigate(globalThis._shForFrame(_w), abs, {}); } catch (e) {}
+        },
+      });
+      this.location.assign = function (v) {
+        let abs; try { abs = new URL(String(v), _w._url).href; } catch (e) { return; }
+        try { globalThis._shDocumentNavigate(globalThis._shForFrame(_w), abs, {}); } catch (e) {}
+      };
+      this.location.replace = function (v) {
+        let abs; try { abs = new URL(String(v), _w._url).href; } catch (e) { return; }
+        try { globalThis._shDocumentNavigate(globalThis._shForFrame(_w), abs, { replace: true }); } catch (e) {}
+      };
+      this.location.reload = function () {
+        try { _w.navigation.reload(); } catch (e) {}
+      };
+    }
     // `location.hash` is a live accessor: assigning is a same-document fragment
     // navigation WITHIN the frame — the frame document's URL updates, the
     // fragment's element becomes the tree's :target, and hashchange fires at
@@ -56755,20 +58317,10 @@ class _IframeWindow {
         configurable: true, enumerable: true,
         get() { try { return new URL(_self._url).hash; } catch (e) { return ''; } },
         set(v) {
-          let s = String(v); if (s[0] === '#') s = s.slice(1);
-          let nu; try { nu = new URL('#' + s, _self._url).href; } catch (e) { return; }
-          if (s === '') nu = nu.split('#')[0];
-          const old = _self._url;
-          _self._url = nu;
-          try { if (_self.document) _self.document._url = nu; } catch (e) {}
-          try { this.href = nu; } catch (e) {}
-          let dec = s; try { dec = decodeURIComponent(s); } catch (e) {}
-          try { _dom('set_target_id', dec, ''); } catch (e) {}
-          if (nu !== old) {
-            setTimeout(() => {
-              try { _self.dispatchEvent(new HashChangeEvent('hashchange', { oldURL: old, newURL: nu })); } catch (e) {}
-            }, 0);
-          }
+          let sv = String(v); if (sv[0] === '#') sv = sv.slice(1);
+          let nu; try { nu = new URL('#' + sv, _self._url).href; } catch (e) { return; }
+          if (sv === '') nu = nu.split('#')[0];
+          try { globalThis._shNavigateFragment(globalThis._shForFrame(_self), nu, {}); } catch (e) {}
         },
       });
     }
@@ -56932,7 +58484,14 @@ const _relocateWindow = function(win, url) {
   if (!loc) return;
   let u = null;
   try { u = new URL(url); } catch (e) {}
-  try { loc.href = url; } catch (e) {}
+  // `href` is a navigating accessor on a frame's Location; the window's own
+  // `_url` is the storage behind it, and writing that is what "the frame is now
+  // here" means. Assigning `loc.href` would ask the frame to navigate again.
+  win._url = url;
+  if (!Object.getOwnPropertyDescriptor(loc, 'href') ||
+      Object.getOwnPropertyDescriptor(loc, 'href').writable) {
+    try { loc.href = url; } catch (e) {}
+  }
   const fields = u
     ? { origin: u.origin, protocol: u.protocol, host: u.host, hostname: u.hostname,
         port: u.port, pathname: u.pathname, search: u.search }
@@ -56953,6 +58512,11 @@ const _installFrameWindow = function(hostEl, doc, url, originUrl) {
     return hostEl._iframeWin;
   }
   prev.document = doc;
+  // ⚠️ ORDER MATTERS: the frame's session history has to be told where it is
+  // GOING while it still knows where it WAS. Writing `_url` first made the
+  // arrival look like a reload of the same address, and a frame that navigated
+  // somewhere new reported one entry instead of two.
+  try { globalThis._shFrameLanded(prev, url, false); } catch (e) {}
   prev._url = url;
   try { doc._ceRegistry = prev.customElements; } catch (e) {}
   _relocateWindow(prev, url);
@@ -62743,6 +64307,9 @@ const _WORKER_HIDDEN = new Set([
   'window', 'Window', 'document', 'Document', 'XMLDocument', 'DetachedDocument',
   'self', 'globalThis', 'frames', 'parent', 'top', 'opener', 'frameElement',
   'location', 'Location', 'history', 'History', 'navigator', 'Navigator',
+  'navigation', 'Navigation', 'NavigationHistoryEntry', 'NavigationDestination',
+  'NavigateEvent', 'NavigationCurrentEntryChangeEvent', 'NavigationTransition',
+  'NavigationActivation',
   // (`origin` is NOT here: it is a WindowOrWorkerGlobalScope member, and a
   // dedicated worker's origin is its creator's.)
   'name', 'status', 'closed', 'length',
@@ -64174,7 +65741,20 @@ globalThis.open = function(url, target, features) {
   return null;
 };
 globalThis.close = function() {};
-globalThis.stop = function() {};
+// `window.stop()` is not a no-op any more: it aborts the navigation in flight,
+// which is what `signal-abort-window-stop` and the precommit tests are asking
+// about. (It still does not stop subresource loads.)
+globalThis.stop = function() {
+  // Take back the parked navigation FIRST: `op_navigate` only queues the request
+  // for the host to act on, so aborting the JS-side promises while leaving that
+  // queued means the page is told the navigation was cancelled and then goes
+  // anyway — the one outcome `stop()` exists to prevent.
+  try { Deno.core.ops.op_cancel_navigation(); } catch (e) {}
+  try {
+    const nav = globalThis.navigation;
+    if (nav && nav._ongoing) { const o = nav._ongoing; nav._ongoing = null; o.abort(); }
+  } catch (e) {}
+};
 // HTML §window.postMessage — the top-level window posting to ITSELF. This was a
 // no-op stub, which silently broke the most common cross-piece signalling idiom
 // on the web (and the relay every CSP `simpleSourcedScript.js` test hangs on):

@@ -53,6 +53,15 @@ pub struct ObscuraState {
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_counter: u64,
     pub intercept_enabled: bool,
+    /// The traversable's SESSION HISTORY, as the JSON the JS side keeps it in.
+    ///
+    /// It has to live outside the JS realm because the realm does not survive a
+    /// navigation — `Page::init_js` drops the whole runtime and builds a new one
+    /// — while the session history is the one thing a navigation must NOT reset.
+    /// The `Page` owns the cell and hands a clone to each realm it creates, so a
+    /// `pushState` in the old document is still there for `navigation.entries()`
+    /// in the new one.
+    pub session_history: Option<Arc<std::sync::Mutex<String>>>,
 }
 
 impl ObscuraState {
@@ -69,6 +78,7 @@ impl ObscuraState {
             intercept_tx: None,
             intercept_counter: 0,
             intercept_enabled: false,
+            session_history: None,
         }
     }
 }
@@ -1717,6 +1727,48 @@ fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[s
 /// what `location`/`document.URL` report without scheduling a navigation:
 /// the document stays, no fetch happens, and the JS side fires
 /// hashchange/popstate itself.
+/// Abandon a navigation this document asked for but has since called
+/// `window.stop()` on. `op_navigate` only PARKS the request in
+/// `pending_navigation` for the host to pick up, so a page that changes its mind
+/// inside the same task must be able to take it back — otherwise `window.stop()`
+/// aborts the JS-side promises while the engine goes anyway.
+#[op2(fast)]
+fn op_cancel_navigation(state: &OpState) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.pending_navigation = None;
+}
+
+/// Read the session history the previous document left behind. Returns "null"
+/// when there is none — a fresh traversable, or a build without a Page.
+#[op2]
+#[string]
+fn op_session_history_load(state: &OpState) -> String {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    match &gs.session_history {
+        Some(cell) => cell
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "null".to_string()),
+        None => "null".to_string(),
+    }
+}
+
+/// Hand the session history back for the NEXT document to pick up. Called on
+/// every mutation, not just at navigation time: the realm can be torn down
+/// without warning, so the store has to be current, not merely eventual.
+#[op2(fast)]
+fn op_session_history_store(state: &OpState, #[string] json: &str) {
+    let gs = state.borrow::<SharedState>().clone();
+    let gs = gs.borrow();
+    if let Some(cell) = &gs.session_history {
+        if let Ok(mut g) = cell.lock() {
+            *g = json.to_string();
+        }
+    }
+}
+
 #[op2(fast)]
 fn op_set_document_url(state: &OpState, #[string] url: &str) {
     let gs = state.borrow::<SharedState>().clone();
@@ -2225,6 +2277,9 @@ pub fn build_extension() -> Extension {
             op_get_cookies_for(),
             op_set_cookie_for(),
             op_navigate(),
+            op_cancel_navigation(),
+            op_session_history_load(),
+            op_session_history_store(),
             op_set_document_url(),
             op_sleep(),
             op_url_parse(),
