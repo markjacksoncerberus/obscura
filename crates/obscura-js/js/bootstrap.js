@@ -5492,51 +5492,538 @@ function _lbIsViewportProxy(el) {
   return quirks ? (el === doc.body) : (el === doc.documentElement);
 }
 
-// ── The scroll position (CSSOM View §"scrolling area origin") ────────────────
-// The box tree is a static snapshot and cannot scroll, but the scroll POSITION
-// is state, not geometry — a number the page sets and reads back — and with a
-// real scrolling area we can finally hold it correctly instead of pinning it to
-// zero. What we still cannot do is move the descendants, so this is honest
-// about being a position and nothing more.
-//
-// ⭐ The range is not always [0, max]. The scrolling origin sits at the
-// block-start/inline-start corner, so when writing-mode or direction puts that
-// corner on the right (or the bottom), the offsets run NEGATIVE. `scrollLeft`
-// on an `rtl` scroller goes 0 → −150, not 0 → 150; a page that clamps to
-// positive numbers scrolls Arabic and Hebrew content to the wrong end.
-function _lbScrollRange(el, axis) {
-  const b = _layoutResolve(el);
-  if (!b || b === 'none') return { min: 0, max: 0 };
-  const extent = axis === 'x'
-    ? Math.max(0, b.scrollWidth - (b.width - b.bl - b.br))
-    : Math.max(0, b.scrollHeight - (b.height - b.bt - b.bb));
+// ── The scroll model (CSSOM View §"scrolling") ───────────────────────────────
+// A scroll position is STATE, not geometry: a number the page writes and reads
+// back, and the one thing about scrolling a static box tree can hold honestly.
+// Everything below is written over one small abstraction — a "scrolling box",
+// which is either an element or `_SCROLL_VIEWPORT` (the document's own) — so
+// that the viewport and an `overflow: auto` div never drift apart in behaviour.
+// What we still cannot do is REPAINT the descendants; what we now do correctly
+// is move them, in every coordinate the page can measure.
+const _SCROLL_VIEWPORT = null;
+// Has any ELEMENT (not the viewport) ever held a non-zero scroll position? See
+// `_lbAncestorScrollOffset` — this is the whole reason a page that never scrolls
+// pays nothing for the scroll model.
+let _lbAnyElementScrolled = false;
+
+// A box only scrolls when its computed overflow says so. `visible` and `clip`
+// generate NO scrolling box, and an element without one is immovable — writing
+// `scrollTop` on it is silently ignored, however far its content overflows.
+// This is not a nicety: a page that could scroll an `overflow: visible` section
+// would report positions no reader could ever be shown.
+const _lbOverflowScrolls = (v) => !!v && v !== 'visible' && v !== 'clip';
+// ⭐ CSS Overflow §"overflow viewport propagation". The root element's overflow is
+// applied to THE VIEWPORT rather than to the root's own box; and when the root's
+// own overflow is `visible`, the <body>'s is taken for the viewport instead and
+// the body is left `visible`. So in that case NEITHER element is a scroll
+// container of its own. This is not a technicality: `body { overflow: hidden }`
+// is how a page says "the window must not scroll", and treating the body as a
+// scroller instead makes `scrollIntoView` stop at the body — moving nothing,
+// leaving the reader exactly where they were, on every page that writes it.
+function _lbOverflowPropagates(el) {
+  const doc = el && el.ownerDocument;
+  if (!doc || doc !== globalThis.document) return false;
+  const root = doc.documentElement;
+  if (!root) return false;
+  if (el === root) return true;
+  if (el !== _lbBodyElementOf(doc)) return false;
+  let rx = 'visible', ry = 'visible';
+  try {
+    const cs = globalThis.getComputedStyle(root);
+    if (cs) { rx = cs.overflowX || 'visible'; ry = cs.overflowY || 'visible'; }
+  } catch (e) {}
+  return rx === 'visible' && ry === 'visible';
+}
+function _lbIsScrollContainer(el) {
+  if (_lbOverflowPropagates(el)) return false;
   let cs = null;
   try { cs = globalThis.getComputedStyle(el); } catch (e) { cs = null; }
+  if (!cs) return false;
+  return _lbOverflowScrolls(cs.overflowX) || _lbOverflowScrolls(cs.overflowY) ||
+         _lbOverflowScrolls(cs.overflow);
+}
+
+// ⭐ How this element's logical directions lie on the two physical axes. Every
+// scroll question that says "start" or "end" has to come through here first:
+// `block` and `inline` are not `y` and `x`, and in a right-to-left or vertical
+// flow they do not even point the same way.
+//
+// The same answer places the SCROLLING ORIGIN, which sits at the
+// block-start/inline-start corner — so when the writing mode or the direction
+// puts that corner on the right (or at the bottom), the offsets run NEGATIVE:
+// `scrollLeft` on an `rtl` scroller goes 0 → −150, not 0 → 150. A model that
+// clamps to positive numbers scrolls Arabic, Hebrew, Japanese and Mongolian
+// content to the wrong end of itself.
+function _lbFlow(el) {
+  let cs = null;
+  try { cs = el ? globalThis.getComputedStyle(el) : null; } catch (e) { cs = null; }
   const wm = (cs && cs.writingMode) || 'horizontal-tb';
   const rtl = !!(cs && cs.direction === 'rtl');
   const vertical = wm.startsWith('vertical') || wm.startsWith('sideways');
-  // Which physical edge the origin sits on, per axis.
-  const negative = axis === 'x'
-    ? (vertical ? wm.indexOf('-rl') >= 0 : rtl)   // block direction if vertical, else inline
-    : (vertical ? rtl : false);                   // inline direction if vertical, else always top-down
-  return negative ? { min: -extent, max: 0 } : { min: 0, max: extent };
+  const blockRL = vertical && wm.indexOf('-rl') >= 0;   // block flows right → left
+  const sidewaysLR = wm === 'sideways-lr';              // inline flows bottom → top
+  return {
+    vertical,
+    // Which logical axis rides on each physical one.
+    xLogical: vertical ? 'block' : 'inline',
+    yLogical: vertical ? 'inline' : 'block',
+    // Does the logical direction run BACKWARDS along the physical axis? That is
+    // also exactly where the scrolling origin sits, which is why the scroll
+    // offsets run negative in the same cases.
+    xReversed: vertical ? blockRL : rtl,
+    yReversed: vertical ? (sidewaysLR ? !rtl : rtl) : false,
+  };
 }
-function _lbGetScroll(el, axis) {
-  const stored = axis === 'x' ? el._scrollLeftPos : el._scrollTopPos;
+function _lbScrollOriginNegative(el, axis) {
+  const f = _lbFlow(el);
+  return axis === 'x' ? f.xReversed : f.yReversed;
+}
+function _lbScrollRange(el, axis) {
+  const b = _layoutResolve(el);
+  if (!b || b === 'none') return { min: 0, max: 0 };
+  if (!_lbIsScrollContainer(el)) return { min: 0, max: 0 };
+  const extent = axis === 'x'
+    ? Math.max(0, b.scrollWidth - (b.width - b.bl - b.br))
+    : Math.max(0, b.scrollHeight - (b.height - b.bt - b.bb));
+  return _lbScrollOriginNegative(el, axis) ? { min: -extent, max: 0 } : { min: 0, max: extent };
+}
+
+// The VIEWPORT's scrolling area. The root element's box carries the union of
+// everything in the document, but the viewport is never smaller than itself —
+// a short page has a zero scroll range, not a negative one.
+function _lbDocScrollArea(axis) {
+  const doc = globalThis.document;
+  const vp = _lbViewport();
+  const root = doc ? doc.documentElement : null;
+  const b = root ? _layoutBoxOf(root) : null;
+  return axis === 'x'
+    ? Math.max(vp.w, b ? b.scrollWidth : 0)
+    : Math.max(vp.h, b ? b.scrollHeight : 0);
+}
+function _lbViewportRange(axis) {
+  const vp = _lbViewport();
+  const doc = globalThis.document;
+  const root = doc ? doc.documentElement : null;
+  const extent = Math.max(0, _lbDocScrollArea(axis) - (axis === 'x' ? vp.w : vp.h));
+  return _lbScrollOriginNegative(root, axis) ? { min: -extent, max: 0 } : { min: 0, max: extent };
+}
+
+// The spec's "body element" concept: the first html-namespace body/frameset
+// child of the root. NOT `document.body`, which already applies the HTML rule —
+// a `foobarNS` <body> counts for nothing here.
+function _lbBodyElementOf(doc) {
+  const root = doc && doc.documentElement;
+  if (!root) return null;
+  for (let c = root.firstElementChild; c; c = c.nextElementSibling) {
+    if ((c.localName === 'body' || c.localName === 'frameset') &&
+        c.namespaceURI === 'http://www.w3.org/1999/xhtml') return c;
+  }
+  return null;
+}
+// "Potentially scrollable": a quirks-mode <body> that scrolls its OWN content,
+// which takes the viewport scroll away from it (and hands it to nobody).
+function _lbPotentiallyScrollable(el) {
+  const doc = el && el.ownerDocument;
+  const root = doc && doc.documentElement;
+  // "has an associated box" — an unrendered body cannot scroll anything.
+  if (_layoutResolve(el) === 'none') return false;
+  // ⚠️ BOTH have to be non-visible, and PER AXIS. The body only keeps its own
+  // scrolling box when the root has already claimed a scrolling box of its own —
+  // if the root is `visible`, the body's overflow propagates to the viewport
+  // instead (see `_lbOverflowPropagates`) and the body scrolls nothing. Reading
+  // this the other way round makes a quirks page with `overflow-y: scroll` on the
+  // root report the viewport's scroll area as the body's own, and vice versa.
+  // ⚠️ The two conditions are NOT the same test. The ROOT only has to stop being
+  // `visible` (a `clip` root has already taken the viewport's scrolling box, so the
+  // body cannot also proxy it); the BODY has to actually scroll, and `clip` does not
+  // scroll. `scrollingElement.html` pins every one of the sixteen combinations.
+  const ov = (n) => {
+    try {
+      const cs = n ? globalThis.getComputedStyle(n) : null;
+      return cs ? [cs.overflowX || 'visible', cs.overflowY || 'visible'] : ['visible', 'visible'];
+    } catch (e) { return ['visible', 'visible']; }
+  };
+  const rootOv = ov(root);
+  const rootClaims = rootOv[0] !== 'visible' || rootOv[1] !== 'visible';
+  const bodyOv = ov(el);
+  const bodyScrolls = _lbOverflowScrolls(bodyOv[0]) || _lbOverflowScrolls(bodyOv[1]);
+  return rootClaims && bodyScrolls;
+}
+
+// Which element's `scrollTop`/`scrollLeft` moves THE VIEWPORT rather than its
+// own box. In standards mode the root element; in quirks mode `<body>`, unless
+// the body is potentially scrollable. The swap is the whole reason
+// `document.scrollingElement` exists.
+function _lbViewportScroller(el) {
+  const doc = el && el.ownerDocument;
+  if (!doc || doc !== globalThis.document) return false;
+  if (doc.compatMode !== 'BackCompat') return el === doc.documentElement;
+  return el === _lbBodyElementOf(doc) && !_lbPotentiallyScrollable(el);
+}
+// In quirks mode the ROOT element answers 0 and moves nothing — the viewport
+// scroll belongs to <body> there, and the root must not report it twice.
+function _lbInertRootScroller(el) {
+  const doc = el && el.ownerDocument;
+  return !!doc && doc === globalThis.document &&
+         doc.compatMode === 'BackCompat' && el === doc.documentElement;
+}
+
+// ── The scrolling box: range, position, write ───────────────────────────────
+const _lbScrollKey = (box) => (box === _SCROLL_VIEWPORT ? '#viewport' : box);
+function _lbScrollBoxRange(box, axis) {
+  return box === _SCROLL_VIEWPORT ? _lbViewportRange(axis) : _lbScrollRange(box, axis);
+}
+function _lbScrollBoxPos(box, axis) {
+  if (box === _SCROLL_VIEWPORT) {
+    const wv = globalThis._winView;
+    const raw = wv ? (axis === 'x' ? wv.scrollX : wv.scrollY) : 0;
+    const r = _lbViewportRange(axis);
+    return Math.min(r.max, Math.max(r.min, raw));
+  }
+  const stored = axis === 'x' ? box._scrollLeftPos : box._scrollTopPos;
   if (stored === undefined) {
     // Nothing set yet: report what the box tree says, which is 0 for a snapshot.
-    const b = _layoutResolve(el);
+    const b = _layoutResolve(box);
     return (b && b !== 'none') ? (axis === 'x' ? b.scrollLeft : b.scrollTop) : 0;
   }
-  const r = _lbScrollRange(el, axis);
+  const r = _lbScrollRange(box, axis);
   return Math.min(r.max, Math.max(r.min, stored));
+}
+// Store one axis, clamped. Returns whether the position actually MOVED — which
+// is what decides whether a `scroll` event is owed.
+function _lbScrollBoxWrite(box, axis, v) {
+  const n = Number(v);
+  if (!isFinite(n)) return false;
+  const r = _lbScrollBoxRange(box, axis);
+  const clamped = Math.min(r.max, Math.max(r.min, n));
+  const before = _lbScrollBoxPos(box, axis);
+  if (box === _SCROLL_VIEWPORT) {
+    const wv = globalThis._winView;
+    if (!wv) return false;
+    if (axis === 'x') wv.scrollX = clamped; else wv.scrollY = clamped;
+  } else {
+    if (axis === 'x') box._scrollLeftPos = clamped; else box._scrollTopPos = clamped;
+    if (clamped !== 0) _lbAnyElementScrolled = true;
+  }
+  return clamped !== before;
+}
+
+// ── The scroll events ───────────────────────────────────────────────────────
+// A scroll nobody is told about is invisible to every library that syncs a
+// header, a sticky nav or an infinite list. CSSOM View queues `scroll` as a task
+// at the next rendering opportunity — at most once per box per opportunity, so a
+// hundred writes in one turn produce ONE event, not a hundred. The viewport's
+// scroll is reported on the DOCUMENT and BUBBLES (that is the only reason
+// `window.onscroll` ever sees it); an element's is reported on itself and does
+// not bubble.
+const _lbScrollQueued = new Map();      // key -> Set of pending event types
+function _lbScrollFire(box, type) {
+  const t = box === _SCROLL_VIEWPORT ? (globalThis.document || null) : box;
+  if (!t) return;
+  const bubbles = box === _SCROLL_VIEWPORT;
+  try {
+    const ev = new globalThis.Event(type, { bubbles, cancelable: false });
+    ev._isTrusted = true;
+    _dispatchSpec(t, ev, false);
+  } catch (e) {}
+}
+function _lbQueueScrollEventOfType(box, type) {
+  const key = _lbScrollKey(box);
+  let set = _lbScrollQueued.get(key);
+  if (!set) { set = new Set(); _lbScrollQueued.set(key, set); }
+  if (set.has(type)) return;
+  set.add(type);
+  const run = () => {
+    const s = _lbScrollQueued.get(key);
+    if (s) { s.delete(type); if (!s.size) _lbScrollQueued.delete(key); }
+    _lbScrollFire(box, type);
+  };
+  try { globalThis.setTimeout(run, 0); } catch (e) { try { run(); } catch (e2) {} }
+}
+const _lbQueueScrollEvent = (box) => _lbQueueScrollEventOfType(box, 'scroll');
+// `scrollend` says the position has come to rest — the signal a page waits on
+// before it does the expensive thing (fetch the next page, snap a carousel).
+// It is queued AFTER the scroll it ends, and the task queue is FIFO, so it can
+// never overtake it.
+const _lbQueueScrollEnd = (box) => _lbQueueScrollEventOfType(box, 'scrollend');
+
+// ── "Perform a scroll" (CSSOM View §"perform a scroll") ─────────────────────
+// One in-flight smooth scroll per box. Anything else arriving at the same box —
+// another smooth scroll, an instant one, or a bare `scrollTop =` — INTERRUPTS
+// it, and the interrupted scroll's promise must say so: a page that awaits
+// `scrollTo(...)` and then finds it was overridden needs to know it never
+// arrived, not to be told it did.
+const _lbScrollAnims = new Map();
+const _LB_SMOOTH_MS = 150;
+const _lbNow = () => {
+  try { return globalThis.performance.now(); } catch (e) { return Date.now(); }
+};
+function _lbCancelScrollAnim(box, interrupted) {
+  const key = _lbScrollKey(box);
+  const a = _lbScrollAnims.get(key);
+  if (!a) return;
+  _lbScrollAnims.delete(key);
+  try { globalThis.cancelAnimationFrame(a.raf); } catch (e) {}
+  try { a.settle({ interrupted: !!interrupted }); } catch (e) {}
+}
+// `auto` is not a synonym for "instant": it defers to the scrolling box's own
+// `scroll-behavior`, which is how a stylesheet — with no script at all — makes
+// every in-page anchor jump glide instead of teleport.
+function _lbResolveScrollBehavior(box, behavior) {
+  if (behavior === 'smooth' || behavior === 'instant') return behavior;
+  const el = box === _SCROLL_VIEWPORT
+    ? (globalThis.document && globalThis.document.documentElement)
+    : box;
+  let cs = null;
+  try { cs = el ? globalThis.getComputedStyle(el) : null; } catch (e) { cs = null; }
+  return (cs && cs.scrollBehavior === 'smooth') ? 'smooth' : 'instant';
+}
+function _lbPerformScroll(box, x, y, behavior) {
+  _lbCancelScrollAnim(box, true);
+  const rx = _lbScrollBoxRange(box, 'x'), ry = _lbScrollBoxRange(box, 'y');
+  const cx = _lbScrollBoxPos(box, 'x'), cy = _lbScrollBoxPos(box, 'y');
+  const nx = Number(x), ny = Number(y);
+  const tx = isFinite(nx) ? Math.min(rx.max, Math.max(rx.min, nx)) : cx;
+  const ty = isFinite(ny) ? Math.min(ry.max, Math.max(ry.min, ny)) : cy;
+  const mode = _lbResolveScrollBehavior(box, behavior);
+  if (mode !== 'smooth' || (tx === cx && ty === cy)) {
+    let moved = _lbScrollBoxWrite(box, 'x', tx);
+    moved = _lbScrollBoxWrite(box, 'y', ty) || moved;
+    if (moved) { _lbQueueScrollEvent(box); _lbQueueScrollEnd(box); }
+    return Promise.resolve({ interrupted: false });
+  }
+  const key = _lbScrollKey(box);
+  return new Promise((resolve) => {
+    const t0 = _lbNow();
+    const rec = { settle: resolve, raf: 0 };
+    _lbScrollAnims.set(key, rec);
+    const step = () => {
+      // Still ours? A later scroll replaces the record, and the replacement —
+      // not this frame — owns the box from then on.
+      if (_lbScrollAnims.get(key) !== rec) return;
+      const p = Math.min(1, (_lbNow() - t0) / _LB_SMOOTH_MS);
+      const e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;  // ease-in-out
+      let moved = _lbScrollBoxWrite(box, 'x', cx + (tx - cx) * e);
+      moved = _lbScrollBoxWrite(box, 'y', cy + (ty - cy) * e) || moved;
+      if (moved) _lbQueueScrollEvent(box);
+      if (p >= 1) {
+        _lbScrollAnims.delete(key);
+        _lbQueueScrollEnd(box);
+        resolve({ interrupted: false });
+        return;
+      }
+      rec.raf = globalThis.requestAnimationFrame(step);
+    };
+    rec.raf = globalThis.requestAnimationFrame(step);
+  });
+}
+
+// The scrolling box an ELEMENT's scroll API acts on: the viewport for the
+// document's scrolling element, itself for a real scroll container, and
+// `undefined` — nothing at all — for everything else.
+function _lbScrollBoxFor(el) {
+  if (_lbInertRootScroller(el)) return undefined;
+  if (_lbViewportScroller(el)) return _SCROLL_VIEWPORT;
+  const b = _layoutResolve(el);
+  if (b === 'none') return undefined;
+  return _lbIsScrollContainer(el) ? el : undefined;
+}
+
+function _lbGetScroll(el, axis) {
+  const box = _lbScrollBoxFor(el);
+  if (box === undefined) return 0;
+  return _lbScrollBoxPos(box, axis);
 }
 function _lbSetScroll(el, axis, v) {
   const n = Number(v);
   if (!isFinite(n)) return;                      // a non-finite scroll is a no-op
-  const r = _lbScrollRange(el, axis);
-  const clamped = Math.min(r.max, Math.max(r.min, n));
-  if (axis === 'x') el._scrollLeftPos = clamped; else el._scrollTopPos = clamped;
+  const box = _lbScrollBoxFor(el);
+  if (box === undefined) return;
+  // The setter is a scroll like any other, so it honours `scroll-behavior` and
+  // it interrupts whatever was already gliding.
+  _lbPerformScroll(box,
+    axis === 'x' ? n : _lbScrollBoxPos(box, 'x'),
+    axis === 'y' ? n : _lbScrollBoxPos(box, 'y'),
+    undefined);
+}
+
+// How far the scrolling ancestors between `el` and the viewport have shifted it.
+// `getBoundingClientRect` is viewport-relative, so every one of those offsets
+// comes off the document-space box the layout engine handed us — that is what
+// makes a rect read differently after a scroll, which is what every sticky
+// header, lazy-loader and IntersectionObserver polyfill is written around.
+function _lbAncestorScrollOffset(el, axis) {
+  // `getBoundingClientRect` is one of the hottest calls on the platform, and on a
+  // page where nothing has ever scrolled the answer is always zero. Walking every
+  // ancestor through `getComputedStyle` to learn that would tax every page for a
+  // feature most never use, so a page pays for this only once it has scrolled
+  // something.
+  if (!_lbAnyElementScrolled) return 0;
+  let acc = 0;
+  for (let p = el && el.parentElement; p; p = p.parentElement) {
+    if (_lbViewportScroller(p) || _lbInertRootScroller(p)) continue;  // the viewport is taken off separately
+    if (!_lbIsScrollContainer(p)) continue;
+    acc += _lbScrollBoxPos(p, axis);
+  }
+  return acc;
+}
+
+// ── "Scroll an element into view" (CSSOM View) ──────────────────────────────
+// The single most-used scroll API on the web: every "skip to content" link,
+// every validation error that jumps you to the offending field, every chat that
+// pins itself to the newest message. It is not one scroll — it walks OUTWARD,
+// scrolling each ancestor scrolling box in turn and then the viewport, and after
+// each step the thing being brought into view becomes that box itself. Getting
+// that walk right is what makes it work inside a scrollable panel inside a
+// scrollable page, which is where it matters most and where a naive one-level
+// implementation quietly does nothing.
+const _LB_ALIGN = new Set(['start', 'center', 'end', 'nearest']);
+function _lbScrollIntoViewOptions(arg) {
+  // The legacy boolean: `true` (and a missing argument) aligns to the start,
+  // `false` to the end. The dictionary form defaults to start/nearest.
+  if (arg === undefined || arg === null || arg === true) return { block: 'start', inline: 'nearest' };
+  if (arg === false) return { block: 'end', inline: 'nearest' };
+  if (typeof arg !== 'object' && typeof arg !== 'function') {
+    throw new TypeError("Failed to execute 'scrollIntoView' on 'Element': The provided value is not of type 'ScrollIntoViewOptions'.");
+  }
+  const out = { block: 'start', inline: 'nearest' };
+  if (arg.block !== undefined) {
+    const v = String(arg.block);
+    if (!_LB_ALIGN.has(v)) throw new TypeError("Failed to execute 'scrollIntoView' on 'Element': The provided value '" + v + "' is not a valid enum value of type ScrollLogicalPosition.");
+    out.block = v;
+  }
+  if (arg.inline !== undefined) {
+    const v = String(arg.inline);
+    if (!_LB_ALIGN.has(v)) throw new TypeError("Failed to execute 'scrollIntoView' on 'Element': The provided value '" + v + "' is not a valid enum value of type ScrollLogicalPosition.");
+    out.inline = v;
+  }
+  if (arg.behavior !== undefined) {
+    const b = String(arg.behavior);
+    if (b !== 'auto' && b !== 'instant' && b !== 'smooth') {
+      throw new TypeError("Failed to execute 'scrollIntoView' on 'Element': The provided value '" + b + "' is not a valid enum value of type ScrollBehavior.");
+    }
+    out.behavior = b;
+  }
+  return out;
+}
+// Where the visible window has to START (in plain left-to-right / top-to-bottom
+// content coordinates) so that `size` at `offset` sits `align` inside it. Working
+// in "visible start" rather than in the scroll offset itself is what lets one
+// piece of arithmetic serve every writing mode: a right-to-left scroller's
+// offsets run 0 → −N, and the caller converts at the end.
+//
+// `padStart`/`padEnd` are the scroller's `scroll-padding` — the page saying "this
+// strip is covered by my sticky header, do not land anything under it". `nearest`
+// stays the kind one: it moves by the least it can, and not at all when the thing
+// is already in view.
+function _lbAlignScroll(align, offset, size, client, curStart, padStart, padEnd) {
+  const regionSize = Math.max(0, client - padStart - padEnd);
+  switch (align) {
+    case 'low': return offset - padStart;
+    case 'high': return offset + size - client + padEnd;
+    case 'center': return offset + size / 2 - padStart - regionSize / 2;
+    default: {
+      const regionStart = curStart + padStart;
+      const regionEnd = curStart + client - padEnd;
+      if (offset < regionStart) return offset - padStart;
+      if (offset + size > regionEnd) {
+        // Too big to fit: showing the start beats showing neither end.
+        return size > regionSize ? offset - padStart : offset + size - client + padEnd;
+      }
+      return curStart;                                    // already in view
+    }
+  }
+}
+// A logical alignment resolved against one physical axis: in a reversed flow the
+// block/inline START is the HIGH physical edge.
+function _lbPhysicalAlign(align, reversed) {
+  if (align === 'start') return reversed ? 'high' : 'low';
+  if (align === 'end') return reversed ? 'low' : 'high';
+  return align;                                            // center / nearest
+}
+// One side of a `scroll-margin` / `scroll-padding`, in px. `scroll-padding: auto`
+// means "no opinion", which is zero for our purposes.
+function _lbInsetPx(el, prop) {
+  let v = '';
+  try { const cs = globalThis.getComputedStyle(el); v = cs ? cs.getPropertyValue(prop) : ''; } catch (e) { v = ''; }
+  const n = parseFloat(v);
+  return isFinite(n) ? n : 0;
+}
+const _LB_SIDES = { x: ['left', 'right'], y: ['top', 'bottom'] };
+function _lbScrollIntoView(el, arg) {
+  let opts;
+  try { opts = _lbScrollIntoViewOptions(arg); } catch (e) { return Promise.reject(e); }
+  const lb = _layoutResolve(el);
+  if (!lb || lb === 'none') return Promise.resolve({ interrupted: false });
+  // A `position: fixed` box is already where it will be: it is anchored to the
+  // viewport, so scrolling the page cannot bring it any further into view, and
+  // moving the page to "reveal" it would drag the reader somewhere else for
+  // nothing.
+  const flow = _lbFlow(el);
+  const alignFor = (axis) => {
+    const logical = axis === 'x' ? flow.xLogical : flow.yLogical;
+    const reversed = axis === 'x' ? flow.xReversed : flow.yReversed;
+    return _lbPhysicalAlign(logical === 'block' ? opts.block : opts.inline, reversed);
+  };
+  // The box being brought into view, in unscrolled document coordinates, grown by
+  // the element's own `scroll-margin` — the gap it asks to keep around itself when
+  // something scrolls it into view.
+  let tx = lb.x - _lbInsetPx(el, 'scroll-margin-left');
+  let ty = lb.y - _lbInsetPx(el, 'scroll-margin-top');
+  let tw = lb.width + _lbInsetPx(el, 'scroll-margin-left') + _lbInsetPx(el, 'scroll-margin-right');
+  let th = lb.height + _lbInsetPx(el, 'scroll-margin-top') + _lbInsetPx(el, 'scroll-margin-bottom');
+  // After each scrolling box is handled, the thing being revealed becomes THAT
+  // box — which is what makes the walk work through nested scrollers.
+  const pending = [];
+  const plan = (box, padSource, originX, originY, clientW, clientH) => {
+    const target = {};
+    for (const axis of ['x', 'y']) {
+      const [lo, hi] = _LB_SIDES[axis];
+      const padStart = _lbInsetPx(padSource, 'scroll-padding-' + lo);
+      const padEnd = _lbInsetPx(padSource, 'scroll-padding-' + hi);
+      // The scroll position IS the visible window's start edge, in the same
+      // left-to-right document coordinates the layout hands us — in a reversed
+      // scroller the content simply begins at a negative offset, which is exactly
+      // where that scroller's position range begins too. No conversion needed;
+      // adding the range's origin on top of it double-counted the reversal and
+      // scrolled Arabic and vertical-rl content a full viewport too far.
+      const curStart = _lbScrollBoxPos(box, axis);
+      const start = _lbAlignScroll(alignFor(axis),
+        (axis === 'x' ? tx - originX : ty - originY),
+        axis === 'x' ? tw : th,
+        axis === 'x' ? clientW : clientH,
+        curStart, padStart, padEnd);
+      target[axis] = start;
+    }
+    pending.push([box, target.x, target.y]);
+  };
+  // ⚠️ The walk STOPS at a `position: fixed` box, itself included. A fixed box is
+  // anchored to the viewport, so no amount of page scrolling brings anything
+  // inside it any further into view — scrolling the page to "reveal" it just
+  // drags the reader somewhere else for nothing. Its own scrollable ancestors
+  // inside the fixed subtree still move.
+  let fixedRoot = !!lb.fixed;
+  for (let p = el.parentElement; p && !fixedRoot; p = p.parentElement) {
+    const pb = _layoutBoxOf(p);
+    if (pb && pb.fixed) fixedRoot = true;
+    if (_lbViewportScroller(p) || _lbInertRootScroller(p)) continue;
+    if (!_lbIsScrollContainer(p)) continue;
+    if (!pb || !pb.hasBox) continue;
+    plan(p, p, pb.x + pb.bl, pb.y + pb.bt,
+      Math.max(0, pb.width - pb.bl - pb.br), Math.max(0, pb.height - pb.bt - pb.bb));
+    tx = pb.x; ty = pb.y; tw = pb.width; th = pb.height;
+  }
+  // …and finally the viewport, whose content origin is the document's own and
+  // whose `scroll-padding` is written on the root element.
+  if (!fixedRoot) {
+    const vp = _lbViewport();
+    const doc = el.ownerDocument;
+    plan(_SCROLL_VIEWPORT, (doc && doc.documentElement) || el, 0, 0, vp.w, vp.h);
+  }
+  if (!pending.length) return Promise.resolve({ interrupted: false });
+  const results = pending.map(([box, x, y]) => _lbPerformScroll(box, x, y, opts.behavior));
+  return Promise.all(results).then(
+    (rs) => ({ interrupted: rs.some((r) => r && r.interrupted) }));
 }
 
 // Resolve an element to one of three answers, which the getters below all need
@@ -7018,9 +7505,15 @@ class Element extends Node {
     const lb = _layoutResolve(this);
     if (lb === 'none') return new globalThis.DOMRect(0, 0, 0, 0);
     if (lb) {
+      // A fixed-position box is anchored to the viewport, so the viewport scroll
+      // does NOT come off it — it is the one box that stays where it is while the
+      // page moves underneath. Everything else loses both the viewport offset and
+      // every scrolling ancestor's.
+      const vx = lb.fixed ? 0 : _lbScrollBoxPos(_SCROLL_VIEWPORT, 'x');
+      const vy = lb.fixed ? 0 : _lbScrollBoxPos(_SCROLL_VIEWPORT, 'y');
       return new globalThis.DOMRect(
-        lb.x - (Number(globalThis.scrollX) || 0),
-        lb.y - (Number(globalThis.scrollY) || 0),
+        lb.x - vx - (lb.fixed ? 0 : _lbAncestorScrollOffset(this, 'x')),
+        lb.y - vy - (lb.fixed ? 0 : _lbAncestorScrollOffset(this, 'y')),
         lb.width, lb.height);
     }
     // A display:none element (self or ancestor) generates no box: an all-zero rect.
@@ -7059,6 +7552,7 @@ class Element extends Node {
   // ARIAMixin reflection properties are defined on Element.prototype just after
   // this class (see __ariaReflectedAttrs) — a table-driven loop covers the full
   // WAI-ARIA set rather than a handful of hand-written accessors.
+  // REDEFINED in the CSSOM View partial below, where it can scroll for real.
   scrollIntoView() { __obscura_click_target = this; }
   // ── Pointer capture (Pointer Events §"Setting Pointer Capture") ───────────
   // Redirect every remaining event from one pointer to THIS element, wherever it
@@ -13902,6 +14396,9 @@ const _GCS_DEFAULTS = {
   'overscroll-behavior-x': 'auto', 'overscroll-behavior-y': 'auto', 'overscroll-behavior-inline': 'auto', 'overscroll-behavior-block': 'auto',
   'text-size-adjust': 'auto',                      // css-size-adjust: `auto | none | <percentage>` (inherited; computed none→100%)
   'overflow-anchor': 'auto',                       // css-scroll-anchoring: `auto | none` (not inherited; computed = specified)
+  // cssom-view: scroll-behavior = `auto | smooth` — whether a programmatic scroll
+  // on this scrolling box glides or teleports. Not inherited; computed = specified.
+  'scroll-behavior': 'auto',
   'box-sizing': 'content-box', cursor: 'auto',
   // css-sizing-4 aspect-ratio = `auto || <ratio>`; not inherited; initial `auto`.
   // Computed = the canonical form (both numbers of the ratio are always serialized),
@@ -14218,6 +14715,14 @@ const _SHORTHAND_LONGHANDS = {
   // every element (split lazily via _parseBorderSideStrict in _expandShorthand).
   outline: ['outline-width', 'outline-style', 'outline-color'],
   'column-rule': ['column-rule-width', 'column-rule-style', 'column-rule-color'],
+  // css-overflow `overflow` / css-overscroll-behavior `overscroll-behavior` — the
+  // #547 `background` shape a fourth time: both expanded on the CSSOM SETTER path
+  // only, so a STYLESHEET's `overflow: hidden` never reached computed style and
+  // `getComputedStyle(el).overflowX` answered `visible` on a scroller. Everything
+  // that asks "is this a scroll container" — which is now the whole scroll model —
+  // was reading that answer.
+  overflow: ['overflow-x', 'overflow-y'],
+  'overscroll-behavior': ['overscroll-behavior-x', 'overscroll-behavior-y'],
 };
 // Set a declaration into a block-level map, respecting within-block cascade
 // order: an !important declaration is never overridden by a later normal one of
@@ -14686,6 +15191,8 @@ const _expandShorthand = (sh, value) => {
   if (sh === 'background') {
     return _parseBackgroundShort(value);  // keyed by the 8 background longhands, or null
   }
+  if (sh === 'overflow') return _parseOverflowShorthand(value);
+  if (sh === 'overscroll-behavior') return _parseOverscrollShorthand(value);
   return null;
 };
 
@@ -18526,6 +19033,9 @@ const _CSSUI_ENUM = {
   // scroll-anchoring candidate). Rejects `all` and any two-keyword combo (`auto none`).
   // Computed = the lowercased keyword (identity); initial `auto`, not inherited.
   'overflow-anchor': new Set(['auto', 'none']),
+  // cssom-view: scroll-behavior = `auto | smooth`. Rejects `instant` (that is a
+  // ScrollBehavior value, not a CSS one) and any two-keyword combination.
+  'scroll-behavior': new Set(['auto', 'smooth']),
   // css-flexbox: flex-direction / flex-wrap single-keyword enums (the two flex-flow
   // longhands). Each rejects `auto` and any two-keyword combination (`column
   // row-reverse`, `nowrap wrap`). Computed = the lowercased keyword (identity).
@@ -18627,6 +19137,8 @@ const _CSSUI_VALIDATED = new Set([
   'text-size-adjust',
   // css-scroll-anchoring: overflow-anchor (`auto | none` keyword enum, computed = specified).
   'overflow-anchor',
+  // cssom-view: scroll-behavior (`auto | smooth` keyword enum, computed = specified).
+  'scroll-behavior',
   // css-display: `display` — predefined single keywords + the two-value `[
   // <display-outside> || <display-inside> ]` / `<display-listitem>` syntax canonicalized
   // to its shortest form (a dedicated _canonCssUi → _canonDisplay branch; computed = specified).
@@ -43418,6 +43930,42 @@ const _shUUID = () => {
 // `docSeq` is which DOCUMENT an entry belongs to. Entries this document created
 // are same-document with it; entries restored from a previous one are not, and
 // reaching them means a real navigation.
+// ── Scroll position data (HTML §"session history entry") ────────────────────
+// A session history entry remembers WHERE THE READER WAS, not just what the page
+// showed. That is the whole difference between a back button that returns you to
+// the paragraph you were reading and one that dumps you at the top of a long
+// article — on a phone, on a slow connection, that difference is the feature.
+// Who owns the scroll for the navigation currently committing. An INTERCEPTED
+// navigation owns its own: the scroll happens when the transition finishes, or —
+// for `intercept({ scroll: "manual" })` — never, because the page said it would
+// place the reader itself. Without this handshake the document-side effects would
+// scroll anyway and quietly undo the page's decision.
+let _shScrollOwner = null;      // null = the document effects do it; else the navigation
+function _shScrollWin(sh) {
+  try { return (sh && sh.win) || globalThis; } catch (e) { return globalThis; }
+}
+function _shSaveScroll(sh) {
+  const rec = sh && sh.entries && sh.entries[sh.index];
+  if (!rec) return;
+  const w = _shScrollWin(sh);
+  try { rec.scroll = [Number(w.scrollX) || 0, Number(w.scrollY) || 0]; } catch (e) {}
+}
+// "Restore scroll position data", with the fragment as the fallback. A page that
+// sets `scrollRestoration = "manual"` is saying it will put the reader back
+// itself — an infinite feed restoring by item id, not by pixel — and we must not
+// fight it.
+function _shRestoreScroll(sh, rec, url) {
+  let mode = 'auto';
+  try { mode = (rec && rec.scrollRestoration) || 'auto'; } catch (e) {}
+  if (mode === 'manual') return;
+  if (rec && rec.scroll) {
+    const w = _shScrollWin(sh);
+    try { w.scrollTo(rec.scroll[0], rec.scroll[1]); } catch (e) {}
+    return;
+  }
+  try { globalThis._shScrollToFragment(url); } catch (e) {}
+}
+
 const _shTop = {
   entries: [], index: 0, docSeq: 0, pendingActivation: null, persist: true,
   win: null,                                            // globalThis; set below
@@ -43447,6 +43995,8 @@ const _shTop = {
     try { globalThis._shFragmentEffects(newUrl, oldUrl, isTraverse, state); } catch (e) {}
   },
   scrollTo(url) { try { globalThis._shScrollToFragment(url); } catch (e) {} },
+  // A TRAVERSAL does not go to the fragment, it goes back to where you were.
+  restoreScroll(rec, url) { _shRestoreScroll(this, rec, url); },
   focusReset() { try { globalThis._shFocusReset(); } catch (e) {} },
 };
 // The old name, kept because it reads better at the call sites that are only
@@ -43958,6 +44508,10 @@ const _shCommit = (sh, url, navigationType, st) => {
     rec = {
       key: _shUUID(), id: _shUUID(), url,
       state: st.nav, cstate: st.classic,
+      // A new entry inherits the scroll restoration mode of the one it grew out
+      // of — a page that switched to manual restoration means it for the whole
+      // session it is running, not for one entry.
+      scrollRestoration: cur && cur.scrollRestoration,
       docSeq: sh.docSeq, sh, w: null, disposed: false,
     };
     // A push prunes the forward entries — the future you did not take.
@@ -43980,6 +44534,9 @@ const _shCommit = (sh, url, navigationType, st) => {
     rec = {
       key: cur.key, id: _shUUID(), url,
       state: st.nav, cstate: st.classic,
+      // A replace is the same SLOT, so both the restoration mode and the reader's
+      // place in the page carry over to the new version.
+      scrollRestoration: cur.scrollRestoration, scroll: cur.scroll,
       docSeq: sh.docSeq, sh, w: null, disposed: false,
     };
     sh.entries[sh.index] = rec;
@@ -44133,7 +44690,12 @@ const _navPerform = (o) => {
       // rejected — the transition is over either way.
       if (ev._intercepted) {
         if (ev._focusReset !== 'manual') sh.focusReset();
-        if (ev._scrollBehavior !== 'manual' && !ev._scrolled) sh.scrollTo(destUrl);
+        if (ev._scrollBehavior !== 'manual' && !ev._scrolled) {
+          // Whatever this navigation's scroll IS — a fragment jump for a push, a
+          // restore for a traversal — not always the fragment.
+          if (o.doScroll) { try { o.doScroll(); } catch (e) {} }
+          else sh.scrollTo(destUrl);
+        }
       }
       if (ok) {
         _navFireAt(nav, 'navigatesuccess');
@@ -44153,6 +44715,9 @@ const _navPerform = (o) => {
   // thenable the whole navigation finishes inside this call — which the ordering
   // tests require.
   const proceed = () => {
+    // The position belongs to the entry we are LEAVING, so it is recorded before
+    // the commit moves the index off it.
+    _shSaveScroll(sh);
     rec = o.commit ? o.commit(destUrl) : fromRec;
     committedOk = true;
     committed.resolve(_shWrap(rec));
@@ -44163,7 +44728,12 @@ const _navPerform = (o) => {
     // focusing steps, the scroll, hashchange, popstate — come AFTER
     // currententrychange, which is the order `currententrychange-before-popstate`
     // asserts.
-    if (o.afterCommit) { try { o.afterCommit(rec, fromRec, destUrl); } catch (e) {} }
+    if (o.afterCommit) {
+      _shScrollOwner = { sh, rec, intercepted: !!ev._intercepted };
+      try { o.afterCommit(rec, fromRec, destUrl); }
+      catch (e) {}
+      finally { _shScrollOwner = null; }
+    }
 
     const handlers = ev._handlers || [];
     const results = [];
@@ -44353,7 +44923,7 @@ const _navTraverseMethod = (nav, key, options) => {
       // test means the test itself is thrown away mid-run.
       crossDocument: crossDoc ? () => sh.navigateCrossTraverse(target.url, at,
         sh.entries[sh.index].key) : null,
-      doScroll: () => sh.scrollTo(target.url),
+      doScroll: () => sh.restoreScroll(target, target.url),
     });
   });
   return { committed: committedD.promise, finished: finishedD.promise };
@@ -44367,15 +44937,21 @@ class History {
     if (!(this instanceof History)) throw new TypeError('Illegal invocation');
     const sh = this._sh; _shInit(sh); return sh.entries.length;
   }
+  // Per ENTRY, not per History object: the mode is a property of the session
+  // history entry the page is currently sitting on, so going back to an entry
+  // that asked for manual restoration gets manual restoration — even if the page
+  // has since flipped the flag on a later entry.
   get scrollRestoration() {
     if (!(this instanceof History)) throw new TypeError('Illegal invocation');
-    return this._scrollRestoration || 'auto';
+    const cur = _shCur(this._sh);
+    return (cur && cur.scrollRestoration) || 'auto';
   }
   set scrollRestoration(v) {
     if (!(this instanceof History)) throw new TypeError('Illegal invocation');
     const s = String(v);
     if (s !== 'auto' && s !== 'manual') return;
-    this._scrollRestoration = s;
+    const cur = _shCur(this._sh);
+    if (cur) cur.scrollRestoration = s;
   }
   // The SAME object across reads within one entry version: a page that mutates
   // `history.state` and reads it back must see its own mutation.
@@ -45880,7 +46456,20 @@ globalThis._shFragmentEffects = function(newUrl, oldUrl, isTraverse, state) {
     let dec = frag; try { dec = decodeURIComponent(frag); } catch (e) {}
     _dom('set_target_id', dec, '');
   } catch (e) {}
-  try { if (target && target.scrollIntoView) target.scrollIntoView(); } catch (e) {}
+  // The scroll. An intercepted navigation does its own (see `_shScrollOwner`); a
+  // TRAVERSAL goes back to where the reader was, not to the fragment; everything
+  // else scrolls the indicated element into view.
+  if (!(_shScrollOwner && _shScrollOwner.intercepted)) {
+    // ⚠️ The traversal's session history is the one that is COMMITTING, which for
+    // an iframe is the frame's own — never `globalThis._shTop`, whose entries
+    // belong to the top-level page.
+    const sh = (_shScrollOwner && _shScrollOwner.sh) || globalThis._shTop;
+    if (isTraverse) {
+      try { _shRestoreScroll(sh, (_shScrollOwner && _shScrollOwner.rec) || _shCur(sh), newUrl); } catch (e) {}
+    } else {
+      try { if (target && target.scrollIntoView) target.scrollIntoView(); } catch (e) {}
+    }
+  }
   const changed = newUrl !== oldUrl;
   if (isTraverse || changed) {
     setTimeout(() => {
@@ -45924,11 +46513,34 @@ globalThis._shFocusReset = function() {
 // Just the scroll half, for `NavigateEvent.scroll()`.
 globalThis._shScrollToFragment = function(url) {
   let frag = '';
-  try { frag = (new URL(url).hash || '').replace(/^#/, ''); } catch (e) {}
-  if (frag === '' || !document) return;
+  let hadHash = false;
+  try { const h = new URL(url).hash || ''; hadHash = h !== ''; frag = h.replace(/^#/, ''); } catch (e) {}
+  if (!document) return;
   let dec = frag; try { dec = decodeURIComponent(frag); } catch (e) {}
+  // An empty fragment, or the literal `#top`, names THE DOCUMENT — that is what
+  // makes the "back to top" link every long page ships actually go to the top,
+  // and it is the only fragment that is not an id lookup.
+  if (frag === '' || dec.toLowerCase() === 'top') {
+    // `#top` only falls back to the document when nothing is actually named "top".
+    let named = null;
+    try { named = dec === '' ? null : (document.getElementById(dec) || null); } catch (e) {}
+    if (!named) {
+      if (!hadHash && frag === '') return;      // no fragment at all: nothing to do
+      try { globalThis.scrollTo(0, 0); } catch (e) {}
+      return;
+    }
+    try { named.scrollIntoView(); } catch (e) {}
+    return;
+  }
   let target = null;
   try { target = document.getElementById(dec) || document.getElementById(frag) || null; } catch (e) {}
+  // The spec also honours a legacy `<a name>` before giving up.
+  if (!target) {
+    try {
+      const anchors = document.getElementsByName ? document.getElementsByName(dec) : null;
+      if (anchors && anchors.length) target = anchors[0];
+    } catch (e) {}
+  }
   try { if (target && target.scrollIntoView) target.scrollIntoView(); } catch (e) {}
 };
 
@@ -69579,17 +70191,25 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   _defNodeRW(Element.prototype, 'scrollLeft',
     function() { return _lbGetScroll(this, 'x'); },
     function(v) { _lbSetScroll(this, 'x', v); });
+  // ⚠️ scroll* and client* do NOT share a viewport rule. `clientHeight` on a
+  // quirks-mode <body> is the viewport, full stop; `scrollHeight` on that same
+  // body is the viewport's scrolling area ONLY while the body is not itself
+  // potentially scrollable — once it is, the body scrolls its own content and
+  // must report its own area, which is exactly what a quirks page measuring
+  // `document.body.scrollHeight` is asking for. Same predicate as scrollTop.
   _defNodeRO(Element.prototype, 'scrollWidth', function() {
+    if (_lbViewportScroller(this)) return _lbRound(_lbDocScrollArea('x'));
     const b = _layoutResolve(this);
     if (b === 'none') return 0;
     if (!b) return 100;
-    return _lbRound(_lbIsViewportProxy(this) ? Math.max(b.scrollWidth, _lbViewport().w) : b.scrollWidth);
+    return _lbRound(b.scrollWidth);
   });
   _defNodeRO(Element.prototype, 'scrollHeight', function() {
+    if (_lbViewportScroller(this)) return _lbRound(_lbDocScrollArea('y'));
     const b = _layoutResolve(this);
     if (b === 'none') return 0;
     if (!b) return 20;
-    return _lbRound(_lbIsViewportProxy(this) ? Math.max(b.scrollHeight, _lbViewport().h) : b.scrollHeight);
+    return _lbRound(b.scrollHeight);
   });
   _defNodeRO(Element.prototype, 'clientWidth', function() {
     if (_lbIsViewportProxy(this)) return _lbRound(_lbViewport().w);
@@ -69775,25 +70395,36 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
     return out;
   };
   // scroll / scrollTo / scrollBy / scrollIntoView return a promise in CSSOM View —
-  // a wrong receiver or a bad argument must reject it, not throw. Layout-less, so
-  // the scroll is instantly "complete"; the promise fulfils with the spec's scroll
-  // result object. scrollIntoView takes ScrollIntoViewOptions (or a boolean), NOT
-  // ScrollToOptions, so it skips the dictionary conversion — and it keeps its
+  // a wrong receiver or a bad argument must reject it, not throw. The promise
+  // settles when the scroll finishes, which for `behavior: "smooth"` is several
+  // frames later; `interrupted` tells a caller whose scroll was overridden that
+  // it never arrived. scrollIntoView takes ScrollIntoViewOptions (or a boolean),
+  // NOT ScrollToOptions, so it skips the dictionary conversion — and it keeps its
   // click-target side effect (Playwright's actionability polling reads it).
-  const _defScrollOp = (proto, name, body) => {
+  //
+  // `scrollBy` is `scrollTo` with the current position added in, and an omitted
+  // component means "+0" there rather than "leave it alone" — the same dictionary,
+  // read against a different origin.
+  const _defScrollOp = (proto, name, relative) => {
     _defOp(proto, name, 0, function(...args) {
       if (!_isViewNode(this)) return Promise.reject(new TypeError("Illegal invocation"));
       let opts;
       try { opts = _toScrollToOptions(args, name); } catch (e) { return Promise.reject(e); }
-      if (body) body.call(this, opts);
-      return Promise.resolve({ interrupted: false });
+      const box = _lbScrollBoxFor(this);
+      if (box === undefined) return Promise.resolve({ interrupted: false });
+      const cx = _lbScrollBoxPos(box, 'x'), cy = _lbScrollBoxPos(box, 'y');
+      const x = opts.left === undefined ? cx : (relative ? cx + opts.left : opts.left);
+      const y = opts.top === undefined ? cy : (relative ? cy + opts.top : opts.top);
+      return _lbPerformScroll(box, x, y, opts.behavior);
     });
   };
-  for (const nm of ['scroll', 'scrollTo', 'scrollBy']) _defScrollOp(Element.prototype, nm, null);
+  _defScrollOp(Element.prototype, 'scroll', false);
+  _defScrollOp(Element.prototype, 'scrollTo', false);
+  _defScrollOp(Element.prototype, 'scrollBy', true);
   _defOp(Element.prototype, 'scrollIntoView', 0, function(arg = undefined) {
     if (!_isViewNode(this)) return Promise.reject(new TypeError("Illegal invocation"));
     __obscura_click_target = this;
-    return Promise.resolve({ interrupted: false });
+    return _lbScrollIntoView(this, arg);
   });
 
   // ── Range partial (CSSOM View): getClientRects / getBoundingClientRect ────────
@@ -69923,10 +70554,15 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   _defWinAttr('outerWidth', () => _winView.outerWidth);
   _defWinAttr('outerHeight', () => _winView.outerHeight);
   _defWinAttr('devicePixelRatio', () => _winView.devicePixelRatio);
-  _defWinAttr('scrollX', () => _winView.scrollX);
-  _defWinAttr('scrollY', () => _winView.scrollY);
-  _defWinAttr('pageXOffset', () => _winView.scrollX);
-  _defWinAttr('pageYOffset', () => _winView.scrollY);
+  // Read through the scroll model, not the raw field: a document that got SHORTER
+  // (an image collapsed, a list filtered) leaves the stored offset past the end of
+  // the new scrolling area, and reporting it would put every measurement on the
+  // page off by the difference.
+  const _winScroll = (axis) => () => _lbScrollBoxPos(_SCROLL_VIEWPORT, axis);
+  _defWinAttr('scrollX', _winScroll('x'));
+  _defWinAttr('scrollY', _winScroll('y'));
+  _defWinAttr('pageXOffset', _winScroll('x'));
+  _defWinAttr('pageYOffset', _winScroll('y'));
   _defWinAttr('screenX', () => _winView.screenX);
   _defWinAttr('screenLeft', () => _winView.screenX);
   _defWinAttr('screenY', () => _winView.screenY);
@@ -69954,18 +70590,23 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   // scroll finishes) — so a wrong receiver, or a ScrollToOptions that fails WebIDL
   // conversion, must REJECT it rather than throw synchronously. Nothing scrolls
   // without a layout engine, so the promise is already settled.
-  const _winScrollOp = (name) => {
+  const _winScrollOp = (name, relative) => {
     _defGlobalOp(name, 0, function(...args) {
+      let opts;
       try {
         _winBrand(this);
-        _toScrollToOptions(args, name);
+        opts = _toScrollToOptions(args, name);
       } catch (e) { return Promise.reject(e); }
-      return Promise.resolve({ interrupted: false });
+      const cx = _lbScrollBoxPos(_SCROLL_VIEWPORT, 'x');
+      const cy = _lbScrollBoxPos(_SCROLL_VIEWPORT, 'y');
+      const x = opts.left === undefined ? cx : (relative ? cx + opts.left : opts.left);
+      const y = opts.top === undefined ? cy : (relative ? cy + opts.top : opts.top);
+      return _lbPerformScroll(_SCROLL_VIEWPORT, x, y, opts.behavior);
     });
   };
-  _winScrollOp('scroll');
-  _winScrollOp('scrollTo');
-  _winScrollOp('scrollBy');
+  _winScrollOp('scroll', false);
+  _winScrollOp('scrollTo', false);
+  _winScrollOp('scrollBy', true);
   _winOp('moveTo', 2, function() {});
   _winOp('moveBy', 2, function() {});
   _winOp('resizeTo', 2, function() {});
@@ -76409,10 +77050,16 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       // ancestor) — this is how a click on an outside list bullet reaches the
       // <li> whose own border box the bullet sits entirely outside of.
       if (!hit && typeof _layoutPseudoBoxOf === 'function') {
+        // Pseudo boxes come back in DOCUMENT coordinates while `x`/`y` are
+        // viewport ones, so a scrolled page needs the same offsets taken off
+        // that `getBoundingClientRect` takes off above — otherwise a bullet
+        // stops being clickable the moment the page moves.
+        var psx = _lbScrollBoxPos(_SCROLL_VIEWPORT, 'x') + _lbAncestorScrollOffset(el, 'x');
+        var psy = _lbScrollBoxPos(_SCROLL_VIEWPORT, 'y') + _lbAncestorScrollOffset(el, 'y');
         for (var pw = 0; pw < 3 && !hit; pw++) {
           var pbx = _layoutPseudoBoxOf(el, pw);
-          if (pbx && x >= pbx.x && x < pbx.x + pbx.width &&
-              y >= pbx.y && y < pbx.y + pbx.height) hit = true;
+          if (pbx && x >= pbx.x - psx && x < pbx.x - psx + pbx.width &&
+              y >= pbx.y - psy && y < pbx.y - psy + pbx.height) hit = true;
         }
       }
       if (hit) matches.push(el);
@@ -76465,32 +77112,13 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   //
   // caretPositionFromPoint stays layout-less: a CaretPosition anchored at the
   // body/root, offset 0. `options` is defaulted so the WebIDL .length is 2, not 3.
-  const _bodyElementOf = (doc) => {
-    // NOT `doc.body`, which already implements the HTML rule; the spec's own
-    // "body element" concept is the first html-namespace body/frameset child of
-    // the root, and the test appends a `foobarNS` <body> expecting it to count
-    // for nothing.
-    const root = doc.documentElement;
-    if (!root) return null;
-    for (let c = root.firstElementChild; c; c = c.nextElementSibling) {
-      if ((c.localName === 'body' || c.localName === 'frameset') && c.namespaceURI === _HTML_NS) return c;
-    }
-    return null;
-  };
-  const _potentiallyScrollable = (el) => {
-    const doc = el.ownerDocument;
-    const root = doc && doc.documentElement;
-    const ov = (n) => { try { const cs = globalThis.getComputedStyle(n); return cs ? (cs.overflow || 'visible') : 'visible'; } catch (e) { return 'visible'; } };
-    // "has an associated box" — an unrendered body cannot scroll anything.
-    if (_layoutResolve(el) === 'none') return false;
-    // The root hiding its overflow takes the viewport scroll away from the body.
-    if (root && root !== el) {
-      const ro = ov(root);
-      if (ro !== 'visible' && ro !== 'clip') return false;
-    }
-    const bo = ov(el);
-    return bo !== 'visible' && bo !== 'clip';
-  };
+  // Both concepts live with the scroll model in the layout bridge — the
+  // scrollTop/scrollLeft routing needs the same two answers this getter does,
+  // and two copies of "which element scrolls the viewport" is exactly the kind
+  // of drift that makes a quirks-mode page behave differently depending on
+  // which property you ask.
+  const _bodyElementOf = _lbBodyElementOf;
+  const _potentiallyScrollable = _lbPotentiallyScrollable;
   Object.defineProperty(Document.prototype, 'scrollingElement', { configurable: true, enumerable: true,
     get: _named('get', 'scrollingElement', function() {
       if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");

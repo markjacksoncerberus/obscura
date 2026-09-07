@@ -529,3 +529,25 @@ navigation-api/currententrychange-event/properties.html
 navigation-api/updateCurrentEntry-method/basic.html
 navigation-api/precommit-handler/precommitHandler-addHandler.html
 navigation-api/focus-reset/basic.html
+
+# ── The scrolled arc (Quests #650–#666) — the scroll model's own held ground ──
+css/cssom-view/scrollintoview.html
+css/cssom-view/elementScroll.html
+css/cssom-view/dom-element-scroll.html
+css/cssom-view/scrollLeftTop.html
+css/cssom-view/HTMLBody-ScrollArea_quirksmode.html
+css/cssom-view/element-scroll-promises.html
+css/cssom-view/element-scroll-promise-interruption.html
+css/cssom-view/window-scroll-promises.html
+css/cssom-view/scroll-behavior-main-frame-root.html
+css/cssom-view/scroll-behavior-main-frame-window.html
+css/cssom-view/scrollWidthHeight-overflow-visible-margin-collapsing.html
+css/cssom-view/scrollWidthHeight-overflow-visible-negative-margins.html
+css/cssom-view/scrollWidthHeight-contain-layout.html
+css/cssom-view/scrollWidthHeight-child-border-within-padding.tentative.html
+css/cssom-view/scrollIntoView-scrollMargin.html
+css/cssom-view/scrollIntoView-scrollPadding.html
+css/cssom-view/scroll-offsets-fractional-zoom.html
+dom/events/scrolling/scroll-event-fired-to-element.html
+dom/events/scrolling/scrollend-event-handler-content-attributes.html
+dom/events/scrolling/scrollend-event-not-fired-on-no-scroll.html

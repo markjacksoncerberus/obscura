@@ -25,6 +25,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F54** | ✅ [The Scrolled Verdict](493-the-scrolled-verdict.md) | **The scroll model — `css/cssom-view/scroll*`, `navigation-api/scroll-behavior/`, `dom/events/scrolling/` (untouched)** | scroll list 462/1579 → **814/1618** (50 files up, 0 down); `dom/events/scrolling` 9/71 → **34/72** (22 up, 0 down) | ⚔️⚔️⚔️ | **SECURED (Quests #650–#666, 2026-09-07).** THE BROWSER COULD NOT MOVE THE PAGE — `window.scrollTo` was an empty function, `window.scrollY` the literal `0`, the `Element` scroll operations converted their arguments and then did nothing, `scrollIntoView` set a click target and returned, and neither `scroll` nor `scrollend` existed anywhere. One *scrolling box* model now covers the viewport and every element. Three finds underneath it: the `overflow` shorthand never reached computed style (the #547 `background` bug, fourth instance); `scrollWidth`/`scrollHeight` were arithmetically wrong (Taffy's `content_size` clamps child offsets to zero); and ⭐⭐ **overflow propagates to the viewport**, which alone took `scrollintoview.html` 0/40 → 40/40. Zero-regression ritual 360 rows, 55,257/55,814 → 55,272/55,829. |
 | **F53** | ✅ [The Traversable Verdict](492-the-traversable-verdict.md) | **`navigation-api/*` — the whole realm, untouched in 624 quests, and the session history underneath it** | realm 1/543 → **230/540**, 179 files up, 7 down (all `0/N`) | ⚔️⚔️⚔️ | **SECURED (Quests #625–#649, 2026-09-06).** `window.navigation` did not exist, and neither did a session history: `history.length` was the constant 1 and `go`/`back`/`forward` were empty functions — the back button of a browser that cannot go back. A real per-window session history (key = the slot, id = the version), mirrored into a cell the Rust `Page` owns so it outlives the document; **a frame is a traversable too** (an `<iframe>` had no `history`, no `navigation`, dead `location` methods, and a link inside it navigated the WHOLE PAGE); the exact event/promise ordering the realm asserts; the push-vs-replace rules 316 of its files are written around; forms, downloads, `<area>`, `precommitHandler`, focus reset, `window.stop()`. ⚠️ Also fixed the RUNNER, which could not see any test registered from an ES module (63 files here alone). |
 | **F52** | ✅ [The Mathematical Verdict](491-the-mathematical-verdict.md) | **`mathml/*` — the whole realm, untouched in 604 quests** | realm 719/3407 → **2850/3409**, 92 files up, 0 down, 79 at 100% | ⚔️⚔️⚔️ | **SECURED (Quests #605–#624, 2026-09-06).** ⭐⭐⭐ **THERE WAS NO MATHML** — `is_mathml_element()` returned `false` with the comment `// not implemented.....`, there was no MathML UA stylesheet anywhere, MathML elements wrapped as `HTMLUnknownElement` with UPPERCASED tag names, and `<mspace width="20px">` measured 0×0 — which is the whole realm, because nearly every `has_<element>` in the shared feature-detection helper resolves to `has_mspace`. ⭐⭐ Foreign content keeps its case (**an SVG bug too**). ⭐⭐ MathML rows are flex, because whitespace between MathML elements is not content. ⭐⭐ Operator spacing hoists to the embellished operator. ⭐⭐ `Selection.toString()` returns RENDERED text (italic `<mi>` 0/112→**112/112**). ⭐⭐⭐ **css-logical never reached the physical properties** — engine-wide, `css/css-logical` 17/269→**167/269**. ⭐⭐ `font-size: math` derived structurally (stylo compiles it for Gecko only). ⛔ Not MathML layout: no fraction bars, no stretchy glyphs, no MATH-table script shifts; `display: math` unparseable here; operator dictionary unimplemented. ⭐ **Found, not fixed: `position: fixed` is not viewport-relative (`left:100px` → 108px) — engine-wide.** |
 | **F51** | ✅ [The Named Verdict](490-the-named-verdict.md) | **`the-window-object` — named access, BarProp, popup features, object/embed contexts** | region 76/174 → **163/174**, 24 files up, 0 down | ⚔️⚔️⚔️ | **SECURED (Quests #595–#604, 2026-08-18).** ⭐⭐⭐ **THE WINDOW HAD NO PROTOTYPE CHAIN** — `Object.getPrototypeOf(window)` was `Object.prototype`, `window.constructor` was not `Window`, and named access was faked by defining an own getter on the global for every `id` present when parsing finished (blind to later elements, unable to forget removed ones, ignorant of `name`, never an `HTMLCollection`). Now `window → Window.prototype → WindowProperties` with the real HTML named-objects algorithm. ⭐ An index past the last frame is a NAME (vs-named 3/10→10/10). ⭐⭐ **BarProp** — six distinct, identity-stable objects per Window; `visible` false once discarded and for every bar of a popup, which is the whole content of `window-open-popup-target.html` (popup-behavior 0/51 TIMEOUT→**51/51**). ⭐⭐ `window.open` feature parsing decides popup-ness. ⭐⭐ `noopener` REUSES the existing named target and withholds only the return value (noopener?indexed 1/9→9/9). ⭐ `document.referrer` exists at all. ⭐⭐ A navigated window's `location` COMPONENTS resync — a reused popup read an empty `location.search` and opened `new BroadcastChannel("")`. ⭐⭐ `object[data]`/`embed[src]` are child browsing contexts (but an image-typed `<embed>` is a picture). ⭐⭐ Navigating a navigable replaces the Document, NOT the Window (Window-document 0/1→1/1). ⭐ WebIDL named-property visibility. ⛔ `EventTarget` is `Node` here so the chain stops at `Object.prototype` (prototype-chain 3/5); `javascript:` URLs (noopener `_self`/`_parent`/`_top`); legacy-platform-object semantics on the global (indexed-properties 3/7); `<frameset>` parsing. |
@@ -355,6 +356,57 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-09-07 — Quests #650–#666: **the scrolled arc** (the scroll model)
+
+Took the outgoing knight's ⭐⭐ pointer — *"a scroll model reachable from JS:
+three realms wait on one primitive"* — and it was all three. `window.scrollTo`
+was `function(x, y) {}` and `window.scrollY` was the literal `0`, so nothing in
+the engine could hold a scroll position for the viewport at all; an element could
+hold one, but held it whether or not it had a scrolling box, and nothing else
+read it. No `scroll` event, no `scrollend` event, no `scroll-behavior` property.
+
+Seventeen quests. One *scrolling box* abstraction — an element or the viewport,
+four functions — so the two can never drift apart; ranges clamped to a real
+scrolling area with the origin placed by the writing mode; the CSSOM View
+promises with their `interrupted` bit and one in-flight smooth scroll per box;
+`scroll`/`scrollend` queued as tasks (the viewport's at the **Document**, and
+bubbling, which is the only reason `window.onscroll` ever sees them);
+`scrollIntoView` as the outward walk it actually is, with `scroll-margin`,
+`scroll-padding` and logical alignment; `getBoundingClientRect` scroll-aware, with
+`position: fixed` boxes correctly staying put; and a session history that
+remembers where the reader was.
+
+Three engine-level finds beneath the realm. ⭐ **The `overflow` shorthand never
+reached computed style** — `getComputedStyle(el).overflowX` said `visible` on an
+element a stylesheet had declared `overflow: hidden` on, because the shorthand
+was expanded on the CSSOM setter path only. That is Quest #547's `background`
+bug for the *fourth* time (after `background`, `outline`, `column-rule`), and it
+gated the whole model: everything that asks "is this a scroll container" reads
+that answer. ⭐ **`scrollWidth`/`scrollHeight` were arithmetically wrong** —
+Taffy's `content_size` clamps each child's offset to zero before measuring, so a
+child pulled up by a negative margin reported its full height from the origin;
+the region is now unioned from the boxes themselves in Rust, with the child
+*margin* box as the trigger and the child *border* box as what the parent's
+end-side padding extends. ⭐⭐ **Overflow propagates to the viewport** — the root
+element's overflow belongs to the viewport, and when the root is `visible` the
+`<body>`'s is taken instead and the body left `visible`; without it
+`body { overflow: hidden }` made the body look like a scroller and
+`scrollIntoView` stopped there and moved nothing. `scrollintoview.html` went
+**0/40 → 40/40** on that one rule.
+
+⛔ The realm's biggest remaining blocker is **not** a scroll problem: `float` is
+not laid out, which is what all five `scrollIntoView-*-writing-mode*` files build
+their grids out of. `vertical-align: <length>` (absent from the fork entirely) is
+the only thing left in `scroll-behavior-element.html`.
+
+**NEXT:** (1) ⭐⭐⭐ `float` layout; (2) ⭐⭐⭐ `position: fixed` viewport-relative
+(carried, and now the only remaining error is the placement); (3) ⭐⭐ a scroll
+*gesture* — the model is built and nothing drives it, so wiring `test_driver`'s
+scroll action opens `dom/events/scrolling`'s user-scroll half and the whole
+`wheel-event-transactions-*` family; (4) ⭐⭐ layout for iframe documents in the
+parent realm; (5) `css-scroll-snap` (93 files, untouched) now has a model to snap.
+
 
 ### 2026-09-06 — Quests #625–#649: **the traversable arc** (`navigation-api/*`)
 

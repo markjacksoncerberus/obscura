@@ -169,6 +169,22 @@ const EMPTY_BOX: NodeBox = NodeBox {
 
 /// A styled, laid-out document. Hold one of these to take multiple screenshots
 /// or answer many geometry queries without re-resolving.
+/// The far edges of one box's scrollable overflow, in its own border-box
+/// coordinates. `own_*` is what that box reports as its scrolling area; the
+/// `propagate_*` pair is what it contributes to an ancestor — see
+/// [`ResolvedDoc::scroll_overflow_extent`] for why the two differ.
+#[derive(Clone, Copy, Default)]
+struct ScrollExtent {
+    own_min_x: f64,
+    own_min_y: f64,
+    own_max_x: f64,
+    own_max_y: f64,
+    prop_min_x: f64,
+    prop_min_y: f64,
+    prop_max_x: f64,
+    prop_max_y: f64,
+}
+
 pub struct ResolvedDoc {
     doc: HtmlDocument,
     viewport: Viewport,
@@ -181,6 +197,11 @@ pub struct ResolvedDoc {
     /// otherwise a patch would measure an image before its intrinsic size
     /// is known. `None` for documents built without one (tests).
     provider: Option<Arc<dyn ResourceProvider>>,
+    /// Memo for [`scroll_overflow_extent`]: Blitz node id → (right, bottom) of
+    /// that node's scrollable overflow, RELATIVE to its own border-box origin.
+    /// Without it, computing the scrolling area for every element on the page
+    /// would re-walk each subtree once per ancestor.
+    scroll_ext: std::cell::RefCell<HashMap<usize, ScrollExtent>>,
 }
 
 impl ResolvedDoc {
@@ -199,6 +220,7 @@ impl ResolvedDoc {
             doc,
             viewport,
             nid_map,
+            scroll_ext: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -257,6 +279,10 @@ impl ResolvedDoc {
     /// outcome worse than a slow one.
     pub fn patch(&mut self, patches: &[ElementPatch]) -> bool {
         use blitz_dom::{ns, LocalName, QualName};
+
+        // The geometry is about to move; nothing measured against the old
+        // layout may survive into the new one.
+        self.scroll_ext.borrow_mut().clear();
 
         // Resolve every target BEFORE touching anything, so a miss costs nothing.
         let mut targets = Vec::with_capacity(patches.len());
@@ -554,6 +580,135 @@ impl ResolvedDoc {
         })
     }
 
+    /// The far edges of a node's scrollable overflow — CSS Overflow §"scrollable
+    /// overflow region" — in the node's own BORDER-box coordinates, before its own
+    /// padding box is taken into account.
+    ///
+    /// ⚠️ Taffy's `content_size` cannot answer this. It measures each child's far
+    /// edge *after clamping the child's offset to zero*, so a child pulled up by a
+    /// negative margin contributes its full height from the origin instead of the
+    /// part of it that actually falls inside — a 100px child at −10px reported 100
+    /// where the reachable area ends at 90. So the region is unioned here, from the
+    /// boxes themselves.
+    ///
+    /// Two contributions per child, and they are NOT the same rectangle:
+    ///
+    ///   * its BORDER box, which is what is actually painted and therefore what
+    ///     has to stay reachable;
+    ///   * its MARGIN box, which is only ever the TRIGGER: when THAT crosses the
+    ///     parent's content edge, the parent's own end-side padding is appended to
+    ///     the child's BORDER box — the resolution of csswg-drafts#129 / #8660 that
+    ///     every engine implements and that
+    ///     `scrollWidthHeight-child-border-within-padding.tentative` pins down.
+    ///     Triggering on the border box instead makes a row of items with negative
+    ///     margins report overflow the reader can never scroll to; extending the
+    ///     margin box instead counts a margin that collapsed out through the
+    ///     parent's edge as content.
+    ///
+    /// A descendant that clips (any non-`visible` overflow) contributes only its own
+    /// border box — its content is its own business — and a `position: fixed` box
+    /// contributes nothing to anybody, because it does not move with the page.
+    ///
+    /// The padding-append is deliberately NOT carried up through the recursion (see
+    /// `propagate`): it is an affordance of the box that owns the padding, and a box
+    /// that actually scrolls clips, so it never propagates anyway. Carrying it up
+    /// would also amplify the one thing the layout engine underneath still gets
+    /// wrong — it does not collapse adjacent margins, so a nested block sits one
+    /// margin lower than it should, and every ancestor would inherit that error as
+    /// phantom overflow.
+    ///
+    /// Memoized per node, so measuring a whole document costs one walk and not one
+    /// walk per ancestor.
+    fn scroll_overflow_extent(&self, blitz_id: usize) -> ScrollExtent {
+        use style::values::specified::box_::DisplayOutside;
+        if let Some(hit) = self.scroll_ext.borrow().get(&blitz_id) {
+            return *hit;
+        }
+        let mut ext = ScrollExtent::default();
+        if let Some(node) = self.doc.get_node(blitz_id) {
+            let l = &node.final_layout;
+            // The parent's own content edges, in its border-box coordinates.
+            let content_left = (l.border.left + l.padding.left) as f64;
+            let content_top = (l.border.top + l.padding.top) as f64;
+            let content_right = (l.size.width - l.border.right - l.padding.right).max(0.0) as f64;
+            let content_bottom = (l.size.height - l.border.bottom - l.padding.bottom).max(0.0) as f64;
+            let base = node.absolute_position(0.0, 0.0);
+            for &child in node.children.iter() {
+                let Some(cn) = self.doc.get_node(child) else {
+                    continue;
+                };
+                let Some(cs) = cn.primary_styles() else {
+                    continue;
+                };
+                if cs.clone_display().outside() == DisplayOutside::None {
+                    continue;
+                }
+                if matches!(
+                    cs.clone_position(),
+                    style::computed_values::position::T::Fixed
+                ) {
+                    continue;
+                }
+                let cpos = cn.absolute_position(0.0, 0.0);
+                let dx = (cpos.x - base.x) as f64;
+                let dy = (cpos.y - base.y) as f64;
+                let cl = &cn.final_layout;
+                let border_right = dx + cl.size.width as f64;
+                let border_bottom = dy + cl.size.height as f64;
+                ext.prop_max_x = ext.prop_max_x.max(border_right);
+                ext.prop_max_y = ext.prop_max_y.max(border_bottom);
+                ext.prop_min_x = ext.prop_min_x.min(dx);
+                ext.prop_min_y = ext.prop_min_y.min(dy);
+                let margin_right = border_right + cl.margin.right as f64;
+                let margin_bottom = border_bottom + cl.margin.bottom as f64;
+                let margin_left = dx - cl.margin.left as f64;
+                let margin_top = dy - cl.margin.top as f64;
+                // The margin box is the TRIGGER, the border box is what gets
+                // extended. Extending the margin box itself would count a margin
+                // that COLLAPSED out through the parent's own edge as overflow —
+                // a plain column of blocks with `margin: 20px` would report 20px
+                // of scrollable content that is not there.
+                //
+                // Both ends, because which one is the scrolling END depends on the
+                // writing mode: a right-to-left scroller overflows LEFTWARD, and a
+                // model that only looked rightward reported no scrolling area at
+                // all for Arabic and Hebrew content.
+                if margin_right > content_right {
+                    ext.own_max_x = ext.own_max_x.max(border_right + l.padding.right as f64);
+                }
+                if margin_bottom > content_bottom {
+                    ext.own_max_y = ext.own_max_y.max(border_bottom + l.padding.bottom as f64);
+                }
+                if margin_left < content_left {
+                    ext.own_min_x = ext.own_min_x.min(dx - l.padding.left as f64);
+                }
+                if margin_top < content_top {
+                    ext.own_min_y = ext.own_min_y.min(dy - l.padding.top as f64);
+                }
+                let clips = !matches!(
+                    cs.clone_overflow_x(),
+                    style::computed_values::overflow_x::T::Visible
+                ) || !matches!(
+                    cs.clone_overflow_y(),
+                    style::computed_values::overflow_x::T::Visible
+                );
+                if !clips {
+                    let sub = self.scroll_overflow_extent(child);
+                    ext.prop_max_x = ext.prop_max_x.max(dx + sub.prop_max_x);
+                    ext.prop_max_y = ext.prop_max_y.max(dy + sub.prop_max_y);
+                    ext.prop_min_x = ext.prop_min_x.min(dx + sub.prop_min_x);
+                    ext.prop_min_y = ext.prop_min_y.min(dy + sub.prop_min_y);
+                }
+            }
+        }
+        ext.own_max_x = ext.own_max_x.max(ext.prop_max_x);
+        ext.own_max_y = ext.own_max_y.max(ext.prop_max_y);
+        ext.own_min_x = ext.own_min_x.min(ext.prop_min_x);
+        ext.own_min_y = ext.own_min_y.min(ext.prop_min_y);
+        self.scroll_ext.borrow_mut().insert(blitz_id, ext);
+        ext
+    }
+
     fn box_for_blitz_id(&self, blitz_id: usize) -> Option<NodeBox> {
         use style::computed_values::visibility::T as Visibility;
         use style::values::specified::box_::{DisplayInside, DisplayOutside};
@@ -592,6 +747,33 @@ impl ResolvedDoc {
             l.size.width as f64,
             l.size.height as f64,
         ));
+        let scroll_ext = self.scroll_overflow_extent(blitz_id);
+        // ⚠️ Only the END-side overflow is scrollable — content that falls before
+        // the scrolling origin can never be reached — and WHICH side is the end is
+        // the writing mode's answer, not a constant. The block axis runs right-to-
+        // left in `vertical-rl`; the inline axis runs right-to-left whenever the
+        // direction is `rtl`, and bottom-to-top in `sideways-lr`.
+        let wm = styles.writing_mode;
+        let x_reversed = if wm.is_vertical() {
+            wm.is_vertical_rl()
+        } else {
+            !wm.is_bidi_ltr()
+        };
+        let y_reversed = wm.is_vertical() && !wm.is_inline_tb();
+        let pad_start_x = l.border.left as f64;
+        let pad_start_y = l.border.top as f64;
+        let pad_end_x = (l.size.width - l.border.right) as f64;
+        let pad_end_y = (l.size.height - l.border.bottom) as f64;
+        let scroll_width = if x_reversed {
+            pad_end_x - scroll_ext.own_min_x.min(pad_start_x)
+        } else {
+            scroll_ext.own_max_x.max(pad_end_x) - pad_start_x
+        };
+        let scroll_height = if y_reversed {
+            pad_end_y - scroll_ext.own_min_y.min(pad_start_y)
+        } else {
+            scroll_ext.own_max_y.max(pad_end_y) - pad_start_y
+        };
         // `scroll_offset` is subtracted by `absolute_position` on the way up, so
         // this box is already in the same coordinate space the spec calls
         // "viewport-relative before the viewport's own scroll is applied".
@@ -608,16 +790,13 @@ impl ResolvedDoc {
             padding_right: l.padding.right as f64,
             padding_bottom: l.padding.bottom as f64,
             padding_left: l.padding.left as f64,
-            // ⚠️ Taffy measures `content_size` from the BORDER-box origin, but
-            // CSSOM View defines the scrolling area against the PADDING box —
-            // so the leading border has to come off before the two can be
-            // compared. Skip that subtraction and every bordered element
-            // reports a scrollHeight one border-width taller than its own
-            // clientHeight, i.e. claims to overflow when it does not.
-            scroll_width: (l.content_size.width as f64 - l.border.left as f64)
-                .max(l.size.width as f64 - l.border.left as f64 - l.border.right as f64),
-            scroll_height: (l.content_size.height as f64 - l.border.top as f64)
-                .max(l.size.height as f64 - l.border.top as f64 - l.border.bottom as f64),
+            // The scrolling area, measured from the PADDING-box origin — which is
+            // what CSSOM View defines `scrollWidth`/`scrollHeight` against — and
+            // floored at the padding box, because a box that does not overflow
+            // scrolls not at all. See `scroll_overflow_extent` for the union and
+            // for why Taffy's `content_size` is not the number wanted here.
+            scroll_width,
+            scroll_height,
             scroll_left: node.scroll_offset.x,
             scroll_top: node.scroll_offset.y,
             has_box: true,
