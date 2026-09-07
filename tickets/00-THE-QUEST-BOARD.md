@@ -25,6 +25,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F56** | ✅ [The Contained Verdict](495-the-contained-verdict.md) | **The containing block — `position: fixed` / `absolute` placed against the right box at last (a ⭐⭐⭐ carried by four arcs)** | `css-position` 1163/1488 → **1167/1488**, `css-scroll-snap` 584 → **592**, scroll list 856 → **861**, layout probe 551 → **553**; **0 files down anywhere** | ⚔️⚔️⚔️ | **SECURED (Quests #673–#675, 2026-09-07).** THE FIXED HEADER WAS NEVER FIXED — Taffy has no containing-block chain and both out-of-flow positions were mapped onto its `Absolute`, so a fixed box was placed against its DOM parent's padding box: `left: 100px` landed at 108px on any page with the default body margin. Out-of-flow boxes are now reparented in the LAYOUT tree only (which is allowed to differ from the DOM tree — `layout_parent` exists because it already does). ⭐ The chain is read from the DOM, not from the tree being edited, so a box comes back when its ancestor *becomes* positioned; ⭐ and an all-`auto`-inset box keeps its static position and is never moved. |
 | **F55** | ✅ [The Snapped Verdict](494-the-snapped-verdict.md) | **`css/css-scroll-snap/` — the untouched behavioural half of a realm whose parsing was already green** | realm 510/788 → **584/796**, 43 files up, 1 down | ⚔️⚔️ | **SECURED (Quests #667–#672, 2026-09-07).** THE CAROUSEL STOPPED BETWEEN SLIDES — `scroll-snap-type` and `scroll-snap-align` were parsed, computed, and acted on by nothing. Built on the previous arc's scroll model (this one was not attemptable before it): a snap position IS an alignment of one area inside the snapport, sharing `scrollIntoView`'s arithmetic. ⭐ Snap scope is TWO rules — cross-axis rejection when one axis snaps, mutual-visibility with a single-area fallback when both do. ⭐ The reported position is DERIVED, so a container snaps on layout and re-snaps when its areas move. Plus the CSS Scroll Snap 2 snap events (fired BEFORE `scrollend`) and, in the RUNNER, the WebDriver **wheel** action source that had been missing entirely. |
 | **F54** | ✅ [The Scrolled Verdict](493-the-scrolled-verdict.md) | **The scroll model — `css/cssom-view/scroll*`, `navigation-api/scroll-behavior/`, `dom/events/scrolling/` (untouched)** | scroll list 462/1579 → **814/1618** (50 files up, 0 down); `dom/events/scrolling` 9/71 → **34/72** (22 up, 0 down) | ⚔️⚔️⚔️ | **SECURED (Quests #650–#666, 2026-09-07).** THE BROWSER COULD NOT MOVE THE PAGE — `window.scrollTo` was an empty function, `window.scrollY` the literal `0`, the `Element` scroll operations converted their arguments and then did nothing, `scrollIntoView` set a click target and returned, and neither `scroll` nor `scrollend` existed anywhere. One *scrolling box* model now covers the viewport and every element. Three finds underneath it: the `overflow` shorthand never reached computed style (the #547 `background` bug, fourth instance); `scrollWidth`/`scrollHeight` were arithmetically wrong (Taffy's `content_size` clamps child offsets to zero); and ⭐⭐ **overflow propagates to the viewport**, which alone took `scrollintoview.html` 0/40 → 40/40. Zero-regression ritual 360 rows, 55,257/55,814 → 55,272/55,829. |
 | **F53** | ✅ [The Traversable Verdict](492-the-traversable-verdict.md) | **`navigation-api/*` — the whole realm, untouched in 624 quests, and the session history underneath it** | realm 1/543 → **230/540**, 179 files up, 7 down (all `0/N`) | ⚔️⚔️⚔️ | **SECURED (Quests #625–#649, 2026-09-06).** `window.navigation` did not exist, and neither did a session history: `history.length` was the constant 1 and `go`/`back`/`forward` were empty functions — the back button of a browser that cannot go back. A real per-window session history (key = the slot, id = the version), mirrored into a cell the Rust `Page` owns so it outlives the document; **a frame is a traversable too** (an `<iframe>` had no `history`, no `navigation`, dead `location` methods, and a link inside it navigated the WHOLE PAGE); the exact event/promise ordering the realm asserts; the push-vs-replace rules 316 of its files are written around; forms, downloads, `<area>`, `precommitHandler`, focus reset, `window.stop()`. ⚠️ Also fixed the RUNNER, which could not see any test registered from an ES module (63 files here alone). |
@@ -357,6 +358,51 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-09-07 — Quests #673–#675: **the contained arc** (the containing block)
+
+The ⭐⭐⭐ pointer four consecutive arcs had named and deferred, taken at last —
+and by the end of the scroll work it was the top blocker in *two* realms at once.
+
+`stylo_taffy` mapped both `Position::Absolute` and `Position::Fixed` onto
+`taffy::Position::Absolute`, and Taffy has no containing-block chain: it lays an
+absolute child out against its own parent's padding box, full stop. So
+`position: fixed; left: 100px; top: 50px` landed at **(108, 58)** on any page
+with the default `<body>` margin and moved with whatever ancestor it happened to
+be written inside; an absolutely positioned box in an unpositioned wrapper was
+offset by wherever that wrapper sat. Every sticky header, modal, toast, dropdown
+and tooltip on the web — the whole vocabulary of overlay UI — placed wrong.
+
+The fix does not teach Taffy about containing blocks. The layout tree is already
+allowed to differ from the DOM tree — `layout_parent` exists precisely because it
+does — so out-of-flow boxes are **reparented in the layout tree only**, after
+construction and before layout, and Taffy positions them against the right
+padding box without knowing anything new.
+
+Three things learned in the doing. ⚠️ The **root ELEMENT**, not the root node:
+`root_node()` is the Document, whose box does not position absolute children at
+all, and hoisting to it silently dropped every inset. ⭐ The containing block must
+be read from the **DOM** ancestor chain, never from the layout tree the pass is
+editing — a box already hoisted to the root has no positioned ancestor left to
+find there, so a layout-tree walk never brings it back when its real ancestor
+*becomes* positioned, which is exactly what a page does to open a dropdown. ⭐ And
+a box with all four insets `auto` is placed at its **static position**, which
+only its own parent knows; hoisting one throws that away, so those are left
+exactly where the DOM put them.
+
+Measured with a hard regression sweep, because this touches every page's layout:
+`css/css-position/` 1163/1488 → 1167/1488, `css-scroll-snap` 584/796 → 592/809,
+the scroll probe list 856 → 861, the layout probe 551 → 553 — **0 files down in
+any of them** — and 0 real regressions over 420 ritual rows (four flagged rows all
+proved flaky by re-running them on the BASE binary, where two measure identically
+and the documented flaky-img file measures *worse*).
+
+**NEXT:** (1) ⭐⭐⭐ `float` layout — now the single biggest remaining wall, in the
+scroll realm and in normal flow both; (2) ⭐⭐ `position: sticky`, still mapped to
+`Relative` and doing nothing, and the thing every table header and section index
+uses; (3) ⭐⭐ layout for iframe documents in the parent realm; (4) ⭐⭐ touch
+panning and keyboard scrolling behind a `touch-action` model.
+
 
 ### 2026-09-07 — Quests #667–#672: **the snapped arc** (`css/css-scroll-snap/`)
 

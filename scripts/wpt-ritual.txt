@@ -563,3 +563,7 @@ css/css-scroll-snap/snap-after-relayout/not-resnap-outside-proximity-threshold.h
 css/css-scroll-snap/snap-events/scrollsnapchange/scrollsnapchange-on-programmatic-scroll.tentative.html
 css/css-scroll-snap/snap-events/scrollsnapchanging/scrollsnapchanging-on-programmatic-scroll.tentative.html
 dom/events/scrolling/wheel-event-composed.html
+
+# ── The contained arc (Quests #673–#675) — the containing block's held ground ──
+css/css-position/position-absolute-container-dynamic-002.html
+css/css-position/position-absolute-dynamic-containing-block.html
