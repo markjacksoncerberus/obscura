@@ -25,6 +25,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F58** | ✅ [The Mapped Verdict](497-the-mapped-verdict.md) | **`html-aam/` — the table that maps an HTML element to WHAT IT IS (chosen by measuring it cold; never had a ledger row)** | `html-aam/` **736/888 → 885/888**, 20 files up, 0 down; `accname/name/comp_name_from_content` 49/79 → **67/79** | ⚔️⚔️ | **SECURED (Quests #680–#697, 2026-09-10).** THE BROWSER COULD NOT SAY WHAT ITS OWN ELEMENTS WERE. ⭐ Naming was PROHIBITED where ARIA only DISCOURAGES it — every phrasing element ignored its own `aria-label` (+46 in one deletion). ⭐⭐ The ROOT of a name computation was hidden from itself: `<area>` and `<rp>` are `display:none` in every UA stylesheet and got no name at all, and an image map's areas ARE the links on the picture. ⭐ The `<label>` outranks the value printed on the button. A hidden `<label>`/`<caption>`/`<legend>` beat a visible one. `<figure>`/`<details>` were named by their caption/summary; the table roles were named from their contents (every cell read twice). Role side: a blank `alt` is a declaration `title` cannot rescue; an `<img>` with no source is not an image; an unnamed nested `<aside>` is not complementary to anything; `draggable`/`autofocus`/`popover` floor an element at `group`. ⛔ 2 `area.html` rows are an upstream test bug (stale `alt` left by the harness). |
 | **F57** | ✅ [The Stuck Verdict](496-the-stuck-verdict.md) | **`position: sticky` — the other half of the overlay vocabulary (chosen over `float` after measuring both)** | `css/css-position/` 1167/1488 → **1200/1488**, 13 files up, 0 down | ⚔️⚔️ | **SECURED (Quests #676–#679, 2026-09-07).** THE HEADER NEVER FOLLOWED YOU DOWN THE PAGE. ⚠️ The engine's handling was worse than nothing: sticky was mapped to Taffy's `Relative` AND handed its insets, so a `top: 50px` header sat 50px low before anything scrolled. Insets no longer reach Taffy; the offset is computed from the scroll model and clamped to the containing block inset by the box's own margins. Nested sticky accumulates ancestors' shifts. ⭐ `float` was measured FIRST and rejected: `css/CSS2/floats*` is almost all reftests and its scoreable files already sit at 120/128 — worth doing for rendering, not for the score. ⛔ The offset does not reach the paint path. |
 | **F56** | ✅ [The Contained Verdict](495-the-contained-verdict.md) | **The containing block — `position: fixed` / `absolute` placed against the right box at last (a ⭐⭐⭐ carried by four arcs)** | `css-position` 1163/1488 → **1167/1488**, `css-scroll-snap` 584 → **592**, scroll list 856 → **861**, layout probe 551 → **553**; **0 files down anywhere** | ⚔️⚔️⚔️ | **SECURED (Quests #673–#675, 2026-09-07).** THE FIXED HEADER WAS NEVER FIXED — Taffy has no containing-block chain and both out-of-flow positions were mapped onto its `Absolute`, so a fixed box was placed against its DOM parent's padding box: `left: 100px` landed at 108px on any page with the default body margin. Out-of-flow boxes are now reparented in the LAYOUT tree only (which is allowed to differ from the DOM tree — `layout_parent` exists because it already does). ⭐ The chain is read from the DOM, not from the tree being edited, so a box comes back when its ancestor *becomes* positioned; ⭐ and an all-`auto`-inset box keeps its static position and is never moved. |
 | **F55** | ✅ [The Snapped Verdict](494-the-snapped-verdict.md) | **`css/css-scroll-snap/` — the untouched behavioural half of a realm whose parsing was already green** | realm 510/788 → **584/796**, 43 files up, 1 down | ⚔️⚔️ | **SECURED (Quests #667–#672, 2026-09-07).** THE CAROUSEL STOPPED BETWEEN SLIDES — `scroll-snap-type` and `scroll-snap-align` were parsed, computed, and acted on by nothing. Built on the previous arc's scroll model (this one was not attemptable before it): a snap position IS an alignment of one area inside the snapport, sharing `scrollIntoView`'s arithmetic. ⭐ Snap scope is TWO rules — cross-axis rejection when one axis snaps, mutual-visibility with a single-area fallback when both do. ⭐ The reported position is DERIVED, so a container snaps on layout and re-snaps when its areas move. Plus the CSS Scroll Snap 2 snap events (fired BEFORE `scrollend`) and, in the RUNNER, the WebDriver **wheel** action source that had been missing entirely. |
@@ -359,6 +360,43 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-09-10 — Quests #680–#697: **the mapped arc** (`html-aam/` — what an element IS)
+
+Region chosen by MEASURING, under the standing order. The outgoing ⭐ list pointed at renderer work
+(the sticky paint path, iframe layout) — both real, both kept on the list — but `html-aam/` had never
+been measured as a realm: it was picked up incidentally by the accessible arc (#454–#456, which built
+`computedRole`/`computedLabel`) and never revisited. Cold baseline: **736/888 over 35 files, ZERO
+could-not-run** — 152 reachable subtests with the `get_computed_role`/`get_computed_label` bridge
+already wired. And it is the most on-mission ground left: `html-aam` is how a screen reader says
+"button, Submit" instead of "clickable", and how an AI agent finds the button it was told to press.
+
+Eighteen findings. The three widest: **(1) naming was PROHIBITED where ARIA only DISCOURAGES it** —
+`_NAME_PROHIBITED` was used to skip computation steps 2B/2D/2E, so every phrasing element ignored its
+own `aria-label`; the prohibition tells an AT not to *announce* a name, not that the name fails to
+compute (+46 in one deletion). **(2) The ROOT of a computation was hidden from itself** — `_computedLabel`
+opened with "if this element is hidden it has no name", and `<area>` and `<rp>` are `display:none` in
+every UA stylesheet on earth. **(3) The `<label>` outranks the value printed on the button**, and
+`<button>` was not treated as a labelable control at all.
+
+Plus: a hidden `<label>`/`<caption>`/`<legend>` contributed text a sighted user had lost, and beat a
+VISIBLE one; `<figure>`/`<details>` were named by their caption/summary (neither is correct — but a
+lone unlabelled `<img>` inside a captioned figure DOES take it); the table roles were "name from
+contents", so a screen reader reads every cell twice; `aria-placeholder` did not exist; `<optgroup
+label>` was named from its options. On the role side: the `<img>` rule (blank `alt` is a declaration,
+`title` does not rescue it, no `src`/`srcset` means not an image); an `aria-labelledby` that resolves
+to nothing is not a name; the nested `<aside>`; `sectionheader`/`sectionfooter`; the MINIMUM ROLE
+(`draggable`/`autofocus`/`popover` floor at `group`); the orphaned `<li>`; the unscoped `<th>`'s axis;
+`address`/`mark`/`dir`; `<input type=checkbox switch>`.
+
+**`html-aam/` 736/888 → 885/888.** ⛔ Honest caps: 2 `area.html` rows are an UPSTREAM TEST BUG (the
+harness's `handleSpecialCases` sets a non-empty `alt` unconditionally and the name-source loop never
+removes it, then expects it ignored — read the harness source); `el-cite-draggable-attr` wants the
+proposed `html-cite` role. **NEXT:** ⭐⭐ `counter()`/`attr()`/rtl inside CSS `content` (the 12
+remaining `comp_name_from_content` rows are all that one style-engine gap, and generated content
+reaches far past accname); ⭐⭐ `core-aam`/`svg-aam`/`dpub-aam`/`graphics-aam` on the same bridge;
+⭐⭐ the sticky offset in the PAINT path (carried); ⭐⭐ iframe-document layout in the parent realm
+(carried). Scroll `tickets/497-the-mapped-verdict.md`.
 
 ### 2026-09-07 — Quests #676–#679: **the stuck arc** (`position: sticky`)
 

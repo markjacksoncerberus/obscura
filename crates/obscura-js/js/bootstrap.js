@@ -77863,7 +77863,8 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 
   // HTML-AAM §html-element-role-mappings. Elements whose role never varies.
   const _HTML_FIXED_ROLES = {
-    article: 'article', aside: 'complementary', b: 'generic', bdi: 'generic',
+    address: 'group', article: 'article', aside: 'complementary',
+    b: 'generic', bdi: 'generic', dir: 'list', mark: 'mark',
     bdo: 'generic', blockquote: 'blockquote', body: 'generic', button: 'button',
     caption: 'caption', code: 'code', data: 'generic', datalist: 'listbox',
     dd: 'definition', del: 'deletion', details: 'group', dfn: 'term',
@@ -77921,13 +77922,49 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
       // author bothered to label is meant to be perceived.
       case 'img': {
         const alt = _attr(el, 'alt');
-        if (alt === '' && !_attr(el, 'aria-label') && !_attr(el, 'aria-labelledby') &&
-            !_attr(el, 'title')) return 'none';
-        return 'image';
+        // A blank `alt` — empty OR whitespace-only — is the author declaring the
+        // image decorative, and only an ARIA name overrides that declaration.
+        // `title` does NOT: a tooltip is a courtesy, not a claim that the picture
+        // carries meaning (w3c/aria#2706).
+        if (alt != null && _isBlankASCII(alt)) {
+          return _authorNamedNonBlank(el) ? 'image' : 'none';
+        }
+        if (alt != null) return 'image';
+        if (_authorNamedNonBlank(el)) return 'image';
+        if (!_isBlankASCII(_attr(el, 'title'))) return 'image';
+        // No name and NO SOURCE: per HTML the element represents nothing, so
+        // announcing "image" would point the user at a picture that is not there.
+        if (!_isBlankASCII(_attr(el, 'src')) ||
+            !_isBlankASCII(_attr(el, 'srcset'))) return 'image';
+        return 'generic';
+      }
+
+      // A listitem belongs to a list. An <li> that is not inside one announces
+      // membership of something the user was never told about, so HTML-AAM gives
+      // it no role at all — it is generic like any other wrapper.
+      case 'li': {
+        // The list need not be the immediate parent: `<ul><div><li>` is markup
+        // every framework emits, and the wrappers in between are generic — they
+        // are not a reason to tell the user this item belongs to nothing. Walk
+        // up through wrappers only, and stop at the first ancestor that IS
+        // something.
+        for (let p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) {
+          const pr = _computedRole(p);
+          if (pr === 'list' || pr === 'menu' || pr === 'menubar') return 'listitem';
+          if (pr !== '' && pr !== 'generic' && pr !== 'none' &&
+              pr !== 'presentation') break;
+        }
+        // …and a list can claim an item that is nowhere near it in the DOM.
+        // aria-owns is how a virtualised list keeps its items in the tree.
+        if (_ownedByListRole(el)) return 'listitem';
+        return 'generic';
       }
 
       case 'input': {
         const t = _inputType(el);
+        // `<input type=checkbox switch>` is a two-state SWITCH, not a checkbox:
+        // "on/off", not "checked/unchecked". Same element, different sentence.
+        if (t === 'checkbox' && _attr(el, 'switch') != null) return 'switch';
         // A text/search input paired with a <datalist> is a combobox, because
         // that is what it behaves like.
         if ((t === 'text' || t === 'search' || t === 'tel' || t === 'url' ||
@@ -77949,6 +77986,23 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
       case 'th': {
         const scope = String(_attr(el, 'scope') || '').toLowerCase();
         if (scope === 'row' || scope === 'rowgroup') return 'rowheader';
+        if (scope === 'col' || scope === 'colgroup') return 'columnheader';
+        // With no `scope` the axis is decided by WHERE THE CELL SITS. A <th> in
+        // a <thead> heads its column. A <th> in a body row that also holds data
+        // cells is the label for that row — the leftmost cell of "Tuesday | 14 |
+        // 3" names the row, and calling it a columnheader makes a screen reader
+        // read every figure in the table under the wrong heading.
+        for (let p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) {
+          const t = _isHTML(p) ? p.localName : '';
+          if (t === 'thead') return 'columnheader';
+          if (t === 'table') break;
+        }
+        const row = el.parentNode;
+        if (row && row.nodeType === 1 && _isHTML(row) && row.localName === 'tr') {
+          for (const c of row.children) {
+            if (_isHTML(c) && c.localName === 'td') return 'rowheader';
+          }
+        }
         return 'columnheader';
       }
 
@@ -77956,22 +78010,61 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
       // inside an article or a section they are just wrappers.
       case 'header': case 'footer': {
         for (let p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) {
-          const t = p.localName;
+          const t = _isHTML(p) ? p.localName : '';
           if (t === 'article' || t === 'aside' || t === 'main' ||
-              t === 'nav' || t === 'section') return 'generic';
+              t === 'nav' || t === 'section') {
+            // Not a page landmark — but not NOTHING either. It heads or closes
+            // the section it is in, and saying so is how a reader jumping by
+            // landmark knows which section they landed in.
+            return tag === 'header' ? 'sectionheader' : 'sectionfooter';
+          }
         }
         return tag === 'header' ? 'banner' : 'contentinfo';
+      }
+
+      // An <aside> is "complementary to the page" — so an aside nested inside a
+      // section of the page is complementary to WHAT, exactly? HTML-AAM's answer
+      // is: to nothing a user can navigate to, unless the author named it. An
+      // unnamed nested aside is a wrapper.
+      case 'aside': {
+        for (let p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) {
+          const t = _isHTML(p) ? p.localName : '';
+          if (t === 'article' || t === 'aside' || t === 'nav' || t === 'section') {
+            return _hasAuthorName(el) ? 'complementary' : 'generic';
+          }
+          if (t === 'main' || t === 'body') break;
+        }
+        return 'complementary';
       }
 
       // A <section> is a landmark only if it is named — an unnamed one gives a
       // screen-reader nothing to announce, so it stays generic.
       case 'section':
-        return (_attr(el, 'aria-label') || _attr(el, 'aria-labelledby') ||
-                _attr(el, 'title')) ? 'region' : 'generic';
+        return _hasAuthorName(el) ? 'region' : 'generic';
 
       default:
         return _HTML_FIXED_ROLES[tag] || '';
     }
+  }
+
+  // Is some element elsewhere in the document claiming this one as a list item?
+  // Only asked for an <li> that is otherwise orphaned, so the scan is rare.
+  function _ownedByListRole(el) {
+    const id = _attr(el, 'id');
+    if (!id) return false;
+    let hosts = [];
+    try {
+      const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+      hosts = Array.prototype.slice.call(
+        (root && root.querySelectorAll ? root : el.ownerDocument)
+          .querySelectorAll('[aria-owns]'));
+    } catch (e) { hosts = []; }
+    for (const h of hosts) {
+      const hr = _computedRole(h);
+      if (hr !== 'list' && hr !== 'menu' && hr !== 'menubar') continue;
+      for (const t of _idrefs(h, 'aria-owns')) if (t === el) return true;
+    }
+    return false;
   }
 
   // The `role` attribute, resolved: first token naming a concrete role, with
@@ -78067,23 +78160,53 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   // question the rule actually turns on — did the AUTHOR name it — which is the
   // only way a `region`/`form` can acquire a name in the first place.
   const _NEEDS_NAME = new Set(['region', 'form']);
-  function _hasAuthorName(el) {
+  // ⚠️ An aria-labelledby that resolves to NOTHING is not a name. The three
+  // ways authors write one by accident — a stale id, an empty element, an
+  // element holding only whitespace — all leave the user with a landmark that
+  // announces itself as blank, which is worse than no landmark at all. So the
+  // question is not "is the attribute there" but "does anything come back".
+  function _authorNamedNonBlank(el) {
     if (!_isBlankASCII(_attr(el, 'aria-label'))) return true;
-    if (!_isBlankASCII(_attr(el, 'title'))) return true;
-    for (const t of _idrefs(el, 'aria-labelledby')) if (t) return true;
+    for (const t of _idrefs(el, 'aria-labelledby')) {
+      if (!_isBlankASCII(_attr(t, 'aria-label'))) return true;
+      let txt = '';
+      try { txt = t.textContent || ''; } catch (e) { txt = ''; }
+      if (!_isBlankASCII(txt)) return true;
+    }
     return false;
+  }
+  function _hasAuthorName(el) {
+    if (_authorNamedNonBlank(el)) return true;
+    return !_isBlankASCII(_attr(el, 'title'));
+  }
+
+  // THE MINIMUM ROLE (HTML-AAM §minimum-role). Three attributes make an element
+  // something the user can ACT on — drag it, land on it at load, open it as a
+  // popover — and an element you can act on cannot be `generic` or `none`,
+  // because those are exactly the roles a screen reader skips over. HTML-AAM
+  // floors such an element at `group` so it is at least reachable.
+  const _MINIMUM_ROLE_ATTRS = ['autofocus', 'draggable', 'popover'];
+  const _FLOORABLE = new Set(['generic', 'none', 'presentation']);
+  function _minimumRoleFloor(el, role) {
+    if (!_FLOORABLE.has(role)) return role;
+    for (const a of _MINIMUM_ROLE_ATTRS) if (_attr(el, a) != null) return 'group';
+    return role;
   }
 
   function _computedRole(el) {
     if (!el || el.nodeType !== 1) return '';
     const explicit = _explicitRole(el);
     if (explicit) {
-      if (explicit === 'none' && _presentationRefused(el)) return _implicitRole(el);
-      return explicit;
+      if (explicit === 'none' && _presentationRefused(el)) {
+        return _minimumRoleFloor(el, _implicitRole(el));
+      }
+      return _minimumRoleFloor(el, explicit);
     }
     const implicit = _implicitRole(el);
-    if (implicit && _ownedByPresentational(el, implicit)) return 'none';
-    return implicit;
+    if (implicit && _ownedByPresentational(el, implicit)) {
+      return _minimumRoleFloor(el, 'none');
+    }
+    return _minimumRoleFloor(el, implicit);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -78184,10 +78307,17 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   }
 
   // Roles whose name comes from what is INSIDE them (ARIA "Name From: contents").
+  //
+  // ⚠️ NOT the table roles — `cell`, `row`, `columnheader`, `rowheader`. They
+  // read as though they should be here, and they were, and it is wrong: a cell's
+  // name would then be its own contents, which a screen reader is about to read
+  // out ANYWAY as the cell's value. The user hears everything twice, and a row
+  // announces itself by reciting every figure in it before you enter it. A table
+  // cell is named by the author (aria-label, title) or not at all.
   const _NAME_FROM_CONTENT = new Set([
-    'button', 'cell', 'checkbox', 'columnheader', 'comment', 'gridcell',
+    'button', 'checkbox', 'comment', 'gridcell',
     'heading', 'link', 'menuitem', 'menuitemcheckbox', 'menuitemradio',
-    'option', 'radio', 'row', 'rowheader', 'sectionhead', 'switch', 'tab',
+    'option', 'radio', 'sectionhead', 'switch', 'tab',
     'tooltip', 'treeitem',
   ]);
 
@@ -78347,20 +78477,29 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 
     if (tag === 'input') {
       const t = _inputType(el);
-      if (t === 'button') {
-        const v = _attr(el, 'value');
-        return _isBlankASCII(v) ? null : v;
-      }
-      if (t === 'submit' || t === 'reset') {
-        const v = _attr(el, 'value');
-        // A submit button with no value still has a name — the UA's own label.
-        return _isBlankASCII(v) ? (t === 'submit' ? 'Submit' : 'Reset') : v;
-      }
-      if (t === 'image') {
-        const alt = _attr(el, 'alt');
-        if (!_isBlankASCII(alt)) return alt;
+      // ⚠️ THE <label> COMES FIRST, for every one of these. The value is the
+      // word PRINTED ON the button; the label is what the page CALLS it, and
+      // where a page bothers to supply both, the label is the considered one.
+      // (HTML-AAM's name-source order: aria-labelledby, aria-label, label, then
+      // the element's own attribute.)
+      if (t === 'button' || t === 'submit' || t === 'reset') {
         const lbl = _labelsName(el, ctx);
         if (lbl != null) return lbl;
+        const v = _attr(el, 'value');
+        if (!_isBlankASCII(v)) return v;
+        // A submit button with no value still has a name — the UA's own label.
+        if (t === 'submit') return 'Submit';
+        if (t === 'reset') return 'Reset';
+        return null;
+      }
+      if (t === 'image') {
+        const lbl = _labelsName(el, ctx);
+        if (lbl != null) return lbl;
+        // `alt` PRESENT is an answer even when it is empty — the author saying
+        // this button's picture needs no words. It stops the search; the title
+        // below must not overrule it.
+        const alt = _attr(el, 'alt');
+        if (alt != null) return alt;
         if (!_isBlankASCII(_attr(el, 'title'))) return null;  // step 2I takes it
         return 'Submit Query';
       }
@@ -78371,9 +78510,16 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
       return _labelsName(el, ctx);
     }
 
-    if (tag === 'textarea' || tag === 'select' || tag === 'meter' ||
-        tag === 'progress' || tag === 'output') {
+    if (tag === 'button' || tag === 'textarea' || tag === 'select' ||
+        tag === 'meter' || tag === 'progress' || tag === 'output') {
       return _labelsName(el, ctx);
+    }
+
+    // <optgroup label="Europe"> — the group's name is an ATTRIBUTE, and its
+    // contents are the options, which are emphatically not its label.
+    if (tag === 'optgroup') {
+      const l = _attr(el, 'label');
+      return _isBlankASCII(l) ? null : l;
     }
 
     // An `alt` attribute IS the image's text alternative — and `alt=""` is a
@@ -78383,29 +78529,42 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
       return alt == null ? null : alt;
     }
 
-    if (tag === 'fieldset') {
+    // A hidden <legend>/<caption> is not this element's name — and when a hidden
+    // one is followed by a visible one, the VISIBLE one is what the sighted user
+    // reads, so it is what everyone else must hear.
+    if (tag === 'fieldset' || tag === 'table') {
+      const want = tag === 'fieldset' ? 'legend' : 'caption';
       for (const c of _a11yChildren(el)) {
-        if (c.nodeType === 1 && c.localName === 'legend') return _fromContent(c, _sub(ctx, true));
+        if (c.nodeType !== 1 || c.localName !== want) continue;
+        if (_hostHiddenAncestral(c) || _attr(c, 'aria-hidden') === 'true') continue;
+        return _fromContent(c, _sub(ctx, true));
       }
       return null;
     }
-    if (tag === 'table') {
-      for (const c of _a11yChildren(el)) {
-        if (c.nodeType === 1 && c.localName === 'caption') return _fromContent(c, _sub(ctx, true));
-      }
-      return null;
-    }
-    if (tag === 'figure') {
-      const fc = _firstDescendant(el, 'figcaption');
-      return fc ? _fromContent(fc, _sub(ctx, true)) : null;
-    }
-    if (tag === 'details') {
-      for (const c of _a11yChildren(el)) {
-        if (c.nodeType === 1 && c.localName === 'summary') return _fromContent(c, _sub(ctx, true));
-      }
-      return null;
-    }
+    // ⚠️ NOT here: <figure>/<figcaption> and <details>/<summary>. Both used to
+    // name their element from that child, and HTML-AAM says neither does — a
+    // figure is named by aria-* or `title` and otherwise has NO name, because
+    // the caption is content the user reads in place, not a label announced
+    // ahead of it. (The figcaption does reach a lone unlabelled <img> inside —
+    // see the last-resort step in _accName.)
     return null;
+  }
+
+  // The <figcaption> of the figure this image is the ONLY content of.
+  function _loneFigureCaption(img) {
+    const fig = img.parentNode;
+    if (!fig || fig.nodeType !== 1 || !_isHTML(fig) || fig.localName !== 'figure') return null;
+    let caption = null;
+    for (const c of fig.childNodes) {
+      if (c.nodeType === 3) {
+        if (!_isBlankASCII(c.data)) return null;   // stray prose: not alone
+        continue;
+      }
+      if (c.nodeType !== 1) continue;
+      if (c.localName === 'figcaption') { if (!caption) caption = c; continue; }
+      if (c !== img) return null;
+    }
+    return caption;
   }
 
   function _firstDescendant(el, tag) {
@@ -78425,6 +78584,11 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     if (!labels || !labels.length) return null;
     const parts = [];
     for (const l of labels) {
+      // A label the author took out of the page is a label they took back. It
+      // is not "referenced" in AccName's sense — the control points at nothing;
+      // the ASSOCIATION points at it — so it earns no exemption and contributes
+      // nothing. Sighted users lost that text, and so must everyone else.
+      if (_hostHiddenAncestral(l) || _attr(l, 'aria-hidden') === 'true') continue;
       const s = _fromContent(l, _sub(ctx, true));
       if (!_isBlankASCII(s)) parts.push(_flattenWS(s));
     }
@@ -78527,15 +78691,31 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     // Step 2A — hidden, and not referenced. `visibility:hidden` deliberately
     // does NOT stop here (see _blocksDescent): a visible descendant of a hidden
     // node is still visible, and silencing the whole subtree would lose it.
-    if (!ctx.hiddenOK && _blocksDescent(node)) return '';
+    //
+    // ⚠️ The node the computation was POINTED AT is exempt. Two elements that
+    // are `display:none` in every UA stylesheet on earth — `<area>` and `<rp>` —
+    // still have names, and those names are the whole point of them: an image
+    // map's areas ARE the links on the picture, and refusing to name one leaves
+    // an agent (or a screen reader) with a clickable region and nothing to call
+    // it. Ask about a node and you get its name; the hidden rule governs what it
+    // may HARVEST from others, not whether it may answer.
+    if (!ctx.hiddenOK && (ctx.recursion || ctx.labelledby) &&
+        _blocksDescent(node)) return '';
 
     ctx.visited.add(node);
     const role = _computedRole(node);
-    const prohibited = _NAME_PROHIBITED.has(role);
-
+    // ⚠️ ARIA's "name prohibited" roles (generic, emphasis, code, paragraph …)
+    // say an AT SHOULD NOT ANNOUNCE a name for these — they are prose, not
+    // controls. They do NOT say the name fails to compute, and an author who
+    // wrote `<code aria-label="the flag">-f</code>` is owed the answer they
+    // asked for: `computedLabel` reports what the computation yields and leaves
+    // the announcing decision to the consumer. (HTML-AAM's per-element accname
+    // tests are explicit about this — every phrasing element is expected to
+    // report its aria-label.)
+    //
     // Step 2B — aria-labelledby. Not consulted when we are already following
     // one, which is what stops two elements naming each other forever.
-    if (!ctx.labelledby && !prohibited) {
+    if (!ctx.labelledby) {
       const targets = _idrefs(node, 'aria-labelledby');
       if (targets.length) {
         const parts = [];
@@ -78569,13 +78749,13 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     }
 
     // Step 2D — aria-label.
-    if (!prohibited) {
+    {
       const al = _attr(node, 'aria-label');
       if (!_isBlankASCII(al)) return al;
     }
 
     // Step 2E — the host language's labelling mechanism.
-    if (!prohibited) {
+    {
       const hl = _hostLanguageLabel(node, ctx);
       if (hl != null) return hl;
     }
@@ -78594,10 +78774,27 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     const title = _attr(node, 'title');
     if (!_isBlankASCII(title)) return title;
 
-    // …and BELOW the tooltip, the placeholder (HTML-AAM orders it last).
+    // …and BELOW the tooltip, the placeholder (HTML-AAM orders it last), with
+    // `aria-placeholder` below THAT — the author's override of a placeholder is
+    // still a placeholder, and a real one wins.
     if (_isHTML(node) && (node.localName === 'input' || node.localName === 'textarea')) {
       const ph = _attr(node, 'placeholder');
       if (!_isBlankASCII(ph)) return ph;
+      const ap = _attr(node, 'aria-placeholder');
+      if (!_isBlankASCII(ap)) return ap;
+    }
+
+    // An <img> with no `alt` at all, ALONE in a <figure> that has a caption:
+    // the caption is describing the picture, because there is nothing else in
+    // the figure for it to describe. Put anything else in the figure and the
+    // caption belongs to the figure as a whole, and the image goes back to
+    // having no name — which is the honest answer, not a guess.
+    if (_isHTML(node) && node.localName === 'img' && _attr(node, 'alt') == null) {
+      const fc = _loneFigureCaption(node);
+      if (fc) {
+        const s = _flattenWS(_fromContent(fc, _sub(ctx, true)));
+        if (!_isBlankASCII(s)) return s;
+      }
     }
 
     // A descendant that contributed nothing but SPACE still contributed the
@@ -78610,8 +78807,6 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 
   function _computedLabel(el) {
     if (!el || el.nodeType !== 1) return '';
-    // The element being asked about is itself hidden: it has no name to give.
-    if (_hiddenAncestral(el)) return '';
     return _flattenWS(_accName(el, {
       visited: new Set(), labelledby: false, recursion: false, hiddenOK: false,
       owners: null,
