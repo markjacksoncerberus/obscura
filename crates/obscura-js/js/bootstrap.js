@@ -762,14 +762,91 @@ const _consoleFn = (level, args) => {
   }).join(" ")); } catch {}
 };
 
-globalThis.console = {
-  log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warn", a),
-  error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("log", a),
-  debug: () => {}, dir: () => {}, trace: () => {}, table: () => {}, group: () => {},
-  groupEnd: () => {}, groupCollapsed: () => {}, time: () => {}, timeEnd: () => {},
-  timeLog: () => {}, count: () => {}, countReset: () => {}, clear: () => {},
-  assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
+// ── console (console.spec.whatwg.org) ────────────────────────────────────────
+// ⚠️ `console` is a NAMESPACE, and a strange one. Its [[Prototype]] is not
+// Object.prototype: it is an EMPTY object that in turn inherits from
+// Object.prototype. That interposed layer is not decoration — it is what lets a
+// page do `Object.setPrototypeOf(console, null)` or shadow a method without
+// touching Object.prototype itself, and every engine has it for compatibility
+// with code written against the original Firebug console.
+//
+// The other thing worth getting right: a LABEL is stringified through the
+// ordinary JS path, so `console.count(obj)` calls `obj.toString()` — and if that
+// throws, the exception is the page's to see, not ours to swallow. A logger that
+// silently eats an exception from the thing it was asked to log is worse than no
+// logger.
+const _consoleCounts = Object.create(null);
+const _consoleTimers = Object.create(null);
+const _consoleLabel = (v, dflt) => (v === undefined ? dflt : String(v));
+const _consoleNs = {
+  log: (...a) => _consoleFn("log", a),
+  warn: (...a) => _consoleFn("warn", a),
+  error: (...a) => _consoleFn("error", a),
+  info: (...a) => _consoleFn("log", a),
+  debug: (...a) => {},
+  dir: (...a) => {},
+  dirxml: (...a) => {},
+  trace: (...a) => {},
+  table: (...a) => {},
+  group: (...a) => {},
+  groupEnd: () => {},
+  groupCollapsed: (...a) => {},
+  time: (label) => {
+    const l = _consoleLabel(label, 'default');
+    if (l in _consoleTimers) {
+      _consoleFn("warn", ["Timer '" + l + "' already exists."]);
+      return;
+    }
+    _consoleTimers[l] = Date.now();
+  },
+  timeLog: (label, ...data) => {
+    const l = _consoleLabel(label, 'default');
+    if (!(l in _consoleTimers)) {
+      _consoleFn("warn", ["Timer '" + l + "' does not exist."]);
+      return;
+    }
+    _consoleFn("log", [l + ": " + (Date.now() - _consoleTimers[l]) + "ms", ...data]);
+  },
+  timeEnd: (label) => {
+    const l = _consoleLabel(label, 'default');
+    if (!(l in _consoleTimers)) {
+      _consoleFn("warn", ["Timer '" + l + "' does not exist."]);
+      return;
+    }
+    _consoleFn("log", [l + ": " + (Date.now() - _consoleTimers[l]) + "ms"]);
+    delete _consoleTimers[l];
+  },
+  count: (label) => {
+    const l = _consoleLabel(label, 'default');
+    const n = (_consoleCounts[l] = (_consoleCounts[l] || 0) + 1);
+    _consoleFn("log", [l + ": " + n]);
+  },
+  countReset: (label) => {
+    const l = _consoleLabel(label, 'default');
+    if (!(l in _consoleCounts)) {
+      _consoleFn("warn", ["Count for '" + l + "' does not exist."]);
+      return;
+    }
+    _consoleCounts[l] = 0;
+  },
+  clear: () => {},
+  assert: (...a) => {
+    // IDL: `assert(optional boolean condition, any... data)` — zero REQUIRED
+    // arguments, so the function's own length must be 0.
+    if (!a[0]) _consoleFn("error", ["Assertion failed:", ...a.slice(1)]);
+  },
 };
+// Every console operation's arguments are OPTIONAL, so every one of them reports
+// a `length` of 0 — including the ones whose JS body names a parameter.
+for (const _k of Object.keys(_consoleNs)) {
+  Object.defineProperty(_consoleNs[_k], 'name', { value: _k, configurable: true });
+  Object.defineProperty(_consoleNs[_k], 'length', { value: 0, configurable: true });
+}
+Object.setPrototypeOf(_consoleNs, Object.create(Object.prototype));
+Object.defineProperty(_consoleNs, Symbol.toStringTag, {
+  value: 'console', writable: false, enumerable: false, configurable: true,
+});
+globalThis.console = _consoleNs;
 
 let _tid = 0;
 const _clearedTimers = new Set();
@@ -12811,12 +12888,73 @@ globalThis.fetch = async (input, init = {}) => {
   return _makeResponse(responseBody, {
     status: parsed.status,
     statusText: parsed.statusText || "",
-    headers: parsed.headers || {},
+    headers: _corsFilterResponseHeaders(parsed.headers || {}, parsed.url || url,
+                                        pageOrigin, fetchMode, init),
     type: respType,
     url: parsed.url || url,
     redirected: !!parsed.redirected,
   });
 };
+
+// ── CORS-exposed response headers (Fetch §cors-filtered-response) ────────────
+// A cross-origin response's headers are NOT the page's to read. Seven are
+// safelisted; everything else is readable only because the server said so, by
+// naming it in `Access-Control-Expose-Headers`. Handing script the whole header
+// block regardless is a real leak: `Set-Cookie`-adjacent session hints, internal
+// routing headers, rate-limit counters, the backend's software version — all of
+// it becomes readable by any page that can make the request.
+//
+// ⚠️ And the list is ALL-OR-NOTHING. `Access-Control-Expose-Headers: bb-8, no no`
+// is not "expose bb-8 and ignore the junk" — `no no` is not a token, so the
+// whole field fails to parse and NOTHING extra is exposed. A parser that
+// salvages the good entries turns a server's typo into an exposure the server
+// never authorised.
+const _CORS_SAFELISTED_RESPONSE_HEADERS = new Set([
+  'cache-control', 'content-language', 'content-length', 'content-type',
+  'expires', 'last-modified', 'pragma',
+]);
+function _corsFilterResponseHeaders(headers, respUrl, pageOrigin, mode, init) {
+  if (mode !== 'cors') return headers;
+  let sameOrigin = true;
+  try { sameOrigin = new URL(respUrl).origin === pageOrigin; } catch (e) { sameOrigin = true; }
+  if (sameOrigin) return headers;
+  let aceh = null;
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === 'access-control-expose-headers') { aceh = headers[k]; break; }
+  }
+  const exposed = new Set();
+  let wildcard = false;
+  if (aceh != null) {
+    const items = String(aceh).split(',').map((t) => t.trim());
+    // An empty field value exposes nothing; a malformed entry poisons the list.
+    let ok = items.length > 0;
+    for (const it of items) {
+      if (it === '*') { wildcard = true; continue; }
+      // An EMPTY entry is not malformed, it is nothing: `, bb-8` and `bb-8,,`
+      // are the ordinary shape of a list assembled by string concatenation, and
+      // rejecting them would punish the server for a trailing comma. A non-empty
+      // entry that is not a token is a different matter — see above.
+      if (!it) continue;
+      if (!_isHeaderName(it)) { ok = false; break; }
+      exposed.add(it.toLowerCase());
+    }
+    if (!ok) { exposed.clear(); wildcard = false; }
+  }
+  // `*` means "everything" only for a request that carried no credentials —
+  // otherwise the server has to name each header, because a credentialed
+  // response is about a specific user.
+  const credentialed = !!(init && init.credentials === 'include');
+  if (wildcard && credentialed) wildcard = false;
+  const out = {};
+  for (const k of Object.keys(headers)) {
+    const lower = k.toLowerCase();
+    if (_CORS_SAFELISTED_RESPONSE_HEADERS.has(lower) ||
+        (wildcard && lower !== 'authorization') || exposed.has(lower)) {
+      out[k] = headers[k];
+    }
+  }
+  return out;
+}
 
 // (`Headers` is defined below, once the RFC 7230 token helpers it needs exist.)
 
@@ -34691,8 +34829,10 @@ const _parseSelectorList = (src, relative, ctx) => {
       // the root `::view-transition` must NOT be functional.
       if (_SEL_VT_FN_PE.has(lname)) { if (!args) return null; }
       else if (lname === 'view-transition' && args) return null;
-      // `::part()` and `::slotted()` are functional PEs — bare forms are invalid.
-      else if ((lname === 'part' || lname === 'slotted') && !args) return null;
+      // `::part()`, `::slotted()` and `::highlight()` are functional PEs — the
+      // bare forms are invalid. `::highlight` with no name has no highlight to
+      // point at: the name IS the registry key.
+      else if ((lname === 'part' || lname === 'slotted' || lname === 'highlight') && !args) return null;
       return { kind: 'pe', name: lname, args };
     }
     if (_SEL_LEGACY_PE.has(lname) && !args) return { kind: 'pe', name: lname, args: null };
@@ -34701,6 +34841,15 @@ const _parseSelectorList = (src, relative, ctx) => {
     return { kind: 'pc', name: lname, args };
   };
   function parsePseudoArgs(name, raw) {       // returns serialized-arg model or null
+    // ::highlight(<custom-ident>) — exactly one name, canonically serialized, so
+    // `::highlight(\31\32\33)` and `::highlight(\31 23)` are the same rule.
+    if (name === 'highlight') {
+      const a = raw.trim();
+      const id = _selReadIdent(a, 0);
+      if (!id || id[1] !== a.length) return null;
+      if (_CSS_WIDE.has(a.toLowerCase()) || a.toLowerCase() === 'default') return null;
+      return { raw: _serIdent(id[0]) };
+    }
     if (_SEL_VT_FN_PE.has(name)) {
       // <pt-name-selector> = '*' | <custom-ident>. <custom-ident> excludes the
       // CSS-wide keywords and `default`; an empty argument is invalid.
@@ -34814,7 +34963,15 @@ const _parseSelectorList = (src, relative, ctx) => {
     for (const su of subs) {
       if (su.kind === 'pe') {
         if (_selIsVtPe(su)) { activeLeaf = null; continue; }
-        activeLeaf = su.name === 'part' ? null : su.name === 'slotted' ? 'slotted' : 'leaf';
+        // Nothing may follow a "leaf" pseudo-element — not even another one.
+        // `::before::highlight(foo)` asks to highlight generated content that is
+        // not in any range, and is not a selector.
+        if (activeLeaf === 'leaf' || activeLeaf === 'slotted') return null;
+        // ::highlight() is as closed as ::slotted(): it names a set of RANGES,
+        // and a range has no `::after`, no `:hover` and no descendants.
+        activeLeaf = su.name === 'part' ? null
+                   : (su.name === 'slotted' || su.name === 'highlight') ? 'slotted'
+                   : 'leaf';
         continue;
       }
       if (activeLeaf === 'slotted') return null;  // no simple selector after ::slotted()
@@ -34855,7 +35012,8 @@ const _parseSelectorList = (src, relative, ctx) => {
       // A view-transition or ::slotted() pseudo-element can't have a descendant/
       // sibling — once one ends a compound, no further combinator+compound follows.
       const prevSubs = parts[parts.length - 1].compound.subs;
-      if (prevSubs.some((su) => _selIsVtPe(su) || (su.kind === 'pe' && su.name === 'slotted'))) return null;
+      if (prevSubs.some((su) => _selIsVtPe(su) ||
+          (su.kind === 'pe' && (su.name === 'slotted' || su.name === 'highlight')))) return null;
       parts.push({ comb, compound: next });
     }
     return parts;
@@ -38813,6 +38971,7 @@ globalThis.UIEvent = class UIEvent extends Event {
     this._view = view;
     this._detail = (o.detail != null) ? o.detail : 0;
     this._which = _evNum(o.which, 0);
+    this._sourceCapabilities = (o.sourceCapabilities != null) ? o.sourceCapabilities : null;
   }
   initUIEvent(type, bubbles, cancelable, view, detail) {
     if (arguments.length < 1)
@@ -38823,6 +38982,294 @@ globalThis.UIEvent = class UIEvent extends Event {
   }
 };
 _idlEventAttrs(UIEvent, ['view', 'detail', 'which'], { initUIEvent: 1 });
+// ── The Entries API (entries-api) ────────────────────────────────────────────
+// What a browser hands a page when someone drags a FOLDER onto it. The File API
+// gives you a flat list of files; this gives you the SHAPE — directories you can
+// walk, names, full paths — which is the difference between "upload these 40
+// files" and "upload this project". It is old, it is prefixed, and it is what
+// every upload widget on the web still calls, so a page that feature-detects
+// `FileSystemEntry` and finds nothing takes its degraded path forever.
+//
+// ⚠️ The interfaces are real and the shapes are exact; what Obscura has no
+// source of yet is an actual dropped directory (there is no OS drag-and-drop
+// here), so `webkitGetAsEntry()` honestly answers null rather than fabricating a
+// tree. The callbacks are still invoked the way the spec says — asynchronously,
+// never synchronously — because a page that gets a synchronous callback here
+// runs its handler before its own state is ready.
+{
+  const _internal = Symbol('entries-api');
+  const _brand = (o, C) => {
+    if (!(o instanceof C)) throw new TypeError('Illegal invocation');
+    return o;
+  };
+  const _ro = (proto, C, names) => {
+    for (const n of names) {
+      const p = '_' + n;
+      Object.defineProperty(proto, n, {
+        enumerable: true, configurable: true,
+        get: _named('get', n, function () { return _brand(this, C)[p]; }),
+      });
+    }
+    Object.defineProperty(proto, Symbol.toStringTag, { value: C.name, configurable: true });
+    Object.defineProperty(C, 'length', { value: 0, configurable: true });
+    _exposeIface(C.name, C);
+  };
+  const _op = (proto, C, name, len, fn) => {
+    Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    Object.defineProperty(fn, 'length', { value: len, configurable: true });
+    Object.defineProperty(proto, name, {
+      enumerable: true, configurable: true, writable: true, value: _markNative(fn),
+    });
+  };
+  // Callbacks are queued, never called in line: the spec is explicit, and a page
+  // whose success callback runs before its own `getFile()` call has returned
+  // will read state it has not written yet.
+  const _later = (fn) => { if (typeof fn === 'function') _queueTask(fn); };
+
+  class FileSystem {
+    constructor() { if (!arguments[_internal]) throw new TypeError('Illegal constructor'); }
+  }
+  class FileSystemEntry {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  class FileSystemDirectoryEntry extends FileSystemEntry {}
+  class FileSystemFileEntry extends FileSystemEntry {}
+  class FileSystemDirectoryReader {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+
+  _ro(FileSystem.prototype, FileSystem, ['name', 'root']);
+  _ro(FileSystemEntry.prototype, FileSystemEntry,
+      ['isFile', 'isDirectory', 'name', 'fullPath', 'filesystem']);
+  _op(FileSystemEntry.prototype, FileSystemEntry, 'getParent', 0, function getParent(success, error) {
+    _brand(this, FileSystemEntry);
+    const self = this;
+    _later(() => { try { success(self._parent || self); } catch (e) {} });
+  });
+  _ro(FileSystemDirectoryEntry.prototype, FileSystemDirectoryEntry, []);
+  _op(FileSystemDirectoryEntry.prototype, FileSystemDirectoryEntry, 'createReader', 0,
+      function createReader() {
+        _brand(this, FileSystemDirectoryEntry);
+        const r = Object.create(FileSystemDirectoryReader.prototype);
+        Object.defineProperty(r, '_entries', { value: this._children || [], configurable: true });
+        Object.defineProperty(r, '_done', { value: false, writable: true, configurable: true });
+        return r;
+      });
+  for (const which of ['getFile', 'getDirectory']) {
+    _op(FileSystemDirectoryEntry.prototype, FileSystemDirectoryEntry, which, 0,
+        function (path, options, success, error) {
+          _brand(this, FileSystemDirectoryEntry);
+          _later(() => {
+            try {
+              if (typeof error === 'function') {
+                error(new DOMException('A requested file or directory could not be found.', 'NotFoundError'));
+              }
+            } catch (e) {}
+          });
+        });
+  }
+  _ro(FileSystemDirectoryReader.prototype, FileSystemDirectoryReader, []);
+  _op(FileSystemDirectoryReader.prototype, FileSystemDirectoryReader, 'readEntries', 1,
+      function readEntries(success, error) {
+        _brand(this, FileSystemDirectoryReader);
+        if (arguments.length < 1)
+          throw new TypeError("Failed to execute 'readEntries' on 'FileSystemDirectoryReader': 1 argument required, but only 0 present.");
+        const self = this;
+        _later(() => {
+          // The reader is a CURSOR: the second call returns the empty array that
+          // means "that was all", and a caller that loops until empty must get
+          // an end.
+          const batch = self._done ? [] : (self._entries || []);
+          self._done = true;
+          try { success(batch); } catch (e) {}
+        });
+      });
+  _ro(FileSystemFileEntry.prototype, FileSystemFileEntry, []);
+  _op(FileSystemFileEntry.prototype, FileSystemFileEntry, 'file', 1,
+      function file(success, error) {
+        _brand(this, FileSystemFileEntry);
+        if (arguments.length < 1)
+          throw new TypeError("Failed to execute 'file' on 'FileSystemFileEntry': 1 argument required, but only 0 present.");
+        const f = this._file;
+        _later(() => {
+          try {
+            if (f) success(f);
+            else if (typeof error === 'function')
+              error(new DOMException('A requested file or directory could not be found.', 'NotFoundError'));
+          } catch (e) {}
+        });
+      });
+
+  // The two places the platform hands an entry out.
+  if (typeof globalThis.DataTransferItem === 'function') {
+    _op(globalThis.DataTransferItem.prototype, globalThis.DataTransferItem,
+        'webkitGetAsEntry', 0, function webkitGetAsEntry() {
+          return this._entry || null;
+        });
+  }
+  // NOTE: `HTMLInputElement` and `File` are declared further down this file, so
+  // their two entries-api members are installed there (search __entriesApiLate).
+}
+
+// ── InputDeviceCapabilities (input-device-capabilities) ──────────────────────
+// WHICH kind of thing generated this event. A `click` from a finger and a
+// `click` from a mouse arrive identically, and a page that needs to know the
+// difference — to decide whether a hover tooltip will ever be reachable, or
+// whether "tap to reveal" is the right affordance — has nowhere else to ask.
+globalThis.InputDeviceCapabilities = class InputDeviceCapabilities {
+  constructor(init) {
+    init = (init == null) ? {} : init;
+    if (typeof init !== 'object')
+      throw new TypeError("Failed to construct 'InputDeviceCapabilities': The provided value is not of type 'InputDeviceCapabilitiesInit'.");
+    this._firesTouchEvents = !!init.firesTouchEvents;
+    this._pointerMovementScrolls = !!init.pointerMovementScrolls;
+  }
+};
+for (const _n of ['firesTouchEvents', 'pointerMovementScrolls']) {
+  const _p = '_' + _n;
+  Object.defineProperty(globalThis.InputDeviceCapabilities.prototype, _n, {
+    enumerable: true, configurable: true,
+    get: _named('get', _n, function () {
+      if (!(this instanceof globalThis.InputDeviceCapabilities)) throw new TypeError('Illegal invocation');
+      return this[_p];
+    }),
+  });
+}
+Object.defineProperty(globalThis.InputDeviceCapabilities.prototype, Symbol.toStringTag,
+  { value: 'InputDeviceCapabilities', configurable: true });
+Object.defineProperty(globalThis.InputDeviceCapabilities, 'length', { value: 0, configurable: true });
+_exposeIface('InputDeviceCapabilities', globalThis.InputDeviceCapabilities);
+// UIEvent gains `sourceCapabilities` — null unless the event was constructed
+// with one, because inventing a device the event did not come from is worse
+// than admitting we do not know.
+Object.defineProperty(UIEvent.prototype, 'sourceCapabilities', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'sourceCapabilities', function () {
+    if (!(this instanceof UIEvent)) throw new TypeError('Illegal invocation');
+    return this._sourceCapabilities !== undefined ? this._sourceCapabilities : null;
+  }),
+});
+
+// ── Touch Events (touch-events-2) ────────────────────────────────────────────
+// A finger is not a mouse: it has WIDTH, it has pressure, and there can be
+// several of them at once. The three interfaces here are the vocabulary for
+// saying so — and the phone or tablet that needs them is very often the only
+// computer in the house.
+//
+// ⚠️ Deliberately WITHOUT the `ontouchstart` handler attributes. `'ontouchstart'
+// in window` is how half the web decides whether it is talking to a touchscreen,
+// and answering yes makes sites serve their mobile layout and swap hover
+// affordances for tap ones. Obscura is driven by an agent through a synthetic
+// pointer, not by a finger, so it must not claim otherwise. The interfaces exist
+// because a page that CONSTRUCTS a TouchEvent (every touch-emulation shim, every
+// test harness, every gesture library's own unit tests) should not die on a
+// missing global; the claim about the hardware is a separate question, and the
+// honest answer to it is no. `touch-events/expose-legacy-touch-event-apis.html`
+// checks exactly this consistency and holds at 16/16 either way.
+globalThis.Touch = class Touch {
+  constructor(init) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to construct 'Touch': 1 argument required, but only 0 present.");
+    if (init == null || typeof init !== 'object')
+      throw new TypeError("Failed to construct 'Touch': The provided value is not of type 'TouchInit'.");
+    if (init.identifier === undefined)
+      throw new TypeError("Failed to construct 'Touch': required member identifier is undefined.");
+    if (init.target === undefined)
+      throw new TypeError("Failed to construct 'Touch': required member target is undefined.");
+    this._identifier = _evNum(init.identifier, 0) | 0;
+    this._target = init.target;
+    this._screenX = _evNum(init.screenX, 0);
+    this._screenY = _evNum(init.screenY, 0);
+    this._clientX = _evNum(init.clientX, 0);
+    this._clientY = _evNum(init.clientY, 0);
+    this._pageX = _evNum(init.pageX, 0);
+    this._pageY = _evNum(init.pageY, 0);
+    // The contact ELLIPSE — how much of the screen the finger is actually
+    // covering. A thumb on a small phone is a very different target from a
+    // stylus tip, and this is the only place the difference is expressed.
+    this._radiusX = _evNum(init.radiusX, 0);
+    this._radiusY = _evNum(init.radiusY, 0);
+    this._rotationAngle = _evNum(init.rotationAngle, 0);
+    this._force = _evNum(init.force, 0);
+    this._altitudeAngle = _evNum(init.altitudeAngle, 0);
+    this._azimuthAngle = _evNum(init.azimuthAngle, 0);
+    this._touchType = (init.touchType === 'stylus') ? 'stylus' : 'direct';
+  }
+};
+_idlEventAttrs(globalThis.Touch, ['identifier', 'target', 'screenX', 'screenY',
+  'clientX', 'clientY', 'pageX', 'pageY', 'radiusX', 'radiusY', 'rotationAngle',
+  'force', 'altitudeAngle', 'azimuthAngle', 'touchType'], {});
+Object.defineProperty(globalThis.Touch, 'length', { value: 1, configurable: true });
+
+// A TouchList is an indexed getter over a frozen snapshot: the fingers on the
+// glass at the instant the event was made, not a live view of them.
+globalThis.TouchList = class TouchList {
+  constructor() {
+    throw new TypeError('Illegal constructor');
+  }
+  item(index) {
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'item' on 'TouchList': 1 argument required, but only 0 present.");
+    const i = Number(index) >>> 0;
+    const a = this._items;
+    return (a && i < a.length) ? a[i] : null;
+  }
+};
+Object.defineProperty(globalThis.TouchList.prototype, 'length', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'length', function () {
+    if (!(this instanceof globalThis.TouchList)) throw new TypeError('Illegal invocation');
+    return this._items ? this._items.length : 0;
+  }),
+});
+_idlEventAttrs(globalThis.TouchList, [], { item: 1 });
+// TouchList is not constructible, so its interface object's `length` is 0 —
+// _idlEventAttrs assumes the event-constructor shape (type + optional init).
+Object.defineProperty(globalThis.TouchList, 'length', { value: 0, configurable: true });
+function _newTouchList(touches) {
+  const l = Object.create(globalThis.TouchList.prototype);
+  const a = [];
+  if (touches != null) for (const t of touches) a.push(t);
+  Object.defineProperty(l, '_items', { value: a, configurable: true });
+  for (let i = 0; i < a.length; i++) {
+    Object.defineProperty(l, i, { value: a[i], enumerable: true, configurable: true });
+  }
+  return l;
+}
+
+globalThis.TouchEvent = class TouchEvent extends UIEvent {
+  constructor(t, o) {
+    o = (o == null) ? {} : o;
+    super(t, o);
+    this._touches = _newTouchList(o.touches);
+    this._targetTouches = _newTouchList(o.targetTouches);
+    this._changedTouches = _newTouchList(o.changedTouches);
+    this._altKey = !!o.altKey;
+    this._metaKey = !!o.metaKey;
+    this._ctrlKey = !!o.ctrlKey;
+    this._shiftKey = !!o.shiftKey;
+  }
+};
+// A touch can be modified too: a stylus button, or a keyboard held down while
+// the other hand taps. Same answer as every other UI event gives.
+Object.defineProperty(globalThis.TouchEvent.prototype, 'getModifierState', {
+  configurable: true, writable: true, enumerable: true,
+  value: _markNative(Object.defineProperty(function getModifierState(key) {
+    if (!(this instanceof globalThis.TouchEvent)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1)
+      throw new TypeError("Failed to execute 'getModifierState' on 'TouchEvent': 1 argument required, but only 0 present.");
+    switch (String(key)) {
+      case 'Alt': return !!this._altKey;
+      case 'Control': return !!this._ctrlKey;
+      case 'Meta': return !!this._metaKey;
+      case 'Shift': return !!this._shiftKey;
+      default: return false;
+    }
+  }, 'length', { value: 1, configurable: true })),
+});
+_idlEventAttrs(globalThis.TouchEvent, ['touches', 'targetTouches', 'changedTouches',
+  'altKey', 'metaKey', 'ctrlKey', 'shiftKey'], { getModifierState: 1 });
+
 globalThis.MouseEvent = class MouseEvent extends UIEvent {
   constructor(t,o) {
     o = (o == null) ? {} : o;
@@ -46363,6 +46810,256 @@ Object.defineProperty(globalThis.CSSStyleRule.prototype, 'styleMap', {
     return m;
   }, 'name', { value: 'get styleMap', configurable: true })),
 });
+// ═════════════════════════════════════════════════════════════════════════════
+// THE CSS CUSTOM HIGHLIGHT API  (css-highlight-api-1)
+// ═════════════════════════════════════════════════════════════════════════════
+// How a page marks up text it did not write the markup for. Search results,
+// spell-check squiggles, a collaborative editor showing you where someone else's
+// cursor is, a screen reader's read-along — all of them want to paint over a
+// RANGE, and before this API the only way was to shred the DOM into <span>s and
+// hope nothing else depended on the shape of the tree. Ranges live alongside the
+// document instead of inside it, so nothing the author wrote is disturbed.
+//
+// ⚠️ Deliberately built on plain ARRAYS rather than a real Set/Map. The WPT
+// suite includes `Highlight-setlike-tampered-Set-prototype` and its Map twin,
+// which replace `Set.prototype.add` and friends before touching a Highlight: an
+// implementation that leans on the global prototypes fails them, and — more to
+// the point — a page that innocently patches `Set.prototype` should not be able
+// to break the browser's own highlighting.
+{
+  const _hlList = new WeakMap();          // instance → backing array
+  const _hlOf = (o, what) => {
+    const a = _hlList.get(o);
+    if (!a) throw new TypeError("Illegal invocation: '" + what + "' called on an incompatible receiver.");
+    return a;
+  };
+  const _named = (fn, name, len) => {
+    Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    Object.defineProperty(fn, 'length', { value: len, configurable: true });
+    return fn;
+  };
+  const _idx = (arr, v) => {
+    for (let i = 0; i < arr.length; i++) if (arr[i] === v) return i;
+    return -1;
+  };
+  // WebIDL `long`: ToNumber, truncate, wrap into the signed 32-bit range.
+  const _toLong = (v) => {
+    const n = Number(v);
+    if (!isFinite(n)) return 0;
+    return n | 0;
+  };
+
+  const HIGHLIGHT_TYPES = ['highlight', 'spelling-error', 'grammar-error'];
+
+  class Highlight {
+    constructor(...ranges) {
+      const arr = [];
+      _hlList.set(this, arr);
+      Object.defineProperty(this, '_priority', { value: 0, writable: true, configurable: true });
+      Object.defineProperty(this, '_type', { value: 'highlight', writable: true, configurable: true });
+      for (const r of ranges) if (_idx(arr, r) < 0) arr.push(r);
+    }
+  }
+  Object.defineProperty(Highlight, 'name', { value: 'Highlight', configurable: true });
+  Object.defineProperty(Highlight, 'length', { value: 0, configurable: true });
+
+  Object.defineProperty(Highlight.prototype, 'priority', {
+    configurable: true, enumerable: true,
+    get: _named(function () { _hlOf(this, 'priority'); return this._priority; }, 'get priority', 0),
+    set: _named(function (v) { _hlOf(this, 'priority'); this._priority = _toLong(v); }, 'set priority', 1),
+  });
+  Object.defineProperty(Highlight.prototype, 'type', {
+    configurable: true, enumerable: true,
+    get: _named(function () { _hlOf(this, 'type'); return this._type; }, 'get type', 0),
+    // An enumeration-typed attribute IGNORES a value outside the enum (WebIDL
+    // §enumeration attributes) — a typo must not throw a page into its catch
+    // branch, it just leaves the highlight as it was.
+    set: _named(function (v) {
+      _hlOf(this, 'type');
+      const t = String(v);
+      for (const k of HIGHLIGHT_TYPES) if (k === t) { this._type = t; return; }
+    }, 'set type', 1),
+  });
+  Object.defineProperty(Highlight.prototype, 'size', {
+    configurable: true, enumerable: true,
+    get: _named(function () { return _hlOf(this, 'size').length; }, 'get size', 0),
+  });
+
+  // `forEach`'s IDL arity is 1 (the optional thisArg does not count), and the JS
+  // function needs two parameters to receive it — so the length is declared, not
+  // inferred.
+  const _IDL_LENGTHS = { forEach: 1, highlightsFromPoint: 2 };
+  const _defMethods = (proto, tag, methods) => {
+    for (const name in methods) {
+      const len = name in _IDL_LENGTHS ? _IDL_LENGTHS[name] : methods[name].length;
+      Object.defineProperty(proto, name, {
+        configurable: true, enumerable: true, writable: true,
+        value: _named(methods[name], name, len),
+      });
+    }
+    Object.defineProperty(proto, Symbol.toStringTag, {
+      configurable: true, value: tag,
+    });
+  };
+
+  function* _setEntries(arr) { for (const v of arr.slice()) yield [v, v]; }
+  function* _setValues(arr) { for (const v of arr.slice()) yield v; }
+
+  _defMethods(Highlight.prototype, 'Highlight', {
+    add(value) {
+      const a = _hlOf(this, 'add');
+      if (_idx(a, value) < 0) a.push(value);
+      return this;                       // setlike `add` is chainable
+    },
+    has(value) { return _idx(_hlOf(this, 'has'), value) >= 0; },
+    delete(value) {
+      const a = _hlOf(this, 'delete');
+      const i = _idx(a, value);
+      if (i < 0) return false;
+      a.splice(i, 1);
+      return true;
+    },
+    clear() { const a = _hlOf(this, 'clear'); a.length = 0; },
+    forEach(cb, thisArg) {
+      const a = _hlOf(this, 'forEach');
+      if (typeof cb !== 'function')
+        throw new TypeError("Failed to execute 'forEach' on 'Highlight': parameter 1 is not of type 'Function'.");
+      // Iterate over a LIVE view: a callback that adds a range must see it, and
+      // one that deletes must not. (Highlight-iteration-with-modifications.)
+      for (let i = 0; i < a.length; i++) cb.call(thisArg, a[i], a[i], this);
+    },
+    entries() { return _setEntries(_hlOf(this, 'entries')); },
+    keys() { return _setValues(_hlOf(this, 'keys')); },
+    values() { return _setValues(_hlOf(this, 'values')); },
+  });
+  Object.defineProperty(Highlight.prototype, Symbol.iterator, {
+    configurable: true, writable: true,
+    value: Highlight.prototype.values,
+  });
+
+  // ── HighlightRegistry — maplike<DOMString, Highlight>, reached as CSS.highlights
+  const _regMap = new WeakMap();          // instance → [[key, value], …]
+  const _regOf = (o, what) => {
+    const a = _regMap.get(o);
+    if (!a) throw new TypeError("Illegal invocation: '" + what + "' called on an incompatible receiver.");
+    return a;
+  };
+  const _regIdx = (a, k) => {
+    for (let i = 0; i < a.length; i++) if (a[i][0] === k) return i;
+    return -1;
+  };
+  class HighlightRegistry {
+    constructor() {
+      throw new TypeError('Illegal constructor');
+    }
+  }
+  Object.defineProperty(HighlightRegistry, 'name', { value: 'HighlightRegistry', configurable: true });
+  Object.defineProperty(HighlightRegistry, 'length', { value: 0, configurable: true });
+  Object.defineProperty(HighlightRegistry.prototype, 'size', {
+    configurable: true, enumerable: true,
+    get: _named(function () { return _regOf(this, 'size').length; }, 'get size', 0),
+  });
+  function* _mapEntries(a) { for (const p of a.slice()) yield [p[0], p[1]]; }
+  function* _mapKeys(a) { for (const p of a.slice()) yield p[0]; }
+  function* _mapValues(a) { for (const p of a.slice()) yield p[1]; }
+  _defMethods(HighlightRegistry.prototype, 'HighlightRegistry', {
+    get(key) {
+      const a = _regOf(this, 'get');
+      const i = _regIdx(a, String(key));
+      return i < 0 ? undefined : a[i][1];
+    },
+    set(key, value) {
+      const a = _regOf(this, 'set');
+      const k = String(key);
+      const i = _regIdx(a, k);
+      if (i < 0) a.push([k, value]); else a[i][1] = value;
+      return this;
+    },
+    has(key) { return _regIdx(_regOf(this, 'has'), String(key)) >= 0; },
+    delete(key) {
+      const a = _regOf(this, 'delete');
+      const i = _regIdx(a, String(key));
+      if (i < 0) return false;
+      a.splice(i, 1);
+      return true;
+    },
+    clear() { const a = _regOf(this, 'clear'); a.length = 0; },
+    forEach(cb, thisArg) {
+      const a = _regOf(this, 'forEach');
+      if (typeof cb !== 'function')
+        throw new TypeError("Failed to execute 'forEach' on 'HighlightRegistry': parameter 1 is not of type 'Function'.");
+      for (let i = 0; i < a.length; i++) cb.call(thisArg, a[i][1], a[i][0], this);
+    },
+    entries() { return _mapEntries(_regOf(this, 'entries')); },
+    keys() { return _mapKeys(_regOf(this, 'keys')); },
+    values() { return _mapValues(_regOf(this, 'values')); },
+    // Which highlights are under this point — the question a page asks when the
+    // user clicks on a search hit, or hovers a spelling squiggle to be offered a
+    // correction. Answered from the RANGES' own client rects, so it agrees with
+    // whatever the layout actually did.
+    highlightsFromPoint(x, y) {
+      const a = _regOf(this, 'highlightsFromPoint');
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to execute 'highlightsFromPoint' on 'HighlightRegistry': 2 arguments required, but only " + arguments.length + " present.");
+      }
+      // WebIDL `float` (not `unrestricted float`): NaN and infinities are a
+      // TypeError, which is what makes highlightsFromPoint("asdf", 10) throw.
+      const fx = Number(x), fy = Number(y);
+      if (!isFinite(fx) || !isFinite(fy)) {
+        throw new TypeError("Failed to execute 'highlightsFromPoint' on 'HighlightRegistry': The provided double value is non-finite.");
+      }
+      const opts = arguments[2];
+      if (opts != null && typeof opts !== 'object' && typeof opts !== 'function') {
+        throw new TypeError("Failed to execute 'highlightsFromPoint' on 'HighlightRegistry': parameter 3 ('options') is not an object.");
+      }
+      const hits = [];
+      for (let i = 0; i < a.length; i++) {
+        const hl = a[i][1];
+        const list = _hlList.get(hl);
+        if (!list) continue;
+        const ranges = [];
+        for (const r of list) {
+          let rects = null;
+          try { rects = r && r.getClientRects ? r.getClientRects() : null; } catch (e) { rects = null; }
+          if (!rects) continue;                       // a StaticRange has no boxes
+          for (let k = 0; k < rects.length; k++) {
+            const b = rects[k];
+            if (fx >= b.left && fx < b.right && fy >= b.top && fy < b.bottom) {
+              ranges.push(r);
+              break;
+            }
+          }
+        }
+        if (ranges.length) {
+          hits.push({ i: i, p: hl._priority | 0, highlight: hl, ranges: ranges });
+        }
+      }
+      // Whatever is painted LAST is hit FIRST: higher priority wins, and equal
+      // priority breaks by registration order REVERSED — the highlight added
+      // later is the one drawn on top, so it is the one the click lands on.
+      hits.sort((m, n) => (n.p - m.p) || (n.i - m.i));
+      return hits.map((h) => ({ highlight: h.highlight, ranges: h.ranges }));
+    },
+  });
+  Object.defineProperty(HighlightRegistry.prototype, Symbol.iterator, {
+    configurable: true, writable: true,
+    value: HighlightRegistry.prototype.entries,
+  });
+
+  const _highlights = Object.create(HighlightRegistry.prototype);
+  _regMap.set(_highlights, []);
+
+  // WebIDL: an interface object is a non-enumerable, writable, configurable
+  // property of the global — a plain assignment makes it enumerable.
+  Object.defineProperty(globalThis, 'Highlight',
+    { value: Highlight, writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(globalThis, 'HighlightRegistry',
+    { value: HighlightRegistry, writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(globalThis.CSS, 'highlights', {
+    configurable: true, enumerable: true, get: _named(function () { return _highlights; }, 'get highlights', 0),
+  });
+}
+
 // WebIDL: a namespace object (CSS) is a NON-enumerable, writable, configurable global
 // data property (a plain assignment is enumerable, which idlharness flags). It stays a
 // plain extensible object.
@@ -62608,6 +63305,108 @@ function _c2dWebGLStub(canvas) {
       TEXTURE_2D: 0x0DE1, RGBA: 0x1908, UNSIGNED_BYTE: 0x1401,
     };
 }
+// ── ImageBitmapRenderingContext (html §the-imagebitmap-rendering-context) ────
+// The cheapest way to put a decoded image on screen: no 2D state machine, no
+// compositing, no copy — the canvas simply ADOPTS a bitmap that was decoded
+// somewhere else (a worker, usually) and the bitmap is emptied in the same
+// breath. That "transfer, don't copy" is the whole point on a device where a
+// 4000×3000 photo is 48 MB: the alternative, `drawImage` into a 2D context,
+// keeps both copies alive at once.
+class ImageBitmapRenderingContext {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get canvas() {
+    if (!this._bmrCanvas) throw new TypeError('Illegal invocation');
+    return this._bmrPublic || this._bmrCanvas;
+  }
+  transferFromImageBitmap(bitmap) {
+    // The PIXELS live on the backing <canvas> even when the object the page
+    // holds is an OffscreenCanvas; `this.canvas` is the one it should see back.
+    const canvas = this._bmrCanvas;
+    if (!canvas) throw new TypeError('Illegal invocation');
+    const publicCanvas = this._bmrPublic || canvas;
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'transferFromImageBitmap' on 'ImageBitmapRenderingContext': 1 argument required, but only 0 present.");
+    }
+    // `null` is not an error — it is "show nothing", and the canvas goes back to
+    // its transparent-black self at its declared size.
+    if (bitmap === null) {
+      _c2dSt(canvas.__c2dCtx).data.fill(0);
+      return undefined;
+    }
+    if (!(bitmap instanceof ImageBitmap)) {
+      throw new TypeError("Failed to execute 'transferFromImageBitmap' on 'ImageBitmapRenderingContext': parameter 1 is not of type 'ImageBitmap'.");
+    }
+    const d = bitmap[_IB];
+    if (!d || d.detached) {
+      throw new DOMException('The input ImageBitmap has been detached.', 'InvalidStateError');
+    }
+    // The canvas takes the bitmap's intrinsic size — the bitmap is the picture,
+    // not a thing painted into a box someone else chose.
+    canvas.width = d.w;
+    canvas.height = d.h;
+    if (publicCanvas !== canvas) { publicCanvas.width = d.w; publicCanvas.height = d.h; }
+    const st = _c2dSt(canvas.__c2dCtx);
+    const src = d.data;
+    if (src && st.data.length === src.length) st.data.set(src);
+    else if (src) {
+      const n = Math.min(st.data.length, src.length);
+      for (let i = 0; i < n; i++) st.data[i] = src[i];
+    }
+    // ⚠️ `alpha: false` does NOT flatten the stored pixels. It says how the
+    // canvas COMPOSITES to the screen — that its backdrop is opaque black —
+    // and WPT reads the result back through `drawImage` into an ordinary 2D
+    // canvas, where the source's alpha is expected to survive intact. Flattening
+    // here would answer the wrong question and lose information the page still
+    // owns; the flag is kept on the context for the compositor to honour.
+    // A TRANSFER, not a copy: the source is emptied, which is what lets the
+    // pixels be handed across without ever existing twice.
+    d.detached = true;
+    d.data = null;
+    return undefined;
+  }
+  get [Symbol.toStringTag]() { return 'ImageBitmapRenderingContext'; }
+}
+// `alpha: false` means the canvas has no transparency at all — every pixel is
+// composited over black once, here, rather than being asked about later.
+// Kept for the compositor: how an `alpha: false` canvas must look once it is
+// actually painted onto the page's opaque backdrop. Not applied to the stored
+// pixels — see transferFromImageBitmap.
+function _bmrOpaque(st) {
+  const a = st.data;
+  for (let i = 0; i < a.length; i += 4) {
+    const al = a[i + 3];
+    // ⚠️ The stored pixels are PREMULTIPLIED. Simply stamping alpha to 255 would
+    // darken every semi-transparent pixel by its own alpha — a half-transparent
+    // pure green would come out as half-brightness green. Dropping the alpha
+    // channel means taking the colour the author actually wrote, so un-premultiply
+    // first and only then declare the pixel opaque.
+    if (al !== 0 && al !== 255) {
+      a[i] = Math.min(255, Math.round((a[i] * 255) / al));
+      a[i + 1] = Math.min(255, Math.round((a[i + 1] * 255) / al));
+      a[i + 2] = Math.min(255, Math.round((a[i + 2] * 255) / al));
+    }
+    a[i + 3] = 255;
+  }
+}
+function _bmrCreate(canvas, attrs) {
+  const alpha = !(attrs && typeof attrs === 'object' && attrs.alpha === false);
+  // Backed by the ordinary 2D pixel state, so everything that already knows how
+  // to read a canvas — toDataURL, createImageBitmap, drawImage — keeps working
+  // with no second code path.
+  if (!canvas.__c2dCtx) {
+    const ctx2d = _c2dCreate(canvas, { alpha: alpha });
+    Object.defineProperty(canvas, '__c2dCtx', { value: ctx2d, configurable: true });
+  }
+  const ctx = Object.create(ImageBitmapRenderingContext.prototype);
+  Object.defineProperty(ctx, '_bmrCanvas', { value: canvas, configurable: true });
+  Object.defineProperty(ctx, '_bmrAlpha', { value: alpha, configurable: true });
+  return ctx;
+}
+_enumAccessors(ImageBitmapRenderingContext.prototype, 'canvas', 'transferFromImageBitmap');
+Object.defineProperty(ImageBitmapRenderingContext, 'length', { value: 0, configurable: true });
+_exposeIface('ImageBitmapRenderingContext', ImageBitmapRenderingContext);
+_markNative(ImageBitmapRenderingContext);
+
 Element.prototype.getContext = function getContext(contextId) {
   if (arguments.length < 1) {
     throw new TypeError("Failed to execute 'getContext' on 'HTMLCanvasElement': 1 argument required, but only 0 present.");
@@ -62623,6 +63422,13 @@ Element.prototype.getContext = function getContext(contextId) {
       Object.defineProperty(this, '__c2dCtx', { value: ctx, configurable: true });
     }
     return this.__c2dCtx;
+  }
+  if (id === 'bitmaprenderer') {
+    if (!this.__bmrCtx) {
+      const ctx = _bmrCreate(this, arguments.length > 1 ? arguments[1] : null);
+      Object.defineProperty(this, '__bmrCtx', { value: ctx, configurable: true });
+    }
+    return this.__bmrCtx;
   }
   if (id === 'webgl' || id === 'experimental-webgl' || id === 'webgl2') return _c2dWebGLStub(this);
   // Anything else — including '2D', '2d\0' and '2ｄ' — is not a context id.
@@ -70580,8 +71386,21 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
     constructor() { if (!_allowVVCtor) throw new TypeError("Illegal constructor"); super(undefined); this._ol = 0; this._ot = 0; this._pl = 0; this._pt = 0; this._w = 0; this._h = 0; this._scale = 1; }
     get offsetLeft() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._ol; }
     get offsetTop() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._ot; }
-    get pageLeft() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._pl; }
-    get pageTop() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._pt; }
+    // ⚠️ pageLeft/pageTop are DOCUMENT coordinates, not viewport ones: where the
+    // visual viewport sits in the page. Without pinch-zoom the visual viewport
+    // is the layout viewport, so that is exactly the scroll position — and
+    // returning a constant 0 tells a page pinned to the top of a document it has
+    // scrolled a thousand pixels down.
+    get pageLeft() {
+      if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation");
+      let sx = 0; try { sx = Number(globalThis.scrollX) || 0; } catch (e) { sx = 0; }
+      return sx + this._ol;
+    }
+    get pageTop() {
+      if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation");
+      let sy = 0; try { sy = Number(globalThis.scrollY) || 0; } catch (e) { sy = 0; }
+      return sy + this._ot;
+    }
     get width() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._w; }
     get height() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._h; }
     get scale() { if (!(this instanceof VisualViewport)) throw new TypeError("Illegal invocation"); return this._scale; }
@@ -76479,7 +77298,17 @@ if (typeof OffscreenCanvas === 'undefined') {
     set width(v) { if (this._el) this._el.width = v; else this.__w = v | 0; }
     get height() { return this._el ? this._el.height : this.__h | 0; }
     set height(v) { if (this._el) this._el.height = v; else this.__h = v | 0; }
-    getContext(type) { return this._el ? this._el.getContext(type) : null; }
+    getContext(type) {
+      if (!this._el) return null;
+      const ctx = this._el.getContext(type, arguments.length > 1 ? arguments[1] : undefined);
+      // The context belongs to the OffscreenCanvas the caller holds, not to the
+      // <canvas> element backing it: `ctx.canvas === theOffscreenCanvas` is how
+      // a worker finds its way back from a context it was handed.
+      if (ctx && typeof ctx === 'object' && ctx._bmrCanvas && ctx._bmrPublic === undefined) {
+        Object.defineProperty(ctx, '_bmrPublic', { value: this, configurable: true });
+      }
+      return ctx;
+    }
     convertToBlob(opts) {
       return new Promise((resolve) => {
         if (!this._el) { resolve(new Blob([])); return; }
@@ -79027,7 +79856,213 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     configurable: true, enumerable: true, writable: true, value: __ariaNotify,
   });
 
-  // ═══════════════════════════════════════════════════════════════════════════
+  // ── Web Share (w3c/web-share) ──────────────────────────────────────────────
+  // `navigator.share()` is how a page hands a link to whatever the person
+  // actually uses — the messaging app on their phone, the notes app, the thing
+  // their family reads. Without it every site ships its own row of social
+  // buttons, each one a third-party script that tracks the reader for the
+  // privilege. The API replaces all of them with one system dialog and no
+  // third parties at all.
+  //
+  // ⚠️ It is [SecureContext], and the test suite checks that `'share' in
+  // navigator` is FALSE on http — so the members cannot simply be defined on the
+  // prototype at startup, because at startup there is no URL yet to judge. The
+  // gate is therefore a small Proxy around `navigator` (the same technique this
+  // file already uses for `document`'s named properties) which hides exactly
+  // these two names on a non-secure page. Everything else passes through.
+  {
+    const _navProtoRef = Object.getPrototypeOf(globalThis.navigator);
+    const _shareUrlOk = (raw) => {
+      let u;
+      try {
+        u = new URL(String(raw), (globalThis.document && globalThis.document.baseURI) ||
+                                  (globalThis.location && globalThis.location.href));
+      } catch (e) { return false; }
+      // Only the web's own schemes. `file:`, `data:`, `about:` and `wss:` are
+      // either local to this machine or meaningless to a share target — handing
+      // one to another application is at best useless and at worst an
+      // exfiltration route out of the page.
+      return u.protocol === 'http:' || u.protocol === 'https:';
+    };
+    // Returns null when the data is shareable, else the reason.
+    const _shareCheck = (data) => {
+      const d = (data == null) ? {} : data;
+      if (typeof d !== 'object') return 'type';
+      const hasTitle = d.title !== undefined;
+      const hasText = d.text !== undefined;
+      const hasUrl = d.url !== undefined;
+      // `files` is a `sequence<File>`: a lone File is not a sequence and is a
+      // TypeError at the IDL boundary, and an EMPTY list is not files at all —
+      // `{files: []}` shares nothing, exactly like `{}`.
+      let fileCount = 0;
+      if (d.files !== undefined && d.files !== null) {
+        if (typeof d.files === 'string' || typeof d.files[Symbol.iterator] !== 'function') {
+          return 'type';
+        }
+        try { fileCount = Array.from(d.files).length; } catch (e) { return 'type'; }
+      }
+      if (!hasTitle && !hasText && !hasUrl && fileCount === 0) return 'empty';
+      if (hasUrl && !_shareUrlOk(d.url)) return 'url';
+      return null;
+    };
+    const _navBrand = (t) => {
+      if (t == null || Object.getPrototypeOf(Object(t)) !== _navProtoRef)
+        throw new TypeError('Illegal invocation');
+    };
+    const canShare = function canShare(data) {
+      _navBrand(this);
+      const why = _shareCheck(arguments.length ? data : undefined);
+      // A bad TYPE is not "cannot share", it is a bad call: `{files: aFile}`
+      // (a File where a sequence belongs) fails WebIDL conversion before the
+      // question is even asked, so it throws rather than answering false.
+      if (why === 'type') {
+        throw new TypeError("Failed to execute 'canShare' on 'Navigator': The provided value cannot be converted to a sequence.");
+      }
+      return why === null;
+    };
+    const share = function share(data) {
+      try { _navBrand(this); } catch (e) { return Promise.reject(e); }
+      const why = _shareCheck(arguments.length ? data : undefined);
+      if (why === 'url' || why === 'type') {
+        return Promise.reject(new TypeError("Failed to execute 'share' on 'Navigator': Invalid URL"));
+      }
+      if (why === 'empty') {
+        return Promise.reject(new TypeError("Failed to execute 'share' on 'Navigator': No known share data fields supplied. If using only new fields (other than title, text and url), you must feature-detect them first."));
+      }
+      // Sharing is a user's act, not a page's. Without an interaction behind it
+      // a share() call is a page trying to open a system dialog unprompted.
+      if (!_cwManager.hasActivation) {
+        return Promise.reject(new DOMException('Must be handling a user gesture to perform a share request.', 'NotAllowedError'));
+      }
+      // There is no share target on this machine, and inventing one that
+      // silently succeeds would tell a page its content went somewhere.
+      return Promise.reject(new DOMException('Share canceled', 'AbortError'));
+    };
+    Object.defineProperty(canShare, 'length', { value: 0, configurable: true });
+    Object.defineProperty(share, 'length', { value: 0, configurable: true });
+    const _navProto = _navProtoRef;
+    for (const [k, v] of [['share', share], ['canShare', canShare]]) {
+      Object.defineProperty(_navProto, k, {
+        enumerable: true, configurable: true, writable: true, value: _markNative(v),
+      });
+    }
+    const _WEB_SHARE_KEYS = new Set(['share', 'canShare']);
+    const _secure = () => { try { return !!globalThis.isSecureContext; } catch (e) { return false; } };
+    const _rawNav = globalThis.navigator;
+    const _navProxy = new Proxy(_rawNav, {
+      has(t, k) { return (_WEB_SHARE_KEYS.has(k) && !_secure()) ? false : Reflect.has(t, k); },
+      get(t, k, r) {
+        if (_WEB_SHARE_KEYS.has(k) && !_secure()) return undefined;
+        // ⚠️ NOT bound to the target: a WebIDL operation read off `navigator`
+        // and then applied to something else must still throw, and a bound
+        // function can never tell.
+        return Reflect.get(t, k, t);
+      },
+      getOwnPropertyDescriptor(t, k) {
+        if (_WEB_SHARE_KEYS.has(k) && !_secure()) return undefined;
+        return Reflect.getOwnPropertyDescriptor(t, k);
+      },
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      value: _navProxy, writable: true, enumerable: true, configurable: true,
+    });
+  }
+
+  // ── isSecureContext (HTML §secure-contexts) ────────────────────────────────
+  // The one-line question a page asks before it tries anything that only a
+  // trustworthy origin may do: register a service worker (so the site works
+  // offline — which matters most where the connection is metered), use
+  // `crypto.subtle`, ask for a camera, store a credential. It did not exist here
+  // at all, so `if (isSecureContext)` threw a ReferenceError and
+  // `if (window.isSecureContext)` silently took the insecure branch on a page
+  // that was perfectly secure.
+  //
+  // "Potentially trustworthy" is an ORIGIN question, not a scheme question: a
+  // page on localhost is trustworthy without TLS (that is how anyone develops),
+  // and a `blob:`/`data:`/`about:blank` document inherits the trust of whatever
+  // created it — which, from inside, is the document we are already running in.
+  {
+    const _trustworthy = (href) => {
+      let u;
+      try { u = new URL(String(href)); } catch (e) { return false; }
+      const p = u.protocol;
+      if (p === 'https:' || p === 'wss:' || p === 'file:') return true;
+      // Inheriting schemes: judged by the document that created them, which for
+      // a top-level read is this one — so fall through to the host test below on
+      // the document's own URL rather than calling them insecure outright.
+      if (p === 'data:' || p === 'about:' || p === 'blob:' || p === 'filesystem:') return true;
+      const h = u.hostname;
+      if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]') return true;
+      if (h.endsWith('.localhost')) return true;
+      return false;
+    };
+    const _isSecure = function () {
+      let href = '';
+      try { href = String(globalThis.location && globalThis.location.href || ''); } catch (e) { href = ''; }
+      if (!href) return false;
+      return _trustworthy(href);
+    };
+    Object.defineProperty(_isSecure, 'name', { value: 'get isSecureContext', configurable: true });
+    const _target = (typeof globalThis.Window === 'function' && globalThis.Window.prototype)
+      ? globalThis.Window.prototype : globalThis;
+    Object.defineProperty(_target, 'isSecureContext', {
+      enumerable: true, configurable: true, get: _isSecure,
+    });
+    if (_target !== globalThis && !('isSecureContext' in globalThis)) {
+      Object.defineProperty(globalThis, 'isSecureContext', {
+        enumerable: true, configurable: true, get: _isSecure,
+      });
+    }
+  }
+
+  // __entriesApiLate — the two entries-api members that hang off interfaces
+  // declared after the block above: an <input webkitdirectory> is how a page asks
+  // for a FOLDER instead of files, and `File.webkitRelativePath` is the only
+  // thing that says where inside that folder each file came from. Without it an
+  // upload of a project directory arrives as a flat pile with the structure lost.
+  if (typeof globalThis.HTMLInputElement === 'function') {
+    Object.defineProperty(globalThis.HTMLInputElement.prototype, 'webkitEntries', {
+      enumerable: true, configurable: true,
+      get: _named('get', 'webkitEntries', function () {
+        if (!(this instanceof globalThis.HTMLInputElement)) throw new TypeError('Illegal invocation');
+        if (!this._webkitEntriesList) {
+          Object.defineProperty(this, '_webkitEntriesList', { value: Object.freeze([]), configurable: true });
+        }
+        return this._webkitEntriesList;
+      }),
+    });
+    Object.defineProperty(globalThis.HTMLInputElement.prototype, 'webkitdirectory', {
+      enumerable: true, configurable: true,
+      get: _named('get', 'webkitdirectory', function () {
+        if (!(this instanceof globalThis.HTMLInputElement)) throw new TypeError('Illegal invocation');
+        return this.hasAttribute('webkitdirectory');
+      }),
+      set: _named('set', 'webkitdirectory', function (v) {
+        if (!(this instanceof globalThis.HTMLInputElement)) throw new TypeError('Illegal invocation');
+        if (v) this.setAttribute('webkitdirectory', '');
+        else this.removeAttribute('webkitdirectory');
+      }),
+    });
+  }
+  if (typeof globalThis.DataTransferItem === 'function' &&
+      !('webkitGetAsEntry' in globalThis.DataTransferItem.prototype)) {
+    const _wg = function webkitGetAsEntry() { return this._entry || null; };
+    Object.defineProperty(_wg, 'length', { value: 0, configurable: true });
+    Object.defineProperty(globalThis.DataTransferItem.prototype, 'webkitGetAsEntry', {
+      enumerable: true, configurable: true, writable: true, value: _markNative(_wg),
+    });
+  }
+  if (typeof globalThis.File === 'function') {
+    Object.defineProperty(globalThis.File.prototype, 'webkitRelativePath', {
+      enumerable: true, configurable: true,
+      get: _named('get', 'webkitRelativePath', function () {
+        if (!(this instanceof globalThis.File)) throw new TypeError('Illegal invocation');
+        return this._webkitRelativePath || '';
+      }),
+    });
+  }
+
+// ═══════════════════════════════════════════════════════════════════════════
   // THE ACCESSIBILITY TREE
   // ═══════════════════════════════════════════════════════════════════════════
   // Role and name answer "what is this ONE element". A screen-reader user
@@ -79132,6 +80167,52 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     }
     return props;
   }
+  // The whole tree, in the shape CDP's Accessibility domain speaks — because an
+  // agent driving Obscura over CDP must get THE SAME ANSWER as a page calling
+  // `element.computedRole`. Two accessibility computations in one browser is two
+  // different answers to "what is this", and the one the agent sees is the one
+  // that decides whether it presses the right button.
+  globalThis.__obscuraA11yFullTree = function () {
+    const out = [];
+    const de = document.documentElement;
+    if (!de) return out;
+    const ROOT = 'ax-root';
+    const axValue = (t, v) => ({ type: t, value: v });
+    const top = _axChildren(de);
+    out.push({
+      nodeId: ROOT, ignored: false,
+      role: axValue('role', 'RootWebArea'),
+      name: axValue('computedString', document.title || ''),
+      childIds: top.map(_axId),
+      backendDOMNodeId: de._nid,
+    });
+    const seen = new Set();
+    const visit = (el, parentId) => {
+      const id = _axId(el);
+      if (seen.has(id)) return;          // aria-owns can reach the same node twice
+      seen.add(id);
+      const p = _axProps(el);
+      const kids = _axChildren(el);
+      const node = {
+        nodeId: id, ignored: false,
+        role: axValue('role', p.role),
+        name: axValue('computedString', p.label),
+        parentId: parentId,
+        backendDOMNodeId: el._nid,
+      };
+      const props = [];
+      for (const k of ['checked', 'expanded', 'selected', 'pressed',
+                       'disabled', 'level', 'description']) {
+        if (p[k] != null) props.push({ name: k, value: axValue('string', String(p[k])) });
+      }
+      if (props.length) node.properties = props;
+      if (kids.length) node.childIds = kids.map(_axId);
+      out.push(node);
+      for (const c of kids) visit(c, id);
+    };
+    for (const c of top) visit(c, ROOT);
+    return out;
+  };
   globalThis.__obscuraA11yProps = (el) => _axProps(el);
   globalThis.__obscuraA11yPropsById = (id) => {
     const el = _axById.get(id);

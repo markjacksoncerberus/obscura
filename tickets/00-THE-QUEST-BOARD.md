@@ -25,6 +25,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F60** | ✅ [The Furnished Verdict](499-the-furnished-verdict.md) | **The accessibility tree over CDP, and eight APIs that were not there (region picked from a fresh 101-file frontier sample over 36 untouched realms)** | 46-file arc probe **130/480 → 444/503**, 23 files up; `touch-events/idlharness` 29 → **100/128**; `entries-api/idlharness` 18 → **67/68**; `css/css-highlight-api` 0 → **145**; `web-share` 15 → **40/41** | ⚔️⚔️ | **SECURED (Quests #712–#730, 2026-09-10).** ⭐⭐⭐ THE BROWSER GAVE TWO DIFFERENT ANSWERS ABOUT WHAT AN ELEMENT IS — `Accessibility.getFullAXTree` answered out of a SEPARATE hardcoded Rust role table, so the view an agent drives by was not the one WPT had just validated to 885/888. Then: the CSS Custom Highlight API (twelve files at 0), Touch/TouchList/TouchEvent, the Entries API, InputDeviceCapabilities, `isSecureContext` (did not exist at all), Web Share behind a `navigator` Proxy, ImageBitmapRenderingContext, and `console` as a real namespace. ⚠️ Plus a security fix: a cross-origin response's headers were handed to script IN FULL — `Access-Control-Expose-Headers` was never consulted, and the list is all-or-nothing. ⛔ 28 touch rows kept off BY CHOICE (`ontouchstart` would tell every site this is a touchscreen). ⭐⭐⭐ Biggest UNFIXED finding: `Range.getBoundingClientRect()` is a literal 0×0 stub. |
 | **F59** | ✅ [The Announced Verdict](498-the-announced-verdict.md) | **The rest of the a11y bridge — `wai-aria/` beyond `role/`, `svg-aam/`, `dpub-aam/`** | 26-file probe **164/304 → 291/304**; `wai-aria/idlharness` **65/121 → 121/121**; `dpub-aam` **0/39 → 39/39** | ⚔️⚔️ | **SECURED (Quests #698–#711, 2026-09-10).** Four walls, not a tail. ⭐ THERE WAS NO VOCABULARY FOR A BOOK — all 41 DPUB-ARIA roles missing, so every `doc-chapter`/`doc-footnote`/`doc-index` fell through to `generic`. ⭐ EVERY SHAPE IN EVERY ICON WAS A SYMBOL — an unnamed `<path>` was `graphics-symbol`, which claims the mark means something. ⭐⭐ THE TREE EXISTED ONLY ONE ELEMENT AT A TIME — built the accessibility tree (stable ids, hidden subtrees absent, `role=none` children PROMOTED) and bridged it to testdriver. ⭐ THE ARIA IDL SURFACE ANSWERED WHEN IT SHOULD HAVE THROWN — `Element.prototype.ariaLabel` returned `null` instead of a TypeError; that plus the accessor names was 52 of 56 idlharness failures. Also `ariaNotify`, `ariaActionsElements`, ARIAMixin on `ElementInternals` (read by the name computation, so a web component stops being a nameless `generic`), and shadow-scoped IDREF resolution. ⛔ 8 rows unwinnable by construction (`data-expectedrole` is a literal log string); 3 more are a test whose `<image>` the HTML parser rewrites to `<img>`. |
 | **F58** | ✅ [The Mapped Verdict](497-the-mapped-verdict.md) | **`html-aam/` — the table that maps an HTML element to WHAT IT IS (chosen by measuring it cold; never had a ledger row)** | `html-aam/` **736/888 → 885/888**, 20 files up, 0 down; `accname/name/comp_name_from_content` 49/79 → **67/79** | ⚔️⚔️ | **SECURED (Quests #680–#697, 2026-09-10).** THE BROWSER COULD NOT SAY WHAT ITS OWN ELEMENTS WERE. ⭐ Naming was PROHIBITED where ARIA only DISCOURAGES it — every phrasing element ignored its own `aria-label` (+46 in one deletion). ⭐⭐ The ROOT of a name computation was hidden from itself: `<area>` and `<rp>` are `display:none` in every UA stylesheet and got no name at all, and an image map's areas ARE the links on the picture. ⭐ The `<label>` outranks the value printed on the button. A hidden `<label>`/`<caption>`/`<legend>` beat a visible one. `<figure>`/`<details>` were named by their caption/summary; the table roles were named from their contents (every cell read twice). Role side: a blank `alt` is a declaration `title` cannot rescue; an `<img>` with no source is not an image; an unnamed nested `<aside>` is not complementary to anything; `draggable`/`autofocus`/`popover` floor an element at `group`. ⛔ 2 `area.html` rows are an upstream test bug (stale `alt` left by the harness). |
 | **F57** | ✅ [The Stuck Verdict](496-the-stuck-verdict.md) | **`position: sticky` — the other half of the overlay vocabulary (chosen over `float` after measuring both)** | `css/css-position/` 1167/1488 → **1200/1488**, 13 files up, 0 down | ⚔️⚔️ | **SECURED (Quests #676–#679, 2026-09-07).** THE HEADER NEVER FOLLOWED YOU DOWN THE PAGE. ⚠️ The engine's handling was worse than nothing: sticky was mapped to Taffy's `Relative` AND handed its insets, so a `top: 50px` header sat 50px low before anything scrolled. Insets no longer reach Taffy; the offset is computed from the scroll model and clamped to the containing block inset by the box's own margins. Nested sticky accumulates ancestors' shifts. ⭐ `float` was measured FIRST and rejected: `css/CSS2/floats*` is almost all reftests and its scoreable files already sit at 120/128 — worth doing for rendering, not for the score. ⛔ The offset does not reach the paint path. |
@@ -361,6 +362,46 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-09-10 — Quests #712–#730: **the furnished arc** (the AX tree over CDP, and eight missing APIs)
+
+**⭐⭐⭐ The headline is a shape this campaign knows well: two answers to one question.** Scrolls 497
+and 498 built one accessibility computation and measured it to 885/888 and 291/304. This arc asked
+what an agent driving Obscura over CDP actually SEES — and `Accessibility.getFullAXTree` was
+answering out of a completely separate Rust implementation: a hardcoded tag→role table of about
+thirty roles and a five-step name guesser. Nothing in it knew about the minimum role, `sectionheader`,
+`doc-chapter`, a `<th>` that heads its row, or that a `role="none"` container's children must be
+PROMOTED rather than dropped. The agent's view is the one that decides whether it presses the right
+button. #712 points the CDP domain at the engine's own tree; the Rust walker survives only as the
+fallback for a page with no JS realm.
+
+Then a fresh **101-file frontier sample across 36 untouched realms** picked the rest: eight APIs a
+page reaches for and finds `undefined`. **The CSS Custom Highlight API** — twelve files at 0, four
+could-not-run; how a page marks up text it did not write the markup for, without shredding the DOM
+into spans (built on plain ARRAYS, because WPT tampers with `Set.prototype` and because a page that
+patches it must not break the browser's own highlighting). **Touch/TouchList/TouchEvent**. **The
+Entries API** — what a browser hands a page when someone drags a FOLDER onto it. **InputDeviceCapabilities**.
+**`isSecureContext`**, which did not exist at all — the one-line question before a service worker or
+`crypto.subtle`, and `if (isSecureContext)` threw a ReferenceError. **Web Share**, gated by a small
+`navigator` Proxy because `[SecureContext]` cannot be decided at startup when there is no URL yet.
+**ImageBitmapRenderingContext**. And **`console` as a real namespace** (empty interposed prototype,
+`@@toStringTag`, every operation `length` 0, labels stringified through `toString()` with the
+exception left for the page to see).
+
+⚠️ **Plus a security fix nobody was looking for:** a cross-origin response's headers were handed to
+script IN FULL. `Access-Control-Expose-Headers` was never consulted, and the list is ALL-OR-NOTHING —
+salvaging the good entries out of `bb-8, no no` turns a server's typo into an exposure it never
+authorised.
+
+**46-file arc probe 130/480 → 444/503, 23 files up.** Zero regressions: html-aam 885/888, the a11y
+bridge 291/304, accname 804/816, a 44-row ritual sample 9156/9187 — all identical. ⛔ The one row
+that moved down is the RUNNER, not the engine: `share-securecontext.http.html` must be served over
+http, and `wpt_run.py` uses an https base; with `--base http://wpt.live` it is 1/1. 28 touch rows are
+kept failing BY CHOICE. **NEXT:** ⭐⭐⭐ **Range geometry from the text layout** — `Range.getBoundingClientRect()`
+is a literal 0×0 stub, which is what every rich-text editor, tooltip-over-selection and find-in-page
+depends on; ⭐⭐ `counter()`/`attr()`/`:dir(rtl)` in CSS `content`; ⭐⭐ FLOAT LAYOUT, which now has
+144 subtests behind it (`css/css-flexbox/align-content-horiz-001a/b` are 0/72 each purely because the
+test's flex containers are `float: left`). Scroll `tickets/499-the-furnished-verdict.md`.
 
 ### 2026-09-10 — Quests #698–#711: **the announced arc** (the rest of the a11y bridge)
 

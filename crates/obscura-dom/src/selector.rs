@@ -277,6 +277,12 @@ pub enum PseudoElement {
     // ::part() in the CSSOM (so their cssText/selectorText serialize) rather than
     // silently dropping them.
     Part(String),
+    // ::highlight(<ident>) — the CSS Custom Highlight API's painting hook. A page
+    // registers a Highlight under a name and then styles it by that name, which
+    // is how a search box paints its hits without touching the DOM. Parsed and
+    // retained (so the rule survives in the CSSOM and serializes); matching is
+    // the painter's business, not the selector engine's.
+    Highlight(String),
 }
 
 impl parser::PseudoElement for PseudoElement {
@@ -303,6 +309,11 @@ impl ToCss for PseudoElement {
             }
             PseudoElement::Part(arg) => {
                 dest.write_str("::part(")?;
+                dest.write_str(arg)?;
+                dest.write_str(")")
+            }
+            PseudoElement::Highlight(arg) => {
+                dest.write_str("::highlight(")?;
                 dest.write_str(arg)?;
                 dest.write_str(")")
             }
@@ -400,6 +411,17 @@ impl<'i> parser::Parser<'i> for ObscuraSelectorParser {
             while arguments.next().is_ok() {}
             let arg = arguments.slice_from(start).trim().to_string();
             return Ok(PseudoElement::Slotted(arg));
+        }
+        if name.eq_ignore_ascii_case("highlight") {
+            // Exactly one <custom-ident>. `::highlight()` with nothing in it, or
+            // with two names, is not a selector — the name IS the registry key.
+            let ident = arguments.expect_ident()?.as_ref().to_string();
+            arguments.expect_exhausted()?;
+            let mut out = String::new();
+            cssparser::serialize_identifier(&ident, &mut out)
+                .map_err(|_| arguments.new_custom_error(
+                    SelectorParseErrorKind::UnsupportedPseudoClassOrElement(name.clone())))?;
+            return Ok(PseudoElement::Highlight(out));
         }
         if name.eq_ignore_ascii_case("part") {
             // ::part(<ident>+) — a non-empty space-separated list of part names.

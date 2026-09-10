@@ -32,7 +32,26 @@ pub async fn handle(
     match method {
         "enable" => Ok(json!({})),
         "getFullAXTree" => {
-            let page = ctx.get_session_page(session_id).ok_or("No page")?;
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            // ⚠️ ONE accessibility computation, not two. The tree an agent reads
+            // over CDP has to be the same tree a page reads through
+            // `element.computedRole` / `computedLabel` — the AccName/HTML-AAM
+            // implementation in the JS realm, which is the one WPT measures. The
+            // Rust walk below it is a hardcoded tag→role table with a name
+            // guesser, and while it was the only thing here it quietly gave a
+            // DIFFERENT answer about what every element on the page was. It stays
+            // only as the fallback for a page with no JS realm at all.
+            let raw = page.evaluate(
+                "(function(){ try { return JSON.stringify(__obscuraA11yFullTree()); } \
+                 catch (e) { return null; } })()",
+            );
+            if let Some(s) = raw.as_str() {
+                if let Ok(nodes) = serde_json::from_str::<Value>(s) {
+                    if nodes.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                        return Ok(json!({ "nodes": nodes }));
+                    }
+                }
+            }
             let nodes = page.with_dom(|dom| build_ax_nodes(dom)).unwrap_or_default();
             Ok(json!({ "nodes": nodes }))
         }
