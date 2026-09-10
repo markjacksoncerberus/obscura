@@ -25,6 +25,7 @@ Live scoreboard of conquered lands: [`../WPT_PROGRESS.md`](../WPT_PROGRESS.md).
 > Measured map: **[`102-the-frontier-survey.md`](102-the-frontier-survey.md)**.
 
 | # | Scroll | Realm | Hold | Difficulty | Bounty |
+| **F59** | ✅ [The Announced Verdict](498-the-announced-verdict.md) | **The rest of the a11y bridge — `wai-aria/` beyond `role/`, `svg-aam/`, `dpub-aam/`** | 26-file probe **164/304 → 291/304**; `wai-aria/idlharness` **65/121 → 121/121**; `dpub-aam` **0/39 → 39/39** | ⚔️⚔️ | **SECURED (Quests #698–#711, 2026-09-10).** Four walls, not a tail. ⭐ THERE WAS NO VOCABULARY FOR A BOOK — all 41 DPUB-ARIA roles missing, so every `doc-chapter`/`doc-footnote`/`doc-index` fell through to `generic`. ⭐ EVERY SHAPE IN EVERY ICON WAS A SYMBOL — an unnamed `<path>` was `graphics-symbol`, which claims the mark means something. ⭐⭐ THE TREE EXISTED ONLY ONE ELEMENT AT A TIME — built the accessibility tree (stable ids, hidden subtrees absent, `role=none` children PROMOTED) and bridged it to testdriver. ⭐ THE ARIA IDL SURFACE ANSWERED WHEN IT SHOULD HAVE THROWN — `Element.prototype.ariaLabel` returned `null` instead of a TypeError; that plus the accessor names was 52 of 56 idlharness failures. Also `ariaNotify`, `ariaActionsElements`, ARIAMixin on `ElementInternals` (read by the name computation, so a web component stops being a nameless `generic`), and shadow-scoped IDREF resolution. ⛔ 8 rows unwinnable by construction (`data-expectedrole` is a literal log string); 3 more are a test whose `<image>` the HTML parser rewrites to `<img>`. |
 | **F58** | ✅ [The Mapped Verdict](497-the-mapped-verdict.md) | **`html-aam/` — the table that maps an HTML element to WHAT IT IS (chosen by measuring it cold; never had a ledger row)** | `html-aam/` **736/888 → 885/888**, 20 files up, 0 down; `accname/name/comp_name_from_content` 49/79 → **67/79** | ⚔️⚔️ | **SECURED (Quests #680–#697, 2026-09-10).** THE BROWSER COULD NOT SAY WHAT ITS OWN ELEMENTS WERE. ⭐ Naming was PROHIBITED where ARIA only DISCOURAGES it — every phrasing element ignored its own `aria-label` (+46 in one deletion). ⭐⭐ The ROOT of a name computation was hidden from itself: `<area>` and `<rp>` are `display:none` in every UA stylesheet and got no name at all, and an image map's areas ARE the links on the picture. ⭐ The `<label>` outranks the value printed on the button. A hidden `<label>`/`<caption>`/`<legend>` beat a visible one. `<figure>`/`<details>` were named by their caption/summary; the table roles were named from their contents (every cell read twice). Role side: a blank `alt` is a declaration `title` cannot rescue; an `<img>` with no source is not an image; an unnamed nested `<aside>` is not complementary to anything; `draggable`/`autofocus`/`popover` floor an element at `group`. ⛔ 2 `area.html` rows are an upstream test bug (stale `alt` left by the harness). |
 | **F57** | ✅ [The Stuck Verdict](496-the-stuck-verdict.md) | **`position: sticky` — the other half of the overlay vocabulary (chosen over `float` after measuring both)** | `css/css-position/` 1167/1488 → **1200/1488**, 13 files up, 0 down | ⚔️⚔️ | **SECURED (Quests #676–#679, 2026-09-07).** THE HEADER NEVER FOLLOWED YOU DOWN THE PAGE. ⚠️ The engine's handling was worse than nothing: sticky was mapped to Taffy's `Relative` AND handed its insets, so a `top: 50px` header sat 50px low before anything scrolled. Insets no longer reach Taffy; the offset is computed from the scroll model and clamped to the containing block inset by the box's own margins. Nested sticky accumulates ancestors' shifts. ⭐ `float` was measured FIRST and rejected: `css/CSS2/floats*` is almost all reftests and its scoreable files already sit at 120/128 — worth doing for rendering, not for the score. ⛔ The offset does not reach the paint path. |
 | **F56** | ✅ [The Contained Verdict](495-the-contained-verdict.md) | **The containing block — `position: fixed` / `absolute` placed against the right box at last (a ⭐⭐⭐ carried by four arcs)** | `css-position` 1163/1488 → **1167/1488**, `css-scroll-snap` 584 → **592**, scroll list 856 → **861**, layout probe 551 → **553**; **0 files down anywhere** | ⚔️⚔️⚔️ | **SECURED (Quests #673–#675, 2026-09-07).** THE FIXED HEADER WAS NEVER FIXED — Taffy has no containing-block chain and both out-of-flow positions were mapped onto its `Absolute`, so a fixed box was placed against its DOM parent's padding box: `left: 100px` landed at 108px on any page with the default body margin. Out-of-flow boxes are now reparented in the LAYOUT tree only (which is allowed to differ from the DOM tree — `layout_parent` exists because it already does). ⭐ The chain is read from the DOM, not from the tree being edited, so a box comes back when its ancestor *becomes* positioned; ⭐ and an all-`auto`-inset box keeps its static position and is never moved. |
@@ -360,6 +361,45 @@ over namespace-aware Rust attribute storage — the field stands thus:
 </details>
 
 ## 📜 Lands already secured this campaign (for the chronicles)
+
+### 2026-09-10 — Quests #698–#711: **the announced arc** (the rest of the a11y bridge)
+
+Took the pointer scroll 497 left. `get_computed_role`/`get_computed_label` were already wired, so
+`wai-aria/` beyond `role/`, `svg-aam/` and `dpub-aam/` were reachable with no harness work. Cold
+26-file baseline **164/304** — four walls, not a tail.
+
+**(1) No vocabulary for a book.** All 41 DPUB-ARIA roles were missing from the valid-role set, so
+`doc-chapter`, `doc-footnote`, `doc-index`, `doc-biblioref` and the rest fell through to `generic`.
+That vocabulary is how a reader moves through a long document by structure instead of by scrolling,
+and digital publishing is most of what a school textbook or a library loan now is. 0/39 → 39/39.
+
+**(2) Every shape in every icon was announced as a symbol.** An unnamed `<circle>`/`<path>`/`<rect>`/
+`<g>` mapped to `graphics-symbol` — which claims the mark carries meaning. Say that about all forty
+paths in an icon set and you have buried the two that do. With it: `xlink:href` makes an SVG `<a>` a
+link (what every editor emitted for a decade), and `xlink:title` is a name source that was consulted
+nowhere.
+
+**(3) ⭐⭐ The tree existed only one element at a time.** Built the accessibility tree itself: stable
+lazily-minted node ids, `aria-hidden`/`display:none` subtrees absent, a `role=none` container absent
+BUT ITS CHILDREN PROMOTED to its parent, and per-node role/label/parent/children/state — bridged to
+testdriver as `get_accessibility_properties_for_element`. This is the query an automation tool
+actually wants: not "what does this selector match" but "what are the controls, and what are they
+called".
+
+**(4) The ARIA IDL surface answered when it should have thrown.** `Element.prototype.ariaLabel`
+quietly returned `null` instead of a TypeError — 52 of 56 `idlharness` failures were that brand check
+plus the accessor names (`{get(){}}` shorthand names the function plain `get`). 65/121 → **121/121**.
+Plus `ariaNotify`, `ariaActionsElements`, the `aria-actions` target excluded from its host's name, an
+ARIA checkbox with no `aria-checked` reported as UNCHECKED rather than unknown, ARIAMixin on
+`ElementInternals` as default semantics that the name/role computation now READS, and IDREFs resolved
+in the element's own node tree so shadow-scoped ids work.
+
+**26-file bridge probe 164/304 → 291/304.** Zero regressions (`html-aam` held 885/888, accname
+804/816, aria-attribute-reflection 41/41, ElementInternals-accessibility 50/50, qsa 1975).
+⛔ 8 rows are unwinnable by construction; 3 more are a tentative test that contradicts one we pass
+49/49. **NEXT:** ⭐⭐ `counter()`/`attr()`/`:dir(rtl)` in CSS `content`; ⭐⭐ wire the new
+accessibility tree to CDP `Accessibility.getFullAXTree`; ⭐⭐ the sticky paint path (carried).
+Scroll `tickets/498-the-announced-verdict.md`.
 
 ### 2026-09-10 — Quests #680–#697: **the mapped arc** (`html-aam/` — what an element IS)
 

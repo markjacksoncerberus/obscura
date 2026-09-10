@@ -436,6 +436,18 @@ TESTDRIVER_BRIDGE_JS = r"""
       try { return Promise.resolve(element.computedLabel); }
       catch (e) { return Promise.reject(e); }
     };
+    // WebDriver "Get Accessibility Properties" — one step past role and label:
+    // the accessibility NODE, with its id, its parent, and the children the tree
+    // actually has (presentational wrappers promoted away). Same rule as above —
+    // the engine computes it, the harness only hands it over.
+    impl.get_accessibility_properties_for_element = function(element) {
+      try { return Promise.resolve(globalThis.__obscuraA11yProps(element)); }
+      catch (e) { return Promise.reject(e); }
+    };
+    impl.get_accessibility_properties_for_accessibility_node = function(id) {
+      try { return Promise.resolve(globalThis.__obscuraA11yPropsById(id)); }
+      catch (e) { return Promise.reject(e); }
+    };
     // Cookies. EVERY test in WPT's `cookies/` realm awaits delete_all_cookies()
     // before its first assertion, so without this the whole realm reads as
     // "Running, 0 complete, N remain" — an instrumentation gate, not an engine

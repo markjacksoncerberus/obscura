@@ -8124,17 +8124,72 @@ const __ariaReflectedAttrs = {
   ariaValueNow: 'aria-valuenow',
   ariaValueText: 'aria-valuetext',
 };
-for (const __jsAttr in __ariaReflectedAttrs) {
-  const __contentAttr = __ariaReflectedAttrs[__jsAttr];
-  Object.defineProperty(Element.prototype, __jsAttr, {
-    configurable: true, enumerable: true,
-    get() { return this.getAttribute(__contentAttr); },
-    set(v) {
-      if (v == null) this.removeAttribute(__contentAttr);
-      else this.setAttribute(__contentAttr, String(v));
-    },
+// ⚠️ THE BRAND CHECK. A WebIDL accessor lives on the PROTOTYPE but belongs to
+// the INSTANCE: `Element.prototype.ariaLabel` must throw a TypeError, not
+// quietly answer `null`. That is not pedantry — it is how every feature-detect
+// and every polyfill on the web asks "does this engine have real ARIA
+// reflection", and an engine that answers `null` instead of throwing is telling
+// them yes when the object it was asked about is not an element at all.
+function __ariaBrand(o) {
+  if (o == null || typeof o !== 'object' || !(o instanceof Element)) {
+    throw new TypeError('Illegal invocation');
+  }
+  return o;
+}
+// ⚠️ AND THE NAMES. A WebIDL accessor's function is named `get ariaLabel` /
+// `set ariaLabel`, and `{ get() {…} }` in an object literal names it plain
+// `get`. Nobody reads these by hand — but every IDL conformance harness does,
+// and so does anything that prints a stack trace for a page author to read.
+function __defineReflector(target, jsAttr, get, set) {
+  Object.defineProperty(get, 'name', { value: 'get ' + jsAttr, configurable: true });
+  Object.defineProperty(get, 'length', { value: 0, configurable: true });
+  Object.defineProperty(set, 'name', { value: 'set ' + jsAttr, configurable: true });
+  Object.defineProperty(set, 'length', { value: 1, configurable: true });
+  Object.defineProperty(target, jsAttr, {
+    configurable: true, enumerable: true, get: get, set: set,
   });
 }
+for (const __jsAttr in __ariaReflectedAttrs) {
+  const __contentAttr = __ariaReflectedAttrs[__jsAttr];
+  __defineReflector(Element.prototype, __jsAttr,
+    function () { return __ariaBrand(this).getAttribute(__contentAttr); },
+    function (v) {
+      const el = __ariaBrand(this);
+      if (v == null) el.removeAttribute(__contentAttr);
+      else el.setAttribute(__contentAttr, String(v));
+    });
+}
+
+// ── ariaNotify (ARIA Notification API) ───────────────────────────────────────
+// "Say this out loud now" — a page telling a screen reader about something that
+// just happened (a row saved, a message arrived) without shoving it into a live
+// region and hoping. Obscura has no speech channel to deliver it to, so the
+// method accepts and validates its arguments and does nothing further: a page
+// that calls it must not crash, and a page that feature-detects it must get an
+// honest "the method is here" rather than a TypeError from a missing property.
+function __ariaNotify(message /*, options */) {
+  if (this == null || typeof this !== 'object' ||
+      !((this instanceof Element) || (this instanceof Document))) {
+    throw new TypeError('Illegal invocation');
+  }
+  if (arguments.length < 1) {
+    throw new TypeError("Failed to execute 'ariaNotify': 1 argument required, but only 0 present.");
+  }
+  String(message);
+  const options = arguments[1];
+  if (options != null && typeof options !== 'object') {
+    throw new TypeError("Failed to execute 'ariaNotify': parameter 2 is not of type 'AriaNotificationOptions'.");
+  }
+  return undefined;
+}
+Object.defineProperty(__ariaNotify, 'length', { value: 1, configurable: true });
+Object.defineProperty(__ariaNotify, 'name', { value: 'ariaNotify', configurable: true });
+Object.defineProperty(Element.prototype, 'ariaNotify', {
+  configurable: true, enumerable: true, writable: true, value: __ariaNotify,
+});
+// `Document` is declared further down this file, so its copy is installed there
+// (search for __ariaNotify) rather than here, where the binding is still in its
+// temporal dead zone.
 
 // ── Global HTMLElement content-attribute reflection (HTML §reflecting + the
 // global attributes). These IDL attributes reflect a content attribute and are
@@ -8519,6 +8574,10 @@ Object.defineProperty(Element.prototype, 'start', {
 // array object until the computed element list actually changes, satisfying the
 // IDL caching invariant.
 const __ariaElementReflectedAttrs = {
+  // `aria-actions` — "these controls act on me". The row's Edit and Delete
+  // buttons belong to the row, and a screen reader can offer them as ACTIONS
+  // instead of making the user hunt for them in the reading order.
+  ariaActionsElements:         { attr: 'aria-actions',          multiple: true },
   ariaActiveDescendantElement: { attr: 'aria-activedescendant', multiple: false },
   ariaControlsElements:        { attr: 'aria-controls',         multiple: true },
   ariaDescribedByElements:     { attr: 'aria-describedby',      multiple: true },
@@ -8534,6 +8593,13 @@ const __ariaElementContentAttrs = new Set(
 // and the element is connected within the same document tree. This covers the
 // light-DOM, not-yet-inserted, and cross-document cases; crossing shadow-tree
 // boundaries is not distinguished (cap).
+function __ariaScopeRoot(el) {
+  try {
+    const r = el.getRootNode ? el.getRootNode() : null;
+    if (r && r.getElementById) return r;
+  } catch (e) {}
+  return el.ownerDocument;
+}
 function __ariaElemValid(self, el) {
   if (!el || el.nodeType !== 1) return false;
   if (!self.isConnected) return false;
@@ -8559,7 +8625,11 @@ for (const __jsAttr in __ariaElementReflectedAttrs) {
         } else if (this.hasAttribute(__attr)) {
           list = [];
           const seen = new Set();
-          const doc = this.ownerDocument;
+          // ⚠️ The IDREF is resolved in the element's OWN node tree, not always
+          // the document: inside a shadow root, ids are scoped to that root, and
+          // resolving against the document finds nothing at all (or, worse, the
+          // wrong element with the same id out in the light DOM).
+          const doc = __ariaScopeRoot(this);
           for (const tok of this.getAttribute(__attr).split(/\s+/)) {
             if (!tok) continue;
             const el = doc.getElementById(tok);
@@ -8598,7 +8668,7 @@ for (const __jsAttr in __ariaElementReflectedAttrs) {
           return __ariaElemValid(this, el) ? el : null;
         }
         if (!this.hasAttribute(__attr)) return null;
-        const el = this.ownerDocument.getElementById(this.getAttribute(__attr));
+        const el = __ariaScopeRoot(this).getElementById(this.getAttribute(__attr));
         return __ariaElemValid(this, el) ? el : null;
       },
       set(v) {
@@ -8610,6 +8680,20 @@ for (const __jsAttr in __ariaElementReflectedAttrs) {
       },
     });
   }
+}
+
+// The Element-typed reflections above were written with `{ get() {} }` object
+// shorthand, which gives their accessor functions the name `get` and no brand
+// check. Rather than restate eight getters and eight setters, re-wrap them once:
+// same behaviour, plus the two things WebIDL requires of any accessor — it
+// throws on a non-Element receiver, and it knows its own name.
+for (const __jsAttr of Object.keys(__ariaElementReflectedAttrs)) {
+  const __d = Object.getOwnPropertyDescriptor(Element.prototype, __jsAttr);
+  if (!__d || !__d.get) continue;
+  const __g = __d.get, __s = __d.set;
+  __defineReflector(Element.prototype, __jsAttr,
+    function () { return __g.call(__ariaBrand(this)); },
+    function (v) { return __s.call(__ariaBrand(this), v); });
 }
 
 // DOM §concept-node-adopt: remove `node` from any parent, then — when the
@@ -49586,6 +49670,41 @@ globalThis.ElementInternals = class ElementInternals {
   get [Symbol.toStringTag]() { return "ElementInternals"; }
 };
 
+// ── ARIAMixin on ElementInternals (HTML §dom-elementinternals / ARIA §internals)
+// A custom element's author writes `internals.role = 'button'` in the element's
+// own code; the PAGE that uses <my-button> may then override it with a `role`
+// attribute. So these are DEFAULT semantics, and — unlike the Element copies —
+// they do NOT reflect to content attributes: the whole point is that the page's
+// markup stays clean and the component still announces itself correctly. Null
+// until the component sets one.
+{
+  const __internalsAria = Object.assign({}, __ariaReflectedAttrs);
+  for (const __jsAttr in __internalsAria) {
+    __defineReflector(globalThis.ElementInternals.prototype, __jsAttr,
+      function () {
+        const d = this._ariaDefaults;
+        return (d && __jsAttr in d) ? d[__jsAttr] : null;
+      },
+      function (v) {
+        const d = this._ariaDefaults || (this._ariaDefaults = {});
+        d[__jsAttr] = v == null ? null : String(v);
+      });
+  }
+  for (const __jsAttr in __ariaElementReflectedAttrs) {
+    const __multiple = __ariaElementReflectedAttrs[__jsAttr].multiple;
+    __defineReflector(globalThis.ElementInternals.prototype, __jsAttr,
+      function () {
+        const d = this._ariaDefaults;
+        return (d && __jsAttr in d) ? d[__jsAttr] : null;
+      },
+      function (v) {
+        const d = this._ariaDefaults || (this._ariaDefaults = {});
+        if (v == null) { d[__jsAttr] = null; return; }
+        d[__jsAttr] = __multiple ? Object.freeze(Array.from(v)) : v;
+      });
+  }
+}
+
 // HTMLElement.attachInternals() (HTML §4.13.5). Autonomous elements only.
 Object.defineProperty(globalThis.HTMLElement.prototype, "attachInternals", {
   configurable: true, writable: true,
@@ -77841,13 +77960,50 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     'sectionheader', 'sectionfooter',
     // Extension-spec roles are valid role tokens too (graphics-aria / dpub-aria).
     'graphics-document', 'graphics-object', 'graphics-symbol',
+    // DPUB-ARIA — the vocabulary of a BOOK. These are how a reader navigates a
+    // long document by structure rather than by scrolling: jump to the chapter,
+    // to the footnote, to the index, back from a citation. Digital publishing is
+    // most of what a school textbook, a public-library loan and a government PDF
+    // replacement actually are, so an engine that drops them to `generic`
+    // flattens every one of those into an undifferentiated wall of text.
+    'doc-abstract', 'doc-acknowledgments', 'doc-afterword', 'doc-appendix',
+    'doc-backlink', 'doc-biblioentry', 'doc-bibliography', 'doc-biblioref',
+    'doc-chapter', 'doc-colophon', 'doc-conclusion', 'doc-cover', 'doc-credit',
+    'doc-credits', 'doc-dedication', 'doc-endnote', 'doc-endnotes',
+    'doc-epigraph', 'doc-epilogue', 'doc-errata', 'doc-example', 'doc-footnote',
+    'doc-foreword', 'doc-glossary', 'doc-glossref', 'doc-index',
+    'doc-introduction', 'doc-noteref', 'doc-notice', 'doc-pagebreak',
+    'doc-pagefooter', 'doc-pageheader', 'doc-pagelist', 'doc-part',
+    'doc-preface', 'doc-prologue', 'doc-pullquote', 'doc-qna', 'doc-subtitle',
+    'doc-tip', 'doc-toc',
   ]);
 
   const _isHTML = (el) => el.namespaceURI == null ||
     el.namespaceURI === 'http://www.w3.org/1999/xhtml';
 
+  // content attribute name → the ARIAMixin IDL name that sets its default, built
+  // from the reflection table itself so the two can never drift apart.
+  const _ARIA_ATTR_TO_IDL = (() => {
+    const m = Object.create(null);
+    for (const k in __ariaReflectedAttrs) m[__ariaReflectedAttrs[k]] = k;
+    return m;
+  })();
+
+  // ⚠️ Falls back to the element's ElementInternals DEFAULT semantics. A custom
+  // element that declared `internals.role = 'button'` IS a button, even though
+  // nothing in the page's markup says so — that is the entire purpose of the
+  // internals ARIA surface, and a computation that only reads content attributes
+  // announces every well-built component as a nameless `generic`.
   const _attr = (el, name) => {
-    try { return el.getAttribute(name); } catch (e) { return null; }
+    let v = null;
+    try { v = el.getAttribute(name); } catch (e) { v = null; }
+    if (v != null) return v;
+    try {
+      const d = el._ceInternals && el._ceInternals._ariaDefaults;
+      const jsAttr = d && _ARIA_ATTR_TO_IDL[name];
+      if (jsAttr && jsAttr in d && typeof d[jsAttr] === 'string') return d[jsAttr];
+    } catch (e) {}
+    return null;
   };
 
   // The `type` of an <input>, lowercased, with the missing/invalid default.
@@ -77900,12 +78056,23 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 
     if (el.namespaceURI === _SVG_NS) {
       if (tag === 'svg') return 'graphics-document';
-      if (tag === 'a') return _attr(el, 'href') != null ? 'link' : 'generic';
-      if (tag === 'g') return 'group';
+      // ⚠️ `xlink:href` is not a legacy curiosity here — it is how most SVG in
+      // the wild links, because it is what every editor emitted for a decade.
+      if (tag === 'a') {
+        return (_attr(el, 'href') != null || _attr(el, 'xlink:href') != null)
+          ? 'link' : 'generic';
+      }
       if (tag === 'image') return 'image';
-      if (tag === 'circle' || tag === 'ellipse' || tag === 'line' ||
-          tag === 'path' || tag === 'polygon' || tag === 'polyline' ||
-          tag === 'rect' || tag === 'use') return 'graphics-symbol';
+      // A shape with no name is DECORATION. `graphics-symbol` says "this mark
+      // means something" — and announcing that about every `<path>` in an icon
+      // set buries the two or three that actually do (SVG-AAM §5.1.2: an
+      // unlabelled graphics element is generic).
+      if (tag === 'g' || tag === 'circle' || tag === 'ellipse' ||
+          tag === 'line' || tag === 'path' || tag === 'polygon' ||
+          tag === 'polyline' || tag === 'rect' || tag === 'use') {
+        if (!_svgNamed(el)) return 'generic';
+        return tag === 'g' ? 'group' : 'graphics-symbol';
+      }
       return '';
     }
     if (el.namespaceURI === _MATHML_NS) return tag === 'math' ? 'math' : '';
@@ -78165,6 +78332,20 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   // element holding only whitespace — all leave the user with a landmark that
   // announces itself as blank, which is worse than no landmark at all. So the
   // question is not "is the attribute there" but "does anything come back".
+  // Has this SVG element been given a name by ANY of SVG's four ways? Asked by
+  // the role mapping, so it must not run the whole name computation (which asks
+  // for the role) — the narrow question is enough.
+  function _svgNamed(el) {
+    if (_authorNamedNonBlank(el)) return true;
+    if (!_isBlankASCII(_attr(el, 'xlink:title'))) return true;
+    if (!_isBlankASCII(_attr(el, 'title'))) return true;
+    for (const c of el.childNodes) {
+      if (c.nodeType === 1 && c.localName === 'title' &&
+          c.namespaceURI === _SVG_NS && !_isBlankASCII(c.textContent)) return true;
+    }
+    return false;
+  }
+
   function _authorNamedNonBlank(el) {
     if (!_isBlankASCII(_attr(el, 'aria-label'))) return true;
     for (const t of _idrefs(el, 'aria-labelledby')) {
@@ -78470,6 +78651,10 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
           return _fromContent(c, _sub(ctx, true));
         }
       }
+      // SVG 1.1's own tooltip attribute, below the <title> element and above
+      // the plain `title` that step 2I will reach. Still all over the web.
+      const xt = _attr(el, 'xlink:title');
+      if (!_isBlankASCII(xt)) return xt;
       return null;
     }
     if (!_isHTML(el)) return null;
@@ -78597,7 +78782,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 
   const _sub = (ctx, recursion) => ({
     visited: ctx.visited, labelledby: ctx.labelledby, owners: ctx.owners,
-    recursion: recursion !== false, hiddenOK: false,
+    actions: ctx.actions, recursion: recursion !== false, hiddenOK: false,
   });
 
   // aria-owns RELOCATES a subtree in the accessibility tree: the owner reads it,
@@ -78623,6 +78808,23 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     return map;
   }
 
+  // Every element any `aria-actions` in this tree points at. Built once per
+  // computation, like the aria-owns map above.
+  function _actionTargets(ctx, el) {
+    if (ctx.actions) return ctx.actions;
+    const set = new Set();
+    let hosts = [];
+    try {
+      const root = el.getRootNode ? el.getRootNode() : el.ownerDocument;
+      hosts = Array.prototype.slice.call(
+        (root && root.querySelectorAll ? root : el.ownerDocument)
+          .querySelectorAll('[aria-actions]'));
+    } catch (e) { hosts = []; }
+    for (const h of hosts) for (const t of _idrefs(h, 'aria-actions')) set.add(t);
+    ctx.actions = set;
+    return set;
+  }
+
   // Steps 2F/2H — the text alternative of everything inside, in order.
   function _fromContent(el, ctx) {
     if (_isHTML(el) && _OPAQUE_CONTROLS.has(el.localName)) return '';
@@ -78631,14 +78833,20 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     // was hidden — a hidden span under a VISIBLE referenced node stays hidden.
     const childHiddenOK = ctx.hiddenOK && _hiddenNode(el);
     const owners = _ownerMap(ctx, el);
+    const actions = _actionTargets(ctx, el);
     for (const child of _a11yChildren(el)) {
       if (child.nodeType === 1) {
         const owner = owners.get(child);
         if (owner && owner !== el) continue;   // read where it was relocated to
+        // An `aria-actions` target is a SEPARATE control that happens to sit
+        // inside its host. Folding its text into the host's name gives you a
+        // button called "Save document Edit" — two commands in one label, and
+        // a user who cannot tell which one they are about to press.
+        if (actions.has(child)) continue;
       }
       const sub = _accName(child, {
         visited: ctx.visited, labelledby: ctx.labelledby, owners: ctx.owners,
-        recursion: true, hiddenOK: childHiddenOK,
+        actions: ctx.actions, recursion: true, hiddenOK: childHiddenOK,
       });
       if (!sub) continue;
       const cs = child.nodeType === 1 ? _CS(child) : null;
@@ -78727,14 +78935,14 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
             ctx.visited.delete(node);
             parts.push(_accName(node, {
               visited: ctx.visited, labelledby: true, recursion: true,
-              hiddenOK: true, owners: ctx.owners,
+              hiddenOK: true, owners: ctx.owners, actions: ctx.actions,
             }));
             ctx.visited.add(node);
             continue;
           }
           parts.push(_accName(t, {
             visited: ctx.visited, labelledby: true, recursion: true,
-            hiddenOK: true, owners: ctx.owners,
+            hiddenOK: true, owners: ctx.owners, actions: ctx.actions,
           }));
         }
         const s = _flattenWS(parts.join(' '));
@@ -78809,9 +79017,126 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     if (!el || el.nodeType !== 1) return '';
     return _flattenWS(_accName(el, {
       visited: new Set(), labelledby: false, recursion: false, hiddenOK: false,
-      owners: null,
+      owners: null, actions: null,
     }));
   }
+
+  // The Document half of ariaNotify (see __ariaNotify, defined with the ARIA
+  // reflection above — `Document` was still in its temporal dead zone there).
+  Object.defineProperty(Document.prototype, 'ariaNotify', {
+    configurable: true, enumerable: true, writable: true, value: __ariaNotify,
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // THE ACCESSIBILITY TREE
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Role and name answer "what is this ONE element". A screen-reader user
+  // pressing "next heading", and an agent asked to "click Submit in the payment
+  // form", both need something else: the SHAPE — what contains what, in the
+  // order a person meets it, with the scaffolding taken out.
+  //
+  // That shape is not the DOM. Three differences, and each of them is the whole
+  // point: a `display:none` or `aria-hidden` subtree is NOT IN THE TREE AT ALL;
+  // a `role="none"` container is not in it either, but its children ARE —
+  // they are PROMOTED to its parent, because the author asked to hide the box,
+  // not what is in it; and an element with no role of its own (a `<span>`
+  // wrapper) is transparent the same way.
+  //
+  // Ids are minted lazily and are stable for the life of the document, so a
+  // caller can hold one and come back to it.
+  let _axSeq = 0;
+  const _axIds = new WeakMap();
+  const _axById = new Map();
+  function _axId(el) {
+    let id = _axIds.get(el);
+    if (id === undefined) {
+      id = 'ax-' + (++_axSeq);
+      _axIds.set(el, id);
+      _axById.set(id, el);
+    }
+    return id;
+  }
+  const _axRemoved = (el) =>
+    _attr(el, 'aria-hidden') === 'true' || _hostHiddenAncestral(el);
+  function _axIncluded(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (_axRemoved(el)) return false;
+    const r = _computedRole(el);
+    return r !== '' && r !== 'none' && r !== 'presentation';
+  }
+  function _axChildren(el) {
+    const out = [];
+    (function walk(node) {
+      for (const c of _a11yChildren(node)) {
+        if (c.nodeType !== 1) continue;
+        if (_axRemoved(c)) continue;          // gone, and so is everything in it
+        if (_axIncluded(c)) out.push(c);
+        else walk(c);                          // transparent: promote its children
+      }
+    })(el);
+    return out;
+  }
+  function _axParent(el) {
+    for (let p = el.parentNode; p && p.nodeType === 1; p = p.parentNode) {
+      if (_axIncluded(p)) return p;
+    }
+    return null;
+  }
+  // "Checked" is a THREE-state answer (true / false / mixed), and the third one
+  // is not decoration: a "select all" box over a partial selection must say so.
+  const _AX_CHECKABLE = new Set([
+    'checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio',
+    'option', 'treeitem',
+  ]);
+  // A control that CAN be checked and does not say it is, is not "unknown" —
+  // it is unchecked, and the user needs to be told that rather than told
+  // nothing. (`option`/`treeitem` are excluded: for those, checkedness is
+  // genuinely optional and absence means the concept does not apply.)
+  const _AX_DEFAULT_UNCHECKED = new Set([
+    'checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio',
+  ]);
+  function _axChecked(el, role) {
+    const ac = _attr(el, 'aria-checked');
+    if (ac != null) return String(ac);
+    if (!_AX_CHECKABLE.has(role)) return undefined;
+    if (_isHTML(el) && el.localName === 'input') {
+      const t = _inputType(el);
+      if (t === 'checkbox' || t === 'radio') {
+        if (el.indeterminate) return 'mixed';
+        return el.checked ? 'true' : 'false';
+      }
+    }
+    return _AX_DEFAULT_UNCHECKED.has(role) ? 'false' : undefined;
+  }
+  function _axProps(el) {
+    if (!el || el.nodeType !== 1) return null;
+    const role = _computedRole(el);
+    const parent = _axParent(el);
+    const props = {
+      accessibilityId: _axId(el),
+      role: role,
+      label: _computedLabel(el),
+      parent: parent ? _axId(parent) : null,
+      children: _axChildren(el).map(_axId),
+    };
+    const ck = _axChecked(el, role);
+    if (ck !== undefined) props.checked = ck;
+    for (const [k, a] of [['description', 'aria-description'],
+                          ['expanded', 'aria-expanded'],
+                          ['selected', 'aria-selected'],
+                          ['pressed', 'aria-pressed'],
+                          ['disabled', 'aria-disabled'],
+                          ['level', 'aria-level']]) {
+      const v = _attr(el, a);
+      if (v != null) props[k] = String(v);
+    }
+    return props;
+  }
+  globalThis.__obscuraA11yProps = (el) => _axProps(el);
+  globalThis.__obscuraA11yPropsById = (id) => {
+    const el = _axById.get(id);
+    return el ? _axProps(el) : null;
+  };
 
   Object.defineProperty(Element.prototype, 'computedRole', {
     configurable: true, enumerable: true,
