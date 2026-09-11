@@ -542,12 +542,36 @@ impl ObscuraJsRuntime {
         Ok(())
     }
 
+    /// The wall-clock budget one classic `<script>` gets before the watchdog
+    /// terminates it.
+    ///
+    /// ⚠️ This used to be five seconds, and only for scripts of 10 kB or more —
+    /// which got both halves of the question wrong. A fifty-byte `while (1) {}`
+    /// was exempt and hung the engine thread (and therefore CDP) forever, while
+    /// a large, perfectly well-behaved script was killed for being slow on the
+    /// modest hardware this browser exists to serve. WPT's own
+    /// `html/dom/reflection-*.html` — 27,000 subtests between three files — is
+    /// exactly that second case: it *generates* its tests, takes well over five
+    /// seconds to do it, and was being executed rather than merely slowed down.
+    ///
+    /// So: every script is guarded, and the budget is generous — measured
+    /// against the heaviest generators WPT has, which need 10-25 s of script
+    /// time on this engine. A page is allowed to be slow; it is not allowed to
+    /// be infinite. `OBSCURA_SCRIPT_TIMEOUT_MS=0` disables the watchdog
+    /// entirely; any other value overrides the default in milliseconds.
+    fn script_budget() -> std::time::Duration {
+        static BUDGET: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            let ms = std::env::var("OBSCURA_SCRIPT_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(60_000);
+            std::time::Duration::from_millis(ms)
+        })
+    }
+
     pub fn execute_script_guarded(&mut self, _name: &str, source: &str) -> Result<(), String> {
-        if source.len() < 10_000 {
-            self.execute_script(_name, source)
-        } else {
-            self.execute_script_with_timeout(source, std::time::Duration::from_secs(5))
-        }
+        self.execute_script_with_timeout(source, Self::script_budget())
     }
 
     pub fn execute_script_with_timeout(
@@ -570,12 +594,31 @@ impl ObscuraJsRuntime {
         ));
         let pair_clone = pair.clone();
 
+        // ⚠️ The deadline is taken HERE, not inside the thread: the budget belongs
+        // to the script, and charging it for however long the OS takes to schedule
+        // a new thread makes a fast page's timeout depend on machine load.
+        let deadline = std::time::Instant::now() + timeout;
+
         let watchdog = std::thread::spawn(move || {
             let (lock, cvar) = &*pair_clone;
             let mut cancelled = lock.lock().unwrap();
-            let deadline = std::time::Instant::now() + timeout;
 
             loop {
+                // ⚠️⚠️ THE PREDICATE IS CHECKED BEFORE WAITING, AND THAT IS THE
+                // WHOLE POINT OF A CONDVAR LOOP. A short script can finish, set
+                // the flag and call `notify_one()` before this thread has even
+                // been scheduled — and a notification sent before anyone is
+                // waiting is simply GONE. Without this check the watchdog then
+                // waits out the entire budget and `watchdog.join()` below blocks
+                // the ENGINE THREAD for exactly that long: not a hung script, a
+                // hung browser, with nothing in the log to say so. The bug was
+                // survivable while the budget was five seconds and only large
+                // scripts were guarded; at sixty seconds, for every script, it
+                // froze whole pages. Measured: `urlpattern.any.html` took 12 s at
+                // a 5 s budget and 52 s at a 25 s one, with zero scripts killed.
+                if *cancelled {
+                    return;
+                }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     isolate_handle.terminate_execution();
@@ -584,9 +627,6 @@ impl ObscuraJsRuntime {
 
                 let result = cvar.wait_timeout(cancelled, remaining).unwrap();
                 cancelled = result.0;
-                if *cancelled {
-                    return;
-                }
             }
         });
 
@@ -608,6 +648,17 @@ impl ObscuraJsRuntime {
                 let msg = e.to_string();
                 if msg.contains("Uncaught Error: execution terminated") {
                     tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
+                    // ⭐⭐ TERMINATION IS STICKY. `terminate_execution()` does not
+                    // just unwind the running script — it puts the isolate into a
+                    // terminating state that makes EVERY subsequent entry into JS
+                    // bail out immediately, until `cancel_terminate_execution()`
+                    // clears it. Without this line the watchdog did not kill a
+                    // script, it killed the page: the document stopped running its
+                    // remaining scripts, its event handlers, and every
+                    // `Runtime.evaluate` a CDP client sent afterwards — which is
+                    // why a slow page read to a driver as a browser that had
+                    // silently stopped answering.
+                    self.runtime.v8_isolate().cancel_terminate_execution();
                     self.runtime.execute_script("<reset>", "undefined".to_string()).ok();
                     Ok(())
                 } else {

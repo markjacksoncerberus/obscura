@@ -1760,12 +1760,17 @@ const _parseStyleDecls = (text, opts) => {
       else if (name === 'font-family') {
         // Canonicalize a valid font-family the same way setProperty does: a quoted
         // <family-name> that is a valid unquoted <custom-ident> sequence drops its
-        // quotes (CSSOM / css-fonts-4 issue #5846). CSS-wide / var()-env() untouched;
-        // an invalid value is left as-is (the generic light canon already ran).
+        // quotes (CSSOM / css-fonts-4 issue #5846). CSS-wide / var()-env() untouched.
+        // ⚠️ An INVALID value is DROPPED, exactly as `setProperty` drops it. This
+        // used to be "left as-is", which made the stylesheet parser and the inline
+        // parser disagree about the same string: `.x { font-family: 0simple }`
+        // survived in a rule and vanished in `el.style`. A declaration that
+        // does not parse is not a declaration, wherever it was written.
         const low = value.toLowerCase();
         if (!_CSS_WIDE.has(low) && !_TF_VAR_RE.test(value)) {
           const c = _canonFontFamily(value);
-          if (c !== null) value = c;
+          if (c === null) continue;
+          value = c;
         }
       }
       else if (_ORIGIN_PROPS.has(name)) {
@@ -10347,6 +10352,17 @@ function _ceAttributeChanged(el, localName, oldValue, newValue, namespace) {
 globalThis.self = globalThis;
 
 globalThis.document = null;
+// Parse `url` against `base` (the document URL when omitted) and return the
+// absolute href, or NULL when it does not parse. Every API that takes a URL from
+// the page owes the page this answer: the URL parser rejecting a string is not a
+// detail to swallow — `xhr.open('GET', 'http://[::1')` that quietly succeeds
+// leaves the caller waiting for a response that was never requested.
+const _parseApiUrl = function(url, base) {
+  try {
+    const b = base !== undefined ? base : (_domParse("document_url") || undefined);
+    return new URL(String(url), b).href;
+  } catch (e) { return null; }
+};
 const _resolveUrl = function(url) {
   if (!url) return url;
   if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
@@ -10379,7 +10395,14 @@ const _navigateTo = function(url, opts) {
 };
 globalThis.location = {
   get href() { return _domParse("document_url") ?? "about:blank"; },
-  set href(url) { _navigateTo(_resolveUrl(url)); },
+  // HTML §dom-location-href: parse relative to the API base URL and throw a
+  // "SyntaxError" DOMException when that fails — silently doing nothing leaves a
+  // page believing it has navigated.
+  set href(url) {
+    const abs = _parseApiUrl(url);
+    if (abs === null) throw new DOMException("Failed to set the 'href' property on 'Location': '" + String(url) + "' is not a valid URL.", 'SyntaxError');
+    _navigateTo(abs);
+  },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -10419,7 +10442,9 @@ globalThis.location = {
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { _navigateTo(_resolveUrl(String(url))); },
+  // [PutForwards=href]: `window.location = x` IS `location.href = x`, including
+  // the SyntaxError an unparseable URL earns.
+  set(url) { _locationObj.href = String(url); },
   configurable: false,
   enumerable: true,
 });
@@ -12427,6 +12452,11 @@ globalThis.navigator = {
   // returns false rather than throwing: the caller is told the bytes are not
   // queued, which is the whole contract of the method.
   sendBeacon(url) {
+    // §sendBeacon step 1: parse the URL; failure is a TypeError, not a `false`
+    // return. `false` means "the bytes were not queued"; a URL that does not
+    // parse means the call itself was wrong, and the two deserve different words.
+    if (_parseApiUrl(url) === null)
+      throw new TypeError("Failed to execute 'sendBeacon' on 'Navigator': Invalid URL");
     try {
       if (typeof globalThis.__cspAllowsURL === 'function'
           && !globalThis.__cspAllowsURL('connect-src', String(url), null)) return false;
@@ -13619,6 +13649,12 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     // `new URL(path, origin)`); the spec parses it to a string. Coerce so the
     // string ops below (.startsWith / .includes) work.
     if (url != null && typeof url !== 'string') url = String(url);
+    // §open step 6: "Let parsedURL be the result of parsing url with base…; if
+    // that returns failure, throw a 'SyntaxError' DOMException." Without this,
+    // `open()` on a broken URL succeeded and `send()` waited on a request the
+    // network layer had already refused to make.
+    if (_parseApiUrl(url) === null)
+      throw new DOMException("Failed to execute 'open' on 'XMLHttpRequest': Invalid URL", 'SyntaxError');
     this._url = url;
     // Snapshot a blob: URL's bytes at open() (spec: the request references the
     // blob now) so a revokeObjectURL before send() doesn't break the fetch.
@@ -28680,7 +28716,7 @@ const _familyReserved = (l) => _FONT_GENERIC.has(l) || _CSS_WIDE.has(l) || l ===
 const _serFamilyString = (content) => {
   const toks = content.split(/\s+/).filter(Boolean);
   if (toks.length && content === toks.join(' ') && toks.every(_isFamilyIdent)
-      && !toks.some((t) => _familyReserved(t.toLowerCase())))
+      && !(toks.length === 1 && _familyReserved(toks[0].toLowerCase())))
     return toks.join(' ');
   return '"' + content.replace(/["\\]/g, '\\$&') + '"';
 };
@@ -28693,7 +28729,13 @@ const _canonOneFamily = (p) => {
   const lows = toks.map((t) => t.toLowerCase());
   if (toks.length === 1 && _FONT_GENERIC.has(lows[0])) return lows[0];  // generic → lowercased
   if (!toks.every(_isFamilyIdent)) return null;
-  if (lows.some(_familyReserved)) return null;               // a reserved keyword can't be an unquoted family
+  // ⚠️ A reserved keyword is excluded only when it is the WHOLE family name.
+  // `<family-name>` is `<custom-ident>+`, and the exclusion belongs to the
+  // name, not to each word in it — so `font-family: simple default` and
+  // `font-family: bongo inherit` are perfectly ordinary two-word family names,
+  // and rejecting them threw away 432 subtests' worth of valid declarations
+  // (and, on a real page, the font the author asked for).
+  if (toks.length === 1 && _familyReserved(lows[0])) return null;
   return toks.join(' ');
 };
 // font-family: [ <family-name> | <generic-family> ]#.
@@ -30737,6 +30779,61 @@ const _parseLegacyColor = (raw) => {
   const v = (h) => parseInt(h.padStart(2, '0').slice(0, 2), 16) || 0;
   return 'rgb(' + v(r) + ', ' + v(g) + ', ' + v(b) + ')';
 };
+// HTML "rules for parsing dimension values" — the grammar behind `<img width=200>`.
+// Deliberately NOT `parseFloat`: the exponent in `20.25e2` is not part of this
+// grammar (it means 20.25, not 2025), a `+` sign is a parse failure, and `200 %`
+// is two hundred PIXELS because the space ends the number. This is the markup a
+// 1998 page is made of, and getting it wrong lays that page out at the wrong size.
+const _parseHtmlDimension = (raw) => {
+  const s = String(raw);
+  let i = 0;
+  while (i < s.length && (s[i] === ' ' || s[i] === '\t' || s[i] === '\n' || s[i] === '\f' || s[i] === '\r')) i++;
+  if (i >= s.length || s[i] < '0' || s[i] > '9') return null;
+  let value = 0;
+  while (i < s.length && s[i] >= '0' && s[i] <= '9') { value = value * 10 + (s.charCodeAt(i) - 48); i++; }
+  if (i < s.length && s[i] === '.') {
+    i++;
+    let divisor = 1;
+    while (i < s.length && s[i] >= '0' && s[i] <= '9') {
+      divisor *= 10;
+      value += (s.charCodeAt(i) - 48) / divisor;
+      i++;
+    }
+  }
+  const percent = i < s.length && s[i] === '%';
+  return { value, percent };
+};
+// A dimension attribute → its CSS value, or null. `ignoringZero` is the spec's
+// second flavour: a `<td width=0>` is not a request for a zero-width cell, it is
+// an author writing nothing.
+const _dimensionHintValue = (raw, ignoringZero) => {
+  const d = _parseHtmlDimension(raw);
+  if (d === null) return null;
+  if (ignoringZero && d.value === 0) return null;
+  return d.percent ? (_serNumber(d.value) + '%') : (_serNumber(d.value) + 'px');
+};
+// Which elements map `width`/`height`, and whether zero counts (HTML §rendering
+// "maps to the dimension property"). `input` only as an image button — a text
+// field's `width` attribute means nothing.
+const _DIM_WH = {
+  hr: { width: true },
+  iframe: { width: true, height: true },
+  marquee: { width: true, height: true },
+  video: { width: true, height: true },
+  object: { width: true, height: true },
+  embed: { width: true, height: true },
+  img: { width: true, height: true },
+  input: { width: true, height: true },
+  td: { width: 'nz', height: 'nz' },
+  th: { width: 'nz', height: 'nz' },
+  table: { width: 'nz', height: true },
+  tr: { height: true },
+  col: { width: true },
+  colgroup: { width: true },
+};
+// `hspace`/`vspace` — the pre-CSS way of asking for breathing room around an
+// image. Each maps to the two margins on its axis.
+const _DIM_SPACE = new Set(['embed', 'img', 'object', 'input', 'marquee']);
 const _presHintDecls = (el) => {
   // Returns a decls map { name: {value, important} } of presentational-hint
   // declarations for `el`, or null when the element contributes none.
@@ -30778,6 +30875,54 @@ const _presHintDecls = (el) => {
     if (el.localName === 'body') {
       const tx = el.getAttribute('text');
       if (tx != null && tx !== '') { const c = _parseLegacyColor(tx); if (c) set('color', c); }
+    }
+    // ── The dimension attributes ────────────────────────────────────────────
+    const ln = el.localName;
+    const wh = _DIM_WH[ln];
+    if (wh && !(ln === 'input' && String(el.getAttribute('type') || '').toLowerCase() !== 'image')) {
+      for (const prop of ['width', 'height']) {
+        if (!wh[prop]) continue;
+        const raw = el.getAttribute(prop);
+        if (raw == null) continue;
+        const v = _dimensionHintValue(raw, wh[prop] === 'nz');
+        if (v !== null) set(prop, v);
+      }
+    }
+    if (_DIM_SPACE.has(ln) && !(ln === 'input' && String(el.getAttribute('type') || '').toLowerCase() !== 'image')) {
+      const hs = el.getAttribute('hspace');
+      if (hs != null) {
+        const v = _dimensionHintValue(hs, false);
+        if (v !== null) { set('margin-left', v); set('margin-right', v); }
+      }
+      const vs = el.getAttribute('vspace');
+      if (vs != null) {
+        const v = _dimensionHintValue(vs, false);
+        if (v !== null) { set('margin-top', v); set('margin-bottom', v); }
+      }
+    }
+    // ⭐ A `<source>`'s dimensions belong to the `<img>` it stands in for. Inside
+    // a `<picture>` the source is the one that describes the resource actually
+    // chosen, so the aspect ratio the author declared there has to reach the
+    // image — otherwise a responsive picture reflows the whole page when it
+    // finally loads, which on a slow connection is the difference between a
+    // readable article and a moving target.
+    if (ln === 'img') {
+      let parent = null;
+      try { parent = el.parentElement; } catch (e) {}
+      if (parent && parent.localName === 'picture') {
+        for (const prop of ['width', 'height']) {
+          if (el.getAttribute(prop) != null) continue;   // the img's own attribute wins
+          let node = el.previousElementSibling;
+          let src = null;
+          while (node) {
+            if (node.localName === 'source' && node.getAttribute(prop) != null) { src = node; break; }
+            node = node.previousElementSibling;
+          }
+          if (!src) continue;
+          const v = _dimensionHintValue(src.getAttribute(prop), false);
+          if (v !== null) set(prop, v);
+        }
+      }
     }
   } catch (e) {}
   return decls;
@@ -31572,6 +31717,12 @@ const _specifiedDecl = (el, kebab) => {
 // computed-style / CSS.supports machinery understands. Drives the proxy `has`
 // trap (so `'color' in getComputedStyle(el)` is true) and CSS.supports().
 const _toCamel = (k) => k.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+// Every IDL attribute name generated for a CSS property (camel-cased, dashed and
+// webkit-cased). Filled in where they are defined, far below; read by the
+// computed-style proxy, which must resolve a property NAME before it delegates
+// to the backing declaration object.
+const _CSS_IDL_ATTRS = new Set();
+const _isCssIdlAttribute = (name) => _CSS_IDL_ATTRS.has(name);
 const _CSS_KNOWN_PROPS = (() => {
   const set = new Set();
   const add = (k) => { set.add(k); set.add(_toCamel(k)); };
@@ -31618,6 +31769,7 @@ const _CSS_KNOWN_PROPS = (() => {
   add('container-type'); add('container-name'); add('container');  // css-contain container-query properties (unblocks CSS.supports('container-type:size'))
   return set;
 })();
+
 // The (kebab) property names a computed style exposes when enumerated — every
 // property getComputedStyle can resolve a value for (CSSOM: a computed style
 // declaration's supported property indices). Custom properties with a computed
@@ -33588,13 +33740,22 @@ globalThis.getComputedStyle = function getComputedStyle(el, _pseudo = null) {
       };
       if (prop === Symbol.iterator) return function* () { for (const n of enumNames()) yield n; };
       if (typeof prop === 'string' && /^\d+$/.test(prop)) return enumNames()[Number(prop)];
+      // ⚠️⚠️ A COMPUTED STYLE ANSWERS FROM THE COMPUTED VALUES, NOT FROM THE
+      // ELEMENT'S INLINE DECLARATION. `target` is the backing
+      // CSSStyleProperties, and now that every CSS property has a real IDL
+      // attribute on that prototype, `'fontSize' in target` is TRUE — so the
+      // delegation below would hand back the *inline* font-size (empty on almost
+      // every element) instead of the resolved `16px`. Property names resolve
+      // first; only genuine interface members (`parentRule`, `setProperty`, …)
+      // fall through to the target.
+      if (typeof prop === 'string' && _isCssIdlAttribute(prop)) return resolve(prop);
       if (prop in target) return target[prop];
       if (typeof prop === 'string') return resolve(prop);
       return undefined;
     },
     has(target, prop) {
       if (prop in target) return true;
-      return typeof prop === 'string' && _CSS_KNOWN_PROPS.has(prop);
+      return typeof prop === 'string' && (_CSS_KNOWN_PROPS.has(prop) || _isCssIdlAttribute(prop));
     }
   });
 };
@@ -34258,6 +34419,11 @@ const _mqParseFeature = (paren) => {
     if (ci === -1) {                                       // (name) — boolean form
       const name = inner.toLowerCase();
       if (!_MQ_IDENT_RE.test(name)) return null;
+      // `min-`/`max-` features are the legacy spelling of a COMPARISON, so they
+      // have no boolean form: `(min-width)` is not "is there a width", it is a
+      // sentence with the second half missing. MQ4 makes it <general-enclosed>,
+      // which is a different thing from a parse error — see `_mqParseQuery`.
+      if (_mqMinMax(name)) return null;
       return { name: _mqStripRange(name), bool: true, minmax: _mqMinMax(name) };
     }
     const name = inner.slice(0, ci).trim().toLowerCase();
@@ -34269,16 +34435,19 @@ const _mqParseFeature = (paren) => {
   const parts = inner.split(/(<=|>=|<|>|=)/).map((s) => s.trim());
   if (parts.length === 3) {
     const [a, op, b] = parts;
-    const aIsName = _MQ_IDENT_RE.test(a.toLowerCase()) && _mqKnown(a.toLowerCase());
+    // ⚠️ The range syntax and the `min-`/`max-` prefixes are two spellings of the
+    // same idea, and MQ4 forbids mixing them: `(min-width > 0px)` says "greater
+    // than" twice and means neither.
+    const aIsName = _MQ_IDENT_RE.test(a.toLowerCase()) && _mqKnown(a.toLowerCase()) && !_mqMinMax(a.toLowerCase());
     if (aIsName) return { name: a.toLowerCase(), op, raw: b };
     const bName = b.toLowerCase();
-    if (!_mqKnown(bName)) return null;
+    if (!_mqKnown(bName) || _mqMinMax(bName)) return null;
     return { name: bName, op: _mqFlipOp(op), raw: a };      // `(200px <= width)`
   }
   if (parts.length === 5) {
     const [a, op1, nm, op2, b] = parts;
     const name = nm.toLowerCase();
-    if (!_mqKnown(name)) return null;
+    if (!_mqKnown(name) || _mqMinMax(name)) return null;
     // `(v1 < width < v2)` — both bounds must point the same direction.
     if ((op1[0] === '<') !== (op2[0] === '<')) return null;
     return { name, range2: [{ op: _mqFlipOp(op1), raw: a }, { op: op2, raw: b }] };
@@ -34307,6 +34476,7 @@ const _mqParseQuery = (raw) => {
   }
   if (!type) type = 'all';
   const features = [];
+  let unknown = false;
   let expectAnd = i > 0 && (modifier !== '' || toks[0][0] !== '(');
   for (; i < toks.length; i++) {
     const t = toks[i];
@@ -34319,13 +34489,22 @@ const _mqParseQuery = (raw) => {
     if (t[0] !== '(') return null;
     if (t[t.length - 1] !== ')') return null;       // unterminated paren group
     const f = _mqParseFeature(t);
-    if (!f) return null;
-    if (!_mqKnown(f.name)) return null;             // unknown feature → `not all`
+    // ⭐ UNPARSEABLE AND UNKNOWN ARE NOT THE SAME ANSWER (MQ4 §error-handling).
+    // A balanced `( <any-value> )` the UA does not understand — a feature from a
+    // spec we have not shipped, a range with two comparisons pointing opposite
+    // ways — is <general-enclosed>: it PARSES, it is kept verbatim in
+    // `mediaText`, and it evaluates to *unknown*, which is false and stays false
+    // under `not`. Collapsing it to `not all` instead would erase the author's
+    // text and — worse — make `not (some-future-feature)` come out TRUE, which
+    // is how a page ends up serving the fallback to the one browser that will
+    // support the feature next year. A grammar error at the QUERY level
+    // (`only (orientation)`, `not not …`, a bare `or`) is a real parse failure.
+    if (!f || !_mqKnown(f.name)) { unknown = true; expectAnd = true; continue; }
     features.push(f);
     expectAnd = true;
   }
-  if (!expectAnd && features.length === 0 && toks.length > (modifier ? 2 : 1)) return null;
-  return { modifier, type, features };
+  if (!expectAnd && features.length === 0 && !unknown && toks.length > (modifier ? 2 : 1)) return null;
+  return { modifier, type, features, unknown };
 };
 // Resolve a parsed value against the context (viewport-relative units need it).
 const _mqResolve = (v, ctx) => {
@@ -34374,6 +34553,9 @@ const _mqEvalFeature = (f, ctx) => {
 // Evaluate a whole parsed query (`not` inverts the type+features result).
 const _mqEvalQuery = (q, ctx) => {
   if (q === null) return false;                       // `not all`
+  // `unknown` is a third truth value, not a false one: `not unknown` is unknown,
+  // and a query whose result is unknown does not match.
+  if (q.unknown) return false;
   const typeOk = q.type === 'all' || _MQ_TYPES_MATCHING.has(q.type);
   const result = typeOk && q.features.every((f) => _mqEvalFeature(f, ctx));
   return q.modifier === 'not' ? !result : result;
@@ -34413,7 +34595,11 @@ const _mqContextFor = (win) => {
 
 const _splitMediaText = (v) =>
   String(v == null ? '' : (typeof v === 'string' ? v : (v.mediaText || '')))
-    .split(',').map((s) => s.trim()).filter(Boolean).map(_serMediaQuery);
+    .split(',').map((s) => s.trim()).filter(Boolean)
+    // ⚠️ The same MQ4 error handling `matchMedia().media` applies. Without it a
+    // `@media only (orientation) {}` rule reported its own broken prelude back
+    // as if the browser had understood it.
+    .map((q) => (_mqParseQuery(q) === null ? 'not all' : _serMediaQuery(q)));
 const _makeMediaList = (text) => {
   _allowMediaListCtor = true;
   let ml; try { ml = new MediaList(); } finally { _allowMediaListCtor = false; }
@@ -35235,8 +35421,7 @@ const _named = (kind, attr, fn) => {
 // (CSSFontFaceDescriptors) pass idlharness's inherited-interface existence checks and
 // authors can brand-check against it. (It stays internally constructible.)
 _exposeIface('CSSStyleDeclaration', CSSStyleDeclaration);
-_exposeIface('CSSStyleProperties', CSSStyleProperties);   // the concrete live-style interface
-// The CSSOM list interfaces (defined earlier, before these helpers existed): expose
+_exposeIface('CSSStyleProperties', CSSStyleProperties);   // the concrete live-style interface// The CSSOM list interfaces (defined earlier, before these helpers existed): expose
 // each interface object non-enumerable + stamp its IDL members enumerable on the
 // prototype (idlharness requires attributes/operations to be enumerable own props).
 _exposeIface('MediaList', MediaList);
@@ -46427,6 +46612,16 @@ globalThis.CSS = {
       const name = String(prop).trim().toLowerCase();
       const val = String(value).trim();
       if (!val) return false;
+      // ⭐ A CSS-WIDE KEYWORD IS VALID IN EVERY DECLARATION. `inherit`,
+      // `initial`, `unset`, `revert` and `revert-layer` are part of the grammar
+      // of a declaration, not of any property's value — so the only question
+      // they raise is whether the PROPERTY exists. Most of the per-family
+      // branches below remembered that and a dozen did not, which made
+      // `CSS.supports('align-content', 'inherit')` answer **false** while
+      // `alignContent` sat right there on the style object. Asked once, at the
+      // top, out of the same registry the IDL attributes are built from, the two
+      // answers cannot drift apart again.
+      if (_CSS_WIDE.has(val.toLowerCase()) && _cssPropertyRecognized(name)) return true;
       if (_GAP_RULE_SH[name]) {                            // css-gaps column-rule/row-rule/rule shorthand
         if (/\bvar\(/i.test(val)) return true;             // var() is syntactically valid
         return _parseGapRuleShorthand(_canonStandardValue(val)) != null;  // validate the <gap-rule-list>
@@ -46767,6 +46962,100 @@ globalThis.CSS = {
     return _serializeCssIdent(String(ident));
   }
 };
+
+// ── One list of "is this a CSS property this engine knows", and one only ─────
+// `CSS.supports()` decides property-hood by walking a long chain of per-family
+// validators; `_CSS_KNOWN_PROPS` is the registry `getComputedStyle` enumerates
+// from. They were never the same list — `ruby-align` was supported and not in
+// the registry; `align-content` was in the registry and reported unsupported —
+// and a browser that gives two answers to "do you support this?" is worse for a
+// page than one that says no twice, because feature detection picks the wrong
+// branch and stays there. This unions them, so the property registry, the
+// `supports()` short-circuit above and the CSSStyleProperties IDL attributes
+// below are all one answer.
+const _CSS_SUPPORTED_PROPS = (() => {
+  const set = new Set();
+  const addAll = (src) => {
+    if (!src) return;
+    const keys = (src instanceof Set) ? src : Object.keys(src);
+    for (const k of keys) if (typeof k === 'string' && !/[A-Z]/.test(k)) set.add(k);
+  };
+  addAll(_CSS_KNOWN_PROPS);
+  addAll(_ALIGN_PROPS); addAll(_ALIGN_SHORTHAND_LH); addAll(_BORDER_EXPAND);
+  addAll(_BORDER_LOGICAL_SH); addAll(_BORDER_LOGICAL_LH); addAll(_BOX_LOGICAL_SH2);
+  addAll(_BOX_LOGICAL_LH); addAll(_CORNER_COMBINED_SH); addAll(_CORNER_SHAPE_SH);
+  addAll(_GAP_BIDI_SH); addAll(_GAP_RULE_SH); addAll(_GRID_GAP_ALIAS);
+  addAll(_RI_SH); addAll(_RI_LEAF); addAll(_SCROLL_SH_LH); addAll(_SCROLL_LONGHANDS);
+  addAll(_BG_VALIDATED); addAll(_BI_VALIDATED); addAll(_COLOR_PROPS);
+  addAll(_COUNTER_VALIDATED); addAll(_CSSTEXT_VALIDATED); addAll(_CSSUI_VALIDATED);
+  addAll(_GRID_LINE_LH); addAll(_GRID_VALIDATED); addAll(_LISTSTYLE_VALIDATED);
+  addAll(_MASK_VALIDATED); addAll(_MATH_PROP_VALIDATED); addAll(_MULTICOL_VALIDATED);
+  addAll(_OVERFLOW_VALIDATED); addAll(_TEXTDECOR_VALIDATED); addAll(_TEXTEMPHASIS_VALIDATED);
+  addAll(_RADIUS_ALIAS);
+  // The properties `supports()` answers for by name rather than by table.
+  for (const k of ['background', 'border-image', 'border-radius', 'clip', 'clip-path',
+    'clip-rule', 'column-gap', 'column-rule', 'font', 'gap', 'grid', 'grid-area',
+    'grid-column', 'grid-gap', 'grid-row', 'grid-template', 'grid-template-areas',
+    'list-style', 'mask', 'mask-type', 'overflow', 'overscroll-behavior', 'row-gap',
+    'shape-image-threshold', 'shape-margin', 'shape-outside', 'text-decoration',
+    'text-emphasis']) set.add(k);
+  return set;
+})();
+function _cssPropertyRecognized(name) {
+  return _CSS_SUPPORTED_PROPS.has(name) || _CSS_KNOWN_PROPS.has(_toCamel(name));
+}
+// ── The IDL attributes CSSOM puts on CSSStyleProperties ──────────────────────
+// `el.style.zIndex = '5'` worked. `'zIndex' in el.style` was FALSE — because
+// reads were being answered by a trap rather than by real properties, and a trap
+// answers `get` but not `in`, not `Object.keys`, not a property descriptor, and
+// not a `class extends` that wants to override one. Feature detection on the
+// platform is written as `'gridTemplateAreas' in document.body.style`, so a
+// browser whose style object cannot be *asked* what it supports reports that it
+// supports nothing — which is how a page decides to serve you the 2009 layout.
+//
+// CSSOM gives each supported property up to three attributes, and this builds
+// all three from the same registry `CSS.supports()` answers out of, so the two
+// can never disagree:
+//   • the camel-cased attribute      `z-index`            → `zIndex`
+//   • the dashed attribute           `z-index`            → `z-index`
+//   • the webkit-cased attribute     `-webkit-line-clamp` → `webkitLineClamp`
+// (The webkit-cased form exists ONLY for `-webkit-` properties: `-moz-binding`
+// gets `MozBinding` and never `mozBinding`, and WPT asserts that difference.)
+{
+  const _idlAttrFor = (prop, lowercaseFirst) => {
+    let out = '', up = false;
+    for (const c of (lowercaseFirst ? prop.substring(1) : prop)) {
+      if (c === '-') { up = true; }
+      else if (up) { up = false; out += (c >= 'a' && c <= 'z') ? c.toUpperCase() : c; }
+      else { out += c; }
+    }
+    return out;
+  };
+  const P = CSSStyleProperties.prototype;
+  const _defStyleAttr = (idlName, prop) => {
+    _CSS_IDL_ATTRS.add(idlName);
+    // Never shadow a real interface member (`cssText`, `length`, `item`,
+    // `parentRule`, `cssFloat`, …) with a generated one.
+    if (Object.prototype.hasOwnProperty.call(P, idlName)) return;
+    if (Object.prototype.hasOwnProperty.call(CSSStyleDeclaration.prototype, idlName)) return;
+    Object.defineProperty(P, idlName, {
+      configurable: true, enumerable: true,
+      get: _named('get', idlName, function() { return this.getPropertyValue(prop); }),
+      // [LegacyNullToEmptyString]: `el.style.color = null` clears the
+      // declaration; it does not set the colour to the word "null".
+      set: _named('set', idlName, function(v) { this.setProperty(prop, v == null ? '' : String(v)); }),
+    });
+  };
+  for (const prop of _CSS_SUPPORTED_PROPS) {
+    // The registry holds both spellings of every property; the kebab one is the
+    // CSS property name and the only one to build attributes from.
+    if (/[A-Z]/.test(prop)) continue;
+    _defStyleAttr(_idlAttrFor(prop, false), prop);
+    if (prop.indexOf('-') >= 0) _defStyleAttr(prop, prop);
+    if (prop.startsWith('-webkit-')) _defStyleAttr(_idlAttrFor(prop, true), prop);
+  }
+}
+
 // ── The numeric factory functions ────────────────────────────────────────────
 // css-typed-om §numeric-factory: one function per unit, so `CSS.px(4)` is the
 // whole of what a page needs to write to say "four pixels" as a value rather
@@ -60193,7 +60482,8 @@ class _IframeWindow {
         configurable: true, enumerable: true,
         get() { return _w._url; },
         set(v) {
-          let abs; try { abs = new URL(String(v), _w._url).href; } catch (e) { return; }
+          const abs = _parseApiUrl(v, _w._url);
+          if (abs === null) throw new DOMException("Failed to set the 'href' property on 'Location': '" + String(v) + "' is not a valid URL.", 'SyntaxError');
           try { globalThis._shDocumentNavigate(globalThis._shForFrame(_w), abs, {}); } catch (e) {}
         },
       });
@@ -60208,6 +60498,16 @@ class _IframeWindow {
       this.location.reload = function () {
         try { _w.navigation.reload(); } catch (e) {}
       };
+    }
+    // [PutForwards=href] on the frame's window too: `frame.contentWindow.location
+    // = url` must navigate the frame, not replace the Location object with a string.
+    {
+      const _loc = this.location;
+      Object.defineProperty(this, 'location', {
+        configurable: true, enumerable: true,
+        get() { return _loc; },
+        set(v) { _loc.href = String(v); },
+      });
     }
     // `location.hash` is a live accessor: assigning is a same-document fragment
     // navigation WITHIN the frame — the frame document's URL updates, the
@@ -78718,6 +79018,717 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     // Only vacate Element.prototype once the member has a real home — an engine
     // build missing every named interface must not silently lose the reflection.
     if (homed) delete Element.prototype[member];
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CONTENT-ATTRIBUTE REFLECTION, ON THE INTERFACE THAT OWNS IT
+// (HTML §common-dom-interfaces "Reflecting content attributes in IDL attributes")
+// ═════════════════════════════════════════════════════════════════════════════
+// Reflection is the plainest promise the DOM makes: `img.alt` IS the `alt=""` in
+// the markup, `td.colSpan` IS `colspan="2"`, and a script that sets one has set
+// the other. It is also the promise a page notices the instant it breaks —
+// `a.ping = url` silently becoming an expando means the beacon never fires, and
+// `th.scope` reading `undefined` means a screen reader is told nothing about a
+// table's headers.
+//
+// Obscura had the mechanism (see `__reflectedStringAttrs` and friends far above)
+// but only a hand-picked subset, all of it hung on `Element.prototype` — which
+// cannot express the truth that `a.type` is a plain string while `input.type` is
+// an enumeration limited to twenty keywords, or that `value` means a DOMString
+// on `<data>` and a double on `<meter>`. So 183 reflected members across 33
+// interfaces were simply absent, and every one of them was a page's expectation
+// quietly failing.
+//
+// This table is transcribed from the HTML element index and is keyed by the
+// INTERFACE, so each member lands exactly where WebIDL says it lives. The eleven
+// reflected types below are the spec's own list; the parsing rules
+// (`_rParseInt` / `_rParseNonneg` / `_rParseFloat`) are HTML's, not
+// JavaScript's, which is the whole reason they are written out here: `parseInt`
+// accepts `0x10` and stops at the first junk character, and HTML's rules do
+// neither.
+{
+  const _rMaxInt = 2147483647;
+  const _rMinInt = -2147483648;
+  const _rIsDigit = (c) => c >= '0' && c <= '9';
+  const _rIsWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\f' || c === '\r';
+
+  // HTML "rules for parsing integers" — false on failure (never NaN, because a
+  // caller must be able to tell "the attribute said 0" from "the attribute was
+  // not a number").
+  const _rParseInt = function(input) {
+    let pos = 0, sign = 1;
+    while (pos < input.length && _rIsWs(input[pos])) pos++;
+    if (pos >= input.length) return false;
+    if (input[pos] === '-') { sign = -1; pos++; }
+    else if (input[pos] === '+') pos++;
+    if (pos >= input.length || !_rIsDigit(input[pos])) return false;
+    let value = 0;
+    while (pos < input.length && _rIsDigit(input[pos])) {
+      value = value * 10 + (input.charCodeAt(pos) - 48);
+      pos++;
+    }
+    return value === 0 ? 0 : sign * value;
+  };
+
+  // HTML "rules for parsing non-negative integers".
+  const _rParseNonneg = function(input) {
+    const v = _rParseInt(input);
+    return (v === false || v < 0) ? false : v;
+  };
+
+  // HTML "rules for parsing floating-point number values". Deliberately not
+  // `Number(s)`: HTML accepts a trailing exponent it cannot complete ("1e" is
+  // 1), rejects leading `.` without a digit, and never accepts hex or Infinity.
+  const _rParseFloat = function(input) {
+    let pos = 0, value = 1, divisor = 1, exponent = 1;
+    while (pos < input.length && _rIsWs(input[pos])) pos++;
+    if (pos >= input.length) return false;
+    if (input[pos] === '-') { value = -1; divisor = -1; pos++; }
+    else if (input[pos] === '+') pos++;
+    if (pos >= input.length) return false;
+    if (input[pos] === '.' && pos + 1 < input.length && _rIsDigit(input[pos + 1])) {
+      value = 0;
+    } else if (!_rIsDigit(input[pos])) {
+      return false;
+    } else {
+      let val = 0;
+      while (pos < input.length && _rIsDigit(input[pos])) {
+        val = val * 10 + (input.charCodeAt(pos) - 48);
+        pos++;
+      }
+      value *= val;
+    }
+    if (pos < input.length && input[pos] === '.') {
+      pos++;
+      while (pos < input.length && _rIsDigit(input[pos])) {
+        divisor *= 10;
+        value += (input.charCodeAt(pos) - 48) / divisor;
+        pos++;
+      }
+    }
+    if (pos < input.length && (input[pos] === 'e' || input[pos] === 'E')) {
+      pos++;
+      if (pos < input.length) {
+        if (input[pos] === '-') { exponent = -1; pos++; }
+        else if (input[pos] === '+') pos++;
+        if (pos < input.length && _rIsDigit(input[pos])) {
+          let exp = 0;
+          do {
+            exp = exp * 10 + (input.charCodeAt(pos) - 48);
+            pos++;
+          } while (pos < input.length && _rIsDigit(input[pos]));
+          exponent *= exp;
+          value *= Math.pow(10, exponent);
+        }
+      }
+    }
+    if (!Number.isFinite(value)) return false;
+    return value === 0 ? 0 : value;
+  };
+
+  const _rLower = (s) => String(s).replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+
+  // WebIDL `long` / `unsigned long` conversions: ToNumber, truncate, wrap modulo
+  // 2^32. A page that writes `el.colSpan = 1.9` has written 1, not thrown.
+  const _rToLong = function(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    let x = Math.trunc(n) % 4294967296;
+    if (x >= 2147483648) x -= 4294967296;
+    else if (x < -2147483648) x += 4294967296;
+    return x === 0 ? 0 : x;   // normalise -0
+  };
+  const _rToULong = function(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    let x = Math.trunc(n) % 4294967296;
+    if (x < 0) x += 4294967296;
+    return x === 0 ? 0 : x;
+  };
+
+  const _rIndexSizeError = function() {
+    const DE = globalThis.DOMException;
+    return DE ? new DE('Index or size is negative or greater than the allowed amount', 'IndexSizeError')
+              : new RangeError('IndexSizeError');
+  };
+
+  // HTML enumerated attribute: map a content value to its canonical keyword, or
+  // to the invalid-value default when it matches none. Matching is ASCII
+  // case-insensitive ONLY — U+212A KELVIN SIGN is not a `k`, and U+017F LATIN
+  // SMALL LETTER LONG S is not an `s`, which is exactly what the suite probes.
+  const _rEnumValue = function(spec, raw) {
+    const kws = spec.k;
+    const lower = _rLower(raw);
+    for (let i = 0; i < kws.length; i++) {
+      if (lower === _rLower(kws[i])) {
+        const canon = kws[i];
+        return (spec.n && Object.prototype.hasOwnProperty.call(spec.n, canon)) ? spec.n[canon] : canon;
+      }
+    }
+    return _rEnumDefault(spec, 'i');
+  };
+  // The missing-value ('d') and invalid-value ('i') defaults. `i` falls back to
+  // `d`, and `d` to the empty string ("no state"). Where the spec leaves the
+  // default implementation-defined it hands us an ARRAY of acceptable answers:
+  // we take `metadata` when it is on offer — fetch what the page needs to lay
+  // the media out, and not the media itself, which is the right default for
+  // someone paying by the megabyte.
+  const _rEnumDefault = function(spec, which) {
+    let d = which === 'i' ? spec.i : spec.d;
+    if (d === undefined) d = which === 'i' ? spec.d : undefined;
+    if (d === undefined) return '';
+    if (Array.isArray(d)) return d.includes('metadata') ? 'metadata' : d[0];
+    return d;
+  };
+
+  // Build the {get, set} pair for one reflected member. `attr` is the content
+  // attribute name (lowercased); `spec.t` the reflected type.
+  const _rAccessors = function(attr, spec) {
+    const t = spec.t;
+    switch (t) {
+      case 'string':
+        return {
+          get() { return this.getAttribute(attr) ?? ''; },
+          // [LegacyNullToEmptyString] on the presentational leftovers: `td.bgColor
+          // = null` means "no colour", not the literal text "null".
+          set(v) { this.setAttribute(attr, (spec.nes && v === null) ? '' : String(v)); },
+        };
+      case 'url':
+        return {
+          get() {
+            // form/formAction is the one URL reflection with a non-empty missing
+            // default: a form with no action submits to the page it is on.
+            if (spec.docUrl && !this.hasAttribute(attr)) {
+              try { return this.ownerDocument.URL; } catch (e) { return ''; }
+            }
+            return _reflectURL(this, attr);
+          },
+          set(v) { this.setAttribute(attr, String(v)); },
+        };
+      case 'boolean':
+        return {
+          get() { return this.hasAttribute(attr); },
+          set(v) { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); },
+        };
+      case 'enum':
+        return {
+          get() {
+            const raw = this.getAttribute(attr);
+            if (raw === null) return _rEnumDefault(spec, 'd');
+            return _rEnumValue(spec, raw);
+          },
+          set(v) {
+            if (spec.nul && (v === null || v === undefined)) { this.removeAttribute(attr); return; }
+            this.setAttribute(attr, String(v));
+          },
+        };
+      case 'long':
+        return {
+          get() {
+            const raw = this.getAttribute(attr);
+            const n = raw === null ? false : _rParseInt(raw);
+            if (n === false || n > _rMaxInt || n < _rMinInt) return spec.d ?? 0;
+            return n;
+          },
+          set(v) { this.setAttribute(attr, String(_rToLong(v))); },
+        };
+      case 'limited long':
+        // "limited to only non-negative numbers": a NEGATIVE assignment throws.
+        return {
+          get() {
+            const raw = this.getAttribute(attr);
+            const n = raw === null ? false : _rParseNonneg(raw);
+            if (n === false || n > _rMaxInt) return spec.d ?? -1;
+            return n;
+          },
+          set(v) {
+            const n = _rToLong(v);
+            if (n < 0) throw _rIndexSizeError();
+            this.setAttribute(attr, String(n));
+          },
+        };
+      case 'unsigned long':
+        return {
+          get() {
+            const raw = this.getAttribute(attr);
+            const n = raw === null ? false : _rParseNonneg(raw);
+            if (n === false || n > _rMaxInt) return spec.d ?? 0;
+            return n;
+          },
+          // Out of the signed range on SET falls back to the default rather than
+          // wrapping — a width of 4294967295 is a mistake, not a 4-gigapixel canvas.
+          set(v) {
+            const n = _rToULong(v);
+            this.setAttribute(attr, String(n > _rMaxInt ? (spec.d ?? 0) : n));
+          },
+        };
+      case 'limited unsigned long':
+        // ">0", and zero on SET throws (`input.size = 0` is a bug, not a request).
+        return {
+          get() {
+            const raw = this.getAttribute(attr);
+            const n = raw === null ? false : _rParseNonneg(raw);
+            if (n === false || n < 1 || n > _rMaxInt) return spec.d ?? 1;
+            return n;
+          },
+          set(v) {
+            const n = _rToULong(v);
+            if (n === 0) throw _rIndexSizeError();
+            this.setAttribute(attr, String(n > _rMaxInt ? (spec.d ?? 1) : n));
+          },
+        };
+      case 'limited unsigned long with fallback':
+        // Same range, but a disallowed value is quietly the default — `<textarea>`
+        // must still have a shape when its `cols` is nonsense.
+        return {
+          get() {
+            const raw = this.getAttribute(attr);
+            const n = raw === null ? false : _rParseNonneg(raw);
+            if (n === false || n < 1 || n > _rMaxInt) return spec.d ?? 1;
+            return n;
+          },
+          set(v) {
+            const n = _rToULong(v);
+            this.setAttribute(attr, String((n < 1 || n > _rMaxInt) ? (spec.d ?? 1) : n));
+          },
+        };
+      case 'clamped unsigned long':
+        // colspan/rowspan/span: the GETTER clamps into [min, max]; the setter
+        // writes what it was given. A `colspan="99999"` is not an error in
+        // markup — it means "to the end of the row", and the clamp says so.
+        return {
+          get() {
+            const raw = this.getAttribute(attr);
+            const n = raw === null ? false : _rParseNonneg(raw);
+            if (n === false) return spec.d;
+            if (n < spec.lo) return spec.lo;
+            if (n > spec.hi) return spec.hi;
+            return n;
+          },
+          set(v) {
+            const n = _rToULong(v);
+            this.setAttribute(attr, String(n > _rMaxInt ? spec.d : n));
+          },
+        };
+      case 'double':
+        return {
+          get() {
+            const raw = this.getAttribute(attr);
+            const n = raw === null ? false : _rParseFloat(raw);
+            return n === false ? (spec.d ?? 0) : n;
+          },
+          set(v) {
+            const n = Number(v);
+            this.setAttribute(attr, String(n === 0 ? 0 : n));
+          },
+        };
+      case 'limited double':
+        // "limited to numbers greater than zero": a non-positive assignment is
+        // IGNORED — `progress.max = 0` leaves the bar as it was rather than
+        // making every value infinite.
+        return {
+          get() {
+            const raw = this.getAttribute(attr);
+            const n = raw === null ? false : _rParseFloat(raw);
+            return (n === false || n <= 0) ? (spec.d ?? 0) : n;
+          },
+          set(v) {
+            const n = Number(v);
+            if (!(n > 0)) return;
+            this.setAttribute(attr, String(n));
+          },
+        };
+      default:
+        return null;
+    }
+  };
+
+  const _REFLECTIONS = {
+    HTMLAnchorElement: {
+      coords: {t:"string"},
+      ping: {t:"string"},
+      shape: {t:"string"},
+    },
+    HTMLAreaElement: {
+      alt: {t:"string"},
+      coords: {t:"string"},
+      noHref: {t:"boolean"},
+      ping: {t:"string"},
+      shape: {t:"string"},
+      type: {t:"string"},
+    },
+    HTMLAudioElement: {
+      autoplay: {t:"boolean"},
+      controls: {t:"boolean"},
+      defaultMuted: {t:"boolean", a:"muted"},
+      loading: {t:"enum", d:"eager", i:"eager", k:["lazy", "eager"]},
+      loop: {t:"boolean"},
+      preload: {t:"enum", d:["none", "metadata", "auto"], k:["none", "metadata", "auto"], n:{"": "auto"}},
+    },
+    HTMLBRElement: {
+      clear: {t:"string"},
+    },
+    HTMLButtonElement: {
+      formAction: {t:"url", docUrl:true},
+      formEnctype: {t:"enum", i:"application/x-www-form-urlencoded", k:["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"]},
+      formMethod: {t:"enum", i:"get", k:["get", "post", "dialog"]},
+      formNoValidate: {t:"boolean"},
+      formTarget: {t:"string"},
+      type: {t:"enum", d:"submit", k:["submit", "reset", "button"]},
+      value: {t:"string"},
+    },
+    HTMLCanvasElement: {
+      height: {t:"unsigned long", d:150},
+      width: {t:"unsigned long", d:300},
+    },
+    HTMLDataElement: {
+      value: {t:"string"},
+    },
+    HTMLDirectoryElement: {
+      compact: {t:"boolean"},
+    },
+    HTMLFontElement: {
+      color: {t:"string", nes:true},
+      face: {t:"string"},
+      size: {t:"string"},
+    },
+    HTMLFrameElement: {
+      frameBorder: {t:"string"},
+      longDesc: {t:"url"},
+      marginHeight: {t:"string", nes:true},
+      marginWidth: {t:"string", nes:true},
+      name: {t:"string"},
+      noResize: {t:"boolean"},
+      scrolling: {t:"string"},
+      src: {t:"url"},
+    },
+    HTMLFrameSetElement: {
+      cols: {t:"string"},
+      rows: {t:"string"},
+    },
+    HTMLMarqueeElement: {
+      behavior: {t:"enum", d:"scroll", k:["scroll", "slide", "alternate"]},
+      bgColor: {t:"string"},
+      direction: {t:"enum", d:"left", k:["up", "right", "down", "left"]},
+      height: {t:"string"},
+      hspace: {t:"unsigned long"},
+      scrollAmount: {t:"unsigned long", d:6},
+      scrollDelay: {t:"unsigned long", d:85},
+      trueSpeed: {t:"boolean"},
+      vspace: {t:"unsigned long"},
+      width: {t:"string"},
+    },
+    HTMLFormElement: {
+      autocomplete: {t:"enum", d:"on", k:["on", "off"]},
+      method: {t:"enum", d:"get", k:["get", "post", "dialog"]},
+      noValidate: {t:"boolean"},
+    },
+    HTMLIFrameElement: {
+      allowFullscreen: {t:"boolean"},
+      frameBorder: {t:"string"},
+      longDesc: {t:"url"},
+      marginHeight: {t:"string", nes:true},
+      marginWidth: {t:"string", nes:true},
+      scrolling: {t:"string"},
+      src: {t:"url"},
+      srcdoc: {t:"string"},
+    },
+    HTMLImageElement: {
+      alt: {t:"string"},
+      border: {t:"string", nes:true},
+      decoding: {t:"enum", d:"auto", i:"auto", k:["async", "sync", "auto"]},
+      height: {t:"unsigned long", cg:true},
+      hspace: {t:"unsigned long"},
+      isMap: {t:"boolean"},
+      longDesc: {t:"url"},
+      lowsrc: {t:"url"},
+      srcset: {t:"string"},
+      useMap: {t:"string"},
+      vspace: {t:"unsigned long"},
+      width: {t:"unsigned long", cg:true},
+    },
+    HTMLInputElement: {
+      accept: {t:"string"},
+      alt: {t:"string"},
+      autocomplete: {t:"string", cg:true},
+      defaultValue: {t:"string", a:"value"},
+      dirName: {t:"string"},
+      formAction: {t:"url", docUrl:true},
+      formEnctype: {t:"enum", i:"application/x-www-form-urlencoded", k:["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"]},
+      formMethod: {t:"enum", i:"get", k:["get", "post"]},
+      formNoValidate: {t:"boolean"},
+      formTarget: {t:"string"},
+      height: {t:"unsigned long", cg:true},
+      max: {t:"string"},
+      maxLength: {t:"limited long"},
+      min: {t:"string"},
+      minLength: {t:"limited long"},
+      pattern: {t:"string"},
+      size: {t:"limited unsigned long", d:20},
+      step: {t:"string"},
+      type: {t:"enum", d:"text", k:["hidden", "text", "search", "tel", "url", "email", "password", "date", "month", "week", "time", "datetime-local", "number", "range", "color", "checkbox", "radio", "file", "submit", "image", "reset", "button"]},
+      useMap: {t:"string"},
+      width: {t:"unsigned long", cg:true},
+    },
+    HTMLLabelElement: {
+      htmlFor: {t:"string", a:"for"},
+    },
+    HTMLMeterElement: {
+      high: {t:"double", cg:true},
+      low: {t:"double", cg:true},
+      max: {t:"double", cg:true},
+      min: {t:"double", cg:true},
+      optimum: {t:"double", cg:true},
+      value: {t:"double", cg:true},
+    },
+    HTMLModElement: {
+      cite: {t:"url"},
+    },
+    HTMLObjectElement: {
+      archive: {t:"string"},
+      border: {t:"string", nes:true},
+      code: {t:"string"},
+      codeBase: {t:"url"},
+      codeType: {t:"string"},
+      data: {t:"url"},
+      declare: {t:"boolean"},
+      hspace: {t:"unsigned long"},
+      standby: {t:"string"},
+      useMap: {t:"string"},
+      vspace: {t:"unsigned long"},
+    },
+    HTMLOptGroupElement: {
+      label: {t:"string"},
+    },
+    HTMLOptionElement: {
+      label: {t:"string", cg:true},
+      value: {t:"string", cg:true},
+    },
+    HTMLParamElement: {
+      value: {t:"string"},
+      valueType: {t:"string"},
+    },
+    HTMLProgressElement: {
+      max: {t:"limited double", d:1},
+    },
+    HTMLQuoteElement: {
+      cite: {t:"url"},
+    },
+    HTMLScriptElement: {
+      htmlFor: {t:"string", a:"for"},
+    },
+    HTMLSelectElement: {
+      autocomplete: {t:"string", cg:true},
+      size: {t:"unsigned long", d:0},
+    },
+    HTMLSourceElement: {
+      sizes: {t:"string"},
+      srcset: {t:"string"},
+    },
+    HTMLTableCellElement: {
+      abbr: {t:"string"},
+      axis: {t:"string"},
+      bgColor: {t:"string", nes:true},
+      ch: {t:"string", a:"char"},
+      chOff: {t:"string", a:"charoff"},
+      colSpan: {t:"clamped unsigned long", d:1, lo:1, hi:1000},
+      headers: {t:"string"},
+      height: {t:"string"},
+      noWrap: {t:"boolean"},
+      rowSpan: {t:"clamped unsigned long", d:1, lo:0, hi:65534},
+      scope: {t:"enum", k:["row", "col", "rowgroup", "colgroup"]},
+      vAlign: {t:"string"},
+      width: {t:"string"},
+    },
+    HTMLTableColElement: {
+      ch: {t:"string", a:"char"},
+      chOff: {t:"string", a:"charoff"},
+      span: {t:"clamped unsigned long", d:1, lo:1, hi:1000},
+      vAlign: {t:"string"},
+      width: {t:"string"},
+    },
+    HTMLTableElement: {
+      bgColor: {t:"string", nes:true},
+      border: {t:"string"},
+      cellPadding: {t:"string", nes:true},
+      cellSpacing: {t:"string", nes:true},
+      frame: {t:"string"},
+      rules: {t:"string"},
+      summary: {t:"string"},
+      width: {t:"string"},
+    },
+    HTMLTableRowElement: {
+      bgColor: {t:"string", nes:true},
+      ch: {t:"string", a:"char"},
+      chOff: {t:"string", a:"charoff"},
+      vAlign: {t:"string"},
+    },
+    HTMLTableSectionElement: {
+      ch: {t:"string", a:"char"},
+      chOff: {t:"string", a:"charoff"},
+      vAlign: {t:"string"},
+    },
+    HTMLTextAreaElement: {
+      autocomplete: {t:"string", cg:true},
+      cols: {t:"limited unsigned long with fallback", d:20},
+      dirName: {t:"string"},
+      maxLength: {t:"limited long"},
+      minLength: {t:"limited long"},
+      rows: {t:"limited unsigned long with fallback", d:2},
+      wrap: {t:"string"},
+    },
+    HTMLTrackElement: {
+      default: {t:"boolean"},
+      kind: {t:"enum", d:"subtitles", i:"metadata", k:["subtitles", "captions", "descriptions", "chapters", "metadata"]},
+      label: {t:"string"},
+      srclang: {t:"string"},
+    },
+    HTMLVideoElement: {
+      autoplay: {t:"boolean"},
+      controls: {t:"boolean"},
+      defaultMuted: {t:"boolean", a:"muted"},
+      height: {t:"unsigned long"},
+      loading: {t:"enum", d:"eager", i:"eager", k:["lazy", "eager"]},
+      loop: {t:"boolean"},
+      playsInline: {t:"boolean"},
+      poster: {t:"url"},
+      preload: {t:"enum", d:["none", "metadata", "auto"], k:["none", "metadata", "auto"], n:{"": "auto"}},
+      width: {t:"unsigned long"},
+    },
+  };
+
+  for (const ifaceName in _REFLECTIONS) {
+    const C = globalThis[ifaceName];
+    if (typeof C !== 'function' || !C.prototype) continue;
+    const members = _REFLECTIONS[ifaceName];
+    for (const idlName in members) {
+      const spec = members[idlName];
+      const attr = spec.a || _rLower(idlName);
+      const t = spec.t;
+      const acc = _rAccessors(attr, spec);
+      if (!acc) continue;
+      // ⚠️⚠️ A REFLECTOR IS NOT ALWAYS *ONLY* A REFLECTOR, AND A GENERATED TABLE
+      // MUST NOT ASSUME IT IS. `iframe.src` navigates the frame; `canvas.width`
+      // resets the bitmap; `input.type` re-renders the control. Those side
+      // effects live in the SETTER, and the first version of this loop replaced
+      // them with a bare `setAttribute` — which is how `iframe.src = url`
+      // stopped loading anything at all, and how the ritual earned its keep for
+      // the second time in one arc. So: an accessor that already exists anywhere
+      // on this interface's prototype chain KEEPS its setter, and this table
+      // supplies only the half that was missing.
+      let getter = acc.get;
+      let setter = acc.set;
+      let inherited = null;
+      for (let o = C.prototype; o; o = Object.getPrototypeOf(o)) {
+        const d = Object.getOwnPropertyDescriptor(o, idlName);
+        if (d) { inherited = d; break; }
+      }
+      if (inherited && inherited.set) {
+        const inh = inherited.set;
+        // The hand-written setters all end in `setAttribute(name, value)` and
+        // most of them forget the WebIDL coercion, so `iframe.src = 7` wrote the
+        // NUMBER. Wrapping restores the coercion without touching the side
+        // effect. ⚠️ Only for the string-shaped types, and never for `srcdoc`:
+        // that one passes a TrustedHTML through UNSTRINGIFIED on purpose, and
+        // stringifying it here would strip the trust off a value the page had
+        // properly vouched for. The numeric setters are left alone entirely —
+        // their coercion carries throws and default-fallbacks a wrapper cannot
+        // express.
+        if ((t === 'string' || t === 'url' || t === 'enum') && idlName !== 'srcdoc') {
+          setter = function(v) { inh.call(this, (spec.nes && v === null) ? '' : String(v)); };
+        } else {
+          setter = inh;
+        }
+      }
+      // `customGetter` marks a member whose VALUE is not the attribute —
+      // `img.width` is the rendered width, `option.value` falls back to the
+      // option's text — so an existing getter is kept exactly as it is.
+      if (spec.cg && inherited && inherited.get) getter = inherited.get;
+      Object.defineProperty(C.prototype, idlName, {
+        configurable: true, enumerable: true,
+        get: _named('get', idlName, getter),
+        set: _named('set', idlName, setter),
+      });
+    }
+  }
+
+  // ── `nonce`: the one reflection that must NOT write its attribute ──────────
+  // A CSP nonce is a secret shared between the server and this document, and the
+  // attack it defends against is a page that can be made to READ it — a dangling
+  // markup injection, or a CSS attribute selector like `script[nonce^="a"]`
+  // exfiltrating it one character at a time. HTML's answer (§nonce-attributes)
+  // is to keep the live value in an internal slot, `[[CryptographicNonce]]`, and
+  // let the content attribute be blanked out once it has been used. So the IDL
+  // setter updates the SLOT and only touches the attribute when the element is
+  // connected — assigning `script.nonce` to an element you are still building
+  // must not stamp the secret into markup that something else may later read.
+  {
+    const _nonceSlots = new WeakMap();
+    const _nonceDesc = {
+      configurable: true, enumerable: true,
+      get: _named('get', 'nonce', function() {
+        const attr = this.getAttribute ? this.getAttribute('nonce') : null;
+        const slot = _nonceSlots.get(this);
+        // A later `setAttribute('nonce', …)` is the page speaking last, and the
+        // spec's attribute-change steps hand the new value straight to the slot.
+        if (slot && slot.attrAt === attr) return slot.value;
+        return attr ?? '';
+      }),
+      set: _named('set', 'nonce', function(v) {
+        const value = String(v);
+        let attrAt = this.getAttribute ? this.getAttribute('nonce') : null;
+        if (this.isConnected && this.setAttribute) {
+          this.setAttribute('nonce', value);
+          attrAt = value;
+        }
+        _nonceSlots.set(this, { value, attrAt });
+      }),
+    };
+    for (const ifaceName of ['HTMLElement', 'SVGElement']) {
+      const C = globalThis[ifaceName];
+      if (typeof C === 'function' && C.prototype) Object.defineProperty(C.prototype, 'nonce', _nonceDesc);
+    }
+  }
+
+  // ── <meter>: the six numbers are a SYSTEM, not six independent reflections ──
+  // HTML §the-meter-element derives every one of them from the others, and the
+  // order matters: `max` is floored by `min`, `high` by `low`, and `value` is
+  // clamped into the range that survives. Reflecting them one at a time gives a
+  // gauge whose needle can sit outside its own dial — which is why the getters
+  // below compute the whole set and then answer.
+  if (typeof globalThis.HTMLMeterElement === 'function') {
+    const _meterNums = function(el) {
+      const num = (name, dflt) => {
+        const raw = el.getAttribute(name);
+        const n = raw === null ? false : _rParseFloat(raw);
+        return n === false ? dflt : n;
+      };
+      const min = num('min', 0);
+      let max = num('max', 1);
+      if (max < min) max = min;
+      let value = num('value', 0);
+      if (value < min) value = min; else if (value > max) value = max;
+      let low = num('low', min);
+      if (low < min) low = min; else if (low > max) low = max;
+      let high = num('high', max);
+      if (high < low) high = low;
+      if (high > max) high = max;
+      let optimum = num('optimum', (min + max) / 2);
+      if (optimum < min) optimum = min; else if (optimum > max) optimum = max;
+      return { min, max, value, low, high, optimum };
+    };
+    for (const nm of ['value', 'min', 'max', 'low', 'high', 'optimum']) {
+      const own = Object.getOwnPropertyDescriptor(globalThis.HTMLMeterElement.prototype, nm);
+      Object.defineProperty(globalThis.HTMLMeterElement.prototype, nm, {
+        configurable: true, enumerable: true,
+        get: _named('get', nm, function() { return _meterNums(this)[nm]; }),
+        set: own && own.set ? own.set : _named('set', nm, function(v) {
+          const n = Number(v);
+          this.setAttribute(nm, String(n === 0 ? 0 : n));
+        }),
+      });
+    }
   }
 }
 
