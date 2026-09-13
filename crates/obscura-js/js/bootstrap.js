@@ -4433,7 +4433,11 @@ class Node extends EventTarget {
         const px = this.prefix;
         el = doc.createElementNS(ns, px ? px + ":" + this.localName : this.localName);
       } else {
-        el = doc.createElement(this.nodeName.toLowerCase());
+        // DOM §clone: the clone is created with the node's IS VALUE, so a customized
+        // built-in clones as itself rather than decaying to a plain element.
+        el = (this._is != null)
+          ? doc.createElement(this.nodeName.toLowerCase(), { is: String(this._is) })
+          : doc.createElement(this.nodeName.toLowerCase());
         el._ownerDoc = doc;
       }
       // Copy attributes directly (O(attrs)) rather than serializing+reparsing
@@ -6924,6 +6928,16 @@ class Element extends Node {
     if (!this._classList) this._classList = _makeTokenList(this, 'class');
     return this._classList;
   }
+  // `part` (CSS Shadow Parts): the names a shadow host exposes to the outside
+  // stylesheet through `::part()`. A live DOMTokenList, exactly like classList —
+  // it was missing entirely, so a component could not name its own internals and
+  // the page around it had no way to restyle them.
+  get part() {
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+    if (!this._partList) this._partList = _makeTokenList(this, 'part');
+    return this._partList;
+  }
+  set part(v) { this.part.value = v == null ? '' : String(v); }
   // classList is [PutForwards=value]: `el.classList = 'x'` sets the class attr.
   set classList(v) { this.classList.value = v == null ? '' : String(v); }
   get style() {
@@ -9303,7 +9317,7 @@ class Document extends Node {
   getElementsByTagNameNS(ns, local) { return _gebTagNameNS(this._nid, ns, local); }
   getElementsByClassName(c) { return _gebClassName(this._nid, c); }
   getElementsByName(name) { return this.querySelectorAll('[name="' + String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]'); }
-  createElement(t) {
+  createElement(t, options) {
     // A standalone (XML-type) document creates elements case-sensitively, in the
     // null namespace, with a plain Element interface (per §createElement: namespace
     // is null unless the document is HTML / application/xhtml+xml).
@@ -9322,19 +9336,35 @@ class Document extends Node {
     // Window-less documents (createHTMLDocument/new Document/XML) have no registry
     // (`_ceRegistryForDoc` → null) and yield a plain element with no custom state.
     const reg = _ceRegistryForDoc(this);
+    // ElementCreationOptions: `{is: "my-link"}` asks for a CUSTOMIZED BUILT-IN — the
+    // element keeps its own local name (and everything the UA gives that element) and
+    // gains the definition's behaviour.
+    const isValue = (options != null && typeof options === 'object' && options.is != null)
+      ? String(options.is) : null;
     if (reg && reg._defs.size && _isValidCustomElementName(local)) {
       const def = reg._defs.get(local);
       if (def && def.name === def.localName) {
-        const cel = _ceConstruct(def);
+        const cel = _ceConstruct(def, this);
         if (cel) cel._ownerDoc = this;
         return cel;
       }
       // Valid custom name, no definition yet → an "undefined" custom element.
       const uel = _wrapEl(+_dom("create_element", local));
-      if (uel) { uel._ownerDoc = this; uel._ceState = "undefined"; }
+      if (uel) { uel._ownerDoc = this; uel._ceState = "undefined"; if (isValue) uel._is = isValue; }
       return uel;
     }
+    if (reg && reg._defs.size && isValue) {
+      const bdef = reg._defs.get(isValue);
+      if (bdef && bdef.localName === local && bdef.name !== bdef.localName) {
+        const bel = _ceConstruct(bdef, this);
+        if (bel) bel._ownerDoc = this;
+        return bel;
+      }
+    }
     const el = _wrapEl(+_dom("create_element", local));
+    // No definition (yet) for this `is` value: the element still REMEMBERS it, so a
+    // later `define()` upgrades it and a clone stays customizable.
+    if (el && isValue) el._is = isValue;
     if (el && local === 'template') {
       el._templateContent = this.createDocumentFragment();
     }
@@ -10038,11 +10068,18 @@ function _isValidCustomElementName(name) {
   }
   return hasHyphen;
 }
-// IsConstructor(f): does f have a [[Construct]] slot? Reflect.construct throws a
-// TypeError if newTarget (3rd arg) is not a constructor — without ever running f.
+// IsConstructor(f): does f have a [[Construct]] slot? This is an INTERNAL question
+// and the answer must not touch a single property of `f` — `customElements.define()`
+// asks it before it is allowed to read `f.prototype`, and WPT counts the reads. A
+// Proxy whose `construct` trap returns its own object is a constructor exactly when
+// its target is one, and `new` on it never enters the target and never gets
+// "prototype" from it. (`Reflect.construct(function(){}, [], f)`, which this used to
+// do, DOES read `f.prototype` — so a page that validated a name after passing a
+// throwing proxy got the proxy's exception swallowed into "not a constructor".)
 function _isConstructor(f) {
   if (typeof f !== 'function') return false;
-  try { Reflect.construct(function () {}, [], f); return true; } catch (e) { return false; }
+  try { new (new Proxy(f, { construct() { return {}; } }))(); return true; }
+  catch (e) { return false; }
 }
 
 // Per-document custom-element registries (HTML: each Window has its own
@@ -10196,13 +10233,46 @@ const _CE_MARKER = { _alreadyConstructed: true };
 // definition's constructor, which allocates its own backing node via the HTMLElement
 // constructor's empty-stack branch. On a thrown constructor, fall back to a bare
 // element in the "failed" state (HTML "create an element" step 6.1.3).
-function _ceConstruct(def) {
+// HTML "create an element", synchronous-custom-elements path. The constructor is
+// only trusted as far as it can be checked: it must hand back THIS element — an
+// empty, parentless, same-document HTML element with the definition's local name —
+// and anything else is an exception that gets REPORTED (to `window.onerror`, as an
+// uncaught error) while `createElement` still returns a usable, "failed" element.
+// Returning the constructor's result unchecked meant `class extends HTMLElement {
+// constructor() { return {foo:'bar'}; } }` put a plain object in the tree and told
+// nobody: the page saw no error and a non-element where an element belongs.
+function _ceConstruct(def, doc) {
+  const targetDoc = doc || def._document || globalThis.document;
   try {
-    return Reflect.construct(def.constructor, [], def.constructor);
+    const result = Reflect.construct(def.constructor, [], def.constructor);
+    if (!result || typeof result !== 'object' || result.nodeType !== 1)
+      throw new TypeError("Custom element constructor did not produce an element");
+    const attrs = result.attributes;
+    if (attrs && attrs.length)
+      throw new DOMException("The result must not have attributes", "NotSupportedError");
+    if (result.firstChild)
+      throw new DOMException("The result must not have children", "NotSupportedError");
+    if (result.parentNode)
+      throw new DOMException("The result must not have a parent", "NotSupportedError");
+    if ((result.ownerDocument || null) !== targetDoc)
+      throw new DOMException("The result must be in the same document", "NotSupportedError");
+    if (result.namespaceURI !== _HTML_NS)
+      throw new DOMException("The result must be in the HTML namespace", "NotSupportedError");
+    if (result.localName !== def.localName)
+      throw new DOMException("The result must have the same local name", "NotSupportedError");
+    return result;
   } catch (e) {
     _reportError(e);
     const el = _wrapEl(+_dom("create_element", def.localName));
-    if (el) { el._ceState = "failed"; el._ceDefinition = def; }
+    if (el) {
+      // A failed AUTONOMOUS element implements HTMLUnknownElement — it is not an
+      // instance of the class that refused to build it. A failed customized
+      // built-in keeps the interface its local name always had.
+      if (def.name === def.localName) {
+        try { Object.setPrototypeOf(el, globalThis.HTMLUnknownElement.prototype); } catch (_) {}
+      }
+      el._ceState = "failed"; el._ceDefinition = def;
+    }
     return el;
   }
 }
@@ -10229,6 +10299,10 @@ function _ceDoUpgrade(el, def) {
   const st = el._ceState;
   if (st === "custom" || st === "failed" || st === "precustomized") return;
   el._ceDefinition = def;
+  // Upgrading through a customized-built-in definition IS what gives the element its
+  // is value — `define()` upgrades markup candidates directly, without passing through
+  // `_ceTryUpgrade`, so recording it here is what makes `<html is="my-html">` clone.
+  if (def.name !== def.localName) el._is = def.name;
   Object.setPrototypeOf(el, def.constructor.prototype);
   // Steps 6–7: enqueue reactions for the PRE-construction observed attributes + connected
   // state, onto el's own reaction queue (drained in place by the invoke loop).
@@ -10274,13 +10348,28 @@ function _ceTryUpgrade(el) {
   if (!el || el.nodeType !== 1) return;
   const st = el._ceState;
   if (st === "custom" || st === "failed" || st === "precustomized") return;
-  if (el._is) return;
   if (el.namespaceURI !== _HTML_NS) return;
   const reg = _ceRegistryForNode(el);       // the element's node-document registry
   if (!reg) return;                          // window-less document → never upgrades
+  // The is value is the internal slot if there is one, else the `is` content attribute
+  // the parser saw. A customized built-in is looked up by THAT name, and the definition
+  // only applies if it was declared for this element's local name.
+  let isValue = el._is;
+  if (isValue === undefined || isValue === null) {
+    const attr = el.getAttribute && el.getAttribute('is');
+    if (attr) isValue = attr;
+  }
+  // HTML "look up a custom element definition" asks for the AUTONOMOUS definition
+  // first: `<my-thing is="other-thing">` is a `my-thing`, and the `is` attribute
+  // is ignored on an element whose own name is already a custom element name.
   const def = reg._defs.get(el.localName);
-  if (!def || def.name !== def.localName) return;
-  _ceEnqueueUpgrade(el, def);
+  if (def && def.name === def.localName) { _ceEnqueueUpgrade(el, def); return; }
+  if (isValue) {
+    const bdef = reg._defs.get(String(isValue));
+    if (!bdef || bdef.localName !== el.localName || bdef.name === bdef.localName) return;
+    el._is = String(isValue);
+    _ceEnqueueUpgrade(el, bdef);
+  }
 }
 
 // Insertion steps: walk an inserted subtree in tree order; enqueue upgrade reactions for
@@ -12385,7 +12474,6 @@ globalThis.navigator = {
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   deviceMemory: 8,
-  connection: { effectiveType: "4g", rtt: 50, downlink: 10, saveData: false },
   // A real, non-automated Chrome exposes navigator.webdriver === false (the
   // property is present and false). Returning `undefined` is itself an
   // automation tell — detectors flag `webdriver !== false` / `!('webdriver' in
@@ -39003,7 +39091,11 @@ class CustomElementRegistry {
           throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': " + n + " is not a function");
         callbacks[n] = v;
       };
+      // The lifecycle callback names, IN SPEC ORDER — a page can observe the order
+      // with a Proxy prototype, and `connectedMoveCallback` (the one `moveBefore()`
+      // calls instead of disconnected+connected) belongs between them.
       getCb('connectedCallback'); getCb('disconnectedCallback');
+      getCb('connectedMoveCallback');
       getCb('adoptedCallback'); getCb('attributeChangedCallback');
       if (callbacks.attributeChangedCallback) {
         const oa = constructor.observedAttributes;
@@ -39034,13 +39126,22 @@ class CustomElementRegistry {
     _ceGlobalByCtor.set(constructor, def);   // global map for the shared HTMLElement ctor
     _ceGlobalDefCount++;                      // fast gate: any definition in any registry
     // Upgrade candidates already in THIS registry's document (HTML define() steps 14–15).
-    if (def.name === def.localName && upgDoc && upgDoc.getElementsByTagName) {
+    if (upgDoc && upgDoc.getElementsByTagName) {
       const matches = upgDoc.getElementsByTagName(localName);
+      const isBuiltin = def.name !== def.localName;
       const candidates = [];
       for (let i = 0; i < matches.length; i++) {
         const el = matches[i];
-        if (el.namespaceURI === _HTML_NS && !el._is &&
-            el._ceState !== "custom" && el._ceState !== "failed") candidates.push(el);
+        if (el.namespaceURI !== _HTML_NS) continue;
+        if (el._ceState === "custom" || el._ceState === "failed") continue;
+        // An autonomous definition claims only elements with NO is value; a
+        // customized built-in claims exactly the ones whose is value is its name.
+        if (isBuiltin) {
+          const elIs = (el._is != null) ? String(el._is)
+            : ((el.getAttribute && el.getAttribute('is')) || null);
+          if (elIs !== def.name) continue;
+        }
+        candidates.push(el);
       }
       // define() is a [CEReactions] boundary: enqueue an upgrade reaction per candidate
       // into one element queue, then invoke — so each element's constructor +
@@ -40193,6 +40294,14 @@ globalThis.AbortSignal = class AbortSignal extends EventTarget {
     this._reason = undefined;
     this._onabort = null;
     this._onabortListener = null;
+    // DOM §3.2 dependent signals. A signal made by `AbortSignal.any()` is
+    // "dependent": it holds its SOURCE signals, and each source holds it back.
+    // Composites are always linked to an ORIGINAL source, never to another
+    // composite — `any([composite])` flattens through to the composite's own
+    // sources, which is what makes abort events fire in creation order.
+    this._sourceSignals = null;
+    this._dependentSignals = null;
+    this._isDependent = false;
   }
   get aborted() { return this._aborted; }
   get reason() { return this._reason; }
@@ -40225,12 +40334,27 @@ globalThis.AbortSignal = class AbortSignal extends EventTarget {
     this._aborted = true;
     this._reason = (reason !== undefined ? reason
       : _abortError('AbortError', 'The operation was aborted'));
+    // Every dependent signal is marked aborted FIRST, then the `abort` events
+    // fire — this signal's first, then the dependents' in the order they were
+    // created. Propagating by listening for the source's `abort` event instead
+    // (what this used to do) fires them depth-first and in creation order only
+    // by accident: a composite built from another composite jumped the queue.
+    const toAbort = [];
+    if (this._dependentSignals) {
+      for (const d of this._dependentSignals) {
+        if (!d._aborted) { d._aborted = true; d._reason = this._reason; toAbort.push(d); }
+      }
+    }
     this._fireAbort();
+    for (const d of toAbort) d._fireAbort();
   }
   _fireAbort() {
     const ev = new Event('abort');
     ev._isTrusted = true;
-    try { this.dispatchEvent(ev); } catch (e) {}
+    // `dispatchEvent` is the PUBLIC entry point and §2.8 clears the trusted
+    // flag on the way in — a UA-fired abort must go through _dispatchSpec or it
+    // arrives at the listener claiming a script made it.
+    try { _dispatchSpec(this, ev, false); } catch (e) {}
   }
   static abort(reason) {
     const s = _newAbortSignal();
@@ -40244,17 +40368,28 @@ globalThis.AbortSignal = class AbortSignal extends EventTarget {
     return s;
   }
   static any(signals) {
-    const s = _newAbortSignal();
-    const arr = Array.from(signals || []);
-    for (const inp of arr) {
-      if (inp && inp.aborted) { s._aborted = true; s._reason = inp.reason; return s; }
-    }
-    const onAbort = function () { s._signalAbort(this.reason); };
-    for (const inp of arr) {
-      if (inp && typeof inp.addEventListener === 'function') inp.addEventListener('abort', onAbort);
-    }
-    return s;
+    return _createDependentSignal(_newAbortSignal(), signals);
   }
+};
+// DOM §3.2 "create a dependent abort signal". An already-aborted source short-
+// circuits the whole thing: the result is born aborted and linked to nothing.
+const _createDependentSignal = function (result, signals) {
+  const arr = Array.from(signals || []);
+  for (const inp of arr) {
+    if (inp && inp.aborted) { result._aborted = true; result._reason = inp.reason; return result; }
+  }
+  result._isDependent = true;
+  for (const inp of arr) {
+    if (!inp) continue;
+    const sources = (inp._isDependent && inp._sourceSignals) ? inp._sourceSignals : [inp];
+    for (const src of sources) {
+      if (!result._sourceSignals) result._sourceSignals = [];
+      result._sourceSignals.push(src);
+      if (!src._dependentSignals) src._dependentSignals = [];
+      src._dependentSignals.push(result);
+    }
+  }
+  return result;
 };
 const _newAbortSignal = function () {
   _allowAbortSignalCtor = true;
@@ -40270,6 +40405,1171 @@ _markNative(globalThis.AbortSignal); _markNative(globalThis.AbortSignal.abort);
 _markNative(globalThis.AbortSignal.timeout); _markNative(globalThis.AbortSignal.any);
 _markNative(globalThis.AbortSignal.prototype.throwIfAborted);
 _markNative(globalThis.AbortController); _markNative(globalThis.AbortController.prototype.abort);
+
+// ── Prioritized Task Scheduling (WHATWG scheduling-apis) ─────────────────────
+// `scheduler.postTask()` is how a page says "this work matters less than that
+// work" instead of dumping everything into one `setTimeout(0)` pile. On a fast
+// machine the difference is invisible; on a hand-me-down laptop it is the
+// difference between a page that responds to a tap and one that does not — the
+// background work yields and the tap handler goes first. The whole realm was
+// missing: `scheduler`, `TaskController`, `TaskSignal` and
+// `TaskPriorityChangeEvent` did not exist, so every scheduler test threw on its
+// first line.
+const _TASK_PRIORITIES = ['user-blocking', 'user-visible', 'background'];
+const _taskPriorityRank = function (p) { return _TASK_PRIORITIES.indexOf(p); };
+const _checkTaskPriority = function (p, where) {
+  if (_TASK_PRIORITIES.indexOf(p) < 0) {
+    throw new TypeError("Failed to execute '" + where + "': The provided value '" + String(p) +
+      "' is not a valid enum value of type TaskPriority.");
+  }
+  return p;
+};
+
+globalThis.TaskPriorityChangeEvent = class TaskPriorityChangeEvent extends Event {
+  constructor(type, init) {
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to construct 'TaskPriorityChangeEvent': 2 arguments required, but only " +
+        arguments.length + " present.");
+    }
+    if (init === null || typeof init !== 'object' || init.previousPriority === undefined) {
+      throw new TypeError("Failed to construct 'TaskPriorityChangeEvent': required member previousPriority is undefined.");
+    }
+    const prev = _checkTaskPriority(String(init.previousPriority), 'TaskPriorityChangeEvent');
+    super(type, init);
+    this._previousPriority = prev;
+  }
+};
+Object.defineProperty(globalThis.TaskPriorityChangeEvent.prototype, 'previousPriority', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'previousPriority', function () {
+    if (!(this instanceof globalThis.TaskPriorityChangeEvent)) throw new TypeError('Illegal invocation');
+    return this._previousPriority;
+  }),
+});
+
+// A TaskSignal is an AbortSignal that also carries a PRIORITY, and that priority
+// can change while tasks are already queued against it. `priority changing` is
+// the spec's re-entrancy guard: a `prioritychange` listener that calls
+// `setPriority()` again gets a NotAllowedError rather than an infinite loop.
+globalThis.TaskSignal = class TaskSignal extends globalThis.AbortSignal {
+  constructor() {
+    super();
+    this._priority = 'user-visible';
+    this._priorityChanging = false;
+    this._onprioritychange = null;
+    this._onprioritychangeListener = null;
+    // Signals whose priority FOLLOWS this one (composite signals made by
+    // `TaskSignal.any(..., {priority: thisSignal})`), and — on such a composite
+    // — the ORIGINAL signal it follows. Like abort dependents, a priority
+    // dependent is always linked to an original source, never to another
+    // composite, so the `prioritychange` events fire in creation order.
+    this._priorityDependents = null;
+    this._prioritySource = null;
+  }
+  get priority() { return this._priority; }
+  get onprioritychange() { return this._onprioritychange; }
+  set onprioritychange(v) {
+    if (this._onprioritychangeListener) {
+      this.removeEventListener('prioritychange', this._onprioritychangeListener);
+      this._onprioritychangeListener = null;
+    }
+    this._onprioritychange = (typeof v === 'function') ? v : null;
+    if (this._onprioritychange) {
+      const self = this;
+      this._onprioritychangeListener = function (ev) {
+        const fn = self._onprioritychange;
+        if (typeof fn === 'function') fn.call(self, ev);
+      };
+      this.addEventListener('prioritychange', this._onprioritychangeListener);
+    }
+  }
+  // "Signal priority change": set the new priority, fire `prioritychange`, and
+  // pass the change on to any composite signal that follows this one.
+  _signalPriorityChange(newPriority) {
+    if (this._priorityChanging) {
+      throw _abortError('NotAllowedError', "Cannot change priority from a 'prioritychange' event listener");
+    }
+    if (this._priority === newPriority) return;
+    this._priorityChanging = true;
+    const previous = this._priority;
+    this._priority = newPriority;
+    // Queued tasks move with the signal and keep their enqueue order — the
+    // scheduler ranks by (priority, sequence) at pick time, so nothing needs
+    // re-sorting here.
+    // Every dependent's priority is updated FIRST, then the events fire: this
+    // signal's, then the dependents' in creation order.
+    const deps = this._priorityDependents ? this._priorityDependents.slice() : [];
+    const previousOfDep = [];
+    for (const d of deps) { previousOfDep.push(d._priority); d._priority = newPriority; }
+    try {
+      this._firePriorityChange(previous);
+      for (let i = 0; i < deps.length; i++) {
+        if (previousOfDep[i] !== newPriority) deps[i]._firePriorityChange(previousOfDep[i]);
+      }
+    } finally {
+      this._priorityChanging = false;
+    }
+  }
+  _firePriorityChange(previousPriority) {
+    const ev = new globalThis.TaskPriorityChangeEvent('prioritychange', { previousPriority });
+    ev._isTrusted = true;
+    try { _dispatchSpec(this, ev, false); } catch (e) {}
+  }
+  static any(signals, options) {
+    // Abort half: exactly AbortSignal.any()'s dependent-signal construction.
+    const s = _createDependentSignal(_newTaskSignal(), signals);
+    // Priority half: a fixed enum value, or another TaskSignal to follow.
+    const p = (options && options.priority !== undefined) ? options.priority : 'user-visible';
+    if (typeof p === 'string') {
+      s._priority = _checkTaskPriority(p, 'any');
+    } else if (p && p instanceof globalThis.TaskSignal) {
+      const source = p._prioritySource || p;
+      s._priority = source._priority;
+      s._prioritySource = source;
+      if (!source._priorityDependents) source._priorityDependents = [];
+      source._priorityDependents.push(s);
+    } else {
+      throw new TypeError("Failed to execute 'any' on 'TaskSignal': The provided priority is neither a TaskPriority nor a TaskSignal.");
+    }
+    return s;
+  }
+};
+const _newTaskSignal = function () {
+  _allowAbortSignalCtor = true;
+  try { return new globalThis.TaskSignal(); }
+  finally { _allowAbortSignalCtor = false; }
+};
+
+globalThis.TaskController = class TaskController extends globalThis.AbortController {
+  constructor(init) {
+    super();
+    const p = (init && init.priority !== undefined) ? String(init.priority) : 'user-visible';
+    _checkTaskPriority(p, 'TaskController');
+    // AbortController's constructor made a plain AbortSignal; a TaskController
+    // owns a TaskSignal.
+    this._signal = _newTaskSignal();
+    this._signal._priority = p;
+  }
+  setPriority(priority) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'setPriority' on 'TaskController': 1 argument required, but only 0 present.");
+    }
+    const p = _checkTaskPriority(String(priority), 'setPriority');
+    this._signal._signalPriorityChange(p);
+  }
+};
+
+// The per-realm scheduler. One pending list, ordered by (priority, enqueue
+// sequence) at pick time rather than by three separate queues — a signal's
+// priority can change AFTER a task is queued, and the spec keeps the task's
+// original enqueue order when it moves, which one sorted list gives for free.
+const _schedState = { pending: [], seq: 0, drainScheduled: false };
+const _schedulerPick = function () {
+  const list = _schedState.pending;
+  let best = -1;
+  for (let i = 0; i < list.length; i++) {
+    const t = list[i];
+    if (t.removed) continue;
+    if (best < 0) { best = i; continue; }
+    const a = list[best];
+    const ra = _taskPriorityRank(a.priority()), rb = _taskPriorityRank(t.priority());
+    if (rb < ra || (rb === ra && t.seq < a.seq)) best = i;
+  }
+  return best;
+};
+const _schedulerScheduleDrain = function () {
+  if (_schedState.drainScheduled) return;
+  _schedState.drainScheduled = true;
+  // One task per event-loop turn: that is what makes a `postTask` task a real
+  // task and not a microtask, and it is what lets higher-priority work posted
+  // meanwhile jump the queue.
+  setTimeout(function () {
+    _schedState.drainScheduled = false;
+    const i = _schedulerPick();
+    if (i < 0) return;
+    const task = _schedState.pending.splice(i, 1)[0];
+    if (_schedState.pending.length) _schedulerScheduleDrain();
+    task.run();
+  }, 0);
+};
+const _schedulerEnqueue = function (task) {
+  _schedState.pending.push(task);
+  _schedulerScheduleDrain();
+};
+
+globalThis.Scheduler = class Scheduler {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  postTask(callback, options) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'postTask' on 'Scheduler': 1 argument required, but only 0 present.");
+    }
+    if (typeof callback !== 'function') {
+      throw new TypeError("Failed to execute 'postTask' on 'Scheduler': parameter 1 is not of type 'Function'.");
+    }
+    const opts = (options === undefined || options === null) ? {} : options;
+    let signal = opts.signal;
+    if (signal !== undefined && signal !== null &&
+        !(signal instanceof globalThis.AbortSignal)) {
+      return Promise.reject(new TypeError("Failed to execute 'postTask' on 'Scheduler': member signal is not of type AbortSignal."));
+    }
+    let fixedPriority = null;
+    if (opts.priority !== undefined && opts.priority !== null) {
+      try { fixedPriority = _checkTaskPriority(String(opts.priority), 'postTask'); }
+      catch (e) { return Promise.reject(e); }
+    }
+    let delay = 0;
+    if (opts.delay !== undefined && opts.delay !== null) {
+      delay = Number(opts.delay);
+      if (!isFinite(delay) || delay < 0) {
+        return Promise.reject(new TypeError("Failed to execute 'postTask' on 'Scheduler': Value is outside the 'unsigned long long' value range."));
+      }
+      delay = Math.floor(delay);
+    }
+    // An explicit `priority` PINS the task; otherwise it follows the signal.
+    const taskSignal = (signal instanceof globalThis.TaskSignal) ? signal : null;
+    const priorityOf = fixedPriority !== null
+      ? function () { return fixedPriority; }
+      : (taskSignal ? function () { return taskSignal._priority; }
+                    : function () { return 'user-visible'; });
+
+    let resolveFn, rejectFn;
+    const promise = new Promise(function (res, rej) { resolveFn = res; rejectFn = rej; });
+    // A promise nobody is listening on yet must not look "unhandled" when an
+    // already-aborted signal rejects it below.
+    if (signal && signal.aborted) {
+      rejectFn(signal.reason);
+      return promise;
+    }
+
+    const task = {
+      seq: _schedState.seq++,
+      priority: priorityOf,
+      removed: false,
+      run: function () {
+        let result;
+        try {
+          result = callback();
+        } catch (e) {
+          detach();
+          rejectFn(e);
+          return;
+        }
+        // The task HAS RUN: aborting the signal afterwards is a no-op, so the
+        // abort algorithm comes off before the (possibly async) result settles.
+        const abortedDuringCallback = !!(signal && signal.aborted);
+        detach();
+        if (abortedDuringCallback) rejectFn(signal.reason);
+        else resolveFn(result);
+      },
+    };
+
+    let onAbort = null;
+    const detach = function () {
+      if (onAbort && signal && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', onAbort);
+        onAbort = null;
+      }
+    };
+    if (signal) {
+      onAbort = function () {
+        task.removed = true;
+        const i = _schedState.pending.indexOf(task);
+        if (i >= 0) _schedState.pending.splice(i, 1);
+        detach();
+        rejectFn(signal.reason);
+      };
+      signal.addEventListener('abort', onAbort);
+    }
+
+    if (delay > 0) setTimeout(function () { if (!task.removed) _schedulerEnqueue(task); }, delay);
+    else _schedulerEnqueue(task);
+    return promise;
+  }
+  // `scheduler.yield()` — hand the event loop back mid-task and continue after
+  // anything more urgent. Continuations run ahead of ordinary tasks of the same
+  // priority, which is what makes a yielding loop still feel responsive.
+  yield() {
+    const self = this;
+    return new Promise(function (resolve) {
+      const task = {
+        seq: -(++_schedState.seq),   // negative sequence ⇒ ahead of posted tasks
+        priority: function () { return 'user-visible'; },
+        removed: false,
+        run: function () { resolve(undefined); },
+      };
+      _schedulerEnqueue(task);
+    });
+  }
+};
+
+// `Window.scheduler` / `WorkerGlobalScope.scheduler` is a [Replaceable]
+// attribute: assigning to it replaces the accessor with a plain data property
+// (scheduler-replaceable.any.js does exactly that, in strict mode, where a
+// getter-only global would throw instead).
+(function () {
+  const _schedulerInstance = Object.create(globalThis.Scheduler.prototype);
+  Object.defineProperty(globalThis, 'scheduler', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'scheduler', function () { return _schedulerInstance; }),
+    set: _named('set', 'scheduler', function (v) {
+      Object.defineProperty(globalThis, 'scheduler', {
+        value: v, writable: true, enumerable: true, configurable: true,
+      });
+    }),
+  });
+})();
+_markNative(globalThis.Scheduler); _markNative(globalThis.Scheduler.prototype.postTask);
+_markNative(globalThis.Scheduler.prototype.yield);
+_markNative(globalThis.TaskController); _markNative(globalThis.TaskController.prototype.setPriority);
+_markNative(globalThis.TaskSignal); _markNative(globalThis.TaskSignal.any);
+_markNative(globalThis.TaskPriorityChangeEvent);
+
+// ── The Generic Sensor API and the sensors built on it ───────────────────────
+// `Accelerometer`, `Gyroscope`, `Magnetometer`, `AmbientLightSensor`,
+// `AbsoluteOrientationSensor`… none of these existed, so a page that asked
+// `if ('AmbientLightSensor' in window)` got a clean "no" — which was true — but a
+// page that assumed them got a ReferenceError, and the `Sensor` base class that
+// tells you what a reading even IS was not there to inherit from.
+//
+// ⛔ HONEST CAP: this browser has no sensor hardware behind it. Every interface,
+// every attribute and every event is real; the READINGS are not, and rather than
+// invent numbers, `start()` reports what a machine with no such sensor reports —
+// an `error` event carrying a `NotReadableError`. That is the same answer Chrome
+// gives on a desktop with no accelerometer, and it is the answer a page can act
+// on. A sensor that never activates has `activated === false`, `hasReading ===
+// false`, a null `timestamp` and null readings, which is the truth.
+globalThis.SensorErrorEvent = class SensorErrorEvent extends Event {
+  constructor(type, errorEventInitDict) {
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to construct 'SensorErrorEvent': 2 arguments required, but only " +
+        arguments.length + " present.");
+    }
+    if (errorEventInitDict === null || typeof errorEventInitDict !== 'object' ||
+        errorEventInitDict.error === undefined) {
+      throw new TypeError("Failed to construct 'SensorErrorEvent': required member error is undefined.");
+    }
+    super(type, errorEventInitDict);
+    this._sensorError = errorEventInitDict.error;
+  }
+};
+Object.defineProperty(globalThis.SensorErrorEvent.prototype, 'error', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'error', function () {
+    if (!(this instanceof globalThis.SensorErrorEvent)) throw new TypeError('Illegal invocation');
+    return this._sensorError;
+  }),
+});
+
+// Shared on* accessors for a non-node EventTarget: the same `_eh*` machinery the
+// worker scopes use, with `instanceof Ctor` as the brand check.
+const _sensorEventHandlers = function (proto, Ctor, names) {
+  for (const name of names) {
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true,
+      get: _named('get', name, function () {
+        if (!(this instanceof Ctor)) throw new TypeError('Illegal invocation');
+        return _ehCurrentValue(this, name);
+      }),
+      set: _named('set', name, function (v) {
+        if (!(this instanceof Ctor)) throw new TypeError('Illegal invocation');
+        if (typeof v === 'function' || (v !== null && typeof v === 'object')) {
+          this['__eh_' + name] = v; _ehActivate(this, name);
+        } else { this['__eh_' + name] = null; }
+      }),
+    });
+  }
+};
+
+globalThis.Sensor = class Sensor extends EventTarget {
+  // No declared parameter: WebIDL's `length` is the REQUIRED argument count, and
+  // `SensorOptions` is optional — a declared `options` would make `Sensor.length`
+  // report 1 and tell every feature detector the dictionary is mandatory.
+  constructor() {
+    super();
+    const options = arguments[0];
+    if (new.target === globalThis.Sensor) throw new TypeError('Illegal constructor');
+    // SensorOptions.frequency is a double; a non-finite one is not a frequency.
+    let frequency = null;
+    if (options !== undefined && options !== null) {
+      if (typeof options !== 'object' && typeof options !== 'function') {
+        throw new TypeError("Failed to construct 'Sensor': The provided value is not of type 'SensorOptions'.");
+      }
+      if (options.frequency !== undefined) {
+        const f = Number(options.frequency);
+        if (!isFinite(f)) {
+          throw new TypeError("Failed to construct 'Sensor': Failed to read the 'frequency' property from 'SensorOptions': The provided double value is non-finite.");
+        }
+        frequency = f;
+      }
+    }
+    this._frequency = frequency;
+    this._sensorState = 'idle';   // "idle" | "activating" | "activated"
+    this._hasReading = false;
+    this._timestamp = null;
+  }
+  get activated() {
+    if (!(this instanceof globalThis.Sensor)) throw new TypeError('Illegal invocation');
+    return this._sensorState === 'activated';
+  }
+  get hasReading() {
+    if (!(this instanceof globalThis.Sensor)) throw new TypeError('Illegal invocation');
+    return this._hasReading === true;
+  }
+  get timestamp() {
+    if (!(this instanceof globalThis.Sensor)) throw new TypeError('Illegal invocation');
+    return this._timestamp;
+  }
+  start() {
+    if (!(this instanceof globalThis.Sensor)) throw new TypeError('Illegal invocation');
+    if (this._sensorState !== 'idle') return;
+    this._sensorState = 'activating';
+    // "Connect to a sensor" fails: there is no such sensor on this device. The
+    // spec's failure path is an `error` event, queued as a task — never a throw
+    // out of start(), which a page has no way to catch usefully.
+    setTimeout(() => {
+      if (this._sensorState !== 'activating') return;
+      this._sensorState = 'idle';
+      this._notifyError(new DOMException(
+        'The sensor is not available on this device.', 'NotReadableError'));
+    }, 0);
+  }
+  stop() {
+    if (!(this instanceof globalThis.Sensor)) throw new TypeError('Illegal invocation');
+    if (this._sensorState === 'idle') return;
+    this._sensorState = 'idle';
+    this._hasReading = false;
+    this._timestamp = null;
+  }
+  _notifyError(err) {
+    const ev = new globalThis.SensorErrorEvent('error', { error: err });
+    ev._isTrusted = true;
+    try { _dispatchSpec(this, ev, false); } catch (e) {}
+  }
+};
+_sensorEventHandlers(globalThis.Sensor.prototype, globalThis.Sensor,
+  ['onreading', 'onactivate', 'onerror']);
+
+// A reading attribute with no reading behind it is `null`, per spec — the value
+// "the sensor has nothing to tell you", which is different from 0.
+const _defSensorReadings = function (Ctor, names) {
+  for (const n of names) {
+    Object.defineProperty(Ctor.prototype, n, {
+      enumerable: true, configurable: true,
+      get: _named('get', n, function () {
+        if (!(this instanceof Ctor)) throw new TypeError('Illegal invocation');
+        return this['_reading_' + n] !== undefined ? this['_reading_' + n] : null;
+      }),
+    });
+  }
+};
+// Every concrete sensor takes an optional options dictionary and adds reading
+// attributes; `referenceFrame` is validated because a page that asks for screen
+// coordinates and silently gets device ones draws its arrow the wrong way round.
+const _SENSOR_REFERENCE_FRAMES = ['device', 'screen'];
+const _defSensor = function (name, Base, readings) {
+  const C = { [name]: class extends Base {
+    constructor() {
+      super(arguments[0]);
+      const sensorOptions = arguments[0];
+      if (sensorOptions !== undefined && sensorOptions !== null &&
+          sensorOptions.referenceFrame !== undefined) {
+        const rf = String(sensorOptions.referenceFrame);
+        if (_SENSOR_REFERENCE_FRAMES.indexOf(rf) < 0) {
+          throw new TypeError("Failed to construct '" + name + "': The provided value '" + rf +
+            "' is not a valid enum value.");
+        }
+        this._referenceFrame = rf;
+      } else {
+        this._referenceFrame = 'device';
+      }
+    }
+  } }[name];
+  globalThis[name] = C;
+  if (readings && readings.length) _defSensorReadings(C, readings);
+  _markNative(C);
+  return C;
+};
+
+const _XYZ = ['x', 'y', 'z'];
+const _Accelerometer = _defSensor('Accelerometer', globalThis.Sensor, _XYZ);
+_defSensor('LinearAccelerationSensor', _Accelerometer, null);
+_defSensor('GravitySensor', _Accelerometer, null);
+_defSensor('Gyroscope', globalThis.Sensor, _XYZ);
+_defSensor('Magnetometer', globalThis.Sensor, _XYZ);
+_defSensor('UncalibratedMagnetometer', globalThis.Sensor,
+  ['x', 'y', 'z', 'xBias', 'yBias', 'zBias']);
+_defSensor('AmbientLightSensor', globalThis.Sensor, ['illuminance']);
+
+// OrientationSensor is abstract (no constructor of its own); its two concrete
+// subclasses are the ones a page builds.
+globalThis.OrientationSensor = class OrientationSensor extends globalThis.Sensor {
+  constructor() {
+    super(arguments[0]);
+    if (new.target === globalThis.OrientationSensor) throw new TypeError('Illegal constructor');
+  }
+  get quaternion() {
+    if (!(this instanceof globalThis.OrientationSensor)) throw new TypeError('Illegal invocation');
+    return this._reading_quaternion !== undefined ? this._reading_quaternion : null;
+  }
+  populateMatrix(targetMatrix) {
+    if (!(this instanceof globalThis.OrientationSensor)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'populateMatrix' on 'OrientationSensor': 1 argument required, but only 0 present.");
+    }
+    const isMatrix = (typeof globalThis.DOMMatrix === 'function') && (targetMatrix instanceof globalThis.DOMMatrix);
+    const isTyped = (targetMatrix instanceof Float32Array) || (targetMatrix instanceof Float64Array);
+    if (!isMatrix && !isTyped) {
+      throw new TypeError("Failed to execute 'populateMatrix' on 'OrientationSensor': The provided value is not of type '(Float32Array or Float64Array or DOMMatrix)'.");
+    }
+    if (isTyped && targetMatrix.length < 16) {
+      throw new DOMException('Target buffer must have at least 16 elements.', 'TypeMismatchError');
+    }
+    // No reading, nothing to write: the spec's own failure for an inactive sensor.
+    throw new DOMException('The sensor is not activated.', 'NotReadableError');
+  }
+};
+_defSensor('AbsoluteOrientationSensor', globalThis.OrientationSensor, null);
+_defSensor('RelativeOrientationSensor', globalThis.OrientationSensor, null);
+
+_markNative(globalThis.Sensor); _markNative(globalThis.Sensor.prototype.start);
+_markNative(globalThis.Sensor.prototype.stop);
+_markNative(globalThis.SensorErrorEvent);
+_markNative(globalThis.OrientationSensor);
+_markNative(globalThis.OrientationSensor.prototype.populateMatrix);
+
+// ── CSS Font Loading (css-font-loading-3) ────────────────────────────────────
+// `document.fonts`, `new FontFace(...)`, `document.fonts.ready` — the API a page
+// uses to know when its text will stop being invisible. None of it existed, so
+// every app that gates its first paint on `document.fonts.ready` (a very common
+// pattern, and the polite one on a slow connection: show the text once, in the
+// right font, instead of twice) waited on `undefined` and threw.
+//
+// Deliberately built on plain ARRAYS, like Highlight above: `FontFaceSet` is a
+// `setlike` and a page that patches `Set.prototype` must not be able to break the
+// browser's font bookkeeping.
+{
+  const _FONT_DISPLAY = ['auto', 'block', 'swap', 'fallback', 'optional'];
+  const _FONT_STRETCH_KW = ['normal', 'ultra-condensed', 'extra-condensed', 'condensed',
+    'semi-condensed', 'semi-expanded', 'expanded', 'extra-expanded', 'ultra-expanded'];
+  const _CSS_WIDE = ['initial', 'inherit', 'unset', 'default', 'revert', 'revert-layer'];
+
+  // Each descriptor canonicalises its value or returns null for "invalid", which
+  // is the difference between a setter that throws SyntaxError and one that takes.
+  const _oneOrRange = (v, one) => {
+    const parts = String(v).trim().split(/\s+/);
+    if (parts.length === 1) return one(parts[0]);
+    if (parts.length === 2) {
+      const a = one(parts[0]), b = one(parts[1]);
+      return (a !== null && b !== null) ? a + ' ' + b : null;
+    }
+    return null;
+  };
+  const _weightOne = (v) => {
+    const s = String(v).toLowerCase();
+    if (s === 'normal' || s === 'bold') return s;
+    const n = Number(s);
+    if (!/^\+?\d+\.?\d*$|^\.\d+$/.test(s) || !isFinite(n) || n < 1 || n > 1000) return null;
+    return String(n);
+  };
+  const _stretchOne = (v) => {
+    const s = String(v).toLowerCase();
+    if (_FONT_STRETCH_KW.indexOf(s) >= 0) return s;
+    const m = /^\+?(\d+\.?\d*|\.\d+)%$/.exec(s);
+    return m ? m[1] + '%' : null;
+  };
+  const _angle = (v) => {
+    const m = /^([+-]?(?:\d+\.?\d*|\.\d+))(deg|grad|rad|turn)$/.exec(String(v).toLowerCase());
+    return m ? m[1] + m[2] : null;
+  };
+  const _canonDescriptor = function (name, value) {
+    const v = String(value).trim();
+    if (v === '') return null;
+    const lower = v.toLowerCase();
+    switch (name) {
+      case 'style': {
+        if (lower === 'normal' || lower === 'italic') return lower;
+        if (lower === 'oblique') return 'oblique';
+        const m = /^oblique\s+(.+)$/.exec(lower);
+        if (!m) return null;
+        const rest = m[1].trim().split(/\s+/);
+        if (rest.length > 2) return null;
+        const angles = rest.map(_angle);
+        if (angles.indexOf(null) >= 0) return null;
+        return 'oblique ' + angles.join(' ');
+      }
+      case 'weight': return _oneOrRange(lower, _weightOne);
+      case 'stretch': return _oneOrRange(lower, _stretchOne);
+      case 'display': return _FONT_DISPLAY.indexOf(lower) >= 0 ? lower : null;
+      case 'unicodeRange': {
+        const parts = v.split(',');
+        const out = [];
+        for (const p of parts) {
+          const t = p.trim();
+          // U+xxx, U+xxx-yyy, U+xx?? — the three forms of <urange>.
+          if (!/^[uU]\+[0-9a-fA-F?]{1,6}(-[0-9a-fA-F]{1,6})?$/.test(t)) return null;
+          out.push('U+' + t.slice(2).toUpperCase());
+        }
+        return out.length ? out.join(', ') : null;
+      }
+      case 'featureSettings': {
+        if (lower === 'normal') return 'normal';
+        const parts = v.split(',');
+        const out = [];
+        for (const p of parts) {
+          const m = /^(["'])([\x20-\x7E]{4})\1(?:\s+(on|off|\d+))?$/.exec(p.trim());
+          if (!m) return null;
+          out.push('"' + m[2] + '"' + (m[3] !== undefined ? ' ' + m[3] : ''));
+        }
+        return out.length ? out.join(', ') : null;
+      }
+      case 'variationSettings': {
+        if (lower === 'normal') return 'normal';
+        const parts = v.split(',');
+        const out = [];
+        for (const p of parts) {
+          const m = /^(["'])([\x20-\x7E]{4})\1\s+([+-]?(?:\d+\.?\d*|\.\d+))$/.exec(p.trim());
+          if (!m) return null;
+          out.push('"' + m[2] + '" ' + m[3]);
+        }
+        return out.length ? out.join(', ') : null;
+      }
+      case 'ascentOverride': case 'descentOverride': case 'lineGapOverride':
+        return _canonFontPct(v, true);
+      default: return null;
+    }
+  };
+
+  // css-fonts-4 §family-name-syntax: a family name is a <string>, or a sequence of
+  // custom identifiers separated by single spaces that is neither a CSS-wide
+  // keyword nor a generic family. A name that does not qualify is not an ERROR —
+  // it is a name that has to be QUOTED, and quoting it is what lets a page call a
+  // font "sans-serif" or "a 1" and still have it work.
+  const _GENERIC_FAMILIES = ['serif', 'sans-serif', 'cursive', 'fantasy', 'monospace',
+    'system-ui', 'ui-serif', 'ui-sans-serif', 'ui-monospace', 'ui-rounded', 'math',
+    'emoji', 'fangsong'];
+  const _IDENT_RE = /^-?[A-Za-z_\u0080-\uFFFF][A-Za-z0-9_\-\u0080-\uFFFF]*$/;
+  const _isUnquotedFamily = function (s) {
+    if (s === '') return false;
+    if (!/^\S+( \S+)*$/.test(s)) return false;   // single spaces only, none at the ends
+    const lower = s.toLowerCase();
+    if (_CSS_WIDE.indexOf(lower) >= 0) return false;
+    if (_GENERIC_FAMILIES.indexOf(lower) >= 0) return false;
+    for (const w of s.split(' ')) if (!_IDENT_RE.test(w)) return false;
+    return true;
+  };
+  const _canonFamily = function (v) {
+    const s = String(v);
+    const t = s.trim();
+    let inner = s;
+    if (t.length >= 2 && ((t[0] === '"' && t[t.length - 1] === '"') ||
+                          (t[0] === "'" && t[t.length - 1] === "'"))) {
+      inner = t.slice(1, -1);
+    }
+    if (_isUnquotedFamily(inner)) return inner;
+    return '"' + inner.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  };
+
+  const _syntaxError = (msg) => new DOMException(msg, 'SyntaxError');
+
+  const _ffState = new WeakMap();
+  const _ffOf = (o, what) => {
+    const st = _ffState.get(o);
+    if (!st) throw new TypeError("Illegal invocation: '" + what + "' called on an incompatible receiver.");
+    return st;
+  };
+  const _len = (fn, name, len) => {
+    Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    Object.defineProperty(fn, 'length', { value: len, configurable: true });
+    return fn;
+  };
+
+  // ── FontFaceFeatures / FontFaceVariations / FontFacePalettes ───────────────
+  // Real interfaces with nothing to report yet: this engine does not expose a
+  // font's OpenType feature or variation tables. Empty is the honest answer, and
+  // it is the one a page can iterate without crashing.
+  class FontFaceFeatures { constructor() { throw new TypeError('Illegal constructor'); } }
+  class FontFaceVariationAxis { constructor() { throw new TypeError('Illegal constructor'); } }
+  for (const [n, dflt] of [['name', ''], ['axisTag', ''], ['minimumValue', 0],
+                           ['maximumValue', 0], ['defaultValue', 0]]) {
+    Object.defineProperty(FontFaceVariationAxis.prototype, n, {
+      configurable: true, enumerable: true,
+      get: _len(function () { return this['_' + n] !== undefined ? this['_' + n] : dflt; }, 'get ' + n, 0),
+    });
+  }
+  function* _setValues(arr) { for (const v of arr.slice()) yield v; }
+  function* _setEntries(arr) { for (const v of arr.slice()) yield [v, v]; }
+  class FontFaceVariations { constructor() { throw new TypeError('Illegal constructor'); } }
+  {
+    const backing = (o) => (o && o._axes) || [];
+    Object.defineProperty(FontFaceVariations.prototype, 'size', {
+      configurable: true, enumerable: true,
+      get: _len(function () { return backing(this).length; }, 'get size', 0),
+    });
+    const methods = {
+      has(v) { return backing(this).indexOf(v) >= 0; },
+      entries() { return _setEntries(backing(this)); },
+      keys() { return _setValues(backing(this)); },
+      values() { return _setValues(backing(this)); },
+      forEach(cb, thisArg) {
+        if (typeof cb !== 'function')
+          throw new TypeError("Failed to execute 'forEach' on 'FontFaceVariations': parameter 1 is not of type 'Function'.");
+        const a = backing(this);
+        for (let i = 0; i < a.length; i++) cb.call(thisArg, a[i], a[i], this);
+      },
+    };
+    for (const k in methods) {
+      Object.defineProperty(FontFaceVariations.prototype, k, {
+        configurable: true, enumerable: true, writable: true,
+        value: _len(methods[k], k, k === 'forEach' ? 1 : methods[k].length),
+      });
+    }
+    Object.defineProperty(FontFaceVariations.prototype, Symbol.iterator, {
+      configurable: true, writable: true, value: FontFaceVariations.prototype.values,
+    });
+    Object.defineProperty(FontFaceVariations.prototype, Symbol.toStringTag, {
+      configurable: true, value: 'FontFaceVariations',
+    });
+  }
+  class FontFacePalette { constructor() { throw new TypeError('Illegal constructor'); } }
+  {
+    const backing = (o) => (o && o._colors) || [];
+    Object.defineProperty(FontFacePalette.prototype, 'length', {
+      configurable: true, enumerable: true,
+      get: _len(function () { return backing(this).length; }, 'get length', 0),
+    });
+    for (const [n, d] of [['usableWithLightBackground', false], ['usableWithDarkBackground', false]]) {
+      Object.defineProperty(FontFacePalette.prototype, n, {
+        configurable: true, enumerable: true,
+        get: _len(function () { return this['_' + n] !== undefined ? this['_' + n] : d; }, 'get ' + n, 0),
+      });
+    }
+    Object.defineProperty(FontFacePalette.prototype, Symbol.iterator, {
+      configurable: true, writable: true,
+      value: _len(function () { return _setValues(backing(this)); }, '[Symbol.iterator]', 0),
+    });
+    Object.defineProperty(FontFacePalette.prototype, Symbol.toStringTag, {
+      configurable: true, value: 'FontFacePalette',
+    });
+  }
+  class FontFacePalettes { constructor() { throw new TypeError('Illegal constructor'); } }
+  {
+    const backing = (o) => (o && o._palettes) || [];
+    Object.defineProperty(FontFacePalettes.prototype, 'length', {
+      configurable: true, enumerable: true,
+      get: _len(function () { return backing(this).length; }, 'get length', 0),
+    });
+    Object.defineProperty(FontFacePalettes.prototype, Symbol.iterator, {
+      configurable: true, writable: true,
+      value: _len(function () { return _setValues(backing(this)); }, '[Symbol.iterator]', 0),
+    });
+    Object.defineProperty(FontFacePalettes.prototype, Symbol.toStringTag, {
+      configurable: true, value: 'FontFacePalettes',
+    });
+  }
+
+  // ── FontFace ───────────────────────────────────────────────────────────────
+  class FontFace {
+    constructor(family, source, descriptors) {
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to construct 'FontFace': 2 arguments required, but only " +
+          arguments.length + " present.");
+      }
+      let resolveLoaded, rejectLoaded;
+      const loaded = new Promise((res, rej) => { resolveLoaded = res; rejectLoaded = rej; });
+      // Nothing awaits `loaded` until the page does; an invalid descriptor must not
+      // look like an unhandled rejection in the meantime.
+      loaded.catch(() => {});
+      const st = {
+        family: '', desc: {
+          style: 'normal', weight: 'normal', stretch: 'normal',
+          unicodeRange: 'U+0-10FFFF', featureSettings: 'normal', variationSettings: 'normal',
+          display: 'auto', ascentOverride: 'normal', descentOverride: 'normal',
+          lineGapOverride: 'normal',
+        },
+        status: 'unloaded', urlSource: null, binary: false,
+        loaded, resolveLoaded, rejectLoaded, error: null,
+        features: Object.create(FontFaceFeatures.prototype),
+        variations: Object.assign(Object.create(FontFaceVariations.prototype), { _axes: [] }),
+        palettes: Object.assign(Object.create(FontFacePalettes.prototype), { _palettes: [] }),
+      };
+      _ffState.set(this, st);
+      // A constructor DEFERS its complaints: an invalid family or descriptor sets the
+      // face to "error" and rejects `loaded`, rather than throwing out of `new`. A
+      // page building a dozen faces in a loop gets a face it can inspect, not a
+      // half-built list and an exception.
+      st.family = _canonFamily(family);
+      if (descriptors !== undefined && descriptors !== null) {
+        if (typeof descriptors !== 'object' && typeof descriptors !== 'function') {
+          throw new TypeError("Failed to construct 'FontFace': The provided value is not of type 'FontFaceDescriptors'.");
+        }
+        // `width` is the new name for `stretch` and wins when both are given.
+        const order = ['style', 'weight', 'stretch', 'width', 'unicodeRange', 'featureSettings',
+          'variationSettings', 'display', 'ascentOverride', 'descentOverride', 'lineGapOverride'];
+        for (const k of order) {
+          if (descriptors[k] === undefined) continue;
+          const key = (k === 'width') ? 'stretch' : k;
+          const canon = _canonDescriptor(key, descriptors[k]);
+          if (canon === null) {
+            _ffFail(st, _syntaxError("Failed to construct 'FontFace': '" + String(descriptors[k]) +
+              "' is not a valid value for the '" + k + "' descriptor."));
+          } else {
+            st.desc[key] = canon;
+          }
+        }
+      }
+      if (typeof source === 'string' || source instanceof String) {
+        st.urlSource = String(source);
+      } else if (source && (ArrayBuffer.isView(source) || source instanceof ArrayBuffer)) {
+        st.binary = true;
+      } else {
+        throw new TypeError("Failed to construct 'FontFace': The provided value is not of type '(CSSOMString or BufferSource)'.");
+      }
+    }
+  }
+  Object.defineProperty(FontFace, 'name', { value: 'FontFace', configurable: true });
+  Object.defineProperty(FontFace, 'length', { value: 2, configurable: true });
+
+  const _ffFail = function (st, err) {
+    if (st.status === 'error') return;
+    st.status = 'error';
+    st.error = err;
+    st.rejectLoaded(err);
+  };
+
+  // Every descriptor is a read/write IDL attribute whose setter REFUSES an invalid
+  // value with a SyntaxError and leaves the old one in place — the alternative
+  // (accept and ignore) silently changes what the page renders.
+  const _descAttr = function (name, key) {
+    Object.defineProperty(FontFace.prototype, name, {
+      configurable: true, enumerable: true,
+      get: _len(function () { return _ffOf(this, name).desc[key]; }, 'get ' + name, 0),
+      set: _len(function (v) {
+        const st = _ffOf(this, name);
+        const canon = _canonDescriptor(key, v);
+        if (canon === null) {
+          throw _syntaxError("Failed to set the '" + name + "' property on 'FontFace': '" +
+            String(v) + "' is not a valid value.");
+        }
+        st.desc[key] = canon;
+      }, 'set ' + name, 1),
+    });
+  };
+  Object.defineProperty(FontFace.prototype, 'family', {
+    configurable: true, enumerable: true,
+    get: _len(function () { return _ffOf(this, 'family').family; }, 'get family', 0),
+    set: _len(function (v) {
+      _ffOf(this, 'family').family = _canonFamily(v);
+    }, 'set family', 1),
+  });
+  for (const n of ['style', 'weight', 'stretch', 'unicodeRange', 'featureSettings',
+                   'variationSettings', 'display', 'ascentOverride', 'descentOverride',
+                   'lineGapOverride']) _descAttr(n, n);
+  // `width` is an alias of `stretch`: two names, ONE value.
+  _descAttr('width', 'stretch');
+
+  Object.defineProperty(FontFace.prototype, 'status', {
+    configurable: true, enumerable: true,
+    get: _len(function () { return _ffOf(this, 'status').status; }, 'get status', 0),
+  });
+  Object.defineProperty(FontFace.prototype, 'loaded', {
+    configurable: true, enumerable: true,
+    get: _len(function () { return _ffOf(this, 'loaded').loaded; }, 'get loaded', 0),
+  });
+  for (const n of ['features', 'variations', 'palettes']) {
+    Object.defineProperty(FontFace.prototype, n, {
+      configurable: true, enumerable: true,
+      get: _len(function () { return _ffOf(this, n)[n]; }, 'get ' + n, 0),
+    });
+  }
+  Object.defineProperty(FontFace.prototype, 'load', {
+    configurable: true, enumerable: true, writable: true,
+    value: _len(function load() {
+      const st = _ffOf(this, 'load');
+      if (st.status !== 'unloaded') return st.loaded;
+      st.status = 'loading';
+      const self = this;
+      // ⛔ HONEST CAP: the bytes are fetched, but this engine does not hand a
+      // downloaded face to the text shaper from here — a successful fetch marks the
+      // face "loaded" so a page's `ready`/`load()` gating proceeds, and a failed one
+      // reports the network error the page needs to see.
+      if (st.binary) {
+        Promise.resolve().then(() => { st.status = 'loaded'; st.resolveLoaded(self); });
+        return st.loaded;
+      }
+      const m = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)/.exec(st.urlSource || '');
+      const url = m ? (m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : m[3]) : null;
+      if (!url) {
+        _ffFail(st, _syntaxError("Failed to execute 'load' on 'FontFace': the src descriptor has no usable url()."));
+        return st.loaded;
+      }
+      (async () => {
+        try {
+          const res = await fetch(url);
+          if (!res || !res.ok) throw new DOMException('A network error occurred.', 'NetworkError');
+          await res.arrayBuffer();
+          st.status = 'loaded';
+          st.resolveLoaded(self);
+        } catch (e) {
+          _ffFail(st, (e instanceof DOMException) ? e : new DOMException('A network error occurred.', 'NetworkError'));
+        }
+      })();
+      return st.loaded;
+    }, 'load', 0),
+  });
+  Object.defineProperty(FontFace.prototype, Symbol.toStringTag, {
+    configurable: true, value: 'FontFace',
+  });
+
+  // ── FontFaceSetLoadEvent ───────────────────────────────────────────────────
+  class FontFaceSetLoadEvent extends Event {
+    constructor(type, eventInitDict) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to construct 'FontFaceSetLoadEvent': 1 argument required, but only 0 present.");
+      }
+      super(type, eventInitDict);
+      const src = (eventInitDict && eventInitDict.fontfaces !== undefined)
+        ? Array.from(eventInitDict.fontfaces) : [];
+      // FrozenArray: a fresh, frozen COPY — the page must not be able to reach back
+      // into the event and change what it reported.
+      this._fontfaces = Object.freeze(src);
+    }
+  }
+  Object.defineProperty(FontFaceSetLoadEvent.prototype, 'fontfaces', {
+    configurable: true, enumerable: true,
+    get: _len(function () {
+      if (!(this instanceof FontFaceSetLoadEvent)) throw new TypeError('Illegal invocation');
+      return this._fontfaces;
+    }, 'get fontfaces', 0),
+  });
+
+  // ── FontFaceSet ────────────────────────────────────────────────────────────
+  const _fsState = new WeakMap();
+  const _fsOf = (o, what) => {
+    const st = _fsState.get(o);
+    if (!st) throw new TypeError("Illegal invocation: '" + what + "' called on an incompatible receiver.");
+    return st;
+  };
+  class FontFaceSet extends EventTarget {
+    constructor() {
+      super();
+      throw new TypeError('Illegal constructor');
+    }
+  }
+  Object.defineProperty(FontFaceSet, 'length', { value: 0, configurable: true });
+  const _newFontFaceSet = function (doc) {
+    const set = Object.create(FontFaceSet.prototype);
+    let resolveReady;
+    const ready = new Promise((res) => { resolveReady = res; });
+    _fsState.set(set, { faces: [], doc: doc || null, ready, resolveReady, cssScanned: false });
+    return set;
+  };
+  // The CSS-connected faces: every `@font-face` rule in the document's stylesheets
+  // is a FontFace in `document.fonts`, with its descriptors already filled in. A
+  // page that reads `[...document.fonts]` is asking what fonts this document
+  // DECLARES, and the answer cannot be "only the ones you added by script".
+  const _FF_RULE_DESC = [
+    ['font-style', 'style'], ['font-weight', 'weight'], ['font-stretch', 'stretch'],
+    ['font-width', 'stretch'], ['unicode-range', 'unicodeRange'],
+    ['font-feature-settings', 'featureSettings'], ['font-variation-settings', 'variationSettings'],
+    ['font-display', 'display'], ['ascent-override', 'ascentOverride'],
+    ['descent-override', 'descentOverride'], ['line-gap-override', 'lineGapOverride'],
+  ];
+  const _fsSyncCssConnected = function (st) {
+    const doc = st.doc;
+    if (!doc || !doc.styleSheets) return;
+    const wanted = [];
+    let sheets;
+    try { sheets = Array.from(doc.styleSheets); } catch (e) { return; }
+    for (const sheet of sheets) {
+      let rules;
+      try { rules = sheet.cssRules; } catch (e) { continue; }
+      if (!rules) continue;
+      for (let i = 0; i < rules.length; i++) {
+        const rule = rules[i];
+        if (!rule || rule.type !== 5 /* FONT_FACE_RULE */) continue;
+        wanted.push(rule);
+      }
+    }
+    for (const rule of wanted) {
+      if (st.faces.some((f) => f._cssRule === rule)) continue;
+      let style;
+      try { style = rule.style; } catch (e) { continue; }
+      if (!style) continue;
+      const family = style.getPropertyValue('font-family') || '';
+      const src = style.getPropertyValue('src') || '';
+      if (!family) continue;
+      let face;
+      try { face = new FontFace(_canonFamily(family), src); } catch (e) { continue; }
+      const fst = _ffState.get(face);
+      for (const [prop, key] of _FF_RULE_DESC) {
+        const v = style.getPropertyValue(prop);
+        if (!v) continue;
+        const canon = _canonDescriptor(key, v);
+        if (canon !== null) fst.desc[key] = canon;
+      }
+      face._cssRule = rule;
+      st.faces.push(face);
+    }
+  };
+  const _fsFaces = function (st) {
+    if (!st.cssScanned) _fsSyncCssConnected(st);
+    return st.faces;
+  };
+  // "Find the matching font faces": the argument is a `font` shorthand, and a
+  // CSS-wide keyword is NOT a font — the spec makes that a SyntaxError rather
+  // than an empty match, because `document.fonts.load('inherit')` is a bug in the
+  // caller and silently resolving hides it.
+  const _parseFontShorthand = function (font) {
+    const s = String(font).trim();
+    if (s === '') return null;
+    const words = s.split(/\s+/);
+    for (const w of words) if (_CSS_WIDE.indexOf(w.toLowerCase()) >= 0) return null;
+    // The family is everything after the last size token; without a size the whole
+    // string is still rejected by the shorthand grammar unless it names a family.
+    return { families: s.split(',').map((x) => x.trim()).filter(Boolean) };
+  };
+  const _fsMethods = {
+    add(font) {
+      const st = _fsOf(this, 'add');
+      if (!_ffState.get(font))
+        throw new TypeError("Failed to execute 'add' on 'FontFaceSet': parameter 1 is not of type 'FontFace'.");
+      const faces = _fsFaces(st);
+      if (faces.indexOf(font) < 0) faces.push(font);
+      return this;
+    },
+    has(font) { return _fsFaces(_fsOf(this, 'has')).indexOf(font) >= 0; },
+    delete(font) {
+      const faces = _fsFaces(_fsOf(this, 'delete'));
+      const i = faces.indexOf(font);
+      if (i < 0) return false;
+      faces.splice(i, 1);
+      return true;
+    },
+    clear() { _fsFaces(_fsOf(this, 'clear')).length = 0; },
+    forEach(cb, thisArg) {
+      const faces = _fsFaces(_fsOf(this, 'forEach'));
+      if (typeof cb !== 'function')
+        throw new TypeError("Failed to execute 'forEach' on 'FontFaceSet': parameter 1 is not of type 'Function'.");
+      for (let i = 0; i < faces.length; i++) cb.call(thisArg, faces[i], faces[i], this);
+    },
+    entries() { return _setEntries(_fsFaces(_fsOf(this, 'entries'))); },
+    keys() { return _setValues(_fsFaces(_fsOf(this, 'keys'))); },
+    values() { return _setValues(_fsFaces(_fsOf(this, 'values'))); },
+    load(font, text) {
+      let st;
+      try { st = _fsOf(this, 'load'); } catch (e) { return Promise.reject(e); }
+      if (arguments.length < 1) {
+        return Promise.reject(new TypeError("Failed to execute 'load' on 'FontFaceSet': 1 argument required, but only 0 present."));
+      }
+      const parsed = _parseFontShorthand(font);
+      if (!parsed) {
+        return Promise.reject(_syntaxError("Failed to execute 'load' on 'FontFaceSet': Could not resolve '" +
+          String(font) + "' as a font shorthand."));
+      }
+      const wait = (typeof globalThis.__fontsSettled === 'function')
+        ? globalThis.__fontsSettled() : Promise.resolve();
+      return wait.then(() => _fsFaces(st).slice(), () => _fsFaces(st).slice());
+    },
+    check(font, text) {
+      const st = _fsOf(this, 'check');
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'check' on 'FontFaceSet': 1 argument required, but only 0 present.");
+      }
+      const parsed = _parseFontShorthand(font);
+      if (!parsed) {
+        throw _syntaxError("Failed to execute 'check' on 'FontFaceSet': Could not resolve '" +
+          String(font) + "' as a font shorthand.");
+      }
+      // Nothing is still loading, so every requested face is as ready as it gets.
+      return _fsFaces(st).every((f) => {
+        const fst = _ffState.get(f);
+        return !fst || fst.status !== 'loading';
+      });
+    },
+  };
+  for (const k in _fsMethods) {
+    Object.defineProperty(FontFaceSet.prototype, k, {
+      configurable: true, enumerable: true, writable: true,
+      value: _len(_fsMethods[k], k,
+        k === 'forEach' ? 1 : k === 'load' || k === 'check' ? 1 : _fsMethods[k].length),
+    });
+  }
+  Object.defineProperty(FontFaceSet.prototype, Symbol.iterator, {
+    configurable: true, writable: true, value: FontFaceSet.prototype.values,
+  });
+  Object.defineProperty(FontFaceSet.prototype, Symbol.toStringTag, {
+    configurable: true, value: 'FontFaceSet',
+  });
+  Object.defineProperty(FontFaceSet.prototype, 'size', {
+    configurable: true, enumerable: true,
+    get: _len(function () { return _fsFaces(_fsOf(this, 'size')).length; }, 'get size', 0),
+  });
+  Object.defineProperty(FontFaceSet.prototype, 'status', {
+    configurable: true, enumerable: true,
+    get: _len(function () {
+      const faces = _fsFaces(_fsOf(this, 'status'));
+      return faces.some((f) => { const s = _ffState.get(f); return s && s.status === 'loading'; })
+        ? 'loading' : 'loaded';
+    }, 'get status', 0),
+  });
+  Object.defineProperty(FontFaceSet.prototype, 'ready', {
+    configurable: true, enumerable: true,
+    get: _len(function () {
+      const st = _fsOf(this, 'ready');
+      // Resolve once the document has settled: the CSS-connected faces have to be
+      // in the set BEFORE `ready` fires, or `[...document.fonts]` inside the
+      // handler — the documented way to find them — comes back empty.
+      if (!st.readyScheduled) {
+        st.readyScheduled = true;
+        const self = this;
+        // `__fontsSettled` polls the RENDER path's in-flight font fetches: a
+        // geometry read is synchronous and bounded, so a page that measures text
+        // after `ready` must not be handed a layout still using the fallback face.
+        const settle = () => {
+          if (st.readySettled) return;
+          st.readySettled = true;
+          const wait = (typeof globalThis.__fontsSettled === 'function')
+            ? globalThis.__fontsSettled() : Promise.resolve();
+          wait.then(() => {
+            try { _fsSyncCssConnected(st); } catch (e) {}
+            st.resolveReady(self);
+          }, () => st.resolveReady(self));
+        };
+        if (st.doc && st.doc.readyState !== 'complete') {
+          try { globalThis.addEventListener('load', () => setTimeout(settle, 0)); }
+          catch (e) { setTimeout(settle, 0); }
+          // A document that finishes loading before that listener lands still has
+          // to settle, so poll for the completed state as a fallback.
+          const tick = () => {
+            if (st.readySettled) return;
+            if (!st.doc || st.doc.readyState === 'complete') settle();
+            else setTimeout(tick, 20);
+          };
+          setTimeout(tick, 20);
+        } else {
+          setTimeout(settle, 0);
+        }
+      }
+      return st.ready;
+    }, 'get ready', 0),
+  });
+  _sensorEventHandlers(FontFaceSet.prototype, FontFaceSet,
+    ['onloading', 'onloadingdone', 'onloadingerror']);
+
+  globalThis.FontFace = FontFace;
+  globalThis.FontFaceFeatures = FontFaceFeatures;
+  globalThis.FontFaceVariationAxis = FontFaceVariationAxis;
+  globalThis.FontFaceVariations = FontFaceVariations;
+  globalThis.FontFacePalette = FontFacePalette;
+  globalThis.FontFacePalettes = FontFacePalettes;
+  globalThis.FontFaceSet = FontFaceSet;
+  globalThis.FontFaceSetLoadEvent = FontFaceSetLoadEvent;
+  globalThis.__newFontFaceSet = _newFontFaceSet;
+  for (const C of [FontFace, FontFaceFeatures, FontFaceVariationAxis, FontFaceVariations,
+                   FontFacePalette, FontFacePalettes, FontFaceSet, FontFaceSetLoadEvent]) {
+    _markNative(C);
+  }
+}
 
 // ===== Close watchers (HTML §6.10 — the close-watcher infrastructure) =====
 // A per-Window "close watcher manager": a list of GROUPS, each group a list of
@@ -42139,6 +43439,1500 @@ _allowClipboardCtor = false;
   _sameObject('permissions', _permissionsInstance);
   _sameObject('clipboard', _clipboardInstance);
 }
+
+// ── Geolocation, Screen Wake Lock, Compute Pressure, device orientation ──────
+// Four APIs a page feature-detects on `navigator` and then uses. All four were
+// simply absent, so `navigator.geolocation` was `undefined` and the "find my
+// nearest…" button on a council or transit site threw before it could tell the
+// reader that location was unavailable.
+//
+// ⛔ HONEST CAPS, stated once here: this engine has no position source, no screen
+// to keep awake, and no CPU-pressure sampling. Every interface below is real and
+// complete; the ANSWERS are the ones a device without that hardware gives — a
+// POSITION_UNAVAILABLE error, a wake lock that is a bookkeeping record, and a
+// pressure observation that refuses rather than inventing a number.
+
+// GeolocationCoordinates / GeolocationPosition / GeolocationPositionError.
+let _allowGeoCtor = false;
+class GeolocationCoordinates {
+  constructor() {
+    if (!_allowGeoCtor) throw new TypeError('Illegal constructor');
+    this._gc = { accuracy: 0, latitude: 0, longitude: 0, altitude: null,
+                 altitudeAccuracy: null, heading: null, speed: null };
+  }
+  toJSON() {
+    if (!this._gc) throw new TypeError('Illegal invocation');
+    const o = {}; for (const k in this._gc) o[k] = this._gc[k]; return o;
+  }
+}
+for (const _k of ['accuracy', 'latitude', 'longitude', 'altitude', 'altitudeAccuracy',
+                  'heading', 'speed']) {
+  Object.defineProperty(GeolocationCoordinates.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._gc) throw new TypeError('Illegal invocation');
+      return this._gc[_k];
+    }),
+  });
+}
+class GeolocationPosition {
+  constructor() {
+    if (!_allowGeoCtor) throw new TypeError('Illegal constructor');
+    this._gp = { coords: new GeolocationCoordinates(), timestamp: Date.now() };
+  }
+  toJSON() {
+    if (!this._gp) throw new TypeError('Illegal invocation');
+    return { coords: this._gp.coords.toJSON(), timestamp: this._gp.timestamp };
+  }
+}
+for (const _k of ['coords', 'timestamp']) {
+  Object.defineProperty(GeolocationPosition.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._gp) throw new TypeError('Illegal invocation');
+      return this._gp[_k];
+    }),
+  });
+}
+class GeolocationPositionError {
+  constructor() {
+    if (!_allowGeoCtor) throw new TypeError('Illegal constructor');
+    this._ge = { code: 2, message: '' };
+  }
+}
+for (const [_k, _v] of [['PERMISSION_DENIED', 1], ['POSITION_UNAVAILABLE', 2], ['TIMEOUT', 3]]) {
+  for (const target of [GeolocationPositionError, GeolocationPositionError.prototype]) {
+    Object.defineProperty(target, _k, { value: _v, enumerable: true, configurable: false, writable: false });
+  }
+}
+for (const _k of ['code', 'message']) {
+  Object.defineProperty(GeolocationPositionError.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._ge) throw new TypeError('Illegal invocation');
+      return this._ge[_k];
+    }),
+  });
+}
+const _newGeoError = function (code, message) {
+  _allowGeoCtor = true;
+  try {
+    const e = new GeolocationPositionError();
+    e._ge.code = code; e._ge.message = message;
+    return e;
+  } finally { _allowGeoCtor = false; }
+};
+class Geolocation {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  getCurrentPosition(successCallback, errorCallback, options) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'getCurrentPosition' on 'Geolocation': 1 argument required, but only 0 present.");
+    }
+    if (typeof successCallback !== 'function') {
+      throw new TypeError("Failed to execute 'getCurrentPosition' on 'Geolocation': parameter 1 is not of type 'Function'.");
+    }
+    if (errorCallback !== undefined && errorCallback !== null && typeof errorCallback !== 'function') {
+      throw new TypeError("Failed to execute 'getCurrentPosition' on 'Geolocation': parameter 2 is not of type 'Function'.");
+    }
+    // No position source. The spec's own answer for that is POSITION_UNAVAILABLE,
+    // delivered to the error callback as a task — never a throw, because a page
+    // that calls this from a click handler has nowhere to catch it.
+    if (typeof errorCallback === 'function') {
+      setTimeout(() => {
+        try {
+          errorCallback(_newGeoError(2, 'This device has no position source.'));
+        } catch (e) { _reportError(e); }
+      }, 0);
+    }
+  }
+  watchPosition(successCallback, errorCallback, options) {
+    this.getCurrentPosition(successCallback, errorCallback, options);
+    return ++_geoWatchId;
+  }
+  clearWatch(watchId) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'clearWatch' on 'Geolocation': 1 argument required, but only 0 present.");
+    }
+  }
+}
+let _geoWatchId = 0;
+globalThis.Geolocation = _markNative(Geolocation);
+globalThis.GeolocationPosition = _markNative(GeolocationPosition);
+globalThis.GeolocationCoordinates = _markNative(GeolocationCoordinates);
+globalThis.GeolocationPositionError = _markNative(GeolocationPositionError);
+
+// ── Screen Wake Lock ───────────────────────────────────────────────────────
+let _allowWakeCtor = false;
+class WakeLockSentinel extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowWakeCtor) throw new TypeError('Illegal constructor');
+    this._wl = { released: false, type: 'screen' };
+  }
+  get released() {
+    if (!this._wl) throw new TypeError('Illegal invocation');
+    return this._wl.released;
+  }
+  get type() {
+    if (!this._wl) throw new TypeError('Illegal invocation');
+    return this._wl.type;
+  }
+  release() {
+    if (!this._wl) return Promise.reject(new TypeError('Illegal invocation'));
+    if (!this._wl.released) {
+      this._wl.released = true;
+      const ev = new Event('release');
+      ev._isTrusted = true;
+      try { _dispatchSpec(this, ev, false); } catch (e) {}
+    }
+    return Promise.resolve(undefined);
+  }
+}
+_sensorEventHandlers(WakeLockSentinel.prototype, WakeLockSentinel, ['onrelease']);
+class WakeLock {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  request(type) {
+    const t = (type === undefined) ? 'screen' : String(type);
+    if (t !== 'screen') {
+      return Promise.reject(new TypeError("Failed to execute 'request' on 'WakeLock': The provided value '" +
+        t + "' is not a valid enum value of type WakeLockType."));
+    }
+    // ⛔ There is no screen here to keep awake. The LOCK is still real
+    // bookkeeping — the page can hold it, observe `released`, and release it —
+    // which is the whole observable contract; what it cannot do is change a
+    // display this browser does not have.
+    _allowWakeCtor = true;
+    try { return Promise.resolve(new WakeLockSentinel()); }
+    finally { _allowWakeCtor = false; }
+  }
+}
+globalThis.WakeLock = _markNative(WakeLock);
+globalThis.WakeLockSentinel = _markNative(WakeLockSentinel);
+
+// ── Compute Pressure ───────────────────────────────────────────────────────
+let _allowPressureCtor = false;
+class PressureRecord {
+  constructor() {
+    if (!_allowPressureCtor) throw new TypeError('Illegal constructor');
+    this._pr = { source: 'cpu', state: 'nominal', time: 0 };
+  }
+  toJSON() {
+    if (!this._pr) throw new TypeError('Illegal invocation');
+    return { source: this._pr.source, state: this._pr.state, time: this._pr.time };
+  }
+}
+for (const _k of ['source', 'state', 'time']) {
+  Object.defineProperty(PressureRecord.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._pr) throw new TypeError('Illegal invocation');
+      return this._pr[_k];
+    }),
+  });
+}
+class PressureObserver {
+  constructor(callback) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'PressureObserver': 1 argument required, but only 0 present.");
+    }
+    if (typeof callback !== 'function') {
+      throw new TypeError("Failed to construct 'PressureObserver': parameter 1 is not of type 'PressureUpdateCallback'.");
+    }
+    this._po = { callback, sources: [] };
+  }
+  observe(source, options) {
+    if (!this._po) return Promise.reject(new TypeError('Illegal invocation'));
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'observe' on 'PressureObserver': 1 argument required, but only 0 present."));
+    }
+    if (String(source) !== 'cpu') {
+      return Promise.reject(new TypeError("Failed to execute 'observe' on 'PressureObserver': The provided value '" +
+        String(source) + "' is not a valid enum value of type PressureSource."));
+    }
+    // ⛔ Nothing here samples CPU pressure. Refusing is the honest answer; a
+    // fabricated "nominal" would tell a page it is safe to do more work on a
+    // machine that may be struggling, which is the opposite of the point.
+    return Promise.reject(new DOMException(
+      'Pressure observation is not supported on this device.', 'NotSupportedError'));
+  }
+  unobserve(source) {
+    if (!this._po) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'unobserve' on 'PressureObserver': 1 argument required, but only 0 present.");
+    }
+  }
+  disconnect() {
+    if (!this._po) throw new TypeError('Illegal invocation');
+    this._po.sources = [];
+  }
+  takeRecords() {
+    if (!this._po) throw new TypeError('Illegal invocation');
+    return [];
+  }
+}
+Object.defineProperty(PressureObserver, 'knownSources', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'knownSources', (function () {
+    const frozen = Object.freeze(['cpu']);
+    return function () { return frozen; };
+  })()),
+});
+globalThis.PressureObserver = _markNative(PressureObserver);
+globalThis.PressureRecord = _markNative(PressureRecord);
+
+// ── Device orientation / motion events ─────────────────────────────────────
+// A phone reports which way it is held; this engine is not a phone, so every
+// reading is null and no event is ever fired. The EVENT INTERFACES still have to
+// exist: a page constructs and dispatches them itself in tests and in polyfills,
+// and `'DeviceOrientationEvent' in window` is how a site decides whether to offer
+// a tilt control at all.
+const _devNum = (v) => (v === undefined || v === null) ? null : Number(v);
+globalThis.DeviceOrientationEvent = class DeviceOrientationEvent extends Event {
+  constructor(type) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'DeviceOrientationEvent': 1 argument required, but only 0 present.");
+    }
+    const init = arguments[1];
+    super(type, init);
+    const o = (init == null) ? {} : init;
+    this._do = {
+      alpha: _devNum(o.alpha), beta: _devNum(o.beta), gamma: _devNum(o.gamma),
+      absolute: !!o.absolute,
+    };
+  }
+  static requestPermission(absolute) {
+    // No sensor to grant access to.
+    return Promise.resolve('denied');
+  }
+};
+for (const _k of ['alpha', 'beta', 'gamma', 'absolute']) {
+  Object.defineProperty(globalThis.DeviceOrientationEvent.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._do) throw new TypeError('Illegal invocation');
+      return this._do[_k];
+    }),
+  });
+}
+let _allowMotionCtor = false;
+class DeviceMotionEventAcceleration {
+  constructor() {
+    if (!_allowMotionCtor) throw new TypeError('Illegal constructor');
+    this._da = { x: null, y: null, z: null };
+  }
+}
+for (const _k of ['x', 'y', 'z']) {
+  Object.defineProperty(DeviceMotionEventAcceleration.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._da) throw new TypeError('Illegal invocation');
+      return this._da[_k];
+    }),
+  });
+}
+class DeviceMotionEventRotationRate {
+  constructor() {
+    if (!_allowMotionCtor) throw new TypeError('Illegal constructor');
+    this._dr = { alpha: null, beta: null, gamma: null };
+  }
+}
+for (const _k of ['alpha', 'beta', 'gamma']) {
+  Object.defineProperty(DeviceMotionEventRotationRate.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._dr) throw new TypeError('Illegal invocation');
+      return this._dr[_k];
+    }),
+  });
+}
+const _newAccel = function (src) {
+  if (src == null) return null;
+  _allowMotionCtor = true;
+  try {
+    const a = new DeviceMotionEventAcceleration();
+    a._da.x = _devNum(src.x); a._da.y = _devNum(src.y); a._da.z = _devNum(src.z);
+    return a;
+  } finally { _allowMotionCtor = false; }
+};
+const _newRotation = function (src) {
+  if (src == null) return null;
+  _allowMotionCtor = true;
+  try {
+    const r = new DeviceMotionEventRotationRate();
+    r._dr.alpha = _devNum(src.alpha); r._dr.beta = _devNum(src.beta); r._dr.gamma = _devNum(src.gamma);
+    return r;
+  } finally { _allowMotionCtor = false; }
+};
+globalThis.DeviceMotionEvent = class DeviceMotionEvent extends Event {
+  constructor(type) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'DeviceMotionEvent': 1 argument required, but only 0 present.");
+    }
+    const init = arguments[1];
+    super(type, init);
+    const o = (init == null) ? {} : init;
+    this._dm = {
+      acceleration: _newAccel(o.acceleration),
+      accelerationIncludingGravity: _newAccel(o.accelerationIncludingGravity),
+      rotationRate: _newRotation(o.rotationRate),
+      interval: (o.interval === undefined) ? 0 : Number(o.interval),
+    };
+  }
+  static requestPermission() { return Promise.resolve('denied'); }
+};
+for (const _k of ['acceleration', 'accelerationIncludingGravity', 'rotationRate', 'interval']) {
+  Object.defineProperty(globalThis.DeviceMotionEvent.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._dm) throw new TypeError('Illegal invocation');
+      return this._dm[_k];
+    }),
+  });
+}
+globalThis.DeviceMotionEventAcceleration = _markNative(DeviceMotionEventAcceleration);
+globalThis.DeviceMotionEventRotationRate = _markNative(DeviceMotionEventRotationRate);
+_markNative(globalThis.DeviceOrientationEvent); _markNative(globalThis.DeviceMotionEvent);
+
+// The [SameObject] navigator entry points for the two of these that have one.
+{
+  const _geolocationInstance = Object.create(Geolocation.prototype);
+  const _wakeLockInstance = Object.create(WakeLock.prototype);
+  const _navSame = (name, value) => Object.defineProperty(_Navigator.prototype, name, {
+    enumerable: true, configurable: true,
+    get: _named('get', name, function () {
+      if (!(this instanceof _Navigator)) throw new TypeError('Illegal invocation');
+      return value;
+    }),
+  });
+  _navSame('geolocation', _geolocationInstance);
+  _navSame('wakeLock', _wakeLockInstance);
+}
+
+// ── WebVTT: TextTrackCue, VTTCue, VTTRegion ──────────────────────────────────
+// A caption is not decoration. `VTTCue` is how a page puts a subtitle on a video
+// it renders itself, how a transcript gets built, and how anyone watching without
+// sound — in a noisy room, on a shared device, or because they are deaf — follows
+// what is being said. `TextTrackCue` did not exist at all, so `VTTCue` had nothing
+// to inherit from and `track.addCue(new VTTCue(...))` threw on the constructor.
+let _allowCueCtor = false;
+globalThis.TextTrackCue = class TextTrackCue extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowCueCtor) throw new TypeError('Illegal constructor');
+    this._cue = { id: '', startTime: 0, endTime: 0, pauseOnExit: false, track: null };
+  }
+};
+{
+  const proto = globalThis.TextTrackCue.prototype;
+  const rw = (name, coerce) => Object.defineProperty(proto, name, {
+    configurable: true, enumerable: true,
+    get: _named('get', name, function () {
+      if (!this._cue) throw new TypeError('Illegal invocation');
+      return this._cue[name];
+    }),
+    set: _named('set', name, function (v) {
+      if (!this._cue) throw new TypeError('Illegal invocation');
+      this._cue[name] = coerce(v);
+    }),
+  });
+  rw('id', String);
+  rw('startTime', Number);
+  rw('endTime', Number);
+  rw('pauseOnExit', Boolean);
+  Object.defineProperty(proto, 'track', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'track', function () {
+      if (!this._cue) throw new TypeError('Illegal invocation');
+      return this._cue.track;
+    }),
+  });
+  _sensorEventHandlers(proto, globalThis.TextTrackCue, ['onenter', 'onexit']);
+}
+_markNative(globalThis.TextTrackCue);
+
+const _VTT_ENUMS = {
+  vertical: ['', 'rl', 'lr'],
+  lineAlign: ['start', 'center', 'end'],
+  positionAlign: ['line-left', 'center', 'line-right', 'auto'],
+  align: ['start', 'center', 'end', 'left', 'right'],
+  scroll: ['', 'up'],
+};
+globalThis.VTTCue = class VTTCue extends globalThis.TextTrackCue {
+  constructor(startTime, endTime, text) {
+    _allowCueCtor = true;
+    try { super(); } finally { _allowCueCtor = false; }
+    if (arguments.length < 3) {
+      throw new TypeError("Failed to construct 'VTTCue': 3 arguments required, but only " +
+        arguments.length + " present.");
+    }
+    this._cue.startTime = Number(startTime);
+    this._cue.endTime = Number(endTime);
+    this._vtt = {
+      region: null, vertical: '', snapToLines: true, line: 'auto', lineAlign: 'start',
+      position: 'auto', positionAlign: 'auto', size: 100, align: 'center',
+      text: String(text),
+    };
+  }
+  // The cue's text as a DOM fragment. Without a WebVTT text parser this is the
+  // cue text as a single text node — the right SHAPE, and the right content for
+  // every cue that carries no markup, which is most of them.
+  getCueAsHTML() {
+    if (!this._vtt) throw new TypeError('Illegal invocation');
+    const frag = document.createDocumentFragment();
+    frag.appendChild(document.createTextNode(this._vtt.text));
+    return frag;
+  }
+};
+{
+  const proto = globalThis.VTTCue.prototype;
+  const store = (o) => { if (!o || !o._vtt) throw new TypeError('Illegal invocation'); return o._vtt; };
+  const plain = (name, coerce) => Object.defineProperty(proto, name, {
+    configurable: true, enumerable: true,
+    get: _named('get', name, function () { return store(this)[name]; }),
+    set: _named('set', name, function (v) { store(this)[name] = coerce(v); }),
+  });
+  plain('region', (v) => (v == null ? null : v));
+  plain('snapToLines', Boolean);
+  plain('size', Number);
+  plain('text', String);
+  for (const name of ['vertical', 'lineAlign', 'positionAlign', 'align']) {
+    const allowed = _VTT_ENUMS[name];
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true,
+      get: _named('get', name, function () { return store(this)[name]; }),
+      // WebIDL: an enumeration-typed attribute IGNORES a value outside the enum.
+      set: _named('set', name, function (v) {
+        const s = String(v);
+        if (allowed.indexOf(s) >= 0) store(this)[name] = s;
+      }),
+    });
+  }
+  // `line` and `position` are `(double or "auto")`.
+  for (const name of ['line', 'position']) {
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true,
+      get: _named('get', name, function () { return store(this)[name]; }),
+      set: _named('set', name, function (v) {
+        if (typeof v === 'string' && v === 'auto') { store(this)[name] = 'auto'; return; }
+        const n = Number(v);
+        if (!isFinite(n)) {
+          throw new TypeError("Failed to set the '" + name + "' property on 'VTTCue': The provided double value is non-finite.");
+        }
+        store(this)[name] = n;
+      }),
+    });
+  }
+}
+_markNative(globalThis.VTTCue);
+
+globalThis.VTTRegion = class VTTRegion {
+  constructor() {
+    this._vr = {
+      id: '', width: 100, lines: 3, regionAnchorX: 0, regionAnchorY: 100,
+      viewportAnchorX: 0, viewportAnchorY: 100, scroll: '',
+    };
+  }
+};
+{
+  const proto = globalThis.VTTRegion.prototype;
+  const store = (o) => { if (!o || !o._vr) throw new TypeError('Illegal invocation'); return o._vr; };
+  const plain = (name, coerce) => Object.defineProperty(proto, name, {
+    configurable: true, enumerable: true,
+    get: _named('get', name, function () { return store(this)[name]; }),
+    set: _named('set', name, function (v) { store(this)[name] = coerce(v); }),
+  });
+  plain('id', String);
+  plain('width', Number);
+  plain('lines', (v) => (Number(v) >>> 0));
+  for (const n of ['regionAnchorX', 'regionAnchorY', 'viewportAnchorX', 'viewportAnchorY']) plain(n, Number);
+  Object.defineProperty(proto, 'scroll', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'scroll', function () { return store(this).scroll; }),
+    set: _named('set', 'scroll', function (v) {
+      const s = String(v);
+      if (_VTT_ENUMS.scroll.indexOf(s) >= 0) store(this).scroll = s;
+    }),
+  });
+}
+_markNative(globalThis.VTTRegion);
+
+// ── The Cookie Store API ─────────────────────────────────────────────────────
+// The asynchronous, structured replacement for the `document.cookie` string. Real
+// cookies underneath: `document.cookie` is this engine's actual cookie jar, so
+// `cookieStore.set()` really does set a cookie and `get()` really does read one.
+// ⛔ What it cannot do is observe a cookie changed by the SERVER — `change` events
+// only fire for writes made through this API, so the `onchange` handler is real
+// but its coverage is narrower than a full implementation's.
+globalThis.CookieChangeEvent = class CookieChangeEvent extends Event {
+  constructor(type) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'CookieChangeEvent': 1 argument required, but only 0 present.");
+    }
+    const init = arguments[1];
+    super(type, init);
+    const o = (init == null) ? {} : init;
+    this._cc = {
+      changed: Object.freeze(o.changed ? Array.from(o.changed) : []),
+      deleted: Object.freeze(o.deleted ? Array.from(o.deleted) : []),
+    };
+  }
+};
+for (const _k of ['changed', 'deleted']) {
+  Object.defineProperty(globalThis.CookieChangeEvent.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._cc) throw new TypeError('Illegal invocation');
+      return this._cc[_k];
+    }),
+  });
+}
+_markNative(globalThis.CookieChangeEvent);
+
+const _cookieJarList = function () {
+  const out = [];
+  let raw = '';
+  try { raw = document.cookie || ''; } catch (e) { return out; }
+  for (const part of raw.split(';')) {
+    const t = part.trim();
+    if (!t) continue;
+    const i = t.indexOf('=');
+    out.push(i < 0 ? { name: '', value: t } : { name: t.slice(0, i), value: t.slice(i + 1) });
+  }
+  return out;
+};
+globalThis.CookieStore = class CookieStore extends EventTarget {
+  constructor() {
+    super();
+    throw new TypeError('Illegal constructor');
+  }
+  get(nameOrOptions) {
+    if (arguments.length < 1) {
+      // `get()` with no arguments matches the current document's URL, which here
+      // means "the first cookie there is".
+      const all = _cookieJarList();
+      return Promise.resolve(all.length ? all[0] : null);
+    }
+    const name = (nameOrOptions !== null && typeof nameOrOptions === 'object')
+      ? (nameOrOptions.name === undefined ? undefined : String(nameOrOptions.name))
+      : String(nameOrOptions);
+    const all = _cookieJarList();
+    if (name === undefined) return Promise.resolve(all.length ? all[0] : null);
+    for (const c of all) if (c.name === name) return Promise.resolve(c);
+    return Promise.resolve(null);
+  }
+  getAll(nameOrOptions) {
+    const all = _cookieJarList();
+    if (arguments.length < 1) return Promise.resolve(all);
+    const name = (nameOrOptions !== null && typeof nameOrOptions === 'object')
+      ? (nameOrOptions.name === undefined ? undefined : String(nameOrOptions.name))
+      : String(nameOrOptions);
+    if (name === undefined) return Promise.resolve(all);
+    return Promise.resolve(all.filter((c) => c.name === name));
+  }
+  set(nameOrOptions, value) {
+    let name, val, opts = {};
+    if (nameOrOptions !== null && typeof nameOrOptions === 'object') {
+      opts = nameOrOptions;
+      if (opts.name === undefined || opts.value === undefined) {
+        return Promise.reject(new TypeError("Failed to execute 'set' on 'CookieStore': required member is undefined."));
+      }
+      name = String(opts.name); val = String(opts.value);
+    } else {
+      if (arguments.length < 2) {
+        return Promise.reject(new TypeError("Failed to execute 'set' on 'CookieStore': 2 arguments required, but only " + arguments.length + " present."));
+      }
+      name = String(nameOrOptions); val = String(value);
+    }
+    let cookie = name + '=' + val + '; path=' + (opts.path === undefined ? '/' : String(opts.path));
+    if (opts.domain != null) cookie += '; domain=' + String(opts.domain);
+    if (opts.expires != null) cookie += '; expires=' + new Date(Number(opts.expires)).toUTCString();
+    try { document.cookie = cookie; } catch (e) { return Promise.reject(e); }
+    this._notifyChange([{ name, value: val }], []);
+    return Promise.resolve(undefined);
+  }
+  delete(nameOrOptions) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'delete' on 'CookieStore': 1 argument required, but only 0 present."));
+    }
+    let name, opts = {};
+    if (nameOrOptions !== null && typeof nameOrOptions === 'object') {
+      opts = nameOrOptions;
+      if (opts.name === undefined) {
+        return Promise.reject(new TypeError("Failed to execute 'delete' on 'CookieStore': required member name is undefined."));
+      }
+      name = String(opts.name);
+    } else {
+      name = String(nameOrOptions);
+    }
+    let cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=' +
+      (opts.path === undefined ? '/' : String(opts.path));
+    if (opts.domain != null) cookie += '; domain=' + String(opts.domain);
+    try { document.cookie = cookie; } catch (e) { return Promise.reject(e); }
+    this._notifyChange([], [{ name, value: '' }]);
+    return Promise.resolve(undefined);
+  }
+  _notifyChange(changed, deleted) {
+    const ev = new globalThis.CookieChangeEvent('change', { changed, deleted });
+    ev._isTrusted = true;
+    try { _dispatchSpec(this, ev, false); } catch (e) {}
+  }
+};
+_sensorEventHandlers(globalThis.CookieStore.prototype, globalThis.CookieStore, ['onchange']);
+_markNative(globalThis.CookieStore);
+globalThis.CookieStoreManager = class CookieStoreManager {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  subscribe(subscriptions) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'subscribe' on 'CookieStoreManager': 1 argument required, but only 0 present."));
+    }
+    const list = this._subs || (this._subs = []);
+    for (const s of Array.from(subscriptions)) list.push(s);
+    return Promise.resolve(undefined);
+  }
+  getSubscriptions() { return Promise.resolve((this._subs || []).slice()); }
+  unsubscribe(subscriptions) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'unsubscribe' on 'CookieStoreManager': 1 argument required, but only 0 present."));
+    }
+    this._subs = [];
+    return Promise.resolve(undefined);
+  }
+};
+_markNative(globalThis.CookieStoreManager);
+{
+  // `window.cookieStore` is a [SameObject] readonly Window attribute.
+  const _cookieStoreInstance = Object.create(globalThis.CookieStore.prototype);
+  Object.defineProperty(globalThis, 'cookieStore', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'cookieStore', function () { return _cookieStoreInstance; }),
+  });
+}
+
+// ── Gamepad ──────────────────────────────────────────────────────────────────
+// ⛔ HONEST CAP: no gamepad is attached and none can be, so `getGamepads()`
+// returns an empty list forever. The interfaces exist because a page reads
+// `navigator.getGamepads()` before it knows that — and because a missing
+// `GamepadButton` turns feature detection into a ReferenceError.
+let _allowGamepadCtor = false;
+globalThis.GamepadButton = class GamepadButton {
+  constructor() {
+    if (!_allowGamepadCtor) throw new TypeError('Illegal constructor');
+    this._gb = { pressed: false, touched: false, value: 0 };
+  }
+};
+for (const _k of ['pressed', 'touched', 'value']) {
+  Object.defineProperty(globalThis.GamepadButton.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._gb) throw new TypeError('Illegal invocation');
+      return this._gb[_k];
+    }),
+  });
+}
+globalThis.GamepadHapticActuator = class GamepadHapticActuator {
+  constructor() {
+    if (!_allowGamepadCtor) throw new TypeError('Illegal constructor');
+    this._ga = { effects: Object.freeze([]) };
+  }
+  playEffect(type) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'playEffect' on 'GamepadHapticActuator': 1 argument required, but only 0 present."));
+    }
+    return Promise.resolve('preempted');
+  }
+  reset() { return Promise.resolve('preempted'); }
+};
+Object.defineProperty(globalThis.GamepadHapticActuator.prototype, 'effects', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'effects', function () {
+    if (!this._ga) throw new TypeError('Illegal invocation');
+    return this._ga.effects;
+  }),
+});
+globalThis.Gamepad = class Gamepad {
+  constructor() {
+    if (!_allowGamepadCtor) throw new TypeError('Illegal constructor');
+    this._gp = {
+      id: '', index: 0, connected: false, timestamp: 0, mapping: '',
+      axes: Object.freeze([]), buttons: Object.freeze([]), touches: Object.freeze([]),
+      vibrationActuator: new globalThis.GamepadHapticActuator(),
+    };
+  }
+};
+for (const _k of ['id', 'index', 'connected', 'timestamp', 'mapping', 'axes',
+                  'buttons', 'touches', 'vibrationActuator']) {
+  Object.defineProperty(globalThis.Gamepad.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._gp) throw new TypeError('Illegal invocation');
+      return this._gp[_k];
+    }),
+  });
+}
+globalThis.GamepadEvent = class GamepadEvent extends Event {
+  constructor(type) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'GamepadEvent': 1 argument required, but only 0 present.");
+    }
+    const init = arguments[1];
+    super(type, init);
+    this._gev = { gamepad: (init && init.gamepad !== undefined) ? init.gamepad : null };
+  }
+};
+Object.defineProperty(globalThis.GamepadEvent.prototype, 'gamepad', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'gamepad', function () {
+    if (!this._gev) throw new TypeError('Illegal invocation');
+    return this._gev.gamepad;
+  }),
+});
+_markNative(globalThis.Gamepad); _markNative(globalThis.GamepadButton);
+_markNative(globalThis.GamepadHapticActuator); _markNative(globalThis.GamepadEvent);
+Object.defineProperty(_Navigator.prototype, 'getGamepads', {
+  writable: true, enumerable: true, configurable: true,
+  value: _named('', 'getGamepads', function getGamepads() {
+    if (!(this instanceof _Navigator)) throw new TypeError('Illegal invocation');
+    return [];
+  }),
+});
+
+// ── Media Session ────────────────────────────────────────────────────────────
+// What a page tells the SYSTEM about what it is playing: the title on the lock
+// screen, the artwork in the notification shade, and which buttons (play, pause,
+// next) the hardware keys are wired to. This engine has no lock screen, but the
+// metadata record is exactly as real as the page makes it, and the action
+// handlers are stored and callable — so a page that registers them keeps working
+// instead of throwing on `navigator.mediaSession`.
+const _MEDIA_SESSION_ACTIONS = ['play', 'pause', 'seekbackward', 'seekforward',
+  'previoustrack', 'nexttrack', 'skipad', 'stop', 'seekto', 'togglemicrophone',
+  'togglecamera', 'togglescreenshare', 'hangup', 'previousslide', 'nextslide',
+  'enterpictureinpicture', 'voiceactivity'];
+let _allowChapterCtor = false;
+const _mediaImage = function (v) {
+  const o = (v == null) ? {} : v;
+  if (o.src === undefined) {
+    throw new TypeError("Failed to read the 'src' property from 'MediaImage': Required member is undefined.");
+  }
+  return Object.freeze({ src: String(o.src), sizes: o.sizes === undefined ? '' : String(o.sizes),
+                         type: o.type === undefined ? '' : String(o.type) });
+};
+globalThis.ChapterInformation = class ChapterInformation {
+  constructor() {
+    if (!_allowChapterCtor) throw new TypeError('Illegal constructor');
+    this._ci = { title: '', startTime: 0, artwork: Object.freeze([]) };
+  }
+};
+for (const _k of ['title', 'startTime', 'artwork']) {
+  Object.defineProperty(globalThis.ChapterInformation.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._ci) throw new TypeError('Illegal invocation');
+      return this._ci[_k];
+    }),
+  });
+}
+_markNative(globalThis.ChapterInformation);
+globalThis.MediaMetadata = class MediaMetadata {
+  constructor() {
+    const init = arguments[0];
+    const o = (init == null) ? {} : init;
+    const chapters = [];
+    for (const c of (o.chapterInfo ? Array.from(o.chapterInfo) : [])) {
+      _allowChapterCtor = true;
+      let ch;
+      try { ch = new globalThis.ChapterInformation(); }
+      finally { _allowChapterCtor = false; }
+      const ci = (c == null) ? {} : c;
+      ch._ci.title = ci.title === undefined ? '' : String(ci.title);
+      ch._ci.startTime = ci.startTime === undefined ? 0 : Number(ci.startTime);
+      ch._ci.artwork = Object.freeze((ci.artwork ? Array.from(ci.artwork) : []).map(_mediaImage));
+      chapters.push(ch);
+    }
+    this._mm = {
+      title: o.title === undefined ? '' : String(o.title),
+      artist: o.artist === undefined ? '' : String(o.artist),
+      album: o.album === undefined ? '' : String(o.album),
+      artwork: Object.freeze((o.artwork ? Array.from(o.artwork) : []).map(_mediaImage)),
+      chapterInfo: Object.freeze(chapters),
+    };
+  }
+};
+{
+  const proto = globalThis.MediaMetadata.prototype;
+  const store = (o) => { if (!o || !o._mm) throw new TypeError('Illegal invocation'); return o._mm; };
+  for (const name of ['title', 'artist', 'album']) {
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true,
+      get: _named('get', name, function () { return store(this)[name]; }),
+      set: _named('set', name, function (v) { store(this)[name] = String(v); }),
+    });
+  }
+  Object.defineProperty(proto, 'artwork', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'artwork', function () { return store(this).artwork; }),
+    set: _named('set', 'artwork', function (v) {
+      store(this).artwork = Object.freeze((v ? Array.from(v) : []).map(_mediaImage));
+    }),
+  });
+  Object.defineProperty(proto, 'chapterInfo', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'chapterInfo', function () { return store(this).chapterInfo; }),
+  });
+}
+_markNative(globalThis.MediaMetadata);
+globalThis.MediaSession = class MediaSession {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  setActionHandler(action, handler) {
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to execute 'setActionHandler' on 'MediaSession': 2 arguments required, but only " + arguments.length + " present.");
+    }
+    const a = String(action);
+    if (_MEDIA_SESSION_ACTIONS.indexOf(a) < 0) {
+      throw new TypeError("Failed to execute 'setActionHandler' on 'MediaSession': The provided value '" +
+        a + "' is not a valid enum value of type MediaSessionAction.");
+    }
+    if (handler !== null && typeof handler !== 'function') {
+      throw new TypeError("Failed to execute 'setActionHandler' on 'MediaSession': parameter 2 is not of type 'MediaSessionActionHandler'.");
+    }
+    const bag = this._handlers || (this._handlers = Object.create(null));
+    bag[a] = handler;
+  }
+  setPositionState(state) {
+    const s = (state == null) ? {} : state;
+    // The spec validates before storing: a negative duration or a position past
+    // the end is a TypeError, not a silently wrong seek bar.
+    if (s.duration !== undefined) {
+      const d = Number(s.duration);
+      if (!(d >= 0)) throw new TypeError("Failed to execute 'setPositionState' on 'MediaSession': duration cannot be negative.");
+      if (s.position !== undefined) {
+        const pos = Number(s.position);
+        if (!(pos >= 0) || pos > d) {
+          throw new TypeError("Failed to execute 'setPositionState' on 'MediaSession': position cannot be greater than duration.");
+        }
+      }
+    }
+    if (s.playbackRate !== undefined && Number(s.playbackRate) === 0) {
+      throw new TypeError("Failed to execute 'setPositionState' on 'MediaSession': playbackRate cannot be 0.");
+    }
+    this._positionState = s;
+  }
+  setMicrophoneActive(active) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'setMicrophoneActive' on 'MediaSession': 1 argument required, but only 0 present."));
+    }
+    this._microphoneActive = !!active;
+    return Promise.resolve(undefined);
+  }
+  setCameraActive(active) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'setCameraActive' on 'MediaSession': 1 argument required, but only 0 present."));
+    }
+    this._cameraActive = !!active;
+    return Promise.resolve(undefined);
+  }
+  setScreenshareActive(active) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'setScreenshareActive' on 'MediaSession': 1 argument required, but only 0 present."));
+    }
+    this._screenshareActive = !!active;
+    return Promise.resolve(undefined);
+  }
+};
+{
+  const proto = globalThis.MediaSession.prototype;
+  Object.defineProperty(proto, 'metadata', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'metadata', function () { return this._metadata || null; }),
+    set: _named('set', 'metadata', function (v) { this._metadata = (v == null) ? null : v; }),
+  });
+  Object.defineProperty(proto, 'playbackState', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'playbackState', function () { return this._playbackState || 'none'; }),
+    set: _named('set', 'playbackState', function (v) {
+      const s = String(v);
+      if (s === 'none' || s === 'paused' || s === 'playing') this._playbackState = s;
+    }),
+  });
+}
+_markNative(globalThis.MediaSession);
+{
+  const _mediaSessionInstance = Object.create(globalThis.MediaSession.prototype);
+  Object.defineProperty(_Navigator.prototype, 'mediaSession', {
+    enumerable: true, configurable: true,
+    get: _named('get', 'mediaSession', function () {
+      if (!(this instanceof _Navigator)) throw new TypeError('Illegal invocation');
+      return _mediaSessionInstance;
+    }),
+  });
+}
+
+// ── Observable / Subscriber (DOM, "Observable" proposal) ─────────────────────
+// A push-based stream of values with a teardown that actually runs. The reason it
+// belongs in a browser rather than in every page's bundle: a page that has to ship
+// its own reactive library pays for it in bytes on a metered connection, every
+// visit, to do something the platform can do for free.
+let _allowSubscriberCtor = false;
+globalThis.Subscriber = class Subscriber {
+  constructor() {
+    if (!_allowSubscriberCtor) throw new TypeError('Illegal constructor');
+    this._sub = { active: true, observer: null, teardowns: [], signal: null, controller: null };
+  }
+  next(value) {
+    if (!this._sub) throw new TypeError('Illegal invocation');
+    if (!this._sub.active) return;
+    const cb = this._sub.observer && this._sub.observer.next;
+    if (typeof cb === 'function') { try { cb.call(undefined, value); } catch (e) { _reportError(e); } }
+  }
+  error(err) {
+    if (!this._sub) throw new TypeError('Illegal invocation');
+    if (!this._sub.active) return;
+    const cb = this._sub.observer && this._sub.observer.error;
+    // An error nobody is listening for is not swallowed — it is REPORTED, the way
+    // an uncaught exception is. Silently dropping it is how a stream that has
+    // stopped working looks exactly like one that had nothing to say.
+    this._close();
+    if (typeof cb === 'function') { try { cb.call(undefined, err); } catch (e) { _reportError(e); } }
+    else _reportError(err);
+  }
+  complete() {
+    if (!this._sub) throw new TypeError('Illegal invocation');
+    if (!this._sub.active) return;
+    const cb = this._sub.observer && this._sub.observer.complete;
+    this._close();
+    if (typeof cb === 'function') { try { cb.call(undefined); } catch (e) { _reportError(e); } }
+  }
+  addTeardown(teardown) {
+    if (!this._sub) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1 || typeof teardown !== 'function') {
+      throw new TypeError("Failed to execute 'addTeardown' on 'Subscriber': parameter 1 is not of type 'Function'.");
+    }
+    // A teardown registered after the subscription closed runs IMMEDIATELY —
+    // otherwise a late registration leaks the very thing it was meant to release.
+    if (!this._sub.active) { try { teardown(); } catch (e) { _reportError(e); } return; }
+    this._sub.teardowns.push(teardown);
+  }
+  _close() {
+    const st = this._sub;
+    if (!st.active) return;
+    st.active = false;
+    const list = st.teardowns.slice();
+    st.teardowns.length = 0;
+    // Teardowns run in REVERSE registration order, innermost resource first.
+    for (let i = list.length - 1; i >= 0; i--) {
+      try { list[i](); } catch (e) { _reportError(e); }
+    }
+    if (st.controller) { try { st.controller.abort(); } catch (e) {} }
+  }
+};
+for (const _k of ['active', 'signal']) {
+  Object.defineProperty(globalThis.Subscriber.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._sub) throw new TypeError('Illegal invocation');
+      return this._sub[_k];
+    }),
+  });
+}
+_markNative(globalThis.Subscriber);
+
+globalThis.Observable = class Observable {
+  constructor(callback) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'Observable': 1 argument required, but only 0 present.");
+    }
+    if (typeof callback !== 'function') {
+      throw new TypeError("Failed to construct 'Observable': parameter 1 is not of type 'SubscribeCallback'.");
+    }
+    this._subscribeCallback = callback;
+  }
+  subscribe(observer, options) {
+    if (typeof this._subscribeCallback !== 'function') throw new TypeError('Illegal invocation');
+    // `ObserverUnion`: a bare function is the `next` handler.
+    let obs;
+    if (typeof observer === 'function') obs = { next: observer };
+    else if (observer !== null && typeof observer === 'object') obs = observer;
+    else obs = {};
+    _allowSubscriberCtor = true;
+    let sub;
+    try { sub = new globalThis.Subscriber(); }
+    finally { _allowSubscriberCtor = false; }
+    sub._sub.observer = obs;
+    const controller = new AbortController();
+    sub._sub.controller = controller;
+    const outer = (options && options.signal !== undefined && options.signal !== null)
+      ? options.signal : null;
+    sub._sub.signal = outer
+      ? globalThis.AbortSignal.any([outer, controller.signal])
+      : controller.signal;
+    if (outer && outer.aborted) { sub._sub.active = false; return; }
+    if (outer) outer.addEventListener('abort', () => sub._close());
+    try { this._subscribeCallback.call(undefined, sub); }
+    catch (e) { sub.error(e); }
+  }
+};
+_markNative(globalThis.Observable);
+
+// ── Screen Orientation ───────────────────────────────────────────────────────
+// `screen.orientation` is how a page finds out it is being read sideways. There
+// is a real viewport behind this, so the answer is real: the type follows the
+// window's own width and height.
+globalThis.ScreenOrientation = class ScreenOrientation extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowScreenOrientationCtor) throw new TypeError('Illegal constructor');
+    this._so = { locked: null };
+  }
+  lock(orientation) {
+    if (!(this instanceof globalThis.ScreenOrientation)) {
+      return Promise.reject(new TypeError('Illegal invocation'));
+    }
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'lock' on 'ScreenOrientation': 1 argument required, but only 0 present."));
+    }
+    const o = String(orientation);
+    if (_ORIENTATION_LOCKS.indexOf(o) < 0) {
+      return Promise.reject(new TypeError("Failed to execute 'lock' on 'ScreenOrientation': The provided value '" +
+        o + "' is not a valid enum value of type OrientationLockType."));
+    }
+    // ⛔ There is no physical display to rotate, and a lock that silently did
+    // nothing would leave a page believing it had pinned the orientation.
+    return Promise.reject(new DOMException(
+      'Screen orientation cannot be locked on this device.', 'NotSupportedError'));
+  }
+  unlock() {
+    if (!(this instanceof globalThis.ScreenOrientation)) throw new TypeError('Illegal invocation');
+    if (this._so) this._so.locked = null;
+  }
+};
+const _ORIENTATION_LOCKS = ['any', 'natural', 'landscape', 'portrait',
+  'portrait-primary', 'portrait-secondary', 'landscape-primary', 'landscape-secondary'];
+let _allowScreenOrientationCtor = false;
+Object.defineProperty(globalThis.ScreenOrientation.prototype, 'type', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'type', function () {
+    if (!(this instanceof globalThis.ScreenOrientation)) throw new TypeError('Illegal invocation');
+    let w = 0, h = 0;
+    try { w = globalThis.innerWidth || 0; h = globalThis.innerHeight || 0; } catch (e) {}
+    return (w > h) ? 'landscape-primary' : 'portrait-primary';
+  }),
+});
+Object.defineProperty(globalThis.ScreenOrientation.prototype, 'angle', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'angle', function () {
+    if (!(this instanceof globalThis.ScreenOrientation)) throw new TypeError('Illegal invocation');
+    return 0;
+  }),
+});
+_sensorEventHandlers(globalThis.ScreenOrientation.prototype, globalThis.ScreenOrientation, ['onchange']);
+_markNative(globalThis.ScreenOrientation);
+globalThis.__newScreenOrientation = function () {
+  _allowScreenOrientationCtor = true;
+  try { return new globalThis.ScreenOrientation(); }
+  finally { _allowScreenOrientationCtor = false; }
+};
+
+// ── Network Information ──────────────────────────────────────────────────────
+// ⭐ THE MOST ON-MISSION OBJECT ON THE PLATFORM. `navigator.connection.saveData`
+// is how a page is TOLD the reader is paying by the megabyte, and `effectiveType`
+// is how it learns the connection is slow enough to skip the hero video. It was a
+// plain object literal on `navigator` — not an interface, not an EventTarget, no
+// prototype, invisible to `'connection' in Navigator.prototype`, and impossible
+// to listen to for a change.
+let _allowNetInfoCtor = false;
+globalThis.NetworkInformation = class NetworkInformation extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowNetInfoCtor) throw new TypeError('Illegal constructor');
+    this._ni = { type: 'unknown', effectiveType: '4g', downlinkMax: Infinity,
+                 downlink: 10, rtt: 50, saveData: false };
+  }
+};
+for (const _k of ['type', 'effectiveType', 'downlinkMax', 'downlink', 'rtt', 'saveData']) {
+  Object.defineProperty(globalThis.NetworkInformation.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._ni) throw new TypeError('Illegal invocation');
+      return this._ni[_k];
+    }),
+  });
+}
+_sensorEventHandlers(globalThis.NetworkInformation.prototype, globalThis.NetworkInformation, ['onchange']);
+_markNative(globalThis.NetworkInformation);
+
+// ── Reporting API ────────────────────────────────────────────────────────────
+// `ReportingObserver` is how a page learns about its OWN deprecations,
+// interventions and CSP violations without a user ever filing a bug. Nothing
+// generates reports here yet, so an observer sees an empty list — which is a
+// truthful "nothing to report", not a broken constructor.
+globalThis.ReportBody = class ReportBody {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  toJSON() { return {}; }
+};
+_markNative(globalThis.ReportBody);
+globalThis.Report = class Report {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  toJSON() {
+    if (!this._rp) throw new TypeError('Illegal invocation');
+    return { type: this._rp.type, url: this._rp.url, body: this._rp.body };
+  }
+};
+for (const _k of ['type', 'url', 'body']) {
+  Object.defineProperty(globalThis.Report.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._rp) throw new TypeError('Illegal invocation');
+      return this._rp[_k];
+    }),
+  });
+}
+_markNative(globalThis.Report);
+globalThis.ReportingObserver = class ReportingObserver {
+  constructor(callback, options) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'ReportingObserver': 1 argument required, but only 0 present.");
+    }
+    if (typeof callback !== 'function') {
+      throw new TypeError("Failed to construct 'ReportingObserver': parameter 1 is not of type 'ReportingObserverCallback'.");
+    }
+    const o = (options == null) ? {} : options;
+    this._ro = {
+      callback,
+      types: o.types ? Array.from(o.types, String) : null,
+      buffered: !!o.buffered,
+      queue: [], observing: false,
+    };
+  }
+  observe() {
+    if (!this._ro) throw new TypeError('Illegal invocation');
+    this._ro.observing = true;
+  }
+  disconnect() {
+    if (!this._ro) throw new TypeError('Illegal invocation');
+    this._ro.observing = false;
+  }
+  takeRecords() {
+    if (!this._ro) throw new TypeError('Illegal invocation');
+    const q = this._ro.queue;
+    this._ro.queue = [];
+    return q;
+  }
+};
+_markNative(globalThis.ReportingObserver);
+
+// ── Scroll-to-text fragment ──────────────────────────────────────────────────
+// `document.fragmentDirective` marks that this engine understands the `:~:text=`
+// half of a URL — the part that lets a link point at a SENTENCE rather than at a
+// page, which is how a citation survives someone reorganising a document.
+globalThis.FragmentDirective = class FragmentDirective {
+  constructor() { throw new TypeError('Illegal constructor'); }
+};
+_markNative(globalThis.FragmentDirective);
+{
+  const _fragmentDirectiveInstance = Object.create(globalThis.FragmentDirective.prototype);
+  Object.defineProperty(Document.prototype, 'fragmentDirective', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'fragmentDirective', function () {
+      if (!(this instanceof Document)) throw new TypeError('Illegal invocation');
+      return _fragmentDirectiveInstance;
+    }),
+  });
+}
+
+// `navigator.connection` / `workerNavigator.connection` — ONE NetworkInformation
+// per realm, on the interface prototype where a feature detector looks.
+{
+  _allowNetInfoCtor = true;
+  let _connectionInstance;
+  try { _connectionInstance = new globalThis.NetworkInformation(); }
+  finally { _allowNetInfoCtor = false; }
+  Object.defineProperty(_Navigator.prototype, 'connection', {
+    enumerable: true, configurable: true,
+    get: _named('get', 'connection', function () {
+      if (!(this instanceof _Navigator)) throw new TypeError('Illegal invocation');
+      return _connectionInstance;
+    }),
+  });
+  globalThis.__navigatorConnection = _connectionInstance;
+}
+
+// ── Credential Management ────────────────────────────────────────────────────
+// `navigator.credentials` is the API a browser's own password manager lives
+// behind, and the API a page uses to offer "sign in with the account you already
+// have" instead of another form. This engine stores no credentials, so `get()`
+// resolves **null** — "there is nobody saved here" — which is exactly the branch
+// every well-written sign-in flow already takes. The RECORDS are real: a
+// `PasswordCredential` built from a form holds what the form held.
+let _allowCredentialCtor = false;
+globalThis.Credential = class Credential {
+  constructor() {
+    if (!_allowCredentialCtor) throw new TypeError('Illegal constructor');
+    this._cr = { id: '', type: '' };
+  }
+  static isConditionalMediationAvailable() { return Promise.resolve(false); }
+};
+for (const _k of ['id', 'type']) {
+  Object.defineProperty(globalThis.Credential.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._cr) throw new TypeError('Illegal invocation');
+      return this._cr[_k];
+    }),
+  });
+}
+_markNative(globalThis.Credential);
+// The CredentialUserData mixin, shared by the two concrete credential types.
+const _defCredentialUserData = function (C) {
+  for (const k of ['name', 'iconURL']) {
+    Object.defineProperty(C.prototype, k, {
+      configurable: true, enumerable: true,
+      get: _named('get', k, function () {
+        if (!this._cr) throw new TypeError('Illegal invocation');
+        return this._cr[k] || '';
+      }),
+    });
+  }
+};
+globalThis.PasswordCredential = class PasswordCredential extends globalThis.Credential {
+  constructor(init) {
+    _allowCredentialCtor = true;
+    try { super(); } finally { _allowCredentialCtor = false; }
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'PasswordCredential': 1 argument required, but only 0 present.");
+    }
+    this._cr.type = 'password';
+    // A <form> initialiser reads the form's own controls — the whole point of the
+    // interface is that the browser can offer to save what the reader just typed.
+    if (init && typeof init === 'object' && init.nodeType === 1 && init.localName === 'form') {
+      const data = new globalThis.FormData(init);
+      this._cr.id = String(data.get('username') || '');
+      this._cr.password = String(data.get('password') || '');
+      this._cr.name = String(data.get('name') || '');
+      this._cr.iconURL = String(data.get('iconURL') || '');
+      this._cr.origin = String((globalThis.location && location.origin) || '');
+      return;
+    }
+    if (init === null || typeof init !== 'object') {
+      throw new TypeError("Failed to construct 'PasswordCredential': The provided value is not of type '(PasswordCredentialData or HTMLFormElement)'.");
+    }
+    if (init.id === undefined || init.password === undefined) {
+      throw new TypeError("Failed to construct 'PasswordCredential': required member is undefined.");
+    }
+    this._cr.id = String(init.id);
+    this._cr.password = String(init.password);
+    this._cr.name = init.name === undefined ? '' : String(init.name);
+    this._cr.iconURL = init.iconURL === undefined ? '' : String(init.iconURL);
+    // `origin` is declared required in the IDL but no shipping engine enforces
+    // it, and WPT's own setup omits it — refusing here would mean the interface
+    // exists and nobody can build one.
+    this._cr.origin = init.origin === undefined ? '' : String(init.origin);
+  }
+};
+Object.defineProperty(globalThis.PasswordCredential.prototype, 'password', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'password', function () {
+    if (!this._cr) throw new TypeError('Illegal invocation');
+    return this._cr.password || '';
+  }),
+});
+_defCredentialUserData(globalThis.PasswordCredential);
+_markNative(globalThis.PasswordCredential);
+globalThis.FederatedCredential = class FederatedCredential extends globalThis.Credential {
+  constructor(init) {
+    _allowCredentialCtor = true;
+    try { super(); } finally { _allowCredentialCtor = false; }
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'FederatedCredential': 1 argument required, but only 0 present.");
+    }
+    if (init === null || typeof init !== 'object') {
+      throw new TypeError("Failed to construct 'FederatedCredential': The provided value is not of type 'FederatedCredentialInit'.");
+    }
+    if (init.id === undefined || init.provider === undefined) {
+      throw new TypeError("Failed to construct 'FederatedCredential': required member is undefined.");
+    }
+    this._cr.type = 'federated';
+    this._cr.id = String(init.id);
+    this._cr.provider = String(init.provider);
+    this._cr.protocol = init.protocol === undefined ? null : String(init.protocol);
+    this._cr.name = init.name === undefined ? '' : String(init.name);
+    this._cr.iconURL = init.iconURL === undefined ? '' : String(init.iconURL);
+  }
+};
+for (const _k of ['provider', 'protocol']) {
+  Object.defineProperty(globalThis.FederatedCredential.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._cr) throw new TypeError('Illegal invocation');
+      return this._cr[_k] === undefined ? null : this._cr[_k];
+    }),
+  });
+}
+_defCredentialUserData(globalThis.FederatedCredential);
+_markNative(globalThis.FederatedCredential);
+globalThis.CredentialsContainer = class CredentialsContainer {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get() {
+    const options = arguments[0];
+    const o = (options == null) ? {} : options;
+    if (o.signal && o.signal.aborted) return Promise.reject(o.signal.reason);
+    // ⛔ Nothing is stored here, so there is no credential to return. `null` is
+    // the spec's "the user has none / declined", not an error.
+    return Promise.resolve(null);
+  }
+  store(credential) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'store' on 'CredentialsContainer': 1 argument required, but only 0 present."));
+    }
+    return Promise.resolve(undefined);
+  }
+  create() {
+    const options = arguments[0];
+    const o = (options == null) ? {} : options;
+    if (o.signal && o.signal.aborted) return Promise.reject(o.signal.reason);
+    if (o.password !== undefined) {
+      try {
+        return Promise.resolve(new globalThis.PasswordCredential(o.password));
+      } catch (e) { return Promise.reject(e); }
+    }
+    if (o.federated !== undefined) {
+      try {
+        return Promise.resolve(new globalThis.FederatedCredential(o.federated));
+      } catch (e) { return Promise.reject(e); }
+    }
+    return Promise.resolve(null);
+  }
+  preventSilentAccess() { return Promise.resolve(undefined); }
+};
+_markNative(globalThis.CredentialsContainer);
+{
+  const _credentialsInstance = Object.create(globalThis.CredentialsContainer.prototype);
+  Object.defineProperty(_Navigator.prototype, 'credentials', {
+    enumerable: true, configurable: true,
+    get: _named('get', 'credentials', function () {
+      if (!(this instanceof _Navigator)) throw new TypeError('Illegal invocation');
+      return _credentialsInstance;
+    }),
+  });
+}
+
+// ── Push API ─────────────────────────────────────────────────────────────────
+// ⛔ HONEST CAP: there is no push service behind this browser, so `subscribe()`
+// rejects with `NotAllowedError` — the same answer a real browser gives when
+// permission has not been granted, and the branch every push flow already has.
+// `getSubscription()` resolves null. The interfaces exist because a page reads
+// `registration.pushManager` before it knows any of that.
+let _allowPushCtor = false;
+globalThis.PushSubscriptionOptions = class PushSubscriptionOptions {
+  constructor() {
+    if (!_allowPushCtor) throw new TypeError('Illegal constructor');
+    this._pso = { userVisibleOnly: false, applicationServerKey: null };
+  }
+};
+for (const _k of ['userVisibleOnly', 'applicationServerKey']) {
+  Object.defineProperty(globalThis.PushSubscriptionOptions.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._pso) throw new TypeError('Illegal invocation');
+      return this._pso[_k];
+    }),
+  });
+}
+globalThis.PushSubscription = class PushSubscription {
+  constructor() {
+    if (!_allowPushCtor) throw new TypeError('Illegal constructor');
+    this._ps = { endpoint: '', expirationTime: null, options: null };
+  }
+  getKey(name) {
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'getKey' on 'PushSubscription': 1 argument required, but only 0 present.");
+    }
+    const n = String(name);
+    if (n !== 'p256dh' && n !== 'auth') {
+      throw new TypeError("Failed to execute 'getKey' on 'PushSubscription': The provided value '" +
+        n + "' is not a valid enum value of type PushEncryptionKeyName.");
+    }
+    return null;
+  }
+  unsubscribe() { return Promise.resolve(false); }
+  toJSON() {
+    if (!this._ps) throw new TypeError('Illegal invocation');
+    return { endpoint: this._ps.endpoint, expirationTime: this._ps.expirationTime, keys: {} };
+  }
+};
+for (const _k of ['endpoint', 'expirationTime', 'options']) {
+  Object.defineProperty(globalThis.PushSubscription.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._ps) throw new TypeError('Illegal invocation');
+      return this._ps[_k];
+    }),
+  });
+}
+globalThis.PushManager = class PushManager {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  subscribe(options) {
+    return Promise.reject(new DOMException(
+      'No push service is available to this browser.', 'NotAllowedError'));
+  }
+  getSubscription() { return Promise.resolve(null); }
+  permissionState(options) { return Promise.resolve('denied'); }
+};
+Object.defineProperty(globalThis.PushManager, 'supportedContentEncodings', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'supportedContentEncodings', (function () {
+    const frozen = Object.freeze(['aes128gcm']);
+    return function () { return frozen; };
+  })()),
+});
+_markNative(globalThis.PushManager); _markNative(globalThis.PushSubscription);
+_markNative(globalThis.PushSubscriptionOptions);
+{
+  const _pushManagerInstance = Object.create(globalThis.PushManager.prototype);
+  Object.defineProperty(globalThis, 'pushManager', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'pushManager', function () { return _pushManagerInstance; }),
+  });
+  globalThis.__pushManager = _pushManagerInstance;
+}
+
+// ── Navigation Preload (Service Workers) ─────────────────────────────────────
+// ⛔ Nothing preloads yet, so the state is honestly `{enabled: false}`; the
+// manager is real so a page's `await registration.navigationPreload.getState()`
+// answers instead of throwing on `undefined`.
+globalThis.NavigationPreloadManager = class NavigationPreloadManager {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  enable() { return Promise.resolve(undefined); }
+  disable() { return Promise.resolve(undefined); }
+  setHeaderValue(value) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'setHeaderValue' on 'NavigationPreloadManager': 1 argument required, but only 0 present."));
+    }
+    this._headerValue = String(value);
+    return Promise.resolve(undefined);
+  }
+  getState() {
+    return Promise.resolve({ enabled: false, headerValue: this._headerValue || 'true' });
+  }
+};
+_markNative(globalThis.NavigationPreloadManager);
+
+// ── Storage Access API ───────────────────────────────────────────────────────
+// A same-origin document always has access to its own storage, so the honest
+// answers are `true` and a resolved promise. The point of having the methods at
+// all is that a framed document can ASK, and be told.
+Object.defineProperty(Document.prototype, 'hasStorageAccess', {
+  writable: true, enumerable: true, configurable: true,
+  value: _named('', 'hasStorageAccess', function hasStorageAccess() {
+    if (!(this instanceof Document)) return Promise.reject(new TypeError('Illegal invocation'));
+    return Promise.resolve(true);
+  }),
+});
+Object.defineProperty(Document.prototype, 'requestStorageAccess', {
+  writable: true, enumerable: true, configurable: true,
+  value: _named('', 'requestStorageAccess', function requestStorageAccess() {
+    if (!(this instanceof Document)) return Promise.reject(new TypeError('Illegal invocation'));
+    return Promise.resolve(undefined);
+  }),
+});
 // ── FormData (XHR §interface-formdata) ────────────────────────────────────────
 // The old implementation was one line, and the line that mattered was
 // `append(k, v) { this._d.push([String(k), String(v)]) }`. That is not a small
@@ -42828,8 +45622,13 @@ globalThis.XMLSerializer = class XMLSerializer {
 // PerformanceEntry/Mark/Measure classes, a high-res now() relative to timeOrigin,
 // PerformanceTiming.toJSON, and a minimal EventTarget surface (performance fires
 // events like `resourcetimingbufferfull`).
+// ⚠️ Only `PerformanceMark` has a constructor in IDL. Every other entry type is
+// made by the PLATFORM — `new PerformanceResourceTiming()` must be a TypeError,
+// because an entry a page can forge is an entry nothing can trust.
+let _allowEntryCtor = false;
 class PerformanceEntry {
   constructor(name, entryType, startTime, duration) {
+    if (!_allowEntryCtor && new.target !== PerformanceMark) throw new TypeError('Illegal constructor');
     this._name = String(name); this._entryType = entryType;
     this._startTime = startTime; this._duration = duration;
   }
@@ -42891,7 +45690,10 @@ globalThis.PerformanceMeasure = _markNative(PerformanceMeasure);
 // `entry.transferSize = 0` can hide a megabyte from whatever is watching the
 // budget, and idlharness asserts the shape besides. The engine fills the store
 // through `_rt` as timing becomes known.
-const _RT_FIELDS = ["initiatorType", "deliveryType", "nextHopProtocol", "contentType", "workerStart", "redirectStart", "redirectEnd", "fetchStart", "domainLookupStart", "domainLookupEnd", "connectStart", "connectEnd", "secureConnectionStart", "requestStart", "responseStart", "firstInterimResponseStart", "finalResponseHeadersStart", "responseEnd", "responseStatus", "transferSize", "encodedBodySize", "decodedBodySize", "serverTiming"];
+const _RT_FIELDS = ["initiatorType", "deliveryType", "nextHopProtocol", "contentType", "workerStart", "redirectStart", "redirectEnd", "fetchStart", "domainLookupStart", "domainLookupEnd", "connectStart", "connectEnd", "secureConnectionStart", "requestStart", "responseStart", "firstInterimResponseStart", "finalResponseHeadersStart", "responseEnd", "responseStatus", "transferSize", "encodedBodySize", "decodedBodySize", "serverTiming",
+  // Service Worker static routing timings: which router rule matched a request
+  // and how long the lookup took. Nothing routes here yet, so they are zero.
+  "workerRouterEvaluationStart", "workerCacheLookupStart", "workerMatchedRouterSource"];
 class PerformanceResourceTiming extends PerformanceEntry {
   constructor(name, entryType, startTime) {
     super(name, entryType || "resource", startTime || 0, 0);
@@ -42905,7 +45707,9 @@ class PerformanceResourceTiming extends PerformanceEntry {
       secureConnectionStart: 0, requestStart: 0, responseStart: 0,
       firstInterimResponseStart: 0, finalResponseHeadersStart: 0,
       responseEnd: 0, responseStatus: 0, transferSize: 0,
-      encodedBodySize: 0, decodedBodySize: 0, serverTiming: [],
+      encodedBodySize: 0, decodedBodySize: 0, serverTiming: Object.freeze([]),
+      workerRouterEvaluationStart: 0, workerCacheLookupStart: 0,
+      workerMatchedRouterSource: "",
     };
   }
   toJSON() {
@@ -42925,61 +45729,333 @@ for (const _k of _RT_FIELDS) {
 }
 globalThis.PerformanceResourceTiming = _markNative(PerformanceResourceTiming);
 
+// Server Timing: the `Server-Timing` response header, parsed into entries a page
+// can read off its resource timing. It is how a site's own monitoring learns that
+// the SERVER was slow rather than the device — which matters most exactly where
+// the device is the thing everyone blames first.
+class PerformanceServerTiming {
+  constructor() {
+    if (!_allowServerTimingCtor) throw new TypeError('Illegal constructor');
+    this._st = { name: '', duration: 0, description: '' };
+  }
+  toJSON() {
+    if (!this._st) throw new TypeError('Illegal invocation');
+    return { name: this._st.name, duration: this._st.duration, description: this._st.description };
+  }
+}
+let _allowServerTimingCtor = false;
+for (const _k of ['name', 'duration', 'description']) {
+  Object.defineProperty(PerformanceServerTiming.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._st) throw new TypeError('Illegal invocation');
+      return this._st[_k];
+    }),
+  });
+}
+globalThis.PerformanceServerTiming = _markNative(PerformanceServerTiming);
+globalThis.__newServerTiming = function (name, duration, description) {
+  _allowServerTimingCtor = true;
+  try {
+    const e = new PerformanceServerTiming();
+    e._st.name = String(name || '');
+    e._st.duration = Number(duration) || 0;
+    e._st.description = String(description || '');
+    return e;
+  } finally { _allowServerTimingCtor = false; }
+};
+
 // Navigation Timing Level 2: the single PerformanceNavigationTiming entry for the
 // document. Created at startup so getEntriesByType('navigation') is populated from
 // the start; the document-lifecycle phases (domInteractive … loadEventEnd) are
 // filled in by __navTimingDCL / __navTimingLoad as the load progresses, and the
 // entry is queued to observers at loadEventEnd.
+// Navigation Timing's confidence signal: how sure the UA is that these numbers
+// describe a typical load rather than a one-off. We do not sample, so the honest
+// answer is a trigger rate of 0 and a value of "low".
+let _allowPerfLegacyCtor = false;
+class PerformanceTimingConfidence {
+  constructor() {
+    if (!_allowPerfLegacyCtor) throw new TypeError('Illegal constructor');
+    this._pc = { randomizedTriggerRate: 0, value: 'low' };
+  }
+  toJSON() {
+    if (!this._pc) throw new TypeError('Illegal invocation');
+    return { randomizedTriggerRate: this._pc.randomizedTriggerRate, value: this._pc.value };
+  }
+}
+for (const _k of ['randomizedTriggerRate', 'value']) {
+  Object.defineProperty(PerformanceTimingConfidence.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._pc) throw new TypeError('Illegal invocation');
+      return this._pc[_k];
+    }),
+  });
+}
+globalThis.PerformanceTimingConfidence = _markNative(PerformanceTimingConfidence);
+
+const _NT_FIELDS = ['unloadEventStart', 'unloadEventEnd', 'domInteractive',
+  'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete',
+  'loadEventStart', 'loadEventEnd', 'type', 'redirectCount', 'criticalCHRestart',
+  'notRestoredReasons', 'activationStart'];
 class PerformanceNavigationTiming extends PerformanceResourceTiming {
   constructor(name) {
     super(name, "navigation", 0);
     this._rt.initiatorType = "navigation";
     this._rt.nextHopProtocol = "http/1.1";
-    this.unloadEventStart = 0;
-    this.unloadEventEnd = 0;
-    this.domInteractive = 0;
-    this.domContentLoadedEventStart = 0;
-    this.domContentLoadedEventEnd = 0;
-    this.domComplete = 0;
-    this.loadEventStart = 0;
-    this.loadEventEnd = 0;
-    this.type = "navigate";
-    this.redirectCount = 0;
-    this.activationStart = 0;
-    this.criticalCHRestart = 0;
-    this.notRestoredReasons = null;
+    // ⚠️ These are READONLY IDL ATTRIBUTES, which means accessors on the interface
+    // prototype — not own data properties on the entry. As own properties they
+    // were invisible to `'domComplete' in PerformanceNavigationTiming.prototype`,
+    // which is how a page feature-detects Navigation Timing 2 at all.
+    this._nt = {
+      unloadEventStart: 0, unloadEventEnd: 0, domInteractive: 0,
+      domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0,
+      loadEventStart: 0, loadEventEnd: 0, type: "navigate", redirectCount: 0,
+      criticalCHRestart: 0, notRestoredReasons: null, activationStart: 0,
+    };
+    _allowPerfLegacyCtor = true;
+    try { this._confidence = new PerformanceTimingConfidence(); }
+    finally { _allowPerfLegacyCtor = false; }
   }
   toJSON() {
     const j = super.toJSON();
     for (const k of ['unloadEventStart', 'unloadEventEnd', 'domInteractive',
       'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete',
       'loadEventStart', 'loadEventEnd', 'type', 'redirectCount'])
-      j[k] = this[k];
+      j[k] = this._nt[k];
     return j;
   }
 }
+for (const _k of _NT_FIELDS) {
+  Object.defineProperty(PerformanceNavigationTiming.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._nt) throw new TypeError("Illegal invocation");
+      return this._nt[_k];
+    }),
+  });
+}
+Object.defineProperty(PerformanceNavigationTiming.prototype, 'confidence', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'confidence', function () {
+    if (!this._nt) throw new TypeError("Illegal invocation");
+    return this._confidence;
+  }),
+});
 globalThis.PerformanceNavigationTiming = _markNative(PerformanceNavigationTiming);
 
-class PerformanceTiming {
-  constructor(t0) {
-    // Attributes for phases that have happened by the time user script runs carry
-    // t0; ones that have NOT yet occurred during page load (DOMContentLoaded/load)
-    // or never apply here (unload/redirect/TLS-on-http) are 0 — which is also what
-    // User Timing's "convert a mark to a timestamp" treats as empty (InvalidAccessError).
-    this.navigationStart = t0; this.unloadEventStart = 0; this.unloadEventEnd = 0;
-    // ⚠️ PerformanceTiming is the LEGACY interface: its members really are own
-    // data properties on the instance (that is what the old spec said), and it
-    // has nothing to do with PerformanceResourceTiming's readonly store.
-    this.redirectStart = 0; this.redirectEnd = 0; this.fetchStart = t0;
-    this.domainLookupStart = t0; this.domainLookupEnd = t0; this.connectStart = t0;
-    this.connectEnd = t0; this.secureConnectionStart = 0; this.requestStart = t0;
-    this.responseStart = t0; this.responseEnd = t0; this.domLoading = t0;
-    this.domInteractive = 0; this.domContentLoadedEventStart = 0;
-    this.domContentLoadedEventEnd = 0; this.domComplete = 0;
-    this.loadEventStart = 0; this.loadEventEnd = 0;
+// The LEGACY `performance.navigation` (Navigation Timing 1). Still read by plenty
+// of analytics code, and still an interface with four constants on it.
+class PerformanceNavigation {
+  constructor() {
+    if (!_allowPerfLegacyCtor) throw new TypeError('Illegal constructor');
+    this._pn = { type: 0, redirectCount: 0 };
   }
-  toJSON() { const o = {}; for (const k of Object.keys(this)) o[k] = this[k]; return o; }
+  toJSON() {
+    if (!this._pn) throw new TypeError('Illegal invocation');
+    return { type: this._pn.type, redirectCount: this._pn.redirectCount };
+  }
 }
+for (const [_k, _v] of [['TYPE_NAVIGATE', 0], ['TYPE_RELOAD', 1],
+                        ['TYPE_BACK_FORWARD', 2], ['TYPE_RESERVED', 255]]) {
+  for (const target of [PerformanceNavigation, PerformanceNavigation.prototype]) {
+    Object.defineProperty(target, _k, { value: _v, enumerable: true, configurable: false, writable: false });
+  }
+}
+for (const _k of ['type', 'redirectCount']) {
+  Object.defineProperty(PerformanceNavigation.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._pn) throw new TypeError('Illegal invocation');
+      return this._pn[_k];
+    }),
+  });
+}
+globalThis.PerformanceNavigation = _markNative(PerformanceNavigation);
+
+// ── The rest of the Performance Timeline's entry types ───────────────────────
+// `PerformanceObserver` can only report an entry type the realm HAS an interface
+// for. Without these, a page that observes `layout-shift` or `largest-contentful-
+// paint` — which is how a site finds out it is janky on a slow device, the exact
+// device this browser exists for — got nothing back and could not even name the
+// type it wanted.
+//
+// ⛔ HONEST CAP: the engine does not yet MEASURE long tasks, layout shifts,
+// event latency or contentful paints, so no entries of these types are produced.
+// The interfaces are real, complete and constructible by the platform; the
+// timeline they would describe is not being recorded yet. A page gets an empty
+// observation rather than a ReferenceError, which is the difference between "this
+// browser has nothing to report" and "this browser is broken".
+let _allowPerfEntryCtor = false;
+const _defPerfEntry = function (name, fields, base) {
+  const Base = base || PerformanceEntry;
+  const C = { [name]: class extends Base {
+    constructor() {
+      if (!_allowPerfEntryCtor) throw new TypeError('Illegal constructor');
+      const a = arguments;
+      _allowEntryCtor = true;
+      try { super(a[0], a[1], a[2], a[3]); }
+      finally { _allowEntryCtor = false; }
+      this._pe = {};
+      for (const k in fields) this._pe[k] = fields[k];
+    }
+    toJSON() {
+      const j = super.toJSON();
+      for (const k in fields) j[k] = this._pe[k];
+      return j;
+    }
+  } }[name];
+  for (const k in fields) {
+    Object.defineProperty(C.prototype, k, {
+      configurable: true, enumerable: true,
+      get: _named('get', k, function () {
+        if (!this._pe) throw new TypeError('Illegal invocation');
+        return this._pe[k];
+      }),
+    });
+  }
+  Object.defineProperty(C, 'length', { value: 0, configurable: true });
+  globalThis[name] = _markNative(C);
+  return C;
+};
+
+// Paint Timing. `paintTime`/`presentationTime` come from the PaintTimingMixin,
+// which LargestContentfulPaint includes too.
+_defPerfEntry('PerformancePaintTiming', { paintTime: 0, presentationTime: null });
+_defPerfEntry('TaskAttributionTiming',
+  { containerType: 'window', containerSrc: '', containerId: '', containerName: '' });
+_defPerfEntry('PerformanceLongTaskTiming', { attribution: Object.freeze([]) });
+_defPerfEntry('PerformanceEventTiming', {
+  processingStart: 0, processingEnd: 0, cancelable: false, target: null,
+  targetSelector: '', interactionId: 0,
+});
+_defPerfEntry('LayoutShiftAttribution', { node: null, previousRect: null, currentRect: null });
+_defPerfEntry('LayoutShift',
+  { value: 0, hadRecentInput: false, lastInputTime: 0, sources: Object.freeze([]) });
+_defPerfEntry('LargestContentfulPaint', {
+  loadTime: 0, renderTime: 0, size: 0, id: '', url: '', element: null,
+  paintTime: 0, presentationTime: null,
+});
+// LayoutShiftAttribution is NOT a PerformanceEntry — it is a plain interface, so
+// it must not inherit the entry members.
+Object.setPrototypeOf(globalThis.LayoutShiftAttribution.prototype, Object.prototype);
+Object.setPrototypeOf(globalThis.LayoutShiftAttribution, Function.prototype);
+delete globalThis.LayoutShiftAttribution.prototype.toJSON;
+
+// `performance.eventCounts` — a readonly maplike of event type → dispatch count.
+// Built on an array for the same reason the highlight registry is: a page that
+// patches `Map.prototype` must not break the browser's own bookkeeping.
+class EventCounts {
+  constructor() { throw new TypeError('Illegal constructor'); }
+}
+{
+  const _ecPairs = new WeakMap();
+  const _ecOf = (o, what) => {
+    const a = _ecPairs.get(o);
+    if (!a) throw new TypeError("Illegal invocation: '" + what + "' called on an incompatible receiver.");
+    return a;
+  };
+  const _ecIdx = (a, k) => { for (let i = 0; i < a.length; i++) if (a[i][0] === k) return i; return -1; };
+  function* _ecEntries(a) { for (const p of a.slice()) yield [p[0], p[1]]; }
+  function* _ecKeys(a) { for (const p of a.slice()) yield p[0]; }
+  function* _ecValues(a) { for (const p of a.slice()) yield p[1]; }
+  const _ecMethods = {
+    get(key) { const a = _ecOf(this, 'get'); const i = _ecIdx(a, String(key)); return i < 0 ? undefined : a[i][1]; },
+    has(key) { return _ecIdx(_ecOf(this, 'has'), String(key)) >= 0; },
+    entries() { return _ecEntries(_ecOf(this, 'entries')); },
+    keys() { return _ecKeys(_ecOf(this, 'keys')); },
+    values() { return _ecValues(_ecOf(this, 'values')); },
+    forEach(cb, thisArg) {
+      const a = _ecOf(this, 'forEach');
+      if (typeof cb !== 'function')
+        throw new TypeError("Failed to execute 'forEach' on 'EventCounts': parameter 1 is not of type 'Function'.");
+      for (let i = 0; i < a.length; i++) cb.call(thisArg, a[i][1], a[i][0], this);
+    },
+  };
+  for (const k in _ecMethods) {
+    Object.defineProperty(EventCounts.prototype, k, {
+      configurable: true, enumerable: true, writable: true, value: _ecMethods[k],
+    });
+    Object.defineProperty(EventCounts.prototype[k], 'name', { value: k, configurable: true });
+    Object.defineProperty(EventCounts.prototype[k], 'length',
+      { value: k === 'forEach' ? 1 : _ecMethods[k].length, configurable: true });
+  }
+  Object.defineProperty(EventCounts.prototype, 'size', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'size', function () { return _ecOf(this, 'size').length; }),
+  });
+  Object.defineProperty(EventCounts.prototype, Symbol.iterator, {
+    configurable: true, writable: true, value: EventCounts.prototype.entries,
+  });
+  Object.defineProperty(EventCounts.prototype, Symbol.toStringTag, {
+    configurable: true, value: 'EventCounts',
+  });
+  globalThis.__newEventCounts = function () {
+    const o = Object.create(EventCounts.prototype);
+    _ecPairs.set(o, []);
+    return o;
+  };
+}
+globalThis.EventCounts = _markNative(EventCounts);
+
+// PerformanceTiming (Navigation Timing 1). Attributes for phases that have
+// happened by the time user script runs carry t0; ones that have NOT yet occurred
+// during page load (DOMContentLoaded/load) or never apply here (unload / redirect
+// / TLS-on-http) are 0 — which is also what User Timing's "convert a mark to a
+// timestamp" treats as empty (InvalidAccessError).
+//
+// ⚠️ These were own data properties on the instance. The interface is legacy, but
+// its members are ordinary readonly IDL attributes and live on the PROTOTYPE —
+// `'loadEventEnd' in performance.timing.__proto__` is the check a compatibility
+// shim makes before deciding the API exists.
+const _PT_FIELDS = ['navigationStart', 'unloadEventStart', 'unloadEventEnd',
+  'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart',
+  'domainLookupEnd', 'connectStart', 'connectEnd', 'secureConnectionStart',
+  'requestStart', 'responseStart', 'responseEnd', 'domLoading', 'domInteractive',
+  'domContentLoadedEventStart', 'domContentLoadedEventEnd', 'domComplete',
+  'loadEventStart', 'loadEventEnd'];
+class PerformanceTiming {
+  constructor() {
+    if (!_allowPerfLegacyCtor) throw new TypeError('Illegal constructor');
+    const t0 = arguments[0] || 0;
+    this._pt = {
+      navigationStart: t0, unloadEventStart: 0, unloadEventEnd: 0,
+      redirectStart: 0, redirectEnd: 0, fetchStart: t0,
+      domainLookupStart: t0, domainLookupEnd: t0, connectStart: t0,
+      connectEnd: t0, secureConnectionStart: 0, requestStart: t0,
+      responseStart: t0, responseEnd: t0, domLoading: t0,
+      domInteractive: 0, domContentLoadedEventStart: 0,
+      domContentLoadedEventEnd: 0, domComplete: 0,
+      loadEventStart: 0, loadEventEnd: 0,
+    };
+  }
+  toJSON() {
+    if (!this._pt) throw new TypeError('Illegal invocation');
+    const o = {};
+    for (const k of _PT_FIELDS) o[k] = this._pt[k];
+    return o;
+  }
+}
+for (const _k of _PT_FIELDS) {
+  Object.defineProperty(PerformanceTiming.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._pt) throw new TypeError('Illegal invocation');
+      return this._pt[_k];
+    }),
+  });
+}
+const _newPerformanceTiming = function (t0) {
+  _allowPerfLegacyCtor = true;
+  try { return new PerformanceTiming(t0); }
+  finally { _allowPerfLegacyCtor = false; }
+};
+const _newPerformanceNavigation = function () {
+  _allowPerfLegacyCtor = true;
+  try { return new PerformanceNavigation(); }
+  finally { _allowPerfLegacyCtor = false; }
+};
 // The PerformanceTiming attribute names a mark name may legacy-resolve against.
 const _PERF_TIMING_ATTRS = {
   navigationStart: 1, unloadEventStart: 1, unloadEventEnd: 1, redirectStart: 1,
@@ -43004,8 +46080,8 @@ class Performance {
     this._bufferFullPending = false;
     this._onresourcetimingbufferfull = null;
     this.timeOrigin = 0;
-    this.timing = new PerformanceTiming(0);
-    this.navigation = { type: 0, redirectCount: 0, toJSON() { return { type: 0, redirectCount: 0 }; } };
+    this._timing = _newPerformanceTiming(0);
+    this._navigation = _newPerformanceNavigation();
     this.memory = { jsHeapSizeLimit: 2172649472, totalJSHeapSize: 19321856, usedJSHeapSize: 16781520 };
   }
   now() {
@@ -43066,7 +46142,10 @@ class Performance {
       startTime = (startOrOptions !== undefined) ? this._resolveMarkName(startOrOptions) : 0;
       endTime = (endMark !== undefined) ? this._resolveMarkName(endMark) : this.now();
     }
-    const m = new PerformanceMeasure(measureName, startTime, endTime - startTime, detail);
+    _allowEntryCtor = true;
+    let m;
+    try { m = new PerformanceMeasure(measureName, startTime, endTime - startTime, detail); }
+    finally { _allowEntryCtor = false; }
     this._entries.push(m);
     _queuePerformanceEntry(m);
     return m;
@@ -43111,7 +46190,10 @@ class Performance {
   // duration > 0 for any real network round-trip.
   _makeResourceEntry(name, initiatorType, startTime, endTime, sizes) {
     if (endTime < startTime) endTime = startTime;
-    const e = new PerformanceResourceTiming(name, "resource", startTime);
+    _allowEntryCtor = true;
+    let e;
+    try { e = new PerformanceResourceTiming(name, "resource", startTime); }
+    finally { _allowEntryCtor = false; }
     e._rt.initiatorType = initiatorType || "";
     e._rt.nextHopProtocol = "http/1.1";
     e._rt.fetchStart = startTime;
@@ -43181,7 +46263,8 @@ class Performance {
     this._bufferFullPending = false;
   }
   toJSON() {
-    return { timeOrigin: this.timeOrigin, timing: this.timing ? this.timing.toJSON() : undefined, navigation: this.navigation };
+    return { timeOrigin: this.timeOrigin, timing: this.timing ? this.timing.toJSON() : undefined,
+             navigation: this.navigation ? this.navigation.toJSON() : undefined };
   }
   // Minimal self-contained EventTarget surface (so `performance` can dispatch).
   addEventListener(type, cb, opts) {
@@ -43209,6 +46292,33 @@ class Performance {
   }
   get onresourcetimingbufferfull() { return this._onresourcetimingbufferfull; }
   set onresourcetimingbufferfull(fn) { this._onresourcetimingbufferfull = (typeof fn === "function") ? fn : null; }
+}
+// `performance.timing` / `performance.navigation` are [SameObject] readonly IDL
+// attributes — accessors on Performance.prototype handing back the same object
+// every read, not writable own properties a page could replace.
+Object.defineProperty(Performance.prototype, 'eventCounts', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'eventCounts', function () {
+    if (!(this instanceof Performance)) throw new TypeError('Illegal invocation');
+    if (!this._eventCounts) this._eventCounts = globalThis.__newEventCounts();
+    return this._eventCounts;
+  }),
+});
+Object.defineProperty(Performance.prototype, 'interactionCount', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'interactionCount', function () {
+    if (!(this instanceof Performance)) throw new TypeError('Illegal invocation');
+    return this._interactionCount || 0;
+  }),
+});
+for (const [_name, _slot] of [['timing', '_timing'], ['navigation', '_navigation']]) {
+  Object.defineProperty(Performance.prototype, _name, {
+    configurable: true, enumerable: true,
+    get: _named('get', _name, function () {
+      if (!(this instanceof Performance)) throw new TypeError('Illegal invocation');
+      return this[_slot];
+    }),
+  });
 }
 globalThis.Performance = _markNative(Performance);
 globalThis.performance = globalThis.performance || new Performance();
@@ -43356,19 +46466,21 @@ const __navTimingDCL = function () {
   // a provisional "about:blank"); refresh it now that the page has parsed.
   try { const u = _domParse("document_url"); if (u) nav._name = u; } catch (e) {}
   const t = p.now();
-  if (!nav.domInteractive) nav.domInteractive = t;
-  if (!nav.domContentLoadedEventStart) nav.domContentLoadedEventStart = t;
-  nav.domContentLoadedEventEnd = p.now();
+  const nt = nav._nt;
+  if (!nt.domInteractive) nt.domInteractive = t;
+  if (!nt.domContentLoadedEventStart) nt.domContentLoadedEventStart = t;
+  nt.domContentLoadedEventEnd = p.now();
 };
 const __navTimingLoad = function () {
   const p = globalThis.performance, nav = p && p._navEntry;
   if (!nav) return;
   try { const u = _domParse("document_url"); if (u) nav._name = u; } catch (e) {}
   const t = p.now();
-  if (!nav.domComplete) nav.domComplete = t;
-  if (!nav.loadEventStart) nav.loadEventStart = t;
-  nav.loadEventEnd = p.now();
-  nav._duration = nav.loadEventEnd; // duration === loadEventEnd per spec
+  const nt = nav._nt;
+  if (!nt.domComplete) nt.domComplete = t;
+  if (!nt.loadEventStart) nt.loadEventStart = t;
+  nt.loadEventEnd = p.now();
+  nav._duration = nt.loadEventEnd; // duration === loadEventEnd per spec
   try { _queuePerformanceEntry(nav); } catch (e) {} // notify observers (registered during parse)
 };
 
@@ -43400,29 +46512,23 @@ const _fontsSettled = () => new Promise((resolve) => {
   };
   poll();
 });
+// The real `FontFaceSet` (defined further up) needs this poll, so hand it over.
+globalThis.__fontsSettled = _fontsSettled;
 const _fontFaceSetOf = new WeakMap();
+// `Document.fonts` (the FontFaceSource mixin): ONE FontFaceSet per document,
+// stable across reads. What stood here was an object literal that reported a size
+// of 0 and threw everything away — `add()` did nothing, `has()` was always false
+// and iterating gave an empty list, so a page could add a font and then be told
+// by the same object that the font was not there.
 Object.defineProperty(Document.prototype, 'fonts', {
-  get() {
+  configurable: true, enumerable: true,
+  get: _named('get', 'fonts', function () {
     let s = _fontFaceSetOf.get(this);
     if (s) return s;
-    s = {
-      get ready() { return _fontsSettled().then(() => s); },
-      check() { return true; },
-      load() { return _fontsSettled(); },
-      add() {},
-      delete() { return false; },
-      clear() {},
-      has() { return false; },
-      forEach() {},
-      get size() { return 0; },
-      get status() { return 'loaded'; },
-      addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-      [Symbol.iterator]() { return [][Symbol.iterator](); },
-    };
+    s = globalThis.__newFontFaceSet(this);
     _fontFaceSetOf.set(this, s);
     return s;
-  },
-  configurable: true,
+  }),
 });
 // Set by the Web Crypto module below: structured-clone support for CryptoKey,
 // which lives down in structuredClone but needs the key's private state. Held
@@ -47737,12 +50843,26 @@ globalThis.HTMLElement = class HTMLElement extends Element {
     const def = _ceGlobalByCtor.get(NT);
     if (!def)
       throw new TypeError("Illegal constructor");
-    // Autonomous only. A customized built-in definition (localName ≠ name) has an
-    // active function object that is a built-in interface, never HTMLElement — which,
-    // in our shared-constructor model, we cannot be, so it always throws (matching the
-    // WPT customized-built-in "must throw" subtests). Autonomous elements proceed.
-    if (def.localName !== def.name)
-      throw new TypeError("Illegal constructor");
+    // A CUSTOMIZED BUILT-IN (`class MyLink extends HTMLAnchorElement {}` defined with
+    // `{extends: 'a'}`) reaches here too: its implicit constructor chains up through
+    // HTMLAnchorElement to this one. HTML §4.13.5 step 6 only asks that the interface
+    // the class extends is the one that local name actually uses — `class extends
+    // HTMLDivElement` defined with `{extends: 'a'}` is a TypeError. Checking the
+    // prototype chain for that interface is exactly that question, asked in a way a
+    // single shared constructor can answer.
+    //
+    // This is not a niche: `is=` is how a page enhances an element the browser already
+    // knows — a <button> that stays a button for the form, the keyboard and the
+    // accessibility tree, with behaviour added. The alternative (an autonomous element
+    // that reimplements <button>) is the pattern that produces unusable pages.
+    if (def.localName !== def.name) {
+      const iface = _htmlClassForLocal(def.localName);
+      let extendsIface = false;
+      for (let c = NT; typeof c === 'function'; c = Object.getPrototypeOf(c)) {
+        if (c === iface) { extendsIface = true; break; }
+      }
+      if (!extendsIface) throw new TypeError("Illegal constructor");
+    }
     const stack = def.constructionStack;
     if (stack.length > 0) {
       const el = stack[stack.length - 1];
@@ -47757,6 +50877,10 @@ globalThis.HTMLElement = class HTMLElement extends Element {
     _cache.set(newNid, this);
     this._ceDefinition = def;
     this._ceState = "custom";
+    // The "is value" is an internal slot, not the `is` content attribute: an element
+    // built by `new MyLink()` or `createElement('a', {is})` carries it with no markup
+    // to show for it, and cloning has to carry it too.
+    if (def.localName !== def.name) this._is = def.name;
     // The element's node document is the registry's document (frame doc for an iframe
     // registry, the main document otherwise). createElement overrides this afterward.
     this._ownerDoc = def._document || globalThis.document;
@@ -53200,6 +56324,11 @@ _ehDefineOnProto(globalThis.SVGElement.prototype, false);
 _ehDefineOnProto(globalThis.MathMLElement.prototype, false);
 _ehDefineOnProto(Document.prototype, false);
 _ehDefineOnProto(globalThis, true);
+// The device-orientation handlers are Window-only (DeviceOrientation Event Spec's
+// partial Window), so they are not in the shared GlobalEventHandlers set.
+_ehDefineOnProto(globalThis, true,
+  ['ondeviceorientation', 'ondeviceorientationabsolute', 'ondevicemotion',
+   'ongamepadconnected', 'ongamepaddisconnected']);
 // Web IDL [Unscopable] members — the @@unscopables object each interface exposes so
 // its unscopable methods (the ParentNode/ChildNode DOM-manipulation set) don't shadow
 // like-named globals inside a `with` scope (used by compiled inline event handlers;
@@ -68065,6 +71194,24 @@ class ServiceWorkerRegistration extends EventTarget {
   get waiting() { if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation"); return this._rrec.waiting; }
   get active() { if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation"); return this._rrec.active; }
   get updateViaCache() { if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation"); return this._rrec.updateViaCache; }
+  // [SameObject] registration extensions from other specs: one object per
+  // registration, stable across reads.
+  get navigationPreload() {
+    if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
+    if (!this._navigationPreload)
+      this._navigationPreload = Object.create(globalThis.NavigationPreloadManager.prototype);
+    return this._navigationPreload;
+  }
+  get pushManager() {
+    if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
+    return globalThis.__pushManager;
+  }
+  get cookies() {
+    if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
+    if (!this._cookieStoreManager)
+      this._cookieStoreManager = Object.create(globalThis.CookieStoreManager.prototype);
+    return this._cookieStoreManager;
+  }
   update() {
     if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
     return Promise.resolve(this);
@@ -71467,6 +74614,104 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   expose('TransformStreamDefaultController', TransformStreamDefaultController);
 })(globalThis);
 
+// ── TextDecoderStream / TextEncoderStream (Encoding §streams) ────────────────
+// Decoding a response as it ARRIVES rather than after it has all landed. On a
+// slow connection that is the difference between a page that shows its first
+// paragraph in a second and one that shows nothing for ten — and it is the only
+// way to decode a stream larger than the device's memory at all.
+//
+// Both `include GenericTransformStream`, so they are not TransformStreams: they
+// OWN one and forward `readable`/`writable` to it. Building them out of the
+// engine's own TransformStream means the backpressure is the real thing.
+(function (global) {
+  const _makeGenericTransform = function (Ctor, tag, buildTransformer, extraAttrs) {
+    Object.defineProperty(Ctor.prototype, 'readable', {
+      configurable: true, enumerable: true,
+      get: _named('get', 'readable', function () {
+        if (!this._gts) throw new TypeError('Illegal invocation');
+        return this._gts.readable;
+      }),
+    });
+    Object.defineProperty(Ctor.prototype, 'writable', {
+      configurable: true, enumerable: true,
+      get: _named('get', 'writable', function () {
+        if (!this._gts) throw new TypeError('Illegal invocation');
+        return this._gts.writable;
+      }),
+    });
+    for (const name in extraAttrs) {
+      const fn = extraAttrs[name];
+      Object.defineProperty(Ctor.prototype, name, {
+        configurable: true, enumerable: true,
+        get: _named('get', name, function () {
+          if (!this._gts) throw new TypeError('Illegal invocation');
+          return fn.call(this);
+        }),
+      });
+    }
+    Object.defineProperty(Ctor.prototype, Symbol.toStringTag, { value: tag, configurable: true });
+    Object.defineProperty(global, Ctor.name, { value: Ctor, writable: true, enumerable: false, configurable: true });
+    _markNative(Ctor);
+  };
+
+  class TextDecoderStream {
+    constructor() {
+      const label = arguments[0], options = arguments[1];
+      // The decoder is built first: a bad label is a RangeError out of the
+      // constructor, before any stream exists to leak.
+      const decoder = new TextDecoder(label === undefined ? 'utf-8' : label, options);
+      this._decoder = decoder;
+      const self = this;
+      this._gts = new TransformStream({
+        transform(chunk, controller) {
+          const text = decoder.decode(chunk, { stream: true });
+          if (text) controller.enqueue(text);
+        },
+        flush(controller) {
+          const text = decoder.decode();
+          if (text) controller.enqueue(text);
+        },
+      });
+    }
+  }
+  Object.defineProperty(TextDecoderStream, 'length', { value: 0, configurable: true });
+  _makeGenericTransform(TextDecoderStream, 'TextDecoderStream', null, {
+    encoding() { return this._decoder.encoding; },
+    fatal() { return this._decoder.fatal; },
+    ignoreBOM() { return this._decoder.ignoreBOM; },
+  });
+
+  class TextEncoderStream {
+    constructor() {
+      const encoder = new TextEncoder();
+      this._encoder = encoder;
+      // A lone surrogate split across two chunks is one character, not two
+      // errors: the high half is HELD until its pair arrives.
+      let pending = '';
+      this._gts = new TransformStream({
+        transform(chunk, controller) {
+          let input = pending + String(chunk);
+          pending = '';
+          const last = input.charCodeAt(input.length - 1);
+          if (last >= 0xD800 && last <= 0xDBFF) {
+            pending = input[input.length - 1];
+            input = input.slice(0, -1);
+          }
+          if (input) controller.enqueue(encoder.encode(input));
+        },
+        flush(controller) {
+          if (pending) controller.enqueue(encoder.encode(pending));
+          pending = '';
+        },
+      });
+    }
+  }
+  Object.defineProperty(TextEncoderStream, 'length', { value: 0, configurable: true });
+  _makeGenericTransform(TextEncoderStream, 'TextEncoderStream', null, {
+    encoding() { return 'utf-8'; },
+  });
+})(globalThis);
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Compression Standard — https://compression.spec.whatwg.org/
@@ -72128,13 +75373,32 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   }
   _enumAccessors(Screen.prototype, 'availWidth', 'availHeight', 'width', 'height', 'colorDepth', 'pixelDepth');
   _exposeIface('Screen', Screen); _markNative(Screen);
+  // `screen.orientation` is a [SameObject] readonly Screen attribute — one
+  // ScreenOrientation per Screen, minted on first read. It has to be installed
+  // HERE, where the Screen class exists; the API's own module runs earlier.
+  {
+    const _screenOrientations = new WeakMap();
+    Object.defineProperty(Screen.prototype, 'orientation', {
+      enumerable: true, configurable: true,
+      get: _named('get', 'orientation', function () {
+        if (!(this instanceof Screen)) throw new TypeError('Illegal invocation');
+        let o = _screenOrientations.get(this);
+        if (!o) { o = globalThis.__newScreenOrientation(); _screenOrientations.set(this, o); }
+        return o;
+      }),
+    });
+  }
   globalThis._newScreen = (w, h) => {
     _allowScreenCtor = true;
     let s; try { s = new Screen(); } finally { _allowScreenCtor = false; }
     s._w = w | 0; s._h = h | 0; s._aw = w | 0; s._ah = (h | 0) - 40; s._cd = 24; s._pd = 24;
     // Screen Orientation API extras (not part of the CSSOM View IDL under test).
+    // ⚠️ `orientation` is NOT set here any more: it is a [SameObject] readonly
+    // attribute on Screen.prototype backed by a real ScreenOrientation (an
+    // EventTarget). The object literal that used to sit here shadowed it, so
+    // `screen.orientation instanceof ScreenOrientation` was false and
+    // `addEventListener('change')` registered nothing at all.
     s.availTop = 0; s.availLeft = 0;
-    s.orientation = { type: "landscape-primary", angle: 0, onchange: null, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } };
     return s;
   };
 
@@ -73024,6 +76288,63 @@ globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { 
   Object.defineProperty(DocumentTimeline, 'length', { value: 0, configurable: true });
   _waTag(DocumentTimeline, 'DocumentTimeline');
   _exposeIface('DocumentTimeline', DocumentTimeline); _markNative(DocumentTimeline);
+
+  // ── ScrollTimeline / ViewTimeline : AnimationTimeline ──────────────────────
+  // Scroll-driven animations: a progress bar that fills as you read, a heading
+  // that shrinks as the page moves. The reason it belongs in the ENGINE rather
+  // than in a page's scroll handler is that a scroll handler runs script on every
+  // frame — on a slow device that is the jank, and this is the API that exists to
+  // avoid it.
+  // ⛔ HONEST CAP: the timeline's `currentTime` is not yet driven from the
+  // scrolling box, so it reports null (the spec's "inactive timeline"). The
+  // interfaces, their options parsing and their attributes are real.
+  const _SCROLL_AXES = ['block', 'inline', 'x', 'y'];
+  class ScrollTimeline extends AnimationTimeline {
+    constructor() {
+      _allowTimelineCtor = true;
+      try { super(); } finally { _allowTimelineCtor = false; }
+      const options = arguments[0];
+      const o = (options == null) ? {} : options;
+      this._stSource = (o.source === undefined) ? (globalThis.document ? document.scrollingElement : null)
+                                                : (o.source || null);
+      const axis = (o.axis === undefined) ? 'block' : String(o.axis);
+      if (_SCROLL_AXES.indexOf(axis) < 0) {
+        throw new TypeError("Failed to construct 'ScrollTimeline': The provided value '" + axis +
+          "' is not a valid enum value of type ScrollAxis.");
+      }
+      this._stAxis = axis;
+    }
+    _currentTime() { return null; }
+  }
+  Object.defineProperty(ScrollTimeline, 'length', { value: 0, configurable: true });
+  _waAttr(ScrollTimeline.prototype, ScrollTimeline, 'source', function() { return this._stSource; });
+  _waAttr(ScrollTimeline.prototype, ScrollTimeline, 'axis', function() { return this._stAxis; });
+  _waTag(ScrollTimeline, 'ScrollTimeline');
+  _exposeIface('ScrollTimeline', ScrollTimeline); _markNative(ScrollTimeline);
+
+  class ViewTimeline extends ScrollTimeline {
+    constructor(options) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to construct 'ViewTimeline': 1 argument required, but only 0 present.");
+      }
+      const o = (options == null) ? {} : options;
+      if (o.subject === undefined) {
+        throw new TypeError("Failed to construct 'ViewTimeline': required member subject is undefined.");
+      }
+      super({ source: null, axis: o.axis });
+      this._vtSubject = o.subject;
+    }
+  }
+  Object.defineProperty(ViewTimeline, 'length', { value: 1, configurable: true });
+  _waAttr(ViewTimeline.prototype, ViewTimeline, 'subject', function() { return this._vtSubject; });
+  _waAttr(ViewTimeline.prototype, ViewTimeline, 'startOffset', function() {
+    return (globalThis.CSS && typeof CSS.px === 'function') ? CSS.px(0) : null;
+  });
+  _waAttr(ViewTimeline.prototype, ViewTimeline, 'endOffset', function() {
+    return (globalThis.CSS && typeof CSS.px === 'function') ? CSS.px(0) : null;
+  });
+  _waTag(ViewTimeline, 'ViewTimeline');
+  _exposeIface('ViewTimeline', ViewTimeline); _markNative(ViewTimeline);
 
   // The document's default timeline. One per document; `document.timeline` is a
   // [SameObject]-style readonly attribute, so it is minted once and cached.
@@ -87716,9 +91037,8 @@ globalThis.__obscura_init = function() {
 
   const t0 = Date.now();
   globalThis.performance.timeOrigin = t0;
-  globalThis.performance.timing = (typeof PerformanceTiming === "function")
-    ? new PerformanceTiming(t0)
-    : { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  // Rebuild the legacy timing record against the real time origin.
+  globalThis.performance._timing = _newPerformanceTiming(t0);
 
   // Create the single PerformanceNavigationTiming entry up-front so
   // getEntriesByType('navigation') is populated for the document's whole lifetime
@@ -87727,7 +91047,10 @@ globalThis.__obscura_init = function() {
   try {
     if (typeof PerformanceNavigationTiming === "function" && globalThis.performance && !globalThis.performance._navEntry) {
       const navUrl = _domParse("document_url") || (globalThis.location && location.href) || "";
-      const nav = new PerformanceNavigationTiming(navUrl);
+      _allowEntryCtor = true;
+      let nav;
+      try { nav = new PerformanceNavigationTiming(navUrl); }
+      finally { _allowEntryCtor = false; }
       globalThis.performance._navEntry = nav;
       globalThis.performance._entries.push(nav);
     }
