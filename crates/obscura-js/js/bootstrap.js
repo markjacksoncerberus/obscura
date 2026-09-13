@@ -178,6 +178,23 @@ Function.prototype.toString = function() {
   return _origToString.call(this);
 };
 const _markNative = function(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; };
+
+// ── "Illegal constructor" ────────────────────────────────────────────────────
+// Most DOM interfaces have NO constructor: `new DocumentType()` is a TypeError
+// in every browser, and for a good reason — what comes back otherwise is a node
+// with no name, no document and no place in any tree, which will fail somewhere
+// far away from the line that made it. The engine still has to mint them, so one
+// shared counter opens the door for exactly the constructions it asks for.
+let _allowInternalCtor = 0;
+const _internalCtor = function (Ctor, ...args) {
+  _allowInternalCtor++;
+  try { return new Ctor(...args); } finally { _allowInternalCtor--; }
+};
+const _illegalCtor = function (name) {
+  if (_allowInternalCtor === 0) {
+    throw new TypeError("Failed to construct '" + name + "': Illegal constructor");
+  }
+};
 _nativeFns.add(Function.prototype.toString);
 
 // A monotonically increasing count of tree mutations, bumped by the mutation
@@ -4801,6 +4818,7 @@ class Comment extends CharacterData {
 // with a real text node so tree ops (appendChild, ranges, traversal) work; the
 // wrapper just reports nodeType 4 / "#cdata-section".
 class CDATASection extends Text {
+  constructor(nid, token) { _illegalCtor('CDATASection'); super(nid, token); }
   get nodeName() { return "#cdata-section"; }
   get nodeType() { return 4; }
   cloneNode() { return _makeCDATA(this.data); }
@@ -4809,7 +4827,7 @@ class CDATASection extends Text {
 // ProcessingInstruction is CharacterData with a target. Backed by a real comment
 // node for tree storage; reports nodeType 7 and nodeName === target.
 class ProcessingInstruction extends CharacterData {
-  constructor(nid, target) { super(nid); this._target = String(target); }
+  constructor(nid, target) { _illegalCtor('ProcessingInstruction'); super(nid); this._target = String(target); }
   get nodeName() { return this._target; }
   get nodeType() { return 7; }
   get target() { return this._target; }
@@ -4818,13 +4836,13 @@ class ProcessingInstruction extends CharacterData {
 
 const _makeCDATA = function(data) {
   const nid = +_dom("create_text_node", String(data ?? ""));
-  const n = new CDATASection(nid, _NID_TOKEN);
+  const n = _internalCtor(CDATASection, nid, _NID_TOKEN);
   _cache.set(nid, n);
   return n;
 };
 const _makePI = function(target, data) {
   const nid = +_dom("create_comment_node", String(data ?? ""));
-  const n = new ProcessingInstruction(nid, target);
+  const n = _internalCtor(ProcessingInstruction, nid, target);
   _cache.set(nid, n);
   return n;
 };
@@ -4897,6 +4915,7 @@ const _validateAndExtract = function(namespace, qname) {
 // they were absent. The members that matter are all overridden below.
 globalThis.Attr = class Attr extends Node {
   constructor(ns, prefix, local, value) {
+    _illegalCtor('Attr');
     super(undefined);
     this._ownerEl = null;
     this._ns = ns == null ? null : String(ns);
@@ -4937,7 +4956,7 @@ globalThis.Attr = class Attr extends Node {
   get childNodes() { return []; }
   get firstChild() { return null; }
   get parentNode() { return null; }
-  cloneNode() { return new Attr(this._ns, this._prefix, this._local, this.value); }
+  cloneNode() { return _internalCtor(globalThis.Attr, this._ns, this._prefix, this._local, this.value); }
   // Attr is not a Node subclass, so it needs its own isSameNode. Attr objects are
   // identity-cached on their element (and held directly when detached), so a plain
   // reference compare is the spec's "otherNode is this".
@@ -4957,6 +4976,7 @@ const _detachAttr = function(a) { if (a._ownerEl) { a._detachedValue = a.value; 
 // prototype members, matching real browsers' getOwnPropertyNames output.
 const _nnmData = new WeakMap();
 globalThis.NamedNodeMap = class NamedNodeMap {
+  constructor() { _illegalCtor('NamedNodeMap'); }
   get [Symbol.toStringTag]() { return 'NamedNodeMap'; }
   get length() { return _nnmData.get(this).items.length; }
   item(i) { const items = _nnmData.get(this).items; i = i >>> 0; return i < items.length ? items[i] : null; }
@@ -4989,7 +5009,7 @@ globalThis.NamedNodeMap = class NamedNodeMap {
 // come from the element's identity cache (so el.attributes[i] === getAttributeNode).
 const _buildNamedNodeMap = function(el) {
   const items = el._syncAttrNodes();
-  const map = new NamedNodeMap();
+  const map = _internalCtor(globalThis.NamedNodeMap);
   _nnmData.set(map, { ownerEl: el, items });
   for (let i = 0; i < items.length; i++)
     Object.defineProperty(map, i, { value: items[i], enumerable: true, configurable: true });
@@ -5013,13 +5033,14 @@ const _buildNamedNodeMap = function(el) {
 // now holds. Derived operations (map/filter/slice) yield plain Arrays via
 // Symbol.species, matching the spec's non-Array NodeList.
 globalThis.NodeList = class NodeList extends Array {
+  constructor(...a) { _illegalCtor('NodeList'); super(...a); }
   static get [Symbol.species]() { return Array; }
   item(i) { i = i >>> 0; return i < this.length ? this[i] : null; }
 };
 // Build a NodeList from an array of nodes (Array's variadic/number-arg constructor
 // is unsafe for this, so assign indices explicitly).
 const _makeNodeList = (nodes) => {
-  const nl = new globalThis.NodeList();
+  const nl = _internalCtor(globalThis.NodeList);
   for (let i = 0; i < nodes.length; i++) nl[i] = nodes[i];
   return nl;
 };
@@ -5034,7 +5055,7 @@ const _makeNodeList = (nodes) => {
 const _childNodesCache = new WeakMap(); // node -> live NodeList proxy
 const _nlIsIndex = (p) => typeof p === 'string' && /^(0|[1-9][0-9]*)$/.test(p);
 const _makeLiveChildNodes = (node) => {
-  const target = new globalThis.NodeList();
+  const target = _internalCtor(globalThis.NodeList);
   let snap = null, snapGen = -1;
   const items = () => {
     if (snap === null || snapGen !== _treeGen) {
@@ -5261,7 +5282,7 @@ const _validateToken = function(t) {
 };
 // Live DOMTokenList backed by an element attribute (class for classList, etc.).
 globalThis.DOMTokenList = class DOMTokenList {
-  constructor(el, attr) { this._el = el; this._attr = attr; }
+  constructor(el, attr) { _illegalCtor('DOMTokenList'); this._el = el; this._attr = attr; }
   get [Symbol.toStringTag]() { return 'DOMTokenList'; }
   _ordered() {
     const seen = new Set(), out = [];
@@ -5315,7 +5336,7 @@ globalThis.DOMTokenList = class DOMTokenList {
 };
 // Wrap so integer-indexed access (classList[0]) works alongside the methods.
 const _makeTokenList = function(el, attr) {
-  const list = new DOMTokenList(el, attr);
+  const list = _internalCtor(globalThis.DOMTokenList, el, attr);
   return new Proxy(list, {
     get(target, prop, recv) {
       if (typeof prop === 'string' && /^[0-9]+$/.test(prop)) {
@@ -6992,7 +7013,7 @@ class Element extends Node {
       live.add(key);
       let a = cache.get(key);
       if (!a || a._ownerEl !== this) {
-        a = new Attr(r.ns, r.prefix, r.local, r.value);
+        a = _internalCtor(globalThis.Attr, r.ns, r.prefix, r.local, r.value);
         a._ownerEl = this;
         cache.set(key, a);
       }
@@ -9169,7 +9190,7 @@ class Document extends Node {
     if (this._doctype !== undefined) return this._doctype;
     const info = _domParse("document_doctype");
     if (info && info.name) {
-      this._doctype = new DocumentType(info.nodeId, info.name, info.publicId || "", info.systemId || "");
+      this._doctype = _internalCtor(DocumentType, info.nodeId, info.name, info.publicId || "", info.systemId || "");
     } else {
       this._doctype = null;
     }
@@ -9379,12 +9400,12 @@ class Document extends Node {
     localName = (localName === undefined) ? "undefined" : String(localName);
     _validateAttrName(localName);
     if (this._isHTMLDoc) localName = _asciiLower(localName);
-    const a = new Attr(null, null, localName, ""); a.__ownerDoc = this; return a;
+    const a = _internalCtor(globalThis.Attr, null, null, localName, ""); a.__ownerDoc = this; return a;
   }
   createAttributeNS(namespace, qualifiedName) {
     const { namespace: ns, prefix, local } =
       _validateAndExtract(namespace, (qualifiedName === undefined) ? "undefined" : String(qualifiedName));
-    const a = new Attr(ns, prefix, local, ""); a.__ownerDoc = this; return a;
+    const a = _internalCtor(globalThis.Attr, ns, prefix, local, ""); a.__ownerDoc = this; return a;
   }
   createDocumentFragment() {
     const nid = +_dom("create_document_fragment");
@@ -9444,11 +9465,11 @@ class Document extends Node {
   }
   createTreeWalker(root, whatToShow, filter) {
     if (!(root instanceof Node)) throw new TypeError("createTreeWalker: root must be a Node");
-    return new TreeWalker(root, __obscura_whatToShow(whatToShow), __obscura_nodeFilterArg(filter));
+    return _internalCtor(globalThis.TreeWalker, root, __obscura_whatToShow(whatToShow), __obscura_nodeFilterArg(filter));
   }
   createNodeIterator(root, whatToShow, filter) {
     if (!(root instanceof Node)) throw new TypeError("createNodeIterator: root must be a Node");
-    return new NodeIterator(root, __obscura_whatToShow(whatToShow), __obscura_nodeFilterArg(filter));
+    return _internalCtor(globalThis.NodeIterator, root, __obscura_whatToShow(whatToShow), __obscura_nodeFilterArg(filter));
   }
   // A document with no browsing context (a DOMParser/createHTMLDocument/XML
   // document) has NO selection at all — not an empty one. `null` here is the
@@ -9490,9 +9511,13 @@ class Document extends Node {
   }
   // document.forms is an HTMLCollection (named access by id/name), not a NodeList.
   get forms() { const d = this; return _makeHTMLCollection(() => [...d.querySelectorAll("form")]); }
-  get images() { return this.querySelectorAll("img"); }
-  get links() { return this.querySelectorAll("a[href], area[href]"); }
-  get scripts() { return this.querySelectorAll("script"); }
+  get images() { const d = this; return _makeHTMLCollection(() => [...d.querySelectorAll("img")]); }
+  get links() { const d = this; return _makeHTMLCollection(() => [...d.querySelectorAll("a[href], area[href]")]); }
+  get scripts() { const d = this; return _makeHTMLCollection(() => [...d.querySelectorAll("script")]); }
+  // `embeds` and `plugins` are the same collection under two names (HTML §3.1.5);
+  // `plugins` is the older one and a surprising amount of code still reads it.
+  get embeds() { const d = this; return _makeHTMLCollection(() => [...d.querySelectorAll("embed")]); }
+  get plugins() { return this.embeds; }
   // The <script> whose classic script is currently executing (null in modules,
   // event handlers, or outside script execution). The running nid is set by the
   // page-load script driver (Rust) and by the dynamic-insertion eval path.
@@ -9633,6 +9658,7 @@ function _templateContentFragment(tpl) {
 
 class DocumentType extends Node {
   constructor(nid, name, publicId, systemId) {
+    _illegalCtor('DocumentType');
     super(nid);
     this._name = name;
     this._publicId = publicId;
@@ -9652,7 +9678,7 @@ class DocumentType extends Node {
   get ownerDocument() { return this._ownerDoc || globalThis.document; }
   // §clone a node: a fresh detached doctype with the same name/publicId/systemId.
   cloneNode() {
-    const dt = new DocumentType(+_dom("create_comment_node", ""), this._name, this._publicId, this._systemId);
+    const dt = _internalCtor(DocumentType, +_dom("create_comment_node", ""), this._name, this._publicId, this._systemId);
     dt._ownerDoc = this._ownerDoc;
     return dt;
   }
@@ -9727,7 +9753,7 @@ class DetachedDocument extends Document {
     // bare DetachedDocument. _IframeDocument is a sibling with a different ctor
     // signature, so branch explicitly rather than via this.constructor.
     const copy = (this instanceof XMLDocument)
-      ? new XMLDocument(this._kind)
+      ? _internalCtor(globalThis.XMLDocument, this._kind)
       : new DetachedDocument(this._kind);
     // A clone starts empty — drop the kind-'html' auto-built <html><head><body>.
     for (let c = copy.firstChild; c; ) { const n = c.nextSibling; copy.removeChild(c); c = n; }
@@ -9935,7 +9961,7 @@ const _wrap = function(nid) {
   else if (t === 10) {
     // DocumentType: its constructor seeds the cache itself, so return directly.
     const info = _domParse("document_doctype");
-    return new DocumentType(nid, _domParse("node_name", nid) || (info && info.name) || "",
+    return _internalCtor(DocumentType, nid, _domParse("node_name", nid) || (info && info.name) || "",
                             (info && info.publicId) || "", (info && info.systemId) || "");
   }
   else n = new Node(nid);
@@ -12481,10 +12507,100 @@ globalThis.chrome = {
   loadTimes() { return {}; },
 };
 
-globalThis.Notification = class Notification {
+// ── Notification (the Notifications API) ──────────────────────────────────────
+// This engine has no way to put a notification on someone's screen, and it does
+// not pretend to: permission is "default", so the spec's own path applies —
+// `new Notification(...)` creates the object, fires `error`, and shows nothing.
+// That is EXACTLY what a browser does for a site the user has not granted, and
+// it is the branch every well-written page already handles.
+//
+// What was there before was a bare class with an empty constructor: no `title`,
+// no `body`, no `close()`, no events. A page could not read back what it had
+// just asked for, and `notification.onclick = …` was an expando nobody would
+// ever call. The record is real now even though the screen is not.
+globalThis.Notification = class Notification extends EventTarget {
   static permission = "default";
-  static requestPermission() { return Promise.resolve("default"); }
-  constructor() {}
+  static maxActions = 0;
+  static requestPermission(deprecatedCallback) {
+    const p = Promise.resolve(globalThis.Notification.permission);
+    if (typeof deprecatedCallback === 'function') {
+      p.then((v) => { try { deprecatedCallback(v); } catch (e) {} });
+    }
+    return p;
+  }
+  constructor(title, options) {
+    super();
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'Notification': 1 argument required, but only 0 present.");
+    }
+    const o = (options == null) ? {} : options;
+    if (typeof o !== 'object') {
+      throw new TypeError("Failed to construct 'Notification': The provided value is not of type 'NotificationOptions'.");
+    }
+    this._title = String(title);
+    this._dir = ['auto', 'ltr', 'rtl'].indexOf(o.dir) === -1 ? 'auto' : o.dir;
+    this._lang = o.lang === undefined ? '' : String(o.lang);
+    this._body = o.body === undefined ? '' : String(o.body);
+    this._tag = o.tag === undefined ? '' : String(o.tag);
+    this._image = o.image === undefined ? '' : String(o.image);
+    this._icon = o.icon === undefined ? '' : String(o.icon);
+    this._badge = o.badge === undefined ? '' : String(o.badge);
+    this._vibrate = o.vibrate === undefined ? [] : (Array.isArray(o.vibrate) ? o.vibrate.map(Number) : [Number(o.vibrate)]);
+    this._timestamp = o.timestamp === undefined ? Date.now() : Number(o.timestamp);
+    this._renotify = !!o.renotify;
+    this._silent = (o.silent === undefined || o.silent === null) ? null : !!o.silent;
+    this._requireInteraction = !!o.requireInteraction;
+    // `data` is a structured clone — a page must not be handed back a live
+    // reference it can mutate behind the notification's back.
+    let data = null;
+    if (o.data !== undefined) {
+      try { data = globalThis.structuredClone(o.data); } catch (e) { data = o.data; }
+    }
+    this._data = data;
+    this._actions = Object.freeze([]);  // maxActions is 0, so the list is empty
+    this._onclick = null; this._onshow = null; this._onerror = null; this._onclose = null;
+    // "If the notification platform does not support … or permission is not
+    // 'granted', queue a task to fire an event named error." It is not granted.
+    const self = this;
+    _queueTask(function () {
+      const ev = new Event('error');
+      ev._isTrusted = true;
+      try { self.dispatchEvent(ev); } catch (e) {}
+      if (typeof self._onerror === 'function') { try { self._onerror.call(self, ev); } catch (e) {} }
+    });
+  }
+  get title() { return this._title; }
+  get dir() { return this._dir; }
+  get lang() { return this._lang; }
+  get body() { return this._body; }
+  get tag() { return this._tag; }
+  get image() { return this._image; }
+  get icon() { return this._icon; }
+  get badge() { return this._badge; }
+  get vibrate() { return this._vibrate; }
+  get timestamp() { return this._timestamp; }
+  get renotify() { return this._renotify; }
+  get silent() { return this._silent; }
+  get requireInteraction() { return this._requireInteraction; }
+  get data() { return this._data; }
+  get actions() { return this._actions; }
+  get onclick() { return this._onclick; }
+  set onclick(v) { this._onclick = (typeof v === 'function') ? v : null; }
+  get onshow() { return this._onshow; }
+  set onshow(v) { this._onshow = (typeof v === 'function') ? v : null; }
+  get onerror() { return this._onerror; }
+  set onerror(v) { this._onerror = (typeof v === 'function') ? v : null; }
+  get onclose() { return this._onclose; }
+  set onclose(v) { this._onclose = (typeof v === 'function') ? v : null; }
+  close() {
+    const self = this;
+    _queueTask(function () {
+      const ev = new Event('close');
+      ev._isTrusted = true;
+      try { self.dispatchEvent(ev); } catch (e) {}
+      if (typeof self._onclose === 'function') { try { self._onclose.call(self, ev); } catch (e) {} }
+    });
+  }
 };
 
 globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
@@ -39005,7 +39121,7 @@ globalThis.DOMImplementation = class DOMImplementation {
       throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': parameter 3 is not of type 'DocumentType'.");
     }
     // A new XMLDocument (its prototype must be EXACTLY XMLDocument.prototype).
-    const doc = new XMLDocument('xml');
+    const doc = _internalCtor(globalThis.XMLDocument, 'xml');
     // DOM §createDocument: the document's content type derives from `namespace`,
     // and createElement's element namespace follows from the content type. The
     // XHTML namespace yields application/xhtml+xml, in which createElement makes
@@ -39047,7 +39163,7 @@ globalThis.DOMImplementation = class DOMImplementation {
       throw new DOMException("'" + name + "' is not a valid doctype name.", "InvalidCharacterError");
     }
     const nid = +_dom("create_comment_node", "");
-    const dt = new DocumentType(nid, name, String(publicId), String(systemId));
+    const dt = _internalCtor(DocumentType, nid, name, String(publicId), String(systemId));
     // The new doctype's node document is the implementation's associated
     // document (the page for `document.implementation`, the detached/iframe
     // document for `doc.implementation`).
@@ -42647,7 +42763,9 @@ function _xmlSerNode(node, namespace, map, idx) {
 // abstract Document. DOMParser's XML branch deliberately returns a plain
 // `_IframeDocument` (also `extends DetachedDocument`, a SIBLING of XMLDocument) so the
 // HTML-spec assertion `!(doc instanceof XMLDocument)` still holds for parsed documents.
-globalThis.XMLDocument = class XMLDocument extends DetachedDocument {};
+globalThis.XMLDocument = class XMLDocument extends DetachedDocument {
+  constructor(kind) { _illegalCtor('XMLDocument'); super(kind); }
+};
 
 globalThis.DOMParser = class DOMParser {
   parseFromString(str, type) {
@@ -42719,6 +42837,12 @@ class PerformanceEntry {
   get entryType() { return this._entryType; }
   get startTime() { return this._startTime; }
   get duration() { return this._duration; }
+  // Two members every entry now carries: `id` distinguishes entries that share a
+  // name, and `navigationId` says which navigation in this document's history
+  // the entry belongs to. Neither has a source of truth here yet, and both have
+  // a defined empty answer.
+  get id() { return this._entryId || ""; }
+  get navigationId() { return this._navigationId || ""; }
   toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; }
 }
 globalThis.PerformanceEntry = _markNative(PerformanceEntry);
@@ -42761,45 +42885,43 @@ globalThis.PerformanceMeasure = _markNative(PerformanceMeasure);
 // becomes known); the document itself is fetched by the Rust layer, so the main
 // navigation entry leaves the network phases at 0 (they occurred before
 // timeOrigin) and only fills the document-lifecycle phases below.
+// ⚠️ A performance entry is a RECORD OF WHAT HAPPENED, so every one of these is
+// a readonly IDL attribute on the prototype, backed by an internal store — not
+// an own writable property on the instance. Page code that can write
+// `entry.transferSize = 0` can hide a megabyte from whatever is watching the
+// budget, and idlharness asserts the shape besides. The engine fills the store
+// through `_rt` as timing becomes known.
+const _RT_FIELDS = ["initiatorType", "deliveryType", "nextHopProtocol", "contentType", "workerStart", "redirectStart", "redirectEnd", "fetchStart", "domainLookupStart", "domainLookupEnd", "connectStart", "connectEnd", "secureConnectionStart", "requestStart", "responseStart", "firstInterimResponseStart", "finalResponseHeadersStart", "responseEnd", "responseStatus", "transferSize", "encodedBodySize", "decodedBodySize", "serverTiming"];
 class PerformanceResourceTiming extends PerformanceEntry {
   constructor(name, entryType, startTime) {
     super(name, entryType || "resource", startTime || 0, 0);
-    this.initiatorType = "";
-    this.deliveryType = "";
-    this.nextHopProtocol = "";
-    // Resource Timing 2 §contentType — the essence (type/subtype, params stripped)
-    // of the response's Content-Type. Exposed only for same-origin (or TAO-passed)
-    // responses; "" for opaque cross-origin ones.
-    this.contentType = "";
-    this.workerStart = 0;
-    this.redirectStart = 0;
-    this.redirectEnd = 0;
-    this.fetchStart = 0;
-    this.domainLookupStart = 0;
-    this.domainLookupEnd = 0;
-    this.connectStart = 0;
-    this.connectEnd = 0;
-    this.secureConnectionStart = 0;
-    this.requestStart = 0;
-    this.responseStart = 0;
-    this.firstInterimResponseStart = 0;
-    this.responseEnd = 0;
-    this.responseStatus = 0;
-    this.transferSize = 0;
-    this.encodedBodySize = 0;
-    this.decodedBodySize = 0;
-    this.serverTiming = [];
+    this._rt = {
+      // Resource Timing 2 §contentType — the essence (type/subtype, params
+      // stripped) of the response's Content-Type. Exposed only for same-origin
+      // (or TAO-passed) responses; "" for opaque cross-origin ones.
+      initiatorType: "", deliveryType: "", nextHopProtocol: "", contentType: "",
+      workerStart: 0, redirectStart: 0, redirectEnd: 0, fetchStart: 0,
+      domainLookupStart: 0, domainLookupEnd: 0, connectStart: 0, connectEnd: 0,
+      secureConnectionStart: 0, requestStart: 0, responseStart: 0,
+      firstInterimResponseStart: 0, finalResponseHeadersStart: 0,
+      responseEnd: 0, responseStatus: 0, transferSize: 0,
+      encodedBodySize: 0, decodedBodySize: 0, serverTiming: [],
+    };
   }
   toJSON() {
     const j = super.toJSON();
-    for (const k of ['initiatorType', 'deliveryType', 'nextHopProtocol', 'contentType', 'workerStart',
-      'redirectStart', 'redirectEnd', 'fetchStart', 'domainLookupStart', 'domainLookupEnd',
-      'connectStart', 'connectEnd', 'secureConnectionStart', 'requestStart', 'responseStart',
-      'responseEnd', 'responseStatus', 'transferSize', 'encodedBodySize', 'decodedBodySize'])
-      j[k] = this[k];
-    j.serverTiming = this.serverTiming;
+    for (const k of _RT_FIELDS) j[k] = this._rt[k];
     return j;
   }
+}
+for (const _k of _RT_FIELDS) {
+  Object.defineProperty(PerformanceResourceTiming.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._rt) throw new TypeError("Illegal invocation");
+      return this._rt[_k];
+    }),
+  });
 }
 globalThis.PerformanceResourceTiming = _markNative(PerformanceResourceTiming);
 
@@ -42811,8 +42933,8 @@ globalThis.PerformanceResourceTiming = _markNative(PerformanceResourceTiming);
 class PerformanceNavigationTiming extends PerformanceResourceTiming {
   constructor(name) {
     super(name, "navigation", 0);
-    this.initiatorType = "navigation";
-    this.nextHopProtocol = "http/1.1";
+    this._rt.initiatorType = "navigation";
+    this._rt.nextHopProtocol = "http/1.1";
     this.unloadEventStart = 0;
     this.unloadEventEnd = 0;
     this.domInteractive = 0;
@@ -42845,6 +42967,9 @@ class PerformanceTiming {
     // or never apply here (unload/redirect/TLS-on-http) are 0 — which is also what
     // User Timing's "convert a mark to a timestamp" treats as empty (InvalidAccessError).
     this.navigationStart = t0; this.unloadEventStart = 0; this.unloadEventEnd = 0;
+    // ⚠️ PerformanceTiming is the LEGACY interface: its members really are own
+    // data properties on the instance (that is what the old spec said), and it
+    // has nothing to do with PerformanceResourceTiming's readonly store.
     this.redirectStart = 0; this.redirectEnd = 0; this.fetchStart = t0;
     this.domainLookupStart = t0; this.domainLookupEnd = t0; this.connectStart = t0;
     this.connectEnd = t0; this.secureConnectionStart = 0; this.requestStart = t0;
@@ -42987,19 +43112,19 @@ class Performance {
   _makeResourceEntry(name, initiatorType, startTime, endTime, sizes) {
     if (endTime < startTime) endTime = startTime;
     const e = new PerformanceResourceTiming(name, "resource", startTime);
-    e.initiatorType = initiatorType || "";
-    e.nextHopProtocol = "http/1.1";
-    e.fetchStart = startTime;
-    e.domainLookupStart = startTime; e.domainLookupEnd = startTime;
-    e.connectStart = startTime; e.connectEnd = startTime;
-    e.requestStart = startTime; e.responseStart = endTime; e.responseEnd = endTime;
+    e._rt.initiatorType = initiatorType || "";
+    e._rt.nextHopProtocol = "http/1.1";
+    e._rt.fetchStart = startTime;
+    e._rt.domainLookupStart = startTime; e._rt.domainLookupEnd = startTime;
+    e._rt.connectStart = startTime; e._rt.connectEnd = startTime;
+    e._rt.requestStart = startTime; e._rt.responseStart = endTime; e._rt.responseEnd = endTime;
     e._duration = endTime - startTime;
     if (sizes) {
-      e.encodedBodySize = sizes.enc || 0;
-      e.decodedBodySize = (sizes.dec != null ? sizes.dec : sizes.enc) || 0;
-      e.transferSize = (sizes.enc || 0) + 300;
-      if (sizes.status) e.responseStatus = sizes.status;
-      if (sizes.contentType != null) e.contentType = sizes.contentType;
+      e._rt.encodedBodySize = sizes.enc || 0;
+      e._rt.decodedBodySize = (sizes.dec != null ? sizes.dec : sizes.enc) || 0;
+      e._rt.transferSize = (sizes.enc || 0) + 300;
+      if (sizes.status) e._rt.responseStatus = sizes.status;
+      if (sizes.contentType != null) e._rt.contentType = sizes.contentType;
     }
     return e;
   }
@@ -51989,7 +52114,7 @@ function _cvReflLong(proto, prop, attr) {
   // reflect a control becoming un-labelable), cached per element for identity.
   const _labelsCache = new WeakMap();
   const _makeLiveLabels = (el) => {
-    const target = new globalThis.NodeList();
+    const target = _internalCtor(globalThis.NodeList);
     const items = () => _labelItemsFor(el);
     return new Proxy(target, {
       get(t, p, r) {
@@ -53359,6 +53484,7 @@ function __obscura_runNodeIteratorPreRemove(toBeRemoved) {
 
 globalThis.NodeIterator = class NodeIterator {
   constructor(root, whatToShow, filter) {
+    _illegalCtor('NodeIterator');
     this._root = root;
     this._reference = root;
     this._beforeReference = true;
@@ -53423,6 +53549,7 @@ globalThis.NodeIterator = class NodeIterator {
 
 globalThis.TreeWalker = class TreeWalker {
   constructor(root, whatToShow, filter) {
+    _illegalCtor('TreeWalker');
     this._root = root;
     this._currentNode = root;
     this._whatToShow = whatToShow >>> 0;
@@ -64181,7 +64308,7 @@ Element.prototype.attachShadow = function attachShadow(init) {
   const nid = +_dom("create_document_fragment");
   _allowShadowConstruct = true;
   let shadow;
-  try { shadow = new ShadowRoot(nid, host, mode); } finally { _allowShadowConstruct = false; }
+  try { shadow = _internalCtor(ShadowRoot, nid, host, mode); } finally { _allowShadowConstruct = false; }
   if (init && init.delegatesFocus) shadow._delegatesFocus = true;
   if (init && init.slotAssignment === 'manual') shadow._slotAssignment = 'manual';
   if (init && init.clonable) shadow._clonable = true;
@@ -79978,11 +80105,12 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     HTMLImageElement: {
       fetchPriority: {t:"enum", d:"auto", i:"auto", k:["high", "low", "auto"]},
       referrerPolicy: {t:"enum", d:"", i:"", k:["", "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin", "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url"]},
-      // ⛔ `sizes` is NOT here on purpose: the source-set algorithm reads
-      // `img.sizes` and distinguishes "no sizes attribute" (undefined) from an
-      // empty one, and a plain reflection getter answering "" for both made
-      // every `srcset` selection pick the wrong candidate. It belongs in the
-      // source-set code, not in a generated table.
+      // `<img controls>` (animated images), `loading` and `sizes`. Nothing in
+      // the source-set algorithm reads the IDL attribute — it goes to
+      // `getAttribute('sizes')` — so these are plain reflections.
+      controls: {t:"boolean"},
+      loading: {t:"enum", d:"eager", i:"eager", k:["lazy", "eager"]},
+      sizes: {t:"string"},
     },
     HTMLInputElement: {
       align: {t:"string"},
@@ -87012,6 +87140,491 @@ const _waWaveshape = (curve, x) => {
   _exposeIface('webkitOfflineAudioContext', OfflineAudioContext);
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// THE MEDIA ELEMENT'S IDL SURFACE, AND THE HTML MEMBERS THAT WERE NOT REFLECTED
+// ═════════════════════════════════════════════════════════════════════════════
+// Obscura has no media decoder, and this block does not pretend otherwise: every
+// value below is the truthful answer for "nothing has been loaded". What it does
+// fix is the far more common failure mode — a page asking a `<video>` a perfectly
+// ordinary question and getting `undefined`, which is not "no video", it is a
+// TypeError three lines later in somebody's player script.
+{
+  const _defRO = function (proto, name, get) {
+    if (!proto || Object.getOwnPropertyDescriptor(proto, name)) return;
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true, get: _named('get', name, get),
+    });
+  };
+  const _defRW = function (proto, name, get, set) {
+    if (!proto || Object.getOwnPropertyDescriptor(proto, name)) return;
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true,
+      get: _named('get', name, get), set: _named('set', name, set),
+    });
+  };
+  const _defOp = function (proto, name, fn, len) {
+    if (!proto || Object.getOwnPropertyDescriptor(proto, name)) return;
+    Object.defineProperty(fn, 'name', { value: name, configurable: true });
+    if (len !== undefined) Object.defineProperty(fn, 'length', { value: len, configurable: true });
+    Object.defineProperty(proto, name, {
+      configurable: true, enumerable: true, writable: true, value: _markNative(fn),
+    });
+  };
+
+  // ── TimeRanges (HTML §4.8.14.11) ───────────────────────────────────────────
+  // A normalised, sorted list of non-overlapping ranges. `start(i)`/`end(i)`
+  // throw IndexSizeError past the end — a player that walks `buffered` without
+  // checking `length` should be told so, not handed NaN.
+  let _allowMediaCtor = false;
+  const _mint = function (Ctor) {
+    _allowMediaCtor = true;
+    try { return new Ctor(); } finally { _allowMediaCtor = false; }
+  };
+  globalThis.TimeRanges = class TimeRanges {
+    constructor() {
+      if (!_allowMediaCtor) throw new TypeError('Illegal constructor');
+      this._ranges = [];
+    }
+    get length() { return this._ranges.length; }
+    start(index) {
+      const i = index >>> 0;
+      if (i >= this._ranges.length) throw new DOMException('Index out of bounds.', 'IndexSizeError');
+      return this._ranges[i][0];
+    }
+    end(index) {
+      const i = index >>> 0;
+      if (i >= this._ranges.length) throw new DOMException('Index out of bounds.', 'IndexSizeError');
+      return this._ranges[i][1];
+    }
+  };
+  const _emptyTimeRanges = () => _mint(globalThis.TimeRanges);
+
+  // ── The track interfaces ───────────────────────────────────────────────────
+  // `<track>` is how a deaf viewer reads a video, and how anyone watching
+  // without sound follows it. The list is empty here because nothing decodes,
+  // but `addTextTrack()` builds a real one and `video.textTracks` finds it.
+  globalThis.TextTrackCueList = class TextTrackCueList {
+    constructor() {
+      if (!_allowMediaCtor) throw new TypeError('Illegal constructor');
+      this._cues = [];
+    }
+    get length() { return this._cues.length; }
+    getCueById(id) {
+      id = String(id);
+      for (const c of this._cues) if (c.id === id) return c;
+      return null;
+    }
+  };
+  globalThis.TextTrack = class TextTrack extends EventTarget {
+    constructor() {
+      super();
+      if (!_allowMediaCtor) throw new TypeError('Illegal constructor');
+      this._kind = 'subtitles'; this._label = ''; this._language = '';
+      this._id = ''; this._inBandMetadataTrackDispatchType = '';
+      this._mode = 'disabled';
+      this._cues = _mint(globalThis.TextTrackCueList);
+      this._activeCues = _mint(globalThis.TextTrackCueList);
+      this._oncuechange = null;
+    }
+    get kind() { return this._kind; }
+    get label() { return this._label; }
+    get language() { return this._language; }
+    get id() { return this._id; }
+    get inBandMetadataTrackDispatchType() { return this._inBandMetadataTrackDispatchType; }
+    get mode() { return this._mode; }
+    set mode(v) {
+      v = String(v);
+      if (v === 'disabled' || v === 'hidden' || v === 'showing') this._mode = v;
+    }
+    get cues() { return this._mode === 'disabled' ? null : this._cues; }
+    get activeCues() { return this._mode === 'disabled' ? null : this._activeCues; }
+    addCue(cue) { if (cue && this._cues._cues.indexOf(cue) === -1) this._cues._cues.push(cue); }
+    removeCue(cue) {
+      const i = this._cues._cues.indexOf(cue);
+      if (i === -1) throw new DOMException('The cue is not in this track.', 'NotFoundError');
+      this._cues._cues.splice(i, 1);
+    }
+    get oncuechange() { return this._oncuechange; }
+    set oncuechange(v) { this._oncuechange = (typeof v === 'function') ? v : null; }
+  };
+  globalThis.TextTrackList = class TextTrackList extends EventTarget {
+    constructor() {
+      super();
+      if (!_allowMediaCtor) throw new TypeError('Illegal constructor');
+      this._tracks = [];
+    }
+    get length() { return this._tracks.length; }
+    getTrackById(id) {
+      id = String(id);
+      for (const t of this._tracks) if (t.id === id) return t;
+      return null;
+    }
+    [Symbol.iterator]() { return this._tracks[Symbol.iterator](); }
+  };
+  globalThis.AudioTrackList = class AudioTrackList extends EventTarget {
+    constructor() {
+      super();
+      if (!_allowMediaCtor) throw new TypeError('Illegal constructor');
+      this._tracks = [];
+    }
+    get length() { return this._tracks.length; }
+    getTrackById(id) { return null; }
+    [Symbol.iterator]() { return this._tracks[Symbol.iterator](); }
+  };
+  globalThis.VideoTrackList = class VideoTrackList extends EventTarget {
+    constructor() {
+      super();
+      if (!_allowMediaCtor) throw new TypeError('Illegal constructor');
+      this._tracks = [];
+    }
+    get length() { return this._tracks.length; }
+    get selectedIndex() { return -1; }
+    getTrackById(id) { return null; }
+    [Symbol.iterator]() { return this._tracks[Symbol.iterator](); }
+  };
+
+  // ── HTMLMediaElement ───────────────────────────────────────────────────────
+  const _ME = globalThis.HTMLMediaElement && globalThis.HTMLMediaElement.prototype;
+  if (_ME) {
+    const _mediaState = new WeakMap();
+    const _st = function (el) {
+      let s = _mediaState.get(el);
+      if (!s) {
+        s = {
+          playbackRate: 1, defaultPlaybackRate: 1, preservesPitch: true,
+          srcObject: null,
+          textTracks: _mint(globalThis.TextTrackList),
+          audioTracks: _mint(globalThis.AudioTrackList),
+          videoTracks: _mint(globalThis.VideoTrackList),
+        };
+        _mediaState.set(el, s);
+      }
+      return s;
+    };
+    // Nothing is buffered, played or seekable until something has been decoded,
+    // and a fresh empty list each read is exactly what that means.
+    _defRO(_ME, 'buffered', function () { return _emptyTimeRanges(); });
+    _defRO(_ME, 'played', function () { return _emptyTimeRanges(); });
+    _defRO(_ME, 'seekable', function () { return _emptyTimeRanges(); });
+    // `currentSrc` is the resource actually selected. Nothing is fetched, so it
+    // is the empty string — the same answer a real browser gives before the
+    // resource selection algorithm has picked anything.
+    _defRO(_ME, 'currentSrc', function () { return ''; });
+    _defRO(_ME, 'textTracks', function () { return _st(this).textTracks; });
+    _defRO(_ME, 'audioTracks', function () { return _st(this).audioTracks; });
+    _defRO(_ME, 'videoTracks', function () { return _st(this).videoTracks; });
+    _defRW(_ME, 'playbackRate',
+      function () { return _st(this).playbackRate; },
+      function (v) { const n = Number(v); if (Number.isFinite(n)) _st(this).playbackRate = n; });
+    _defRW(_ME, 'defaultPlaybackRate',
+      function () { return _st(this).defaultPlaybackRate; },
+      function (v) { const n = Number(v); if (Number.isFinite(n)) _st(this).defaultPlaybackRate = n; });
+    _defRW(_ME, 'preservesPitch',
+      function () { return _st(this).preservesPitch; },
+      function (v) { _st(this).preservesPitch = !!v; });
+    _defRW(_ME, 'srcObject',
+      function () { return _st(this).srcObject; },
+      function (v) { _st(this).srcObject = (v == null) ? null : v; });
+    _defOp(_ME, 'addTextTrack', function addTextTrack(kind, label, language) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'addTextTrack' on 'HTMLMediaElement': 1 argument required, but only 0 present.");
+      }
+      kind = String(kind);
+      if (['subtitles', 'captions', 'descriptions', 'chapters', 'metadata'].indexOf(kind) === -1) {
+        throw new TypeError("Failed to execute 'addTextTrack' on 'HTMLMediaElement': The provided value '" + kind + "' is not a valid enum value of type TextTrackKind.");
+      }
+      const t = _mint(globalThis.TextTrack);
+      t._kind = kind;
+      t._label = label === undefined ? '' : String(label);
+      t._language = language === undefined ? '' : String(language);
+      t._mode = 'hidden';
+      _st(this).textTracks._tracks.push(t);
+      return t;
+    }, 1);
+    // "If the media resource has a timeline offset, return it; otherwise return
+    // a NaN Date." Nothing here has one.
+    _defOp(_ME, 'getStartDate', function getStartDate() { return new Date(NaN); }, 0);
+  }
+
+  // ── HTMLTrackElement ───────────────────────────────────────────────────────
+  const _TR = globalThis.HTMLTrackElement && globalThis.HTMLTrackElement.prototype;
+  if (_TR) {
+    for (const [k, v] of [['NONE', 0], ['LOADING', 1], ['LOADED', 2], ['ERROR', 3]]) {
+      for (const holder of [globalThis.HTMLTrackElement, _TR]) {
+        if (!Object.getOwnPropertyDescriptor(holder, k)) {
+          Object.defineProperty(holder, k, { value: v, writable: false, enumerable: true, configurable: false });
+        }
+      }
+    }
+    const _trackOf = new WeakMap();
+    _defRO(_TR, 'readyState', function () { return 0; }); // NONE — nothing fetched
+    _defRO(_TR, 'track', function () {
+      let t = _trackOf.get(this);
+      if (!t) {
+        t = _mint(globalThis.TextTrack);
+        t._kind = (this.getAttribute('kind') || 'subtitles').toLowerCase();
+        t._label = this.getAttribute('label') || '';
+        t._language = this.getAttribute('srclang') || '';
+        _trackOf.set(this, t);
+      }
+      return t;
+    });
+  }
+
+  // ── `new Audio()` is a legacy FACTORY, not a class of its own ──────────────
+  // It was a stand-alone stub object with four properties on it, so `new Audio()`
+  // was not an HTMLAudioElement, was not an Element, was not a Node — it could
+  // not be appended to the document, could not take a listener, and answered
+  // `undefined` to every question the media IDL defines. `Image()` and
+  // `Option()` in this file have been real factories for a long time; this one
+  // now matches them.
+  // WebIDL §"legacy factory function": the object on the global is a
+  // CONSTRUCTOR — `Image()` without `new` is a TypeError, its `prototype` is the
+  // interface prototype and is {writable:false, enumerable:false,
+  // configurable:false}, and its `length` is its required-argument count (0).
+  // Ours were plain functions, so `Image.prototype = {}` was a thing a page
+  // could do, and every `new Image()` afterwards would have inherited from it.
+  const _legacyFactory = function (name, ifaceName, build, len) {
+    const Iface = globalThis[ifaceName];
+    if (!Iface) return;
+    const ctor = function () {
+      if (new.target === undefined) {
+        throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this object constructor cannot be called as a function.");
+      }
+      return build.apply(null, arguments);
+    };
+    Object.defineProperty(ctor, 'name', { value: name, configurable: true });
+    Object.defineProperty(ctor, 'length', { value: len, configurable: true });
+    Object.defineProperty(ctor, 'prototype', {
+      value: Iface.prototype, writable: false, enumerable: false, configurable: false,
+    });
+    Object.defineProperty(globalThis, name, {
+      value: _markNative(ctor), writable: true, enumerable: false, configurable: true,
+    });
+  };
+  _legacyFactory('Audio', 'HTMLAudioElement', function (src) {
+    const el = globalThis.document.createElement('audio');
+    el.setAttribute('preload', 'auto');
+    if (src !== undefined) el.setAttribute('src', String(src));
+    return el;
+  }, 0);
+  _legacyFactory('Image', 'HTMLImageElement', function (w, h) {
+    const img = globalThis.document.createElement('img');
+    if (w !== undefined && w !== null) img.width = w;
+    if (h !== undefined && h !== null) img.height = h;
+    return img;
+  }, 0);
+  if (globalThis.HTMLOptionElement) {
+    const _oldOption = globalThis.Option;
+    _legacyFactory('Option', 'HTMLOptionElement', function () {
+      return _oldOption.apply(null, arguments);
+    }, 0);
+  }
+
+  // ── Reflected DOMTokenLists: rel, sizes, blocking ──────────────────────────
+  // `a.relList.contains('noopener')` is how a page checks a link's own policy,
+  // and `link.sizes` is how an icon picker reads a favicon set. Both were absent.
+  const _tokenReflect = function (ifaceName, idlName, attr) {
+    const P = globalThis[ifaceName] && globalThis[ifaceName].prototype;
+    if (!P || Object.getOwnPropertyDescriptor(P, idlName)) return;
+    const slot = '_tl_' + idlName;
+    Object.defineProperty(P, idlName, {
+      configurable: true, enumerable: true,
+      get: _named('get', idlName, function () {
+        return this[slot] || (this[slot] = _makeTokenList(this, attr));
+      }),
+      set: _named('set', idlName, function (v) {
+        (this[slot] || (this[slot] = _makeTokenList(this, attr))).value = String(v);
+      }),
+    });
+  };
+  for (const n of ['HTMLAnchorElement', 'HTMLAreaElement', 'HTMLLinkElement', 'HTMLFormElement'])
+    _tokenReflect(n, 'relList', 'rel');
+  _tokenReflect('HTMLLinkElement', 'sizes', 'sizes');
+  for (const n of ['HTMLLinkElement', 'HTMLScriptElement', 'HTMLStyleElement'])
+    _tokenReflect(n, 'blocking', 'blocking');
+
+  // ── HTMLElement's remaining content-attribute surface ──────────────────────
+  const _HE = globalThis.HTMLElement && globalThis.HTMLElement.prototype;
+  if (_HE) {
+    // An enumerated attribute whose invalid and missing values are both "".
+    const _enumReflect = function (idlName, attr, keywords) {
+      _defRW(_HE, idlName,
+        function () {
+          const raw = this.getAttribute(attr);
+          if (raw === null) return '';
+          const v = String(raw).toLowerCase();
+          return keywords.indexOf(v) === -1 ? '' : v;
+        },
+        function (v) { this.setAttribute(attr, String(v)); });
+    };
+    _enumReflect('autocapitalize', 'autocapitalize', ['none', 'off', 'on', 'sentences', 'words', 'characters']);
+    // `autocorrect` and `writingSuggestions` default to ON when absent: a form
+    // that never asked to turn them off must not have them turned off.
+    _defRW(_HE, 'autocorrect',
+      function () {
+        const raw = this.getAttribute('autocorrect');
+        return raw === null ? true : String(raw).toLowerCase() !== 'off';
+      },
+      function (v) { this.setAttribute('autocorrect', v ? 'on' : 'off'); });
+    _defRW(_HE, 'writingSuggestions',
+      function () {
+        const raw = this.getAttribute('writingsuggestions');
+        if (raw === null) return 'true';
+        return String(raw).toLowerCase() === 'false' ? 'false' : 'true';
+      },
+      function (v) { this.setAttribute('writingsuggestions', String(v)); });
+    // A heading-offset pair from the (very new) headings proposal: plain
+    // reflected unsigned longs.
+    _defRW(_HE, 'headingOffset',
+      function () { const n = parseInt(this.getAttribute('headingoffset'), 10); return Number.isFinite(n) && n >= 0 ? n : 0; },
+      function (v) { this.setAttribute('headingoffset', String(v >>> 0)); });
+    _defRW(_HE, 'headingReset',
+      function () { return this.hasAttribute('headingreset'); },
+      function (v) { if (v) this.setAttribute('headingreset', ''); else this.removeAttribute('headingreset'); });
+    // `accessKeyLabel` is the key combination the UA would actually show. There
+    // is no UA chrome here to show one, and HTML explicitly allows "".
+    _defRO(_HE, 'accessKeyLabel', function () { return ''; });
+  }
+
+  // ── getSVGDocument() — the embedded-document accessors ─────────────────────
+  // Defined on iframe/embed/object/frame; returns the content document when it
+  // is an SVG document, else null.
+  for (const n of ['HTMLIFrameElement', 'HTMLEmbedElement', 'HTMLObjectElement', 'HTMLFrameElement']) {
+    const P = globalThis[n] && globalThis[n].prototype;
+    _defOp(P, 'getSVGDocument', function getSVGDocument() {
+      let doc = null;
+      try { doc = this.contentDocument; } catch (e) { doc = null; }
+      if (!doc) return null;
+      const root = doc.documentElement;
+      return (root && root.namespaceURI === 'http://www.w3.org/2000/svg') ? doc : null;
+    }, 0);
+  }
+
+  // ── The odds and ends ──────────────────────────────────────────────────────
+  const _P = (n) => globalThis[n] && globalThis[n].prototype;
+
+  // `form.relList` needed `rel` above; `form.requestSubmit(submitter)` submits
+  // as though the submitter had been activated, running validation first.
+  _defOp(_P('HTMLFormElement'), 'requestSubmit', function requestSubmit(submitter) {
+    if (submitter !== undefined && submitter !== null) {
+      if (!(submitter instanceof globalThis.HTMLElement)) {
+        throw new TypeError("Failed to execute 'requestSubmit' on 'HTMLFormElement': parameter 1 is not of type 'HTMLElement'.");
+      }
+      if (submitter.form !== this) {
+        throw new DOMException('The specified element is not owned by this form element.', 'NotFoundError');
+      }
+    }
+    if (typeof this.submit === 'function') this.submit();
+  }, 0);
+
+  // `textarea.type` is the constant "textarea"; `textLength` is the length of
+  // the API value, which is what a character counter reads.
+  _defRO(_P('HTMLTextAreaElement'), 'type', function () { return 'textarea'; });
+  _defRO(_P('HTMLTextAreaElement'), 'textLength', function () { return String(this.value == null ? '' : this.value).length; });
+
+  // `progress.position` is the fraction done, or -1 for an INDETERMINATE bar —
+  // the one value that tells a screen reader "we do not know how long this is".
+  _defRO(_P('HTMLProgressElement'), 'position', function () {
+    if (!this.hasAttribute('value')) return -1;
+    const max = Number(this.max);
+    if (!(max > 0)) return -1;
+    return Math.min(1, Math.max(0, Number(this.value) / max));
+  });
+
+  // `output.htmlFor` is a DOMTokenList over `for` (not a string — that is
+  // `label.htmlFor`, which is a different member of a different interface).
+  _tokenReflect('HTMLOutputElement', 'htmlFor', 'for');
+
+  // `legend.form` is its fieldset's form owner, not its own ancestor form.
+  _defRO(_P('HTMLLegendElement'), 'form', function () {
+    const fs = this.parentElement;
+    if (!fs || fs.localName !== 'fieldset') return null;
+    return fs.form || null;
+  });
+
+  // `map.areas` is the live list of `<area>` descendants.
+  _defRO(_P('HTMLMapElement'), 'areas', function () {
+    const self = this;
+    return _makeHTMLCollection(() => Array.prototype.slice.call(self.querySelectorAll('area')));
+  });
+
+  // `showPicker()` opens the UA's own picker. There is no UA chrome here, so the
+  // honest answer is the exception the spec already defines for "this control
+  // has no picker" — never a silent no-op that leaves a page waiting.
+  for (const n of ['HTMLInputElement', 'HTMLSelectElement']) {
+    _defOp(_P(n), 'showPicker', function showPicker() {
+      if (this.disabled) throw new DOMException('HTMLElement is disabled.', 'InvalidStateError');
+      if (!this.isConnected) throw new DOMException('HTMLElement is not fully active.', 'InvalidStateError');
+      throw new DOMException('showPicker() is not available: this agent has no UA picker.', 'NotAllowedError');
+    }, 0);
+  }
+
+  // `<marquee>` is deprecated and still on a great many old pages.
+  const _MQ = _P('HTMLMarqueeElement');
+  if (_MQ) {
+    _defRW(_MQ, 'loop',
+      function () { const n = parseInt(this.getAttribute('loop'), 10); return (Number.isFinite(n) && n > 0) ? n : -1; },
+      function (v) { const n = Number(v); if (n === -1 || n > 0) this.setAttribute('loop', String(n)); });
+    _defOp(_MQ, 'start', function start() {}, 0);
+    _defOp(_MQ, 'stop', function stop() {}, 0);
+  }
+
+  // `canvas.transferControlToOffscreen()` hands the bitmap to a worker. There is
+  // no OffscreenCanvas pipeline here, so it says so rather than returning a
+  // surface that draws nowhere.
+  _defOp(_P('HTMLCanvasElement'), 'transferControlToOffscreen', function transferControlToOffscreen() {
+    throw new DOMException('OffscreenCanvas is not supported.', 'NotSupportedError');
+  }, 0);
+
+  // `HTMLScriptElement.supports(type)` is a STATIC.
+  if (globalThis.HTMLScriptElement && !Object.getOwnPropertyDescriptor(globalThis.HTMLScriptElement, 'supports')) {
+    const supports = function supports(type) {
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to execute 'supports' on 'HTMLScriptElement': 1 argument required, but only 0 present.");
+      }
+      const t = String(type);
+      return t === 'classic' || t === 'module' || t === 'importmap' || t === 'speculationrules';
+    };
+    Object.defineProperty(supports, 'length', { value: 1, configurable: true });
+    Object.defineProperty(globalThis.HTMLScriptElement, 'supports', {
+      value: _markNative(supports), writable: true, enumerable: true, configurable: true,
+    });
+  }
+
+  // `template.shadowRootCustomElementRegistry` reflects the attribute of the
+  // same name; the registry itself is the window's (see Document's).
+  _defRW(_P('HTMLTemplateElement'), 'shadowRootCustomElementRegistry',
+    function () { return this.getAttribute('shadowrootcustomelementregistry') || ''; },
+    function (v) { this.setAttribute('shadowrootcustomelementregistry', String(v)); });
+
+  // ── The two collection interfaces that had no interface object ─────────────
+  // `document.all` is an HTMLAllCollection and `form.elements` an
+  // HTMLFormControlsCollection; both were plain HTMLCollections, so a page could
+  // not brand-check either and `all.item("name")` did not exist.
+  if (!globalThis.HTMLFormControlsCollection) {
+    globalThis.HTMLFormControlsCollection = class HTMLFormControlsCollection extends globalThis.HTMLCollection {
+      get [Symbol.toStringTag]() { return 'HTMLFormControlsCollection'; }
+    };
+  }
+  if (!globalThis.HTMLAllCollection) {
+    globalThis.HTMLAllCollection = class HTMLAllCollection {
+      get [Symbol.toStringTag]() { return 'HTMLAllCollection'; }
+      get length() { return _hcItems(this).length; }
+      item(nameOrIndex) {
+        if (nameOrIndex === undefined) return null;
+        const s = String(nameOrIndex);
+        if (/^(0|[1-9][0-9]*)$/.test(s)) {
+          const items = _hcItems(this); const i = +s;
+          return i < items.length ? items[i] : null;
+        }
+        return this.namedItem(s);
+      }
+      namedItem(name) { return _hcNamedItem(_hcItems(this), String(name)); }
+    };
+  }
+}
+
 globalThis.__obscura_init = function() {
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
   _fpCache = null;
@@ -87269,6 +87882,256 @@ globalThis.__obscura_init = function() {
     Object.setPrototypeOf(globalThis, globalThis.Window.prototype);
   } catch (e) {}
 
+  // ── A member belongs to the interface that DECLARES it ────────────────────
+  // Several HTML members are implemented once on `Element.prototype` and
+  // dispatch on `localName` — economical, and invisible to a page reading
+  // `element.title`. It is not invisible to a page that reads
+  // `Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'title')`, nor to a
+  // subclass that wants to override just its own. The descriptor is copied down
+  // to the interface WebIDL names, leaving the shared implementation in place.
+  try {
+    const _OWNS = {
+      HTMLElement: ['title', 'draggable', 'innerText', 'outerText', 'enterKeyHint',
+                    'inputMode', 'autofocus', 'hidden', 'lang', 'dir', 'translate',
+                    'spellcheck', 'accessKey'],
+      HTMLAnchorElement: ['download'],
+      HTMLAreaElement: ['download'],
+      HTMLVideoElement: ['videoWidth', 'videoHeight', 'poster', 'playsInline'],
+      HTMLImageElement: ['width', 'height'],
+      HTMLIFrameElement: ['width', 'height'],
+      HTMLObjectElement: ['width', 'height'],
+      HTMLEmbedElement: ['width', 'height'],
+      HTMLCanvasElement: ['width', 'height'],
+    };
+    for (const iface in _OWNS) {
+      const C = globalThis[iface];
+      if (!C || !C.prototype) continue;
+      for (const name of _OWNS[iface]) {
+        if (Object.getOwnPropertyDescriptor(C.prototype, name)) continue;
+        let d = null;
+        for (let o = Object.getPrototypeOf(C.prototype); o; o = Object.getPrototypeOf(o)) {
+          d = Object.getOwnPropertyDescriptor(o, name);
+          if (d) break;
+        }
+        if (!d) continue;
+        try { Object.defineProperty(C.prototype, name, d); } catch (e) {}
+      }
+    }
+  } catch (e) {}
+
+  // ── A readonly attribute has NO setter ────────────────────────────────────
+  // `template.content` and `select.type` had one. A setter on a readonly
+  // attribute is not harmless: `select.type = 'text'` silently succeeding is a
+  // page believing it changed a control that did not change.
+  try {
+    for (const [iface, name] of [['HTMLTemplateElement', 'content'],
+                                 ['HTMLSelectElement', 'type'],
+                                 ['HTMLTextAreaElement', 'type'],
+                                 ['HTMLProgressElement', 'position']]) {
+      const C = globalThis[iface];
+      if (!C || !C.prototype) continue;
+      const d = Object.getOwnPropertyDescriptor(C.prototype, name);
+      if (!d || !d.get || !d.set || !d.configurable) continue;
+      Object.defineProperty(C.prototype, name, {
+        configurable: true, enumerable: d.enumerable, get: d.get,
+      });
+    }
+  } catch (e) {}
+
+  // ── `form.elements` is an HTMLFormControlsCollection ───────────────────────
+  // A page reaches a control by name through it (`form.elements.namedItem`),
+  // and a plain HTMLCollection cannot answer the RadioNodeList case at all.
+  try {
+    const _FE = globalThis.HTMLFormElement && globalThis.HTMLFormElement.prototype;
+    const _FCC = globalThis.HTMLFormControlsCollection;
+    if (_FE && _FCC) {
+      const d = Object.getOwnPropertyDescriptor(_FE, 'elements');
+      if (d && d.get) {
+        const inner = d.get;
+        Object.defineProperty(_FE, 'elements', {
+          configurable: true, enumerable: true,
+          get: _named('get', 'elements', function () {
+            const c = inner.call(this);
+            try {
+              if (c && Object.getPrototypeOf(c) === globalThis.HTMLCollection.prototype) {
+                Object.setPrototypeOf(c, _FCC.prototype);
+              }
+            } catch (e) {}
+            return c;
+          }),
+        });
+      }
+    }
+  } catch (e) {}
+
+  // ── `script.text` is the element's child text content ─────────────────────
+  try {
+    const _SC = globalThis.HTMLScriptElement && globalThis.HTMLScriptElement.prototype;
+    if (_SC && !Object.getOwnPropertyDescriptor(_SC, 'text')) {
+      Object.defineProperty(_SC, 'text', {
+        configurable: true, enumerable: true,
+        get: _named('get', 'text', function () { return this.textContent || ''; }),
+        set: _named('set', 'text', function (v) { this.textContent = v == null ? '' : String(v); }),
+      });
+    }
+    // `a.text` is the same idea on an anchor.
+    const _A = globalThis.HTMLAnchorElement && globalThis.HTMLAnchorElement.prototype;
+    if (_A && !Object.getOwnPropertyDescriptor(_A, 'text')) {
+      Object.defineProperty(_A, 'text', {
+        configurable: true, enumerable: true,
+        get: _named('get', 'text', function () { return this.textContent || ''; }),
+        set: _named('set', 'text', function (v) { this.textContent = v == null ? '' : String(v); }),
+      });
+    }
+  } catch (e) {}
+
+  // ── `<selectedcontent>` ───────────────────────────────────────────────────
+  // The customisable-select proposal's element. It carries no members of its
+  // own; what a page needs is for it to BE an interface, so that a
+  // `document.createElement('selectedcontent')` is not an unknown element.
+  try {
+    if (!globalThis.HTMLSelectedContentElement && globalThis.HTMLElement) {
+      globalThis.HTMLSelectedContentElement =
+        class HTMLSelectedContentElement extends globalThis.HTMLElement {};
+    }
+  } catch (e) {}
+
+  // ── The Window and Document members that were simply not there ─────────────
+  // `window.closed` is how a page that opened a helper window knows the user
+  // shut it; `window.name` survives a navigation and is how a popup is
+  // addressed; `document.lastModified` is what a cached page prints as its date.
+  // Each of these is ordinary, old, widely-used surface that answered
+  // `undefined`.
+  try {
+    // ⚠️ WebIDL §3.7.7: for an interface declared `[Global]`, its members are
+    // own properties of THE GLOBAL OBJECT, not of the interface prototype
+    // object. `window.closed` defined on `Window.prototype` is inherited, and
+    // inherited is not what the standard (or a page reading
+    // `Object.getOwnPropertyDescriptor(window, 'closed')`) expects.
+    const _defWin = function (name, get, set) {
+      if (Object.getOwnPropertyDescriptor(globalThis, name)) return;
+      const d = { configurable: true, enumerable: true, get: _named('get', name, get) };
+      if (set) d.set = _named('set', name, set);
+      Object.defineProperty(globalThis, name, d);
+    };
+    const _defWinOp = function (name, fn, len) {
+      if (Object.getOwnPropertyDescriptor(globalThis, name)) return;
+      Object.defineProperty(fn, 'name', { value: name, configurable: true });
+      Object.defineProperty(fn, 'length', { value: len, configurable: true });
+      Object.defineProperty(globalThis, name, {
+        configurable: true, enumerable: true, writable: true, value: _markNative(fn),
+      });
+    };
+    // `window`, `document`, `top` and `location` are [LegacyUnforgeable]: own,
+    // non-configurable ACCESSORS on the global. As own data properties a page
+    // (or an injected script) could simply overwrite `window.document` and every
+    // later reader would follow the replacement. `location` is already right.
+    for (const _n of ['window', 'document', 'top']) {
+      const _d = Object.getOwnPropertyDescriptor(globalThis, _n);
+      if (!_d || !_d.configurable || !('value' in _d)) continue;
+      const _v = _d.value;
+      try {
+        Object.defineProperty(globalThis, _n, {
+          configurable: false, enumerable: true,
+          get: _named('get', _n, function () { return _v; }),
+        });
+      } catch (e) {}
+    }
+    // ⚠️ `self`, `parent` and `frames` are [Replaceable], NOT plain readonly.
+    // A [Replaceable] attribute has a SETTER, and that setter's job is to
+    // replace the accessor with an ordinary data property holding whatever was
+    // assigned. Getting this wrong is not cosmetic: `encode-form-common.js` (the
+    // helper behind every legacy-encoding form test on the platform) does
+    // `frames = [...]` in a sloppy-mode script, and against a getter-only
+    // accessor that assignment silently does NOTHING — the variable keeps
+    // pointing at the window's frame list, the test's iframes are never found,
+    // and a thousand subtests go `notrun` with no error anywhere.
+    for (const _n of ['self', 'parent', 'frames']) {
+      const _d = Object.getOwnPropertyDescriptor(globalThis, _n);
+      if (!_d || !_d.configurable || !('value' in _d)) continue;
+      const _v = _d.value;
+      try {
+        Object.defineProperty(globalThis, _n, {
+          configurable: true, enumerable: true,
+          get: _named('get', _n, function () { return _v; }),
+          set: _named('set', _n, function (v) {
+            Object.defineProperty(globalThis, _n, {
+              value: v, writable: true, enumerable: true, configurable: true,
+            });
+          }),
+        });
+      } catch (e) {}
+    }
+    // A window this engine hands out is live until it is discarded.
+    _defWin('closed', function () { return globalThis._discarded === true; });
+    // The browsing context's name. Settable, and it outlives a navigation.
+    _defWin('name',
+      function () { return globalThis._windowName || ''; },
+      function (v) { globalThis._windowName = String(v); });
+    // `status` is the legacy status-bar text. There is no status bar, so it
+    // stores and returns exactly what was written — which is all any page can
+    // observe of it in a modern browser either.
+    _defWin('status',
+      function () { return globalThis._windowStatus || ''; },
+      function (v) { globalThis._windowStatus = String(v); });
+    // `clientInformation` is IE's name for `navigator`, still shipped by every
+    // browser and still feature-detected by old code.
+    _defWin('clientInformation', function () { return globalThis.navigator; });
+    // Origin-keyed agent clusters are not something this engine opts into.
+    _defWin('originAgentCluster', function () { return false; });
+    // Netscape-era event capture. Both are defined to do nothing.
+    _defWinOp('captureEvents', function captureEvents() {}, 0);
+    _defWinOp('releaseEvents', function releaseEvents() {}, 0);
+
+    const _D = globalThis.Document && globalThis.Document.prototype;
+    if (_D) {
+      // "The date and time of the resource's last modification, in the user's
+      // LOCAL time zone, MM/DD/YYYY hh:mm:ss" — no timezone marker, by spec.
+      if (!Object.getOwnPropertyDescriptor(_D, 'lastModified')) {
+        Object.defineProperty(_D, 'lastModified', {
+          configurable: true, enumerable: true,
+          get: _named('get', 'lastModified', function () {
+            const d = this._lastModified instanceof Date ? this._lastModified : new Date();
+            const p = (n) => String(n).padStart(2, '0');
+            return p(d.getMonth() + 1) + '/' + p(d.getDate()) + '/' + d.getFullYear() +
+              ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+          }),
+        });
+      }
+      // Two event handler IDL attributes that are Document's own, not
+      // GlobalEventHandlers'.
+      _ehDefineOnProto(_D, false, ['onreadystatechange', 'onvisibilitychange']);
+      // `Document.parseHTML(html, options)` is the SAFE half of the pair whose
+      // unsafe half already exists: it sanitizes, so it takes a plain DOMString
+      // and needs no Trusted Types vouch.
+      if (!Object.getOwnPropertyDescriptor(globalThis.Document, 'parseHTML') &&
+          typeof globalThis.Document.parseHTMLUnsafe === 'function') {
+        const parseHTML = function parseHTML(html, options) {
+          if (arguments.length < 1) {
+            throw new TypeError("Failed to execute 'parseHTML' on 'Document': 1 argument required, but only 0 present.");
+          }
+          const doc = globalThis.Document.parseHTMLUnsafe(String(html), options);
+          // "Parse HTML" runs the Sanitizer over the result; without one, the
+          // honest thing is to strip the script-bearing elements the safe form
+          // is defined to remove rather than pretend the string was vetted.
+          try {
+            for (const el of [...doc.querySelectorAll('script, noscript')]) el.remove();
+            for (const el of [...doc.querySelectorAll('*')]) {
+              for (const a of [...el.attributes]) {
+                if (/^on/i.test(a.name)) el.removeAttribute(a.name);
+              }
+            }
+          } catch (e) {}
+          return doc;
+        };
+        Object.defineProperty(parseHTML, 'length', { value: 1, configurable: true });
+        Object.defineProperty(globalThis.Document, 'parseHTML', {
+          value: _markNative(parseHTML), writable: true, enumerable: true, configurable: true,
+        });
+      }
+    }
+  } catch (e) {}
+
   // ── WebIDL: "called with too few arguments must throw TypeError" ────────────
   // Every WebIDL operation with required arguments throws a TypeError when it is
   // called with fewer, and its `.length` IS that required count. Writing that
@@ -87326,6 +88189,8 @@ globalThis.__obscura_init = function() {
       insertBefore: 2, appendChild: 1, replaceChild: 2, removeChild: 1,
     },
     Document: {
+      execCommand: 1, queryCommandEnabled: 1, queryCommandIndeterm: 1,
+      queryCommandState: 1, queryCommandSupported: 1, queryCommandValue: 1,
       getElementsByTagName: 1, getElementsByTagNameNS: 2, getElementsByClassName: 1,
       createElement: 1, createElementNS: 2, createTextNode: 1, createCDATASection: 1,
       createComment: 1, createProcessingInstruction: 2, importNode: 1, adoptNode: 1,
@@ -87337,6 +88202,7 @@ globalThis.__obscura_init = function() {
     DocumentFragment: { getElementById: 1 },
     DocumentType: {},
     Element: {
+      getBoxQuads: 0, convertQuadFromNode: 2, convertRectFromNode: 2, convertPointFromNode: 2,
       getAttribute: 1, getAttributeNS: 2, setAttribute: 2, setAttributeNS: 3,
       removeAttribute: 1, removeAttributeNS: 2, toggleAttribute: 1,
       hasAttribute: 1, hasAttributeNS: 2, getAttributeNode: 1, getAttributeNodeNS: 2,
@@ -87346,7 +88212,7 @@ globalThis.__obscura_init = function() {
       matches: 1, webkitMatchesSelector: 1, closest: 1, attachShadow: 1,
       querySelector: 1, querySelectorAll: 1,
     },
-    Text: { splitText: 1 },
+    Text: { splitText: 1, getBoxQuads: 0 },
     CharacterData: {
       substringData: 2, appendData: 1, insertData: 2, deleteData: 2, replaceData: 3,
     },
@@ -87389,6 +88255,35 @@ globalThis.__obscura_init = function() {
     // just the replacement string — so its required count is the MINIMUM across
     // the overloads, which is what the interface object's `length` reports too.
     HTMLAllCollection: { item: 0, namedItem: 1 },
+    HTMLElement: { showPopover: 0, togglePopover: 0, hidePopover: 0, click: 0, focus: 0, blur: 0 },
+    HTMLDialogElement: { close: 0, show: 0, showModal: 0, requestClose: 0 },
+    HTMLSlotElement: { assignedNodes: 0, assignedElements: 0, assign: 0 },
+    HTMLCanvasElement: { toDataURL: 0, toBlob: 1, getContext: 1 },
+    HTMLImageElement: { decode: 0 },
+    CSSPseudoElement: { getBoxQuads: 0 },
+    // Performance, User Timing, Resource Timing, Encoding — an operation whose
+    // arguments are all optional has length 0, and an ES method that spells them
+    // out reports the wrong one.
+    Performance: {
+      mark: 1, measure: 1, clearMarks: 0, clearMeasures: 0, getEntries: 0,
+      getEntriesByType: 1, getEntriesByName: 1, setResourceTimingBufferSize: 1,
+      clearResourceTimings: 0, now: 0, toJSON: 0,
+    },
+    PerformanceObserver: { observe: 0, disconnect: 0, takeRecords: 0 },
+    PerformanceObserverEntryList: { getEntries: 0, getEntriesByType: 1, getEntriesByName: 1 },
+    PerformanceEntry: { toJSON: 0 },
+    PerformanceResourceTiming: { toJSON: 0 },
+    TextDecoder: { decode: 0 },
+    TextEncoder: { encode: 0, encodeInto: 2 },
+    URLSearchParams: { get: 1, getAll: 1, has: 1, set: 2, append: 2, delete: 1, sort: 0, toString: 0 },
+    URL: { toJSON: 0 },
+    IDBFactory: { open: 1, deleteDatabase: 1, databases: 0, cmp: 2 },
+    IDBDatabase: { createObjectStore: 1, deleteObjectStore: 1, transaction: 1, close: 0 },
+    IDBObjectStore: { add: 1, put: 1, delete: 1, get: 1, getKey: 1, getAll: 0, getAllKeys: 0, getAllRecords: 0, count: 0, clear: 0, openCursor: 0, openKeyCursor: 0, index: 1, createIndex: 2, deleteIndex: 1 },
+    IDBIndex: { get: 1, getKey: 1, getAll: 0, getAllKeys: 0, count: 0, openCursor: 0, openKeyCursor: 0 },
+    IDBCursor: { advance: 1, continue: 0, continuePrimaryKey: 2, update: 1, delete: 0 },
+    IDBKeyRange: { includes: 1 },
+    Notification: { close: 0 },
     HTMLButtonElement: { setCustomValidity: 1 },
     HTMLFieldSetElement: { setCustomValidity: 1 },
     HTMLFormElement: { requestSubmit: 0, reset: 0, submit: 0 },
@@ -87409,7 +88304,8 @@ globalThis.__obscura_init = function() {
   const _ARITY_STATIC = {
     AbortSignal: { abort: 0, timeout: 1, any: 1 },
     HTMLScriptElement: { supports: 1 },
-    Document: { parseHTMLUnsafe: 1 },
+    Document: { parseHTMLUnsafe: 1, parseHTML: 1 },
+    Window: { postMessage: 1 },
     Range: {},
   };
 
@@ -87487,6 +88383,13 @@ globalThis.__obscura_init = function() {
   //     one object's private field off another object that happens to have a
   //     similarly-named one.
   const _brandMark = Symbol('obscura.brandChecked');
+  // Several members are implemented once on `Element.prototype` and dispatch on
+  // `localName` (`title`, `draggable`, `innerText`, `width`, …). `instanceof`
+  // cannot catch a call on `HTMLElement.prototype` for those, because
+  // `HTMLElement.prototype instanceof Element` is perfectly true — and yet an
+  // interface prototype object is never an instance of anything: it has no
+  // internal slots, which is exactly why WebIDL says the getter must throw.
+  const _idlProtoSet = new WeakSet();
   // WebIDL §3.7.6: "if the operation's return type is a promise type, ... return
   // a promise rejected with the exception" — a promise-returning operation
   // NEVER throws synchronously, not even for a `this` of the wrong brand. A
@@ -87522,7 +88425,7 @@ globalThis.__obscura_init = function() {
     const wrapped = function () {
       // `undefined`/`null` and any object outside the interface are rejected;
       // the interface object's own prototype is deliberately NOT an instance.
-      if (!(this instanceof ctor)) {
+      if (!(this instanceof ctor) || _idlProtoSet.has(this)) {
         const err = new TypeError("Failed to " + (kind === 'op' ? "execute '" + name + "' on '"
           : (kind === 'set' ? "set the '" : "read the '") + name + "' property " + (kind === 'set' ? "on '" : "from '"))
           + iface + "': Illegal invocation");
@@ -87546,6 +88449,16 @@ globalThis.__obscura_init = function() {
   // through every same-realm frame's window, and `globalThis instanceof Window`
   // is the only one of those we can promise.
   const _IDL_NO_BRAND = new Set(['Window']);
+  // `Window` is not written as a class here, so the class-shaped test below
+  // does not recognise it — but it IS an interface, and its prototype needs the
+  // same enumerability and the same non-writable `prototype` property as every
+  // other one.
+  const _IDL_FORCE_INTERFACE = new Set(['Window']);
+  // [LegacyLenientThis] (HTML): these three getters must answer `undefined` for
+  // a wrong `this` instead of throwing. They are the compatibility shims for
+  // code that copied a handler off a prototype, and the standard keeps them
+  // quiet on purpose.
+  const _IDL_LENIENT_THIS = new Set(['onreadystatechange', 'onmouseenter', 'onmouseleave']);
 
   //  5. §3.7.5 — the interface prototype object carries a @@toStringTag whose
   //     value is the interface's identifier, which is what makes
@@ -87581,7 +88494,7 @@ globalThis.__obscura_init = function() {
           if (typeof d.value === 'function') {
             const w = _idlBrandWrap(d.value, ctor, iface, 'op', k);
             if (w !== d.value) { d.value = w; changed = true; }
-          } else if (d.get || d.set) {
+          } else if ((d.get || d.set) && !_IDL_LENIENT_THIS.has(k)) {
             const g = d.get ? _idlBrandWrap(d.get, ctor, iface, 'get', k) : d.get;
             const st = d.set ? _idlBrandWrap(d.set, ctor, iface, 'set', k) : d.set;
             if (g !== d.get || st !== d.set) { d.get = g; d.set = st; changed = true; }
@@ -87621,6 +88534,11 @@ globalThis.__obscura_init = function() {
     DOMTokenList: 0, DOMStringMap: 0, DOMImplementation: 0, MutationRecord: 0,
     Range: 0, AbstractRange: 0, NodeIterator: 0, TreeWalker: 0,
     XPathResult: 0, XPathExpression: 0, XPathEvaluator: 0,
+    PerformanceEntry: 0, PerformanceMark: 1, PerformanceMeasure: 0,
+    PerformanceObserver: 1, PerformanceResourceTiming: 0,
+    PerformanceNavigationTiming: 0, PerformanceObserverEntryList: 0,
+    TextDecoder: 0, TextEncoder: 0, TextDecoderStream: 0, TextEncoderStream: 0,
+    URLSearchParams: 0, URL: 1, Performance: 0,
   };
   const _isConstantName = (k) => /^[A-Z][A-Z0-9_]*$/.test(k);
 
@@ -87661,7 +88579,8 @@ globalThis.__obscura_init = function() {
         v.prototype && typeof v.prototype === 'object' &&
         Object.getOwnPropertyDescriptor(v.prototype, 'constructor') &&
         v.prototype.constructor === v &&
-        Object.getOwnPropertyDescriptor(v, 'prototype').writable === false;
+        (Object.getOwnPropertyDescriptor(v, 'prototype').writable === false ||
+         _IDL_FORCE_INTERFACE.has(k));
       const isNamespace = _IDL_NAMESPACE_OBJECTS.indexOf(k) !== -1;
       if (!isInterface && !isNamespace) continue;
       if (d.enumerable) {
@@ -87669,6 +88588,38 @@ globalThis.__obscura_init = function() {
           Object.defineProperty(globalThis, k, {
             value: v, writable: d.writable !== false, enumerable: false, configurable: true,
           });
+        } catch (e) {}
+      }
+      if (isInterface) {
+        try { _idlProtoSet.add(v.prototype); } catch (e) {}
+        // ⭐ An interface that implements EventTarget must BE one. A dozen
+        // interfaces here grew their own `addEventListener`/`removeEventListener`
+        // /`dispatchEvent` trio and never joined the hierarchy, so
+        // `request instanceof EventTarget` was false, `Object.getPrototypeOf(
+        // IDBRequest.prototype)` was Object.prototype, and a page that
+        // generically accepted "anything you can listen to" rejected them. Their
+        // own three methods still shadow EventTarget's — this only fixes where
+        // they sit.
+        try {
+          if (globalThis.EventTarget && v !== globalThis.EventTarget &&
+              Object.getPrototypeOf(v.prototype) === Object.prototype &&
+              Object.getOwnPropertyDescriptor(v.prototype, 'addEventListener') &&
+              Object.getOwnPropertyDescriptor(v.prototype, 'dispatchEvent')) {
+            Object.setPrototypeOf(v.prototype, globalThis.EventTarget.prototype);
+            if (Object.getPrototypeOf(v) === Function.prototype) {
+              Object.setPrototypeOf(v, globalThis.EventTarget);
+            }
+          }
+        } catch (e) {}
+        // §3.7.3: the `prototype` property is {writable:false, enumerable:false,
+        // configurable:false}. `Window.prototype = {}` was assignable.
+        try {
+          const pd = Object.getOwnPropertyDescriptor(v, 'prototype');
+          if (pd && pd.configurable && pd.writable) {
+            Object.defineProperty(v, 'prototype', {
+              value: v.prototype, writable: false, enumerable: false, configurable: false,
+            });
+          }
         } catch (e) {}
       }
       if (isInterface && v.name === '') {
@@ -87680,14 +88631,102 @@ globalThis.__obscura_init = function() {
         if (!_ES_BUILTIN_GLOBALS.has(k)) {
           _idlFixEnumerability(v, k);
           if (k !== 'Window') _idlFixToStringTag(v, k);
-          if (Object.prototype.hasOwnProperty.call(_ARITY_CTOR, k)) {
-            try { Object.defineProperty(v, 'length', { value: _ARITY_CTOR[k], writable: false, enumerable: false, configurable: true }); } catch (e) {}
+          const ctorLen = Object.prototype.hasOwnProperty.call(_ARITY_CTOR, k)
+            ? _ARITY_CTOR[k]
+            // Every element interface and every collection is constructed with
+            // no arguments (`new HTMLElement()` is how a custom element calls
+            // up), so their interface objects report 0.
+            : (/^(?:HTML|SVG|MathML)\w*Element$/.test(k) || /(?:Collection|List|Map)$/.test(k) ? 0 : undefined);
+          if (ctorLen !== undefined) {
+            try { Object.defineProperty(v, 'length', { value: ctorLen, writable: false, enumerable: false, configurable: true }); } catch (e) {}
           }
         }
       }
     }
   } catch (e) {}
 
+
+  // ── The global object is a platform object too ─────────────────────────────
+  // `Window` is declared `[Global]`, so its members live on the global object
+  // itself — which means they need the same brand check every other member got:
+  // `Object.getOwnPropertyDescriptor(window, 'document').get.call({})` must
+  // throw, not hand a stranger's object the page's document.
+  try {
+    const W = globalThis.Window;
+    if (W) {
+      // The interface object inherits from EventTarget's, and its `prototype`
+      // property is not writable. `Window` is written as a plain function here,
+      // so neither was true.
+      if (globalThis.EventTarget && Object.getPrototypeOf(W) !== globalThis.EventTarget) {
+        try { Object.setPrototypeOf(W, globalThis.EventTarget); } catch (e) {}
+      }
+      const pd = Object.getOwnPropertyDescriptor(W, 'prototype');
+      if (pd && pd.configurable !== false && pd.writable) {
+        try {
+          Object.defineProperty(W, 'prototype', {
+            value: W.prototype, writable: false, enumerable: false, configurable: false,
+          });
+        } catch (e) {}
+      }
+    }
+    // `window.external` — the IE-era object. Both of its operations are defined
+    // to do nothing, and pages still feature-detect the object itself.
+    if (!('external' in globalThis) && globalThis.External) {
+      const ext = Object.create(globalThis.External.prototype);
+      Object.defineProperty(globalThis, 'external', {
+        configurable: true, enumerable: true,
+        get: _named('get', 'external', function () { return ext; }),
+      });
+    } else if (!('external' in globalThis)) {
+      const External = class External {
+        AddSearchProvider() {}
+        IsSearchProviderInstalled() { return 0; }
+      };
+      globalThis.External = External;
+      const ext = new External();
+      Object.defineProperty(globalThis, 'external', {
+        configurable: true, enumerable: true,
+        get: _named('get', 'external', function () { return ext; }),
+      });
+    }
+
+    // Required arguments for the operations that live on the global.
+    _requireArgs(globalThis, 'Window', {
+      postMessage: 1, alert: 0, confirm: 0, prompt: 0, open: 0, close: 0, stop: 0,
+      focus: 0, blur: 0, print: 0, scroll: 0, scrollTo: 0, scrollBy: 0,
+      getComputedStyle: 1, matchMedia: 1, requestAnimationFrame: 1,
+      cancelAnimationFrame: 1, getSelection: 0, moveTo: 2, moveBy: 2,
+      resizeTo: 2, resizeBy: 2, btoa: 1, atob: 1, structuredClone: 1,
+      queueMicrotask: 1, reportError: 1, fetch: 1,
+    });
+
+    // Now the brand check — for the FIVE members WebIDL marks
+    // [LegacyUnforgeable], plus `self`. Not for the rest of the global's
+    // accessors: `window.innerWidth` and every `on*` handler are read off the
+    // global with `this` set to all sorts of things by all sorts of code, and
+    // the standard does not ask them to object. (Measured the hard way: a blanket
+    // brand check here cost 21 subtests across cssom-view, css-animations and
+    // selection, and gained the five below.)
+    const _GLOBAL_BRANDED = new Set(['window', 'document', 'top', 'location', 'self']);
+    const _globalBrand = function () {
+      for (const k of _GLOBAL_BRANDED) {
+        let d;
+        try { d = Object.getOwnPropertyDescriptor(globalThis, k); } catch (e) { continue; }
+        if (!d || !d.configurable || (!d.get && !d.set)) continue;
+        if (_IDL_LENIENT_THIS.has(k)) continue;
+        if (d.get && d.get[_brandMark]) continue;
+        const g = d.get ? _idlBrandWrap(d.get, W, 'Window', 'get', k) : d.get;
+        const st = d.set ? _idlBrandWrap(d.set, W, 'Window', 'set', k) : d.set;
+        if (g === d.get && st === d.set) continue;
+        try {
+          Object.defineProperty(globalThis, k, {
+            configurable: true, enumerable: d.enumerable, get: g, set: st,
+          });
+        } catch (e) {}
+      }
+    };
+    if (W) _globalBrand();
+  } catch (e) {}
 
   delete globalThis.__obscura_init;
 };
