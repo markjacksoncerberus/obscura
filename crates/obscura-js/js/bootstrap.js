@@ -2,6 +2,19 @@
 
 const __obscura_errors = [];
 
+// ⭐ THE LANGUAGE'S OWN GLOBALS, NAMED BEFORE WE ADD ANY OF OUR OWN.
+//
+// WebIDL and ECMAScript disagree about one visible detail: a method on a
+// WebIDL prototype is ENUMERABLE, a method on an ES class prototype is not.
+// Since every interface here is written as an ES class, every operation on the
+// platform has the wrong descriptor — and the sweep at the end of init that
+// corrects them has to be able to tell `Node.prototype.appendChild` (ours, fix
+// it) from `Array.prototype.push` (the language's, never touch it).
+//
+// Taken here, at the top of the first script the engine ever runs, this set is
+// exactly the built-ins — nothing of ours exists yet to be caught in it.
+const _ES_BUILTIN_GLOBALS = new Set(Object.getOwnPropertyNames(globalThis));
+
 // ⭐ THE ENGINE'S OWN COMPILERS, CAPTURED BEFORE THE PAGE CAN SEE THEM.
 //
 // Content Security Policy's `script-src` without `'unsafe-eval'` means "this
@@ -643,8 +656,8 @@ const _ehResolveThis = (t, isGlobal) => {
 // name already carrying its own accessor so bespoke definitions (window's __winon_ set,
 // CloseWatcher) win. The get/set are name-stamped ("get onclick" / "set onclick") and
 // brand-throw on a wrong `this` — both WebIDL conformance requirements idlharness checks.
-const _ehDefineOnProto = function(proto, isGlobal) {
-  for (const name of _EH_HANDLER_NAMES) {
+const _ehDefineOnProto = function(proto, isGlobal, names) {
+  for (const name of (names || _EH_HANDLER_NAMES)) {
     if (Object.getOwnPropertyDescriptor(proto, name)) continue;
     Object.defineProperty(proto, name, {
       configurable: true, enumerable: true,
@@ -3889,11 +3902,35 @@ const _styleProxy = (decl) => new Proxy(decl, {
   }
 });
 
-class Node {
+// ── EventTarget (DOM §2.7) ───────────────────────────────────────────────────
+// For most of this campaign `EventTarget` WAS `Node` — a single class carrying
+// both the tree and the dispatch surface, aliased onto the global. It worked,
+// and it was wrong in ways a page can see: `new EventTarget()` handed back
+// something that claimed to be a node, `XMLHttpRequest` was `instanceof Node`,
+// `Object.getPrototypeOf(Node.prototype)` was Object.prototype instead of
+// EventTarget.prototype, and the window could not sit on the prototype chain
+// the HTML Standard gives it (Window → WindowProperties → EventTarget) without
+// inheriting forty Node accessors that would be invoked with no node id.
+//
+// So the dispatch surface lives here now, on its own interface, and everything
+// that is an event target without being a tree node — XMLHttpRequest, Worker,
+// MessagePort, PermissionStatus, EventSource, Navigation — extends THIS.
+class EventTarget {
+  constructor() {}
+  addEventListener(type, handler, opts) { _addListener(this, type, handler, opts); }
+  removeEventListener(type, handler, opts) { _removeListener(this, type, handler, opts); }
+  dispatchEvent(event) { return _dispatchPublic(this, event); }
+}
+
+class Node extends EventTarget {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
   static TEXT_NODE = 3;
   static CDATA_SECTION_NODE = 4;
+  // 5 and 6 have been unused since DOM4 removed entity nodes, but the constants
+  // are still part of the interface and a page may still read them.
+  static ENTITY_REFERENCE_NODE = 5;
+  static ENTITY_NODE = 6;
   static PROCESSING_INSTRUCTION_NODE = 7;
   static COMMENT_NODE = 8;
   static DOCUMENT_NODE = 9;
@@ -3907,13 +3944,7 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 0x10;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 0x20;
 
-  constructor(nid) { this._nid = nid; }
-  // EventTarget surface — shared by every node kind (Element, Document, Text,
-  // CharacterData, DocumentFragment, DocumentType). All route through the unified
-  // spec dispatch keyed by the node's _nid.
-  addEventListener(type, handler, opts) { _addListener(this, type, handler, opts); }
-  removeEventListener(type, handler, opts) { _removeListener(this, type, handler, opts); }
-  dispatchEvent(event) { return _dispatchPublic(this, event); }
+  constructor(nid) { super(); this._nid = nid; }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   // A node's owner is the main document unless it was created by / adopted into
@@ -4852,8 +4883,21 @@ const _validateAndExtract = function(namespace, qname) {
 // A real Attr node (nodeType 2). When attached to an element its value reads/
 // writes through the element's namespace-aware DOM ops (so it stays live);
 // while detached (createAttribute, or after removal) it holds its own value.
-globalThis.Attr = class Attr {
+// ── Attr (DOM §4.9) ──────────────────────────────────────────────────────────
+// An Attr IS a Node — that is what the IDL says, and it is why `attr
+// .addEventListener` exists, why `attr instanceof Node` is true, and why
+// `Object.getPrototypeOf(Attr.prototype)` has to be `Node.prototype`. This class
+// used to stand alone and re-declare the handful of Node members it needed, so
+// everything else a page might reasonably reach for through an attribute node
+// simply was not there.
+//
+// It carries no node id of its own (attributes live inside their element in the
+// Rust tree), so the inherited tree accessors it does not override answer for a
+// node that is not in the tree — which is exactly what they did before, when
+// they were absent. The members that matter are all overridden below.
+globalThis.Attr = class Attr extends Node {
   constructor(ns, prefix, local, value) {
+    super(undefined);
     this._ownerEl = null;
     this._ns = ns == null ? null : String(ns);
     this._prefix = prefix == null ? null : String(prefix);
@@ -4898,8 +4942,8 @@ globalThis.Attr = class Attr {
   // identity-cached on their element (and held directly when detached), so a plain
   // reference compare is the spec's "otherNode is this".
   isSameNode(other) { return other === this; }
-  // Attr is not a Node subclass here, so mirror the namespace-resolution API
-  // (it resolves through the owner element — see _locateNamespace, nodeType 2).
+  // Namespace resolution for an Attr goes through its owner element (see
+  // _locateNamespace, nodeType 2), not through a parent it does not have.
   lookupNamespaceURI(prefix) { return _locateNamespace(this, (prefix == null || prefix === '') ? null : String(prefix)); }
   lookupPrefix(namespace) { return (namespace == null || namespace === '') ? null : _locatePrefix(this, String(namespace)); }
   isDefaultNamespace(namespace) { return _locateNamespace(this, null) === ((namespace == null || namespace === '') ? null : String(namespace)); }
@@ -5040,6 +5084,19 @@ const _makeLiveChildNodes = (node) => {
 globalThis.HTMLCollection = class HTMLCollection {
   get [Symbol.toStringTag]() { return 'HTMLCollection'; }
 };
+// WebIDL §3.7.10: an interface with an indexed property getter and no declared
+// iterable still gets @@iterator — and it is %Array.prototype.values% itself,
+// not a copy. Without it `for (const el of parent.children)` throws "is not
+// iterable", which is ordinary code in ordinary pages: iterating an element's
+// children is about as common as the DOM gets. (NamedNodeMap is the same shape
+// and gets the same treatment.)
+for (const _C of [globalThis.HTMLCollection, globalThis.NamedNodeMap]) {
+  if (_C && !Object.getOwnPropertyDescriptor(_C.prototype, Symbol.iterator)) {
+    Object.defineProperty(_C.prototype, Symbol.iterator, {
+      value: Array.prototype.values, writable: true, enumerable: false, configurable: true,
+    });
+  }
+}
 const _hcRefresh = new WeakMap(); // proxy -> refresh thunk (returns Element[])
 const _hcItems = (c) => _hcRefresh.get(c)();
 // An HTMLCollection's supported property names are, in a single tree-order pass:
@@ -7512,7 +7569,7 @@ class Element extends Node {
         } catch (e) {}
         _queueTask(() => {
           const ev = new Event('error');
-          ev.isTrusted = true; ev.target = el2;
+          ev._isTrusted = true; ev._target = el2;
           try { _dispatchSpec(el2, ev); } catch (e) {}
           if (!el2['__ehon_onerror']) {
             const a = el2.getAttribute && el2.getAttribute('onerror');
@@ -9404,89 +9461,12 @@ class Document extends Node {
     return __obscura_focused ? _retarget(__obscura_focused, this) : this.body;
   }
   get implementation() {
-    // The implementation is "associated" with the document it was read from
-    // (`document.implementation` for the page, `doc.implementation` for a
-    // createHTMLDocument/createDocument/iframe document). `createDocumentType`'s
-    // returned doctype takes THIS document as its node document — so capture it.
-    const _implDoc = this;
-    return {
-      createHTMLDocument(title) {
-        const doc = new DetachedDocument('html');
-        // Spec: createHTMLDocument prepends a <!DOCTYPE html> before <html>.
-        const dt = this.createDocumentType('html', '', '');
-        dt._ownerDoc = doc;
-        doc.insertBefore(dt, doc.documentElement);
-        doc._doctype = dt;
-        if (title !== undefined) {
-          const t = doc.createElement('title');
-          t.textContent = String(title);
-          doc.head.appendChild(t);
-        }
-        return doc;
-      },
-      createDocument(namespace, qualifiedName, doctype) {
-        // WebIDL: createDocument(namespace, qualifiedName, [optional] doctype) —
-        // namespace + qualifiedName are required (so <2 args → TypeError), and
-        // `doctype` is a nullable DocumentType (null/undefined → none, anything
-        // else that isn't a DocumentType → TypeError during argument conversion).
-        if (arguments.length < 2) {
-          throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': 2 arguments required, but only " + arguments.length + " present.");
-        }
-        if (doctype !== null && doctype !== undefined && !(doctype instanceof DocumentType)) {
-          throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': parameter 3 is not of type 'DocumentType'.");
-        }
-        // A new XMLDocument (its prototype must be EXACTLY XMLDocument.prototype).
-        const doc = new XMLDocument('xml');
-        // DOM §createDocument: the document's content type derives from `namespace`,
-        // and createElement's element namespace follows from the content type. The
-        // XHTML namespace yields application/xhtml+xml, in which createElement makes
-        // HTML-namespace elements (so this matches createHTMLDocument structurally);
-        // SVG → image/svg+xml; anything else → application/xml.
-        if (namespace === "http://www.w3.org/1999/xhtml") {
-          doc._createMode = 'xhtml'; doc._contentType = "application/xhtml+xml";
-        } else if (namespace === "http://www.w3.org/2000/svg") {
-          doc._contentType = "image/svg+xml";
-        }
-        // WebIDL argument coercion: namespace is `DOMString?` (null/undefined → null,
-        // else stringified), qualifiedName is `[LegacyNullToEmptyString] DOMString`
-        // (null → "", but undefined → the string "undefined"). _validateAndExtract
-        // also maps "" → null namespace, matching the test's expected namespaceURI.
-        const ns = (namespace === null || namespace === undefined) ? null : String(namespace);
-        const qname = (qualifiedName === null) ? "" : String(qualifiedName);
-        // Spec order: create the document element FIRST (so an invalid name throws
-        // before any node is appended), then append the doctype, then the element.
-        let element = null;
-        if (qname !== "") element = doc.createElementNS(ns, qname);
-        if (doctype) { doctype._ownerDoc = doc; doc.appendChild(doctype); doc._doctype = doctype; }
-        if (element) { doc.appendChild(element); doc._docEl = element; }
-        return doc;
-      },
-      createDocumentType(qualifiedName, publicId, systemId) {
-        // WebIDL: createDocumentType(DOMString name, DOMString publicId,
-        // DOMString systemId) — all three are required (so <3 args → TypeError)
-        // and plain (non-nullable) DOMStrings.
-        if (arguments.length < 3) {
-          throw new TypeError("Failed to execute 'createDocumentType' on 'DOMImplementation': 3 arguments required, but only " + arguments.length + " present.");
-        }
-        const name = String(qualifiedName);
-        // DOM §createDocumentType: throw InvalidCharacterError if `name` is not a
-        // "valid doctype name" — i.e. it contains ASCII whitespace (TAB/LF/FF/CR/
-        // SPACE), U+0000 NULL, or U+003E '>'. The empty string IS valid. (Note:
-        // this is deliberately looser than createElementNS's QName check — a
-        // doctype name like ":foo"/"foo:"/"prefix::local"/"@" is allowed here.)
-        if (/[\u0000\u0009\u000A\u000C\u000D\u0020>]/.test(name)) {
-          throw new DOMException("'" + name + "' is not a valid doctype name.", "InvalidCharacterError");
-        }
-        const nid = +_dom("create_comment_node", "");
-        const dt = new DocumentType(nid, name, String(publicId), String(systemId));
-        // The new doctype's node document is the implementation's associated
-        // document (the page for `document.implementation`, the detached/iframe
-        // document for `doc.implementation`).
-        dt._ownerDoc = _implDoc;
-        return dt;
-      },
-      hasFeature() { return true; },
-    };
+    // WebIDL brand check: `Object.getOwnPropertyDescriptor(Document.prototype,
+    // 'implementation').get.call(Document.prototype)` must throw, not answer.
+    if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");
+    // DOM §4.5: `implementation` returns THE DOMImplementation associated with
+    // this document — the same object every time, not a fresh one per read.
+    return this.__implementation || (this.__implementation = _newDOMImplementation(this));
   }
   get styleSheets() {
     if (typeof this._nid !== 'number') throw new TypeError("Illegal invocation");   // WebIDL brand check (on Document.prototype)
@@ -9596,8 +9576,10 @@ class DocumentFragment extends Node {
     return _makeNodeList(ids.map(_wrapEl).filter(Boolean));
   }
   get children() {
-    const ids = _domParse("element_children", this._nid) || [];
-    return ids.map(_wrapEl).filter(Boolean);
+    // ParentNode.children is an HTMLCollection. Handing back a plain Array made
+    // `frag.children.namedItem(…)` and `frag.children.item(…)` throw on an
+    // object that looked close enough to work.
+    return _makeHTMLCollection(() => (_domParse("element_children", this._nid) || []).map(_wrapEl).filter(Boolean));
   }
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { const ch = this.children; return ch[ch.length - 1] || null; }
@@ -10753,11 +10735,11 @@ const _invokeListeners = function(struct, event, phase) {
   // §2.9 invoke step: if propagation was stopped, this struct is skipped entirely.
   if (event._propagationStopped) return;
   const target = struct.it;
-  event.currentTarget = target;
+  event._currentTarget = target;
   // Retargeting: event.target is this struct's shadow-adjusted target and
   // event.relatedTarget its per-struct retargeted relatedTarget. A base Event has
   // no relatedTarget slot, so only mutate it when one already exists.
-  event.target = struct.et;
+  event._target = struct.et;
   // `relatedTarget` is a readonly IDL attribute over a private field, so the
   // retargeting writes the backing slot — the public accessor is readonly on
   // purpose (see _idlEventAttrs).
@@ -10832,7 +10814,7 @@ const _dispatchSpec = function(target, event, fromPublic) {
   // state check above, so a throwing re-dispatch leaves isTrusted intact.
   if (fromPublic) event._isTrusted = false;
   event._dispatchFlag = true;
-  if (!event.target) event.target = target;
+  if (!event._target) event._target = target;
   // Pointer bookkeeping: a pointer is ACTIVE from the moment it announces itself
   // until it lifts or is cancelled, and only an active pointer can be captured.
   // Tracking it here — at the one place every event passes through — means the
@@ -10912,23 +10894,23 @@ const _dispatchSpec = function(target, event, fromPublic) {
   // target (the origin target and each shadow-host boundary) is AT_TARGET.
   for (let i = structs.length - 1; i >= 0; i--) {
     const s = structs[i];
-    event.eventPhase = s.sat ? 2 : 1;
+    event._eventPhase = s.sat ? 2 : 1;
     _invokeListeners(s, event, 'capturing');
   }
   // Bubbling pass: target -> outermost. Pass-through structs run only if the event
   // bubbles; AT_TARGET structs always run.
   for (let i = 0; i < structs.length; i++) {
     const s = structs[i];
-    if (s.sat) event.eventPhase = 2;
-    else if (event.bubbles) event.eventPhase = 3;
+    if (s.sat) event._eventPhase = 2;
+    else if (event._bubbles) event._eventPhase = 3;
     else continue;
     _invokeListeners(s, event, 'bubbling');
   }
 
   // §2.9 clean-up: clear the stop-propagation flags so the event can be dispatched
   // again (the canceled / defaultPrevented flag intentionally persists).
-  event.eventPhase = 0;
-  event.currentTarget = null;
+  event._eventPhase = 0;
+  event._currentTarget = null;
   event._composedPath = null;
   event._propagationStopped = false;
   event._immediatePropagationStopped = false;
@@ -10936,11 +10918,11 @@ const _dispatchSpec = function(target, event, fromPublic) {
   // Post-dispatch target = the target retargeted to the outermost tree (the value
   // an outside reader sees), unless clear-targets hides a shadow-tree node.
   if (_clearTargets) {
-    event.target = null;
+    event._target = null;
     if ('relatedTarget' in event) event._relatedTarget = null;
     if ('_cmdSource' in event) event._sourceLive = null;
   } else if (structs.length) {
-    event.target = structs[structs.length - 1].et;
+    event._target = structs[structs.length - 1].et;
   }
   return !event.defaultPrevented;
 };
@@ -11202,8 +11184,8 @@ const _fireIframeElementLoad = function(el) {
   if (!el || el._loadEventFired) return;
   el._loadEventFired = true;
   const ev = new Event('load'); // bubbles=false, cancelable=false
-  ev.isTrusted = true; // UA-originated load event
-  ev.target = el;
+  ev._isTrusted = true; // UA-originated load event
+  ev._target = el;
   // Dispatch directly (not the public dispatchEvent, which would clear isTrusted).
   try { _dispatchSpec(el, ev); } catch (e) {}
   // An IDL/JS-set onload already fired as an installed listener during dispatch. A
@@ -11227,8 +11209,8 @@ const _fireElementError = function(el) {
   if (!el || el._loadEventFired) return;
   el._loadEventFired = true;
   const ev = new Event('error'); // bubbles=false, cancelable=false
-  ev.isTrusted = true;
-  ev.target = el;
+  ev._isTrusted = true;
+  ev._target = el;
   try { _dispatchSpec(el, ev); } catch (e) {}
   // See _fireIframeElementLoad: an un-activated markup `onerror` still runs once.
   // ⚠️ This fallback compiles the attribute SOURCE directly, so it has to ask
@@ -11251,8 +11233,8 @@ const _fireElementError = function(el) {
 function _fireInputThenChange(el) {
   for (const type of ['input', 'change']) {
     const ev = new Event(type, { bubbles: true, cancelable: false });
-    ev.isTrusted = true;
-    ev.target = el;
+    ev._isTrusted = true;
+    ev._target = el;
     try { _dispatchSpec(el, ev); } catch (e) {}
   }
 }
@@ -13477,7 +13459,7 @@ const _xhrFireProgress = function (target, type, transmitted, length) {
   // The engine generated this, so it is TRUSTED — dispatched through the spec
   // path directly rather than through the public `dispatchEvent`, which is
   // required to mark whatever it is handed as untrusted.
-  ev.isTrusted = true;
+  ev._isTrusted = true;
   _dispatchSpec(target, ev);
 };
 
@@ -13526,16 +13508,15 @@ const _toUnsignedLong = (v) => Number(v) >>> 0;
 // harms nobody else. Named in the scroll; no WPT file measures the difference.
 const _isWorkerScope = () => false;
 
-// `EventTarget` is `Node` in this engine, and the `globalThis.EventTarget` alias
-// is not installed until far later in this file — so the base class is named
-// directly here. `super(undefined)` (no node id) is how every other non-tree event
-// target here — MessagePort, Worker, ServiceWorker — joins the one dispatch path.
-class XMLHttpRequestEventTarget extends Node {
+// An XHR is an event target and nothing else — never a tree node. It joins the
+// one dispatch path through EventTarget, the same door MessagePort, Worker and
+// ServiceWorker use.
+class XMLHttpRequestEventTarget extends EventTarget {
   constructor() {
     // Abstract: `new XMLHttpRequestEventTarget()` is not a thing a page may do,
     // but a subclass calling super() must get through.
     if (new.target === XMLHttpRequestEventTarget) throw new TypeError('Illegal constructor');
-    super(undefined);
+    super();
   }
 }
 // An XHR event goes to the object it happened to and stops. See _getEventParent.
@@ -14170,7 +14151,7 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   // all behave, which is the entire reason XMLHttpRequest is an EventTarget.
   _fireEvent(type) {
     const ev = new Event(type);
-    ev.isTrusted = true;
+    ev._isTrusted = true;
     _dispatchSpec(this, ev);
   }
 
@@ -38645,7 +38626,10 @@ globalThis.MutationObserver = class MutationObserver {
     if (!t) return;
     const o = t.options;
     // Tailor record to what this observer asked for (oldValue is opt-in).
-    const out = {
+    let oldValue = null;
+    if (rec.type === 'attributes' && o.attributeOldValue) oldValue = rec.oldValue ?? null;
+    if (rec.type === 'characterData' && o.characterDataOldValue) oldValue = rec.oldValue ?? null;
+    this._records.push(_newMutationRecord({
       type: rec.type,
       target: rec.target,
       addedNodes: rec.addedNodes,
@@ -38654,13 +38638,47 @@ globalThis.MutationObserver = class MutationObserver {
       nextSibling: rec.nextSibling,
       attributeName: rec.type === 'attributes' ? rec.attributeName : null,
       attributeNamespace: rec.type === 'attributes' ? (rec.attributeNamespace ?? null) : null,
-      oldValue: null,
-    };
-    if (rec.type === 'attributes' && o.attributeOldValue) out.oldValue = rec.oldValue ?? null;
-    if (rec.type === 'characterData' && o.characterDataOldValue) out.oldValue = rec.oldValue ?? null;
-    this._records.push(out);
+      oldValue,
+    }));
     __scheduleMutationDelivery();
   }
+};
+
+// ── MutationRecord (DOM §4.3.3) ──────────────────────────────────────────────
+// A record of a change that already happened, so every member is a readonly IDL
+// attribute on a prototype — and `addedNodes`/`removedNodes` are NodeLists, not
+// arrays: a page that does `record.addedNodes.item(0)` or reads `.length` off a
+// live-looking list is not doing anything unusual.
+let _allowMutationRecordCtor = false;
+globalThis.MutationRecord = class MutationRecord {
+  constructor() {
+    if (!_allowMutationRecordCtor) throw new TypeError("Illegal constructor");
+  }
+  get type() { return this._type; }
+  get target() { return this._target; }
+  get addedNodes() { return this._addedNodes; }
+  get removedNodes() { return this._removedNodes; }
+  get previousSibling() { return this._previousSibling; }
+  get nextSibling() { return this._nextSibling; }
+  get attributeName() { return this._attributeName; }
+  get attributeNamespace() { return this._attributeNamespace; }
+  get oldValue() { return this._oldValue; }
+};
+const _newMutationRecord = function (init) {
+  _allowMutationRecordCtor = true;
+  let r;
+  try { r = new globalThis.MutationRecord(); }
+  finally { _allowMutationRecordCtor = false; }
+  r._type = init.type;
+  r._target = init.target;
+  r._addedNodes = _makeNodeList(init.addedNodes || []);
+  r._removedNodes = _makeNodeList(init.removedNodes || []);
+  r._previousSibling = init.previousSibling ?? null;
+  r._nextSibling = init.nextSibling ?? null;
+  r._attributeName = init.attributeName ?? null;
+  r._attributeNamespace = init.attributeNamespace ?? null;
+  r._oldValue = init.oldValue ?? null;
+  return r;
 };
 
 // Deliver every observer's queued records on a microtask. Callbacks may mutate
@@ -38951,6 +38969,105 @@ class CustomElementRegistry {
 }
 globalThis.CustomElementRegistry = CustomElementRegistry;
 globalThis.customElements = new CustomElementRegistry();
+// ── DOMImplementation (DOM §4.5) ─────────────────────────────────────────────
+// An interface, not an object literal: `document.implementation` must be the
+// SAME object on every read, its three operations must live on a prototype that
+// `instanceof DOMImplementation` can see, and the interface object itself must
+// be on the global where `new DOMImplementation()` throws.
+let _allowDOMImplementationCtor = false;
+globalThis.DOMImplementation = class DOMImplementation {
+  constructor() {
+    if (!_allowDOMImplementationCtor) throw new TypeError("Illegal constructor");
+  }
+  createHTMLDocument(title) {
+    const doc = new DetachedDocument('html');
+    // Spec: createHTMLDocument prepends a <!DOCTYPE html> before <html>.
+    const dt = this.createDocumentType('html', '', '');
+    dt._ownerDoc = doc;
+    doc.insertBefore(dt, doc.documentElement);
+    doc._doctype = dt;
+    if (title !== undefined) {
+      const t = doc.createElement('title');
+      t.textContent = String(title);
+      doc.head.appendChild(t);
+    }
+    return doc;
+  }
+  createDocument(namespace, qualifiedName, doctype) {
+    // WebIDL: createDocument(namespace, qualifiedName, [optional] doctype) —
+    // namespace + qualifiedName are required (so <2 args → TypeError), and
+    // `doctype` is a nullable DocumentType (null/undefined → none, anything
+    // else that isn't a DocumentType → TypeError during argument conversion).
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': 2 arguments required, but only " + arguments.length + " present.");
+    }
+    if (doctype !== null && doctype !== undefined && !(doctype instanceof DocumentType)) {
+      throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': parameter 3 is not of type 'DocumentType'.");
+    }
+    // A new XMLDocument (its prototype must be EXACTLY XMLDocument.prototype).
+    const doc = new XMLDocument('xml');
+    // DOM §createDocument: the document's content type derives from `namespace`,
+    // and createElement's element namespace follows from the content type. The
+    // XHTML namespace yields application/xhtml+xml, in which createElement makes
+    // HTML-namespace elements (so this matches createHTMLDocument structurally);
+    // SVG → image/svg+xml; anything else → application/xml.
+    if (namespace === "http://www.w3.org/1999/xhtml") {
+      doc._createMode = 'xhtml'; doc._contentType = "application/xhtml+xml";
+    } else if (namespace === "http://www.w3.org/2000/svg") {
+      doc._contentType = "image/svg+xml";
+    }
+    // WebIDL argument coercion: namespace is `DOMString?` (null/undefined → null,
+    // else stringified), qualifiedName is `[LegacyNullToEmptyString] DOMString`
+    // (null → "", but undefined → the string "undefined"). _validateAndExtract
+    // also maps "" → null namespace, matching the test's expected namespaceURI.
+    const ns = (namespace === null || namespace === undefined) ? null : String(namespace);
+    const qname = (qualifiedName === null) ? "" : String(qualifiedName);
+    // Spec order: create the document element FIRST (so an invalid name throws
+    // before any node is appended), then append the doctype, then the element.
+    let element = null;
+    if (qname !== "") element = doc.createElementNS(ns, qname);
+    if (doctype) { doctype._ownerDoc = doc; doc.appendChild(doctype); doc._doctype = doctype; }
+    if (element) { doc.appendChild(element); doc._docEl = element; }
+    return doc;
+  }
+  createDocumentType(qualifiedName, publicId, systemId) {
+    // WebIDL: createDocumentType(DOMString name, DOMString publicId,
+    // DOMString systemId) — all three are required (so <3 args → TypeError)
+    // and plain (non-nullable) DOMStrings.
+    if (arguments.length < 3) {
+      throw new TypeError("Failed to execute 'createDocumentType' on 'DOMImplementation': 3 arguments required, but only " + arguments.length + " present.");
+    }
+    const name = String(qualifiedName);
+    // DOM §createDocumentType: throw InvalidCharacterError if `name` is not a
+    // "valid doctype name" — i.e. it contains ASCII whitespace (TAB/LF/FF/CR/
+    // SPACE), U+0000 NULL, or U+003E '>'. The empty string IS valid. (Note:
+    // this is deliberately looser than createElementNS's QName check — a
+    // doctype name like ":foo"/"foo:"/"prefix::local"/"@" is allowed here.)
+    if (/[\u0000\u0009\u000A\u000C\u000D\u0020>]/.test(name)) {
+      throw new DOMException("'" + name + "' is not a valid doctype name.", "InvalidCharacterError");
+    }
+    const nid = +_dom("create_comment_node", "");
+    const dt = new DocumentType(nid, name, String(publicId), String(systemId));
+    // The new doctype's node document is the implementation's associated
+    // document (the page for `document.implementation`, the detached/iframe
+    // document for `doc.implementation`).
+    dt._ownerDoc = this._implDoc;
+    return dt;
+  }
+  hasFeature() { return true; }
+};
+// The implementation is "associated" with the document it was read from
+// (`document.implementation` for the page, `doc.implementation` for a
+// createHTMLDocument/createDocument/iframe document). `createDocumentType`'s
+// returned doctype takes THAT document as its node document.
+const _newDOMImplementation = function (doc) {
+  _allowDOMImplementationCtor = true;
+  let impl;
+  try { impl = new globalThis.DOMImplementation(); }
+  finally { _allowDOMImplementationCtor = false; }
+  Object.defineProperty(impl, '_implDoc', { value: doc, writable: true });
+  return impl;
+};
 globalThis.NodeFilter = {
   SHOW_ALL: 0xFFFFFFFF,
   SHOW_ELEMENT: 0x1,
@@ -38975,22 +39092,31 @@ globalThis.NodeFilter = {
 // class + `globalThis.performance` are defined (it needs the entry buffer to read
 // buffered entries and to be notified on mark()/measure()).
 
+// One shared descriptor and one shared getter for every event ever constructed —
+// `isTrusted` is an own property per instance, and minting a closure per event
+// would be a real cost on a path the whole platform runs through.
+const _EVENT_IS_TRUSTED_DESC = {
+  enumerable: true, configurable: false,
+  get: _named('get', 'isTrusted', function () { return this._isTrusted === true; }),
+};
 globalThis.Event = class Event {
   constructor(t,o) {
     o = (o == null) ? {} : o; // a null/undefined dictionary is the empty dictionary
-    this.type = (t === undefined) ? "" : String(t);
-    this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;
-    this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;
-    this.timeStamp=Date.now();
+    this._type = (t === undefined) ? "" : String(t);
+    this._bubbles=!!o.bubbles;this._cancelable=!!o.cancelable;this._composed=!!o.composed;
+    this._defaultPrevented=false;this._target=null;this._currentTarget=null;this._eventPhase=0;
+    this._timeStamp=Date.now();
     this._propagationStopped=false;this._immediatePropagationStopped=false;
     this._isTrusted=false;this._dispatchFlag=false;this._composedPath=null;
     this._initialized=true; // constructed events are initialized; createEvent unsets this
+    Object.defineProperty(this, 'isTrusted', _EVENT_IS_TRUSTED_DESC);
   }
-  // isTrusted is false for script-dispatched events; the engine marks UA-originated
-  // events (e.g. a frame's load) trusted via the internal setter.
-  get isTrusted() { return this._isTrusted === true; }
-  set isTrusted(v) { this._isTrusted = !!v; }
-  get srcElement() { return this.target; } // legacy alias for target
+  // isTrusted is [LegacyUnforgeable]: an OWN, non-configurable accessor on every
+  // event instance, not an inherited one. That is the whole point of the flag —
+  // a page must not be able to delete or redefine `isTrusted` on the prototype
+  // and have every event it dispatches thereafter claim to come from the user.
+  // (The engine marks UA-originated events by writing the backing field.)
+  get srcElement() { return this._target; } // legacy alias for target
   // DOM §2.9 composedPath(): the propagation path visible from the current target,
   // hiding invocation targets inside closed shadow trees the current target can't
   // see (tracked via the per-struct root-of-closed-tree / slot-in-closed-tree
@@ -39030,24 +39156,44 @@ globalThis.Event = class Event {
   // Legacy aliases backed by the stop-propagation / canceled state.
   get cancelBubble() { return this._propagationStopped; }
   set cancelBubble(v) { if (v) this._propagationStopped = true; }
-  get returnValue() { return !this.defaultPrevented; }
+  get returnValue() { return !this._defaultPrevented; }
   // §preventDefault / legacy returnValue: a cancel is ignored while the "in
   // passive listener flag" is set (a preventDefault() from a passive listener
   // must NOT mark the event canceled).
-  set returnValue(v) { if (v === false && this.cancelable && !this._inPassiveListener) this.defaultPrevented = true; }
-  preventDefault() { if (this.cancelable && !this._inPassiveListener) this.defaultPrevented=true; }
+  set returnValue(v) { if (v === false && this._cancelable && !this._inPassiveListener) this._defaultPrevented = true; }
+  preventDefault() { if (this._cancelable && !this._inPassiveListener) this._defaultPrevented=true; }
   stopPropagation(){ this._propagationStopped=true; }
   stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent': 1 argument required, but only 0 present.");
     if (this._dispatchFlag) return; // no-op while dispatching
     this._initialized=true;
-    this.type = (type === undefined) ? "" : String(type);
-    this.bubbles=!!bubbles;this.cancelable=!!cancelable;
-    this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false;
-    this._isTrusted=false;this.target=null;
+    this._type = (type === undefined) ? "" : String(type);
+    this._bubbles=!!bubbles;this._cancelable=!!cancelable;
+    this._defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false;
+    this._isTrusted=false;this._target=null;
   }
 };
+// DOM §2.2: every one of these is a READONLY IDL attribute, which means an
+// ENUMERABLE accessor on the PROTOTYPE backed by a private field — not an own
+// data property on the instance. The difference is not bookkeeping. An own data
+// property lets a listener write `event.target = somethingElse` and hand every
+// later listener in the propagation path a forged record of what happened; an
+// event is supposed to be the account of something that already occurred, and
+// nothing that already occurred is a setting. (The UI event interfaces below have
+// been built this way since Quest #461 via `_idlEventAttrs`; the base interface
+// they all extend had been missed.)
+for (const _n of ['type', 'target', 'currentTarget', 'eventPhase', 'bubbles',
+                  'cancelable', 'composed', 'defaultPrevented', 'timeStamp']) {
+  const _priv = '_' + _n;
+  Object.defineProperty(Event.prototype, _n, {
+    enumerable: true, configurable: true,
+    get: _named('get', _n, function () {
+      if (!(this instanceof Event)) throw new TypeError("Illegal invocation");
+      return this[_priv];
+    }),
+  });
+}
 // eventPhase constants — on the interface object AND the prototype (so instances
 // see them through the chain); testharness's `name in object` accepts inherited.
 for (const [k, v] of [["NONE",0],["CAPTURING_PHASE",1],["AT_TARGET",2],["BUBBLING_PHASE",3]]) {
@@ -39055,7 +39201,7 @@ for (const [k, v] of [["NONE",0],["CAPTURING_PHASE",1],["AT_TARGET",2],["BUBBLIN
   Object.defineProperty(Event.prototype, k, { value: v, enumerable: true, writable: false, configurable: false });
 }
 globalThis.CustomEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.detail=(o.detail !== undefined ? o.detail : null); }
+  constructor(t,o={}) { super(t,o);this._detail=(o.detail !== undefined ? o.detail : null); }
   // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
   // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
   // instead of new CustomEvent(...). See issue #41.
@@ -39063,15 +39209,22 @@ globalThis.CustomEvent = class extends Event {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initCustomEvent': 1 argument required, but only 0 present.");
     if (this._dispatchFlag) return;
     this._initialized = true;
-    this.type = (type === undefined) ? "" : String(type);
-    this.bubbles = !!bubbles;
-    this.cancelable = !!cancelable;
-    this.defaultPrevented = false;
+    this._type = (type === undefined) ? "" : String(type);
+    this._bubbles = !!bubbles;
+    this._cancelable = !!cancelable;
+    this._defaultPrevented = false;
     this._propagationStopped = false; this._immediatePropagationStopped = false;
-    this._isTrusted = false; this.target = null;
-    this.detail = (detail !== undefined ? detail : null);
+    this._isTrusted = false; this._target = null;
+    this._detail = (detail !== undefined ? detail : null);
   }
 };
+Object.defineProperty(CustomEvent.prototype, 'detail', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'detail', function () {
+    if (!(this instanceof CustomEvent)) throw new TypeError("Illegal invocation");
+    return this._detail;
+  }),
+});
 // Shared EventModifierInit getModifierState (Mouse/Keyboard).
 // Only the modifiers EventModifierInit can actually set are reportable. `Fn`,
 // `Hyper`, `Super`, `Symbol` and friends are real modifier key values with no
@@ -39908,24 +40061,99 @@ globalThis.CommandEvent = class CommandEvent extends Event {
 _markNative(CommandEvent);
 
 const _abortError = function(name, msg) { if (typeof DOMException === 'function') return new DOMException(msg, name); const e = new Error(msg); e.name = name; return e; };
-globalThis.AbortSignal = class AbortSignal {
-  constructor() { this.aborted = false; this.reason = undefined; this.onabort = null; this._listeners = []; }
-  addEventListener(type, fn) { if (type === 'abort' && typeof fn === 'function') this._listeners.push(fn); }
-  removeEventListener(type, fn) { if (type === 'abort') { const i = this._listeners.indexOf(fn); if (i >= 0) this._listeners.splice(i, 1); } }
-  dispatchEvent(ev) { const type = ev && ev.type; if (type === 'abort') { const list = this._listeners.slice(); for (const fn of list) { try { fn.call(this, ev); } catch (e) {} } if (typeof this.onabort === 'function') { try { this.onabort.call(this, ev); } catch (e) {} } } return true; }
-  throwIfAborted() { if (this.aborted) throw (this.reason !== undefined ? this.reason : _abortError('AbortError', 'The operation was aborted')); }
-  _fireAbort() { const ev = (typeof Event === 'function') ? new Event('abort') : { type: 'abort' }; this.dispatchEvent(ev); }
-  static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = (reason !== undefined ? reason : _abortError('AbortError', 'The operation was aborted')); return s; }
-  static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { if (!s.aborted) { s.aborted = true; s.reason = _abortError('TimeoutError', 'The operation timed out'); s._fireAbort(); } }, ms); return s; }
-  static any(signals) { const s = new AbortSignal(); const arr = Array.from(signals || []); for (const inp of arr) { if (inp && inp.aborted) { s.aborted = true; s.reason = inp.reason; return s; } } const onAbort = function() { if (!s.aborted) { s.aborted = true; s.reason = this.reason; s._fireAbort(); } }; for (const inp of arr) { if (inp && typeof inp.addEventListener === 'function') inp.addEventListener('abort', onAbort); } return s; }
+// ── AbortSignal / AbortController (DOM §3.2) ─────────────────────────────────
+// An AbortSignal is a real EventTarget: it has no constructor of its own, its
+// state is readonly IDL attributes on the prototype, and `onabort` is an event
+// handler — which means it fires in the order it was SET relative to the other
+// `abort` listeners, not before all of them. The previous version kept a private
+// listener array and called `onabort` last, so a page that did
+// `signal.onabort = a; signal.addEventListener('abort', b)` saw b then a.
+let _allowAbortSignalCtor = false;
+globalThis.AbortSignal = class AbortSignal extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowAbortSignalCtor) throw new TypeError("Illegal constructor");
+    this._aborted = false;
+    this._reason = undefined;
+    this._onabort = null;
+    this._onabortListener = null;
+  }
+  get aborted() { return this._aborted; }
+  get reason() { return this._reason; }
+  get onabort() { return this._onabort; }
+  set onabort(v) {
+    if (this._onabortListener) {
+      this.removeEventListener('abort', this._onabortListener);
+      this._onabortListener = null;
+    }
+    this._onabort = (typeof v === 'function') ? v : null;
+    if (this._onabort) {
+      const self = this;
+      this._onabortListener = function (ev) {
+        const fn = self._onabort;
+        if (typeof fn === 'function') fn.call(self, ev);
+      };
+      this.addEventListener('abort', this._onabortListener);
+    }
+  }
+  throwIfAborted() {
+    if (this._aborted) {
+      throw (this._reason !== undefined ? this._reason
+        : _abortError('AbortError', 'The operation was aborted'));
+    }
+  }
+  // "Signal abort": set the state, THEN fire — a listener that reads
+  // `signal.aborted` must already see true.
+  _signalAbort(reason) {
+    if (this._aborted) return;
+    this._aborted = true;
+    this._reason = (reason !== undefined ? reason
+      : _abortError('AbortError', 'The operation was aborted'));
+    this._fireAbort();
+  }
+  _fireAbort() {
+    const ev = new Event('abort');
+    ev._isTrusted = true;
+    try { this.dispatchEvent(ev); } catch (e) {}
+  }
+  static abort(reason) {
+    const s = _newAbortSignal();
+    s._aborted = true;
+    s._reason = (reason !== undefined ? reason : _abortError('AbortError', 'The operation was aborted'));
+    return s;
+  }
+  static timeout(ms) {
+    const s = _newAbortSignal();
+    setTimeout(() => { s._signalAbort(_abortError('TimeoutError', 'The operation timed out')); }, ms);
+    return s;
+  }
+  static any(signals) {
+    const s = _newAbortSignal();
+    const arr = Array.from(signals || []);
+    for (const inp of arr) {
+      if (inp && inp.aborted) { s._aborted = true; s._reason = inp.reason; return s; }
+    }
+    const onAbort = function () { s._signalAbort(this.reason); };
+    for (const inp of arr) {
+      if (inp && typeof inp.addEventListener === 'function') inp.addEventListener('abort', onAbort);
+    }
+    return s;
+  }
+};
+const _newAbortSignal = function () {
+  _allowAbortSignalCtor = true;
+  try { return new globalThis.AbortSignal(); }
+  finally { _allowAbortSignalCtor = false; }
 };
 globalThis.AbortController = class AbortController {
-  constructor() { this.signal = new AbortSignal(); }
-  abort(reason) { if (this.signal.aborted) return; this.signal.aborted = true; this.signal.reason = (reason !== undefined ? reason : _abortError('AbortError', 'The operation was aborted')); this.signal._fireAbort(); }
+  constructor() { this._signal = _newAbortSignal(); }
+  get signal() { return this._signal; }
+  abort(reason) { this._signal._signalAbort(reason); }
 };
-_markNative(AbortSignal); _markNative(AbortSignal.abort); _markNative(AbortSignal.timeout); _markNative(AbortSignal.any);
-_markNative(AbortSignal.prototype.addEventListener); _markNative(AbortSignal.prototype.removeEventListener); _markNative(AbortSignal.prototype.dispatchEvent); _markNative(AbortSignal.prototype.throwIfAborted);
-_markNative(AbortController); _markNative(AbortController.prototype.abort);
+_markNative(globalThis.AbortSignal); _markNative(globalThis.AbortSignal.abort);
+_markNative(globalThis.AbortSignal.timeout); _markNative(globalThis.AbortSignal.any);
+_markNative(globalThis.AbortSignal.prototype.throwIfAborted);
+_markNative(globalThis.AbortController); _markNative(globalThis.AbortController.prototype.abort);
 
 // ===== Close watchers (HTML §6.10 — the close-watcher infrastructure) =====
 // A per-Window "close watcher manager": a list of GROUPS, each group a list of
@@ -41497,7 +41725,7 @@ const _permissionState = (name) =>
   _permissionStates.has(name) ? _permissionStates.get(name) : (_PERMISSION_DEFAULTS[name] || "prompt");
 
 let _allowPermissionStatus = false;
-class PermissionStatus extends Node {
+class PermissionStatus extends EventTarget {
   constructor() {
     if (!_allowPermissionStatus) throw new TypeError("Illegal constructor");
     super(undefined);
@@ -41671,7 +41899,7 @@ class ClipboardItem {
     return _CLIP_SUPPORTED.indexOf(s) >= 0;
   }
 }
-class Clipboard extends Node {
+class Clipboard extends EventTarget {
   constructor() {
     if (!_allowClipboardCtor) throw new TypeError("Illegal constructor");
     super(undefined);
@@ -44978,7 +45206,7 @@ class StorageEvent extends Event {
     // The base Event maps `undefined` to "" (its no-argument fallback); here the
     // argument was definitely supplied, so WebIDL's DOMString conversion applies
     // and `new StorageEvent(undefined)` really does have type "undefined".
-    this.type = String(type);
+    this._type = String(type);
     this._key = (o.key === undefined || o.key === null) ? null : String(o.key);
     this._oldValue = (o.oldValue === undefined || o.oldValue === null) ? null : String(o.oldValue);
     this._newValue = (o.newValue === undefined || o.newValue === null) ? null : String(o.newValue);
@@ -45328,7 +45556,7 @@ const _shMint = (Ctor, rec) => {
   return o;
 };
 
-class NavigationHistoryEntry extends Node {
+class NavigationHistoryEntry extends EventTarget {
   constructor() {
     if (!_shAllow.on) throw new TypeError('Illegal constructor');
     super(undefined);
@@ -45544,7 +45772,7 @@ const _navDeferred = () => {
 };
 
 const _navAllow = { on: false };
-class Navigation extends Node {
+class Navigation extends EventTarget {
   constructor() {
     if (!_navAllow.on) throw new TypeError('Illegal constructor');
     super(undefined);
@@ -47535,7 +47763,7 @@ globalThis.HTMLVideoElement = class HTMLVideoElement extends globalThis.HTMLMedi
       const target = srcEl || el;
       if (!srcEl) st.error = _newMediaError(4, 'The media resource indicated by the src attribute was not suitable.');
       const ev = new Event('error');
-      ev.isTrusted = true; ev.target = target;
+      ev._isTrusted = true; ev._target = target;
       try { _dispatchSpec(target, ev); } catch (e) {}
       if (!target['__ehon_onerror']) {
         const a = target.getAttribute && target.getAttribute('onerror');
@@ -47761,7 +47989,7 @@ globalThis._fireFocusEvent = function(target, type, bubbles, related) {
   try {
     const C = (typeof FocusEvent === 'function') ? FocusEvent : Event;
     const ev = new C(type, { bubbles: !!bubbles, composed: true, relatedTarget: related || null });
-    ev.isTrusted = true;
+    ev._isTrusted = true;
     _dispatchSpec(target, ev);
   } catch (e) {}
 };
@@ -51149,7 +51377,7 @@ function _cvReflLong(proto, prop, attr) {
       let ev;
       try { ev = new Event("select", { bubbles: true, cancelable: false }); }
       catch (e) { return; }
-      ev.isTrusted = true; ev.target = el;
+      ev._isTrusted = true; ev._target = el;
       // onselect fires as an installed GlobalEventHandlers listener during dispatch.
       try { _dispatchSpec(el, ev); } catch (e) {}
     }, 0);
@@ -51849,7 +52077,7 @@ function _cvReflLong(proto, prop, attr) {
     try { ev = new Event("reset", { bubbles: true, cancelable: true }); }
     catch (e) { ev = null; }
     if (ev) {
-      ev.isTrusted = true;
+      ev._isTrusted = true;
       // Dispatch privately so the trusted flag survives (the public path clears it).
       _dispatchSpec(this, ev);
       // onreset fires as an installed GlobalEventHandlers listener during dispatch;
@@ -52860,9 +53088,102 @@ const _defineUnscopables = function(proto, names) {
 // ParentNode + ChildNode unscopables live on Element; Document/DocumentFragment carry
 // only the ParentNode set. (HTMLElement/SVGElement inherit Element's.)
 _defineUnscopables(Element.prototype,
-  ['after', 'append', 'before', 'moveBefore', 'prepend', 'remove', 'replaceChildren', 'replaceWith']);
+  ['after', 'append', 'before', 'prepend', 'remove', 'replaceChildren', 'replaceWith', 'slot']);
 _defineUnscopables(Document.prototype, ['append', 'prepend', 'replaceChildren']);
 _defineUnscopables(DocumentFragment.prototype, ['append', 'prepend', 'replaceChildren']);
+// CharacterData and DocumentType are ChildNodes too — they carry the ChildNode
+// half of the list and nothing else. Without any @@unscopables object at all,
+// `with (textNode) { after(…) }` shadowed a same-named global, and idlharness
+// could not read the property it is required to find.
+_defineUnscopables(CharacterData.prototype, ['after', 'before', 'remove', 'replaceWith']);
+_defineUnscopables(DocumentType.prototype, ['after', 'before', 'remove', 'replaceWith']);
+
+// NonDocumentTypeChildNode — the two siblings a Text/Comment/PI node can name.
+// Element has had them since the start; CharacterData never did, so a framework
+// anchored on a comment node (Svelte, Vue, Lit all do) could walk forward to the
+// next element only by hand.
+for (const _side of ['previous', 'next']) {
+  const _step = _side + 'Sibling';
+  Object.defineProperty(CharacterData.prototype, _side + 'ElementSibling', {
+    enumerable: true, configurable: true,
+    get: _named('get', _side + 'ElementSibling', function () {
+      let s = this[_step];
+      while (s && s.nodeType !== 1) s = s[_step];
+      return s || null;
+    }),
+  });
+}
+
+// ParentNode's other three on Document, and `moveBefore` on the three interfaces
+// that declare it (it lived only on Node.prototype, so `Element.prototype
+// .moveBefore` — which is where every caller and every test looks — was missing).
+for (const _p of [Element.prototype, Document.prototype, DocumentFragment.prototype]) {
+  if (!Object.getOwnPropertyDescriptor(_p, 'moveBefore')) {
+    _p.moveBefore = Node.prototype.moveBefore;
+  }
+}
+for (const [_name, _fn] of [
+  ['firstElementChild', function () { return this.children[0] || null; }],
+  ['lastElementChild', function () { const c = this.children; return c[c.length - 1] || null; }],
+  ['childElementCount', function () { return this.children.length; }],
+]) {
+  if (!Object.getOwnPropertyDescriptor(Document.prototype, _name)) {
+    Object.defineProperty(Document.prototype, _name, {
+      enumerable: true, configurable: true, get: _named('get', _name, _fn),
+    });
+  }
+}
+
+// ParentNode.children on Document — the element children of the document, which
+// is the `<html>` element and nothing else, but a page that walks
+// `node.children` generically should not fall off the top of the tree.
+Object.defineProperty(Document.prototype, 'children', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'children', function () {
+    return _makeHTMLCollection(() => (_domParse("element_children", this._nid) || []).map(_wrapEl).filter(Boolean));
+  }),
+});
+
+// Scoped custom element registries: the attribute exists on Document and Element
+// and is nullable. We have exactly one registry — the window's — so a document
+// with a browsing context reports it and everything detached reports null,
+// which is the honest answer rather than a shared registry we do not have.
+Object.defineProperty(Document.prototype, 'customElementRegistry', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'customElementRegistry', function () {
+    const view = this.defaultView;
+    return view ? (view.customElements || null) : null;
+  }),
+});
+Object.defineProperty(Element.prototype, 'customElementRegistry', {
+  enumerable: true, configurable: true,
+  get: _named('get', 'customElementRegistry', function () {
+    const doc = this.ownerDocument;
+    return doc ? doc.customElementRegistry : null;
+  }),
+});
+
+// Fullscreen's two event handler IDL attributes live on Document and Element,
+// not on GlobalEventHandlers; ShadowRoot gets `onslotchange` the same way.
+_ehDefineOnProto(Document.prototype, false, ['onfullscreenchange', 'onfullscreenerror']);
+_ehDefineOnProto(Element.prototype, false, ['onfullscreenchange', 'onfullscreenerror']);
+if (globalThis.ShadowRoot) _ehDefineOnProto(globalThis.ShadowRoot.prototype, false, ['onslotchange']);
+
+// NodeList.length is an IDL attribute on the prototype. Our NodeList extends
+// Array, so every instance also has Array's own `length` — that own property
+// still wins, and `assert_inherits` on an instance stays red (named in the
+// scroll). The prototype half is real and reachable.
+if (!Object.getOwnPropertyDescriptor(globalThis.NodeList.prototype, 'length')) {
+  Object.defineProperty(globalThis.NodeList.prototype, 'length', {
+    enumerable: true, configurable: true,
+    // Read the OWN slot, never `this.length` — on the prototype (which is not an
+    // Array exotic object and so has no own length) that would re-enter here.
+    get: _named('get', 'length', function () {
+      const d = Object.getOwnPropertyDescriptor(this, 'length');
+      return d && typeof d.value === 'number' ? d.value >>> 0 : 0;
+    }),
+  });
+}
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;
@@ -52878,7 +53199,7 @@ for (const k of Object.getOwnPropertyNames(Node)) {
 }
 globalThis.Element = Element;
 globalThis.Document = Document;
-globalThis.EventTarget = Node;
+globalThis.EventTarget = EventTarget;
 
 // ===================== Fullscreen API (partial) ================================
 // A JS-level model of the fullscreen element STACK — enough to drive the top-layer
@@ -52950,14 +53271,18 @@ globalThis.EventTarget = Node;
     globalThis.Document.prototype.exitFullscreen;
 
   // `document.fullscreenElement` — the topmost element of the fullscreen stack, or null.
+  // [LegacyLenientSetter]: assigning to these is a silent no-op rather than a
+  // TypeError in strict mode — old code does `document.fullscreenElement = x`.
   Object.defineProperty(globalThis.Document.prototype, 'fullscreenElement', {
     configurable: true, enumerable: true,
     get() { const s = globalThis._fullscreenStack; return (s && s.length) ? s[s.length - 1] : null; },
+    set() {},
   });
   // `document.fullscreenEnabled` — fullscreen is available in this (top-level) document.
   Object.defineProperty(globalThis.Document.prototype, 'fullscreenEnabled', {
     configurable: true, enumerable: true,
     get() { return true; },
+    set() {},
   });
 }
 // ---------------------------------------------------------------------------
@@ -54412,10 +54737,10 @@ const _cspReport = (policy, effectiveDirective, violatedDirective, blockedURI, e
   let ev = null;
   try { ev = new globalThis.SecurityPolicyViolationEvent('securitypolicyviolation', init); }
   catch (e) { return; }
-  ev.isTrusted = true;
+  ev._isTrusted = true;
   const target = (element && element.isConnected !== false) ? element : (globalThis.document || null);
   if (!target) return;
-  ev.target = target;
+  ev._target = target;
   // ⭐ "QUEUE A TASK to fire the event" (CSP3 §"report a violation"), not "fire
   // it here". The difference is visible: `try { eval(…) } catch (e) { log('blocked') }`
   // must log `blocked` BEFORE the violation listener runs, because the throw
@@ -59140,8 +59465,8 @@ const _edFireInputEvent = (type, target, init) => {
       targetRanges: init.targetRanges || [],
     });
   } catch (e) { return true; }
-  ev.isTrusted = true;
-  ev.target = target;
+  ev._isTrusted = true;
+  ev._target = target;
   try { return _dispatchSpec(target, ev); } catch (e) { return true; }
 };
 
@@ -59743,6 +60068,14 @@ globalThis.AbstractRange = class AbstractRange {
   get endOffset() { return this._eo; }
   get collapsed() { return this._sc === this._ec && this._so === this._eo; }
 };
+// Range was written before AbstractRange existed and so does not `extend` it —
+// but it IS one, and `Object.getPrototypeOf(Range.prototype)` has to say so.
+// Reparenting here (rather than moving 400 lines of Range above this point)
+// gives exactly the chain the IDL describes.
+if (globalThis.Range && Object.getPrototypeOf(globalThis.Range.prototype) === Object.prototype) {
+  Object.setPrototypeOf(globalThis.Range.prototype, globalThis.AbstractRange.prototype);
+  Object.setPrototypeOf(globalThis.Range, globalThis.AbstractRange);
+}
 globalThis.StaticRange = class StaticRange extends AbstractRange {
   constructor(init) {
     // `super()` would hit AbstractRange's guard, so StaticRange is built by
@@ -60353,7 +60686,7 @@ const _windowClose = function(win) {
   setTimeout(() => {
     try {
       const ev = new Event('pagehide');
-      ev.isTrusted = true;
+      ev._isTrusted = true;
       win.dispatchEvent(ev);
     } catch (e) {}
     try { win.opener = null; } catch (e) {}
@@ -67847,7 +68180,7 @@ globalThis.prompt = function() { return null; };
 const _schedulePopupLoad = function(win) {
   setTimeout(() => {
     if (win.closed) return;
-    try { const ev = new Event('load'); ev.isTrusted = true; win.dispatchEvent(ev); } catch (e) {}
+    try { const ev = new Event('load'); ev._isTrusted = true; win.dispatchEvent(ev); } catch (e) {}
   }, 0);
 };
 const _loadPopupUrl = async function(win, fullUrl) {
@@ -68114,7 +68447,7 @@ globalThis.postMessage = function(message, targetOriginOrOptions) {
   _queueTask(() => {
     try {
       const ev = new MessageEvent('message', { data: data, origin: _srcOrigin, source: _srcWin });
-      ev.isTrusted = true;
+      ev._isTrusted = true;
       _dispatchSpec(globalThis, ev);
     } catch (e) {}
   });
@@ -76175,7 +76508,7 @@ if (typeof FileReader === 'undefined') {
       let ev;
       try { ev = new ProgressEvent(type, { lengthComputable: false, loaded: 0, total: 0 }); }
       catch (e) { ev = new Event(type); }
-      ev.isTrusted = true;
+      ev._isTrusted = true;
       _dispatchSpec(this, ev);
     }
     _read(blob, kind, encoding) {
@@ -76716,7 +77049,7 @@ if (typeof FileReader === 'undefined') {
 
   const _sseOrigin = (u) => { try { return new URL(u).origin; } catch (e) { return ''; } };
 
-  globalThis.EventSource = class EventSource extends Node {
+  globalThis.EventSource = class EventSource extends EventTarget {
     constructor(url, eventSourceInitDict) {
       super(undefined);
       if (arguments.length < 1)
@@ -76783,7 +77116,7 @@ if (typeof FileReader === 'undefined') {
       if (this._handle) { try { Deno.core.ops.op_sse_close(this._handle); } catch (e) {} this._handle = 0; }
     }
 
-    _fire(ev) { ev.isTrusted = true; _dispatchSpec(this, ev); }
+    _fire(ev) { ev._isTrusted = true; _dispatchSpec(this, ev); }
 
     // §"fail the connection": permanent. The server said something that will not
     // become right by asking again (a 404, an HTML error page), so retrying
@@ -77238,7 +77571,7 @@ globalThis.WebSocket = class WebSocket {
     }
   }
 
-  _fire(ev) { ev.isTrusted = true; _dispatchSpec(this, ev); }
+  _fire(ev) { ev._isTrusted = true; _dispatchSpec(this, ev); }
 
   _closeWith(code, reason, clean) {
     if (this._readyState === 3) return;
@@ -79358,7 +79691,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
       shape: {t:"string"},
       type: {t:"string"},
     },
-    HTMLAudioElement: {
+    HTMLMediaElement: {
       autoplay: {t:"boolean"},
       controls: {t:"boolean"},
       defaultMuted: {t:"boolean", a:"muted"},
@@ -79369,6 +79702,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
     HTMLBRElement: {
       clear: {t:"string"},
     },
+
     HTMLButtonElement: {
       formAction: {t:"url", docUrl:true},
       formEnctype: {t:"enum", i:"application/x-www-form-urlencoded", k:["application/x-www-form-urlencoded", "multipart/form-data", "text/plain"]},
@@ -79597,6 +79931,121 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
       width: {t:"unsigned long"},
     },
   };
+
+  // ── Reflections added on top of the transcribed table ─────────────────────
+  // Several of these interfaces already have a block above; JavaScript object
+  // literals keep only the LAST key of a duplicated name, which would have
+  // silently deleted everything the first block declared. So the additions live
+  // in their own table and are merged member-by-member.
+  const _REFLECTIONS_EXTRA = {
+    HTMLAreaElement: {
+      referrerPolicy: {t:"enum", d:"", i:"", k:["", "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin", "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url"]},
+    },
+    HTMLBodyElement: {
+      aLink: {t:"string", a:"alink", nes:true},
+      background: {t:"string"},
+      bgColor: {t:"string", a:"bgcolor", nes:true},
+      link: {t:"string", nes:true},
+      text: {t:"string", nes:true},
+      vLink: {t:"string", a:"vlink", nes:true},
+    },
+    HTMLEmbedElement: {
+      align: {t:"string"},
+      height: {t:"string"},
+      width: {t:"string"},
+    },
+    HTMLFormElement: {
+      acceptCharset: {t:"string", a:"accept-charset"},
+      action: {t:"url", docUrl:true},
+    },
+    HTMLFrameElement: {
+      marginHeight: {t:"string", a:"marginheight", nes:true},
+      marginWidth: {t:"string", a:"marginwidth", nes:true},
+    },
+    HTMLHRElement: {
+      size: {t:"string"},
+      width: {t:"string"},
+    },
+    HTMLIFrameElement: {
+      align: {t:"string"},
+      allow: {t:"string"},
+      allowFullscreen: {t:"boolean", a:"allowfullscreen"},
+      height: {t:"string"},
+      width: {t:"string"},
+      loading: {t:"enum", d:"eager", i:"eager", k:["lazy", "eager"]},
+      referrerPolicy: {t:"enum", d:"", i:"", k:["", "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin", "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url"]},
+    },
+    HTMLImageElement: {
+      fetchPriority: {t:"enum", d:"auto", i:"auto", k:["high", "low", "auto"]},
+      referrerPolicy: {t:"enum", d:"", i:"", k:["", "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin", "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url"]},
+      // ⛔ `sizes` is NOT here on purpose: the source-set algorithm reads
+      // `img.sizes` and distinguishes "no sizes attribute" (undefined) from an
+      // empty one, and a plain reflection getter answering "" for both made
+      // every `srcset` selection pick the wrong candidate. It belongs in the
+      // source-set code, not in a generated table.
+    },
+    HTMLInputElement: {
+      align: {t:"string"},
+      alt: {t:"string"},
+      alpha: {t:"boolean"},
+      colorSpace: {t:"enum", d:"limited-srgb", i:"limited-srgb", k:["limited-srgb", "display-p3"]},
+      dirName: {t:"string", a:"dirname"},
+    },
+    HTMLLIElement: {
+      type: {t:"string"},
+      value: {t:"long"},
+    },
+    HTMLLegendElement: {
+      align: {t:"string"},
+    },
+    HTMLLinkElement: {
+      charset: {t:"string"},
+      disabled: {t:"boolean"},
+      fetchPriority: {t:"enum", d:"auto", i:"auto", k:["high", "low", "auto"]},
+      imageSizes: {t:"string", a:"imagesizes"},
+      imageSrcset: {t:"string", a:"imagesrcset"},
+      media: {t:"string"},
+      referrerPolicy: {t:"enum", d:"", i:"", k:["", "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin", "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url"]},
+    },
+    HTMLMetaElement: {
+      content: {t:"string"},
+      httpEquiv: {t:"string", a:"http-equiv"},
+    },
+    HTMLObjectElement: {
+      align: {t:"string"},
+      height: {t:"string"},
+      width: {t:"string"},
+    },
+    HTMLPreElement: {
+      width: {t:"long"},
+    },
+    HTMLScriptElement: {
+      async: {t:"boolean"},
+      charset: {t:"string"},
+      defer: {t:"boolean"},
+      fetchPriority: {t:"enum", d:"auto", i:"auto", k:["high", "low", "auto"]},
+      referrerPolicy: {t:"enum", d:"", i:"", k:["", "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin", "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url"]},
+    },
+    HTMLSourceElement: {
+      height: {t:"unsigned long"},
+      width: {t:"unsigned long"},
+    },
+    HTMLStyleElement: {
+      type: {t:"string"},
+    },
+    HTMLTableElement: {
+      align: {t:"string"},
+    },
+    HTMLTableRowElement: {
+      align: {t:"string"},
+    },
+    HTMLTableSectionElement: {
+      align: {t:"string"},
+    },
+  };
+  for (const _iface in _REFLECTIONS_EXTRA) {
+    _REFLECTIONS[_iface] = Object.assign(_REFLECTIONS[_iface] || {}, _REFLECTIONS_EXTRA[_iface]);
+  }
 
   for (const ifaceName in _REFLECTIONS) {
     const C = globalThis[ifaceName];
@@ -86749,13 +87198,14 @@ globalThis.__obscura_init = function() {
   // both missed — so a real global or Web API can never be shadowed by page
   // markup, which is exactly the guarantee the old code was hand-rolling.
   try {
-    // ⛔ The chain stops at Object.prototype rather than continuing through
-    // EventTarget.prototype, because in this engine `EventTarget` IS `Node`
-    // (see `globalThis.EventTarget = Node`) — splicing Node.prototype above the
-    // global would hand every page a `window.parentNode`, `window.textContent`
-    // and forty more Node accessors invoked with a receiver that has no node id.
-    // A real, separate EventTarget interface is the prerequisite; until then the
-    // last two subtests of window-prototype-chain.html stay red, honestly.
+    // HTML §"the Window object": the chain is
+    //   window → Window.prototype → WindowProperties → EventTarget.prototype.
+    // That last hop was impossible while `EventTarget` was an alias for `Node`
+    // (splicing Node.prototype above the global would have handed every page a
+    // `window.parentNode`, `window.textContent` and forty more Node accessors
+    // invoked with a receiver that has no node id). EventTarget is its own
+    // interface now, carrying only the three dispatch operations, so the real
+    // chain is safe to build.
     // Own slots for the two fields `_windowIsLive` reads, so the commonest
     // internal question about the main window is answered by a property hit
     // instead of a walk down to the named-properties object and a tree query.
@@ -86781,7 +87231,7 @@ globalThis.__obscura_init = function() {
       } catch (e) {}
       return true;
     };
-    const _npoTarget = Object.create(Object.prototype);
+    const _npoTarget = Object.create(globalThis.EventTarget ? globalThis.EventTarget.prototype : Object.prototype);
     Object.defineProperty(_npoTarget, Symbol.toStringTag,
       { value: 'WindowProperties', writable: false, enumerable: false, configurable: true });
     const _windowProperties = new Proxy(_npoTarget, {
@@ -86818,6 +87268,426 @@ globalThis.__obscura_init = function() {
     Object.setPrototypeOf(globalThis.Window.prototype, _windowProperties);
     Object.setPrototypeOf(globalThis, globalThis.Window.prototype);
   } catch (e) {}
+
+  // ── WebIDL: "called with too few arguments must throw TypeError" ────────────
+  // Every WebIDL operation with required arguments throws a TypeError when it is
+  // called with fewer, and its `.length` IS that required count. Writing that
+  // check by hand at each call site is how a hundred of them came to be missing,
+  // so the counts live in one table instead and a single wrapper enforces them.
+  //
+  // The wrapper keeps the method's name, its property descriptor (WebIDL
+  // operations are writable, enumerable, configurable on the prototype) and its
+  // `this`, and it is a no-op for any name the interface does not actually have —
+  // so a table entry for something we have not built yet costs nothing.
+  const _arityMark = Symbol('obscura.arityGuarded');
+  const _arityLabel = (iface, name, need, got) =>
+    "Failed to execute '" + name + "' on '" + iface + "': " + need +
+    (need === 1 ? " argument required, but only " : " arguments required, but only ") +
+    got + " present.";
+
+  function _requireArgs(target, iface, spec) {
+    if (!target) return;
+    for (const name of Object.keys(spec)) {
+      const need = spec[name];
+      let desc;
+      try { desc = Object.getOwnPropertyDescriptor(target, name); } catch (e) { continue; }
+      if (!desc || typeof desc.value !== 'function') continue;
+      const orig = desc.value;
+      // A second pass over the same table must not stack wrappers.
+      if (orig[_arityMark]) continue;
+      const guarded = function () {
+        if (arguments.length < need) {
+          throw new TypeError(_arityLabel(iface, name, need, arguments.length));
+        }
+        return Reflect.apply(orig, this, arguments);
+      };
+      Object.defineProperty(guarded, 'name', { value: name, configurable: true });
+      Object.defineProperty(guarded, 'length', { value: need, configurable: true });
+      Object.defineProperty(guarded, _arityMark, { value: true });
+      try {
+        Object.defineProperty(target, name, {
+          value: guarded,
+          writable: desc.writable !== false,
+          enumerable: desc.enumerable === true,
+          configurable: desc.configurable !== false,
+        });
+      } catch (e) { /* a frozen interface keeps what it had */ }
+    }
+  }
+
+  // Prototype operations, keyed by interface exactly as WebIDL declares them:
+  // the count is the number of arguments BEFORE the first `optional` (a
+  // variadic tail is optional, hence 0).
+  const _ARITY_PROTO = {
+    EventTarget: { addEventListener: 2, removeEventListener: 2, dispatchEvent: 1 },
+    Node: {
+      isEqualNode: 1, isSameNode: 1, compareDocumentPosition: 1, contains: 1,
+      lookupPrefix: 1, lookupNamespaceURI: 1, isDefaultNamespace: 1,
+      insertBefore: 2, appendChild: 1, replaceChild: 2, removeChild: 1,
+    },
+    Document: {
+      getElementsByTagName: 1, getElementsByTagNameNS: 2, getElementsByClassName: 1,
+      createElement: 1, createElementNS: 2, createTextNode: 1, createCDATASection: 1,
+      createComment: 1, createProcessingInstruction: 2, importNode: 1, adoptNode: 1,
+      createAttribute: 1, createAttributeNS: 2, createEvent: 1, getElementById: 1,
+      createNodeIterator: 1, createTreeWalker: 1,
+      createExpression: 1, createNSResolver: 1, evaluate: 2,
+      getElementsByName: 1, elementFromPoint: 2, elementsFromPoint: 2,
+    },
+    DocumentFragment: { getElementById: 1 },
+    DocumentType: {},
+    Element: {
+      getAttribute: 1, getAttributeNS: 2, setAttribute: 2, setAttributeNS: 3,
+      removeAttribute: 1, removeAttributeNS: 2, toggleAttribute: 1,
+      hasAttribute: 1, hasAttributeNS: 2, getAttributeNode: 1, getAttributeNodeNS: 2,
+      setAttributeNode: 1, setAttributeNodeNS: 1, removeAttributeNode: 1,
+      getElementsByTagName: 1, getElementsByTagNameNS: 2, getElementsByClassName: 1,
+      insertAdjacentElement: 2, insertAdjacentText: 2, insertAdjacentHTML: 2,
+      matches: 1, webkitMatchesSelector: 1, closest: 1, attachShadow: 1,
+      querySelector: 1, querySelectorAll: 1,
+    },
+    Text: { splitText: 1 },
+    CharacterData: {
+      substringData: 2, appendData: 1, insertData: 2, deleteData: 2, replaceData: 3,
+    },
+    AbortController: { abort: 0 },
+    Range: {
+      collapse: 0, cloneRange: 0, detach: 0, toString: 0,
+      setStart: 2, setEnd: 2, setStartBefore: 1, setStartAfter: 1,
+      setEndBefore: 1, setEndAfter: 1, selectNode: 1, selectNodeContents: 1,
+      compareBoundaryPoints: 2, insertNode: 1, surroundContents: 1,
+      isPointInRange: 2, comparePoint: 2, intersectsNode: 1,
+      createContextualFragment: 1,
+    },
+    AbstractRange: {},
+    NodeList: { item: 1 },
+    HTMLCollection: { item: 1, namedItem: 1 },
+    NamedNodeMap: {
+      item: 1, getNamedItem: 1, getNamedItemNS: 2, setNamedItem: 1,
+      setNamedItemNS: 1, removeNamedItem: 1, removeNamedItemNS: 2,
+    },
+    DOMTokenList: {
+      item: 1, contains: 1, toggle: 1, replace: 2, supports: 1,
+    },
+    DOMStringMap: {},
+    DOMImplementation: { createDocumentType: 3, createDocument: 2, createHTMLDocument: 0, hasFeature: 0 },
+    MutationObserver: { observe: 1 },
+    Event: { initEvent: 1 },
+    CustomEvent: { initCustomEvent: 1 },
+    XPathResult: { snapshotItem: 1 },
+    XPathEvaluator: { createExpression: 1, createNSResolver: 1, evaluate: 2 },
+    XPathExpression: { evaluate: 1 },
+    XSLTProcessor: {
+      importStylesheet: 1, transformToFragment: 2, transformToDocument: 1,
+      setParameter: 3, getParameter: 2, removeParameter: 2,
+    },
+    CSSStyleDeclaration: {
+      getPropertyValue: 1, getPropertyPriority: 1, setProperty: 2,
+      removeProperty: 1, item: 1,
+    },
+    // The HTML element interfaces. `setRangeText` is overloaded — one form takes
+    // just the replacement string — so its required count is the MINIMUM across
+    // the overloads, which is what the interface object's `length` reports too.
+    HTMLAllCollection: { item: 0, namedItem: 1 },
+    HTMLButtonElement: { setCustomValidity: 1 },
+    HTMLFieldSetElement: { setCustomValidity: 1 },
+    HTMLFormElement: { requestSubmit: 0, reset: 0, submit: 0 },
+    HTMLInputElement: { setCustomValidity: 1, setRangeText: 1, setSelectionRange: 2, stepUp: 0, stepDown: 0 },
+    HTMLMediaElement: { addTextTrack: 1, canPlayType: 1, fastSeek: 1 },
+    HTMLObjectElement: { setCustomValidity: 1 },
+    HTMLOptionsCollection: { add: 1, remove: 1 },
+    HTMLOutputElement: { setCustomValidity: 1 },
+    HTMLScriptElement: { supports: 1 },
+    HTMLSelectElement: { item: 1, namedItem: 1, setCustomValidity: 1, add: 1, remove: 0 },
+    HTMLTableElement: { deleteRow: 1, insertRow: 0 },
+    HTMLTableRowElement: { deleteCell: 1, insertCell: 0 },
+    HTMLTableSectionElement: { deleteRow: 1, insertRow: 0 },
+    HTMLTextAreaElement: { setCustomValidity: 1, setRangeText: 1, setSelectionRange: 2 },
+  };
+
+  // Static operations live on the constructor, not the prototype.
+  const _ARITY_STATIC = {
+    AbortSignal: { abort: 0, timeout: 1, any: 1 },
+    HTMLScriptElement: { supports: 1 },
+    Document: { parseHTMLUnsafe: 1 },
+    Range: {},
+  };
+
+  try {
+    for (const iface of Object.keys(_ARITY_PROTO)) {
+      const ctor = globalThis[iface];
+      if (ctor && ctor.prototype) _requireArgs(ctor.prototype, iface, _ARITY_PROTO[iface]);
+    }
+    // Same table again, down every intermediate prototype a subclass introduces:
+    // an override that forgot the argument check is still the DECLARING
+    // interface's operation as far as a page (and idlharness) is concerned.
+    for (const g of Object.getOwnPropertyNames(globalThis)) {
+      if (_ES_BUILTIN_GLOBALS.has(g)) continue;
+      // Read the DESCRIPTOR, never the property: `globalThis.document` is an
+      // accessor that materializes the document, and running it here — before
+      // the page has been parsed — cached a null `doctype` for the lifetime of
+      // the page. A sweep must not be able to change what it is sweeping.
+      let d;
+      try { d = Object.getOwnPropertyDescriptor(globalThis, g); } catch (e) { continue; }
+      if (!d || !('value' in d)) continue;
+      const sub = d.value;
+      if (typeof sub !== 'function' || !sub.prototype) continue;
+      for (const iface of Object.keys(_ARITY_PROTO)) {
+        const base = globalThis[iface];
+        if (!base || base === sub || typeof base !== 'function' || !base.prototype) continue;
+        if (!(sub.prototype instanceof base)) continue;
+        let proto = sub.prototype;
+        let guard = 0;
+        while (proto && proto !== base.prototype && guard++ < 16) {
+          _requireArgs(proto, iface, _ARITY_PROTO[iface]);
+          proto = Object.getPrototypeOf(proto);
+        }
+      }
+    }
+    for (const iface of Object.keys(_ARITY_STATIC)) {
+      const ctor = globalThis[iface];
+      if (ctor) _requireArgs(ctor, iface, _ARITY_STATIC[iface]);
+    }
+  } catch (e) {}
+
+
+  // ── WebIDL: the SHAPE of an interface object ────────────────────────────────
+  // Two rules that every interface on the platform obeys and that a plain
+  // `globalThis.Foo = class Foo {}` quietly breaks:
+  //
+  //  1. §3.7 — an interface object is exposed on the global as
+  //     { writable: true, enumerable: FALSE, configurable: true }. A plain
+  //     assignment makes it enumerable, so `for (const k in window)` walks the
+  //     platform's entire class list — hundreds of names a page never named, in
+  //     front of the handful it did.
+  //  2. §3.7.4 — a CONSTANT is { writable: false, enumerable: true,
+  //     configurable: false } on BOTH the interface object and its prototype.
+  //     `Node.ELEMENT_NODE = 99` must not be a thing a page can do.
+  //
+  // Both are swept generically at the end of init rather than written out at each
+  // definition site, because the definition sites are eight hundred lines apart
+  // and the next interface added would have missed them again.
+  const _IDL_NAMESPACE_OBJECTS = ['NodeFilter', 'CSS', 'WebAssembly', 'console'];
+
+  //  3. §3.7.6 / §3.7.7 — an operation and an attribute are ENUMERABLE on the
+  //     interface prototype object. Every interface here is an ES class, and an
+  //     ES class method is NOT enumerable, so `Object.keys(Node.prototype)` came
+  //     back empty where a browser lists the whole DOM. Anything named `_…` is
+  //     ours and stays hidden; `constructor`, `length`, `name`, `prototype` and
+  //     every symbol keep the descriptors the language gives them.
+  // `length`/`name` are the FUNCTION's own — never enumerable on the interface
+  // object. On the interface PROTOTYPE they are ordinary IDL attributes
+  // (`NamedNodeMap.prototype.length`), so the exclusion is per-holder.
+  const _IDL_CTOR_NEVER_ENUMERABLE = new Set(['constructor', 'prototype', 'length', 'name']);
+
+  //  4. §3.7.5 — every member brand-checks its `this`. `Document.prototype.URL`
+  //     read off the PROTOTYPE, or `Element.prototype.setAttribute.call({}, …)`,
+  //     must throw a TypeError rather than quietly answering. That is not test
+  //     trivia: a member that answers for any `this` is a member that will read
+  //     one object's private field off another object that happens to have a
+  //     similarly-named one.
+  const _brandMark = Symbol('obscura.brandChecked');
+  // WebIDL §3.7.6: "if the operation's return type is a promise type, ... return
+  // a promise rejected with the exception" — a promise-returning operation
+  // NEVER throws synchronously, not even for a `this` of the wrong brand. A
+  // caller writing `handle.getFile().catch(…)` has one place to handle failure,
+  // and a synchronous throw walks straight past it.
+  //
+  // Nothing in the shape of a function says what it returns, so ask its source
+  // (through the toString the engine kept before the page-facing one was
+  // installed): an `async` operation, or one that hands back a Promise, is a
+  // promise-returning operation.
+  // `_promise(...)` is this engine's own "run this body and hand back a promise"
+  // helper (WebCryptoAPI's whole surface is built on it) and
+  // `promiseRejectedWith`/`promiseResolvedWith` are the Streams reference
+  // implementation's, so both count.
+  const _PROMISE_SOURCE_RE =
+    /^\s*async[\s(]|\bPromise\b|\b_promise\s*\(|\bpromise(?:Rejected|Resolved)With\s*\(/;
+  const _returnsPromise = function (fn) {
+    try { return _PROMISE_SOURCE_RE.test(_origToString.call(fn)); } catch (e) { return false; }
+  };
+  // A member that ALREADY brand-checks needs no wrapper, and the hottest members
+  // on the platform (every `getAttribute`, every geometry getter) are exactly the
+  // ones that were written with the check by hand. Wrapping them would add a
+  // second `instanceof` and a second stack frame to the DOM's busiest paths for
+  // no behaviour at all.
+  const _SELF_CHECKED_RE = /Illegal invocation|Illegal constructor/;
+  const _selfBrandChecks = function (fn) {
+    try { return _SELF_CHECKED_RE.test(_origToString.call(fn)); } catch (e) { return false; }
+  };
+
+  function _idlBrandWrap(fn, ctor, iface, kind, name) {
+    if (typeof fn !== 'function' || fn[_brandMark] || _selfBrandChecks(fn)) return fn;
+    const asPromise = _returnsPromise(fn);
+    const wrapped = function () {
+      // `undefined`/`null` and any object outside the interface are rejected;
+      // the interface object's own prototype is deliberately NOT an instance.
+      if (!(this instanceof ctor)) {
+        const err = new TypeError("Failed to " + (kind === 'op' ? "execute '" + name + "' on '"
+          : (kind === 'set' ? "set the '" : "read the '") + name + "' property " + (kind === 'set' ? "on '" : "from '"))
+          + iface + "': Illegal invocation");
+        if (asPromise) return Promise.reject(err);
+        throw err;
+      }
+      return fn.apply(this, arguments);
+    };
+    try {
+      // WebIDL §3.7.6/§3.7.7: the operation's function is named for the
+      // operation; an accessor's is "get foo" / "set foo". An object-literal
+      // `{ get() {…} }` is named just "get", and a mixin installed as
+      // `Proto.prepend = _pnPrepend` carries the helper's internal name.
+      Object.defineProperty(wrapped, 'name', { value: kind === 'op' ? name : kind + ' ' + name, configurable: true });
+      Object.defineProperty(wrapped, 'length', { value: fn.length, configurable: true });
+    } catch (e) {}
+    Object.defineProperty(wrapped, _brandMark, { value: true });
+    return wrapped;
+  }
+  // Window is excluded: its members are reached through the global object and
+  // through every same-realm frame's window, and `globalThis instanceof Window`
+  // is the only one of those we can promise.
+  const _IDL_NO_BRAND = new Set(['Window']);
+
+  //  5. §3.7.5 — the interface prototype object carries a @@toStringTag whose
+  //     value is the interface's identifier, which is what makes
+  //     `Object.prototype.toString.call(node)` say `[object HTMLDivElement]`
+  //     instead of `[object Object]`. Only added where one is absent: an
+  //     interface that already declares its own knows better.
+  function _idlFixToStringTag(ctor, iface) {
+    try {
+      if (Object.getOwnPropertyDescriptor(ctor.prototype, Symbol.toStringTag)) return;
+      Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+        value: iface, writable: false, enumerable: false, configurable: true,
+      });
+    } catch (e) {}
+  }
+
+  function _idlFixEnumerability(ctor, iface) {
+    const brand = !_IDL_NO_BRAND.has(iface);
+    for (const holder of [ctor.prototype, ctor]) {
+      const isProto = holder === ctor.prototype;
+      let keys;
+      try { keys = Object.getOwnPropertyNames(holder); } catch (e) { continue; }
+      for (const k of keys) {
+        if (k.charCodeAt(0) === 95) continue;
+        if (isProto ? k === 'constructor' : _IDL_CTOR_NEVER_ENUMERABLE.has(k)) continue;
+        const d = Object.getOwnPropertyDescriptor(holder, k);
+        if (!d || !d.configurable) continue;
+        const orig = d.value;
+        let changed = false;
+        // A constant was just fixed to {writable:false, configurable:false} and
+        // is already enumerable; anything else non-configurable is not ours.
+        if (!d.enumerable) { d.enumerable = true; changed = true; }
+        if (brand && isProto) {
+          if (typeof d.value === 'function') {
+            const w = _idlBrandWrap(d.value, ctor, iface, 'op', k);
+            if (w !== d.value) { d.value = w; changed = true; }
+          } else if (d.get || d.set) {
+            const g = d.get ? _idlBrandWrap(d.get, ctor, iface, 'get', k) : d.get;
+            const st = d.set ? _idlBrandWrap(d.set, ctor, iface, 'set', k) : d.set;
+            if (g !== d.get || st !== d.set) { d.get = g; d.set = st; changed = true; }
+          }
+        }
+        if (!changed) continue;
+        // A maplike/setlike/iterable interface installs the SAME function object
+        // under a symbol key as under its name — `AudioParamMap.prototype
+        // [Symbol.iterator] === AudioParamMap.prototype.entries` is a thing the
+        // spec asserts. Wrapping the named one alone would break that identity,
+        // so the symbol alias follows its function.
+        const before = orig;
+        try { Object.defineProperty(holder, k, d); } catch (e) { continue; }
+        const after = d.value;
+        if (typeof after === 'function' && after !== before) {
+          for (const sym of Object.getOwnPropertySymbols(holder)) {
+            const sd = Object.getOwnPropertyDescriptor(holder, sym);
+            if (sd && sd.configurable && sd.value === before) {
+              sd.value = after;
+              try { Object.defineProperty(holder, sym, sd); } catch (e) {}
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // §3.7.1 — an interface object's `length` is the number of REQUIRED arguments
+  // of its constructor, and 0 for an interface with no constructor at all. An ES
+  // class reports its declared parameter count, which counts the optional ones.
+  const _ARITY_CTOR = {
+    Event: 1, CustomEvent: 1, MutationObserver: 1, StaticRange: 1, AbortController: 0,
+    AbortSignal: 0, EventTarget: 0, Node: 0, Document: 0, XMLDocument: 0,
+    DocumentFragment: 0, ShadowRoot: 0, DocumentType: 0, CharacterData: 0,
+    Text: 0, Comment: 0, CDATASection: 0, ProcessingInstruction: 0,
+    Element: 0, Attr: 0, NamedNodeMap: 0, NodeList: 0, HTMLCollection: 0,
+    DOMTokenList: 0, DOMStringMap: 0, DOMImplementation: 0, MutationRecord: 0,
+    Range: 0, AbstractRange: 0, NodeIterator: 0, TreeWalker: 0,
+    XPathResult: 0, XPathExpression: 0, XPathEvaluator: 0,
+  };
+  const _isConstantName = (k) => /^[A-Z][A-Z0-9_]*$/.test(k);
+
+  function _idlFixConstants(holder) {
+    if (!holder) return;
+    let keys;
+    try { keys = Object.getOwnPropertyNames(holder); } catch (e) { return; }
+    for (const k of keys) {
+      if (!_isConstantName(k)) continue;
+      const d = Object.getOwnPropertyDescriptor(holder, k);
+      // Only a plain numeric/boolean data property is a WebIDL constant, and only
+      // a configurable one can be corrected — an ES built-in's own frozen
+      // constants (Number.EPSILON, …) are neither ours nor wrong.
+      if (!d || !d.configurable || !('value' in d)) continue;
+      const t = typeof d.value;
+      if (t !== 'number' && t !== 'boolean') continue;
+      try {
+        Object.defineProperty(holder, k, {
+          value: d.value, writable: false, enumerable: true, configurable: false,
+        });
+      } catch (e) {}
+    }
+  }
+
+  try {
+    for (const k of Object.getOwnPropertyNames(globalThis)) {
+      const d = Object.getOwnPropertyDescriptor(globalThis, k);
+      if (!d || !d.configurable || !('value' in d)) continue;
+      const v = d.value;
+      // An interface object is a CLASS. An ordinary function also has a
+      // `prototype` whose `constructor` points back at it — `window.getSelection`
+      // looked exactly like an interface by that test, and making it
+      // non-enumerable took it out of `for (k in window)` where WebIDL puts it.
+      // A class's `prototype` is non-writable; a function's is writable. That is
+      // the difference, and it is the only one visible from here.
+      const isInterface =
+        typeof v === 'function' &&
+        v.prototype && typeof v.prototype === 'object' &&
+        Object.getOwnPropertyDescriptor(v.prototype, 'constructor') &&
+        v.prototype.constructor === v &&
+        Object.getOwnPropertyDescriptor(v, 'prototype').writable === false;
+      const isNamespace = _IDL_NAMESPACE_OBJECTS.indexOf(k) !== -1;
+      if (!isInterface && !isNamespace) continue;
+      if (d.enumerable) {
+        try {
+          Object.defineProperty(globalThis, k, {
+            value: v, writable: d.writable !== false, enumerable: false, configurable: true,
+          });
+        } catch (e) {}
+      }
+      if (isInterface && v.name === '') {
+        try { Object.defineProperty(v, 'name', { value: k, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+      }
+      _idlFixConstants(v);
+      if (isInterface) {
+        _idlFixConstants(v.prototype);
+        if (!_ES_BUILTIN_GLOBALS.has(k)) {
+          _idlFixEnumerability(v, k);
+          if (k !== 'Window') _idlFixToStringTag(v, k);
+          if (Object.prototype.hasOwnProperty.call(_ARITY_CTOR, k)) {
+            try { Object.defineProperty(v, 'length', { value: _ARITY_CTOR[k], writable: false, enumerable: false, configurable: true }); } catch (e) {}
+          }
+        }
+      }
+    }
+  } catch (e) {}
+
 
   delete globalThis.__obscura_init;
 };

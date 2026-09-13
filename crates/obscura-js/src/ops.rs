@@ -1866,26 +1866,210 @@ fn url_components_json(u: &url::Url) -> String {
     .to_string()
 }
 
+/// Byte range of the host inside a URL-shaped string (userinfo and `:port`
+/// excluded), or `None` when the string carries no authority.
+///
+/// Only ever called on the IDNA-failure retry path below, so it is allowed to be
+/// approximate about exotic inputs: the worst outcome of a wrong answer is that
+/// the retry does not fire and we report the same failure we already had.
+fn url_host_span(input: &str) -> Option<std::ops::Range<usize>> {
+    // WHATWG strips leading C0-control-or-space before parsing.
+    let lead = input.len() - input.trim_start_matches(|c: char| c <= ' ').len();
+    let s = &input[lead..];
+
+    // An absolute reference starts `scheme:`; a scheme-relative one starts `//`.
+    let after_scheme = match s.find(':') {
+        Some(i)
+            if i > 0
+                && s.as_bytes()[0].is_ascii_alphabetic()
+                && s.as_bytes()[..i]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) =>
+        {
+            i + 1
+        }
+        _ => 0,
+    };
+    let rest = &s[after_scheme..];
+    // "special authority slashes state": two or more slashes (either lean) open
+    // the authority; fewer means this reference has no host of its own.
+    let slashes = rest
+        .bytes()
+        .take_while(|b| *b == b'/' || *b == b'\\')
+        .count();
+    if slashes < 2 {
+        return None;
+    }
+    let auth_start = after_scheme + slashes;
+    let auth = &s[auth_start..];
+    let auth_len = auth
+        .find(|c| c == '/' || c == '?' || c == '#' || c == '\\')
+        .unwrap_or(auth.len());
+    let auth = &auth[..auth_len];
+
+    // Credentials end at the LAST `@`; a port begins at the last `:` outside an
+    // IPv6 literal (which we decline to touch at all).
+    let host_start = auth.rfind('@').map(|i| i + 1).unwrap_or(0);
+    let host = &auth[host_start..];
+    if host.starts_with('[') {
+        return None;
+    }
+    let host_len = host.rfind(':').unwrap_or(host.len());
+    let base = lead + auth_start + host_start;
+    Some(base..base + host_len)
+}
+
+/// Rewrite every `xn--` label of an all-ASCII host so that the `idna` crate will
+/// stop trying to decode it, WITHOUT changing its length. Returns `None` when the
+/// host is not all-ASCII, carries a percent-escape (rust-url would change its
+/// length by decoding), or holds no `xn--` label to rewrite.
+fn mask_punycode_labels(host: &str) -> Option<String> {
+    if host.is_empty() || !host.is_ascii() || host.contains('%') {
+        return None;
+    }
+    let mut out = String::with_capacity(host.len());
+    let mut masked_any = false;
+    for (i, label) in host.split('.').enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        if label.len() >= 4 && label[..2].eq_ignore_ascii_case("xn") && &label[2..4] == "--" {
+            // `xn--ab-j1t` -> `xnaaab-j1t`: same length, same trailing bytes, but
+            // no longer an ACE prefix, so UTS-46 leaves the label alone.
+            out.push_str(&label[..2]);
+            out.push_str("aa");
+            out.push_str(&label[4..]);
+            masked_any = true;
+        } else {
+            out.push_str(label);
+        }
+    }
+    if masked_any {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// The WHATWG URL Standard does not re-encode a domain that is ALREADY ASCII.
+/// `xn--ab-j1t` is punycode for `a<ZWNJ>b`, which UTS-46 rejects (CONTEXTJ) — but
+/// the host the page asked for was plain ASCII text, so the answer is that text,
+/// lowercased, not a thrown TypeError. Every browser behaves this way; the `idna`
+/// crate has no knob for it and fails the whole parse instead.
+///
+/// So: when — and only when — rust-url refuses a host for an IDNA reason, hand it
+/// the same host with each `xn--` label disguised (equal length, no longer an ACE
+/// prefix) and remember the pair, so the caller can put the real labels back into
+/// the components it serializes. Everything else about the host — forbidden code
+/// points, an IPv4 shorthand, an empty authority — is still judged by rust-url,
+/// on the disguised host, exactly as before.
+type PunycodeDisguise = (String, String);
+
+/// Restore a disguised host in the JSON components `url_components_json` produced.
+/// Both strings are ASCII and the same length, so this is a straight substitution
+/// — and in `href` the authority is the first thing after the scheme, so the first
+/// occurrence is always the right one.
+fn restore_disguised_host(json: &str, masked: &str, real: &str) -> String {
+    let mut v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return json.to_string(),
+    };
+    for key in ["host", "hostname", "origin", "href"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            let fixed = s.replacen(masked, real, 1);
+            v[key] = serde_json::Value::String(fixed);
+        }
+    }
+    v.to_string()
+}
+
+/// Parse a URL, tolerating an all-ASCII host that UTS-46 rejects. Returns the
+/// parsed URL plus the disguise to undo (if one was needed).
+fn url_parse_tolerating_ascii_punycode(
+    input: &str,
+    base: Option<&url::Url>,
+) -> Option<(url::Url, Option<PunycodeDisguise>)> {
+    let first = match base {
+        Some(b) => b.join(&collapse_special_authority_slashes(input, b)),
+        None => url::Url::parse(input),
+    };
+    let err = match first {
+        Ok(u) => return Some((u, None)),
+        Err(e) => e,
+    };
+    if err != url::ParseError::IdnaError {
+        return None;
+    }
+    let span = url_host_span(input)?;
+    let host = &input[span.clone()];
+    let masked = mask_punycode_labels(host)?;
+
+    let mut disguised = String::with_capacity(input.len());
+    disguised.push_str(&input[..span.start]);
+    disguised.push_str(&masked);
+    disguised.push_str(&input[span.end..]);
+
+    let parsed = match base {
+        Some(b) => b.join(&collapse_special_authority_slashes(&disguised, b)),
+        None => url::Url::parse(&disguised),
+    }
+    .ok()?;
+
+    // rust-url lowercases an ASCII host; if it rewrote it further (an IPv4
+    // shorthand, say) the disguise is no longer a substring and we must not guess.
+    let from = masked.to_ascii_lowercase();
+    if parsed.host_str() != Some(from.as_str()) {
+        return None;
+    }
+    let to = host.to_ascii_lowercase();
+    Some((parsed, Some((from, to))))
+}
+
+/// `Url::set_host` with the same tolerance. `Ok(Some(pair))` means the host was
+/// set under a disguise the caller must undo; `Ok(None)` means it was set as-is.
+fn set_host_tolerating_ascii_punycode(
+    u: &mut url::Url,
+    host: &str,
+) -> Result<Option<PunycodeDisguise>, ()> {
+    match u.set_host(Some(host)) {
+        Ok(()) => Ok(None),
+        Err(url::ParseError::IdnaError) => {
+            let masked = mask_punycode_labels(host).ok_or(())?;
+            u.set_host(Some(&masked)).map_err(|_| ())?;
+            let from = masked.to_ascii_lowercase();
+            if u.host_str() != Some(from.as_str()) {
+                return Err(());
+            }
+            Ok(Some((from, host.to_ascii_lowercase())))
+        }
+        Err(_) => Err(()),
+    }
+}
+
 /// WHATWG URL parsing backing the JS `URL` class. Uses the `url` crate (real
 /// spec parser) instead of a regex. Returns the components as JSON; `valid:false`
 /// (so JS throws TypeError) when the input can't be parsed (with the given base).
 #[op2]
 #[string]
 fn op_url_parse(#[string] input: String, #[string] base: String) -> String {
-    let parsed = if base.is_empty() {
-        url::Url::parse(&input)
+    let base_url = if base.is_empty() {
+        None
     } else {
         match url::Url::parse(&base) {
-            Ok(b) => {
-                let rel = collapse_special_authority_slashes(&input, &b);
-                b.join(&rel)
-            }
-            Err(e) => Err(e),
+            Ok(b) => Some(b),
+            // A base that will not parse is a failure no matter what `input` says.
+            Err(_) => return "{\"valid\":false}".to_string(),
         }
     };
-    match parsed {
-        Ok(u) => url_components_json(&u),
-        Err(_) => "{\"valid\":false}".to_string(),
+    match url_parse_tolerating_ascii_punycode(&input, base_url.as_ref()) {
+        Some((u, disguise)) => {
+            let json = url_components_json(&u);
+            match disguise {
+                Some((masked, real)) => restore_disguised_host(&json, &masked, &real),
+                None => json,
+            }
+        }
+        None => "{\"valid\":false}".to_string(),
     }
 }
 
@@ -1984,12 +2168,21 @@ fn op_url_set(#[string] href: String, #[string] part: String, #[string] value: S
     // (e.g. an empty host that corrupts internal offsets — url-2.5.8 lib.rs:2881).
     // Catch it so a URL setter can NEVER abort the process; a panic = no-op setter.
     let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut u = match url::Url::parse(&href) {
-            Ok(u) => u,
-            Err(_) => return None,
-        };
-        apply_url_setter(&mut u, &part, &value);
-        Some(url_components_json(&u))
+        // The href we are handed may itself carry an all-ASCII host UTS-46 rejects
+        // (a previous setter put it there), so re-parse it with the same tolerance.
+        let (mut u, mut disguise) = url_parse_tolerating_ascii_punycode(&href, None)?;
+        if let Some(pair) = apply_url_setter(&mut u, &part, &value) {
+            disguise = Some(pair);
+        }
+        let json = url_components_json(&u);
+        Some(match disguise {
+            // Only undo a disguise the FINAL host still wears — a later setter may
+            // have replaced the host outright.
+            Some((masked, real)) if u.host_str() == Some(masked.as_str()) => {
+                restore_disguised_host(&json, &masked, &real)
+            }
+            _ => json,
+        })
     }));
     match applied {
         Ok(Some(json)) => json,
@@ -2006,7 +2199,7 @@ fn strip_tab_newline(v: &str) -> String {
     v.chars().filter(|c| *c != '\t' && *c != '\n' && *c != '\r').collect()
 }
 
-fn apply_url_setter(u: &mut url::Url, part: &str, raw: &str) {
+fn apply_url_setter(u: &mut url::Url, part: &str, raw: &str) -> Option<PunycodeDisguise> {
     match part {
         // The userinfo setters DON'T strip tab/newline — they UTF-8 percent-encode
         // the value with the userinfo encode set, so \t/\n/\r become %09/%0A/%0D.
@@ -2045,7 +2238,7 @@ fn apply_url_setter(u: &mut url::Url, part: &str, raw: &str) {
                         // [IPv6] literal legitimately contains ':'.)
                         let candidate = truncate_host(&value, special);
                         if !candidate.starts_with('[') && candidate.contains(':') {
-                            return;
+                            return None;
                         }
                         let v = hostname_prefix(&value, special);
                         if v.is_empty() {
@@ -2053,7 +2246,7 @@ fn apply_url_setter(u: &mut url::Url, part: &str, raw: &str) {
                                 let _ = u.set_host(None);
                             }
                         } else {
-                            let _ = u.set_host(Some(v));
+                            return set_host_tolerating_ascii_punycode(u, v).unwrap_or(None);
                         }
                     }
                 }
@@ -2069,10 +2262,11 @@ fn apply_url_setter(u: &mut url::Url, part: &str, raw: &str) {
                             }
                         } else {
                             let (host, port) = split_host_port(v);
-                            if u.set_host(Some(host)).is_ok() {
+                            if let Ok(disguise) = set_host_tolerating_ascii_punycode(u, host) {
                                 if let Some(ps) = port {
                                     set_port_from(u, ps);
                                 }
+                                return disguise;
                             }
                         }
                     }
@@ -2095,6 +2289,7 @@ fn apply_url_setter(u: &mut url::Url, part: &str, raw: &str) {
             }
         }
     }
+    None
 }
 
 /// Decode bytes per the WHATWG Encoding Standard using `encoding_rs` (Gecko's
