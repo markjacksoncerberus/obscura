@@ -13811,6 +13811,10 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   get response() { return this._response; }
 
   open(method, url, async_) {
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to execute 'open' on 'XMLHttpRequest': 2 arguments required, but only " +
+        arguments.length + " present.");
+    }
     // §open: method is a ByteString. Coerce (>0xFF → TypeError), validate it is
     // a token (else SyntaxError), reject forbidden methods (SecurityError), then
     // byte-uppercase the well-known methods. (`open-method-bogus` etc.)
@@ -32081,6 +32085,13 @@ class CSSStyleValue {
     return v === null ? [] : [v];
   }
 }
+for (const _m of ['parse', 'parseAll']) {
+  const _fn = CSSStyleValue[_m];
+  if (typeof _fn === 'function') {
+    Object.defineProperty(_fn, 'name', { value: _m, configurable: true });
+    Object.defineProperty(_fn, 'length', { value: 2, configurable: true });
+  }
+}
 globalThis.CSSStyleValue = CSSStyleValue;
 class CSSKeywordValue extends CSSStyleValue {
   constructor(value) {
@@ -43200,9 +43211,21 @@ class Permissions {
     _permissionStatuses.push(status);
     return Promise.resolve(status);
   }
+  // `request()` and `revoke()` are the two legacy operations from the earlier
+  // Permissions draft. Neither can CHANGE anything here — this browser has no one
+  // to ask and nothing to forget — so both answer with the permission's current
+  // status, which is the honest result of a request that was not granted and a
+  // revocation that had nothing to revoke.
+  request(descriptor) {
+    return this.query(descriptor);
+  }
+  revoke(descriptor) {
+    return this.query(descriptor);
+  }
 }
 _idlShape(PermissionStatus, { ctorLength: 0 });
-_idlShape(Permissions, { ctorLength: 0, promiseOps: ['query'], arity: { query: 1 } });
+_idlShape(Permissions, { ctorLength: 0, promiseOps: ['query', 'request', 'revoke'],
+  arity: { query: 1, request: 1, revoke: 1 } });
 const _permissionsInstance = Object.create(Permissions.prototype);
 // Set a permission's state and tell everyone watching. Nothing on the page can
 // reach this — a page changing its own permissions is the thing permissions
@@ -43806,6 +43829,179 @@ _markNative(globalThis.DeviceOrientationEvent); _markNative(globalThis.DeviceMot
   });
   _navSame('geolocation', _geolocationInstance);
   _navSame('wakeLock', _wakeLockInstance);
+}
+
+// ── The background-work registration extensions ──────────────────────────────
+// Background Fetch, Background Sync, Periodic Background Sync and the Content
+// Index all hang off `ServiceWorkerRegistration`, and all four are about the same
+// thing: finishing work when the connection comes back. That is not a nicety for
+// someone on a reliable line — it is the difference between an upload that
+// survives the walk out of signal and one that has to be started again.
+//
+// ⛔ HONEST CAP: this engine has no background scheduler, so nothing is deferred
+// and nothing is retried. Every registration is REAL bookkeeping the page can read
+// back (`getTags()` returns what you registered), and the operations that would
+// need a scheduler refuse rather than pretend.
+let _allowBgCtor = false;
+globalThis.SyncManager = class SyncManager {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  register(tag) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'register' on 'SyncManager': 1 argument required, but only 0 present."));
+    }
+    const tags = this._tags || (this._tags = []);
+    const t = String(tag);
+    if (tags.indexOf(t) < 0) tags.push(t);
+    return Promise.resolve(undefined);
+  }
+  getTags() { return Promise.resolve((this._tags || []).slice()); }
+};
+globalThis.PeriodicSyncManager = class PeriodicSyncManager {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  register(tag, options) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'register' on 'PeriodicSyncManager': 1 argument required, but only 0 present."));
+    }
+    const tags = this._tags || (this._tags = []);
+    const t = String(tag);
+    if (tags.indexOf(t) < 0) tags.push(t);
+    return Promise.resolve(undefined);
+  }
+  getTags() { return Promise.resolve((this._tags || []).slice()); }
+  unregister(tag) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'unregister' on 'PeriodicSyncManager': 1 argument required, but only 0 present."));
+    }
+    const tags = this._tags || (this._tags = []);
+    const i = tags.indexOf(String(tag));
+    if (i >= 0) tags.splice(i, 1);
+    return Promise.resolve(undefined);
+  }
+};
+const _CONTENT_CATEGORIES = ['', 'homepage', 'article', 'video', 'audio'];
+globalThis.ContentIndex = class ContentIndex {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  add(description) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'add' on 'ContentIndex': 1 argument required, but only 0 present."));
+    }
+    const d = (description == null) ? {} : description;
+    for (const k of ['id', 'title', 'description', 'url']) {
+      if (d[k] === undefined) {
+        return Promise.reject(new TypeError("Failed to execute 'add' on 'ContentIndex': required member " + k + " is undefined."));
+      }
+    }
+    const cat = d.category === undefined ? '' : String(d.category);
+    if (_CONTENT_CATEGORIES.indexOf(cat) < 0) {
+      return Promise.reject(new TypeError("Failed to execute 'add' on 'ContentIndex': The provided value '" +
+        cat + "' is not a valid enum value of type ContentCategory."));
+    }
+    const list = this._entries || (this._entries = []);
+    const entry = { id: String(d.id), title: String(d.title), description: String(d.description),
+                    category: cat, icons: d.icons ? Array.from(d.icons) : [], url: String(d.url) };
+    const i = list.findIndex((e) => e.id === entry.id);
+    if (i >= 0) list[i] = entry; else list.push(entry);
+    return Promise.resolve(undefined);
+  }
+  delete(id) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'delete' on 'ContentIndex': 1 argument required, but only 0 present."));
+    }
+    const list = this._entries || (this._entries = []);
+    const i = list.findIndex((e) => e.id === String(id));
+    if (i >= 0) list.splice(i, 1);
+    return Promise.resolve(undefined);
+  }
+  getAll() { return Promise.resolve((this._entries || []).slice()); }
+};
+globalThis.BackgroundFetchRecord = class BackgroundFetchRecord {
+  constructor() {
+    if (!_allowBgCtor) throw new TypeError('Illegal constructor');
+    this._bfr = { request: null, responseReady: Promise.reject(new DOMException(
+      'No background fetch was performed.', 'NetworkError')) };
+    this._bfr.responseReady.catch(() => {});
+  }
+};
+for (const _k of ['request', 'responseReady']) {
+  Object.defineProperty(globalThis.BackgroundFetchRecord.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._bfr) throw new TypeError('Illegal invocation');
+      return this._bfr[_k];
+    }),
+  });
+}
+globalThis.BackgroundFetchRegistration = class BackgroundFetchRegistration extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowBgCtor) throw new TypeError('Illegal constructor');
+    this._bf = {
+      id: '', uploadTotal: 0, uploaded: 0, downloadTotal: 0, downloaded: 0,
+      result: '', failureReason: '', recordsAvailable: false,
+    };
+  }
+  abort() {
+    if (!(this instanceof globalThis.BackgroundFetchRegistration)) {
+      return Promise.reject(new TypeError('Illegal invocation'));
+    }
+    return Promise.resolve(false);
+  }
+  match(request, options) {
+    if (!(this instanceof globalThis.BackgroundFetchRegistration)) {
+      return Promise.reject(new TypeError('Illegal invocation'));
+    }
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'match' on 'BackgroundFetchRegistration': 1 argument required, but only 0 present."));
+    }
+    return Promise.resolve(undefined);
+  }
+  matchAll() {
+    if (!(this instanceof globalThis.BackgroundFetchRegistration)) {
+      return Promise.reject(new TypeError('Illegal invocation'));
+    }
+    return Promise.resolve([]);
+  }
+};
+for (const _k of ['id', 'uploadTotal', 'uploaded', 'downloadTotal', 'downloaded',
+                  'result', 'failureReason', 'recordsAvailable']) {
+  Object.defineProperty(globalThis.BackgroundFetchRegistration.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._bf) throw new TypeError('Illegal invocation');
+      return this._bf[_k];
+    }),
+  });
+}
+_sensorEventHandlers(globalThis.BackgroundFetchRegistration.prototype,
+  globalThis.BackgroundFetchRegistration, ['onprogress']);
+globalThis.BackgroundFetchManager = class BackgroundFetchManager {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  fetch(id, requests, options) {
+    if (arguments.length < 2) {
+      return Promise.reject(new TypeError("Failed to execute 'fetch' on 'BackgroundFetchManager': 2 arguments required, but only " + arguments.length + " present."));
+    }
+    const list = Array.isArray(requests) ? requests : [requests];
+    if (!list.length) {
+      return Promise.reject(new TypeError("Failed to execute 'fetch' on 'BackgroundFetchManager': At least one request must be given."));
+    }
+    // ⛔ There is no background scheduler to hand the work to. Refusing is the
+    // honest answer; a resolved registration that never downloads anything would
+    // leave a page waiting for a `progress` event that cannot come.
+    return Promise.reject(new DOMException(
+      'Background fetch is not supported on this device.', 'NotSupportedError'));
+  }
+  get(id) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'get' on 'BackgroundFetchManager': 1 argument required, but only 0 present."));
+    }
+    return Promise.resolve(null);
+  }
+  getIds() { return Promise.resolve([]); }
+};
+for (const _C of [globalThis.SyncManager, globalThis.PeriodicSyncManager,
+                  globalThis.ContentIndex, globalThis.BackgroundFetchManager,
+                  globalThis.BackgroundFetchRegistration, globalThis.BackgroundFetchRecord]) {
+  _markNative(_C);
 }
 
 // ── WebVTT: TextTrackCue, VTTCue, VTTRegion ──────────────────────────────────
@@ -44933,6 +45129,481 @@ Object.defineProperty(Document.prototype, 'requestStorageAccess', {
     return Promise.resolve(undefined);
   }),
 });
+
+// ── ProximitySensor (the sensor family's last member) ────────────────────────
+// Same contract and the same ⛔ cap as the rest of the Generic Sensor family:
+// real interface, honest `NotReadableError` on `start()`, null readings.
+_defSensor('ProximitySensor', globalThis.Sensor, ['distance', 'max', 'near']);
+
+// ── Presentation API ─────────────────────────────────────────────────────────
+// "Show this on the big screen." ⛔ HONEST CAP: there is no second display to
+// present to, so `start()` rejects with `NotFoundError` — the same answer a real
+// browser gives when no cast device is on the network, and the branch every
+// presentation flow already has. `PresentationAvailability.value` is `false`,
+// which is the truth and is what a page checks before offering the button.
+let _allowPresentationCtor = false;
+globalThis.PresentationAvailability = class PresentationAvailability extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowPresentationCtor) throw new TypeError('Illegal constructor');
+    this._pa = { value: false };
+  }
+};
+Object.defineProperty(globalThis.PresentationAvailability.prototype, 'value', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'value', function () {
+    if (!this._pa) throw new TypeError('Illegal invocation');
+    return this._pa.value;
+  }),
+});
+_sensorEventHandlers(globalThis.PresentationAvailability.prototype,
+  globalThis.PresentationAvailability, ['onchange']);
+globalThis.PresentationConnection = class PresentationConnection extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowPresentationCtor) throw new TypeError('Illegal constructor');
+    this._pc = { id: '', url: '', state: 'closed', binaryType: 'arraybuffer' };
+  }
+  close() {
+    if (!this._pc) throw new TypeError('Illegal invocation');
+    if (this._pc.state === 'connected' || this._pc.state === 'connecting') this._pc.state = 'closed';
+  }
+  terminate() {
+    if (!this._pc) throw new TypeError('Illegal invocation');
+    this._pc.state = 'terminated';
+  }
+  send(message) {
+    if (!this._pc) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'send' on 'PresentationConnection': 1 argument required, but only 0 present.");
+    }
+    // Nothing is connected, so there is nowhere for the message to go.
+    throw new DOMException('The connection is not in the connected state.', 'InvalidStateError');
+  }
+};
+for (const _k of ['id', 'url', 'state']) {
+  Object.defineProperty(globalThis.PresentationConnection.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._pc) throw new TypeError('Illegal invocation');
+      return this._pc[_k];
+    }),
+  });
+}
+Object.defineProperty(globalThis.PresentationConnection.prototype, 'binaryType', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'binaryType', function () {
+    if (!this._pc) throw new TypeError('Illegal invocation');
+    return this._pc.binaryType;
+  }),
+  set: _named('set', 'binaryType', function (v) {
+    if (!this._pc) throw new TypeError('Illegal invocation');
+    const s = String(v);
+    if (s === 'blob' || s === 'arraybuffer') this._pc.binaryType = s;
+  }),
+});
+_sensorEventHandlers(globalThis.PresentationConnection.prototype,
+  globalThis.PresentationConnection, ['onconnect', 'onclose', 'onterminate', 'onmessage']);
+globalThis.PresentationConnectionList = class PresentationConnectionList extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowPresentationCtor) throw new TypeError('Illegal constructor');
+    this._pcl = { connections: Object.freeze([]) };
+  }
+};
+Object.defineProperty(globalThis.PresentationConnectionList.prototype, 'connections', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'connections', function () {
+    if (!this._pcl) throw new TypeError('Illegal invocation');
+    return this._pcl.connections;
+  }),
+});
+_sensorEventHandlers(globalThis.PresentationConnectionList.prototype,
+  globalThis.PresentationConnectionList, ['onconnectionavailable']);
+globalThis.PresentationRequest = class PresentationRequest extends EventTarget {
+  constructor(urls) {
+    super();
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to construct 'PresentationRequest': 1 argument required, but only 0 present.");
+    }
+    const list = (typeof urls === 'string' || urls instanceof String)
+      ? [String(urls)] : Array.from(urls, String);
+    if (!list.length) {
+      throw new TypeError("Failed to construct 'PresentationRequest': An empty sequence of URLs is not allowed.");
+    }
+    const base = (globalThis.location && location.href) || 'about:blank';
+    this._pr = { urls: list.map((u) => { try { return new URL(u, base).href; } catch (e) {
+      throw new DOMException("'" + u + "' is not a valid URL.", 'SyntaxError'); } }) };
+  }
+  start() {
+    if (!this._pr) return Promise.reject(new TypeError('Illegal invocation'));
+    return Promise.reject(new DOMException(
+      'No presentation display is available.', 'NotFoundError'));
+  }
+  reconnect(presentationId) {
+    if (!this._pr) return Promise.reject(new TypeError('Illegal invocation'));
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'reconnect' on 'PresentationRequest': 1 argument required, but only 0 present."));
+    }
+    return Promise.reject(new DOMException(
+      'No presentation connection with that id exists.', 'NotFoundError'));
+  }
+  getAvailability() {
+    if (!this._pr) return Promise.reject(new TypeError('Illegal invocation'));
+    _allowPresentationCtor = true;
+    try { return Promise.resolve(new globalThis.PresentationAvailability()); }
+    finally { _allowPresentationCtor = false; }
+  }
+};
+_sensorEventHandlers(globalThis.PresentationRequest.prototype,
+  globalThis.PresentationRequest, ['onconnectionavailable']);
+globalThis.PresentationConnectionAvailableEvent =
+  class PresentationConnectionAvailableEvent extends Event {
+    constructor(type, eventInitDict) {
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to construct 'PresentationConnectionAvailableEvent': 2 arguments required, but only " + arguments.length + " present.");
+      }
+      if (eventInitDict === null || typeof eventInitDict !== 'object' ||
+          eventInitDict.connection === undefined) {
+        throw new TypeError("Failed to construct 'PresentationConnectionAvailableEvent': required member connection is undefined.");
+      }
+      super(type, eventInitDict);
+      this._pcae = { connection: eventInitDict.connection };
+    }
+  };
+Object.defineProperty(globalThis.PresentationConnectionAvailableEvent.prototype, 'connection', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'connection', function () {
+    if (!this._pcae) throw new TypeError('Illegal invocation');
+    return this._pcae.connection;
+  }),
+});
+const _PC_CLOSE_REASONS = ['error', 'closed', 'wentaway'];
+globalThis.PresentationConnectionCloseEvent =
+  class PresentationConnectionCloseEvent extends Event {
+    constructor(type, eventInitDict) {
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to construct 'PresentationConnectionCloseEvent': 2 arguments required, but only " + arguments.length + " present.");
+      }
+      if (eventInitDict === null || typeof eventInitDict !== 'object' ||
+          eventInitDict.reason === undefined) {
+        throw new TypeError("Failed to construct 'PresentationConnectionCloseEvent': required member reason is undefined.");
+      }
+      const reason = String(eventInitDict.reason);
+      if (_PC_CLOSE_REASONS.indexOf(reason) < 0) {
+        throw new TypeError("Failed to construct 'PresentationConnectionCloseEvent': The provided value '" +
+          reason + "' is not a valid enum value of type PresentationConnectionCloseReason.");
+      }
+      super(type, eventInitDict);
+      this._pcce = { reason, message: eventInitDict.message === undefined ? '' : String(eventInitDict.message) };
+    }
+  };
+for (const _k of ['reason', 'message']) {
+  Object.defineProperty(globalThis.PresentationConnectionCloseEvent.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._pcce) throw new TypeError('Illegal invocation');
+      return this._pcce[_k];
+    }),
+  });
+}
+globalThis.PresentationReceiver = class PresentationReceiver {
+  constructor() { throw new TypeError('Illegal constructor'); }
+};
+Object.defineProperty(globalThis.PresentationReceiver.prototype, 'connectionList', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'connectionList', function () {
+    if (!this._prv) {
+      _allowPresentationCtor = true;
+      try { this._prv = Promise.resolve(new globalThis.PresentationConnectionList()); }
+      finally { _allowPresentationCtor = false; }
+    }
+    return this._prv;
+  }),
+});
+globalThis.Presentation = class Presentation {
+  constructor() { throw new TypeError('Illegal constructor'); }
+};
+Object.defineProperty(globalThis.Presentation.prototype, 'defaultRequest', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'defaultRequest', function () { return this._defaultRequest || null; }),
+  set: _named('set', 'defaultRequest', function (v) { this._defaultRequest = (v == null) ? null : v; }),
+});
+Object.defineProperty(globalThis.Presentation.prototype, 'receiver', {
+  configurable: true, enumerable: true,
+  // A receiving browsing context is one this browser never is: `null` says so.
+  get: _named('get', 'receiver', function () { return null; }),
+});
+for (const _C of [globalThis.Presentation, globalThis.PresentationRequest,
+                  globalThis.PresentationAvailability, globalThis.PresentationConnection,
+                  globalThis.PresentationConnectionList, globalThis.PresentationReceiver,
+                  globalThis.PresentationConnectionAvailableEvent,
+                  globalThis.PresentationConnectionCloseEvent]) _markNative(_C);
+{
+  const _presentationInstance = Object.create(globalThis.Presentation.prototype);
+  Object.defineProperty(_Navigator.prototype, 'presentation', {
+    enumerable: true, configurable: true,
+    get: _named('get', 'presentation', function () {
+      if (!(this instanceof _Navigator)) throw new TypeError('Illegal invocation');
+      return _presentationInstance;
+    }),
+  });
+}
+
+// ── Storage Buckets ──────────────────────────────────────────────────────────
+// Named, independently-evictable buckets of storage. The point for this browser's
+// readers: a page can mark the offline article it saved as more important than its
+// image cache, so the device evicts the cache first. ⛔ The buckets are a real
+// registry here but they are not yet separate STORES — every bucket's `indexedDB`
+// and `caches` are the origin's own, and `persist()` answers false.
+let _allowBucketCtor = false;
+globalThis.StorageBucket = class StorageBucket {
+  constructor() {
+    if (!_allowBucketCtor) throw new TypeError('Illegal constructor');
+    this._sb = { name: '', expires: null, persisted: false };
+  }
+  persist() {
+    if (!(this instanceof globalThis.StorageBucket)) return Promise.reject(new TypeError('Illegal invocation'));
+    return Promise.resolve(false);
+  }
+  persisted() {
+    if (!(this instanceof globalThis.StorageBucket)) return Promise.reject(new TypeError('Illegal invocation'));
+    return Promise.resolve(this._sb ? this._sb.persisted : false);
+  }
+  estimate() {
+    if (!(this instanceof globalThis.StorageBucket)) return Promise.reject(new TypeError('Illegal invocation'));
+    if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.estimate) {
+      return navigator.storage.estimate();
+    }
+    return Promise.resolve({ usage: 0, quota: 0 });
+  }
+  setExpires(expires) {
+    if (!(this instanceof globalThis.StorageBucket)) return Promise.reject(new TypeError('Illegal invocation'));
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'setExpires' on 'StorageBucket': 1 argument required, but only 0 present."));
+    }
+    this._sb.expires = Number(expires);
+    return Promise.resolve(undefined);
+  }
+  expires() {
+    if (!(this instanceof globalThis.StorageBucket)) return Promise.reject(new TypeError('Illegal invocation'));
+    return Promise.resolve(this._sb ? this._sb.expires : null);
+  }
+  getDirectory() {
+    if (!(this instanceof globalThis.StorageBucket)) return Promise.reject(new TypeError('Illegal invocation'));
+    if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory) {
+      return navigator.storage.getDirectory();
+    }
+    return Promise.reject(new DOMException('No file system is available.', 'NotSupportedError'));
+  }
+};
+Object.defineProperty(globalThis.StorageBucket.prototype, 'name', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'name', function () {
+    if (!this._sb) throw new TypeError('Illegal invocation');
+    return this._sb.name;
+  }),
+});
+for (const _k of ['indexedDB', 'caches']) {
+  Object.defineProperty(globalThis.StorageBucket.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._sb) throw new TypeError('Illegal invocation');
+      return _k === 'indexedDB' ? globalThis.indexedDB : globalThis.caches;
+    }),
+  });
+}
+// A bucket name is a lowercase ASCII string of letters, digits, `-` and `_`, not
+// starting with `-`, at most 64 characters. Anything else is a TypeError, because
+// a name the UA cannot store is a bucket the page will never find again.
+const _validBucketName = (n) => /^[a-z0-9_][a-z0-9_-]{0,63}$/.test(n);
+globalThis.StorageBucketManager = class StorageBucketManager {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  open(name) {
+    const options = arguments[1];
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'open' on 'StorageBucketManager': 1 argument required, but only 0 present."));
+    }
+    const n = String(name);
+    if (!_validBucketName(n)) {
+      return Promise.reject(new TypeError("Failed to execute 'open' on 'StorageBucketManager': The bucket name '" + n + "' is not valid."));
+    }
+    const store = this._buckets || (this._buckets = new Map());
+    let b = store.get(n);
+    if (!b) {
+      _allowBucketCtor = true;
+      try { b = new globalThis.StorageBucket(); } finally { _allowBucketCtor = false; }
+      b._sb.name = n;
+      store.set(n, b);
+    }
+    const o = (options == null) ? {} : options;
+    if (o.expires !== undefined) b._sb.expires = Number(o.expires);
+    return Promise.resolve(b);
+  }
+  keys() { return Promise.resolve(Array.from((this._buckets || new Map()).keys()).sort()); }
+  delete(name) {
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'delete' on 'StorageBucketManager': 1 argument required, but only 0 present."));
+    }
+    const n = String(name);
+    if (!_validBucketName(n)) {
+      return Promise.reject(new TypeError("Failed to execute 'delete' on 'StorageBucketManager': The bucket name '" + n + "' is not valid."));
+    }
+    if (this._buckets) this._buckets.delete(n);
+    return Promise.resolve(undefined);
+  }
+};
+_markNative(globalThis.StorageBucket); _markNative(globalThis.StorageBucketManager);
+{
+  const _storageBucketsInstance = Object.create(globalThis.StorageBucketManager.prototype);
+  Object.defineProperty(_Navigator.prototype, 'storageBuckets', {
+    enumerable: true, configurable: true,
+    get: _named('get', 'storageBuckets', function () {
+      if (!(this instanceof _Navigator)) throw new TypeError('Illegal invocation');
+      return _storageBucketsInstance;
+    }),
+  });
+}
+
+// ── Picture-in-Picture ───────────────────────────────────────────────────────
+// ⛔ HONEST CAP, and it is the honest KIND of cap: `document.pictureInPictureEnabled`
+// is **false**, which is precisely how a page is supposed to find out that PiP is
+// unavailable here. The interfaces exist so the check itself does not throw.
+globalThis.PictureInPictureWindow = class PictureInPictureWindow extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowPipCtor) throw new TypeError('Illegal constructor');
+    this._pip = { width: 0, height: 0 };
+  }
+};
+let _allowPipCtor = false;
+for (const _k of ['width', 'height']) {
+  Object.defineProperty(globalThis.PictureInPictureWindow.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._pip) throw new TypeError('Illegal invocation');
+      return this._pip[_k];
+    }),
+  });
+}
+_sensorEventHandlers(globalThis.PictureInPictureWindow.prototype,
+  globalThis.PictureInPictureWindow, ['onresize']);
+globalThis.PictureInPictureEvent = class PictureInPictureEvent extends Event {
+  constructor(type, eventInitDict) {
+    if (arguments.length < 2) {
+      throw new TypeError("Failed to construct 'PictureInPictureEvent': 2 arguments required, but only " + arguments.length + " present.");
+    }
+    if (eventInitDict === null || typeof eventInitDict !== 'object' ||
+        eventInitDict.pictureInPictureWindow === undefined) {
+      throw new TypeError("Failed to construct 'PictureInPictureEvent': required member pictureInPictureWindow is undefined.");
+    }
+    super(type, eventInitDict);
+    this._pipe = { pictureInPictureWindow: eventInitDict.pictureInPictureWindow };
+  }
+};
+Object.defineProperty(globalThis.PictureInPictureEvent.prototype, 'pictureInPictureWindow', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'pictureInPictureWindow', function () {
+    if (!this._pipe) throw new TypeError('Illegal invocation');
+    return this._pipe.pictureInPictureWindow;
+  }),
+});
+_markNative(globalThis.PictureInPictureWindow); _markNative(globalThis.PictureInPictureEvent);
+Object.defineProperty(Document.prototype, 'pictureInPictureEnabled', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'pictureInPictureEnabled', function () {
+    if (!(this instanceof Document)) throw new TypeError('Illegal invocation');
+    return false;
+  }),
+});
+Object.defineProperty(Document.prototype, 'pictureInPictureElement', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'pictureInPictureElement', function () {
+    if (!(this instanceof Document)) throw new TypeError('Illegal invocation');
+    return null;
+  }),
+});
+Object.defineProperty(Document.prototype, 'exitPictureInPicture', {
+  writable: true, enumerable: true, configurable: true,
+  value: _named('', 'exitPictureInPicture', function exitPictureInPicture() {
+    if (!(this instanceof Document)) return Promise.reject(new TypeError('Illegal invocation'));
+    return Promise.reject(new DOMException(
+      'There is no Picture-in-Picture element in this document.', 'InvalidStateError'));
+  }),
+});
+
+// ── Remote Playback ──────────────────────────────────────────────────────────
+// "Play this on the TV." ⛔ Nothing to connect to: the state is `disconnected`,
+// the availability callback is told `false`, and `prompt()` rejects `NotFoundError`.
+let _allowRemoteCtor = false;
+globalThis.RemotePlayback = class RemotePlayback extends EventTarget {
+  constructor() {
+    super();
+    if (!_allowRemoteCtor) throw new TypeError('Illegal constructor');
+    this._rp = { state: 'disconnected', nextId: 1, watchers: new Map() };
+  }
+  watchAvailability(callback) {
+    if (!this._rp) return Promise.reject(new TypeError('Illegal invocation'));
+    if (arguments.length < 1 || typeof callback !== 'function') {
+      return Promise.reject(new TypeError("Failed to execute 'watchAvailability' on 'RemotePlayback': parameter 1 is not of type 'RemotePlaybackAvailabilityCallback'."));
+    }
+    const id = this._rp.nextId++;
+    this._rp.watchers.set(id, callback);
+    // The callback is invoked once with the current (and only) answer.
+    setTimeout(() => {
+      if (this._rp.watchers.has(id)) {
+        try { callback(false); } catch (e) { _reportError(e); }
+      }
+    }, 0);
+    return Promise.resolve(id);
+  }
+  cancelWatchAvailability(id) {
+    if (!this._rp) return Promise.reject(new TypeError('Illegal invocation'));
+    if (id === undefined) this._rp.watchers.clear();
+    else this._rp.watchers.delete(Number(id));
+    return Promise.resolve(undefined);
+  }
+  prompt() {
+    if (!this._rp) return Promise.reject(new TypeError('Illegal invocation'));
+    return Promise.reject(new DOMException(
+      'No remote playback device is available.', 'NotFoundError'));
+  }
+};
+Object.defineProperty(globalThis.RemotePlayback.prototype, 'state', {
+  configurable: true, enumerable: true,
+  get: _named('get', 'state', function () {
+    if (!this._rp) throw new TypeError('Illegal invocation');
+    return this._rp.state;
+  }),
+});
+_sensorEventHandlers(globalThis.RemotePlayback.prototype, globalThis.RemotePlayback,
+  ['onconnecting', 'onconnect', 'ondisconnect']);
+_markNative(globalThis.RemotePlayback);
+
+// ── VideoPlaybackQuality ─────────────────────────────────────────────────────
+// The frame-drop counters a player reads to decide whether to step down its
+// quality. ⛔ Nothing decodes, so every counter is honestly zero.
+globalThis.VideoPlaybackQuality = class VideoPlaybackQuality {
+  constructor() {
+    if (!_allowVpqCtor) throw new TypeError('Illegal constructor');
+    this._vpq = {
+      creationTime: (globalThis.performance ? performance.now() : 0),
+      droppedVideoFrames: 0, totalVideoFrames: 0, corruptedVideoFrames: 0,
+    };
+  }
+};
+let _allowVpqCtor = false;
+for (const _k of ['creationTime', 'droppedVideoFrames', 'totalVideoFrames', 'corruptedVideoFrames']) {
+  Object.defineProperty(globalThis.VideoPlaybackQuality.prototype, _k, {
+    configurable: true, enumerable: true,
+    get: _named('get', _k, function () {
+      if (!this._vpq) throw new TypeError('Illegal invocation');
+      return this._vpq[_k];
+    }),
+  });
+}
+_markNative(globalThis.VideoPlaybackQuality);
+
 // ── FormData (XHR §interface-formdata) ────────────────────────────────────────
 // The old implementation was one line, and the line that mattered was
 // `append(k, v) { this._d.push([String(k), String(v)]) }`. That is not a small
@@ -44971,7 +45642,10 @@ const _fdCreateEntry = function(name, value, filename, hasFilename) {
 };
 if (typeof FormData === "undefined") {
   globalThis.FormData = class FormData {
-    constructor(form, submitter) {
+    // No declared parameters: an interface object's `length` is its REQUIRED
+    // argument count, and both of FormData's are optional.
+    constructor() {
+      const form = arguments[0], submitter = arguments[1];
       this._d = [];
       // new FormData(form) collects the form's current controls. Our form model
       // hands back name/value pairs; a file control contributes its File objects.
@@ -56315,6 +56989,87 @@ _exposeIface('SVGUseElementShadowRoot', SVGUseElementShadowRoot); _markNative(SV
 // Install the on* event handler IDL accessors (HTML GlobalEventHandlers) on the
 // element/document interfaces + the window names it is still missing. NOT on
 // Element.prototype (SVG/HTML elements reach them through their own prototypes).
+
+// The three media-element extensions these specs add. Declared on the interface
+// that OWNS them (scroll 502's rule): `remote` is HTMLMediaElement's, the
+// Picture-in-Picture and frame-callback members are HTMLVideoElement's.
+{
+  const V = globalThis.HTMLVideoElement, M = globalThis.HTMLMediaElement;
+  if (M) {
+    const _remotes = new WeakMap();
+    Object.defineProperty(M.prototype, 'remote', {
+      configurable: true, enumerable: true,
+      get: _named('get', 'remote', function () {
+        if (typeof this._nid !== 'number') throw new TypeError('Illegal invocation');
+        let r = _remotes.get(this);
+        if (!r) {
+          _allowRemoteCtor = true;
+          try { r = new globalThis.RemotePlayback(); } finally { _allowRemoteCtor = false; }
+          _remotes.set(this, r);
+        }
+        return r;
+      }),
+    });
+  }
+  if (V) {
+    Object.defineProperty(V.prototype, 'requestPictureInPicture', {
+      writable: true, enumerable: true, configurable: true,
+      value: _named('', 'requestPictureInPicture', function requestPictureInPicture() {
+        if (typeof this._nid !== 'number') return Promise.reject(new TypeError('Illegal invocation'));
+        return Promise.reject(new DOMException(
+          'Picture-in-Picture is not available.', 'NotSupportedError'));
+      }),
+    });
+    // `disablePictureInPicture` is a reflected boolean content attribute; the two
+    // handlers are HTMLVideoElement's own, not GlobalEventHandlers'.
+    Object.defineProperty(V.prototype, 'disablePictureInPicture', {
+      configurable: true, enumerable: true,
+      get: _named('get', 'disablePictureInPicture', function () {
+        if (typeof this._nid !== 'number') throw new TypeError('Illegal invocation');
+        return this.hasAttribute('disablepictureinpicture');
+      }),
+      set: _named('set', 'disablePictureInPicture', function (v) {
+        if (typeof this._nid !== 'number') throw new TypeError('Illegal invocation');
+        if (v) this.setAttribute('disablepictureinpicture', '');
+        else this.removeAttribute('disablepictureinpicture');
+      }),
+    });
+    _ehDefineOnProto(V.prototype, false,
+      ['onenterpictureinpicture', 'onleavepictureinpicture']);
+    Object.defineProperty(V.prototype, 'getVideoPlaybackQuality', {
+      writable: true, enumerable: true, configurable: true,
+      value: _named('', 'getVideoPlaybackQuality', function getVideoPlaybackQuality() {
+        if (typeof this._nid !== 'number') throw new TypeError('Illegal invocation');
+        _allowVpqCtor = true;
+        try { return new globalThis.VideoPlaybackQuality(); }
+        finally { _allowVpqCtor = false; }
+      }),
+    });
+    // ⛔ No frames are ever presented, so a requested callback is registered and
+    // never invoked — which is what a <video> with nothing playing does anyway.
+    Object.defineProperty(V.prototype, 'requestVideoFrameCallback', {
+      writable: true, enumerable: true, configurable: true,
+      value: _named('', 'requestVideoFrameCallback', function requestVideoFrameCallback(callback) {
+        if (typeof this._nid !== 'number') throw new TypeError('Illegal invocation');
+        if (arguments.length < 1 || typeof callback !== 'function') {
+          throw new TypeError("Failed to execute 'requestVideoFrameCallback' on 'HTMLVideoElement': parameter 1 is not of type 'VideoFrameRequestCallback'.");
+        }
+        this._rvfcNext = (this._rvfcNext || 0) + 1;
+        return this._rvfcNext;
+      }),
+    });
+    Object.defineProperty(V.prototype, 'cancelVideoFrameCallback', {
+      writable: true, enumerable: true, configurable: true,
+      value: _named('', 'cancelVideoFrameCallback', function cancelVideoFrameCallback(handle) {
+        if (typeof this._nid !== 'number') throw new TypeError('Illegal invocation');
+        if (arguments.length < 1) {
+          throw new TypeError("Failed to execute 'cancelVideoFrameCallback' on 'HTMLVideoElement': 1 argument required, but only 0 present.");
+        }
+      }),
+    });
+  }
+}
+
 _ehDefineOnProto(globalThis.HTMLElement.prototype, false);
 _ehDefineOnProto(globalThis.SVGElement.prototype, false);
 // MathML Core gives MathMLElement the same GlobalEventHandlers mixin HTML and SVG
@@ -56527,17 +57282,35 @@ globalThis.EventTarget = EventTarget;
   // `document.fullscreenElement` — the topmost element of the fullscreen stack, or null.
   // [LegacyLenientSetter]: assigning to these is a silent no-op rather than a
   // TypeError in strict mode — old code does `document.fullscreenElement = x`.
+  // ⚠️ The get/set functions are NAMED and their `length` declared: WebIDL says a
+  // [LegacyLenientSetter]'s setter takes one argument, and a bare `set() {}` has
+  // length 0 — which idlharness reads as the wrong shape for the attribute.
   Object.defineProperty(globalThis.Document.prototype, 'fullscreenElement', {
     configurable: true, enumerable: true,
-    get() { const s = globalThis._fullscreenStack; return (s && s.length) ? s[s.length - 1] : null; },
-    set() {},
+    get: _named('get', 'fullscreenElement', function () {
+      const s = globalThis._fullscreenStack; return (s && s.length) ? s[s.length - 1] : null;
+    }),
+    set: _named('set', 'fullscreenElement', function (_v) {}),
   });
   // `document.fullscreenEnabled` — fullscreen is available in this (top-level) document.
   Object.defineProperty(globalThis.Document.prototype, 'fullscreenEnabled', {
     configurable: true, enumerable: true,
-    get() { return true; },
-    set() {},
+    get: _named('get', 'fullscreenEnabled', function () { return true; }),
+    set: _named('set', 'fullscreenEnabled', function (_v) {}),
   });
+  // `document.fullscreen` is the deprecated alias of `fullscreenElement !== null`,
+  // and it is [Unscopable] — `with (document) { fullscreen }` must NOT resolve to it.
+  Object.defineProperty(globalThis.Document.prototype, 'fullscreen', {
+    configurable: true, enumerable: true,
+    get: _named('get', 'fullscreen', function () {
+      const s = globalThis._fullscreenStack; return !!(s && s.length);
+    }),
+    set: _named('set', 'fullscreen', function (_v) {}),
+  });
+  try {
+    const u = globalThis.Document.prototype[Symbol.unscopables];
+    if (u) u.fullscreen = true;
+  } catch (e) {}
 }
 // ---------------------------------------------------------------------------
 // Tree traversal primitives shared by NodeIterator + TreeWalker (DOM §6).
@@ -71211,6 +71984,42 @@ class ServiceWorkerRegistration extends EventTarget {
     if (!this._cookieStoreManager)
       this._cookieStoreManager = Object.create(globalThis.CookieStoreManager.prototype);
     return this._cookieStoreManager;
+  }
+  get sync() {
+    if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
+    if (!this._syncManager) this._syncManager = Object.create(globalThis.SyncManager.prototype);
+    return this._syncManager;
+  }
+  get periodicSync() {
+    if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
+    if (!this._periodicSyncManager)
+      this._periodicSyncManager = Object.create(globalThis.PeriodicSyncManager.prototype);
+    return this._periodicSyncManager;
+  }
+  get index() {
+    if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
+    if (!this._contentIndex) this._contentIndex = Object.create(globalThis.ContentIndex.prototype);
+    return this._contentIndex;
+  }
+  get backgroundFetch() {
+    if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");
+    if (!this._backgroundFetch)
+      this._backgroundFetch = Object.create(globalThis.BackgroundFetchManager.prototype);
+    return this._backgroundFetch;
+  }
+  // Notifications' two registration operations. ⛔ Permission is "default" here
+  // and the spec's own rule applies: showing a notification without a grant is a
+  // TypeError, not a silent no-op.
+  showNotification(title, options) {
+    if (!(this instanceof ServiceWorkerRegistration)) return Promise.reject(new TypeError("Illegal invocation"));
+    if (arguments.length < 1) {
+      return Promise.reject(new TypeError("Failed to execute 'showNotification' on 'ServiceWorkerRegistration': 1 argument required, but only 0 present."));
+    }
+    return Promise.reject(new TypeError('No notification permission has been granted for this origin.'));
+  }
+  getNotifications(filter) {
+    if (!(this instanceof ServiceWorkerRegistration)) return Promise.reject(new TypeError("Illegal invocation"));
+    return Promise.resolve([]);
   }
   update() {
     if (!(this instanceof ServiceWorkerRegistration)) throw new TypeError("Illegal invocation");

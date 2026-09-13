@@ -1,6 +1,6 @@
 # 📜 Scroll 503 — The Attended Verdict
 
-> **Quests #803–#840 · 2026-09-13 · branch `engine-per-page-threads`**
+> **Quests #803–#850 · 2026-09-13 · branch `engine-per-page-threads`**
 >
 > Scroll 501 taught the engine what an interface *is*; scroll 502 gave the
 > interfaces their members. This one went looking for the interfaces that were
@@ -23,7 +23,7 @@
 By measuring **every `idlharness` file on the platform**: 174 files, one per realm,
 generated from Chrome's own run summary so every path is guaranteed valid. Cold
 baseline: **11,778 / 15,818 (74.5%)**, all but one runnable. After this arc:
-**12,773 / 15,818 (80.7%)** — **+995, 32 files up, 0 files down.**
+**13,227 / 15,818 (83.6%)** — **+1,449, 55 files up, 0 files down.**
 
 That list *is* the survey. The previous arc had taken 27 of those files to 97.5%;
 these numbers say what the other 147 look like, and they are not a tail — they are
@@ -345,13 +345,53 @@ previous knight wrote the reason down in the file — `'ontouchstart' in window`
 how half the web decides it is talking to a touchscreen, and this browser is driven
 by a synthetic pointer, not a finger. That is a decision, not a gap.
 
+## XI. ⭐⭐ Quests #841–#850 — a third pass, and the last honest rows
+
+- **Presentation API** — "show this on the big screen". `navigator.presentation`,
+  `PresentationRequest`, `PresentationConnection`, `PresentationAvailability` and
+  the two events. **16 → 100 / 103.** ⛔ No second display: `start()` rejects
+  `NotFoundError` and `availability.value` is `false`, which is the truth and is
+  what a page checks before offering the button at all.
+- **Storage Buckets** — named, independently-evictable storage, so a page can mark
+  the article someone saved for offline as more important than its image cache and
+  the device evicts the cache first. **17 → 50 / 50.** ⛔ The buckets are a real
+  registry but not yet separate STORES.
+- **Picture-in-Picture** — `document.pictureInPictureEnabled` is **false**, which is
+  exactly how a page is meant to find out PiP is unavailable; the interfaces exist
+  so the check itself does not throw. **26 → 51 / 67.**
+- **Remote Playback** — `video.remote`, `watchAvailability()` (the callback is told
+  `false`, once), `prompt()` rejects `NotFoundError`. **12 → 34 / 38.**
+- **`getVideoPlaybackQuality()` / `requestVideoFrameCallback()`** — the frame-drop
+  counters a player reads to decide whether to step down its quality (honestly zero),
+  and the frame callback (registered, never invoked, because nothing decodes).
+  **11 → 29 / 30** and **12 → 16 / 18**.
+- **`ProximitySensor`** — the sensor family's last member, same contract and same cap.
+  **2 → 16 / 16.**
+- **Background Fetch / Background Sync / Periodic Background Sync / Content Index** —
+  four registration extensions about one thing: finishing work when the connection
+  comes back. For someone who loses signal walking out of a building that is the
+  difference between an upload that survives and one that has to start again.
+  **9 → 42/45**, **8 → 17/17**, **10 → 19/33**, **8 → 26/26**. ⛔ There is no
+  background scheduler: the registrations are real bookkeeping a page can read back,
+  and `backgroundFetch.fetch()` refuses rather than resolving a registration that
+  would never download anything.
+- **`permissions.request()` / `revoke()`** — the two legacy operations. Neither can
+  change anything here, so both answer with the permission's current status: the
+  honest result of a request that was not granted. **4 → 7/7** and **4 → 7/7**.
+- Three shape fixes the sweep turned up: `document.fullscreenEnabled`'s
+  `[LegacyLenientSetter]` had `length` 0 (a setter takes one argument) and
+  `document.fullscreen` was missing along with its `@@unscopables` entry
+  (**37 → 41/42**); `XMLHttpRequest.open()` accepted zero arguments (its first two
+  are required); and `FormData.length` reported 2 when both of its arguments are
+  optional. **`xhr/idlharness` 188 → 191/196.**
+
 ---
 
 ## Results
 
 | file | before | after |
 |---|---:|---:|
-| **the 174-file idlharness sweep** | **11,778 / 15,818 (74.5%)** | **12,773 / 15,818 (80.7%)** — +995, **32 files up, 0 down** |
+| **the 174-file idlharness sweep** | **11,778 / 15,818 (74.5%)** | **13,227 / 15,818 (83.6%)** — +1,449, **55 files up, 0 down** |
 | `scheduler/` (27 files) | 0 / 71 | **70 / 71** |
 | `custom-elements/` (170 files) | 2,949 / 4,267 | **3,520 / 4,267** |
 | `custom-elements/builtin-coverage.html` | 111 / 444 | **444 / 444** |
@@ -390,17 +430,35 @@ by a synthetic pointer, not a finger. That is a decision, not a gap.
 | `service-workers/idlharness` | 143 / 175 | **155 / 175** |
 | `storage-access-api/idlharness` | 8 / 12 | **10 / 12** |
 | `streams/idlharness.any` | 226 / 228 | **227 / 228** |
+| `presentation-api/controlling-ua/idlharness` | 16 / 103 | **100 / 103** |
+| `storage/buckets/idlharness-worker` | 17 / 50 | **50 / 50** |
+| `picture-in-picture/idlharness` | 26 / 67 | **51 / 67** |
+| `remote-playback/idlharness` | 12 / 38 | **34 / 38** |
+| `media-playback-quality/idlharness` | 11 / 30 | **29 / 30** |
+| `video-rvfc/idlharness` | 12 / 18 | **16 / 18** |
+| `proximity/idlharness` | 2 / 16 | **16 / 16** |
+| `background-fetch/idlharness` | 9 / 45 | **42 / 45** |
+| `background-sync/idlharness` | 8 / 17 | **17 / 17** |
+| `periodic-background-sync/idlharness` | 10 / 33 | **19 / 33** |
+| `content-index/idlharness` | 8 / 26 | **26 / 26** |
+| `permissions-request` / `permissions-revoke` | 4 / 7 each | **7 / 7 each** |
+| `fullscreen/idlharness` | 37 / 42 | **41 / 42** |
+| `xhr/idlharness.any` | 188 / 196 | **191 / 196** |
+| `input-device-capabilities/idlharness` | 20 / 22 | **22 / 22** |
+| `dom/idlharness?exclude=Node` | 1292 / 1366 | **1297 / 1366** |
 
 ### The zero-regression ritual
 
-**392 rows compared, before → after: 1 up, 390 equal, 0 regressions.**
-Before `56,072 / 56,602`; after `56,124 / 56,602` (+52 — a bonus from
-`the-img-element/naturalWidth-naturalHeight-width-height.html` **176 → 228 / 258**).
+**392 rows compared, before → after: 2 up, 390 equal, 0 regressions.**
+The two that moved up are bonuses: `xhr/idlharness.any.html` **188 → 191 / 196**
+(the `open()` arity and `FormData.length` fixes) and
+`the-img-element/naturalWidth-naturalHeight-width-height.html` **176 → 184 / 258**.
 
-⚠️ One row read `78/78 → could-not-run`, and it is **not** a regression: it is the
-documented server-degradation gotcha after ~390 CDP sessions in one run.
+⚠️ Two rows read lower in the sweep output and **neither is a regression**: both are
+the documented server-degradation gotcha after ~390 CDP sessions in a single run.
 `css/css-conditional/container-queries/custom-property-style-queries.html` measures
-**78/78 on a fresh server**, re-verified in-session.
+**78/78** and `dom/events/scrolling/scrollend-event-handler-content-attributes.html`
+measures **4/4** on a fresh server — re-verified in-session, twice.
 
 ---
 

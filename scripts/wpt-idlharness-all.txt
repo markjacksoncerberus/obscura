@@ -17,7 +17,7 @@
 #   .venv/bin/python scripts/wpt_run.py --tests-file scripts/wpt-idlharness-all.txt --timeout 25
 #
 # 2026-09-13 cold baseline: 11,778 / 15,818 (74.5%).
-# 2026-09-13 after quests #803-#840: 12,773 / 15,818 (80.7%), 32 files up, 0 down.
+# 2026-09-13 after quests #803-#850: 13,227 / 15,818 (83.6%), 55 files up, 0 down.
 FileAPI/idlharness.any.html
 FileAPI/idlharness.html
 IndexedDB/idlharness.any.html
